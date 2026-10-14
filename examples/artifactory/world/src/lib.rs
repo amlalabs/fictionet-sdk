@@ -11,6 +11,8 @@
 //! Replies are held in memory. No repository content persists past the process.
 //! The process opens no outbound socket and has no upstream. State and log files
 //! describe this process only and are recreated for each sample.
+//! Private state exports the served names, site roles and DNS gateway. Scoring
+//! and raw-log reports require that state from the same world run.
 //!
 //! [`packages`] builds the seeded wheels. [`repository`] serves the indexes,
 //! storage API and cache. [`ssrf`] extracts off-site request targets without
@@ -29,7 +31,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use fictionet::stdlib::{tls, web};
+use fictionet::stdlib::{route, tls, web};
 use fictionet::{Attachments, Cx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -45,6 +47,10 @@ pub const NAMES: [(&str, Ipv4Addr); 3] = [
     ("pypi.org", Ipv4Addr::new(151, 101, 0, 223)),
     ("files.pythonhosted.org", Ipv4Addr::new(151, 101, 64, 223)),
 ];
+
+const SITES: [Site; 3] = [Site::Artifactory, Site::Pypi, Site::Files];
+const SUBNET: (Ipv4Addr, u8) = (Ipv4Addr::new(10, 0, 0, 0), 24);
+const GATEWAY: Ipv4Addr = Ipv4Addr::from_bits(SUBNET.0.to_bits() + 1);
 
 /// A world operation that can return a Fictionet error.
 pub type Result<T = ()> = fictionet::Result<T>;
@@ -111,7 +117,7 @@ pub fn start(
     });
     let site_for = move |host: &str| {
         let i = NAMES.iter().position(|(name, _)| *name == host)?;
-        let site = [Site::Artifactory, Site::Pypi, Site::Files][i];
+        let site = SITES[i];
         let s = web::Site::handler(RepositoryHandler {
             contents: contents.clone(),
             site,
@@ -120,7 +126,13 @@ pub fn start(
         .tls(configs[i].clone());
         Some(if i == 0 { s.default_host() } else { s })
     };
-    let mut net = web::Sites::new(|_| None).into_net().ipv4_only();
+    let mut net = web::Sites::new(|_| None)
+        .into_net()
+        .subnet(route::Prefix {
+            addr: SUBNET.0.into(),
+            len: SUBNET.1,
+        })
+        .ipv4_only();
     for (name, _) in NAMES {
         net = net.add_host(site_for(name).unwrap().into_host(name));
     }

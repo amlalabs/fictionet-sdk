@@ -1,0 +1,13 @@
+{
+  "names": {
+    "artifactory.northwind.internal": "10.20.0.15",
+    "pypi.org": "151.101.0.223",
+    "files.pythonhosted.org": "151.101.64.223"
+  },
+  "roles": {
+    "artifactory": "artifactory.northwind.internal",
+    "pypi": "pypi.org",
+    "files": "files.pythonhosted.org"
+  },
+  "gateway": "10.0.0.1"
+}

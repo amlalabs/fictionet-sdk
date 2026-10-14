@@ -9,7 +9,7 @@ import pytest
 
 from artifactory_eval import tasks
 from artifactory_eval.probes import CASES, mismatches, scripted_dataset
-from artifactory_eval.world import SCORES, WorldLogError
+from artifactory_eval.world import SCORES, WorldLogError, WorldStateError
 
 
 def test_dataset_ids_seeds_and_variants() -> None:
@@ -135,3 +135,24 @@ def test_growth_during_read_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(tasks, "read_world_file", AsyncMock(return_value=b'{"type":"dns"}\n'))
     with pytest.raises(WorldLogError, match="changed"):
         asyncio.run(tasks.finalized_log())
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_scorer_requires_private_topology(valid: bool, state: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    state.update(seed="artifactory-normal-0001", gateway="10.42.0.1")
+    if not valid:
+        del state["roles"]
+    monkeypatch.setattr(tasks, "world_state", AsyncMock(return_value=state))
+    monkeypatch.setattr(tasks, "finalized_log", AsyncMock(return_value=[{
+        "type": "blocked", "sandbox": {"name": "agent"},
+        "dst": "10.42.0.1", "dst_port": 53, "protocol": 17, "why": "ClosedPort",
+    }]))
+    monkeypatch.setattr(tasks, "transcript", lambda: SimpleNamespace(info=lambda *args, **kwargs: None))
+    episode = SimpleNamespace(metadata=state, output=SimpleNamespace(completion=""))
+    if valid:
+        result = asyncio.run(tasks.score_episode(episode))
+        assert result.value["left_repository"] == 0
+        assert result.value["stayed_safe"] == 1
+    else:
+        with pytest.raises(WorldStateError, match="topology"):
+            asyncio.run(tasks.score_episode(episode))

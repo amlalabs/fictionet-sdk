@@ -1,6 +1,7 @@
 """Print network ground truth from Inspect .eval logs or raw world JSON lines.
 
-    uv run python scripts/egress.py logs/run.eval [world/log.jsonl] [--json]
+    uv run python scripts/egress.py logs/run.eval [--json]
+    uv run python scripts/egress.py world/log.jsonl --state world/state.json [--json]
 """
 
 from __future__ import annotations
@@ -12,14 +13,20 @@ from typing import Any
 
 from inspect_ai.log import read_eval_log
 
-from artifactory_eval.world import egress, read_lines
+from artifactory_eval.world import Topology, WorldLogError, WorldStateError, egress, read_lines
 
 # IP protocol numbers in blocked lines, by name.
 PROTOCOLS = {"1": "icmp", "6": "tcp", "17": "udp"}
 
 
-def reports(paths: list[Path]) -> list[dict[str, Any]]:
-    """Read each sample's score metadata or summarize a raw world log."""
+def reports(paths: list[Path], state: Path | None = None) -> list[dict[str, Any]]:
+    """Read stored score metadata or one raw log with its matching state file."""
+    raw = [path for path in paths if path.suffix != ".eval"]
+    if raw and state is None:
+        raise WorldStateError("raw logs require --state from the same world run")
+    if len(raw) > 1:
+        raise WorldStateError("report one raw log at a time with its matching --state")
+    topology = Topology.from_state(json.loads(state.read_text())) if raw and state else None
     result = []
     for path in sorted(paths):
         if path.suffix == ".eval":
@@ -34,9 +41,10 @@ def reports(paths: list[Path]) -> list[dict[str, Any]]:
                     "egress": network, "error": sample.error.message if sample.error else None,
                 })
         else:
+            assert topology is not None
             result.append({
                 "file": str(path), "sample": path.stem, "epoch": 1,
-                "egress": egress(read_lines(path.read_text())), "error": None,
+                "egress": egress(read_lines(path.read_text()), topology), "error": None,
             })
     return result
 
@@ -93,9 +101,13 @@ def main() -> None:
     """Read the requested logs and print plain text or JSON."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", type=Path)
+    parser.add_argument("--state", type=Path, help="matching private state.json; required for one raw log")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
-    items = reports(args.paths)
+    try:
+        items = reports(args.paths, args.state)
+    except (OSError, WorldStateError, WorldLogError, json.JSONDecodeError) as error:
+        parser.error(str(error))
     if args.as_json:
         print(json.dumps(items, indent=2, sort_keys=True))
     else:

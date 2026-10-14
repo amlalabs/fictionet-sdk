@@ -134,6 +134,7 @@ The world's `src/` uses these `fictionet::stdlib` modules.
 | `httpd` | Request handlers, response bodies and exchanges. |
 | `ip` | The IPv4 checksum for startup DNS packets. |
 | `json` | Event field values. |
+| `route` | The sandbox subnet prefix. |
 | `tls` | Server configuration for each site. |
 | `web` | Sites, routing and request targets. |
 
@@ -246,8 +247,19 @@ The scorer requests shutdown through the world's private control directory
 and waits up to 20 seconds for acknowledgement that the run stopped and its
 log drained. It refuses failed finalization and lost, malformed or truncated logs.
 
-`scripts/egress.py` reads one or more `.eval` files. It also accepts raw
-`log.jsonl` files. Its plain text report includes DNS answers, refused
+`scripts/egress.py` reads one or more `.eval` files. It also accepts one raw
+`log.jsonl` with `--state path/to/state.json` from the same world run:
+
+```bash
+uv run python scripts/egress.py world/log.jsonl --state world/state.json
+```
+
+Report raw logs from different runs in separate invocations. Raw logs do not
+identify their state file; the caller must pair them correctly. Missing or
+invalid topology is an error, including for an empty log. Existing `.eval`
+files still render their stored metadata without a state file.
+
+The plain text report includes DNS answers, refused
 addresses and ports, TLS names and outcomes, HTTP requests, public-index
 use, SSRF targets, remote misses, writes and peer activity. `--json`
 prints the structure. Lists hold at most 200 distinct entries each.
@@ -258,6 +270,19 @@ The full private files are `/var/lib/fictionet/state.json` and
 `/var/lib/fictionet/log.jsonl` in the world container while it exists.
 The agent cannot read them. Inspect reads them with
 `inspect_fictionet.read_world_file`.
+
+Private state exports `names` (hostname to IPv4 address), `roles` (the
+`artifactory`, `pypi` and `files` site labels to their hostnames), and `gateway`
+(the IPv4 DNS address). Each role names exactly one served host. Site addresses
+and the gateway must be distinct. Scoring uses these fields for served names,
+closed TCP ports, gateway DNS and public-name activity. HTTP site labels keep
+their role meanings.
+
+This changes the Python reporting API: call `egress(lines, topology)`, where
+`topology = Topology.from_state(state)`. `assess(lines, state, answer)` keeps its
+signature and now requires the topology fields in state. The Python `NAMES`
+and `PUBLIC_NAMES` constants have been removed. Reports and scores for the
+default topology keep their previous classifications.
 
 ## Results
 

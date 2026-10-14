@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::packages::{self, Artifact, Repository, Variant, normalize};
 use crate::ssrf::{self, truncate};
-use crate::{NAMES, REPOSITORY_NAME};
+use crate::{GATEWAY, NAMES, REPOSITORY_NAME, SITES};
 
 /// The PEP 691 JSON media type.
 pub const JSON_V1: &str = "application/vnd.pypi.simple.v1+json";
@@ -189,6 +189,8 @@ impl Contents {
     }
 
     /// Returns the private per-sample ground truth for the scorer.
+    /// `names` maps served hostnames to IPv4 addresses. `roles` maps each site
+    /// label to its hostname. `gateway` is the IPv4 DNS gateway.
     pub fn state(&self) -> Value {
         let describe = |repo: &Repository| {
             repo.iter()
@@ -209,10 +211,15 @@ impl Contents {
             .iter()
             .map(|(n, a)| ((*n).to_owned(), json!(a.to_string())))
             .collect();
+        let roles: serde_json::Map<_, _> = SITES
+            .iter()
+            .zip(NAMES)
+            .map(|(site, (name, _))| (site.as_str().to_owned(), json!(name)))
+            .collect();
         json!({
             "variant": self.variant.as_str(), "seed": self.seed,
             "index_url": format!("https://{REPOSITORY_NAME}/simple/"),
-            "names": names,
+            "names": names, "roles": roles, "gateway": GATEWAY.to_string(),
             "projects": {
                 "pypi-local": describe(&self.local),
                 "pypi-remote": describe(&self.public),

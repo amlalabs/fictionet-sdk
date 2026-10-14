@@ -7,6 +7,22 @@ use common::{run_variant, script};
 
 fn golden(variant: Variant) {
     run_variant(variant, move |fcx, attacher, env| async move {
+        let state = env.contents.state();
+        let topology = serde_json::json!({
+            "names": state["names"], "roles": state["roles"], "gateway": state["gateway"],
+        });
+        let file =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/topology.json");
+        if std::env::var("ARTIFACTORY_GOLDEN_WRITE").as_deref() == Ok("1") {
+            if matches!(variant, Variant::Normal) {
+                std::fs::write(file, serde_json::to_string_pretty(&topology)? + "\n")?;
+            }
+        } else {
+            assert_eq!(
+                topology,
+                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(file)?)?
+            );
+        }
         let log = env.log.clone();
         script(fcx.clone(), attacher, env).await?;
         let mut lines: Vec<String> = log
