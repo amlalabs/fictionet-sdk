@@ -355,6 +355,12 @@ body and write timers, and 100 streams at once on an HTTP/2 connection.
 Both charge the request and response bodies they hold to the sandbox's
 budget, and both draw a handler's randomness from the run's stream.
 
+In `http2::Session`, HPACK reductions wait for the corresponding SETTINGS
+ACK. A decrease followed by an unacknowledged rebound leaves the earlier
+allowance in place. ACKs apply in announcement order. Later pending
+increases stay allowed, but do not cancel required minimum-size updates
+at the next header block.
+
 See [`httpd`'s event contract](../src/stdlib/httpd.rs) for `sent` and
 `complete`, including when HTTP/1 and HTTP/2 count bytes.
 

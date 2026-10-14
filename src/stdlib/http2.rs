@@ -19,6 +19,7 @@
 //! closes both halves with `peer_reset`, and retires their DATA decoders.
 //! Idle-stream checks and stream ownership belong to the caller.
 //! SETTINGS reductions take effect when the sending direction reads its ACK.
+//! Later pending HPACK increases do not cancel required size updates.
 
 use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{
@@ -1322,6 +1323,7 @@ pub struct Session {
     stopped: bool,
     failed: Option<Error>,
     settings_updates: std::collections::VecDeque<SettingsUpdate>,
+    table_limit: usize,
     initial_window: u32,
     frame_size: u32,
 }
@@ -1356,6 +1358,7 @@ impl Session {
             stopped: false,
             failed: None,
             settings_updates: std::collections::VecDeque::new(),
+            table_limit: 4096,
             initial_window: 65_535,
             frame_size: DEFAULT_FRAME_SIZE as u32,
         }
@@ -1387,6 +1390,7 @@ impl Session {
         self.peer_resets.clear();
         self.reset_before = [0; 2];
         self.settings_updates.clear();
+        self.table_limit = 4096;
         self.initial_window = 65_535;
         self.frame_size = DEFAULT_FRAME_SIZE as u32;
         self.settings = SettingsState::default();
@@ -1480,6 +1484,8 @@ impl Session {
     /// Applies SETTINGS announced in the other direction. Increases can
     /// apply at once. HPACK, window, and frame-size reductions wait for this
     /// direction's SETTINGS ACK. At most 64 unacknowledged sets are retained.
+    /// ACKs apply in announcement order. HPACK allows later pending increases
+    /// while retaining any required minimum-size update at the next block.
     /// Errors stop the direction.
     pub fn peer_settings(&mut self, settings: &Settings) -> Result<(), Error> {
         if self.stopped {
@@ -1516,10 +1522,9 @@ impl Session {
         // Reductions remain optional until ACK, including for new streams.
         let initial = self.initial_window.max(window_max);
         self.set_initial_window(initial, window_min, initial)?;
-        if peer.header_table_size > self.peer.header_table_size {
-            self.blocks
-                .table
-                .set_settings_limit(peer.header_table_size as usize);
+        if peer.header_table_size as usize > self.table_limit {
+            self.table_limit = peer.header_table_size as usize;
+            self.blocks.table.set_settings_limit(self.table_limit);
         }
         self.settings_updates.push_back(SettingsUpdate {
             table_min: table_min.map(|n| n as usize),
@@ -1566,15 +1571,18 @@ impl Session {
         };
         if let Some(limit) = update.table_min {
             self.blocks.table.set_settings_limit(limit);
-            self.blocks.table.set_settings_limit(update.table_final);
         }
         // Later increases may already be in use before their own ACK.
+        let mut table_limit = update.table_final;
         let mut window = update.window;
         let mut frame_size = update.frame_size;
         for pending in &self.settings_updates {
+            table_limit = table_limit.max(pending.table_final);
             window = window.max(pending.window_max);
             frame_size = frame_size.max(pending.frame_max);
         }
+        self.table_limit = table_limit;
+        self.blocks.table.set_settings_limit(table_limit);
         self.set_initial_window(window, window, window)?;
         self.set_frame_size(frame_size);
         Ok(())
@@ -2331,6 +2339,93 @@ mod tests {
         block.push(0x88);
         accept(&mut c, &raw(1, 4, 5, &block));
         assert_eq!(c.blocks.table.table_capacity(), Some(2048));
+    }
+
+    #[test]
+    fn hpack_pending_rebound_keeps_in_flight_headers_valid() {
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        for value in [1024, 2048] {
+            c.peer_settings(&Settings {
+                flags: 0,
+                entries: vec![Setting { id: 1, value }],
+            })
+            .unwrap();
+        }
+        assert_eq!(c.peer().header_table_size, 2048);
+        let events = accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        assert!(matches!(&events[..], [Event::Headers { fields, .. }]
+            if fields == &[hpack::Field::new(":status", "200")]));
+        assert_eq!(c.blocks.table.settings_limit(), Some(4096));
+
+        accept(&mut c, &raw(4, 1, 0, &[]));
+        let mut block = Vec::new();
+        fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 1024).unwrap();
+        fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 2048).unwrap();
+        block.push(0x88);
+        accept(&mut c, &raw(1, 4, 3, &block));
+        assert_eq!(c.blocks.table.settings_limit(), Some(2048));
+        accept(&mut c, &raw(4, 1, 0, &[]));
+        accept(&mut c, &raw(1, 4, 5, &[0x88]));
+        assert_eq!(c.blocks.table.table_capacity(), Some(2048));
+    }
+
+    #[test]
+    fn hpack_acknowledged_minima_allow_later_pending_increases() {
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        for value in [2048, 1024, 8192] {
+            c.peer_settings(&Settings {
+                flags: 0,
+                entries: vec![Setting { id: 1, value }],
+            })
+            .unwrap();
+        }
+        accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        for (stream, minimum) in [(3, 2048), (5, 1024)] {
+            accept(&mut c, &raw(4, 1, 0, &[]));
+            let mut block = Vec::new();
+            fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, minimum).unwrap();
+            fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 8192).unwrap();
+            block.push(0x88);
+            accept(&mut c, &raw(1, 4, stream, &block));
+            assert_eq!(c.blocks.table.table_capacity(), Some(8192));
+            assert_eq!(c.blocks.table.settings_limit(), Some(8192));
+        }
+        accept(&mut c, &raw(4, 1, 0, &[]));
+        accept(&mut c, &raw(1, 4, 7, &[0x88]));
+    }
+
+    #[test]
+    fn hpack_pending_increases_preserve_required_acknowledged_reductions() {
+        for ack_count in [1, 2] {
+            for update in [None, Some(2048)] {
+                let mut c = Session::server_side(Limits::default());
+                accept(&mut c, &settings());
+                for value in [1024, 8192] {
+                    c.peer_settings(&Settings {
+                        flags: 0,
+                        entries: vec![Setting { id: 1, value }],
+                    })
+                    .unwrap();
+                }
+                for _ in 0..ack_count {
+                    accept(&mut c, &raw(4, 1, 0, &[]));
+                }
+                let mut block = Vec::new();
+                if let Some(value) = update {
+                    fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, value).unwrap();
+                }
+                block.push(0x88);
+                let frame = raw(1, 4, 1, &block);
+                assert_eq!(c.push(&frame), frame.len());
+                assert_eq!(
+                    c.next().unwrap().unwrap_err().code,
+                    ErrorCode::CompressionError
+                );
+                assert!(c.next().is_none());
+            }
+        }
     }
 
     #[test]
