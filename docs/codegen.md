@@ -52,6 +52,12 @@ A body's `Wire` implementation excludes this outer framing.
 The header records the generator package version and escaped input
 basenames, followed by a `#![doc]` attribute with the schema's
 documentation. It never includes input directory paths or timestamps.
+Codec and fuzz headers also record a regeneration command. It includes
+nondefault limits in the order shown below and omits limits equal to the
+defaults. To reproduce the output, use the recorded generator version and
+schema, resolve the input basenames, and replace `<this file>` with the
+output path. Run a fuzz recipe from the target's directory so its
+target-relative module path resolves correctly.
 Declaration order is preserved. Identical validated inputs produce
 identical output bytes, without a formatter installed.
 

@@ -110,6 +110,81 @@ fn generate_limits_fuzz_and_bad_files() {
 }
 
 #[test]
+fn recorded_recipes_reproduce_bounded_artifacts() {
+    let scratch = Scratch::new();
+    std::fs::write(
+        scratch.0.join("schema.json"),
+        include_str!("schemas/recursive.json"),
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
+        .current_dir(&scratch.0)
+        .args([
+            "ir",
+            "schema.json",
+            "-o",
+            "module.rs",
+            "--fuzz",
+            "fuzz.rs",
+            "--max-nodes",
+            "100",
+            "--max-allocation",
+            "2048",
+            "--max-depth",
+            "8",
+            "--max-collection",
+            "2",
+            "--max-message",
+            "512",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let module = std::fs::read_to_string(scratch.0.join("module.rs")).unwrap();
+    let fuzz = std::fs::read_to_string(scratch.0.join("fuzz.rs")).unwrap();
+    for (filename, source) in [("module.rs", &module), ("fuzz.rs", &fuzz)] {
+        let recipe = source
+            .lines()
+            .find_map(|line| line.strip_prefix("// Regenerate with: fictionet-codegen "))
+            .unwrap()
+            .replace("<this file>", filename);
+        std::fs::remove_file(scratch.0.join("module.rs")).unwrap();
+        if filename == "fuzz.rs" {
+            std::fs::remove_file(scratch.0.join("fuzz.rs")).unwrap();
+        }
+        // These fixture paths contain no whitespace or escaped characters.
+        let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
+            .current_dir(&scratch.0)
+            .args(
+                recipe
+                    .split_ascii_whitespace()
+                    .map(|arg| arg.trim_matches('"')),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{recipe}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("module.rs")).unwrap(),
+            module,
+            "{recipe}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("fuzz.rs")).unwrap(),
+            fuzz,
+            "{recipe}"
+        );
+    }
+}
+
+#[test]
 fn outputs_cannot_alias_inputs_or_each_other() {
     let scratch = Scratch::new();
     let schema = include_str!("schemas/recursive.json");

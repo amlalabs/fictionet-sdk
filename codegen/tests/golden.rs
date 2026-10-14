@@ -109,6 +109,47 @@ fn header_quotes_untrusted_filenames() {
 }
 
 #[test]
+fn headers_record_only_nondefault_limits_in_order() {
+    for (limits, options) in [
+        (Limits::default(), ""),
+        (
+            Limits {
+                max_collection: 0,
+                ..Limits::default()
+            },
+            " --max-collection 0",
+        ),
+        (
+            Limits {
+                max_message: 128,
+                max_collection: 8,
+                max_depth: 4,
+                max_allocation: 32,
+                max_nodes: 8,
+            },
+            " --max-message 128 --max-collection 8 --max-depth 4 --max-allocation 32 --max-nodes 8",
+        ),
+    ] {
+        let checked = validate(Default::default(), limits).unwrap();
+        let inputs = ["schema.json".into()];
+        for (source, outputs) in [
+            (emit("ir", &checked, &inputs).unwrap(), "-o <this file>"),
+            (
+                emit_fuzz("ir", &checked, "module.rs", &inputs).unwrap(),
+                "-o \"module.rs\" --fuzz <this file>",
+            ),
+        ] {
+            assert_eq!(
+                source.lines().nth(2).unwrap(),
+                format!(
+                    "// Regenerate with: fictionet-codegen ir \"schema.json\"{options} {outputs}"
+                )
+            );
+        }
+    }
+}
+
+#[test]
 fn output_limit_counts_emitted_bytes() {
     let checked = validate(Default::default(), Limits::default()).unwrap();
     let base = emit("x", &checked, &[]).unwrap();
