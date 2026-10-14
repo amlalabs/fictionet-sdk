@@ -6,6 +6,9 @@ use std::time::Duration;
 use super::packets::LinkWatch;
 use crate::watch::Graph;
 
+/// Enough for one session's full set of distinct packet subscriptions.
+const DEFAULT_WATCHES: usize = 64;
+
 /// How long a link's decoded packets are kept after the last observer
 /// stopped asking for them.
 #[cfg(feature = "observe")]
@@ -28,12 +31,49 @@ const REAP_EVERY: Duration = if cfg!(test) {
 /// watch's inner state. Watch creation and decoding also take graph state
 /// locks, so callers must release graph state before calling this set.
 /// Subscription release drops the watch lock before scheduling the reaper.
-#[derive(Default)]
 pub(crate) struct WatchSet {
-    watches: Mutex<HashMap<u64, Arc<LinkWatch>>>,
+    state: Mutex<State>,
+}
+
+struct State {
+    watches: HashMap<u64, Arc<LinkWatch>>,
+    limit: usize,
+}
+
+impl State {
+    /// Evicts the longest-idle watches first, with link ids breaking ties.
+    /// Active subscriptions always keep their watch.
+    fn evict_idle(&mut self, limit: usize) {
+        while self.watches.len() > limit {
+            let victim = self
+                .watches
+                .iter()
+                .filter_map(|(&id, w)| w.idle_order().map(|order| (order, id)))
+                .min();
+            let Some((_, id)) = victim else { break };
+            self.watches.remove(&id);
+        }
+    }
+}
+
+impl Default for WatchSet {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(State {
+                watches: HashMap::new(),
+                limit: DEFAULT_WATCHES,
+            }),
+        }
+    }
 }
 
 impl WatchSet {
+    pub(crate) fn set_limit(&self, limit: usize) {
+        let mut state = self.state.lock();
+        state.limit = limit;
+        state.evict_idle(limit);
+    }
+
     /// Finds or creates a watch of link `id` in the graph owning this set.
     /// Subscribes under the map lock so reaping cannot forget it between
     /// lookup and subscription.
@@ -41,42 +81,51 @@ impl WatchSet {
         &self,
         graph: &Arc<Graph>,
         id: u64,
-    ) -> Option<(Arc<LinkWatch>, Subscription)> {
+    ) -> Result<(Arc<LinkWatch>, Subscription), &'static str> {
         self.reap_idle();
-        let mut watches = self.watches.lock();
-        let w = match watches.get(&id) {
+        let mut state = self.state.lock();
+        let w = match state.watches.get(&id) {
             Some(w) => w.clone(),
             None => {
-                let w = Arc::new(LinkWatch::start(graph, id)?);
-                watches.insert(id, w.clone());
+                let w = LinkWatch::start(graph, id).ok_or("no such link")?;
+                if state.watches.values().filter(|w| !w.is_idle()).count() >= state.limit {
+                    return Err("this world has too many watched links");
+                }
+                let w = Arc::new(w);
+                let limit = state.limit;
+                state.evict_idle(limit - 1);
+                state.watches.insert(id, w.clone());
                 w
             }
         };
         w.subscribe();
         let subscription = Subscription(w.clone());
-        Some((w, subscription))
+        Ok((w, subscription))
     }
 
     /// The watch of link `id`, if one is kept. Does not subscribe or reap.
     pub(crate) fn existing(&self, id: u64) -> Option<Arc<LinkWatch>> {
-        self.watches.lock().get(&id).cloned()
+        self.state.lock().watches.get(&id).cloned()
     }
 
     /// Forgets watches with no subscriber for a minute. Takes each watch's
     /// lock under the map lock, as acquisition does.
     pub(crate) fn reap_idle(&self) {
-        self.watches.lock().retain(|_, w| !w.idle_for(WATCH_LINGER));
+        self.state
+            .lock()
+            .watches
+            .retain(|_, w| !w.idle_for(WATCH_LINGER));
     }
 
     /// Whether the run keeps any watches.
     pub(crate) fn is_empty(&self) -> bool {
-        self.watches.lock().is_empty()
+        self.state.lock().watches.is_empty()
     }
 
     /// Releases the run's watches. Active streams keep their own holds
     /// until they finish. The caller must release graph state first.
     pub(crate) fn end_run(&self) {
-        self.watches.lock().clear();
+        self.state.lock().watches.clear();
     }
 
     /// Releases a subscription even if its graph is gone. The watch lock
@@ -85,6 +134,11 @@ impl WatchSet {
         if watch.unsubscribe()
             && let Some(graph) = watch.graph()
         {
+            {
+                let mut state = graph.watches.state.lock();
+                let limit = state.limit;
+                state.evict_idle(limit);
+            }
             let _ = Self::reap_later(&graph);
         }
     }
@@ -161,6 +215,97 @@ fn start_reaper() -> bool {
 #[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_watch_capacity_preserves_sharing_and_releases_on_drop() {
+        use crate::watch::Meter;
+        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        graph.watches.set_limit(1);
+        let first = Meter::new();
+        let second = Meter::new();
+        graph.owns(&first, 0, 1);
+        graph.owns(&second, 0, 1);
+        let (watch, a) = graph.watches.acquire(&graph, first.id).unwrap();
+        let (shared, b) = graph.watches.acquire(&graph, first.id).unwrap();
+        assert!(Arc::ptr_eq(&watch, &shared));
+        assert_eq!(
+            graph.watches.acquire(&graph, u64::MAX).err(),
+            Some("no such link")
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                graph.watches.acquire(&graph, second.id).err(),
+                Some("this world has too many watched links")
+            );
+            assert!(graph.watches.existing(second.id).is_none());
+        }
+        drop(a);
+        assert!(graph.watches.acquire(&graph, second.id).is_err());
+        first.sent(0, &crate::Packet(vec![0x45; 20]));
+        shared.pump();
+        assert_eq!(shared.rows_after(0, 10).len(), 1);
+        let weak = Arc::downgrade(&watch);
+        drop((watch, shared, b));
+        assert!(weak.upgrade().is_some(), "idle history lingers");
+        let (_watch, _sub) = graph.watches.acquire(&graph, second.id).unwrap();
+        assert!(weak.upgrade().is_none(), "admission releases idle history");
+        assert!(graph.watches.existing(first.id).is_none());
+    }
+
+    #[test]
+    fn admission_evicts_longest_idle_watches_first() {
+        use crate::watch::Meter;
+        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        graph.watches.set_limit(3);
+        let meters: Vec<_> = (0..5).map(|_| Meter::new()).collect();
+        for meter in &meters {
+            graph.owns(meter, 0, 1);
+        }
+        let (_watch, _sub) = graph.watches.acquire(&graph, meters[0].id).unwrap();
+        let (_, first) = graph.watches.acquire(&graph, meters[1].id).unwrap();
+        let (_, second) = graph.watches.acquire(&graph, meters[2].id).unwrap();
+        // Release out of link-id order. Active links are never victims.
+        drop(second);
+        drop(first);
+        assert_eq!(
+            graph.watches.acquire(&graph, u64::MAX).err(),
+            Some("no such link")
+        );
+        assert!(graph.watches.existing(meters[1].id).is_some());
+        assert!(graph.watches.existing(meters[2].id).is_some());
+        let (_watch, _sub) = graph.watches.acquire(&graph, meters[3].id).unwrap();
+        assert!(graph.watches.existing(meters[0].id).is_some());
+        assert!(graph.watches.existing(meters[1].id).is_some());
+        assert!(graph.watches.existing(meters[2].id).is_none());
+        let (_watch, _sub) = graph.watches.acquire(&graph, meters[4].id).unwrap();
+        assert!(graph.watches.existing(meters[0].id).is_some());
+        assert!(graph.watches.existing(meters[1].id).is_none());
+        assert!(graph.watches.existing(meters[3].id).is_some());
+        assert_eq!(graph.watches.state.lock().watches.len(), 3);
+    }
+
+    #[test]
+    fn lowering_watch_capacity_preserves_active_subscriptions() {
+        use crate::watch::Meter;
+        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        graph.watches.set_limit(2);
+        let first = Meter::new();
+        let second = Meter::new();
+        graph.owns(&first, 0, 1);
+        graph.owns(&second, 0, 1);
+        let (watch, a) = graph.watches.acquire(&graph, first.id).unwrap();
+        drop(graph.watches.acquire(&graph, second.id).unwrap());
+        graph.watches.set_limit(0);
+        assert!(graph.watches.existing(second.id).is_none());
+        let (shared, b) = graph.watches.acquire(&graph, first.id).unwrap();
+        assert!(Arc::ptr_eq(&watch, &shared));
+        assert!(graph.watches.acquire(&graph, second.id).is_err());
+        drop((a, b));
+        assert!(graph.watches.is_empty());
+        assert!(graph.watches.acquire(&graph, first.id).is_err());
+        graph.watches.set_limit(1);
+        assert!(graph.watches.acquire(&graph, second.id).is_ok());
+    }
 
     #[test]
     fn subscribers_share_a_watch_and_reuse_its_history() {

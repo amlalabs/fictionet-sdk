@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use fictionet::sync::Mutex;
+
 use super::json::{self, Object, Scalar};
 use super::packets::{LinkWatch, keylog};
 use super::view::{self, View};
@@ -27,18 +29,75 @@ const PACKET_TICK: Duration = Duration::from_millis(100);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Subscriptions one session may hold.
 const MAX_SUBSCRIPTIONS: usize = 64;
+/// Matches the dashboard's connection cap, including direct observers.
+const DEFAULT_SESSIONS: usize = 64;
 
-pub(crate) fn start(attacher: Attacher, fd: OwnedFd) {
-    let _ = std::thread::Builder::new()
-        .name("fictionet-observe".into())
-        .spawn(move || {
-            let mut session = Session {
-                attacher,
-                fd,
-                subs: Vec::new(),
-            };
-            let _ = session.run();
-        });
+/// Sessions admitted by one listener, including clients with no streams.
+pub(crate) struct Sessions(Mutex<Admission>);
+
+struct Admission {
+    limit: usize,
+    active: usize,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self(Mutex::new(Admission {
+            limit: DEFAULT_SESSIONS,
+            active: 0,
+        }))
+    }
+}
+
+impl Sessions {
+    pub(crate) fn set_limit(&self, limit: usize) {
+        self.0.lock().limit = limit;
+    }
+
+    /// Reserves before sending `accept` or starting a thread.
+    pub(crate) fn reserve(self: &Arc<Self>) -> Option<SessionSlot> {
+        let mut admission = self.0.lock();
+        if admission.active >= admission.limit {
+            return None;
+        }
+        admission.active += 1;
+        Some(SessionSlot(self.clone()))
+    }
+}
+
+/// Releases admission on disconnect, failed acceptance, or failed spawn.
+pub(crate) struct SessionSlot(Arc<Sessions>);
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.0.0.lock().active -= 1;
+    }
+}
+
+pub(crate) fn start(attacher: Attacher, fd: OwnedFd, slot: SessionSlot) {
+    let _ = start_thread(
+        attacher,
+        fd,
+        slot,
+        std::thread::Builder::new().name("fictionet-observe".into()),
+    );
+}
+
+fn start_thread(
+    attacher: Attacher,
+    fd: OwnedFd,
+    slot: SessionSlot,
+    builder: std::thread::Builder,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    builder.spawn(move || {
+        let _slot = slot;
+        let mut session = Session {
+            attacher,
+            fd,
+            subs: Vec::new(),
+        };
+        let _ = session.run();
+    })
 }
 
 /// Counts a connected observer, so links copy packets and TLS keeps keys.
@@ -244,7 +303,10 @@ impl Session {
                     return self.reply(id, &error("the request needs a link, such as \"e5\""));
                 };
                 let watch = match (op, &graph) {
-                    ("packets", Some(g)) => g.watches.acquire(g, link).map(|(w, s)| (w, Some(s))),
+                    ("packets", Some(g)) => match g.watches.acquire(g, link) {
+                        Ok((w, s)) => Some((w, Some(s))),
+                        Err(reason) => return self.reply(id, &error(reason)),
+                    },
                     ("packet" | "pcap", Some(g)) => g.watches.existing(link).map(|w| (w, None)),
                     _ => None,
                 };
@@ -310,6 +372,7 @@ impl Session {
                     Some(i) => {
                         let sub = self.subs.remove(i);
                         self.reply(sub.id(), &event("end", r#"{"reason":"cancelled"}"#))?;
+                        drop(sub);
                         self.reply(id, r#"{"ok":true}"#)
                     }
                     None => self.reply(id, &error("no such subscription")),
@@ -468,6 +531,57 @@ fn world(graph: Option<&Graph>) -> String {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn session_slots_are_bounded_and_reusable() {
+        let sessions = Arc::new(Sessions::default());
+        sessions.set_limit(2);
+        let first = sessions.reserve().unwrap();
+        let second = sessions.reserve().unwrap();
+        assert!(sessions.reserve().is_none());
+        drop(first);
+        let reused = sessions.reserve().unwrap();
+        assert!(sessions.reserve().is_none());
+        sessions.set_limit(0);
+        drop((second, reused));
+        assert!(sessions.reserve().is_none());
+        sessions.set_limit(1);
+        assert!(sessions.reserve().is_some());
+    }
+
+    #[test]
+    fn session_slots_release_on_disconnect_and_failed_thread_creation() {
+        for fail in [false, true] {
+            let sessions = Arc::new(Sessions::default());
+            sessions.set_limit(1);
+            let mut fds = [0; 2];
+            // SAFETY: socketpair initializes two descriptors, owned from here.
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr())
+                },
+                0
+            );
+            let (ours, theirs) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            let (attacher, _attachments) = crate::attachments();
+            let builder = std::thread::Builder::new();
+            let builder = if fail {
+                builder.stack_size(usize::MAX)
+            } else {
+                builder
+            };
+            let started = start_thread(attacher, ours, sessions.reserve().unwrap(), builder);
+            if fail {
+                assert!(started.is_err());
+            } else {
+                assert!(sessions.reserve().is_none());
+                drop(theirs);
+                started.unwrap().join().unwrap();
+            }
+            assert!(sessions.reserve().is_some());
+        }
+    }
 
     #[test]
     fn full_event_batch_schedules_immediate_catch_up() {

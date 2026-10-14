@@ -3,7 +3,7 @@
 
 use fictionet::sync::Mutex;
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use super::decode::Dissector;
@@ -20,6 +20,9 @@ pub(crate) const ROW_BYTES: usize = 32 << 20;
 /// How many copies one call to [`LinkWatch::pump`] decodes, so that a
 /// session gets back to its observer even while the link floods.
 const PUMP_BATCH: usize = 1024;
+
+/// Orders last-subscriber releases for idle-watch eviction.
+static NEXT_RELEASE: AtomicU64 = AtomicU64::new(1);
 
 /// A decoded packet.
 struct Row {
@@ -64,6 +67,7 @@ struct Inner {
     row_bytes: usize,
     /// When the last subscriber left.
     released: Instant,
+    released_order: u64,
     /// The node at each end, for the browser.
     ends: [String; 2],
     label: Option<String>,
@@ -108,6 +112,7 @@ impl LinkWatch {
                 rows: VecDeque::new(),
                 row_bytes: 0,
                 released: Instant::now(),
+                released_order: 0,
                 ends,
                 label,
                 keys: VecDeque::new(),
@@ -137,8 +142,22 @@ impl LinkWatch {
         if last {
             inner.guard = None;
             inner.released = Instant::now();
+            inner.released_order = NEXT_RELEASE.fetch_add(1, Ordering::Relaxed);
         }
         last
+    }
+
+    /// Whether admission may evict this watch. Call under the set's map
+    /// lock so no subscription can arrive between checking and eviction.
+    pub(super) fn is_idle(&self) -> bool {
+        self.subscribers.load(Ordering::SeqCst) == 0
+    }
+
+    /// The last release's order, if idle. Call under the set's map lock
+    /// so no subscription can arrive between checking and eviction.
+    pub(super) fn idle_order(&self) -> Option<u64> {
+        let inner = self.inner.lock();
+        self.is_idle().then_some(inner.released_order)
     }
 
     /// Whether this watch may be forgotten: it has no subscriber, and the last

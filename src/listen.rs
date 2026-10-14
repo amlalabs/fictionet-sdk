@@ -90,6 +90,9 @@ impl std::error::Error for ParseWorldSocketError {}
 /// A socket file left behind by a world that has exited is replaced.
 ///
 /// The socket speaks the [relay protocol](crate::proto).
+/// With `observe` enabled, it admits at most 64 observer sessions,
+/// including idle clients. [`Listening::set_observer_limit`] changes
+/// that ceiling. See the [observer budgets](crate::observe#resource-limits).
 /// Dropping the returned [`Listening`] closes the socket, so no more
 /// sandboxes can attach. Sandboxes already attached stay attached, and the
 /// helper thread keeps running until the last of them detaches.
@@ -179,6 +182,8 @@ pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listen
         wake_fd,
         conns: Mutex::new(HashMap::new()),
         closing: AtomicBool::new(false),
+        #[cfg(feature = "observe")]
+        sessions: Arc::default(),
     });
     let (closed_tx, closed_rx) = mpsc::channel();
     let helper_shared = shared.clone();
@@ -242,6 +247,8 @@ pub(crate) struct ListenShared {
     conns: Mutex<HashMap<u64, Arc<ConnSlot>>>,
     /// The [`Listening`] was dropped.
     closing: AtomicBool,
+    #[cfg(feature = "observe")]
+    sessions: Arc<crate::observe::Sessions>,
 }
 
 impl ListenShared {
@@ -544,11 +551,15 @@ fn handshake_step(
     if hello.kind == relay::OBSERVE {
         // An observer is not a sandbox: it takes no name and never becomes
         // an Attachment. Its session runs on a thread of its own.
+        let Some(slot) = shared.sessions.reserve() else {
+            refuse("this listener has too many observer sessions");
+            return None;
+        };
         if unix::send(fd, &Message::Accept.encode(), true).is_err() {
             return None;
         }
         let _ = epoll_ctl(shared.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, 0, 0);
-        crate::observe::serve_session(attacher.clone(), handshake.fd);
+        crate::observe::serve_session(attacher.clone(), handshake.fd, slot);
         return None;
     }
     let guard = match attacher.reserve(&hello.name) {
@@ -771,6 +782,20 @@ pub struct Listening {
 const OBSERVERS_LINGER: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Listening {
+    /// Sets the maximum number of observer sessions on this listener.
+    /// The default is 64, including sessions with no subscriptions.
+    /// A full listener refuses new observers before starting a thread.
+    /// Attachments are unaffected.
+    ///
+    /// Lowering the limit leaves existing sessions connected. New ones
+    /// are refused until the count falls below the limit. Zero refuses all
+    /// new observers. Each listener has its own limit, even when listeners
+    /// share an [`Attacher`].
+    #[cfg(feature = "observe")]
+    pub fn set_observer_limit(&self, limit: usize) {
+        self.shared.sessions.set_limit(limit);
+    }
+
     /// Binds a socket with a new attachment channel.
     /// Keep the returned guard alive while accepting attachments.
     /// Existing attachments survive when the guard is dropped.

@@ -595,6 +595,133 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
 }
 
 #[test]
+fn observer_session_capacity_counts_idle_clients_and_reuses_slots() {
+    let path = temp_socket();
+    let (attacher, _attachments) = fictionet::attachments();
+    let listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )
+    .unwrap();
+    listening.set_observer_limit(2);
+    let mut first = Client::connect(&path, "first").unwrap();
+    first.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    let second = Client::connect(&path, "second").unwrap();
+    let refusal = "the world refused: this listener has too many observer sessions";
+    for _ in 0..3 {
+        assert_eq!(
+            Client::connect(&path, "excess").err().as_deref(),
+            Some(refusal)
+        );
+    }
+    start_sandbox(&path, "agent", Arc::new(AtomicBool::new(true)));
+    assert!(text(&first.call(r#"{"op":"world"}"#).unwrap()).contains(r#""running":false"#));
+    drop(second);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut reused = loop {
+        match Client::connect(&path, "reused") {
+            Ok(client) => break client,
+            Err(reason) => {
+                assert_eq!(reason, refusal);
+                assert!(
+                    Instant::now() < deadline,
+                    "the disconnected slot was not released"
+                );
+                std::thread::yield_now();
+            }
+        }
+    };
+    reused.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    listening.set_observer_limit(0);
+    assert_eq!(
+        Client::connect(&path, "disabled").err().as_deref(),
+        Some(refusal)
+    );
+    assert!(reused.call(r#"{"op":"world"}"#).unwrap().end);
+    assert!(first.call(r#"{"op":"world"}"#).unwrap().end);
+}
+
+#[test]
+fn watch_capacity_errors_preserve_shared_streams_and_cancel_frees_admission() {
+    let path = temp_socket();
+    let (attacher, mut attachments) = fictionet::attachments();
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )
+    .unwrap();
+    let mut world = std::pin::pin!(fictionet::run(
+        fictionet::Seed::from_u64(1),
+        move |fcx| async move {
+            fcx.set_observe_watch_limit(1);
+            let mut links = Vec::new();
+            for (end, mut other) in [fictionet::pair(), fictionet::pair()] {
+                end.observe_link().unwrap().label(&fcx, "test".into());
+                fcx.spawn(move |fcx| async move {
+                    other.recv(&fcx).await?;
+                    Ok(())
+                });
+                links.push(end);
+            }
+            attachments.next(&fcx).await?;
+            drop(links);
+            Ok(())
+        }
+    ));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    // Start the world, then its endpoint tasks so both links are visible.
+    for _ in 0..2 {
+        assert!(std::future::Future::poll(world.as_mut(), &mut cx).is_pending());
+    }
+    let mut first = Client::connect(&path, "first").unwrap();
+    let mut second = Client::connect(&path, "second").unwrap();
+    first.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    second.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    let graph = text(&first.call(r#"{"op":"graph"}"#).unwrap());
+    let edges: Vec<String> = graph
+        .match_indices(r#"{"id":"e"#)
+        .map(|(at, _)| {
+            graph[at + 8..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect()
+        })
+        .collect();
+    assert_eq!(edges.len(), 2, "{graph}");
+    let packets = |edge: &str| format!(r#"{{"op":"packets","link":"e{edge}"}}"#);
+    let a = first.call(&packets(&edges[0])).unwrap();
+    let b = second.call(&packets(&edges[0])).unwrap();
+    assert!(!a.end && !b.end);
+    assert_eq!(text(&a), text(&b));
+    let refusal = r#"{"error":"this world has too many watched links"}"#;
+    for _ in 0..3 {
+        let refused = second.call(&packets(&edges[1])).unwrap();
+        assert!(refused.end);
+        assert_eq!(text(&refused), refusal);
+    }
+    let cancel = first
+        .request(&format!(r#"{{"op":"cancel","id":{}}}"#, a.id))
+        .unwrap();
+    let seen = until(&mut first, |v| v.id == cancel);
+    assert!(seen.iter().any(|v| v.id == a.id && v.end));
+    assert_eq!(text(&first.call(&packets(&edges[1])).unwrap()), refusal);
+    let cancel = second
+        .request(&format!(r#"{{"op":"cancel","id":{}}}"#, b.id))
+        .unwrap();
+    until(&mut second, |v| v.id == cancel);
+    let admitted = first.call(&packets(&edges[1])).unwrap();
+    assert!(!admitted.end);
+    assert!(text(&admitted).starts_with(r#"{"event":"link""#));
+    let forgotten = second
+        .call(&format!(r#"{{"op":"pcap","link":"e{}"}}"#, edges[0]))
+        .unwrap();
+    assert_eq!(
+        text(&forgotten),
+        r#"{"error":"nothing is watching that link"}"#
+    );
+}
+
+#[test]
 fn an_observer_takes_no_name() {
     let path = temp_socket();
     let _listening = start_world(&path);

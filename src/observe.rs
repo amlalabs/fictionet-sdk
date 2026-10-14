@@ -228,9 +228,9 @@
 //! busy link costs at most about 130 copies every 100 ms, or 1,300 a
 //! second, however many packets cross it. The dashboard marks where
 //! packets were skipped. A watched link keeps its
-//! latest 4,096 decoded packets, up to 32 MiB, and keeps them for a minute
+//! latest 4,096 decoded packets, up to 32 MiB, and keeps them for up to a minute
 //! after the last observer stops watching it, for the detail pane and the
-//! capture download.
+//! capture download. Admission pressure can evict idle history sooner.
 //!
 //! Each copy is decoded the way Wireshark decodes it. Packets on a link are
 //! IPv4 or IPv6 with no Ethernet header. The decoder reads IP, TCP, UDP and
@@ -316,12 +316,52 @@
 //! this with ten sandboxes sending HTTPS requests, unwatched, with the graph
 //! watched, and with all ten sandbox links watched.
 //!
+//! ## Resource limits
+//!
+//! Each listener admits at most 64 observer sessions by default. This
+//! matches the dashboard's 64-connection ceiling and also covers direct
+//! clients. A session with no subscriptions still occupies a slot. A full
+//! listener answers `hello` with `refuse` and the reason
+//! `this listener has too many observer sessions`. A slot is reserved before
+//! acceptance and released on disconnect or failed thread creation.
+//! [`Listening::set_observer_limit`](crate::Listening::set_observer_limit)
+//! changes this ceiling. Separate listeners have separate session budgets.
+//!
+//! Each session may hold 64 subscriptions. Each run retains at most 64 link
+//! watches by default, enough for one full session of distinct links and
+//! the ten-link observation benchmark. All subscribers to one link share
+//! its decoder and history. At capacity, a new link evicts an idle watch,
+//! choosing the longest-idle watch first, then the lowest link id for ties.
+//! If all watches are active, `packets`
+//! replies `{"error":"this world has too many watched links"}` and ends
+//! that request. Unknown links return `{"error":"no such link"}` even at
+//! capacity. Existing streams and subscriptions to retained links
+//! continue. [`Cx::set_observe_watch_limit`](crate::Cx::set_observe_watch_limit)
+//! changes the run's ceiling. A lower ceiling preserves active watches
+//! until their subscribers leave. Lowering the session ceiling likewise
+//! preserves connected clients. Zero refuses new sessions or new links.
+//!
+//! The default watch budget allows up to 2 GiB of retained decoded row
+//! data: 64 times the 32 MiB per-watch budget. Idle watches count too.
+//! Eviction forgets their history; `packet` and `pcap` then report that
+//! nothing watches the link. Watching it again starts packet numbering at 1.
+//! Reads already in progress and streams draining an ended run can keep
+//! their own holds until they finish.
+//!
+//! These are admission and retention budgets, not a process-memory bound.
+//! They exclude thread stacks, socket buffers, graph and event views,
+//! packet taps, TLS key caches, decoder state (including custom protocols),
+//! temporary reply/export buffers, and allocation overhead. Multiple
+//! listeners and runs each have their own budgets. Events and packet taps
+//! have separate retention limits. Pending handshakes and attached sandboxes
+//! are outside these observer limits.
+//!
 //! # The API
 //!
 //! Every observer speaks the same API. An observer connects to the world
-//! socket and sends a `hello` with the type `observe`. The world accepts it
-//! without taking a sandbox name. Then the observer sends requests, and the
-//! world answers each with one or more values. The
+//! socket and sends a `hello` with the type `observe`. When capacity allows,
+//! the world accepts it without taking a sandbox name. Then the observer
+//! sends requests, and the world answers each with one or more values. The
 //! [relay protocol](crate::proto#observer-sessions) describes the messages
 //! that carry them. This section describes what they say.
 //!
@@ -366,8 +406,8 @@
 //! setup.
 //!
 //! `packet` and `pcap` read the decoded packets of a link that is watched,
-//! or was watched in the last minute. Send `packets` first. A packet's
-//! `seq` numbers the packets of one watch, from 1.
+//! or has idle history that has not expired or been evicted. Send `packets`
+//! first. A packet's `seq` numbers the packets of one watch, from 1.
 //!
 //! ## The graph
 //!
@@ -536,14 +576,20 @@ use std::sync::Arc;
 
 use crate::Cx;
 pub use keys::observed_config;
+#[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
+pub(crate) use session::{SessionSlot, Sessions};
 #[cfg(feature = "observe")]
 pub(crate) use watches::WatchSet;
 
 /// Serves one observer session on `fd`, which has been accepted on the
 /// world socket of `attacher`.
 #[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
-pub(crate) fn serve_session(attacher: crate::Attacher, fd: std::os::fd::OwnedFd) {
-    session::start(attacher, fd);
+pub(crate) fn serve_session(
+    attacher: crate::Attacher,
+    fd: std::os::fd::OwnedFd,
+    slot: SessionSlot,
+) {
+    session::start(attacher, fd, slot);
 }
 
 /// An opaque link an [`Interface`](crate::Interface) belongs to.

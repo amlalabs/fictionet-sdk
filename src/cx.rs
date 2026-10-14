@@ -345,6 +345,20 @@ impl Cx {
         *self.run.graph.protocols.lock() = registry;
     }
 
+    /// Sets the maximum number of retained link watches in this run.
+    /// The default is 64. Observers of the same link share one watch.
+    /// At capacity, a new link evicts the longest-idle watch, with the
+    /// lowest link id breaking ties. If all watches are active, its request
+    /// gets a capacity error.
+    ///
+    /// Lowering the limit evicts idle watches first. Active watches stay
+    /// until their subscribers leave, even if they exceed the new limit.
+    /// Zero refuses new links. Subscriptions to retained links still work.
+    #[cfg(feature = "observe")]
+    pub fn set_observe_watch_limit(&self, limit: usize) {
+        self.run.graph.watches.set_limit(limit);
+    }
+
     /// Records `event` in the run's [event log](crate::events), dated now
     /// on the run's clock, with the task that records it. Every run keeps
     /// its events, whether or not anyone reads them.

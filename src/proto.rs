@@ -111,11 +111,16 @@
 //! An observer, such as `fictionet dashboard` or `fictionet observe`, uses
 //! the same socket as attach. It sends a `hello` with the type `observe`
 //! and version 1. The world ignores the MTU, and treats the name as a label
-//! for the observer: unlike a sandbox's name, it is not reserved, so any
-//! number of observers can use the same one. The world always answers
-//! `accept`, unless the version is wrong, and never makes the connection
-//! an [`Attachment`](crate::Attachment). It refuses any other type that
-//! starts with `observe`, such as `observe2`: those are kept for later
+//! for the observer: unlike a sandbox's name, it is not reserved, so multiple
+//! admitted observers can use the same one. The world answers `accept`
+//! when observation is enabled, the version is supported, and its listener
+//! has a session slot. By default each listener admits 64 observers,
+//! including idle clients. At capacity it sends `refuse` with the reason
+//! `this listener has too many observer sessions`. See
+//! [resource limits](crate::observe#resource-limits) for configuration.
+//! It never makes the connection an [`Attachment`](crate::Attachment).
+//! It refuses any other type that starts with `observe`, such as `observe2`:
+//! those are kept for later
 //! versions of the observe API. Anyone who can open the world
 //! socket can observe the world, so the socket's file permissions decide
 //! who may watch, as they decide who may attach.

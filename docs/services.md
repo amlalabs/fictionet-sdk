@@ -545,6 +545,34 @@ inspected. Raw reply bytes and flags stay intact. The CLI writes the original
 bytes; the dashboard forwards the original JSON data in SSE, with one `data:`
 line per line of JSON. Event names with line breaks are sent as errors instead.
 
+Each world listener admits 64 observer sessions by default, including idle
+clients and direct API users. A full listener refuses the greeting with
+`this listener has too many observer sessions`. Disconnecting frees a slot.
+`Listening::set_observer_limit` changes this ceiling for one listener.
+Each session can hold 64 subscriptions. Each run retains at most 64 link
+watches by default, shared by all subscribers to each link.
+`Cx::set_observe_watch_limit` changes that ceiling. The defaults fit the
+dashboard's 64-connection cap and a session watching 64 distinct links.
+
+When a new link needs a slot, idle watches are evicted longest-idle first,
+with the lowest link id breaking ties.
+If all watches are active, `packets` returns
+`{"error":"this world has too many watched links"}` and ends that request.
+Unknown links return `{"error":"no such link"}` even at capacity.
+Existing streams and subscriptions to retained links keep working.
+Idle history lasts up to a minute, but admission can evict it sooner.
+Eviction removes packet details and capture history; a later watch starts
+numbering packets at 1. Lowering a ceiling preserves active users until
+they leave. Zero refuses new sessions or new links.
+
+The default retained-row budget totals at most 2 GiB (64 times 32 MiB).
+This is not a process-memory bound. Packet taps, event retention, TLS keys,
+decoder state, graph views, thread stacks, socket buffers, temporary replies
+and exports, and allocation overhead are separate costs. Reads in progress
+and streams draining an ended run can keep their own watch holds until they
+finish. Multiple listeners and runs have separate budgets.
+Pending handshakes and attached sandboxes are outside these observer limits.
+
 The dashboard lists the events under **Events**, from what the log held
 when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The
