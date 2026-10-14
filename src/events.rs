@@ -31,13 +31,22 @@
 //! Every run keeps an [`EventLog`], from its first moment to its end,
 //! with no sink to set. Recording numbers each event (`seq`, from 1, with
 //! no gaps) and dates it on the run's clock ([`Cx::now`]), never the
-//! host's, so two runs that do the same things record the same sequence.
+//! host's. In a lab, repeatability depends on the world's inputs and clock
+//! use; see [Repeatable runs](crate::running#repeatable-runs), including
+//! the HTTP/2 exception.
 //! The log is bounded: it holds the latest [`MAX_EVENTS`] events, and at
 //! most [`MAX_EVENT_BYTES`] of them ([`Event::size`]). Past either limit
 //! the oldest go first. An event larger than its part's byte limit is
 //! numbered but not kept, without evicting other events. Every reader
 //! that missed some is told how many, with an `events.dropped` event in
 //! their place ([`EventLog::after`]), including gaps from rejected events.
+//!
+//! [`Net::start`](crate::stdlib::net::Net::start) records `run.start`, with
+//! the seed and clock origin. Neither [`run`](crate::run) nor
+//! [`lab`](crate::lab) emits it automatically. A world built from lower-level
+//! pieces calls `fcx.events().start(&fcx, Fields::new())` itself. The event
+//! log reports what happened; it is not a recording of every input needed
+//! to replay a real run.
 //!
 //! # Repeats
 //!
@@ -1359,7 +1368,12 @@ impl EventLog {
     /// contiguous-byte consumption convention. `fields` add the world's own
     /// facts, such as the date the world says it is (`world_date`): the world owns its dates, and services take
     /// them from it, never from the host's clock.
-    /// [`Net`](crate::stdlib::net::Net) records it when it starts serving.
+    /// [`Net::start`](crate::stdlib::net::Net::start) calls this when it
+    /// starts serving. Neither [`run`](crate::run) nor [`lab`](crate::lab)
+    /// calls it. Worlds without `Net` call it explicitly, usually before
+    /// recording other events. Each call records another event; it is not
+    /// deduplicated. Its `at` is zero even if recorded later, while its
+    /// sequence number follows the events already recorded.
     pub fn start(&self, fcx: &Cx, fields: Fields) {
         let wall = if cfg!(target_arch = "wasm32") || fcx.mode() == crate::RunMode::Lab {
             Value::Null

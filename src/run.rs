@@ -33,8 +33,11 @@ use crate::{Cx, Result};
 /// Randomness comes from `seed`: every random number the world draws
 /// through its [`Cx`] is the next part of one stream started from it. Use
 /// [`Seed::random`](crate::Seed::random) for a fresh seed, or
-/// [`Seed::from_u64`](crate::Seed::from_u64) for a fixed one. The run's
-/// start event records the seed.
+/// [`Seed::from_u64`](crate::Seed::from_u64) for a fixed one.
+/// [`Net::start`](crate::stdlib::net::Net::start) records the seed in
+/// `run.start`. Worlds without `Net` call
+/// [`EventLog::start`](crate::events::EventLog::start) explicitly; neither
+/// `run` nor [`lab`] emits that event itself.
 ///
 /// # When the future finishes
 ///
@@ -120,10 +123,15 @@ where
 /// A lab runs the world on the same executor as [`run`], with randomness
 /// from `seed` in the same way. Only the clock differs. It starts at zero,
 /// and when every task is waiting it jumps to the earliest deadline, waking
-/// timers due at the same instant in the order they were set. So the same
-/// seed and the same inputs give the same event log and the same packets.
-/// [Repeatable runs](crate::running#repeatable-runs) says what repeats and
-/// what does not.
+/// timers due at the same instant in the order they were set. With a closed
+/// world, the same seed and ordered inputs give the same event log and
+/// packets. This requires the world to use the run's clock, randomness and
+/// task scheduling. [Repeatable runs](crate::running#repeatable-runs)
+/// lists the requirements and the HTTP/2 host-clock exception.
+///
+/// Like [`run`], `lab` leaves `run.start` recording to
+/// [`Net::start`](crate::stdlib::net::Net::start) or an explicit call to
+/// [`EventLog::start`](crate::events::EventLog::start).
 ///
 /// Each run has its own task identities. A lab started inside another
 /// run's task has a world root with no parent in the outer run.

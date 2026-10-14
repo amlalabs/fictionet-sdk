@@ -7,6 +7,11 @@
 //! and no `fictionet attach`. To run a world now, with real commands, start
 //! with [`getting_started`](crate::getting_started).
 //!
+//! This module is the running guide. The [`run`](crate::run) and
+//! [`lab`](crate::lab) functions own scheduling and the run's lifetime;
+//! [`Cx`](crate::Cx) and [`Task`](crate::Task) describe regions and waits.
+//! [`events`](crate::events) describes recording and retention.
+//!
 //! # The program
 //!
 //! Fictionet does not own `main` or the executor. A world runs inside an
@@ -61,11 +66,14 @@
 //! 3. **[`run(seed, f)`](crate::run)** returns a future and does nothing else.
 //!    When the future is first polled, it makes the world's
 //!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every random
-//!    number the world draws comes from `seed`;
-//!    [`Seed::random`](crate::Seed::random) picks a fresh one, and the run
-//!    records it in its start event (see [Repeatable runs](#repeatable-runs)). Every task the
-//!    world starts with [`Cx::spawn`](crate::Cx::spawn), and every stdlib
-//!    task, is polled inside this same future.
+//!    number drawn through `Cx` comes from `seed`;
+//!    [`Seed::random`](crate::Seed::random) picks a fresh one.
+//!    [`Net::start`](crate::stdlib::net::Net::start) records it in `run.start`.
+//!    Without `Net`, world code calls
+//!    [`EventLog::start`](crate::events::EventLog::start) explicitly.
+//!    `run` and `lab` do not emit that event. Every task the world starts
+//!    with [`Cx::spawn`](crate::Cx::spawn), and every stdlib task, is polled
+//!    inside this same future.
 //! 4. **[`block_on`](crate::block_on)** polls the future on the current
 //!    thread, and sleeps while there is nothing to do. The helper threads
 //!    wake it when a packet arrives or a timer is due.
@@ -136,9 +144,15 @@
 //! a stdlib connection's read, and the rest. Each of these returns `Err`,
 //! with [`Cancelled`](crate::Cancelled) itself or with its own error type's
 //! `Cancelled` variant, such as [`RecvError::Cancelled`](crate::RecvError::Cancelled).
-//! A cancel is never `None`, `Ok`, or another error such as a broken
-//! connection, and it comes before anything the wait already holds, such
-//! as queued packets. The task usually passes it up with `?`.
+//! For these waits, cancellation comes before anything the wait already
+//! holds, such as queued packets, or a due deadline. The task usually
+//! passes it up with `?`.
+//!
+//! Two waits deliberately give ready work precedence. [`Cx::race`](crate::Cx::race)
+//! polls its work first, then checks cancellation, then the deadline.
+//! [`Task::join`](crate::Task::join) returns an already stored task result
+//! before checking the joining `Cx`'s cancellation. These waits can return
+//! a result even when the region is cancelled.
 //!
 //! An await on anything outside Fictionet is not interrupted. A task that
 //! waits on a tokio socket, a database query or a channel keeps waiting
@@ -325,13 +339,21 @@
 //! - **Nothing waits forever.** A lab whose tasks all wait with no deadline
 //!   ends with an error that says so.
 //!
-//! A lab run with the same seed and the same inputs repeats exactly: the
-//! same event log, byte for byte with its timestamps, and the same packets.
-//! TLS repeats too, with fixed certificates and the
-//! [`tls`](crate::stdlib::tls) provider, whose key exchange and signatures
-//! draw from the run's seed. One thing inside the SDK's dependencies still
-//! reads the system clock: h2 forgets an HTTP/2 stream the world reset after
-//! one second of real time (see [`httpd`](crate::stdlib::httpd)).
+//! With those conditions, a lab run repeats its event log, including
+//! timestamps, and its packets byte for byte, subject to the HTTP/2
+//! exception below. The seed alone is not enough. Keep the world code,
+//! configuration and ordered inputs fixed. Use `Cx` for time, randomness
+//! and task scheduling. Do not let host clocks, OS entropy, external I/O,
+//! independently scheduled tasks or unordered collection iteration decide
+//! what the world does. Fix service data and dates too. TLS repeats with
+//! fixed certificates and the [`tls`](crate::stdlib::tls) provider, whose
+//! key exchange and signatures draw from the run's seed.
+//!
+//! **HTTP/2 has a host-clock exception.** The h2 dependency forgets an
+//! HTTP/2 stream that the world reset after one second of real time (see
+//! [`httpd`](crate::stdlib::httpd)). That expiry does not follow lab time,
+//! so runs whose behavior depends on it do not have an exact replay
+//! guarantee.
 //!
 //! A real run with the same seed makes the same random choices for the
 //! same inputs in the same order. But real sandboxes decide when packets

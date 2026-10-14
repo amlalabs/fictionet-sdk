@@ -19,8 +19,13 @@
 //! A world's time and randomness come from one place, its [`Cx`], and its
 //! randomness from a seed. With real sandboxes it runs on real time
 //! ([`run`]). In a test it runs on simulated time ([`lab`]), where the same
-//! seed and the same inputs give the same event log and the same packets,
-//! byte for byte. [`running`] shows both.
+//! seed and ordered inputs give the same event log and packets when the
+//! world is closed. [Repeatable runs](running#repeatable-runs) lists the
+//! requirements and the HTTP/2 host-clock exception. [`running`] is the
+//! guide; [`run`], [`lab`] and [`Cx`] document the runtime operations, and
+//! [`events`] documents recording. `run.start` records the seed only when
+//! [`Net::start`](stdlib::net::Net::start) or world code calls
+//! [`EventLog::start`](events::EventLog::start).
 //!
 //! # How a sandbox connects to a world
 //!

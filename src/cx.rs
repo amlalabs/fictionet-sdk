@@ -88,11 +88,15 @@ use crate::watch::Group;
 ///
 /// Stopping is cooperative. Cancelling a region does not drop its tasks.
 /// Instead, [`Cx::cancelled`] finishes for every `Cx` in the region, and
-/// every wait in the region (`recv`, `sleep`, and the rest) returns early
-/// with [`Cancelled`], or with its error type's `Cancelled` variant, before
-/// anything the wait already holds. Each task then ends on its own, usually
-/// by passing that error up with `?`. A task that ends with a cancel has
-/// not failed, so its region keeps no error for it.
+/// waits such as `recv` and `sleep` return early with [`Cancelled`], or
+/// with their error type's `Cancelled` variant, before held data or a due
+/// deadline. Each task then ends on its own, usually by passing that error
+/// up with `?`. A task that ends with a cancel has not failed, so its region
+/// keeps no error for it.
+///
+/// Two waits give ready results precedence: [`Cx::race`] polls its work
+/// before checking cancellation, and [`Task::join`] returns an already
+/// stored task result before checking the joining `Cx`'s cancellation.
 ///
 /// Only Fictionet's own waits see a cancel. A task waiting on something
 /// else, such as a tokio socket or a database query, is not interrupted,
@@ -421,8 +425,12 @@ impl Cx {
     }
 
     /// Runs `fut` until it finishes, `deadline` passes, or this `Cx`'s
-    /// [region](Cx#regions) is cancelled, whichever comes first. `None`
-    /// waits with no deadline.
+    /// [region](Cx#regions) is cancelled. `None` waits with no deadline.
+    ///
+    /// Each poll tries `fut` first: a ready output wins even if the region
+    /// is already cancelled or the deadline is due. If `fut` is pending,
+    /// cancellation wins over the deadline. This is an exception to the
+    /// cancellation-first behavior of waits such as [`Cx::sleep`].
     ///
     /// To race more than one thing, join them into `fut` with
     /// [`std::future::poll_fn`]: the first one ready gives the output.
@@ -691,9 +699,9 @@ pub enum JoinError {
     /// keeps, shared, not a copy: downcast it to the task's own type.
     Failed(crate::Error),
     /// The task did not finish: it ended with a cancel, or the region of
-    /// the `Cx` passed to `join` was cancelled first, or the run was
-    /// dropped, or admission was refused because the task's region had
-    /// completed.
+    /// the `Cx` passed to `join` was cancelled with no task result ready,
+    /// or the run was dropped, or admission was refused because the task's
+    /// region had completed.
     Cancelled,
 }
 
@@ -736,11 +744,15 @@ impl Task {
     ///
     /// If the task failed, this returns [`JoinError::Failed`] with the
     /// task's own error, the same one its region keeps, as [`Cx::spawn`]
-    /// says. It is ready before the failure cancels the region, so a joiner
-    /// in that same region still gets it. If the task ended with a cancel,
-    /// or `fcx`'s region is cancelled before the task ends, or the run is
-    /// dropped, this returns [`JoinError::Cancelled`]. It also returns
-    /// `Cancelled` if the task was refused because its region had completed.
+    /// says. Each poll checks for a stored task result before checking
+    /// `fcx`'s cancellation. Any stored result wins, including `Ok(())`.
+    /// A failure is stored before it cancels the region, so a joiner in
+    /// that same region still gets the error.
+    ///
+    /// If no result is ready and `fcx`'s region is cancelled, this returns
+    /// [`JoinError::Cancelled`]. It also returns `Cancelled` if the task
+    /// ended with a cancel, was dropped with the run, or was refused
+    /// because its region had completed.
     pub async fn join(self, fcx: &Cx) -> Result<(), JoinError> {
         let mut wait = CancelWait::default();
         poll_fn(|cx| {
