@@ -10,6 +10,10 @@
 //! [`Inputs::for_observation`] and header blocks with
 //! [`HeaderBlocks::for_observation`], which report what they cannot read
 //! instead of failing; observe's HTTP/2 presenter is built on them.
+//! Announce a request's opening HEADERS to the response direction's
+//! [`Session::peer_open`] before routing WINDOW_UPDATE. The direction that
+//! reads a PUSH_PROMISE registers its promised stream. This retains credit
+//! received before response headers.
 //! Route SETTINGS and WINDOW_UPDATE to the opposite direction's
 //! [`Session::peer_settings`] and [`Session::peer_window_update`].
 //! Route RST_STREAM through [`Session::peer_reset`], then retire both halves.
@@ -20,6 +24,19 @@
 //! Idle-stream checks and stream ownership belong to the caller.
 //! SETTINGS reductions take effect when the sending direction reads its ACK.
 //! Later pending HPACK increases do not cancel required size updates.
+//!
+//! ```
+//! use fictionet::stdlib::http2::{Limits, Session, WindowUpdate};
+//!
+//! let mut response = Session::server_side(Limits::default());
+//! // The request direction has emitted opening HEADERS for stream 1.
+//! response.peer_open(1)?;
+//! response.peer_window_update(&WindowUpdate {
+//!     stream: 1, flags: 0, increment: 65_536,
+//! })?;
+//! assert_eq!(response.stream_window(1), Some(131_071));
+//! # Ok::<(), fictionet::stdlib::http2::Error>(())
+//! ```
 
 use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{
@@ -900,7 +917,8 @@ pub struct Limits {
     /// Maximum retained decoded name and value bytes in a block.
     /// Indexed references can expand a few encoded bytes up to this limit.
     pub header_list: usize,
-    /// Maximum tracked stream states, including ended streams until retired.
+    /// Maximum tracked stream states, including peer openings and promised
+    /// streams before headers, and ended streams until retired.
     pub streams: usize,
 }
 impl Default for Limits {
@@ -1295,8 +1313,11 @@ struct SettingsUpdate {
 /// `server_side` reads server-to-client bytes. A nonempty direction requires
 /// initial SETTINGS. An empty direction can end cleanly.
 ///
-/// Route SETTINGS, WINDOW_UPDATE, and RST_STREAM as described in the module
-/// docs. Use [`peer_reset`](Self::peer_reset) for streams abandoned by GOAWAY.
+/// Announce request openings to the response direction's
+/// [`peer_open`](Self::peer_open) before routing WINDOW_UPDATE. Promised streams
+/// are registered here when PUSH_PROMISE is read. Route SETTINGS, WINDOW_UPDATE,
+/// and RST_STREAM as described in the module docs. Use
+/// [`peer_reset`](Self::peer_reset) for streams abandoned by GOAWAY.
 /// SETTINGS reductions take effect when that sender acknowledges them.
 /// This owner handles framing, compression, stream endings, and flow control.
 /// The caller coordinates request IDs, push permission, HTTP field semantics,
@@ -1315,6 +1336,7 @@ pub struct Session {
     settings: SettingsState,
     peer: SettingsState,
     streams: BTreeMap<u32, StreamState>,
+    retired_before: [u32; 2],
     peer_resets: BTreeSet<u32>,
     reset_before: [u32; 2],
     window: i64,
@@ -1350,6 +1372,7 @@ impl Session {
             settings: SettingsState::default(),
             peer: SettingsState::default(),
             streams: BTreeMap::new(),
+            retired_before: [0; 2],
             peer_resets: BTreeSet::new(),
             reset_before: [0; 2],
             window: 65_535,
@@ -1387,6 +1410,7 @@ impl Session {
         ));
         self.blocks.forget();
         self.streams.clear();
+        self.retired_before = [0; 2];
         self.peer_resets.clear();
         self.reset_before = [0; 2];
         self.settings_updates.clear();
@@ -1435,14 +1459,49 @@ impl Session {
     }
     /// Releases an ended stream's metadata once the caller has retired its
     /// DATA decoder. Returns false for an unknown or still-open stream.
+    /// Keeps the highest retired ID for each parity. Untracked IDs at or below
+    /// it cannot reopen. Announce peer openings in stream ID order with
+    /// [`peer_open`](Self::peer_open) so lower active streams remain tracked.
     /// Peer-reset tracking survives retirement.
     pub fn retire(&mut self, stream: u32) -> bool {
         if self.streams.get(&stream).is_some_and(|s| s.closed) {
             self.streams.remove(&stream);
+            let before = &mut self.retired_before[(stream % 2) as usize];
+            *before = (*before).max(stream);
             true
         } else {
             false
         }
+    }
+    /// Registers a stream opened by a request in the other direction.
+    /// Call this on the response direction before routing WINDOW_UPDATE.
+    /// PUSH_PROMISE registers its promised stream in the direction that reads
+    /// it. The caller checks ownership and opening order.
+    ///
+    /// Reserves one of [`Limits::streams`] states using the current initial
+    /// window. It does not mark this direction's headers as received; DATA
+    /// still requires final headers. Repeated calls preserve existing credit.
+    /// Closed, retired, and peer-reset streams are not reopened. See
+    /// [`retire`](Self::retire) for the retirement watermark.
+    /// Invalid IDs and stream state exhaustion stop the direction.
+    pub fn peer_open(&mut self, stream: u32) -> Result<(), Error> {
+        if self.stopped {
+            return Ok(());
+        }
+        let result = self.open_stream(stream);
+        self.remember(result)
+    }
+    fn open_stream(&mut self, stream: u32) -> Result<(), Error> {
+        if stream == 0 || stream > MAX_WINDOW {
+            return Err(protocol("invalid stream ID"));
+        }
+        if self.retired(stream) || self.reset_by_peer(stream) {
+            return Ok(());
+        }
+        self.stream_state(stream).map(|_| ())
+    }
+    fn retired(&self, stream: u32) -> bool {
+        !self.streams.contains_key(&stream) && stream <= self.retired_before[(stream % 2) as usize]
     }
     /// Marks a stream closed after a peer reset or abandonment by GOAWAY.
     /// The caller can then release it with [`retire`](Self::retire).
@@ -1587,9 +1646,10 @@ impl Session {
         self.set_frame_size(frame_size);
         Ok(())
     }
-    /// Applies credit announced by the other direction. Unknown streams
-    /// are ignored, including streams whose metadata was retired. The caller
-    /// checks idle-stream rules using both directions' opening headers.
+    /// Applies credit announced by the other direction. Register peer openings
+    /// with [`peer_open`](Self::peer_open) first to retain credit before headers.
+    /// Unknown, closed, and retired streams are ignored. The caller checks
+    /// idle-stream rules using both directions' opening headers.
     /// Overflow and invalid increments stop decoding.
     pub fn peer_window_update(&mut self, update: &WindowUpdate) -> Result<(), Error> {
         if self.stopped {
@@ -1602,6 +1662,9 @@ impl Session {
             let window = if update.stream == 0 {
                 &mut self.window
             } else if let Some(state) = self.streams.get_mut(&update.stream) {
+                if state.closed {
+                    return Ok(());
+                }
                 &mut state.window
             } else {
                 return Ok(());
@@ -1625,6 +1688,9 @@ impl Session {
         result
     }
     fn stream_state(&mut self, id: u32) -> Result<&mut StreamState, Error> {
+        if self.retired(id) {
+            return Err(error(ErrorCode::StreamClosed, "headers on retired stream"));
+        }
         if !self.streams.contains_key(&id) && self.streams.len() >= self.limits.streams {
             return Err(budget("stream state limit"));
         }
@@ -1714,6 +1780,7 @@ impl Session {
                 if self.side == Side::Client {
                     return Err(protocol("client sent PUSH_PROMISE"));
                 }
+                self.open_stream(promised)?;
                 return Ok(Some(Event::PushPromise {
                     stream: block.stream,
                     promised,
@@ -2072,14 +2139,180 @@ mod tests {
     fn peer_credit_before_response_headers_and_after_retirement_is_allowed() {
         let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
-        let update = fixture_window_update(1, 0, 1 << 20);
+        let update = fixture_window_update(1, 0, 65_536);
         // The caller has observed the request HEADERS in the other direction.
+        c.peer_open(1).unwrap();
         c.peer_window_update(&update).unwrap();
+        c.peer_window_update(&fixture_window_update(0, 0, 65_536))
+            .unwrap();
         accept(&mut c, &raw(1, 4, 1, &[0x88]));
-        accept(&mut c, &raw(0, 1, 1, b"done"));
+        for i in 0..4 {
+            let events = accept(&mut c, &raw(0, u8::from(i == 3), 1, &[0; 16_384]));
+            assert!(matches!(&events[..], [Event::Data { data, .. }] if data.len() == 16_384));
+        }
+        assert_eq!(c.stream_window(1), Some(65_535));
+        assert_eq!(c.connection_window(), 65_535);
+        c.peer_open(1).unwrap();
+        c.peer_window_update(&fixture_window_update(1, 0, MAX_WINDOW))
+            .unwrap();
+        assert_eq!(c.stream_window(1), Some(65_535));
         assert!(c.retire(1));
+        c.peer_open(1).unwrap();
         c.peer_window_update(&update).unwrap();
+        assert_eq!(c.stream_window(1), None);
         assert!(c.failed().is_none());
+    }
+
+    #[test]
+    fn peer_open_preserves_credit_and_bounds_stream_state() {
+        let mut c = Session::server_side(Limits {
+            streams: 2,
+            ..Limits::default()
+        });
+        c.peer_open(1).unwrap();
+        c.peer_window_update(&fixture_window_update(1, 0, 10))
+            .unwrap();
+        c.peer_open(1).unwrap();
+        assert_eq!(c.stream_window(1), Some(65_545));
+        c.peer_open(3).unwrap();
+        c.peer_open(1).unwrap();
+        assert_eq!(c.streams.len(), 2);
+        let e = c.peer_open(5).unwrap_err();
+        assert_eq!(e.code, ErrorCode::EnhanceYourCalm);
+        assert_eq!(c.failed(), Some(&e));
+        assert_eq!(c.stream_window(5), None);
+        assert!(c.next().is_none());
+    }
+
+    #[test]
+    fn push_promise_retains_early_credit_and_bounds_stream_state() {
+        let mut c = Session::server_side(Limits {
+            streams: 2,
+            ..Limits::default()
+        });
+        accept(&mut c, &settings());
+        accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        let promise = raw(5, 4, 1, &[0, 0, 0, 2, 0x82]);
+        assert!(matches!(
+            accept(&mut c, &promise)[..],
+            [Event::PushPromise { promised: 2, .. }]
+        ));
+        for stream in [2, 0] {
+            c.peer_window_update(&fixture_window_update(stream, 0, 65_536))
+                .unwrap();
+        }
+        accept(&mut c, &promise);
+        accept(&mut c, &raw(1, 4, 2, &[0x88]));
+        for i in 0..4 {
+            let events = accept(&mut c, &raw(0, u8::from(i == 3), 2, &[0; 16_384]));
+            assert!(matches!(&events[..], [Event::Data { data, .. }] if data.len() == 16_384));
+        }
+        assert_eq!(c.stream_window(2), Some(65_535));
+        assert_eq!(c.connection_window(), 65_535);
+        assert!(c.retire(2));
+        accept(&mut c, &promise);
+        assert_eq!(c.stream_window(2), None);
+        c.peer_reset(4);
+        accept(&mut c, &raw(5, 4, 1, &[0, 0, 0, 4, 0x82]));
+        assert_eq!(c.stream_window(4), None);
+        accept(&mut c, &raw(5, 4, 1, &[0, 0, 0, 6, 0x82]));
+        assert_eq!(c.stream_window(6), Some(65_535));
+        assert_eq!(c.push(&raw(5, 4, 1, &[0, 0, 0, 8, 0x82])), 14);
+        let e = c.next().unwrap().unwrap_err();
+        assert_eq!(e.code, ErrorCode::EnhanceYourCalm);
+        assert_eq!(c.failed(), Some(&e));
+        assert_eq!(c.stream_window(8), None);
+        assert!(c.next().is_none());
+    }
+
+    #[test]
+    fn peer_open_validates_ids_and_still_requires_headers() {
+        for stream in [0, MAX_WINDOW + 1] {
+            let mut c = Session::server_side(Limits::default());
+            let e = c.peer_open(stream).unwrap_err();
+            assert_eq!(e.code, ErrorCode::ProtocolError);
+            assert_eq!(c.failed(), Some(&e));
+            assert!(c.streams.is_empty());
+        }
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        c.peer_open(1).unwrap();
+        assert_eq!(c.push(&raw(0, 0, 1, b"early")), 14);
+        assert_eq!(
+            c.next().unwrap().unwrap_err().code,
+            ErrorCode::ProtocolError
+        );
+    }
+
+    #[test]
+    fn peer_open_uses_current_settings_and_retains_credit_across_ack() {
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        for value in [70_000, 2] {
+            c.peer_settings(&Settings {
+                flags: 0,
+                entries: vec![Setting { id: 4, value }],
+            })
+            .unwrap();
+        }
+        c.peer_open(1).unwrap();
+        assert_eq!(c.stream_window(1), Some(70_000));
+        c.peer_window_update(&fixture_window_update(1, 0, 10))
+            .unwrap();
+        accept(&mut c, &raw(4, 1, 0, &[]));
+        assert_eq!(c.stream_window(1), Some(70_010));
+        accept(&mut c, &raw(4, 1, 0, &[]));
+        assert_eq!(c.stream_window(1), Some(12));
+        assert!(matches!(
+            accept(&mut c, &raw(1, 4, 1, &[0x88]))[..],
+            [Event::Headers { .. }]
+        ));
+        accept(&mut c, &raw(0, 1, 1, &[0; 12]));
+        assert_eq!(c.stream_window(1), Some(0));
+    }
+
+    #[test]
+    fn peer_open_after_retirement_preserves_lower_active_streams_and_parity() {
+        let mut c = Session::server_side(Limits {
+            streams: 2,
+            ..Limits::default()
+        });
+        accept(&mut c, &settings());
+        c.peer_open(1).unwrap();
+        c.peer_open(3).unwrap();
+        accept(&mut c, &raw(1, 5, 3, &[0x88]));
+        assert!(c.retire(3));
+        c.peer_open(3).unwrap();
+        assert_eq!(c.stream_window(3), None);
+        c.peer_open(2).unwrap();
+        assert_eq!(c.stream_window(2), Some(65_535));
+        c.peer_open(1).unwrap();
+        c.peer_window_update(&fixture_window_update(1, 0, 10))
+            .unwrap();
+        accept(&mut c, &raw(1, 5, 1, &[0x88]));
+        assert_eq!(c.stream_window(1), Some(65_545));
+        assert_eq!(c.push(&raw(1, 5, 3, &[0x88])), 10);
+        assert_eq!(c.next().unwrap().unwrap_err().code, ErrorCode::StreamClosed);
+    }
+
+    #[test]
+    fn peer_open_does_not_revive_reset_streams() {
+        let mut c = Session::server_side(Limits {
+            streams: 1,
+            ..Limits::default()
+        });
+        accept(&mut c, &settings());
+        for stream in [1, 3, 5] {
+            c.peer_reset(stream);
+            c.peer_open(stream).unwrap();
+            c.peer_window_update(&fixture_window_update(stream, 0, MAX_WINDOW))
+                .unwrap();
+            assert_eq!(c.stream_window(stream), None);
+        }
+        c.peer_open(1).unwrap();
+        assert_eq!(c.stream_window(1), None);
+        assert!(accept(&mut c, &raw(0, 1, 1, b"late")).is_empty());
+        assert_eq!(c.connection_window(), 65_531);
     }
 
     #[test]

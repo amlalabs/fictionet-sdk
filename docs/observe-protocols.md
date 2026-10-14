@@ -83,8 +83,16 @@ customize presentation; it uses only public SDK APIs. It reads frames with
 `stdlib::http2::HeaderBlocks::for_observation`, the same frame parser and
 header assembly that strict `Frames` and `Session` use, which notes what
 it cannot read instead of failing. Strict `Frames` and `Session` check
-RFC 9113 framing and directional state. `Session::peer_settings` and
-`Session::peer_window_update` apply control frames from the other direction. `lost`
+RFC 9113 framing and directional state. Announce a request's opening HEADERS
+to the response direction's `Session::peer_open` before routing WINDOW_UPDATE.
+The direction that reads a PUSH_PROMISE registers its promised stream. This
+retains stream credit received before response headers, within `Limits::streams`.
+Registration does not allow DATA before that direction's final headers.
+`Session::peer_settings` and `Session::peer_window_update` apply control frames
+from the other direction.
+Ended streams keep their metadata until `retire`. Retirement keeps a watermark
+for each stream parity; untracked IDs at or below it cannot reopen. Register
+openings in stream ID order so lower active streams remain tracked. `lost`
 clears state and stops decoding because a TCP gap does not identify the next
 frame boundary.
 

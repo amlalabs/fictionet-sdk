@@ -98,6 +98,7 @@ impl Stack {
                 end,
             } => {
                 if dir == 0 {
+                    self.h2[1].peer_open(stream).unwrap();
                     self.requests.push(
                         grpc::Request::parse(fields.iter().map(|f| (&f.name, &f.value))).unwrap(),
                     );
@@ -241,6 +242,92 @@ fn peer_resets_allow_repeated_stream_retirement() {
         );
         assert!(stack.h2[1].retire(stream));
     }
+    assert!(stack.h2[1].failed().is_none());
+}
+
+#[test]
+fn request_opening_retains_credit_before_response_headers() {
+    let mut stack = Stack::new();
+    stack.segment(0, 100, 2, &[]);
+    stack.segment(1, 200, 0x12, &[]);
+    let settings = http2::Settings {
+        flags: 0,
+        entries: vec![],
+    }
+    .to_bytes()
+    .unwrap();
+    let request = grpc::Request::new(
+        grpc::MethodPath::new("echo.Service", "Call").unwrap(),
+        grpc::ContentType::plain(),
+    );
+    let fields: Vec<_> = request
+        .to_headers()
+        .unwrap()
+        .into_iter()
+        .map(|(n, v)| hpack::Field::new(n, v))
+        .collect();
+    let mut client = [http2::PREFACE.as_slice(), &settings].concat();
+    client.extend(headers(&mut hpack::Encoder::new(0), 1, &fields, true));
+    for stream in [1, 0] {
+        http2::WindowUpdate {
+            stream,
+            flags: 0,
+            increment: 65_536,
+        }
+        .write(&mut client)
+        .unwrap();
+    }
+    let mut client_seq = stack.reordered(0, 101, &client);
+    assert_eq!(stack.h2[1].stream_window(1), Some(131_071));
+    let mut server = settings;
+    server.extend(headers(
+        &mut hpack::Encoder::new(0),
+        1,
+        &[hpack::Field::new(":status", "200")],
+        false,
+    ));
+    let message = grpc::Message {
+        compressed: false,
+        data: vec![b'x'; 59],
+    }
+    .to_bytes()
+    .unwrap();
+    for i in 0..4 {
+        http2::Data {
+            stream: 1,
+            flags: u8::from(i == 3),
+            data: message.repeat(256),
+            padding: None,
+        }
+        .write(&mut server)
+        .unwrap();
+    }
+    stack.reordered(1, 201, &server);
+    assert_eq!(stack.messages.len(), 1024);
+    assert!(
+        stack
+            .messages
+            .iter()
+            .all(|(dir, stream, data)| *dir == 1 && *stream == 1 && data.as_slice() == [b'x'; 59])
+    );
+    assert_eq!(stack.h2[1].stream_window(1), Some(65_535));
+    assert_eq!(stack.h2[1].connection_window(), 65_535);
+    assert!(stack.h2[0].retire(1));
+    assert!(stack.h2[1].retire(1));
+    for _ in 0..2 {
+        client_seq = stack.reordered(
+            0,
+            client_seq,
+            &http2::WindowUpdate {
+                stream: 1,
+                flags: 0,
+                increment: http2::MAX_WINDOW,
+            }
+            .to_bytes()
+            .unwrap(),
+        );
+    }
+    assert_eq!(stack.h2[1].stream_window(1), None);
     assert!(stack.h2[1].failed().is_none());
 }
 
