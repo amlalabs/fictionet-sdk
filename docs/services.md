@@ -118,6 +118,10 @@ reading it. A local reset makes retained handles report `ConnError::Reset`;
 an endpoint stop makes them report `ConnError::Closed`. The reset socket
 stays until its RST can be sent, even when packet output is full.
 
+TCP takes the peer's initial sequence number only from an accepted handshake.
+Invalid or unsolicited SYN-ACKs cannot move the connection's receive window
+or keep its buffer pages resident.
+
 ### One protocol, two framings
 
 Kerberos frames a message with a four-byte length over TCP, and sends one

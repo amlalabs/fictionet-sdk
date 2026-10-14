@@ -14,6 +14,10 @@
 //! splits a machine's packets so that only TCP, and ICMP errors about it,
 //! reach this layer.
 //!
+//! The peer's initial sequence number comes only from an accepted
+//! handshake. Invalid or unsolicited SYN-ACKs cannot move the receive
+//! window or keep a connection's buffer pages resident.
+//!
 //! This builds a machine at `104.18.32.7` and accepts connections on its
 //! port 443. The other end of the [`pair`](fictionet::pair) goes to a router,
 //! as the [`route`](fictionet::stdlib::route) page shows:
@@ -49,7 +53,7 @@ use std::task::{Context, Poll, Waker};
 use smoltcp::iface::{Config, Interface as Iface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{self as stcp, State as TcpState};
-use smoltcp::wire::{HardwareAddress, IpCidr};
+use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Packet, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::ip::{
@@ -423,7 +427,9 @@ struct Conn {
     /// The acknowledgment number and window of the last segment from the
     /// peer that smoltcp was given.
     last_fed: Option<(u32, u16)>,
-    /// The highest sequence number past data from the peer, so far.
+    /// An upper bound on the sequence number past data from the peer that
+    /// smoltcp may hold, including out-of-order data. smoltcp exposes only
+    /// the readable part of its receive queue.
     rx_end: Option<u32>,
     /// Kept until the socket is gone, after the handle is dropped too: see
     /// [`TcpConnection::hold_until_gone`].
@@ -811,9 +817,21 @@ impl State {
                 _ => false,
             };
         }
-        let t = &packet[ip.payload.start..];
-        let data_len = ip.payload.len().saturating_sub(((t[12] >> 4) as usize) * 4);
-        let data = data_len > 0;
+        // Validate before trimming or repairing can recalculate checksums,
+        // and before a rejected packet can change connection bookkeeping.
+        if ip.src.is_ipv4() && !Ipv4Packet::new_unchecked(&packet).verify_checksum() {
+            return false;
+        }
+        let t = &packet[ip.payload.clone()];
+        let Ok(repr) = TcpRepr::parse(
+            &TcpPacket::new_unchecked(t),
+            &ip.src.into(),
+            &ip.dst.into(),
+            &Default::default(),
+        ) else {
+            return false;
+        };
+        let data = !repr.payload.is_empty();
         let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
         let flags = t[13];
@@ -841,6 +859,7 @@ impl State {
         }
         let mut packet = packet;
         let mut extra = None;
+        let mut rx_end = None;
         let handle = self.by_tuple.get(&(dst, src)).copied();
         if let Some(h) = handle {
             let c = self.conns.get_mut(&h).unwrap();
@@ -854,18 +873,12 @@ impl State {
             }
             let t = &packet[ip.payload.clone()];
             let data_len = t.len().saturating_sub(((t[12] >> 4) as usize) * 4);
-            if data_len > 0 {
-                let end = seq.wrapping_add(data_len as u32);
-                if c.rx_end.is_none_or(|e| (end.wrapping_sub(e) as i32) > 0) {
-                    c.rx_end = Some(end);
-                }
-                if self.pages.contains_key(&h) {
-                    self.dirty.insert(h);
-                }
+            // SYN payload is ignored by smoltcp. Only synchronized data
+            // can hold buffer pages, and trimming bounds its right edge.
+            if data_len > 0 && !syn && !rst && ack && c.irs.is_some() {
+                rx_end = Some(seq.wrapping_add(data_len as u32));
             }
-            if syn && ack {
-                c.irs = Some(seq);
-            } else if ack && !syn && !rst {
+            if ack && !syn && !rst {
                 extra = repair_ack(
                     c,
                     self.sockets.get::<stcp::Socket>(self.handles[&h]),
@@ -897,6 +910,7 @@ impl State {
         self.dev.rx = Some(packet);
         self.iface
             .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
+        let consumed = self.dev.rx.is_none();
         self.dev.rx = None;
         for (id, socket) in idle {
             self.handles.insert(id, self.sockets.add(socket));
@@ -904,6 +918,20 @@ impl State {
         if let Some(h) = handle {
             let after = self.get(h).state();
             let c = self.conns.get_mut(&h).unwrap();
+            if syn
+                && before == Some(TcpState::SynSent)
+                && matches!(after, TcpState::Established | TcpState::SynReceived)
+            {
+                c.irs = Some(seq);
+            }
+            if consumed && let Some(end) = rx_end {
+                if c.rx_end.is_none_or(|e| (end.wrapping_sub(e) as i32) > 0) {
+                    c.rx_end = Some(end);
+                }
+                if self.pages.contains_key(&h) {
+                    self.dirty.insert(h);
+                }
+            }
             if rst && before != Some(after) && matches!(after, TcpState::Closed | TcpState::Listen)
             {
                 c.rst = true;
@@ -931,11 +959,9 @@ impl State {
             // At most one idle socket took the SYN.
             let l = self.listeners.get_mut(&dst.port()).unwrap();
             let (sockets, handles) = (&self.sockets, &self.handles);
-            if let Some(i) = l
-                .idle
-                .iter()
-                .position(|&h| sockets.get::<stcp::Socket>(handles[&h]).state() != TcpState::Listen)
-            {
+            if let Some(i) = l.idle.iter().position(|&h| {
+                sockets.get::<stcp::Socket>(handles[&h]).state() == TcpState::SynReceived
+            }) {
                 let h = l.idle.swap_remove(i);
                 l.embryonic.push(h);
                 let s = self.sockets.get::<stcp::Socket>(self.handles[&h]);
@@ -2103,6 +2129,135 @@ mod tests {
             != smoltcp::iface::PollResult::None
         {}
         std::mem::take(&mut st.dev.tx)
+    }
+
+    #[test]
+    fn rejected_syn_acks_leave_handshake_bookkeeping_unchanged() {
+        rejected_syn_acks(false);
+    }
+
+    #[test]
+    fn unsolicited_syn_acks_leave_established_bookkeeping_unchanged() {
+        rejected_syn_acks(true);
+    }
+
+    fn rejected_syn_acks(established: bool) {
+        for (local, peer) in [
+            ("10.0.0.1:1234", "10.0.0.2:80"),
+            ("[fd00::1]:1234", "[fd00::2]:80"),
+        ] {
+            let local: SocketAddr = local.parse().unwrap();
+            let peer: SocketAddr = peer.parse().unwrap();
+            block_on(lab(Seed::from_u64(1), |fcx| async move {
+                let (_raw, side) = pair();
+                let ep = endpoint_with(&fcx, side, local.ip(), Options::default().buffer(MIN_BUFFER));
+                let now = smol_now(&fcx);
+                let mut st = ep.shared.state.lock();
+                let mut s = new_socket(MIN_BUFFER);
+                s.0.connect(st.iface.context(), peer, local).unwrap();
+                let h = st.add_socket(s);
+                st.conns.insert(h, Conn::new(local, peer, Side::Client));
+                st.by_tuple.insert((local, peer), h);
+                let packets = egress(&mut st, now);
+                let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
+                let irs = u32::MAX - 3;
+                if established {
+                    st.ingress(local.ip(), now, segment(peer, local, irs, ack, 0x12).0);
+                    egress(&mut st, now);
+                    assert_eq!(st.get(h).state(), TcpState::Established);
+                }
+                let before = st.get(h).state();
+                for fault in [
+                    "empty_checksum", "checksum", "ack", "offset", "options", "flags", "ip", "none",
+                ] {
+                    if fault == "none" && !established || fault == "ip" && local.is_ipv6() {
+                        continue;
+                    }
+                    // This origin would put the receive edge at the first real byte.
+                    let seq = irs.wrapping_sub(MIN_BUFFER as u32);
+                    let mut p = segment(peer, local, seq, ack, 0x12).0;
+                    let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
+                    if !matches!(fault, "empty_checksum" | "none") {
+                        p.extend_from_slice(b"ignored");
+                    }
+                    match fault {
+                        "ack" => p[tcp_at + 8..tcp_at + 12]
+                            .copy_from_slice(&ack.wrapping_add(1).to_be_bytes()),
+                        "offset" => p[tcp_at + 12] = 4 << 4,
+                        "options" => {
+                            p[tcp_at + 12] = 6 << 4;
+                            p[tcp_at + 20..tcp_at + 24].copy_from_slice(&[2, 1, 0, 0]);
+                        }
+                        "flags" => p[tcp_at + 13] |= 4,
+                        _ => {}
+                    }
+                    fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
+                    if matches!(fault, "empty_checksum" | "checksum") {
+                        p[tcp_at + 16] ^= 1;
+                    } else if fault == "ip" {
+                        p[10] ^= 1;
+                    }
+                    st.ingress(local.ip(), now, p);
+                    assert_eq!(st.get(h).state(), before, "{fault}");
+                    assert_eq!(st.conns[&h].irs, established.then_some(irs), "{fault}");
+                    assert_eq!(st.conns[&h].rx_end, None, "{fault}");
+                    assert!(!st.dirty.contains(&h), "{fault}");
+                    egress(&mut st, now);
+                }
+                if !established {
+                    st.ingress(local.ip(), now, segment(peer, local, irs, ack, 0x12).0);
+                    egress(&mut st, now);
+                }
+                assert_eq!(st.get(h).state(), TcpState::Established);
+                assert_eq!(st.conns[&h].irs, Some(irs));
+                // Out-of-order data crosses zero. Releasing quiet pages must
+                // preserve it until the gap fills.
+                let expected = b"abcdefgh";
+                for begin in [4usize, 0] {
+                    let seq = irs.wrapping_add(1).wrapping_add(begin as u32);
+                    let mut p = segment(peer, local, seq, ack, 0x10).0;
+                    let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
+                    p.extend_from_slice(&expected[begin..begin + 4]);
+                    fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
+                    st.ingress(local.ip(), now, p);
+                    egress(&mut st, now);
+                    st.release_quiet();
+                }
+                let mut got = [0; 8];
+                assert_eq!(st.sock(h).recv_slice(&mut got).unwrap(), expected.len());
+                assert_eq!(&got, expected);
+                drop(st);
+                fcx.cancel();
+                Ok(())
+            }))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn simultaneous_open_records_the_accepted_syn_origin() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:1234".parse()?;
+            let peer: SocketAddr = "10.0.0.2:80".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            let mut s = new_socket(MIN_BUFFER);
+            s.0.connect(st.iface.context(), peer, local).unwrap();
+            let h = st.add_socket(s);
+            st.conns.insert(h, Conn::new(local, peer, Side::Client));
+            st.by_tuple.insert((local, peer), h);
+            egress(&mut st, now);
+            st.ingress(local.ip(), now, segment(peer, local, u32::MAX, 0, 0x02).0);
+            assert_eq!(st.get(h).state(), TcpState::SynReceived);
+            assert_eq!(st.conns[&h].irs, Some(u32::MAX));
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
     }
 
     #[test]
