@@ -40,6 +40,12 @@ exact total limit. It leaves the vector's length and contents unchanged.
 can use this public helper and map each reason to their own error.
 `codec::append_bounded` keeps its separate `Buffer::MAX_LIMIT` clamp.
 
+`codec::dot_body` shares dot transparency for SMTP and POP3. Its accumulator
+retains the first body error through the terminator and keeps counting bytes
+after rejection. Callers supply validation and translate fatal errors. SMTP
+limits unstuffed lines and rejects NUL; POP3 limits stuffed lines and allows
+NUL in bodies. Both writers validate and reserve before appending output.
+
 ## 1. A service
 
 A service is the server side of one protocol, for one connection. It

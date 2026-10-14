@@ -31,6 +31,8 @@
 //! [`reserve_bytes`] grows a byte vector under an explicit total limit and
 //! returns neutral [`ReserveError`] reasons. It leaves contents unchanged.
 //! [`append_bounded`] also appends bytes and clamps to [`Buffer::MAX_LIMIT`].
+//! [`dot_body`] shares dot transparency and bounded assembly. Protocols keep
+//! their line limits, validation, error translation, and mode changes.
 //!
 //! The code outside tests uses only `core` and `alloc`. Nothing here does
 //! I/O, reads a clock or uses global state. [`serve`](super::serve) runs a
@@ -158,6 +160,7 @@ mod combinators;
 pub mod crc32c;
 mod declarations;
 mod demux;
+pub mod dot_body;
 pub use fictionet::{codec_from, error_display, fixed_fields, open_enum, prefixed, text_wire};
 mod faults;
 pub mod field;

@@ -744,26 +744,12 @@ impl Wire for Data {
     /// Empty messages and 8-bit content are allowed. Errors leave `out`
     /// unchanged; extension negotiation belongs to the caller.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.bytes.len() > MAX_DATA || (!self.bytes.is_empty() && !self.bytes.ends_with(b"\r\n"))
-        {
-            return Err(Error::Unwritable);
-        }
-        let mut size = self.bytes.len().checked_add(3).ok_or(Error::Unwritable)?;
-        for line in self.bytes.split_inclusive(|b| *b == b'\n') {
-            let content = line.strip_suffix(b"\r\n").ok_or(Error::Unwritable)?;
-            check_data_line(content).map_err(|_| Error::Unwritable)?;
-            size = size
-                .checked_add(usize::from(content.starts_with(b".")))
-                .ok_or(Error::Unwritable)?;
-        }
+        let size = codec::dot_body::encoded_len(&self.bytes, MAX_DATA, |content, _| {
+            check_data_line(content).is_ok()
+        })
+        .ok_or(Error::Unwritable)?;
         out.try_reserve(size).map_err(|_| Error::Unwritable)?;
-        for line in self.bytes.split_inclusive(|b| *b == b'\n') {
-            if line.starts_with(b".") {
-                out.push(b'.');
-            }
-            out.extend_from_slice(line);
-        }
-        out.extend_from_slice(b".\r\n");
+        codec::dot_body::write(&self.bytes, out);
         Ok(())
     }
 }
@@ -842,9 +828,7 @@ pub struct Inputs {
     mode: Mode,
     partial: bool,
     skipping: bool,
-    data: Vec<u8>,
-    data_size: usize,
-    rejected: Option<Error>,
+    data: codec::dot_body::Accumulator<Error>,
 }
 
 impl Default for Inputs {
@@ -861,9 +845,7 @@ impl Inputs {
             mode: Mode::Command,
             partial: false,
             skipping: false,
-            data: Vec::new(),
-            data_size: 0,
-            rejected: None,
+            data: codec::dot_body::Accumulator::new(MAX_DATA),
         }
     }
 
@@ -901,7 +883,7 @@ impl Decode for Inputs {
     }
 
     fn held(&self) -> usize {
-        self.data.len()
+        self.data.held()
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, FrameError> {
@@ -934,56 +916,26 @@ impl Decode for Inputs {
                 used,
             ));
         }
-        if line.as_deref() == Ok(b".".as_slice()) {
-            self.mode = Mode::Command;
-            self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
-            self.data_size = 0;
-            let data = core::mem::take(&mut self.data);
-            return Ok(codec::Step::Item(
-                self.rejected
-                    .take()
-                    .map_or_else(|| Ok(Input::Message(data)), Err),
-                used,
-            ));
-        }
         if matches!(line, Err(Error::LineTooLong)) {
             return Err(FrameError::LineTooLong);
         }
-        self.data_size = self
-            .data_size
-            .checked_add(used)
-            .and_then(|n| {
-                n.checked_sub(usize::from(
-                    line.as_ref().is_ok_and(|b| b.starts_with(b".")),
-                ))
-            })
-            .filter(|&n| n <= MAX_DATA)
-            .ok_or(FrameError::TooMuchData)?;
-        let result = line.and_then(|line| {
-            let content = line.strip_prefix(b".").unwrap_or(&line);
-            check_data_line(content)?;
-            Ok(line)
-        });
-        match result {
-            Ok(line) if self.rejected.is_none() => {
-                let content = line.strip_prefix(b".").unwrap_or(&line);
-                codec::reserve_bytes(&mut self.data, content.len() + 2, MAX_DATA).map_err(
-                    |error| match error {
-                        codec::ReserveError::TooLong { .. } => FrameError::TooMuchData,
-                        codec::ReserveError::Allocation => FrameError::Allocation,
-                    },
-                )?;
-                self.data.extend_from_slice(content);
-                self.data.extend_from_slice(b"\r\n");
-            }
-            Err(Error::LineTooLong) => return Err(FrameError::LineTooLong),
-            Err(e) => {
-                self.rejected.get_or_insert(e);
-                self.data.clear();
-            }
-            _ => {}
+        let step = self.data.push(
+            line.as_deref().map_err(|&error| error),
+            used,
+            |content| match check_data_line(content) {
+                Err(Error::LineTooLong) => Err(FrameError::LineTooLong),
+                result => Ok(result.err()),
+            },
+            |error| match error {
+                codec::ReserveError::TooLong { .. } => FrameError::TooMuchData,
+                codec::ReserveError::Allocation => FrameError::Allocation,
+            },
+        )?;
+        if matches!(step, codec::Step::Item(..)) {
+            self.mode = Mode::Command;
+            self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
         }
-        Ok(codec::Step::Skip(used))
+        Ok(step.map(|body| body.map(Input::Message)))
     }
 }
 

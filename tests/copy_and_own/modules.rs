@@ -58,6 +58,8 @@ macro_rules! protocols {
         pub mod dnp3;
         #[path = "../../src/stdlib/dns.rs"]
         pub mod dns;
+        #[path = "../../src/stdlib/codec/dot_body.rs"]
+        pub mod dot_body;
         #[path = "../../src/stdlib/dtls.rs"]
         pub mod dtls;
         #[path = "../../src/stdlib/enip.rs"]

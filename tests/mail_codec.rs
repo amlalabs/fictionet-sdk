@@ -731,6 +731,90 @@ fn pop3_exact_limits_and_assembly_errors() {
 }
 
 #[test]
+fn dot_bodies_preserve_protocol_validation_and_pipelined_tails() {
+    let smtp_data = || {
+        let mut inputs = smtp::Inputs::new();
+        inputs.start_data().unwrap();
+        inputs
+    };
+    let pop_body = || {
+        let mut outputs = pop3::Outputs::new();
+        outputs.expect(true).unwrap();
+        outputs.expect(true).unwrap();
+        outputs
+    };
+    for (body, smtp_error, pop_error) in [
+        (b"".as_slice(), None, false),
+        (b"..dot\r\n\r\n", None, false),
+        (b"nul\0\r\n", Some(smtp::Error::Text), false),
+        (b"cr\rx\r\n", Some(smtp::Error::Text), true),
+        (b".\n", Some(smtp::Error::LineEnding), true),
+        (b"nul\0\r\nlf\n", Some(smtp::Error::Text), true),
+        (b"lf\nnul\0\r\n", Some(smtp::Error::LineEnding), true),
+    ] {
+        let smtp_wire = [body, b".\r\nNOOP\r\n"].concat();
+        let items = read(smtp_data, &smtp_wire);
+        let unstuffed = body.strip_prefix(b".").unwrap_or(body);
+        assert_eq!(
+            items,
+            vec![
+                Ok(smtp_error.map_or_else(|| Ok(smtp::Input::Message(unstuffed.to_vec())), Err)),
+                Ok(Ok(smtp::Input::Command(smtp::Command::new("NOOP", None)))),
+            ]
+        );
+        let pop_wire = [b"+OK first\r\n".as_slice(), body, b".\r\n+OK next\r\n.\r\n"].concat();
+        assert_eq!(
+            read(pop_body, &pop_wire),
+            vec![
+                Ok(if pop_error {
+                    Err(pop3::Error::BadBodyLine)
+                } else {
+                    Ok(pop3::Output::Reply(
+                        pop3::Reply::ok("first").with_body(unstuffed.to_vec()),
+                    ))
+                }),
+                Ok(Ok(pop3::Output::Reply(
+                    pop3::Reply::ok("next").with_body(vec![])
+                ))),
+            ]
+        );
+        if smtp_error.is_some() {
+            contract::check_refused(&smtp::Data {
+                bytes: body.to_vec(),
+            });
+        }
+        if pop_error {
+            contract::check_refused(&pop3::Reply::ok("first").with_body(body.to_vec()));
+        } else {
+            contract::check_wire_value(&pop3::Reply::ok("first").with_body(body.to_vec()));
+        }
+    }
+}
+
+#[test]
+fn pop3_stuffed_line_limit_rejects_the_extra_dot() {
+    let mut body = vec![b'x'; pop3::MAX_DATA_LINE - 2];
+    body.extend_from_slice(b"\r\n");
+    contract::check_wire_value(&pop3::Reply::ok("").with_body(body.clone()));
+    body[0] = b'.';
+    contract::check_refused(&pop3::Reply::ok("").with_body(body.clone()));
+    let wire = [b"+OK\r\n.".as_slice(), &body, b".\r\n"].concat();
+    let multi = || {
+        let mut outputs = pop3::Outputs::new();
+        outputs.expect(true).unwrap();
+        outputs
+    };
+    assert_eq!(
+        read(multi, &wire),
+        vec![Err(Fail::Protocol(pop3::FrameError::Line(
+            codec::LineError::TooLong {
+                max: pop3::MAX_DATA_LINE - 2,
+            }
+        )))]
+    );
+}
+
+#[test]
 fn imap_line_text_and_literal_limits() {
     let command = imap::Command::new(
         "a",
@@ -903,6 +987,42 @@ fn assemblies_stop_at_named_body_limits() {
         }
     }
     assert!(pop.failed().is_some());
+}
+
+#[test]
+fn rejected_dot_bodies_still_enforce_total_limits() {
+    fn fill<D: Decode>(decoder: &mut D, max_line: usize, max_body: usize)
+    where
+        D::Item: core::fmt::Debug,
+    {
+        assert!(matches!(decoder.decode(b"bad\n", false), Ok(Step::Skip(4))));
+        let line = [b"..".as_slice(), &vec![b'x'; max_line - 4], b"\r\n"].concat();
+        let charge = line.len() - 1;
+        for _ in 0..(max_body - 4) / charge {
+            assert!(matches!(decoder.decode(&line, false), Ok(Step::Skip(n)) if n == line.len()));
+            assert_eq!(decoder.held(), 0);
+        }
+        let remaining = (max_body - 4) % charge;
+        let last = [vec![b'x'; remaining - 2], b"\r\n".to_vec()].concat();
+        assert!(matches!(decoder.decode(&last, false), Ok(Step::Skip(n)) if n == remaining));
+        assert_eq!(decoder.held(), 0);
+    }
+    let mut smtp = smtp::Inputs::new();
+    smtp.start_data().unwrap();
+    fill(&mut smtp, smtp::MAX_DATA_LINE + 1, smtp::MAX_DATA);
+    assert_eq!(
+        smtp.decode(b"\r\n", false),
+        Err(smtp::FrameError::TooMuchData)
+    );
+
+    let mut pop = pop3::Outputs::new();
+    pop.expect(true).unwrap();
+    assert_eq!(pop.decode(b"+OK\r\n", false), Ok(Step::Skip(5)));
+    fill(&mut pop, pop3::MAX_DATA_LINE, pop3::MAX_BODY);
+    assert_eq!(
+        pop.decode(b"\r\n", false),
+        Err(pop3::FrameError::BodyTooLong)
+    );
 }
 
 #[test]

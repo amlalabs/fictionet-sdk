@@ -847,20 +847,11 @@ impl Wire for Reply {
             .filter(|&n| n <= MAX_REPLY_LINE)
             .ok_or(Error::Unwritable)?;
         if let Some(body) = &self.body {
-            if !body.is_empty() && !body.ends_with(b"\r\n") {
-                return Err(Error::Unwritable);
-            }
-            for line in body.split_inclusive(|b| *b == b'\n') {
-                let content = line.strip_suffix(b"\r\n").ok_or(Error::Unwritable)?;
-                let stuffed = usize::from(content.starts_with(b"."));
-                if content.contains(&b'\r') || line.len().saturating_add(stuffed) > MAX_DATA_LINE {
-                    return Err(Error::Unwritable);
-                }
-                size = size
-                    .checked_add(line.len() + stuffed)
-                    .ok_or(Error::Unwritable)?;
-            }
-            size = size.checked_add(3).ok_or(Error::Unwritable)?;
+            let body_size = codec::dot_body::encoded_len(body, MAX_BODY, |content, stuffed| {
+                !content.contains(&b'\r') && stuffed <= MAX_DATA_LINE
+            })
+            .ok_or(Error::Unwritable)?;
+            size = size.checked_add(body_size).ok_or(Error::Unwritable)?;
         }
         out.try_reserve(size).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(status);
@@ -875,13 +866,7 @@ impl Wire for Reply {
         out.extend_from_slice(self.text.as_bytes());
         out.extend_from_slice(b"\r\n");
         if let Some(body) = &self.body {
-            for line in body.split_inclusive(|b| *b == b'\n') {
-                if line.starts_with(b".") {
-                    out.push(b'.');
-                }
-                out.extend_from_slice(line);
-            }
-            out.extend_from_slice(b".\r\n");
+            codec::dot_body::write(body, out);
         }
         Ok(())
     }
@@ -1167,8 +1152,7 @@ pub struct Outputs {
     raw_line: bool,
     partial: bool,
     pending: Option<Reply>,
-    body_size: usize,
-    rejected: bool,
+    body: codec::dot_body::Accumulator<Error>,
 }
 
 impl Default for Outputs {
@@ -1186,8 +1170,7 @@ impl Outputs {
             raw_line: false,
             partial: false,
             pending: None,
-            body_size: 0,
-            rejected: false,
+            body: codec::dot_body::Accumulator::new(MAX_BODY),
         }
     }
 
@@ -1237,8 +1220,8 @@ impl Decode for Outputs {
                 r.text
                     .len()
                     .saturating_add(r.code.as_ref().map_or(0, String::len))
-                    .saturating_add(r.body.as_ref().map_or(0, Vec::len))
             }))
+            .saturating_add(self.body.held())
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, FrameError> {
@@ -1292,8 +1275,7 @@ impl Decode for Outputs {
                 Reply::parse_line(&b)
             });
             match reply {
-                Ok(mut reply) if reply.ok && multi => {
-                    reply.body = Some(Vec::new());
+                Ok(reply) if reply.ok && multi => {
                     self.pending = Some(reply);
                     self.lines = codec::Lines::new(MAX_DATA_LINE - 2, codec::Ending::Crlf);
                     return Ok(codec::Step::Skip(used));
@@ -1304,49 +1286,22 @@ impl Decode for Outputs {
                 }
             }
         }
-        if line.as_deref() == Ok(b".".as_slice()) {
+        let step = self.body.push(
+            line.as_deref().map_err(|_| Error::BadBodyLine),
+            used,
+            |content| Ok(content.contains(&b'\r').then_some(Error::BadBodyLine)),
+            |error| match error {
+                codec::ReserveError::TooLong { .. } => FrameError::BodyTooLong,
+                codec::ReserveError::Allocation => FrameError::Allocation,
+            },
+        )?;
+        if let codec::Step::Item(body, used) = step {
             let reply = self.pending.take().ok_or(Error::BadStatus);
             self.lines = codec::Lines::new(MAX_REPLY_LINE - 2, codec::Ending::Crlf);
-            self.body_size = 0;
             return Ok(codec::Step::Item(
-                if core::mem::take(&mut self.rejected) {
-                    Err(Error::BadBodyLine)
-                } else {
-                    reply.map(Output::Reply)
-                },
+                body.and_then(|body| reply.map(|reply| Output::Reply(reply.with_body(body)))),
                 used,
             ));
-        }
-        self.body_size = self
-            .body_size
-            .checked_add(used)
-            .and_then(|n| {
-                n.checked_sub(usize::from(
-                    line.as_ref().is_ok_and(|b| b.starts_with(b".")),
-                ))
-            })
-            .filter(|&n| n <= MAX_BODY)
-            .ok_or(FrameError::BodyTooLong)?;
-        match line {
-            Ok(line) if !line.contains(&b'\r') && !self.rejected => {
-                if let Some(body) = self.pending.as_mut().and_then(|r| r.body.as_mut()) {
-                    let content = line.strip_prefix(b".").unwrap_or(&line);
-                    codec::reserve_bytes(body, content.len() + 2, MAX_BODY).map_err(|error| {
-                        match error {
-                            codec::ReserveError::TooLong { .. } => FrameError::BodyTooLong,
-                            codec::ReserveError::Allocation => FrameError::Allocation,
-                        }
-                    })?;
-                    body.extend_from_slice(content);
-                    body.extend_from_slice(b"\r\n");
-                }
-            }
-            _ => {
-                self.rejected = true;
-                if let Some(body) = self.pending.as_mut().and_then(|r| r.body.as_mut()) {
-                    body.clear();
-                }
-            }
         }
         Ok(codec::Step::Skip(used))
     }
