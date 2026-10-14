@@ -332,6 +332,11 @@ The run waits for file writers at shutdown. Discard a sample if
 
 ## 6. The dashboard
 
+The dashboard and `fictionet observe` use a temporary 11-second timeout
+when sending hello to the world and waiting for its answer. A silent world
+causes a handshake-timeout error. After acceptance, these greeting timeouts
+are cleared; callers control how long to wait for subscription replies.
+
 The dashboard lists the events under **Events**, from what the log held
 when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The

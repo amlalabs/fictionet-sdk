@@ -425,9 +425,26 @@ pub mod observer {
     impl Client {
         /// Connects to the world socket at `path` as an observer called
         /// `name`. Fails with the world's reason if it refuses.
+        /// Sending hello and waiting for its answer each time out after
+        /// 11 seconds. After acceptance, replies wait forever unless
+        /// [`Self::set_timeout`] sets a limit.
         pub fn connect(path: &str, name: &str) -> Result<Client, String> {
             let fd = unix::connect(path)
                 .map_err(|e| format!("connecting to the world at {path}: {e}"))?;
+            Self::hello(fd, name, HANDSHAKE_TIMEOUT + Duration::from_secs(1))
+        }
+
+        fn hello(fd: OwnedFd, name: &str, timeout: Duration) -> Result<Client, String> {
+            for option in [libc::SO_SNDTIMEO, libc::SO_RCVTIMEO] {
+                unix::set_timeout(fd.as_raw_fd(), option, Some(timeout))
+                    .map_err(|e| format!("setting the handshake timeout: {e}"))?;
+            }
+            let handshake_error = |e: io::Error| match e.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                    "the observer hello handshake timed out".to_owned()
+                }
+                _ => e.to_string(),
+            };
             let hello = Hello {
                 version: VERSION,
                 mtu: 0,
@@ -435,16 +452,22 @@ pub mod observer {
                 name: name.into(),
             };
             unix::send(fd.as_raw_fd(), &Message::Hello(hello).encode(), false)
-                .map_err(|e| e.to_string())?;
+                .map_err(handshake_error)?;
             let mut client = Client {
                 fd,
                 next_id: 1,
                 buf: vec![0; MAX_MESSAGE + 1],
             };
             let n = unix::recv(client.fd.as_raw_fd(), &mut client.buf, false)
-                .map_err(|e| e.to_string())?;
+                .map_err(handshake_error)?;
             match decode(&client.buf[..n]) {
-                Ok(Message::Accept) => Ok(client),
+                Ok(Message::Accept) => {
+                    for option in [libc::SO_SNDTIMEO, libc::SO_RCVTIMEO] {
+                        unix::set_timeout(client.fd.as_raw_fd(), option, None)
+                            .map_err(|e| format!("clearing the handshake timeout: {e}"))?;
+                    }
+                    Ok(client)
+                }
                 Ok(Message::Refuse(reason)) => Err(format!("the world refused: {reason}")),
                 _ if n == 0 => Err("the world closed the connection".into()),
                 _ => Err("the world sent something other than accept".into()),
@@ -505,6 +528,73 @@ pub mod observer {
         /// Gives up waiting for replies after `timeout`, or never.
         pub fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
             unix::set_timeout(self.fd.as_raw_fd(), libc::SO_RCVTIMEO, timeout)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pair() -> (OwnedFd, OwnedFd) {
+            let mut fds = [-1; 2];
+            // SAFETY: fds has space for both descriptors, owned from here.
+            unsafe {
+                assert_eq!(
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()),
+                    0
+                );
+                (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+            }
+        }
+
+        #[test]
+        fn hello_times_out_on_a_silent_peer() {
+            let (fd, peer) = pair();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                tx.send(Client::hello(fd, "test", Duration::from_millis(20)).err())
+                    .unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            drop(peer);
+            thread.join().unwrap();
+            assert_eq!(
+                result.unwrap().as_deref(),
+                Some("the observer hello handshake timed out")
+            );
+        }
+
+        #[test]
+        fn accept_clears_both_hello_timeouts() {
+            let (fd, peer) = pair();
+            unix::send(peer.as_raw_fd(), &Message::Accept.encode(), false).unwrap();
+            let mut client = Client::hello(fd, "test", Duration::from_millis(20)).unwrap();
+            for option in [libc::SO_SNDTIMEO, libc::SO_RCVTIMEO] {
+                let mut tv = libc::timeval {
+                    tv_sec: -1,
+                    tv_usec: -1,
+                };
+                let mut len = std::mem::size_of_val(&tv) as libc::socklen_t;
+                // SAFETY: getsockopt writes a timeval into tv and its size into len.
+                assert_eq!(
+                    unsafe {
+                        libc::getsockopt(
+                            client.fd.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            option,
+                            (&raw mut tv).cast(),
+                            &mut len,
+                        )
+                    },
+                    0
+                );
+                assert_eq!((tv.tv_sec, tv.tv_usec), (0, 0));
+            }
+            client.set_timeout(Some(Duration::from_millis(20))).unwrap();
+            assert_eq!(
+                client.next_value().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
         }
     }
 }

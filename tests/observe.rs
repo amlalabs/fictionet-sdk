@@ -2,7 +2,7 @@
 //! with one sandbox, and an observer asking for the graph, following its
 //! changes and custom events, and watching a link's packets.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -21,6 +21,55 @@ fn temp_socket() -> String {
     let dir = std::env::temp_dir().join(format!("fn-obs-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("world.sock").to_str().unwrap().to_owned()
+}
+
+#[test]
+fn an_observer_times_out_when_an_accepted_connection_never_answers_hello() {
+    let path = temp_socket();
+    let (addr, len) = unix::address(std::path::Path::new(&path)).unwrap();
+    // SAFETY: the socket is owned from here; addr is valid for len bytes.
+    let listener = unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
+        assert!(fd >= 0);
+        let listener = OwnedFd::from_raw_fd(fd);
+        assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
+        assert_eq!(libc::listen(fd, 1), 0);
+        listener
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let client_path = path.clone();
+    let thread = std::thread::spawn(move || {
+        tx.send(Client::connect(&client_path, "silent-peer").err())
+            .unwrap();
+    });
+    // SAFETY: accept needs no address output; the returned fd is owned here.
+    let peer = unsafe {
+        let fd = libc::accept(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(fd >= 0);
+        OwnedFd::from_raw_fd(fd)
+    };
+    unix::set_timeout(
+        peer.as_raw_fd(),
+        libc::SO_RCVTIMEO,
+        Some(Duration::from_secs(5)),
+    )
+    .unwrap();
+    let mut buf = vec![0; relay::MAX_MESSAGE];
+    let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
+    assert!(matches!(relay::decode(&buf[..n]), Ok(Message::Hello(_))));
+    let result = rx.recv_timeout(relay::HANDSHAKE_TIMEOUT + Duration::from_secs(10));
+    drop(peer);
+    thread.join().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).unwrap();
+    assert_eq!(
+        result.unwrap().as_deref(),
+        Some("the observer hello handshake timed out")
+    );
 }
 
 /// Starts a world on `path` that echoes every sandbox's packets through a
