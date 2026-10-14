@@ -6,6 +6,10 @@
 /// nesting, allocation, and node limits. Each invocation defines distinct
 /// types and uses the supplied schema limits. Sampling and contract helpers
 /// compile only when tests are enabled in the consuming crate.
+///
+/// Optional values that encode as their null sentinel are refused with the
+/// generated error type's `Value` variant. Failed writes leave the destination
+/// unchanged.
 #[macro_export]
 macro_rules! generated_runtime {
     ($error:ident, $wire:ident, $max_message:ident, $max_depth:ident,
@@ -538,7 +542,7 @@ macro_rules! generated_runtime {
                         None => self.scalar(null, le),
                     }
                 }
-                /// Writes the null value for `None`. Values never encode as null.
+                /// Writes the null value for `None`. Refuses `Some` values that encode as null.
                 pub fn nullable_ref<S: Scalar, T>(
                     &mut self,
                     value: &Option<T>,
@@ -547,7 +551,15 @@ macro_rules! generated_runtime {
                     f: impl FnOnce(&mut Self, &T) -> Result<(), $error>,
                 ) -> Result<(), $error> {
                     match value {
-                        Some(v) => f(self, v),
+                        Some(v) => {
+                            let start = self.bytes.len();
+                            f(self, v)?;
+                            let bytes = self.bytes.get(start..).ok_or($error::Truncated)?;
+                            if Reader::new(bytes).scalar::<S>(le)?.same(null) {
+                                return Err($error::Value);
+                            }
+                            Ok(())
+                        }
                         None => self.scalar(null, le),
                     }
                 }

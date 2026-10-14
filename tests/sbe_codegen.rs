@@ -159,6 +159,45 @@ fn nested_open_enum_alias_refusal_is_transactional() {
     }
 }
 
+#[test]
+fn optional_enum_null_collision_is_transactional() {
+    use sample::{Error, Flags, Order, Price, Quote, QuoteKind, Side, Status};
+    let mut value = Order {
+        id: 0,
+        symbol: b"ABCDEF".to_vec(),
+        quote: Quote {
+            price: Price { mantissa: 0 },
+            side: Side::Buy,
+            kind: QuoteKind::Firm,
+        },
+        qty: 0,
+        open: None,
+        status: None,
+        flags: Flags(0),
+        flag: b' ',
+        maybe: None,
+        level: None,
+        fills: Vec::new(),
+        memo: Vec::new(),
+    };
+    for status in [None, Some(Status::Open), Some(Status::Unknown(254))] {
+        value.status = status;
+        let mut out = vec![7, 8, 9];
+        value.write(&mut out).unwrap();
+        assert_eq!(&out[..3], &[7, 8, 9]);
+        assert_eq!(Order::parse(&out[3..]).unwrap(), value);
+    }
+
+    value.status = Some(Status::Unknown(255));
+    let mut out = vec![7, 8, 9];
+    assert_eq!(value.write(&mut out), Err(Error::Value));
+    assert_eq!(out, [7, 8, 9]);
+
+    let status = Status::Unknown(255);
+    assert_eq!(status.to_bytes().unwrap(), [255]);
+    assert_eq!(Status::parse(&[255]).unwrap(), status);
+}
+
 /// A value as both sides can print it: leaves in schema order, with
 /// brackets around byte arrays and groups. Constants are left out.
 #[derive(Clone, Debug, PartialEq)]

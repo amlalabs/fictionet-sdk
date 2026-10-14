@@ -334,7 +334,11 @@ that no message uses are left out; every enum and set is emitted.
 Generated enums preserve values absent from the schema as `Unknown(raw)`.
 The writer refuses `Unknown(raw)` with `Error::Value` when `raw` names a
 declared variant. Use the named variant instead. Other unknown values
-round-trip unchanged. A refusal leaves the destination unchanged.
+round-trip unchanged. In an optional field, `Some` must not encode as the
+null sentinel. The writer refuses that collision with `Error::Value`,
+including `Some(Unknown(raw))` when `raw` is the sentinel. The same unknown
+value remains valid in a standalone enum. A refusal leaves the destination
+unchanged.
 
 Generated readers accept acting versions from the schema version up.
 Longer blocks from newer senders are skipped. Senders on older versions

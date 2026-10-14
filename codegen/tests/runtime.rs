@@ -126,3 +126,50 @@ fn float_ranges_refuse_nan() {
         }
     }
 }
+
+const NULL: u16 = 0x1234;
+
+#[derive(Debug, PartialEq)]
+struct NullableRef(u16, Option<u16>);
+impl __wire::Codec for NullableRef {
+    fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
+        Ok(Self(
+            r.scalar(le)?,
+            r.nullable_ref(NULL, le, |r| r.scalar(le))?,
+        ))
+    }
+    fn encode(&self, w: &mut __wire::Writer, le: bool) -> Result<(), Error> {
+        w.scalar(self.0, le)?;
+        w.nullable_ref(&self.1, NULL, le, |w, v| w.scalar(*v, le))
+    }
+    fn sample(_: &mut __wire::Sampler) -> Result<Self, Error> {
+        Ok(Self(0, None))
+    }
+}
+
+#[test]
+fn nullable_ref_preserves_presence() {
+    for le in [false, true] {
+        for prefix in [0, NULL] {
+            for optional in [None, Some(0), Some(NULL.swap_bytes()), Some(u16::MAX)] {
+                let value = NullableRef(prefix, optional);
+                let mut out = vec![7, 8, 9];
+                __wire::write(&value, &mut out, le).unwrap();
+                assert_eq!(&out[..3], &[7, 8, 9]);
+                assert_eq!(__wire::parse::<NullableRef>(&out[3..], le), Ok(value));
+            }
+        }
+    }
+}
+
+#[test]
+fn nullable_ref_null_collision_is_transactional() {
+    for le in [false, true] {
+        for prefix in [0, NULL] {
+            let value = NullableRef(prefix, Some(NULL));
+            let mut out = vec![7, 8, 9];
+            assert_eq!(__wire::write(&value, &mut out, le), Err(Error::Value));
+            assert_eq!(out, [7, 8, 9]);
+        }
+    }
+}
