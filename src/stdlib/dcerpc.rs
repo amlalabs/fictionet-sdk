@@ -797,7 +797,8 @@ pub enum Error {
     /// or for another call ID, type, context or operation, or with another
     /// auth type, level or context ID than the first fragment, or with a
     /// verifier when the first had none or the other way round (MS-RPCE
-    /// 2.2.2.11).
+    /// 2.2.2.11). A change in integer byte order, character set or float
+    /// format also rejects the fragment.
     UnexpectedFragment {
         /// The fragment's call ID.
         call_id: u32,
@@ -1562,6 +1563,11 @@ fn security(p: &Pdu) -> Option<(u8, u8, u32)> {
 /// call has no auth verifier: each fragment's verifier is checked, if the
 /// world checks it, before the fragment is pushed. Every fragment must
 /// use the first one's auth type, level and context ID.
+///
+/// Every fragment must also use the same integer byte order, character
+/// set and float format. Reserved data representation bytes may differ.
+/// A mismatch returns [`Error::UnexpectedFragment`] and drops the partial
+/// call, so a new call can start.
 #[derive(Debug)]
 pub struct Reassembler {
     limit: usize,
@@ -1632,6 +1638,9 @@ impl Reassembler {
             return Err(Error::UnexpectedFragment { call_id });
         };
         let same = p.call_id == call_id
+            && p.drep.little_endian() == pdu.drep.little_endian()
+            && p.drep.character() == pdu.drep.character()
+            && p.drep.float() == pdu.drep.float()
             && self.security == security(&pdu)
             && match (&p.body, &pdu.body) {
                 (
@@ -2542,6 +2551,68 @@ mod tests {
         let got = r.push(with(2, Some(auth(1)))).unwrap().unwrap();
         assert_eq!(got.body.stub(), Some(&[1; 30][..]));
         assert_eq!(got.auth, None);
+    }
+
+    #[test]
+    fn reassembly_keeps_one_data_representation() {
+        let representations = [
+            DataRep::LITTLE_ENDIAN,
+            DataRep::BIG_ENDIAN,
+            DataRep([0x11, 0, 0, 0]),
+            DataRep([0x10, 1, 0, 0]),
+        ];
+        for body in [
+            request(vec![1, 0, 0, 0, 0, 0, 0, 2]).body,
+            fixture_body_response(8, 0, 0, vec![1, 0, 0, 0, 0, 0, 0, 2]),
+        ] {
+            for first in representations {
+                for last in representations {
+                    let mut whole = Pdu::new(7, body.clone());
+                    whole.drep = first;
+                    let mut parts = whole.fragments(28).unwrap();
+                    assert_eq!(parts.len(), 2);
+                    parts[1].drep = last;
+                    let parse = |p: &Pdu| Pdu::parse(&p.to_bytes().unwrap()).unwrap();
+                    let mut r = Reassembler::default();
+                    assert_eq!(r.push(parse(&parts[0])), Ok(None));
+                    assert_eq!(r.pending(), 4);
+                    let got = r.push(parse(&parts[1]));
+                    if first == last {
+                        assert_eq!(got, Ok(Some(whole.clone())));
+                    } else {
+                        assert_eq!(got, Err(Error::UnexpectedFragment { call_id: 7 }));
+                    }
+                    assert_eq!(r.pending(), 0);
+
+                    // A new call succeeds after either completion or rejection.
+                    whole.call_id = 8;
+                    let valid = whole.fragments(28).unwrap();
+                    assert_eq!(r.push(parse(&valid[0])), Ok(None));
+                    assert_eq!(r.push(parse(&valid[1])), Ok(Some(whole)));
+                    assert_eq!(r.pending(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reassembly_ignores_reserved_data_representation_bytes() {
+        for drep in [DataRep::LITTLE_ENDIAN, DataRep::BIG_ENDIAN] {
+            let mut whole = request(vec![1; 8]);
+            whole.drep = drep;
+            let mut parts = whole.fragments(28).unwrap();
+            parts[1].drep.0[2..].copy_from_slice(&[0x12, 0x34]);
+            let mut r = Reassembler::default();
+            assert_eq!(
+                r.push(Pdu::parse(&parts[0].to_bytes().unwrap()).unwrap()),
+                Ok(None)
+            );
+            assert_eq!(
+                r.push(Pdu::parse(&parts[1].to_bytes().unwrap()).unwrap()),
+                Ok(Some(whole))
+            );
+            assert_eq!(r.pending(), 0);
+        }
     }
 
     #[test]
