@@ -5,7 +5,8 @@ Every request is one of:
 - a search (Google, DuckDuckGo, Bing): the result list is made once per
   query and kept. Each result is written down as a mention of its URL, with
   its title and snippet, before anyone asks for that URL.
-- a fixed page from the seed: served exactly as written.
+- a fixed page from the seed: bytes and response metadata captured on first
+  use, then served from the store even if the source changes or disappears.
 - a page already in the store: served exactly as stored.
 - a new page: made from the seed, its mentions (the searches and links that
   led to it) and what the world has already said, then stored. Its links
@@ -21,6 +22,7 @@ hold is a 404, and a query it does not hold has no results.
 """
 from __future__ import annotations
 
+import base64
 import html
 import re
 import threading
@@ -104,6 +106,21 @@ class World:
         self.seed = seed
         self.store = store
         self.generator = generator
+        config = None
+        if isinstance(generator, Model):
+            config = {"provider": generator.client.provider, "model": generator.model,
+                      "reasoning": getattr(generator.client, "reasoning", "")}
+        elif generator is not None:
+            config = {"provider": "stub", "model": generator.model}
+        store.bind(seed.fingerprint(), config)
+        if generator is not None:
+            for fixed in seed.fixed:
+                if store.page(fixed.host, fixed.target) is None:
+                    try:
+                        with fixed.file.open("rb"):
+                            pass
+                    except OSError as err:
+                        raise ValueError(f"{seed.path}: fixed page file {fixed.file} does not exist") from err
         self.year = seed.date[:4]
         self.prefetch = prefetch if generator else 0
         self.pool = ThreadPoolExecutor(max_workers=4) if self.prefetch else None
@@ -263,17 +280,25 @@ class World:
                         {"Server": render.server_of(profile)}, meta)
 
     def _fixed(self, host: str, target: str, fixed) -> Response:
-        body = fixed.file.read_bytes()
-
         def make() -> dict:
+            body = fixed.file.read_bytes()
             return {"url": fixed.url, "status": 200, "title": fixed.title, "description": fixed.description,
-                    "claims": [], "model": "fixed", "created": time.time(), "file": fixed.file.name}
+                    "claims": [], "model": "fixed", "created": time.time(), "file": fixed.file.name,
+                    "body_base64": base64.b64encode(body).decode("ascii"),
+                    "content_type": fixed.content_type, "headers": {"Server": "nginx"}}
 
-        _, made = self.store.page_once(host, target, make)
-        if made:
-            self._note_links(fixed.url, body.decode("utf-8", "replace"))
-        return Response(200, fixed.content_type, body, {"Server": "nginx"},
-                        {"kind": "page", "cache": "fixed", "title": fixed.title})
+        record, made = self.store.page(host, target), False
+        if record is None:
+            if self.generator is None:
+                return self._not_found(host, target, "missing")
+            record, made = self.store.page_once(host, target, make)
+        if not {"body_base64", "status", "content_type", "headers", "title"} <= record.keys():
+            raise self.store.incompatible(f"incomplete fixed snapshot for {fixed.url}")
+        body = base64.b64decode(record["body_base64"], validate=True)
+        if made and record["content_type"].startswith("text/html"):
+            self._note_links(record["url"], body.decode("utf-8", "replace"))
+        return Response(record["status"], record["content_type"], body, record["headers"],
+                        {"kind": "page", "cache": "fixed", "title": record["title"]})
 
     def _not_found(self, host: str, target: str, cache: str) -> Response:
         profile = self.store.site(host)

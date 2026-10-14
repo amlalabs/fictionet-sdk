@@ -138,7 +138,11 @@ has said.
   once and stored. Every later request, from any client, gets the stored
   copy. Making happens under a file lock, so when two requests (or two
   worlds sharing a store) ask for a new URL at once, the first makes it and
-  the second waits and reads it.
+  the second waits and reads it. Fixed pages follow the same rule. Their
+  original bytes, status, content type and headers are captured on first
+  use. Editing or deleting a fixed source file does not change that response.
+  With generation enabled, uncaptured fixed pages need readable source
+  files at startup.
 * **Results and pages agree.** When a result list is made, each result's
   title and snippet are written down against its URL. When the URL is first
   fetched, the page gets that title exactly and is asked to contain the
@@ -243,10 +247,13 @@ pages/www.halvardsystems.com/support/@mentions.json   the results and links that
 pages/www.halvardsystems.com/@site.json               the host's name, kind, navigation and footer
 searches/halvard%20gateway%20vulnerability/@search.json
 @cast.json            the people pages name
+@store.json           format version, seed fingerprint and generator configuration
 claims.jsonl          every claim, with the page that made it
 generations.jsonl     every model call: kind, URL or query, model, time, tokens, cost, raw answer
 addresses.jsonl       every pool address given out
 ```
+
+Fixed page records use `body_base64` to preserve binary bytes as well as text.
 
 ## Speed and cost
 
@@ -370,6 +377,28 @@ from everything the earlier one made: the same pages, results, cast and
 addresses. With `ADAPTIVE_WEB_GENERATOR=replay` it makes nothing new: a URL
 the store does not hold gets a 404, logged as `missing`, and a query it does
 not hold gets an empty result list. A replay needs no network and no key.
+This includes fixed URLs: replay serves their retained bytes, without
+opening the source files. An unfetched fixed URL is still missing.
+
+The store checks a versioned identity at startup. The seed fingerprint
+covers the parsed date, question, scenario, facts, sites, addresses and
+fixed-page declarations, including titles, content types and relative file
+names. It excludes the installation directory and fixed file bytes. Those
+bytes belong to the response captured on first use. Give the seed an explicit
+date when retaining a run; the default date changes each day.
+
+Continuing generation also requires the same provider, model and reasoning
+setting. Replay uses the retained generator identity and needs no provider
+credentials. Prefetch and generation limits can change between runs.
+
+An incompatible or unversioned store is rejected. Old fixed records kept
+only metadata, so they cannot prove what bytes were served. They are never
+silently filled from today's source files. To rebuild, choose a new empty
+`ADAPTIVE_WEB_STORE_DIR` and run with a generator such as `stub`. Direct
+backend users choose a new `ADAPTIVE_WEB_STORE` instead. Keep the old store
+and its judgments for audit. Rebuilding creates a new snapshot; it does not
+recover historical responses or validate published realism scores. Replay
+requires a store initialized by a generator.
 
 ```bash
 export ADAPTIVE_WEB_STORE_DIR=$PWD/store

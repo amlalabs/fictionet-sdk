@@ -6,6 +6,7 @@
     pages/<host>/@site.json                    the host's name, navigation, footer
     searches/<query>/@search.json              one result list, shared by every engine
     @cast.json                                 the people pages name, made once
+    @store.json                                format version, seed and generator identity
     claims.jsonl                               every page's stated claims, in order
     generations.jsonl                          every generator call: inputs, output, time
 
@@ -19,7 +20,8 @@ name that starts with `%` alone, `?`, `+` or `@`, so the store's own files
 
 Every write goes to a temporary file first and is renamed into place, so a
 reader never sees half a page. Next to a file that is made once there is a
-lock file (`@page.lock`, `@search.lock`, `@site.lock`, `@mentions.lock`, `@cast.lock`).
+lock file (`@page.lock`, `@search.lock`, `@site.lock`, `@mentions.lock`,
+`@cast.lock`, `@store.lock`).
 """
 from __future__ import annotations
 
@@ -35,6 +37,12 @@ from urllib.parse import quote
 
 SAFE = "-._~!$&'(),;=:"
 CHUNK = 180
+# Bump when stored responses or the seed/configuration identity change incompatibly.
+VERSION = 1
+
+
+class Error(ValueError):
+    """A store cannot be reused as a snapshot of this world."""
 
 
 def _chunks(name: str) -> list[str]:
@@ -75,6 +83,37 @@ class Store:
     def __init__(self, root: Path):
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
+
+    def incompatible(self, reason: str) -> Error:
+        """Explain why reuse failed and how to build a separate snapshot."""
+        return Error(f"cannot reuse store {self.root}: {reason}; rebuild in a fresh "
+                     "ADAPTIVE_WEB_STORE_DIR (ADAPTIVE_WEB_STORE for the backend). "
+                     "Keep the old store for audit")
+
+    def bind(self, seed: str, generator: dict | None) -> None:
+        """Initialize or check the versioned seed and generator identity.
+
+        Replay checks the seed but uses the retained generator identity.
+        Unversioned stores cannot establish historical fixed response bytes.
+        """
+        with self._locked(self.root / "@store.lock"):
+            path = self.root / "@store.json"
+            if not path.exists():
+                if any(p.name != "@store.lock" for p in self.root.iterdir()):
+                    raise self.incompatible("legacy store has no versioned identity or complete fixed snapshots")
+                if generator is None:
+                    raise self.incompatible("replay needs an initialized snapshot")
+                self._write(path, {"version": VERSION, "seed": seed, "generator": generator})
+                return
+            record = self._read(path)
+            if not isinstance(record, dict) or record.get("version") != VERSION:
+                raise self.incompatible("unsupported store format version")
+            if record.get("seed") != seed:
+                raise self.incompatible("seed fingerprint mismatch")
+            if not isinstance(record.get("generator"), dict):
+                raise self.incompatible("missing generator configuration")
+            if generator is not None and record["generator"] != generator:
+                raise self.incompatible("generator configuration mismatch")
 
     # --- paths ---------------------------------------------------------
     def page_dir(self, host: str, target: str) -> Path:

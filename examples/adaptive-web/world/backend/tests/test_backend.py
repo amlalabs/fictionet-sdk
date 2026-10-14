@@ -11,18 +11,22 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import unquote
 
 from adaptive import llm, prompts, seed as seeds, tells
 from adaptive.generate import Model
 from adaptive.seed import target_of
-from adaptive.store import Store, url_parts
+from adaptive.store import Error as StoreError, Store, url_parts
 from adaptive.stub import Stub
 from adaptive.world import World, snippet_core, text_of, unsupported_snippets
 
@@ -203,6 +207,223 @@ class Serving(unittest.TestCase):
             self.assertEqual(r.meta["cache"], "fixed")
             # Its links are written down for the pages behind them.
             self.assertTrue(w.store.mentions(fixed.host, "/support/kb/KB-3381"))
+
+
+class FixedSnapshots(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        shutil.copytree(SEEDS, self.root / "seeds")
+        self.seed_path = self.root / "seeds" / SEED.path.name
+        self.seed = seeds.load(self.seed_path)
+        self.fixed = self.seed.fixed[0]
+        self.store = Store(self.root / "store" / self.seed.name)
+
+    def open(self, replay=False, seed=None):
+        seed = seed or self.seed
+        return World(seed, self.store, None if replay else Stub(seed))
+
+    def fetch(self, world):
+        return world.handle("GET", self.fixed.host, self.fixed.target)
+
+    def test_fixed_snapshot_survives_changed_and_deleted_sources(self):
+        w = self.open()
+        first = self.fetch(w)
+        self.fixed.file.write_bytes(b"a changed advisory")
+        self.assertEqual(self.fetch(w), first)
+        # A newly loaded seed and store represent a backend restart.
+        for replay in (False, True):
+            seed = seeds.load(self.seed_path)
+            restarted = World(seed, Store(self.store.root), None if replay else Stub(seed))
+            self.assertEqual(self.fetch(restarted), first)
+        self.fixed.file.unlink()
+        seed = seeds.load(self.seed_path)
+        for replay in (False, True):
+            restarted = World(seed, Store(self.store.root), None if replay else Stub(seed))
+            self.assertEqual(self.fetch(restarted), first)
+        # Response metadata also comes from the retained record.
+        self.fixed.title = "Changed title"
+        self.fixed.content_type = "application/octet-stream"
+        self.assertEqual(self.fetch(w), first)
+
+    def test_fixed_binary_and_empty_bodies_round_trip(self):
+        self.fixed.content_type = "application/octet-stream"
+        bodies = (bytes(range(256)) + b'<a href="/binary-link">Not HTML</a>', b"")
+        for i, body in enumerate(bodies):
+            with self.subTest(body=body):
+                self.store = Store(self.root / f"binary-{i}")
+                self.fixed.file.write_bytes(body)
+                first = self.fetch(self.open())
+                self.assertEqual((first.status, first.content_type, first.body, first.headers),
+                                 (200, "application/octet-stream", body, {"Server": "nginx"}))
+                self.fixed.file.unlink()
+                self.assertEqual(self.fetch(self.open(replay=True)), first)
+                self.assertEqual(self.store.mentions(self.fixed.host, "/binary-link"), [])
+
+    def test_source_is_read_once_under_concurrent_requests(self):
+        w = self.open()
+        read_bytes, calls = Path.read_bytes, []
+
+        def read(path):
+            calls.append(path)
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", autospec=True, side_effect=read):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                responses = list(pool.map(lambda _: self.fetch(w), range(16)))
+        self.assertEqual(calls, [self.fixed.file])
+        self.assertTrue(all(r == responses[0] for r in responses))
+
+    def test_first_use_captures_source_and_failed_read_can_be_retried(self):
+        w = self.open()
+        self.fixed.file.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.fetch(w)
+        self.assertIsNone(self.store.page(self.fixed.host, self.fixed.target))
+        self.fixed.file.write_bytes(b"written after store initialization")
+        self.assertEqual(self.fetch(w).body, b"written after store initialization")
+
+    def test_generation_requires_readable_uncaptured_sources(self):
+        open_file = Path.open
+
+        def open(path, *args, **kwargs):
+            if path == self.fixed.file:
+                raise PermissionError("source is unreadable")
+            return open_file(path, *args, **kwargs)
+
+        with patch.object(Path, "open", autospec=True, side_effect=open):
+            with self.assertRaises(ValueError) as raised:
+                self.open()
+        self.assertEqual(str(raised.exception),
+                         f"{self.seed_path}: fixed page file {self.fixed.file} does not exist")
+
+    def test_backend_rejects_missing_fixed_source_before_listening(self):
+        import backend
+        self.fixed.file.unlink()
+        for kind in ("stub", "openrouter", "anthropic"):
+            with self.subTest(generator=kind), \
+                    patch.dict(os.environ, {"ADAPTIVE_WEB_SEED": str(self.seed_path),
+                                            "ADAPTIVE_WEB_STORE": str(self.root / kind),
+                                            "ADAPTIVE_WEB_GENERATOR": kind, "ADAPTIVE_WEB_PREFETCH": "0",
+                                            "OPENROUTER_API_KEY": "test", "ANTHROPIC_API_KEY": "test"}), \
+                    patch.object(backend.sys, "argv", ["backend.py", "0"]), \
+                    patch.object(backend, "Server") as server, \
+                    patch("sys.stdout"), patch("sys.stderr") as stderr:
+                self.assertEqual(backend.main(), 2)
+                server.assert_not_called()
+                self.assertEqual("".join(c.args[0] for c in stderr.write.call_args_list),
+                                 f"{self.seed_path}: fixed page file {self.fixed.file} does not exist\n")
+
+    def test_replay_never_snapshots_an_unseen_fixed_page(self):
+        self.open()
+        for deleted in (False, True):
+            if deleted:
+                self.fixed.file.unlink()
+            replay = self.open(replay=True, seed=seeds.load(self.seed_path))
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("replay read a source")):
+                response = self.fetch(replay)
+            self.assertEqual((response.status, response.meta["cache"]), (404, "missing"))
+            self.assertIsNone(self.store.page(self.fixed.host, self.fixed.target))
+
+    def test_seed_identity_checks_all_declarations_but_not_installation_path(self):
+        self.open()
+        self.assertEqual(self.seed.fingerprint(), SEED.fingerprint())
+        changes = [replace(self.seed, **{key: value}) for key, value in (
+            ("date", "2026-12-01"), ("question", "A different question"),
+            ("scenario", "A different scenario"), ("facts", ["A different fact"]),
+            ("sites", [replace(self.seed.sites[0], about="A different site")]),
+            ("addresses", {"example.com": "203.0.113.1"}),
+        )]
+        changes += [replace(self.seed, fixed=[replace(self.fixed, **{key: value})]) for key, value in (
+            ("url", "https://example.com/other"), ("title", "A different title"),
+            ("description", "A different description"), ("content_type", "text/plain"),
+            ("file", self.fixed.file.with_name("other.html")),
+        )]
+        for changed in changes:
+            for replay in (False, True):
+                with self.subTest(seed=changed, replay=replay):
+                    with self.assertRaisesRegex(StoreError, "seed fingerprint mismatch.*rebuild"):
+                        self.open(replay=replay, seed=changed)
+
+    def test_generator_identity_checks_provider_model_and_reasoning(self):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test", "ADAPTIVE_WEB_REASONING": "low"}):
+            client = llm.client("openrouter", "some/model")
+        World(self.seed, self.store, Model(self.seed, client))
+        # Operational limits can change without changing response configuration.
+        World(self.seed, self.store, Model(self.seed, client), generation_budget=0)
+        self.open(replay=True)
+        for field, value in (("provider", "anthropic"), ("model", "other/model"), ("reasoning", "high")):
+            with self.subTest(field=field), patch.object(client, field, value):
+                with self.assertRaisesRegex(StoreError, "generator configuration mismatch"):
+                    World(self.seed, self.store, Model(self.seed, client))
+        with self.assertRaisesRegex(StoreError, "generator configuration mismatch"):
+            self.open()
+
+    def test_legacy_store_is_rejected_and_rebuild_is_explicit(self):
+        legacy = {"url": self.fixed.url, "status": 200, "title": self.fixed.title,
+                  "model": "fixed", "file": self.fixed.file.name}
+        self.store.page_once(self.fixed.host, self.fixed.target, lambda: legacy)
+        for replay in (False, True):
+            with self.assertRaisesRegex(StoreError, "legacy store.*rebuild in a fresh ADAPTIVE_WEB_STORE_DIR"):
+                self.open(replay=replay)
+        self.assertEqual(self.store.page(self.fixed.host, self.fixed.target), legacy)
+        self.assertFalse((self.store.root / "@store.json").exists())
+        self.store = Store(self.root / "rebuilt")
+        self.assertEqual(self.fetch(self.open()).body, self.fixed.file.read_bytes())
+
+    def test_initialization_cannot_mix_different_seeds(self):
+        changed = replace(self.seed, facts=["A different fact"])
+        barrier = threading.Barrier(2)
+
+        def initialize(seed):
+            barrier.wait()
+            try:
+                self.open(seed=seed)
+                return seed
+            except StoreError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            initialized = list(pool.map(initialize, [self.seed, changed]))
+        winners = [seed for seed in initialized if seed is not None]
+        self.assertEqual(len(winners), 1)
+        self.open(replay=True, seed=winners[0])
+
+    def test_empty_replay_store_requires_initialization(self):
+        with self.assertRaisesRegex(StoreError, "replay needs an initialized snapshot"):
+            self.open(replay=True)
+        self.assertFalse((self.store.root / "@store.json").exists())
+        self.open()
+        self.open(replay=True)
+
+    def test_unsupported_version_and_incomplete_fixed_records_are_rejected(self):
+        w = self.open()
+        self.store.page_once(self.fixed.host, self.fixed.target, lambda: {"model": "fixed"})
+        with self.assertRaisesRegex(StoreError, "incomplete fixed snapshot.*rebuild"):
+            self.fetch(w)
+        with self.assertRaisesRegex(StoreError, "incomplete fixed snapshot.*rebuild"):
+            self.fetch(self.open(replay=True))
+        path = self.store.root / "@store.json"
+        manifest = json.loads(path.read_text())
+        manifest["version"] = 999
+        path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(StoreError, "unsupported store format version"):
+            self.open(replay=True)
+
+    def test_backend_reports_incompatible_store_before_listening(self):
+        import backend
+        self.open()
+        self.seed_path.write_text(self.seed_path.read_text() + "\nA different scenario\n")
+        with patch.dict(os.environ, {"ADAPTIVE_WEB_SEED": str(self.seed_path),
+                                     "ADAPTIVE_WEB_STORE": str(self.store.root.parent),
+                                     "ADAPTIVE_WEB_GENERATOR": "replay"}), \
+                patch.object(backend.sys, "argv", ["backend.py", "0"]), \
+                patch.object(backend, "Server") as server, \
+                patch("sys.stderr") as stderr:
+            self.assertEqual(backend.main(), 2)
+        server.assert_not_called()
+        self.assertIn("seed fingerprint mismatch", "".join(c.args[0] for c in stderr.write.call_args_list))
 
 
 class FakeOpenRouter(BaseHTTPRequestHandler):

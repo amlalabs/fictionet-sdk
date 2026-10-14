@@ -22,7 +22,11 @@
 //!   date, so every response's `Date` header is in the scenario, and each
 //!   certificate was issued shortly before it.
 //! - **Pages** ([`backend`]): every site forwards to the Python backend
-//!   on 127.0.0.1, which makes, stores and serves the pages.
+//!   on 127.0.0.1, which makes, stores and serves the pages. Fixed responses
+//!   retain their bytes and metadata on first use. Replay needs no fixed
+//!   source files and returns 404 for pages absent from the store. Stores
+//!   check the seed and generator identity; incompatible or legacy stores
+//!   require an explicit rebuild in a fresh directory.
 //! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, the
 //!   ready file, and the store. The log is written from the run's events
 //!   ([`events`]).

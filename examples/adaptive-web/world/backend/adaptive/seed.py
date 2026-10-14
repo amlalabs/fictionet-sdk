@@ -7,7 +7,7 @@ The front matter holds what must hold everywhere in the world:
     facts     sentences every page must agree with
     [[sites]] host + about: hosts the scenario is about
     [[fixed]] url + file (+ title, description, content_type): pages
-              served exactly as written, in place of generated ones
+              captured on first use, then served from the store
     [addresses]  host = "a.b.c.d": addresses for hosts that should not
               get one from the world's pool
 
@@ -17,9 +17,12 @@ Only the standard library is needed (tomllib, Python 3.11 and later).
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import ipaddress
+import json
+import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -52,6 +55,19 @@ class Seed:
     sites: list[Site] = field(default_factory=list)
     fixed: list[Fixed] = field(default_factory=list)
     addresses: dict[str, str] = field(default_factory=dict)
+
+    def fingerprint(self) -> str:
+        """Identity of the parsed seed, independent of its installation path.
+
+        Fixed file names are included, but their bytes are captured on first
+        use. Reopening a snapshot never needs to read those source files.
+        """
+        config = asdict(self)
+        del config["path"]
+        for fixed in config["fixed"]:
+            fixed["file"] = os.path.relpath(fixed["file"], self.path.parent.resolve())
+        data = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
     def fixed_for(self, host: str, target: str) -> Fixed | None:
         for f in self.fixed:
@@ -97,8 +113,6 @@ def load(path: Path) -> Seed:
     for f in meta.get("fixed", []):
         host, target = target_of(f["url"])
         file = (path.parent / f["file"]).resolve()
-        if not file.is_file():
-            raise ValueError(f"{path}: fixed page file {file} does not exist")
         fixed.append(Fixed(url=f["url"], host=host, target=target, file=file,
                            title=f.get("title", ""), description=f.get("description", ""),
                            content_type=f.get("content_type", "text/html; charset=utf-8")))

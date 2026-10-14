@@ -18,7 +18,8 @@ Environment:
   ADAPTIVE_WEB_GENERATOR  stub (default), openrouter, anthropic, or replay
   ADAPTIVE_WEB_MODEL      the model (default: llm.DEFAULT_MODELS for the provider)
   ADAPTIVE_WEB_STORE      where pages are kept (default /var/lib/adaptive-web);
-                          each seed gets its own directory under it
+                          each seed gets its own versioned directory under it.
+                          Use a fresh directory to rebuild an incompatible store.
   ADAPTIVE_WEB_PREFETCH   pages to make ahead from each new result list
                           (default 3 with a model, else 0)
   ADAPTIVE_WEB_REASONING  reasoning effort for OpenRouter models that think
@@ -144,7 +145,11 @@ def main() -> int:
         return 2
     prefetch = int(os.environ.get("ADAPTIVE_WEB_PREFETCH") or (3 if isinstance(generator, Model) else 0))
     store = Store(Path(os.environ.get("ADAPTIVE_WEB_STORE", "/var/lib/adaptive-web")) / seed.name)
-    world = World(seed, store, generator, prefetch)
+    try:
+        world = World(seed, store, generator, prefetch)
+    except ValueError as err:
+        print(err, file=sys.stderr)
+        return 2
     Handler.world = world
     server = Server(("127.0.0.1", port), Handler)
     addresses = {h: {"addr": a, "why": "search engine"} for h, a in ENGINE_ADDRESSES.items()}
