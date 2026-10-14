@@ -615,6 +615,25 @@ fn assemble_fragments_with_interleaved_control() {
     contract::check_decode(|| Assemble::new(Frames, 4, fragments), &data);
 }
 #[test]
+fn assemble_exact_limit_and_refusal_preserve_held_bytes() {
+    let mut decoder = Assemble::new(Frames, 3, fragments);
+    assert_eq!(
+        decoder.decode(&[3, 0, b'a', b'b'], false),
+        Ok(Step::Skip(4))
+    );
+    assert_eq!(decoder.held(), 2);
+    assert_eq!(
+        decoder.decode(&[3, 1, b'c', b'd'], false),
+        Err(AssembleError::TooLong { limit: 3 })
+    );
+    assert_eq!(decoder.held(), 2);
+    assert_eq!(
+        decoder.decode(&[2, 1, b'c'], false),
+        Ok(Step::Item(Assembled::Message(b"abc".to_vec()), 3))
+    );
+    assert_eq!(decoder.held(), 0);
+}
+#[test]
 fn assemble_limit_incomplete_empty_and_inner_error() {
     for data in [&[1, 0][..], &[2, 0, b'a']] {
         let mut s = Stream::new(Assemble::new(Frames, 4, fragments));

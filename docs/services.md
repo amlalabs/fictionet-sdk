@@ -33,6 +33,13 @@ TDS response decoding has two separate ceilings: 4 MiB of wire bytes and
 limits, not a process-memory bound; see the [`tds` module docs](../src/stdlib/tds.rs)
 for the accounting rules and exclusions.
 
+`codec::reserve_bytes` reserves space for additional bytes under a caller's
+exact total limit. It leaves the vector's length and contents unchanged.
+`ReserveError::TooLong` reports length overflow or a total above the limit;
+`ReserveError::Allocation` reports storage refusal. Copied protocol modules
+can use this public helper and map each reason to their own error.
+`codec::append_bounded` keeps its separate `Buffer::MAX_LIMIT` clamp.
+
 ## 1. A service
 
 A service is the server side of one protocol, for one connection. It

@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::{convert::Infallible, error::Error, fmt, marker::PhantomData};
-use fictionet::stdlib::codec::{Buffer, Decode, Step, Wire};
+use fictionet::stdlib::codec::{Buffer, Decode, ReserveError, Step, Wire, reserve_bytes};
 
 /// Applies a closure to each item without changing framing or errors.
 pub struct Map<D, F> {
@@ -377,23 +377,12 @@ impl<D: Decode, T, F: FnMut(D::Item) -> Fragment<T>> Decode for Assemble<D, F> {
             Step::Item(item, n) => match (self.f)(item) {
                 Fragment::Whole(item) => Ok(Step::Item(Assembled::Whole(item), n)),
                 Fragment::Part { data, last } => {
-                    if data.len() > self.limit.saturating_sub(self.buf.len()) {
-                        return Err(AssembleError::TooLong { limit: self.limit });
-                    }
-                    // Geometric growth, capped by the named message limit.
-                    let size = self.buf.len().saturating_add(data.len());
-                    if size > self.buf.capacity() {
-                        let target = size
-                            .max(self.buf.capacity().saturating_mul(2))
-                            .min(self.limit);
-                        if self
-                            .buf
-                            .try_reserve_exact(target.saturating_sub(self.buf.len()))
-                            .is_err()
-                        {
-                            return Err(AssembleError::Allocation);
+                    reserve_bytes(&mut self.buf, data.len(), self.limit).map_err(|error| {
+                        match error {
+                            ReserveError::TooLong { limit } => AssembleError::TooLong { limit },
+                            ReserveError::Allocation => AssembleError::Allocation,
                         }
-                    }
+                    })?;
                     self.buf.extend_from_slice(&data);
                     self.active = !last;
                     Ok(if last {

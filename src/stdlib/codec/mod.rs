@@ -28,6 +28,10 @@
 //! [`Recorder`] keeps each item with the bytes it came from. [`Faults`]
 //! applies a plan of byte and item faults. All three work with any decoder.
 //!
+//! [`reserve_bytes`] grows a byte vector under an explicit total limit and
+//! returns neutral [`ReserveError`] reasons. It leaves contents unchanged.
+//! [`append_bounded`] also appends bytes and clamps to [`Buffer::MAX_LIMIT`].
+//!
 //! The code outside tests uses only `core` and `alloc`. Nothing here does
 //! I/O, reads a clock or uses global state. [`serve`](super::serve) runs a
 //! decoder over a live connection.
@@ -147,6 +151,7 @@ use alloc::vec::Vec;
 
 pub mod ascii;
 pub mod base64;
+mod bounded;
 mod buffer;
 pub mod civil;
 mod combinators;
@@ -170,6 +175,7 @@ pub use fictionet::{generated_runtime, layout};
 mod recorder;
 mod stream;
 
+pub use bounded::{ReserveError, reserve_bytes};
 pub use buffer::Buffer;
 pub use combinators::{
     Assemble, AssembleError, Assembled, Collect, CollectError, Ending, Fragment, LineError, Lines,

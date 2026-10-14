@@ -4,7 +4,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::{error::Error, fmt, ops::Range};
-use fictionet::stdlib::codec::{Buffer, Decode, Fail, PumpError, Stream, StreamEvent, Wire};
+use fictionet::stdlib::codec::{
+    Buffer, Decode, Fail, PumpError, ReserveError, Stream, StreamEvent, Wire, reserve_bytes,
+};
 
 /// A policy decision for one item's consumed bytes.
 /// [`Drop`](Self::Drop) is the canonical empty decision. Empty Replace and
@@ -64,6 +66,14 @@ impl<E: Error + 'static> Error for RewriteError<E> {
         match self {
             Self::Write(e) => Some(e),
             Self::TooLong { .. } | Self::Allocation | Self::Capacity { .. } => None,
+        }
+    }
+}
+impl<E> From<ReserveError> for RewriteError<E> {
+    fn from(error: ReserveError) -> Self {
+        match error {
+            ReserveError::TooLong { limit } => Self::TooLong { limit },
+            ReserveError::Allocation => Self::Allocation,
         }
     }
 }
@@ -307,8 +317,10 @@ impl Interceptor {
             };
             return Some(Err(PumpError::Handler(error.into())));
         }
-        if let Err(error) = reserve_output::<W>(out, reserve, self.limit) {
-            return Some(Err(PumpError::Handler(error.into())));
+        if let Err(error) = reserve_bytes(out, reserve, self.limit) {
+            return Some(Err(PumpError::Handler(
+                RewriteError::<W>::from(error).into(),
+            )));
         }
         let start = out.len();
         let mut action = Some(action);
@@ -463,7 +475,7 @@ pub fn append_bounded<E>(
         .len()
         .checked_mul(copies)
         .ok_or(RewriteError::TooLong { limit })?;
-    reserve_output(out, added, limit)?;
+    reserve_bytes(out, added, limit)?;
     if added != 0 {
         for _ in 0..copies {
             out.extend_from_slice(bytes);
@@ -472,24 +484,39 @@ pub fn append_bounded<E>(
     Ok(())
 }
 
-fn reserve_output<E>(out: &mut Vec<u8>, added: usize, limit: usize) -> Result<(), RewriteError<E>> {
-    let size = out
-        .len()
-        .checked_add(added)
-        .filter(|size| *size <= limit)
-        .ok_or(RewriteError::TooLong { limit })?;
-    if size > out.capacity() {
-        let target = size.max(out.capacity().saturating_mul(2)).min(limit);
-        out.try_reserve_exact(target.saturating_sub(out.len()))
-            .map_err(|_| RewriteError::Allocation)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use fictionet::stdlib::{json, modbus, test_support::decode_all};
+
+    #[test]
+    fn bounded_append_keeps_clamp_and_rolls_back_refusals() {
+        let mut out = b"ab".to_vec();
+        append_bounded::<()>(b"c", 2, &mut out, 4).unwrap();
+        assert_eq!(out, b"abcc");
+        let capacity = out.capacity();
+        for (bytes, copies, limit, expected) in [
+            (b"d".as_slice(), 1, 4, 4),
+            (b"xx".as_slice(), usize::MAX, usize::MAX, Buffer::MAX_LIMIT),
+            (
+                b"x".as_slice(),
+                Buffer::MAX_LIMIT + 1,
+                usize::MAX,
+                Buffer::MAX_LIMIT,
+            ),
+        ] {
+            assert_eq!(
+                append_bounded::<()>(bytes, copies, &mut out, limit),
+                Err(RewriteError::TooLong { limit: expected })
+            );
+            assert_eq!(out, b"abcc");
+            assert_eq!(out.capacity(), capacity);
+        }
+        append_bounded::<()>(b"", usize::MAX, &mut out, 4).unwrap();
+        append_bounded::<()>(b"x", 0, &mut out, 4).unwrap();
+        assert_eq!(out, b"abcc");
+        assert_eq!(out.capacity(), capacity);
+    }
 
     #[test]
     fn replacement_writer_gets_remaining_budget_and_stops_on_excess() {

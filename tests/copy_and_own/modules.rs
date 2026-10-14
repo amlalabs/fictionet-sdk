@@ -18,6 +18,8 @@ macro_rules! protocols {
         pub mod base64;
         #[path = "../../src/stdlib/bgp.rs"]
         pub mod bgp;
+        #[path = "../../src/stdlib/codec/bounded.rs"]
+        pub mod bounded;
         #[path = "../../src/stdlib/codec/buffer.rs"]
         pub mod buffer;
         #[path = "../../src/stdlib/ca.rs"]
