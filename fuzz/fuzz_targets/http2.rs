@@ -3,6 +3,7 @@ use fictionet::stdlib::{codec::Wire, http2, test_support::contract};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    http2::harness::check_actions(data);
     let bytes = &data[..data.len().min(4096)];
     contract::check_decode(|| http2::Inputs::with_limit(4096), bytes);
     contract::check_decode(|| http2::Inputs::client_side(4096), bytes);

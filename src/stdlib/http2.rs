@@ -1886,6 +1886,402 @@ impl Session {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::*;
+
+    const MAX_ACTIONS: usize = 64;
+    const STREAMS: u32 = 16;
+    const VALUES: [u32; 9] = [0, 1, 1024, 2048, 4096, 65_535, 65_536, 100_000, MAX_WINDOW];
+
+    #[derive(Clone, Copy, Debug)]
+    enum Action {
+        Open { stream: u32, end: bool, table: u8 },
+        Settings { id: u16, value: u32 },
+        Ack,
+        Credit { stream: u32, increment: u32 },
+        Reset(u32),
+        Retire(u32),
+        Data { stream: u32, len: usize, end: bool },
+        Eof,
+        Loss,
+    }
+
+    struct Pair {
+        sessions: [Session; 2],
+        events: Vec<(usize, Result<Event, Error>)>,
+        data: [usize; 2],
+        chunk: usize,
+    }
+
+    impl Pair {
+        fn new(chunk: usize) -> Self {
+            let limits = Limits {
+                frame: DEFAULT_FRAME_SIZE,
+                streams: 8,
+                ..Limits::default()
+            };
+            let mut pair = Self {
+                sessions: [Session::client_side(limits), Session::server_side(limits)],
+                events: Vec::new(),
+                data: [0; 2],
+                chunk,
+            };
+            pair.feed(0, PREFACE);
+            for dir in 0..2 {
+                pair.frame(
+                    dir,
+                    &Settings {
+                        flags: 0,
+                        entries: vec![],
+                    },
+                );
+            }
+            // Consume the initial announcements so later ACKs belong to actions.
+            for dir in 0..2 {
+                pair.apply(dir, Action::Ack);
+            }
+            pair.events.clear();
+            pair
+        }
+
+        fn drain(&mut self, dir: usize) {
+            while let Some(event) = self.sessions[dir].next() {
+                let peer = &mut self.sessions[1 - dir];
+                let routed = match &event {
+                    Ok(Event::Headers { stream, .. }) => peer.peer_open(*stream),
+                    Ok(Event::PushPromise { promised, .. }) => peer.peer_open(*promised),
+                    Ok(Event::Settings(settings)) => peer.peer_settings(settings),
+                    Ok(Event::WindowUpdate(update)) => peer.peer_window_update(update),
+                    Ok(Event::Reset { stream, .. }) => {
+                        peer.peer_reset(*stream);
+                        Ok(())
+                    }
+                    Ok(Event::Data { data, .. }) => {
+                        self.data[dir] += data.len();
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                };
+                self.events.push((dir, event));
+                if let Err(error) = routed {
+                    assert_eq!(self.sessions[1 - dir].failed(), Some(&error));
+                    assert!(self.sessions[1 - dir].is_done());
+                    self.events.push((1 - dir, Err(error)));
+                }
+            }
+        }
+
+        fn feed(&mut self, dir: usize, bytes: &[u8]) {
+            for part in bytes.chunks(self.chunk) {
+                let mut rest = part;
+                while !rest.is_empty() {
+                    let n = self.sessions[dir].push(rest);
+                    assert!(n <= rest.len());
+                    self.drain(dir);
+                    assert!(n > 0, "session made no progress after draining");
+                    rest = &rest[n..];
+                }
+            }
+        }
+
+        fn frame(&mut self, dir: usize, frame: &impl Wire) {
+            self.feed(dir, &frame.to_bytes().unwrap());
+        }
+
+        fn apply(&mut self, dir: usize, action: Action) {
+            match action {
+                Action::Open { stream, end, table } => {
+                    let mut fragment = Vec::new();
+                    let updates: &[u64] = match table % 4 {
+                        1 => &[1024],
+                        2 => &[1024, 2048],
+                        3 => &[0, 4096],
+                        _ => &[],
+                    };
+                    for &size in updates {
+                        fictionet::stdlib::prefix_int::write(&mut fragment, 5, 0x20, size).unwrap();
+                    }
+                    fragment.push(if dir == 0 { 0x82 } else { 0x88 });
+                    self.frame(
+                        dir,
+                        &Headers {
+                            stream,
+                            flags: 4 | u8::from(end),
+                            fragment,
+                            priority: None,
+                            padding: None,
+                        },
+                    );
+                }
+                Action::Settings { id, value } => self.frame(
+                    dir,
+                    &Settings {
+                        flags: 0,
+                        entries: vec![Setting { id, value }],
+                    },
+                ),
+                Action::Ack => self.frame(
+                    dir,
+                    &Settings {
+                        flags: 1,
+                        entries: vec![],
+                    },
+                ),
+                Action::Credit { stream, increment } => self.frame(
+                    dir,
+                    &WindowUpdate {
+                        stream,
+                        flags: 0,
+                        increment,
+                    },
+                ),
+                Action::Reset(stream) => self.frame(
+                    dir,
+                    &Reset {
+                        stream,
+                        flags: 0,
+                        code: 8,
+                    },
+                ),
+                Action::Retire(stream) => {
+                    self.sessions[dir].retire(stream);
+                }
+                Action::Data { stream, len, end } => {
+                    // Four legal frames cross the initial window with a four-byte input.
+                    let mut left = len.min(65_536);
+                    loop {
+                        let take = left.min(DEFAULT_FRAME_SIZE);
+                        left -= take;
+                        self.frame(
+                            dir,
+                            &Data {
+                                stream,
+                                flags: u8::from(end && left == 0),
+                                data: vec![0x61; take],
+                                padding: None,
+                            },
+                        );
+                        if left == 0 {
+                            break;
+                        }
+                    }
+                }
+                Action::Eof => {
+                    self.sessions[dir].end();
+                    self.drain(dir);
+                    assert!(self.sessions[dir].is_done());
+                }
+                Action::Loss => {
+                    self.sessions[dir].lost();
+                    assert!(self.sessions[dir].is_done());
+                    assert_eq!(self.sessions[dir].held(), 0);
+                    assert_eq!(self.sessions[dir].buffered(), 0);
+                    assert!(self.sessions[dir].next().is_none());
+                }
+            }
+        }
+
+        fn compare(&self, other: &Self) {
+            assert_eq!(self.events, other.events);
+            assert_eq!(self.data, other.data);
+            for (a, b) in self.sessions.iter().zip(&other.sessions) {
+                assert_eq!(a.failed(), b.failed());
+                assert_eq!(a.is_done(), b.is_done());
+                assert_eq!(a.settings(), b.settings());
+                assert_eq!(a.peer(), b.peer());
+                assert_eq!(a.connection_window(), b.connection_window());
+                assert_eq!(a.held(), b.held());
+                assert_eq!(a.buffered(), b.buffered());
+                assert!(a.streams.len() <= a.limits.streams);
+                assert!(a.peer_resets.len() <= a.limits.streams);
+                assert!(a.settings_updates.len() <= 64);
+                for stream in 1..=STREAMS {
+                    assert_eq!(a.stream_window(stream), b.stream_window(stream));
+                }
+            }
+        }
+    }
+
+    fn run(actions: impl IntoIterator<Item = (usize, Action)>, chunk: usize) -> Pair {
+        let mut whole = Pair::new(usize::MAX);
+        let mut split = Pair::new(chunk);
+        for (dir, action) in actions
+            .into_iter()
+            .take(MAX_ACTIONS)
+            .chain([(0, Action::Eof), (1, Action::Eof)])
+        {
+            whole.events.clear();
+            split.events.clear();
+            whole.apply(dir, action);
+            split.apply(dir, action);
+            whole.compare(&split);
+        }
+        // Keep the pre-loss state for deterministic regressions.
+        for dir in 0..2 {
+            split.apply(dir, Action::Loss);
+        }
+        whole
+    }
+
+    /// Runs at most 64 four-byte actions through paired directions. The first
+    /// byte selects the operation and direction, the second selects a stream,
+    /// and the last two select bounded values and flags. Compares events and
+    /// state under whole-frame and fragmented delivery, including invalid orders.
+    pub fn check_actions(bytes: &[u8]) {
+        let actions = bytes.as_chunks::<4>().0.iter().take(MAX_ACTIONS).map(|b| {
+            let dir = usize::from(b[0] & 1);
+            let stream = u32::from(b[1]) % STREAMS + 1;
+            let value = VALUES[usize::from(b[2]) % VALUES.len()];
+            let end = b[3] & 1 != 0;
+            let action = match (b[0] / 2) % 10 {
+                0 => Action::Open {
+                    stream,
+                    end,
+                    table: b[3] >> 1,
+                },
+                1 => Action::Settings { id: 1, value },
+                2 => Action::Settings { id: 4, value },
+                3 => Action::Ack,
+                4 => Action::Credit {
+                    stream: if b[3] & 2 != 0 { 0 } else { stream },
+                    increment: value.max(1),
+                },
+                5 => Action::Reset(stream),
+                6 => Action::Retire(stream),
+                7 => Action::Data {
+                    stream,
+                    len: [0, 1, 16_384, 65_535, 65_536][usize::from(b[2]) % 5],
+                    end,
+                },
+                8 => Action::Eof,
+                _ => Action::Loss,
+            };
+            (dir, action)
+        });
+        run(actions, usize::from(bytes.last().copied().unwrap_or(0)) + 1);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn open(stream: u32) -> Action {
+            Action::Open {
+                stream,
+                end: false,
+                table: 0,
+            }
+        }
+
+        #[test]
+        fn paired_early_credit_is_spent_beyond_initial_window() {
+            let pair = run(
+                [
+                    (0, open(1)),
+                    (
+                        0,
+                        Action::Credit {
+                            stream: 1,
+                            increment: 65_536,
+                        },
+                    ),
+                    (
+                        0,
+                        Action::Credit {
+                            stream: 0,
+                            increment: 65_536,
+                        },
+                    ),
+                    (1, open(1)),
+                    (
+                        1,
+                        Action::Data {
+                            stream: 1,
+                            len: 65_536,
+                            end: true,
+                        },
+                    ),
+                ],
+                7,
+            );
+            assert_eq!(pair.data, [0, 65_536]);
+            assert_eq!(pair.sessions[1].stream_window(1), Some(65_535));
+            assert_eq!(pair.sessions[1].connection_window(), 65_535);
+            assert!(pair.sessions.iter().all(|s| s.failed().is_none()));
+        }
+
+        #[test]
+        fn paired_hpack_rebound_waits_for_ordered_acks() {
+            let pair = run(
+                [
+                    (0, Action::Settings { id: 1, value: 1024 }),
+                    (0, Action::Settings { id: 1, value: 2048 }),
+                    (1, open(1)),
+                    (1, Action::Ack),
+                    (
+                        1,
+                        Action::Open {
+                            stream: 3,
+                            end: false,
+                            table: 2,
+                        },
+                    ),
+                    (1, Action::Ack),
+                    (1, open(5)),
+                ],
+                1,
+            );
+            assert!(pair.sessions.iter().all(|s| s.failed().is_none()));
+            for stream in [1, 3, 5] {
+                assert_eq!(pair.sessions[1].stream_window(stream), Some(65_535));
+            }
+            assert_eq!(pair.sessions[1].blocks.table.table_capacity(), Some(2048));
+        }
+
+        #[test]
+        fn paired_reset_and_retire_discard_in_flight_data() {
+            let pair = run(
+                [
+                    (0, open(1)),
+                    (1, open(1)),
+                    (1, Action::Reset(1)),
+                    (0, Action::Retire(1)),
+                    (1, Action::Retire(1)),
+                    (
+                        0,
+                        Action::Data {
+                            stream: 1,
+                            len: 16_384,
+                            end: true,
+                        },
+                    ),
+                    (0, open(3)),
+                    (1, open(3)),
+                ],
+                17,
+            );
+            assert_eq!(pair.data, [0, 0]);
+            assert_eq!(pair.sessions[0].connection_window(), 65_535 - 16_384);
+            assert!(pair.sessions.iter().all(|s| s.failed().is_none()));
+            assert!(pair.sessions.iter().all(|s| s.stream_window(1).is_none()));
+        }
+
+        #[test]
+        fn paired_compact_actions_are_bounded_and_repeatable() {
+            use fictionet::stdlib::{codec::Lcg, test_support::rounds};
+            let mut rng = Lcg::new(0x4832);
+            for _ in 0..rounds(100) {
+                let mut bytes = vec![0; 4 * (MAX_ACTIONS + 1)];
+                rng.fill(&mut bytes);
+                check_actions(&bytes);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn fixture_window_update(stream: u32, flags: u8, increment: u32) -> WindowUpdate {
