@@ -4,6 +4,7 @@
 # proxy and SOCKS5 proxy.
 # needs: sdk
 . "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/web_setup.sh"
 
 token="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
 proxy="http://relay:$token@127.0.0.1:8080"
@@ -21,12 +22,7 @@ cleanup
 
 step "Start the world"
 note "The same web_world example as demos/web: example.test over HTTPS, plain.test over HTTP."
-mkdir -p /run/fictionet
-chmod 700 /run/fictionet
-web_world /run/fictionet/world.sock /run/fictionet/ca.pem >/run/world.log 2>&1 &
-world_pid=$!
-wait_for /run/fictionet/world.sock 10
-sed 's/^/    /' /run/world.log
+start_web
 install -m 0644 /run/fictionet/ca.pem /run/agent-ca.pem
 
 step "Make a sandbox with no network at all"
