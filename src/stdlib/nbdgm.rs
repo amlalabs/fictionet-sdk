@@ -22,8 +22,12 @@
 //!
 //! A datagram too long for one packet is sent in fragments. The first has
 //! the first flag set, each but the last has the more flag set, and each
-//! says where its bytes start in the whole. A [`Reassembler`] puts them
-//! back together, and [`Packet::split`] cuts a datagram into fragments.
+//! carries the total length and an offset into the encoded names plus user
+//! data. [`Body::Fragment`] keeps those bytes raw. A [`Reassembler`] checks
+//! contiguous coverage and decodes the names only when the whole region is
+//! present. [`Packet::split`] cuts a complete datagram into these fragments.
+//! The former format with repeated names and per-fragment lengths is not
+//! supported.
 //!
 //! What a datagram carries is kept as raw bytes. Browser announcements
 //! are SMB mailslot messages to `\MAILSLOT\BROWSE`; reading them is up to
@@ -40,7 +44,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::nbdgm::{Body, DatagramKind, Name, Packet};
+//! use fictionet::stdlib::nbdgm::{Body, DatagramKind, Name, Packet, Reassembler};
 //! use std::net::Ipv4Addr;
 //!
 //! // The agent's machine tells the workgroup's master browser it exists.
@@ -69,6 +73,15 @@
 //! assert_eq!(d.destination, Name::new("WORKGROUP", 0x1d));
 //! assert_eq!(d.source.to_string(), "LAPTOP<00>");
 //! assert_eq!(d.data, announcement);
+//!
+//! // Fragment sizes and offsets count the names as well as the user data.
+//! let mut reassembler = Reassembler::new();
+//! let mut whole = None;
+//! for fragment in sent.split(80).unwrap() {
+//!     let bytes = fragment.to_bytes().unwrap();
+//!     whole = reassembler.push(Packet::parse(&bytes).unwrap());
+//! }
+//! assert_eq!(whole, Some(sent));
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16};
@@ -89,8 +102,8 @@ pub const ERROR_LEN: usize = HEADER_LEN + 1;
 /// The longest packet this module reads or writes: the most bytes one UDP
 /// datagram over IPv4 can carry. A longer packet is refused.
 pub const MAX_PACKET: usize = 65_507;
-/// The most datagram bytes a [`Reassembler`] puts back together. The
-/// offset field is 16 bits, so no whole datagram is meant to be longer.
+/// The most encoded name and user-data bytes a [`Reassembler`] puts back
+/// together. The total length field is 16 bits.
 pub const MAX_REASSEMBLED: usize = 65_535;
 /// The most datagrams a [`Reassembler`] holds partly put together. When
 /// one more starts, the oldest is dropped.
@@ -347,21 +360,89 @@ impl DatagramKind {
     }
 }
 
-/// A datagram, or one fragment of one.
+/// A complete datagram with decoded names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Datagram {
     /// Who it is for.
     pub kind: DatagramKind,
-    /// Where this fragment's data starts in the whole datagram's data. It
-    /// is 0 for a datagram sent whole.
-    pub offset: u16,
     /// The name it is from.
     pub source: Name,
     /// The name it is for.
     pub destination: Name,
     /// The data, such as an SMB browser announcement, as raw bytes. A
-    /// writer refuses data that does not fit in [`MAX_PACKET`] with the names.
+    /// packet writer refuses data that does not fit in [`MAX_PACKET`] with the
+    /// names and header. Use [`Packet::split`] for larger datagrams.
     pub data: Vec<u8>,
+}
+
+impl Datagram {
+    /// Reads both names and keeps the remaining bytes as user data.
+    fn decode(kind: DatagramKind, bytes: &[u8]) -> Result<Self, Error> {
+        let (source, used) = Name::parse_prefix(bytes)?;
+        let (destination, used2) = Name::parse_prefix(&bytes[used..])?;
+        Ok(Self {
+            kind,
+            source,
+            destination,
+            data: bytes[used + used2..].to_vec(),
+        })
+    }
+
+    /// Writes both names, refusing totals above [`MAX_REASSEMBLED`] with the data.
+    fn names(&self) -> Result<Vec<u8>, Error> {
+        let mut bytes = self.source.to_bytes()?;
+        self.destination.write(&mut bytes)?;
+        if self.data.len() > MAX_REASSEMBLED - bytes.len() {
+            return Err(Error::Unwritable);
+        }
+        Ok(bytes)
+    }
+
+    /// Writes both names and data, refusing totals above [`MAX_REASSEMBLED`].
+    fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut bytes = self.names()?;
+        bytes.extend_from_slice(&self.data);
+        Ok(bytes)
+    }
+}
+
+/// Raw bytes from a fragmented datagram's encoded names and user data.
+/// The packet's flags identify the first and last fragments. Names are
+/// decoded only after [`Reassembler`] has all the bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fragment {
+    /// Who the datagram is for.
+    pub kind: DatagramKind,
+    /// The total encoded name and user-data length, repeated in every fragment.
+    pub total_length: u16,
+    /// The offset of these bytes into the encoded names and user data.
+    pub offset: u16,
+    /// This fragment's bytes, without the 14-byte datagram header.
+    pub data: Vec<u8>,
+}
+
+impl Fragment {
+    /// Checks the fragment's extent and flags against the declared total length.
+    fn validate(total_length: u16, offset: u16, length: usize, flags: Flags) -> Result<(), Error> {
+        if length > MAX_PACKET - DATAGRAM_HEADER_LEN {
+            return Err(Error::TooLong(DATAGRAM_HEADER_LEN + length));
+        }
+        let end = usize::from(offset) + length;
+        let total = usize::from(total_length);
+        if end > total {
+            return Err(Error::Length {
+                field: total_length,
+                actual: end,
+            });
+        }
+        if !flags.more && end < total {
+            return Err(Error::Truncated);
+        }
+        if length == 0 || flags.first != (offset == 0) || (flags.more && end == total) {
+            return Err(Error::Fragment);
+        }
+        Ok(())
+    }
 }
 
 /// Why a datagram server could not deliver a datagram.
@@ -402,8 +483,10 @@ impl ErrorCode {
 /// What a packet holds after the common header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Body {
-    /// A direct unique, direct group or broadcast datagram.
+    /// A complete direct unique, direct group or broadcast datagram.
     Datagram(Datagram),
+    /// Raw bytes of a datagram that needs reassembly.
+    Fragment(Fragment),
     /// A datagram server could not deliver a datagram.
     Error(ErrorCode),
     /// Asks a datagram server whether it can deliver to this name.
@@ -419,6 +502,7 @@ impl Body {
     pub fn msg_type(&self) -> u8 {
         match self {
             Body::Datagram(d) => d.kind.msg_type(),
+            Body::Fragment(f) => f.kind.msg_type(),
             Body::Error(_) => msg_type::ERROR,
             Body::QueryRequest(_) => msg_type::QUERY_REQUEST,
             Body::PositiveQueryResponse(_) => msg_type::POSITIVE_QUERY_RESPONSE,
@@ -449,21 +533,23 @@ pub struct Packet {
 pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
-    /// The packet ended before a field it needs.
+    /// The packet ended before a field it needs, or a last fragment ends
+    /// before the declared total length.
     Truncated,
     /// The packet is longer than [`MAX_PACKET`].
     TooLong(usize),
     /// The message type is not one the RFC defines.
     MsgType(u8),
-    /// A datagram's length field does not match the bytes after the
-    /// offset field: it says `field`, and there are `actual` (more than
-    /// `field`; fewer reads as [`Error::Truncated`]).
+    /// A fragment extends past the declared total length.
     Length {
         /// What the length field says.
         field: u16,
-        /// How many bytes there are.
+        /// The fragment offset plus its byte length.
         actual: usize,
     },
+    /// A fragment is empty, its first flag disagrees with its offset, or
+    /// its more flag is set despite reaching the declared total length.
+    Fragment,
     /// A name is not well formed: its first label is not 32 letters from
     /// `A` to `P`, a label is too long or a pointer, or it passes
     /// [`MAX_NAME_LEN`].
@@ -480,9 +566,10 @@ fictionet::error_display!(Error, f, {
     Error::Length { field, actual } => {
         write!(
             f,
-            "length field {field}, but {actual} bytes follow the offset"
+            "length field {field}, but fragment ends at {actual}"
         )
     }
+    Error::Fragment => f.write_str("invalid fragment flags, offset or empty data"),
     Error::Name => f.write_str("malformed NetBIOS name"),
     Error::Trailing(n) => write!(f, "{n} bytes after the end of the packet"),
 });
@@ -505,7 +592,6 @@ impl Packet {
             source_port,
             body: Body::Datagram(Datagram {
                 kind,
-                offset: 0,
                 source,
                 destination,
                 data,
@@ -513,8 +599,8 @@ impl Packet {
         }
     }
 
-    /// The datagram this packet holds, or `None` for an error, query or
-    /// response packet.
+    /// The complete datagram this packet holds, or `None` for a raw fragment,
+    /// error, query or response packet.
     pub fn as_datagram(&self) -> Option<&Datagram> {
         match &self.body {
             Body::Datagram(d) => Some(d),
@@ -564,52 +650,47 @@ impl Packet {
         }
     }
 
-    /// Splits this datagram into fragments of at most max_data bytes.
-    /// The fragment size is limited to what fits with the names, and at least one.
-    /// Offsets start at zero. Refuses data above [`MAX_REASSEMBLED`] or invalid names.
-    /// Non-datagram packets come back as one packet.
-    pub fn split(&self, max_data: usize) -> Result<Vec<Packet>, Error> {
-        let Body::Datagram(d) = &self.body else {
-            return Ok(vec![self.clone()]);
+    /// Splits a complete datagram's encoded names and user data into fragments.
+    /// `max_fragment` counts bytes after the 14-byte header. It is clamped to
+    /// fit both names in the first packet and to stay within [`MAX_PACKET`].
+    /// Every fragment keeps the same total length, which includes both names.
+    /// Refuses totals above [`MAX_REASSEMBLED`], invalid names and flags that
+    /// do not describe a complete datagram. Raw fragments are refused; other
+    /// packet types come back as one packet.
+    pub fn split(&self, max_fragment: usize) -> Result<Vec<Packet>, Error> {
+        let d = match &self.body {
+            Body::Datagram(d) => d,
+            Body::Fragment(_) => return Err(Error::Unwritable),
+            _ => return Ok(vec![self.clone()]),
         };
-        let (source, destination) = (d.source.to_bytes()?, d.destination.to_bytes()?);
-        let names = source.len() + destination.len();
-        let room = MAX_PACKET - DATAGRAM_HEADER_LEN - names;
-        let size = max_data.clamp(1, room);
-        if d.data.len() > MAX_REASSEMBLED {
+        if !self.flags.first || self.flags.more {
             return Err(Error::Unwritable);
         }
-        let data = &d.data;
-        let chunks: Vec<&[u8]> = if data.is_empty() {
-            vec![data]
-        } else {
-            data.chunks(size).collect()
-        };
-        let last = chunks.len() - 1;
-        let mut out = Vec::with_capacity(chunks.len());
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            // Every chunk starts before MAX_REASSEMBLED, so its offset fits.
-            let offset = (i * size) as u16;
-            let flags = Flags {
-                more: i < last,
-                first: i == 0,
-                node_type: self.flags.node_type,
-            };
-            // Each fragment copies the names and its own bytes, never the
-            // whole data, so cutting a long datagram finely stays linear.
-            let fragment = Datagram {
-                kind: d.kind,
-                offset,
-                source: d.source.clone(),
-                destination: d.destination.clone(),
-                data: chunk.to_vec(),
-            };
+        let bytes = d.encode()?;
+        let names = bytes.len() - d.data.len();
+        let size = max_fragment.clamp(names, MAX_PACKET - DATAGRAM_HEADER_LEN);
+        if bytes.len() <= size {
+            return Ok(vec![self.clone()]);
+        }
+        let mut out = Vec::with_capacity(bytes.len().div_ceil(size));
+        for (i, chunk) in bytes.chunks(size).enumerate() {
+            // The total is at most MAX_REASSEMBLED, so every offset fits.
+            let offset = i * size;
             out.push(Packet {
-                flags,
+                flags: Flags {
+                    more: offset + chunk.len() < bytes.len(),
+                    first: i == 0,
+                    node_type: self.flags.node_type,
+                },
                 id: self.id,
                 source_ip: self.source_ip,
                 source_port: self.source_port,
-                body: Body::Datagram(fragment),
+                body: Body::Fragment(Fragment {
+                    kind: d.kind,
+                    total_length: bytes.len() as u16,
+                    offset: offset as u16,
+                    data: chunk.to_vec(),
+                }),
             });
         }
         Ok(out)
@@ -635,9 +716,12 @@ struct Pending {
 /// Puts fragmented datagrams back together. Pass each datagram packet
 /// as it comes; it hands back each datagram once its last fragment is in.
 /// Fragments of one datagram share a source address, port and id, and
-/// must come in order. A fragment out of order, or one whose names or
-/// kind differ from the first, drops the datagram. It holds at most
-/// [`MAX_PENDING`] datagrams, each at most [`MAX_REASSEMBLED`] bytes.
+/// must come in order. A gap, overlap, invalid extent, changed total length,
+/// kind or node type drops the pending datagram. A new first fragment replaces
+/// the pending datagram with the same key. Names are decoded after exact
+/// coverage of the declared total. Invalid names drop the completed datagram.
+/// It holds at most [`MAX_PENDING`] datagrams, each at most
+/// [`MAX_REASSEMBLED`] encoded name and user-data bytes.
 #[derive(Debug, Default)]
 pub struct Reassembler {
     pending: Vec<Pending>,
@@ -649,32 +733,45 @@ impl Reassembler {
         Reassembler::default()
     }
 
-    /// Takes one packet. It returns the whole datagram, with offset 0 and
-    /// the first flag set, once one is complete. A datagram sent whole
-    /// comes straight back. Packets that are not datagrams are ignored.
+    /// Takes one packet. It returns a complete [`Body::Datagram`] with the
+    /// first flag set and the more flag clear once all bytes are present.
+    /// A valid complete datagram comes straight back. Invalid fragments drop
+    /// matching pending state. Packets that are not datagrams are ignored.
     pub fn push(&mut self, mut packet: Packet) -> Option<Packet> {
-        let Body::Datagram(d) = &mut packet.body else {
+        if !matches!(packet.body, Body::Datagram(_) | Body::Fragment(_)) {
             return None;
-        };
+        }
         let key = (packet.source_ip, packet.source_port, packet.id);
         let at = self
             .pending
             .iter()
             .position(|p| (p.first.source_ip, p.first.source_port, p.first.id) == key);
+        if let Body::Datagram(d) = &packet.body {
+            if let Some(i) = at {
+                self.pending.remove(i);
+            }
+            return (packet.flags.first && !packet.flags.more && d.names().is_ok())
+                .then_some(packet);
+        }
+        let Body::Fragment(d) = &mut packet.body else {
+            return None;
+        };
+        if Fragment::validate(d.total_length, d.offset, d.data.len(), packet.flags).is_err()
+            || (packet.flags.first && !packet.flags.more)
+        {
+            if let Some(i) = at {
+                self.pending.remove(i);
+            }
+            return None;
+        }
         if packet.flags.first {
             if let Some(i) = at {
                 self.pending.remove(i);
             }
-            if d.offset != 0 || d.data.len() > MAX_REASSEMBLED {
-                return None;
-            }
-            if !packet.flags.more {
-                return Some(packet);
-            }
             if self.pending.len() >= MAX_PENDING {
                 self.pending.remove(0);
             }
-            // The data moves out of the first fragment, so it is held once.
+            // The bytes move out of the first fragment, so they are held once.
             let data = std::mem::take(&mut d.data);
             self.pending.push(Pending {
                 first: packet,
@@ -684,19 +781,13 @@ impl Reassembler {
         }
         let i = at?;
         let p = &mut self.pending[i];
-        let Body::Datagram(start) = &p.first.body else {
+        let Body::Fragment(start) = &p.first.body else {
             return None;
         };
-        let fits = p
-            .data
-            .len()
-            .checked_add(d.data.len())
-            .is_some_and(|n| n <= MAX_REASSEMBLED);
         if usize::from(d.offset) != p.data.len()
-            || !fits
+            || d.total_length != start.total_length
             || d.kind != start.kind
-            || d.source != start.source
-            || d.destination != start.destination
+            || packet.flags.node_type != p.first.flags.node_type
         {
             self.pending.remove(i);
             return None;
@@ -705,11 +796,10 @@ impl Reassembler {
         if packet.flags.more {
             return None;
         }
+        let kind = d.kind;
         let Pending { mut first, data } = self.pending.remove(i);
         first.flags.more = false;
-        if let Body::Datagram(whole) = &mut first.body {
-            whole.data = data;
-        }
+        first.body = Body::Datagram(Datagram::decode(kind, &data).ok()?);
         Some(first)
     }
 
@@ -746,7 +836,8 @@ impl Wire for Packet {
     type WriteError = Error;
 
     /// Reads the packet in `b`, which must be one whole UDP datagram.
-    /// Refuses malformed or trailing input.
+    /// Keeps fragments raw and decodes names only for complete datagrams.
+    /// Refuses invalid fragment extents, flags, malformed names or trailing input.
     fn parse(b: &[u8]) -> Result<Packet, Error> {
         if b.len() > MAX_PACKET {
             return Err(Error::TooLong(b.len()));
@@ -773,29 +864,20 @@ impl Wire for Packet {
                 if rest.len() < 4 {
                     return Err(Error::Truncated);
                 }
-                let field = be16(rest, 0).ok_or(Error::Truncated)?;
+                let total_length = be16(rest, 0).ok_or(Error::Truncated)?;
                 let offset = be16(rest, 2).ok_or(Error::Truncated)?;
-                let after = &rest[4..];
-                let want = usize::from(field);
-                if after.len() < want {
-                    return Err(Error::Truncated);
+                let data = &rest[4..];
+                Fragment::validate(total_length, offset, data.len(), flags)?;
+                if flags.first && !flags.more {
+                    Body::Datagram(Datagram::decode(kind, data)?)
+                } else {
+                    Body::Fragment(Fragment {
+                        kind,
+                        total_length,
+                        offset,
+                        data: data.to_vec(),
+                    })
                 }
-                if after.len() > want {
-                    return Err(Error::Length {
-                        field,
-                        actual: after.len(),
-                    });
-                }
-                let (source, used) = Name::parse_prefix(after)?;
-                let (destination, used2) = Name::parse_prefix(&after[used..])?;
-                let data = after[used + used2..].to_vec();
-                Body::Datagram(Datagram {
-                    kind,
-                    offset,
-                    source,
-                    destination,
-                    data,
-                })
             }
             msg_type::ERROR => {
                 let (&code, extra) = rest.split_first().ok_or(Error::Truncated)?;
@@ -825,7 +907,7 @@ impl Wire for Packet {
         })
     }
 
-    /// Appends the complete datagram. Refuses invalid names, oversized data and
+    /// Appends one packet. Refuses invalid names, fragment extents, oversized data and
     /// values that would change on reading. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::with_capacity(DATAGRAM_HEADER_LEN + 2 * (ENCODED_LEN + 2));
@@ -836,21 +918,20 @@ impl Wire for Packet {
         out.extend_from_slice(&self.source_port.to_be_bytes());
         match &self.body {
             Body::Datagram(d) => {
-                let source = d.source.to_bytes()?;
-                let destination = d.destination.to_bytes()?;
-                // Names are at most 255 bytes each, so there is always room.
-                let room = MAX_PACKET - DATAGRAM_HEADER_LEN - source.len() - destination.len();
-                if d.data.len() > room {
+                let bytes = d.encode()?;
+                if bytes.len() > MAX_PACKET - DATAGRAM_HEADER_LEN {
                     return Err(Error::Unwritable);
                 }
-                let data = &d.data;
-                let length = source.len() + destination.len() + data.len();
-                // MAX_PACKET is under 65,536, so the length fits.
-                out.extend_from_slice(&(length as u16).to_be_bytes());
-                out.extend_from_slice(&d.offset.to_be_bytes());
-                out.extend_from_slice(&source);
-                out.extend_from_slice(&destination);
-                out.extend_from_slice(data);
+                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes());
+                out.extend_from_slice(&bytes);
+            }
+            Body::Fragment(f) => {
+                Fragment::validate(f.total_length, f.offset, f.data.len(), self.flags)
+                    .map_err(|_| Error::Unwritable)?;
+                out.extend_from_slice(&f.total_length.to_be_bytes());
+                out.extend_from_slice(&f.offset.to_be_bytes());
+                out.extend_from_slice(&f.data);
             }
             Body::Error(code) => out.push(code.code()),
             Body::QueryRequest(n)
@@ -906,7 +987,7 @@ mod tests {
             vec![1, 2, 3],
         );
         b.flags = Flags {
-            more: true,
+            more: false,
             first: true,
             node_type: NodeType::M,
         };
@@ -1225,6 +1306,222 @@ mod tests {
         contract::check_wire_value(&over);
     }
 
+    fn independent_fragments() -> (Vec<u8>, Vec<u8>) {
+        // RFC 1001 section 17.1.2: 68 name bytes and 512 user bytes.
+        // These bytes do not use the codec's name or packet writer.
+        let mut first = vec![0x10, 0x03, 0, 7, 10, 0, 0, 1, 0, 138, 2, 68, 0, 0];
+        first.extend_from_slice(b"\x20EGFCEFEECACACACACACACACACACACACA\0");
+        first.extend_from_slice(b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\0");
+        first.extend((0..466).map(|i| i as u8));
+        let mut last = vec![0x10, 0, 0, 7, 10, 0, 0, 1, 0, 138, 2, 68, 2, 22];
+        last.extend((466..512).map(|i| i as u8));
+        (first, last)
+    }
+
+    #[test]
+    fn independent_wire_fragments() {
+        let (first, last) = independent_fragments();
+        assert_eq!(first.len(), 14 + 534);
+        assert_eq!(last.len(), 14 + 46);
+        let mut r = Reassembler::new();
+        for (bytes, offset, length) in [(&first, 0, 534), (&last, 534, 46)] {
+            let p = Packet::parse(bytes).unwrap();
+            let Body::Fragment(f) = &p.body else {
+                panic!("not a raw fragment")
+            };
+            assert_eq!(
+                (f.total_length, f.offset, f.data.len()),
+                (580, offset, length)
+            );
+            assert_eq!(p.as_datagram(), None);
+            assert!(!p.carries_smb());
+            assert_eq!(p.to_bytes().unwrap(), *bytes);
+        }
+        assert_eq!(r.push(Packet::parse(&first).unwrap()), None);
+        assert_eq!(r.pending(), 1);
+        let got = r.push(Packet::parse(&last).unwrap()).unwrap();
+        assert_eq!(r.pending(), 0);
+        let expected = Packet::datagram(
+            DatagramKind::DirectUnique,
+            7,
+            Ipv4Addr::new(10, 0, 0, 1),
+            138,
+            Name::new("FRED", b' '),
+            Name::wildcard(),
+            (0..512).map(|i| i as u8).collect(),
+        );
+        assert_eq!(got, expected);
+        let written: Vec<_> = expected
+            .split(534)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_bytes().unwrap())
+            .collect();
+        assert_eq!(written, [first, last]);
+    }
+
+    #[test]
+    fn fragment_coverage_and_metadata() {
+        let (first, last) = independent_fragments();
+        // These fragments each fit their own declared extent, but cannot
+        // complete the pending region: gap, overlap, changed total or kind.
+        let mut gap = last.clone();
+        gap[13] += 1;
+        gap.remove(14);
+        let mut overlap = last.clone();
+        overlap[13] -= 1;
+        overlap.push(0);
+        let mut total = last.clone();
+        total[11] += 1;
+        total.push(0);
+        let mut kind = last.clone();
+        kind[0] = 0x11;
+        let mut node = last.clone();
+        node[1] = 0x04;
+        for bytes in [gap, overlap, total, kind, node] {
+            let mut r = Reassembler::new();
+            assert_eq!(r.push(Packet::parse(&first).unwrap()), None);
+            assert_eq!(r.push(Packet::parse(&bytes).unwrap()), None);
+            assert_eq!(r.pending(), 0);
+            assert_eq!(r.push(Packet::parse(&last).unwrap()), None);
+        }
+        // The last fragment cannot complete anything without the first.
+        let mut r = Reassembler::new();
+        assert_eq!(r.push(Packet::parse(&last).unwrap()), None);
+        assert_eq!(r.pending(), 0);
+        // Missing bytes never complete a datagram.
+        assert_eq!(r.push(Packet::parse(&first).unwrap()), None);
+        assert_eq!(r.pending(), 1);
+        let mut short = Packet::parse(&last).unwrap();
+        if let Body::Fragment(f) = &mut short.body {
+            f.data.pop();
+        }
+        assert_eq!(r.push(short), None);
+        assert_eq!(r.pending(), 0);
+    }
+
+    #[test]
+    fn invalid_fragment_extents_and_flags() {
+        let (first, last) = independent_fragments();
+        let mut short = last.clone();
+        short.pop();
+        assert_eq!(Packet::parse(&short), Err(Error::Truncated));
+        let mut over = last.clone();
+        over.push(0);
+        assert_eq!(
+            Packet::parse(&over),
+            Err(Error::Length {
+                field: 580,
+                actual: 581
+            })
+        );
+        let mut more = last.clone();
+        more[1] = 1;
+        let mut misplaced_first = last.clone();
+        misplaced_first[1] = 2;
+        let mut no_first = first.clone();
+        no_first[1] = 1;
+        let mut empty = first.clone();
+        empty.truncate(14);
+        // The old encoder declared a separate total for each fragment.
+        let mut legacy = first.clone();
+        legacy[10..12].copy_from_slice(&534u16.to_be_bytes());
+        for bytes in [more, misplaced_first, no_first, empty, legacy] {
+            assert_eq!(Packet::parse(&bytes), Err(Error::Fragment));
+        }
+        let mut invalid = Packet::parse(&last).unwrap();
+        invalid.flags.more = true;
+        assert_eq!(invalid.to_bytes(), Err(Error::Unwritable));
+        contract::check_wire_value(&invalid);
+        let mut whole = sample_datagram();
+        whole.flags.more = true;
+        assert_eq!(whole.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(whole.split(80), Err(Error::Unwritable));
+        contract::check_wire_value(&whole);
+    }
+
+    #[test]
+    fn names_are_decoded_after_reassembly() {
+        let (mut first, last) = independent_fragments();
+        // The raw parser preserves invalid name bytes until completion.
+        first[15] = b'Q';
+        let first = Packet::parse(&first).unwrap();
+        assert!(first.to_bytes().is_ok());
+        let mut r = Reassembler::new();
+        assert_eq!(r.push(first), None);
+        assert_eq!(r.pending(), 1);
+        assert_eq!(r.push(Packet::parse(&last).unwrap()), None);
+        assert_eq!(r.pending(), 0);
+    }
+
+    #[test]
+    fn pending_eviction_and_replacement() {
+        let (first, last) = independent_fragments();
+        let first = Packet::parse(&first).unwrap();
+        let last = Packet::parse(&last).unwrap();
+        let mut r = Reassembler::new();
+        for id in 0..=MAX_PENDING as u16 {
+            let mut p = first.clone();
+            p.id = id;
+            assert_eq!(r.push(p), None);
+        }
+        assert_eq!(r.pending(), MAX_PENDING);
+        let mut tail = last.clone();
+        tail.id = 0;
+        assert_eq!(r.push(tail), None);
+        assert_eq!(r.pending(), MAX_PENDING);
+        let mut tail = last.clone();
+        tail.id = 1;
+        assert!(r.push(tail).is_some());
+        assert_eq!(r.pending(), MAX_PENDING - 1);
+        // A new first fragment replaces the old bytes for the same key.
+        let mut replacement = first;
+        if let Body::Fragment(f) = &mut replacement.body {
+            f.data[68] = 42;
+        }
+        assert_eq!(r.push(replacement), None);
+        assert_eq!(r.pending(), MAX_PENDING - 1);
+        let got = r.push(last).unwrap();
+        assert_eq!(got.as_datagram().unwrap().data[0], 42);
+        assert_eq!(r.pending(), MAX_PENDING - 2);
+    }
+
+    #[test]
+    fn split_scoped_names_and_packet_limits() {
+        let mut p = sample_datagram();
+        if let Body::Datagram(d) = &mut p.body {
+            d.source = d.source.clone().with_scope("corp.example");
+            d.destination = d.destination.clone().with_scope("corp.example");
+            d.data = vec![7; MAX_REASSEMBLED - 94];
+        }
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
+        for size in [0, 1, 94, 534, usize::MAX] {
+            let parts = p.split(size).unwrap();
+            let mut r = Reassembler::new();
+            let mut got = None;
+            for part in parts {
+                let bytes = part.to_bytes().unwrap();
+                assert!(bytes.len() <= MAX_PACKET);
+                assert_eq!(be16(&bytes, 10), Some(u16::MAX));
+                got = r.push(Packet::parse(&bytes).unwrap());
+            }
+            assert_eq!(got, Some(p.clone()));
+            assert_eq!(r.pending(), 0);
+        }
+        assert_eq!(Reassembler::new().push(p.clone()), Some(p.clone()));
+        if let Body::Datagram(d) = &mut p.body {
+            d.data.push(0);
+        }
+        assert_eq!(p.split(534), Err(Error::Unwritable));
+        assert_eq!(Reassembler::new().push(p), None);
+        // No user bytes still carries both names in one packet.
+        let mut empty = sample_datagram();
+        if let Body::Datagram(d) = &mut empty.body {
+            d.data.clear();
+        }
+        assert_eq!(empty.split(1).unwrap(), [empty]);
+    }
+
     #[test]
     fn split_and_reassemble() {
         let mut p = sample_datagram();
@@ -1238,7 +1535,7 @@ mod tests {
         let offsets: Vec<u16> = parts
             .iter()
             .map(|f| {
-                if let Body::Datagram(d) = &f.body {
+                if let Body::Fragment(d) = &f.body {
                     d.offset
                 } else {
                     0
@@ -1271,11 +1568,11 @@ mod tests {
         odd.flags.first = true;
         assert_eq!(r.push(odd), None);
         assert_eq!(r.pending(), 0);
-        // A different destination drops it.
+        // A different kind drops it.
         r.push(parts[0].clone());
         let mut other = parts[1].clone();
-        if let Body::Datagram(d) = &mut other.body {
-            d.destination = Name::new("ELSE", 0);
+        if let Body::Fragment(d) = &mut other.body {
+            d.kind = DatagramKind::Broadcast;
         }
         assert_eq!(r.push(other), None);
         assert_eq!(r.pending(), 0);
@@ -1300,7 +1597,7 @@ mod tests {
         r.push(big.clone());
         let mut next = parts[1].clone();
         next.id = 999;
-        if let Body::Datagram(d) = &mut next.body {
+        if let Body::Fragment(d) = &mut next.body {
             d.data = vec![0; MAX_REASSEMBLED];
         }
         assert_eq!(r.push(next), None);
@@ -1308,14 +1605,14 @@ mod tests {
 
     #[test]
     fn split_large_is_linear() {
-        // The largest datagram cut into one-byte fragments: each fragment
-        // copies only its own byte, so this stays fast.
+        // The largest datagram cut at the minimum size that fits both names.
+        // Each fragment copies only its own bytes, so this stays fast.
         let mut p = sample_datagram();
         if let Body::Datagram(d) = &mut p.body {
-            d.data = (0..MAX_REASSEMBLED).map(|i| i as u8).collect();
+            d.data = (0..MAX_REASSEMBLED - 68).map(|i| i as u8).collect();
         }
         let parts = p.split(1).unwrap();
-        assert_eq!(parts.len(), MAX_REASSEMBLED);
+        assert_eq!(parts.len(), MAX_REASSEMBLED.div_ceil(68));
         let mut r = Reassembler::new();
         let mut got = None;
         for f in parts {
@@ -1328,7 +1625,7 @@ mod tests {
         else {
             panic!("not reassembled")
         };
-        assert_eq!(whole.data.len(), MAX_REASSEMBLED);
+        assert_eq!(whole.data.len(), MAX_REASSEMBLED - 68);
         assert!(whole.data.iter().enumerate().all(|(i, &b)| b == i as u8));
         assert!(p.as_datagram().is_some());
         assert!(
@@ -1352,8 +1649,12 @@ mod tests {
             let back = Packet::parse(&bytes).unwrap();
             assert_eq!(back, p);
             assert_eq!(back.to_bytes().unwrap(), bytes);
-            for f in p.split(3).unwrap() {
-                assert_eq!(Packet::parse(&f.to_bytes().unwrap()).unwrap(), f);
+            if matches!(p.body, Body::Fragment(_)) {
+                assert_eq!(p.split(3), Err(Error::Unwritable));
+            } else {
+                for f in p.split(3).unwrap() {
+                    assert_eq!(Packet::parse(&f.to_bytes().unwrap()).unwrap(), f);
+                }
             }
             if let Some(q) = p.query_response(ip(), 138, true) {
                 assert_eq!(Packet::parse(&q.to_bytes().unwrap()), Ok(q));
@@ -1368,7 +1669,9 @@ mod tests {
     #[test]
     fn random_buffers() {
         let mut rng = Lcg::new(0x6e62_6467);
-        let seeds = samples();
+        let mut seeds = samples();
+        let (first, last) = independent_fragments();
+        seeds.extend([first, last]);
         let mut r = Reassembler::new();
         for round in 0..6000 {
             let mut buf = if round % 3 == 0 {
@@ -1416,9 +1719,12 @@ mod tests {
                 let mut p = sample_datagram();
                 p.id = id;
                 if let Body::Datagram(d) = &mut p.body {
-                    d.data = rng.bytes(49);
+                    d.data = vec![0; 300];
+                    rng.fill(&mut d.data);
                 }
-                stream.extend(p.split(1 + rng.index(10)).unwrap());
+                let parts = p.split(68 + rng.index(100)).unwrap();
+                assert!(parts.len() >= 3);
+                stream.extend(parts);
                 sent.push(p);
             }
             for i in (1..stream.len()).rev() {

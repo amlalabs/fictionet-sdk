@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::nbdgm::{ErrorCode, MAX_PENDING, Name, Packet, Reassembler};
+use fictionet::stdlib::nbdgm::{Body, Error, ErrorCode, MAX_PENDING, Name, Packet, Reassembler};
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;
@@ -35,7 +35,13 @@ fuzz_target!(|data: &[u8]| {
         contract::check_wire_value(&e);
         assert!(e.to_bytes().is_ok());
         let mut whole = None;
-        for f in p.split(1 + n % 64).unwrap() {
+        let fragments = if matches!(p.body, Body::Fragment(_)) {
+            assert_eq!(p.split(534), Err(Error::Unwritable));
+            vec![p.clone()]
+        } else {
+            p.split(1 + n % 128).unwrap()
+        };
+        for f in fragments {
             contract::check_wire_value(&f);
             assert!(f.to_bytes().is_ok());
             if let Some(w) = reassembler.push(f) {
