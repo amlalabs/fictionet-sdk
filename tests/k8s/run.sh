@@ -2,6 +2,9 @@
 # The Kubernetes test: charts/fictionet-sandbox on a kind cluster.
 #
 #   tests/k8s/run.sh
+#   tests/k8s/run.sh --test-ordering  # timestamp fixtures only; no cluster needed
+#
+# Both modes run timestamp fixtures before any image build or cluster access.
 #
 # Needs docker, kind, kubectl and helm on PATH. It builds the attach,
 # web_world and agent images, makes a kind cluster named
@@ -15,7 +18,7 @@
 #   4. HTTPS to the world's site works with the world's CA,
 #   5. 1.1.1.1, the cluster's DNS and the API server are unreachable,
 #   6. the agent cannot set eth0 up, and cannot see the world's socket,
-#   7. the agent started after attach was ready,
+#   7. the agent started no earlier than attach, and attach is ready,
 #   8. when attach is stopped the agent has no network at all, and when
 #      Kubernetes restarts it the network comes back,
 #   9. with INSPECT=1, tests/k8s/inspect_eval.py passes through Inspect's
@@ -35,7 +38,6 @@ cleanup() {
     helm uninstall "$release" --wait >/dev/null 2>&1 || true
     if [ "$made_cluster" = 1 ]; then kind delete cluster --name "$cluster" >/dev/null 2>&1 || true; fi
 }
-trap cleanup EXIT
 
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
@@ -51,6 +53,40 @@ check() {
     out="$("$@" 2>&1 | tr '\n' ' ')" || true
     if grep -qE -- "$want" <<<"$out"; then pass "$name"; else fail "$name: wanted /$want/, got: $out"; fi
 }
+
+# Kubernetes start times have second granularity. Equality is valid coarse
+# start-order evidence, but says nothing about when attach became ready.
+starts_in_order() {
+    local attach_started="$1" agent_started="$2"
+    [[ -n "$attach_started" && -n "$agent_started" && ! "$agent_started" < "$attach_started" ]]
+}
+
+test_ordering_fixtures() {
+    test_ordering() {
+        local name="$1" want="$2" attach_started="$3" agent_started="$4" ordered=false
+        if starts_in_order "$attach_started" "$agent_started"; then ordered=true; fi
+        check "$name" "^$want $" echo "$ordered"
+    }
+    test_ordering "equal start timestamps are accepted" true \
+        2026-10-14T12:00:00Z 2026-10-14T12:00:00Z
+    test_ordering "a later agent start is accepted" true \
+        2026-10-14T12:00:00Z 2026-10-14T12:00:01Z
+    test_ordering "a missing attach start is rejected" false \
+        '' 2026-10-14T12:00:00Z
+    test_ordering "a missing agent start is rejected" false \
+        2026-10-14T12:00:00Z ''
+    test_ordering "two missing starts are rejected" false '' ''
+    test_ordering "reversed start timestamps are rejected" false \
+        2026-10-14T12:00:01Z 2026-10-14T12:00:00Z
+}
+
+test_ordering_fixtures
+if [ "${1:-}" = --test-ordering ]; then
+    if [ "$failures" -gt 0 ]; then exit 1; fi
+    exit 0
+fi
+
+trap cleanup EXIT
 
 docker build -q -f "$root/deploy/Dockerfile" --target attach -t fictionet-attach:dev "$root" >/dev/null
 docker build -q -f "$root/deploy/Dockerfile" --target web-world -t fictionet-web-world:dev "$root" >/dev/null
@@ -102,11 +138,16 @@ check "ip link set eth0 up is refused" 'Operation not permitted' agent ip link s
 check "ip route add is refused" 'Operation not permitted' agent ip route add 1.1.1.1 dev eth0
 check "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/relay
 
-# 7. Order: the agent started after attach was ready.
-attach_ready="$(kubectl get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].state.running.startedAt}')"
+# 7. Coarse start ordering and current readiness are separate checks.
+attach_started="$(kubectl get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].state.running.startedAt}')"
 agent_started="$(kubectl get pod "$pod" -o jsonpath='{.status.containerStatuses[?(@.name=="default")].state.running.startedAt}')"
-check "the agent started after attach" 'after' \
-    sh -c "[ \"$agent_started\" \> \"$attach_ready\" ] && echo after || echo 'attach $attach_ready, agent $agent_started'"
+if starts_in_order "$attach_started" "$agent_started"; then
+    pass "the agent started no earlier than attach"
+else
+    fail "start ordering: attach $attach_started, agent $agent_started"
+fi
+check "attach is ready" '^true ?$' \
+    kubectl get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].ready}'
 check "attach made /dev/net/tun and took eth0 down" 'eth0 is down.*made /dev/net/tun.*attached as tun0' \
     kubectl logs "$pod" -c attach
 
