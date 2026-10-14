@@ -286,9 +286,12 @@
 //!    to `--dns` on port 53, from `--ip-addr` and a random UDP port from
 //!    49152 up (`Stack::lookup`). The query goes out immediately, again 1
 //!    second later and again 2 seconds after that, and attach gives up 7
-//!    seconds after the first. The first `A` record of the answer is used,
-//!    and cached for its TTL, at most 60 seconds, so a name in the cache
-//!    sends no query. A name the world does not know is remembered for 5
+//!    seconds after the first. Attach follows up to 16 `CNAME` aliases from
+//!    the queried name and uses the first `A` record for the final name.
+//!    Unrelated records are ignored. Cycles and longer chains fail the lookup.
+//!    The address is cached for the shortest TTL in the chain, at most 60
+//!    seconds. A zero TTL expires immediately. A name in the cache sends no
+//!    query. A name the world does not know is remembered for 5
 //!    seconds. While a lookup is on its way, other requests for the same
 //!    name wait for its answer instead of sending their own query. An IPv4
 //!    address in the request skips the lookup. There is no `AAAA` query,

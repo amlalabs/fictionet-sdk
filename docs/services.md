@@ -187,6 +187,13 @@ gets its address by DHCP or by its first packet, and asks the gateway at
 `10.0.0.1` for names. It reaches every host and no other sandbox. An
 address with no host answers "host unreachable", and a closed port a RST.
 
+With `fictionet attach --type http_proxy` or `--type socks5`, attach looks
+names up in the world's DNS. It follows at most 16 CNAME aliases from the
+queried name and uses an A record for the final name. It ignores unrelated
+answers and rejects cycles or longer chains. The cache keeps the address
+for the shortest TTL among those aliases and the A record, at most 60
+seconds. A zero TTL expires immediately.
+
 Other kinds of port:
 
 - `tcp_with(port, world, make, opts)`: the same, with `ServeOptions` for
