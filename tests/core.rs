@@ -200,6 +200,44 @@ fn event_wait_predicate_can_record_into_same_log() {
     .unwrap();
 }
 
+#[test]
+fn event_wait_checks_cancellation_before_inspecting_matches() {
+    for n in [0, 1] {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            fcx.record(Event::new("test", "tick"));
+            fcx.cancel();
+            let result = fcx
+                .events()
+                .wait(&fcx, n, ms(10), |_| {
+                    panic!("cancelled wait inspected events")
+                })
+                .await;
+            assert_eq!(result.unwrap_err(), Cancelled);
+            Ok(())
+        }))
+        .unwrap();
+    }
+}
+
+#[test]
+fn event_wait_predicate_cancellation_wins_over_matches_and_timeout() {
+    for n in [1, 2] {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            fcx.record(Event::new("test", "tick"));
+            let result = fcx
+                .events()
+                .wait(&fcx, n, Duration::ZERO, |_| {
+                    fcx.cancel();
+                    true
+                })
+                .await;
+            assert_eq!(result.unwrap_err(), Cancelled);
+            Ok(())
+        }))
+        .unwrap();
+    }
+}
+
 /// Every kind of wait ends with `Cancelled` when the region fails.
 #[test]
 fn cancellation_ends_every_wait() {

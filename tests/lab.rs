@@ -4,8 +4,68 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use fictionet::events::Event;
 use fictionet::time::{Instant, ms};
 use fictionet::{Cancelled, JoinError, RaceError, RunMode, Seed, Timer, block_on, lab};
+
+#[test]
+fn event_wait_stops_at_its_limit_between_sampling_ticks() {
+    for limit in [Duration::ZERO, Duration::from_nanos(1), ms(1), ms(15)] {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            fcx.sleep(ms(3)).await?;
+            fcx.record(Event::new("test", "tick"));
+            let start = fcx.now();
+            let got = fcx
+                .events()
+                .wait(&fcx, 2, limit, |event| event.is("test", "tick"))
+                .await?;
+            assert_eq!(got.len(), 1);
+            assert_eq!(fcx.now(), start + limit);
+            Ok(())
+        }))
+        .unwrap();
+    }
+}
+
+#[test]
+fn event_wait_accepts_an_overflowing_limit() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        fcx.sleep(ms(1)).await?;
+        fcx.spawn(|fcx| async move {
+            fcx.sleep(ms(1)).await?;
+            fcx.record(Event::new("test", "tick"));
+            Ok(())
+        });
+        let got = fcx
+            .events()
+            .wait(&fcx, 1, Duration::MAX, |event| event.is("test", "tick"))
+            .await?;
+        assert_eq!(got.len(), 1);
+        assert_eq!(fcx.now().since_start(), ms(11));
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn event_wait_cancellation_wins_at_the_deadline() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let log = fcx.events();
+        let mut wait = pin!(log.wait(&fcx, 1, ms(1), |_| true));
+        poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        fcx.sleep(ms(1)).await?;
+        fcx.record(Event::new("test", "tick"));
+        fcx.cancel();
+        assert_eq!(wait.await.unwrap_err(), Cancelled);
+        assert_eq!(fcx.now().since_start(), ms(1));
+        Ok(())
+    }))
+    .unwrap();
+}
 
 #[test]
 fn a_minute_passes_without_waiting_a_minute() {

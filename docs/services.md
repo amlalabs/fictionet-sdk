@@ -357,6 +357,12 @@ let logins = events.of("prompt", "login");
 `EventLog::wait` checks a snapshot of the held events, oldest first, with
 the log unlocked. Its predicate may read or record events in the same log.
 Events recorded by the predicate are considered on the next check.
+It checks every 10 ms on the run's clock, shortening the last sleep to
+the remaining time limit. At the deadline it returns the matches so far.
+A limit that overflows the clock's range has no deadline. Cancellation
+returns `Cancelled` before inspecting events and before returning matches,
+even when enough events are already held, `n` is zero, or the deadline
+has arrived.
 
 The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
 `level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,

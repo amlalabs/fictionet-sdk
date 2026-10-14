@@ -1305,7 +1305,10 @@ impl EventLog {
     /// match so far if the time ran out. Each check first records the
     /// counts of [repeats](self#repeats) that are due. Returns early with
     /// [`Cancelled`](crate::Cancelled) if `fcx`'s [region](Cx#regions) is
-    /// cancelled.
+    /// cancelled. Cancellation is checked before inspecting events and
+    /// before returning matches, even if `n` is zero or the deadline has
+    /// arrived. The last sleep is shortened to the remaining time. A limit
+    /// that overflows the clock's range has no deadline.
     ///
     /// Each check takes a snapshot of the held events, oldest first, then
     /// calls `pick` without holding the log's lock. The predicate may read
@@ -1318,8 +1321,11 @@ impl EventLog {
         limit: std::time::Duration,
         mut pick: impl FnMut(&Event) -> bool,
     ) -> Result<Vec<Event>, crate::Cancelled> {
-        let deadline = fcx.now() + limit;
+        let deadline = fcx.now().since_start().saturating_add(limit);
         loop {
+            if fcx.is_cancelled() {
+                return Err(crate::Cancelled);
+            }
             self.store.advance(fcx.now());
             let events: Vec<Arc<Event>> = {
                 let s = self.store.state.lock();
@@ -1330,10 +1336,17 @@ impl EventLog {
                 .filter(|e| pick(e))
                 .map(|e| (*e).clone())
                 .collect();
-            if got.len() >= n || fcx.now() >= deadline {
+            if fcx.is_cancelled() {
+                return Err(crate::Cancelled);
+            }
+            let now = fcx.now().since_start();
+            if got.len() >= n || now >= deadline {
                 return Ok(got);
             }
-            fcx.sleep(std::time::Duration::from_millis(10)).await?;
+            let next = now
+                .saturating_add(std::time::Duration::from_millis(10))
+                .min(deadline);
+            fcx.sleep_until(Instant::from_since_start(next)).await?;
         }
     }
 }
