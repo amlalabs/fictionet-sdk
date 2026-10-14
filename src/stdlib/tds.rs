@@ -31,6 +31,16 @@
 //!
 //! Readers check lengths and return [`Error`] for bad
 //! input. Buffers have named limits, including [`MAX_MESSAGE`].
+//! Token readers and writers also share a limit of 1,048,576 decoded units
+//! per reader or written stream: one per token, metadata column, row value
+//! or RETURNVALUE value. Null values count too. Columns supplied to
+//! [`TokenReader::with_columns`] count once at the start. Charges happen
+//! before allocation and are not refunded when metadata changes or a caller
+//! drops a token. Exceeding the limit gives [`Error::Limit`] when reading
+//! and [`Error::Unwritable`] when writing. This is separate from the
+//! wire-byte limit, and it is not a process-memory limit: string and byte
+//! payloads, vector spare capacity, allocator overhead, and the reader's
+//! copy of the current columns are not decoded units.
 //! A decimal or numeric column's maximum length must hold its
 //! precision, as [`TypeInfo::max_len`] gives.
 //!
@@ -78,7 +88,7 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
-    Decode, Reader, Step, Trailing, Truncated, Wire, be16, le16, le32, le64,
+    Decode, Reader, Step, Trailing, Truncated, Wire, Work, be16, le16, le32, le64,
 };
 
 /// The TCP port SQL Server listens on.
@@ -92,8 +102,8 @@ pub const MIN_PACKET_SIZE: usize = 512;
 /// The largest packet size a client and server may agree on.
 pub const MAX_PACKET_SIZE: usize = 32767;
 /// The longest message a [`Messages`] puts back together, the most data
-/// [`Message::packets`] writes, and the most bytes a [`TokenStream`]
-/// holds.
+/// [`Message::packets`] writes, and the most wire bytes a [`TokenStream`]
+/// reads or writes. Decoded units have a separate limit; see the module docs.
 pub const MAX_MESSAGE: usize = 4 << 20;
 /// The most options a PRELOGIN message may carry.
 pub const MAX_PRELOGIN_OPTIONS: usize = 32;
@@ -120,6 +130,10 @@ pub const MAX_HEADERS: usize = 16;
 /// The most columns a COLMETADATA token may describe. SQL Server allows
 /// 4096 in a SELECT.
 pub const MAX_COLUMNS: usize = 4096;
+/// The most decoded units per token reader or written stream; see the module docs.
+const MAX_DECODED_UNITS: usize = 1 << 20;
+/// The decoded-unit budget's name in [`Error::Limit`].
+const DECODED_UNITS: &str = "response decoded units";
 /// The collation SQL Server sends by default: Latin1_General_CI_AS
 /// (US English, case insensitive, accent sensitive).
 pub const DEFAULT_COLLATION: [u8; 5] = [0x09, 0x04, 0xd0, 0x00, 0x34];
@@ -2618,12 +2632,21 @@ fn other_len(t: u8) -> Option<OtherLen> {
     }
 }
 
+fn charge_decoded(work: &mut Work, units: usize) -> Result<(), Error> {
+    work.charge(units).map_err(|_| Error::Limit(DECODED_UNITS))
+}
+
 /// Reads one token from the start of `b`, with `columns` the columns of
 /// the last COLMETADATA token. It returns the token and how many bytes
 /// it took.
-fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Error> {
+fn read_token(
+    b: &[u8],
+    columns: Option<&[Column]>,
+    work: &mut Work,
+) -> Result<(Token, usize), Error> {
     let mut c = Reader::new(b);
     let t = c.u8()?;
+    charge_decoded(work, 1)?;
     let token = match t {
         token::LOGINACK => {
             let body = c.u16_block()?;
@@ -2695,6 +2718,7 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
                 if count > MAX_COLUMNS {
                     return Err(Error::Limit("columns"));
                 }
+                charge_decoded(work, count)?;
                 let mut cols = Vec::with_capacity(count);
                 for _ in 0..count {
                     let user_type = c.u32_le()?;
@@ -2713,6 +2737,7 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
         }
         token::ROW | token::NBCROW => {
             let cols = columns.ok_or(Error::NoColumns)?;
+            charge_decoded(work, cols.len())?;
             let bitmap = if t == token::NBCROW {
                 c.take(cols.len().div_ceil(8))?
             } else {
@@ -2737,6 +2762,7 @@ fn read_token(b: &[u8], columns: Option<&[Column]>) -> Result<(Token, usize), Er
         }
         token::RETURNSTATUS => Token::ReturnStatus(c.u32_le()? as i32),
         token::RETURNVALUE => {
+            charge_decoded(work, 1)?;
             let ordinal = c.u16_le()?;
             let name = c.b_varchar()?;
             let status = c.u8()?;
@@ -3092,12 +3118,14 @@ fn u16_block(out: &mut Vec<u8>, t: u8, body: &[u8]) -> Result<(), Error> {
 
 /// Reads the tokens of a server's response, one at a time. It keeps the
 /// columns of the last COLMETADATA token to read the rows after it, and
-/// stops after the first error.
+/// stops after the first error. Each reader has the module's decoded-unit
+/// budget, even when its caller discards tokens as it reads them.
 #[derive(Debug)]
 pub struct TokenReader<'a> {
     data: &'a [u8],
     pos: usize,
     columns: Option<Vec<Column>>,
+    work: Work,
     failed: bool,
 }
 
@@ -3105,10 +3133,15 @@ impl<'a> TokenReader<'a> {
     /// A reader of the tokens in `data`, the data of one message.
     /// Data above [`MAX_MESSAGE`] gives one error on the first read.
     pub fn new(data: &'a [u8]) -> TokenReader<'a> {
+        Self::with_limit(data, MAX_DECODED_UNITS)
+    }
+
+    fn with_limit(data: &'a [u8], limit: usize) -> TokenReader<'a> {
         TokenReader {
             data,
             pos: 0,
             columns: None,
+            work: Work::new(DECODED_UNITS, limit),
             failed: false,
         }
     }
@@ -3119,14 +3152,21 @@ impl<'a> TokenReader<'a> {
     /// are: at most [`MAX_COLUMNS`], each of a type this module reads with
     /// parameters a COLMETADATA token could carry. Others give
     /// [`Error::Limit`], [`Error::UnsupportedType`] or [`Error::Invalid`].
+    /// These columns count against this reader's decoded-unit budget.
     pub fn with_columns(data: &'a [u8], columns: Vec<Column>) -> Result<TokenReader<'a>, Error> {
+        Self::with_columns_limit(data, columns, MAX_DECODED_UNITS)
+    }
+
+    fn with_columns_limit(
+        data: &'a [u8],
+        columns: Vec<Column>,
+        limit: usize,
+    ) -> Result<TokenReader<'a>, Error> {
         check_columns(&columns)?;
-        Ok(TokenReader {
-            data,
-            pos: 0,
-            columns: Some(columns),
-            failed: false,
-        })
+        let mut reader = Self::with_limit(data, limit);
+        charge_decoded(&mut reader.work, columns.len())?;
+        reader.columns = Some(columns);
+        Ok(reader)
     }
 
     /// The columns of the last COLMETADATA token, if one has come.
@@ -3151,7 +3191,11 @@ impl Iterator for TokenReader<'_> {
             self.failed = true;
             return Some(Err(Error::Limit("response past MAX_MESSAGE")));
         }
-        match read_token(&self.data[self.pos..], self.columns.as_deref()) {
+        match read_token(
+            &self.data[self.pos..],
+            self.columns.as_deref(),
+            &mut self.work,
+        ) {
             Ok((tok, used)) => {
                 self.pos += used;
                 if let Token::ColMetadata(Some(cols)) = &tok {
@@ -3180,7 +3224,8 @@ impl Wire for TokenStream {
 
     /// Reads all tokens, tracking column metadata for rows. Refuses unknown
     /// layouts, invalid types or values, rows without columns, partial
-    /// tokens, and data above [`MAX_MESSAGE`].
+    /// tokens, data above [`MAX_MESSAGE`], and responses above the module's
+    /// decoded-unit budget.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_MESSAGE {
             return Err(Error::Limit("response past MAX_MESSAGE"));
@@ -3191,15 +3236,33 @@ impl Wire for TokenStream {
     }
 
     /// Appends the response. Refuses rows without columns, mismatched
-    /// values or types, oversized fields, and output above [`MAX_MESSAGE`].
+    /// values or types, oversized fields, output above [`MAX_MESSAGE`], and
+    /// responses above the same decoded-unit budget as the reader.
     /// A token must read back unchanged. Errors leave the destination unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.write_with_limit(out, MAX_DECODED_UNITS)
+    }
+}
+
+impl TokenStream {
+    fn write_with_limit(&self, out: &mut Vec<u8>, limit: usize) -> Result<(), Error> {
         let mut bytes = Vec::new();
         let mut columns: Option<&[Column]> = None;
+        let mut work = Work::new(DECODED_UNITS, limit);
         for token in &self.0 {
+            // Preflight before writing; readback uses the same allowance.
+            let mut read_work = work;
+            charge_decoded(&mut work, 1).map_err(|_| Error::Unwritable)?;
+            let units = match token {
+                Token::ColMetadata(Some(cols)) => cols.len(),
+                Token::Row(values) | Token::NbcRow(values) => values.len(),
+                Token::ReturnValue(_) => 1,
+                _ => 0,
+            };
+            charge_decoded(&mut work, units).map_err(|_| Error::Unwritable)?;
             let start = bytes.len();
             write_token(&mut bytes, token, columns).map_err(|_| Error::Unwritable)?;
-            match read_token(&bytes[start..], columns) {
+            match read_token(&bytes[start..], columns, &mut read_work) {
                 Ok((back, used)) if used == bytes.len() - start && back == *token => {}
                 _ => return Err(Error::Unwritable),
             }
@@ -5245,7 +5308,11 @@ mod tests {
         );
         let many = vec![Column::new("x", TypeInfo::fixed(data_type::INT1)); MAX_COLUMNS + 1];
         assert_eq!(
-            TokenReader::with_columns(&[], many).err(),
+            TokenReader::with_columns(&[], many.clone()).err(),
+            Some(Error::Limit("columns"))
+        );
+        assert_eq!(
+            TokenReader::with_columns_limit(&[], many, MAX_COLUMNS).err(),
             Some(Error::Limit("columns"))
         );
         let odd = Column::new("x", TypeInfo::nullable(data_type::INTN, 3));
@@ -5257,6 +5324,180 @@ mod tests {
         assert!(TokenReader::with_columns(&[], vec![no_collation]).is_err());
         let mut r = TokenReader::with_columns(&[token::ROW, 7], all_types()[..1].to_vec()).unwrap();
         assert_eq!(r.next(), Some(Ok(Token::Row(vec![Value::TinyInt(7)]))));
+    }
+
+    fn check_decoded_budget(stream: TokenStream, units: usize) {
+        let bytes = stream.to_bytes().unwrap();
+        for limit in [units, units + 1] {
+            let mut reader = TokenReader::with_limit(&bytes, limit);
+            assert_eq!(
+                reader.by_ref().collect::<Result<Vec<_>, _>>(),
+                Ok(stream.0.clone())
+            );
+            assert_eq!(reader.work.used(), units);
+            let mut out = vec![42];
+            stream.write_with_limit(&mut out, limit).unwrap();
+            assert_eq!(&out[1..], bytes);
+        }
+        let mut reader = TokenReader::with_limit(&bytes, units - 1);
+        assert_eq!(
+            reader.by_ref().collect::<Result<Vec<_>, _>>(),
+            Err(Error::Limit(DECODED_UNITS))
+        );
+        let position = reader.position();
+        assert!(position < bytes.len());
+        assert_eq!(reader.next(), None);
+        assert_eq!(reader.position(), position);
+        let mut out = vec![42];
+        assert_eq!(
+            stream.write_with_limit(&mut out, units - 1),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(out, [42]);
+    }
+
+    #[test]
+    fn decoded_budget_public_boundary() {
+        // Pin the documented ceiling through the public API. Compact all-null
+        // rows fit well below MAX_MESSAGE while expanding to about a million values.
+        const UNITS: usize = 1_048_576;
+        let count = 4096;
+        let columns = vec![Column::new("", TypeInfo::fixed(data_type::INT1)); count];
+        let mut bytes = TokenStream(vec![Token::ColMetadata(Some(columns))])
+            .to_bytes()
+            .unwrap();
+        let rows = (UNITS - count - 1) / (count + 1);
+        for _ in 0..rows {
+            bytes.push(token::NBCROW);
+            bytes.resize(bytes.len() + count.div_ceil(8), 0xff);
+        }
+        for _ in 0..UNITS - (rows + 1) * (count + 1) {
+            bytes.extend_from_slice(&[token::COLMETADATA, 0xff, 0xff]);
+        }
+        let mut stream = TokenStream::parse(&bytes).unwrap();
+        let encoded = stream.to_bytes().unwrap();
+        assert_eq!(encoded, bytes);
+        assert_eq!(TokenStream::parse(&encoded).as_ref(), Ok(&stream));
+
+        let position = bytes.len();
+        bytes.extend_from_slice(&[token::COLMETADATA, 0xff, 0xff]);
+        assert!(bytes.len() < MAX_MESSAGE);
+        assert_eq!(
+            TokenStream::parse(&bytes).err(),
+            Some(Error::Limit("response decoded units"))
+        );
+        let mut reader = TokenReader::new(&bytes);
+        for token in &stream.0 {
+            assert_eq!(reader.next().unwrap().as_ref(), Ok(token));
+        }
+        assert_eq!(reader.position(), position);
+        assert_eq!(
+            reader.next(),
+            Some(Err(Error::Limit("response decoded units")))
+        );
+        assert_eq!(reader.position(), position);
+        assert_eq!(reader.next(), None);
+
+        stream.0.push(Token::ColMetadata(None));
+        let mut out = vec![42];
+        assert_eq!(stream.write(&mut out), Err(Error::Unwritable));
+        assert_eq!(out, [42]);
+    }
+
+    #[test]
+    fn decoded_budget_counts_rows_and_nulls() {
+        for count in [0, 1, 7, 8, 9, 31] {
+            let columns = vec![Column::new("", TypeInfo::fixed(data_type::INT1)); count];
+            for row in [
+                Token::Row(vec![Value::TinyInt(7); count]),
+                Token::NbcRow(vec![Value::Null; count]),
+            ] {
+                check_decoded_budget(
+                    TokenStream(vec![
+                        Token::ColMetadata(Some(columns.clone())),
+                        row.clone(),
+                        row,
+                    ]),
+                    3 * (1 + count),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_budget_survives_metadata_changes() {
+        let col = Column::new("", TypeInfo::fixed(data_type::INT1));
+        check_decoded_budget(
+            TokenStream(vec![
+                Token::ColMetadata(Some(vec![col.clone(); 3])),
+                Token::NbcRow(vec![Value::Null; 3]),
+                Token::ColMetadata(None),
+                Token::NbcRow(vec![Value::Null; 3]),
+                Token::ColMetadata(Some(vec![col])),
+                Token::Row(vec![Value::TinyInt(7)]),
+            ]),
+            17,
+        );
+    }
+
+    #[test]
+    fn decoded_budget_charges_before_reading_payloads() {
+        // These bodies are missing. The budget must refuse their allocation
+        // before the reader reaches the missing columns, bitmap or values.
+        let mut reader = TokenReader::with_limit(&[token::COLMETADATA, 2, 0], 2);
+        assert_eq!(reader.next(), Some(Err(Error::Limit(DECODED_UNITS))));
+        assert_eq!(reader.columns(), None);
+        assert_eq!(reader.position(), 0);
+        for kind in [token::ROW, token::NBCROW] {
+            let columns = vec![Column::new("", TypeInfo::fixed(data_type::INT1)); 9];
+            let data = [kind];
+            let mut reader = TokenReader::with_columns_limit(&data, columns, 10).unwrap();
+            assert_eq!(reader.next(), Some(Err(Error::Limit(DECODED_UNITS))));
+            assert_eq!(reader.position(), 0);
+            assert_eq!(reader.next(), None);
+        }
+        let mut reader = TokenReader::with_limit(&[token::RETURNVALUE], 1);
+        assert_eq!(reader.next(), Some(Err(Error::Limit(DECODED_UNITS))));
+    }
+
+    #[test]
+    fn decoded_budget_counts_initial_columns() {
+        let columns = vec![Column::new("", TypeInfo::fixed(data_type::INT1)); 9];
+        assert_eq!(
+            TokenReader::with_columns_limit(&[], columns.clone(), 8).err(),
+            Some(Error::Limit(DECODED_UNITS))
+        );
+        let mut empty = TokenReader::with_columns_limit(&[], columns.clone(), 9).unwrap();
+        assert_eq!(empty.work.used(), 9);
+        assert_eq!(empty.next(), None);
+        let bytes = [token::NBCROW, 0xff, 1, token::NBCROW, 0xff, 1];
+        let row = Token::NbcRow(vec![Value::Null; 9]);
+        let mut reader = TokenReader::with_columns_limit(&bytes, columns.clone(), 29).unwrap();
+        assert_eq!(reader.next(), Some(Ok(row.clone())));
+        assert_eq!(reader.next(), Some(Ok(row.clone())));
+        assert_eq!(reader.next(), None);
+        assert_eq!(reader.work.used(), 29);
+        let mut reader = TokenReader::with_columns_limit(&bytes, columns, 28).unwrap();
+        assert_eq!(reader.next(), Some(Ok(row)));
+        assert_eq!(reader.next(), Some(Err(Error::Limit(DECODED_UNITS))));
+        assert_eq!(reader.position(), 3);
+        assert_eq!(reader.next(), None);
+    }
+
+    #[test]
+    fn decoded_budget_counts_return_values() {
+        check_decoded_budget(
+            TokenStream(vec![Token::ReturnValue(ReturnValue {
+                ordinal: 0,
+                name: String::new(),
+                status: return_status::OUTPUT,
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::fixed(data_type::INT1),
+                value: Value::TinyInt(7),
+            })]),
+            2,
+        );
     }
 
     fn check(bytes: &[u8]) {

@@ -37,7 +37,75 @@ fn value_for(ty: u8, b: &[u8]) -> Value {
     }
 }
 
+fn check_nbcrows(data: &[u8]) {
+    let byte = |i: usize| data.get(i % data.len().max(1)).copied().unwrap_or(0);
+    let count = usize::from(byte(1) % 65);
+    let columns = vec![Column::new("", TypeInfo::fixed(data_type::INT1)); count];
+    let mut bytes = TokenStream(vec![Token::ColMetadata(Some(columns.clone()))])
+        .to_bytes()
+        .unwrap();
+    let start = bytes.len();
+    for row in 0..usize::from(byte(2) % 9 + 1) {
+        bytes.push(token::NBCROW);
+        let bitmap: Vec<u8> = (0..count.div_ceil(8)).map(|i| byte(row + i)).collect();
+        bytes.extend_from_slice(&bitmap);
+        for i in 0..count {
+            if bitmap[i / 8] & (1 << (i % 8)) == 0 {
+                bytes.push(byte(row + i + 3));
+            }
+        }
+    }
+    let stream = TokenStream::parse(&bytes).unwrap();
+    contract::check_wire_value(&stream);
+    assert_eq!(
+        TokenReader::with_columns(&bytes[start..], columns)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        stream.0[1..]
+    );
+
+    if data.len() < 4 || byte(0) != 0 || byte(1) != 0 {
+        return;
+    }
+    // The documented production budget. Build compact wire data directly
+    // to exercise the decoder's allocation limit.
+    const UNITS: usize = 1 << 20;
+    let limit = [UNITS - 1, UNITS, UNITS + 1][usize::from(byte(2) % 3)];
+    let count = [511, 512, 513, 4095, MAX_COLUMNS][usize::from(byte(3) % 5)];
+    let columns = vec![Column::new("", TypeInfo::fixed(data_type::INT1)); count];
+    let mut bytes = TokenStream(vec![Token::ColMetadata(Some(columns))])
+        .to_bytes()
+        .unwrap();
+    let rows = (limit - count - 1) / (count + 1);
+    for _ in 0..rows {
+        bytes.push(token::NBCROW);
+        bytes.resize(bytes.len() + count.div_ceil(8), 0xff);
+    }
+    for _ in 0..limit - (rows + 1) * (count + 1) {
+        bytes.extend_from_slice(&[token::COLMETADATA, 0xff, 0xff]);
+    }
+    assert!(bytes.len() < MAX_MESSAGE);
+    match TokenStream::parse(&bytes) {
+        Ok(stream) => {
+            assert!(limit <= UNITS);
+            let encoded = stream.to_bytes().unwrap();
+            assert_eq!(TokenStream::parse(&encoded), Ok(stream));
+        }
+        Err(error) => {
+            assert_eq!(limit, UNITS + 1);
+            assert_eq!(error, Error::Limit("response decoded units"));
+            let mut stream = TokenStream::parse(&bytes[..bytes.len() - 3]).unwrap();
+            stream.0.push(Token::ColMetadata(None));
+            let mut out = vec![42];
+            assert_eq!(stream.write(&mut out), Err(Error::Unwritable));
+            assert_eq!(out, [42]);
+        }
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
+    check_nbcrows(data);
     contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
     contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), data, 128);
     contract::check_decode_with_alloc_limit(|| Messages::with_limit(LIMIT), data, 2 * MAX_PACKET);

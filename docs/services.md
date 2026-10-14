@@ -28,6 +28,11 @@ It classifies first fragments by port without parsing a complete datagram.
 It checks address families and IP size limits and always writes a checksum.
 Allocation, MTU limits, fragments and IP header fields stay with the caller.
 
+TDS response decoding has two separate ceilings: 4 MiB of wire bytes and
+1,048,576 decoded units per reader or written token stream. These are codec
+limits, not a process-memory bound; see the [`tds` module docs](../src/stdlib/tds.rs)
+for the accounting rules and exclusions.
+
 ## 1. A service
 
 A service is the server side of one protocol, for one connection. It
