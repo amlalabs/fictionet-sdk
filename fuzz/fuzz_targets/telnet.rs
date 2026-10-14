@@ -57,7 +57,71 @@ impl Decode for Session {
     }
 }
 
+fn check_control_scanner(data: &[u8], chunk: usize) {
+    let make = || {
+        let mut events = Events::new();
+        events.set_binary(true);
+        events
+    };
+    let (events, failure) = decode_all(make, data);
+    let mut expected = events.into_iter();
+    let mut scanner = telnet::ControlScanner::new();
+    let mut at = 0;
+    let mut end = 0;
+    loop {
+        let input = &data[at..end];
+        let used = match scanner.scan(input, end == data.len()) {
+            Ok(Step::Item(telnet::ControlSpan::Data, used)) => {
+                for &byte in &input[..used] {
+                    assert_eq!(expected.next(), Some(Event::Data(vec![byte])));
+                }
+                used
+            }
+            Ok(Step::Item(telnet::ControlSpan::Error(error), used)) => {
+                assert_eq!(expected.next(), Some(Event::Error(error)));
+                used
+            }
+            Ok(Step::Item(_, used)) => {
+                assert_eq!(
+                    expected.next(),
+                    Some(BinaryEvent::parse(&input[..used]).unwrap().0)
+                );
+                used
+            }
+            Ok(Step::Skip(used)) => used,
+            Ok(Step::Need) if end < data.len() => {
+                end = end.saturating_add(chunk).min(data.len());
+                continue;
+            }
+            Ok(Step::Need) => {
+                let want = if input.is_empty() {
+                    None
+                } else {
+                    Some(fictionet::stdlib::codec::Fail::Truncated {
+                        unread: input.len(),
+                    })
+                };
+                assert_eq!(failure, want);
+                break;
+            }
+            Err(error) => {
+                assert_eq!(
+                    failure,
+                    Some(fictionet::stdlib::codec::Fail::Protocol(error))
+                );
+                break;
+            }
+            Ok(Step::End) => panic!("scanner ended early"),
+        };
+        assert!(used <= input.len());
+        at += used;
+    }
+    assert_eq!(expected.next(), None);
+}
+
 fuzz_target!(|data: &[u8]| {
+    check_control_scanner(data, 1);
+    check_control_scanner(data, telnet::MAX_EVENT_WIRE);
     contract::check_wire::<Event>(data);
     contract::check_wire::<BinaryEvent>(data);
     contract::check_wire::<Subnegotiation>(data);

@@ -295,6 +295,138 @@ fn telnet_eof_reports_partial_units_once() {
 }
 
 #[test]
+fn telnet_control_spans_leave_payloads_and_following_bytes_in_place() {
+    use tn::{ControlScanner, ControlSpan};
+
+    let mut scanner = ControlScanner::new();
+    assert_eq!(
+        scanner.scan(b"\r\0text\xff", false),
+        Ok(Step::Item(ControlSpan::Data, 6))
+    );
+    for (bytes, span) in [
+        (vec![255, 255], ControlSpan::EscapedIac),
+        (vec![255, 241], ControlSpan::Command(tn::Command::Nop)),
+        (
+            vec![255, 251, 0],
+            ControlSpan::Negotiation {
+                verb: tn::Verb::Will,
+                option: 0,
+            },
+        ),
+        (
+            vec![255, 250, 42, 255, 255, 13, 0, 255, 240],
+            ControlSpan::Subnegotiation { option: 42 },
+        ),
+        (
+            vec![255, 250, 255, 255, 240],
+            ControlSpan::Subnegotiation { option: 255 },
+        ),
+        (
+            vec![255, 1],
+            ControlSpan::Error(tn::Error::UnknownCommand(1)),
+        ),
+        (
+            vec![255, 240],
+            ControlSpan::Error(tn::Error::StraySubnegotiationEnd),
+        ),
+    ] {
+        for split in 0..bytes.len() {
+            let mut scanner = ControlScanner::new();
+            assert_eq!(scanner.scan(&bytes[..split], false), Ok(Step::Need));
+            let mut input = bytes.clone();
+            input.push(b'x');
+            assert_eq!(
+                scanner.scan(&input, false),
+                Ok(Step::Item(span, bytes.len()))
+            );
+            assert_eq!(
+                scanner.scan(&input[bytes.len()..], false),
+                Ok(Step::Item(ControlSpan::Data, 1))
+            );
+        }
+    }
+}
+
+fn scan_telnet(chunks: &[&[u8]]) -> (Vec<tn::Event>, Option<Fail<tn::Error>>) {
+    let mut scanner = tn::ControlScanner::new();
+    let mut input = Vec::new();
+    let mut events = Vec::new();
+    for (chunk, eof) in chunks
+        .iter()
+        .map(|chunk| (*chunk, false))
+        .chain([(&[][..], true)])
+    {
+        input.extend_from_slice(chunk);
+        loop {
+            let used = match scanner.scan(&input, eof) {
+                Ok(Step::Item(tn::ControlSpan::Data, used)) => {
+                    events.extend(input[..used].iter().map(|&b| tn::Event::Data(vec![b])));
+                    used
+                }
+                Ok(Step::Item(tn::ControlSpan::Error(error), used)) => {
+                    events.push(tn::Event::Error(error));
+                    used
+                }
+                Ok(Step::Item(_, used)) => {
+                    events.push(tn::BinaryEvent::parse(&input[..used]).unwrap().0);
+                    used
+                }
+                Ok(Step::Skip(used)) => used,
+                Ok(Step::Need) => {
+                    if eof && !input.is_empty() {
+                        return (
+                            events,
+                            Some(Fail::Truncated {
+                                unread: input.len(),
+                            }),
+                        );
+                    }
+                    break;
+                }
+                Err(error) => return (events, Some(Fail::Protocol(error))),
+                Ok(Step::End) => panic!("scanner ended early"),
+            };
+            input.drain(..used);
+        }
+    }
+    (events, None)
+}
+
+#[test]
+fn telnet_control_scanner_matches_events_at_every_split() {
+    let make = || {
+        let mut events = tn::Events::new();
+        events.set_binary(true);
+        events
+    };
+    let mut cases = vec![
+        b"text\r\0\xff\xff\xff\xfb\0\xff\xf1".to_vec(),
+        vec![255],
+        vec![255, 251],
+        vec![255, 250],
+        vec![255, 250, 42, 1, 255],
+        vec![255, 250, 42, 1, 255, 251, 0],
+    ];
+    for size in [0, tn::MAX_SUBNEGOTIATION, tn::MAX_SUBNEGOTIATION + 1] {
+        let mut bytes = vec![255, 250, 42];
+        bytes.extend([255, 255].repeat(size));
+        for end in [&[][..], &[255], &[255, 240], &[255, 241]] {
+            let mut input = bytes.clone();
+            input.extend_from_slice(end);
+            cases.push(input);
+        }
+    }
+    for bytes in cases {
+        let expected = decode_all(make, &bytes);
+        for split in 0..=bytes.len() {
+            assert_eq!(scan_telnet(&[&bytes[..split], &bytes[split..]]), expected);
+        }
+        let chunks: Vec<_> = bytes.chunks(1).collect();
+        assert_eq!(scan_telnet(&chunks), expected);
+    }
+}
+
+#[test]
 fn telnet_wire_is_exact_strict_and_transactional() {
     for event in [
         tn::Event::Data(vec![]),

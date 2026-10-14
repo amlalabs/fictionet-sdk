@@ -22,6 +22,8 @@
 //! The default delivers each data byte immediately. Batch readers can use
 //! [`Events::with_limit`] to wait for larger runs. [`Event`] uses NVT
 //! encoding; [`BinaryEvent`] carries an event in binary mode.
+//! [`ControlScanner`] exposes the same bounded control framing without NVT
+//! conversion or payload allocation. Callers keep the input and receive spans.
 //! Unknown commands and interrupted or oversized subnegotiations produce
 //! [`Event::Error`] items. The stream then continues.
 //!
@@ -479,6 +481,194 @@ pub const MAX_DATA: usize = 1024;
 /// including doubled IAC bytes, framing, or detection of an oversized payload.
 pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 5;
 
+/// The kind of wire span found by [`ControlScanner`].
+/// The consumed length is carried by [`Step::Item`]. No payload is copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlSpan {
+    /// A nonempty run of bytes before the next IAC, with no NVT conversion.
+    Data,
+    /// Two IAC bytes representing one data byte.
+    EscapedIac,
+    /// A command with no option.
+    Command(Command),
+    /// WILL, WONT, DO or DONT for an option.
+    Negotiation {
+        /// Which of the four.
+        verb: Verb,
+        /// The option code.
+        option: u8,
+    },
+    /// A complete IAC SB ... IAC SE. The escaped payload is
+    /// `input[3..used - 2]`; each doubled IAC represents one payload byte.
+    Subnegotiation {
+        /// The option code.
+        option: u8,
+    },
+    /// A recoverable framing fault. The consumed bytes are dropped.
+    Error(Error),
+}
+
+/// Finds Telnet data and control spans without allocation or session policy.
+///
+/// The caller owns the input buffer. After [`Step::Need`], append bytes to
+/// the same unconsumed prefix. After [`Step::Item`] or [`Step::Skip`], remove
+/// exactly the reported length before calling again. Scan cursors make
+/// bytewise input linear. Data spans end at IAC or the end of the current
+/// input, so their lengths may depend on chunk boundaries. CR and NUL are
+/// ordinary data; the caller decides whether to apply NVT conversion.
+///
+/// Subnegotiations allow [`MAX_SUBNEGOTIATION`] decoded payload bytes.
+/// At most [`MAX_EVENT_WIRE`] input bytes need buffering. Oversized payloads
+/// yield `Skip` steps until IAC SE, then [`Error::SubnegotiationTooLong`].
+/// An interrupting command instead yields [`Error::SubnegotiationInterrupted`]
+/// and leaves that command unread. This can be an item consuming zero bytes
+/// after a skip. The next call reads the command. No payload is retained.
+///
+/// Partial controls return `Need`, even at EOF; the caller reports truncation
+/// if unread bytes remain. EOF during an oversized payload returns
+/// `Err(Error::Truncated)` once discarded bytes have been consumed. Stop
+/// using the scanner after that error. Recoverable faults are `ControlSpan::Error`
+/// items, so callers can translate them into their own protocol errors.
+///
+/// ```
+/// use fictionet::stdlib::codec::Step;
+/// use fictionet::stdlib::telnet::{ControlScanner, ControlSpan, Command};
+///
+/// let mut scanner = ControlScanner::new();
+/// assert_eq!(scanner.scan(b"USER ", false), Ok(Step::Item(ControlSpan::Data, 5)));
+/// assert_eq!(scanner.scan(b"\xff", false), Ok(Step::Need));
+/// assert_eq!(scanner.scan(b"\xff\xf4", false),
+///     Ok(Step::Item(ControlSpan::Command(Command::InterruptProcess), 2)));
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct ControlScanner {
+    scanned: usize,
+    count: usize,
+    dropping: Option<u8>,
+}
+
+impl ControlScanner {
+    /// Starts at a data or control boundary.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Recognizes the next span, or requests more input without consuming it.
+    /// Follow the buffering and EOF contract on [`ControlScanner`].
+    pub fn scan(&mut self, input: &[u8], eof: bool) -> Result<Step<ControlSpan>, Error> {
+        if let Some(option) = self.dropping {
+            return self.discard(input, eof, option);
+        }
+        let Some(&first) = input.first() else {
+            return Ok(Step::Need);
+        };
+        if first != IAC {
+            let used = input.iter().position(|&b| b == IAC).unwrap_or(input.len());
+            return Ok(Step::Item(ControlSpan::Data, used));
+        }
+        if input.get(1) == Some(&IAC) {
+            return Ok(Step::Item(ControlSpan::EscapedIac, 2));
+        }
+        let Some(&command) = input.get(1) else {
+            return Ok(Step::Need);
+        };
+        if let Some(verb) = Verb::from_byte(command) {
+            let Some(&option) = input.get(2) else {
+                return Ok(Step::Need);
+            };
+            return Ok(Step::Item(ControlSpan::Negotiation { verb, option }, 3));
+        }
+        if command == cmd::SB {
+            let Some(&option) = input.get(2) else {
+                return Ok(Step::Need);
+            };
+            return Ok(self.subnegotiation(input, option));
+        }
+        let event = if let Some(command) = Command::from_byte(command) {
+            ControlSpan::Command(command)
+        } else if command == cmd::SE {
+            ControlSpan::Error(Error::StraySubnegotiationEnd)
+        } else {
+            ControlSpan::Error(Error::UnknownCommand(command))
+        };
+        Ok(Step::Item(event, 2))
+    }
+
+    fn reset_scan(&mut self) {
+        self.scanned = 0;
+        self.count = 0;
+    }
+
+    fn subnegotiation(&mut self, input: &[u8], option: u8) -> Step<ControlSpan> {
+        self.scanned = self.scanned.max(3);
+        loop {
+            let Some(&byte) = input.get(self.scanned) else {
+                return Step::Need;
+            };
+            if byte == IAC {
+                let Some(&next) = input.get(self.scanned.saturating_add(1)) else {
+                    return Step::Need;
+                };
+                if next != IAC {
+                    let end = self.scanned;
+                    self.reset_scan();
+                    if next != cmd::SE {
+                        return Step::Item(
+                            ControlSpan::Error(Error::SubnegotiationInterrupted { option }),
+                            end,
+                        );
+                    }
+                    return Step::Item(
+                        ControlSpan::Subnegotiation { option },
+                        end.saturating_add(2),
+                    );
+                }
+            }
+            self.scanned = self.scanned.saturating_add(if byte == IAC { 2 } else { 1 });
+            self.count += 1; // Stop at MAX_SUBNEGOTIATION + 1.
+            if self.count > MAX_SUBNEGOTIATION {
+                let used = self.scanned;
+                self.reset_scan();
+                self.dropping = Some(option);
+                return Step::Skip(used);
+            }
+        }
+    }
+
+    fn discard(&mut self, input: &[u8], eof: bool, option: u8) -> Result<Step<ControlSpan>, Error> {
+        let mut at = 0usize;
+        while let Some(&byte) = input.get(at) {
+            if byte == IAC {
+                let Some(&next) = input.get(at.saturating_add(1)) else {
+                    break;
+                };
+                if next != IAC {
+                    self.dropping = None;
+                    return Ok(if next == cmd::SE {
+                        Step::Item(
+                            ControlSpan::Error(Error::SubnegotiationTooLong { option }),
+                            at.saturating_add(2),
+                        )
+                    } else {
+                        Step::Item(
+                            ControlSpan::Error(Error::SubnegotiationInterrupted { option }),
+                            at,
+                        )
+                    });
+                }
+            }
+            at = at.saturating_add(if byte == IAC { 2 } else { 1 });
+        }
+        if at > 0 {
+            Ok(Step::Skip(at))
+        } else if eof {
+            Err(Error::Truncated)
+        } else {
+            Ok(Step::Need)
+        }
+    }
+}
+
 /// Reads one Telnet event per call without retaining input bytes.
 ///
 /// By default, each data byte is delivered as its own event, so interactive
@@ -525,7 +715,7 @@ pub struct Events {
     scanned: usize,
     count: usize,
     cr_nul: bool,
-    dropping: Option<u8>,
+    controls: ControlScanner,
 }
 
 impl Default for Events {
@@ -550,7 +740,7 @@ impl Events {
             scanned: 0,
             count: 0,
             cr_nul: false,
-            dropping: None,
+            controls: ControlScanner::new(),
         }
     }
 
@@ -576,6 +766,35 @@ impl Events {
     fn reset_scan(&mut self) {
         self.scanned = 0;
         self.count = 0;
+    }
+
+    fn control(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, Error> {
+        Ok(match self.controls.scan(input, eof)? {
+            Step::Need => Step::Need,
+            Step::End => Step::End,
+            Step::Skip(used) => Step::Skip(used),
+            Step::Item(span, used) => {
+                let event = match span {
+                    ControlSpan::Data | ControlSpan::EscapedIac => return Ok(self.data(input, eof)),
+                    ControlSpan::Command(command) => Event::Command(command),
+                    ControlSpan::Negotiation { verb, option } => {
+                        Event::Negotiation { verb, option }
+                    }
+                    ControlSpan::Subnegotiation { option } => {
+                        let raw = input.get(3..used.saturating_sub(2)).unwrap_or_default();
+                        let mut data = Vec::new();
+                        let mut at = 0usize;
+                        while let Some(&b) = raw.get(at) {
+                            data.push(b);
+                            at = at.saturating_add(if b == IAC { 2 } else { 1 });
+                        }
+                        Event::Subnegotiation { option, data }
+                    }
+                    ControlSpan::Error(error) => Event::Error(error),
+                };
+                Step::Item(event, used)
+            }
+        })
     }
 
     fn data_item(&mut self, input: &[u8]) -> Step<Event> {
@@ -610,82 +829,6 @@ impl Events {
             return Step::Need;
         }
     }
-
-    fn subnegotiation(&mut self, input: &[u8], option: u8) -> Step<Event> {
-        self.scanned = self.scanned.max(3);
-        loop {
-            let Some(&byte) = input.get(self.scanned) else {
-                return Step::Need;
-            };
-            if byte == IAC {
-                let Some(&next) = input.get(self.scanned.saturating_add(1)) else {
-                    return Step::Need;
-                };
-                if next != IAC {
-                    let end = self.scanned;
-                    self.reset_scan();
-                    if next != cmd::SE {
-                        return Step::Item(
-                            Event::Error(Error::SubnegotiationInterrupted { option }),
-                            end,
-                        );
-                    }
-                    let raw = input.get(3..end).unwrap_or_default();
-                    let mut data = Vec::new();
-                    let mut at = 0usize;
-                    while let Some(&b) = raw.get(at) {
-                        data.push(b);
-                        at = at.saturating_add(if b == IAC { 2 } else { 1 });
-                    }
-                    return Step::Item(
-                        Event::Subnegotiation { option, data },
-                        end.saturating_add(2),
-                    );
-                }
-            }
-            self.scanned = self.scanned.saturating_add(if byte == IAC { 2 } else { 1 });
-            self.count += 1; // Stop at MAX_SUBNEGOTIATION + 1.
-            if self.count > MAX_SUBNEGOTIATION {
-                let used = self.scanned;
-                self.reset_scan();
-                self.dropping = Some(option);
-                return Step::Skip(used);
-            }
-        }
-    }
-
-    fn discard(&mut self, input: &[u8], eof: bool, option: u8) -> Result<Step<Event>, Error> {
-        let mut at = 0usize;
-        while let Some(&byte) = input.get(at) {
-            if byte == IAC {
-                let Some(&next) = input.get(at.saturating_add(1)) else {
-                    break;
-                };
-                if next != IAC {
-                    self.dropping = None;
-                    return Ok(if next == cmd::SE {
-                        Step::Item(
-                            Event::Error(Error::SubnegotiationTooLong { option }),
-                            at.saturating_add(2),
-                        )
-                    } else {
-                        Step::Item(
-                            Event::Error(Error::SubnegotiationInterrupted { option }),
-                            at,
-                        )
-                    });
-                }
-            }
-            at = at.saturating_add(if byte == IAC { 2 } else { 1 });
-        }
-        if at > 0 {
-            Ok(Step::Skip(at))
-        } else if eof {
-            Err(Error::Truncated)
-        } else {
-            Ok(Step::Need)
-        }
-    }
 }
 
 // One data byte and its wire width. Commands and partial escapes stop the scan.
@@ -713,8 +856,8 @@ impl codec::Decode for Events {
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, Error> {
-        if let Some(option) = self.dropping {
-            return self.discard(input, eof, option);
+        if self.controls.dropping.is_some() {
+            return self.control(input, eof);
         }
         let Some(&first) = input.first() else {
             return Ok(Step::Need);
@@ -728,29 +871,7 @@ impl codec::Decode for Events {
         if first != IAC || input.get(1) == Some(&IAC) {
             return Ok(self.data(input, eof));
         }
-        let Some(&command) = input.get(1) else {
-            return Ok(Step::Need);
-        };
-        if let Some(verb) = Verb::from_byte(command) {
-            let Some(&option) = input.get(2) else {
-                return Ok(Step::Need);
-            };
-            return Ok(Step::Item(Event::Negotiation { verb, option }, 3));
-        }
-        if command == cmd::SB {
-            let Some(&option) = input.get(2) else {
-                return Ok(Step::Need);
-            };
-            return Ok(self.subnegotiation(input, option));
-        }
-        let event = if let Some(command) = Command::from_byte(command) {
-            Event::Command(command)
-        } else if command == cmd::SE {
-            Event::Error(Error::StraySubnegotiationEnd)
-        } else {
-            Event::Error(Error::UnknownCommand(command))
-        };
-        Ok(Step::Item(event, 2))
+        self.control(input, eof)
     }
 }
 
