@@ -25,6 +25,34 @@ start watching links. New watches use that registry. The existing
 without binary changes. Watches already running retain their registry and
 connection state.
 
+Packet streams distinguish three kinds of missing data. `skipped` counts
+packets omitted by sampling since the previous tap copy. The additive
+`evicted` field counts copies evicted before decoding, since the previous
+decoded row. The tap keeps at most 4,096 copies and 8 MiB. If it loses every
+copy, the next decoded row carries that loss. Counts of sampled packets
+carried by evicted copies are unavailable. Packet `seq` values still number
+decoded rows; detail requests use the same numbers.
+
+Decoded history keeps at most 4,096 rows and 32 MiB. When a subscriber asks
+for rows that have expired, the stream sends
+`{"event":"packet_gap","data":{"after":7,"next":12,"missed":4}}`
+before sending the remaining rows. Here rows 8 through 11 were lost to that
+subscriber. This also applies to a new subscription with `after:0`.
+If no rows remain, `next` is the next row number to be assigned. The cursor
+advances past the gap so it is reported only once. Merged dashboard streams
+include the source `link` in gap data.
+
+The drawer shows sampling, capture eviction and subscriber overruns
+separately. Capture and overrun totals survive browser queue trimming and
+pause. Reconnecting reloads history and resets all three totals. These are
+reported counts, not complete traffic totals: expired rows may have carried
+earlier sampling or capture loss. Capture downloads contain retained packets;
+the new loss metadata is carried by the JSON stream, not the pcapng file.
+
+These fields and events are additive changes to observer API version 1.
+Rust public paths and signatures are unchanged. Clients should accept unknown
+fields and events. When reading older streams, a missing `evicted` means zero.
+
 Capture downloads include the deduplicated TLS secrets from the link watch
 and the current world ring. Each keeps at most 20,000 secrets. A quiet watch
 can retain secrets after the world ring rotates. Retention is best effort:

@@ -299,6 +299,13 @@ mod tests {
         ] {
             assert_eq!(inspect(bytes), Some(("node".into(), data.into())));
         }
+        let gap = br#"{"event":"packet_gap","data":{"after":1,"next":4,"missed":2}}"#;
+        let (name, data) = inspect(gap).unwrap();
+        assert_eq!(name, "packet_gap");
+        assert_eq!(
+            add_link(&data, "e7"),
+            r#"{"link":"e7","after":1,"next":4,"missed":2}"#
+        );
         for bytes in [
             br#"{"error":"x"}"#.as_slice(),
             br#"{"event":"node","data":}"#,

@@ -466,11 +466,21 @@ impl Session {
                     }
                     *next = now + PACKET_TICK;
                     watch.pump();
-                    for (seq, row) in watch.rows_after(*cursor, 500) {
+                    let (missed, rows) = watch.rows_after(*cursor, 500);
+                    if missed > 0 {
+                        let gap = Object::new()
+                            .num("after", *cursor)
+                            .num("next", *cursor + missed + 1)
+                            .num("missed", missed)
+                            .done();
+                        out.push((*id, event("packet_gap", &gap), false));
+                        *cursor += missed;
+                    }
+                    for (seq, row) in rows {
                         out.push((*id, event("packet", &row), false));
                         *cursor = seq;
                     }
-                    if watch.closed() && watch.rows_after(*cursor, 1).is_empty() {
+                    if watch.closed() && watch.rows_after(*cursor, 1).1.is_empty() {
                         out.push((*id, event("end", r#"{"reason":"the link closed"}"#), true));
                         ended.push(*id);
                     }
@@ -531,6 +541,94 @@ fn world(graph: Option<&Graph>) -> String {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn packet_subscribers_report_overruns_once_before_retained_rows() {
+        for (limit, bytes, retained) in [(2, super::super::packets::ROW_BYTES, 2), (4, 0, 0)] {
+            let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+            let meter = crate::watch::Meter::new();
+            graph.owns(&meter, 0, 1);
+            let mut fds = [0; 2];
+            // SAFETY: socketpair initializes the two owned descriptors.
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr())
+                },
+                0
+            );
+            let (ours, theirs) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            let (attacher, _attachments) = crate::attachments();
+            let mut session = Session {
+                attacher,
+                fd: ours,
+                subs: Vec::new(),
+            };
+            // A new subscriber, a lagging subscriber, and one already caught up.
+            for (id, cursor) in [(1, 0), (2, 1), (3, 4)] {
+                let (watch, subscription) = graph.watches.acquire(&graph, meter.id).unwrap();
+                watch.set_limits(limit, bytes);
+                session.subs.push(Sub::Packets {
+                    id,
+                    watch,
+                    cursor,
+                    _held: (subscription, Viewer::new(graph.clone())),
+                    next: Instant::now(),
+                });
+            }
+            for _ in 0..4 {
+                meter.sent(0, &crate::Packet(vec![0x45; 20]));
+            }
+            session.pump().unwrap();
+            let mut buf = vec![0; relay::MAX_MESSAGE + 1];
+            for (id, after) in [(1, 0), (2, 1)] {
+                let n = unix::recv(theirs.as_raw_fd(), &mut buf, true).unwrap();
+                let Ok(Message::Reply {
+                    id: got,
+                    body,
+                    flags,
+                }) = relay::decode(&buf[..n])
+                else {
+                    panic!("not a reply")
+                };
+                assert_eq!((got, flags), (id, 0));
+                let next = 5 - retained;
+                let missed = next - after - 1;
+                assert_eq!(
+                    std::str::from_utf8(body).unwrap(),
+                    format!(
+                        r#"{{"event":"packet_gap","data":{{"after":{after},"next":{next},"missed":{missed}}}}}"#
+                    )
+                );
+                for seq in next..=4 {
+                    let n = unix::recv(theirs.as_raw_fd(), &mut buf, true).unwrap();
+                    let Ok(Message::Reply { id: got, body, .. }) = relay::decode(&buf[..n]) else {
+                        panic!("not a reply")
+                    };
+                    assert_eq!(got, id);
+                    assert!(
+                        std::str::from_utf8(body)
+                            .unwrap()
+                            .starts_with(&format!(r#"{{"event":"packet","data":{{"seq":{seq},"#))
+                    );
+                }
+            }
+            // Even an entirely evicted batch advances each subscriber's cursor.
+            for sub in &mut session.subs {
+                if let Sub::Packets { cursor, next, .. } = sub {
+                    assert_eq!(*cursor, 4);
+                    *next = Instant::now();
+                }
+            }
+            session.pump().unwrap();
+            assert_eq!(
+                unix::recv(theirs.as_raw_fd(), &mut buf, true)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
 
     #[test]
     fn session_slots_are_bounded_and_reusable() {

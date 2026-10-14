@@ -61,10 +61,14 @@ struct Inner {
     guard: Option<TapGuard>,
     /// The last copy taken from the tap.
     after: u64,
+    /// Copies evicted before the next decoded row.
+    evicted: u64,
     next_row: u64,
     dissector: Dissector,
     rows: VecDeque<Row>,
     row_bytes: usize,
+    max_rows: usize,
+    max_bytes: usize,
     /// When the last subscriber left.
     released: Instant,
     released_order: u64,
@@ -107,10 +111,13 @@ impl LinkWatch {
             inner: Mutex::new(Inner {
                 guard: None,
                 after: 0,
+                evicted: 0,
                 next_row: 1,
                 dissector: Dissector::with_registry(graph.protocols.lock().clone()),
                 rows: VecDeque::new(),
                 row_bytes: 0,
+                max_rows: ROWS,
+                max_bytes: ROW_BYTES,
                 released: Instant::now(),
                 released_order: 0,
                 ends,
@@ -198,7 +205,9 @@ impl LinkWatch {
         let mut done = 0;
         while done < PUMP_BATCH {
             let Some(guard) = &inner.guard else { return };
-            let copies = guard.tap.since(inner.after, 512);
+            let (evicted, copies) = guard.tap.since(inner.after, 512);
+            inner.after += evicted;
+            inner.evicted += evicted;
             if copies.is_empty() {
                 return;
             }
@@ -235,6 +244,7 @@ impl LinkWatch {
                     .num("side", copy.side)
                     .num("len", copy.data.len())
                     .num("skipped", copy.skipped)
+                    .num("evicted", std::mem::take(&mut inner.evicted))
                     .str("src", &decoded.src)
                     .str("dst", &decoded.dst)
                     .str("proto", &decoded.proto)
@@ -267,7 +277,7 @@ impl LinkWatch {
                 };
                 inner.row_bytes += row.bytes();
                 inner.rows.push_back(row);
-                while inner.rows.len() > ROWS || inner.row_bytes > ROW_BYTES {
+                while inner.rows.len() > inner.max_rows || inner.row_bytes > inner.max_bytes {
                     let Some(old) = inner.rows.pop_front() else {
                         break;
                     };
@@ -277,17 +287,28 @@ impl LinkWatch {
         }
     }
 
-    /// Packet list lines after row `after`, at most `max`.
-    pub(crate) fn rows_after(&self, after: u64, max: usize) -> Vec<(u64, String)> {
+    /// Packet list lines after row `after`, at most `max`, and how many
+    /// rows before them are no longer kept.
+    pub(crate) fn rows_after(&self, after: u64, max: usize) -> (u64, Vec<(u64, String)>) {
         let inner = self.inner.lock();
+        let first = inner.rows.front().map_or(inner.next_row, |r| r.seq);
+        let missed = first.saturating_sub(after.saturating_add(1));
         let skip = inner.rows.partition_point(|r| r.seq <= after);
-        inner
+        let rows = inner
             .rows
             .iter()
             .skip(skip)
             .take(max)
             .map(|r| (r.seq, r.summary.clone()))
-            .collect()
+            .collect();
+        (missed, rows)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_limits(&self, rows: usize, bytes: usize) {
+        let mut inner = self.inner.lock();
+        inner.max_rows = rows;
+        inner.max_bytes = bytes;
     }
 
     /// The detail of row `seq`, if it is still kept.
@@ -403,6 +424,64 @@ mod tests {
     }
 
     #[test]
+    fn capture_reports_eviction_separately_from_sampling_without_renumbering() {
+        let (_graph, meter, watch, _subscription) = setup();
+        watch
+            .inner
+            .lock()
+            .guard
+            .as_ref()
+            .unwrap()
+            .tap
+            .set_limits(2, 1024);
+        for _ in 0..67 {
+            meter.sent(0, &crate::Packet(vec![0x45; 20]));
+        }
+        watch.pump();
+        let (missed, rows) = watch.rows_after(0, 10);
+        assert_eq!(missed, 0);
+        assert_eq!(rows.len(), 2);
+        for ((seq, row), (expected, skipped, evicted)) in rows.iter().zip([(1, 0, 64), (2, 1, 0)]) {
+            assert_eq!(*seq, expected);
+            assert!(row.starts_with(&format!(r#"{{"seq":{expected},"#)));
+            assert!(row.contains(&format!(r#""skipped":{skipped},"evicted":{evicted},"#)));
+            assert!(
+                watch
+                    .detail(*seq)
+                    .unwrap()
+                    .starts_with(&format!(r#"{{"seq":{seq},"#))
+            );
+        }
+        watch.pump();
+        assert_eq!(watch.rows_after(0, 10), (0, rows));
+    }
+
+    #[test]
+    fn capture_carries_eviction_from_an_empty_tap_once() {
+        let (_graph, meter, watch, _subscription) = setup();
+        watch
+            .inner
+            .lock()
+            .guard
+            .as_ref()
+            .unwrap()
+            .tap
+            .set_limits(2, 20);
+        for _ in 0..3 {
+            meter.sent(0, &crate::Packet(vec![0; 21]));
+        }
+        watch.pump();
+        watch.pump();
+        assert!(watch.rows_after(0, 10).1.is_empty());
+        capture(&meter, &watch);
+        capture(&meter, &watch);
+        let (_, rows) = watch.rows_after(0, 10);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].1.contains(r#""skipped":0,"evicted":3"#));
+        assert!(rows[1].1.contains(r#""skipped":0,"evicted":0"#));
+    }
+
+    #[test]
     fn quiet_capture_keeps_keys_after_world_ring_rotates() {
         let (graph, meter, watch, _subscription) = setup();
         graph.key(key(0));
@@ -429,7 +508,7 @@ mod tests {
         // Traffic resumes: the watch's bounded cache also evicts the old key.
         capture(&meter, &watch);
         assert_eq!(watch.inner.lock().keys.len(), MAX_KEYS);
-        assert_eq!(watch.rows_after(0, 10).len(), 2);
+        assert_eq!(watch.rows_after(0, 10).1.len(), 2);
         assert_eq!(exported_keys(&watch), current);
     }
 

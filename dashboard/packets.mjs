@@ -1,6 +1,6 @@
 // The packet drawer: its stream, queue, selection, detail and hex view.
 // The caller passes DOM helpers, graph links, labels and orientation, and a fit callback.
-export function createPackets({ $, el, packetStream, packet, getEdge, ends, nodeLabel, fmtCount, fit }) {
+export function createPackets({ $, el, packetStream, packet, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000 }) {
   // ---------------------------------------------------------------------------
   // The packet drawer
 
@@ -8,13 +8,13 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
   const prows = $('prows');
   const plist = $('plist');
   // What the drawer watches: { links: [{ id, flip }], source, paused, held,
-  // queue, skipped, rows }. A packet's side is turned to the drawn edge's:
+  // queue, lastTime, skipped, evicted, missed, rows }. A packet's side is turned to the drawn edge's:
   // 0 from its first end, 1 from its second.
   let packets = null;
   let selection = 0;
   let detailRequest = null;
   /// Rows the packet list keeps.
-  const MAX_ROWS = 3000;
+  const MAX_ROWS = maxRows;
   /// How long a merged packet view holds packets to put them in order.
   const MERGE_HOLD_MS = 400;
 
@@ -53,6 +53,7 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
     $('pcap').setAttribute('download', many ? 'fictionet-links.pcapng' : `fictionet-${list}.pcapng`);
     $('pause').textContent = 'Pause';
     $('sampled').hidden = true;
+    $('sampled').textContent = '';
     prows.replaceChildren();
     clearDetail(many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.');
     const flips = new Map(members.map((m) => [m.e.id, m.flip]));
@@ -61,25 +62,38 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
       invalidateSelection();
       // A new subscription replays retained history, possibly with restarted
       // sequence numbers. Replace its state before accepting any replay.
-      packets = { ...packets, rows: 0, held: [], queue: [], skipped: 0, open: members.length };
+      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length };
       prows.replaceChildren();
       addGap('Packet history reloaded after reconnect.');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
       clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
     });
-    packets = { flips, many, source, rows: 0, paused: false, held: [], queue: [], skipped: 0, open: members.length };
+    packets = { flips, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length };
     source.addEventListener('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
       p.link = p.link || list;
-      p.came = performance.now();
+      packets.lastTime.set(p.link, p.t);
       if (flips.get(p.link)) p.side = 1 - p.side;
-      // Only the last rows are ever shown, so only those are kept while the
-      // view is paused or the tab is hidden.
-      const q = packets.paused ? packets.held : packets.queue;
-      q.push(p);
-      if (q.length > MAX_ROWS * 2) q.splice(0, q.length - MAX_ROWS);
+      // Keep capture loss visible even if its row leaves the browser's queue.
+      if (p.evicted > 0) {
+        packets.evicted += p.evicted;
+        showCounts();
+      }
+      queueEntry(p);
+    });
+    source.addEventListener('packet_gap', (ev) => {
+      if (packets?.source !== source) return;
+      const gap = JSON.parse(ev.data);
+      packets.missed += gap.missed;
+      showCounts();
+      const link = gap.link || list;
+      // Equal times keep arrival order, so a gap follows this link's last row.
+      queueEntry({
+        t: packets.lastTime.get(link) ?? 0,
+        gap: `Packets ${gap.after + 1}–${gap.next - 1} of link ${link} are no longer kept (${fmtCount(gap.missed)} rows missed).`,
+      });
     });
     source.addEventListener('link_end', () => {
       if (packets?.source === source) packets.open--;
@@ -89,6 +103,15 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
       addGap(many ? 'Every one of these links has closed.' : 'The link closed: both of its ends are gone.');
     });
     fit();
+  }
+
+  function queueEntry(entry) {
+    entry.came = performance.now();
+    // Only the last rows are ever shown, so only those are kept while the
+    // view is paused or the tab is hidden. Gap notices share the same limit.
+    const q = packets.paused ? packets.held : packets.queue;
+    q.push(entry);
+    if (q.length > MAX_ROWS * 2) q.splice(0, q.length - MAX_ROWS);
   }
 
   function closePackets() {
@@ -125,6 +148,21 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
     el('td', { colspan: 8, text }, tr);
   }
 
+  function showCounts() {
+    const counts = [];
+    if (packets.skipped) counts.push(`Sampled: ${fmtCount(packets.skipped)} packets not copied`);
+    if (packets.evicted) counts.push(`Capture: ${fmtCount(packets.evicted)} copies evicted`);
+    if (packets.missed) counts.push(`Subscriber: ${fmtCount(packets.missed)} rows missed`);
+    $('sampled').hidden = !counts.length;
+    $('sampled').textContent = counts.join(' · ');
+    $('sampled').title = 'Sampling leaves packets uncopied. Capture eviction drops copies before decoding. Subscriber overruns lose decoded rows before delivery. Counts cover the loss reported by this history; expired rows may have carried more sampling or capture loss.';
+  }
+
+  function trimRows() {
+    let extra = prows.children.length - MAX_ROWS;
+    while (extra-- > 0) prows.firstChild.remove();
+  }
+
   /// Adds the packets that came since the last frame, in one change to the
   /// table, and keeps the newest in view unless the viewer scrolled up.
   function flushPackets() {
@@ -147,24 +185,24 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
     }
     const frag = document.createDocumentFragment();
     // A flood only ever shows its last rows.
-    for (const p of batch.slice(-MAX_ROWS)) addPacket(p, frag);
+    for (const p of batch.slice(-MAX_ROWS)) {
+      if (p.gap) addGap(p.gap, frag);
+      else addPacket(p, frag);
+    }
     prows.appendChild(frag);
-    let extra = prows.children.length - MAX_ROWS;
-    while (extra-- > 0) prows.firstChild.remove();
+    trimRows();
     if (nearBottom) plist.scrollTop = plist.scrollHeight;
   }
 
   function addPacket(p, parent) {
     if (p.skipped > 0) {
       packets.skipped += p.skipped;
-      $('sampled').hidden = false;
-      $('sampled').textContent = `Sampled: ${fmtCount(packets.skipped)} packets not copied`;
-      $('sampled').title = 'The link is busy, so the dashboard copies some of its packets, not all. The rows with a dashed line above them follow packets that were not copied.';
+      showCounts();
     }
     packets.rows++;
     // One link numbers its own packets; merged links are numbered here.
     const no = packets.many ? packets.rows : p.seq;
-    const tr = el('tr', { class: `${p.side === 1 ? 'back' : ''} ${p.skipped > 0 ? 'after-gap' : ''} ${p.tags.join(' ')}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
+    const tr = el('tr', { class: `${p.side === 1 ? 'back' : ''} ${p.skipped > 0 || p.evicted > 0 ? 'after-gap' : ''} ${p.tags.join(' ')}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
     const cells = [no, p.t.toFixed(4), '', p.src, p.dst, p.proto, p.len, p.info];
     cells.forEach((c, i) => {
       const td = el('td', { text: String(c) }, tr);
@@ -175,6 +213,7 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
       if (i === 5) td.className = 'proto';
     });
     tr.title = p.skipped > 0 ? `${p.info}\n(${p.skipped} packet${p.skipped === 1 ? '' : 's'} before this one not copied)` : p.info;
+    if (p.evicted > 0) tr.title += `\n(${p.evicted} captured ${p.evicted === 1 ? 'copy' : 'copies'} before this one evicted before decoding)`;
     tr.dataset.text = `${p.src} ${p.dst} ${p.proto} ${p.info}`.toLowerCase();
     filterRow(tr);
     tr.addEventListener('click', () => showPacket(p, tr));

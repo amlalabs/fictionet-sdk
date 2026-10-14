@@ -878,7 +878,7 @@ button.link:hover {
 .drawer-head .sampled {
   color: var(--accent-text);
   font-size: 12px;
-  white-space: nowrap;
+  white-space: normal;
 }
 .drawer-body {
   display: grid;

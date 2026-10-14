@@ -263,6 +263,8 @@ pub(crate) struct Tap {
 struct TapState {
     copies: VecDeque<Copy>,
     bytes: usize,
+    max_packets: usize,
+    max_bytes: usize,
     next_seq: u64,
     window_start: Instant,
     in_window: u64,
@@ -278,6 +280,8 @@ impl Tap {
             state: Mutex::new(TapState {
                 copies: VecDeque::new(),
                 bytes: 0,
+                max_packets: TAP_PACKETS,
+                max_bytes: TAP_BYTES,
                 next_seq: 1,
                 window_start: Instant::ZERO,
                 in_window: 0,
@@ -314,7 +318,7 @@ impl Tap {
             data: data.into(),
             skipped,
         });
-        while s.copies.len() > TAP_PACKETS || s.bytes > TAP_BYTES {
+        while s.copies.len() > s.max_packets || s.bytes > s.max_bytes {
             let Some(old) = s.copies.pop_front() else {
                 break;
             };
@@ -322,12 +326,24 @@ impl Tap {
         }
     }
 
-    /// Copies with a sequence number of `after + 1` or more, at most `max`.
-    pub(crate) fn since(&self, after: u64, max: usize) -> Vec<Copy> {
+    /// Copies after `after`, at most `max`, and how many copies before
+    /// them were evicted. An empty buffer can still report eviction.
+    pub(crate) fn since(&self, after: u64, max: usize) -> (u64, Vec<Copy>) {
         let s = self.state.lock();
-        let first = s.copies.front().map_or(0, |c| c.seq);
-        let skip = (after + 1).saturating_sub(first) as usize;
-        s.copies.iter().skip(skip).take(max).cloned().collect()
+        let first = s.copies.front().map_or(s.next_seq, |c| c.seq);
+        let missed = first.saturating_sub(after.saturating_add(1));
+        let skip = s.copies.partition_point(|c| c.seq <= after);
+        (
+            missed,
+            s.copies.iter().skip(skip).take(max).cloned().collect(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_limits(&self, packets: usize, bytes: usize) {
+        let mut s = self.state.lock();
+        s.max_packets = packets;
+        s.max_bytes = bytes;
     }
 }
 
@@ -782,13 +798,15 @@ mod tests {
             for _ in 0..66 {
                 meter.sent(0, &Packet(vec![1]));
             }
-            let before = guard.tap.since(0, 100);
+            let (missed, before) = guard.tap.since(0, 100);
+            assert_eq!(missed, 0);
             assert_eq!(before.len(), 65);
             assert!(before.iter().all(|copy| copy.at == Instant::ZERO));
             fcx.sleep(WINDOW).await?;
             assert_eq!(fcx.graph().since_start(), WINDOW);
             meter.sent(0, &Packet(vec![2]));
-            let after = guard.tap.since(65, 100);
+            let (missed, after) = guard.tap.since(65, 100);
+            assert_eq!(missed, 0);
             assert_eq!(after.len(), 1);
             assert_eq!(after[0].at.since_start(), WINDOW);
             assert_eq!(after[0].skipped, 1);
@@ -806,6 +824,54 @@ mod tests {
     }
 
     #[test]
+    fn tap_reports_eviction_at_both_limits_and_at_cursor_boundaries() {
+        for (packets, bytes) in [(2, TAP_BYTES), (TAP_PACKETS, 8)] {
+            let tap = Tap::new(Arc::new(crate::entropy::RunEnvironment::new(
+                crate::Seed::from_u64(0),
+                crate::RunMode::Lab,
+            )));
+            tap.set_limits(packets, bytes);
+            for _ in 0..4 {
+                tap.push(0, &[0; 4]);
+            }
+            let (missed, copies) = tap.since(0, 1);
+            assert_eq!(missed, 2);
+            assert_eq!(copies.len(), 1);
+            assert_eq!(copies[0].seq, 3);
+            assert_eq!(copies[0].skipped, 0);
+            assert_eq!(tap.since(1, 10).0, 1);
+            assert_eq!(tap.since(2, 10).0, 0);
+            let (missed, copies) = tap.since(3, 10);
+            assert_eq!(missed, 0);
+            assert_eq!(copies[0].seq, 4);
+            for after in [4, u64::MAX] {
+                let (missed, copies) = tap.since(after, 10);
+                assert_eq!(missed, 0);
+                assert!(copies.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn tap_reports_eviction_even_when_no_copy_fits() {
+        let tap = Tap::new(Arc::new(crate::entropy::RunEnvironment::new(
+            crate::Seed::from_u64(0),
+            crate::RunMode::Lab,
+        )));
+        tap.set_limits(2, 4);
+        assert_eq!(tap.since(0, 10).0, 0);
+        tap.push(0, &[0; 5]);
+        let (missed, copies) = tap.since(0, 10);
+        assert_eq!(missed, 1);
+        assert!(copies.is_empty());
+        assert_eq!(tap.since(1, 10).0, 0);
+        tap.push(0, &[0; 4]);
+        let (missed, copies) = tap.since(1, 10);
+        assert_eq!(missed, 0);
+        assert_eq!(copies[0].seq, 2);
+    }
+
+    #[test]
     fn a_tap_copies_only_while_watched_and_is_bounded() {
         let meter = Meter::new();
         meter.sent(0, &Packet(vec![1; 10]));
@@ -815,13 +881,14 @@ mod tests {
         )));
         meter.sent(1, &Packet(vec![2; 10]));
         meter.sent(0, &Packet(vec![3; 10]));
-        let copies = guard.tap.since(0, 100);
+        let (missed, copies) = guard.tap.since(0, 100);
+        assert_eq!(missed, 0);
         assert_eq!(copies.len(), 2);
         assert_eq!(
             (copies[0].seq, copies[0].side, copies[0].data[0]),
             (1, 1, 2)
         );
-        assert_eq!(guard.tap.since(1, 100).len(), 1);
+        assert_eq!(guard.tap.since(1, 100).1.len(), 1);
         assert_eq!(meter.totals(), [2, 20, 1, 10]);
         drop(guard);
         assert!(!meter.tapped.load(Ordering::Relaxed));
@@ -836,7 +903,8 @@ mod tests {
         for _ in 0..1000 {
             meter.sent(0, &Packet(vec![0; 4]));
         }
-        let copies = guard.tap.since(0, 10_000);
+        let (missed, copies) = guard.tap.since(0, 10_000);
+        assert_eq!(missed, 0);
         assert!(copies.len() < 200, "{} copies", copies.len());
         let skipped: u64 = copies.iter().map(|c| c.skipped).sum();
         assert!(

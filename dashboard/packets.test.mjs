@@ -28,9 +28,14 @@ class Element extends EventTarget {
     if (name.startsWith('data-')) this.dataset[name.slice(5)] = String(value);
   }
   appendChild(child) {
-    if (child.tag === 'fragment') this.children.push(...child.children);
-    else this.children.push(child);
+    if (child.tag === 'fragment') child.children.forEach((c) => this.appendChild(c));
+    else {
+      this.children.push(child);
+      if (typeof child !== 'string') child.parent = this;
+    }
   }
+  get firstChild() { return this.children[0]; }
+  remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); }
   append(...children) { children.forEach((child) => this.appendChild(child)); }
   replaceChildren(...children) {
     this.children = [];
@@ -45,7 +50,7 @@ class Element extends EventTarget {
   click() { this.dispatchEvent(new Event('click')); }
 }
 
-function setup(t, links = ['a']) {
+function setup(t, links = ['a'], maxRows = 3000) {
   const elements = new Map();
   const previousDocument = globalThis.document;
   t.after(() => {
@@ -81,7 +86,7 @@ function setup(t, links = ['a']) {
     EventSource,
     fetch: (url, { signal }) => new Promise((resolve, reject) => requests.push({ url, signal, resolve, reject })),
   });
-  const view = createPackets({ $, el, ...transport, fmtCount: String, fit() {} });
+  const view = createPackets({ $, el, ...transport, fmtCount: String, fit() {}, maxRows });
   const open = () => view.openLinks('From', 'To', links.map((id) => ({ e: { id }, flip: false })));
   open();
   const source = sources[0];
@@ -98,6 +103,115 @@ function setup(t, links = ['a']) {
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const detail = (seq) => ({ seq, len: 40, t: seq, layers: [], buffers: [{ name: 'packet', hex: '4142' }, { name: 'payload', hex: '43' }] });
+
+test('capture eviction and subscriber overruns stay distinct from sampling and row identity', async (t) => {
+  const h = setup(t);
+  h.source.emit('packet_gap', { after: 1, next: 5, missed: 3 });
+  h.send(5, { skipped: 2, evicted: 7 });
+  h.send(6, { skipped: 0, evicted: 0 });
+  h.flush();
+  assert.match($('prows').textContent, /Packets 2–4 of link a are no longer kept/);
+  assert.equal($('sampled').textContent, 'Sampled: 2 packets not copied · Capture: 7 copies evicted · Subscriber: 3 rows missed');
+  const [first, second] = h.rows();
+  assert.deepEqual(h.rows().map((r) => r.dataset.seq), ['5', '6']);
+  assert.equal(first.classList.contains('after-gap'), true);
+  assert.match(first.title, /2 packets before this one not copied/);
+  assert.match(first.title, /7 captured copies before this one evicted before decoding/);
+  assert.equal(second.classList.contains('after-gap'), false);
+  first.click();
+  assert.match(h.requests[0].url, /link=a&seq=5/);
+  h.requests[0].resolve({ ok: true, json: async () => detail(5) });
+  await settle();
+  assert.match($('tree').textContent, /Packet 5/);
+});
+
+test('merged loss names its link and leaves display and detail numbering intact', (t) => {
+  const h = setup(t, ['a', 'b']);
+  h.source.emit('packet_gap', { link: 'b', after: 0, next: 9, missed: 8 });
+  h.send(9, { link: 'b', t: 2, evicted: 3, skipped: 0 });
+  h.send(4, { link: 'a', t: 1, evicted: 2, skipped: 0 });
+  h.flush();
+  assert.match($('prows').textContent, /Packets 1–8 of link b/);
+  assert.deepEqual(h.rows().map((r) => [r.children[0].textContent, r.dataset.link, r.dataset.seq]), [['1', 'a', '4'], ['2', 'b', '9']]);
+  assert.equal($('sampled').textContent, 'Capture: 5 copies evicted · Subscriber: 8 rows missed');
+  for (const row of h.rows()) assert.equal(row.classList.contains('after-gap'), true);
+});
+
+for (const paused of [false, true]) {
+  test(`subscriber gaps follow earlier packets while ${paused ? 'paused' : 'waiting to render'}`, (t) => {
+    const h = setup(t);
+    h.send(1, { skipped: 0 }); // Queued before any pause.
+    if (paused) $('pause').click();
+    h.send(2, { skipped: 0 });
+    h.send(3, { skipped: 0 });
+    h.source.emit('packet_gap', { after: 3, next: 10, missed: 6 });
+    assert.equal($('sampled').textContent, 'Subscriber: 6 rows missed');
+    h.send(10, { skipped: 0 });
+    if (paused) $('pause').click();
+    h.flush();
+    assert.deepEqual($('prows').children.map((r) => r.dataset.seq), ['1', '2', '3', undefined, '10']);
+    assert.equal($('prows').children[3].classList.contains('gap'), true);
+  });
+}
+
+test('merged subscriber gaps follow earlier packets still held for ordering', (t) => {
+  const h = setup(t, ['a', 'b']);
+  h.send(1, { link: 'b', t: 2, skipped: 0 });
+  h.send(1, { link: 'a', t: 1, skipped: 0 });
+  h.view.flush(); // Both rows are still within the merge hold window.
+  h.source.emit('packet_gap', { link: 'b', after: 1, next: 5, missed: 3 });
+  assert.equal($('sampled').textContent, 'Subscriber: 3 rows missed');
+  h.send(5, { link: 'b', t: 3, skipped: 0 });
+  h.send(2, { link: 'a', t: 2, skipped: 0 });
+  h.view.flush();
+  h.flush();
+  assert.deepEqual($('prows').children.map((r) => r.classList.contains('gap') ? 'gap' : `${r.dataset.link}:${r.dataset.seq}`), ['a:1', 'b:1', 'gap', 'a:2', 'b:5']);
+  assert.deepEqual(h.rows().map((r) => r.children[0].textContent), ['1', '2', '3', '4']);
+});
+
+for (const paused of [false, true]) {
+  test(`loss survives small browser limits while ${paused ? 'paused' : 'waiting to render'}`, (t) => {
+    const h = setup(t, ['a'], 2);
+    if (paused) $('pause').click();
+    h.source.emit('packet_gap', { after: 0, next: 2, missed: 1 });
+    h.send(2, { evicted: 3, skipped: 0 });
+    for (let seq = 3; seq <= 8; seq++) h.send(seq, { skipped: 0 });
+    if (paused) $('pause').click();
+    h.flush();
+    assert.deepEqual(h.rows().map((r) => r.dataset.seq), ['7', '8']);
+    assert.equal($('prows').children.length, 2);
+    assert.equal($('sampled').textContent, 'Capture: 3 copies evicted · Subscriber: 1 rows missed');
+    // Gap notices are bounded even if no rows survive server retention.
+    for (let seq = 9; seq <= 12; seq++) {
+      h.source.emit('packet_gap', { after: seq - 1, next: seq + 1, missed: 1 });
+    }
+    h.flush();
+    assert.equal($('prows').children.length, 2);
+    assert.equal($('prows').children.every((r) => r.classList.contains('gap')), true);
+    assert.equal($('sampled').textContent, 'Capture: 3 copies evicted · Subscriber: 5 rows missed');
+  });
+}
+
+test('reconnect and reopen reset loss totals and ignore an old stream', (t) => {
+  const h = setup(t);
+  for (let reconnect = 0; reconnect < 3; reconnect++) {
+    h.source.emit('packet_gap', { after: 0, next: 3, missed: 2 });
+    h.send(3, { evicted: 4, skipped: 0 });
+    assert.equal($('sampled').textContent, 'Capture: 4 copies evicted · Subscriber: 2 rows missed');
+    h.source.emit('open');
+    h.flush();
+    assert.equal($('sampled').hidden, true);
+    assert.equal($('sampled').textContent, '');
+    assert.equal(h.rows().length, 0);
+  }
+  h.send(3, { evicted: 4 });
+  h.open();
+  h.source.emit('packet_gap', { after: 0, next: 3, missed: 2 });
+  h.send(4, { evicted: 8 });
+  assert.equal($('sampled').hidden, true);
+  assert.equal($('sampled').textContent, '');
+  assert.equal(h.rows().length, 0);
+});
 
 async function pending(request, stage) {
   let resolve, reject;

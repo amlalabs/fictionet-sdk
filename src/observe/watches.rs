@@ -243,7 +243,7 @@ mod tests {
         assert!(graph.watches.acquire(&graph, second.id).is_err());
         first.sent(0, &crate::Packet(vec![0x45; 20]));
         shared.pump();
-        assert_eq!(shared.rows_after(0, 10).len(), 1);
+        assert_eq!(shared.rows_after(0, 10).1.len(), 1);
         let weak = Arc::downgrade(&watch);
         drop((watch, shared, b));
         assert!(weak.upgrade().is_some(), "idle history lingers");
@@ -321,17 +321,17 @@ mod tests {
         graph.watches.reap_idle();
         meter.sent(0, &crate::Packet(vec![0x45; 20]));
         shared.pump();
-        assert_eq!(watch.rows_after(0, 10).len(), 1);
+        assert_eq!(watch.rows_after(0, 10).1.len(), 1);
 
         drop(second);
         meter.sent(0, &crate::Packet(vec![0x45; 20]));
         watch.pump();
-        assert_eq!(watch.rows_after(0, 10).len(), 1);
+        assert_eq!(watch.rows_after(0, 10).1.len(), 1);
         let (resumed, _subscription) = graph.watches.acquire(&graph, meter.id).unwrap();
         assert!(Arc::ptr_eq(&watch, &resumed));
         meter.sent(0, &crate::Packet(vec![0x45; 20]));
         resumed.pump();
-        assert_eq!(resumed.rows_after(0, 10).len(), 2);
+        assert_eq!(resumed.rows_after(0, 10).1.len(), 2);
     }
 
     #[test]
@@ -355,7 +355,7 @@ mod tests {
         assert!(graph.watches.existing(active.id).is_none());
         assert!(idle_watch.upgrade().is_none());
         watch.pump();
-        assert_eq!(watch.rows_after(0, 10).len(), 1);
+        assert_eq!(watch.rows_after(0, 10).1.len(), 1);
         let active_watch = Arc::downgrade(&watch);
         drop(watch);
         assert!(active_watch.upgrade().is_some());
@@ -416,12 +416,12 @@ mod tests {
         let (w, sub) = graph.watches.acquire(&graph, meter.id).unwrap();
         meter.sent(0, &crate::Packet(vec![0x45; 20]));
         w.pump();
-        assert_eq!(w.rows_after(0, 10).len(), 1);
+        assert_eq!(w.rows_after(0, 10).1.len(), 1);
         drop(sub);
         meter.sent(0, &crate::Packet(vec![0x45; 20]));
         w.pump();
         assert_eq!(
-            w.rows_after(0, 10).len(),
+            w.rows_after(0, 10).1.len(),
             1,
             "nothing is copied with no subscriber"
         );

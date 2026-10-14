@@ -555,6 +555,7 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
         "{packet}"
     );
     let seq = number_after(&packet, "seq");
+    assert_eq!(number_after(&packet, "evicted"), 0);
 
     // Its layers and bytes.
     client

@@ -610,6 +610,7 @@ fn the_dashboard_merges_the_packets_of_several_links() {
             && data.contains(r#""seq":"#)
         {
             packets += 1;
+            assert!(data.contains(r#""evicted":0"#), "{data}");
             let link = data
                 .split(r#""link":""#)
                 .nth(1)

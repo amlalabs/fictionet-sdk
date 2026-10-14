@@ -65,7 +65,7 @@
 //! Only the current selection can fill them. Closing or reopening the drawer
 //! cancels pending detail requests. Failed requests leave no old bytes visible.
 //! If the packet stream reconnects, the list reloads retained history. It
-//! clears old rows, pending packets, sampling totals and the selected detail.
+//! clears old rows, pending packets, sampling and loss totals, and the selected detail.
 //! A paused list stays paused and holds the replay until resumed.
 //!
 //! The dashboard is a separate program from the world. `fictionet
@@ -230,10 +230,16 @@
 //! Past that it copies one packet in two, then one in four, and so on, so a
 //! busy link costs at most about 130 copies every 100 ms, or 1,300 a
 //! second, however many packets cross it. The dashboard marks where
-//! packets were skipped. A watched link keeps its
+//! packets were skipped. The tap keeps up to 4,096 copies and 8 MiB before
+//! decoding. If it fills, it evicts older copies. The dashboard reports this
+//! capture loss separately from sampling. A watched link keeps its
 //! latest 4,096 decoded packets, up to 32 MiB, and keeps them for up to a minute
 //! after the last observer stops watching it, for the detail pane and the
 //! capture download. Admission pressure can evict idle history sooner.
+//! A subscriber that falls behind this history gets a `packet_gap` event
+//! counting the rows it missed. The drawer shows that loss separately too.
+//! Loss totals reset when the drawer reloads history. They count only reports
+//! received in that history; evicted rows can have carried earlier loss reports.
 //!
 //! Each copy is decoded the way Wireshark decodes it. Packets on a link are
 //! IPv4 or IPv6 with no Ethernet header. The decoder reads IP, TCP, UDP and
@@ -504,15 +510,35 @@
 //! Each `packet` event of a `packets` stream is one line of the list:
 //!
 //! ```text
-//! {"seq":12401,"t":95.838490,"side":0,"len":85,"skipped":0,"src":"10.0.0.1:53",
+//! {"seq":12401,"t":95.838490,"side":0,"len":85,"skipped":0,"evicted":0,"src":"10.0.0.1:53",
 //!  "dst":"10.0.0.2:47583","proto":"DNS",
 //!  "info":"Standard query response 0x8d89 A example.test A 203.0.113.10","tags":[]}
 //! ```
 //!
 //! `side` is 0 for a packet sent by the edge's `a`, 1 for one sent by `b`.
-//! `skipped` counts the packets before this one that were not copied.
+//! `skipped` counts packets omitted by sampling since the previous tap copy.
+//! `evicted` counts copies lost from the tap before this row was decoded,
+//! since the previous decoded row. These are separate counts. If the tap
+//! loses every copy, the next decoded row carries the loss. Sampling counts
+//! carried by evicted copies are unavailable. Row numbers still count decoded
+//! rows from 1; capture loss does not leave holes in those numbers.
 //! `tags` can hold `decrypted`, `retransmission`, `reset`, `fragment`,
 //! `gap`, `malformed` and `dns-error`.
+//!
+//! If a subscriber's cursor predates retained rows, the stream sends this
+//! event before the remaining rows:
+//!
+//! ```text
+//! {"event":"packet_gap","data":{"after":7,"next":12,"missed":4}}
+//! ```
+//!
+//! Rows after `after` and before `next` are no longer kept. `missed` is their
+//! count. `next` is the first retained row, or the next row number to be
+//! assigned if none remain. The cursor advances past the gap even when no
+//! rows remain, so a gap is reported once per subscription. This also applies
+//! to an initial `after:0` request when older history has expired. It counts
+//! decoded rows, not tap copies or sampled packets. Merged dashboard streams
+//! add `link` to the gap data, as they do for packet data.
 //!
 //! `packet` gives one packet's `layers` and `buffers`. Each layer has a
 //! `name`, a `summary`, and `fields`, each with a `name` and `value`. A
@@ -660,7 +686,8 @@ mod tests {
             packet.extend_from_slice(&[0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1]);
             meter.sent(0, &crate::Packet(packet));
             watch.pump();
-            let rows = watch.rows_after(0, 10);
+            let (missed, rows) = watch.rows_after(0, 10);
+            assert_eq!(missed, 0);
             assert_eq!(rows.len(), 1);
             assert!(rows[0].1.contains(r#""proto":"Modbus/TCP""#));
             let detail = watch.detail(rows[0].0).unwrap();
