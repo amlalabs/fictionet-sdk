@@ -7,12 +7,15 @@ run inside a *world*: a Rust program you write, which decides what every name
 resolves to, which sites exist, what they serve, and how packets are routed,
 delayed and dropped.
 
-The world sees every DNS query, TLS handshake and HTTP request the agent makes. It
-can log each one in its own process, outside the sandbox, where the agent can't
-read or change the log. Nothing leaves. In each setup the docs describe, the
-sandbox's only way out leads into the world. A name or address the world does not
-serve fails, as it would on a network cut off from the internet. The world can
-still forward a site to a real server on purpose.
+When the harness makes the world the sandbox's only network path, the world sees
+every DNS query, TLS handshake and HTTP request the agent makes. It can log each
+one in its own process, outside the sandbox. The harness must keep the world's
+socket, files and processes out of the agent's reach so it cannot read or change
+the log. Fictionet supplies the network; the harness supplies the rest of the
+sandbox and prevents the agent from changing or escaping that boundary. Within
+that boundary, a name or address the world does not serve fails, as it would on a
+network cut off from the internet. The world can still forward a site to a real
+server on purpose. See [the security model](SECURITY.md).
 
 ## Who it is for
 
@@ -25,9 +28,10 @@ the network. The examples in this repository ask questions like these:
 * What does it make of a subnet full of hosts when it runs `nmap`
   ([scan](examples/scan))?
 
-A world gives each run the same sites, with no live pages that change, no real
-accounts and no way out. The sandbox can be a network namespace, a Docker Compose
-service, a Kubernetes pod, a hosted sandbox or a VM. An
+A world can give each run the same sites, with no live pages that change and no
+real accounts. Keeping the agent inside it depends on the harness's sandbox boundary.
+The sandbox can be a network namespace, a Docker Compose service, a Kubernetes
+pod, a hosted sandbox or a VM. An
 [Inspect](https://inspect.aisi.org.uk/) eval can use a world as its sandbox with
 one call.
 
@@ -84,6 +88,14 @@ for upstream HTTP requests. See the [feature table](src/lib.rs)
 for the feature relationships. The crate still links Rust's standard library.
 
 ## Quick start
+
+This is a **trusted connectivity demonstration**. A network namespace isolates
+networking only. The `sudo ip netns exec` commands below run as root and share
+the host's filesystem, users and processes. Root can leave the namespace. Do not
+use this recipe as a sandbox for an untrusted agent. See
+[the boundary explanation](src/getting_started.rs) and
+[the attachment guide](src/attaching.rs) for the harness's responsibilities and
+deployment options using containers or VMs.
 
 You need Linux, Rust 1.91 or later, `sudo`, `ip` (iproute2) and `curl`. These
 commands run the `web_world` example and attach a network namespace named `agent`
