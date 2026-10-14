@@ -154,9 +154,10 @@ jobs:
       - name: Artifactory's eval
         working-directory: examples/artifactory
         run: uv run --locked pytest
+      - uses: azure/setup-helm@v4.3.0
       - name: The Inspect package
         working-directory: python/inspect_fictionet
-        run: uv run --locked --extra k8s pytest
+        run: uv run --locked --extra k8s --no-editable --reinstall-package inspect-fictionet pytest
       - name: Inspect Kubernetes scorer regressions
         run: uv run --project python/inspect_fictionet --locked --extra k8s python -m unittest discover -s tests/k8s -p 'test_*.py'
       # From the crate root, so rust-toolchain.toml there, not fuzz/'s
