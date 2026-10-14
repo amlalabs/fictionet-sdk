@@ -383,6 +383,22 @@ mod tests {
     }
 
     #[test]
+    fn http_trailers_preserve_the_next_response_in_capture() {
+        for trailers in ["", "X-Test: yes\r\n", "X-Test: yes\r\nX-Other: two\r\n"] {
+            let bytes = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n{trailers}\r\nHTTP/1.1 204 No Content\r\n\r\n"
+            );
+            for chunk in [1, bytes.len()] {
+                let mut f = Feeder::new((40000, 80));
+                f.send(false, b"GET / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n", 1500);
+                let d = f.send(true, bytes.as_bytes(), chunk);
+                assert_eq!(d.proto, "HTTP");
+                assert!(d.info.ends_with("HTTP/1.1 204 No Content"), "{}", d.info);
+            }
+        }
+    }
+
+    #[test]
     fn modbus_requests_and_responses() {
         // Port 40000 sorts first, so direction 0 (false) is the client's.
         let mut f = Feeder::new((40000, 502));

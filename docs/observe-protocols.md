@@ -44,8 +44,12 @@ plaintext selection in both directions, as in the outer conversation.
 Selection is not retried at each record. User replacements apply inside TLS
 too. HTTP/1 capture reads each head with `stdlib::http1`'s lenient reader
 (`RequestHead::parse_lenient`), which checks syntax but not the framing
-rules an endpoint applies, and frames bodies itself. Framing for DNS, DHCP,
-Modbus, HTTP/1, HTTP/2, and TLS uses `Stream` and `Present`.
+rules an endpoint applies, and frames bodies itself. Chunked bodies end after
+the empty line that terminates all trailers. Trailer bytes do not enter the
+body preview, and the next message starts after that empty line. Incomplete
+trailer sections retain incremental scan progress within the capture buffer
+limit. Framing for DNS, DHCP, Modbus, HTTP/1, HTTP/2, and TLS uses `Stream`
+and `Present`.
 
 These files can be copied into another crate and edited:
 

@@ -302,6 +302,9 @@ impl Present for Dhcp {
 
 /// HTTP/1 capture parser. It shares a bounded request-method queue with
 /// the other direction so HEAD and CONNECT responses retain their framing.
+/// Chunked bodies finish after the empty line ending the complete trailer
+/// section. Trailers are scanned incrementally within the capture buffer
+/// limit and are not included in body previews.
 #[derive(Default)]
 pub struct Http1 {
     state: Http1State,
@@ -417,7 +420,7 @@ impl Decode for Http1 {
                 head.len(),
             ));
         }
-        // Cache both line boundaries. Size and trailer lines are scanned
+        // Cache each line boundary. Size and trailer lines are scanned
         // once even when every byte arrives in its own segment.
         if matches!(self.state, Http1State::Chunked { left: 0, .. }) {
             if self.final_chunk.is_none() {
@@ -446,7 +449,7 @@ impl Decode for Http1 {
                     return Ok(Step::Skip(used));
                 }
             }
-            if let Some(used) = self.final_chunk {
+            while let Some(used) = self.final_chunk {
                 let after = input.get(used..).unwrap_or_default();
                 let Some(rest) = self.find(after, b"\r\n") else {
                     if input.len() >= self.capacity() {
@@ -455,13 +458,15 @@ impl Decode for Http1 {
                     }
                     return Ok(Step::Need);
                 };
+                let end = used.saturating_add(rest).saturating_add(2);
+                if rest != 0 {
+                    self.final_chunk = Some(end);
+                    continue;
+                }
                 self.final_chunk = None;
                 let state = std::mem::take(&mut self.state);
                 if let Http1State::Chunked { total, seen, .. } = state {
-                    return Ok(Step::Item(
-                        body_item(total, &seen),
-                        used.saturating_add(rest).saturating_add(2),
-                    ));
+                    return Ok(Step::Item(body_item(total, &seen), end));
                 }
             }
         }
@@ -1122,6 +1127,104 @@ mod tests {
     }
 
     #[test]
+    fn http_trailers_preserve_pipelined_responses_at_every_split() {
+        for trailers in [
+            "",
+            "X-Test: yes\r\n",
+            "X-Test: yes\r\nX-Other: two\r\nX-End: three\r\n",
+        ] {
+            for body in ["", "1\r\nx\r\n"] {
+                let first = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}0\r\n{trailers}\r\n"
+                );
+                let next = "HTTP/1.1 204 No Content\r\n\r\n";
+                let head = "HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n";
+                let bytes = format!("{first}{next}{head}{next}");
+                for split in 0..=bytes.len() + 1 {
+                    let [request, response] = Http1::pair();
+                    let methods = Arc::clone(&response.methods);
+                    let mut request = Stream::new(request);
+                    let requests = b"GET / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\nHEAD / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n";
+                    assert_eq!(request.push(requests), requests.len());
+                    for _ in 0..4 {
+                        request.next().unwrap().unwrap();
+                    }
+                    assert!(request.next().is_none());
+                    let mut response = Stream::new(response);
+                    let pieces = if split > bytes.len() {
+                        bytes.as_bytes().chunks(1).collect::<Vec<_>>()
+                    } else {
+                        vec![&bytes.as_bytes()[..split], &bytes.as_bytes()[split..]]
+                    };
+                    let mut items = Vec::new();
+                    for piece in pieces {
+                        assert_eq!(response.push(piece), piece.len());
+                        while let Some(item) = response.next_span() {
+                            items.push(item.unwrap());
+                        }
+                    }
+                    assert_eq!(items.len(), 5, "trailers={trailers:?}, split={split}");
+                    let summaries: Vec<_> = items.iter().map(|(item, _)| item.summary()).collect();
+                    assert_eq!(
+                        summaries,
+                        [
+                            "HTTP/1.1 200 OK",
+                            if body.is_empty() {
+                                "0 bytes"
+                            } else {
+                                "1 bytes"
+                            },
+                            "HTTP/1.1 204 No Content",
+                            "HTTP/1.1 200 OK",
+                            "HTTP/1.1 204 No Content",
+                        ]
+                    );
+                    let preview = &items[1].0.layer.as_ref().unwrap().fields[0];
+                    assert_eq!(preview.name, "Text");
+                    assert_eq!(preview.value, if body.is_empty() { "" } else { "x" });
+                    assert_eq!(items[1].1.end, first.len() as u64);
+                    assert_eq!(
+                        items[2].1,
+                        first.len() as u64..(first.len() + next.len()) as u64
+                    );
+                    assert_eq!(response.offset(), bytes.len() as u64);
+                    assert!(methods.lock().0.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn http_truncated_trailers_do_not_complete_the_body() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let ending = b"0\r\nX-Test: yes\r\nX-Other: two\r\n\r\n";
+        for end in 0..ending.len() {
+            let mut http = Http1::default();
+            assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
+            for n in 0..=end {
+                assert!(matches!(http.decode(&ending[..n], false), Ok(Step::Need)));
+            }
+            assert!(matches!(http.decode(&ending[..end], true), Ok(Step::Need)));
+            assert!(matches!(http.state, Http1State::Chunked { .. }));
+        }
+    }
+
+    #[test]
+    fn http_unterminated_trailers_keep_the_buffer_bound() {
+        let mut http = Http1::default();
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
+        let mut bytes = b"0\r\nX-Test: ".to_vec();
+        bytes.resize(http.capacity() - 1, b'x');
+        assert!(matches!(http.decode(&bytes, false), Ok(Step::Need)));
+        bytes.push(b'x');
+        assert!(matches!(http.decode(&bytes, false), Ok(Step::Skip(n)) if n == bytes.len()));
+        assert!(matches!(http.state, Http1State::Head));
+        assert_eq!(http.scanned, 0);
+        assert_eq!(http.final_chunk, None);
+    }
+
+    #[test]
     fn http_size_and_trailer_scans_resume_without_rescanning() {
         let mut http = Http1 {
             state: Http1State::Chunked {
@@ -1132,11 +1235,18 @@ mod tests {
             ..Http1::default()
         };
         let mut bytes = b"0\r\n".to_vec();
-        for _ in 0..1000 {
-            bytes.push(b'x');
+        for _ in 0..3 {
+            let start = bytes.len();
+            for _ in 0..1000 {
+                bytes.push(b'x');
+                assert!(matches!(http.decode(&bytes, false), Ok(Step::Need)));
+                assert_eq!(http.final_chunk, Some(start));
+                assert_eq!(http.scanned, bytes.len() - start);
+            }
+            bytes.extend_from_slice(b"\r\n");
             assert!(matches!(http.decode(&bytes, false), Ok(Step::Need)));
-            assert_eq!(http.final_chunk, Some(3));
-            assert_eq!(http.scanned, bytes.len() - 3);
+            assert_eq!(http.final_chunk, Some(bytes.len()));
+            assert_eq!(http.scanned, 0);
         }
         bytes.extend_from_slice(b"\r\n");
         assert!(matches!(http.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len()));
