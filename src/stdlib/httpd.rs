@@ -14,7 +14,8 @@
 //!   and an `http::Request<Bytes>`, and returns an `http::Response<Bytes>`.
 //!   No runtime is involved, so it unit-tests with
 //!   [`serve::Harness`]. An async route gets
-//!   a [`Cx`] instead.
+//!   a [`Cx`] instead. Callbacks run only with bodies held in full;
+//!   incomplete bodies get `400 Bad Request`.
 //! - [`tower`]: any `tower_service::Service<http::Request<Body>>`, such as an
 //!   `axum::Router`, run as deferred work of the connection.
 //! - [`VirtualHosts`]: picks a handler by the request's host, as a web server
@@ -150,9 +151,13 @@ type Boxed = Pin<Box<dyn http_body::Body<Data = Bytes, Error = Error> + Send>>;
 /// The body of every request a handler gets and every response it
 /// returns: bytes known in full, or a stream of them.
 ///
-/// A request's body is always whole: the service reads it before calling
-/// the handler. A response's body may stream, as a tower service's does;
-/// one whose length is known goes out with `content-length`.
+/// The service reads a request's body before calling the handler. On
+/// native HTTP/1, a cut-off body reaches a custom [`Handler`] or tower
+/// service as a stream of the bytes received, followed by an error.
+/// [`Router`] rejects it. HTTP/2 and hyper's HTTP/1 upgrade path reject
+/// body collection errors before calling any handler.
+/// A response's body may stream, as a tower service's does; one whose
+/// length is known goes out with `content-length`.
 pub struct Body(Inner);
 
 enum Inner {
@@ -427,6 +432,11 @@ enum Route {
 /// first route added that matches wins. A path that no route has gets the
 /// fallback, `404 Not Found` unless set; a path some route has, with
 /// another method, gets `405 Method Not Allowed`.
+///
+/// Callbacks receive only bodies held in full, including valid empty
+/// bodies. Any other body gets `400 Bad Request` before route selection.
+/// To inspect partial HTTP/1 bodies as a stream ending in an error, use a
+/// custom [`Handler`] or [`tower`] service. See [`Body`].
 #[derive(Clone, Default)]
 pub struct Router {
     routes: Vec<(Option<Method>, String, Route)>,
@@ -518,7 +528,10 @@ impl Router {
 impl Handler for Router {
     fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
         let (parts, body) = request.into_parts();
-        let request = Request::from_parts(parts, body.bytes().unwrap_or_default());
+        let Some(body) = body.bytes() else {
+            return Reply::Now(status_only(StatusCode::BAD_REQUEST));
+        };
+        let request = Request::from_parts(parts, body);
         let route = match self.find(request.method(), request.uri().path()) {
             Ok(route) => route.clone(),
             Err(known) => {

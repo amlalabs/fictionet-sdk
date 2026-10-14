@@ -578,7 +578,7 @@ fn http1_answers_bytes_that_are_not_http_with_400_and_an_error_event() {
 }
 
 #[test]
-fn http1_sends_100_continue_and_a_cut_off_body_still_reaches_the_handler() {
+fn http1_sends_100_continue_and_rejects_a_cut_off_body_before_the_router_callback() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let keep = seen.clone();
     let router = Router::new().post("/u", move |_, r: http::Request<Bytes>| {
@@ -591,13 +591,115 @@ fn http1_sends_100_continue_and_a_cut_off_body_still_reaches_the_handler() {
     assert!(http_text(&h).starts_with("HTTP/1.1 100 Continue\r\n\r\n"));
     h.push(b"ok").unwrap();
     assert_eq!(*seen.lock().unwrap(), [2]);
-    // A body cut off by the end of input: the handler still runs. The
-    // router reads a body that ended early as empty; a tower handler reads
-    // it frame by frame and sees what came, then the error.
+    // A body cut off by the end of input never reaches the byte callback.
     h.push(b"POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc")
         .unwrap();
     let _ = h.end();
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(*seen.lock().unwrap(), [2]);
+    assert!(http_text(&h).contains("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(h.closed());
+}
+
+#[test]
+fn http1_router_rejects_incomplete_bodies_before_route_selection() {
+    let router = Router::new()
+        .post("/u", |_, _| {
+            panic!("incomplete body reached a byte callback")
+        })
+        .route_async(Some(http::Method::POST), "/async", |_, _| async {
+            panic!("incomplete body reached an async byte callback")
+        });
+    for router in [
+        router.clone(),
+        router.fallback(|_, _| panic!("incomplete body reached the fallback")),
+    ] {
+        for target in ["POST /u", "POST /async", "POST /missing", "GET /u"] {
+            for body in [
+                "Content-Length: 10\r\n\r\nabc",
+                "Content-Length: 10\r\n\r\n",
+                "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+                "Transfer-Encoding: chunked\r\n\r\nz\r\n",
+            ] {
+                let mut h =
+                    Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
+                let request = format!("{target} HTTP/1.1\r\nHost: a\r\n{body}");
+                let _ = h.push(request.as_bytes());
+                let _ = h.end();
+                assert!(
+                    http_text(&h).starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                    "{request:?}: {}",
+                    http_text(&h)
+                );
+                assert_eq!(h.pending(), (0, 0));
+                assert!(h.closed());
+            }
+        }
+    }
+}
+
+#[test]
+fn http1_router_accepts_valid_empty_post_bodies() {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let keep = seen.clone();
+    let router = Router::new().post("/u", move |_, request| {
+        assert!(request.body().is_empty());
+        keep.fetch_add(1, Ordering::Relaxed);
+        http::Response::new(Bytes::new())
+    });
+    for body in [
+        "\r\n",
+        "Content-Length: 0\r\n\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    ] {
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
+        h.push(format!("POST /u HTTP/1.1\r\nHost: a\r\n{body}").as_bytes())
+            .unwrap();
+        assert!(http_text(&h).starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+    assert_eq!(seen.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn http1_custom_handler_receives_partial_body_then_error() {
+    use http_body::Body as _;
+
+    struct Partial(Arc<AtomicUsize>);
+    impl httpd::Handler for Partial {
+        fn call(
+            &self,
+            request: http::Request<httpd::Body>,
+            _: &mut httpd::Exchange<'_>,
+        ) -> httpd::Reply {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            let mut body = request.into_body();
+            assert!(body.bytes().is_none());
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+                panic!("missing partial body");
+            };
+            assert_eq!(frame.into_data().unwrap(), b"abc"[..]);
+            let Poll::Ready(Some(Err(error))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+                panic!("missing body error");
+            };
+            assert_eq!(error.to_string(), "the request body was cut off");
+            assert!(matches!(
+                Pin::new(&mut body).poll_frame(&mut cx),
+                Poll::Ready(None)
+            ));
+            httpd::Reply::Now(http::Response::new(httpd::Body::empty()))
+        }
+    }
+    let seen = Arc::new(AtomicUsize::new(0));
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::new(Partial(seen.clone())),
+        (),
+    );
+    h.push(b"POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc")
+        .unwrap();
+    let _ = h.end();
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+    assert!(http_text(&h).starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(h.closed());
 }
 

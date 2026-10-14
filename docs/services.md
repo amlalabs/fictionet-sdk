@@ -298,6 +298,14 @@ let api = Router::new()
     .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
 ```
 
+`Router` calls byte callbacks only with bodies held in full. An incomplete
+body gets `400 Bad Request` before routing, so it never reaches a route or
+the fallback, and never gets the usual `404` or `405`. A valid empty body
+still reaches the callback. On native HTTP/1, a custom `httpd::Handler` or tower service
+can read a cut-off body frame by frame: it gets the bytes received, then
+an error. HTTP/2 and hyper's HTTP/1 upgrade path reject body collection
+errors before calling any handler.
+
 An axum `Router`, or any tower service over `http::Request<web::Body>`,
 runs with `httpd::tower(service)`. A handler adds facts to its request's
 event by putting `events::Fields` in its response's extensions.
