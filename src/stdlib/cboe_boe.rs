@@ -2648,7 +2648,8 @@ pub struct ExchangeConfig {
     /// past it is rejected with reason "o".
     pub max_orders: usize,
     /// The most executions remembered for [`Exchange::bust`], 1 to
-    /// [`MAX_EXECUTIONS`]. The oldest are forgotten.
+    /// [`MAX_EXECUTIONS`]. Each retains its negotiated return fields.
+    /// The oldest are forgotten.
     pub max_executions: usize,
     /// The first OrderID assigned.
     pub first_order_id: u64,
@@ -2722,7 +2723,7 @@ pub enum OrderEvent {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Execution {
     exec_id: u64,
     cl_ord_id: ClOrdId,
@@ -2735,6 +2736,9 @@ struct Execution {
     time: u64,
     clearing_firm: Text<4>,
     clearing_account: Text<4>,
+    /// Trade Cancel or Correct fields saved after the fill. ReturnTable
+    /// bounds the count and size of the values.
+    fields: Optional<ReturnTable>,
 }
 
 /// What a return field is filled from.
@@ -2770,7 +2774,9 @@ struct Context<'a> {
 /// orders matching its ClearingFirm, Symbol or RiskGroupIDs, acknowledged
 /// as its MassCancelInst asks ("Purge Orders"). Every reply carries the
 /// return fields the member's login asked for, filled from the order, or
-/// zero where nothing applies.
+/// zero where nothing applies. Trade busts use fields saved immediately
+/// after the original execution, independent of later order changes or
+/// ClOrdID reuse.
 ///
 /// Orders are bounded by [`ExchangeConfig::max_orders`] and remembered
 /// executions by [`ExchangeConfig::max_executions`]. An `Err` leaves the
@@ -3034,7 +3040,8 @@ impl Exchange {
 
     /// Executes `shares` of a live order at `price` with a
     /// BaseLiquidityIndicator, and returns the Order Execution with a new
-    /// ExecID. The order is done when no shares are left.
+    /// ExecID. The order is done when no shares are left. Saves the
+    /// negotiated Trade Cancel or Correct fields for [`bust`](Self::bust).
     pub fn execute(
         &mut self,
         cl_ord_id: ClOrdId,
@@ -3058,6 +3065,13 @@ impl Exchange {
             Some(Opt::ClearingFirm(t) | Opt::ClearingAccount(t)) => *t,
             _ => Text::default(),
         };
+        let fcx = Context {
+            order: Some(&after),
+            last_shares: shares,
+            last_px: price,
+            liquidity,
+            mass_cancel_id: None,
+        };
         let execution = Execution {
             exec_id,
             cl_ord_id,
@@ -3070,6 +3084,7 @@ impl Exchange {
             time: now,
             clearing_firm: text4(FieldId::ClearingFirm),
             clearing_account: text4(FieldId::ClearingAccount),
+            fields: self.returns(TradeCancelOrCorrect::KIND, fcx),
         };
         let reply = OrderExecution {
             header: Header {
@@ -3086,16 +3101,7 @@ impl Exchange {
             sub_liquidity_indicator: 0,
             contra_broker: Text::default(),
             reserved_internal: 0,
-            fields: self.returns(
-                OrderExecution::KIND,
-                Context {
-                    order: Some(&after),
-                    last_shares: shares,
-                    last_px: price,
-                    liquidity,
-                    mass_cancel_id: None,
-                },
-            ),
+            fields: self.returns(OrderExecution::KIND, fcx),
         };
         self.next_exec_id = next;
         if after.leaves_qty == 0 {
@@ -3161,13 +3167,14 @@ impl Exchange {
     }
     /// Cancels (`corrected` 0) or corrects a remembered execution, and
     /// returns the Trade Cancel or Correct. The order's shares are not
-    /// restored, as a bust does not reopen an order.
+    /// restored, as a bust does not reopen an order. Return fields describe
+    /// the order immediately after that execution: LeavesQty is the
+    /// quantity left then, even after later fills, modifies or cancels.
     pub fn bust(&mut self, exec_id: u64, corrected: Price, now: u64) -> Result<Outbound, Error> {
         let e = self
             .executions
             .remove(&exec_id)
             .ok_or(Error::UnknownExecution(exec_id))?;
-        let order = self.orders.get(&e.cl_ord_id);
         Ok(TradeCancelOrCorrect {
             header: Header {
                 unit: e.unit,
@@ -3186,16 +3193,7 @@ impl Exchange {
             corrected_price: corrected,
             orig_time: e.time,
             reserved_internal: 0,
-            fields: self.returns(
-                TradeCancelOrCorrect::KIND,
-                Context {
-                    order,
-                    last_shares: e.shares,
-                    last_px: e.price,
-                    liquidity: e.liquidity,
-                    mass_cancel_id: None,
-                },
-            ),
+            fields: e.fields,
         }
         .into())
     }
@@ -4760,11 +4758,178 @@ mod tests {
         assert_eq!(x.orders().count(), 0);
     }
 
+    fn historical_fields(leaves_qty: u32) -> Optional<ReturnTable> {
+        returns(vec![
+            Opt::Side(b'1'),
+            Opt::Price(Price(100_000)),
+            Opt::ExecInst(0),
+            Opt::OrdType(b'2'),
+            Opt::Symbol(text("ZVZZT")),
+            Opt::Capacity(b'A'),
+            Opt::Account(Text::default()),
+            Opt::ClearingFirm(text("FIRM")),
+            Opt::MaxFloor(0),
+            Opt::OrderQty(300),
+            Opt::OrigClOrdId(Text::default()),
+            Opt::LeavesQty(leaves_qty),
+            Opt::LastShares(300 - leaves_qty),
+            Opt::LastPx(Price(99_000)),
+            Opt::DisplayPrice(Price(100_000)),
+            Opt::WorkingPrice(Price(100_000)),
+            Opt::BaseLiquidityIndicator(b'A'),
+            Opt::StopPx(Price(0)),
+        ])
+    }
+
+    #[test]
+    fn exchange_busts_keep_completed_and_cancelled_order_fields() {
+        for completed in [false, true] {
+            for reused in [false, true] {
+                let fields = historical_fields(if completed { 0 } else { 200 });
+                let mut x = Exchange::new(
+                    ExchangeConfig::default(),
+                    BTreeMap::from([(TradeCancelOrCorrect::KIND, fields.bitfields())]),
+                )
+                .unwrap();
+                let id = text("A1");
+                x.receive(&good("A1", 300), 1);
+                x.accept(id, 2, 2).unwrap();
+                let shares = if completed { 300 } else { 100 };
+                x.execute(id, shares, Price(99_000), b'A', 3).unwrap();
+                if !completed {
+                    x.cancel(id, codes::reason::USER_REQUESTED, 4).unwrap();
+                }
+                assert!(x.order(id).is_none());
+                if reused {
+                    x.receive(
+                        &new_order(
+                            "A1",
+                            500,
+                            vec![
+                                Opt::Symbol(text("OTHER")),
+                                Opt::Capacity(b'P'),
+                                Opt::Price(Price(200_000)),
+                                Opt::Account(text("NEW")),
+                                Opt::ClearingFirm(text("NEXT")),
+                            ],
+                        ),
+                        5,
+                    );
+                    x.accept(id, 3, 6).unwrap();
+                }
+                let before = x.order(id).cloned();
+                let bust = x.bust(1, Price(98_000), 7).unwrap();
+                check_wire_value(&bust);
+                assert_eq!(
+                    bust,
+                    TradeCancelOrCorrect {
+                        header: header(2, 0),
+                        transaction_time: 7,
+                        cl_ord_id: id,
+                        order_id: 1,
+                        exec_ref_id: 1,
+                        side: b'1',
+                        base_liquidity_indicator: b'A',
+                        clearing_firm: text("FIRM"),
+                        clearing_account: Text::default(),
+                        last_shares: shares,
+                        last_px: Price(99_000),
+                        corrected_price: Price(98_000),
+                        orig_time: 3,
+                        reserved_internal: 0,
+                        fields,
+                    }
+                    .into()
+                );
+                assert_eq!(x.order(id), before.as_ref());
+            }
+        }
+    }
+
+    #[test]
+    fn exchange_busts_keep_fields_before_modifies_and_restates() {
+        for next_id in ["A1", "A2"] {
+            let fields = historical_fields(200);
+            let mut x = Exchange::new(
+                ExchangeConfig::default(),
+                BTreeMap::from([(TradeCancelOrCorrect::KIND, fields.bitfields())]),
+            )
+            .unwrap();
+            x.receive(&good("A1", 300), 1);
+            x.accept(text("A1"), 2, 2).unwrap();
+            x.execute(text("A1"), 100, Price(99_000), b'A', 3).unwrap();
+            let id = text(next_id);
+            let modified = x.receive(
+                &ModifyOrder {
+                    header: Header::default(),
+                    cl_ord_id: id,
+                    orig_cl_ord_id: text("A1"),
+                    fields: Optional::new()
+                        .with(Opt::OrderQty(250))
+                        .unwrap()
+                        .with(Opt::Price(Price(105_000)))
+                        .unwrap()
+                        .with(Opt::Side(b'2'))
+                        .unwrap()
+                        .with(Opt::OrdType(b'4'))
+                        .unwrap()
+                        .with(Opt::ExecInst(b'P'))
+                        .unwrap()
+                        .with(Opt::MaxFloor(10))
+                        .unwrap()
+                        .with(Opt::StopPx(Price(101_000)))
+                        .unwrap(),
+                }
+                .into(),
+                4,
+            );
+            assert!(matches!(reply(&modified), Outbound::OrderModified(_)));
+            x.execute(id, 50, Price(104_000), b'R', 5).unwrap();
+            x.restate(id, 75, b'L', 6).unwrap();
+            let before = x.order(id).cloned();
+            let Outbound::TradeCancelOrCorrect(t) = x.bust(1, Price(0), 7).unwrap() else {
+                panic!()
+            };
+            assert_eq!(t.fields, fields);
+            assert_eq!(t.cl_ord_id, text("A1"));
+            assert_eq!(t.side, b'1');
+            assert_eq!(x.order(id), before.as_ref());
+            let mut fields = historical_fields(100);
+            for f in [
+                Opt::Side(b'2'),
+                Opt::Price(Price(105_000)),
+                Opt::ExecInst(b'P'),
+                Opt::OrdType(b'4'),
+                Opt::MaxFloor(10),
+                Opt::OrderQty(250),
+                Opt::OrigClOrdId(text("A1")),
+                Opt::LastShares(50),
+                Opt::LastPx(Price(104_000)),
+                Opt::DisplayPrice(Price(105_000)),
+                Opt::WorkingPrice(Price(105_000)),
+                Opt::BaseLiquidityIndicator(b'R'),
+                Opt::StopPx(Price(101_000)),
+            ] {
+                fields.set(f).unwrap();
+            }
+            let bust = x.bust(2, Price(0), 8).unwrap();
+            check_wire_value(&bust);
+            let Outbound::TradeCancelOrCorrect(t) = bust else {
+                panic!()
+            };
+            assert_eq!(t.fields, fields);
+            assert_eq!(t.cl_ord_id, id);
+            assert_eq!(t.side, b'2');
+            assert_eq!(x.order(id), before.as_ref());
+        }
+    }
+
     // Busts find the execution by ExecID in the bounded store (not by a
     // scan), the oldest is forgotten first, and each bust removes it.
     #[test]
     fn exchange_busts_by_exec_id_within_the_limit() {
-        let returns = config().returns.into_iter().collect();
+        let returns =
+            BTreeMap::from([(TradeCancelOrCorrect::KIND, historical_fields(0).bitfields())]);
         let config = ExchangeConfig {
             max_executions: 2,
             first_exec_id: 10,
@@ -4774,16 +4939,25 @@ mod tests {
         x.receive(&good("A1", 300), 1);
         x.accept(text("A1"), 1, 1).unwrap();
         for _ in 0..3 {
-            x.execute(text("A1"), 1, Price(1), b'A', 2).unwrap();
+            x.execute(text("A1"), 100, Price(99_000), b'A', 2).unwrap();
+            assert!(x.executions.len() <= 2);
         }
+        assert!(x.orders().next().is_none());
         assert_eq!(x.executions.len(), 2);
         assert_eq!(x.bust(10, Price(0), 3), Err(Error::UnknownExecution(10)));
         let Outbound::TradeCancelOrCorrect(t) = x.bust(12, Price(0), 3).unwrap() else {
             panic!()
         };
         assert_eq!(t.exec_ref_id, 12);
+        let mut fields = historical_fields(0);
+        fields.set(Opt::LastShares(100)).unwrap();
+        assert_eq!(t.fields, fields);
         assert_eq!(x.bust(12, Price(0), 3), Err(Error::UnknownExecution(12)));
-        assert!(x.bust(11, Price(0), 3).is_ok());
+        let Outbound::TradeCancelOrCorrect(t) = x.bust(11, Price(0), 3).unwrap() else {
+            panic!()
+        };
+        fields.set(Opt::LeavesQty(100)).unwrap();
+        assert_eq!(t.fields, fields);
         assert!(x.executions.is_empty());
     }
 
