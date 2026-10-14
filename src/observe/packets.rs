@@ -73,28 +73,10 @@ struct Inner {
     keys_seen: u64,
 }
 
-/// One `packets` stream's hold on a watch. While any is held, the link's
-/// packets are copied.
-pub(crate) struct Subscription(Arc<LinkWatch>);
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        let mut inner = self.0.inner.lock();
-        if self.0.subscribers.fetch_sub(1, Ordering::SeqCst) == 1 {
-            inner.guard = None;
-            inner.released = Instant::now();
-            drop(inner);
-            if let Some(graph) = self.0.graph.upgrade() {
-                let _ = super::reap_later(&graph);
-            }
-        }
-    }
-}
-
 impl LinkWatch {
     /// A watch of link `id`, if the graph has it. It copies nothing until
     /// someone subscribes.
-    pub(crate) fn start(graph: &Arc<Graph>, id: u64) -> Option<LinkWatch> {
+    pub(super) fn start(graph: &Arc<Graph>, id: u64) -> Option<LinkWatch> {
         let (meter, ends, label) = {
             let s = graph.state();
             let link = s.links.get(&id)?;
@@ -134,9 +116,9 @@ impl LinkWatch {
         })
     }
 
-    /// Starts copying the link's packets, until the returned subscription
-    /// is dropped.
-    pub(crate) fn subscribe(self: &Arc<Self>) -> Subscription {
+    /// Starts copying the link's packets. Called under the watch set's
+    /// map lock so reaping cannot forget the watch while subscribing.
+    pub(super) fn subscribe(&self) {
         let mut inner = self.inner.lock();
         if self.subscribers.fetch_add(1, Ordering::SeqCst) == 0
             && let Some(meter) = self.meter.upgrade()
@@ -145,12 +127,23 @@ impl LinkWatch {
             inner.guard = Some(meter.watch(&graph.environment));
             inner.after = 0;
         }
-        Subscription(self.clone())
+    }
+
+    /// Releases one subscription. Returns whether it was the last, after
+    /// releasing the lock so the watch set can schedule reaping.
+    pub(super) fn unsubscribe(&self) -> bool {
+        let mut inner = self.inner.lock();
+        let last = self.subscribers.fetch_sub(1, Ordering::SeqCst) == 1;
+        if last {
+            inner.guard = None;
+            inner.released = Instant::now();
+        }
+        last
     }
 
     /// Whether this watch may be forgotten: it has no subscriber, and the last
     /// left more than `linger` ago.
-    pub(crate) fn idle_for(&self, linger: std::time::Duration) -> bool {
+    pub(super) fn idle_for(&self, linger: std::time::Duration) -> bool {
         // Under the lock that subscribing and leaving take, so a subscriber
         // that is just arriving is counted.
         let inner = self.inner.lock();
@@ -350,6 +343,7 @@ pub fn hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observe::watches::Subscription;
     use crate::stdlib::codec::le32;
     use crate::watch::MAX_KEYS;
 
@@ -357,8 +351,7 @@ mod tests {
         let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
-        let watch = Arc::new(LinkWatch::start(&graph, meter.id).unwrap());
-        let subscription = watch.subscribe();
+        let (watch, subscription) = graph.watches.acquire(&graph, meter.id).unwrap();
         (graph, meter, watch, subscription)
     }
 

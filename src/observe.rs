@@ -525,10 +525,7 @@ use std::sync::Arc;
 use crate::Cx;
 pub use keys::observed_config;
 #[cfg(feature = "observe")]
-pub(crate) use packets::LinkWatch;
-#[cfg(feature = "observe")]
-#[cfg_attr(target_arch = "wasm32", allow(unused_imports))]
-pub(crate) use watches::{existing_watch, reap, reap_later, watch};
+pub(crate) use watches::WatchSet;
 
 /// Serves one observer session on `fd`, which has been accepted on the
 /// world socket of `attacher`.
@@ -587,7 +584,7 @@ mod tests {
             fcx.observe_protocols(registry);
             let meter = Meter::new();
             watched.owns(&meter, 0, 1);
-            let (watch, _subscription) = watch(&watched, meter.id).unwrap();
+            let (watch, _subscription) = watched.watches.acquire(&watched, meter.id).unwrap();
             let mut packet = vec![0u8; 40];
             packet[0] = 0x45;
             packet[2..4].copy_from_slice(&52u16.to_be_bytes());

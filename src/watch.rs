@@ -444,7 +444,7 @@ pub(crate) struct Graph {
     pub(crate) protocols: Mutex<crate::observe::Registry>,
     /// Watched links, so observers of one link share one decoded copy.
     #[cfg(feature = "observe")]
-    pub(crate) watches: Mutex<std::collections::HashMap<u64, Arc<crate::observe::LinkWatch>>>,
+    pub(crate) watches: crate::observe::WatchSet,
 }
 
 #[derive(Default)]
@@ -482,7 +482,7 @@ impl Graph {
             }),
             events: crate::events::Store::new(mode),
             #[cfg(feature = "observe")]
-            watches: Mutex::default(),
+            watches: crate::observe::WatchSet::default(),
             protocols: Mutex::default(),
         })
     }
@@ -548,7 +548,7 @@ impl Graph {
         self.events.close();
         // Nothing more crosses the world's links: stop watching them.
         #[cfg(feature = "observe")]
-        self.watches.lock().clear();
+        self.watches.end_run();
     }
 
     fn link<'a>(&self, s: &'a mut GraphState, meter: &Arc<Meter>) -> &'a mut LinkInfo {

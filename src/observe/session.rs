@@ -11,8 +11,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::json::{self, Object, Scalar};
-use super::packets::{LinkWatch, Subscription, keylog};
+use super::packets::{LinkWatch, keylog};
 use super::view::{self, View};
+use super::watches::Subscription;
 use crate::Attacher;
 use crate::relay::{self, Message, unix};
 use crate::watch::Graph;
@@ -243,10 +244,8 @@ impl Session {
                     return self.reply(id, &error("the request needs a link, such as \"e5\""));
                 };
                 let watch = match (op, &graph) {
-                    ("packets", Some(g)) => super::watch(g, link).map(|(w, s)| (w, Some(s))),
-                    ("packet" | "pcap", Some(g)) => {
-                        super::existing_watch(g, link).map(|w| (w, None))
-                    }
+                    ("packets", Some(g)) => g.watches.acquire(g, link).map(|(w, s)| (w, Some(s))),
+                    ("packet" | "pcap", Some(g)) => g.watches.existing(link).map(|w| (w, None)),
                     _ => None,
                 };
                 match op {
@@ -349,7 +348,7 @@ impl Session {
                         }
                         (Some(graph), Some((g, view, _))) if *g == generation => {
                             if *next_graph <= now {
-                                super::reap(&graph);
+                                graph.watches.reap_idle();
                                 for (name, data) in view::changes(&graph, view) {
                                     out.push((*id, event(name, &data), false));
                                 }
