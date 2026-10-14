@@ -1675,6 +1675,34 @@
 //! RFC 8415 has the VM's DHCPv6 client drop that address, and ask again
 //! for the address attach passes packets from.
 //!
+//! Attach reads DHCPv6 requests with the shared
+//! [`stdlib::dhcpv6::Message`](crate::stdlib::dhcpv6::Message) codec before
+//! making lease decisions. Malformed requests get no reply. This includes
+//! malformed options that attach does not use, later duplicate options, and
+//! options nested inside identity associations or addresses. A malformed
+//! option suppresses even a Confirm status or a Release or Decline
+//! acknowledgement.
+//!
+//! A request is malformed if it has, among others:
+//!
+//! - Client and server DUIDs outside 3 through 130 bytes, including
+//!   duplicates.
+//! - Short IA_NA, IA_TA, IA_PD, IAADDR and IAPREFIX bodies, truncated nested
+//!   options, and prefix lengths above 128.
+//! - Wrong lengths for option requests, preference, elapsed time,
+//!   authentication, unicast, reconfiguration and refresh timers. Rapid
+//!   Commit and Reconfigure Accept must have empty bodies.
+//! - Short status codes, status text that is not UTF-8 or ends in NUL,
+//!   malformed user or vendor classes, and malformed vendor option framing.
+//! - Empty DNS server lists, lists with partial addresses, and malformed
+//!   domain search lists.
+//! - More than 65,527 bytes in all.
+//!
+//! Unknown options are accepted and ignored. Of two valid client or server
+//! IDs, the first counts. The shared codec keeps deeply nested containers
+//! and domain labels it cannot represent as raw bytes, and attach accepts
+//! those too.
+//!
 //! **MTU.** Frames carry at most `--mtu` bytes of IP packet. Longer ones
 //! are dropped both ways. Attach leaves a DHCPv6 request unanswered if its
 //! full reply would exceed the MTU or an option, UDP or IPv6 length limit.

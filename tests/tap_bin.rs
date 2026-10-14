@@ -264,6 +264,157 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// DHCPv6 validation happens before lease policy over the QEMU socket too.
+#[test]
+fn a_fake_qemu_gets_dhcpv6_after_malformed_requests() {
+    use fictionet::stdlib::dhcpv6::{self, DhcpOption, Duid, IaNa, Message, msg};
+
+    let dir = temp_dir();
+    let world = dir.join("w.sock");
+    let vm_sock = dir.join("vm.sock");
+    let ready = dir.join("ready");
+    let (attacher, mut attachments) = fictionet::attachments();
+    let listening =
+        fictionet::listen(fictionet::WorldSocket::UnixSocket(world.clone()), attacher).unwrap();
+    let attach = Command::new(BIN)
+        .args([
+            "attach",
+            "--world",
+            &format!("unix:{}", world.display()),
+            "--name",
+            "vm6",
+            "--type",
+            "tap",
+        ])
+        .arg(format!("--vm=qemu:{}", vm_sock.display()))
+        .args([
+            "--no-ip-addr",
+            "--ip-addr-v6",
+            "fd00::2/64",
+            "--gateway-v6",
+            "fd00::1",
+            "--dns-v6",
+            "fd00::53",
+        ])
+        .arg(format!("--ready-file={}", ready.display()))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let qemu_side = std::thread::spawn(move || {
+        for _ in 0..100 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut qemu = UnixStream::connect(&vm_sock).unwrap();
+        qemu.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let send_request = |qemu: &mut UnixStream, request: &[u8]| {
+            let builder = etherparse::PacketBuilder::ipv6(
+                "fe80::5054:ff:fe12:3456"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+                dhcpv6::ALL_DHCP_RELAY_AGENTS_AND_SERVERS.octets(),
+                64,
+            )
+            .udp(dhcpv6::CLIENT_PORT, dhcpv6::SERVER_PORT);
+            let mut packet = Vec::new();
+            builder.write(&mut packet, request).unwrap();
+            send(qemu, &frame([0x33, 0x33, 0, 1, 0, 2], 0x86dd, &packet));
+        };
+        let recv_reply = |qemu: &mut UnixStream| loop {
+            let frame = recv(qemu);
+            assert_eq!(&frame[12..14], &[0x86, 0xdd]);
+            let ip = &frame[14..];
+            if ip[6] == 58 {
+                assert_eq!(ip[40], 134, "router advertisement");
+                continue;
+            }
+            assert_eq!(&frame[..6], &VM);
+            assert_eq!(ip[6], 17);
+            assert_eq!(u16::from_be_bytes([ip[42], ip[43]]), dhcpv6::CLIENT_PORT);
+            break Message::parse(&ip[48..]).unwrap();
+        };
+        let client = Duid::ll(dhcpv6::hardware::ETHERNET, &VM);
+        let mut request = Message::new(msg::SOLICIT, 1);
+        request.options = vec![
+            DhcpOption::ClientId(client.clone()),
+            DhcpOption::IaNa(IaNa {
+                iaid: 7,
+                ..IaNa::default()
+            }),
+        ];
+        let valid = request.to_bytes().unwrap();
+        // Short DUID, nonempty Rapid Commit, and a truncated nested IAADDR.
+        for malformed in [
+            vec![1, 0, 0, 0, 0, 1, 0, 2, 0, 3],
+            [valid.as_slice(), &[0, 14, 0, 1, 0]].concat(),
+            [
+                valid.as_slice(),
+                &[0, 3, 0, 13, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ]
+            .concat(),
+        ] {
+            send_request(&mut qemu, &malformed);
+        }
+        send_request(&mut qemu, &valid);
+        let advertise = recv_reply(&mut qemu);
+        assert_eq!(
+            (advertise.msg_type, advertise.transaction),
+            (msg::ADVERTISE, 1)
+        );
+        assert_eq!(advertise.client_id(), Some(&client));
+        let server = Duid::ll(dhcpv6::hardware::ETHERNET, &GATEWAY);
+        assert_eq!(advertise.server_id(), Some(&server));
+        let ia = advertise.ia_na().next().unwrap();
+        assert_eq!(ia.iaid, 7);
+        assert_eq!(
+            ia.addresses().next().unwrap().address,
+            "fd00::2".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        assert_eq!(
+            advertise.option(dhcpv6::opt::DNS_SERVERS),
+            Some(&DhcpOption::DnsServers(vec!["fd00::53".parse().unwrap()]))
+        );
+        request.msg_type = msg::REQUEST;
+        request.transaction = 2;
+        request.options.push(DhcpOption::ServerId(server));
+        send_request(&mut qemu, &request.to_bytes().unwrap());
+        let reply = recv_reply(&mut qemu);
+        assert_eq!((reply.msg_type, reply.transaction), (msg::REPLY, 2));
+        assert_eq!(reply.ia_na().next(), Some(ia));
+    });
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::from_u64(6),
+        move |fcx| async move {
+            let mut vm = attachments.get(&fcx, "vm6").await?;
+            loop {
+                match poll_once(&fcx, &mut vm) {
+                    Some(Ok(packet)) => panic!("DHCPv6 reached the world: {packet:?}"),
+                    Some(Err(RecvError::Closed)) => break,
+                    Some(Err(e)) => return Err(fictionet::Error::msg(format!("{e:?}"))),
+                    None => fcx.sleep(fictionet::time::ms(10)).await?,
+                }
+            }
+            Ok(())
+        },
+    ))
+    .unwrap();
+    qemu_side.join().unwrap();
+    drop(listening);
+    let out = attach.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A live socket of another program at the path is never replaced, even
 /// with a space in the path; a stale one is.
 #[test]

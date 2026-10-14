@@ -24,7 +24,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use fictionet::relay::{self, unix};
-use fictionet::stdlib::dhcp;
+use fictionet::stdlib::{dhcp, dhcpv6};
 
 use crate::addresses;
 use crate::args::{Family, TapArgs, VmLink};
@@ -230,7 +230,7 @@ impl Link {
                 return FromVm::Drop(Why::Handled);
             }
             Upper::Udp {
-                port: addresses::DHCP6_SERVER_PORT,
+                port: dhcpv6::SERVER_PORT,
                 payload: request,
             } => {
                 return match &self.v6 {
@@ -258,7 +258,7 @@ impl Link {
             // As for DHCP over IPv4: no answer to a fragment, and none past
             // when attach owns DHCPv6.
             Upper::UdpFragment {
-                port: addresses::DHCP6_SERVER_PORT,
+                port: dhcpv6::SERVER_PORT,
             } if self.v6 != Family::FromWorld => {
                 return FromVm::Drop(Why::Handled);
             }
