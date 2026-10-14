@@ -12,6 +12,11 @@ world's live request log, or choose a deployment recipe below.
 | [Kubernetes with proxies](k8s-proxy.yaml) | Kubernetes and the sandbox Helm chart. Clients use HTTP or SOCKS proxies. |
 | [Local namespace](netns.sh) | Linux and root, with a world already running. This is a trusted connectivity recipe; a network namespace alone does not isolate files or processes. |
 
-The [`fictionet::attaching` rustdoc](../../src/attaching.rs) gives the build,
-start, check and cleanup commands. Cold image builds download base images
-and packages.
+The [`fictionet::attaching` guide](../../src/attaching.rs) owns the build,
+start, check and cleanup commands, and the isolation requirements for each
+target. It includes these five files directly, so edits to a recipe appear
+in the guide. Cold image builds download base images and packages.
+
+For the manual namespace walkthrough and troubleshooting, use
+[Getting started](../../src/getting_started.rs). The
+[hosted example](../hosted/README.md) records dated provider results.

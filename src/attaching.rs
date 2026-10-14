@@ -9,7 +9,9 @@
 //! `tun` setup, and [Every flag](#every-flag) lists the flags of
 //! `fictionet attach` with a link to where each is explained. If you have
 //! not attached a sandbox before, walk through
-//! [`getting_started`](crate::getting_started) first.
+//! [`getting_started`](crate::getting_started) first. This page owns the
+//! deployment procedures. The recipe files below are included directly from
+//! `examples/attach`, so the instructions and runnable examples use the same files.
 //!
 //! `fictionet attach` is a relay. You run one next to each sandbox,
 //! wherever it can get at the sandbox's packets. It connects to the world's
@@ -488,30 +490,17 @@
 //!
 #![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../examples/attach/k8s-tun.yaml"), "```"))]
 //!
-//! The world's socket must be `/run/relay/relay.sock`. The agent shares
-//! the pod's network namespace, so it can list that socket in
-//! `/proc/net/unix`, and the path names nothing. The `attach`
-//! value sets attach's flags for every service. `ipAddr`, `gateway` and
-//! `dns` default to `10.0.0.2/24`, `10.0.0.1` and `10.0.0.1`, and an empty
-//! value means the flag's `--no-` form. `ipAddrV6`, `gatewayV6` and
-//! `dnsV6` are empty by default, so pods get IPv4 only. Set them to
-//! `2001:db8::2/64`, `2001:db8::1` and `2001:db8::1` to give a pod IPv6 in
-//! a world built on [`Sites`](crate::stdlib::web::Sites). A service's own `attach` value
-//! overrides them for that service. Each service starts from
-//! `serviceDefaults`, and `values.yaml` in the chart describes every value.
-//! `runtimeClassName` sets the pods' runtime class, such as `gvisor`. If it
-//! is empty, the pods get the cluster's default.
+//! The [chart's values reference](https://github.com/amlalabs/fictionet-sdk/blob/main/charts/fictionet-sandbox/values.yaml)
+//! describes every setting and its default. Use `attach` for settings shared
+//! by all services, and a service's own `attach` for overrides. Each service
+//! starts from `serviceDefaults`. Set the IPv6 address, gateway and DNS values
+//! to enable IPv6; an empty address setting means the flag's `--no-` form.
+//! `runtimeClassName` selects a runtime such as gVisor.
 //!
-//! Every container has a memory limit, so an agent that allocates without
-//! end is killed in its own container, not the node's other pods. The
-//! agent may use 2 GiB and one CPU, as in Inspect's own chart, the world
-//! 2 GiB, and attach 512 MiB. The requests, which the scheduler goes by,
-//! are much smaller (256 MiB and 0.1 CPU for the agent, 64 MiB for the
-//! world, 32 MiB for attach), so many sandboxes fit on one node. Set a
-//! service's `resources`, or its world's, to change them: the value
-//! replaces the default whole, and `{}` means no limits. Kubernetes has no process limit per
-//! container, so set the kubelet's `podPidsLimit` on the nodes that run
-//! sandboxes, to stop a fork bomb.
+//! Every container has a memory limit. Use the service's `resources`, or its
+//! world's, to size your workload; each replaces the default whole, and `{}`
+//! means no limits. Kubernetes has no process limit per container, so set the
+//! kubelet's `podPidsLimit` on the nodes that run sandboxes to stop a fork bomb.
 //!
 //! `imagePullPolicy: Never` is there because the images are loaded into
 //! kind's node by hand, below. On a cluster that pulls from a registry,
@@ -686,15 +675,11 @@
 //! `examples/hosted/build.sh` first. It builds `fictionet` and `web_world`
 //! for Debian, so nothing is compiled in the sandbox.
 //!
-//! This is what the Docker inside each provider's sandbox gave attach, as
-//! tested on 2 October 2026:
-//!
-//! | | Daytona | E2B |
-//! |---|---|---|
-//! | Sandbox | a container from `docker:28.3.3-dind`, root, every capability | a VM, kernel 6.1, user `user` with sudo |
-//! | `/dev/net/tun`, `cap_add: [NET_ADMIN]` | work | work |
-//! | Docker | started by hand: `dockerd-entrypoint.sh dockerd &` | from the template, run with `sudo` |
-//! | Sandbox to healthy, with images built in it | 17 s | 28 s, after a one-time 26 s template build |
+//! The [hosted example README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md)
+//! owns the provider evidence: SDK versions, measurements, failures and
+//! limitations from 2 October 2026. Those results describe that run, not a
+//! promise about every provider account or version. The commands below are
+//! the deployment procedure for those examples.
 //!
 //! ## Run it locally first
 //!
@@ -706,21 +691,17 @@
 //! three containers, `check.sh` runs 19 checks from outside them, and
 //! Compose removes them:
 //!
-//! ```text
-//! $ examples/hosted/build.sh
-//! $ cd examples/hosted
-//! $ docker compose up -d --build --wait
-//! $ ./check.sh
-//! outer address 172.17.0.5, gateway 172.17.0.1, docker0 172.18.0.1
-//! PASS: the agent has only lo and tun0
-//! ...
-//! PASS: the sandbox's own network (172.18.0.1) fails
-//! ALL PASSED
-//! $ docker compose down -v
+//! ```sh
+//! examples/hosted/build.sh
+//! (
+//!   cd examples/hosted || exit
+//!   trap 'docker compose down -v' EXIT
+//!   docker compose up -d --build --wait && ./check.sh
+//! )
 //! ```
 //!
-//! `build.sh` took 56 s, `up` took 40 to 100 s (most of it `apt-get` in the
-//! agent's image), `check.sh` 6 to 7 s, and `down` 0.7 s.
+//! Expect `ALL PASSED` from `check.sh`. The hosted README keeps the
+//! [full check output and timings](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-was-run-2-october-2026).
 //!
 //! ## Directly, with each provider's SDK
 //!
@@ -739,41 +720,9 @@
 //! inside it, and deletes the sandbox, even when a check fails. On Daytona it makes the sandbox from
 //! `docker:28.3.3-dind` with 2 vCPU and 4 GiB, and starts dockerd. On E2B
 //! it first builds a template, `fictionet-dind`: Ubuntu 24.04 with
-//! `docker.io` and `docker-compose-v2`. `check.sh` printed the same on both
-//! providers:
-//!
-//! ```text
-//! PASS: the agent has only lo and tun0
-//! PASS: tun0 has 10.0.0.2/24
-//! PASS: the default route is tun0
-//! PASS: resolv.conf points at the world
-//! PASS: the world's DNS answers
-//! PASS: HTTPS with the world's CA
-//! PASS: ping the gateway
-//! PASS: the agent has no NET_ADMIN
-//! PASS: the agent cannot delete its route
-//! PASS: the agent cannot add a link
-//! PASS: the agent cannot see the world socket
-//! PASS: DNS to 1.1.1.1 fails
-//! PASS: DNS to 8.8.8.8 fails
-//! PASS: HTTPS to 1.1.1.1 fails
-//! PASS: a real name does not resolve
-//! PASS: the metadata address fails
-//! PASS: the sandbox's own network (172.20.0.53) fails
-//! PASS: the sandbox's own network (172.20.0.1) fails
-//! PASS: the sandbox's own network (172.17.0.1) fails
-//! ALL PASSED
-//! ```
-//!
-//! The last three addresses are the sandbox's own address, its gateway and
-//! the inner Docker's bridge. On E2B the first two were `169.254.0.21` and
-//! `169.254.0.22`.
-//!
-//! Two things to know when you write your own:
-//!
-//! - Both providers' upload APIs write files without the execute bit. Copy
-//!   binaries into an image with `COPY --chmod=0755`.
-//! - `docker:dind` is Alpine and has no bash.
+//! `docker.io` and `docker-compose-v2`. See the hosted README for
+//! [provider capabilities](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-the-sandboxes-gave-docker)
+//! and [upload and image limitations](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#things-that-broke-on-the-way).
 //!
 //! ## Through Inspect
 //!
@@ -788,15 +737,10 @@
 //! ```
 //!
 //! The eval needs no model: a scripted solver runs five commands in the
-//! agent's container, and the scorer checks the output. Both providers
-//! scored 5 of 5. Sample setup took 20 to 42 s on Daytona, with five
-//! samples at once, and 30 to 38 s on E2B, one at a time.
-//!
-//! - inspect-sandboxes 0.6.0 refuses a compose file with a top-level
-//!   `name:` or a `build.target`. Use one Dockerfile per image.
-//! - On E2B, run one sample at a time with `--max-samples 1`. With several
-//!   at once, each one rebuilds the same template, and all but one fail
-//!   with `400: build is not in waiting state`.
+//! agent's container, and the scorer checks the output. The hosted README
+//! records the [results](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-was-run-2-october-2026)
+//! and [Compose restrictions and E2B template race](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#things-that-broke-on-the-way)
+//! behind the command's `--max-samples 1` setting.
 //!
 //! ## Through Harbor
 //!
@@ -811,24 +755,17 @@
 //! ```
 //!
 //! The `oracle` agent runs the task's `solution/solve.sh`, so no model is
-//! needed. It scored 1.0, after 24 s of setup. Harbor's E2B backend does
-//! not run Compose, so it cannot run this task.
+//! needed. See the hosted README for the
+//! [tested result](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-was-run-2-october-2026)
+//! and [E2B backend limitation](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#things-that-broke-on-the-way).
 //!
 //! ## The provider's network
 //!
 //! The agent cannot reach the sandbox's network, whatever the provider
 //! allows. Docker inside the sandbox can, and it needs that network to pull
-//! images. What each provider lets the sandbox reach:
-//!
-//! - **Daytona, tiers 1 and 2.** The sandbox reaches only Daytona's list of
-//!   essential services, such as PyPI, Debian and Docker Hub.
-//!   `network_block_all` at creation is honored, but then nothing can be
-//!   pulled. Changing it on a running sandbox is refused: "Network access
-//!   is restricted and cannot be overridden at the sandbox level." Allow
-//!   lists are ignored.
-//! - **E2B.** Egress is open by default. `allow_internet_access=False`
-//!   blocked HTTPS and UDP DNS to 8.8.8.8 and 1.1.1.1. `deny_out` and
-//!   `allow_out` by IP address worked.
+//! images. The hosted README records the
+//! [egress rules observed for each account](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#the-sandboxs-own-network).
+//! Check those limitations when choosing how to build and start the sandbox.
 //!
 //! # Behind a proxy: `http_proxy` and `socks5`
 //!
@@ -1408,6 +1345,10 @@
 //! `tun` sandbox. Inside the VM, the agent can be root and nothing
 //! changes: its kernel has one network card, and every packet through it
 //! goes to the world.
+//!
+//! `tests/vm` exercises this attachment setup. The repository's separate
+//! [`vm/` development appliance](https://github.com/amlalabs/fictionet-sdk/blob/main/vm/README.md)
+//! hosts demos and tests; its own network is QEMU user-mode networking.
 //!
 //! The frames reach attach in one of two ways, chosen with `--vm`:
 //!

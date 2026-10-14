@@ -185,9 +185,12 @@ cmp fictionet/ca.pem complete.pem
         self.assertEqual(error.exception.code, 19)
         self.assertIn(' down ', commands[-1])
 
-    def test_hosted_readme_keeps_directory_and_check_status(self):
-        readme = (ROOT / 'examples/hosted/README.md').read_text()
-        recipe = readme.split('# Local Docker\n', 1)[1].split('# Daytona', 1)[0]
+    def test_local_hosted_recipe_keeps_directory_and_check_status(self):
+        guide = (ROOT / 'src/attaching.rs').read_text()
+        section = guide.split('//! ## Run it locally first\n', 1)[1].split('//! ## ', 1)[0]
+        block = section.split('//! ```sh\n', 1)[1].split('//! ```', 1)[0]
+        lines = [line.removeprefix('//! ') for line in block.splitlines()]
+        recipe = '\n'.join(lines[lines.index('('):lines.index(')') + 1])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             hosted = root / 'examples/hosted'

@@ -1,9 +1,11 @@
 //! Getting started: from `cargo build` to an HTTPS request from a sandbox.
 //!
-//! This page runs the crate's `web_world` example, a small world of
-//! websites, and attaches one sandbox to it. Everything runs on one Linux
-//! machine. Every command below was run as shown, and every output is
-//! copied from that run.
+//! This page runs the crate's `web_world` example, a small world of websites,
+//! and attaches one sandbox to it. Everything runs on one Linux machine.
+//! Every command below was run as shown, and every output except the
+//! observer's is copied from that run. This is the manual namespace tutorial;
+//! the [attachment guide](crate::attaching) covers deployment and the
+//! scripted namespace recipe.
 //!
 //! You need:
 //!
@@ -43,7 +45,8 @@
 //!
 //! - `target/release/examples/web_world`, the world. It runs its local
 //!   sites on a tokio runtime and makes no upstream requests.
-//! - `target/release/fictionet`, which has the `fictionet attach` command.
+//! - `target/release/fictionet`, which has the `fictionet attach` and
+//!   `fictionet observe` commands.
 //!
 //! # 2. Make the socket's directory
 //!
@@ -282,10 +285,46 @@
 //! curl: (6) Could not resolve host: example.test
 //! ```
 //!
+//! ## Watch the world's events
+//!
+//! In another terminal, start watching the world's HTTP requests:
+//!
+//! ```text
+//! $ target/release/fictionet observe --world unix:/run/fictionet/world.sock watch | grep '"kind":"request"'
+//! ```
+//!
+//! Back in the third terminal, repeat these two requests:
+//!
+//! ```text
+//! $ sudo ip netns exec agent curl -sS --cacert /run/fictionet/ca.pem -w '%{remote_ip}\n' https://example.test/
+//! hello from https example.test 443 over HTTP/2.0
+//! 2001:db8:113::10
+//! $ sudo ip netns exec agent curl -sS -i http://example.test/ | head -3
+//! HTTP/1.1 301 Moved Permanently
+//! content-type: text/plain; charset=utf-8
+//! location: https://example.test/
+//! ```
+//!
+//! The observer shows the world's side. Every world keeps a log of events, and
+//! `web_world`'s sites record one for each DNS query, TLS handshake and HTTP request.
+//! `fictionet observe` prints each event as a line of JSON while it watches.
+//! These lines come from a separate run of the same two requests (cut short
+//! here):
+//!
+//! ```text
+//! {"event":"event","data":{...,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 200","sandbox":{"id":1,"name":"agent","addr":"10.0.0.2","addr_v6":"2001:db8::2"},"conn":3,...,"fields":{"scheme":"https","host":"example.test","method":"GET","path":"/","status":200,...},"node":"t32",...}}
+//! {"event":"event","data":{...,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 301","sandbox":{"id":1,"name":"agent",...},"conn":4,...,"fields":{"scheme":"http","host":"example.test","method":"GET","path":"/","status":301,...},"node":"t33",...}}
+//! ```
+//!
+//! `fictionet dashboard` shows the same world in a browser
+//! ([`observe`](crate::observe)). An eval writes such events to a log file of its own,
+//! as the [Border](https://github.com/amlalabs/fictionet-sdk/tree/main/examples/border)
+//! and [FakeWiki](https://github.com/amlalabs/fictionet-sdk/tree/main/examples/fakewiki) worlds do.
+//!
 //! # 7. Stop
 //!
-//! Press Ctrl-C in the attach terminal. Attach exits, and removes `tun0` as
-//! it goes:
+//! Press Ctrl-C in the observe terminal, then in the attach terminal. Attach
+//! exits, and removes `tun0` as it goes:
 //!
 //! ```text
 //! $ sudo ip netns exec agent ip link show tun0

@@ -89,80 +89,17 @@ for the feature relationships. The crate still links Rust's standard library.
 
 ## Quick start
 
+Follow [Getting started](src/getting_started.rs) for the full Linux namespace
+walkthrough: build `web_world`, attach a namespace, make HTTPS requests, watch
+the world's events, and clean up. It includes expected output and troubleshooting.
+You need Linux, Rust 1.91 or later, `sudo`, iproute2 and `curl`.
+
 This is a **trusted connectivity demonstration**. A network namespace isolates
-networking only. The `sudo ip netns exec` commands below run as root and share
-the host's filesystem, users and processes. Root can leave the namespace. Do not
-use this recipe as a sandbox for an untrusted agent. See
-[the boundary explanation](src/getting_started.rs) and
-[the attachment guide](src/attaching.rs) for the harness's responsibilities and
-deployment options using containers or VMs.
-
-You need Linux, Rust 1.91 or later, `sudo`, `ip` (iproute2) and `curl`. These
-commands run the `web_world` example and attach a network namespace named `agent`
-to it as the sandbox. Then they watch the world and make requests from inside the
-sandbox. The attach command names
-the world's socket (`--world`), the sandbox (`--name`) and its namespace
-(`--netns`). Attach runs no DHCP for a `tun` sandbox, so the last six flags give
-the sandbox its IPv4 and IPv6 address, gateway and DNS server.
-
-```console
-$ cargo build --release --bin fictionet --example web_world
-$ sudo mkdir -p /run/fictionet && sudo chown "$USER" /run/fictionet
-
-# Terminal 1: the world
-$ target/release/examples/web_world /run/fictionet/world.sock /run/fictionet/ca.pem
-listening on /run/fictionet/world.sock, CA in /run/fictionet/ca.pem
-
-# Terminal 2: a sandbox, attached
-$ sudo ip netns add agent && sudo ip -n agent link set lo up
-$ sudo mkdir -p /etc/netns/agent && echo "hosts: files dns" | sudo tee /etc/netns/agent/nsswitch.conf >/dev/null
-$ sudo target/release/fictionet attach --world unix:/run/fictionet/world.sock --name agent --type tun \
-    --netns /run/netns/agent \
-    --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
-    --ip-addr-v6 2001:db8::2/64 --gateway-v6 2001:db8::1 --dns-v6 2001:db8::1
-fictionet attach: agent attached as tun0
-
-# Terminal 3: what the world sees, one line per HTTP request
-$ target/release/fictionet observe --world unix:/run/fictionet/world.sock watch | grep '"kind":"request"'
-
-# Terminal 4: inside the sandbox
-$ sudo ip netns exec agent curl -sS --cacert /run/fictionet/ca.pem -w '%{remote_ip}\n' https://example.test/
-hello from https example.test 443 over HTTP/2.0
-2001:db8:113::10
-$ sudo ip netns exec agent curl -sS -i http://example.test/ | head -1
-HTTP/1.1 301 Moved Permanently
-$ sudo ip netns exec agent curl -sS --cacert /run/fictionet/ca.pem https://nope.test/
-curl: (6) Could not resolve host: nope.test
-$ sudo ip netns exec agent curl -sS http://1.1.1.1/
-curl: (7) Failed to connect to 1.1.1.1:80 after 0 ms: Could not connect to server
-```
-
-An axum app inside the world serves `example.test` over HTTP/2, with a certificate
-from the CA the world made when it started. The world is dual-stack, so curl
-reached it over IPv6, at the address it printed last. `nope.test` does not exist in
-this world, and `1.1.1.1` is not on its network. The `nsswitch.conf` line makes
-programs in the namespace look names up in the world, even on a host where
-`systemd-resolved` would otherwise answer them.
-
-Terminal 3 shows the world's side. Every world keeps a log of events, and
-`web_world`'s sites record one for each DNS query, TLS handshake and HTTP request.
-`fictionet observe` prints each event as a line of JSON while it watches (cut short
-here):
-
-```text
-{"event":"event","data":{"seq":9,"at":4.050251,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 200","sandbox":{"id":1,"name":"agent","addr":"10.0.0.2","addr_v6":"2001:db8::2"},"conn":3,...,"fields":{"scheme":"https","host":"example.test","method":"GET","path":"/","status":200,...},"node":"t32",...}}
-{"event":"event","data":{"seq":12,"at":4.063997,"source":"http","kind":"request","level":"info","summary":"GET example.test/ 301","sandbox":{"id":1,"name":"agent",...},"conn":4,...,"fields":{"scheme":"http","host":"example.test","method":"GET","path":"/","status":301,...},"node":"t33",...}}
-```
-
-`fictionet dashboard` shows the same world in a browser
-([`observe`](src/observe.rs)). An eval writes such events to a log file of its own,
-as the [Border](examples/border) and [FakeWiki](examples/fakewiki) worlds do.
-
-To clean up, press Ctrl-C in the observe, attach and world terminals, then run
-`sudo ip netns del agent && sudo rm -r /etc/netns/agent`.
-
-[`getting_started`](src/getting_started.rs) walks through the same steps with every
-output, and what to do when something goes wrong.
+networking only. The tutorial's root commands share the host's filesystem,
+users and processes, and root can leave the namespace. Do not use it as a
+sandbox for an untrusted agent. The [attachment guide](src/attaching.rs) owns
+the deployment instructions for containers, Kubernetes, hosted sandboxes,
+proxies and VMs, including the harness's isolation responsibilities.
 
 ## A world in a few lines
 
@@ -222,7 +159,7 @@ protocol of your own in the dashboard, see
 
 | Where the sandbox runs | How it attaches | Tested by |
 |---|---|---|
-| A network namespace on the host (`ip netns`) | `tun` | the quick start above |
+| A network namespace on the host (`ip netns`) | `tun` | [Getting started](src/getting_started.rs) |
 | Docker Compose: the agent shares the network namespace of an `attach` container | `tun` | `tests/docker/web`, and the examples below |
 | Kubernetes: `world` and `attach` as native sidecars, from the Helm chart in [`charts/fictionet-sandbox`](charts/fictionet-sandbox), which the k8s sandbox of [Inspect](https://inspect.aisi.org.uk/), a framework for running AI evals, accepts | `tun`, under runc and gVisor | `tests/k8s/run.sh` on kind |
 | Daytona and E2B: the Compose setup inside one hosted sandbox | `tun` | [`examples/hosted`](examples/hosted) |
@@ -248,7 +185,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 |---|---|
 | [`examples/ping_world.rs`](examples/ping_world.rs) | The smallest world: it answers every ping and drops everything else. |
 | [`examples/custom_protocol`](examples/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom dashboard presenter. Runs without network or root. |
-| [`examples/web_world.rs`](examples/web_world.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The quick start runs it. |
+| [`examples/web_world.rs`](examples/web_world.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The getting-started tutorial runs it. |
 | [`examples/delayed_sites.rs`](examples/delayed_sites.rs) | Each site is 200 ms away, using `stdlib::delay` and `Attachments::map`. |
 | [`examples/lossy_sites.rs`](examples/lossy_sites.rs) | `stdlib::filter` drops 5% of packets each way. |
 | [`examples/bottleneck_sites.rs`](examples/bottleneck_sites.rs) | An 8 Mbit/s link using `stdlib::bottleneck`, with a count of queue drops. |

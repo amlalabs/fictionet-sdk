@@ -224,15 +224,11 @@
 //! whether the sandbox can still reach the provider's own DNS server with
 //! egress blocked, and whether it has a metadata address.
 //!
-//! Other things to measure on hosted sandboxes:
-//!
-//! - whether a Daytona tier 3 or 4 sandbox can cut its own egress after
-//!   `docker compose up`;
-//! - how much faster startup is with images in a registry, or baked into a
-//!   Daytona snapshot or an E2B template (each sample now pulls Debian and
-//!   runs `apt-get`);
-//! - Daytona's VM sandboxes, and Modal's VM runtime through Harbor;
-//! - many samples at once (five have been run).
+//! The [hosted example README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md)
+//! keeps the provider measurements and limitations from 2 October 2026,
+//! including the [egress checks](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#the-sandboxs-own-network)
+//! and [open questions](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#still-unknown).
+//! Use that record when planning further provider tests.
 //!
 //! # `fictionet --world`
 //!

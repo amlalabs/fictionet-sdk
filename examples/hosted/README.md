@@ -1,23 +1,19 @@
 # Fictionet on hosted sandboxes
 
-The Docker Compose setup from `tests/docker/web`, run inside one hosted
-sandbox that has Docker of its own: Daytona or E2B. Three containers run
-inside the sandbox:
+This directory runs the Docker Compose setup inside a hosted sandbox with
+its own Docker daemon. The [attachment guide](../../src/attaching.rs)
+owns the setup and run instructions. This README owns the dated provider
+measurements and limitations below.
 
-- `world`: the `web_world` example, with no network (`network_mode: none`).
-  Its only door is the world socket on a volume.
-- `attach`: `fictionet attach --type tun`, with `NET_ADMIN` and
-  `/dev/net/tun`. It makes `tun0` in its own network namespace.
-- `default` (`main` in the Harbor task): the agent. It joins attach's
-  network namespace, so `tun0` is its only interface. It has no
-  `NET_ADMIN` and does not see the world socket.
+The world, attach and agent run in separate containers. The agent shares
+attach's network namespace, where `tun0` is its only interface besides
+loopback. See [Docker Compose](../../src/attaching.rs)
+for the isolation rules.
 
-No new Fictionet code is needed. The images are built inside the sandbox
-from two small Dockerfiles and the binaries in `bin/`.
-
-On local Docker or Kubernetes, `python/inspect_fictionet` writes this compose
-file for you: [`web_eval.py`](../../python/inspect_fictionet/examples/web_eval.py)
-is `eval.py` with one call in place of `compose.yaml`.
+On local Docker or Kubernetes, [`python/inspect_fictionet`](../../python/inspect_fictionet)
+writes the deployment for you. Its
+[`web_eval.py`](../../python/inspect_fictionet/examples/web_eval.py) uses one call
+in place of this example's `compose.yaml`.
 
 ## Files
 
@@ -34,32 +30,22 @@ is `eval.py` with one call in place of `compose.yaml`.
 
 ## Run it
 
-```sh
-examples/hosted/build.sh
+Run the commands from the repository root.
+Follow these sections of the attachment guide:
 
-# Local Docker
-(
-  cd examples/hosted || exit
-  trap 'docker compose down -v' EXIT
-  docker compose up -d --build --wait && ./check.sh
-)
-
-# Daytona or E2B, directly (pip install daytona e2b)
-DAYTONA_API_KEY=... python examples/hosted/run_hosted.py daytona
-E2B_API_KEY=... python examples/hosted/run_hosted.py e2b
-
-# Inspect, through inspect-sandboxes (pip install inspect-ai inspect-sandboxes)
-inspect eval examples/hosted/eval.py --model mockllm/model -T provider=daytona
-inspect eval examples/hosted/eval.py --model mockllm/model -T provider=e2b --max-samples 1
-
-# Harbor (pip install 'harbor[daytona]')
-harbor run -p examples/hosted/harbor/fictionet-web -a oracle -e daytona
-```
+- [Run it locally first](../../src/attaching.rs): build the binaries and
+  check the Compose setup.
+- [Directly, with each provider's SDK](../../src/attaching.rs): run on
+  Daytona or E2B.
+- [Through Inspect](../../src/attaching.rs): run the scripted eval.
+- [Through Harbor](../../src/attaching.rs): run the oracle task.
 
 ## What was run, 2 October 2026
 
 All on the same day, with inspect-ai 0.3.276, inspect-sandboxes 0.6.0,
-harbor 0.23.0, daytona 0.220.0 and e2b 2.52.0.
+harbor 0.23.0, daytona 0.220.0 and e2b 2.52.0. The capabilities, failures,
+egress rules and unknowns below describe those versions and accounts on
+that date.
 
 | Path | Result | Startup per sample |
 |---|---|---|
@@ -71,6 +57,11 @@ harbor 0.23.0, daytona 0.220.0 and e2b 2.52.0.
 | Harbor, `-e docker` | reward 1.0 | |
 | Harbor, `-e daytona` | reward 1.0 | 24 s of environment setup |
 | Harbor, `-e e2b` | fails, see below | |
+
+In the local Docker run, `build.sh` took 56 s, `up` took 40 to 100 s
+(most of it `apt-get` in the agent's image), `check.sh` 6 to 7 s, and
+`down` 0.7 s. The outer address was `172.17.0.5`, the gateway
+`172.17.0.1`, and the Docker bridge `172.18.0.1`.
 
 `check.sh` on Daytona:
 
@@ -158,7 +149,7 @@ for the world and for dockerd, which pulls images.
 - Daytona tiers 3 and 4: whether an allow list can be set after
   `compose up`, so the sandbox itself has no egress while the agent runs.
 - Startup with images from a registry, or a Daytona snapshot or E2B
-  template with the images inside. Today each sample pulls Debian and runs
-  `apt-get` (14 to 23 s of the startup above).
+  template with the images inside. In these runs each sample pulled Debian
+  and ran `apt-get` (14 to 23 s of the startup above).
 - Modal's VM runtime through Harbor, and Daytona VM sandboxes.
 - Many samples at once: only five were run, on Daytona.
