@@ -1,7 +1,7 @@
 //! STUN: reading and writing Session Traversal Utilities for NAT messages,
 //! with no I/O.
 //!
-//! `Message` implements `Wire`, `codec::Frames<Frame>` decodes stream messages, and
+//! `Message` and `Frame` implement `Wire`, `codec::Frames<Frame>` yields `Frame` values, and
 //! `answer_binding` builds a stateless Binding reply. There is no ICE or TURN
 //! session, `Service`, live transport, or HMAC computation or verification.
 //!
@@ -24,11 +24,13 @@
 //! UDP datagram it receives, reads it with [`Message::parse`], passes it and
 //! the datagram's source address to [`answer_binding`], and sends the
 //! reply's bytes back. Over TCP, [`Stream<Frames<Frame>>`](fictionet::stdlib::codec::Stream)
-//! splits the byte stream into messages. Use [`codec::Stream::with_next`] for each
-//! frame's exact bytes. Integrity values stay as raw bytes. World code
+//! splits the byte stream into [`Frame`] values. Each frame's `.0` holds its
+//! exact bytes, including padding. Frames compose directly with
+//! [`codec::Interceptor`] and [`codec::Faults`]. Integrity values stay as raw bytes. World code
 //! computes HMACs over those original bytes, including their padding.
-//! [`codec::Wire::write`] uses zero padding and recomputes FINGERPRINT.
-//! It rejects invalid fields and leaves the destination unchanged.
+//! Writing a [`Frame`] preserves those bytes. Writing a [`Message`] uses zero
+//! padding and recomputes FINGERPRINT.
+//! The message writer rejects invalid fields and leaves the destination unchanged.
 //!
 //! ```
 //! use std::net::SocketAddr;
@@ -886,6 +888,11 @@ pub fn answer_binding(request: &Message, source: SocketAddr) -> Option<Message> 
 }
 
 /// One bounded message's bytes, with only its framing checked.
+///
+/// [`codec::Frames<Frame>`] yields this type. The bytes include the header,
+/// attributes and original padding. [`Wire::write`] copies them unchanged
+/// after checking the framing. Use [`Message::parse`] on `.0` to check and
+/// interpret attributes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame(pub Vec<u8>);
 
@@ -894,7 +901,7 @@ impl Wire for Frame {
     type WriteError = Error;
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match Self::parse_prefix(bytes, &Self::default_limit())? {
-            Some((data, used)) if used == bytes.len() => Ok(Self(data)),
+            Some((frame, used)) if used == bytes.len() => Ok(frame),
             Some((_, used)) => Err(Error::TrailingBytes(bytes.len() - used)),
             None => Err(Error::Truncated),
         }
@@ -907,14 +914,14 @@ impl Wire for Frame {
 }
 
 fictionet::prefixed! {
-    /// Frames one STUN message and yields its uninterpreted bytes.
+    /// Frames one STUN message and yields a byte-preserving [`Frame`].
     /// Partial input needs more bytes, including at EOF. The stream reports truncation.
-    Frame => (Vec<u8>, Error, ());
+    Frame => (Frame, Error, ());
     name = "STUN";
     default {}
     capacity(_) { MAX_MESSAGE }
     fn parse_prefix(input: &[u8], _: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Error> {
-        Ok(header(input)?.map(|total| (input[..total].to_vec(), total)))
+        Ok(header(input)?.map(|total| (Frame(input[..total].to_vec()), total)))
     }
 }
 
@@ -1452,7 +1459,7 @@ mod tests {
                 let mut d = Stream::new(Frames::<Frame>::new());
                 put(&mut d, &s[..n]);
                 assert_eq!(
-                    d.next().map(|r| r.map(|frame| Message::parse(&frame))),
+                    d.next().map(|r| r.map(|frame| Message::parse(&frame.0))),
                     None
                 );
             }
@@ -1472,7 +1479,7 @@ mod tests {
         let mut got = Vec::new();
         for byte in test_support::chunks(&stream, &[1]) {
             put(&mut d, byte);
-            while let Some(m) = d.next().map(|r| r.map(|frame| Message::parse(&frame))) {
+            while let Some(m) = d.next().map(|r| r.map(|frame| Message::parse(&frame.0))) {
                 got.push(m.unwrap().map(|m| m.class));
             }
         }
@@ -1494,12 +1501,12 @@ mod tests {
         // the decoder drops bytes pushed after it.
         put(&mut d, &[0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4]);
         assert_eq!(
-            d.next().map(|r| r.map(|frame| Message::parse(&frame))),
+            d.next().map(|r| r.map(|frame| Message::parse(&frame.0))),
             Some(Err(codec::Fail::Protocol(Error::MagicCookie(0x0102_0304))))
         );
         put(&mut d, &SAMPLE_REQUEST);
         assert_eq!(
-            d.next().map(|r| r.map(|frame| Message::parse(&frame))),
+            d.next().map(|r| r.map(|frame| Message::parse(&frame.0))),
             None
         );
         assert!(d.failed().is_some());
@@ -1759,7 +1766,7 @@ mod tests {
                 let took = d.push(rest);
                 assert!(took > 0 || d.buffered() == MAX_MESSAGE);
                 rest = &rest[took..];
-                while let Some(m) = d.next().map(|r| r.map(|frame| Message::parse(&frame))) {
+                while let Some(m) = d.next().map(|r| r.map(|frame| Message::parse(&frame.0))) {
                     assert!(m.is_ok());
                     count += 1;
                 }
@@ -1769,7 +1776,7 @@ mod tests {
             // Interleaved pushes keep working once part of the buffer is read.
             put(&mut d, &one[..5]);
             assert_eq!(
-                d.next().map(|r| r.map(|frame| Message::parse(&frame))),
+                d.next().map(|r| r.map(|frame| Message::parse(&frame.0))),
                 None
             );
             assert_eq!(d.buffered(), 5);
@@ -1777,7 +1784,7 @@ mod tests {
             put(&mut d, &one);
             assert!(
                 d.next()
-                    .map(|r| r.map(|frame| Message::parse(&frame)))
+                    .map(|r| r.map(|frame| Message::parse(&frame.0)))
                     .unwrap()
                     .is_ok()
             );
@@ -1785,12 +1792,12 @@ mod tests {
             put(&mut d, &one[..3]);
             assert!(
                 d.next()
-                    .map(|r| r.map(|frame| Message::parse(&frame)))
+                    .map(|r| r.map(|frame| Message::parse(&frame.0)))
                     .unwrap()
                     .is_ok()
             );
             assert_eq!(
-                d.next().map(|r| r.map(|frame| Message::parse(&frame))),
+                d.next().map(|r| r.map(|frame| Message::parse(&frame.0))),
                 None
             );
             assert_eq!(d.buffered(), 3);
@@ -1856,8 +1863,9 @@ mod tests {
         put(&mut d, &stream);
         for s in samples() {
             let frame = d.next().unwrap().unwrap();
-            assert_eq!(frame, s);
-            assert!(Message::parse(&frame).is_ok());
+            assert_eq!(frame.0, s);
+            assert_eq!(contract::check_written(&frame), s);
+            assert!(Message::parse(&frame.0).is_ok());
         }
         assert_eq!(d.next(), None);
         assert_ne!(
@@ -1915,7 +1923,7 @@ mod tests {
         let source = "192.0.2.1:32853".parse().unwrap();
         for pattern in [&[][..], &[1], &[3, 1, 17]] {
             let mut stream =
-                Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame)));
+                Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)));
             let mut results = Vec::new();
             let mut replies = Vec::new();
             let mut expected_replies = Vec::new();
@@ -1949,7 +1957,7 @@ mod tests {
             assert_eq!(stream.next(), None);
 
             let mut response_stream =
-                Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame)));
+                Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)));
             let mut responses = Vec::new();
             for byte in &replies {
                 assert_eq!(
@@ -1967,7 +1975,7 @@ mod tests {
 
         // Mixed attribute and header errors obey the decoder contract.
         contract::check_decode(
-            || Frames::<Frame>::new().map(|frame| Message::parse(&frame)),
+            || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
             &bytes,
         );
     }
@@ -2011,10 +2019,11 @@ mod tests {
         for sample in samples() {
             contract::check_decode(Frames::<Frame>::new, sample);
             contract::check_decode(
-                || Frames::<Frame>::new().map(|frame| Message::parse(&frame)),
+                || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
                 sample,
             );
             contract::check_wire::<Message>(sample);
+            contract::check_wire::<Frame>(sample);
         }
         let mut message = Message::binding_request([1; 12]);
         message
@@ -2026,7 +2035,7 @@ mod tests {
         assert_eq!(Frames::<Frame>::new().held(), 0);
         contract::check_decode(Frames::<Frame>::new, &bytes);
         contract::check_decode(
-            || Frames::<Frame>::new().map(|frame| Message::parse(&frame)),
+            || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
             &bytes,
         );
         contract::check_wire::<Message>(&bytes);
@@ -2034,11 +2043,11 @@ mod tests {
         let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&bytes), MAX_MESSAGE);
         assert_eq!(stream.push(&bytes), 0);
-        assert_eq!(stream.next(), Some(Ok(bytes.clone())));
+        assert_eq!(stream.next(), Some(Ok(Frame(bytes.clone()))));
         assert_eq!(stream.buffered(), 0);
         assert_eq!(stream.push(&bytes), MAX_MESSAGE);
         stream.end();
-        assert_eq!(stream.next(), Some(Ok(bytes)));
+        assert_eq!(stream.next(), Some(Ok(Frame(bytes))));
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), None);
     }
@@ -2180,6 +2189,7 @@ mod tests {
     }
 
     fn check_round_trip(bytes: &[u8]) {
+        contract::check_wire::<Frame>(bytes);
         contract::check_wire::<Message>(bytes);
         if let Ok(message) = Message::parse(bytes) {
             assert_eq!(
@@ -2198,13 +2208,13 @@ mod tests {
 
     fn check_stream(bytes: &[u8]) -> usize {
         contract::check_decode(
-            || Frames::<Frame>::new().map(|frame| Message::parse(&frame)),
+            || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
             bytes,
         );
         let (frames, _) = test_support::decode_all(Frames::<Frame>::new, bytes);
         frames
             .iter()
-            .filter_map(|frame| Message::parse(frame).ok())
+            .filter_map(|frame| Message::parse(&frame.0).ok())
             .inspect(|message| {
                 contract::check_wire_value(message);
             })

@@ -10,10 +10,12 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(Frames::<Frame>::new, data);
     contract::check_decode(
-        || Frames::<Frame>::new().map(|frame| <Message as Wire>::parse(&frame)),
+        || Frames::<Frame>::new().map(|frame| <Message as Wire>::parse(&frame.0)),
         data,
     );
     contract::check_wire::<Message>(data);
+    contract::check_wire::<Frame>(data);
+    contract::check_wire_value(&Frame(data.to_vec()));
 
     // MESSAGE-INTEGRITY uses each frame's original bytes at its stream offset.
     let mut stream = Stream::new(Frames::<Frame>::new());
@@ -28,7 +30,8 @@ fuzz_target!(|data: &[u8]| {
             let start = usize::try_from(span.start).unwrap();
             let end = usize::try_from(span.end).unwrap();
             assert_eq!(Some(raw), data.get(start..end));
-            assert_eq!(frame, raw);
+            assert_eq!(frame.0, raw);
+            assert_eq!(frame.to_bytes().unwrap(), raw);
         }) {
             if result.is_err() {
                 break;

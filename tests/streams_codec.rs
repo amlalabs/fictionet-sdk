@@ -4,7 +4,7 @@ use core::fmt::Debug;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, Wire};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::{openvpn, rtcp, rtp, snmp, ssh};
+use fictionet::stdlib::{openvpn, rtcp, rtp, snmp, ssh, stun};
 
 fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
@@ -176,6 +176,129 @@ fn openvpn_wire_is_exact_and_transactional() {
         <openvpn::Frame as Wire>::parse(&[0, 2, 1]),
         Err(openvpn::Error::Truncated)
     );
+}
+
+fn stun_padded_request() -> Vec<u8> {
+    let mut request = stun::Message::binding_request([7; 12]);
+    request.attributes = vec![
+        stun::Attribute::Username("bob".into()),
+        stun::Attribute::Other {
+            typ: stun::attr::MESSAGE_INTEGRITY,
+            value: vec![0x5a; 20],
+        },
+    ];
+    request.fingerprint = true;
+    let mut bytes = request.to_bytes().unwrap();
+    // Preserve nonzero USERNAME padding, with a fingerprint over those bytes.
+    bytes[stun::HEADER_LEN + 7] = 0xa5;
+    let fingerprint_at = bytes.len() - 8;
+    let fingerprint = stun::crc32(&bytes[..fingerprint_at]) ^ stun::FINGERPRINT_XOR;
+    bytes[fingerprint_at + 4..].copy_from_slice(&fingerprint.to_be_bytes());
+    bytes
+}
+
+#[test]
+fn stun_frames_are_writable_and_preserve_padding() {
+    let bytes = stun_padded_request();
+    let message = stun::Message::parse(&bytes).unwrap();
+    assert_ne!(message.to_bytes().unwrap(), bytes);
+    let frame = stun::Frame::parse(&bytes).unwrap();
+    assert_eq!(frame.0, bytes);
+    assert_eq!(contract::check_exact(&frame), bytes);
+    contract::check_truncated(Frames::<stun::Frame>::new, &bytes);
+    assert_eq!(
+        check(Frames::<stun::Frame>::new, &bytes.repeat(2)),
+        (vec![frame.clone(), frame], None)
+    );
+}
+
+#[test]
+fn stun_frame_wire_checks_only_framing_and_is_transactional() {
+    let bytes = stun_padded_request();
+    for (invalid, error) in [
+        (vec![], stun::Error::Truncated),
+        (bytes[..bytes.len() - 1].to_vec(), stun::Error::Truncated),
+        (
+            [bytes.clone(), vec![0]].concat(),
+            stun::Error::TrailingBytes(1),
+        ),
+        (vec![0xc0], stun::Error::TopBits(0xc0)),
+        (vec![0, 1, 0, 2], stun::Error::Length(2)),
+        (
+            vec![0, 1, 0, 0, 1, 2, 3, 4],
+            stun::Error::MagicCookie(0x0102_0304),
+        ),
+    ] {
+        assert_eq!(stun::Frame::parse(&invalid), Err(error));
+        assert_eq!(contract::check_refused(&stun::Frame(invalid)), error);
+    }
+
+    // An invalid attribute remains a writable frame for raw forwarding.
+    let mut invalid_attribute = bytes;
+    invalid_attribute[stun::HEADER_LEN + 2..stun::HEADER_LEN + 4]
+        .copy_from_slice(&u16::MAX.to_be_bytes());
+    assert!(stun::Message::parse(&invalid_attribute).is_err());
+    let frame = stun::Frame::parse(&invalid_attribute).unwrap();
+    assert_eq!(contract::check_written(&frame), invalid_attribute);
+}
+
+#[test]
+fn stun_frames_compose_with_interception_and_fault_writing() {
+    use fictionet::stdlib::codec::{Faults, Interceptor, ItemFault, Rewrite, Rule, Trigger};
+
+    let bytes = stun_padded_request();
+    let input = bytes.repeat(2);
+    let mut stream = Stream::new(Frames::<stun::Frame>::new());
+    assert_eq!(stream.push(&input), input.len());
+    stream.end();
+    let proxy = Interceptor::new(input.len());
+    let mut intercepted = Vec::new();
+    while let Some(result) = proxy.next(&mut stream, &mut intercepted, |frame, raw, span| {
+        assert_eq!(frame.0, raw);
+        assert_eq!(raw, bytes);
+        assert_eq!(span.end - span.start, bytes.len() as u64);
+        Rewrite::Replace(vec![frame.clone()])
+    }) {
+        result.unwrap();
+    }
+    assert!(stream.is_done());
+    assert_eq!(intercepted, input);
+
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
+    let mut faults = Faults::new(3 * bytes.len(), 0);
+    let plan = [
+        Rule {
+            when: Trigger::At(1),
+            fault: ItemFault::Action {
+                delay: None,
+                rewrite: Rewrite::Replace(vec![stun::Frame::parse(&bytes).unwrap()]),
+            },
+        },
+        Rule {
+            when: Trigger::At(2),
+            fault: ItemFault::Action {
+                delay: None,
+                rewrite: Rewrite::Repeat(2),
+            },
+        },
+    ];
+    let mut stream = Stream::new(Frames::<stun::Frame>::new());
+    let mut output = Vec::new();
+    for chunk in intercepted.chunks(3) {
+        assert_eq!(stream.push(chunk), chunk.len());
+        while let Some(result) = faults.next(&entropy, &mut stream, &mut output, &plan) {
+            assert_eq!(result.unwrap(), None);
+        }
+    }
+    stream.end();
+    assert!(
+        faults
+            .next(&entropy, &mut stream, &mut output, &plan)
+            .is_none()
+    );
+    faults.flush(&mut output).unwrap();
+    assert!(stream.is_done());
+    assert_eq!(output, bytes.repeat(3));
 }
 
 fn media_packet() -> rtp::Packet {

@@ -176,6 +176,17 @@ its own limits and errors: `read_data` reports `Error::Limit("TPKT payload")`
 before checking the data header, and `Connection::from_packet` checks its
 smaller connection-header limit before parsing COTP.
 
+### Writable STUN frames
+
+STUN stream framing uses `codec::Frames<stun::Frame>`. It yields
+`stun::Frame` values, not `Vec<u8>`; read a frame's bytes through `.0`.
+The frame implements `Wire`, so it can pass directly through
+`codec::Interceptor::next` and `codec::Faults::next`, including replacement
+writing. Framing still checks only the header and length. Reading and
+writing a frame preserves the original attributes and nonzero padding.
+Use `stun::Message::parse(&frame.0)` to interpret attributes. Writing that
+message uses zero padding and recomputes FINGERPRINT.
+
 ### Owning recursive protocol values
 
 AMQP `FieldValue`, Thrift `Value`, and protobuf `Value` release nested

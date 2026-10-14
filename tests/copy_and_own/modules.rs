@@ -339,15 +339,20 @@ protocols!();
 
 // These are the copied types, so their Prefixed impls must use public APIs.
 fn copied_frames() {
-    use fictionet::stdlib::codec::{Decode, Frames, Prefixed};
+    use fictionet::stdlib::codec::{Decode, Frames, Prefixed, Wire};
     fn check<T: Prefixed>(_decoder: Frames<T>)
     where
         Frames<T>: Decode,
     {
     }
+    fn check_writable<D: Decode>(_decoder: D)
+    where
+        D::Item: Wire,
+    {
+    }
     check(Frames::<modbus::Frame>::new());
     check(Frames::<kerberos::Frame>::new());
-    check(Frames::<stun::Frame>::new());
+    check_writable(Frames::<stun::Frame>::new());
     check(Frames::<ocsp::Frame>::new());
     check(Frames::<spnego::Frame>::new());
     check(Frames::<diameter::Message>::with_limit(1024));
