@@ -3469,7 +3469,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg};
     use fictionet::stdlib::test_support::contract::{
-        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
+        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value, check_written,
     };
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{decode_all, mutate};
@@ -4434,10 +4434,7 @@ mod tests {
                 }
                 for action in &actions {
                     if let Action::Send(message) = action {
-                        assert_eq!(
-                            Outbound::parse(&message.to_bytes().unwrap()).unwrap(),
-                            *message
-                        );
+                        check_written(message);
                     }
                 }
                 let Action::Send(Outbound::LoginResponse(response)) = &actions[0] else {
@@ -4504,8 +4501,7 @@ mod tests {
                 else {
                     panic!("missing login refusal")
                 };
-                check_wire_value(response);
-                assert_eq!(response.to_bytes().unwrap().len(), MAX_MESSAGE);
+                assert_eq!(check_written(response).len(), MAX_MESSAGE);
                 assert_ne!(response.status, b'A');
                 assert_eq!(response.tail.groups, request.params);
                 assert!(response.tail.units.is_empty());
@@ -4792,12 +4788,15 @@ mod tests {
                 )
                 .unwrap();
                 let id = text("A1");
-                x.receive(&good("A1", 300), 1);
-                x.accept(id, 2, 2).unwrap();
+                assert_eq!(
+                    x.receive(&good("A1", 300), 1),
+                    [Action::Event(OrderEvent::NewOrderRequested(id))]
+                );
+                check_written(&x.accept(id, 2, 2).unwrap());
                 let shares = if completed { 300 } else { 100 };
-                x.execute(id, shares, Price(99_000), b'A', 3).unwrap();
+                check_written(&x.execute(id, shares, Price(99_000), b'A', 3).unwrap());
                 if !completed {
-                    x.cancel(id, codes::reason::USER_REQUESTED, 4).unwrap();
+                    check_written(&x.cancel(id, codes::reason::USER_REQUESTED, 4).unwrap());
                 }
                 assert!(x.order(id).is_none());
                 if reused {
@@ -4815,11 +4814,11 @@ mod tests {
                         ),
                         5,
                     );
-                    x.accept(id, 3, 6).unwrap();
+                    check_written(&x.accept(id, 3, 6).unwrap());
                 }
                 let before = x.order(id).cloned();
                 let bust = x.bust(1, Price(98_000), 7).unwrap();
-                check_wire_value(&bust);
+                check_written(&bust);
                 assert_eq!(
                     bust,
                     TradeCancelOrCorrect {
@@ -4913,7 +4912,7 @@ mod tests {
                 fields.set(f).unwrap();
             }
             let bust = x.bust(2, Price(0), 8).unwrap();
-            check_wire_value(&bust);
+            check_written(&bust);
             let Outbound::TradeCancelOrCorrect(t) = bust else {
                 panic!()
             };
