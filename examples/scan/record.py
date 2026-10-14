@@ -12,21 +12,21 @@ dashboard.webm.
 
 import asyncio
 import os
+import re
 import shutil
+import subprocess
 import sys
 import urllib.parse
 from pathlib import Path
 
 from playwright.async_api import async_playwright
 
-URL = sys.argv[1]
-OUT = Path(sys.argv[2])
-COMPOSE = sys.argv[3:]  # how to run `docker compose` for this stack
 W, H = 1920, 1080
 PANEL = 600  # the terminal panel's width
 
 DISCOVERY = ["nmap", "-sn", "-n", "10.0.0.0/24"]
 PORT_SCAN = ["nmap", "-sS", "-sV", "-n", "-p", "1-1024", "--max-rate", "200", "10.0.0.0/24"]
+HOSTS = {"10.0.0.10", "10.0.0.11", "10.0.0.12", "10.0.0.13", "10.0.0.50"}
 
 # The terminal panel, the captions and a pointer, added to the page. Only
 # the recording has them; the dashboard itself is unchanged.
@@ -172,25 +172,46 @@ async def type_command(page, argv):
     await page.evaluate("t => rec.write(t)", "\n")
 
 
-async def run_command(page, argv):
-    """Runs a command in the scanner container, and shows its output."""
+def validate_scan(output, services=False):
+    """Requires the hosts and, for a port scan, the advertised container services."""
+    reports = re.split(r"^Nmap scan report for (\S+)\s*$", output, flags=re.MULTILINE)
+    hosts = dict(zip(reports[1::2], reports[2::2]))
+    up = {host for host, report in hosts.items() if re.search(r"^Host is up\b", report, re.MULTILINE)}
+    if up != HOSTS:
+        raise ValueError(f"Expected hosts {sorted(HOSTS)}, found {sorted(up)}")
+    if services:
+        for port, service, product in [(22, "ssh", "OpenSSH"), (80, "http", "nginx")]:
+            if not re.search(
+                rf"^{port}/tcp\s+open\s+{service}\s+{product}\b",
+                hosts["10.0.0.50"], re.MULTILINE,
+            ):
+                raise ValueError(f"Expected {product} on 10.0.0.50:{port}")
+
+
+async def run_command(page, argv, compose, out):
+    """Shows and saves command output, then raises if the command failed."""
+    command = [*compose, "exec", "-T", "scanner", *argv]
     proc = await asyncio.create_subprocess_exec(
-        *COMPOSE, "exec", "-T", "scanner", *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
-    out = []
+    lines = []
     while line := await proc.stdout.readline():
         text = line.decode(errors="replace")
-        out.append(text)
+        lines.append(text)
         await page.evaluate("t => rec.write(t)", text)
-    await proc.wait()
-    (OUT / "nmap.txt").open("a").write("$ " + " ".join(argv) + "\n" + "".join(out) + "\n")
-    return "".join(out)
+    status = await proc.wait()
+    output = "".join(lines)
+    with (out / "nmap.txt").open("a") as transcript:
+        transcript.write("$ " + " ".join(argv) + "\n" + output + "\n")
+    if status:
+        raise subprocess.CalledProcessError(status, command, output=output)
+    return output
 
 
-async def main():
-    OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / "nmap.txt").write_text("")
-    video_dir = OUT / "video"
+async def main(url, out, compose):
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "nmap.txt").write_text("")
+    video_dir = out / "video"
     shutil.rmtree(video_dir, ignore_errors=True)
     async with async_playwright() as p:
         browser = await p.chromium.launch(executable_path=os.environ.get("CHROMIUM") or None)
@@ -203,7 +224,7 @@ async def main():
         page = await context.new_page()
         page.on("pageerror", lambda e: print("page error:", e, file=sys.stderr))
         token = Path(os.environ["SCAN_DASHBOARD_TOKEN_FILE"]).read_text().strip()
-        await page.goto(URL + "?theme=light#token=" + urllib.parse.quote(token, safe=""))
+        await page.goto(url + "?theme=light#token=" + urllib.parse.quote(token, safe=""))
         await page.wait_for_function("sessionStorage.getItem('fictionet_token') !== null")
         # A fresh layout: no places or open groups from an earlier visit.
         await page.evaluate("() => localStorage.clear()")
@@ -219,13 +240,13 @@ async def main():
         # Host discovery.
         await page.evaluate("t => rec.caption(t)", "<b>Host discovery.</b> nmap pings the /24, and the scanner’s link lights up.")
         await type_command(page, DISCOVERY)
-        await run_command(page, DISCOVERY)
+        validate_scan(await run_command(page, DISCOVERY, compose, out))
         await asyncio.sleep(1.5)
 
         # The port scan runs while the viewer looks around.
         await page.evaluate("t => rec.caption(t)", "<b>SYN scan</b> of ports 1–1024 on every host that answered, then <b>service detection</b>.")
         await type_command(page, PORT_SCAN)
-        scan = asyncio.create_task(run_command(page, PORT_SCAN))
+        scan = asyncio.create_task(run_command(page, PORT_SCAN, compose, out))
         await asyncio.sleep(2.5)
 
         # Open one host's group, in place.
@@ -280,7 +301,7 @@ async def main():
         await ptr.move(x + 120, y + 260, 500)
         await asyncio.sleep(1.5)
 
-        await scan
+        validate_scan(await scan, services=True)
         await page.evaluate(
             "t => rec.caption(t)",
             "<b>All five hosts found.</b> 10.0.0.50 is the <b>real container</b>: nmap names its real nginx and OpenSSH.",
@@ -289,8 +310,9 @@ async def main():
         await context.close()
         await browser.close()
     videos = sorted(video_dir.glob("*.webm"))
-    videos[-1].rename(OUT / "dashboard.webm")
+    videos[-1].rename(out / "dashboard.webm")
     shutil.rmtree(video_dir, ignore_errors=True)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main(sys.argv[1], Path(sys.argv[2]), sys.argv[3:]))

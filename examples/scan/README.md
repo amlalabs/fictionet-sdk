@@ -170,3 +170,9 @@ closes a group and opens its merged packet list, and drags a box and a
 group. The output folder gets `dashboard.webm` as recorded,
 `dashboard.mp4` (H.264), a smaller `dashboard.gif`, and `nmap.txt` with
 the two scans' output. The recording is about 67 seconds long.
+
+The recorder saves the scanner output before checking its exit status.
+It stops if either scan fails or does not find all five expected hosts.
+Before showing the success caption, it also requires nmap to identify
+OpenSSH on port 22 and nginx on port 80 of `10.0.0.50`. Failed scans leave
+their output in `nmap.txt` for diagnosis.

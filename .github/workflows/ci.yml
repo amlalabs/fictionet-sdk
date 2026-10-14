@@ -133,6 +133,8 @@ jobs:
         run: python3 -m unittest discover -s examples/common -p 'test_*.py'
       - name: Demo regressions
         run: python3 -m unittest discover -s demos/tests -p 'test_*.py'
+      - name: Scan recorder regressions
+        run: uv run --with playwright python -m unittest discover -s examples/scan/tests -p 'test_*.py'
       - name: The adaptive web's backend
         working-directory: examples/adaptive-web/world/backend
         run: python3 -m unittest discover tests
