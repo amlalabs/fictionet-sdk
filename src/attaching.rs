@@ -1837,7 +1837,8 @@
 //! Attach runs as root, so it never writes through a link: a `resolv.conf`
 //! path that is a symlink, or a file with other hard links, is an error.
 //! The `--ready-file` is always made new, replacing whatever was at its
-//! path.
+//! path. If writing it fails, attach exits with status 1 and tries to remove
+//! the file it created. It leaves a replacement at that path alone.
 //!
 //! For example, a harness might start the agent with runc, in the namespace
 //! `/run/netns/agent`, and give it the host directory `/srv/agent/etc` as

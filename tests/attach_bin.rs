@@ -605,6 +605,73 @@ fn ready_exits_0_only_when_the_file_exists() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(feature = "tokio")]
+#[test]
+fn a_failed_ready_file_write_does_not_leave_a_successful_probe() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = temp_dir();
+    let sock = dir.join("w.sock");
+    let ready = dir.join("ready");
+    let token = dir.join("token");
+    std::fs::write(&token, "test-token\n").unwrap();
+    let (attacher, _attachments) = fictionet::attachments();
+    let _listening =
+        fictionet::listen(fictionet::WorldSocket::UnixSocket(sock.clone()), attacher).unwrap();
+
+    // The child may create a file, but writing past this size returns EFBIG.
+    for limit in [0, 3] {
+        let mut command = Command::new(BIN);
+        command
+            .args([
+                "attach",
+                "--world",
+                &format!("unix:{}", sock.display()),
+                "--name",
+                &format!("agent-{limit}"),
+                "--type",
+                "http_proxy",
+                "--listen",
+                "127.0.0.1:0",
+                "--ip-addr",
+                "10.0.0.2",
+                "--dns",
+                "10.0.0.1",
+                "--token-file",
+            ])
+            .arg(&token)
+            .arg("--ready-file")
+            .arg(&ready);
+        // SAFETY: the hook only calls async-signal-safe functions in the child.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let size = libc::rlimit {
+                    rlim_cur: limit,
+                    rlim_max: limit,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &size) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = command.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(err.contains("writing the ready file"), "{err}");
+        assert!(
+            err.contains(&std::io::Error::from_raw_os_error(libc::EFBIG).to_string()),
+            "{err}"
+        );
+        let probe = Command::new(BIN).arg("ready").arg(&ready).output().unwrap();
+        assert_eq!(probe.status.code(), Some(1));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn wait_blocked_waits_while_an_address_answers_and_exits_0_once_it_stops() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

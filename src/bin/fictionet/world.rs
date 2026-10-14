@@ -155,13 +155,31 @@ pub(crate) fn clear_ready_file(path: Option<&Path>) {
 /// Writes the ready file: the sandbox's name and a newline. Attach often
 /// runs as root, so the file is made new, never written through what is
 /// at the path: whatever is there (such as a symlink to another file) is
-/// removed first, and a file that appears in between is an error.
+/// removed first, and a file that appears in between is an error. If
+/// writing fails, tries to remove the created file, leaving replacements
+/// alone.
 pub(crate) fn write_ready_file(path: Option<&Path>, name: &str) -> Result<(), Failure> {
+    write_ready_file_with(path, name, io::Write::write_all)
+}
+
+fn write_ready_file_with(
+    path: Option<&Path>,
+    name: &str,
+    write: impl FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> Result<(), Failure> {
     if let Some(path) = path {
         let _ = fs::remove_file(path);
         let mut f = open_own_file(path, true).map_err(err("writing the ready file"))?;
-        io::Write::write_all(&mut f, format!("{name}\n").as_bytes())
-            .map_err(err("writing the ready file"))?;
+        if let Err(e) = write(&mut f, format!("{name}\n").as_bytes()) {
+            use std::os::unix::fs::MetadataExt;
+            // Keep f open so its inode cannot be reused for a replacement.
+            if let (Ok(owned), Ok(current)) = (f.metadata(), fs::symlink_metadata(path))
+                && (owned.dev(), owned.ino()) == (current.dev(), current.ino())
+            {
+                let _ = fs::remove_file(path);
+            }
+            return Err(err("writing the ready file")(e));
+        }
     }
     Ok(())
 }
@@ -284,6 +302,61 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
         assert!(fs::symlink_metadata(&ready).unwrap().file_type().is_file());
         assert_eq!(fs::read_to_string(&ready).unwrap(), "agent\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_ready_file_write_removes_empty_and_partial_files() {
+        let dir = temp_dir("ready-failed");
+        let ready = dir.join("attach.ready");
+        for written in [0, 3] {
+            let result = write_ready_file_with(Some(&ready), "agent", |f, bytes| {
+                io::Write::write_all(f, &bytes[..written])?;
+                assert_eq!(fs::read(&ready).unwrap(), &bytes[..written]);
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+            let Err(Failure::Error(message)) = result else {
+                panic!("expected a ready-file write error");
+            };
+            assert_eq!(
+                message,
+                format!(
+                    "writing the ready file: {}",
+                    io::Error::from_raw_os_error(libc::ENOSPC)
+                )
+            );
+            assert_eq!(
+                fs::symlink_metadata(&ready).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_ready_file_write_leaves_replacements_alone() {
+        let dir = temp_dir("ready-replaced");
+        let ready = dir.join("attach.ready");
+        let original = dir.join("original");
+        for symlink in [false, true] {
+            let result = write_ready_file_with(Some(&ready), "agent", |f, bytes| {
+                io::Write::write_all(f, &bytes[..3])?;
+                fs::rename(&ready, &original)?;
+                if symlink {
+                    std::os::unix::fs::symlink(&original, &ready)?;
+                } else {
+                    fs::write(&ready, "replacement\n")?;
+                }
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+            assert!(matches!(result, Err(Failure::Error(_))));
+            if symlink {
+                assert_eq!(fs::read_link(&ready).unwrap(), original);
+            } else {
+                assert_eq!(fs::read_to_string(&ready).unwrap(), "replacement\n");
+            }
+            assert_eq!(fs::read_to_string(&original).unwrap(), "age");
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
