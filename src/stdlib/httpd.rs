@@ -64,9 +64,13 @@
 //!
 //! HTTP/2 runs on hyper, behind the same [`Handler`] trait and the
 //! same events, with the same [`Limits`] and seeded randomness. It charges
-//! the request and response bodies it holds to the connection's
-//! [`Budget`]. hyper's own buffers are not charged. HTTP/2 request body
-//! and write stall timeouts use Fictionet deadlines. Hyper runs without a
+//! the request heads, request events and bodies it holds to the connection's
+//! [`Budget`]. A request head stays charged while its handler waits. Its
+//! event stays charged until it is recorded, including while a response
+//! streams. If hyper cannot charge the metadata, it rejects the stream
+//! before calling the handler and records `answer: budget` without a status.
+//! Transport buffers and hyper's own buffers are not charged. HTTP/2 request
+//! body and write stall timeouts use Fictionet deadlines. Hyper runs without a
 //! timer, with keep-alive pings and adaptive windows disabled. h2 retains
 //! reset streams for its default `reset_stream_duration` of one second of
 //! real time. Its reset-stream expiry reads the system clock, so late
@@ -101,7 +105,7 @@
 //! (`[name, value]` pairs in the order of `http::HeaderMap`), `started`
 //! (seconds on the run's clock), `answer` (`handler`, `error`, `cancelled`,
 //! what the handler set, such as `redirect`, or, over HTTP/2, `too_large`,
-//! `timeout`, `cut_off` or `budget` for a request body the service turned
+//! `timeout`, `cut_off` or `budget` for a request the service turned
 //! down), `status`, `sent` (body bytes the connection took) and `complete`
 //! (whether it took the whole body). Over HTTP/1 a byte counts once it is
 //! written, and the event is made after the last one is; over HTTP/2 once
@@ -811,6 +815,36 @@ struct Tracker {
     event: Option<Event>,
 }
 
+/// Owned HTTP head storage. `http` hides allocation capacities, so charge
+/// string lengths and the header map's capacity, including shared values
+/// in full. Extensions and third-party allocation overhead are excluded.
+fn request_held<B>(request: &Request<B>) -> usize {
+    let uri = request.uri();
+    let headers = request.headers();
+    let slots = headers.capacity() + headers.len() - headers.keys_len();
+    std::mem::size_of::<http::request::Parts>()
+        + request.method().as_str().len()
+        + uri.scheme_str().map_or(0, str::len)
+        + uri.authority().map_or(0, |a| a.as_str().len())
+        + uri.path_and_query().map_or(0, |p| p.as_str().len())
+        + slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
+        + headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
+            .sum::<usize>()
+}
+
+fn head_held(head: &RequestHead) -> usize {
+    head.method.capacity()
+        + head.target.capacity()
+        + head.headers.capacity() * std::mem::size_of::<http1::Header>()
+        + head
+            .headers
+            .iter()
+            .map(|h| h.name.capacity() + h.value.capacity())
+            .sum::<usize>()
+}
+
 fn version_name(v: Version) -> &'static str {
     match v {
         Version::HTTP_09 => "HTTP/0.9",
@@ -822,6 +856,10 @@ fn version_name(v: Version) -> &'static str {
 }
 
 impl Tracker {
+    fn held(&self) -> usize {
+        self.event.as_ref().map_or(0, Event::size)
+    }
+
     fn new<B>(request: &Request<B>, conn: &ConnInfo, started: Instant) -> Tracker {
         let host = request_host(request);
         let headers: Vec<Value> = request
@@ -1098,6 +1136,7 @@ impl Http1 {
         request.extensions_mut().insert(driver.conn().clone());
         let head_only = request.method() == Method::HEAD;
         let tracker = Tracker::new(&request, driver.conn(), self.started);
+        let held = held + request_held(&request);
         let now = driver.now();
         let conn = driver.conn().clone();
         let reply = if self.too_big {
@@ -1442,7 +1481,7 @@ impl serve::Service for Http1 {
     }
 
     fn held(&self) -> usize {
-        self.body.capacity()
+        self.body.capacity() + self.head.as_ref().map_or(0, head_held)
     }
 
     fn on_fail(
@@ -1767,7 +1806,7 @@ impl Pending for Streaming {
     fn held(&self) -> usize {
         let response = self.response.as_ref().map_or(0, |r| r.body().full_len());
         let body = self.body.as_ref().map_or(0, Body::full_len);
-        self.request_held + self.rest_held + response + body
+        self.request_held + self.tracker.held() + self.rest_held + response + body
     }
 }
 
@@ -1785,10 +1824,13 @@ pub struct HttpOptions {
     /// the HTTP/1 head limit allows.
     pub first_bytes: Option<Duration>,
     /// What connections are charged to ([`ServeOptions::budget`]): over
-    /// HTTP/1 what the service holds, over HTTP/2 each request's body and
-    /// each response frame until its last slice is dropped. Response storage
-    /// is charged by its original byte length; spare capacity and backing
-    /// storage outside a supplied slice are not exposed by `Bytes`.
+    /// HTTP/1 what the service holds, over HTTP/2 each request's head and body,
+    /// its event metadata, and each response frame until its last slice is
+    /// dropped. Heads count method, URI and header bytes, plus header slots;
+    /// hidden capacities, extensions and third-party overhead are excluded.
+    /// Events use [`Event::size`]. Transport and hyper buffers are excluded.
+    /// Response storage is charged by its original byte length; spare capacity
+    /// and backing storage outside a supplied slice are not exposed by `Bytes`.
     pub budget: Option<Budget>,
     /// The world's date and time at the start of the run, for `Date`
     /// headers. `None`: no `Date` header. See [Dates](self#dates).
@@ -2319,13 +2361,34 @@ mod h2 {
         type Future = Answer;
 
         fn call(&self, request: Request<Incoming>) -> Answer {
+            let mut tracker = Tracker::new(&request, &self.info, self.fcx.now());
+            let metadata = self.budget.as_ref().map(|budget| {
+                let head = budget.charge(request_held(&request))?;
+                let event = budget.charge(tracker.held())?;
+                Some((head, event))
+            });
+            let (head_charge, event_charge) = match metadata {
+                Some(Some((head, event))) => (Some(head), Some(event)),
+                None => (None, None),
+                Some(None) => {
+                    if let Some(event) = tracker.finish(
+                        Some(Fields::new().with("answer", "budget")), None, 0, false,
+                    ) {
+                        self.fcx.record(event.conn(&self.info));
+                    }
+                    return Box::pin(std::future::ready(Err(Error::msg(
+                        "request metadata exceeds budget",
+                    ))));
+                }
+            };
             let on_upgrade = request
                 .extensions()
                 .get::<hyper::upgrade::OnUpgrade>()
                 .cloned();
             let route = self.clone();
             let track = Track {
-                tracker: Tracker::new(&request, &route.info, route.fcx.now()),
+                tracker,
+                _charge: event_charge,
                 fcx: route.fcx.clone(),
                 info: route.info.clone(),
                 extra: None,
@@ -2343,7 +2406,10 @@ mod h2 {
                 let (parts, body) = request.into_parts();
                 let head_only = parts.method == Method::HEAD;
                 let response = match route.body(body, &mut charge).await {
-                    Err(answer) => *answer,
+                    Err(answer) => {
+                        drop(parts);
+                        *answer
+                    }
                     Ok(body) => {
                         let mut request = Request::from_parts(parts, Body::from(body));
                         request.extensions_mut().insert((*route.info).clone());
@@ -2360,6 +2426,7 @@ mod h2 {
                         }
                     }
                 };
+                drop(head_charge);
                 if response.status() == StatusCode::SWITCHING_PROTOCOLS
                     && let Some(upgraded) = &route.upgraded
                 {
@@ -2435,6 +2502,7 @@ mod h2 {
     /// One request's event, sent when it is dropped.
     struct Track {
         tracker: Tracker,
+        _charge: Option<Charge>,
         fcx: Cx,
         info: Arc<ConnInfo>,
         extra: Option<Fields>,
@@ -2904,6 +2972,7 @@ mod h2 {
                         rest: Bytes::new(),
                         track: Track {
                             tracker: Tracker::new(&request, &info, fcx.now()),
+                            _charge: None,
                             fcx: fcx.clone(),
                             info: info.clone(),
                             extra: None,
@@ -3161,6 +3230,7 @@ mod router_tests {
             &ConnInfo::default(),
             Instant::ZERO,
         );
+        let metadata = tracker.held();
         let inner = Streaming::new(
             None,
             Some(Response::new(Body::from(vec![b'x'; 3 * PIECE]))),
@@ -3178,7 +3248,11 @@ mod router_tests {
             (),
         );
         harness.open().unwrap();
-        assert_eq!(&held.lock()[..3], &[3 * PIECE, 3 * PIECE, 0]);
+        assert_eq!(
+            &held.lock()[..3],
+            &[3 * PIECE + metadata, 3 * PIECE + metadata, metadata]
+        );
+        assert_eq!(held.lock().last(), Some(&0));
     }
 
     #[test]

@@ -92,8 +92,8 @@
 //!   that sandbox's [`Budget`], 256 MiB unless [`Limits::sandbox_budget`]
 //!   says otherwise. A connection that would pass it is closed. The service
 //!   driver charges its buffers and what the service reports holding, and
-//!   HTTP/2 charges the bodies it holds ([`serve`] lists each charge). A
-//!   [`PortServer`] of your own charges what it chooses. A sandbox has one
+//!   HTTP/2 charges retained request heads, events and bodies (see [`httpd`]).
+//!   A [`PortServer`] of your own charges what it chooses. A sandbox has one
 //!   budget for both its addresses, from when it attaches until it
 //!   detaches. A trusted sandbox ([`Net::route`]) has none.
 //! - **Every link** inside the network holds at most 4 MiB of packets each

@@ -361,8 +361,15 @@ runs on hyper, behind the same `Handler` trait. The stdlib's `http2`
 module reads and writes HTTP/2 frames and tracks a session's state, but it
 does not serve. Both versions share one set of `httpd::Limits`: body size,
 body and write timers, and 100 streams at once on an HTTP/2 connection.
-Both charge the request and response bodies they hold to the sandbox's
-budget, and both draw a handler's randomness from the run's stream.
+Both charge retained request heads, request events and bodies to the sandbox's
+budget. A pending handler keeps its request charge. The copied event metadata
+stays charged until the event is recorded, including while the response streams.
+Heads count method, URI and header bytes and header slots. Events use
+`Event::size()`. Hidden capacities in `http` types, request extensions,
+third-party allocation overhead and transport buffers are outside these counts.
+Hyper rejects a request whose metadata does not fit before calling its handler.
+It records `answer: budget` without a status and ends that stream. Both versions
+draw a handler's randomness from the run's stream.
 
 In `http2::Session`, HPACK reductions wait for the corresponding SETTINGS
 ACK. A decrease followed by an unacknowledged rebound leaves the earlier

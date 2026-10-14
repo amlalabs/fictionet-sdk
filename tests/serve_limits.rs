@@ -10,6 +10,8 @@ mod service_fixture;
 mod common;
 #[path = "common/done.rs"]
 mod done;
+#[path = "common/wait.rs"]
+mod wait;
 #[path = "common/world.rs"]
 mod world;
 
@@ -507,10 +509,10 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
                 });
             let opts = HttpOptions {
                 limits: Limits {
-                    body: 3000,
+                    body: 9000,
                     ..Limits::default()
                 },
-                budget: Some(Budget::new(2000)),
+                budget: Some(Budget::new(8000)),
                 ..HttpOptions::default()
             };
             serve_http(&fcx, &server, 80, Arc::new(router), opts)?;
@@ -556,10 +558,10 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
             let (status, body) = ask(http::Method::POST, "/echo", vec![b'a'; 1500]).await?;
             assert_eq!((status, body.len()), (200, 1500));
             // Within the limit, past the budget.
-            let (status, _) = ask(http::Method::POST, "/echo", vec![b'b'; 2500]).await?;
+            let (status, _) = ask(http::Method::POST, "/echo", vec![b'b'; 7500]).await?;
             assert_eq!(status, 503);
             // Past the limit.
-            let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 3500]).await?;
+            let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 9500]).await?;
             assert_eq!(status, 413);
 
             let events = kept
@@ -591,9 +593,10 @@ fn pending_http1_requests_keep_their_body_charge() {
             ServeOptions::default().budget(budget.clone()),
         )
         .with_fcx(fcx.clone());
+        h.open().unwrap();
+        let base = budget.used();
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 8192\r\n\r\n")
             .unwrap();
-        let base = budget.used();
         h.push(&[b'x'; 8192]).unwrap();
         assert_eq!(h.pending(), (1, 0));
         assert!(budget.used() >= base + 8192);
@@ -630,15 +633,320 @@ fn truncated_http1_requests_keep_their_body_charge() {
             ServeOptions::default().budget(budget.clone()),
         )
         .with_fcx(fcx.clone());
+        h.open().unwrap();
+        let base = budget.used();
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 16384\r\n\r\n")
             .unwrap();
-        let base = budget.used();
         h.push(&[b'x'; 8192]).unwrap();
         let _ = h.end();
         assert_eq!(h.pending(), (1, 0));
         assert!(budget.used() >= base + 8192);
         drop(h);
         assert_eq!(budget.used(), 0);
+        Ok(())
+    });
+}
+
+#[test]
+fn http1_charges_heads_while_reading_and_metadata_while_waiting() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let budget = Budget::new(1 << 20);
+        let router = Router::new().route_async(None, "/", |fcx, request| async move {
+            fcx.sleep(Duration::from_secs(1)).await.unwrap();
+            assert_eq!(request.headers()["x-large"].as_bytes().len(), 4096);
+            http::Response::new(Bytes::new())
+        });
+        let mut h = Harness::with_options(
+            fictionet::Seed::from_u64(0),
+            Http1::new(router),
+            (),
+            ServeOptions::default().budget(budget.clone()),
+        )
+        .with_fcx(fcx.clone());
+        h.open().unwrap();
+        let base = budget.used();
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: a.test\r\nX-Large: {}\r\nContent-Length: 1\r\n\r\n",
+            "x".repeat(4096)
+        );
+        h.push(head.as_bytes()).unwrap();
+        assert!(budget.used() >= base + 4096, "the head waits for the body");
+        h.push(b"x").unwrap();
+        assert_eq!(h.pending(), (1, 0));
+        assert!(
+            budget.used() >= base + 8192,
+            "the handler and event each hold headers"
+        );
+        fcx.sleep(Duration::from_secs(1)).await?;
+        assert!(!h.poll().unwrap().is_empty());
+        assert_eq!(budget.used(), base);
+
+        // Leave room for one head, but not its copy in the pending event.
+        let other = budget.charge(budget.limit() - base - 6000).unwrap();
+        assert!(h.push(head.as_bytes()).unwrap().is_empty());
+        assert!(h.push(b"x").unwrap().is_empty());
+        assert_eq!(h.end_reason(), Some(Ended::Budget));
+        assert_eq!(h.pending(), (0, 0));
+        drop(h);
+        drop(other);
+        assert_eq!(budget.used(), 0);
+        Ok(())
+    });
+}
+
+fn metadata_request() -> http::Request<Full<Bytes>> {
+    http::Request::get("http://a.test/")
+        .header("x-large", "x".repeat(4096))
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+struct WaitingMetadata;
+
+impl Handler for WaitingMetadata {
+    fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        Reply::Later(Box::new(move |fcx| {
+            Box::pin(async move {
+                fcx.record(Event::new("test", "waiting"));
+                std::future::pending::<()>().await;
+                assert_eq!(request.headers()["x-large"].as_bytes().len(), 4096);
+                Ok(http::Response::new(Body::empty()))
+            })
+        }))
+    }
+}
+
+#[test]
+fn http2_rejects_metadata_before_calling_the_handler() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let budget = Budget::new(1024);
+        let router = Router::new().get("/", |_, _| panic!("metadata was not admitted"));
+        serve_http(
+            &fcx,
+            &server,
+            80,
+            Arc::new(router),
+            HttpOptions {
+                budget: Some(budget.clone()),
+                ..HttpOptions::default()
+            },
+        )?;
+        let conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let (mut send, driving) = hyper::client::conn::http2::handshake(
+            Exec(fcx.clone()),
+            Io {
+                fcx: fcx.clone(),
+                conn,
+            },
+        )
+        .await?;
+        fcx.spawn(move |_| async move {
+            let _ = driving.await;
+            Ok(())
+        });
+        assert!(send.send_request(metadata_request()).await.is_err());
+        let events = fcx.events().of("http", "request");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].str("answer"), Some("budget"));
+        assert_eq!(budget.used(), 0);
+        Ok(())
+    });
+}
+
+#[test]
+fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let budget = Budget::new(64 << 10);
+        let shared = budget.clone();
+        fcx.region(move |fcx| async move {
+            let budget = shared;
+            let (server, client) = two_machines(&fcx);
+            serve_http(
+                &fcx,
+                &server,
+                80,
+                Arc::new(WaitingMetadata),
+                HttpOptions {
+                    budget: Some(budget.clone()),
+                    ..HttpOptions::default()
+                },
+            )?;
+            let conn = client
+                .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+                .await?;
+            let (mut send, driving) = hyper::client::conn::http2::handshake(
+                Exec(fcx.clone()),
+                Io {
+                    fcx: fcx.clone(),
+                    conn,
+                },
+            )
+            .await?;
+            fcx.spawn(move |_| async move {
+                let _ = driving.await;
+                Ok(())
+            });
+            let first = send.send_request(metadata_request());
+            fcx.events()
+                .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("test", "waiting"))
+                .await?;
+            let one = budget.used();
+            assert!(one >= 8192, "request and event headers both count");
+            // Event timestamps can differ in size between requests.
+            let other = budget.charge(budget.limit() - 2 * one - 1024).unwrap();
+            let second = send.send_request(metadata_request());
+            wait::until(&fcx, Duration::from_secs(1), || {
+                fcx.events().of("test", "waiting").len() == 2
+            })
+            .await;
+            let two = budget.used();
+            assert!(two >= other.bytes() + 2 * 8192);
+            assert!(send.send_request(metadata_request()).await.is_err());
+            assert_eq!(fcx.events().of("test", "waiting").len(), 2);
+            assert_eq!(budget.used(), two);
+
+            drop(first);
+            wait::until(&fcx, Duration::from_secs(1), || budget.used() == two - one).await;
+            let third = send.send_request(metadata_request());
+            wait::until(&fcx, Duration::from_secs(1), || {
+                fcx.events().of("test", "waiting").len() == 3
+            })
+            .await;
+            assert!(budget.used() >= other.bytes() + 2 * 8192);
+            drop(other);
+            fcx.cancel();
+            fcx.cancelled().await;
+            // Keep both response futures alive until the server region stops.
+            let _keep = (second, third);
+            Ok(())
+        })
+        .await?;
+        assert_eq!(budget.used(), 0);
+        Ok(())
+    });
+}
+
+#[test]
+fn http1_pending_metadata_releases_on_reset() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let budget = Budget::new(1 << 20);
+        serve_http(
+            &fcx,
+            &server,
+            80,
+            Arc::new(WaitingMetadata),
+            HttpOptions {
+                budget: Some(budget.clone()),
+                ..HttpOptions::default()
+            },
+        )?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let head = format!(
+            "GET / HTTP/1.1\r\nHost: a.test\r\nX-Large: {}\r\n\r\n",
+            "x".repeat(4096)
+        );
+        conn.write_all(&fcx, head.as_bytes()).await?;
+        fcx.events()
+            .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("test", "waiting"))
+            .await?;
+        assert!(budget.used() >= 8192);
+        conn.reset();
+        wait::until(&fcx, Duration::from_secs(1), || budget.used() == 0).await;
+        assert_eq!(
+            fcx.events().of("http", "request")[0].str("answer"),
+            Some("cancelled")
+        );
+        Ok(())
+    });
+}
+
+struct WaitingBody;
+
+impl http_body::Body for WaitingBody {
+    type Data = Bytes;
+    type Error = fictionet::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        Poll::Pending
+    }
+}
+
+struct StreamingMetadata;
+
+impl Handler for StreamingMetadata {
+    fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        Reply::Now(http::Response::new(Body::new(WaitingBody)))
+    }
+}
+
+#[test]
+fn request_events_stay_charged_while_responses_stream() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let budget = Budget::new(1 << 20);
+        let mut h = Harness::with_options(
+            fictionet::Seed::from_u64(0),
+            Http1::new(StreamingMetadata),
+            (),
+            ServeOptions::default().budget(budget.clone()),
+        );
+        h.open().unwrap();
+        let base = budget.used();
+        let head = format!(
+            "GET / HTTP/1.1\r\nHost: a.test\r\nX-Large: {}\r\n\r\n",
+            "x".repeat(4096)
+        );
+        assert!(
+            h.push(head.as_bytes())
+                .unwrap()
+                .starts_with(b"HTTP/1.1 200")
+        );
+        assert_eq!(h.pending(), (1, 0));
+        assert!(budget.used() >= base + 4096);
+        assert!(!h.events().iter().any(|e| e.is("http", "request")));
+        drop(h);
+        assert_eq!(budget.used(), 0);
+
+        let (server, client) = two_machines(&fcx);
+        serve_http(
+            &fcx,
+            &server,
+            80,
+            Arc::new(StreamingMetadata),
+            HttpOptions {
+                budget: Some(budget.clone()),
+                ..HttpOptions::default()
+            },
+        )?;
+        let conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let (mut send, driving) = hyper::client::conn::http2::handshake(
+            Exec(fcx.clone()),
+            Io {
+                fcx: fcx.clone(),
+                conn,
+            },
+        )
+        .await?;
+        fcx.spawn(move |_| async move {
+            let _ = driving.await;
+            Ok(())
+        });
+        let response = send.send_request(metadata_request()).await?;
+        assert_eq!(response.status(), 200);
+        assert!(budget.used() >= 4096);
+        assert!(fcx.events().of("http", "request").is_empty());
+        drop(response);
+        wait::until(&fcx, Duration::from_secs(1), || budget.used() == 0).await;
         Ok(())
     });
 }
