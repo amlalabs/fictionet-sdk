@@ -307,6 +307,20 @@ the first host's `Server` takes in the others through
 of HTTP, so a copy of `httpd` with its own handlers
 plugs in the same way.
 
+Each routed request carries an `httpd::Target`. Its `routing` field is
+`Routing::Exact` when the requested host matches a registered name, or
+`Routing::Fallback` when a default site answers. The `host` field keeps
+the requested name in both cases.
+
+With `web-proxy`, `web::Proxy` forwards only exact matches. A fallback
+request gets `421 Misdirected Request` before any upstream I/O, even if
+the proxy's site has `default_host()`. Its request event carries
+`answer: misdirected`. For catch-all forwarding, use
+`web::forward(upstream)`: it always connects to that fixed origin and
+preserves the requested `Host`. `Proxy`'s tower service returns
+`httpd::Body`, so it can answer with a local rejection as well as a
+streamed upstream response.
+
 `Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. HTTP/2
 runs on hyper, behind the same `Handler` trait. The stdlib's `http2`
 module reads and writes HTTP/2 frames and tracks a session's state, but it

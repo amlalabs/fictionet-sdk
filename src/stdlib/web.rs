@@ -148,6 +148,11 @@
 //!    `Transfer-Encoding` and the like) are dropped both ways. Every other
 //!    header, and the body, passes through unchanged.
 //!
+//! Only an exact match to a registered host can be proxied. A request
+//! routed through [`default_host`](Site::default_host) gets `421 Misdirected
+//! Request` before any upstream I/O. Use `web::forward(upstream)` for a
+//! catch-all that forwards to one fixed origin.
+//!
 //! The certificate for `github.com` lists `github.com` and `*.github.com`
 //! as its names, so it covers `api.github.com` too. A name two levels
 //! deeper, such as `a.b.github.com`, needs a certificate of its own.
@@ -259,7 +264,9 @@
 //!   from the connection, not from headers: TLS or not, and the port the
 //!   connection arrived on. Its host comes from the request, the same
 //!   authority or `Host` header that chose the site. Its SNI comes from the
-//!   TLS client hello. Handlers read it with
+//!   TLS client hello. Its [`routing`](Target::routing) is [`Routing::Exact`]
+//!   for a registered host or [`Routing::Fallback`] for the default site.
+//!   Handlers read it with
 //!   `request.extensions().get::<web::Target>()`, or with axum's
 //!   `Extension` extractor.
 //!
@@ -517,7 +524,7 @@ use std::sync::Arc;
 use http::{Request, Response};
 
 use fictionet::stdlib::httpd::{self, Handler, Server};
-pub use fictionet::stdlib::httpd::{Body, Target};
+pub use fictionet::stdlib::httpd::{Body, Routing, Target};
 use fictionet::stdlib::net::{Host, Net};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::tls::ServerConfig;
@@ -770,8 +777,12 @@ impl Site {
     /// (`http://203.0.113.10/`) reaches it, and so does any `Host` header.
     /// Without this, such requests get `421 Misdirected Request`.
     ///
-    /// The request's [`Target`] keeps the host the client named. The rest
-    /// is as for any request to the site: over plain HTTP, a site with
+    /// The request's [`Target`] keeps the host the client named and marks
+    /// [`routing`](Target::routing) as [`Routing::Fallback`]. `web::Proxy`
+    /// rejects these requests with `421 Misdirected Request` before any
+    /// upstream I/O. Use `web::Forward` for a fixed-origin catch-all.
+    /// Requests for this site's registered name still use [`Routing::Exact`].
+    /// The rest is as for any request to the site: over plain HTTP, a site with
     /// [`tls`](Site::tls) redirects to https (to the host the client
     /// named) unless it has [`plain_http`](Site::plain_http). A TLS
     /// handshake still needs an SNI that names a site at the address.

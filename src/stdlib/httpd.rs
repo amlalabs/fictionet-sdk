@@ -303,7 +303,8 @@ where
 /// `request.extensions().get::<Target>()`, or axum's `Extension`.
 ///
 /// The scheme, port and SNI come from the connection, not from headers the
-/// client wrote. The host is the one the request named.
+/// client wrote. The host is the one the request named, even when routing
+/// used the default site. [`routing`](Self::routing) says how it matched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Target {
@@ -316,6 +317,18 @@ pub struct Target {
     pub port: u16,
     /// The name the client sent in its TLS hello. `None` without TLS.
     pub sni: Option<String>,
+    /// Whether the requested host matched a registered site or used the default.
+    pub routing: Routing,
+}
+
+/// How [`VirtualHosts`] selected a request's handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Routing {
+    /// The requested host matched a registered name after normalization.
+    Exact,
+    /// No registered name matched; the default site supplied the handler.
+    Fallback,
 }
 
 /// What a sync handler can use: the clock reading the service took,
@@ -624,7 +637,8 @@ impl VHost {
 /// - A site with `https` asked for over plain HTTP gets a `301` to the same
 ///   path at `https://host`, unless it has `plain_http`.
 /// - Every other request goes to the site's handler, with a [`Target`] in
-///   its extensions.
+///   its extensions. Its [`Target::routing`] distinguishes a registered
+///   host from a default-site fallback.
 ///
 /// Its own answers put `answer` in the request's event: `no_host`,
 /// `misdirected` or `redirect`.
@@ -657,6 +671,8 @@ impl VirtualHosts {
 
     /// Makes `site` the default, for hosts no site has. The first default
     /// set keeps the role.
+    /// Requests routed this way keep their requested host and carry
+    /// [`Routing::Fallback`] in their [`Target`].
     pub fn set_default(&self, site: VHost) {
         self.inner
             .default
@@ -680,13 +696,14 @@ impl VirtualHosts {
         self.get(name).is_some_and(|s| s.https)
     }
 
-    fn site_or_default(&self, host: &str) -> Option<VHost> {
-        self.get(host).or_else(|| {
+    fn site_or_default(&self, host: &str) -> Option<(VHost, Routing)> {
+        self.get(host).map(|site| (site, Routing::Exact)).or_else(|| {
             self.inner
                 .default
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
+                .map(|site| (site, Routing::Fallback))
         })
     }
 }
@@ -715,7 +732,7 @@ impl Handler for VirtualHosts {
                 "misdirected",
             ))
         };
-        let Some(site) = self.site_or_default(&host) else {
+        let Some((site, routing)) = self.site_or_default(&host) else {
             return misdirected();
         };
         let tls = ex.conn().tls;
@@ -744,6 +761,7 @@ impl Handler for VirtualHosts {
                     host,
                     port: conn.local.map_or(0, |a| a.port()),
                     sni: conn.sni.as_deref().map(str::to_owned),
+                    routing,
                 };
                 request.extensions_mut().insert(target);
                 site.handler.call(request, ex)
@@ -1940,6 +1958,9 @@ impl Server {
 
     /// Answers requests at its address whose host names no site there.
     /// The first default site at an address keeps the role.
+    /// These requests keep their requested host in [`Target`] and carry
+    /// [`Routing::Fallback`]. Handlers that forward dynamically should
+    /// check [`Target::routing`].
     pub fn default_host(mut self) -> Server {
         self.default_host = true;
         self

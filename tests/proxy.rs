@@ -1079,3 +1079,191 @@ mod requirements;
 fn missing_curl_fails_in_ci() {
     requirements::fails_in_ci("https_through_both_doors_with_curl", "no curl");
 }
+
+mod routing {
+    use fictionet::Seed;
+    use fictionet::stdlib::httpd::{self, Body, Handler, Routing, Target, VHost, VirtualHosts};
+    use http::{Request, Response};
+    use std::net::SocketAddr;
+
+    pub(super) fn request(uri: &str, host: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    pub(super) fn route(vhosts: &VirtualHosts, request: Request<Body>, port: u16) -> httpd::Reply {
+        let conn = fictionet::events::ConnInfo::new(
+            1,
+            SocketAddr::from(([203, 0, 113, 1], port)),
+            "10.0.0.2:5000".parse().unwrap(),
+        );
+        let entropy = fictionet::SeededEntropy::new(Seed::from_u64(0));
+        let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
+        vhosts.call(request, &mut ex)
+    }
+
+    #[test]
+    fn virtual_hosts_report_exact_and_fallback_matches() {
+        let site = VHost::new(httpd::Router::new().fallback(|_, request| {
+            let target = request.extensions().get::<Target>().unwrap().clone();
+            let mut response = Response::new(bytes::Bytes::new());
+            response.extensions_mut().insert(target);
+            response
+        }));
+        let vhosts = VirtualHosts::new();
+        vhosts.insert("allowed.test", site.clone());
+        vhosts.set_default(site);
+        for (uri, host, name, routing) in [
+            ("/", "Allowed.Test.:1234", "allowed.test", Routing::Exact),
+            ("/", "unknown.test", "unknown.test", Routing::Fallback),
+            ("/", "127.0.0.1", "127.0.0.1", Routing::Fallback),
+            (
+                "http://unknown.test/",
+                "allowed.test",
+                "unknown.test",
+                Routing::Fallback,
+            ),
+            (
+                "http://allowed.test/",
+                "unknown.test",
+                "allowed.test",
+                Routing::Exact,
+            ),
+        ] {
+            let httpd::Reply::Now(response) = route(&vhosts, request(uri, host), 80) else {
+                panic!("the router answers immediately");
+            };
+            let target = response.extensions().get::<Target>().unwrap();
+            assert_eq!(target.host, name);
+            assert_eq!(target.routing, routing);
+            assert_eq!(target.scheme, http::uri::Scheme::HTTP);
+            assert_eq!(target.port, 80);
+        }
+    }
+}
+
+#[cfg(feature = "web-proxy")]
+mod upstream {
+    use super::routing::{request, route};
+    use fictionet::stdlib::httpd::{self, Body, VHost, VirtualHosts};
+    use fictionet::stdlib::web;
+    use fictionet::{Cx, Seed};
+    use http::{Response, StatusCode};
+    use http_body_util::BodyExt;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn response(fcx: &Cx, reply: httpd::Reply) -> Response<Body> {
+        match reply {
+            httpd::Reply::Now(response) => response,
+            httpd::Reply::Later(work) => work(fcx.clone()).await.unwrap(),
+        }
+    }
+
+    async fn origin() -> (SocketAddr, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buf = [0; 4096];
+            while !received.ends_with(b"\r\n\r\n") {
+                let n = conn.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0);
+                received.extend_from_slice(&buf[..n]);
+            }
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8(received).unwrap()
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_fallback_hosts_before_upstream_io() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fictionet::run(Seed::from_u64(0), |fcx| async move {
+            let site = VHost::new(httpd::tower(web::proxy(&fcx)?));
+            let vhosts = VirtualHosts::new();
+            vhosts.insert("allowed.test", site.clone());
+            vhosts.set_default(site);
+            for (uri, host) in [
+                ("/", "127.0.0.1"),
+                ("/", "169.254.169.254"),
+                ("/", "unknown.test"),
+                ("http://127.0.0.1/", "allowed.test"),
+            ] {
+                let reply = route(&vhosts, request(uri, host), port);
+                let mut response = Box::pin(response(&fcx, reply));
+                let response = std::future::poll_fn(|cx| {
+                    let polled = response.as_mut().poll(cx);
+                    assert!(
+                        polled.is_ready(),
+                        "fallback rejection must not wait for I/O"
+                    );
+                    polled
+                })
+                .await;
+                assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+                let fields = response
+                    .extensions()
+                    .get::<fictionet::events::Fields>()
+                    .unwrap();
+                assert_eq!(
+                    fields.get("answer").and_then(|value| value.as_str()),
+                    Some("misdirected")
+                );
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_exact_hosts_even_when_the_site_is_default() {
+        let (address, server) = origin().await;
+        fictionet::run(Seed::from_u64(0), |fcx| async move {
+            let site = VHost::new(httpd::tower(web::proxy(&fcx)?));
+            let vhosts = VirtualHosts::new();
+            vhosts.insert("127.0.0.1", site.clone());
+            vhosts.set_default(site);
+            let reply = route(&vhosts, request("/page?q=1", "127.0.0.1:1"), address.port());
+            let response = response(&fcx, reply).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let received = server.await.unwrap().to_ascii_lowercase();
+        assert!(received.starts_with("get /page?q=1 http/1.1\r\n"));
+        assert!(received.contains(&format!("host: {address}\r\n")));
+    }
+
+    #[tokio::test]
+    async fn forward_accepts_fallback_hosts_at_its_fixed_origin() {
+        let (address, server) = origin().await;
+        fictionet::run(Seed::from_u64(0), |fcx| async move {
+            let site = VHost::new(web::forward(format!("http://{address}").parse()?));
+            let vhosts = VirtualHosts::new();
+            vhosts.insert("allowed.test", site.clone());
+            vhosts.set_default(site);
+            let reply = route(&vhosts, request("/page?q=1", "unknown.test"), 80);
+            let response = response(&fcx, reply).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let received = server.await.unwrap().to_ascii_lowercase();
+        assert!(received.starts_with("get /page?q=1 http/1.1\r\n"));
+        assert!(received.contains("host: unknown.test\r\n"));
+    }
+}

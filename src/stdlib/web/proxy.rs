@@ -1,6 +1,6 @@
 //! Forwarding HTTP requests to real sites.
 
-use fictionet::stdlib::httpd::{self, Body, Handler, Target};
+use fictionet::stdlib::httpd::{self, Body, Handler, Routing, Target};
 use fictionet::{Cx, Error};
 use http::{Request, Response};
 use std::sync::Arc;
@@ -24,6 +24,10 @@ use std::sync::Arc;
 /// Only names the callback hands to `proxy(&fcx)` are forwarded, so the world
 /// stays closed unless it opens a name on purpose. To change some responses
 /// and pass the rest through, wrap it in tower or axum middleware.
+/// A target must have [`Routing::Exact`]. Requests routed through a
+/// default host get `421 Misdirected Request` before any upstream I/O.
+/// Their request events carry `answer: misdirected`.
+/// Use [`forward`] for a catch-all that forwards to one fixed origin.
 ///
 /// The world checks the real site's certificate against the Mozilla root
 /// store (`webpki-roots`). Hop-by-hop headers (`Connection`, `Keep-Alive`,
@@ -41,13 +45,15 @@ pub fn proxy(fcx: &Cx) -> Result<Proxy, Error> {
 }
 
 /// The handler made by [`proxy`].
+/// Its tower response body is [`Body`], for both upstream responses and
+/// local routing rejections.
 #[derive(Clone)]
 pub struct Proxy {
     client: Arc<ProxyClient>,
 }
 
 impl tower_service::Service<Request<Body>> for Proxy {
-    type Response = Response<hyper::body::Incoming>;
+    type Response = Response<Body>;
     type Error = Error;
     type Future =
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
@@ -115,7 +121,7 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
 async fn send_upstream(
     client: Arc<ProxyClient>,
     request: Request<Body>,
-) -> Result<Response<hyper::body::Incoming>, Error> {
+) -> Result<Response<Body>, Error> {
     use http::uri::Scheme;
     let target = request
         .extensions()
@@ -126,6 +132,16 @@ async fn send_upstream(
                 "web::proxy(&fcx) serves only requests that web::Sites routed: there is no web::Target",
             )
         })?;
+    if target.routing != Routing::Exact {
+        let mut response = httpd::text(
+            http::StatusCode::MISDIRECTED_REQUEST,
+            "This proxy does not serve unregistered hosts.\n",
+        );
+        response
+            .extensions_mut()
+            .insert(fictionet::events::Fields::new().with("answer", "misdirected"));
+        return Ok(response);
+    }
     let (mut parts, body) = request.into_parts();
     let default_port = (target.scheme == Scheme::HTTP && target.port == 80)
         || (target.scheme == Scheme::HTTPS && target.port == 443);
@@ -149,13 +165,15 @@ async fn send_upstream(
         .await
         .map_err(|e| httpd::BadGateway(format!("{}: {e}", target.host)))?;
     strip_hop_by_hop(response.headers_mut());
-    Ok(response)
+    Ok(response.map(Body::new))
 }
 
 /// Forwards requests to a fixed HTTP or HTTPS origin through the world's
 /// network. Paths, queries, bodies, and the original `Host` header are
 /// preserved. Connection-specific headers are removed in both directions.
 /// The upstream must contain a scheme and authority. Its path is ignored.
+/// The origin does not depend on [`Target`], so default-host requests can
+/// be forwarded here even when their routing is [`Routing::Fallback`].
 /// This handler requires a tokio runtime and real host I/O.
 pub fn forward(upstream: http::Uri) -> Forward {
     Forward {
@@ -165,6 +183,8 @@ pub fn forward(upstream: http::Uri) -> Forward {
 }
 
 /// A handler that forwards to one fixed origin.
+/// Its tower response body is [`hyper::body::Incoming`], since it only
+/// returns upstream responses and needs no local routing rejections.
 #[derive(Clone)]
 pub struct Forward {
     upstream: http::Uri,
