@@ -26,6 +26,15 @@
 //! `Authorization: Bearer <token>` instead. All requests, including
 //! `/api/keylog` from loopback, require authentication.
 //!
+//! The dashboard serves one request per connection. It accepts HTTP/1.0 and
+//! HTTP/1.1 GET requests with a path starting with `/`. The request head is
+//! limited to 16 KiB, including the first `\r\n\r\n`. Bytes after it cannot
+//! supply headers or another request. Invalid request lines and headers close
+//! the connection. Repeated `Host`, `Authorization`, `Cookie`, `Origin`, or
+//! `Sec-Fetch-Site` fields are rejected. Request bodies are unsupported:
+//! `Transfer-Encoding` is rejected, and `Content-Length` may occur only once
+//! and must be zero.
+//!
 //! This is the `web_world` example with one sandbox, `agent`, fetching
 //! pages with `curl`:
 //!

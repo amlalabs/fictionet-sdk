@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use fictionet::relay::observer::Client;
 use fictionet::relay::proxy::auth::Token;
+use fictionet::stdlib::codec::ascii::{is_tchar, trim_ows_str};
 
 use crate::observe::{take_world, world_path};
 
@@ -53,6 +54,8 @@ const STREAMS: [&str; 2] = ["watch", "packets"];
 const MAX_CONNECTIONS: usize = 64;
 /// Links one merged `packets` or `pcap` call may name.
 const MAX_MERGED: usize = 32;
+/// Request-head bytes, including the terminating blank line.
+const MAX_HEAD: usize = 16 << 10;
 
 pub(crate) fn main(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -146,11 +149,25 @@ pub(crate) struct Request {
 }
 
 pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
-    let text = std::str::from_utf8(buf).ok()?;
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    if end + 4 > MAX_HEAD {
+        return None;
+    }
+    let text = std::str::from_utf8(&buf[..end]).ok()?;
     let mut lines = text.split("\r\n");
     let mut first = lines.next()?.split(' ');
     let method = first.next()?.to_owned();
     let target = first.next()?;
+    let version = first.next()?;
+    if method.is_empty()
+        || !method.bytes().all(is_tchar)
+        || !target.starts_with('/')
+        || !target.bytes().all(|b| b.is_ascii_graphic() && b != b'#')
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || first.next().is_some()
+    {
+        return None;
+    }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let query = query
         .split('&')
@@ -162,18 +179,33 @@ pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
         .collect();
     let (mut host, mut fetch_site, mut origin) = (None, None, None);
     let (mut authorization, mut cookie) = (None, None);
+    let mut content_length = None;
     for line in lines {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
+        let (k, v) = line.split_once(':')?;
+        if k.is_empty()
+            || !k.bytes().all(is_tchar)
+            || v.bytes().any(|b| b.is_ascii_control() && b != b'\t')
+        {
+            return None;
+        }
+        let v = trim_ows_str(v);
+        let field = match k.to_ascii_lowercase().as_str() {
+            "authorization" => &mut authorization,
+            "cookie" => &mut cookie,
+            "host" => &mut host,
+            "sec-fetch-site" => &mut fetch_site,
+            "origin" => &mut origin,
+            "transfer-encoding" => return None,
+            "content-length" => {
+                if v.is_empty() || !v.bytes().all(|b| b == b'0') {
+                    return None;
+                }
+                &mut content_length
+            }
+            _ => continue,
         };
-        let v = Some(v.trim().to_owned());
-        match k.trim().to_ascii_lowercase().as_str() {
-            "authorization" => authorization = v,
-            "cookie" => cookie = v,
-            "host" => host = v,
-            "sec-fetch-site" => fetch_site = v,
-            "origin" => origin = v,
-            _ => {}
+        if field.replace(v.to_owned()).is_some() {
+            return None;
         }
     }
     Some(Request {
@@ -344,8 +376,15 @@ fn read_head(
 ) -> io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
-    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-        if buf.len() > 16 << 10 {
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            if end + 4 > MAX_HEAD {
+                return Ok(None);
+            }
+            buf.truncate(end + 4);
+            return Ok(Some(buf));
+        }
+        if buf.len() >= MAX_HEAD {
             return Ok(None);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -358,7 +397,6 @@ fn read_head(
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    Ok(Some(buf))
 }
 
 fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io::Result<()> {
@@ -753,6 +791,121 @@ fn stream(mut client: Client, conn: TcpStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_first_request_head_is_read_and_parsed() {
+        let head = b"GET /api/keylog HTTP/1.1\r\nHost: evil.example\r\nOrigin: http://evil.example\r\nSec-Fetch-Site: cross-site\r\n\r\n";
+        for suffix in [
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nSec-Fetch-Site: same-origin\r\nAuthorization: Bearer secret\r\nCookie: fictionet_token=secret\r\n\r\n".as_slice(),
+            b"Authorization: Bearer secret\r\nCookie: fictionet_token=secret\r\n\r\n",
+            b"\xff\x00",
+        ] {
+            let wire = [head.as_slice(), suffix].concat();
+            let req = parse_request(&wire).unwrap();
+            assert_eq!(req.path, "/api/keylog");
+            assert_eq!(req.host.as_deref(), Some("evil.example"));
+            assert_eq!(req.origin.as_deref(), Some("http://evil.example"));
+            assert_eq!(req.fetch_site.as_deref(), Some("cross-site"));
+            assert!(req.authorization.is_none());
+            assert!(req.cookie.is_none());
+            for split in 0..=wire.len() {
+                let mut input = (&wire[..split]).chain(&wire[split..]);
+                let result = read_head(Instant::now() + Duration::from_secs(10), |_, chunk| {
+                    input.read(chunk)
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!(result, head, "split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn request_heads_require_valid_lines_and_unambiguous_fields() {
+        for line in [
+            "GET /",
+            "GET / HTTP/2.0",
+            "GET / http/1.1",
+            "GET / HTTP/1.10",
+            "GET / HTTP/1.1 extra",
+            "GET  / HTTP/1.1",
+            "GET\t/ HTTP/1.1",
+            "G(ET / HTTP/1.1",
+            " / HTTP/1.1",
+            "GET /\t HTTP/1.1",
+            "GET /\x7f HTTP/1.1",
+            "GET /#fragment HTTP/1.1",
+            "GET http://localhost/ HTTP/1.1",
+        ] {
+            let head = format!("{line}\r\nHost: localhost\r\n\r\n");
+            assert!(parse_request(head.as_bytes()).is_none(), "{line:?}");
+        }
+        for fields in [
+            "Host : localhost",
+            " Host: localhost",
+            ": value",
+            "Bad(Name: value",
+            "Missing-Colon",
+            "X: one\r\n two",
+            "X: one\ntwo",
+            "X: one\rtwo",
+            "X: \x00",
+            "X: \x7f",
+            "Content-Length: 1",
+            "Content-Length: -0",
+            "Content-Length:",
+            "Content-Length: 0, 0",
+            "Transfer-Encoding: chunked",
+            "Transfer-Encoding: identity",
+            "Content-Length: 0\r\nTransfer-Encoding: chunked",
+        ] {
+            let head = format!("GET / HTTP/1.1\r\n{fields}\r\n\r\n");
+            assert!(parse_request(head.as_bytes()).is_none(), "{fields:?}");
+        }
+        for name in [
+            "Host",
+            "Authorization",
+            "Cookie",
+            "Origin",
+            "Sec-Fetch-Site",
+            "Content-Length",
+        ] {
+            let head = format!(
+                "GET / HTTP/1.1\r\n{name}: 0\r\n{}: 0\r\n\r\n",
+                name.to_ascii_lowercase()
+            );
+            assert!(parse_request(head.as_bytes()).is_none(), "{name}");
+        }
+        assert!(parse_request(b"GET / HTTP/1.1\r\nHost: localhost\r\n").is_none());
+        for version in ["HTTP/1.0", "HTTP/1.1"] {
+            let head = format!(
+                "GET / {version}\r\nHost: localhost\r\nContent-Length:\t000 \t\r\nX: a\r\nX: b\r\n\r\n"
+            );
+            assert!(parse_request(head.as_bytes()).is_some());
+        }
+    }
+
+    #[test]
+    fn the_head_limit_includes_the_terminator_but_not_the_suffix() {
+        for size in [(16 << 10) - 1, 16 << 10, (16 << 10) + 1, (16 << 10) + 1024] {
+            let mut head = String::from("GET / HTTP/1.1\r\nHost: localhost\r\nX-Padding: ");
+            head.push_str(&"x".repeat(size - head.len() - 4));
+            head.push_str("\r\n\r\n");
+            let wire = format!("{head}ignored suffix");
+            assert_eq!(parse_request(wire.as_bytes()).is_some(), size <= 16 << 10);
+            for chunk_size in [1, 1023, 1024] {
+                let mut input = wire.as_bytes();
+                let result = read_head(Instant::now() + Duration::from_secs(10), |_, chunk| {
+                    input.read(&mut chunk[..chunk_size])
+                })
+                .unwrap();
+                assert!(
+                    result.as_deref() == (size <= 16 << 10).then_some(head.as_bytes()),
+                    "size {size}, chunks of {chunk_size}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn header_progress_cannot_extend_the_deadline() {

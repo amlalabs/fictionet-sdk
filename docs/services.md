@@ -359,6 +359,14 @@ synchronously. Browser runs can use an in-memory sink with
 
 ## 6. The dashboard
 
+The dashboard serves one HTTP/1.0 or HTTP/1.1 GET request per connection.
+The target must be a path starting with `/`. The head may be at most 16 KiB,
+including the first `\r\n\r\n`. Bytes after it cannot supply headers or another
+request. Invalid request lines and headers close the connection. Repeated
+`Host`, `Authorization`, `Cookie`, `Origin`, or `Sec-Fetch-Site` fields are
+rejected. Request bodies are unsupported: `Transfer-Encoding` is rejected,
+and `Content-Length` may occur only once and must be zero.
+
 The dashboard and `fictionet observe` use a temporary 11-second timeout
 when sending hello to the world and waiting for its answer. A silent world
 causes a handshake-timeout error. After acceptance, these greeting timeouts

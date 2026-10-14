@@ -181,6 +181,33 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
             raw_get(port, route, "Authorization: Bearer wrong\r\n").starts_with("HTTP/1.1 401")
         );
     }
+    // A coalesced request or body suffix cannot supply the first request's headers.
+    for suffix in [
+        "Authorization: Bearer dashboard-test-token\r\nCookie: fictionet_token=dashboard-test-token\r\nHost: localhost\r\nOrigin: http://localhost\r\nSec-Fetch-Site: same-origin\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer dashboard-test-token\r\nCookie: fictionet_token=dashboard-test-token\r\nOrigin: http://localhost\r\nSec-Fetch-Site: same-origin\r\n\r\n",
+    ] {
+        for (headers, status) in [
+            ("Host: localhost\r\n", "401"),
+            (
+                "Host: evil.example\r\nAuthorization: Bearer dashboard-test-token\r\n",
+                "403",
+            ),
+            (
+                "Host: localhost\r\nAuthorization: Bearer dashboard-test-token\r\nOrigin: http://evil.example\r\nSec-Fetch-Site: cross-site\r\n",
+                "403",
+            ),
+        ] {
+            let response = raw_request(
+                port,
+                &format!("GET /api/keylog HTTP/1.1\r\n{headers}\r\n{suffix}"),
+            );
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert_eq!(response.matches("HTTP/1.1 ").count(), 1);
+        }
+    }
     assert!(raw_get(port, "/login?token=wrong", "").starts_with("HTTP/1.1 401"));
     let login = raw_get(port, "/login?token=dashboard-test-token", "");
     assert!(login.starts_with("HTTP/1.1 303"), "{login}");
@@ -487,14 +514,17 @@ fn a_watch_exits_0_when_the_world_ends() {
 }
 
 fn raw_get(port: u16, path: &str, headers: &str) -> String {
+    raw_request(
+        port,
+        &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n"),
+    )
+}
+
+fn raw_request(port: u16, request: &str) -> String {
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    write!(
-        conn,
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n"
-    )
-    .unwrap();
+    conn.write_all(request.as_bytes()).unwrap();
     let mut response = String::new();
     conn.read_to_string(&mut response).unwrap();
     response
