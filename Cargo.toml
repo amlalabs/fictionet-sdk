@@ -166,6 +166,10 @@ name = "http2_grpc"
 required-features = ["tokio"]
 
 [[test]]
+name = "httpd"
+required-features = ["std", "tokio", "observe"]
+
+[[test]]
 name = "listen"
 required-features = ["std"]
 
