@@ -1250,8 +1250,9 @@ struct Execution {
 /// midnight, read by the caller.
 ///
 /// The exchange applies the rules the specification states: UserRefNums
-/// must increase per UserRefIdx channel, and a lower or repeated one is a
-/// retransmission and ignored (1.2); quantities must be 1 to 999,999
+/// must be nonzero and increase per UserRefIdx channel. Zero, lower and
+/// repeated references are ignored as retransmissions (1.2), including
+/// enable and disable requests; quantities must be 1 to 999,999
 /// (2.1); a replace of an order that is not open, or with a used
 /// UserRefNum, is ignored, and one with an invalid quantity cancels the
 /// original (2.2); a cancel sets the order's open shares and is ignored if
@@ -1616,17 +1617,14 @@ impl Exchange {
     }
     /// Consumes a UserRefNum if it is above the channel's last.
     fn consume(&mut self, token: Token) -> bool {
-        let last = self.last.entry(token.user_ref_idx).or_insert(0);
-        if token.user_ref <= *last {
+        if !self.fresh(token) {
             return false;
         }
-        *last = token.user_ref;
+        self.last.insert(token.user_ref_idx, token.user_ref);
         true
     }
     fn fresh(&self, token: Token) -> bool {
-        self.last
-            .get(&token.user_ref_idx)
-            .is_none_or(|last| token.user_ref > *last)
+        token.user_ref > self.last.get(&token.user_ref_idx).copied().unwrap_or(0)
     }
     fn firm_of(&self, options: &Options) -> Firm {
         options
@@ -1881,7 +1879,11 @@ impl Exchange {
         if !enable && !listed && self.disabled.len() >= MAX_DISABLED_FIRMS {
             return vec![Action::Event(Event::Ignored(Ignored::TooManyFirms(target)))];
         }
-        self.consume(token);
+        if !self.consume(token) {
+            return vec![Action::Event(Event::Ignored(Ignored::Retransmission(
+                token,
+            )))];
+        }
         if enable {
             self.disabled.retain(|f| *f != target);
         } else if !listed {
@@ -3230,6 +3232,91 @@ mod tests {
     }
 
     #[test]
+    fn exchange_entry_control_requires_fresh_references() {
+        let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
+        let firm = x.config.default_firm;
+        let wire = [0x44, 0, 0, 0, 0, 0x20, 0x20, 0x20, 0x20, 0, 0];
+        let zero = Inbound::parse(&wire).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                x.receive(&zero, 0).unwrap(),
+                [Action::Event(Event::Ignored(Ignored::Retransmission(
+                    token(0)
+                )))]
+            );
+            assert!(!x.is_disabled(firm));
+            assert_eq!(x.next_user_ref(0), Some(1));
+        }
+
+        // Each channel starts at one. Invalid enables must leave the firm disabled.
+        for channel in [0, 4] {
+            let options = Options::of(Opt::UserRefIdx(channel));
+            let disable = |user_ref| -> Inbound {
+                DisableOrderEntry {
+                    user_ref,
+                    firm: Firm::blank(),
+                    options: options.clone(),
+                }
+                .into()
+            };
+            let enable = |user_ref| -> Inbound {
+                EnableOrderEntry {
+                    user_ref,
+                    firm: Firm::blank(),
+                    options: options.clone(),
+                }
+                .into()
+            };
+            for (message, user_ref, accepted, disabled, next) in [
+                (enable(0), 0, false, false, Some(1)),
+                (disable(1), 1, true, true, Some(2)),
+                (enable(1), 1, false, true, Some(2)),
+                (enable(0), 0, false, true, Some(2)),
+                (disable(1), 1, false, true, Some(2)),
+                (enable(u32::MAX), u32::MAX, true, false, None),
+                (enable(u32::MAX), u32::MAX, false, false, None),
+                (disable(u32::MAX), u32::MAX, false, false, None),
+                (disable(1), 1, false, false, None),
+                (disable(0), 0, false, false, None),
+            ] {
+                let actions = x.receive(&message, 0).unwrap();
+                if accepted {
+                    let response: Outbound = if disabled {
+                        DisableOrderEntryResponse {
+                            timestamp: 0,
+                            user_ref,
+                            firm: Firm::blank(),
+                            options: options.clone(),
+                        }
+                        .into()
+                    } else {
+                        EnableOrderEntryResponse {
+                            timestamp: 0,
+                            user_ref,
+                            firm: Firm::blank(),
+                            options: options.clone(),
+                        }
+                        .into()
+                    };
+                    assert_eq!(actions, [Action::Send(response)]);
+                } else {
+                    assert_eq!(
+                        actions,
+                        [Action::Event(Event::Ignored(Ignored::Retransmission(
+                            Token {
+                                user_ref_idx: channel,
+                                user_ref,
+                            }
+                        )))]
+                    );
+                }
+                assert_eq!(x.is_disabled(firm), disabled);
+                assert_eq!(x.next_user_ref(channel), next);
+            }
+        }
+    }
+
+    #[test]
     fn exchange_sends_no_disable_response_when_the_list_is_full() {
         let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
         let disable = |user_ref: u32, firm: Firm| -> Inbound {
@@ -3259,10 +3346,34 @@ mod tests {
             [Action::Event(Event::Ignored(Ignored::TooManyFirms(full)))]
         );
         assert!(!x.is_disabled(full));
+        let fresh_channel = Inbound::DisableOrderEntry(DisableOrderEntry {
+            user_ref: 1,
+            firm: full,
+            options: Options::of(Opt::UserRefIdx(4)),
+        });
+        assert_eq!(
+            x.receive(&fresh_channel, 2).unwrap(),
+            [Action::Event(Event::Ignored(Ignored::TooManyFirms(full)))]
+        );
+        assert_eq!(x.next_user_ref(4), Some(1));
         // The UserRefNum was not consumed; disabling a listed firm again
         // still answers.
         assert_eq!(x.next_user_ref(0), Some(next));
         let out = sends(x.receive(&disable(next, name(0)), 3).unwrap());
         assert!(matches!(out[..], [Outbound::DisableOrderEntryResponse(_)]));
+        x.receive(
+            &EnableOrderEntry {
+                user_ref: next + 1,
+                firm: name(0),
+                options: Options::default(),
+            }
+            .into(),
+            4,
+        )
+        .unwrap();
+        let out = sends(x.receive(&fresh_channel, 5).unwrap());
+        assert!(matches!(out[..], [Outbound::DisableOrderEntryResponse(_)]));
+        assert!(x.is_disabled(full));
+        assert_eq!(x.next_user_ref(4), Some(2));
     }
 }
