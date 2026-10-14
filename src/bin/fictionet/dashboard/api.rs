@@ -2,7 +2,7 @@ use std::io;
 use std::net::TcpStream;
 use std::time::Duration;
 
-use fictionet::relay::observer::Client;
+use fictionet::relay::observer::{Client, Envelope};
 
 use super::respond;
 use super::sse::{stream, stream_merged};
@@ -121,7 +121,7 @@ pub(super) fn api(
         let disposition = format!("Content-Disposition: attachment; filename=\"{name}\"\r\n");
         return respond(&mut conn, "200 OK", kind, &value.bytes, &disposition);
     }
-    let status = if value.bytes.starts_with(br#"{"error":"#) {
+    let status = if matches!(value.envelope(), Some(Envelope::Error(_))) {
         "404 Not Found"
     } else {
         "200 OK"

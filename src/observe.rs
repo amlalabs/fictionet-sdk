@@ -78,8 +78,8 @@
 //!
 //! # From a shell
 //!
-//! `fictionet observe` makes one request and prints each value of the reply
-//! as one line of JSON, for scripts and harnesses. (`pcap` and `keylog`
+//! `fictionet observe` makes one request and writes each JSON value followed
+//! by a newline, for scripts and harnesses. (`pcap` and `keylog`
 //! replies are binary, and are written out as they are.) The request follows the
 //! flags: `world` reports whether the world runs, and `watch` prints the
 //! graph of tasks and links, then every change to it. With no request,
@@ -345,6 +345,15 @@
 //! `{"event":"end","data":{"reason":"..."}}` when its link closes, the
 //! world ends (a `watch` sends `ended` first), or it is cancelled.
 //!
+//! The CLI and dashboard recognize event and error envelopes by their JSON
+//! fields. Whitespace, key order and string escapes do not affect recognition.
+//! Recognition does not depend on size, element count or nesting depth.
+//! Invalid JSON, duplicate envelope fields, mixed event/error objects, and
+//! missing or wrongly typed fields are not recognized. Binary values are not
+//! inspected. The CLI preserves the original bytes. The dashboard forwards the
+//! original JSON data in server-sent events, with one `data:` line per line of
+//! JSON. Event names with line breaks are sent as errors instead.
+//!
 //! An observer finds the world's run the first time the world asks its
 //! [`Attachments`](crate::Attachments) for a sandbox, with
 //! [`next`](crate::Attachments::next) or [`get`](crate::Attachments::get).
@@ -507,7 +516,7 @@ pub use registry::{Match, Protocol, Registry, Selection};
 #[cfg(feature = "observe")]
 mod app;
 mod decode;
-mod json;
+pub(crate) mod json;
 mod keys;
 #[cfg(feature = "observe")]
 mod packets;

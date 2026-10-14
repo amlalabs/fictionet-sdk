@@ -2,7 +2,7 @@ use std::io::{self, BufWriter, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use fictionet::relay::observer::Client;
+use fictionet::relay::observer::{Client, Envelope, Value};
 
 use super::api::{observe_request, quote, with_link};
 
@@ -42,19 +42,17 @@ pub(super) fn stream_merged(
                 let Some(link) = open.get(&value.id).cloned() else {
                     continue;
                 };
-                match split_event(&value.bytes) {
-                    Some(("end", data)) => {
-                        write!(out, "event: link_end\ndata: {}\n\n", add_link(data, &link))?
+                match event(&value) {
+                    Some((name, data)) if name == "end" => {
+                        write_event(&mut out, "link_end", &add_link(data, &link))?
                     }
-                    Some((name, data)) => {
-                        write!(out, "event: {name}\ndata: {}\n\n", add_link(data, &link))?
-                    }
+                    Some((name, data)) => write_event(&mut out, &name, &add_link(data, &link))?,
                     None => {
                         let data = format!(
                             "{{\"error\":{}}}",
                             quote(&String::from_utf8_lossy(&value.bytes))
                         );
-                        write!(out, "event: link_end\ndata: {}\n\n", add_link(&data, &link))?
+                        write_event(&mut out, "link_end", &add_link(&data, &link))?
                     }
                 }
                 out.flush()?;
@@ -76,21 +74,27 @@ pub(super) fn stream_merged(
             Err(e) => return Err(e),
         }
     }
-    write!(
-        out,
-        "event: end\ndata: {{\"reason\":\"every link closed\"}}\n\n"
-    )?;
+    write_event(&mut out, "end", r#"{"reason":"every link closed"}"#)?;
     out.flush()
 }
 
-/// Splits a stream value, `{"event":"<name>","data":<data>}`, into its
-/// name and data.
-pub(crate) fn split_event(value: &[u8]) -> Option<(&str, &str)> {
-    let text = std::str::from_utf8(value).ok()?;
-    let rest = text.strip_prefix(r#"{"event":""#)?;
-    let (name, rest) = rest.split_once('"')?;
-    let data = rest.strip_prefix(r#","data":"#)?.strip_suffix('}')?;
+/// An event's name and original JSON data, ready for server-sent events.
+pub(crate) fn event(value: &Value) -> Option<(String, &str)> {
+    let Envelope::Event { name, data } = value.envelope()? else {
+        return None;
+    };
+    if name.contains(['\r', '\n']) {
+        return None;
+    }
     Some((name, data))
+}
+
+fn write_event(out: &mut impl Write, name: &str, data: &str) -> io::Result<()> {
+    writeln!(out, "event: {name}")?;
+    for line in data.split(['\r', '\n']) {
+        writeln!(out, "data: {line}")?;
+    }
+    writeln!(out)
 }
 
 /// Relays a stream as server-sent events until either side closes.
@@ -113,13 +117,9 @@ pub(super) fn stream(mut client: Client, conn: TcpStream) -> io::Result<()> {
             }
         }) {
             Ok(Some(value)) => {
-                match split_event(&value.bytes) {
-                    Some((name, data)) => write!(out, "event: {name}\ndata: {data}\n\n")?,
-                    None => write!(
-                        out,
-                        "event: error\ndata: {}\n\n",
-                        String::from_utf8_lossy(&value.bytes)
-                    )?,
+                match event(&value) {
+                    Some((name, data)) => write_event(&mut out, &name, data)?,
+                    None => write_event(&mut out, "error", &String::from_utf8_lossy(&value.bytes))?,
                 }
                 out.flush()?;
                 if value.end {
@@ -127,10 +127,7 @@ pub(super) fn stream(mut client: Client, conn: TcpStream) -> io::Result<()> {
                 }
             }
             Ok(None) => {
-                write!(
-                    out,
-                    "event: end\ndata: {{\"reason\":\"the world closed\"}}\n\n"
-                )?;
+                write_event(&mut out, "end", r#"{"reason":"the world closed"}"#)?;
                 return out.flush();
             }
             Err(e)

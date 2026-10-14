@@ -1,16 +1,16 @@
-//! `fictionet observe`: the observe API from a shell. Prints each value the
-//! world sends as one line of JSON, so scripts can read a world without
-//! speaking the relay protocol themselves.
+//! `fictionet observe`: the observe API from a shell. Writes each JSON value
+//! followed by a newline, so scripts can read a world without speaking the
+//! relay protocol themselves. The original bytes are preserved.
 
 use std::io::Write;
 
-use fictionet::relay::observer::Client;
+use fictionet::relay::observer::{Client, Envelope};
 
 pub(crate) const USAGE: &str = "\
 usage: fictionet observe --world unix:<path> [<request>]
 
-Connects to a world socket as an observer, sends one request, and prints
-each value of the reply as one line of JSON. Streams (watch, packets) run
+Connects to a world socket as an observer, sends one request, and writes
+each JSON reply followed by a newline. Streams (watch, packets) run
 until the world ends them or you stop the command. Binary values (pcap,
 keylog) are written to stdout as they are.
 
@@ -141,7 +141,8 @@ pub(crate) fn main(args: &[String]) -> i32 {
                 return 1;
             }
         };
-        saw_ended |= !value.binary && value.bytes.starts_with(br#"{"event":"ended","#);
+        let envelope = value.envelope();
+        saw_ended |= matches!(&envelope, Some(Envelope::Event { name, .. }) if name == "ended");
         let mut out = stdout.lock();
         let written = if value.binary {
             out.write_all(&value.bytes)
@@ -159,7 +160,7 @@ pub(crate) fn main(args: &[String]) -> i32 {
             return 1;
         }
         if value.end {
-            return if !value.binary && value.bytes.starts_with(br#"{"error":"#) {
+            return if matches!(envelope, Some(Envelope::Error(_))) {
                 1
             } else {
                 0

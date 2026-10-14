@@ -230,7 +230,7 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
 #[cfg(test)]
 mod tests {
     use super::api::{merged_links, observe_request, with_link};
-    use super::sse::{add_link, split_event};
+    use super::sse::{add_link, event};
     use super::*;
 
     #[test]
@@ -268,14 +268,45 @@ mod tests {
         );
         assert_eq!(add_link(r#"{"seq":1}"#, "e7"), r#"{"link":"e7","seq":1}"#);
         assert_eq!(add_link("{}", "e7"), r#"{"link":"e7"}"#);
+        assert_eq!(add_link("{ }", "e7"), r#"{"link":"e7"}"#);
+        assert_eq!(add_link("{\n }", "e7"), r#"{"link":"e7"}"#);
+        assert_eq!(
+            add_link("{\n\"reason\": \"x\" }", "e7"),
+            "{\"link\":\"e7\",\n\"reason\": \"x\" }",
+        );
     }
 
     #[test]
     fn stream_values_split_into_events() {
-        assert_eq!(
-            split_event(br#"{"event":"node","data":{"id":"t1"}}"#),
-            Some(("node", r#"{"id":"t1"}"#))
-        );
-        assert_eq!(split_event(br#"{"error":"x"}"#), None);
+        let inspect = |bytes: &[u8]| {
+            event(&fictionet::relay::observer::Value {
+                id: 1,
+                bytes: bytes.to_vec(),
+                binary: false,
+                end: false,
+            })
+            .map(|(name, data)| (name, data.to_owned()))
+        };
+        for (bytes, data) in [
+            (
+                br#"{"event":"node","data":{"id":"t1"}}"#.as_slice(),
+                r#"{"id":"t1"}"#,
+            ),
+            (
+                b" { \"data\": {\n\"id\": \"t1\" }, \"event\": \"no\\u0064e\" } \n",
+                "{\n\"id\": \"t1\" }",
+            ),
+        ] {
+            assert_eq!(inspect(bytes), Some(("node".into(), data.into())));
+        }
+        for bytes in [
+            br#"{"error":"x"}"#.as_slice(),
+            br#"{"event":"node","data":}"#,
+            br#"{"event":"node","data":{}} trailing"#,
+            br#"{"event":"node\ninjected","data":{}}"#,
+            br#"{"event":"node\rinjected","data":{}}"#,
+        ] {
+            assert_eq!(inspect(bytes), None);
+        }
     }
 }

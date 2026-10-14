@@ -181,12 +181,12 @@ pub(crate) fn parse_flat(text: &str) -> Option<std::collections::HashMap<String,
     } else {
         loop {
             p.ws();
-            let k = p.string()?;
+            let k = p.string(false)?;
             p.ws();
             p.eat(b':')?;
             p.ws();
             let v = match p.peek()? {
-                b'"' => Scalar::Str(p.string()?),
+                b'"' => Scalar::Str(p.string(false)?),
                 b't' => p.word("true", Scalar::Bool(true))?,
                 b'f' => p.word("false", Scalar::Bool(false))?,
                 b'n' => p.word("null", Scalar::Null)?,
@@ -208,31 +208,32 @@ pub(crate) fn parse_flat(text: &str) -> Option<std::collections::HashMap<String,
     (p.i == p.b.len()).then_some(out)
 }
 
-#[cfg(feature = "observe")]
-struct Parser<'a> {
-    b: &'a [u8],
-    i: usize,
+#[cfg(feature = "std")]
+pub(crate) struct Parser<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) i: usize,
 }
 
-#[cfg(feature = "observe")]
+#[cfg(feature = "std")]
 impl Parser<'_> {
-    fn peek(&self) -> Option<u8> {
+    pub(crate) fn peek(&self) -> Option<u8> {
         self.b.get(self.i).copied()
     }
-    fn ws(&mut self) {
+    pub(crate) fn ws(&mut self) {
         while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
             self.i += 1;
         }
     }
-    fn eat(&mut self, c: u8) -> Option<()> {
+    pub(crate) fn eat(&mut self, c: u8) -> Option<()> {
         (self.peek()? == c).then(|| self.i += 1)
     }
-    fn word(&mut self, w: &str, v: Scalar) -> Option<Scalar> {
+    fn word<T>(&mut self, w: &str, v: T) -> Option<T> {
         self.b[self.i..].starts_with(w.as_bytes()).then(|| {
             self.i += w.len();
             v
         })
     }
+    #[cfg(feature = "observe")]
     fn number(&mut self) -> Option<f64> {
         let start = self.i;
         while matches!(
@@ -246,28 +247,37 @@ impl Parser<'_> {
             .parse()
             .ok()
     }
-    fn string(&mut self) -> Option<String> {
-        self.eat(b'"')?;
+    // Flat requests replace lone surrogates; envelopes reject them.
+    pub(crate) fn string(&mut self, strict: bool) -> Option<String> {
         let mut out = Vec::new();
+        self.scan_string(strict, |bytes| out.extend_from_slice(bytes))?;
+        String::from_utf8(out).ok()
+    }
+
+    fn scan_string(&mut self, strict: bool, mut emit: impl FnMut(&[u8])) -> Option<()> {
+        self.eat(b'"')?;
         loop {
             let c = self.peek()?;
             self.i += 1;
             match c {
-                b'"' => return String::from_utf8(out).ok(),
+                b'"' => return Some(()),
                 // JSON strings hold no raw control characters.
                 0..0x20 => return None,
                 b'\\' => {
                     let e = self.peek()?;
                     self.i += 1;
                     match e {
-                        b'"' | b'\\' | b'/' => out.push(e),
-                        b'n' => out.push(b'\n'),
-                        b't' => out.push(b'\t'),
-                        b'r' => out.push(b'\r'),
-                        b'b' => out.push(8),
-                        b'f' => out.push(12),
+                        b'"' | b'\\' | b'/' => emit(&[e]),
+                        b'n' => emit(b"\n"),
+                        b't' => emit(b"\t"),
+                        b'r' => emit(b"\r"),
+                        b'b' => emit(&[8]),
+                        b'f' => emit(&[12]),
                         b'u' => {
                             let hex = std::str::from_utf8(self.b.get(self.i..self.i + 4)?).ok()?;
+                            if strict && !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+                                return None;
+                            }
                             self.i += 4;
                             let mut code = u32::from_str_radix(hex, 16).ok()?;
                             if (0xd800..=0xdbff).contains(&code)
@@ -284,14 +294,99 @@ impl Parser<'_> {
                                     self.i += 6;
                                 }
                             }
-                            let ch = char::from_u32(code).unwrap_or('\u{fffd}');
+                            let ch = match char::from_u32(code) {
+                                Some(ch) => ch,
+                                None if strict => return None,
+                                None => '\u{fffd}',
+                            };
                             let mut buf = [0; 4];
-                            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            emit(ch.encode_utf8(&mut buf).as_bytes());
                         }
                         _ => return None,
                     }
                 }
-                c => out.push(c),
+                c => emit(&[c]),
+            }
+        }
+    }
+
+    fn skip_number(&mut self) -> Option<()> {
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        match self.peek()? {
+            b'0' => self.i += 1,
+            b'1'..=b'9' => self.digits()?,
+            _ => return None,
+        }
+        if self.peek() == Some(b'.') {
+            self.i += 1;
+            self.digits()?;
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            self.digits()?;
+        }
+        Some(())
+    }
+
+    fn digits(&mut self) -> Option<()> {
+        let start = self.i;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        (self.i > start).then_some(())
+    }
+
+    fn skip_key(&mut self) -> Option<()> {
+        self.scan_string(true, |_| {})?;
+        self.ws();
+        self.eat(b':')
+    }
+
+    /// Validates one JSON value without allocating its contents. The caller
+    /// checks UTF-8. A stack of closing delimiters keeps nesting off the call stack.
+    pub(crate) fn skip_value(&mut self) -> Option<()> {
+        let mut stack = Vec::new();
+        loop {
+            self.ws();
+            match self.peek()? {
+                b'{' | b'[' => {
+                    let end = if self.peek()? == b'{' { b'}' } else { b']' };
+                    self.i += 1;
+                    self.ws();
+                    if self.eat(end).is_none() {
+                        stack.push(end);
+                        if end == b'}' {
+                            self.skip_key()?;
+                        }
+                        continue;
+                    }
+                }
+                b'"' => self.scan_string(true, |_| {})?,
+                b't' => self.word("true", ())?,
+                b'f' => self.word("false", ())?,
+                b'n' => self.word("null", ())?,
+                _ => self.skip_number()?,
+            }
+            loop {
+                let Some(&end) = stack.last() else {
+                    return Some(());
+                };
+                self.ws();
+                if self.eat(end).is_some() {
+                    stack.pop();
+                } else {
+                    self.eat(b',')?;
+                    self.ws();
+                    if end == b'}' {
+                        self.skip_key()?;
+                    }
+                    break;
+                }
             }
         }
     }

@@ -480,6 +480,16 @@ when sending hello to the world and waiting for its answer. A silent world
 causes a handshake-timeout error. After acceptance, these greeting timeouts
 are cleared; callers control how long to wait for subscription replies.
 
+Both commands inspect observer event and error envelopes as JSON. Field
+order, whitespace and string escapes do not affect recognition. Inspection
+uses `relay::observer::Value::envelope`. Recognition does not depend on size,
+element count or nesting depth.
+Invalid JSON, missing or wrongly typed fields, duplicate envelope fields,
+and mixed event/error objects are not recognized. Binary values are never
+inspected. Raw reply bytes and flags stay intact. The CLI writes the original
+bytes; the dashboard forwards the original JSON data in SSE, with one `data:`
+line per line of JSON. Event names with line breaks are sent as errors instead.
+
 The dashboard lists the events under **Events**, from what the log held
 when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The

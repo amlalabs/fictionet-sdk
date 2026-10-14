@@ -142,6 +142,206 @@ fn observe_prints_json_lines() {
     }
 }
 
+/// A scripted observer peer, with the same replies for each request.
+fn with_observer(replies: &[(u8, &[u8])], requests: usize, run: impl FnOnce(&str)) {
+    use fictionet::relay::{self, Message, unix};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let path = temp_socket();
+    let (addr, len) = unix::address(std::path::Path::new(&path)).unwrap();
+    // SAFETY: the socket is owned here; addr is valid for len bytes.
+    let listener = unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
+        assert!(fd >= 0);
+        let listener = OwnedFd::from_raw_fd(fd);
+        assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
+        assert_eq!(libc::listen(fd, 1), 0);
+        listener
+    };
+    std::thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let mut remaining = requests;
+            while remaining != 0 {
+                // SAFETY: accept needs no address output; the returned fd is owned here.
+                let peer = unsafe {
+                    let fd = libc::accept(
+                        listener.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                    assert!(fd >= 0);
+                    OwnedFd::from_raw_fd(fd)
+                };
+                unix::set_timeout(
+                    peer.as_raw_fd(),
+                    libc::SO_RCVTIMEO,
+                    Some(Duration::from_secs(5)),
+                )
+                .unwrap();
+                let mut buf = vec![0; relay::MAX_MESSAGE];
+                let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
+                assert!(matches!(relay::decode(&buf[..n]), Ok(Message::Hello(_))));
+                unix::send(peer.as_raw_fd(), &Message::Accept.encode(), false).unwrap();
+                while remaining != 0 {
+                    let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    remaining -= 1;
+                    let Message::Request { id, .. } = relay::decode(&buf[..n]).unwrap() else {
+                        panic!("expected an observer request");
+                    };
+                    for &(flags, body) in replies {
+                        unix::send(
+                            peer.as_raw_fd(),
+                            &Message::Reply { id, flags, body }.encode(),
+                            false,
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        });
+        run(&path);
+        server.join().unwrap();
+    });
+    drop(listener);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).unwrap();
+}
+
+#[test]
+fn observe_inspects_envelopes_and_preserves_bytes() {
+    use fictionet::relay::{BINARY, END};
+
+    for (flags, bytes, status) in [
+        (END, br#"{"error":"missing"}"#.as_slice(), 1),
+        (END, b" \n{ \"extra\": 1, \"error\": \"missing\" }\n", 1),
+        (END, br#"{"error":false}"#, 0),
+        (END, br#"{"error":"truncated""#, 0),
+        (END | BINARY, br#"{"error":"binary"}"#, 0),
+        (0, br#"{"event":"ended","data":{}}"#, 0),
+        (0, b" { \"data\": {}, \"event\": \"end\\u0065d\" } \n", 0),
+        (0, br#"{"event":"ended","data":}"#, 1),
+        (0, br#"{"event":"ended","data":{}} trailing"#, 1),
+        (BINARY, br#"{"event":"ended","data":{}}"#, 1),
+    ] {
+        with_observer(&[(flags, bytes)], 1, |path| {
+            let out = Command::new(BIN)
+                .args(["observe", "--world", &format!("unix:{path}"), "watch"])
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(status), "{out:?}");
+            let expected = if flags & BINARY != 0 {
+                bytes.to_vec()
+            } else {
+                [bytes, b"\n"].concat()
+            };
+            assert_eq!(out.stdout, expected);
+        });
+    }
+}
+
+#[test]
+fn dashboard_inspects_envelopes_for_json_and_streams() {
+    use fictionet::relay::END;
+
+    for (route, requests, bytes, status, expected) in [
+        (
+            "/api/packet",
+            1,
+            " { \"extra\": 1, \"error\": \"missing\" } ",
+            "404 Not Found",
+            " { \"extra\": 1, \"error\": \"missing\" } ",
+        ),
+        (
+            "/api/packet",
+            1,
+            "{\"error\":false}",
+            "200 OK",
+            "{\"error\":false}",
+        ),
+        (
+            "/api/watch",
+            1,
+            " {\n\"data\": { \"id\": \"t1\" }, \"event\": \"no\\u0064e\"\n} ",
+            "200 OK",
+            "event: node\ndata: { \"id\": \"t1\" }\n\n",
+        ),
+        (
+            "/api/watch",
+            1,
+            "{\"event\":\"node\",\"data\":{\n\"id\": \"t1\"\n}}",
+            "200 OK",
+            "event: node\ndata: {\ndata: \"id\": \"t1\"\ndata: }\n\n",
+        ),
+        (
+            "/api/watch",
+            1,
+            "{\"event\":\"node\",\"data\":}",
+            "200 OK",
+            "event: error\ndata: {\"event\":\"node\",\"data\":}\n\n",
+        ),
+        (
+            "/api/watch",
+            1,
+            "{\n\"error\": \"missing\"\n}",
+            "200 OK",
+            "event: error\ndata: {\ndata: \"error\": \"missing\"\ndata: }\n\n",
+        ),
+        (
+            "/api/packets?link=e3,e7",
+            2,
+            " { \"data\": {\n\"reason\": \"closed\" }, \"event\": \"end\" } ",
+            "200 OK",
+            "event: link_end\ndata: {\"link\":\"e3\",\ndata: \"reason\": \"closed\" }\n\nevent: link_end\ndata: {\"link\":\"e7\",\ndata: \"reason\": \"closed\" }\n\nevent: end\ndata: {\"reason\":\"every link closed\"}\n\n",
+        ),
+        (
+            "/api/packets?link=e3,e7",
+            2,
+            "{\"event\":\"end\",\"data\":{ }}",
+            "200 OK",
+            "event: link_end\ndata: {\"link\":\"e3\"}\n\nevent: link_end\ndata: {\"link\":\"e7\"}\n\nevent: end\ndata: {\"reason\":\"every link closed\"}\n\n",
+        ),
+    ] {
+        with_observer(&[(END, bytes.as_bytes())], requests, |path| {
+            let token_file = format!("{path}.token");
+            std::fs::write(&token_file, "dashboard-test-token\n").unwrap();
+            let mut child = Command::new(BIN)
+                .args([
+                    "dashboard",
+                    "--world",
+                    &format!("unix:{path}"),
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--token-file",
+                    &token_file,
+                ])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let port = line
+                .trim_end()
+                .rsplit(':')
+                .next()
+                .unwrap()
+                .trim_end_matches('/')
+                .parse()
+                .unwrap();
+            let (head, body) = get(port, route);
+            child.kill().unwrap();
+            child.wait().unwrap();
+            std::fs::remove_file(token_file).unwrap();
+            assert_eq!(head, format!("HTTP/1.1 {status}"));
+            assert_eq!(body, expected);
+        });
+    }
+}
+
 #[test]
 fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     let path = temp_socket();
