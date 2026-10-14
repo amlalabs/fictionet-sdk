@@ -22,6 +22,10 @@
 //! data means are up to world code.
 //!
 //! [`over_tpkt`] wraps TPDUs in TPKT packets and writes segmented messages.
+//! [`Tpdu::parse`] and [`Wire::parse`] accept at most [`MAX_TPDU`] bytes,
+//! including the TPDU header. Larger inputs return [`Error::TpduTooLong`]
+//! before header checks or allocation. [`over_tpkt::tpdu`] uses the same
+//! bound, including for hand-built packets. There is no unbounded parser.
 //!
 //! ```
 //! use fictionet::stdlib::{codec::{Assembled, Stream, finish, pump}, cotp, tpkt};
@@ -670,16 +674,8 @@ impl Wire for Tpdu {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads one TPDU. Input over [`MAX_TPDU`] returns [`Error::TpduTooLong`].
-    /// Invalid length indicators, short headers, unsupported codes, or an
-    /// unexpected header or data length return the corresponding
-    /// [`Error`].
+    /// Reads one TPDU through the bounded [`Tpdu::parse`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > MAX_TPDU {
-            return Err(Error::TpduTooLong {
-                length: bytes.len(),
-            });
-        }
         Tpdu::parse(bytes)
     }
 
@@ -761,7 +757,9 @@ pub mod over_tpkt {
         Ok(Packet::new(Wire::to_bytes(tpdu)?))
     }
 
-    /// Reads the payload as one COTP TPDU.
+    /// Reads the payload as one COTP TPDU through [`Tpdu::parse`].
+    /// Payloads over [`super::MAX_TPDU`] return [`Error::TpduTooLong`],
+    /// including in hand-built packets.
     pub fn tpdu(packet: &Packet) -> Result<Tpdu, Error> {
         Tpdu::parse(&packet.payload)
     }
@@ -787,9 +785,8 @@ pub mod over_tpkt {
 ///
 /// Items are `Result<Tpdu, Error>`. A malformed TPDU is an item error;
 /// it does not end framing and can be answered with [`ErrorTpdu::rejecting`].
-/// TPKT already bounds each payload to [`MAX_TPDU`], so only the standalone
-/// [`Wire`] parser needs [`Error::TpduTooLong`]. Framing errors are
-/// [`tpkt::Error`].
+/// TPKT already bounds each payload to [`MAX_TPDU`], so these items cannot
+/// contain [`Error::TpduTooLong`]. Framing errors are [`tpkt::Error`].
 pub type Tpdus = Map<Frames<tpkt::Packet>, fn(tpkt::Packet) -> Result<Tpdu, Error>>;
 
 /// Creates a TPDU decoder with a TPKT packet limit, including its header.
@@ -836,7 +833,16 @@ pub fn messages(packet_limit: usize, message_limit: usize) -> Messages {
 
 impl Tpdu {
     /// Reads the TPDU in `b`: all of it, as one packet carries.
+    ///
+    /// Input over [`MAX_TPDU`] bytes, including the header, returns
+    /// [`Error::TpduTooLong`] before header checks or allocation.
+    /// Invalid length indicators, short headers, unsupported codes, or an
+    /// unexpected header or data length return the corresponding [`Error`].
+    /// [`Wire::parse`] uses this same parser.
     pub fn parse(b: &[u8]) -> Result<Tpdu, Error> {
+        if b.len() > MAX_TPDU {
+            return Err(Error::TpduTooLong { length: b.len() });
+        }
         let (&li, rest) = b.split_first().ok_or(Error::Empty)?;
         if usize::from(li) > MAX_HEADER {
             return Err(Error::LengthIndicator(li));
@@ -1021,6 +1027,77 @@ mod codec_tests {
     fn over_tpkt_payload_errors() {
         let bad = tpkt::Packet::new(vec![2, 0x10, 0]);
         assert_eq!(over_tpkt::tpdu(&bad), Err(Error::Unsupported(0x10)));
+    }
+
+    #[test]
+    fn parse_size_boundary_matches_wire_and_packet_conversion() {
+        for header in [
+            &[2, 0xf0, 0x80][..],
+            &[6, 0xe0, 0, 0, 0, 1, 0],
+            &[6, 0xd0, 0, 1, 0, 2, 0],
+            &[6, 0x80, 0, 1, 0, 2, 0],
+        ] {
+            for length in [header.len(), MAX_TPDU - 1, MAX_TPDU, MAX_TPDU + 1] {
+                let mut bytes = header.to_vec();
+                bytes.resize(length, 0x5a);
+                let packet = tpkt::Packet::new(bytes);
+                let parsed = Tpdu::parse(&packet.payload);
+                if length > MAX_TPDU {
+                    assert_eq!(parsed, Err(Error::TpduTooLong { length }));
+                } else {
+                    assert_eq!(
+                        parsed.as_ref().unwrap().to_bytes(),
+                        Ok(packet.payload.clone())
+                    );
+                }
+                assert_eq!(<Tpdu as Wire>::parse(&packet.payload), parsed);
+                assert_eq!(over_tpkt::tpdu(&packet), parsed);
+                if length == MAX_TPDU {
+                    let wire = packet.to_bytes().unwrap();
+                    assert_eq!(wire.len(), tpkt::MAX_PACKET);
+                    assert_eq!(drive(tpdus(tpkt::MAX_PACKET), &[&wire]), vec![parsed]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_size_error_precedes_header_errors() {
+        for (header, error) in [
+            (&[255][..], Error::LengthIndicator(255)),
+            (&[0], Error::Unsupported(0)),
+            (&[1, 0xf0], Error::LengthIndicator(1)),
+            (&[2, 0x10, 0], Error::Unsupported(0x10)),
+            (&[4, 0x70, 0, 0, 0], Error::UnexpectedData),
+        ] {
+            let mut bytes = header.to_vec();
+            bytes.resize(MAX_TPDU, 0);
+            for length in [MAX_TPDU, MAX_TPDU + 1] {
+                bytes.resize(length, 0);
+                let expected = Err(if length > MAX_TPDU {
+                    Error::TpduTooLong { length }
+                } else {
+                    error
+                });
+                assert_eq!(Tpdu::parse(&bytes), expected);
+                assert_eq!(<Tpdu as Wire>::parse(&bytes), expected);
+                assert_eq!(over_tpkt::tpdu(&tpkt::Packet::new(bytes.clone())), expected);
+            }
+        }
+        for (bytes, error) in [
+            (&[][..], Error::Empty),
+            (&[255], Error::LengthIndicator(255)),
+            (&[2], Error::Truncated { needed: 3, have: 1 }),
+            (&[0], Error::Unsupported(0)),
+            (&[1, 0xf0], Error::LengthIndicator(1)),
+        ] {
+            assert_eq!(Tpdu::parse(bytes), Err(error));
+            assert_eq!(<Tpdu as Wire>::parse(bytes), Err(error));
+            assert_eq!(
+                over_tpkt::tpdu(&tpkt::Packet::new(bytes.to_vec())),
+                Err(error)
+            );
+        }
     }
 
     #[test]
@@ -1344,9 +1421,8 @@ mod codec_tests {
         assert!(over_tpkt::from_tpdu(&raw).is_err());
         assert_eq!(oversized.to_bytes(), Err(Error::Unwritable));
         let oversized_wire = [vec![2, 0xf0, 0x80], vec![0; MAX_TPDU - 2]].concat();
-        assert!(Tpdu::parse(&oversized_wire).is_ok());
         assert_eq!(
-            <Tpdu as Wire>::parse(&oversized_wire),
+            Tpdu::parse(&oversized_wire),
             Err(Error::TpduTooLong {
                 length: MAX_TPDU + 1
             })

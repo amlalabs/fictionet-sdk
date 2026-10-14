@@ -524,6 +524,8 @@ fictionet::prefixed! {
 
 /// Extracts the bytes of an unsegmented RDP X.224 Data TPDU using COTP.
 /// Use the sibling COTP reassembler yourself for non-RDP segmented traffic.
+/// A payload over [`tpkt::MAX_PAYLOAD`] returns [`Error::Limit`] before
+/// checking the data header or parsing COTP.
 pub fn read_data(packet: &tpkt::Packet) -> Result<Vec<u8>, Error> {
     bound(packet.payload.len(), tpkt::MAX_PAYLOAD, "TPKT payload")?;
     check(
@@ -653,6 +655,8 @@ pub struct Connection {
 }
 impl Connection {
     /// Reads the complete connection header in a sibling TPKT packet.
+    /// A payload over [`cotp::MAX_HEADER`] plus one byte returns
+    /// [`Error::Limit`] before parsing COTP.
     pub fn from_packet(packet: &tpkt::Packet) -> Result<Self, Error> {
         bound(
             packet.payload.len(),
@@ -2976,6 +2980,19 @@ mod tests {
         assert_eq!(Connection::from_packet(&p), Ok(c.clone()));
         c.routing_token.insert(0, b'a');
         assert!(c.to_packet().is_err());
+        for length in [cotp::MAX_HEADER + 2, cotp::MAX_TPDU + 1] {
+            let mut oversized = p.clone();
+            oversized.payload.resize(length, 0);
+            assert_eq!(
+                Connection::from_packet(&oversized),
+                Err(Error::Limit("connection header"))
+            );
+            oversized.payload[0] = 255;
+            assert_eq!(
+                Connection::from_packet(&oversized),
+                Err(Error::Limit("connection header"))
+            );
+        }
     }
 
     #[test]
@@ -3840,10 +3857,25 @@ mod tests {
     #[test]
     fn data_transport_limits_and_refusals() {
         let b = vec![7; MAX_PDU];
-        let p = write_data(&b).unwrap();
-        assert_eq!(p.to_bytes().unwrap().len(), MAX_FRAME);
+        let mut p = write_data(&b).unwrap();
+        let wire = p.to_bytes().unwrap();
+        assert_eq!(wire.len(), MAX_FRAME);
+        assert_eq!(Frame::parse(&wire), Ok(Frame::SlowPath(p.clone())));
         assert_eq!(read_data(&p), Ok(b));
-        assert!(write_data(&vec![0; MAX_PDU + 1]).is_err());
+        p.payload.push(0);
+        assert_eq!(read_data(&p), Err(Error::Limit("TPKT payload")));
+        assert_eq!(
+            cotp::over_tpkt::tpdu(&p),
+            Err(cotp::Error::TpduTooLong {
+                length: cotp::MAX_TPDU + 1
+            })
+        );
+        p.payload[0] = 255;
+        assert_eq!(read_data(&p), Err(Error::Limit("TPKT payload")));
+        assert_eq!(
+            write_data(&vec![0; MAX_PDU + 1]),
+            Err(Error::Limit("RDP data"))
+        );
         let mut p = write_data(&[]).unwrap();
         p.payload[2] = 0;
         assert!(read_data(&p).is_err());

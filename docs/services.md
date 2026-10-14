@@ -160,6 +160,22 @@ one the call came over, so the KDC can answer `KRB_ERR_RESPONSE_TOO_BIG`
 on UDP. Serve them with `Host::tcp(88, ..)` and `Host::udp(88, ..)` and
 the same `State`.
 
+### COTP packet bounds
+
+`cotp::Tpdu::parse` and its `Wire::parse` implementation read one complete
+TPDU of at most `cotp::MAX_TPDU` bytes, including its header. This is the
+largest payload a TPKT packet can carry: 65531 bytes. Larger inputs return
+`cotp::Error::TpduTooLong` before header checks or allocation. Standalone
+parsing previously accepted oversized connection, disconnect and data TPDUs;
+it now uses the same limit as `Wire`. Inputs within the limit keep the same
+grammar and errors. There is no unbounded parser.
+
+`cotp::over_tpkt::tpdu` applies this limit even to a hand-built
+`tpkt::Packet`. Packets read by the TPKT decoder already fit it. RDP keeps
+its own limits and errors: `read_data` reports `Error::Limit("TPKT payload")`
+before checking the data header, and `Connection::from_packet` checks its
+smaller connection-header limit before parsing COTP.
+
 ### Owning recursive protocol values
 
 AMQP `FieldValue`, Thrift `Value`, and protobuf `Value` release nested

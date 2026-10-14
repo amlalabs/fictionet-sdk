@@ -31,12 +31,16 @@ fuzz_target!(|data: &[u8]| {
         .chain([data])
     {
         check_wire::<Tpdu>(tpdu);
-        check_wire_value(&tpkt::Packet::new(tpdu.to_vec()));
-        match <Tpdu as Wire>::parse(tpdu) {
+        let packet = tpkt::Packet::new(tpdu.to_vec());
+        check_wire_value(&packet);
+        let parsed = Tpdu::parse(tpdu);
+        assert_eq!(parsed, <Tpdu as Wire>::parse(tpdu));
+        assert_eq!(parsed, cotp::over_tpkt::tpdu(&packet));
+        match parsed {
             Ok(t) => {
                 check_wire_value(&t);
                 if let Ok(bytes) = t.to_bytes() {
-                    assert_eq!(<Tpdu as Wire>::parse(&bytes), Ok(t.clone()));
+                    assert_eq!(Tpdu::parse(&bytes), Ok(t.clone()));
                 }
                 match &t {
                     Tpdu::Data(d) => {
@@ -48,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
                             assert!(c.allows_class0());
                             assert_eq!(cc.class, 0);
                             let cc = Tpdu::ConnectionConfirm(cc);
-                            assert_eq!(<Tpdu as Wire>::parse(&cc.to_bytes().unwrap()), Ok(cc));
+                            assert_eq!(Tpdu::parse(&cc.to_bytes().unwrap()), Ok(cc));
                         }
                         None => assert!(!c.allows_class0()),
                     },
@@ -58,7 +62,7 @@ fuzz_target!(|data: &[u8]| {
             Err(Error::TpduTooLong { .. }) => {}
             Err(e) => {
                 let er = Tpdu::Error(ErrorTpdu::rejecting(0, tpdu, &e));
-                assert_eq!(<Tpdu as Wire>::parse(&er.to_bytes().unwrap()), Ok(er));
+                assert_eq!(Tpdu::parse(&er.to_bytes().unwrap()), Ok(er));
             }
         }
     }
@@ -69,8 +73,7 @@ fuzz_target!(|data: &[u8]| {
         let mut whole = Reassembler::new();
         let mut got = None;
         for s in segment(data, size) {
-            let Ok(Tpdu::Data(back)) =
-                <Tpdu as Wire>::parse(&Tpdu::Data(s.clone()).to_bytes().unwrap())
+            let Ok(Tpdu::Data(back)) = Tpdu::parse(&Tpdu::Data(s.clone()).to_bytes().unwrap())
             else {
                 panic!()
             };
