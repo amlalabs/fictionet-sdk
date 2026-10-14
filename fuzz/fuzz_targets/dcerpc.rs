@@ -12,7 +12,7 @@ use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::dcerpc::harness::rewrite;
 use fictionet::stdlib::dcerpc::{
     Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error, MAX_FRAG,
-    MAX_FRAGMENTS, Pdu, Reassembler, SyntaxId, Uuid, flags,
+    MAX_FRAGMENTS, MAX_STUB, Pdu, Reassembler, SyntaxId, Uuid, flags,
 };
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
@@ -174,9 +174,11 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 /// The fragments of one call, each given a verifier and maybe a cancel:
-/// they join only if every verifier has the first one's type, level and
-/// context ID, and the joined call keeps any cancel.
+/// they join only if every verifier and semantic representation agrees,
+/// and the joined call keeps any cancel. Reserved representation bytes may vary.
 fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<()> {
+    let recovery = parts.clone();
+    let recovered = want.clone();
     let first: Option<(u8, u8, u32)> = u.arbitrary()?;
     let mut fail = None;
     for (i, f) in parts.iter_mut().enumerate() {
@@ -191,7 +193,17 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
             context_id,
             value: vec![1],
         });
-        if i > 0 && s != first && fail.is_none() {
+        if i > 0 {
+            match u.int_in_range(0..=5u8)? {
+                0 => f.drep.0[0] ^= 0x10,
+                1 => f.drep.0[0] ^= 1,
+                2 => f.drep.0[1] ^= 1,
+                3 => f.drep.0[2..].copy_from_slice(&u.arbitrary::<[u8; 2]>()?),
+                _ => {}
+            }
+        }
+        // The first two wire bytes carry integer, character and float formats.
+        if i > 0 && (s != first || f.drep.0[..2] != want.drep.0[..2]) && fail.is_none() {
             fail = Some(i);
         }
         if u.ratio(1, 8)? {
@@ -217,28 +229,102 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
             })
             .fold(0, u8::max);
     }
+    check_related(parts, want, fail, recovery, recovered);
+    Ok(())
+}
+
+/// Checks related fragments against their expected outcome and valid-call recovery.
+fn check_related(
+    parts: Vec<Pdu>,
+    want: Pdu,
+    fail: Option<usize>,
+    recovery: Vec<Pdu>,
+    recovered: Pdu,
+) {
     let mut r = Reassembler::default();
     let n = parts.len();
     for (i, f) in parts.into_iter().enumerate() {
         let got = r.push(f);
         match fail {
-            Some(at) if i == at => {
+            Some(at) if i >= at => {
                 assert_eq!(
                     got,
                     Err(Error::UnexpectedFragment {
                         call_id: want.call_id
                     })
                 );
-                return Ok(());
+                assert_eq!(r.pending(), 0);
             }
             _ if i + 1 == n => assert_eq!(got, Ok(Some(want.clone()))),
             _ => assert_eq!(got, Ok(None)),
         }
+        assert!(r.pending() <= MAX_STUB);
     }
-    Ok(())
+    assert_eq!(r.pending(), 0);
+    // A valid fragmented call with the same ID must recover after rejection.
+    let n = recovery.len();
+    for (i, f) in recovery.into_iter().enumerate() {
+        let got = r.push(f).unwrap();
+        if i + 1 == n {
+            assert_eq!(got, Some(recovered.clone()));
+        } else {
+            assert_eq!(got, None);
+        }
+        assert!(r.pending() <= MAX_STUB);
+    }
+    assert_eq!(r.pending(), 0);
+}
+
+/// REP\0, request/response selector, two four-byte representations, then stub.
+/// This mode reaches the representation oracle without generating a valid PDU
+/// and fragmentation size through Unstructured first.
+fn representations(data: &[u8]) {
+    if data.len() < 9 {
+        return;
+    }
+    let body = |stub: Vec<u8>| {
+        if data[0] & 1 == 0 {
+            Body::Request {
+                alloc_hint: 0,
+                context_id: 0,
+                opnum: 1,
+                object: None,
+                stub,
+            }
+        } else {
+            Body::Response {
+                alloc_hint: 0,
+                context_id: 0,
+                cancel_count: 0,
+                stub,
+            }
+        }
+    };
+    let stub = &data[9..data.len().min(1033)];
+    let mut want = Pdu::new(7, body(stub.to_vec()));
+    want.drep = DataRep(data[1..5].try_into().unwrap());
+    want.drep.0[0] &= 0x1f;
+    let mut first = Pdu::new(7, body(stub[..stub.len() / 2].to_vec()));
+    first.flags = flags::FIRST_FRAG;
+    first.drep = want.drep;
+    let mut last = Pdu::new(7, body(stub[stub.len() / 2..].to_vec()));
+    last.flags = flags::LAST_FRAG;
+    last.drep = DataRep(data[5..9].try_into().unwrap());
+    last.drep.0[0] &= 0x1f;
+    // Exercise each fragment's own byte order on the wire before reassembly.
+    let parse = |p: &Pdu| Pdu::parse(&p.to_bytes().unwrap()).unwrap();
+    let parts = vec![parse(&first), parse(&last)];
+    let fail = (first.drep.0[..2] != last.drep.0[..2]).then_some(1);
+    last.drep = first.drep;
+    let recovery = vec![parse(&first), parse(&last)];
+    check_related(parts, want.clone(), fail, recovery, want);
 }
 
 fuzz_target!(|data: &[u8]| {
+    if let Some(data) = data.strip_prefix(b"REP\0") {
+        representations(data);
+        return;
+    }
     contract::check_decode_capacity(Frames::<Pdu>::new, data);
     contract::check_wire::<Pdu>(data);
     contract::check_decode_capacity(|| Frames::<Pdu>::with_limit(0), data);
@@ -268,6 +354,31 @@ fuzz_target!(|data: &[u8]| {
         let _ = r.push(p);
         assert!(r.pending() <= 4096);
     }
+    // A valid call must recover even when the stream left an incomplete call.
+    let request = |stub| {
+        Pdu::new(
+            7,
+            Body::Request {
+                alloc_hint: 0,
+                context_id: 0,
+                opnum: 1,
+                object: None,
+                stub,
+            },
+        )
+    };
+    let mut first = request(vec![1]);
+    first.flags = flags::FIRST_FRAG;
+    let mut last = request(vec![2]);
+    last.flags = flags::LAST_FRAG;
+    let mut got = r.push(first.clone());
+    if matches!(got, Err(Error::Interleaved { .. })) {
+        assert_eq!(r.pending(), 0);
+        got = r.push(first);
+    }
+    assert_eq!(got, Ok(None));
+    assert_eq!(r.push(last), Ok(Some(request(vec![1, 2]))));
+    assert_eq!(r.pending(), 0);
     let _ = Pdu::parse(data);
     let _ = built(data);
 });
