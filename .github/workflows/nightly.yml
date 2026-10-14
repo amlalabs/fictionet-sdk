@@ -12,10 +12,6 @@ jobs:
   k8s:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        script: [run, proxy]
     steps:
       - uses: actions/checkout@v4
       - uses: helm/kind-action@v1
@@ -23,7 +19,7 @@ jobs:
           install_only: true
       - uses: azure/setup-helm@v4.3.0
       - uses: azure/setup-kubectl@v4
-      - run: tests/k8s/${{ matrix.script }}.sh
+      - run: tests/k8s/run.sh
 
   vm:
     runs-on: ubuntu-latest

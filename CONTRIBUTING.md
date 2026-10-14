@@ -96,9 +96,10 @@ A change to `fictionet attach` or to how a world is reached should also pass the
 Docker tests (`tests/docker/*/run.sh`), and for the Helm chart, the Kubernetes test
 (`tests/k8s/run.sh`). Each script builds what it needs, checks, and cleans up.
 
-CI runs the TCP/UDP, web, ping and proxy Docker scripts on every push and
-pull request. The nightly integration workflow runs both kind tests and
-the QEMU VM test, with its prepared image cached. Nested VM and gVisor
+CI runs the TCP/UDP, web, ping and proxy Docker scripts and the restricted
+kind proxy test (`tests/k8s/proxy.sh`) on every push and pull request.
+The nightly integration workflow runs the tun kind test (`tests/k8s/run.sh`)
+and the QEMU VM test, with its prepared image cached. Nested VM and gVisor
 tests remain manual. Missing host capabilities fail when `CI` is set.
 
 The Docker web and proxy tests and `tests/k8s/proxy.sh` check full transfer

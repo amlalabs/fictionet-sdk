@@ -12,9 +12,9 @@ COPY benches benches
 # any build. Examples link dev-dependencies, and tests/copy_and_own reads
 # a file in codegen/tests.
 COPY codegen codegen
-COPY tests/copy_and_own tests/copy_and_own
+# Copy all tests because Cargo reads every test target the manifest declares.
+COPY tests tests
 COPY examples examples
-COPY tests/web_fixture tests/web_fixture
 # The hosted example also copies web_world out of this image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-web-target \

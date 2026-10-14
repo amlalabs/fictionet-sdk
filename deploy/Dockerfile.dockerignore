@@ -6,5 +6,5 @@
 !dashboard
 !benches
 !codegen
-!tests/copy_and_own
+!tests
 !examples

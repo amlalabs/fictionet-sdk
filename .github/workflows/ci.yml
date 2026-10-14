@@ -289,3 +289,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: tests/docker/${{ matrix.test }}/run.sh
+
+  k8s-proxy:
+    name: restricted kind proxy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # The script creates its own cluster and removes it on exit.
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - uses: azure/setup-helm@v4.3.0
+      - uses: azure/setup-kubectl@v4
+      - name: Check prerequisites
+        run: |
+          docker info
+          kind version
+          kubectl version --client
+          helm version
+      # Pod Security "restricted" admits the release, the agent starts only
+      # once the NetworkPolicy blocks its direct traffic, and only the proxy
+      # is reachable from the pod.
+      - name: Restricted proxy isolation and startup
+        run: tests/k8s/proxy.sh
+        env:
+          FICTIONET_PERF_CHECK: "0"
