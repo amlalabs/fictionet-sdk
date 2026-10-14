@@ -17,6 +17,11 @@
 //! version up: newer senders' longer blocks are skipped (section 5.3), and
 //! older senders are refused.
 //!
+//! See the [differential-testing comparison] for the intentional differences
+//! from the runtime SBE decoder: older acting versions and unknown enums.
+//!
+//! [differential-testing comparison]: https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md#guarantees-and-checks
+//!
 //! Not mapped, with an [`ErrorKind::Unsupported`] error: primitive arrays
 //! other than `char` and `uint8`, optional floats (their null is NaN),
 //! optional composite fields, and header or dimension composites with

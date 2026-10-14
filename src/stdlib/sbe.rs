@@ -31,6 +31,11 @@
 //! every value and leave the destination unchanged on error. Constants are
 //! present in the value tree but occupy no wire bytes. Fields introduced
 //! after the acting version become [`Value::Absent`] (section 5.4).
+//!
+//! See the [differential-testing comparison] for the intentional differences
+//! from generated SBE readers: older acting versions and unknown enums.
+//!
+//! [differential-testing comparison]: https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md#guarantees-and-checks
 
 use fictionet::stdlib::codec::{Decode, Step, Wire, Work};
 use fictionet::stdlib::xml;
