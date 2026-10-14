@@ -225,6 +225,16 @@ reference and use `core::mem::take` on the child vector, table, or message.
 For a Thrift list or map, take its `items` or `entries` vector. The protocol
 module docs show extraction examples. Public module paths are unchanged.
 
+### Validating TFTP agreements
+
+TFTP `Negotiated` fields are now private, with read-only accessors.
+This is a source compatibility change: replace field reads with
+`block_size()`, `timeout()`, `transfer_size()` and `oack()`.
+Replace struct literals with `Negotiated::from_oack(options)?`.
+`oack()` returns a slice; use `.to_vec()` for an owned option list.
+Exhaustive matches on `tftp::Error` must handle the new
+`InvalidOptionValue` variant.
+
 ### Dates belong to the world
 
 `driver.now()` is the run's clock: time since the run started, with no

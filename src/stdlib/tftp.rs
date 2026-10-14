@@ -32,6 +32,10 @@
 //! A request may name each option only once (RFC 2347), so the readers
 //! and writers both refuse repeated option names.
 //!
+//! Negotiated settings are immutable. Use [`negotiate`] for a request or
+//! [`Negotiated::from_oack`] to validate a custom agreement. A transfer
+//! sends the validated options unchanged and uses their block size.
+//!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::tftp::{negotiate, Event, Packet, ReadTransfer, MAX_BLOCK_SIZE};
@@ -43,7 +47,7 @@
 //!
 //! let file = vec![0xab; 1500];
 //! let agreed = negotiate(&request.options, Some(file.len() as u64), MAX_BLOCK_SIZE);
-//! assert_eq!(agreed.block_size, 1024);
+//! assert_eq!(agreed.block_size(), 1024);
 //! let mut transfer = ReadTransfer::negotiated(file, &agreed);
 //!
 //! // The server answers the options first, with an OACK.
@@ -291,9 +295,9 @@ pub enum Packet {
     },
 }
 
-/// Why bytes are not a TFTP packet. A server answers most of these with
-/// an ERROR packet with [`ErrorCode::IllegalOperation`], or drops the
-/// datagram.
+/// Why a packet or option agreement is invalid. A server answers most
+/// of these with an ERROR packet with [`ErrorCode::IllegalOperation`],
+/// or drops the datagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The value cannot be written without changing it.
@@ -321,6 +325,9 @@ pub enum Error {
     MissingValue,
     /// A request or OACK names the same option twice, in any case.
     DuplicateOption,
+    /// A custom agreement has a nonnumeric or out-of-range `blksize`,
+    /// `timeout` or `tsize` value.
+    InvalidOptionValue,
     /// An ACK or ERROR packet has bytes after its last field.
     TrailingBytes,
 }
@@ -340,6 +347,7 @@ fictionet::error_display!(Error, f, {
     Error::TooManyOptions => write!(f, "more than {MAX_OPTIONS} options"),
     Error::MissingValue => write!(f, "option name with no value"),
     Error::DuplicateOption => write!(f, "option named twice"),
+    Error::InvalidOptionValue => write!(f, "option value is not a number in range"),
     Error::TrailingBytes => write!(f, "bytes after the packet's last field"),
 });
 
@@ -380,20 +388,82 @@ pub fn parse_number(s: &str) -> Option<u64> {
     })
 }
 
-/// What [`negotiate`] agreed for one transfer.
+/// Validated options for one transfer, made by [`negotiate`] or
+/// [`Negotiated::from_oack`]. The settings and OACK cannot be changed separately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Negotiated {
+    block_size: u16,
+    timeout: Option<u8>,
+    transfer_size: Option<u64>,
+    oack: Vec<TftpOption>,
+}
+
+impl Negotiated {
+    /// Validates a custom OACK and derives its settings once.
+    ///
+    /// Keeps the options in their original order, case and spelling. An
+    /// empty list means no OACK and the default settings. Unknown options
+    /// are kept but do not affect the settings this module understands.
+    /// The caller checks that the options answer the client's request and
+    /// that any custom options are supported by its transfer logic.
+    ///
+    /// Returns [`Error::Unwritable`] for repeated names, embedded NULs or
+    /// options exceeding the packet, string or option-count limits.
+    /// Returns [`Error::InvalidOptionValue`] unless known values are decimal
+    /// numbers accepted by [`parse_number`]: `blksize` in [`MIN_BLOCK_SIZE`]
+    /// through [`MAX_BLOCK_SIZE`], `timeout` in [`MIN_TIMEOUT`] through
+    /// [`MAX_TIMEOUT`], and `tsize` in `0..=u64::MAX`.
+    pub fn from_oack(oack: Vec<TftpOption>) -> Result<Negotiated, Error> {
+        // Check Packet::write's OACK limits so the agreement can always be sent.
+        put_options(&mut opcode::OACK.to_be_bytes().to_vec(), &oack, MAX_PACKET)?;
+        let mut n = Negotiated {
+            block_size: DEFAULT_BLOCK_SIZE,
+            timeout: None,
+            transfer_size: None,
+            oack,
+        };
+        for o in &n.oack {
+            if o.name.eq_ignore_ascii_case(option::BLKSIZE) {
+                n.block_size = parse_number(&o.value)
+                    .and_then(|v| u16::try_from(v).ok())
+                    .filter(|v| (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(v))
+                    .ok_or(Error::InvalidOptionValue)?;
+            } else if o.name.eq_ignore_ascii_case(option::TIMEOUT) {
+                n.timeout = Some(
+                    parse_number(&o.value)
+                        .and_then(|v| u8::try_from(v).ok())
+                        .filter(|v| *v >= MIN_TIMEOUT)
+                        .ok_or(Error::InvalidOptionValue)?,
+                );
+            } else if o.name.eq_ignore_ascii_case(option::TSIZE) {
+                n.transfer_size = Some(parse_number(&o.value).ok_or(Error::InvalidOptionValue)?);
+            }
+        }
+        Ok(n)
+    }
+
     /// The block size: [`DEFAULT_BLOCK_SIZE`] unless a `blksize` option
     /// was accepted.
-    pub block_size: u16,
-    /// The timeout in seconds the client asked for, if it was in range.
+    pub fn block_size(&self) -> u16 {
+        self.block_size
+    }
+
+    /// The agreed timeout in seconds, if any.
     /// The caller uses it to time its resends.
-    pub timeout: Option<u8>,
-    /// The transfer size, if the client sent `tsize`.
-    pub transfer_size: Option<u64>,
-    /// The options to send back in an OACK, in the order the client sent
-    /// them. Empty when none were accepted; the server then sends no OACK.
-    pub oack: Vec<TftpOption>,
+    pub fn timeout(&self) -> Option<u8> {
+        self.timeout
+    }
+
+    /// The agreed transfer size, if any.
+    pub fn transfer_size(&self) -> Option<u64> {
+        self.transfer_size
+    }
+
+    /// The options to send back in an OACK, in their agreed order.
+    /// Empty when none were accepted; the server then sends no OACK.
+    pub fn oack(&self) -> &[TftpOption] {
+        &self.oack
+    }
 }
 
 /// Answers a request's options as a server, following RFC 2347 to 2349.
@@ -523,34 +593,22 @@ impl ReadTransfer {
         ReadTransfer::start(data, DEFAULT_BLOCK_SIZE, None)
     }
 
-    /// A transfer with what [`negotiate`] agreed. It starts with an OACK
+    /// A transfer with validated options. It starts with an OACK
     /// when there are options to acknowledge, and with block 1 if not.
     ///
-    /// The OACK keeps the options from `agreed.oack` that fit, with
-    /// strings clipped and repeats left out. A `blksize`
-    /// option whose value is not a number from [`MIN_BLOCK_SIZE`] to
-    /// [`MAX_BLOCK_SIZE`] is left out too. The block size is the one the
-    /// OACK's `blksize` gives the client, or [`DEFAULT_BLOCK_SIZE`] when
-    /// it has none, so `agreed.block_size` is not used and the client and
-    /// server always agree on it.
+    /// Sends [`Negotiated::oack`] unchanged and uses [`Negotiated::block_size`].
+    /// Custom agreements are checked when they are made, not here.
+    /// Use [`negotiate`] or [`Negotiated::from_oack`] to make the agreement.
     pub fn negotiated(data: Vec<u8>, agreed: &Negotiated) -> ReadTransfer {
-        let mut block_size = DEFAULT_BLOCK_SIZE;
-        let mut oack = Vec::new();
-        for (name, value) in clipped_options(&agreed.oack, 2, MAX_PACKET) {
-            if name.eq_ignore_ascii_case(option::BLKSIZE) {
-                match parse_number(value).and_then(|v| u16::try_from(v).ok()) {
-                    Some(v) if (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&v) => block_size = v,
-                    _ => continue,
-                }
-            }
-            oack.push(TftpOption::new(name, value));
-        }
-        let oack = if oack.is_empty() { None } else { Some(oack) };
-        ReadTransfer::start(data, block_size, oack)
+        let oack = if agreed.oack.is_empty() {
+            None
+        } else {
+            Some(agreed.oack.clone())
+        };
+        ReadTransfer::start(data, agreed.block_size, oack)
     }
 
     fn start(data: Vec<u8>, block_size: u16, oack: Option<Vec<TftpOption>>) -> ReadTransfer {
-        let block_size = block_size.clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
         // A usize always fits in a u64 on the targets Rust supports.
         let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let blocks = (len / u64::from(block_size)).saturating_add(1);
@@ -766,21 +824,6 @@ fn take_options(b: &[u8], mut pos: usize) -> Result<Vec<TftpOption>, Error> {
     Ok(options)
 }
 
-/// `s` cut at its first NUL and to [`MAX_STRING`] bytes, at a character
-/// boundary.
-fn clipped_string(s: &str) -> &str {
-    clipped_utf8(s.split('\0').next().unwrap_or(""), MAX_STRING)
-}
-
-/// `s` cut to at most `max` bytes, at a character boundary.
-fn clipped_utf8(s: &str, max: usize) -> &str {
-    let mut end = s.len().min(max);
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), Error> {
     if s.len() > MAX_STRING || s.contains('\0') {
         return Err(Error::Unwritable);
@@ -788,28 +831,6 @@ fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), Error> {
     out.extend_from_slice(s.as_bytes());
     out.push(0);
     Ok(())
-}
-
-/// Options retained by the transfer constructor after `start` bytes: the first
-/// [`MAX_OPTIONS`], clipped, leaving out repeats of a name already
-/// written, and stopping at the first that would go past `limit` bytes.
-fn clipped_options(options: &[TftpOption], start: usize, limit: usize) -> Vec<(&str, &str)> {
-    let mut written: Vec<(&str, &str)> = Vec::new();
-    let mut len = start;
-    let mut names = std::collections::HashSet::new();
-    for o in options.iter().take(MAX_OPTIONS) {
-        let (name, value) = (clipped_string(&o.name), clipped_string(&o.value));
-        if !names.insert(name.to_ascii_lowercase()) {
-            continue;
-        }
-        let next = len + name.len() + value.len() + 2;
-        if next > limit {
-            break;
-        }
-        len = next;
-        written.push((name, value));
-    }
-    written
 }
 
 fn put_options(out: &mut Vec<u8>, options: &[TftpOption], limit: usize) -> Result<(), Error> {
@@ -960,7 +981,6 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
-    use fictionet::stdlib::test_support::rounds;
 
     fn data_packet(block: u16, data: Vec<u8>) -> Packet {
         Packet::Data { block, data }
@@ -1235,30 +1255,30 @@ mod tests {
         };
         // RFC 2348: blksize, clamped to the server's limit.
         let n = negotiate(&opts(&[("BLKSIZE", "1428")]), None, MAX_BLOCK_SIZE);
-        assert_eq!(n.block_size, 1428);
-        assert_eq!(n.oack, opts(&[("blksize", "1428")]));
+        assert_eq!(n.block_size(), 1428);
+        assert_eq!(n.oack(), opts(&[("blksize", "1428")]));
         let n = negotiate(&opts(&[("blksize", "65464")]), None, 1024);
-        assert_eq!(n.block_size, 1024);
+        assert_eq!(n.block_size(), 1024);
         let n = negotiate(&opts(&[("blksize", "65464")]), None, MAX_BLOCK_SIZE);
-        assert_eq!(n.block_size, MAX_BLOCK_SIZE);
+        assert_eq!(n.block_size(), MAX_BLOCK_SIZE);
         // Too small, not a number: ignored.
         let n = negotiate(&opts(&[("blksize", "7"), ("blksize", "x")]), None, 0);
-        assert_eq!((n.block_size, n.oack.len()), (DEFAULT_BLOCK_SIZE, 0));
+        assert_eq!((n.block_size(), n.oack().len()), (DEFAULT_BLOCK_SIZE, 0));
         // A server limit below the minimum still allows the minimum.
         let n = negotiate(&opts(&[("blksize", "8")]), None, 0);
-        assert_eq!(n.block_size, 8);
+        assert_eq!(n.block_size(), 8);
         // RFC 2349: timeout in 1..=255, tsize answered with the size.
         for bad in ["0", "256"] {
-            assert_eq!(negotiate(&opts(&[("timeout", bad)]), None, 512).oack, []);
+            assert_eq!(negotiate(&opts(&[("timeout", bad)]), None, 512).oack(), []);
         }
         let n = negotiate(&opts(&[("timeout", "3")]), None, 512);
-        assert_eq!(n.timeout, Some(3));
-        assert_eq!(n.oack, opts(&[("timeout", "3")]));
+        assert_eq!(n.timeout(), Some(3));
+        assert_eq!(n.oack(), opts(&[("timeout", "3")]));
         let n = negotiate(&opts(&[("tsize", "0")]), Some(673312), 512);
-        assert_eq!(n.transfer_size, Some(673312));
-        assert_eq!(n.oack, opts(&[("tsize", "673312")]));
+        assert_eq!(n.transfer_size(), Some(673312));
+        assert_eq!(n.oack(), opts(&[("tsize", "673312")]));
         let n = negotiate(&opts(&[("tsize", "42")]), None, 512);
-        assert_eq!(n.oack, opts(&[("tsize", "42")]));
+        assert_eq!(n.oack(), opts(&[("tsize", "42")]));
         // Unknown options and repeats are left out; order is kept.
         let n = negotiate(
             &opts(&[
@@ -1271,9 +1291,9 @@ mod tests {
             Some(5),
             MAX_BLOCK_SIZE,
         );
-        assert_eq!(n.block_size, 1024);
-        assert_eq!(n.oack, opts(&[("tsize", "5"), ("blksize", "1024")]));
-        assert_eq!(negotiate(&[], Some(1), 512).oack, []);
+        assert_eq!(n.block_size(), 1024);
+        assert_eq!(n.oack(), opts(&[("tsize", "5"), ("blksize", "1024")]));
+        assert_eq!(negotiate(&[], Some(1), 512).oack(), []);
     }
 
     /// Runs a transfer to the end with in-order ACKs, and returns the
@@ -1439,7 +1459,7 @@ mod tests {
             None,
             MAX_BLOCK_SIZE,
         );
-        assert_eq!((n.block_size, n.oack.len()), (DEFAULT_BLOCK_SIZE, 0));
+        assert_eq!((n.block_size(), n.oack().len()), (DEFAULT_BLOCK_SIZE, 0));
         let n = negotiate(
             &[
                 TftpOption::new("timeout", "x"),
@@ -1448,7 +1468,7 @@ mod tests {
             None,
             MAX_BLOCK_SIZE,
         );
-        assert_eq!(n.timeout, None);
+        assert_eq!(n.timeout(), None);
     }
 
     // RFC 2348: blksize values range from 8 to 65464. Larger ones are not
@@ -1456,9 +1476,9 @@ mod tests {
     #[test]
     fn blksize_above_the_range_is_ignored() {
         let n = negotiate(&[TftpOption::new("blksize", "65465")], None, MAX_BLOCK_SIZE);
-        assert_eq!((n.block_size, n.oack.len()), (DEFAULT_BLOCK_SIZE, 0));
+        assert_eq!((n.block_size(), n.oack().len()), (DEFAULT_BLOCK_SIZE, 0));
         let n = negotiate(&[TftpOption::new("blksize", "65464")], None, 1024);
-        assert_eq!(n.block_size, 1024);
+        assert_eq!(n.block_size(), 1024);
     }
 
     // An Other code that has a name of its own writes and reads back as
@@ -1474,86 +1494,138 @@ mod tests {
         assert_ne!(ErrorCode::Other(9), ErrorCode::OptionNegotiation);
     }
 
-    // RFC 1350: with no blksize in the OACK, blocks are 512 bytes. A
-    // Negotiated whose block_size and oack disagree must follow the oack,
-    // which is what the client sees.
     #[test]
-    fn negotiated_block_size_follows_the_oack() {
-        let quiet = Negotiated {
-            block_size: 8,
-            timeout: None,
-            transfer_size: None,
-            oack: vec![],
-        };
+    fn custom_oack_settings_and_transfer_agree() {
+        let options = vec![
+            TftpOption::new("TSIZE", "00017"),
+            TftpOption::new("x-note", "custom"),
+            TftpOption::new("BlkSize", "0008"),
+            TftpOption::new("Timeout", "003"),
+        ];
+        let agreed = Negotiated::from_oack(options.clone()).unwrap();
+        assert_eq!(agreed.block_size(), 8);
+        assert_eq!(agreed.timeout(), Some(3));
+        assert_eq!(agreed.transfer_size(), Some(17));
+        assert_eq!(agreed.oack(), options);
+        let mut t = ReadTransfer::negotiated(vec![1; 17], &agreed);
+        assert_eq!(t.block_size(), agreed.block_size());
+        let packet = Packet::OptionAck { options };
+        assert_eq!(t.current(), Some(packet.clone()));
+        assert_eq!(Packet::parse(&packet.to_bytes().unwrap()), Ok(packet));
+        assert_eq!(run(t.clone()), vec![1; 17]);
+        assert_eq!(t.receive_ack(0), Event::Send(data_packet(1, vec![1; 8])));
+        assert_eq!(t.receive_ack(1), Event::Send(data_packet(2, vec![1; 8])));
+        assert_eq!(t.receive_ack(2), Event::Send(data_packet(3, vec![1])));
+        assert_eq!(t.receive_ack(3), Event::Complete);
+    }
+
+    #[test]
+    fn custom_oack_defaults_and_boundaries() {
+        let quiet = Negotiated::from_oack(vec![]).unwrap();
+        assert_eq!(quiet, negotiate(&[], None, MAX_BLOCK_SIZE));
         let t = ReadTransfer::negotiated(vec![1; 1000], &quiet);
         assert_eq!(t.block_size(), DEFAULT_BLOCK_SIZE);
         assert_eq!(t.current(), Some(data_packet(1, vec![1; 512])));
-        let loud = Negotiated {
-            block_size: 1024,
-            timeout: None,
-            transfer_size: None,
-            oack: vec![TftpOption::new("BlkSize", "8")],
-        };
-        assert_eq!(
-            ReadTransfer::negotiated(vec![1; 1000], &loud).block_size(),
-            8
-        );
-        // A blksize the client could not accept is not sent, and the
-        // default holds.
-        let bad = Negotiated {
-            block_size: 7,
-            timeout: None,
-            transfer_size: None,
-            oack: vec![TftpOption::new("blksize", "7")],
-        };
-        let t = ReadTransfer::negotiated(vec![], &bad);
-        assert_eq!(
-            (t.block_size(), t.current()),
-            (DEFAULT_BLOCK_SIZE, Some(data_packet(1, vec![])))
-        );
-        // A repeat is not what the client sees, so it does not count.
-        let twice = Negotiated {
-            block_size: 16,
-            timeout: None,
-            transfer_size: None,
-            oack: vec![
-                TftpOption::new("blksize", "8"),
-                TftpOption::new("blksize", "16"),
-            ],
-        };
-        let t = ReadTransfer::negotiated(vec![], &twice);
-        assert_eq!(t.block_size(), 8);
-        let Some(oack) = t.current() else { panic!() };
-        assert_eq!(Packet::parse(&oack.to_bytes().unwrap()), Ok(oack));
+        for (block_size, timeout, size) in [
+            (MIN_BLOCK_SIZE, MIN_TIMEOUT, 0),
+            (MAX_BLOCK_SIZE, MAX_TIMEOUT, u64::MAX),
+        ] {
+            let agreed = Negotiated::from_oack(vec![
+                TftpOption::new("blksize", &block_size.to_string()),
+                TftpOption::new("timeout", &timeout.to_string()),
+                TftpOption::new("tsize", &size.to_string()),
+            ])
+            .unwrap();
+            assert_eq!(agreed.block_size(), block_size);
+            assert_eq!(agreed.timeout(), Some(timeout));
+            assert_eq!(agreed.transfer_size(), Some(size));
+        }
+        let agreed = Negotiated::from_oack(vec![TftpOption::new("timeout", "1")]).unwrap();
+        assert_eq!(agreed.block_size(), DEFAULT_BLOCK_SIZE);
+        assert_eq!(agreed.transfer_size(), None);
+        let mut t = ReadTransfer::negotiated(vec![1; 1000], &agreed);
+        assert_eq!(t.block_size(), DEFAULT_BLOCK_SIZE);
+        assert!(matches!(t.current(), Some(Packet::OptionAck { .. })));
+        assert_eq!(t.receive_ack(0), Event::Send(data_packet(1, vec![1; 512])));
     }
 
-    // What a transfer keeps of a caller's OACK is bounded by what can be
-    // written, not by the caller's list.
     #[test]
-    fn negotiated_keeps_a_bounded_oack() {
-        let big = "x".repeat(rounds(100_000));
-        let mut oack: Vec<TftpOption> = (0..rounds(100_000))
+    fn custom_oack_rejects_invalid_values() {
+        for name in ["BlkSize", "Timeout", "TSIZE"] {
+            for value in [
+                "",
+                "x",
+                "-1",
+                "+8",
+                " 8",
+                "8 ",
+                "1e3",
+                "18446744073709551616",
+                "000000000000000000001",
+            ] {
+                assert_eq!(
+                    Negotiated::from_oack(vec![TftpOption::new(name, value)]),
+                    Err(Error::InvalidOptionValue),
+                    "{name}={value}",
+                );
+            }
+        }
+        for (name, value) in [
+            ("blksize", "0"),
+            ("blksize", "7"),
+            ("blksize", "65465"),
+            ("blksize", "65536"),
+            ("timeout", "0"),
+            ("timeout", "256"),
+        ] {
+            assert_eq!(
+                Negotiated::from_oack(vec![TftpOption::new(name, value)]),
+                Err(Error::InvalidOptionValue),
+            );
+        }
+    }
+
+    #[test]
+    fn custom_oack_rejects_unwritable_options() {
+        let big = "x".repeat(MAX_STRING + 1);
+        for options in [
+            vec![
+                TftpOption::new("blksize", "8"),
+                TftpOption::new("BlkSize", "16"),
+            ],
+            vec![TftpOption::new("x", "1"), TftpOption::new("X", "2")],
+            vec![TftpOption::new("blksize\0", "8")],
+            vec![TftpOption::new("blksize", "8\0")],
+            vec![TftpOption::new(&big, "1")],
+            vec![TftpOption::new("x", &big)],
+            (0..=MAX_OPTIONS)
+                .map(|i| TftpOption::new(&format!("o{i}"), "1"))
+                .collect(),
+        ] {
+            assert_eq!(Negotiated::from_oack(options), Err(Error::Unwritable));
+        }
+        let options = (0..MAX_OPTIONS)
             .map(|i| TftpOption::new(&format!("o{i}"), "1"))
             .collect();
-        oack.insert(0, TftpOption::new(&big, &big));
-        let agreed = Negotiated {
-            block_size: 512,
-            timeout: None,
-            transfer_size: None,
-            oack,
-        };
-        let t = ReadTransfer::negotiated(vec![], &agreed);
-        let Some(Packet::OptionAck { options }) = t.current() else {
-            panic!()
-        };
-        assert!(options.len() <= MAX_OPTIONS);
-        assert!(
-            options
-                .iter()
-                .all(|o| o.name.len() <= MAX_STRING && o.value.len() <= MAX_STRING)
+        assert_eq!(
+            Negotiated::from_oack(options).unwrap().oack().len(),
+            MAX_OPTIONS
         );
-        let p = Packet::OptionAck { options };
-        assert_eq!(Packet::parse(&p.to_bytes().unwrap()), Ok(p));
+    }
+
+    #[test]
+    fn custom_oack_packet_limit() {
+        let mut options: Vec<_> = (0..126)
+            .map(|i| TftpOption::new(&format!("x{i:03}"), &"x".repeat(MAX_STRING)))
+            .collect();
+        let remaining = MAX_PACKET - 2 - 126 * (MAX_STRING + 6) - 5;
+        options.push(TftpOption::new("end", &"x".repeat(remaining)));
+        let agreed = Negotiated::from_oack(options.clone()).unwrap();
+        let packet = ReadTransfer::negotiated(vec![], &agreed).current().unwrap();
+        assert_eq!(packet.to_bytes().unwrap().len(), MAX_PACKET);
+        assert_eq!(Packet::parse(&packet.to_bytes().unwrap()), Ok(packet));
+        options.last_mut().unwrap().value.push('x');
+        assert_eq!(Negotiated::from_oack(options), Err(Error::Unwritable));
     }
 
     // RFC 2347 bounds a request only by its 512 bytes. Seventeen small
@@ -1569,7 +1641,7 @@ mod tests {
         let Packet::ReadRequest(r) = &p else { panic!() };
         assert_eq!(r.options.len(), 17);
         assert_eq!(p.to_bytes().unwrap(), rrq);
-        assert_eq!(negotiate(&r.options, Some(1), 512).oack, []);
+        assert_eq!(negotiate(&r.options, Some(1), 512).oack(), []);
     }
 
     #[test]
@@ -1647,9 +1719,9 @@ mod tests {
                 };
                 if let Some(options) = options {
                     let n = negotiate(options, Some(buf.len() as u64), rng.next() as u16);
-                    assert!((MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&n.block_size));
+                    assert!((MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&n.block_size()));
                     let oack = Packet::OptionAck {
-                        options: n.oack.clone(),
+                        options: n.oack().to_vec(),
                     };
                     assert_eq!(Packet::parse(&oack.to_bytes().unwrap()), Ok(oack));
                     assert_eq!(run(ReadTransfer::negotiated(buf.clone(), &n)), buf);

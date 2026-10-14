@@ -77,19 +77,22 @@ fuzz_target!(|data: &[u8]| {
         if let Some(options) = options {
             let agreed = negotiate(options, Some(data.len() as u64), MAX_BLOCK_SIZE);
             let oack = Packet::OptionAck {
-                options: agreed.oack.clone(),
+                options: agreed.oack().to_vec(),
             };
             contract::check_wire_value(&oack);
             assert!(oack.to_bytes().is_ok());
-            // The transfer follows the parsed options as given, too, even
-            // when they were not negotiated.
-            for agreed in [
-                agreed.clone(),
-                Negotiated {
-                    oack: options.clone(),
-                    ..agreed
-                },
-            ] {
+            assert_eq!(
+                Negotiated::from_oack(agreed.oack().to_vec()),
+                Ok(agreed.clone())
+            );
+            assert_eq!(
+                receive(ReadTransfer::negotiated(data.to_vec(), &agreed)),
+                data
+            );
+            // A valid custom agreement preserves the options and uses
+            // the same block size as the client.
+            if let Ok(agreed) = Negotiated::from_oack(options.clone()) {
+                assert_eq!(agreed.oack(), options);
                 assert_eq!(
                     receive(ReadTransfer::negotiated(data.to_vec(), &agreed)),
                     data
