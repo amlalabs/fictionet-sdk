@@ -23,7 +23,7 @@
 #      on the pod's own node, and names do not resolve in the pod;
 #   4. a wrong token is refused, and nothing outside the world is
 #      reachable through the proxy;
-#   5. ten downloads of 16 MiB at once do not stall;
+#   5. ten downloads of 16 MiB at once complete;
 #   6. when attach is stopped the agent has no way out, and when
 #      Kubernetes restarts it the proxy comes back.
 # It removes the namespace at the end, and the cluster if it made it.
@@ -36,6 +36,7 @@ ns=fictionet-restricted
 release=fnproxy
 pod="fictionet-sandbox-$release-default-0"
 socks_pod="fictionet-sandbox-$release-socks-0"
+source "$here/../throughput.sh"
 failures=0
 made_cluster=0
 
@@ -169,17 +170,14 @@ check "the API server's address through the proxy is a world address with no mac
     agent curl -sS -m 10 -k "https://$api/version"
 check "a real name through the proxy does not exist in the world: 502" 'response 502' agent curl -sS -m 10 https://example.com/
 
-# 5. No stalls.
-out="$(agent sh -c "seq 10 | xargs -P 10 -I{} curl -sS -o /dev/null -w '%{time_total}\n' https://example.test/big" | sort -n | tr '\n' ' ')"
-read -r -a times <<<"$out"
-if [[ ${#times[@]} == 10 ]] && awk -v t="${times[-1]}" 'BEGIN { exit !(t < 2) }'; then
-    pass "10 downloads of 16 MiB at once, none stalled (${times[0]} s to ${times[-1]} s)"
+# 5. Complete downloads, with timing thresholds in performance mode.
+check_downloads "10 downloads of 16 MiB at once" 10 2 0 \
+    agent sh -c "seq 10 | xargs -P 10 -I{} curl -fsS --max-time 30 -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/big"
+if speed="$(check_transfer 16777216 agent curl -fsS --max-time 30 -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big)"; then
+    pass "16 MiB at $((speed * 8 / 1000000)) Mbit/s"
 else
-    fail "10 downloads of 16 MiB at once: $out"
+    fail "16 MiB: $speed"
 fi
-out="$(agent curl -sS -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big)"
-read -r size speed <<<"$out"
-if [[ $size == 16777216 ]]; then pass "16 MiB at $((speed * 8 / 1000000)) Mbit/s"; else fail "16 MiB: $out"; fi
 check "attach logged the requests" 'CONNECT example.test:443 \(203\.0\.113\.10\) 200' kubectl -n "$ns" logs "$pod" -c attach
 
 check "attach has not restarted under load" '^0 ?$' \

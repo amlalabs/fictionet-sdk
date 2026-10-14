@@ -90,6 +90,26 @@ request. The nightly integration workflow runs the Docker proxy, both kind
 tests and the QEMU VM test, with its prepared image cached. Nested VM and
 gVisor tests remain manual. Missing host capabilities fail when `CI` is set.
 
+The Docker web and proxy tests and `tests/k8s/proxy.sh` check full transfer
+sizes and counts, with a 30-second deadline per bulk transfer (60 seconds for
+the 32 parallel web downloads, which share one attach socket). They print
+throughput and timing measurements on every run. Strict download timings
+(including the web test's spread and recovery comparison) require
+`FICTIONET_PERF_CHECK=1`:
+
+```console
+$ FICTIONET_PERF_CHECK=1 tests/docker/web/run.sh
+$ FICTIONET_PERF_CHECK=1 tests/docker/proxy/run.sh
+$ FICTIONET_PERF_CHECK=1 tests/k8s/proxy.sh
+```
+
+Use a controlled machine for these performance checks. Routine runs check
+transfer completion, sizes and counts. They do not enforce strict timing
+thresholds or provide strict throughput regression coverage. Incomplete or failed
+transfers and transfers that exceed the completion deadline fail. Run the transfer
+check fixtures without Docker or Kubernetes with `bash tests/throughput_test.sh`.
+CI runs these fixtures on every push and pull request.
+
 ## Releases
 
 Set the package version in `Cargo.toml` and refresh the lockfiles with Cargo.

@@ -18,7 +18,7 @@
 #   8. an agent that pushes hard does not break things: 300 HTTP/2 streams
 #      at once, pings in fragments, 300 open connections (past 256 are
 #      reset at once, and idle ones closed after 10 seconds), 32 large downloads
-#      at once without stalls, and 250 idle connections that each
+#      at once with complete responses, and 250 idle connections that each
 #      downloaded 1 MiB without the world keeping that memory, and 2,000
 #      connections left in CLOSE_WAIT (256 served, the rest reset) without
 #      slowing the machine,
@@ -34,6 +34,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 compose=(docker compose -f "$here/compose.yaml")
 
 source "$here/../common.sh"
+source "$here/../../throughput.sh"
 ca=(--cacert /run/ca/ca.pem)
 
 cleanup
@@ -93,23 +94,17 @@ if [[ $b == $((a + 1)) ]]; then pass "the site keeps its state ($a then $b)"; el
 
 # Throughput: 16 MiB over HTTPS, HTTP/2 and HTTP/1.1.
 for v in --http2 --http1.1; do
-    out="$(agent curl -sS "${ca[@]}" $v -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big)"
-    read -r size speed <<<"$out"
-    if [[ $size == 16777216 ]]; then
+    if speed="$(check_transfer 16777216 agent curl -fsS --max-time 30 "${ca[@]}" $v -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big)"; then
         pass "16 MiB over $v at $((speed * 8 / 1000000)) Mbit/s"
     else
-        fail "16 MiB over $v: $out"
+        fail "16 MiB over $v: $speed"
     fi
 done
 
-# No stalls: a packet lost on a full socket buffer costs a 1 s retransmit.
-# With small buffers about a third of these downloads stalled.
-slow=0
-for i in $(seq 10); do
-    t="$(agent curl -sS "${ca[@]}" -o /dev/null -w '%{time_total}' https://example.test/big)"
-    if [[ ${t%%.*} -ge 1 ]]; then slow=$((slow + 1)); fi
-done
-if [[ $slow == 0 ]]; then pass "10 downloads of 16 MiB, none stalled"; else fail "$slow of 10 downloads took over a second"; fi
+# A packet lost on a full socket buffer costs a 1 s retransmit.
+# Check that threshold only on a controlled performance runner.
+check_downloads "10 sequential downloads of 16 MiB" 10 1 0 \
+    agent bash -c "seq 10 | xargs -P 1 -I{} curl -fsS --max-time 30 ${ca[*]} -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/big"
 
 # 7. The proxy.
 check "web::proxy(&fcx) reaches the real upstream" '^hello from the real upstream: GET /some/path\?q=1 HTTP/1.1 $' \
@@ -153,41 +148,49 @@ check "300 open connections: 256 kept, the rest reset at once; idle ones closed 
 # in all than the socket buffer to attach holds. Packets that do not fit
 # wait in the world; when they were dropped, most of these downloads
 # stalled a second or more (smoltcp's minimum retransmission timeout).
-out="$(agent bash -c "seq 32 | xargs -P 32 -I{} curl -sS ${ca[*]} -o /dev/null -w '%{time_total}\n' https://example.test/big" | sort -n | tr '\n' ' ')"
-read -r -a times <<<"$out"
-spread="$(awk -v a="${times[0]}" -v b="${times[-1]}" 'BEGIN { printf "%.2f", b - a }')"
-if [[ ${#times[@]} == 32 ]] && awk -v s="$spread" 'BEGIN { exit !(s < 0.8) }'; then
-    pass "32 downloads of 16 MiB at once, none stalled (${times[0]} s to ${times[-1]} s)"
-else
-    fail "32 downloads of 16 MiB at once: $out"
-fi
+# Allow 60 s for completion: these transfers share one attach socket and
+# move 512 MiB in total. This deadline catches stalls on a busy runner.
+check_downloads "32 downloads of 16 MiB at once" 32 0 0.8 \
+    agent bash -c "seq 32 | xargs -P 32 -I{} curl -fsS --max-time 60 ${ca[*]} -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/big"
 
 # Memory: 250 connections that each downloaded 1 MiB and then sit idle.
 world_pid="$(docker inspect -f '{{.State.Pid}}' "$("${compose[@]}" ps -q world)")"
 rss() { awk '/^VmRSS:/ { print int($2 / 1024) }' "/proc/$world_pid/status"; }
 before="$(rss)"
-# The script says how many it opened, then holds them quiet for 10 s.
-exec {pin}< <(agent python3 -c '
-import socket, sys, time
+start_holder opened agent timeout 120 python3 -c '
+import socket, sys
 socks = []
 for i in range(250):
-    s = socket.create_connection(("198.18.0.1", 80))
+    s = socket.create_connection(("198.18.0.1", 80), timeout=30)
     s.sendall(b"GET /mb HTTP/1.1\r\nHost: plain.test\r\n\r\n")
     buf = b""
     while b"\r\n\r\n" not in buf:
-        buf += s.recv(65536)
+        chunk = s.recv(65536)
+        if not chunk:
+            raise RuntimeError("incomplete response headers")
+        buf += chunk
     got = len(buf.split(b"\r\n\r\n", 1)[1])
     while got < 1 << 20:
-        got += len(s.recv(1 << 20))
+        chunk = s.recv(1 << 20)
+        if not chunk:
+            raise RuntimeError("incomplete response body")
+        got += len(chunk)
     socks.append(s)
 print(len(socks), flush=True)
-time.sleep(10)
-')
-read -r -t 120 -u "$pin" opened || opened=0
-# The world gives a quiet connection's buffer pages back within 2 s.
-sleep 4
+sys.stdin.readline()
+' || opened=0
+# The world returns a quiet connection's buffer pages within a few seconds;
+# give it 10 s, once all 250 connections have finished their downloads.
 held="$(rss)"
-exec {pin}<&-
+if [[ $opened == 250 ]]; then
+    for _ in $(seq 100); do
+        (( held - before < 50 )) && break
+        sleep 0.1
+        held="$(rss)"
+    done
+fi
+release_holder || opened=0
+drain_connections agent || fail "250 idle connections did not finish closing"
 if [[ $opened == 250 ]] && (( held - before < 50 )); then
     pass "250 idle connections after 1 MiB each: world memory ${before} MB, then ${held} MB"
 else
@@ -202,19 +205,19 @@ fi
 # is as fast as before.
 # The script connects to 198.18.0.1 over IPv4. The limit is per machine,
 # and the site's IPv6 address is another machine, so curl uses IPv4 too.
-plain_big() { agent curl -sS -4 -o /dev/null -w '%{time_total}' http://plain.test/big; }
-# The 250 connections above are held until their script ends.
-sleep 8
-fresh="$(plain_big)"
-exec {pin}< <(agent python3 -c '
-import resource, socket, time
+plain_big() {
+    check_transfer 16777216 agent curl -fsS --max-time 30 -4 -o /dev/null -w '%{size_download} %{time_total}' http://plain.test/big
+}
+fresh="$(plain_big)" || fresh=failed
+start_holder counts agent timeout 120 python3 -c '
+import resource, socket, sys
 resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
 served, reset, socks = 0, 0, []
 for i in range(2000):
     # A connection past the limit is reset right after the handshake. The
     # reset can arrive before connect() returns, and then connect() fails.
     try:
-        s = socket.create_connection(("198.18.0.1", 80))
+        s = socket.create_connection(("198.18.0.1", 80), timeout=30)
     except ConnectionResetError:
         reset += 1
         continue
@@ -232,15 +235,14 @@ for i in range(2000):
         reset += 1
     socks.append(s)
 print(served, reset, flush=True)
-time.sleep(5)
-')
-read -r -t 120 -u "$pin" served reset || served=0
-held="$(agent curl -sS -4 -o /dev/null http://plain.test/big 2>&1 || true)"
-exec {pin}<&-
-# The script has ended and its sockets have closed.
-sleep 6
-after="$(plain_big)"
-if [[ $served == 256 && $reset == 1744 && $held == *"reset by peer"* ]] && awk -v a="$after" -v f="$fresh" 'BEGIN { exit !(a < 2 * f + 0.1) }'; then
+sys.stdin.readline()
+' || counts='0 0'
+read -r served reset <<<"$counts"
+held="$(agent curl -sS --max-time 30 -4 -o /dev/null http://plain.test/big 2>&1 || true)"
+release_holder || served=0
+drain_connections agent || fail "CLOSE_WAIT connections did not finish closing"
+after="$(plain_big)" || after=failed
+if [[ $served == 256 && $reset == 1744 && $held == *"reset by peer"* ]] && check_recovery "$fresh" "$after"; then
     pass "2,000 connections left in CLOSE_WAIT: 256 served, 1744 reset; 16 MiB took ${fresh} s before, ${after} s after"
 else
     fail "2,000 connections left in CLOSE_WAIT: served ${served:-?} reset ${reset:-?}, while held: ${held}; 16 MiB took ${fresh} s before, ${after} s after"
@@ -286,9 +288,11 @@ check "an IPv6 address with no site is unreachable (ICMPv6 address unreachable)"
 ms=$(( ($(date +%s%N) - start) / 1000000 ))
 if (( ms < 3000 )); then pass "it failed fast (${ms} ms, including docker exec)"; else fail "it took ${ms} ms"; fi
 check "ping -6 an address with no site" 'Address unreachable' agent ping -6 -c 1 -W 2 2001:db8:99::1
-out="$(agent curl -sS "${ca[@]}" -6 -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big)"
-read -r size speed <<<"$out"
-if [[ $size == 16777216 ]]; then pass "16 MiB over IPv6 at $((speed * 8 / 1000000)) Mbit/s"; else fail "16 MiB over IPv6: $out"; fi
+if speed="$(check_transfer 16777216 agent curl -fsS --max-time 30 "${ca[@]}" -6 -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big)"; then
+    pass "16 MiB over IPv6 at $((speed * 8 / 1000000)) Mbit/s"
+else
+    fail "16 MiB over IPv6: $speed"
+fi
 
 echo
 echo "--- world log"

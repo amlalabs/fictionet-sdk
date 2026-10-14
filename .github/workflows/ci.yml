@@ -75,6 +75,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Transfer check fixtures
+        run: bash tests/throughput_test.sh
       - name: Install the pinned toolchain
         run: rustup toolchain install
       - name: Check formatting

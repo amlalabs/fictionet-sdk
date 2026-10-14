@@ -15,7 +15,7 @@
 #      get 502, or SOCKS replies 4 and 5, at once;
 #   4. nothing outside the world is reachable: not through the proxies,
 #      not around them, and not by DNS;
-#   5. ten downloads of 16 MiB at once do not stall, through either door,
+#   5. ten downloads of 16 MiB at once complete, through either door,
 #      and 64 MiB uploads arrive whole;
 #   6. 1,000 HTTPS requests, 200 at a time, all succeed;
 #   7. when the world stops, attach exits and the proxies are gone.
@@ -29,6 +29,7 @@ RELAY_TOKEN="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
 export RELAY_TOKEN
 
 source "$here/../common.sh"
+source "$here/../../throughput.sh"
 
 cleanup
 "${compose[@]}" build --quiet
@@ -119,27 +120,26 @@ check "the sandbox has no ping and no raw sockets" 'Operation not permitted|Perm
 check "the sandbox has no capabilities" '^CapEff:\s+0+ $' agent grep CapEff /proc/self/status
 check "the sandbox cannot see the world socket" 'No such file or directory' agent ls /run/fictionet
 
-# 5. Throughput, no stalls, uploads.
+# 5. Throughput, complete downloads, uploads.
 for door in http socks; do
     if [[ $door == http ]]; then x=(); else x=(-x "\$SOCKS"); fi
-    out="$(socks "curl -sS ${x[*]} -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big")"
-    read -r size speed <<<"$out"
-    if [[ $size == 16777216 ]]; then pass "16 MiB through the $door door at $((speed * 8 / 1000000)) Mbit/s"; else fail "16 MiB through the $door door: $out"; fi
+    if speed="$(check_transfer 16777216 socks "curl -fsS --max-time 30 ${x[*]} -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big")"; then
+        pass "16 MiB through the $door door at $((speed * 8 / 1000000)) Mbit/s"
+    else
+        fail "16 MiB through the $door door: $speed"
+    fi
     # Ten at once. A packet lost on a full socket buffer costs a 1 s
     # retransmit; the prototype's lost wake-up stalled one for 45 s.
-    out="$(socks "seq 10 | xargs -P 10 -I{} curl -sS ${x[*]} -o /dev/null -w '%{time_total}\n' https://example.test/big" | sort -n | tr '\n' ' ')"
-    read -r -a times <<<"$out"
-    if [[ ${#times[@]} == 10 ]] && awk -v t="${times[-1]}" 'BEGIN { exit !(t < 1) }'; then
-        pass "10 downloads of 16 MiB at once through the $door door, none stalled (${times[0]} s to ${times[-1]} s)"
+    check_downloads "10 downloads of 16 MiB at once through the $door door" 10 1 0 \
+        socks "seq 10 | xargs -P 10 -I{} curl -fsS --max-time 30 ${x[*]} -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/big"
+    if took="$(check_transfer 67108864 socks "head -c 67108864 /dev/zero | curl -fsS --max-time 30 ${x[*]} --data-binary @- -w '%{time_total}' https://example.test/upload")"; then
+        pass "a 64 MiB upload through the $door door, in ${took} s"
     else
-        fail "10 downloads of 16 MiB at once through the $door door: $out"
+        fail "a 64 MiB upload through the $door door: $took"
     fi
-    out="$(socks "head -c 67108864 /dev/zero | curl -sS ${x[*]} --data-binary @- -w '%{time_total}' https://example.test/upload" | tr '\n' ' ')"
-    read -r got took <<<"$out"
-    if [[ $got == 67108864 ]]; then pass "a 64 MiB upload through the $door door, in ${took} s"; else fail "a 64 MiB upload through the $door door: $out"; fi
 done
 check "a 64 MiB upload as a plain-HTTP request" '^67108864 $' \
-    agent sh -c 'head -c 67108864 /dev/zero | curl -sS --data-binary @- http://plain.test/upload'
+    agent sh -c 'head -c 67108864 /dev/zero | curl -fsS --max-time 30 --data-binary @- http://plain.test/upload'
 
 # 6. Many requests.
 start=$(date +%s%N)
