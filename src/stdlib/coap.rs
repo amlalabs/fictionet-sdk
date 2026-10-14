@@ -1660,6 +1660,61 @@ fn write_body(
     Ok(())
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Block, Error, MAX_BODY, Reassembler};
+
+    /// Checks block round trips, out-of-order refusal, body-limit refusal, and
+    /// block-number exhaustion.
+    /// `szx` must be from 0 to 6. The effective limit is `max.min(MAX_BODY)`.
+    pub fn check_blocks(body: &[u8], szx: u8, max: usize) {
+        assert!(szx <= 6);
+        let limit = max.min(MAX_BODY);
+        let mut a = Reassembler::new(max);
+        let mut num = 0;
+        while let Some((block, chunk)) = Block::take(body, num, szx) {
+            let before = a.body().len();
+            if num > 0 {
+                let skipped = Block {
+                    num: num + 1,
+                    ..block
+                };
+                assert!(matches!(
+                    a.push(skipped, chunk),
+                    Err(Error::OutOfOrder { .. })
+                ));
+                assert_eq!(a.body().len(), before);
+            }
+            if chunk.len() > limit - before {
+                let saved = a.clone();
+                assert_eq!(a.push(block, chunk), Err(Error::BodyTooLarge));
+                assert_eq!(a, saved);
+                assert!(!a.is_done());
+                assert_eq!(a.body(), &body[..before]);
+                return;
+            }
+            assert_eq!(a.push(block, chunk), Ok(!block.more));
+            assert_eq!(a.body().len(), before + chunk.len());
+            assert!(a.body().len() <= limit);
+            if !block.more {
+                assert!(a.is_done());
+                assert_eq!(a.body(), body);
+                return;
+            }
+            num += 1;
+        }
+        // At SZX 0 the block numbers run out at MAX_BODY. There is no
+        // representable next block with which to exceed the body cap.
+        let represented = (Block::MAX_NUM as usize + 1) * (16 << szx);
+        assert_eq!(num, Block::MAX_NUM + 1);
+        assert!(body.len() > represented);
+        assert!(!a.is_done());
+        assert_eq!(a.body(), &body[..represented]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2476,6 +2531,29 @@ mod tests {
         );
         assert!(!Block::take(&[0; 32], 1, 0).unwrap().0.more);
         assert_eq!(Block::take(&body, Block::MAX_NUM + 1, 0), None);
+    }
+
+    #[test]
+    fn block_property_body_limits() {
+        let body: Vec<u8> = (0..2049).map(|i| i as u8).collect();
+        for szx in 0..=6 {
+            for max in [0, 1, 15, 16, 17, 1023, 1024, 1025, 2048] {
+                for len in [max, max + 1] {
+                    harness::check_blocks(&body[..len], szx, max);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_property_max_body() {
+        // The fuzz reproducer is 0x06 followed by MAX_BODY + 1 bytes of
+        // 0xff. Its last block is valid, but exceeds the reassembly cap.
+        let body = vec![0xff; MAX_BODY + 1];
+        for szx in 0..=6 {
+            harness::check_blocks(&body[..MAX_BODY], szx, MAX_BODY);
+            harness::check_blocks(&body, szx, body.len());
+        }
     }
 
     #[test]

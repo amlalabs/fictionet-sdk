@@ -25,6 +25,7 @@ use fictionet::stdlib::coap::Type;
 
 use fictionet::stdlib::coap::option;
 
+use fictionet::stdlib::coap::harness::check_blocks;
 use fictionet::stdlib::coap::peek_header;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
@@ -140,33 +141,10 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // The bytes as a series of blocks: a body cut with Block::take goes
-    // back together whatever the block size, and a cut that is out of
-    // order or the wrong size is refused without changing the body.
+    // Constructed blocks round-trip within the effective body limit.
+    // Oversized bodies are refused or exhaust the block numbers.
     if let [szx, rest @ ..] = data {
-        let szx = szx % 7;
-        let mut a = Reassembler::new(rest.len());
-        let mut num = 0;
-        while let Some((block, chunk)) = Block::take(rest, num, szx) {
-            let before = a.body().len();
-            if num > 0 {
-                let skipped = Block {
-                    num: num + 1,
-                    ..block
-                };
-                assert!(matches!(
-                    a.push(skipped, chunk),
-                    Err(Error::OutOfOrder { .. })
-                ));
-                assert_eq!(a.body().len(), before);
-            }
-            if a.push(block, chunk).unwrap() {
-                break;
-            }
-            num += 1;
-        }
-        assert!(a.is_done());
-        assert_eq!(a.body(), rest);
+        check_blocks(rest, szx % 7, rest.len());
     }
 
     for frame in decode_all(Frames::<Frame>::new, data).0 {
