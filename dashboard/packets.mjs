@@ -1,6 +1,6 @@
 // The packet drawer: its stream, queue, selection, detail and hex view.
 // The caller passes DOM helpers, graph links, labels and orientation, and a fit callback.
-export function createPackets({ $, el, getEdge, ends, nodeLabel, fmtCount, fit }) {
+export function createPackets({ $, el, packetStream, packet, getEdge, ends, nodeLabel, fmtCount, fit }) {
   // ---------------------------------------------------------------------------
   // The packet drawer
 
@@ -55,7 +55,7 @@ export function createPackets({ $, el, getEdge, ends, nodeLabel, fmtCount, fit }
     $('tree').replaceChildren(el('p', { class: 'placeholder', text: many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.' }));
     $('hex').hidden = true;
     const flips = new Map(members.map((m) => [m.e.id, m.flip]));
-    const source = new EventSource(`api/packets?link=${list}`);
+    const source = packetStream(list);
     packets = { flips, many, source, rows: 0, paused: false, held: [], queue: [], skipped: 0, open: members.length };
     source.addEventListener('packet', (ev) => {
       const p = JSON.parse(ev.data);
@@ -171,7 +171,7 @@ export function createPackets({ $, el, getEdge, ends, nodeLabel, fmtCount, fit }
     if (!packets) return;
     for (const r of prows.querySelectorAll('tr.on')) r.classList.remove('on');
     tr.classList.add('on');
-    const res = await fetch(`api/packet?link=${p.link}&seq=${p.seq}`);
+    const res = await packet(p);
     if (!res.ok) {
       $('tree').replaceChildren(el('p', { class: 'placeholder', text: 'This packet is no longer kept. The dashboard keeps the last 4,096 packets of a link.' }));
       return;

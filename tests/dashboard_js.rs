@@ -1,4 +1,4 @@
-//! The dashboard's own JavaScript tests (`dashboard/groups.test.mjs`), run
+//! All of the dashboard's JavaScript test files (`dashboard/`), run
 //! with node. Skipped, with a note, where node is not installed, except
 //! under CI (`CI` set), where a missing node fails the test.
 
