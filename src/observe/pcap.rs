@@ -1,6 +1,6 @@
 //! Captures in the pcapng format, which Wireshark and tcpdump read.
 //!
-//! The packets are raw IP with no link layer (`LINKTYPE_RAW`). The world's
+//! The packets are raw IP with no link layer (`LINKTYPE_RAW`). Available
 //! TLS secrets go in a Decryption Secrets Block, so Wireshark decrypts the
 //! TLS in the file with no `SSLKEYLOGFILE` setting.
 
@@ -69,10 +69,9 @@ mod tests {
         let packet = [
             0x45u8, 0, 0, 21, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1, 7,
         ];
-        let file = pcapng(
-            &[(1_700_000_000_000_000, &packet[..])],
-            b"CLIENT_RANDOM aa bb\n",
-        );
+        let micros = 1_700_000_000_000_000;
+        let keys = b"CLIENT_RANDOM aa bbbb\n";
+        let file = pcapng(&[(micros, &packet[..])], keys);
         let mut kinds = Vec::new();
         let mut i = 0;
         while i < file.len() {
@@ -82,6 +81,13 @@ mod tests {
             );
             assert_eq!(len % 4, 0);
             assert_eq!(le32(&file, i + len - 4).unwrap() as usize, len);
+            if kind == 0x0a {
+                assert_eq!(le32(&file, i + 8).unwrap(), 0x544c_534b);
+                assert_eq!(le32(&file, i + 12).unwrap() as usize, keys.len());
+                assert_eq!(&file[i + 16..i + 16 + keys.len()], keys);
+                let padding = &file[i + 16 + keys.len()..i + len - 4];
+                assert_eq!(padding, &[0, 0]);
+            }
             kinds.push(kind);
             i += len;
         }
@@ -89,6 +95,9 @@ mod tests {
         assert_eq!(kinds, [0x0a0d_0d0a, 1, 0x0a, 6]);
         // The packet block holds the packet whole.
         let epb = file.len() - (12 + 20 + 24);
+        let timestamp =
+            ((le32(&file, epb + 12).unwrap() as u64) << 32) | le32(&file, epb + 16).unwrap() as u64;
+        assert_eq!(timestamp, micros);
         assert_eq!(le32(&file, epb + 20).unwrap(), 21);
         assert_eq!(&file[epb + 28..epb + 28 + 21], &packet);
     }

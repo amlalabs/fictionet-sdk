@@ -25,6 +25,12 @@ start watching links. New watches use that registry. The existing
 without binary changes. Watches already running retain their registry and
 connection state.
 
+Capture downloads include the deduplicated TLS secrets from the link watch
+and the current world ring. Each keeps at most 20,000 secrets. A quiet watch
+can retain secrets after the world ring rotates. Retention is best effort:
+secrets evicted from both caches are unavailable even if their packets remain.
+The `keylog` operation returns only the current world ring.
+
 `Observed<D>` drives ordered bytes directly. Its [placement contract](../src/observe/present.rs)
 covers exact spans, hop limits, live updates, resets and reassembly buffers.
 For a removed outer header, record `Spans::skip`, then record its unchanged

@@ -244,9 +244,13 @@
 //! secrets, about 4,000 sessions, and forgets older ones. The decoder uses them to decrypt TLS
 //! 1.3 on watched links, so a link that carries HTTPS shows the HTTP inside
 //! it. A session that started before anyone was following cannot be
-//! decrypted. TLS 1.2 is shown encrypted. The capture download carries the
-//! keys in the file itself, so Wireshark decrypts both versions with no
-//! setting.
+//! decrypted. TLS 1.2 is shown encrypted. Each link watch also caches up to
+//! 20,000 secrets as it decodes packets. The capture download carries the
+//! deduplicated keys from both the watch and the current world ring, so
+//! Wireshark can decrypt both versions with no setting. Secret retention is
+//! best effort and is not tied to retained packets. A secret evicted from
+//! both caches is unavailable even if its packets remain. The `keylog`
+//! operation returns only the current world ring.
 //!
 //! # User protocols
 //!

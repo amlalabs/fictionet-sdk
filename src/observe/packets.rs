@@ -2,7 +2,7 @@
 //! the packet list, the detail pane and the capture download.
 
 use fictionet::sync::Mutex;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -288,13 +288,35 @@ impl LinkWatch {
             .map(|r| r.detail.clone())
     }
 
-    /// Every kept packet as a pcapng file, with the world's TLS keys in it,
-    /// so Wireshark opens it decrypted.
+    /// Every kept packet as a pcapng file, with the watch's cached TLS keys
+    /// and the world's current keys, so Wireshark can decrypt it.
     pub(crate) fn pcapng(&self) -> Vec<u8> {
-        let keys = self.graph.upgrade().map(|g| keylog(&g)).unwrap_or_default();
-        let inner = self.inner.lock();
-        let packets: Vec<(u64, &[u8])> =
-            inner.rows.iter().map(|r| (r.micros, &r.data[..])).collect();
+        let (rows, mut keys) = {
+            let inner = self.inner.lock();
+            let rows: Vec<_> = inner
+                .rows
+                .iter()
+                .map(|r| (r.micros, r.data.clone()))
+                .collect();
+            let keys: Vec<_> = inner.keys.iter().cloned().collect();
+            (rows, keys)
+        };
+        // Snapshot the world separately: never hold both locks for export.
+        if let Some(graph) = self.graph.upgrade() {
+            keys.extend(graph.state().keys.iter().cloned());
+        }
+        let mut seen = BTreeSet::new();
+        let keys = keylog_lines(keys.iter().filter(|k| {
+            seen.insert((
+                k.label.as_str(),
+                k.client_random.as_slice(),
+                k.secret.as_slice(),
+            ))
+        }));
+        let packets: Vec<(u64, &[u8])> = rows
+            .iter()
+            .map(|(micros, data)| (*micros, &data[..]))
+            .collect();
         super::pcap::pcapng(&packets, keys.as_bytes())
     }
 }
@@ -302,8 +324,12 @@ impl LinkWatch {
 /// The world's TLS secrets in the `SSLKEYLOGFILE` format.
 pub(crate) fn keylog(graph: &Graph) -> String {
     let s = graph.state();
+    keylog_lines(&s.keys)
+}
+
+fn keylog_lines<'a>(keys: impl IntoIterator<Item = &'a KeyLine>) -> String {
     let mut out = String::new();
-    for k in &s.keys {
+    for k in keys {
         out.push_str(&k.label);
         out.push(' ');
         super::json::push_hex(&mut out, &k.client_random);
@@ -319,4 +345,111 @@ pub fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     super::json::push_hex(&mut s, b);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::codec::le32;
+    use crate::watch::MAX_KEYS;
+
+    fn setup() -> (Arc<Graph>, Arc<Meter>, Arc<LinkWatch>, Subscription) {
+        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let meter = Meter::new();
+        graph.owns(&meter, 0, 1);
+        let watch = Arc::new(LinkWatch::start(&graph, meter.id).unwrap());
+        let subscription = watch.subscribe();
+        (graph, meter, watch, subscription)
+    }
+
+    fn key(n: usize) -> KeyLine {
+        KeyLine {
+            label: "CLIENT_TRAFFIC_SECRET_0".into(),
+            client_random: (n as u64).to_be_bytes().repeat(4),
+            secret: vec![0xab; 32],
+        }
+    }
+
+    fn capture(meter: &Meter, watch: &LinkWatch) {
+        meter.sent(0, &crate::Packet(vec![0x45; 20]));
+        watch.pump();
+    }
+
+    fn exported_keys(watch: &LinkWatch) -> String {
+        let file = watch.pcapng();
+        let mut i = 0;
+        while i < file.len() {
+            let len = le32(&file, i + 4).unwrap() as usize;
+            if le32(&file, i).unwrap() == 0x0a {
+                assert_eq!(le32(&file, i + 8).unwrap(), 0x544c_534b);
+                let key_len = le32(&file, i + 12).unwrap() as usize;
+                return String::from_utf8(file[i + 16..i + 16 + key_len].to_vec()).unwrap();
+            }
+            i += len;
+        }
+        String::new()
+    }
+
+    #[test]
+    fn quiet_capture_keeps_keys_after_world_ring_rotates() {
+        let (graph, meter, watch, _subscription) = setup();
+        graph.key(key(0));
+        let original = keylog(&graph);
+        capture(&meter, &watch);
+        let rows = watch.rows_after(0, 10);
+
+        // Sessions elsewhere rotate the world ring without new packets here.
+        for n in 1..=MAX_KEYS {
+            graph.key(key(n));
+        }
+        watch.pump();
+        assert_eq!(watch.rows_after(0, 10), rows);
+        let current = keylog(&graph);
+        assert_eq!(current.lines().count(), MAX_KEYS);
+        assert!(!current.contains(&original));
+        let exported = exported_keys(&watch);
+        assert!(
+            exported.starts_with(&original),
+            "the retained key is missing"
+        );
+        assert_eq!(exported, format!("{original}{current}"));
+
+        // Traffic resumes: the watch's bounded cache also evicts the old key.
+        capture(&meter, &watch);
+        assert_eq!(watch.inner.lock().keys.len(), MAX_KEYS);
+        assert_eq!(watch.rows_after(0, 10).len(), 2);
+        assert_eq!(exported_keys(&watch), current);
+    }
+
+    #[test]
+    fn capture_deduplicates_complete_key_lines() {
+        let (graph, meter, watch, _subscription) = setup();
+        graph.key(key(0));
+        capture(&meter, &watch);
+        let original = keylog(&graph);
+        graph.key(key(0));
+        let mut server = key(0);
+        server.label = "SERVER_TRAFFIC_SECRET_0".into();
+        graph.key(server);
+        let mut different = key(0);
+        different.secret = vec![0xcd; 32];
+        graph.key(different);
+        capture(&meter, &watch);
+        let world = keylog(&graph);
+        assert_eq!(world.lines().count(), 4);
+        let exported = exported_keys(&watch);
+        assert_eq!(exported, world.strip_prefix(&original).unwrap());
+        assert_eq!(exported.lines().count(), 3);
+    }
+
+    #[test]
+    fn capture_keeps_keys_after_world_is_dropped() {
+        let (graph, meter, watch, _subscription) = setup();
+        graph.key(key(0));
+        let expected = keylog(&graph);
+        capture(&meter, &watch);
+        drop(graph);
+        assert!(watch.graph().is_none());
+        assert_eq!(exported_keys(&watch), expected);
+    }
 }
