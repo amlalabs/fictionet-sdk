@@ -263,10 +263,14 @@ pub fn rounds(n: usize) -> usize {
 /// Times `run(n)` and `run(4 * n)`, alternating, three times each, and
 /// keeps the fastest of each. Linear work takes about 4 times as long at
 /// 4 times the size, quadratic work about 16 times. The check fails when the
-/// ratio exceeds 10. It times the CPU the calling thread uses, not the
-/// clock on the wall, so other work on a busy machine does not count. Pick
-/// `n` so that `run(n)` takes at least a millisecond, or timer noise decides
-/// the ratio.
+/// ratio exceeds 10.
+///
+/// On Unix, [`thread_cpu_time`] uses the calling thread's CPU clock with
+/// the `std` feature or in this crate's unit tests. Time spent running other
+/// threads does not count. Wall time is the fallback if the clock fails,
+/// on other targets, or for other callers built without `std`, such as
+/// integration tests. Pick `n` so that `run(n)` takes at least a millisecond,
+/// or timer noise decides the ratio.
 ///
 /// `run` builds its input and decodes it; building with `repeat` or a loop
 /// is linear too, so it does not hide quadratic decoding.
@@ -294,25 +298,36 @@ pub fn assert_linear(name: &str, n: usize, mut run: impl FnMut(usize)) {
     );
 }
 
-/// Returns the CPU time used by the calling thread when available.
-/// Otherwise returns elapsed wall time since the first fallback call.
+/// Returns the CPU time used by the calling thread on Unix with the `std`
+/// feature or in this crate's unit tests, regardless of features.
+/// If the CPU clock fails, on other targets, or for other callers built
+/// without `std` (such as integration tests), returns elapsed wall time
+/// since the first fallback call.
 pub fn thread_cpu_time() -> core::time::Duration {
-    fictionet::cfg_std! {
-    #[cfg(unix)]
-    {
-        let mut t = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
+    macro_rules! read_clock {
+        ($enabled:meta) => {
+            #[cfg($enabled)]
+            {
+                let mut t = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                // SAFETY: `t` is a valid, writable timespec.
+                if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) } == 0 {
+                    return core::time::Duration::new(
+                        u64::try_from(t.tv_sec).unwrap_or_default(),
+                        u32::try_from(t.tv_nsec).unwrap_or_default(),
+                    );
+                }
+            }
         };
-        // SAFETY: `t` is a valid, writable timespec.
-        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) } == 0 {
-            return core::time::Duration::new(
-                u64::try_from(t.tv_sec).unwrap_or_default(),
-                u32::try_from(t.tv_nsec).unwrap_or_default(),
-            );
-        }
     }
-    }
+    // Select the SDK's feature so this module stays copyable.
+    fictionet::cfg_std!({
+        read_clock!(unix);
+    } else {
+        read_clock!(all(unix, test));
+    });
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed()
 }
@@ -593,6 +608,18 @@ mod tests {
             x = black_box(x.wrapping_mul(31).wrapping_add(i as u64));
         }
         black_box(x);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thread_cpu_time_excludes_sleep() {
+        let started = super::thread_cpu_time();
+        std::thread::sleep(core::time::Duration::from_millis(50));
+        let elapsed = super::thread_cpu_time() - started;
+        assert!(
+            elapsed < core::time::Duration::from_millis(25),
+            "sleep used {elapsed:?} of thread CPU time"
+        );
     }
 
     #[test]
