@@ -37,6 +37,12 @@
 //! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
 //! An unknown-length HTTP/1.1 body ends with a zero-size chunk only at EOF.
 //! Pending polls and empty data frames do not end the response.
+//! All backends suppress response bodies for `HEAD`, informational statuses,
+//! `204` and `304`. For other statuses, `HEAD` keeps the handler's
+//! `Content-Length`, or uses the body's known length when none was set.
+//! Native HTTP/1 omits lengths for bodyless statuses and otherwise writes
+//! the body's known length or chooses framing for an unknown length.
+//! The hyper adapter leaves supplied lengths to hyper's framing rules.
 //!
 //! With `tokio`, a request that asks to switch protocols (`Connection: upgrade` with an
 //! `Upgrade` field, as a WebSocket handshake does) makes [`Http1`] hand
@@ -972,19 +978,23 @@ fn error_event(conn: &ConnInfo, cause: &'static str, detail: String) -> Event {
 pub struct Limits {
     /// Head limits for HTTP/1's decoder.
     pub head: http1::Limits,
-    /// The largest request body read. Past it, HTTP/1 hands the handler
-    /// what came, as a body that ends in an error, and closes the
-    /// connection after the answer; HTTP/2 answers the stream `413`.
+    /// The largest request body held. An oversized body gets `413`
+    /// without calling the handler. Native HTTP/1 drains the request
+    /// before answering and closes the connection. Hyper's HTTP/1
+    /// upgrade path and HTTP/2 reject it during collection.
     /// Default 64 MiB.
     pub body: usize,
     /// HTTP/1: how long a request's head may take to arrive, counted from
     /// when the service starts waiting for it, which includes the wait
-    /// between requests. Default 30 seconds.
+    /// between requests. This also applies to hyper's HTTP/1 upgrade
+    /// path. HTTP/2 has no request-head deadline. Default 30 seconds.
     pub header_timeout: Duration,
     /// How long a request's body may take to arrive, counted from its
     /// head, so a client that trickles a body cannot hold the connection
-    /// for ever. HTTP/1 closes the connection; HTTP/2 answers the stream
-    /// `408`. Default 30 seconds.
+    /// for ever. Native HTTP/1 closes the connection. Hyper's HTTP/1
+    /// upgrade path and HTTP/2 answer `408` when collection times out,
+    /// or `400` on a body read error, without calling the handler.
+    /// All these deadlines use the Fictionet clock. Default 30 seconds.
     pub body_timeout: Duration,
     /// How long a write may take no bytes before the connection ends: a
     /// client that stopped reading. Default 30 seconds.
@@ -1263,26 +1273,54 @@ fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Reques
     builder.body(body).ok()
 }
 
-fn no_body(status: StatusCode) -> bool {
-    status.is_informational()
-        || status == StatusCode::NO_CONTENT
-        || status == StatusCode::NOT_MODIFIED
+/// Shared response decisions, before either backend chooses wire framing.
+struct ResponsePolicy {
+    bodiless: bool,
+    len: Option<u64>,
+    date: Option<HeaderValue>,
 }
 
-/// Writes a response head. `len` is the body's length if known. Returns
-/// whether the connection must close after the body: a body of unknown
-/// length to an HTTP/1.0 client ends with the connection.
-/// `date` is the `Date` header to send if the response has none.
+impl ResponsePolicy {
+    fn new(
+        parts: &http::response::Parts,
+        len: Option<u64>,
+        head_only: bool,
+        date: Option<HeaderValue>,
+    ) -> Self {
+        let no_body = parts.status.is_informational()
+            || parts.status == StatusCode::NO_CONTENT
+            || parts.status == StatusCode::NOT_MODIFIED;
+        let len = if no_body {
+            None
+        } else if head_only {
+            // A handler that drops the HEAD body can supply the GET length.
+            parts
+                .headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+                .or(len)
+        } else {
+            len
+        };
+        Self {
+            bodiless: head_only || no_body,
+            len,
+            date: date.filter(|_| !parts.headers.contains_key(DATE)),
+        }
+    }
+}
+
+/// Writes a response head. Returns whether the connection must close
+/// after the body: a body of unknown length to an HTTP/1.0 client ends
+/// with the connection.
 fn encode(
     out: &mut Vec<u8>,
     version: Version,
-    response: &Response<Body>,
-    len: Option<u64>,
-    head_only: bool,
+    parts: &http::response::Parts,
+    policy: &ResponsePolicy,
     close: bool,
-    date: Option<HeaderValue>,
 ) -> bool {
-    let status = response.status();
+    let status = parts.status;
     let v10 = version == Version::HTTP_10;
     let mut close = close;
     out.extend_from_slice(if v10 { b"HTTP/1.0 " } else { b"HTTP/1.1 " });
@@ -1290,11 +1328,7 @@ fn encode(
     out.push(b' ');
     out.extend_from_slice(status.canonical_reason().unwrap_or("").as_bytes());
     out.extend_from_slice(b"\r\n");
-    let given_len = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
-    for (name, value) in response.headers() {
+    for (name, value) in &parts.headers {
         if matches!(
             name.as_str(),
             "content-length" | "transfer-encoding" | "connection" | "keep-alive"
@@ -1306,20 +1340,16 @@ fn encode(
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    if let Some(date) = date.filter(|_| !response.headers().contains_key(DATE)) {
+    if let Some(date) = &policy.date {
         out.extend_from_slice(b"date: ");
         out.extend_from_slice(date.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    if !no_body(status) {
-        // A HEAD answer keeps the length a GET would have, which a handler
-        // that drops the body itself says in its own header.
-        match if head_only { given_len.or(len) } else { len } {
-            Some(n) => out.extend_from_slice(format!("content-length: {n}\r\n").as_bytes()),
-            None if head_only => {}
-            None if v10 => close = true,
-            None => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
-        }
+    match policy.len {
+        Some(n) => out.extend_from_slice(format!("content-length: {n}\r\n").as_bytes()),
+        None if policy.bodiless => {}
+        None if v10 => close = true,
+        None => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
     }
     if status == StatusCode::SWITCHING_PROTOCOLS {
         out.extend_from_slice(b"connection: upgrade\r\n");
@@ -1338,15 +1368,9 @@ fn write_simple(
     status: StatusCode,
     date: Option<HeaderValue>,
 ) {
-    encode(
-        out,
-        version,
-        &status_only(status),
-        Some(0),
-        false,
-        true,
-        date,
-    );
+    let (parts, _) = status_only(status).into_parts();
+    let policy = ResponsePolicy::new(&parts, Some(0), false, date);
+    encode(out, version, &parts, &policy, true);
 }
 
 /// The `Date` header at `now` on the run's clock, in a world whose date at
@@ -1718,29 +1742,25 @@ impl Pending for Streaming {
             }
             if let Some(response) = self.response.take() {
                 let (parts, body) = response.into_parts();
-                let response = Response::from_parts(parts, Body::empty());
-                let len = body.size_hint().exact();
-                let mut head = Vec::new();
                 let now = driver.fcx().map_or(self.asked, Cx::now);
-                self.close = encode(
-                    &mut head,
-                    self.version,
-                    &response,
-                    len,
+                let policy = ResponsePolicy::new(
+                    &parts,
+                    body.size_hint().exact(),
                     self.head_only,
-                    self.close,
                     date_header(self.date, now),
                 );
+                let mut head = Vec::new();
+                self.close = encode(&mut head, self.version, &parts, &policy, self.close);
                 if self.close {
                     // An HTTP/1.0 body of unknown length ends with the
                     // connection, whatever the request asked for.
                     driver.close();
                 }
-                self.status = Some(response.status());
-                self.extra = response.extensions().get::<Fields>().cloned();
-                let bodiless = self.head_only || no_body(response.status());
-                self.chunked = !bodiless && len.is_none() && self.version != Version::HTTP_10;
-                if bodiless {
+                self.status = Some(parts.status);
+                self.extra = parts.extensions.get::<Fields>().cloned();
+                self.chunked =
+                    !policy.bodiless && policy.len.is_none() && self.version != Version::HTTP_10;
+                if policy.bodiless {
                     return self.piece(head, 0);
                 }
                 // A body held in full goes out with the head, a piece at
@@ -2476,19 +2496,22 @@ mod h2 {
                 } else {
                     over_budget().into_parts()
                 };
-                if !parts.headers.contains_key(DATE)
-                    && let Some(date) = date_header(route.date, route.fcx.now())
-                {
+                let policy = ResponsePolicy::new(
+                    &parts,
+                    body.size_hint().exact(),
+                    head_only,
+                    date_header(route.date, route.fcx.now()),
+                );
+                if let Some(date) = policy.date {
                     parts.headers.insert(DATE, date);
                 }
                 track.extra = parts.extensions.get::<Fields>().cloned();
                 track.status = Some(parts.status);
-                let bodiless = head_only || no_body(parts.status);
+                let bodiless = policy.bodiless;
                 let body = if bodiless {
                     // hyper would send the body on HTTP/2 even for HEAD,
                     // which breaks the stream.
-                    if let Some(len) = body.size_hint().exact()
-                        && !no_body(parts.status)
+                    if let Some(len) = policy.len
                         && !parts.headers.contains_key(CONTENT_LENGTH)
                     {
                         parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(len));

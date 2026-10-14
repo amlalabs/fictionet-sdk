@@ -519,6 +519,48 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
 }
 
 #[test]
+fn http1_response_policy_preserves_native_framing() {
+    for (method, status, given, length, body) in [
+        ("GET", 101, "7", None, ""),
+        ("GET", 103, "7", None, ""),
+        ("GET", 204, "7", None, ""),
+        ("GET", 304, "7", None, ""),
+        ("HEAD", 200, "invalid", Some("4"), ""),
+        ("GET", 200, "7", Some("4"), "body"),
+    ] {
+        let router = Router::new().route(None, "/", move |_, _| {
+            http::Response::builder()
+                .status(status)
+                .header("content-length", given)
+                .body(Bytes::from_static(b"body"))
+                .unwrap()
+        });
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+        let request = format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n");
+        let reply = String::from_utf8(h.push(request.as_bytes()).unwrap()).unwrap();
+        let (head, got) = reply.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
+        assert_eq!(got, body, "{reply}");
+        assert_eq!(
+            head.lines()
+                .find_map(|line| line.strip_prefix("content-length: ")),
+            length,
+            "{reply}"
+        );
+        assert!(!head.contains("transfer-encoding"), "{reply}");
+        let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        assert_eq!(
+            event.get("sent").and_then(json::Value::as_u64),
+            Some(body.len() as u64)
+        );
+        assert_eq!(
+            event.get("complete").and_then(json::Value::as_bool),
+            Some(true)
+        );
+    }
+}
+
+#[test]
 fn an_http11_request_with_no_host_reaches_the_handler_as_one_that_names_no_host() {
     let vhosts = httpd::VirtualHosts::new();
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ());

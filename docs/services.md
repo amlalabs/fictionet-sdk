@@ -442,6 +442,15 @@ event by putting `events::Fields` in its response's extensions.
 HTTP/1.1 responses with unknown-length bodies use chunked encoding. Pending
 polls and empty data frames do not end the response. The zero-size chunk is
 sent only at body EOF, so the next response can use the same connection.
+HTTP/1.0 closes the connection to end an unknown-length response.
+
+All backends suppress response bodies for `HEAD`, informational statuses,
+`204` and `304`. For other statuses, `HEAD` uses a supplied `Content-Length`
+to describe the body a GET would have, or the known body length. Native
+HTTP/1 omits lengths for bodyless statuses and uses the body's length for
+other responses. The hyper adapter leaves supplied lengths to hyper's framing
+rules. All backends keep a supplied `Date`; otherwise they use the world's
+date, when set.
 
 On a network, `httpd::Server` is the `PortServer` that serves a handler on a
 port, and `httpd::Server::served_by` puts one on ports 80 and 443 as `web::Sites`
@@ -504,6 +513,16 @@ third-party allocation overhead and transport buffers are outside these counts.
 Hyper rejects a request whose metadata does not fit before calling its handler.
 It records `answer: budget` without a status and ends that stream. Both versions
 draw a handler's randomness from the run's stream.
+
+An oversized request body gets `413` without calling the handler. Native
+HTTP/1 drains the request before answering and closes the connection.
+Hyper's HTTP/1 upgrade path and HTTP/2 reject it during body collection.
+Native HTTP/1 closes on a body deadline. Both hyper paths answer `408` when
+body collection times out and `400` when reading the body fails, before
+calling the handler. A transport failure may prevent that answer reaching
+the client. HTTP/1 head deadlines include the wait between requests, also
+after handoff to hyper. HTTP/2 has no request-head deadline. Body deadlines
+and write stall deadlines use the Fictionet clock on every backend.
 
 In `http2::Session`, HPACK reductions wait for the corresponding SETTINGS
 ACK. A decrease followed by an unacknowledged rebound leaves the earlier

@@ -276,6 +276,160 @@ impl Handler for Streams {
     }
 }
 
+#[test]
+fn response_policy_agrees_across_native_and_hyper() {
+    struct Responses;
+
+    impl Handler for Responses {
+        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            let status: u16 = request.uri().path()[1..].parse().unwrap();
+            let bytes = Bytes::from_static(b"body");
+            let body = if request.headers().contains_key("x-unknown") {
+                Body::new(Unsized(Some(bytes)))
+            } else {
+                Body::from(bytes)
+            };
+            let mut response = http::Response::builder().status(status);
+            if let Some(len) = request.headers().get("x-length") {
+                response = response.header("content-length", len);
+            }
+            if let Some(date) = request.headers().get("x-date") {
+                response = response.header("date", date);
+            }
+            Reply::Now(response.body(body).unwrap())
+        }
+    }
+
+    world(Duration::from_secs(30), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let start = std::time::SystemTime::UNIX_EPOCH;
+        let own_date = "Mon, 01 Jan 2001 00:00:00 GMT";
+        for (port, date) in [(80, None), (81, Some(start))] {
+            serve_http(
+                &fcx,
+                &server,
+                port,
+                Arc::new(Responses),
+                HttpOptions {
+                    date,
+                    ..HttpOptions::default()
+                },
+            )?;
+            for backend in ["native", "upgrade", "h2"] {
+                // Method, status, unknown size, supplied length, wire lengths
+                // (native HTTP/1, hyper HTTP/1, HTTP/2), and received body.
+                for (method, status, unknown, given, lengths, body) in [
+                    ("GET", 200, false, None, [Some("4"); 3], "body"),
+                    ("GET", 200, true, None, [None; 3], "body"),
+                    (
+                        "GET",
+                        200,
+                        false,
+                        Some("004"),
+                        [Some("4"), Some("004"), Some("004")],
+                        "body",
+                    ),
+                    ("HEAD", 200, false, None, [Some("4"); 3], ""),
+                    ("HEAD", 200, false, Some("7"), [Some("7"); 3], ""),
+                    ("HEAD", 200, true, None, [None; 3], ""),
+                    ("HEAD", 200, true, Some("7"), [Some("7"); 3], ""),
+                    ("GET", 204, false, None, [None; 3], ""),
+                    ("GET", 304, false, None, [None; 3], ""),
+                    ("HEAD", 304, false, None, [None; 3], ""),
+                    ("GET", 304, false, Some("7"), [None, None, Some("7")], ""),
+                ] {
+                    for supplied_date in [false, true] {
+                        let mut request = http::Request::builder()
+                            .method(method)
+                            .uri(format!("http://a.test/{status}"))
+                            .header("host", "a.test");
+                        if unknown {
+                            request = request.header("x-unknown", "yes");
+                        }
+                        if let Some(len) = given {
+                            request = request.header("x-length", len);
+                        }
+                        if supplied_date {
+                            request = request.header("x-date", own_date);
+                        }
+                        if backend == "upgrade" {
+                            request = request
+                                .header("connection", "upgrade")
+                                .header("upgrade", "websocket");
+                        }
+                        let request = request.body(Full::new(Bytes::new()))?;
+                        let conn = client
+                            .connect(&fcx, SocketAddr::new(SERVER.into(), port))
+                            .await?;
+                        let io = Io {
+                            fcx: fcx.clone(),
+                            conn,
+                        };
+                        let before = fcx.now();
+                        let response = if backend == "h2" {
+                            let (mut send, driving) =
+                                hyper::client::conn::http2::handshake(Exec(fcx.clone()), io)
+                                    .await?;
+                            fcx.spawn(move |_| async move {
+                                let _ = driving.await;
+                                Ok(())
+                            });
+                            send.send_request(request).await?
+                        } else {
+                            let (mut send, driving) =
+                                hyper::client::conn::http1::handshake(io).await?;
+                            fcx.spawn(move |_| async move {
+                                let _ = driving.await;
+                                Ok(())
+                            });
+                            send.send_request(request).await?
+                        };
+                        let case = format!(
+                            "{backend} {method} {status} unknown={unknown} length={given:?} date={date:?} supplied_date={supplied_date}"
+                        );
+                        assert_eq!(response.status(), status, "{case}");
+                        let index = match backend {
+                            "native" => 0,
+                            "upgrade" => 1,
+                            _ => 2,
+                        };
+                        assert_eq!(
+                            response
+                                .headers()
+                                .get("content-length")
+                                .map(|v| v.to_str().unwrap()),
+                            lengths[index],
+                            "{case}"
+                        );
+                        assert_eq!(
+                            response.headers().contains_key("transfer-encoding"),
+                            unknown && method == "GET" && backend != "h2",
+                            "{case}"
+                        );
+                        let dates: Vec<_> = response.headers().get_all("date").iter().collect();
+                        if supplied_date {
+                            assert_eq!(dates, [own_date], "{case}");
+                        } else if date.is_some() {
+                            assert_eq!(dates.len(), 1, "{case}");
+                            let earliest = httpd::date_header(date, before).unwrap();
+                            let latest = httpd::date_header(date, fcx.now()).unwrap();
+                            assert!(dates[0] == earliest || dates[0] == latest, "{case}");
+                        } else {
+                            assert!(dates.is_empty(), "{case}");
+                        }
+                        assert_eq!(
+                            response.into_body().collect().await?.to_bytes(),
+                            body,
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
 /// An HTTP/1.0 response of unknown length ends with the connection, even
 /// when the client asked to keep it alive. Before, the connection stayed
 /// open and the client waited for the end of the body until a timer
