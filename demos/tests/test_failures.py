@@ -4,12 +4,26 @@ import os
 from pathlib import Path
 import runpy
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+
+CA = """-----BEGIN CERTIFICATE-----
+MIIBfjCCASOgAwIBAgIUXTPmZFNqiy55DXYFjxBijg9nCEUwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJZGVtby10ZXN0MB4XDTI2MTAxNDIxNTQzOFoXDTM2MTAxMTIx
+NTQzOFowFDESMBAGA1UEAwwJZGVtby10ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEYY/pl05nVwgSouSZvxW77WNZsUfDQPRd1BxsLXcVu1+CC6yKGLOX+6Q5
+5eu8/f8gqR14h5oczaYg+quLPby+hKNTMFEwHQYDVR0OBBYEFJrdgO5hl7N9gEan
+woJ0kXhVbzYXMB8GA1UdIwQYMBaAFJrdgO5hl7N9gEanwoJ0kXhVbzYXMA8GA1Ud
+EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAL/BgLw5XnZiWGTwW3CixmGZ
+kmu8qO18sMF8hhCoPU5bAiEAmxKwDG8vcmMhgNqbgxdaXe3y+MNXYmEa6F5jMiT/
+lXc=
+-----END CERTIFICATE-----
+"""
 
 
 class Failures(unittest.TestCase):
@@ -60,6 +74,88 @@ class Failures(unittest.TestCase):
         result = subprocess.run(['bash', '-o', 'pipefail', '-c', pipeline],
                                 input='', capture_output=True, text=True)
         self.assertEqual(result.returncode, 4)
+
+    def web_start(self, scenario):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'complete.pem').write_text(CA)
+            for name in ('ticks', 'acks'):
+                os.mkfifo(root / name)
+            # Each readiness sleep advances the fake world by one step.
+            # The handshake makes partial publication independent of timing.
+            (root / 'world.py').write_text('''
+from pathlib import Path
+import socket
+import sys
+
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+ca = Path(sys.argv[2])
+scenario = sys.argv[3]
+print('fake world startup', flush=True)
+with open('ticks') as ticks, open('acks', 'w') as acks:
+    for step, _ in enumerate(ticks, 1):
+        if scenario == 'exit':
+            sys.exit(17)
+        if scenario in ('partial', 'unfinished'):
+            ca.write_text(Path('complete.pem').read_text()[:100])
+        if scenario == 'invalid':
+            ca.write_text('-----BEGIN CERTIFICATE-----\\ninvalid\\n-----END CERTIFICATE-----\\n')
+        if step >= 2 and scenario in ('delayed', 'partial'):
+            ca.write_text(Path('complete.pem').read_text())
+        acks.write('done\\n')
+        acks.flush()
+''')
+            script = (ROOT / 'demos/guest/web_setup.sh').read_text().replace('/run/', f'{root}/')
+            command = f'''
+. {shlex.quote(str(ROOT / 'demos/guest/lib.sh'))}
+{script}
+exec 3<>ticks 4<>acks
+polls=0
+web_world() {{ exec python3 world.py "$@" {shlex.quote(scenario)}; }}
+sleep() {{
+    polls=$((polls + 1))
+    printf 'tick\\n' >&3
+    if [[ {shlex.quote(scenario)} == exit ]]; then
+        wait "$world_pid" || true
+    else
+        read -r -u 4
+    fi
+}}
+trap 'stop_pid "${{world_pid:-}}"; echo "polls=$polls"' EXIT
+start_web
+echo ready
+cmp fictionet/ca.pem complete.pem
+'''
+            return subprocess.run(['bash', '-c', command], cwd=root,
+                                  capture_output=True, text=True, timeout=15)
+
+    def test_web_waits_for_complete_ca(self):
+        for scenario in ('delayed', 'partial'):
+            with self.subTest(scenario=scenario):
+                result = self.web_start(scenario)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('ready', result.stdout)
+                self.assertIn('polls=2', result.stdout)
+
+    def test_web_ca_timeout_keeps_diagnostics(self):
+        for scenario in ('missing', 'unfinished', 'invalid'):
+            with self.subTest(scenario=scenario):
+                result = self.web_start(scenario)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('ready', result.stdout)
+                self.assertIn('timed out', result.stderr)
+                self.assertIn('ca.pem', result.stderr)
+                self.assertIn('fake world startup', result.stderr)
+                self.assertIn('polls=100', result.stdout)
+
+    def test_web_exit_before_ca_keeps_diagnostics(self):
+        result = self.web_start('exit')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('ready', result.stdout)
+        self.assertIn('exited before', result.stderr)
+        self.assertIn('fake world startup', result.stderr)
+        self.assertIn('polls=1', result.stdout)
 
     def test_hosted_start_failure_skips_checks_and_cleans_up(self):
         module = runpy.run_path(str(ROOT / 'examples/hosted/run_hosted.py'))

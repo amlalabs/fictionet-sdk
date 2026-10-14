@@ -29,6 +29,9 @@ it down at the end. Run `vm/run up` first to keep one VM for several demos, and
 
 The scripts that run inside the VM are in [`guest/`](guest). Each starts with a
 `# needs:` line that says which binaries `vm/guest/build.sh` builds for it.
+The web, proxy and dashboard demos wait for the world's socket and a complete,
+readable CA certificate before continuing. If the world exits or startup times
+out, they stop and print the world log.
 
 ## How long they take
 

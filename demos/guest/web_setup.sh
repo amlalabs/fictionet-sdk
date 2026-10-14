@@ -13,8 +13,24 @@ start_web() {
     chmod 700 /run/fictionet
     web_world /run/fictionet/world.sock /run/fictionet/ca.pem >/run/world.log 2>&1 &
     world_pid=$!
-    wait_for /run/fictionet/world.sock 10
-    sed 's/^/    /' /run/world.log
+    local i
+    for ((i = 0; i < 100; i++)); do
+        if ! kill -0 "$world_pid" 2>/dev/null; then
+            echo "demo: web_world exited before its socket and CA were ready" >&2
+            sed 's/^/    /' /run/world.log >&2
+            return 1
+        fi
+        if [[ -S /run/fictionet/world.sock && -s /run/fictionet/ca.pem ]] &&
+            python3 -c 'import ssl, sys; ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(sys.argv[1])' \
+                /run/fictionet/ca.pem 2>/dev/null; then
+            sed 's/^/    /' /run/world.log
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "demo: timed out waiting for /run/fictionet/world.sock and a complete /run/fictionet/ca.pem" >&2
+    sed 's/^/    /' /run/world.log >&2
+    return 1
 }
 
 attach_web() {
