@@ -95,10 +95,10 @@
 //!
 //! Native real runs with `std` write files on a helper thread with a bounded
 //! queue. In browsers, labs and builds without `std`, sinks write and flush
-//! synchronously on the run's thread, in event order, without queue overflow
-//! or writer scheduling affecting the log. A lab's `run.start.wall` is null;
-//! real runs record their wall date. Attach a sink before recording begins to
-//! retain events beyond the in-memory log's limits.
+//! synchronously in the subscription's drainer, in event order, without
+//! writer-queue overflow or writer scheduling affecting the log. A lab's
+//! `run.start.wall` is null; real runs record their wall date. Attach a sink
+//! before recording begins to retain events beyond the in-memory log's limits.
 //!
 //! # What it costs
 //!
@@ -106,13 +106,17 @@
 //! in full for each retained copy, with estimated allocation overhead.
 //! They exclude spare capacity in history queues and window indexes,
 //! static strings, temporary allocations while recording or reading, and
-//! copies held by readers or callbacks. These are retention budgets, not
-//! a process-memory limit.
+//! copies held by readers, callbacks, or pending subscription deliveries.
+//! These are retention budgets, not a process-memory limit.
 //!
 //! Recording takes the event the caller built, looks up the task that
-//! recorded it, and appends it to the log under one lock. Callbacks run
-//! after that, in the task that recorded, so they must return quickly and
-//! never block. The `sites` group of the performance suite (`cargo bench
+//! recorded it, and appends it to the log under one lock. Each subscription
+//! queues replay and live events in sequence order. One caller drains that
+//! queue, invoking callbacks one at a time outside the log and delivery locks.
+//! Reentrant or concurrent recording leaves queued callbacks to the active
+//! drainer, which may run in a different task or thread from the recorder.
+//! Callbacks must return quickly and never block. See [`EventLog::subscribe`].
+//! The `sites` group of the performance suite (`cargo bench
 //! --bench perf -- sites`) measures the cost on HTTPS requests, which
 //! record one `http.request` event each. On a busy 24-core machine, a
 //! median of three runs took 9.5 µs of CPU per HTTP/1.1 request from ten
@@ -697,6 +701,64 @@ fn value_size(v: &Value) -> usize {
 /// A callback given to [`EventLog::subscribe`].
 type Subscriber = Arc<dyn Fn(&Arc<Event>) + Send + Sync>;
 
+/// A subscriber and the events waiting for it, delivered in order.
+struct Subscription {
+    f: Subscriber,
+    delivery: Mutex<Delivery>,
+}
+
+/// The events queued for a subscriber, and whether a caller is draining
+/// them.
+#[derive(Default)]
+struct Delivery {
+    pending: VecDeque<Arc<Event>>,
+    draining: bool,
+}
+
+/// Releases the drainer if a callback unwinds. The panic still propagates.
+struct Drainer<'a> {
+    delivery: &'a Mutex<Delivery>,
+    active: bool,
+}
+
+impl Drop for Drainer<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.delivery.lock().draining = false;
+        }
+    }
+}
+
+impl Subscription {
+    /// Called with the store locked, so replay and live events share its order.
+    fn enqueue(&self, events: &[Arc<Event>]) {
+        self.delivery.lock().pending.extend(events.iter().cloned());
+    }
+
+    fn drain(&self) {
+        let mut delivery = self.delivery.lock();
+        if delivery.draining {
+            return;
+        }
+        delivery.draining = true;
+        let mut drainer = Drainer {
+            delivery: &self.delivery,
+            active: true,
+        };
+        loop {
+            let Some(event) = delivery.pending.pop_front() else {
+                // Release ownership while locked, before another caller can take it.
+                delivery.draining = false;
+                drainer.active = false;
+                return;
+            };
+            drop(delivery);
+            (self.f)(&event);
+            delivery = self.delivery.lock();
+        }
+    }
+}
+
 /// How many events may wait for a file's writer thread.
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 const FILE_QUEUE: usize = 100_000;
@@ -859,7 +921,7 @@ struct State {
     /// The same, oldest first, each with when its count is due.
     due: VecDeque<(Instant, Arc<RepeatKey>)>,
     /// Shared, so recording takes a reference count, not a copy.
-    subscribers: Arc<[Subscriber]>,
+    subscribers: Arc<[Arc<Subscription>]>,
     /// Whether the run is over.
     closed: bool,
     /// The file writers' threads, joined when the run is over.
@@ -1005,11 +1067,12 @@ impl Store {
             return;
         }
         let subscribers = s.subscribers.clone();
+        for subscription in subscribers.iter() {
+            subscription.enqueue(events);
+        }
         drop(s);
-        for event in events {
-            for f in subscribers.iter() {
-                f(event);
-            }
+        for subscription in subscribers.iter() {
+            subscription.drain();
         }
     }
 
@@ -1035,12 +1098,13 @@ impl Store {
             {
                 writers = std::mem::take(&mut s.writers);
             }
+            for subscription in s.subscribers.iter() {
+                subscription.enqueue(&out);
+            }
             std::mem::replace(&mut s.subscribers, Arc::new([]))
         };
-        for event in &out {
-            for f in subscribers.iter() {
-                f(event);
-            }
+        for subscription in subscribers.iter() {
+            subscription.drain();
         }
         // The writers end once their senders, in the subscribers, are gone.
         drop(subscribers);
@@ -1158,29 +1222,41 @@ impl EventLog {
 
     /// Calls `f` with every event the log holds now, oldest first (with
     /// an `events.dropped` event wherever some were dropped), then with
-    /// every event recorded from now on, in the task that records it,
-    /// until the run is over, including events too large to retain.
-    /// `f` must return quickly and never block:
-    /// hand the event to a channel that never waits. Once the run is over,
-    /// `f` gets only what the log holds.
+    /// every event recorded from now on until the run is over, including
+    /// events too large to retain. Replay and live events share one FIFO:
+    /// `f` runs in sequence order, one call at a time, outside the log and
+    /// delivery locks. Once the run is over, `f` gets only what the log holds.
+    ///
+    /// `f` may read, record, or subscribe to the same log. Reentrant or
+    /// concurrent recording queues events for the caller already draining
+    /// this subscription. Recording or subscribing may return before those
+    /// callbacks finish. Callbacks can run in a different task or thread from
+    /// the recorder; no helper thread is created for them. Different
+    /// subscriptions may run concurrently. A callback panic propagates to the
+    /// caller draining it. If the run ends while a callback is active, that
+    /// caller still drains the events already queued for the subscription.
+    ///
+    /// `f` must return quickly and never block: hand the event to a channel
+    /// that never waits.
     pub fn subscribe(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
         self.subscribe_arc(Arc::new(move |event| f(event)));
     }
 
     fn subscribe_arc(&self, f: Subscriber) {
-        let held = {
+        let subscription = Arc::new(Subscription {
+            f,
+            delivery: Mutex::default(),
+        });
+        {
             let mut s = self.store.state.lock();
-            let held = after_locked(&s, 0, usize::MAX);
+            subscription.enqueue(&after_locked(&s, 0, usize::MAX));
             if !s.closed {
-                let mut all: Vec<Subscriber> = s.subscribers.iter().cloned().collect();
-                all.push(f.clone());
+                let mut all: Vec<_> = s.subscribers.iter().cloned().collect();
+                all.push(subscription.clone());
                 s.subscribers = all.into();
             }
-            held
-        };
-        for e in held {
-            f(&e);
         }
+        subscription.drain();
     }
 
     /// Writes every event to `path` as JSON Lines ([`Event::to_json`]),
@@ -1198,8 +1274,10 @@ impl EventLog {
     /// `std` uses a thread that flushes whenever it has caught up. The run's
     /// end waits for the thread to write and flush every line. In browsers,
     /// labs and builds without `std`, each line is written and flushed
-    /// synchronously on the recording task's thread, without a queue or
-    /// writer thread. Successful synchronous sinks lose no lines.
+    /// synchronously in the subscription's drainer, without a writer thread.
+    /// Replay and live lines follow sequence order, with the callback context
+    /// described by [`EventLog::subscribe`]. Successful synchronous sinks lose
+    /// no lines.
     ///
     /// A line is lost, and counted ([`EventLog::lost`]), when it does not
     /// fit in the thread's queue (100,000 events or 16 MiB of retained
@@ -1611,6 +1689,170 @@ mod tests {
         store.close();
         numbered(&store, 1);
         assert_eq!(seen.lock().len(), 5, "a closed log calls no one");
+    }
+
+    #[test]
+    fn reentrant_recording_follows_the_rest_of_replay() {
+        let store = Store::new(crate::RunMode::Lab);
+        numbered(&store, 2);
+        let log = EventLog::new(store.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = seen.clone();
+        let recording = store.clone();
+        log.subscribe(move |event| {
+            if event.seq == 1 {
+                numbered(&recording, 1);
+            }
+            out.lock().push(event.seq);
+        });
+        store.close();
+        assert_eq!(*seen.lock(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn reentrant_recording_reaches_each_subscriber_in_order() {
+        for mode in [crate::RunMode::Lab, crate::RunMode::Real] {
+            let store = Store::new(mode);
+            let log = EventLog::new(store.clone());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let first = seen.clone();
+            let recording = store.clone();
+            log.subscribe(move |event| {
+                if event.seq == 3 {
+                    numbered(&recording, 1);
+                }
+                first.lock().push(event.seq);
+            });
+            numbered(&store, 2);
+            let followed = Arc::new(Mutex::new(Vec::new()));
+            let second = followed.clone();
+            log.subscribe(move |event| second.lock().push(event.seq));
+            let sink = Sink::default();
+            log.to_writer(Box::new(sink.clone()));
+            numbered(&store, 1);
+            store.close();
+            assert_eq!(*seen.lock(), [1, 2, 3, 4]);
+            assert_eq!(*followed.lock(), [1, 2, 3, 4]);
+            let expected: String = log
+                .all()
+                .iter()
+                .map(|event| event.to_line() + "\n")
+                .collect();
+            assert_eq!(*sink.bytes.lock(), expected.as_bytes());
+            assert_eq!(log.lost(), 0);
+        }
+    }
+
+    #[test]
+    fn reentrant_recording_follows_all_due_repeat_summaries() {
+        let store = Store::new(crate::RunMode::Lab);
+        let log = EventLog::new(store.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = seen.clone();
+        let recording = store.clone();
+        log.subscribe(move |event| {
+            if event.seq == 3 {
+                numbered(&recording, 1);
+            }
+            out.lock().push(event.seq);
+        });
+        for dst in ["192.0.2.1", "192.0.2.2"] {
+            refused(&store, 0, dst, 1);
+            refused(&store, 0, dst, 2);
+        }
+        store.advance(Instant::ZERO + REPEAT_WINDOW);
+        store.close();
+        assert_eq!(*seen.lock(), [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_panicking_callback_releases_its_drainer() {
+        let store = Store::new(crate::RunMode::Lab);
+        numbered(&store, 2);
+        let log = EventLog::new(store.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = seen.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.subscribe(move |event| {
+                assert_ne!(event.seq, 1, "callback panic");
+                out.lock().push(event.seq);
+            });
+        }));
+        assert!(result.is_err());
+        numbered(&store, 1);
+        store.close();
+        assert_eq!(*seen.lock(), [2, 3]);
+    }
+
+    #[test]
+    fn concurrent_recording_queues_behind_replay_and_live_callbacks() {
+        for replay in [false, true] {
+            let store = Store::new(crate::RunMode::Lab);
+            let log = EventLog::new(store.clone());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let out = seen.clone();
+            let (entered, started) = std::sync::mpsc::channel();
+            let (release, resume) = std::sync::mpsc::channel();
+            let resume = Mutex::new(resume);
+            let callback = move |event: &Event| {
+                if event.seq == 1 {
+                    entered.send(()).unwrap();
+                    resume.lock().recv().unwrap();
+                }
+                out.lock().push((event.seq, std::thread::current().id()));
+            };
+            let drainer = if replay {
+                numbered(&store, 2);
+                std::thread::spawn(move || log.subscribe(callback))
+            } else {
+                log.subscribe(callback);
+                let recording = store.clone();
+                std::thread::spawn(move || numbered(&recording, 1))
+            };
+            let thread = drainer.thread().id();
+            started.recv().unwrap();
+            numbered(&store, 1);
+            let waiting = seen.lock().is_empty();
+            release.send(()).unwrap();
+            drainer.join().unwrap();
+            store.close();
+            assert!(waiting, "recording returns while its callback is queued");
+            let last = if replay { 3 } else { 2 };
+            let expected: Vec<_> = (1..=last).map(|seq| (seq, thread)).collect();
+            assert_eq!(*seen.lock(), expected);
+        }
+    }
+
+    #[test]
+    fn closing_queues_repeat_summaries_behind_active_callbacks() {
+        let store = Store::new(crate::RunMode::Lab);
+        refused(&store, 0, "192.0.2.1", 1);
+        refused(&store, 0, "192.0.2.1", 2);
+        let log = EventLog::new(store.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = seen.clone();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let resume = Mutex::new(resume);
+        let drainer = std::thread::spawn(move || {
+            log.subscribe(move |event| {
+                if event.seq == 1 {
+                    entered.send(()).unwrap();
+                    resume.lock().recv().unwrap();
+                }
+                out.lock().push(event.seq);
+            });
+        });
+        started.recv().unwrap();
+        store.close();
+        let waiting = seen.lock().is_empty();
+        release.send(()).unwrap();
+        drainer.join().unwrap();
+        assert!(
+            waiting,
+            "closing queues the summary without overlapping callbacks"
+        );
+        assert_eq!(*seen.lock(), [1, 2]);
     }
 
     fn at(ms: u64) -> Instant {

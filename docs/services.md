@@ -408,6 +408,15 @@ late subscribers and dropped-event reporting. Sum `count` when grading
 packet repeats; a port scan of 65,535 ports to one machine costs a couple of
 events a second while its repeat windows fit.
 
+Each subscription receives replay and live events in sequence order, one
+callback at a time, outside the log and delivery locks. A callback may read,
+record, or subscribe to the same log. Reentrant or concurrent recording queues
+events for the caller already draining that subscription. Recording or
+subscribing may return before those callbacks finish. A callback can run in a
+different task or thread from the one that recorded its event, and must return
+quickly without blocking. A callback panic propagates to the caller draining it.
+If the run ends during a callback, its caller still drains the queued events.
+
 History holds up to 50,000 ordinary events within 16 MiB and 5,000 repeats
 within 2 MiB. An event larger than its history's byte limit is numbered but
 not kept. It does not evict other events. Readers see an `events.dropped`
@@ -420,14 +429,15 @@ Byte accounting includes owned capacities, task names, and the full shared
 connection metadata for each retained copy, plus estimated allocation
 overhead. It excludes spare capacity in history queues and window indexes,
 static strings, temporary allocations while recording or reading, and
-copies held by readers or callbacks. These fixed retention limits do not
-bound total process memory.
+copies held by readers, callbacks, or pending subscription deliveries. These
+fixed retention limits do not bound total process memory.
 
 Native real runs use writer threads and wait for them at shutdown. In
 browsers, labs and builds without `std`, event sinks write and flush each line
-synchronously. Browser runs can use an in-memory sink with
-`EventLog::to_writer`. Native writer queues have their own limit of 100,000
-events or 16 MiB of event data; oversized events are lost there too.
+synchronously in the subscription's drainer, in sequence order. Browser runs
+can use an in-memory sink with `EventLog::to_writer`. Native writer queues
+have their own limit of 100,000 events or 16 MiB of event data; oversized
+events are lost there too.
 Discard a sample if
 [`EventLog::lost`](../src/events.rs) is nonzero.
 

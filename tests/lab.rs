@@ -446,6 +446,39 @@ fn lab_event_bytes_repeat() {
 }
 
 #[test]
+fn reentrant_event_subscriptions_preserve_replay_and_sink_order() {
+    block_on(lab(Seed::from_u64(7), |fcx| async move {
+        let log = fcx.events();
+        fcx.record(Event::new("test", "first"));
+        fcx.record(Event::new("test", "second"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = seen.clone();
+        let recording = fcx.clone();
+        log.subscribe(move |event| {
+            if event.is("test", "first") || event.is("test", "live") {
+                recording.record(Event::new("test", "reentrant"));
+            }
+            out.lock().unwrap().push(event.seq);
+        });
+        assert_eq!(*seen.lock().unwrap(), [1, 2, 3]);
+
+        let bytes = Bytes(Arc::default(), std::thread::current().id());
+        log.to_writer(Box::new(bytes.clone()));
+        fcx.record(Event::new("test", "live"));
+        assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4, 5]);
+        let expected: String = log
+            .all()
+            .iter()
+            .map(|event| event.to_line() + "\n")
+            .collect();
+        assert_eq!(*bytes.0.lock().unwrap(), expected.as_bytes());
+        assert_eq!(log.lost(), 0);
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn seeded_service_faults_repeat_at_the_same_points() {
     use fictionet::events::{ConnInfo, Event};
     use fictionet::prelude::*;
