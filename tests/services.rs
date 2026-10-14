@@ -11,6 +11,8 @@ mod service_fixture;
 mod common;
 #[path = "common/done.rs"]
 mod done;
+#[path = "common/echo_service.rs"]
+mod echo_service;
 #[path = "common/timeout.rs"]
 mod timeout;
 #[path = "common/wait.rs"]
@@ -19,6 +21,7 @@ mod wait;
 mod world;
 
 use done::Done;
+use echo_service::{Echo, Ticker};
 use fictionet::stdlib::sandbox::{Machine, machine};
 use timeout::timeout;
 use world::world;
@@ -50,7 +53,7 @@ use fictionet::stdlib::modbus::{
 use fictionet::stdlib::net::{Arrival, Host, Net, PortServer, PreparedShare, Sni};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::serve::{
-    self, Budget, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan,
+    self, Budget, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan,
     ServeOptions, Served, Timer, Transcript, Upgrade,
 };
 use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};
@@ -92,119 +95,6 @@ async fn read_some<C: Connection>(fcx: &Cx, conn: &mut C, want: usize) -> Vec<u8
 
 // ---------------------------------------------------------------------------
 // Services used below
-
-/// Echoes each line, closes on `quit`, hands over on `handoff`, and on
-/// `later` answers through deferred work.
-struct Echo;
-
-service_fixture! {
-    Echo => (Lines, (), Infallible);
-
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
-    }
-
-    on_open(self; _, driver) -> Flow {
-        driver.reply().extend_from_slice(b"hello\n");
-        Ok(Flow::Continue)
-    }
-
-    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
-        let Ok(line) = line else {
-            driver.reply().extend_from_slice(b"too long\n");
-            return Ok(Flow::Continue);
-        };
-        driver.record(
-            Event::new("echo", "line")
-                .summary(String::from_utf8_lossy(&line))
-                .field("bytes", line.len() as u64),
-        );
-        match line.as_slice() {
-            b"quit" => {
-                driver.reply().extend_from_slice(b"bye\n");
-                Ok(Flow::Close)
-            }
-            b"handoff" => Ok(Flow::Upgrade(Upgrade::Handoff)),
-            b"later" => {
-                driver.defer(Later { step: 0 });
-                Ok(Flow::Continue)
-            }
-            _ => {
-                driver.reply().extend_from_slice(&line);
-                driver.reply().push(b'\n');
-                Ok(Flow::Continue)
-            }
-        }
-    }
-
-    on_end(self, end: Ended; _, driver) -> () {
-        if end == Ended::Eof {
-            driver.reply().extend_from_slice(b"eof\n");
-        }
-        Ok(())
-    }
-}
-
-/// Deferred work: waits a little, then sends two chunks.
-struct Later {
-    step: u8,
-}
-
-impl Pending for Later {
-    fn poll_next(
-        &mut self,
-        driver: &mut PendingDriver<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
-        if self.step == 0 {
-            // Not ready the first time: the driver waits for the waker.
-            self.step = 1;
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        self.step += 1;
-        match self.step {
-            2 => Poll::Ready(Some(Ok(b"la".to_vec()))),
-            3 => {
-                driver.record(Event::new("echo", "later").field("written", driver.written()));
-                Poll::Ready(Some(Ok(b"ter\n".to_vec())))
-            }
-            _ => Poll::Ready(None),
-        }
-    }
-}
-
-/// Sends `tick` on a timer, three times, then closes.
-struct Ticker {
-    ticks: u32,
-}
-
-service_fixture! {
-    Ticker => (Lines, (), Infallible);
-
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
-    }
-
-    on_open(self; _, driver) -> Flow {
-        driver.set_timer("tick", Duration::from_millis(30));
-        Ok(Flow::Continue)
-    }
-
-    on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
-        Ok(Flow::Continue)
-    }
-
-    on_timer(self, _: Timer; _, driver) -> Flow {
-        self.ticks += 1;
-        driver.reply().extend_from_slice(b"tick\n");
-        if self.ticks == 3 {
-            return Ok(Flow::Close);
-        }
-        driver.set_timer("tick", Duration::from_millis(30));
-        Ok(Flow::Continue)
-    }
-}
 
 /// A PLC's state: sixteen holding registers.
 #[derive(Default)]
@@ -283,77 +173,6 @@ fn mb(transaction: u16, request: MbRequest) -> Vec<u8> {
 
 // ---------------------------------------------------------------------------
 // The harness
-
-#[test]
-fn the_harness_runs_a_service_with_no_runtime() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
-    assert_eq!(h.open().unwrap(), b"hello\n");
-    assert_eq!(h.push(b"one\ntw").unwrap(), b"one\n");
-    assert_eq!(h.push(b"o\n").unwrap(), b"two\n");
-    // A line past the limit is one error item, and the service goes on.
-    assert_eq!(h.push(&[b'x'; 100]).unwrap(), b"too long\n");
-    assert_eq!(h.push(b"\nthree\n").unwrap(), b"three\n");
-    assert_eq!(h.push(b"quit\n").unwrap(), b"bye\n");
-    assert!(h.closed());
-    assert_eq!(h.end_reason(), Some(Ended::Closed));
-    assert!(matches!(h.push(b"more\n"), Err(HarnessError::Closed)));
-    let lines: Vec<&str> = h.events().iter().map(|e| e.summary.as_str()).collect();
-    assert_eq!(lines, ["one", "two", "three", "quit"]);
-    assert_eq!(h.output(), b"hello\none\ntwo\ntoo long\nthree\nbye\n");
-}
-
-#[test]
-fn the_harness_moves_its_clock_and_ticks() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Ticker { ticks: 0 }, ());
-    h.open().unwrap();
-    assert!(h.deadline().is_some());
-    assert_eq!(h.advance(Duration::from_millis(10)).unwrap(), b"");
-    assert_eq!(h.advance(Duration::from_millis(25)).unwrap(), b"tick\n");
-    assert_eq!(h.advance(Duration::from_millis(30)).unwrap(), b"tick\n");
-    assert_eq!(h.advance(Duration::from_millis(30)).unwrap(), b"tick\n");
-    assert!(h.closed());
-}
-
-#[test]
-fn a_half_close_ends_with_the_last_reply() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
-    h.push(b"a\nb").unwrap();
-    // The unterminated line is an error item at the end, then on_end.
-    assert_eq!(h.end().unwrap(), b"too long\neof\n");
-    assert_eq!(h.end_reason(), Some(Ended::Eof));
-}
-
-#[test]
-fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
-    struct Strict {
-        unread: Vec<u8>,
-    }
-    service_fixture! {
-        Strict => (fictionet::stdlib::codec::Frames<modbus::Frame>, (), Infallible);
-        decoder(self) {
-            fictionet::stdlib::codec::Frames::<modbus::Frame>::new()
-        }
-        on_item(self, _: Frame; _, _) -> Flow {
-            Ok(Flow::Continue)
-        }
-        on_fail(self, _: &fictionet::stdlib::codec::Fail<modbus::Error>; _, driver) -> () {
-            self.unread = driver.unread().to_vec();
-            driver.reply().extend_from_slice(b"no");
-            Ok(())
-        }
-    }
-    let mut h = Harness::new(
-        fictionet::Seed::from_u64(0),
-        Strict { unread: Vec::new() },
-        (),
-    );
-    // Protocol id 7: not Modbus.
-    let bad = [0, 1, 0, 7, 0, 6, 1, 3, 0, 0, 0, 1];
-    assert!(matches!(h.push(&bad), Err(HarnessError::Decode(_))));
-    assert_eq!(h.output(), b"no");
-    assert_eq!(h.service().unread, bad);
-    assert_eq!(h.end_reason(), Some(Ended::Failed));
-}
 
 /// A service's replies must not depend on how the client's bytes were cut
 /// into chunks: every split of the input gives the same output.
