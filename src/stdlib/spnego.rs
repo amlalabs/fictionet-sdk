@@ -88,6 +88,10 @@ pub const INIT_TAG: u8 = 0xa0;
 pub const RESP_TAG: u8 = 0xa1;
 
 /// Why bytes are not a SPNEGO token, or why a writer could not write one.
+///
+/// [`Error::Asn1`] returns the underlying error from
+/// [`source()`](std::error::Error::source). Its display is `malformed ASN.1`;
+/// [`fictionet::ErrorChain`] includes the underlying diagnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// Encoding would change the value when parsed.
@@ -123,20 +127,33 @@ pub enum Error {
     HintAddress,
 }
 
-fictionet::error_display!(Error, f, {
-    Error::Unwritable => f.write_str("value cannot be written without changing it"),
-    Error::Asn1(e) => write!(f, "ASN.1: {e}"),
-    Error::TooLong => write!(f, "token longer than {MAX_TOKEN} bytes"),
-    Error::TooManyMechs => write!(f, "more than {MAX_MECHS} mechanisms"),
-    Error::NotToken => f.write_str("not a GSS-API or SPNEGO token"),
-    Error::Indefinite => f.write_str("indefinite length on a token"),
-    Error::WrongMech => f.write_str("GSS-API wrapper for a mechanism other than SPNEGO"),
-    Error::Field => f.write_str("field out of order, repeated or not context-specific"),
-    Error::WrappedResp => f.write_str("negTokenResp inside a GSS-API wrapper"),
-    Error::MissingMechTypes => f.write_str("NegTokenInit without mechTypes"),
-    Error::NegState(v) => write!(f, "negState {v}, outside 0..=3"),
-    Error::HintAddress => f.write_str("hintAddress, which a sender must leave out"),
-});
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Asn1(_) => f.write_str("malformed ASN.1"),
+            Error::TooLong => write!(f, "token longer than {MAX_TOKEN} bytes"),
+            Error::TooManyMechs => write!(f, "more than {MAX_MECHS} mechanisms"),
+            Error::NotToken => f.write_str("not a GSS-API or SPNEGO token"),
+            Error::Indefinite => f.write_str("indefinite length on a token"),
+            Error::WrongMech => f.write_str("GSS-API wrapper for a mechanism other than SPNEGO"),
+            Error::Field => f.write_str("field out of order, repeated or not context-specific"),
+            Error::WrappedResp => f.write_str("negTokenResp inside a GSS-API wrapper"),
+            Error::MissingMechTypes => f.write_str("NegTokenInit without mechTypes"),
+            Error::NegState(v) => write!(f, "negState {v}, outside 0..=3"),
+            Error::HintAddress => f.write_str("hintAddress, which a sender must leave out"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Asn1(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<asn1::Error> for Error {
     fn from(e: asn1::Error) -> Error {
@@ -927,6 +944,39 @@ mod tests {
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+
+    #[test]
+    fn asn1_error_source_and_display() {
+        use std::error::Error as _;
+
+        let error = NegotiationToken::parse(&[RESP_TAG, 0x03, 0x30, 0x00]).unwrap_err();
+        assert_eq!(error, Error::Asn1(asn1::Error::Truncated));
+        let source = error.source().unwrap();
+        assert_eq!(
+            source.downcast_ref::<asn1::Error>(),
+            Some(&asn1::Error::Truncated)
+        );
+        assert!(source.source().is_none());
+        assert_eq!(error.to_string(), "malformed ASN.1");
+        assert_eq!(source.to_string(), "input ends inside an element");
+        assert_eq!(
+            fictionet::ErrorChain(&error).to_string(),
+            "malformed ASN.1: input ends inside an element"
+        );
+    }
+
+    #[test]
+    fn local_error_source_and_display() {
+        use std::error::Error as _;
+
+        let error = Error::NegState(4);
+        assert!(error.source().is_none());
+        assert_eq!(error.to_string(), "negState 4, outside 0..=3");
+        assert_eq!(
+            fictionet::ErrorChain(&error).to_string(),
+            "negState 4, outside 0..=3"
+        );
+    }
 
     fn initial_context_token(mech: Mech, inner: Vec<u8>) -> InitialContextToken {
         InitialContextToken { mech, inner }
