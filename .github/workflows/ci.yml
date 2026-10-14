@@ -206,6 +206,8 @@ jobs:
           workspaces: fuzz
       - name: Every target has a [[bin]] and a corpus directory
         run: fuzz/check-targets.sh
+      - name: Fuzz sweep regressions
+        run: bash fuzz/tests/run_all.sh
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       # +nightly overrides the stable toolchain pinned in rust-toolchain.toml.

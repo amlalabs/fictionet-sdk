@@ -3,6 +3,7 @@
 # after another, and reports the ones that failed at the end instead of
 # stopping at the first. Needs nightly and cargo-fuzz; build first with
 # `cargo +nightly fuzz build -O -a`. Extra arguments go to libFuzzer.
+# Fails if target discovery fails or returns no targets.
 #
 #   fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
 #
@@ -17,8 +18,17 @@ shift || true
 triple=()
 [ -n "${FUZZ_TRIPLE:-}" ] && triple=(--target "$FUZZ_TRIPLE")
 
+if ! targets=$(cargo +nightly fuzz list); then
+  echo "::error::fuzz target discovery failed" >&2
+  exit 1
+fi
+if [[ -z "${targets//[[:space:]]/}" ]]; then
+  echo "::error::fuzz target discovery returned no targets" >&2
+  exit 1
+fi
+
 failed=()
-for t in $(cargo +nightly fuzz list); do
+for t in $targets; do
   echo "::group::$t"
   # libFuzzer refuses a corpus directory that does not exist.
   mkdir -p "fuzz/corpus/$t"

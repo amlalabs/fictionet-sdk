@@ -74,6 +74,9 @@ fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
 ```
 
 It goes on past a target that fails and lists the failures at the end.
+It fails without running any targets if `cargo fuzz list` fails or
+lists no targets. `fuzz/tests/run_all.sh` tests the sweep with a stub
+cargo, and CI runs it.
 Every target needs a `[[bin]]` in `fuzz/Cargo.toml` and a directory in
 `fuzz/corpus/`, even an empty one. `fuzz/check-targets.sh` checks both,
 and CI runs it.
