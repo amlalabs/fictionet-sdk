@@ -150,6 +150,10 @@ has said.
   piece, and logs any it cannot find as `unsupported_snippets`. A result for
   a page that already exists shows that page's own title and description.
   Google, DuckDuckGo and Bing share one result list per query.
+  Choosing a title and recording its mention happen under the same URL
+  lock as page creation. Concurrent queries and direct page requests use
+  the first reserved title, even across worlds sharing a store. A search
+  waits for an in-progress page to finish before using its metadata.
 * **Links carry context.** Every link on a page is written down with its
   anchor text, so the page behind it knows how it was reached, even when
   the client sends no Referer.

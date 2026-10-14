@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import queue
 import re
 import shutil
 import tempfile
@@ -17,6 +18,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,7 +26,7 @@ from unittest.mock import patch
 from urllib.parse import unquote
 
 from adaptive import llm, prompts, seed as seeds, tells
-from adaptive.generate import Model
+from adaptive.generate import Made, Model
 from adaptive.seed import target_of
 from adaptive.store import Error as StoreError, Store, url_parts
 from adaptive.stub import Stub
@@ -164,6 +166,141 @@ class Consistency(unittest.TestCase):
         page = ("Kwame Osei | Oct 5 Just finished the HG-900 updates last night. "
                 "Any issues with the 7.2.4 release so far? 12 replies")
         self.assertEqual(unsupported_snippets([stitched], page), [])
+
+
+RACE_HOST = "race.example-site.com"
+RACE_TARGET = "/story"
+RACE_URL = f"https://{RACE_HOST}{RACE_TARGET}"
+
+
+class CompetingTitles(Stub):
+    def search(self, query, known, claims, cast):
+        return Made({"results": [{"url": RACE_URL, "title": query, "snippet": f"Snippet for {query}.",
+                                  "date": "1 Oct 2026"}]}, self.model, 0)
+
+
+class PausedMetadata(Store):
+    """Pause the first reader with an empty mention snapshot. The other
+    request reaches the URL lock before the first reader continues."""
+
+    def __init__(self, root, first, ready, contending):
+        super().__init__(root)
+        self.pause = first
+        self.signal = not first
+        self.ready = ready
+        self.contending = contending
+
+    def _read(self, path):
+        value = super()._read(path)
+        if self.pause and path == self.page_dir(RACE_HOST, RACE_TARGET) / "@mentions.json":
+            self.pause = False
+            self.ready.wait(timeout=10)
+            self.contending.wait(timeout=10)
+        return value
+
+    @contextmanager
+    def _locked(self, path):
+        if (self.signal and path.parent == self.page_dir(RACE_HOST, RACE_TARGET)
+                and path.name in ("@page.lock", "@mentions.lock")):
+            # The old search path only locked the append, after choosing
+            # its title. The new path locks before reading any metadata.
+            self.signal = False
+            self.contending.wait(timeout=10)
+        with super()._locked(path):
+            yield
+
+
+def competing_request(root, first, action, ready, contending, out):
+    try:
+        store = PausedMetadata(Path(root), first, ready, contending)
+        w = World(SEED, store, CompetingTitles(SEED))
+        if not first:
+            ready.wait(timeout=10)
+        response = (w.page(RACE_HOST, RACE_TARGET) if action == "page"
+                    else w.search("google", action))
+        out.put((action, response, None))
+    except Exception as err:
+        out.put((action, None, repr(err)))
+
+
+class ConcurrentMetadata(unittest.TestCase):
+    def race(self, first, processes, second="second"):
+        with tempfile.TemporaryDirectory() as d:
+            if processes:
+                context = multiprocessing.get_context("spawn")
+                ready, contending = context.Barrier(2), context.Barrier(2)
+                out, worker = context.Queue(), context.Process
+            else:
+                ready, contending = threading.Barrier(2), threading.Barrier(2)
+                out, worker = queue.Queue(), threading.Thread
+            workers = [worker(target=competing_request,
+                              args=(d, i == 0, action, ready, contending, out), daemon=True)
+                       for i, action in enumerate((first, second))]
+            try:
+                for w in workers:
+                    w.start()
+                got = [out.get(timeout=15) for _ in workers]
+                for w in workers:
+                    w.join(timeout=10)
+                    self.assertFalse(w.is_alive(), "URL metadata lock deadlocked")
+                for _, _, error in got:
+                    self.assertIsNone(error)
+            finally:
+                ready.abort()
+                contending.abort()
+                for w in workers:
+                    if processes and w.is_alive():
+                        w.terminate()
+                    w.join(timeout=10)
+                if processes:
+                    out.close()
+                    out.join_thread()
+
+            w = World(SEED, Store(Path(d)), CompetingTitles(SEED))
+            page = w.page(RACE_HOST, RACE_TARGET)
+            title = "Story" if first == "page" else first
+            self.assertEqual(page.meta["title"], title)
+            self.assertIn(f"<title>{title}</title>".encode(), page.body)
+            replay = World(SEED, Store(Path(d)), None)
+            self.assertEqual(replay.page(RACE_HOST, RACE_TARGET).body, page.body)
+            queries = []
+            for action, response, _ in got:
+                if action == "page":
+                    self.assertEqual(response.body, page.body)
+                    continue
+                queries.append(action)
+                self.assertEqual(results(response.body), [(RACE_URL, title)])
+                cached = replay.search("google", action)
+                self.assertEqual(cached.meta["cache"], "cached")
+                self.assertEqual(cached.body, response.body)
+                record = w.store.search(action)["results"][0]
+                self.assertEqual(record["title"], title)
+                self.assertEqual(record["date"], "1 Oct 2026")
+                snippet = (w.store.page(RACE_HOST, RACE_TARGET)["description"] if first == "page"
+                           else f"Snippet for {action}.")
+                self.assertEqual(record["snippet"], snippet)
+            mentions = w.store.mentions(RACE_HOST, RACE_TARGET)
+            self.assertEqual(sorted(m["query"] for m in mentions), sorted(queries))
+            self.assertEqual({m["title"] for m in mentions}, {title})
+            self.assertTrue(all(m["rank"] == 1 for m in mentions))
+
+    def test_competing_searches_in_threads(self):
+        self.race("first", processes=False)
+
+    def test_competing_searches_in_processes(self):
+        self.race("first", processes=True)
+
+    def test_direct_page_and_search_in_threads(self):
+        self.race("page", processes=False)
+
+    def test_direct_page_and_search_in_processes(self):
+        self.race("page", processes=True)
+
+    def test_search_and_direct_page_in_threads(self):
+        self.race("first", processes=False, second="page")
+
+    def test_search_and_direct_page_in_processes(self):
+        self.race("first", processes=True, second="page")
 
 
 class Tells(unittest.TestCase):

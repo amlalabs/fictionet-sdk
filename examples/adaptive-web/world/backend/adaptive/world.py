@@ -16,6 +16,8 @@ Every request is one of:
 The consistency rules live here: a page takes the title its first mention
 showed, a result for a URL the world already knows shows what the world
 said about it, and every snippet is checked against the page behind it.
+Searches reserve that title under the same URL lock as page creation, so
+concurrent searches and direct page requests publish one title.
 
 Without a generator (replay) nothing new is made: a URL the store does not
 hold is a 404, and a query it does not hold has no results.
@@ -216,29 +218,16 @@ class World:
             host, target = target_of(r["url"])
             if not host or any(x["url"] == r["url"] for x in results):
                 continue
-            r = self._as_known(host, target, r)
-            results.append(r)
-            self.store.add_mention(host, target, {"via": "search", "query": query, "rank": rank, "title": r["title"],
-                                                  "snippet": r["snippet"], "date": r.get("date", "")})
+            fixed = self.seed.fixed_for(host, target)
+            mention = self.store.reserve_mention(
+                host, target, {"via": "search", "query": query, "rank": rank, "title": r["title"],
+                               "snippet": r["snippet"], "date": r.get("date", "")},
+                {"title": fixed.title, "description": fixed.description} if fixed else None)
+            results.append(dict(r, title=mention["title"], snippet=mention["snippet"]))
         self.store.log_generation({"kind": "search", "query": query, **made.usage(), "raw": made.raw})
         return {"query": query, "key": key, "results": results, "related": made.fields.get("related", []),
                 "questions": made.fields.get("questions", []), "ads": made.fields.get("ads", []),
                 **made.usage(), "created": time.time()}
-
-    def _as_known(self, host: str, target: str, result: dict) -> dict:
-        """A result for a URL the world already knows shows what the world
-        said about it: the page's title and description, the fixed page's,
-        or the title an earlier result showed."""
-        page = self.store.page(host, target)
-        fixed = self.seed.fixed_for(host, target)
-        earlier = [m["title"] for m in self.store.mentions(host, target) if m.get("title")]
-        if page and page.get("title"):
-            return dict(result, title=page["title"], snippet=page.get("description") or result["snippet"])
-        if fixed:
-            return dict(result, title=fixed.title or result["title"], snippet=fixed.description or result["snippet"])
-        if earlier:
-            return dict(result, title=earlier[0])
-        return result
 
     def _prefetch(self, host: str, target: str) -> None:
         try:

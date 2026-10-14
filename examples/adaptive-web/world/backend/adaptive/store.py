@@ -22,6 +22,12 @@ Every write goes to a temporary file first and is renamed into place, so a
 reader never sees half a page. Next to a file that is made once there is a
 lock file (`@page.lock`, `@search.lock`, `@site.lock`, `@mentions.lock`,
 `@cast.lock`, `@store.lock`).
+
+Search results reserve a URL's title under its page lock, then its mentions
+lock. Search creation holds its query lock outside these locks. Page
+creation holds the same page lock from reading mentions through writing
+the page. It never takes a search lock. Outgoing links are recorded after
+releasing the page lock, so two pages cannot wait on each other's locks.
 """
 from __future__ import annotations
 
@@ -203,6 +209,32 @@ class Store:
 
     def mentions(self, host: str, target: str) -> list[dict]:
         return self._read(self.page_dir(host, target) / "@mentions.json") or []
+
+    def reserve_mention(self, host: str, target: str, mention: dict, fixed: dict | None = None) -> dict:
+        """Choose and record a search mention's canonical metadata atomically.
+
+        An existing page supplies its title and description, then a fixed
+        page declaration, then the first titled mention. Return the mention
+        with that metadata so the caller publishes the same title. The page
+        lock also excludes page creation until the mention is on disk.
+        """
+        directory = self.page_dir(host, target)
+        with self._locked(directory / "@page.lock"):
+            with self._locked(directory / "@mentions.lock"):
+                page = self.page(host, target)
+                current = self.mentions(host, target)
+                earlier = [m["title"] for m in current if m.get("title")]
+                if page and page.get("title"):
+                    mention = dict(mention, title=page["title"],
+                                   snippet=page.get("description") or mention["snippet"])
+                elif fixed is not None:
+                    mention = dict(mention, title=fixed.get("title") or mention["title"],
+                                   snippet=fixed.get("description") or mention["snippet"])
+                elif earlier:
+                    mention = dict(mention, title=earlier[0])
+                if mention not in current:
+                    self._write(directory / "@mentions.json", current + [mention])
+                return mention
 
     def add_mention(self, host: str, target: str, mention: dict) -> None:
         path = self.page_dir(host, target) / "@mentions.json"
