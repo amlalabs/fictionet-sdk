@@ -2349,6 +2349,9 @@ pub struct TreeConnectResponse {
 }
 
 /// An IOCTL response.
+///
+/// The complete message may be up to [`MAX_MESSAGE`] bytes, including the
+/// SMB2 header, the fixed body, input, alignment padding and output.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IoctlResponse {
     /// The code, as in the request.
@@ -2813,11 +2816,7 @@ impl Response {
                 put32(&mut w, 0);
                 w.extend_from_slice(&r.input);
                 if !r.output.is_empty() {
-                    too_long(
-                        HEADER_LEN
-                            .saturating_add(out_at as usize)
-                            .saturating_add(r.output.len()),
-                    )?;
+                    too_long((out_at as usize).saturating_add(r.output.len()))?;
                     w.resize(out_at as usize - HEADER_LEN, 0);
                     w.extend_from_slice(&r.output);
                 }
@@ -5084,6 +5083,76 @@ mod tests {
             le32(&response_body(&none, command::IOCTL, 0).unwrap(), 32).ok_or(Error::Truncated),
             Ok(0)
         );
+    }
+
+    #[test]
+    fn ioctl_response_message_size_limit() {
+        let header = Header::new(command::IOCTL, 0);
+        for input_len in [0, 1, 8, 9] {
+            let out_at = (112usize + input_len).next_multiple_of(8);
+            for size in [MAX_MESSAGE - 1, MAX_MESSAGE, MAX_MESSAGE + 1] {
+                let resp = Response::Ioctl(IoctlResponse {
+                    input: vec![1; input_len],
+                    output: vec![2; size - out_at],
+                    ..Default::default()
+                });
+                let result = resp.message(&header, status::SUCCESS);
+                if size > MAX_MESSAGE {
+                    assert_eq!(result, Err(Error::Unwritable));
+                    continue;
+                }
+                let message = result.unwrap();
+                let bytes = message.to_bytes().unwrap();
+                assert_eq!(bytes.len(), size);
+                assert_eq!(le32(&bytes, 96), Some(out_at as u32));
+                assert!(bytes[112 + input_len..out_at].iter().all(|&b| b == 0));
+                let parsed = Message::parse(&bytes).unwrap();
+                assert_eq!(parsed, message);
+                assert_eq!(parsed.response(), Ok(resp));
+            }
+        }
+    }
+
+    #[test]
+    fn ioctl_response_at_limit_rebuilds_from_wire() {
+        let mut bytes = header_bytes(command::IOCTL, 0, flags::SERVER_TO_REDIR, 0, 7, 0, 0);
+        bytes.extend_from_slice(&le(
+            &[
+                49,
+                0,
+                0,
+                0,
+                0,
+                112,
+                1,
+                120,
+                (MAX_MESSAGE - 120) as u64,
+                0,
+                0,
+            ],
+            &[2, 2, 4, 8, 8, 4, 4, 4, 4, 4, 4],
+        ));
+        bytes.push(1);
+        bytes.resize(120, 0);
+        bytes.resize(MAX_MESSAGE, 2);
+        let Packet::Smb2(messages) = Packet::parse(&bytes).unwrap() else {
+            panic!()
+        };
+        assert_eq!(messages.len(), 1);
+        let response = messages[0].response().unwrap();
+        let Response::Ioctl(ioctl) = &response else {
+            panic!()
+        };
+        assert_eq!(ioctl.input, [1]);
+        assert_eq!(ioctl.output.len(), MAX_MESSAGE - 120);
+        assert!(ioctl.output.iter().all(|&b| b == 2));
+        let rebuilt = response
+            .message(&Header::new(command::IOCTL, 7), status::SUCCESS)
+            .unwrap();
+        assert_eq!(rebuilt.body, messages[0].body);
+        let encoded = rebuilt.to_bytes().unwrap();
+        assert_eq!(encoded.len(), MAX_MESSAGE);
+        assert_eq!(Message::parse(&encoded).unwrap().response(), Ok(response));
     }
 
     #[test]
