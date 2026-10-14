@@ -112,6 +112,12 @@ seconds) ends the connection: a client that stops reading cannot hold a
 reply, or a service's timers, for ever. A client that resets the
 connection ends it at once, also while a write waits.
 
+TCP disappearance watches wake when either side resets the connection or
+the endpoint stops, even while a handler keeps the connection without
+reading it. A local reset makes retained handles report `ConnError::Reset`;
+an endpoint stop makes them report `ConnError::Closed`. The reset socket
+stays until its RST can be sent, even when packet output is full.
+
 ### One protocol, two framings
 
 Kerberos frames a message with a four-byte length over TCP, and sends one

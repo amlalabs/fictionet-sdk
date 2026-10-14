@@ -406,7 +406,7 @@ impl Listen {
 struct Conn {
     local: SocketAddr,
     remote: SocketAddr,
-    /// A RST arrived for this connection.
+    /// A RST arrived for this connection, or this side aborted it.
     rst: bool,
     /// A FIN arrived for this connection.
     fin: bool,
@@ -428,8 +428,8 @@ struct Conn {
     /// Kept until the socket is gone, after the handle is dropped too: see
     /// [`TcpConnection::hold_until_gone`].
     held: Vec<Box<dyn std::any::Any + Send>>,
-    /// Woken when a RST arrives or this side aborts, and when the
-    /// connection is forgotten: see [`GoneWatch`].
+    /// Woken when a RST arrives or this side aborts, when the endpoint
+    /// stops, and when the connection is forgotten: see [`GoneWatch`].
     gone: Vec<Waker>,
 }
 
@@ -748,6 +748,15 @@ impl State {
         }
     }
 
+    /// Resets the connection and wakes its waiters, keeping the socket
+    /// until its RST can be sent.
+    fn abort(&mut self, h: Id) {
+        let c = self.conns.get_mut(&h).unwrap();
+        c.rst = true;
+        c.wake_gone();
+        self.sock(h).abort();
+    }
+
     /// Hands a socket whose handle is gone to the driver, which removes it
     /// once it has closed. Unread data means the application lost bytes,
     /// so the peer gets a RST, as from a kernel.
@@ -757,7 +766,7 @@ impl State {
             return;
         }
         if abort || self.get(h).can_recv() {
-            self.sock(h).abort();
+            self.abort(h);
         } else {
             self.conns.get_mut(&h).unwrap().shut = true;
             self.close_if_drained(h);
@@ -1195,6 +1204,7 @@ impl Shared {
         // Aborting wakes each socket's reader and writer.
         let handles: Vec<Id> = st.conns.keys().copied().collect();
         for h in handles {
+            wakers.append(&mut st.conns.get_mut(&h).unwrap().gone);
             st.sock(h).abort();
         }
         for h in std::mem::take(&mut st.orphans) {
@@ -1341,10 +1351,7 @@ impl Endpoint {
             return;
         }
         for h in hs {
-            let c = st.conns.get_mut(&h).expect("listed above");
-            c.rst = true;
-            c.wake_gone();
-            st.sock(h).abort();
+            st.abort(h);
         }
         st.kick();
     }
@@ -1595,8 +1602,9 @@ impl TcpConnection {
         self.local
     }
 
-    /// Closes the connection with a RST immediately. Its socket is removed
-    /// without waiting for the peer.
+    /// Closes the connection with a RST immediately and wakes disappearance
+    /// watches. Its socket stays until the RST can be sent, without waiting
+    /// for the peer.
     ///
     /// Dropping a connection whose received bytes were all read closes it
     /// with a FIN instead. Its socket then stays until the peer has finished
@@ -1606,13 +1614,13 @@ impl TcpConnection {
     /// limit, resets each connection it is done with.
     pub fn reset(self) {
         let mut st = self.shared.state.lock();
-        st.sock(self.handle).abort();
+        st.abort(self.handle);
         st.kick();
     }
 
     /// A watch that says when this connection has been reset, by either
-    /// side, or is gone, without reading from it. For a server that is not
-    /// reading, such as HTTP/1.1 while a handler works.
+    /// side, is gone, or its endpoint has stopped, without reading from it.
+    /// For a server that is not reading, such as HTTP/1.1 while a handler works.
     pub fn gone_watch(&self) -> GoneWatch {
         GoneWatch {
             shared: self.shared.clone(),
@@ -1630,8 +1638,8 @@ impl TcpConnection {
     }
 }
 
-/// Says when a connection has been reset or is gone, without reading
-/// from it. See [`TcpConnection::gone_watch`].
+/// Says when a connection has been reset, is gone, or its endpoint has
+/// stopped, without reading from it. See [`TcpConnection::gone_watch`].
 #[derive(Clone)]
 pub struct GoneWatch {
     shared: Arc<Shared>,
@@ -1639,17 +1647,19 @@ pub struct GoneWatch {
 }
 
 impl GoneWatch {
-    /// Ready once the connection was reset, or is gone.
+    /// Ready once the connection was reset, is gone, or its endpoint stopped.
     pub fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
         poll_gone(&self.shared, self.handle, cx)
     }
 
     /// Resets the connection, as [`TcpConnection::reset`] does, after the
-    /// connection itself was handed on.
+    /// connection itself was handed on. Wakes disappearance watches even
+    /// while the connection handle is retained. Reads and writes on that
+    /// handle report [`ConnError::Reset`].
     pub fn reset(&self) {
         let mut st = self.shared.state.lock();
         if st.conns.contains_key(&self.handle) {
-            st.sock(self.handle).abort();
+            st.abort(self.handle);
             st.kick();
         }
     }
@@ -1867,6 +1877,110 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.1.lock().push(self.0);
         }
+    }
+
+    #[test]
+    fn local_reset_wakes_watches_before_rst_egress() {
+        for reset in 0..3 {
+            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+                let (a, b) = pair();
+                let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
+                let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
+                let mut listener = server.listen(80)?;
+                let _client = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+                let conn = listener.accept(&fcx).await?;
+                let h = conn.handle;
+                let watches = [conn.gone_watch(), conn.gone_watch()];
+                let log = Arc::new(Mutex::new(Vec::new()));
+                for (i, watch) in watches.iter().enumerate() {
+                    let waker = Waker::from(Arc::new(WakeLog(i as u16, log.clone())));
+                    assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_pending());
+                }
+                let mut conn = Some(conn);
+                match reset {
+                    0 => watches[0].reset(),
+                    1 => conn.take().unwrap().reset(),
+                    _ => server.abort_peer(client.addr()),
+                }
+                assert_eq!(*log.lock(), [0, 1]);
+                let cx = &mut Context::from_waker(Waker::noop());
+                for watch in &watches {
+                    assert!(watch.poll_gone(cx).is_ready());
+                }
+                if let Some(conn) = &mut conn {
+                    assert!(matches!(
+                        conn.poll_read(&fcx, cx, &mut [0]),
+                        Poll::Ready(Err(ConnError::Reset))
+                    ));
+                    assert!(matches!(
+                        conn.poll_write(&fcx, cx, b"x"),
+                        Poll::Ready(Err(ConnError::Reset))
+                    ));
+                }
+                let now = smol_now(&fcx);
+                {
+                    let mut st = server.shared.state.lock();
+                    st.dev.tx.clear();
+                    for _ in 0..EGRESS_PACKETS {
+                        st.dev.transmit(now).unwrap().consume(40, |_| {});
+                    }
+                    let st = &mut *st;
+                    st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
+                    st.housekeeping(now);
+                    assert!(st.conns.contains_key(&h), "unsent reset must keep its socket");
+                    assert!(st.get(h).remote_endpoint().is_some());
+                    st.dev.tx.clear();
+                    let packets = egress(st, now);
+                    assert_eq!(packets.len(), 1);
+                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                    assert_eq!(t[13] & 4, 4);
+                    st.housekeeping(now);
+                    assert_eq!(st.conns.contains_key(&h), conn.is_some());
+                }
+                drop(conn);
+                let mut st = server.shared.state.lock();
+                st.housekeeping(now);
+                assert!(!st.conns.contains_key(&h));
+                drop(st);
+                fcx.cancel();
+                Ok(())
+            })).unwrap();
+        }
+    }
+
+    #[test]
+    fn stop_wakes_watches_with_retained_connection() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (a, b) = pair();
+            let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
+            let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
+            let mut listener = server.listen(80)?;
+            let _client = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+            let mut conn = listener.accept(&fcx).await?;
+            let watches = [conn.gone_watch(), conn.gone_watch()];
+            let log = Arc::new(Mutex::new(Vec::new()));
+            for (i, watch) in watches.iter().enumerate() {
+                let waker = Waker::from(Arc::new(WakeLog(i as u16, log.clone())));
+                assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_pending());
+            }
+            server.shared.stop();
+            assert_eq!(*log.lock(), [0, 1]);
+            let cx = &mut Context::from_waker(Waker::noop());
+            for watch in &watches {
+                assert!(watch.poll_gone(cx).is_ready());
+            }
+            assert!(matches!(
+                conn.poll_read(&fcx, cx, &mut [0]),
+                Poll::Ready(Err(ConnError::Closed))
+            ));
+            assert!(matches!(
+                conn.poll_write(&fcx, cx, b"x"),
+                Poll::Ready(Err(ConnError::Closed))
+            ));
+            assert!(server.shared.state.lock().conns.contains_key(&conn.handle));
+            fcx.cancel();
+            Ok(())
+        })).unwrap();
     }
 
     #[test]
