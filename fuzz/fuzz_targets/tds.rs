@@ -146,7 +146,10 @@ fuzz_target!(|data: &[u8]| {
     }
     let kinds = [
         TypeInfo::nullable(data_type::INTN, 4),
-        TypeInfo::decimal(head.first().map_or(1, |p| p % 38 + 1), 0),
+        TypeInfo {
+            max_len: [5, 9, 13, 17][head.get(3).map_or(0, |b| usize::from(*b) % 4)],
+            ..TypeInfo::decimal(head.first().map_or(1, |p| p % 38 + 1), 0)
+        },
         TypeInfo::scaled(data_type::TIMEN, head.get(1).map_or(0, |s| s % 8)),
         TypeInfo::scaled(data_type::DATETIMEOFFSETN, head.get(2).map_or(0, |s| s % 8)),
         TypeInfo::string(data_type::NVARCHAR, 40),

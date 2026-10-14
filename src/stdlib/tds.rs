@@ -31,6 +31,8 @@
 //!
 //! Readers check lengths and return [`Error`] for bad
 //! input. Buffers have named limits, including [`MAX_MESSAGE`].
+//! A decimal or numeric column's maximum length must hold its
+//! precision, as [`TypeInfo::max_len`] gives.
 //!
 //! [MS-TDS]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/
 //!
@@ -1660,10 +1662,14 @@ pub struct TypeInfo {
     pub ty: u8,
     /// The most bytes a value may take, for types with a length. 0xFFFF
     /// for a varchar(max), nvarchar(max) or varbinary(max) column.
+    /// Decimal and numeric lengths are 5, 9, 13 or 17, including the sign,
+    /// and at least 5 for precision 1 to 9, 9 for 10 to 19, 13 for 20 to
+    /// 28, and 17 for 29 to 38.
     pub max_len: u32,
     /// For decimal and numeric columns: the number of digits, 1 to 38.
     pub precision: u8,
-    /// For decimal and numeric columns, the digits after the point. For
+    /// For decimal and numeric columns, the digits after the point,
+    /// at most [`precision`](Self::precision). For
     /// time, datetime2 and datetimeoffset, the digits of a second's
     /// fraction, 0 to 7.
     pub scale: u8,
@@ -1983,6 +1989,20 @@ fn decimal_len(precision: u8) -> u8 {
     }
 }
 
+/// Decimal metadata must leave room for the width the writer uses.
+fn check_decimal(t: &TypeInfo) -> Result<(), Error> {
+    if ![5, 9, 13, 17].contains(&t.max_len)
+        || !(1..=38).contains(&t.precision)
+        || t.scale > t.precision
+    {
+        return Err(Error::Invalid("decimal precision or scale"));
+    }
+    if t.max_len < u32::from(decimal_len(t.precision)) {
+        return Err(Error::Invalid("decimal length for precision"));
+    }
+    Ok(())
+}
+
 /// The bytes of a time of `scale`.
 fn time_len(scale: u8) -> usize {
     match scale {
@@ -2088,12 +2108,7 @@ fn read_type_info(c: &mut Reader) -> Result<TypeInfo, Error> {
             t.max_len = u32::from(c.u8()?);
             t.precision = c.u8()?;
             t.scale = c.u8()?;
-            if ![5, 9, 13, 17].contains(&t.max_len)
-                || !(1..=38).contains(&t.precision)
-                || t.scale > t.precision
-            {
-                return Err(Error::Invalid("decimal precision or scale"));
-            }
+            check_decimal(&t)?;
         }
         Class::Scaled => {
             t.scale = c.u8()?;
@@ -2120,6 +2135,7 @@ fn read_type_info(c: &mut Reader) -> Result<TypeInfo, Error> {
 fn write_type_info(out: &mut Vec<u8>, t: &TypeInfo) -> Result<(), Error> {
     match class(t.ty) {
         Some(Class::ByteLen | Class::Decimal) if t.max_len > 255 => return Err(Error::Unwritable),
+        Some(Class::Decimal) => check_decimal(t)?,
         Some(Class::UShort { .. }) if t.max_len > 0xffff => return Err(Error::Unwritable),
         None => return Err(Error::Unwritable),
         _ => {}
@@ -4734,6 +4750,127 @@ mod tests {
         let max = TypeInfo::decimal(38, 0);
         assert_eq!(takes(max.clone(), d(10u128.pow(38) - 1)), Ok(()));
         assert_eq!(takes(max, d(10u128.pow(38))), Err(Error::Unwritable));
+    }
+
+    #[test]
+    fn decimal_metadata_refuses_width_below_precision() {
+        // This parsed as 1, but writing it needed 17 bytes in a 5-byte column.
+        let bytes = [
+            0x81, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x05, 0x26, 0x00, 0x00,
+            0xd1, 0x05, 0x01, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let bad = Error::Invalid("decimal length for precision");
+        assert_eq!(TokenStream::parse(&bytes), Err(bad));
+        let mut reader = TokenReader::new(&bytes);
+        assert_eq!(reader.next(), Some(Err(bad)));
+        assert_eq!(reader.next(), None);
+    }
+
+    #[test]
+    fn decimal_metadata_width_boundaries() {
+        for ty in [data_type::DECIMALN, data_type::NUMERICN] {
+            for (precision, minimum) in [
+                (1, 5),
+                (9, 5),
+                (10, 9),
+                (19, 9),
+                (20, 13),
+                (28, 13),
+                (29, 17),
+                (38, 17),
+            ] {
+                for max_len in [5, 9, 13, 17] {
+                    for scale in [0, precision] {
+                        let t = TypeInfo {
+                            ty,
+                            max_len: u32::from(max_len),
+                            ..TypeInfo::decimal(precision, scale)
+                        };
+                        let columns = vec![Column::new("", t.clone())];
+                        let row = vec![Value::Decimal {
+                            positive: true,
+                            value: 1,
+                        }];
+                        let stream = TokenStream(vec![
+                            Token::ColMetadata(Some(columns.clone())),
+                            Token::Row(row.clone()),
+                        ]);
+                        let mut bytes = vec![
+                            0x81, 1, 0, 0, 0, 0, 0, 1, 0, ty, max_len, precision, scale, 0, 0xd1,
+                            5, 1, 1, 0, 0, 0,
+                        ];
+                        if max_len < minimum {
+                            let bad = Error::Invalid("decimal length for precision");
+                            assert_eq!(TokenStream::parse(&bytes), Err(bad), "{t:?}");
+                            assert_eq!(TokenReader::with_columns(&[], columns).err(), Some(bad));
+                            let mut out = vec![0xaa];
+                            assert_eq!(stream.write(&mut out), Err(Error::Unwritable));
+                            assert_eq!(out, [0xaa]);
+                            assert_eq!(takes(t, Value::Null), Err(Error::Unwritable));
+                        } else {
+                            assert_eq!(TokenStream::parse(&bytes), Ok(stream.clone()), "{t:?}");
+                            let mut reader =
+                                TokenReader::with_columns(&bytes[14..], columns).unwrap();
+                            assert_eq!(reader.next(), Some(Ok(Token::Row(row))));
+                            assert_eq!(reader.next(), None);
+                            bytes[15] = minimum;
+                            bytes.resize(16 + usize::from(minimum), 0);
+                            assert_eq!(stream.to_bytes(), Ok(bytes.clone()), "{t:?}");
+                            assert_eq!(TokenStream::parse(&bytes), Ok(stream));
+                            assert_eq!(takes(t.clone(), Value::Null), Ok(()));
+                            let limit = 10u128.pow(u32::from(precision));
+                            assert_eq!(
+                                takes(
+                                    t.clone(),
+                                    Value::Decimal {
+                                        positive: false,
+                                        value: limit - 1
+                                    }
+                                ),
+                                Ok(())
+                            );
+                            assert_eq!(
+                                takes(
+                                    t,
+                                    Value::Decimal {
+                                        positive: true,
+                                        value: limit
+                                    }
+                                ),
+                                Err(Error::Unwritable)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_metadata_error_precedence() {
+        for (max_len, precision, scale, error) in [
+            (4, 38, 0, Error::Invalid("decimal precision or scale")),
+            (5, 0, 0, Error::Invalid("decimal precision or scale")),
+            (5, 39, 0, Error::Invalid("decimal precision or scale")),
+            (5, 38, 39, Error::Invalid("decimal precision or scale")),
+            (5, 38, 0, Error::Invalid("decimal length for precision")),
+        ] {
+            // Metadata errors precede the missing column name and row.
+            let bytes = [
+                0x81, 1, 0, 0, 0, 0, 0, 0, 0, 0x6a, max_len, precision, scale,
+            ];
+            assert_eq!(TokenStream::parse(&bytes), Err(error));
+            let t = TypeInfo {
+                max_len: u32::from(max_len),
+                ..TypeInfo::decimal(precision, scale)
+            };
+            assert_eq!(
+                TokenReader::with_columns(&[], vec![Column::new("", t)]).err(),
+                Some(error)
+            );
+            // The full metadata must arrive before it can be validated.
+            assert_eq!(TokenStream::parse(&bytes[..12]), Err(Error::Truncated));
+        }
     }
 
     /// MS-TDS 2.2.5.5.1.8: a time is within a day, a date at most
