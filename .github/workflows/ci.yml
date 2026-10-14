@@ -136,6 +136,8 @@ jobs:
       - name: The adaptive web's backend
         working-directory: examples/adaptive-web/world/backend
         run: python3 -m unittest discover tests
+      - name: The adaptive web's realism judge
+        run: python3 -m unittest discover -s examples/adaptive-web/scripts -p 'test_*.py'
       - name: The browser example, on the host
         run: cargo test --locked --manifest-path examples/wasm_world/Cargo.toml
       - name: The browser example, in Node.js

@@ -14,9 +14,11 @@ to JUDGE_MODEL, which should be a model other than the generator. The judge
 is told that one of the two is real and one was written by a model, and
 picks the written one. Each pair is shown twice, in both orders, so a
 preference for the first or second place cancels out. The realism score is
-the share of judgments in which the judge picked the real one: 50% means it
-cannot tell them apart, 0% means it always can. The judge's reasons are
-saved next to the bench's pages, for finding the tells that give pages away.
+the share of valid judgments in which the judge picked the real one: 50%
+means it cannot tell them apart, 0% means it always can on valid judgments.
+Invalid output is retried up to three attempts and then excluded from the
+rate. A group with no valid judgments has no rate. All raw answers and
+attempt costs are saved next to the bench's pages for audit.
 """
 from __future__ import annotations
 
@@ -71,6 +73,7 @@ REAL_PAGES = {
     ],
 }
 CHARS = 2500
+JUDGE_ATTEMPTS = 3
 
 JUDGE = """You are shown two {kind}s, A and B, as plain text as an agent with curl would read them.
 One was captured from the real web. The other was written by an AI model to imitate a real one.
@@ -154,6 +157,64 @@ def real(out: Path) -> None:
             print(f"{seed}: {url}: HTTP {code}, {len(text)} characters{'' if ok else ', not kept'}")
 
 
+def parse_verdict(text: str) -> dict:
+    """Read one JSON object, optionally in one Markdown code fence, with an
+    exact A/B choice, ignoring case and whitespace."""
+    fence = re.fullmatch(r"```[^\s`]*[ \t]*\r?\n(.*?)\r?\n```", text.strip(), re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    verdict = json.loads(text)
+    if not isinstance(verdict, dict):
+        raise ValueError("expected a JSON object")
+    picked = verdict.get("written_by_ai")
+    if not isinstance(picked, str) or picked.strip().upper() not in ("A", "B"):
+        raise ValueError("written_by_ai must be A or B")
+    return {**verdict, "written_by_ai": picked.strip().upper()}
+
+
+def total_cost(records: list[dict]) -> float | None:
+    """Sum costs only when every cost is reported; an unknown cost stays unknown."""
+    return None if any(r["cost"] is None for r in records) else sum(r["cost"] for r in records)
+
+
+def judge_pair(client, kind: str, made_text: str, real_text: str, what: str, made_first: bool) -> dict:
+    """Judge one ordering, retaining every attempt and scoring only a valid choice."""
+    a, b = (made_text, real_text) if made_first else (real_text, made_text)
+    attempts = []
+    picked = None
+    reason = None
+    for _ in range(JUDGE_ATTEMPTS):
+        c = client.complete("You are a careful judge.", JUDGE.format(kind=kind, a=a, b=b), 1500)
+        attempt = {"raw": c.text, "cost": c.cost, "valid": False}
+        attempts.append(attempt)
+        try:
+            verdict = parse_verdict(c.text)
+        except ValueError as err:
+            attempt["error"] = str(err)
+            continue
+        attempt["valid"] = True
+        picked = verdict["written_by_ai"]
+        reason = verdict.get("reason")
+        break
+    valid = picked is not None
+    return {"kind": kind, "what": what, "made_first": made_first, "valid": valid,
+            "picked": picked, "fooled": picked == ("B" if made_first else "A") if valid else None,
+            "reason": reason, "cost": total_cost(attempts), "attempts": attempts}
+
+
+def summarize(verdicts: list[dict]) -> dict:
+    """Report valid denominators and exhausted failures separately for each kind."""
+    row = {}
+    for kind in ("search result list", "web page"):
+        vs = [v for v in verdicts if v["kind"] == kind]
+        valid = [v for v in vs if v["valid"]]
+        fooled = sum(v["fooled"] for v in valid)
+        row[kind] = {"fooled": fooled, "valid": len(valid), "invalid": len(vs) - len(valid),
+                     "rate": fooled / len(valid) if valid else None}
+    row["judge_cost"] = total_cost(verdicts)
+    return row
+
+
 def judge(bench: Path, real_dir: Path, judge_model: str) -> None:
     client = llm.client("openrouter", judge_model)
     client.reasoning = "low"
@@ -177,23 +238,9 @@ def judge(bench: Path, real_dir: Path, judge_model: str) -> None:
         verdicts = []
         for kind, made_text, real_text, what in pairs:
             for made_first in (True, False):
-                a, b = (made_text, real_text) if made_first else (real_text, made_text)
-                c = client.complete("You are a careful judge.", JUDGE.format(kind=kind, a=a, b=b), 1500)
-                m = re.search(r"\{.*\}", c.text, re.S)
-                try:
-                    v = json.loads(m.group(0)) if m else {}
-                except json.JSONDecodeError:
-                    v = {}
-                picked = str(v.get("written_by_ai", "")).strip().upper()[:1]
-                fooled = picked == ("B" if made_first else "A")
-                verdicts.append({"kind": kind, "what": what, "made_first": made_first, "picked": picked,
-                                 "fooled": fooled, "reason": v.get("reason", c.text[:300]), "cost": c.cost})
+                verdicts.append(judge_pair(client, kind, made_text, real_text, what, made_first))
         (model_dir / "judgments.json").write_text(json.dumps(verdicts, indent=1))
-        row = {}
-        for kind in ("search result list", "web page"):
-            vs = [v for v in verdicts if v["kind"] == kind]
-            row[kind] = (sum(v["fooled"] for v in vs), len(vs))
-        row["judge_cost"] = sum(v["cost"] or 0 for v in verdicts)
+        row = summarize(verdicts)
         summary[model_dir.name] = row
         print(model_dir.name, row, flush=True)
     (bench / f"realism-{judge_model.replace('/', '_')}.json").write_text(json.dumps(summary, indent=1))
