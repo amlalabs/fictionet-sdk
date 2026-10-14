@@ -1816,7 +1816,8 @@ pub enum CloseReason {
     /// Nothing arrived within [`Timers::idle_timeout_ms`].
     IdleTimeout,
     /// The peer sent a message that does not parse, or one its role or
-    /// the session's state does not allow.
+    /// the session's state does not allow, or the complete Login Response
+    /// would exceed [`MAX_MESSAGE`].
     Protocol,
 }
 
@@ -2186,6 +2187,12 @@ pub enum ServerPhase {
 /// Inbound sequence numbers may skip forward or be 0, but one not above
 /// the last is a protocol violation: the server sends a Logout with
 /// reason "!" and closes. Driving rules are those of [`Client`].
+///
+/// Before accepting or refusing a login, the server checks the complete
+/// response size, including echoed parameter groups and available units.
+/// If it exceeds [`MAX_MESSAGE`], the server reports
+/// [`Event::Disconnected`] with [`CloseReason::Protocol`] and sends nothing.
+/// Return fields and sequence numbers stay unchanged.
 #[derive(Clone, Debug)]
 pub struct Server {
     phase: ServerPhase,
@@ -2429,6 +2436,9 @@ impl Server {
                 groups: request.params.clone(),
             },
         };
+        if response.wire_len() > MAX_MESSAGE {
+            return Ok(self.close(CloseReason::Protocol));
+        }
         let mut actions = vec![Action::Send(response.into())];
         for (&unit, &through) in &highest {
             let after = match asked.get(&unit) {
@@ -2472,7 +2482,7 @@ impl Server {
         Ok(self.refuse(status, text))
     }
     fn refuse(&mut self, status: u8, text: &str) -> Vec<Action<Outbound, Event>> {
-        let request = self.request.take().unwrap_or_default();
+        let request = self.request.clone().unwrap_or_default();
         let no_unspecified = request
             .params
             .0
@@ -2496,6 +2506,10 @@ impl Server {
                 groups: request.params,
             },
         };
+        if response.wire_len() > MAX_MESSAGE {
+            return self.close(CloseReason::Protocol);
+        }
+        self.request = None;
         self.clock.sent = self.clock.now;
         let mut actions = vec![Action::Send(response.into())];
         actions.extend(self.close(CloseReason::Rejected));
@@ -4341,6 +4355,168 @@ mod tests {
                 .unwrap(),
             [Action::Event(Event::Disconnected(CloseReason::Protocol))]
         );
+    }
+
+    fn login_of_length(len: usize, mut groups: Vec<ParamGroup>) -> LoginRequest {
+        groups.push(ParamGroup::Other {
+            kind: 0x99,
+            data: Vec::new(),
+        });
+        let mut request = LoginRequest {
+            params: ParamGroups(groups),
+            ..LoginRequest::default()
+        };
+        let padding = len - request.wire_len();
+        let Some(ParamGroup::Other { data, .. }) = request.params.0.last_mut() else {
+            unreachable!()
+        };
+        data.resize(padding, 0);
+        let bytes = request.to_bytes().unwrap();
+        assert_eq!(bytes.len(), len);
+        LoginRequest::parse(&bytes).unwrap()
+    }
+
+    fn pending_login(request: &LoginRequest) -> Server {
+        let mut server = Server::new(Timers::default(), 0).unwrap();
+        server.receive(&request.clone().into(), 1).unwrap();
+        assert_eq!(server.phase(), ServerPhase::LoginPending);
+        server
+    }
+
+    fn assert_login_overflow(server: &Server, actions: &[Action<Outbound, Event>]) {
+        assert!(matches!(
+            actions,
+            [Action::Event(Event::Disconnected(CloseReason::Protocol))]
+        ));
+        assert_eq!(server.phase(), ServerPhase::Closed);
+        assert!(server.returns().is_empty());
+        assert_eq!(server.last_inbound(), 0);
+        assert!(server.sent().is_empty());
+        assert_eq!(server.clock.sent, 0);
+        assert_eq!(server.clock.received, 1);
+    }
+
+    #[test]
+    fn login_response_overflow() {
+        let request = login_of_length(65_537, Vec::new());
+        assert!(
+            matches!(&request.params.0[..], [ParamGroup::Other { data, .. }] if data.len() == 65_505)
+        );
+        let mut server = pending_login(&request);
+        let actions = server.accept(150, &[], 2).unwrap();
+        assert_login_overflow(&server, &actions);
+
+        let mut server = pending_login(&request);
+        let actions = server.reject(b'N', "Not authorized", 2).unwrap();
+        assert_login_overflow(&server, &actions);
+    }
+
+    #[test]
+    fn login_response_size_boundary() {
+        for available in [
+            Vec::new(),
+            vec![unit_sequence(1, 0)],
+            vec![unit_sequence(1, 7)],
+            (1..=255).map(|unit| unit_sequence(unit, 7)).collect(),
+        ] {
+            for extra in [0, 1] {
+                // The response adds 49 fixed/count bytes and five per available unit.
+                let request = login_of_length(
+                    MAX_MESSAGE - 49 - 5 * available.len() + extra,
+                    vec![ParamGroup::ReturnBitfields {
+                        message_type: 0x25,
+                        bitfields: vec![0, 0x41],
+                    }],
+                );
+                let mut server = pending_login(&request);
+                let actions = server.accept(150, &available, 2).unwrap();
+                if extra != 0 {
+                    assert_login_overflow(&server, &actions);
+                    continue;
+                }
+                for action in &actions {
+                    if let Action::Send(message) = action {
+                        assert_eq!(
+                            Outbound::parse(&message.to_bytes().unwrap()).unwrap(),
+                            *message
+                        );
+                    }
+                }
+                let Action::Send(Outbound::LoginResponse(response)) = &actions[0] else {
+                    panic!("missing Login Response")
+                };
+                assert_eq!(response.to_bytes().unwrap().len(), MAX_MESSAGE);
+                assert_eq!(response.status, b'A');
+                assert_eq!(response.tail.groups, request.params);
+                assert_eq!(response.tail.units, available);
+                assert_eq!(server.last_inbound(), 150);
+                assert_eq!(server.sent(), available);
+                assert_eq!(server.returns().get(&0x25), Some(&vec![0, 0x41]));
+                if available.iter().any(|u| u.sequence != 0) {
+                    assert_eq!(server.phase(), ServerPhase::Replaying);
+                    assert!(matches!(actions[1], Action::Event(Event::Replay { .. })));
+                } else {
+                    assert_eq!(server.phase(), ServerPhase::LoggedIn);
+                    assert!(matches!(
+                        actions[1],
+                        Action::Send(Outbound::ReplayComplete(_))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn login_refusal_size_boundary() {
+        for group in [
+            None,
+            Some(ParamGroup::UnitSequences {
+                no_unspecified_unit_replay: 0,
+                units: vec![unit_sequence(2, 1)],
+            }),
+            Some(ParamGroup::UnitSequences {
+                no_unspecified_unit_replay: 0,
+                units: vec![unit_sequence(1, 2)],
+            }),
+            Some(ParamGroup::ReturnBitfields {
+                message_type: 0x37,
+                bitfields: vec![1],
+            }),
+        ] {
+            for extra in [0, 1] {
+                let request = login_of_length(
+                    MAX_MESSAGE - 49 + extra,
+                    group.clone().into_iter().collect(),
+                );
+                let mut server = pending_login(&request);
+                let actions = if group.is_some() {
+                    server.accept(150, &[unit_sequence(1, 1)], 2)
+                } else {
+                    server.reject(b'N', "Not authorized", 2)
+                }
+                .unwrap();
+                if extra != 0 {
+                    assert_login_overflow(&server, &actions);
+                    continue;
+                }
+                let [
+                    Action::Send(Outbound::LoginResponse(response)),
+                    Action::Event(Event::Disconnected(CloseReason::Rejected)),
+                ] = &actions[..]
+                else {
+                    panic!("missing login refusal")
+                };
+                check_wire_value(response);
+                assert_eq!(response.to_bytes().unwrap().len(), MAX_MESSAGE);
+                assert_ne!(response.status, b'A');
+                assert_eq!(response.tail.groups, request.params);
+                assert!(response.tail.units.is_empty());
+                assert_eq!(server.phase(), ServerPhase::Closed);
+                assert!(server.returns().is_empty());
+                assert_eq!(server.last_inbound(), 0);
+                assert!(server.sent().is_empty());
+            }
+        }
     }
 
     #[test]
