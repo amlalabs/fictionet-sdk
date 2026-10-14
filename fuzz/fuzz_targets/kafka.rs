@@ -60,6 +60,7 @@ fuzz_target!(|data: &[u8]| {
                 ),
             ] {
                 if let Ok(body) = body {
+                    assert!(payload.len() <= MAX_FRAME);
                     contract::check_wire_value(&Request {
                         header: RequestHeader {
                             api_key: key,
@@ -81,6 +82,7 @@ fuzz_target!(|data: &[u8]| {
                 ),
             ] {
                 if let Ok(body) = body {
+                    assert!(payload.len() <= MAX_FRAME);
                     let response = Response {
                         header: ResponseHeader::default(),
                         body,

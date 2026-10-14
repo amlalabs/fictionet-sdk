@@ -36,6 +36,9 @@
 //! times its size in memory, since each field of a few bytes becomes a
 //! struct. A world that wants less sets a lower frame limit with
 //! [`codec::Frames<Frame>::with_limit`](fictionet::stdlib::codec::Frames::with_limit).
+//! Standalone typed body parsers also reject inputs over [`MAX_FRAME`]
+//! before allocating fields. They check the version first. ApiVersions
+//! responses retain their version-0 fallback, with the same size limit.
 //!
 //! Writers refuse with [`Error::Unwritable`] any value that cannot be
 //! preserved in its version, including excess lengths, invalid tags, and
@@ -81,8 +84,9 @@ use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
 
 /// The TCP port Kafka brokers listen on.
 pub const PORT: u16 = 9092;
-/// The largest frame payload this module reads or writes, in bytes. It is
-/// Kafka's default for the broker setting `socket.request.max.bytes`.
+/// The largest frame payload or standalone body this module reads or writes,
+/// in bytes. It is Kafka's default for the broker setting
+/// `socket.request.max.bytes`.
 pub const MAX_FRAME: usize = 104_857_600;
 /// The length of a frame's size prefix.
 pub const SIZE_LEN: usize = 4;
@@ -232,7 +236,7 @@ pub enum Error {
     /// A frame's size was negative or over the limit. The stream cannot be
     /// read any further, and a broker closes the connection.
     FrameSize(i32),
-    /// An input exceeds its size limit: [`MAX_FRAME`] for a payload or header.
+    /// An input exceeds its size limit: [`MAX_FRAME`] for a payload, header or body.
     TooLarge(usize),
     /// A varint ran past its last allowed byte.
     Varint,
@@ -1096,6 +1100,13 @@ fn check_version(api_key: i16, api_version: i16) -> Result<(), Error> {
     }
 }
 
+fn body_reader(body: &[u8]) -> Result<Reader<'_>, Error> {
+    if body.len() > MAX_FRAME {
+        return Err(Error::TooLarge(body.len()));
+    }
+    Ok(Reader::new(body))
+}
+
 /// Finishes a body only if its versioned reader preserves the value.
 fn finish_body<T: PartialEq>(
     writer: Writer,
@@ -1166,10 +1177,11 @@ impl ApiVersionsRequest {
 
     /// Reads the body of an ApiVersions request of version `version`.
     /// Fields the version does not have get their defaults.
+    /// A body longer than [`MAX_FRAME`] is [`Error::TooLarge`].
     pub fn parse(body: &[u8], version: i16) -> Result<ApiVersionsRequest, Error> {
         check_version(api_key::API_VERSIONS, version)?;
+        let mut r = body_reader(body)?;
         let mut out = ApiVersionsRequest::default();
-        let mut r = Reader::new(body);
         if version >= 3 {
             out.client_software_name = r.compact_string()?;
             out.client_software_version = r.compact_string()?;
@@ -1238,6 +1250,7 @@ impl ApiVersionsResponse {
     /// read in `version` are read again in version 0, and taken if they
     /// carry that error. The body's tagged fields 0 to 3 must hold what
     /// Kafka defines for them.
+    /// A body longer than [`MAX_FRAME`] is [`Error::TooLarge`] for a supported version.
     pub fn parse(body: &[u8], version: i16) -> Result<ApiVersionsResponse, Error> {
         match ApiVersionsResponse::parse_exact(body, version) {
             Err(e) if version > 0 => match ApiVersionsResponse::parse_exact(body, 0) {
@@ -1251,7 +1264,7 @@ impl ApiVersionsResponse {
     fn parse_exact(body: &[u8], version: i16) -> Result<ApiVersionsResponse, Error> {
         check_version(api_key::API_VERSIONS, version)?;
         let flex = version >= 3;
-        let mut r = Reader::new(body);
+        let mut r = body_reader(body)?;
         let error_code = r.i16_be()?;
         let n = r.arr_f(flex)?.ok_or(Error::Null)?;
         let mut api_keys = Vec::new();
@@ -1384,10 +1397,11 @@ impl Default for MetadataRequest {
 impl MetadataRequest {
     /// Reads the body of a Metadata request of version `version`. Fields
     /// the version does not have get their defaults.
+    /// A body longer than [`MAX_FRAME`] is [`Error::TooLarge`].
     pub fn parse(body: &[u8], version: i16) -> Result<MetadataRequest, Error> {
         check_version(api_key::METADATA, version)?;
         let flex = version >= 9;
-        let mut r = Reader::new(body);
+        let mut r = body_reader(body)?;
         let topics = match r.arr_f(flex)? {
             None if version == 0 => return Err(Error::Null),
             None => None,
@@ -1644,10 +1658,11 @@ impl Default for MetadataResponse {
 impl MetadataResponse {
     /// Reads the body of a Metadata response of version `version`. Fields
     /// the version does not have get their defaults.
+    /// A body longer than [`MAX_FRAME`] is [`Error::TooLarge`].
     pub fn parse(body: &[u8], version: i16) -> Result<MetadataResponse, Error> {
         check_version(api_key::METADATA, version)?;
         let flex = version >= 9;
-        let mut r = Reader::new(body);
+        let mut r = body_reader(body)?;
         let mut out = MetadataResponse::default();
         if version >= 3 {
             out.throttle_time_ms = r.i32_be()?;
@@ -3388,6 +3403,82 @@ mod tests {
     }
 
     #[test]
+    fn direct_bodies_enforce_the_aggregate_frame_limit() {
+        fn check<T>(
+            mut prefix: Vec<u8>,
+            key: i16,
+            version: i16,
+            max_version: i16,
+            parse: fn(&[u8], i16) -> Result<T, Error>,
+        ) {
+            assert_eq!(prefix.pop(), Some(0)); // Replace the empty tagged-field section.
+            for size in [MAX_FRAME - 1, MAX_FRAME, MAX_FRAME + 1] {
+                let mut body = Vec::with_capacity(size);
+                body.extend_from_slice(&prefix);
+                body.push(2);
+                // Each tag has a one-byte ID and a four-byte length. Both
+                // fields fit individually; only their aggregate can exceed the cap.
+                let data_len = size - prefix.len() - 11;
+                for (tag, len) in [(4, data_len / 2), (5, data_len - data_len / 2)] {
+                    body.extend(encoded(|w| {
+                        w.uvarint(tag);
+                        w.uvarint(len as u32);
+                    }));
+                    body.resize(body.len() + len, 0);
+                }
+                assert_eq!(body.len(), size);
+                let result = parse(&body, version).map(drop);
+                if size <= MAX_FRAME {
+                    assert_eq!(result, Ok(()));
+                } else {
+                    assert_eq!(result, Err(Error::TooLarge(size)));
+                    for version in 0..=max_version {
+                        assert_eq!(parse(&body, version).map(drop), Err(Error::TooLarge(size)));
+                    }
+                    for version in [-1, max_version + 1] {
+                        assert_eq!(
+                            parse(&body, version).map(drop),
+                            Err(Error::UnsupportedVersion {
+                                api_key: key,
+                                api_version: version,
+                            })
+                        );
+                    }
+                }
+            }
+        }
+
+        check(
+            ApiVersionsRequest::default().encode(3).unwrap(),
+            api_key::API_VERSIONS,
+            3,
+            API_VERSIONS_MAX_VERSION,
+            ApiVersionsRequest::parse,
+        );
+        check(
+            ApiVersionsResponse::default().encode(3).unwrap(),
+            api_key::API_VERSIONS,
+            3,
+            API_VERSIONS_MAX_VERSION,
+            ApiVersionsResponse::parse,
+        );
+        check(
+            MetadataRequest::default().encode(9).unwrap(),
+            api_key::METADATA,
+            9,
+            METADATA_MAX_VERSION,
+            MetadataRequest::parse,
+        );
+        check(
+            MetadataResponse::default().encode(9).unwrap(),
+            api_key::METADATA,
+            9,
+            METADATA_MAX_VERSION,
+            MetadataResponse::parse,
+        );
+    }
+
+    #[test]
     fn api_versions_response_falls_back_to_version_0() {
         // A broker that does not speak ApiVersions version 3 answers in
         // version 0: correlation ID 1, UNSUPPORTED_VERSION, no APIs.
@@ -3403,6 +3494,10 @@ mod tests {
         // With the APIs the broker speaks, as Kafka 2.4 and later send.
         let p = [0, 0x23, 0, 0, 0, 1, 0, 18, 0, 0, 0, 2];
         let got = ApiVersionsResponse::parse(&p, 3).unwrap();
+        assert_eq!(
+            ApiVersionsResponse::parse(&p, API_VERSIONS_MAX_VERSION + 1),
+            Ok(got.clone())
+        );
         assert_eq!(
             got.api_keys,
             [ApiVersion {
