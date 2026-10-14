@@ -2,6 +2,7 @@
 # The ping test for `fictionet attach --type tun`, under Docker Compose.
 #
 #   tests/docker/ping/run.sh
+#   tests/docker/ping/run.sh --self-test  # Check restart polling without Docker.
 #
 # It checks that:
 #   1. the sandbox can ping the world over IPv4 and IPv6,
@@ -16,8 +17,6 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 compose=(docker compose -f "$here/compose.yaml")
 
-source "$here/../common.sh"
-
 # Waits up to 10 s for the world's log to contain a line.
 world_says() {
     for _ in $(seq 50); do
@@ -26,6 +25,65 @@ world_says() {
     done
     return 1
 }
+
+# Counts abc's attachments in the world's log.
+attachment_count() {
+    "${compose[@]}" logs --no-log-prefix world 2>/dev/null |
+        awk '/^attached abc mtu 1500( |$)/ { n++ } END { print n+0 }'
+}
+
+# Waits up to 10 s for an attachment after the captured count.
+world_attaches_again() {
+    local count
+    for _ in $(seq 50); do
+        if count="$(attachment_count)" && (( count > $1 )); then return 0; fi
+        sleep 0.2
+    done
+    return 1
+}
+
+# Checks the restart wait against stub logs, before any Docker command: an old
+# attachment must not count, a new one must, and the wait gives up after 50 tries.
+self_test() (
+    self_test_fail() { echo "FAIL: restart polling self-test: $*" >&2; exit 1; }
+    compose=(stub_logs)
+    logs=''
+    sleeps=0
+    fresh_after=0
+    stub_logs() { printf '%s\n' "$logs"; }
+    sleep() {
+        [[ $1 == 0.2 ]] || self_test_fail "expected a 0.2 s sleep, got $1"
+        sleeps=$((sleeps + 1))
+        if (( sleeps == fresh_after )); then
+            logs+=$'\nattached abc mtu 1500'
+        fi
+    }
+
+    [[ $(attachment_count) == 0 ]] || self_test_fail "empty logs must have no attachments"
+    logs=$'attached abc mtu 1500\ndetached abc\nattached term mtu 1500'
+    before="$(attachment_count)" || self_test_fail "could not read initial count"
+    [[ $before == 1 ]] || self_test_fail "expected one abc attachment, got $before"
+    if world_attaches_again "$before"; then
+        self_test_fail "stale attachment satisfied restart polling"
+    fi
+    [[ $sleeps == 50 ]] || self_test_fail "stale logs must time out after 50 sleeps, got $sleeps"
+
+    sleeps=0
+    fresh_after=3
+    world_attaches_again "$before" || self_test_fail "fresh attachment was not observed"
+    [[ $sleeps == 3 && $(attachment_count) == 2 ]] || self_test_fail "expected two attachments after three sleeps"
+
+    before="$(attachment_count)" || self_test_fail "could not read updated count"
+    sleeps=0
+    world_attaches_again "$before" || self_test_fail "next fresh attachment was not observed"
+    [[ $sleeps == 3 && $(attachment_count) == 3 ]] || self_test_fail "expected three attachments after three sleeps"
+    echo "PASS: restart polling rejects stale logs, waits for fresh logs, and is bounded"
+)
+
+self_test || exit 1
+if [[ ${1:-} == --self-test ]]; then exit 0; fi
+
+source "$here/../common.sh"
 
 attach_flags=(--world unix:/run/fictionet/world.sock --type tun
     --no-ip-addr --no-gateway --no-dns
@@ -78,9 +136,11 @@ docker rm -f "$id" >/dev/null 2>&1 || true
 "${compose[@]}" kill -s SIGKILL attach >/dev/null 2>&1
 if world_says "detached abc"; then pass "SIGKILL: the world saw abc detach"; else fail "SIGKILL: no detach"; fi
 
-# 6. The world goes away: attach removes the device and exits 0.
-"${compose[@]}" start attach >/dev/null
-if world_says "attached abc mtu 1500.*" && [[ "$("${compose[@]}" logs --no-log-prefix world | grep -c '^attached abc')" == 2 ]]; then
+# 6. The world goes away: attach removes the device and exits 0. Count abc's
+# attachments first, so the first attachment's line cannot pass for the restart.
+if ! before="$(attachment_count)"; then
+    fail "could not read attachment count before restart"
+elif "${compose[@]}" start attach >/dev/null && world_attaches_again "$before"; then
     "${compose[@]}" kill -s SIGKILL world >/dev/null 2>&1
     code="$(docker wait "$("${compose[@]}" ps -aq attach)")"
     logs="$("${compose[@]}" logs --no-log-prefix attach)"
