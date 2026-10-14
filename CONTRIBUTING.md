@@ -10,10 +10,20 @@ write the code. Security problems go by email, not in issues: see
 
 ## The checks
 
-CI runs these commands on every pull request, in four feature sets:
-default features, `--no-default-features`, `--all-features`, and
-`--no-default-features --features tokio`. A pull request must pass
-each configuration. Run them before you push:
+CI runs these commands on every pull request, in five feature sets:
+
+| Configuration | Cargo feature flags |
+| --- | --- |
+| Default features | No flags |
+| No default features | `--no-default-features` |
+| All features | `--all-features` |
+| Std and observation without Tokio | `--no-default-features --features std,observe` |
+| Tokio without observation | `--no-default-features --features tokio` |
+
+A pull request must pass each configuration. Run all five commands below
+for each row before you push. They show the default configuration. For the
+other rows, append the listed feature flags to each Cargo command, before
+`-- -D warnings` for clippy:
 
 ```console
 $ cargo build --locked --workspace --all-targets
@@ -21,12 +31,6 @@ $ cargo nextest run --locked --workspace
 $ cargo test --locked --doc --workspace
 $ RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
 $ cargo clippy --locked --workspace --all-targets -- -D warnings
-
-$ cargo build --locked --workspace --all-targets --no-default-features
-$ cargo nextest run --locked --workspace --no-default-features
-$ cargo test --locked --doc --workspace --no-default-features
-$ RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --no-default-features
-$ cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 ```
 
 CI also checks that every crate in the repository is formatted with the
@@ -193,28 +197,18 @@ All code, not only protocol modules, names its contexts one way:
 traffic through it, and prints a table. Run all of it, or name the groups you want:
 
 ```console
-$ cargo bench --bench perf
-$ cargo bench --bench perf -- tcp path
-$ cargo bench --bench perf -- sites --reps 5
-$ cargo bench --bench perf -- --quick
+$ cargo bench --locked --bench perf
+$ cargo bench --locked --bench perf -- tcp path
+$ cargo bench --locked --bench perf -- sites --reps 5
+$ cargo bench --locked --bench perf -- --quick
 ```
 
-`--list` says what each group measures:
+Use `--list` for the complete list of groups and what each measures. The suite
+covers network throughput and latency, scheduler and timer costs, memory and
+allocations, logging and observation overhead, and decoder throughput:
 
 ```console
-$ cargo bench --bench perf -- --list
-tcp      bulk TCP between two endpoints on one pair: 1, 10 and 100 flows
-path     bulk TCP through a protocol split at each end and a router: 1, 10 and 100 flows
-idle     one active TCP flow beside 0 and 99 idle connections on the same endpoints
-delay    bulk TCP over a delayed link (10 ms and 50 ms each way)
-sched    the scheduler: packet ping-pong through a pair, and small TCP exchanges
-memory   memory held by a delay and a bottleneck whose output is never read
-relay    the relay protocol: socketpair sends, and an echo through listen
-sites    HTTP/1.1 and HTTP/2 over TLS to a Sites site, from 1 and 10 sandboxes
-observe  the cost of an observer watching the graph and ten sandbox links
-graph    HTTP/2 latency with 1,000 sites while an observer watches the graph
-proxy    fictionet attach --type http_proxy: DNS queries for cold and missing names
-decoders in-memory TPKT/COTP, HTTP/1 requests and ITCH in 16 KiB chunks
+$ cargo bench --locked --bench perf -- --list
 ```
 
 Each run of a case repeats three times by default (`--reps`). Rates and times are

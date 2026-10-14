@@ -299,10 +299,9 @@ Start at the crate root, which explains the main ideas, then read in this order:
 
 ## Building and testing
 
-[CONTRIBUTING.md](CONTRIBUTING.md) lists the build, test and documentation
-checks for default features, `--no-default-features`, `--all-features`,
-and `--no-default-features --features tokio`, as well as
-the Docker and Kubernetes tests.
+[CONTRIBUTING.md](CONTRIBUTING.md#the-checks) lists the complete CI feature
+matrix and the build, test, documentation and clippy commands to run for each
+configuration. It also covers the Docker and Kubernetes tests.
 
 ## License
 
