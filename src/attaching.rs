@@ -1304,9 +1304,12 @@
 //! finding the host or network unreachable: what a policy that drops or
 //! rejects packets does. A connection that succeeds starts the count
 //! again, and so does any other failure, such as no socket being
-//! available, because that says nothing about the network. If an address still answers after `networkPolicy.waitTimeout`
-//! seconds (120 by default), it exits 1, and Kubernetes keeps the agent's
-//! container from starting and tries `wait-blocked` again.
+//! available, because that says nothing about the network. All three rounds
+//! must finish before `networkPolicy.waitTimeout` seconds (120 by default).
+//! Connection attempts and pauses share this deadline and use only the time
+//! left. A round that finishes at or after the deadline cannot count as
+//! success. If the deadline expires first, it exits 1, and Kubernetes keeps
+//! the agent's container from starting and tries `wait-blocked` again.
 //!
 //! On kind, kindnet enforced the policy before `wait-blocked` started, and
 //! it exited after the three rounds:

@@ -7,6 +7,8 @@
 //! runs this as an init container just before the agent's container, so
 //! the agent starts only once a direct connection to the API server (and
 //! to any other address given) fails, several times in a row.
+//! All rounds must finish before one deadline. Connection attempts and
+//! pauses use only the time left before that deadline.
 
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -15,11 +17,12 @@ pub(crate) const USAGE: &str = "\
 usage: fictionet wait-blocked [--api-server] [--timeout <seconds>] [<ip:port>...]
 
 Tries a TCP connection to each address every half second, and exits 0 once
-every one of them has failed (refused, unreachable or timed out after 1 s)
+every one of them has failed (refused, unreachable or timed out after up to 1 s)
 3 rounds in a row. A connection that succeeds, or any other failure (such
 as no socket being available), starts the count again.
 Exits 1 if that has not happened within --timeout seconds (default 120),
-and 2 on bad arguments.
+and 2 on bad arguments. Probes and pauses share that deadline. A round
+that finishes at or after the deadline cannot count as success.
 
   --api-server         also try the Kubernetes API server, from
                        KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT
@@ -100,7 +103,7 @@ fn classify(e: &std::io::Error) -> Outcome {
     }
 }
 
-fn probe(a: SocketAddr) -> Outcome {
+fn probe(a: SocketAddr, start: Instant, deadline: Duration) -> Outcome {
     // A socket that cannot even be made says nothing about the network.
     let family = if a.is_ipv4() {
         libc::AF_INET
@@ -117,18 +120,30 @@ fn probe(a: SocketAddr) -> Outcome {
     }
     // SAFETY: fd is a descriptor this function just made.
     unsafe { libc::close(fd) };
-    match TcpStream::connect_timeout(&a, CONNECT_TIMEOUT) {
+    let Some(timeout) = probe_timeout(deadline, start.elapsed()) else {
+        return Outcome::Unknown("the deadline expired".into());
+    };
+    match TcpStream::connect_timeout(&a, timeout) {
         Ok(_) => Outcome::Open,
         Err(e) => classify(&e),
     }
 }
 
+fn probe_timeout(deadline: Duration, now: Duration) -> Option<Duration> {
+    let remaining = deadline.saturating_sub(now);
+    (!remaining.is_zero()).then_some(remaining.min(CONNECT_TIMEOUT))
+}
+
 /// Each address with what trying it showed, tried all at once.
-fn try_all(addresses: &[SocketAddr]) -> Vec<(SocketAddr, Outcome)> {
+fn try_all(
+    addresses: &[SocketAddr],
+    start: Instant,
+    deadline: Duration,
+) -> Vec<(SocketAddr, Outcome)> {
     std::thread::scope(|s| {
         let tries: Vec<_> = addresses
             .iter()
-            .map(|&a| s.spawn(move || (a, probe(a))))
+            .map(|&a| s.spawn(move || (a, probe(a, start, deadline))))
             .collect();
         tries
             .into_iter()
@@ -177,18 +192,41 @@ pub(crate) fn main(argv: &[String]) -> i32 {
         }
     };
     let start = Instant::now();
+    wait(
+        &args,
+        || start.elapsed(),
+        |addresses, deadline| try_all(addresses, start, deadline),
+        std::thread::sleep,
+    )
+}
+
+fn wait(
+    args: &Args,
+    clock: impl Fn() -> Duration,
+    mut probes: impl FnMut(&[SocketAddr], Duration) -> Vec<(SocketAddr, Outcome)>,
+    mut sleep: impl FnMut(Duration),
+) -> i32 {
+    // Clock readings and the deadline share one monotonic origin.
+    let start = clock();
+    let deadline = start.saturating_add(args.timeout);
     let mut failed_rounds = 0;
     let mut last = String::new();
-    loop {
-        let outcomes = try_all(&args.addresses);
+    while clock() < deadline {
+        let outcomes = probes(&args.addresses, deadline);
         let now = describe(&outcomes);
+        if clock() >= deadline {
+            if !now.is_empty() {
+                last = now;
+            }
+            break;
+        }
         if now.is_empty() {
             failed_rounds += 1;
             if failed_rounds >= ROUNDS {
                 eprintln!(
                     "fictionet wait-blocked: {} unreachable {ROUNDS} times in a row, after {:.1} s",
                     list(&args.addresses),
-                    start.elapsed().as_secs_f64()
+                    (clock() - start).as_secs_f64()
                 );
                 return 0;
             }
@@ -198,30 +236,134 @@ pub(crate) fn main(argv: &[String]) -> i32 {
                 eprintln!("fictionet wait-blocked: {now}; waiting");
             }
         }
-        if start.elapsed() >= args.timeout {
-            eprintln!(
-                "fictionet wait-blocked: after {} s, {}. Check that the cluster's CNI enforces NetworkPolicy, \
-                 and that no other policy allows this pod's traffic",
-                args.timeout.as_secs(),
-                if now.is_empty() {
-                    last.as_str()
-                } else {
-                    now.as_str()
-                },
-            );
-            return 1;
-        }
         last = now;
-        std::thread::sleep(INTERVAL);
+        sleep(INTERVAL.min(deadline.saturating_sub(clock())));
     }
+    eprintln!(
+        "fictionet wait-blocked: after {} s, {}. Check that the cluster's CNI enforces NetworkPolicy, \
+         and that no other policy allows this pod's traffic",
+        args.timeout.as_secs(),
+        if last.is_empty() {
+            "not enough blocked rounds before the deadline"
+        } else {
+            last.as_str()
+        },
+    );
+    1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn final_blocked_round_must_finish_before_the_deadline() {
+        for (final_probe_ms, status) in [(999, 0), (1000, 1), (1001, 1)] {
+            let clock = Cell::new(Duration::from_secs(10));
+            let args = Args {
+                addresses: vec!["127.0.0.1:443".parse().unwrap()],
+                timeout: Duration::from_secs(2),
+            };
+            let mut rounds = 0;
+            let result = wait(
+                &args,
+                || clock.get(),
+                |addresses, deadline| {
+                    assert_eq!(deadline, Duration::from_secs(12));
+                    rounds += 1;
+                    if rounds == ROUNDS {
+                        clock.set(clock.get() + Duration::from_millis(final_probe_ms));
+                    }
+                    vec![(addresses[0], Outcome::Blocked)]
+                },
+                |duration| clock.set(clock.get() + duration),
+            );
+            assert_eq!(rounds, ROUNDS);
+            assert_eq!(result, status, "final probe took {final_probe_ms} ms");
+        }
+    }
+
+    #[test]
+    fn sleeps_use_the_remaining_budget_and_expiry_stops_new_rounds() {
+        for (timeout_ms, oversleep_ms, sleeps) in
+            [(750, 0, vec![500, 250]), (1001, 1, vec![500, 500])]
+        {
+            let clock = Cell::new(Duration::ZERO);
+            let args = Args {
+                addresses: vec!["127.0.0.1:443".parse().unwrap()],
+                timeout: Duration::from_millis(timeout_ms),
+            };
+            let mut rounds = 0;
+            let mut actual_sleeps = Vec::new();
+            let result = wait(
+                &args,
+                || clock.get(),
+                |addresses, _| {
+                    rounds += 1;
+                    vec![(addresses[0], Outcome::Blocked)]
+                },
+                |duration| {
+                    actual_sleeps.push(duration.as_millis());
+                    clock.set(clock.get() + duration + Duration::from_millis(oversleep_ms));
+                },
+            );
+            assert_eq!(result, 1);
+            assert_eq!(rounds, 2);
+            assert_eq!(actual_sleeps, sleeps);
+        }
+    }
+
+    #[test]
+    fn probes_use_only_the_remaining_budget_and_never_a_zero_timeout() {
+        let deadline = Duration::from_secs(2);
+        for (now_ms, timeout_ms) in [
+            (0, Some(1000)),
+            (1900, Some(100)),
+            (2000, None),
+            (2001, None),
+        ] {
+            assert_eq!(
+                probe_timeout(deadline, Duration::from_millis(now_ms)),
+                timeout_ms.map(Duration::from_millis),
+            );
+        }
+    }
+
+    #[test]
+    fn open_or_unknown_probes_restart_the_blocked_round_count() {
+        for outcome in [
+            Outcome::Open,
+            Outcome::Unknown("no socket available".into()),
+        ] {
+            let clock = Cell::new(Duration::ZERO);
+            let args = Args {
+                addresses: vec!["127.0.0.1:443".parse().unwrap()],
+                timeout: Duration::from_secs(10),
+            };
+            let mut outcomes = [
+                Outcome::Blocked,
+                outcome,
+                Outcome::Blocked,
+                Outcome::Blocked,
+                Outcome::Blocked,
+            ]
+            .into_iter();
+            assert_eq!(
+                wait(
+                    &args,
+                    || clock.get(),
+                    |addresses, _| vec![(addresses[0], outcomes.next().unwrap())],
+                    |duration| clock.set(clock.get() + duration),
+                ),
+                0,
+            );
+            assert_eq!(outcomes.next(), None);
+        }
     }
 
     #[test]

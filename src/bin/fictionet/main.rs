@@ -13,8 +13,9 @@
 //! Exit status of `ready <path>`: 0 if the path exists, 1 if not, 2 on bad
 //! arguments.
 //!
-//! Exit status of `wait-blocked`: 0 once every address is unreachable, 1
-//! if one is still reachable at the timeout, 2 on bad arguments.
+//! Exit status of `wait-blocked`: 0 once every address is unreachable for
+//! three rounds before the timeout, 1 if the deadline expires first, 2 on
+//! bad arguments.
 
 mod addresses;
 mod args;

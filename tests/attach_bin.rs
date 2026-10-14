@@ -698,6 +698,11 @@ fn wait_blocked_waits_while_an_address_answers_and_exits_0_once_it_stops() {
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("unreachable 3 times in a row"));
 
+    // Even instant refusals cannot complete three rounds before one second.
+    let out = run(&["--timeout", "1", &closed]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("after 1 s"));
+
     // One address still answers: no exit 0, however many others fail.
     let out = run(&["--timeout", "1", &closed, &open]);
     assert_eq!(out.status.code(), Some(1));
