@@ -48,6 +48,13 @@ CI also checks that the crate builds with Rust 1.91, the minimum version in
 runs `fuzz/check-targets.sh`. Nightly and manual runs also run every target
 for 60 seconds.
 
+CI also runs the fuzz helper library's regression tests on the pinned stable
+toolchain. Run this command from the repository root:
+
+```console
+$ RUSTFLAGS="--cfg fuzzing" cargo test --locked --manifest-path fuzz/Cargo.toml --lib
+```
+
 CI runs `cargo bench --locked -p fictionet-copy-modules --bench tcp` in release to compare copied TCP throughput and allocation counts with the built-in module.
 
 ## Running the tests

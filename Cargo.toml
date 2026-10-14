@@ -251,6 +251,7 @@ required-features = ["std"]
 
 [[example]]
 name = "capture_sites"
+test = true
 required-features = ["std"]
 
 [[example]]
