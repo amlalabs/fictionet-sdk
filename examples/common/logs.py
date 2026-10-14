@@ -6,9 +6,18 @@ import json
 async def read_log(world, log: str, offset: int = 0, *, raw: bool = False, read_file=None) -> list[dict] | bytes:
     """Copy the log to a snapshot and check that the snapshot is read completely.
 
-    Read the snapshot through the supplied read_file accessor or world.read_file.
-    Return raw bytes when requested, or entries after a line offset. Check for
-    lost log lines in all entries before applying the offset.
+    For final scoring, await finalize_world first: a complete snapshot does not
+    prove the live writer has drained. The caller must supply a trusted world
+    sandbox and file accessor; this helper does not check sandbox identity.
+
+    Requires world.exec with sh, cp and wc, and a writable log directory. Calls
+    for the same log must be serialized because they share log + ".snapshot".
+    Read that snapshot through the supplied read_file accessor or world.read_file
+    as bytes, checking its byte count and final newline (unless empty).
+
+    By default, parse JSON and check all entries for lost lines before applying
+    the line offset. With raw=True, return bytes without parsing, loss checks,
+    or offset handling; the caller must check for lost lines before grading.
     """
     snapshot = log + ".snapshot"
     r = await world.exec(["sh", "-c", 'cp "$1" "$2" && wc -c < "$2"', "sh", log, snapshot])

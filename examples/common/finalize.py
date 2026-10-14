@@ -10,6 +10,13 @@ async def finalize_world(world, agent, log: str, timeout: float = 20) -> None:
     The request cancels the whole run, including its attachment receiver and listener.
     A failed world or writer cannot acknowledge. The world stays alive after shutdown
     so the harness can read its files. Repeated calls read the same acknowledgement.
+
+    Requires a separate world sandbox with exec, touch and cat, and the control
+    protocol in examples/common/log.rs. The log's parent must be private to the
+    world and writable. The world clears stale control files at startup, watches
+    for "finalize", then writes "ok" and a newline to "finalized" after draining
+    the writer and checking output failures and lost lines. Await this helper
+    before read_log; acknowledgement does not validate the later file transfer.
     """
     if world is agent:
         raise RuntimeError("no separate world sandbox for finalization")

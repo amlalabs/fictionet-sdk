@@ -381,18 +381,19 @@ Inspect sees three sandboxes: `default`, `world` and `attach`.
 ## Reading the world's log
 
 A world can write down what the agent did, as it happened: the requests it
-made, the names it looked up, the form it filled in. That log is the ground
-truth for a scorer. Write it to a file in the world's container, then read
-it after the agent has finished:
+made, the names it looked up, the form it filled in. A scorer needs both
+trusted provenance and a complete log. The agent finishing does not mean
+the world's exchanges have stopped or its log writer has drained.
+
+`read_world_file` checks provenance only. It does not finalize the world,
+check for truncated reads, or detect lost log lines. For an immutable file,
+such as the CA certificate written before the world is ready, use it directly
+from a scorer:
 
 ```python
 from inspect_fictionet import read_world_file
 
-@scorer(metrics=[accuracy()])
-def sent_password():
-    async def score(state, target):
-        log = await read_world_file("/var/log/world/requests.jsonl")
-        ...
+ca = await read_world_file("/run/ca/ca.pem")
 ```
 
 `read_world_file(path)` is `sandbox("world").read_file(path)`, with one
@@ -405,10 +406,42 @@ published ones, and on files in the world's volumes. `examples/web_eval.py`
 reads the CA certificate this way, and checks that the agent sees the same
 file.
 
+For log scoring, follow the existing composition in Artifactory's
+[`finalized_log`](../../examples/artifactory/src/artifactory_eval/tasks.py)
+and its [log parser](../../examples/artifactory/src/artifactory_eval/world.py):
+
+1. Await [`finalize_world(world, agent, log)`](../../examples/common/finalize.py).
+   It creates `finalize` beside the log and waits for `finalized` containing
+   exactly `ok\n`. The world's control handler cancels the run, stopping
+   input and exchanges. It drains the writer, closes pending folds, and
+   checks for output failures and lost lines before acknowledging. A timeout
+   or invalid acknowledgement makes the sample unscorable.
+2. Only after acknowledgement, call
+   [`read_log(world, log, read_file=read_world_file)`](../../examples/common/logs.py).
+   It copies the log to `<log>.snapshot`, counts that file's bytes, and reads
+   it as bytes through the trusted accessor. It rejects a byte-count mismatch
+   or a nonempty snapshot without a final newline. A snapshot alone does not
+   prove that the live log was drained.
+3. Reject lost log lines before grading. By default, `read_log` parses JSON
+   and rejects any `{"type": "lost"}` entry before applying a line offset.
+   With `raw=True`, it checks the transfer but returns bytes without parsing
+   or loss checks. Artifactory uses this mode and performs those checks in
+   its own parser. Collection failures must not become an empty log or a score.
+
+These are repository example helpers, not an `inspect_fictionet` package API.
+They require a separate world sandbox with `exec`, `touch`, `cat`, and a
+shell with `cp` and `wc`. The log directory must be writable and private to
+the world. The world must implement the
+[`examples/common/log.rs` finalization protocol](../../examples/common/log.rs),
+clear stale control files at startup, and stay alive to serve file reads
+after acknowledgement. These helpers do not work unchanged in shell-free
+images. Serialize collection for a log: calls share its snapshot path.
+
 On Kubernetes, inspect_k8s_sandbox makes one sandbox per pod, the agent's
 container, so the world's files cannot be read through Inspect, and
 `read_world_file` raises. There, have the world write its log somewhere the
-agent cannot reach, and read it from outside the pod.
+agent cannot reach, and read it from outside the pod. That collector still
+needs finalization acknowledgement, snapshot validation, and loss checking.
 
 ## Troubleshooting
 

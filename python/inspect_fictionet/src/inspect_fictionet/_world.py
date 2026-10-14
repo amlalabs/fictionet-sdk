@@ -4,14 +4,19 @@ from inspect_ai.util import sandbox
 
 
 async def read_world_file(path: str, *, text: bool = True) -> str | bytes:
-    """Reads a file from the world's container, such as a log the world
-    writes of what the agent did.
+    """Reads a file from the world's container, such as its immutable CA certificate.
 
-    Call it from a scorer, after the agent has finished. It is
+    Call it from a scorer. It is
     `sandbox("world").read_file(path)`, with one check first: that the
     sample really has a sandbox named `world`. Inspect's `sandbox(name)`
     returns the default sandbox, the agent's, when a sample has only one
     sandbox, and then the agent could write the file this reads.
+
+    This establishes provenance only, not completeness. Finishing the agent
+    does not drain the world's log writer. For log scoring, first require
+    finalization acknowledgement, then validate a snapshot's byte count and
+    final newline and check for lost lines. See "Reading the world's log"
+    in the package README for the example helpers and their requirements.
 
     The docker backend has the sandbox `world`. inspect_k8s_sandbox makes
     one sandbox per pod, the agent's container, so on Kubernetes this
