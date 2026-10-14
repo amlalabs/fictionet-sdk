@@ -155,6 +155,22 @@ one the call came over, so the KDC can answer `KRB_ERR_RESPONSE_TOO_BIG`
 on UDP. Serve them with `Host::tcp(88, ..)` and `Host::udp(88, ..)` and
 the same `State`.
 
+### Owning recursive protocol values
+
+AMQP `FieldValue`, Thrift `Value`, and protobuf `Value` release nested
+containers with an explicit work list. A hand-built tree can be dropped
+normally even after a writer refuses it for exceeding the depth limit.
+Parser and writer limits, errors, and wire bytes are unchanged. `Clone`,
+`Debug`, and equality still recurse; they are not safe for arbitrarily
+deep hand-built trees.
+
+These enums now implement `Drop`. This is a source compatibility change:
+consuming patterns cannot move their non-`Copy` fields out. Match a
+reference to inspect a value. To extract owned data, match a mutable
+reference and use `core::mem::take` on the child vector, table, or message.
+For a Thrift list or map, take its `items` or `entries` vector. The protocol
+module docs show extraction examples. Public module paths are unchanged.
+
 ### Dates belong to the world
 
 `driver.now()` is the run's clock: time since the run started, with no

@@ -35,6 +35,24 @@
 //! below, because the agent can send any bytes it likes. Every writer
 //! checks the same limits, so what it writes always reads back.
 //!
+//! [`Value`] implements `Drop` to release nested trees without recursion,
+//! including hand-built trees beyond [`MAX_DEPTH`]. `Clone`, `Debug`, and
+//! equality still recurse. Adding `Drop` is a source compatibility change:
+//! patterns cannot move non-`Copy` fields out of a value. Match a reference
+//! to inspect fields, or use [`core::mem::take`] through a mutable reference
+//! to extract a struct's fields or binary bytes. For a list, set, or map,
+//! take its `items` or `entries` vector:
+//!
+//! ```
+//! use fictionet::stdlib::thrift::{List, Type, Value};
+//!
+//! let mut value = Value::List(List { elem: Type::I32, items: vec![Value::I32(7)] });
+//! let Value::List(list) = &mut value else { unreachable!() };
+//! let owned = core::mem::take(&mut list.items);
+//! assert_eq!(owned, vec![Value::I32(7)]);
+//! assert!(list.items.is_empty());
+//! ```
+//!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
@@ -268,6 +286,8 @@ impl Type {
 /// A value of any type, read without a schema. Two values are equal when
 /// they write the same bytes: a NaN double equals a NaN with the same bits,
 /// and 0.0 does not equal -0.0.
+/// Dropping a value uses an explicit work list, even beyond [`MAX_DEPTH`].
+/// Take owned fields through a mutable reference with [`core::mem::take`].
 #[derive(Clone, Debug)]
 pub enum Value {
     /// A boolean.
@@ -296,6 +316,41 @@ pub enum Value {
     Set(List),
     /// A map.
     Map(Map),
+}
+
+impl Drop for Value {
+    fn drop(&mut self) {
+        // Detach containers before dropping their parent. Scalars drop in
+        // place, so an all-scalar container needs no work list allocation.
+        fn container(value: &Value) -> bool {
+            matches!(
+                value,
+                Value::Struct(_) | Value::List(_) | Value::Set(_) | Value::Map(_)
+            )
+        }
+        fn detach(value: &mut Value, pending: &mut Vec<Value>) {
+            match value {
+                Value::Struct(fields) => {
+                    pending.extend(fields.drain(..).map(|f| f.value).filter(container));
+                }
+                Value::List(list) | Value::Set(list) => {
+                    pending.extend(list.items.drain(..).filter(container));
+                }
+                Value::Map(map) => pending.extend(
+                    map.entries
+                        .drain(..)
+                        .flat_map(|(key, value)| [key, value])
+                        .filter(container),
+                ),
+                _ => {}
+            }
+        }
+        let mut pending = Vec::new();
+        detach(self, &mut pending);
+        while let Some(mut value) = pending.pop() {
+            detach(&mut value, &mut pending);
+        }
+    }
 }
 
 /// One field of a struct: its number and its value.
@@ -2021,6 +2076,35 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_hand_built_values_drop_after_refusal() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let containers: [fn(Value) -> Value; 5] = [
+                    |v| Value::Struct(vec![f(1, v), f(2, Value::Binary(b"sibling".to_vec()))]),
+                    |v| Value::List(list(v.ty(), vec![v])),
+                    |v| Value::Set(list(v.ty(), vec![v])),
+                    |v| Value::Map(map(v.ty(), Type::Byte, vec![(v, Value::Byte(0))])),
+                    |v| Value::Map(map(Type::Byte, v.ty(), vec![(Value::Byte(0), v)])),
+                ];
+                for wrap in containers {
+                    let mut v = Value::Binary(b"leaf".to_vec());
+                    for _ in 0..rounds(100_000) {
+                        v = wrap(v);
+                    }
+                    let binary = ValueBody::<false, 12>(Value::Struct(vec![f(1, v)]));
+                    assert_eq!(binary.to_bytes(), Err(Error::Unwritable));
+                    let compact = ValueBody::<true, 12>(binary.0);
+                    assert_eq!(compact.to_bytes(), Err(Error::Unwritable));
+                    drop(compact);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn value_count_limit() {
         let half = Value::List(list(Type::Bool, vec![Value::Bool(true); MAX_VALUES / 2]));
         let v = Value::Struct(vec![f(1, half.clone()), f(2, half)]);
@@ -2684,14 +2768,14 @@ mod tests {
     }
 
     fn random_message(r: &mut Lcg) -> Message {
-        let Value::Struct(body) = random_value(r, Type::Struct, 1) else {
+        let Value::Struct(body) = &mut random_value(r, Type::Struct, 1) else {
             unreachable!()
         };
         Message {
             name: ["", "ping", "getUser", "\u{e9}t\u{e9}"][r.index(4)].to_string(),
             kind: MessageType::from_code(1 + r.index(4) as u8).unwrap(),
             seq: r.next() as i32 - (1 << 30),
-            body,
+            body: core::mem::take(body),
         }
     }
 

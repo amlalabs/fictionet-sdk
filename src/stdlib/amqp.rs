@@ -29,6 +29,23 @@
 //! closes the connection with. Writers return an [`Error`] rather
 //! than write bytes a reader would refuse.
 //!
+//! [`FieldValue`] implements `Drop` to release nested trees without recursion,
+//! including hand-built trees beyond [`MAX_DEPTH`]. `Clone`, `Debug`, and
+//! equality still recurse. Adding `Drop` is a source compatibility change:
+//! patterns cannot move non-`Copy` fields out of a value. Match a reference
+//! to inspect fields, or use [`core::mem::take`] through a mutable reference
+//! to extract an array, table, or byte string:
+//!
+//! ```
+//! use fictionet::stdlib::amqp::FieldValue;
+//!
+//! let mut value = FieldValue::Array(vec![FieldValue::I32(7)]);
+//! let FieldValue::Array(items) = &mut value else { unreachable!() };
+//! let owned = core::mem::take(items);
+//! assert_eq!(owned, vec![FieldValue::I32(7)]);
+//! assert_eq!(value.as_array(), Some(&[][..]));
+//! ```
+//!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //! use fictionet::stdlib::amqp::{
@@ -737,6 +754,8 @@ impl Wire for Table {
 /// `l` is unsigned; here, as in RabbitMQ, both are signed integers.
 ///
 /// Float equality compares the wire bits, including NaNs.
+/// Dropping a value uses an explicit work list, even beyond [`MAX_DEPTH`].
+/// Take owned fields through a mutable reference with [`core::mem::take`].
 #[derive(Clone, Debug)]
 pub enum FieldValue {
     /// `t`: a boolean, one byte. Any byte but 0 is true.
@@ -780,6 +799,35 @@ pub enum FieldValue {
     Void,
     /// `x`: a byte array.
     Bytes(Vec<u8>),
+}
+
+impl Drop for FieldValue {
+    fn drop(&mut self) {
+        // Detach containers before dropping their parent. Scalars drop in
+        // place, so an all-scalar container needs no work list allocation.
+        fn detach(value: &mut FieldValue, pending: &mut Vec<FieldValue>) {
+            match value {
+                FieldValue::Array(items) => pending.extend(
+                    items
+                        .drain(..)
+                        .filter(|v| matches!(v, FieldValue::Array(_) | FieldValue::Table(_))),
+                ),
+                FieldValue::Table(table) => pending.extend(
+                    table
+                        .entries
+                        .drain(..)
+                        .map(|(_, v)| v)
+                        .filter(|v| matches!(v, FieldValue::Array(_) | FieldValue::Table(_))),
+                ),
+                _ => {}
+            }
+        }
+        let mut pending = Vec::new();
+        detach(self, &mut pending);
+        while let Some(mut value) = pending.pop() {
+            detach(&mut value, &mut pending);
+        }
+    }
 }
 
 impl PartialEq for FieldValue {
@@ -3543,32 +3591,38 @@ mod tests {
 
     #[test]
     fn deep_properties_are_refused_without_copying() {
-        // A hundred thousand nested arrays in the headers. content_frames
-        // reads the properties where they are, so it stops at MAX_DEPTH
-        // rather than copying every level first.
-        let mut v = FieldValue::Void;
-        for _ in 0..rounds(100_000) {
-            v = FieldValue::Array(vec![v]);
-        }
-        let mut t = Table::new();
-        t.entries.push((s("a"), v));
-        let mut props = BasicProperties {
-            headers: Some(t),
-            ..Default::default()
-        };
-        assert_eq!(
-            content_frames(1, &publish(), &props, b"", 0),
-            Err(Error::Unwritable)
-        );
-        // Take the value apart a level at a time, so dropping it does not
-        // recurse either.
-        let Some(mut t) = props.headers.take() else {
-            panic!()
-        };
-        let mut next = t.entries.pop().map(|(_, v)| v);
-        while let Some(FieldValue::Array(mut inner)) = next {
-            next = inner.pop();
-        }
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                for arrays in [true, false] {
+                    let mut v = FieldValue::Void;
+                    for _ in 0..rounds(100_000) {
+                        let sibling = FieldValue::LongString(b"sibling".to_vec());
+                        v = if arrays {
+                            FieldValue::Array(vec![sibling, v])
+                        } else {
+                            FieldValue::Table(Table {
+                                entries: vec![(s("sibling"), sibling), (s("child"), v)],
+                            })
+                        };
+                    }
+                    let props = BasicProperties {
+                        headers: Some(Table {
+                            entries: vec![(s("a"), v)],
+                        }),
+                        ..Default::default()
+                    };
+                    // Writing stops at MAX_DEPTH without copying the tree.
+                    assert_eq!(
+                        content_frames(1, &publish(), &props, b"", 0),
+                        Err(Error::Unwritable)
+                    );
+                    drop(props);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

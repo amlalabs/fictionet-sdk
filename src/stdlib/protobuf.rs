@@ -26,6 +26,25 @@
 //! Messages are capped at [`MAX_MESSAGE`] bytes and [`MAX_FIELDS`] fields.
 //! Groups and embedded messages nest at most [`MAX_DEPTH`] deep.
 //!
+//! [`Value`] implements `Drop` to release groups without recursion, including
+//! hand-built trees beyond [`MAX_DEPTH`]. `Clone`, `Debug`, and equality still
+//! recurse. Adding `Drop` is a source compatibility change: patterns cannot
+//! move non-`Copy` fields out of a value. Match a reference to inspect fields,
+//! or use [`core::mem::take`] through a mutable reference to extract bytes
+//! or a group's message. [`Message::fields`] can still be moved out directly:
+//!
+//! ```
+//! use fictionet::stdlib::protobuf::{Message, Value};
+//!
+//! let mut message = Message::new();
+//! message.push_uint64(1, 7);
+//! let mut value = Value::Group(message);
+//! let Value::Group(group) = &mut value else { unreachable!() };
+//! let owned = core::mem::take(group);
+//! assert_eq!(owned.uint64(1), Some(7));
+//! assert!(group.fields.is_empty());
+//! ```
+//!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
@@ -213,6 +232,8 @@ pub fn zigzag_decode32(v: u32) -> i32 {
 }
 
 /// One field's value, as the wire type carries it.
+/// Dropping a value uses an explicit work list, even beyond [`MAX_DEPTH`].
+/// Take owned fields through a mutable reference with [`core::mem::take`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     /// Wire type 0.
@@ -225,6 +246,29 @@ pub enum Value {
     Group(Message),
     /// Wire type 5: four bytes, little-endian.
     Fixed32(u32),
+}
+
+impl Drop for Value {
+    fn drop(&mut self) {
+        // Detach groups before dropping their parent. Scalars drop in
+        // place, so a group of scalars needs no work list allocation.
+        fn detach(value: &mut Value, pending: &mut Vec<Value>) {
+            if let Value::Group(group) = value {
+                pending.extend(
+                    group
+                        .fields
+                        .drain(..)
+                        .map(|f| f.value)
+                        .filter(|v| matches!(v, Value::Group(_))),
+                );
+            }
+        }
+        let mut pending = Vec::new();
+        detach(self, &mut pending);
+        while let Some(mut value) = pending.pop() {
+            detach(&mut value, &mut pending);
+        }
+    }
 }
 
 impl Value {
@@ -979,7 +1023,7 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{decode_all, mutate, rounds};
 
     fn check(input: &[u8]) {
         contract::check_decode_with_alloc_limit(
@@ -1328,6 +1372,27 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn deeply_nested_hand_built_values_drop_after_refusal() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut m = Message::new();
+                for _ in 0..rounds(100_000) {
+                    let mut outer = Message::new();
+                    outer.push_bytes(2, b"sibling");
+                    outer.push_group(3, Message::new());
+                    outer.push_group(1, m);
+                    m = outer;
+                }
+                assert_eq!(m.to_bytes(), Err(Error::TooDeep));
+                drop(m);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     fn sample() -> Message {
