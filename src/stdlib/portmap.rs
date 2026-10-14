@@ -22,7 +22,9 @@
 //! a successful reply. What is registered, and what a forwarded call does,
 //! is up to world code. A portmapper sends no reply at all when CALLIT
 //! fails; [`silent_on_failure`]
-//! says which calls those are.
+//! says which calls those are. Check the RPC version first: a wrong version
+//! gets an RPC_MISMATCH reply even for CALLIT. A successful portmap version 2
+//! CALLIT result contains a port and length-prefixed forwarded results.
 //!
 //! Over TCP, map [`onc_rpc::messages`] with a
 //! closure. [`Request::read`] also accepts version, procedure, and arguments
@@ -50,7 +52,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::onc_rpc::{Accept, Body, Call, Message, Reply};
+//! use fictionet::stdlib::onc_rpc::{Accept, Body, Call, Message, Reject, Reply};
 //! use fictionet::stdlib::portmap::{
 //!     silent_on_failure, format_uaddr, parse_uaddr, procedure, Error, PmapRequest, PmapResult, Request, Rpcb,
 //!     RpcbRequest, RpcbResult, IPPROTO_TCP,
@@ -112,6 +114,11 @@
 //! // A forwarded call gets no reply, since this host forwards nothing.
 //! let forward = Request::Pmap(PmapRequest::CallIt(Default::default()));
 //! assert!(answer(&forward.to_call().unwrap()).is_none());
+//!
+//! // A wrong RPC version is refused even when the procedure is CALLIT.
+//! let mut call = forward.to_call().unwrap();
+//! call.rpc_version = 3;
+//! assert_eq!(answer(&call), Some(Reply::Denied(Reject::RpcMismatch { low: 2, high: 2 })));
 //! ```
 
 use std::net::{IpAddr, SocketAddr};
@@ -1361,6 +1368,11 @@ mod tests {
             results: vec![],
         });
         assert_eq!(r.to_bytes().unwrap(), [0, 0, 2, 0x7b, 0, 0, 0, 0]);
+        // A port word alone is not a CALLIT result: the opaque length is missing.
+        assert_eq!(
+            PmapResult::parse(procedure::CALLIT, &[0, 0, 0, 0]),
+            Err(Error::Xdr(onc_rpc::Error::Short))
+        );
     }
 
     #[test]

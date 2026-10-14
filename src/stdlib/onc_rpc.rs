@@ -26,48 +26,37 @@
 //! XDR arguments and results.
 //! [`Writer::finish`] reports values that exceed its record budget.
 //! World code selects the program, procedure, and reply.
+//! The example below wraps a NULL call and its empty result in RPC envelopes.
+//! See [`portmap`](fictionet::stdlib::portmap) for procedure dispatch,
+//! including RPC-version checks and silent failures for unforwarded CALLITs.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Assembled, Wire};
 //! use fictionet::stdlib::onc_rpc::{
-//!     records, Body, Call, Record, Message, MAX_RECORD,
-//!     Reply, IPPROTO_TCP,
+//!     records, Body, Call, Record, Message, MAX_RECORD, Reply,
 //! };
 //!
-//! use fictionet::stdlib::portmap::{Mapping, silent_on_failure, Request, PmapRequest, PmapResult};
-//!
-//! /// A portmapper that knows one program: NFS version 3 on TCP port 2049.
-//! /// `None` means it sends no reply.
-//! fn answer(call: &Call) -> Option<Reply> {
-//!     Some(match Request::from_call(call) {
-//!         Ok(Request::Pmap(PmapRequest::GetPort(m))) => {
-//!             let nfs = m.program == 100_003 && m.version == 3 && m.protocol == IPPROTO_TCP;
-//!             Reply::success(PmapResult::Port(if nfs { 2049 } else { 0 }).to_bytes().unwrap())
-//!         }
-//!         Ok(Request::Pmap(PmapRequest::Null)) => Reply::success(Vec::new()),
-//!         // Refuse to register or list anything.
-//!         Ok(_) => Reply::success(vec![0, 0, 0, 0]),
-//!         // It forwards no calls, and a CALLIT that fails gets no reply.
-//!         Err(_) if silent_on_failure(call) => return None,
-//!         Err(error) => error.reply(),
-//!     })
-//! }
-//!
-//! // A client asks, over TCP, which port NFS version 3 uses. Call 7.
-//! let mapping = Mapping { program: 100_003, version: 3, protocol: IPPROTO_TCP, port: 0 };
-//! let request = Request::Pmap(PmapRequest::GetPort(mapping)).call(7).unwrap();
+//! // NFS version 3's NULL procedure takes no arguments and returns no results.
+//! let request = Message {
+//!     xid: 7,
+//!     body: Body::Call(Call::new(100_003, 3, 0, Vec::new())),
+//! };
+//! // Over TCP, the RPC envelope travels inside a record.
 //! let mut decoder = Stream::new(records(MAX_RECORD));
 //! let bytes = Record::from_message(&request).unwrap().to_bytes().unwrap();
 //! assert_eq!(decoder.push(&bytes), bytes.len());
 //! let Assembled::Message(record) = decoder.next().unwrap().unwrap();
 //! let message = Message::parse(&record).unwrap();
-//! let Body::Call(call) = &message.body else { panic!("not a call") };
-//! let reply = message.reply(answer(call).unwrap());
-//! // Call 7, a reply, accepted, an AUTH_NONE verifier, success, port 2049.
-//! assert_eq!(
-//!     reply.to_bytes().unwrap(),
-//!     [0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 1]
-//! );
+//! assert_eq!(message, request);
+//!
+//! // After dispatching this NULL call, the server wraps its empty result.
+//! // The reply keeps the call's transaction ID.
+//! let reply = message.reply(Reply::success(Vec::new()));
+//! assert_eq!(reply.xid, 7);
+//! let bytes = Record::from_message(&reply).unwrap().to_bytes().unwrap();
+//! assert_eq!(decoder.push(&bytes), bytes.len());
+//! let Assembled::Message(record) = decoder.next().unwrap().unwrap();
+//! assert_eq!(Message::parse(&record).unwrap(), reply);
 //! ```
 
 use core::convert::Infallible;
