@@ -966,17 +966,14 @@ impl Decode for Inputs {
         });
         match result {
             Ok(line) if self.rejected.is_none() => {
-                if self.data_size > self.data.capacity() {
-                    let target = self
-                        .data_size
-                        .max(self.data.capacity().saturating_mul(2))
-                        .min(MAX_DATA);
-                    self.data
-                        .try_reserve_exact(target.saturating_sub(self.data.len()))
-                        .map_err(|_| FrameError::Allocation)?;
-                }
-                self.data
-                    .extend_from_slice(line.strip_prefix(b".").unwrap_or(&line));
+                let content = line.strip_prefix(b".").unwrap_or(&line);
+                codec::reserve_bytes(&mut self.data, content.len() + 2, MAX_DATA).map_err(
+                    |error| match error {
+                        codec::ReserveError::TooLong { .. } => FrameError::TooMuchData,
+                        codec::ReserveError::Allocation => FrameError::Allocation,
+                    },
+                )?;
+                self.data.extend_from_slice(content);
                 self.data.extend_from_slice(b"\r\n");
             }
             Err(Error::LineTooLong) => return Err(FrameError::LineTooLong),

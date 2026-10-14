@@ -88,7 +88,7 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
-    Decode, Reader, Step, Trailing, Truncated, Wire, Work, be16, le16, le32, le64,
+    Decode, Reader, Step, Trailing, Truncated, Wire, Work, be16, le16, le32, le64, reserve_bytes,
 };
 
 /// The TCP port SQL Server listens on.
@@ -735,15 +735,8 @@ impl Decode for Messages {
         if last {
             message.status |= bits & status::IGNORE;
         }
-        if total > message.data.capacity() {
-            let target = total
-                .max(message.data.capacity().saturating_mul(2))
-                .min(self.limit);
-            message
-                .data
-                .try_reserve_exact(target.saturating_sub(message.data.len()))
-                .map_err(|_| Error::TooLong(total))?;
-        }
+        reserve_bytes(&mut message.data, used - HEADER_LEN, self.limit)
+            .map_err(|_| Error::TooLong(total))?;
         message.data.extend_from_slice(&packet[HEADER_LEN..]);
         if last {
             Ok(Step::Item(message, used))

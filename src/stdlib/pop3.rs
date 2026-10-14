@@ -1330,15 +1330,14 @@ impl Decode for Outputs {
         match line {
             Ok(line) if !line.contains(&b'\r') && !self.rejected => {
                 if let Some(body) = self.pending.as_mut().and_then(|r| r.body.as_mut()) {
-                    if self.body_size > body.capacity() {
-                        let target = self
-                            .body_size
-                            .max(body.capacity().saturating_mul(2))
-                            .min(MAX_BODY);
-                        body.try_reserve_exact(target.saturating_sub(body.len()))
-                            .map_err(|_| FrameError::Allocation)?;
-                    }
-                    body.extend_from_slice(line.strip_prefix(b".").unwrap_or(&line));
+                    let content = line.strip_prefix(b".").unwrap_or(&line);
+                    codec::reserve_bytes(body, content.len() + 2, MAX_BODY).map_err(|error| {
+                        match error {
+                            codec::ReserveError::TooLong { .. } => FrameError::BodyTooLong,
+                            codec::ReserveError::Allocation => FrameError::Allocation,
+                        }
+                    })?;
+                    body.extend_from_slice(content);
                     body.extend_from_slice(b"\r\n");
                 }
             }

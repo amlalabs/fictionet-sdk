@@ -80,7 +80,7 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire};
+use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire, reserve_bytes};
 
 /// The TCP port MySQL servers listen on.
 pub const PORT: u16 = 3306;
@@ -733,14 +733,7 @@ impl Decode for Messages {
             Some((first, _, bytes)) => (first, bytes),
             None => (seq, Vec::new()),
         };
-        if total > bytes.capacity() {
-            let target = total
-                .max(bytes.capacity().saturating_mul(2))
-                .min(self.limit);
-            bytes
-                .try_reserve_exact(target.saturating_sub(bytes.len()))
-                .map_err(|_| Error::TooLong(total))?;
-        }
+        reserve_bytes(&mut bytes, payload.len(), self.limit).map_err(|_| Error::TooLong(total))?;
         bytes.extend_from_slice(payload);
         if length < MAX_PACKET_PAYLOAD {
             return Ok(Step::Item(

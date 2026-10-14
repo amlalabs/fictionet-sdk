@@ -1232,26 +1232,14 @@ impl Writer {
     }
 
     fn append(&mut self, bytes: &[u8], literal: bool) -> Result<(), Error> {
-        let total = self
-            .out
-            .len()
-            .checked_add(bytes.len())
-            .filter(|&n| n <= MAX_MESSAGE)
-            .ok_or(Error::Unwritable)?;
+        codec::reserve_bytes(&mut self.out, bytes.len(), MAX_MESSAGE)
+            .map_err(|_| Error::Unwritable)?;
         if !literal {
             self.text = self
                 .text
                 .checked_add(bytes.len())
                 .filter(|&n| n <= MAX_TEXT)
                 .ok_or(Error::Unwritable)?;
-        }
-        if total > self.out.capacity() {
-            let target = total
-                .max(self.out.capacity().saturating_mul(2))
-                .min(MAX_MESSAGE);
-            self.out
-                .try_reserve_exact(target.saturating_sub(self.out.len()))
-                .map_err(|_| Error::Unwritable)?;
         }
         self.out.extend_from_slice(bytes);
         Ok(())
@@ -1437,20 +1425,12 @@ impl MessageLines {
     }
 
     fn append(&mut self, bytes: &[u8]) -> Result<(), FrameError> {
-        let size = self
-            .message
-            .len()
-            .checked_add(bytes.len())
-            .filter(|&n| n <= MAX_MESSAGE)
-            .ok_or(FrameError::TooLong)?;
-        if size > self.message.capacity() {
-            let target = size
-                .max(self.message.capacity().saturating_mul(2))
-                .min(MAX_MESSAGE);
-            self.message
-                .try_reserve_exact(target.saturating_sub(self.message.len()))
-                .map_err(|_| FrameError::Allocation)?;
-        }
+        codec::reserve_bytes(&mut self.message, bytes.len(), MAX_MESSAGE).map_err(|error| {
+            match error {
+                codec::ReserveError::TooLong { .. } => FrameError::TooLong,
+                codec::ReserveError::Allocation => FrameError::Allocation,
+            }
+        })?;
         self.message.extend_from_slice(bytes);
         Ok(())
     }
