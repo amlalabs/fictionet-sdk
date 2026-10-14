@@ -216,6 +216,22 @@ struct Hub {
     state: Mutex<HubState>,
 }
 
+impl Hub {
+    /// Reclaims detached attachments, including those passed through maps.
+    fn reclaim_detached(self: &Arc<Self>) {
+        let mut hub = Some(self.clone());
+        while let Some(current) = hub {
+            let (gone, mapped) = {
+                let mut state = current.state.lock();
+                (state.take_detached(), state.mapped.upgrade())
+            };
+            // Closing an attachment can take this hub's lock again.
+            drop(gone);
+            hub = mapped;
+        }
+    }
+}
+
 #[derive(Default)]
 struct HubState {
     /// A real listener feeds this hub, even if it has since closed.
@@ -224,6 +240,8 @@ struct HubState {
     names: HashSet<String>,
     /// Attachments not yet handed out, in arrival order.
     pending: VecDeque<Attachment>,
+    /// Where `map` passes attachments on, so detach cleanup follows them.
+    mapped: Weak<Hub>,
     /// The world waiting in `get` or `next`.
     waker: Option<Waker>,
     /// The task of [`Attachments::map`] that feeds this hub, woken when
@@ -237,6 +255,18 @@ struct HubState {
 }
 
 impl HubState {
+    /// Removes detached attachments without dropping them under the lock.
+    fn take_detached(&mut self) -> VecDeque<Attachment> {
+        if !self.pending.iter().any(Attachment::detached) {
+            return VecDeque::new();
+        }
+        let (gone, live) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(Attachment::detached);
+        self.pending = live;
+        gone
+    }
+
     /// Checks the listener boundary before exposing this hub to a run.
     fn bind(&mut self, fcx: &Cx) -> bool {
         if self.real_listener && fcx.mode() == crate::RunMode::Lab {
@@ -261,6 +291,7 @@ pub(crate) struct NameGuard {
 impl Drop for NameGuard {
     fn drop(&mut self) {
         self.hub.state.lock().names.remove(&self.name);
+        self.hub.reclaim_detached();
     }
 }
 
@@ -360,8 +391,11 @@ impl Attacher {
             return;
         }
         state.pending.push_back(attachment);
+        // A detach can race with delivery, including a map passing it on.
+        let gone = state.take_detached();
         let waker = state.waker.take();
         drop(state);
+        drop(gone);
         if let Some(w) = waker {
             w.wake();
         }
@@ -420,6 +454,11 @@ impl std::error::Error for AttachError {}
 ///
 /// The loop ends when the world stops: `next` returns [`Cancelled`], and
 /// `?` passes it up, which ends the task without failing it.
+///
+/// A sandbox that detaches before the world takes it is discarded, along
+/// with its queued packets. Its resources are reclaimed even if the world
+/// is not polling this stream, including after [`map`](Attachments::map).
+/// Attachments already taken by the world are left for it to drain or drop.
 pub struct Attachments {
     hub: Arc<Hub>,
 }
@@ -521,6 +560,7 @@ impl Attachments {
             if !state.bind(fcx) {
                 return Attachments { hub };
             }
+            state.mapped = Arc::downgrade(&hub);
         }
         let out = Attacher { hub: hub.clone() };
         let wrap = Arc::new(Mutex::new(wrap));
@@ -580,19 +620,13 @@ impl Attachments {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(Cancelled));
         }
-        let mut gone = VecDeque::new();
+        let gone;
         {
             let mut state = self.hub.state.lock();
             if !state.bind(fcx) {
                 return Poll::Ready(Err(Cancelled));
             }
-            if state.pending.iter().any(Attachment::detached) {
-                let (dead, live) = std::mem::take(&mut state.pending)
-                    .into_iter()
-                    .partition(Attachment::detached);
-                state.pending = live;
-                gone = dead;
-            }
+            gone = state.take_detached();
             if let Some(found) = state
                 .pending
                 .iter()
@@ -636,6 +670,69 @@ impl Drop for Attachments {
 #[cfg(all(test, feature = "std", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_pending_attachments_are_reclaimed_without_polling() {
+        let (attacher, attachments) = attachments();
+        let first = attacher.attach("first").unwrap();
+        let agent = attacher.attach("agent").unwrap();
+        let last = attacher.attach("last").unwrap();
+        drop(agent);
+        for _ in 0..100 {
+            let agent = attacher.attach("agent").unwrap();
+            assert_eq!(attachments.hub.state.lock().pending.len(), 3);
+            drop(agent);
+            assert_eq!(attachments.hub.state.lock().pending.len(), 2);
+        }
+        let names: Vec<_> = attachments
+            .hub
+            .state
+            .lock()
+            .pending
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        assert_eq!(names, ["first", "last"]);
+        drop((first, last));
+        assert!(attachments.hub.state.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn delivery_reclaims_an_attachment_that_detached_in_transit() {
+        let (attacher, attachments) = attachments();
+        let agent = attacher.attach("agent").unwrap();
+        let pending = attachments.hub.state.lock().pending.pop_front().unwrap();
+        drop(agent);
+        attacher.deliver(pending);
+        assert!(attachments.hub.state.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn detach_cleanup_follows_chained_maps_without_polling() {
+        let (attacher, attachments) = attachments();
+        crate::block_on(crate::lab(
+            crate::Seed::from_u64(0),
+            move |fcx| async move {
+                let wrap = |_: &Cx, a: Attachment| {
+                    assert_eq!(a.name(), "barrier", "detached agents must not be wrapped");
+                    a
+                };
+                let mut mapped = attachments.map(&fcx, wrap).map(&fcx, wrap);
+                for _ in 0..100 {
+                    let agent = attacher.attach("agent").unwrap();
+                    let barrier = attacher.attach("barrier").unwrap();
+                    let taken = mapped.get(&fcx, "barrier").await?;
+                    // Taking the barrier proves the map tasks passed the agent on.
+                    assert_eq!(mapped.hub.state.lock().pending.len(), 1);
+                    drop(agent);
+                    assert!(mapped.hub.state.lock().pending.is_empty());
+                    drop((taken, barrier));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn a_lab_get_refuses_a_listener_hub_with_a_pending_attachment() {

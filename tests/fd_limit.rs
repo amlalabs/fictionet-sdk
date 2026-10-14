@@ -10,6 +10,8 @@ use std::time::Duration;
 use fictionet::relay::{self, Hello, Message, unix};
 use fictionet::{WorldSocket, attachments, listen};
 
+static LIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The `stat` files of the threads whose name starts with `prefix`, opened
 /// now, so they can be read when no descriptors are left.
 fn thread_stats(prefix: &str) -> Vec<std::fs::File> {
@@ -45,6 +47,7 @@ fn ticks(stats: &[std::fs::File]) -> u64 {
 /// spin on the listening socket. It accepts again once descriptors are free.
 #[test]
 fn running_out_of_descriptors_does_not_spin_the_helper() {
+    let _lock = LIMIT_LOCK.lock().unwrap();
     let path = format!(
         "{}/fictionet-test-{}-fdlimit.sock",
         std::env::temp_dir().display(),
@@ -109,4 +112,105 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     let n = unix::recv(client.as_raw_fd(), &mut buf, false)
         .expect("no answer after descriptors were freed");
     assert_eq!(&buf[..n], &[relay::ACCEPT]);
+}
+
+#[test]
+fn reconnects_reclaim_pending_sockets_without_world_polling() {
+    use fictionet::{Interface, InterfaceExt, Packet, Seed, block_on, run};
+    use std::sync::mpsc;
+
+    let _lock = LIMIT_LOCK.lock().unwrap();
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    let low = libc::rlimit {
+        rlim_cur: 64.min(limit.rlim_cur),
+        rlim_max: limit.rlim_max,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
+    struct RestoreLimit(libc::rlimit);
+    impl Drop for RestoreLimit {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+        }
+    }
+    let _restore = RestoreLimit(limit);
+
+    for mapped in [false, true] {
+        let path = format!(
+            "{}/fictionet-test-{}-churn-{mapped}.sock",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let (attacher, attachments) = attachments();
+        let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (mut go, mut wait) = fictionet::pair();
+        let world = std::thread::spawn(move || {
+            block_on(run(Seed::from_u64(0), move |fcx| async move {
+                let mut attachments = if mapped {
+                    attachments.map(&fcx, |_, a| {
+                        assert_eq!(a.name(), "barrier", "pending agents must not be wrapped");
+                        a
+                    })
+                } else {
+                    attachments
+                };
+                for _ in 0..128 {
+                    drop(attachments.get(&fcx, "barrier").await?);
+                    ready_tx.send(()).unwrap();
+                    // Keep the stream alive without polling it during detach.
+                    wait.recv(&fcx).await?;
+                }
+                Ok(())
+            }))
+        });
+        let connect = |name: &str| {
+            let fd = unix::connect(&path).unwrap();
+            unix::set_timeout(
+                fd.as_raw_fd(),
+                libc::SO_RCVTIMEO,
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+            let hello = Message::Hello(Hello {
+                version: relay::VERSION,
+                mtu: 1500,
+                kind: "tun".into(),
+                name: name.into(),
+            });
+            unix::send(fd.as_raw_fd(), &hello.encode(), false).unwrap();
+            let mut buf = [0u8; 256];
+            let n = unix::recv(fd.as_raw_fd(), &mut buf, false).unwrap();
+            assert_eq!(&buf[..n], &[relay::ACCEPT]);
+            fd
+        };
+        for _ in 0..128 {
+            let agent = connect("agent");
+            let barrier = connect("barrier");
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(barrier);
+            // Leave a received packet behind, then half-close. Closing the
+            // unread socket can report either EOF or a connection reset.
+            unix::send(agent.as_raw_fd(), &Message::Packet(&[42]).encode(), false).unwrap();
+            assert_eq!(
+                unsafe { libc::shutdown(agent.as_raw_fd(), libc::SHUT_WR) },
+                0
+            );
+            let mut buf = [0u8; 1];
+            match unix::recv(agent.as_raw_fd(), &mut buf, false) {
+                Ok(0) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("pending socket was not reclaimed: {other:?}"),
+            }
+            drop(agent);
+            go.send(Packet(vec![]));
+        }
+        world.join().unwrap().unwrap();
+    }
 }

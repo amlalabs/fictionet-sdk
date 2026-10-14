@@ -93,6 +93,9 @@ impl std::error::Error for ParseWorldSocketError {}
 /// Dropping the returned [`Listening`] closes the socket, so no more
 /// sandboxes can attach. Sandboxes already attached stay attached, and the
 /// helper thread keeps running until the last of them detaches.
+/// If a sandbox detaches before the world takes its attachment, the helper
+/// thread reclaims its socket and buffers, even when the world is not
+/// polling [`Attachments`](crate::Attachments).
 ///
 /// The attachment hub is marked as fed by a real listener. Using its
 /// [`Attachments`](crate::Attachments) in a [`lab`](crate::lab), through

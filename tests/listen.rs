@@ -518,6 +518,51 @@ fn reattaching_before_the_world_asks_gives_the_new_connection() {
     out.unwrap();
 }
 
+#[test]
+fn a_taken_attachment_drains_packets_after_detach_and_reconnect() {
+    let path = socket_path("drain");
+    let (attacher, mut attachments) = attachments();
+    let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (go, mut wait) = fictionet::pair();
+    let world = std::thread::spawn(move || {
+        block_on(run(fictionet::Seed::from_u64(0), move |fcx| async move {
+            let mut first = attachments.get(&fcx, "agent").await?;
+            ready_tx.send(()).unwrap();
+            assert_eq!(wait.recv(&fcx).await, Err(RecvError::Closed));
+            for i in 0..100u8 {
+                assert_eq!(first.recv(&fcx).await?, Packet(vec![i]));
+            }
+            assert_eq!(first.recv(&fcx).await, Err(RecvError::Closed));
+            drop(first);
+            let mut next = attachments.get(&fcx, "agent").await?;
+            assert_eq!(next.recv(&fcx).await?, Packet(vec![255]));
+            Ok(())
+        }))
+    });
+    let first = Client::attach(&path, "agent");
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    for i in 0..100u8 {
+        first.send(&Message::Packet(&[i]));
+    }
+    drop(first);
+    let mut next = None;
+    poll::until(Duration::from_secs(5), || {
+        let client = Client::connect(&path);
+        client.hello("agent", 1500);
+        if client.recv() == Some(vec![relay::ACCEPT]) {
+            next = Some(client);
+            true
+        } else {
+            false
+        }
+    });
+    let next = next.unwrap();
+    next.send(&Message::Packet(&[255]));
+    drop(go);
+    world.join().unwrap().unwrap();
+}
+
 /// The world sends a burst far past the connection's buffer and then waits
 /// for the test to finish, never reading from the attachment. The queue is
 /// still written out, in order, as attach reads.
