@@ -121,6 +121,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::future::{Future, poll_fn};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
@@ -137,7 +138,7 @@ use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
 use fictionet::stdlib::ConnectionExt;
 use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::json::Value;
-use fictionet::stdlib::net::{Arrival, ConfigFor, Host, PortServer, Sni};
+use fictionet::stdlib::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
 use fictionet::stdlib::serve::Prefixed;
 use fictionet::stdlib::serve::{
     self, Budget, Driver, Ended, Flow, Pending, PendingDriver, ServeOptions, Timer,
@@ -1952,6 +1953,8 @@ pub async fn serve_connection<C: Connection + Unpin>(
 /// Every host at one address that serves HTTP on a port shares that port:
 /// the first host's `Server` takes in the others' sites as
 /// [`VirtualHosts`], and each request goes to the site its host names.
+/// Names and defaults belong to the local address and port where `Net`
+/// installed them. Sharing one address does not add sites at another.
 /// Over TLS, ALPN offers `h2` and `http/1.1` with `tokio`, or only
 /// `http/1.1` without it.
 ///
@@ -1967,7 +1970,7 @@ pub struct Server {
     default_host: bool,
     limits: Limits,
     date: Option<SystemTime>,
-    vhosts: VirtualHosts,
+    vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
     tls: Option<ConfigFor>,
 }
 
@@ -1988,7 +1991,7 @@ impl Server {
             default_host: false,
             limits: Limits::default(),
             date: None,
-            vhosts: VirtualHosts::new(),
+            vhosts: Arc::default(),
             tls: None,
         }
     }
@@ -2012,7 +2015,7 @@ impl Server {
     }
 
     /// Answers requests at its address whose host names no site there.
-    /// The first default site at an address keeps the role.
+    /// The first default site at each local address and port keeps the role.
     /// These requests keep their requested host in [`Target`] and carry
     /// [`Routing::Fallback`]. Handlers that forward dynamically should
     /// check [`Target::routing`].
@@ -2051,10 +2054,10 @@ impl Server {
     /// Each installed port has a fresh virtual-host table, including
     /// when this builder was cloned.
     pub fn served_by(mut self, host: Host) -> Host {
-        self.vhosts = VirtualHosts::new();
+        self.vhosts = Arc::default();
         let secure = self.tls.take().map(|config| {
             let mut server = self.clone();
-            server.vhosts = VirtualHosts::new();
+            server.vhosts = Arc::default();
             server.vhost.plain_http = false;
             (config, server)
         });
@@ -2070,7 +2073,14 @@ impl Server {
 
 impl PortServer for Server {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let handler: Arc<dyn Handler> = Arc::new(self.vhosts.clone());
+        let vhosts = arrival.info.local.and_then(|local| {
+            self.vhosts
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&local)
+                .cloned()
+        });
+        let handler: Arc<dyn Handler> = Arc::new(vhosts.unwrap_or_default());
         let opts = HttpOptions {
             limits: self.limits,
             first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
@@ -2091,18 +2101,27 @@ impl PortServer for Server {
         })
     }
 
-    fn share(&self, names: &[String], other: &Arc<dyn PortServer>) -> bool {
+    fn prepare_share(
+        &self,
+        local: SocketAddr,
+        names: &[String],
+        other: &Arc<dyn PortServer>,
+    ) -> Option<PreparedShare> {
         let other: &dyn Any = &**other;
-        let Some(site) = other.downcast_ref::<Server>() else {
-            return false;
-        };
-        for name in names {
-            self.vhosts.insert(name, site.vhost.clone());
-        }
-        if site.default_host {
-            self.vhosts.set_default(site.vhost.clone());
-        }
-        true
+        let site = other.downcast_ref::<Server>()?;
+        let (vhost, default_host) = (site.vhost.clone(), site.default_host);
+        let names = names.to_vec();
+        let endpoints = self.vhosts.clone();
+        Some(PreparedShare::new(move || {
+            let mut endpoints = endpoints.write().unwrap_or_else(|e| e.into_inner());
+            let vhosts = endpoints.entry(local).or_default();
+            for name in names {
+                vhosts.insert(&name, vhost.clone());
+            }
+            if default_host {
+                vhosts.set_default(vhost);
+            }
+        }))
     }
 }
 

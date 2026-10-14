@@ -4579,6 +4579,161 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
     });
 }
 
+fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
+    for distinct in [false, true] {
+        run_world::world(Duration::from_secs(60), move |fcx| async move {
+            let v4: IpAddr = "203.0.113.8".parse()?;
+            let v6: IpAddr = "2001:db8:1::8".parse()?;
+            let (shared, other, separate) = if shared_v6 {
+                (v6, v4, "203.0.113.9".parse::<IpAddr>()?)
+            } else {
+                (v4, v6, "2001:db8:1::9".parse::<IpAddr>()?)
+            };
+            let date = SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000);
+            let certs = certs(&fcx, &["a.test", "b.test", "c.test"]);
+            let roots = Arc::new(certs.roots);
+            let config = Arc::new(
+                tls::config_builder(&fcx, date)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(certs.chain, certs.key)
+                    .unwrap(),
+            );
+            let (attacher, attachments) = fictionet::attachments();
+            web::Sites::new(move |name| {
+                let site = match name {
+                    "a.test" => web::Site::new(Plain("a")).at(shared).at(other),
+                    "b.test" => {
+                        let site = web::Site::new(Plain("b")).at(shared);
+                        let site = if distinct {
+                            site.at(separate)
+                        } else if shared_v6 {
+                            site.ipv6_only()
+                        } else {
+                            site.ipv4_only()
+                        };
+                        if defaults { site.default_host() } else { site }
+                    }
+                    "c.test" if defaults => {
+                        let site = web::Site::new(Plain("c")).at(other).default_host();
+                        if shared_v6 {
+                            site.ipv4_only()
+                        } else {
+                            site.ipv6_only()
+                        }
+                    }
+                    _ => return None,
+                };
+                Some(site.tls(config.clone()).plain_http())
+            })
+            .start(&fcx, attachments)?;
+            let m4 = default_machine(&fcx, &attacher);
+            let m6 = machine(&fcx, attacher.attach("b")?, ME6);
+            assert_eq!(
+                dns_at(&fcx, &m4, GATEWAY.into(), "a.test", RecordType::A)
+                    .await
+                    .0,
+                ResponseCode::NoError
+            );
+            let m = if shared_v6 { &m6 } else { &m4 };
+            let mut existing = plain_client(&fcx, m, shared, false).await;
+            assert_eq!(
+                existing.get("http", "b.test", "/").await.status,
+                StatusCode::MISDIRECTED_REQUEST
+            );
+            for name in ["b.test", "c.test"]
+                .into_iter()
+                .take(if defaults { 2 } else { 1 })
+            {
+                assert_eq!(
+                    dns_at(&fcx, &m4, GATEWAY.into(), name, RecordType::A)
+                        .await
+                        .0,
+                    ResponseCode::NoError
+                );
+            }
+            assert!(
+                existing
+                    .get("http", "b.test", "/")
+                    .await
+                    .body
+                    .starts_with("b ")
+            );
+            for addr in [shared, other, separate]
+                .into_iter()
+                .take(if distinct { 3 } else { 2 })
+            {
+                let m = if addr.is_ipv4() { &m4 } else { &m6 };
+                for secure in [false, true] {
+                    for h2 in [false, true] {
+                        let (mut client, scheme) = if secure {
+                            let tcp = m.tcp.connect(&fcx, SocketAddr::new(addr, 443)).await?;
+                            let sni = if addr == separate { "b.test" } else { "a.test" };
+                            let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
+                            let conn = TlsClient::new(&fcx, tcp, &roots, sni, alpn, date)?;
+                            (Client::new(&fcx, conn, h2).await, "https")
+                        } else {
+                            (plain_client(&fcx, m, addr, h2).await, "http")
+                        };
+                        for name in ["a.test", "b.test", "B.TeSt.", "unknown.test"] {
+                            let exact = match name {
+                                "a.test" if addr != separate => Some("a"),
+                                "b.test" | "B.TeSt." if addr != other => Some("b"),
+                                _ => None,
+                            };
+                            let expected = exact.or_else(|| {
+                                defaults.then_some(if addr == other { "c" } else { "b" })
+                            });
+                            let got = client.get(scheme, name, "/").await;
+                            match expected {
+                                Some(label) => {
+                                    assert_eq!(
+                                        got.status,
+                                        StatusCode::OK,
+                                        "{addr} {scheme} {name}"
+                                    );
+                                    assert!(
+                                        got.body.starts_with(&format!("{label} ")),
+                                        "{addr} {scheme} {name}: {}",
+                                        got.body
+                                    );
+                                }
+                                None => assert_eq!(
+                                    got.status,
+                                    StatusCode::MISDIRECTED_REQUEST,
+                                    "{addr} {scheme} {name}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn shared_ipv4_keeps_ipv6_virtual_hosts_local() {
+    endpoint_scoped_sites(false, false);
+}
+
+#[test]
+fn shared_ipv6_keeps_ipv4_virtual_hosts_local() {
+    endpoint_scoped_sites(true, false);
+}
+
+#[test]
+fn shared_ipv4_keeps_defaults_local() {
+    endpoint_scoped_sites(false, true);
+}
+
+#[test]
+fn shared_ipv6_keeps_defaults_local() {
+    endpoint_scoped_sites(true, true);
+}
+
 #[test]
 fn https_http2_and_plain_http_over_ipv6() {
     world_events(|fcx, attacher, env, log| async move {

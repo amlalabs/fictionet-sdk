@@ -269,17 +269,49 @@ pub trait PortServer: Any + Send + Sync {
         Vec::new()
     }
 
-    /// A host is placed on this accept's port at its address (for a TLS
-    /// port, on one of the port's names), with the DNS names `names` and
-    /// the accept `other`. The first host on a port is offered its own
-    /// accept. Returns whether this accept serves that host too, as
-    /// virtual hosts share an HTTP port; if not, `other` serves the port
-    /// alone, which on a plain port is an error. The default takes only
-    /// itself. On a TLS port, subsequent hosts are offered to the first
-    /// installed accept, even if it declined an earlier host.
-    fn share(&self, names: &[String], other: &Arc<dyn PortServer>) -> bool {
-        let _ = names;
+    /// Prepares to serve `other`'s DNS `names` at the local endpoint.
+    /// This must not change either server. Return a token that commits
+    /// the registration without failure, scoped to `local`. Dropping
+    /// the token must leave both servers unchanged.
+    ///
+    /// The first host is offered its own accept. `None` declines sharing:
+    /// on an occupied plain port this is an error; on TLS, `other` serves
+    /// its names separately and is offered itself. Declining that offer
+    /// installs it without a commit. The default shares only with itself.
+    /// Subsequent TLS hosts are always offered to the first accept, even
+    /// if it declined an earlier host.
+    ///
+    /// `Net` prepares every port at every address before committing any
+    /// sharing. Tokens commit in address and port declaration order.
+    /// Several tokens may be prepared before any commits, so a token
+    /// must also work after earlier tokens have committed.
+    fn prepare_share(
+        &self,
+        local: SocketAddr,
+        names: &[String],
+        other: &Arc<dyn PortServer>,
+    ) -> Option<PreparedShare> {
+        let _ = (local, names);
         std::ptr::addr_eq(self as *const Self, Arc::as_ptr(other))
+            .then(|| PreparedShare::new(|| {}))
+    }
+}
+
+/// A side-effect-free sharing decision from [`PortServer::prepare_share`].
+/// Dropping it cancels the registration. Only [`commit`](Self::commit)
+/// changes the server.
+pub struct PreparedShare(Box<dyn FnOnce() + Send>);
+
+impl PreparedShare {
+    /// Captures an infallible commit, including its local endpoint and
+    /// the prepared registration. The closure runs only on commit.
+    pub fn new(commit: impl FnOnce() + Send + 'static) -> PreparedShare {
+        PreparedShare(Box::new(commit))
+    }
+
+    /// Applies the prepared registration. This must not fail or reject it.
+    pub fn commit(self) {
+        (self.0)();
     }
 }
 
@@ -1406,7 +1438,12 @@ impl Shared {
             .map(IpAddr::V4)
             .into_iter()
             .chain(placed.v6.map(IpAddr::V6));
-        for addr in addrs {
+        let prepared = addrs
+            .map(|addr| {
+                Machine::prepare(addr, world.machines.get(&addr), &host).map(|ports| (addr, ports))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (addr, ports) in prepared {
             let machine = match world.machines.get(&addr) {
                 Some(m) => m.clone(),
                 None => {
@@ -1415,7 +1452,7 @@ impl Shared {
                     m
                 }
             };
-            machine.add(&host)?;
+            machine.add(&host, ports)?;
         }
         Ok(placed)
     }
@@ -1455,6 +1492,7 @@ impl Shared {
                 .find(|a| free(*a) && !world.machines.contains_key(a))
                 .ok_or_else(|| format!("LAN {name} has no free address left"))?,
         };
+        let prepared = Machine::prepare(addr, world.machines.get(&addr), host)?;
         let machine = match world.machines.get(&addr) {
             Some(m) => m.clone(),
             None => {
@@ -1468,7 +1506,7 @@ impl Shared {
                 m
             }
         };
-        machine.add(host)?;
+        machine.add(host, prepared)?;
         Ok(match addr {
             IpAddr::V4(a) => Placed {
                 v4: Some(a),
@@ -1626,6 +1664,33 @@ struct TlsNames {
     first: Option<Arc<dyn PortServer>>,
 }
 
+fn tls_names(sni: &Sni, names: &[String], port: u16) -> Result<Vec<String>, String> {
+    match sni {
+        Sni::Any => Ok(vec![String::new()]),
+        Sni::Name(n) => Ok(vec![n.clone()]),
+        Sni::Names if names.is_empty() => Err(format!(
+            "TLS on port {port} is for the host's names, and it has none"
+        )),
+        Sni::Names => Ok(names.to_vec()),
+    }
+}
+
+/// Existing handlers and names reserved by this preparation.
+#[derive(Default)]
+struct PortPlan {
+    existing: Option<Arc<Port>>,
+    plain: Option<Arc<dyn PortServer>>,
+    first_tls: Option<Arc<dyn PortServer>>,
+    names: HashSet<String>,
+}
+
+/// One service whose sharing decision has been prepared.
+struct PreparedPort {
+    number: u16,
+    spec: PortSpec,
+    share: Option<PreparedShare>,
+}
+
 /// One address with its services.
 struct Machine {
     fcx: Cx,
@@ -1688,86 +1753,98 @@ impl Machine {
         Ok(p)
     }
 
-    /// Adds a host's services.
-    fn add(self: &Arc<Self>, host: &Host) -> Result<(), String> {
-        let sandbox: Option<serve::SandboxOf> = self.shared.upgrade().map(|s| {
-            let hooks = s.hooks.clone();
-            Arc::new(move |a: IpAddr| Some(hooks.sandbox_at(a))) as serve::SandboxOf
-        });
-        let addr = self.addr;
+    /// Checks services against installed ports and earlier preparations.
+    fn prepare(
+        addr: IpAddr,
+        machine: Option<&Arc<Self>>,
+        host: &Host,
+    ) -> Result<Vec<PreparedPort>, String> {
+        let mut ports = HashMap::<u16, PortPlan>::new();
+        let mut udp_ports = HashSet::new();
+        let mut prepared = Vec::new();
         for (number, spec) in &host.ports {
-            match spec {
-                PortSpec::Udp(start) => {
-                    if !self.udp_ports.lock().insert(*number) {
-                        return Err(format!("UDP port {number} at {addr} is already served"));
-                    }
-                    let socket = self
-                        .udp
-                        .bind(*number)
-                        .map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
-                    start(
-                        &self.fcx,
-                        socket,
-                        SocketAddr::new(addr, *number),
-                        sandbox.clone(),
-                    );
+            let local = SocketAddr::new(addr, *number);
+            if matches!(spec, PortSpec::Udp(_)) {
+                if !udp_ports.insert(*number)
+                    || machine.is_some_and(|m| m.udp_ports.lock().contains(number))
+                {
+                    return Err(format!("UDP port {number} at {addr} is already served"));
                 }
-                PortSpec::Tcp(accept) => {
-                    let port = self.port(*number)?;
-                    if !port
-                        .tls
+                prepared.push(PreparedPort {
+                    number: *number,
+                    spec: spec.clone(),
+                    share: None,
+                });
+                continue;
+            }
+            if *number == 0 {
+                return Err(format!(
+                    "TCP port {number} at {addr}: TCP port 0 cannot be listened on"
+                ));
+            }
+            let port = ports.entry(*number).or_insert_with(|| {
+                let existing = machine.and_then(|m| m.ports.lock().get(number).cloned());
+                let plain = existing
+                    .as_ref()
+                    .and_then(|p| p.plain.read().unwrap_or_else(|e| e.into_inner()).clone());
+                let first_tls = existing.as_ref().and_then(|p| {
+                    p.tls
                         .read()
                         .unwrap_or_else(|e| e.into_inner())
-                        .by_name
-                        .is_empty()
+                        .first
+                        .clone()
+                });
+                PortPlan {
+                    existing,
+                    plain,
+                    first_tls,
+                    names: HashSet::new(),
+                }
+            });
+            let tls = port
+                .existing
+                .as_ref()
+                .map(|p| p.tls.read().unwrap_or_else(|e| e.into_inner()));
+            let (spec, share) = match spec {
+                PortSpec::Udp(_) => unreachable!(),
+                PortSpec::Tcp(accept) => {
+                    if !port.names.is_empty() || tls.as_ref().is_some_and(|t| !t.by_name.is_empty())
                     {
                         return Err(format!(
                             "TCP port {number} at {addr} serves TLS, and cannot serve without it too"
                         ));
                     }
-                    let mut plain = port.plain.write().unwrap_or_else(|e| e.into_inner());
-                    match &*plain {
-                        None => {
-                            accept.share(&host.names, accept);
-                            *plain = Some(accept.clone());
-                        }
+                    let (served_by, share) = match &port.plain {
+                        None => (
+                            accept.clone(),
+                            accept.prepare_share(local, &host.names, accept),
+                        ),
                         Some(front) => {
-                            if !front.share(&host.names, accept) {
-                                return Err(format!(
+                            let share = front.prepare_share(local, &host.names, accept)
+                                .ok_or_else(|| format!(
                                     "TCP port {number} at {addr} is already served by another host"
-                                ));
-                            }
+                                ))?;
+                            (front.clone(), Some(share))
                         }
-                    }
+                    };
+                    port.plain = Some(served_by.clone());
+                    (PortSpec::Tcp(served_by), share)
                 }
                 PortSpec::Tls {
                     sni,
                     config,
                     accept,
                 } => {
-                    let port = self.port(*number)?;
-                    if port
-                        .plain
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_some()
-                    {
+                    if port.plain.is_some() {
                         return Err(format!(
                             "TCP port {number} at {addr} serves without TLS, and cannot serve TLS too"
                         ));
                     }
-                    let names: Vec<String> = match sni {
-                        Sni::Any => vec![String::new()],
-                        Sni::Name(n) => vec![n.clone()],
-                        Sni::Names if host.names.is_empty() => {
-                            return Err(format!(
-                                "TLS on port {number} is for the host's names, and it has none"
-                            ));
-                        }
-                        Sni::Names => host.names.clone(),
-                    };
-                    let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
-                    if let Some(taken) = names.iter().find(|n| tls.by_name.contains_key(*n)) {
+                    let names = tls_names(sni, &host.names, *number)?;
+                    if let Some(taken) = names.iter().find(|n| {
+                        port.names.contains(*n)
+                            || tls.as_ref().is_some_and(|t| t.by_name.contains_key(*n))
+                    }) {
                         let name = if taken.is_empty() {
                             "any name"
                         } else {
@@ -1775,21 +1852,89 @@ impl Machine {
                         };
                         return Err(format!("TLS port {number} at {addr} already serves {name}"));
                     }
-                    let front = tls.first.clone();
-                    let served_by = match front {
-                        Some(front) if front.share(&host.names, accept) => front,
-                        _ => {
-                            accept.share(&host.names, accept);
-                            accept.clone()
-                        }
-                    };
-                    tls.first.get_or_insert_with(|| served_by.clone());
+                    let shared = port.first_tls.as_ref().and_then(|front| {
+                        front
+                            .prepare_share(local, &host.names, accept)
+                            .map(|share| (front.clone(), Some(share)))
+                    });
+                    let (served_by, share) = shared.unwrap_or_else(|| {
+                        (
+                            accept.clone(),
+                            accept.prepare_share(local, &host.names, accept),
+                        )
+                    });
+                    port.first_tls.get_or_insert_with(|| served_by.clone());
+                    port.names.extend(names);
+                    (
+                        PortSpec::Tls {
+                            sni: sni.clone(),
+                            config: config.clone(),
+                            accept: served_by,
+                        },
+                        share,
+                    )
+                }
+            };
+            prepared.push(PreparedPort {
+                number: *number,
+                spec,
+                share,
+            });
+        }
+        Ok(prepared)
+    }
+
+    /// Installs the prepared services in declaration order.
+    fn add(self: &Arc<Self>, host: &Host, prepared: Vec<PreparedPort>) -> Result<(), String> {
+        let sandbox: Option<serve::SandboxOf> = self.shared.upgrade().map(|s| {
+            let hooks = s.hooks.clone();
+            Arc::new(move |a: IpAddr| Some(hooks.sandbox_at(a))) as serve::SandboxOf
+        });
+        let addr = self.addr;
+        for PreparedPort {
+            number,
+            spec,
+            share,
+        } in prepared
+        {
+            match spec {
+                PortSpec::Udp(start) => {
+                    let socket = self
+                        .udp
+                        .bind(number)
+                        .map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
+                    self.udp_ports.lock().insert(number);
+                    start(
+                        &self.fcx,
+                        socket,
+                        SocketAddr::new(addr, number),
+                        sandbox.clone(),
+                    );
+                }
+                PortSpec::Tcp(accept) => {
+                    let port = self.port(number)?;
+                    if let Some(share) = share {
+                        share.commit();
+                    }
+                    *port.plain.write().unwrap_or_else(|e| e.into_inner()) = Some(accept);
+                }
+                PortSpec::Tls {
+                    sni,
+                    config,
+                    accept,
+                } => {
+                    let port = self.port(number)?;
+                    let names = tls_names(&sni, &host.names, number)?;
+                    if let Some(share) = share {
+                        share.commit();
+                    }
+                    let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
+                    tls.first.get_or_insert_with(|| accept.clone());
                     for name in names {
-                        let alpn = served_by.alpn();
                         let entry = TlsName {
                             config: config.clone(),
-                            accept: served_by.clone(),
-                            alpn,
+                            accept: accept.clone(),
+                            alpn: accept.alpn(),
                             last: Mutex::new(None),
                         };
                         tls.by_name.insert(name, Arc::new(entry));
@@ -3133,9 +3278,15 @@ mod tests {
             fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async {})
             }
-            fn share(&self, _: &[String], _: &Arc<dyn PortServer>) -> bool {
+            fn prepare_share(
+                &self,
+                local: SocketAddr,
+                _: &[String],
+                _: &Arc<dyn PortServer>,
+            ) -> Option<PreparedShare> {
+                assert_eq!(local, "203.0.113.8:443".parse().unwrap());
                 self.1.lock().push(self.0);
-                false
+                None
             }
         }
         fictionet::block_on(fictionet::run(

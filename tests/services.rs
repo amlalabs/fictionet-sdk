@@ -47,7 +47,7 @@ use fictionet::stdlib::json;
 use fictionet::stdlib::modbus::{
     self, Exception, Frame, Request as MbRequest, Response as MbResponse,
 };
-use fictionet::stdlib::net::{Arrival, Net, PortServer, Sni};
+use fictionet::stdlib::net::{Arrival, Host, Net, PortServer, PreparedShare, Sni};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::serve::{
     self, Budget, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan,
@@ -1103,6 +1103,160 @@ async fn lookup(fcx: &Cx, s: &Machine, name: &str) -> Option<Ipv4Addr> {
         RData::A(a) => Some(a.0),
         _ => None,
     })
+}
+
+type Registrations = Vec<(SocketAddr, Vec<String>)>;
+
+#[derive(Clone, Default)]
+struct Sharing {
+    installed: Arc<Mutex<Registrations>>,
+    reject: Option<SocketAddr>,
+}
+
+impl PortServer for Sharing {
+    fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async {})
+    }
+
+    fn prepare_share(
+        &self,
+        local: SocketAddr,
+        names: &[String],
+        _: &Arc<dyn PortServer>,
+    ) -> Option<PreparedShare> {
+        if self.reject == Some(local) && names.iter().any(|n| n == "bad.test") {
+            return None;
+        }
+        let installed = self.installed.clone();
+        let names = names.to_vec();
+        Some(PreparedShare::new(move || {
+            installed.lock().unwrap().push((local, names));
+        }))
+    }
+}
+
+#[test]
+fn port_sharing_prepares_without_mutation_and_defaults_to_identity() {
+    let local = "203.0.113.8:80".parse().unwrap();
+    let first: Arc<dyn PortServer> = Arc::new(Spy::default());
+    let other: Arc<dyn PortServer> = Arc::new(Spy::default());
+    first.prepare_share(local, &[], &first).unwrap().commit();
+    assert!(first.prepare_share(local, &[], &other).is_none());
+
+    let server = Sharing::default();
+    let names = vec!["one.test".to_owned()];
+    let cancelled = server.prepare_share(local, &names, &other).unwrap();
+    let committed = server.prepare_share(local, &names, &other).unwrap();
+    assert!(server.installed.lock().unwrap().is_empty());
+    drop(cancelled);
+    assert!(server.installed.lock().unwrap().is_empty());
+    committed.commit();
+    assert_eq!(*server.installed.lock().unwrap(), [(local, names)]);
+}
+
+#[test]
+fn rejected_port_sharing_discards_preparations_at_every_endpoint() {
+    for reject in ["203.0.113.8:8", "[2001:db8:1::8]:7"] {
+        let reject: SocketAddr = reject.parse().unwrap();
+        world(Duration::from_secs(60), move |fcx| async move {
+            let v4 = Ipv4Addr::new(203, 0, 113, 8);
+            let v6: Ipv6Addr = "2001:db8:1::8".parse()?;
+            let server = Sharing {
+                reject: Some(reject),
+                ..Sharing::default()
+            };
+            let host = |name: &str| {
+                Host::new(name)
+                    .dns_name(name)
+                    .at(v4)
+                    .at(v6)
+                    .port_server(7, server.clone())
+                    .port_server(8, server.clone())
+            };
+            let first = host("first.test");
+            let (bad, good) = (host("bad.test"), host("good.test"));
+            let (attacher, attachments) = fictionet::attachments();
+            Net::new()
+                .add_host(first)
+                .resolve(move |name| match name {
+                    "bad.test" => Some(bad.clone()),
+                    "good.test" => Some(good.clone()),
+                    _ => None,
+                })
+                .start(&fcx, attachments)?;
+            let endpoints = [
+                SocketAddr::new(v4.into(), 7),
+                SocketAddr::new(v4.into(), 8),
+                SocketAddr::new(v6.into(), 7),
+                SocketAddr::new(v6.into(), 8),
+            ];
+            let expected: Vec<_> = endpoints
+                .into_iter()
+                .map(|local| (local, vec!["first.test".to_owned()]))
+                .collect();
+            assert_eq!(*server.installed.lock().unwrap(), expected);
+            let m = machine(&fcx, attacher.attach("client")?, ME);
+            assert_eq!(lookup(&fcx, &m, "bad.test").await, None);
+            assert_eq!(*server.installed.lock().unwrap(), expected);
+            assert_eq!(lookup(&fcx, &m, "good.test").await, Some(v4));
+            let good: Vec<_> = endpoints
+                .into_iter()
+                .map(|local| (local, vec!["good.test".to_owned()]))
+                .collect();
+            assert_eq!(server.installed.lock().unwrap()[4..], good);
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn a_rejected_host_does_not_install_http_names_or_a_default() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let addr = Ipv4Addr::new(203, 0, 113, 8);
+        let server = || {
+            httpd::Server::new(Router::new().get("/", |_, _| http::Response::new("hello".into())))
+        };
+        let first = Host::new("first")
+            .dns_name("first.test")
+            .at(addr)
+            .ipv4_only()
+            .port_server(80, server())
+            .port_server(81, Spy::default());
+        let bad = Host::new("bad")
+            .dns_name("bad.test")
+            .at(addr)
+            .ipv4_only()
+            .port_server(80, server().default_host())
+            .port_server(81, Spy::default());
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .add_host(first)
+            .resolve(move |_| Some(bad.clone()))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        assert_eq!(lookup(&fcx, &m, "bad.test").await, None);
+        let mut conn = m
+            .tcp
+            .connect(&fcx, SocketAddr::new(addr.into(), 80))
+            .await?;
+        for (name, status) in [
+            ("first.test", 200),
+            ("bad.test", 421),
+            ("unknown.test", 421),
+        ] {
+            let request = fictionet::stdlib::http1::Request::parse(
+                format!("GET / HTTP/1.1\r\nHost: {name}\r\n\r\n").as_bytes(),
+            )?;
+            assert_eq!(
+                fictionet::stdlib::sandbox::request(&fcx, &mut conn, &request)
+                    .await?
+                    .head
+                    .status,
+                status
+            );
+        }
+        Ok(())
+    });
 }
 
 #[test]

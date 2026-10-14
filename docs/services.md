@@ -354,9 +354,21 @@ Net::new()
 
 Sites of several hosts at one address share the port as virtual hosts:
 the first host's `Server` takes in the others through
-[`PortServer::share`](../src/stdlib/net.rs#L274). `Net` itself knows nothing
-of HTTP, so a copy of `httpd` with its own handlers
-plugs in the same way.
+[`PortServer::prepare_share`](../src/stdlib/net.rs). It receives the local
+`SocketAddr`, the host's DNS names and the other server. It returns `None`
+to decline sharing, or a `PreparedShare` token. Preparation must not change
+either server. The token captures an infallible commit; dropping it leaves
+the servers unchanged. `Net` prepares all the host's ports at all its
+addresses before committing any sharing, in address and declaration order.
+A token must still work after earlier tokens commit. The default shares
+only with the same server. On TLS, a declined host serves its own SNI
+names, and later hosts are still offered to the first server.
+
+HTTP names and defaults belong to each local address and port. Sharing an
+IPv4 address does not add a site's names or default to another IPv6 address,
+or the reverse. The first default at each endpoint keeps the role. Names
+are matched without case or a trailing dot. `Net` itself knows nothing of
+HTTP, so a copy of `httpd` with its own handlers plugs in the same way.
 
 Each routed request carries an `httpd::Target`. Its `routing` field is
 `Routing::Exact` when the requested host matches a registered name, or
