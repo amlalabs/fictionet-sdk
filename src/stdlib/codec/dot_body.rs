@@ -2,7 +2,7 @@
 //!
 //! Callers frame lines and choose validation, line limits, and error classes.
 //! [`Accumulator`] removes one leading dot and retains the first rejection
-//! through the terminator. [`encoded_len`] and [`write`] share the reverse
+//! through the terminator. [`encoded_len`] and [`write()`] share the reverse
 //! operation, so callers can validate and reserve before changing output.
 
 extern crate alloc;
