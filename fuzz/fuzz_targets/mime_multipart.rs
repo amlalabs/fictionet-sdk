@@ -5,22 +5,23 @@ use fictionet::stdlib::codec::{Decode, Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::mime_multipart::{
-    Body, Entity, Error, Headers, MAX_ENTITY, MAX_HEADER_BYTES, Multipart, ParamValue, Part, Parts,
-    boundary, valid_boundary,
+    Body, Entity, Error, Headers, MAX_BOUNDARY, MAX_ENTITY, MAX_HEADER_BYTES, Multipart,
+    ParamValue, Part, Parts, boundary, valid_boundary,
 };
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {
-    let (bnd, data) = match input.split_first() {
-        Some((&n, rest)) => {
-            let len = usize::from(n % 8);
-            match rest.get(..len).and_then(|b| std::str::from_utf8(b).ok()) {
-                Some(b) if valid_boundary(b) => (b.to_string(), &rest[len..]),
-                _ => ("a".to_string(), rest),
-            }
-        }
-        None => ("a".to_string(), input),
+    let (&n, rest) = input.split_first().unwrap_or((&0, input));
+    // Keep every existing corpus selector's meaning, and also try all valid lengths.
+    check(rest, usize::from(n % 8));
+    check(rest, usize::from(n) % MAX_BOUNDARY + 1);
+});
+
+fn check(input: &[u8], len: usize) {
+    let (bnd, data) = match input.get(..len).and_then(|b| std::str::from_utf8(b).ok()) {
+        Some(b) if valid_boundary(b) => (b.to_string(), &input[len..]),
+        _ => ("a".to_string(), input),
     };
     let make = || Parts::new(&bnd).unwrap();
     contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
@@ -108,4 +109,4 @@ fuzz_target!(|input: &[u8]| {
             contract::check_wire::<Entity>(input.as_bytes());
         }
     }
-});
+}

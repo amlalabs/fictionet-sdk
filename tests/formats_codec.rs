@@ -276,7 +276,7 @@ fn multipart_preamble_fuzz_crash_contract() {
     input.extend_from_slice(&[b'\t'; 3]);
     input.extend_from_slice(&[b' '; 20]);
     input.extend_from_slice(&[b'\t'; 2]);
-    // The fuzz target uses 0x0d % 8 candidate bytes as the boundary.
+    // The fuzz target's legacy selector still uses 0x0d % 8 candidate bytes.
     // They start with LF, so it falls back to "a" and drops only 0x0d.
     assert!(!mime::valid_boundary(
         std::str::from_utf8(&input[1..6]).unwrap()
@@ -529,6 +529,117 @@ fn multipart_chunked_round_trip_and_eof() {
         decode_all(make, b"--boundary\r\nX: value").1,
         Some(Fail::Truncated { .. })
     ));
+}
+
+#[test]
+fn multipart_all_boundary_lengths_streaming() {
+    for len in 1..=mime::MAX_BOUNDARY {
+        let boundary = "a".repeat(len);
+        let almost = format!("{}b", "a".repeat(len - 1));
+        let body = format!("body\r\n--{almost}\r\n--{boundary}x");
+        let expected = vec![
+            mime::Part {
+                body: body.as_bytes().to_vec(),
+                ..mime::Part::default()
+            },
+            mime::Part::default(),
+        ];
+        let make = || mime::Parts::new(&boundary).unwrap();
+        for padding in [0, mime::MAX_PADDING] {
+            let pad = " \t".repeat(padding / 2);
+            let input = format!(
+                "--{almost}\r\n--{boundary}{pad}\r\n\r\n{body}\r\n--{boundary}{pad}\r\n\r\n\r\n--{boundary}--{pad}\r\nepilogue"
+            );
+            // The contract includes one-byte chunks, splitting every CRLF and candidate.
+            check(make, input.as_bytes());
+            assert_eq!(decode_all(make, input.as_bytes()), (expected.clone(), None));
+            assert_eq!(
+                mime::Multipart::parse(input.as_bytes(), &boundary)
+                    .unwrap()
+                    .parts,
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn multipart_long_boundary_padding_limits() {
+    for len in [8, 69, 70] {
+        let boundary = "a".repeat(len);
+        let make = || mime::Parts::new(&boundary).unwrap();
+        for padding in [mime::MAX_PADDING, mime::MAX_PADDING + 1] {
+            let pad = "\t".repeat(padding);
+            for ending in ["", "\r\n"] {
+                for input in [
+                    format!("--{boundary}{pad}\r\n\r\nx\r\n--{boundary}--{ending}"),
+                    format!(
+                        "--{boundary}\r\n\r\nx\r\n--{boundary}{pad}\r\n\r\ny\r\n--{boundary}--{ending}"
+                    ),
+                    format!("--{boundary}\r\n\r\nx\r\n--{boundary}--{pad}{ending}"),
+                ] {
+                    check(make, input.as_bytes());
+                    let (parts, error) = decode_all(make, input.as_bytes());
+                    let whole = mime::Multipart::parse(input.as_bytes(), &boundary);
+                    if padding == mime::MAX_PADDING {
+                        assert_eq!(error, None);
+                        assert_eq!(parts, whole.unwrap().parts);
+                    } else {
+                        assert_eq!(error, Some(Fail::Protocol(mime::Error::Padding)));
+                        assert_eq!(whole, Err(mime::Error::Padding));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn multipart_long_boundary_corpus() {
+    for (seed, len, expected_error) in [
+        (
+            include_bytes!("../fuzz/corpus/mime_multipart/boundary-8").as_slice(),
+            8,
+            None,
+        ),
+        (
+            include_bytes!("../fuzz/corpus/mime_multipart/boundary-69").as_slice(),
+            69,
+            None,
+        ),
+        (
+            include_bytes!("../fuzz/corpus/mime_multipart/long-boundary").as_slice(),
+            70,
+            None,
+        ),
+        (
+            include_bytes!("../fuzz/corpus/mime_multipart/long-boundary-padding").as_slice(),
+            70,
+            None,
+        ),
+        (
+            include_bytes!("../fuzz/corpus/mime_multipart/long-boundary-padding-over-limit")
+                .as_slice(),
+            70,
+            Some(mime::Error::Padding),
+        ),
+    ] {
+        assert_eq!(usize::from(seed[0]) % mime::MAX_BOUNDARY + 1, len);
+        let boundary = std::str::from_utf8(&seed[1..=len]).unwrap();
+        assert!(mime::valid_boundary(boundary));
+        let data = &seed[len + 1..];
+        let make = || mime::Parts::new(boundary).unwrap();
+        check(make, data);
+        let (parts, error) = decode_all(make, data);
+        assert_eq!(error, expected_error.map(Fail::Protocol));
+        match mime::Multipart::parse(data, boundary) {
+            Ok(whole) => {
+                assert_eq!(parts, whole.parts);
+                assert_eq!(parts.len(), 1);
+            }
+            Err(error) => assert_eq!(Some(error), expected_error),
+        }
+    }
 }
 
 #[test]
