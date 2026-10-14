@@ -33,9 +33,11 @@
 //! no gaps) and dates it on the run's clock ([`Cx::now`]), never the
 //! host's, so two runs that do the same things record the same sequence.
 //! The log is bounded: it holds the latest [`MAX_EVENTS`] events, and at
-//! most [`MAX_EVENT_BYTES`] of them ([`Event::size`]). Past either limit the oldest go first,
-//! and every reader that missed some is told how many, with an
-//! `events.dropped` event in their place ([`EventLog::after`]).
+//! most [`MAX_EVENT_BYTES`] of them ([`Event::size`]). Past either limit
+//! the oldest go first. An event larger than its part's byte limit is
+//! numbered but not kept, without evicting other events. Every reader
+//! that missed some is told how many, with an `events.dropped` event in
+//! their place ([`EventLog::after`]), including gaps from rejected events.
 //!
 //! # Repeats
 //!
@@ -64,10 +66,16 @@
 //!   flood of repeats never pushes out another event, and other events
 //!   never push out repeats. A reader that missed some is told as for any
 //!   other event: an `events.dropped` event stands where they were.
+//! - Open windows have separate bounds: 1,024 windows and
+//!   [`MAX_OPEN_REPEAT_BYTES`] for their keys, first events and numeric
+//!   detail ranges. To make room, the oldest windows record their counts
+//!   early. A repeat too large for a window is recorded individually with
+//!   `count` set to 1, subject to the repeat history's limits.
 //!
-//! So a flood costs at most two events per second for each distinct kind
-//! of repeat, and never costs the run a service's event, an HTTP request,
-//! a DNS query, a TLS handshake or a connection's open and close.
+//! While its windows fit, a flood costs at most two events per second for
+//! each distinct kind of repeat, and never costs the run a service's
+//! event, an HTTP request, a DNS query, a TLS handshake or a connection's
+//! open and close.
 //!
 //! Everything that reads events reads this log:
 //!
@@ -82,7 +90,8 @@
 //!
 //! A reader that starts late misses nothing the log still holds: a file
 //! or a callback set halfway through a run first gets what the log kept,
-//! then the rest as it is recorded.
+//! then the rest as it is recorded. Live callbacks receive even events
+//! too large to retain. File sinks still apply their own queue limits.
 //!
 //! Native real runs with `std` write files on a helper thread with a bounded
 //! queue. In browsers, labs and builds without `std`, sinks write and flush
@@ -92,6 +101,13 @@
 //! retain events beyond the in-memory log's limits.
 //!
 //! # What it costs
+//!
+//! Byte budgets charge owned capacities and shared connection metadata
+//! in full for each retained copy, with estimated allocation overhead.
+//! They exclude spare capacity in history queues and window indexes,
+//! static strings, temporary allocations while recording or reading, and
+//! copies held by readers or callbacks. These are retention budgets, not
+//! a process-memory limit.
 //!
 //! Recording takes the event the caller built, looks up the task that
 //! recorded it, and appends it to the log under one lock. Callbacks run
@@ -178,14 +194,19 @@ pub fn record_drop<F>(
 /// How many events a run's log holds. Past this, the oldest are dropped.
 pub const MAX_EVENTS: usize = 50_000;
 /// How many bytes of events a run's log holds, as [`Event::size`] counts
-/// them. Past this, the oldest are dropped.
+/// them. Past this, the oldest are dropped. A larger event is not kept.
 pub const MAX_EVENT_BYTES: usize = 16 << 20;
 /// How many [repeats](self#repeats) a run's log holds, beside its other
 /// events. Past this, the oldest repeats are dropped.
 pub const MAX_REPEATS: usize = 5_000;
 /// How many bytes of [repeats](self#repeats) a run's log holds, beside its
-/// other events. Past this, the oldest repeats are dropped.
+/// other events. Past this, the oldest repeats are dropped. A larger
+/// repeat is not kept.
 pub const MAX_REPEAT_BYTES: usize = 2 << 20;
+/// How many bytes open [repeat windows](self#repeats) hold, separately
+/// from the recorded repeats. Counts close early to stay within this
+/// budget. A repeat too large for a window is recorded individually.
+pub const MAX_OPEN_REPEAT_BYTES: usize = 2 << 20;
 /// How long, on the run's clock, repeats of an event are counted before
 /// the log records their count. See [Repeats](self#repeats).
 pub const REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
@@ -525,17 +546,17 @@ impl Event {
 
     /// About how many bytes the event holds in memory, each allocation's
     /// overhead included, as the log counts them against
-    /// [`MAX_EVENT_BYTES`].
+    /// [`MAX_EVENT_BYTES`]. Shared connection metadata is charged in full
+    /// for each event. Owned task names are included; static strings are not.
     pub fn size(&self) -> usize {
-        let slot = std::mem::size_of::<(&str, Value)>();
-        let fields = self.fields.0.capacity() * slot
-            + self
-                .fields
-                .0
-                .iter()
-                .map(|(_, v)| value_size(v))
-                .sum::<usize>();
-        ALLOC + std::mem::size_of::<Event>() + heap(self.summary.capacity()) + heap(fields)
+        heap(std::mem::size_of::<Event>() + ARC_COUNTS)
+            + heap(self.summary.capacity())
+            + fields_size(&self.fields)
+            + conn_size(&self.conn)
+            + self.origin.as_ref().map_or(0, |o| match &o.name {
+                Cow::Owned(name) => heap(name.capacity()),
+                Cow::Borrowed(_) => 0,
+            })
     }
 
     /// The event as one JSON object: `seq`, `at` (seconds since the run
@@ -632,10 +653,25 @@ impl Event {
 
 /// What the allocator adds to each allocation, about.
 const ALLOC: usize = 32;
+/// The strong and weak reference counts in an Arc allocation.
+const ARC_COUNTS: usize = 2 * std::mem::size_of::<usize>();
 
 /// The bytes an allocation of `n` takes, or none for an empty one.
 fn heap(n: usize) -> usize {
     if n == 0 { 0 } else { n + ALLOC }
+}
+
+fn fields_size(fields: &Fields) -> usize {
+    heap(fields.0.capacity() * std::mem::size_of::<(&str, Value)>())
+        + fields.0.iter().map(|(_, v)| value_size(v)).sum::<usize>()
+}
+
+fn conn_size(conn: &ConnInfo) -> usize {
+    conn.sandbox
+        .as_ref()
+        .map_or(0, |s| heap(ARC_COUNTS + s.name.len()))
+        + conn.sni.as_ref().map_or(0, |s| heap(ARC_COUNTS + s.len()))
+        + conn.alpn.as_ref().map_or(0, |a| heap(ARC_COUNTS + a.len()))
 }
 
 /// About how many bytes `v` holds on the heap, beyond its own slot.
@@ -695,13 +731,16 @@ impl Part {
     }
 
     /// Keeps `event`, of `size` bytes, and drops the oldest past the
-    /// bounds. Returns how many it dropped.
+    /// bounds. Rejects an event that cannot fit by itself. Returns how
+    /// many it dropped or rejected.
     fn push(&mut self, event: Arc<Event>, size: usize) -> u64 {
+        if self.max == 0 || size > self.max_bytes {
+            return 1;
+        }
         self.events.push_back(event);
         self.bytes += size;
         let mut dropped = 0;
-        while self.events.len() > self.max || (self.bytes > self.max_bytes && self.events.len() > 1)
-        {
+        while self.events.len() > self.max || self.bytes > self.max_bytes {
             let Some(old) = self.events.pop_front() else {
                 break;
             };
@@ -721,6 +760,14 @@ struct RepeatKey {
     fields: Fields,
 }
 
+impl RepeatKey {
+    fn size(&self) -> usize {
+        heap(std::mem::size_of::<RepeatKey>() + ARC_COUNTS)
+            + conn_size(&self.conn)
+            + fields_size(&self.fields)
+    }
+}
+
 /// A run of alike repeats, counted after the first.
 struct Window {
     /// The first of them, without its detail.
@@ -733,7 +780,36 @@ struct Window {
 }
 
 impl Window {
-    fn add(&mut self, at: Instant, detail: &Fields) {
+    fn size(&self) -> usize {
+        self.first.size() + std::mem::size_of::<Window>() - std::mem::size_of::<Event>()
+            + self.ranges_size()
+            + std::mem::size_of::<Arc<RepeatKey>>()
+            + std::mem::size_of::<(Instant, Arc<RepeatKey>)>()
+    }
+
+    fn ranges_size(&self) -> usize {
+        heap(self.ranges.capacity() * std::mem::size_of::<(&str, u64, u64)>())
+    }
+
+    /// Counts this repeat only if its new ranges fit in `available` bytes.
+    fn add(&mut self, at: Instant, detail: &Fields, available: usize) -> bool {
+        let new = detail
+            .iter()
+            .filter(|(name, value)| {
+                value.as_u64().is_some() && !self.ranges.iter().any(|r| r.0 == *name)
+            })
+            .count();
+        if self.ranges.len() + new > self.ranges.capacity() {
+            let capacity = (self.ranges.len() + new)
+                .max(self.ranges.capacity() * 2)
+                .max(4);
+            let growth =
+                heap(capacity * std::mem::size_of::<(&str, u64, u64)>()) - self.ranges_size();
+            if growth > available {
+                return false;
+            }
+            self.ranges.reserve_exact(capacity - self.ranges.len());
+        }
         self.count += 1;
         self.last = self.last.max(at);
         for (name, value) in detail.iter() {
@@ -743,6 +819,7 @@ impl Window {
                 None => self.ranges.push((name, n, n)),
             }
         }
+        true
     }
 
     /// The event that counts the repeats after the first, if there were
@@ -776,6 +853,9 @@ struct State {
     clock: Instant,
     /// The runs of repeats being counted.
     open: HashMap<Arc<RepeatKey>, Window>,
+    /// Bytes charged to open keys and windows, apart from either history.
+    open_bytes: usize,
+    max_open_bytes: usize,
     /// The same, oldest first, each with when its count is due.
     due: VecDeque<(Instant, Arc<RepeatKey>)>,
     /// Shared, so recording takes a reference count, not a copy.
@@ -818,8 +898,11 @@ impl State {
         let Some((_, key)) = self.due.pop_front() else {
             return;
         };
-        if let Some(event) = self.open.remove(&key).and_then(Window::summary) {
-            self.keep(event, true, out);
+        if let Some(window) = self.open.remove(&key) {
+            self.open_bytes -= key.size() + window.size();
+            if let Some(event) = window.summary() {
+                self.keep(event, true, out);
+            }
         }
     }
 }
@@ -835,6 +918,8 @@ impl Store {
                 dropped: 0,
                 clock: Instant::ZERO,
                 open: HashMap::new(),
+                open_bytes: 0,
+                max_open_bytes: MAX_OPEN_REPEAT_BYTES,
                 due: VecDeque::new(),
                 subscribers: Arc::new([]),
                 closed: false,
@@ -866,28 +951,42 @@ impl Store {
         let mut out = Vec::new();
         let mut s = self.state.lock();
         s.advance(event.at, &mut out);
-        if let Some(window) = s.open.get_mut(&key) {
-            window.add(event.at, &detail);
-        } else {
-            if s.open.len() >= OPEN_WINDOWS {
+        loop {
+            let available = s.max_open_bytes - s.open_bytes;
+            let Some(window) = s.open.get_mut(&key) else {
+                break;
+            };
+            let before = window.ranges_size();
+            if window.add(event.at, &detail, available) {
+                let growth = window.ranges_size() - before;
+                s.open_bytes += growth;
+                Store::tell(s, &out);
+                return;
+            }
+            s.close_oldest(&mut out);
+        }
+        event.conn = key.conn.clone();
+        event.fields = key.fields.clone();
+        let first = Window {
+            first: event.clone(),
+            count: 0,
+            last: event.at,
+            ranges: Vec::new(),
+        };
+        let size = key.size() + first.size();
+        if size <= s.max_open_bytes {
+            while s.open.len() >= OPEN_WINDOWS || s.open_bytes + size > s.max_open_bytes {
                 s.close_oldest(&mut out);
             }
-            event.conn = key.conn.clone();
-            event.fields = key.fields.clone();
-            let first = Window {
-                first: event.clone(),
-                count: 0,
-                last: event.at,
-                ranges: Vec::new(),
-            };
             let key = Arc::new(key);
             let due = s.clock + REPEAT_WINDOW;
+            s.open_bytes += size;
             s.open.insert(key.clone(), first);
             s.due.push_back((due, key));
-            event.fields.extend(detail);
-            event.fields.set("count", 1u64);
-            s.keep(event, true, &mut out);
         }
+        event.fields.extend(detail);
+        event.fields.set("count", 1u64);
+        s.keep(event, true, &mut out);
         Store::tell(s, &out);
     }
 
@@ -1052,7 +1151,7 @@ impl EventLog {
         self.store.last()
     }
 
-    /// How many events the log has dropped for its limits.
+    /// How many events the log has evicted or rejected for its limits.
     pub fn dropped(&self) -> u64 {
         self.store.state.lock().dropped
     }
@@ -1060,7 +1159,8 @@ impl EventLog {
     /// Calls `f` with every event the log holds now, oldest first (with
     /// an `events.dropped` event wherever some were dropped), then with
     /// every event recorded from now on, in the task that records it,
-    /// until the run is over. `f` must return quickly and never block:
+    /// until the run is over, including events too large to retain.
+    /// `f` must return quickly and never block:
     /// hand the event to a channel that never waits. Once the run is over,
     /// `f` gets only what the log holds.
     pub fn subscribe(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
@@ -1357,6 +1457,133 @@ mod tests {
         assert!(s.events.events.len() < 40 && s.dropped > 0);
     }
 
+    #[test]
+    fn small_limits_reject_without_evicting_and_accept_exact_fits() {
+        let event = Arc::new(Event::new("test", "small"));
+        let size = event.size();
+        for (max, bytes) in [(0, size), (1, 0), (1, size - 1)] {
+            let mut part = Part::new(max, bytes);
+            assert_eq!(part.push(event.clone(), size), 1);
+            assert!(part.events.is_empty());
+            assert_eq!(part.bytes, 0);
+        }
+        let mut part = Part::new(2, size);
+        assert_eq!(part.push(event.clone(), size), 0);
+        let large = Arc::new(Event::new("test", "large").summary("x"));
+        assert_eq!(part.push(large.clone(), large.size()), 1);
+        assert!(Arc::ptr_eq(&part.events[0], &event));
+        assert_eq!(part.bytes, size);
+        assert_eq!(part.push(event.clone(), size), 1);
+        assert_eq!((part.events.len(), part.bytes), (1, size));
+    }
+
+    #[test]
+    fn oversized_events_leave_gaps_but_reach_live_subscribers() {
+        let store = Store::new(crate::RunMode::Lab);
+        let log = EventLog::new(store.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let live = seen.clone();
+        log.subscribe(move |e| live.lock().push((e.seq, e.kind)));
+        for repeat in [false, true] {
+            let oversized = Event::new("test", "oversized").summary("x".repeat(if repeat {
+                MAX_REPEAT_BYTES
+            } else {
+                MAX_EVENT_BYTES
+            }));
+            for event in [
+                oversized.clone(),
+                Event::new("test", "before"),
+                oversized.clone(),
+                Event::new("test", "after"),
+                oversized,
+            ] {
+                if repeat {
+                    store.push_repeat(event, Fields::new());
+                } else {
+                    store.push(event);
+                }
+            }
+        }
+        assert_eq!((log.recorded(), log.dropped()), (10, 6));
+        assert_eq!(
+            seen.lock().iter().map(|e| e.0).collect::<Vec<_>>(),
+            (1..=10).collect::<Vec<_>>()
+        );
+        assert_eq!(seen.lock().iter().filter(|e| e.1 == "oversized").count(), 6);
+        let all = log.all();
+        assert_eq!(
+            all.iter()
+                .map(|e| (e.seq, e.u64("count")))
+                .collect::<Vec<_>>(),
+            [
+                (1, Some(1)),
+                (2, None),
+                (3, Some(1)),
+                (4, None),
+                (6, Some(2)),
+                (7, Some(1)),
+                (8, Some(1)),
+                (9, Some(1)),
+                (10, Some(1))
+            ]
+        );
+        let mut after = 0;
+        for expected in &all {
+            let page = log.after(after, 1);
+            assert_eq!(&page[0], expected);
+            after = page[0].seq;
+        }
+        assert!(log.after(after, 1).is_empty());
+        store.close();
+        let replay = Arc::new(Mutex::new(Vec::new()));
+        let late = replay.clone();
+        log.subscribe(move |e| late.lock().push(e.clone()));
+        assert_eq!(*replay.lock(), all);
+        assert_eq!(log.all(), all, "the closed log keeps its gaps");
+    }
+
+    #[test]
+    fn metadata_is_charged_even_when_shared() {
+        let mut event = Event::new("test", "metadata");
+        let empty = event.size();
+        let name: Arc<str> = "x".repeat(MAX_EVENT_BYTES / 2).into();
+        event.conn = ConnInfo {
+            sandbox: Some(Sandbox {
+                id: 1,
+                name: name.clone(),
+                addr: None,
+                addr_v6: None,
+            }),
+            sni: Some(name),
+            alpn: Some(Arc::from(&b"h2"[..])),
+            ..ConnInfo::default()
+        };
+        assert_eq!(
+            event.size() - empty,
+            2 * heap(ARC_COUNTS + MAX_EVENT_BYTES / 2) + heap(ARC_COUNTS + 2)
+        );
+        assert_eq!(event.clone().size(), event.size());
+        let metadata = event.size();
+        event.origin = Some(Origin {
+            task: 1,
+            name: Cow::Borrowed("static"),
+            file: file!(),
+            line: line!(),
+            parent: 0,
+        });
+        assert_eq!(event.size(), metadata);
+        let mut name = String::with_capacity(4096);
+        name.push('x');
+        let charged = heap(name.capacity());
+        event.origin.as_mut().unwrap().name = Cow::Owned(name);
+        assert_eq!(event.size(), metadata + charged);
+        let store = Store::new(crate::RunMode::Lab);
+        store.push(event);
+        let s = store.state.lock();
+        assert_eq!((s.events.bytes, s.dropped), (0, 1));
+        assert!(s.events.events.is_empty());
+    }
+
     /// A subscriber set late gets what the log holds, then what follows.
     #[test]
     fn subscribers_replay_then_follow() {
@@ -1460,6 +1687,111 @@ mod tests {
             Some(1)
         );
         assert_eq!(log.of("net", "blocked").len(), 5);
+    }
+
+    fn assert_open_budget(store: &Store) {
+        let s = store.state.lock();
+        assert_eq!(s.open.len(), s.due.len());
+        assert!(s.open.len() <= OPEN_WINDOWS);
+        assert!(s.open_bytes <= s.max_open_bytes);
+        assert_eq!(
+            s.open_bytes,
+            s.open
+                .iter()
+                .map(|(k, w)| k.size() + w.size())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn large_distinct_repeat_keys_close_oldest_windows_early() {
+        let store = Store::new(crate::RunMode::Lab);
+        let log = EventLog::new(store.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let live = seen.clone();
+        log.subscribe(move |e| live.lock().push((e.u64("i"), e.u64("count"))));
+        for i in 0..40u64 {
+            let event = Event::new("test", "repeat")
+                .field("key", "x".repeat(128 << 10))
+                .field("i", i);
+            store.push_repeat(event.clone(), Fields::new());
+            store.push_repeat(event, Fields::new());
+            assert_open_budget(&store);
+        }
+        assert!(store.state.lock().open.len() < 40);
+        assert!(
+            log.dropped() > 0,
+            "history eviction does not free open keys"
+        );
+        store.close();
+        assert_open_budget(&store);
+        assert_eq!(store.state.lock().open_bytes, 0);
+        let seen = seen.lock();
+        for i in 0..40 {
+            assert_eq!(
+                seen.iter()
+                    .filter(|e| e.0 == Some(i))
+                    .map(|e| e.1.unwrap())
+                    .sum::<u64>(),
+                2
+            );
+        }
+        // Every second occurrence is a summary. They close in insertion order.
+        let mut first = [false; 40];
+        let summaries: Vec<_> = seen
+            .iter()
+            .filter_map(|e| {
+                let i = e.0.unwrap() as usize;
+                std::mem::replace(&mut first[i], true).then_some(i)
+            })
+            .collect();
+        assert_eq!(summaries, (0..40).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_repeat_too_large_for_a_window_is_recorded_individually() {
+        let store = Store::new(crate::RunMode::Lab);
+        let log = EventLog::new(store.clone());
+        let event =
+            Event::new("test", "repeat").field("key", "x".repeat(MAX_OPEN_REPEAT_BYTES / 2));
+        assert!(event.size() < MAX_REPEAT_BYTES);
+        for _ in 0..3 {
+            store.push_repeat(event.clone(), Fields::new());
+            assert_open_budget(&store);
+            assert_eq!(store.state.lock().open_bytes, 0);
+        }
+        assert_eq!((log.recorded(), log.dropped()), (3, 2));
+        assert_eq!(log.of("test", "repeat")[0].u64("count"), Some(1));
+    }
+
+    #[test]
+    fn growing_repeat_ranges_close_windows_before_exceeding_the_budget() {
+        let store = Store::new(crate::RunMode::Lab);
+        let log = EventLog::new(store.clone());
+        let event = Event::new("test", "repeat");
+        store.push_repeat(event.clone(), Fields::new());
+        let base = store.state.lock().open_bytes;
+        store.state.lock().max_open_bytes =
+            base + heap(4 * std::mem::size_of::<(&str, u64, u64)>());
+        for name in ["a", "b", "c", "d", "e"] {
+            store.push_repeat(event.clone(), Fields::new().with(name, 7u64));
+            assert_open_budget(&store);
+        }
+        let all = log.all();
+        assert_eq!(
+            all.iter()
+                .map(|e| e.u64("count").unwrap())
+                .collect::<Vec<_>>(),
+            [1, 4, 1]
+        );
+        assert_eq!(
+            all[1].get("d"),
+            Some(&Value::Array(vec![7u64.into(), 7u64.into()]))
+        );
+        assert_eq!(all[2].u64("e"), Some(7));
+        store.advance(at(1000));
+        assert_open_budget(&store);
+        assert_eq!(store.state.lock().open_bytes, 0);
     }
 
     /// Repeats have bounds of their own: a flood of them, more than the

@@ -354,12 +354,29 @@ such as LDAP attributes, go under one field as an object.
 The [event log](../src/events.rs) documents retention, repeat aggregation,
 late subscribers and dropped-event reporting. Sum `count` when grading
 packet repeats; a port scan of 65,535 ports to one machine costs a couple of
-events a second.
+events a second while its repeat windows fit.
+
+History holds up to 50,000 ordinary events within 16 MiB and 5,000 repeats
+within 2 MiB. An event larger than its history's byte limit is numbered but
+not kept. It does not evict other events. Readers see an `events.dropped`
+gap in its place; live callbacks still receive it. Open repeat windows have
+a separate 2 MiB budget and a limit of 1,024 windows. The oldest counts
+close early to make room, including when numeric detail ranges grow. A
+repeat too large for a window is recorded individually with `count` 1.
+
+Byte accounting includes owned capacities, task names, and the full shared
+connection metadata for each retained copy, plus estimated allocation
+overhead. It excludes spare capacity in history queues and window indexes,
+static strings, temporary allocations while recording or reading, and
+copies held by readers or callbacks. These fixed retention limits do not
+bound total process memory.
 
 Native real runs use writer threads and wait for them at shutdown. In
 browsers, labs and builds without `std`, event sinks write and flush each line
 synchronously. Browser runs can use an in-memory sink with
-`EventLog::to_writer`. Discard a sample if
+`EventLog::to_writer`. Native writer queues have their own limit of 100,000
+events or 16 MiB of event data; oversized events are lost there too.
+Discard a sample if
 [`EventLog::lost`](../src/events.rs) is nonzero.
 
 ## 6. The dashboard
