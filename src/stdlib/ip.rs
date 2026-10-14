@@ -13,6 +13,10 @@
 //! each one to the code for that protocol. No protocol layer
 //! knows about the others, and each sees only its own packets.
 //!
+//! [`prepare_split_protocols`] builds the same interfaces without starting
+//! a task. Call [`Prepared::start`] when they are ready to forward packets,
+//! or drop the driver and interfaces to discard the preparation.
+//!
 //! Here a DNS server's machine at `1.1.1.1` gets TCP and UDP on port 53:
 //!
 //! ```
@@ -75,6 +79,7 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::task::Poll;
@@ -255,35 +260,62 @@ async fn split(
 /// many are waiting.
 #[track_caller]
 pub fn split_protocols(fcx: &Cx, inner: impl Interface) -> (End, End, End, End) {
+    let (ends, task) = prepare_split_protocols(fcx, inner);
+    task.start(fcx);
+    ends
+}
+
+/// A protocol split's driver, ready to start with its task name.
+/// Dropping it discards the driver without starting a task.
+pub struct Prepared<F> {
+    task: F,
+}
+
+impl<F: Future<Output = fictionet::Result> + Send + 'static> Prepared<F> {
+    /// Starts forwarding in the context used to prepare the split.
+    #[track_caller]
+    pub fn start(self, fcx: &Cx) {
+        fcx.spawn_as(|| "split_protocols".into(), move |_| self.task);
+    }
+}
+
+/// Builds the interfaces and driver of [`split_protocols`] without starting
+/// a task. Call [`Prepared::start`] with `fcx` to start forwarding, or drop
+/// the driver and interfaces to discard the preparation.
+pub fn prepare_split_protocols(
+    fcx: &Cx,
+    inner: impl Interface,
+) -> (
+    (End, End, End, End),
+    Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
+) {
     let (tcp, tcp_mine) = capped();
     let (udp, udp_mine) = capped();
     let (icmp, icmp_mine) = capped();
     let (other, other_mine) = capped();
-    fcx.spawn_as(
-        || "split_protocols".into(),
-        move |fcx| async move {
-            let ports = Ports::new(vec![
-                Box::new(inner) as Box<dyn Interface>,
-                Box::new(tcp_mine),
-                Box::new(udp_mine),
-                Box::new(icmp_mine),
-                Box::new(other_mine),
-            ]);
-            split(
-                fcx,
-                ports,
-                Some(Reassembly::default()),
-                |packet| match protocol_end(&packet.0) {
-                    protocol::TCP => 1,
-                    protocol::UDP => 2,
-                    protocol::ICMP | protocol::ICMPV6 => 3,
-                    _ => 4,
-                },
-            )
-            .await
-        },
-    );
-    (tcp, udp, icmp, other)
+    let fcx = fcx.clone();
+    let task = async move {
+        let ports = Ports::new(vec![
+            Box::new(inner) as Box<dyn Interface>,
+            Box::new(tcp_mine),
+            Box::new(udp_mine),
+            Box::new(icmp_mine),
+            Box::new(other_mine),
+        ]);
+        split(
+            fcx,
+            ports,
+            Some(Reassembly::default()),
+            |packet| match protocol_end(&packet.0) {
+                protocol::TCP => 1,
+                protocol::UDP => 2,
+                protocol::ICMP | protocol::ICMPV6 => 3,
+                _ => 4,
+            },
+        )
+        .await
+    };
+    ((tcp, udp, icmp, other), Prepared { task })
 }
 
 /// Which end of [`split_protocols`] a whole (not fragmented) packet belongs

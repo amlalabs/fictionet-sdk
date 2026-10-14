@@ -4715,6 +4715,120 @@ fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
 }
 
 #[test]
+fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
+    use fictionet::stdlib::codec::{Ending, LineError, Lines};
+    use fictionet::stdlib::httpd;
+    use fictionet::stdlib::net::{Host, Net};
+    use fictionet::stdlib::serve::{Driver, Flow, Service};
+
+    struct Quiet;
+    impl Service for Quiet {
+        type Decoder = Lines;
+        type State = ();
+        type Error = Infallible;
+        fn decoder(&self) -> Lines {
+            Lines::new(64, Ending::LfOrCrlf)
+        }
+        fn on_item(
+            &mut self,
+            _: Result<Vec<u8>, LineError>,
+            _: &(),
+            _: &mut Driver<'_, Lines>,
+        ) -> Result<Flow, Infallible> {
+            Ok(Flow::Continue)
+        }
+    }
+
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let v4: IpAddr = "203.0.113.8".parse()?;
+        let v6: IpAddr = "2001:db8:1::8".parse()?;
+        let date = SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000);
+        let certs = certs(&fcx, &["first.test", "bad.test", "good.test"]);
+        let roots = Arc::new(certs.roots);
+        let config = Arc::new(
+            tls::config_builder(&fcx, date)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs.chain, certs.key)
+                .unwrap(),
+        );
+        let site = |label: &'static str, default| {
+            let config = config.clone();
+            let server = httpd::Server::new(
+                httpd::Router::new().get("/", move |_, _| Response::new(label.into())),
+            )
+            .tls_with(move |_| config.clone())
+            .plain_http();
+            if default {
+                server.default_host()
+            } else {
+                server
+            }
+        };
+        let first =
+            site("first", false).served_by(Host::new("first").dns_name("first.test").at(v4).at(v6));
+        // Only IPv6 has an ephemeral socket at 49152. IPv4 preparation
+        // succeeds before the rejected declaration reaches that conflict.
+        let occupied = Host::new("occupied")
+            .at(v6)
+            .ipv6_only()
+            .udp(0, Arc::new(()), || Quiet);
+        let bad = site("bad", true)
+            .served_by(Host::new("bad").at(v4).at(v6))
+            .udp(49152, Arc::new(()), || Quiet);
+        let good = site("good", false).served_by(Host::new("good").at(v4).at(v6));
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .add_host(first)
+            .add_host(occupied)
+            .resolve(move |name| match name {
+                "bad.test" => Some(bad.clone()),
+                "good.test" => Some(good.clone()),
+                _ => None,
+            })
+            .start(&fcx, attachments)?;
+        let m4 = default_machine(&fcx, &attacher);
+        let m6 = machine(&fcx, attacher.attach("b")?, ME6);
+        let mut existing = plain_client(&fcx, &m4, v4, false).await;
+        assert_eq!(existing.get("http", "first.test", "/").await.body, "first");
+        assert_eq!(
+            dns(&fcx, &m4, "bad.test", RecordType::A).await.0,
+            ResponseCode::NXDomain
+        );
+        assert_eq!(
+            existing.get("http", "bad.test", "/").await.status,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        for (m, addr) in [(&m4, v4), (&m6, v6)] {
+            for secure in [false, true] {
+                let (mut client, scheme) = if secure {
+                    let tcp = m.tcp.connect(&fcx, SocketAddr::new(addr, 443)).await?;
+                    let conn =
+                        TlsClient::new(&fcx, tcp, &roots, "first.test", &[b"http/1.1"], date)?;
+                    (Client::new(&fcx, conn, false).await, "https")
+                } else {
+                    (plain_client(&fcx, m, addr, false).await, "http")
+                };
+                assert_eq!(client.get(scheme, "first.test", "/").await.body, "first");
+                for name in ["bad.test", "unknown.test"] {
+                    assert_eq!(
+                        client.get(scheme, name, "/").await.status,
+                        StatusCode::MISDIRECTED_REQUEST
+                    );
+                }
+            }
+            let tcp = m.tcp.connect(&fcx, SocketAddr::new(addr, 443)).await?;
+            let mut conn = TlsClient::new(&fcx, tcp, &roots, "bad.test", &[b"http/1.1"], date)?;
+            assert!(conn.handshake(&fcx).await.is_err());
+        }
+        assert_eq!(lookup(&fcx, &m4, "good.test").await, v4);
+        assert_eq!(existing.get("http", "good.test", "/").await.body, "good");
+        Ok(())
+    });
+}
+
+#[test]
 fn shared_ipv4_keeps_ipv6_virtual_hosts_local() {
     endpoint_scoped_sites(false, false);
 }

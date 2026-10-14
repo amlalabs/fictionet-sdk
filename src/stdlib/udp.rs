@@ -7,6 +7,10 @@
 //! datagrams with [`recv`](Socket::recv) and sends them with
 //! [`send_to`](Socket::send_to).
 //!
+//! [`prepare_endpoint`] builds the same endpoint without starting a task,
+//! so sockets can be bound before [`Prepared::start`]. Drop the driver and
+//! its handles to discard the preparation.
+//!
 //! The interface comes from [`ip::split_protocols`],
 //! which splits a machine's packets so that only UDP, and ICMP errors
 //! about it, reach this layer.
@@ -36,7 +40,7 @@ pub use wire::{Datagram, Error, encode, encoded_len};
 
 use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, VecDeque};
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Poll, Waker};
@@ -79,6 +83,37 @@ const DATAGRAM_COST: usize = 64;
 /// reach this layer, such as errors about datagrams it sent, are dropped.
 #[track_caller]
 pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
+    let (endpoint, task) = prepare_endpoint(fcx, inner, addr);
+    task.start(fcx);
+    endpoint
+}
+
+/// A UDP endpoint's driver, ready to start with its task name.
+/// Dropping it discards the driver without starting a task.
+pub struct Prepared<F> {
+    task: F,
+}
+
+impl<F: Future<Output = fictionet::Result> + Send + 'static> Prepared<F> {
+    /// Starts the endpoint in the context used to prepare it.
+    #[track_caller]
+    pub fn start(self, fcx: &Cx) {
+        fcx.spawn_as(|| "udp::endpoint".into(), move |_| self.task);
+    }
+}
+
+/// Builds a UDP endpoint and its driver without starting a task.
+/// Sockets can be bound before the driver starts. Call [`Prepared::start`]
+/// with `fcx` to run the endpoint, or drop the driver and all its handles to
+/// discard the preparation. Uses `fcx` for randomness.
+pub fn prepare_endpoint(
+    fcx: &Cx,
+    inner: impl Interface,
+    addr: IpAddr,
+) -> (
+    Endpoint,
+    Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
+) {
     let shared = Arc::new(Shared {
         addr,
         inner: Mutex::new(Box::new(inner)),
@@ -91,25 +126,23 @@ pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
         }),
     });
     let driver = shared.clone();
-    fcx.spawn_as(
-        || "udp::endpoint".into(),
-        move |fcx| async move {
-            drive(&fcx, &driver).await;
-            let wakers: Vec<Waker> = {
-                let mut st = driver.state.lock();
-                st.stopped = true;
-                st.sockets
-                    .values_mut()
-                    .filter_map(|s| s.waker.take())
-                    .collect()
-            };
-            for w in wakers {
-                w.wake();
-            }
-            Ok(())
-        },
-    );
-    Endpoint { shared }
+    let fcx = fcx.clone();
+    let task = async move {
+        drive(&fcx, &driver).await;
+        let wakers: Vec<Waker> = {
+            let mut st = driver.state.lock();
+            st.stopped = true;
+            st.sockets
+                .values_mut()
+                .filter_map(|s| s.waker.take())
+                .collect()
+        };
+        for w in wakers {
+            w.wake();
+        }
+        Ok(())
+    };
+    (Endpoint { shared }, Prepared { task })
 }
 
 struct Shared {

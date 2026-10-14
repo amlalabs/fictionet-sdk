@@ -1210,6 +1210,187 @@ fn rejected_port_sharing_discards_preparations_at_every_endpoint() {
 }
 
 #[test]
+fn failed_host_binding_leaves_no_route_service_or_registration() {
+    for failure in [
+        "bind",
+        "port-zero",
+        "udp-duplicate",
+        "tcp-duplicate",
+        "tls-plain",
+        "sni-duplicate",
+    ] {
+        world(Duration::from_secs(60), move |fcx| async move {
+            let addr = Ipv4Addr::new(203, 0, 113, 8);
+            let server = Sharing::default();
+            let started = Arc::new(AtomicUsize::new(0));
+            let count = started.clone();
+            // Port zero binds 49152, so the final bind fails after TCP sharing
+            // and two UDP sockets have been prepared.
+            let bad = Host::new("bad")
+                .ipv4_only()
+                .at(addr)
+                .port_server(80, server.clone())
+                .udp(9, Arc::new(()), move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Echo
+                });
+            let config = |_: &Cx| -> Arc<fictionet::stdlib::tls::ServerConfig> {
+                panic!("no handshake for a rejected host")
+            };
+            let bad = match failure {
+                "bind" => bad
+                    .udp(0, Arc::new(()), || Echo)
+                    .udp(49152, Arc::new(()), || Echo),
+                "port-zero" => bad.tcp(0, Arc::new(()), || Echo),
+                "udp-duplicate" => bad.udp(9, Arc::new(()), || Echo),
+                "tcp-duplicate" => bad
+                    .tcp(81, Arc::new(()), || Echo)
+                    .tcp(81, Arc::new(()), || Echo),
+                "tls-plain" => bad.tls_accept(80, Sni::Any, config, Spy::default()),
+                "sni-duplicate" => bad
+                    .tls_accept(443, Sni::Any, config, Spy::default())
+                    .tls_accept(443, Sni::Any, config, Spy::default()),
+                _ => unreachable!(),
+            };
+            let (attacher, attachments) = fictionet::attachments();
+            Net::new()
+                .resolve(move |name| match name {
+                    "bad.test" => Some(bad.clone()),
+                    "good.test" => Some(
+                        Host::new("good")
+                            .ipv4_only()
+                            .at(addr)
+                            .tcp(80, Arc::new(()), || Echo)
+                            .udp(9, Arc::new(()), || Echo)
+                            .udp(49152, Arc::new(()), || Echo),
+                    ),
+                    _ => None,
+                })
+                .start(&fcx, attachments)?;
+            let m = machine(&fcx, attacher.attach("client")?, ME);
+            assert_eq!(lookup(&fcx, &m, "bad.test").await, None);
+            assert_eq!(started.load(Ordering::SeqCst), 0);
+            assert!(server.installed.lock().unwrap().is_empty());
+            assert!(matches!(
+                m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 80)).await,
+                Err(ConnError::Unreachable(_))
+            ));
+            assert_eq!(lookup(&fcx, &m, "good.test").await, Some(addr));
+            let mut conn = m
+                .tcp
+                .connect(&fcx, SocketAddr::new(addr.into(), 80))
+                .await?;
+            assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn failed_lan_join_or_missing_tls_names_does_not_commit_services() {
+    for lan in [false, true] {
+        world(Duration::from_secs(60), move |fcx| async move {
+            let server = Sharing::default();
+            let started = Arc::new(AtomicUsize::new(0));
+            let count = started.clone();
+            let host =
+                Host::new("bad")
+                    .port_server(80, server.clone())
+                    .udp(9, Arc::new(()), move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Echo
+                    });
+            let net = if lan {
+                Net::new()
+                    .lan("corp", "192.168.56.0/24".parse()?)
+                    .add_host(host.on("corp").at(Ipv4Addr::new(192, 168, 56, 255)))
+            } else {
+                Net::new().add_host(host.tls_accept(
+                    443,
+                    Sni::Names,
+                    |_| panic!("no handshake"),
+                    Spy::default(),
+                ))
+            };
+            let (_attacher, attachments) = fictionet::attachments();
+            assert!(net.start(&fcx, attachments).is_err());
+            assert_eq!(started.load(Ordering::SeqCst), 0);
+            assert!(server.installed.lock().unwrap().is_empty());
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn a_second_family_bind_failure_preserves_existing_services() {
+    for existing_v4 in [false, true] {
+        world(Duration::from_secs(60), move |fcx| async move {
+            let v4 = Ipv4Addr::new(203, 0, 113, 8);
+            let v6: Ipv6Addr = "2001:db8:1::8".parse()?;
+            let server = Sharing::default();
+            let first = Host::new("first")
+                .dns_name("first.test")
+                .at(v6)
+                .ipv6_only()
+                .port_server(80, server.clone())
+                .udp(0, Arc::new(()), || Echo);
+            let mut net = Net::new().add_host(first);
+            if existing_v4 {
+                net = net.add_host(
+                    Host::new("first4")
+                        .dns_name("first4.test")
+                        .at(v4)
+                        .ipv4_only()
+                        .port_server(80, server.clone())
+                        .tcp(7, Arc::new(()), || Echo),
+                );
+            }
+            let bad = Host::new("bad")
+                .at(v4)
+                .at(v6)
+                .port_server(80, server.clone())
+                .tcp(81, Arc::new(()), || Echo)
+                .udp(9, Arc::new(()), || Echo)
+                .udp(49152, Arc::new(()), || Echo);
+            let good = Host::new("good")
+                .at(v4)
+                .at(v6)
+                .port_server(80, server.clone())
+                .tcp(81, Arc::new(()), || Echo)
+                .udp(9, Arc::new(()), || Echo);
+            let (attacher, attachments) = fictionet::attachments();
+            net.resolve(move |name| match name {
+                "bad.test" => Some(bad.clone()),
+                "good.test" => Some(good.clone()),
+                _ => None,
+            })
+            .start(&fcx, attachments)?;
+            let before = server.installed.lock().unwrap().clone();
+            let m = machine(&fcx, attacher.attach("client")?, ME);
+            let mut existing = if existing_v4 {
+                Some(m.tcp.connect(&fcx, SocketAddr::new(v4.into(), 7)).await?)
+            } else {
+                None
+            };
+            assert_eq!(lookup(&fcx, &m, "bad.test").await, None);
+            assert_eq!(*server.installed.lock().unwrap(), before);
+            let closed = m.tcp.connect(&fcx, SocketAddr::new(v4.into(), 81)).await;
+            if let Some(conn) = &mut existing {
+                assert!(matches!(closed, Err(ConnError::Refused)));
+                conn.write_all(&fcx, b"still here\n").await?;
+                assert_eq!(read_some(&fcx, conn, 17).await, b"hello\nstill here\n");
+            } else {
+                assert!(matches!(closed, Err(ConnError::Unreachable(_))));
+            }
+            assert_eq!(lookup(&fcx, &m, "good.test").await, Some(v4));
+            let mut conn = m.tcp.connect(&fcx, SocketAddr::new(v4.into(), 81)).await?;
+            assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
+            Ok(())
+        });
+    }
+}
+
+#[test]
 fn a_rejected_host_does_not_install_http_names_or_a_default() {
     world(Duration::from_secs(60), |fcx| async move {
         let addr = Ipv4Addr::new(203, 0, 113, 8);

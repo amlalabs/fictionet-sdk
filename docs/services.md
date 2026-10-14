@@ -305,6 +305,12 @@ Net::new()
 
 `start` fails if a host cannot be served as declared: an address a host
 cannot have, two services on one port, or a port that cannot be opened.
+Each host is prepared at all its addresses before any of it is published.
+A rejected host leaves no new machine, route, listener, task, TLS name or
+HTTP virtual host, and consumes no automatic address. Existing hosts keep
+serving unchanged. A rejected resolver result records `net.error` and its
+DNS lookup answers NXDOMAIN. Hosts already installed by `start` remain
+installed if a later host fails.
 
 Every sandbox that attaches joins `10.0.0.0/24` (and `2001:db8::/64`),
 gets its address by DHCP or by its first packet, and asks the gateway at

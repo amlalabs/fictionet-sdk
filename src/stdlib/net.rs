@@ -110,14 +110,18 @@
 //! - **Errors.** A host that cannot be served as declared, such as one at
 //!   an address a host cannot have, two services on one port (one with
 //!   TLS and one without count as two), or a port
-//!   that cannot be listened on, makes [`Net::start`] fail.
+//!   that cannot be listened on, makes [`Net::start`] fail. A rejected host
+//!   adds no machine, route, listener, task, TLS name or virtual host, and
+//!   consumes no automatic address. Existing hosts remain unchanged. Hosts
+//!   returned by the resolver follow the same rule; their failed lookups
+//!   record `net.error` and answer NXDOMAIN.
 //!
 //! The limits and rules are those [`web::Sites`](fictionet::stdlib::web::Sites)
 //! documents in detail, which runs on this.
 
 use fictionet::sync::Mutex;
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -558,6 +562,7 @@ impl Host {
 
     /// Serves UDP `port` with one [`Service`] made by `make`, which gets
     /// every datagram ([`serve::datagram`]).
+    /// Port zero asks the endpoint to choose a free port ([`udp::Endpoint::bind`]).
     pub fn udp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
     where
         S: Service,
@@ -783,6 +788,8 @@ impl Net {
     /// Returns once every host is placed. The network runs in background
     /// tasks in `fcx`'s region until that region is cancelled. Fails if a
     /// subnet cannot be used, or a host cannot be served as declared.
+    /// A rejected host leaves no installation behind. Earlier hosts and
+    /// the network infrastructure remain until the region is cancelled.
     pub fn start(self, fcx: &Cx, mut attachments: Attachments) -> Result<(), Error> {
         let subnet = Subnet::new(self.subnet)?;
         let subnet6 = if self.ipv6 {
@@ -1393,6 +1400,18 @@ impl Shared {
     /// Fails if an address given with `at` cannot be served, it ends up
     /// with no address, or a service cannot be added.
     fn place(self: &Arc<Self>, world: &mut World, host: Host) -> Result<Placed, String> {
+        let automatic = (world.next_auto, world.next_auto6);
+        let result = self.place_inner(world, host);
+        if result.is_err() {
+            (world.next_auto, world.next_auto6) = automatic;
+        }
+        result
+    }
+
+    /// Prepares `host` at every address, then commits it. A failure
+    /// leaves no machine, route, port or task, but may have taken
+    /// automatic addresses, which `place` gives back.
+    fn place_inner(self: &Arc<Self>, world: &mut World, host: Host) -> Result<Placed, String> {
         if let Some(name) = &host.lan {
             return self.place_on_lan(world, name, &host);
         }
@@ -1440,19 +1459,17 @@ impl Shared {
             .chain(placed.v6.map(IpAddr::V6));
         let prepared = addrs
             .map(|addr| {
-                Machine::prepare(addr, world.machines.get(&addr), &host).map(|ports| (addr, ports))
+                let machine = Machine::stage(self, addr, &label, world.machines.get(&addr));
+                let ports = machine.machine.prepare(&host)?;
+                Ok((machine, ports))
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (addr, ports) in prepared {
-            let machine = match world.machines.get(&addr) {
-                Some(m) => m.clone(),
-                None => {
-                    let m = Machine::start(self, addr, &label, None)?;
-                    world.machines.insert(addr, m.clone());
-                    m
-                }
-            };
-            machine.add(&host, ports)?;
+            .collect::<Result<Vec<_>, String>>()?;
+        for (mut machine, ports) in prepared {
+            if let Some(side) = machine.route.take() {
+                self.router
+                    .add(host_prefix(machine.machine.addr), Box::new(side));
+            }
+            machine.commit(world, ports);
         }
         Ok(placed)
     }
@@ -1492,21 +1509,16 @@ impl Shared {
                 .find(|a| free(*a) && !world.machines.contains_key(a))
                 .ok_or_else(|| format!("LAN {name} has no free address left"))?,
         };
-        let prepared = Machine::prepare(addr, world.machines.get(&addr), host)?;
-        let machine = match world.machines.get(&addr) {
-            Some(m) => m.clone(),
-            None => {
-                let label = host
-                    .names
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| host.label.clone());
-                let m = Machine::start(self, addr, &label, Some(&seg.lan))?;
-                world.machines.insert(addr, m.clone());
-                m
-            }
-        };
-        machine.add(host, prepared)?;
+        let label = host.names.first().unwrap_or(&host.label);
+        let mut machine = Machine::stage(self, addr, label, world.machines.get(&addr));
+        let ports = machine.machine.prepare(host)?;
+        // Joining is the last fallible step. No service or task has started.
+        if let Some(side) = machine.route.take() {
+            seg.lan
+                .add(addr, Box::new(side), None)
+                .map_err(|e| e.to_string())?;
+        }
+        machine.commit(world, ports);
         Ok(match addr {
             IpAddr::V4(a) => Placed {
                 v4: Some(a),
@@ -1675,20 +1687,57 @@ fn tls_names(sni: &Sni, names: &[String], port: u16) -> Result<Vec<String>, Stri
     }
 }
 
-/// Existing handlers and names reserved by this preparation.
-#[derive(Default)]
+/// One TCP port as this preparation leaves it: the installed or new port,
+/// the listener staged for a new one, and the handlers and names reserved.
 struct PortPlan {
-    existing: Option<Arc<Port>>,
+    port: Arc<Port>,
+    listener: Option<tcp::Listener>,
     plain: Option<Arc<dyn PortServer>>,
     first_tls: Option<Arc<dyn PortServer>>,
     names: HashSet<String>,
 }
 
-/// One service whose sharing decision has been prepared.
-struct PreparedPort {
-    number: u16,
-    spec: PortSpec,
-    share: Option<PreparedShare>,
+/// One service with its socket and sharing decision ready to commit.
+enum PreparedPort {
+    Udp {
+        number: u16,
+        socket: udp::Socket,
+        start: UdpStart,
+    },
+    Tcp {
+        number: u16,
+        port: Arc<Port>,
+        listener: Option<tcp::Listener>,
+        service: PreparedTcp,
+        share: Option<PreparedShare>,
+    },
+}
+
+enum PreparedTcp {
+    Plain(Arc<dyn PortServer>),
+    Tls {
+        accept: Arc<dyn PortServer>,
+        entries: Vec<(String, Arc<TlsName>)>,
+    },
+}
+
+/// A new machine has no published route or running tasks until commit.
+struct PreparedMachine {
+    machine: Arc<Machine>,
+    route: Option<End>,
+    start: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl PreparedMachine {
+    fn commit(self, world: &mut World, ports: Vec<PreparedPort>) {
+        if let Some(start) = self.start {
+            start();
+            world
+                .machines
+                .insert(self.machine.addr, self.machine.clone());
+        }
+        self.machine.add(ports);
+    }
 }
 
 /// One address with its services.
@@ -1704,27 +1753,26 @@ struct Machine {
 }
 
 impl Machine {
-    /// Starts a machine at `addr`: a route, TCP and UDP with no ports open,
-    /// and ping replies, in a group named after `label` and the address.
-    fn start(
+    /// Builds a machine without publishing its route or starting its tasks.
+    fn stage(
         shared: &Arc<Shared>,
         addr: IpAddr,
         label: &str,
-        lan: Option<&route::Lan<Box<dyn Interface>>>,
-    ) -> Result<Arc<Machine>, String> {
-        let fcx = &shared.fcx.group(format!("{label} ({addr})"));
-        let (router_side, side) = link();
-        match lan {
-            Some(lan) => lan
-                .add(addr, Box::new(router_side), None)
-                .map_err(|e| e.to_string())?,
-            None => shared.router.add(host_prefix(addr), Box::new(router_side)),
+        existing: Option<&Arc<Machine>>,
+    ) -> PreparedMachine {
+        if let Some(machine) = existing {
+            return PreparedMachine {
+                machine: machine.clone(),
+                route: None,
+                start: None,
+            };
         }
-        let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, side);
-        let tcp = tcp::endpoint(fcx, tcp, addr);
-        let udp = udp::endpoint(fcx, udp, addr);
-        fcx.spawn(move |fcx| pings(fcx, icmp, addr));
-        Ok(Arc::new(Machine {
+        let fcx = shared.fcx.group(format!("{label} ({addr})"));
+        let (router_side, side) = link();
+        let ((tcp, udp, icmp, _other), split) = ip::prepare_split_protocols(&fcx, side);
+        let (tcp, tcp_task) = tcp::prepare_endpoint(&fcx, tcp, addr, tcp::Options::default());
+        let (udp, udp_task) = udp::prepare_endpoint(&fcx, udp, addr);
+        let machine = Arc::new(Machine {
             fcx: fcx.clone(),
             addr,
             tcp,
@@ -1733,47 +1781,39 @@ impl Machine {
             udp_ports: Mutex::new(HashSet::new()),
             peers: shared.peers.clone(),
             shared: Arc::downgrade(shared),
-        }))
-    }
-
-    /// The port `port`, made and listened on if it is new.
-    fn port(self: &Arc<Self>, port: u16) -> Result<Arc<Port>, String> {
-        let mut ports = self.ports.lock();
-        if let Some(p) = ports.get(&port) {
-            return Ok(p.clone());
+        });
+        PreparedMachine {
+            machine,
+            route: Some(router_side),
+            start: Some(Box::new(move || {
+                split.start(&fcx);
+                tcp_task.start(&fcx);
+                udp_task.start(&fcx);
+                fcx.spawn(move |fcx| pings(fcx, icmp, addr));
+            })),
         }
-        let listener = self
-            .tcp
-            .listen(port)
-            .map_err(|e| format!("TCP port {port} at {}: {e}", self.addr))?;
-        let p: Arc<Port> = Arc::default();
-        ports.insert(port, p.clone());
-        let (m, slot) = (self.clone(), p.clone());
-        self.fcx.spawn(move |fcx| accept(fcx, listener, m, slot));
-        Ok(p)
     }
 
     /// Checks services against installed ports and earlier preparations.
-    fn prepare(
-        addr: IpAddr,
-        machine: Option<&Arc<Self>>,
-        host: &Host,
-    ) -> Result<Vec<PreparedPort>, String> {
+    fn prepare(&self, host: &Host) -> Result<Vec<PreparedPort>, String> {
+        let addr = self.addr;
         let mut ports = HashMap::<u16, PortPlan>::new();
         let mut udp_ports = HashSet::new();
         let mut prepared = Vec::new();
         for (number, spec) in &host.ports {
             let local = SocketAddr::new(addr, *number);
-            if matches!(spec, PortSpec::Udp(_)) {
-                if !udp_ports.insert(*number)
-                    || machine.is_some_and(|m| m.udp_ports.lock().contains(number))
-                {
+            if let PortSpec::Udp(start) = spec {
+                if !udp_ports.insert(*number) || self.udp_ports.lock().contains(number) {
                     return Err(format!("UDP port {number} at {addr} is already served"));
                 }
-                prepared.push(PreparedPort {
+                let socket = self
+                    .udp
+                    .bind(*number)
+                    .map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
+                prepared.push(PreparedPort::Udp {
                     number: *number,
-                    spec: spec.clone(),
-                    share: None,
+                    socket,
+                    start: start.clone(),
                 });
                 continue;
             }
@@ -1782,34 +1822,41 @@ impl Machine {
                     "TCP port {number} at {addr}: TCP port 0 cannot be listened on"
                 ));
             }
-            let port = ports.entry(*number).or_insert_with(|| {
-                let existing = machine.and_then(|m| m.ports.lock().get(number).cloned());
-                let plain = existing
-                    .as_ref()
-                    .and_then(|p| p.plain.read().unwrap_or_else(|e| e.into_inner()).clone());
-                let first_tls = existing.as_ref().and_then(|p| {
-                    p.tls
+            let port = match ports.entry(*number) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let existing = self.ports.lock().get(number).cloned();
+                    let listener = if existing.is_none() {
+                        Some(
+                            self.tcp
+                                .listen(*number)
+                                .map_err(|e| format!("TCP port {number} at {addr}: {e}"))?,
+                        )
+                    } else {
+                        None
+                    };
+                    let port = existing.unwrap_or_default();
+                    let plain = port.plain.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    let first_tls = port
+                        .tls
                         .read()
                         .unwrap_or_else(|e| e.into_inner())
                         .first
-                        .clone()
-                });
-                PortPlan {
-                    existing,
-                    plain,
-                    first_tls,
-                    names: HashSet::new(),
+                        .clone();
+                    entry.insert(PortPlan {
+                        port,
+                        listener,
+                        plain,
+                        first_tls,
+                        names: HashSet::new(),
+                    })
                 }
-            });
-            let tls = port
-                .existing
-                .as_ref()
-                .map(|p| p.tls.read().unwrap_or_else(|e| e.into_inner()));
-            let (spec, share) = match spec {
+            };
+            let tls = port.port.tls.read().unwrap_or_else(|e| e.into_inner());
+            let (service, share) = match spec {
                 PortSpec::Udp(_) => unreachable!(),
                 PortSpec::Tcp(accept) => {
-                    if !port.names.is_empty() || tls.as_ref().is_some_and(|t| !t.by_name.is_empty())
-                    {
+                    if !port.names.is_empty() || !tls.by_name.is_empty() {
                         return Err(format!(
                             "TCP port {number} at {addr} serves TLS, and cannot serve without it too"
                         ));
@@ -1828,7 +1875,7 @@ impl Machine {
                         }
                     };
                     port.plain = Some(served_by.clone());
-                    (PortSpec::Tcp(served_by), share)
+                    (PreparedTcp::Plain(served_by), share)
                 }
                 PortSpec::Tls {
                     sni,
@@ -1841,10 +1888,10 @@ impl Machine {
                         ));
                     }
                     let names = tls_names(sni, &host.names, *number)?;
-                    if let Some(taken) = names.iter().find(|n| {
-                        port.names.contains(*n)
-                            || tls.as_ref().is_some_and(|t| t.by_name.contains_key(*n))
-                    }) {
+                    if let Some(taken) = names
+                        .iter()
+                        .find(|n| port.names.contains(*n) || tls.by_name.contains_key(*n))
+                    {
                         let name = if taken.is_empty() {
                             "any name"
                         } else {
@@ -1864,85 +1911,89 @@ impl Machine {
                         )
                     });
                     port.first_tls.get_or_insert_with(|| served_by.clone());
-                    port.names.extend(names);
+                    port.names.extend(names.iter().cloned());
+                    let entries = names
+                        .into_iter()
+                        .map(|name| {
+                            let entry = TlsName {
+                                config: config.clone(),
+                                accept: served_by.clone(),
+                                alpn: served_by.alpn(),
+                                last: Mutex::new(None),
+                            };
+                            (name, Arc::new(entry))
+                        })
+                        .collect();
                     (
-                        PortSpec::Tls {
-                            sni: sni.clone(),
-                            config: config.clone(),
+                        PreparedTcp::Tls {
                             accept: served_by,
+                            entries,
                         },
                         share,
                     )
                 }
             };
-            prepared.push(PreparedPort {
+            prepared.push(PreparedPort::Tcp {
                 number: *number,
-                spec,
+                port: port.port.clone(),
+                listener: port.listener.take(),
+                service,
                 share,
             });
         }
         Ok(prepared)
     }
 
-    /// Installs the prepared services in declaration order.
-    fn add(self: &Arc<Self>, host: &Host, prepared: Vec<PreparedPort>) -> Result<(), String> {
+    /// Installs the prepared services in declaration order without failure.
+    fn add(self: &Arc<Self>, prepared: Vec<PreparedPort>) {
         let sandbox: Option<serve::SandboxOf> = self.shared.upgrade().map(|s| {
             let hooks = s.hooks.clone();
             Arc::new(move |a: IpAddr| Some(hooks.sandbox_at(a))) as serve::SandboxOf
         });
-        let addr = self.addr;
-        for PreparedPort {
-            number,
-            spec,
-            share,
-        } in prepared
-        {
-            match spec {
-                PortSpec::Udp(start) => {
-                    let socket = self
-                        .udp
-                        .bind(number)
-                        .map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
+        for prepared in prepared {
+            match prepared {
+                PreparedPort::Udp {
+                    number,
+                    socket,
+                    start,
+                } => {
                     self.udp_ports.lock().insert(number);
                     start(
                         &self.fcx,
                         socket,
-                        SocketAddr::new(addr, number),
+                        SocketAddr::new(self.addr, number),
                         sandbox.clone(),
                     );
                 }
-                PortSpec::Tcp(accept) => {
-                    let port = self.port(number)?;
-                    if let Some(share) = share {
-                        share.commit();
-                    }
-                    *port.plain.write().unwrap_or_else(|e| e.into_inner()) = Some(accept);
-                }
-                PortSpec::Tls {
-                    sni,
-                    config,
-                    accept,
+                PreparedPort::Tcp {
+                    number,
+                    port,
+                    listener,
+                    service,
+                    share,
                 } => {
-                    let port = self.port(number)?;
-                    let names = tls_names(&sni, &host.names, number)?;
                     if let Some(share) = share {
                         share.commit();
                     }
-                    let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
-                    tls.first.get_or_insert_with(|| accept.clone());
-                    for name in names {
-                        let entry = TlsName {
-                            config: config.clone(),
-                            accept: accept.clone(),
-                            alpn: accept.alpn(),
-                            last: Mutex::new(None),
-                        };
-                        tls.by_name.insert(name, Arc::new(entry));
+                    match service {
+                        PreparedTcp::Plain(accept) => {
+                            *port.plain.write().unwrap_or_else(|e| e.into_inner()) = Some(accept);
+                        }
+                        PreparedTcp::Tls { accept, entries } => {
+                            let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
+                            tls.first.get_or_insert(accept);
+                            tls.by_name.extend(entries);
+                        }
+                    }
+                    if let Some(listener) = listener {
+                        self.ports.lock().insert(number, port.clone());
+                        let machine = self.clone();
+                        self.fcx
+                            .spawn(move |fcx| accept(fcx, listener, machine, port));
                     }
                 }
             }
         }
-        Ok(())
     }
 
     /// Whether TCP `port` is open here.
@@ -3269,6 +3320,95 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn failed_hosts_reuse_automatic_addresses_even_without_negative_caching() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |fcx| async move {
+            let shared = Arc::new(Shared {
+                fcx: fcx.clone(),
+                resolver: Some(Arc::new(|name| Some(match name {
+                    "address.test" => Host::new(name).at(Ipv6Addr::LOCALHOST),
+                    "bind.test" => {
+                        let mut host = Host::new(name);
+                        let start: UdpStart = Arc::new(|_, _, _, _| panic!("not committed"));
+                        host.ports.push((0, PortSpec::Udp(start.clone())));
+                        host.ports.push((49152, PortSpec::Udp(start)));
+                        host
+                    }
+                    _ => Host::new(name),
+                }))),
+                subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
+                subnet6: Some(Subnet6::new("2001:db8::/64".parse().unwrap()).unwrap()),
+                router: route::router(&fcx, Vec::new()),
+                world: Mutex::new(World::new(MAX_HOSTS)),
+                leases: Mutex::default(),
+                gateway_tcp: Mutex::default(),
+                hooks: Arc::new(Hooks {
+                    by_addr: Mutex::default(),
+                    conns: AtomicU64::new(0),
+                    attached: Mutex::default(),
+                }),
+                fixed: Vec::new(),
+                peers: Peers::new(Limits::default().connections_per_peer),
+                limits: Limits::default(),
+                lans: BTreeMap::new(),
+            });
+            shared.world.lock().max_unknown = 0;
+            for name in ["address.test", "bind.test", "bind.test"] {
+                assert!(matches!(shared.lookup(name), Lookup::NoHost));
+                let world = shared.world.lock();
+                assert!(world.machines.is_empty());
+                assert!(world.names.is_empty());
+                assert_eq!(world.resolved, 0);
+                assert_eq!((world.next_auto, world.next_auto6), (1, 1));
+                assert!(!world.auto_full);
+            }
+            let Lookup::Host(placed) = shared.lookup("good.test") else {
+                panic!("a valid host fits after rejected hosts");
+            };
+            assert_eq!(placed.v4, Some("198.18.0.1".parse().unwrap()));
+            assert_eq!(placed.v6, Some("2001:2::1".parse().unwrap()));
+            fcx.cancel();
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn failed_hosts_remember_an_exhausted_automatic_range() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |fcx| async move {
+            let shared = Arc::new(Shared {
+                fcx: fcx.clone(),
+                resolver: Some(Arc::new(|name| Some(Host::new(name)))),
+                subnet: Subnet::new("198.18.0.0/15".parse().unwrap()).unwrap(),
+                subnet6: None,
+                router: route::router(&fcx, Vec::new()),
+                world: Mutex::new(World::new(MAX_HOSTS)),
+                leases: Mutex::default(),
+                gateway_tcp: Mutex::default(),
+                hooks: Arc::new(Hooks {
+                    by_addr: Mutex::default(),
+                    conns: AtomicU64::new(0),
+                    attached: Mutex::default(),
+                }),
+                fixed: Vec::new(),
+                peers: Peers::new(Limits::default().connections_per_peer),
+                limits: Limits::default(),
+                lans: BTreeMap::new(),
+            });
+            shared.world.lock().max_unknown = 0;
+            for name in ["first.test", "second.test"] {
+                assert!(matches!(shared.lookup(name), Lookup::NoHost));
+                let world = shared.world.lock();
+                assert!(world.auto_full);
+                assert!(world.machines.is_empty());
+                assert!(world.names.is_empty());
+                assert_eq!(world.resolved, 0);
+                assert_eq!((world.next_auto, world.next_auto6), (1, 1));
+            }
+            fcx.cancel();
+            Ok(())
+        })).unwrap();
     }
 
     #[test]

@@ -8,6 +8,11 @@
 //! connections, or [`connect`](Endpoint::connect) to another machine. Each
 //! connection is a [`TcpConnection`], which implements [`Connection`].
 //!
+//! [`endpoint_with`] takes custom [`Options`]. [`prepare_endpoint`] builds
+//! the same endpoint without starting a task, so listeners can be opened
+//! before [`Prepared::start`]. Drop the driver and its handles to discard
+//! the preparation.
+//!
 //! Inside, an endpoint is one background task that runs the smoltcp TCP
 //! stack. The interface it takes comes from
 //! [`ip::split_protocols`](fictionet::stdlib::ip::split_protocols), which
@@ -45,7 +50,7 @@
 use fictionet::stdlib::codec::Side;
 use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -242,6 +247,38 @@ impl Options {
 /// ```
 #[track_caller]
 pub fn endpoint_with(fcx: &Cx, inner: impl Interface, addr: IpAddr, options: Options) -> Endpoint {
+    let (endpoint, task) = prepare_endpoint(fcx, inner, addr, options);
+    task.start(fcx);
+    endpoint
+}
+
+/// A TCP endpoint's driver, ready to start with its task name.
+/// Dropping it discards the driver without starting a task.
+pub struct Prepared<F> {
+    task: F,
+}
+
+impl<F: Future<Output = fictionet::Result> + Send + 'static> Prepared<F> {
+    /// Starts the endpoint in the context used to prepare it.
+    #[track_caller]
+    pub fn start(self, fcx: &Cx) {
+        fcx.spawn_as(|| "tcp::endpoint".into(), move |_| self.task);
+    }
+}
+
+/// Builds a TCP endpoint and its driver without starting a task.
+/// Listeners can be opened before the driver starts. Call [`Prepared::start`]
+/// with `fcx` to run the endpoint, or drop the driver and all its handles to
+/// discard the preparation. Uses `fcx` for the clock and randomness.
+pub fn prepare_endpoint(
+    fcx: &Cx,
+    inner: impl Interface,
+    addr: IpAddr,
+    options: Options,
+) -> (
+    Endpoint,
+    Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
+) {
     let mut dev = Dev::default();
     let mut config = Config::new(HardwareAddress::Ip);
     config.random_seed = fcx.random_u64();
@@ -279,15 +316,13 @@ pub fn endpoint_with(fcx: &Cx, inner: impl Interface, addr: IpAddr, options: Opt
         }),
     });
     let driver = shared.clone();
-    fcx.spawn_as(
-        || "tcp::endpoint".into(),
-        move |fcx| async move {
-            drive(&fcx, &driver, inner).await;
-            driver.stop();
-            Ok(())
-        },
-    );
-    Endpoint { shared }
+    let fcx = fcx.clone();
+    let task = async move {
+        drive(&fcx, &driver, inner).await;
+        driver.stop();
+        Ok(())
+    };
+    (Endpoint { shared }, Prepared { task })
 }
 
 fn smol_now(fcx: &Cx) -> smoltcp::time::Instant {
