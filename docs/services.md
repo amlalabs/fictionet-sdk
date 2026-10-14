@@ -137,6 +137,21 @@ reading it. A local reset makes retained handles report `ConnError::Reset`;
 an endpoint stop makes them report `ConnError::Closed`. The reset socket
 stays until its RST can be sent, even when packet output is full.
 
+After a graceful close, a dropped TCP connection releases its
+`hold_until_gone` items, including connection counts, when it reaches
+TIME-WAIT. Its `GoneWatch` becomes ready, and resetting it does nothing.
+Only transport recovery state stays: the socket, tuple, buffers and outgoing
+port remain until smoltcp's ten-second transport timer expires. Retransmitted
+FINs get ACKs and restart that timer without holding connection counts.
+Each endpoint retains at most 1,024 dropped TIME-WAIT sockets. If more
+accumulate, housekeeping forgets them in the order it first saw them as
+TIME-WAIT orphans; later packets for those tuples may get RSTs. This cap
+does not evict sockets with live handles or sockets still closing. At the
+default buffer size the cap retains up to 512 MiB of buffer address space.
+On native builds, empty buffer pages can be released while the mappings
+stay; browser buffers use the heap. Larger configured buffers increase
+this bound.
+
 TCP takes the peer's initial sequence number only from an accepted handshake.
 Invalid or unsolicited SYN-ACKs cannot move the connection's receive window
 or keep its buffer pages resident.

@@ -935,12 +935,9 @@ fn lossy_relay(
 fn a_fin_is_acked_before_a_dropped_connection_is_forgotten() {
     // The client closes first. The server answers with data and its own
     // FIN, in one segment or, a moment apart, in two. The client reads to
-    // the end and drops its handle at once. Its socket is in TIME-WAIT
-    // then, and is forgotten: it must ACK the server's FIN first.
-    // Otherwise the server keeps its socket until it sends the FIN again,
-    // a second later, and gets a RST. A server that counts open
-    // connections per client (web::Sites) then counts this one for that
-    // second.
+    // the end and drops its handle at once. Its socket stays in TIME-WAIT,
+    // but must ACK the FIN promptly so the server can release its socket
+    // without waiting for a retransmission.
     fin_then_drop(Duration::ZERO);
     fin_then_drop(Duration::from_millis(3));
 }
@@ -992,6 +989,90 @@ fn fin_then_drop(gap: Duration) {
         (server_fins, resets),
         (1, 0),
         "gap {gap:?}: the server's FIN went unanswered: {seen:?}"
+    );
+}
+
+#[test]
+fn a_lost_final_ack_is_recovered_after_handle_drop() {
+    lost_final_ack(false);
+}
+
+#[test]
+fn simultaneous_close_recovers_a_lost_final_ack() {
+    lost_final_ack(true);
+}
+
+fn lost_final_ack(simultaneous: bool) {
+    let seen = Arc::new(Mutex::new((0, 0, 0)));
+    let log = seen.clone();
+    world(Duration::from_secs(10), move |fcx| async move {
+        let (a, b) = pair();
+        let (c, d) = pair();
+        let mut fin_end = None;
+        lossy_relay(&fcx, b, c, move |p| {
+            let header = fictionet::stdlib::ip::Header::parse_whole(&p.0).unwrap();
+            let t = header.payload(&p.0);
+            let flags = t[13];
+            let mut seen = log.lock().unwrap();
+            if flags & 4 != 0 {
+                seen.2 += 1;
+            }
+            if header.src == ip(B) && flags & 1 != 0 {
+                seen.0 += 1;
+                fin_end = Some(u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1));
+            }
+            if header.src == ip(A)
+                && flags == 0x10
+                && Some(u32::from_be_bytes(t[8..12].try_into().unwrap())) == fin_end
+            {
+                seen.1 += 1;
+                return seen.1 == 1;
+            }
+            false
+        });
+        let ea = tcp::endpoint(&fcx, a, ip(A));
+        let eb = tcp::endpoint(&fcx, d, ip(B));
+        let mut listener = eb.listen(80)?;
+        let mut client = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+        let mut server = listener.accept(&fcx).await?;
+        let watch = client.gone_watch();
+        let port = client.local_addr().port();
+        let held = Arc::new(());
+        client.hold_until_gone(Box::new(held.clone()));
+        client.shutdown(&fcx).await?;
+        if !simultaneous {
+            assert_eq!(read_to_end(&fcx, &mut server).await?, b"");
+        }
+        // In the simultaneous case neither shutdown yields before both
+        // sides have closed their send half.
+        server.shutdown(&fcx).await?;
+        assert_eq!(read_to_end(&fcx, &mut client).await?, b"");
+        drop(client);
+        assert_eq!(read_to_end(&fcx, &mut server).await?, b"");
+        drop(server);
+        fcx.sleep(Duration::from_millis(20)).await?;
+        assert!(poll_fn(|cx| Poll::Ready(watch.poll_gone(cx).is_ready())).await);
+        assert_eq!(Arc::strong_count(&held), 1);
+        assert!(
+            ea.listen(port).is_err(),
+            "TIME-WAIT still owns the local port"
+        );
+        // A completed connection cannot be reset through its watch. Its
+        // transport state still has to ACK the retransmitted FIN below.
+        watch.reset();
+        watch.hold_until_gone(Box::new(held.clone()));
+        assert_eq!(Arc::strong_count(&held), 1);
+        fcx.sleep(Duration::from_secs(3)).await?;
+        assert!(poll_fn(|cx| Poll::Ready(watch.poll_gone(cx).is_ready())).await);
+        assert_eq!(Arc::strong_count(&held), 1);
+        fcx.sleep(Duration::from_secs(11)).await?;
+        let _reused = ea.listen(port).expect("expiry frees the local port");
+        Ok(())
+    });
+    assert_eq!(
+        *seen.lock().unwrap(),
+        (2, 2, 0),
+        "one retransmitted FIN, its replacement ACK, and no RST"
     );
 }
 

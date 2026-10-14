@@ -104,9 +104,9 @@ const MAX_BACKLOG: usize = 65_536;
 const BACKLOG_PER_PEER: usize = 256;
 /// The first local port for outgoing connections.
 const EPHEMERAL: u16 = 49152;
-/// smoltcp's delayed-ACK wait. A dropped connection in TIME-WAIT is kept
-/// this long after the peer's FIN, so the ACK it owes is sent.
-const ACK_DELAY: Duration = Duration::from_millis(10);
+/// Dropped TIME-WAIT sockets per endpoint. Past this limit, those first
+/// seen in TIME-WAIT by housekeeping are forgotten first.
+const MAX_TIME_WAIT: usize = 1024;
 
 /// Starts TCP for a machine with address `addr`, on the TCP packets of
 /// `inner`.
@@ -135,6 +135,19 @@ const ACK_DELAY: Duration = Duration::from_millis(10);
 /// destination-unreachable messages can fail a pending connect; see
 /// [`Endpoint::connect`]. Other ICMP messages are dropped. Established
 /// connections ignore ICMP, and there is no path MTU discovery.
+///
+/// A dropped connection that reaches TIME-WAIT releases items kept with
+/// [`TcpConnection::hold_until_gone`], including connection counts, and
+/// makes its [`GoneWatch`] ready. Only transport recovery state stays:
+/// its socket, tuple, buffers and outgoing port remain until smoltcp's
+/// ten-second transport timer expires. Retransmitted FINs get ACKs and
+/// restart that timer. An endpoint retains at most 1,024 such sockets.
+/// Past that cap, housekeeping forgets them in the order it first saw
+/// them as TIME-WAIT orphans, so later packets for those tuples may get
+/// RSTs. Live handles and sockets still closing are not evicted. At the
+/// default buffer size, the cap retains up to 512 MiB of buffer address
+/// space; empty pages can be released on native builds, while browser
+/// buffers use the heap. Larger buffers increase this bound.
 #[track_caller]
 pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
     endpoint_with(fcx, inner, addr, Options::default())
@@ -250,7 +263,6 @@ pub fn endpoint_with(fcx: &Cx, inner: impl Interface, addr: IpAddr, options: Opt
             pages: HashMap::new(),
             dirty: HashSet::new(),
             next_release: None,
-            next_tidy: None,
             dev,
             listeners: BTreeMap::new(),
             conns: BTreeMap::new(),
@@ -259,6 +271,7 @@ pub fn endpoint_with(fcx: &Cx, inner: impl Interface, addr: IpAddr, options: Opt
             next_port: EPHEMERAL
                 + fictionet::Entropy::random_below(fcx, 65536 - EPHEMERAL as u64) as u16,
             orphans: Vec::new(),
+            time_wait: VecDeque::new(),
             stopped: false,
             driver: None,
             buffer: options.buffer,
@@ -361,9 +374,6 @@ struct State {
     dirty: HashSet<Id>,
     /// When `dirty` is next looked at.
     next_release: Option<smoltcp::time::Instant>,
-    /// When `housekeeping` must run again to remove an orphan in TIME-WAIT
-    /// that still owed an ACK.
-    next_tidy: Option<smoltcp::time::Instant>,
     dev: Dev,
     /// Listener maintenance and shutdown wake in ascending port order.
     listeners: BTreeMap<u16, Listen>,
@@ -376,6 +386,8 @@ struct State {
     next_port: u16,
     /// Connections whose handle was dropped, removed once they close.
     orphans: Vec<Id>,
+    /// Retired orphans, in the order housekeeping first saw TIME-WAIT.
+    time_wait: VecDeque<Id>,
     stopped: bool,
     /// The driver task, woken when a handle has work for it.
     driver: Option<Waker>,
@@ -418,10 +430,10 @@ struct Conn {
     rst: bool,
     /// A FIN arrived for this connection.
     fin: bool,
-    /// When the last segment with a FIN arrived.
-    fin_at: Option<smoltcp::time::Instant>,
     /// This side called shutdown.
     shut: bool,
+    /// The handle was dropped and only TIME-WAIT recovery state remains.
+    retired: bool,
     /// This side connected, so it holds its local port.
     side: Side,
     /// The peer's initial sequence number, from its SYN.
@@ -439,11 +451,11 @@ struct Conn {
     /// smoltcp may hold, including out-of-order data. smoltcp exposes only
     /// the readable part of its receive queue.
     rx_end: Option<u32>,
-    /// Kept until the socket is gone, after the handle is dropped too: see
+    /// Kept until retirement or socket removal, after handle drop too: see
     /// [`TcpConnection::hold_until_gone`].
     held: Vec<Box<dyn std::any::Any + Send>>,
     /// Woken when a RST arrives or this side aborts, when the endpoint
-    /// stops, and when the connection is forgotten: see [`GoneWatch`].
+    /// stops, and on retirement or socket removal: see [`GoneWatch`].
     gone: Vec<Waker>,
 }
 
@@ -460,8 +472,8 @@ impl Conn {
             remote,
             rst: false,
             fin: false,
-            fin_at: None,
             shut: false,
+            retired: false,
             side,
             irs: None,
             iss: None,
@@ -1044,10 +1056,8 @@ impl State {
                 )
             {
                 c.fin = true;
-                // ACK an accepted FIN immediately. Housekeeping keeps a
-                // TIME-WAIT socket until this ACK has gone out, even if
-                // the application drops its handle after reading EOF.
-                c.fin_at = Some(now);
+                // ACK an accepted FIN immediately, even if the application
+                // drops its handle after reading EOF.
                 self.sockets
                     .get_mut::<stcp::Socket>(self.handles[&h])
                     .set_ack_delay(None);
@@ -1078,7 +1088,7 @@ impl State {
 
     /// Moves finished handshakes to the accept queues and removes orphans
     /// that have closed.
-    fn housekeeping(&mut self, now: smoltcp::time::Instant) {
+    fn housekeeping(&mut self) {
         let mut woken = Vec::new();
         // Removed after the loop: `listeners` is borrowed in it.
         let mut gone = Vec::new();
@@ -1129,31 +1139,38 @@ impl State {
             self.remove_socket(h);
         }
         let mut i = 0;
-        self.next_tidy = None;
         while i < self.orphans.len() {
             let h = self.orphans[i];
             let state = self.get(h).state();
-            // In TIME-WAIT, an ACK for the peer's FIN may still wait for
-            // smoltcp's delayed-ACK timer. Keep the socket until it is sent.
-            let owed = (state == TcpState::TimeWait)
-                .then(|| self.conns.get(&h).and_then(|c| c.fin_at))
-                .flatten()
-                .map(|t| t + ACK_DELAY.into())
-                .filter(|&until| now < until);
-            if let Some(until) = owed {
-                self.next_tidy = Some(self.next_tidy.map_or(until, |t| t.min(until)));
-                i += 1;
-            } else if (state == TcpState::Closed && self.get(h).remote_endpoint().is_none())
-                || state == TcpState::TimeWait
-            {
+            if state == TcpState::Closed && self.get(h).remote_endpoint().is_none() {
                 // An aborted socket is already CLOSED, but keeps its
                 // endpoint until smoltcp sends the RST. The output
                 // allowance may leave that packet for the next turn.
                 self.orphans.swap_remove(i);
                 self.remove_conn(h);
             } else {
+                // smoltcp owns the explicit TIME-WAIT expiry and exposes
+                // it through poll_at. Retransmitted FINs restart its ten-
+                // second timer; egress moves the socket to CLOSED at expiry.
+                // The orphan timeout must not interrupt that with a RST.
+                if state == TcpState::TimeWait && !self.conns[&h].retired {
+                    self.sock(h).set_timeout(None);
+                    let c = self.conns.get_mut(&h).unwrap();
+                    c.retired = true;
+                    c.held.clear();
+                    woken.append(&mut c.gone);
+                    self.time_wait.push_back(h);
+                }
                 i += 1;
             }
+        }
+        self.time_wait.retain(|h| self.conns.contains_key(h));
+        if self.time_wait.len() > MAX_TIME_WAIT {
+            while self.time_wait.len() > MAX_TIME_WAIT {
+                let h = self.time_wait.pop_front().unwrap();
+                self.remove_conn(h);
+            }
+            self.orphans.retain(|h| self.conns.contains_key(h));
         }
         self.compact();
         for w in woken {
@@ -1335,6 +1352,7 @@ impl Shared {
         for h in std::mem::take(&mut st.orphans) {
             st.remove_conn(h);
         }
+        st.time_wait.clear();
         drop(st);
         for w in wakers {
             w.wake();
@@ -1391,7 +1409,7 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
             while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets)
                 != smoltcp::iface::PollResult::None
             {}
-            st.housekeeping(now);
+            st.housekeeping();
             exhausted = st.dev.tx.len() >= EGRESS_PACKETS || !batch.is_empty();
             std::mem::swap(&mut out, &mut st.dev.tx);
             for p in &out {
@@ -1411,10 +1429,7 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
                 }
             }
             let at = st.iface.poll_at(now, &st.sockets);
-            [at, st.next_release, st.next_tidy]
-                .into_iter()
-                .flatten()
-                .min()
+            [at, st.next_release].into_iter().flatten().min()
         };
         for p in out.drain(..) {
             inner.send(Packet(p));
@@ -1743,11 +1758,12 @@ impl TcpConnection {
     /// for the peer.
     ///
     /// Dropping a connection whose received bytes were all read closes it
-    /// with a FIN instead. Its socket then stays until the peer has finished
-    /// closing too, or has sent nothing for a minute, so a peer that keeps
-    /// sending keeps the socket. A server that must bound how many sockets
-    /// a peer can hold, such as one that turns connections away past a
-    /// limit, resets each connection it is done with.
+    /// with a FIN instead. Its connection counts stay until the peer has
+    /// finished closing too, or has sent nothing for a minute. Reaching
+    /// TIME-WAIT releases those counts; only bounded transport recovery
+    /// state stays (see [`endpoint`]). A server that must bound how many
+    /// closing sockets a peer can hold, such as one that turns connections
+    /// away past a limit, resets each connection it is done with.
     pub fn reset(self) {
         let mut st = self.shared.state.lock();
         st.abort(self.handle);
@@ -1764,11 +1780,14 @@ impl TcpConnection {
         }
     }
 
-    /// Keeps `item` until the connection's socket is gone, which may be
+    /// Keeps `item` until the connection is gone, which may be
     /// after this handle is dropped: closing waits for the peer (FIN-WAIT,
-    /// LAST-ACK) for up to a minute. Limits that count connections hold
-    /// their count here, so a peer that never finishes closing cannot open
-    /// more past the limit. Each call keeps one more item.
+    /// LAST-ACK) until it has sent nothing for a minute. A socket that reaches
+    /// TIME-WAIT after handle drop releases its items immediately. Only
+    /// transport recovery state stays as described in [`endpoint`]. Limits
+    /// that count connections hold their count here, so a peer that never
+    /// finishes closing cannot open more past the limit. Each call keeps
+    /// one more item.
     pub fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
         self.gone_watch().hold_until_gone(item);
     }
@@ -1776,6 +1795,8 @@ impl TcpConnection {
 
 /// Says when a connection has been reset, is gone, or its endpoint has
 /// stopped, without reading from it. See [`TcpConnection::gone_watch`].
+/// A dropped connection is gone once it reaches TIME-WAIT, even while
+/// its transport recovery state stays to ACK retransmitted FINs.
 #[derive(Clone)]
 pub struct GoneWatch {
     shared: Arc<Shared>,
@@ -1791,23 +1812,25 @@ impl GoneWatch {
     /// Resets the connection, as [`TcpConnection::reset`] does, after the
     /// connection itself was handed on. Wakes disappearance watches even
     /// while the connection handle is retained. Reads and writes on that
-    /// handle report [`ConnError::Reset`].
+    /// handle report [`ConnError::Reset`]. Does nothing after the dropped
+    /// connection reaches TIME-WAIT and is retired by housekeeping.
     pub fn reset(&self) {
         let mut st = self.shared.state.lock();
-        if st.conns.contains_key(&self.handle) {
+        if st.conns.get(&self.handle).is_some_and(|c| !c.retired) {
             st.abort(self.handle);
             st.kick();
         }
     }
 
-    /// Keeps `item` until the connection's socket is gone: see
+    /// Keeps `item` until the connection is gone: see
     /// [`TcpConnection::hold_until_gone`]. Works after the connection
-    /// itself was handed on, such as boxed behind TLS.
+    /// itself was handed on, such as boxed behind TLS. Drops `item`
+    /// immediately if the connection has already retired into TIME-WAIT.
     pub fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
         let mut st = self.shared.state.lock();
         match st.conns.get_mut(&self.handle) {
-            Some(c) => c.held.push(item),
-            None => drop(item),
+            Some(c) if !c.retired => c.held.push(item),
+            _ => drop(item),
         }
     }
 }
@@ -1820,7 +1843,7 @@ fn poll_gone(shared: &Shared, handle: Id, cx: &mut Context<'_>) -> Poll<()> {
     }
     match st.conns.get_mut(&handle) {
         None => Poll::Ready(()),
-        Some(c) if c.rst => Poll::Ready(()),
+        Some(c) if c.rst || c.retired => Poll::Ready(()),
         Some(c) => {
             if !c.gone.iter().any(|w| w.will_wake(cx.waker())) {
                 c.gone.push(cx.waker().clone());
@@ -1987,7 +2010,7 @@ mod tests {
             let t = Header::parse_whole(&syn_ack[0]).unwrap().payload(&syn_ack[0]);
             let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
             st.ingress(local.ip(), now, segment(peer, local, 101, ack, 16).0);
-            st.housekeeping(now);
+            st.housekeeping();
             let h = st.listeners.get_mut(&80).unwrap().ready.pop_front().unwrap();
             st.orphan(h, true);
             for _ in 0..EGRESS_PACKETS {
@@ -1995,15 +2018,182 @@ mod tests {
             }
             let st = &mut *st;
             st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
-            st.housekeeping(now);
+            st.housekeeping();
             assert!(st.conns.contains_key(&h), "unsent reset must keep its socket");
             st.dev.tx.clear();
             let packets = egress(st, now);
             assert_eq!(packets.len(), 1);
             let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
             assert_eq!(t[13] & 4, 4);
-            st.housekeeping(now);
+            st.housekeeping();
             assert!(!st.conns.contains_key(&h));
+            Ok(())
+        })).unwrap();
+    }
+
+    /// Handshakes a connection. Returns its socket and next send sequence.
+    fn established(
+        st: &mut State,
+        now: smoltcp::time::Instant,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> (Id, u32) {
+        st.ingress(local.ip(), now, segment(peer, local, 100, 0, 2).0);
+        let syn_ack = egress(st, now);
+        let t = Header::parse_whole(&syn_ack[0]).unwrap().payload(&syn_ack[0]);
+        let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
+        st.ingress(local.ip(), now, segment(peer, local, 101, ack, 16).0);
+        st.housekeeping();
+        let l = st.listeners.get_mut(&local.port()).unwrap();
+        let h = l.ready.pop_front().unwrap();
+        l.left(peer.ip());
+        (h, ack)
+    }
+
+    /// Handshakes and actively closes a connection, leaving its final ACK
+    /// for egress. Returns the dropped socket and the peer's FIN.
+    fn time_wait(
+        st: &mut State,
+        now: smoltcp::time::Instant,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> (Id, Packet) {
+        let (h, ack) = established(st, now, local, peer);
+        st.sock(h).close();
+        let fin = egress(st, now);
+        assert_eq!(Header::parse_whole(&fin[0]).unwrap().payload(&fin[0])[13], 0x11);
+        let peer_fin = segment(peer, local, 101, ack.wrapping_add(1), 0x11);
+        st.ingress(local.ip(), now, peer_fin.0.clone());
+        assert_eq!(st.get(h).state(), TcpState::TimeWait);
+        st.orphan(h, false);
+        (h, peer_fin)
+    }
+
+    #[test]
+    fn time_wait_survives_full_output_and_expires_after_retransmission() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            let (h, fin) = time_wait(&mut st, now, local, peer);
+            drop(st);
+            let watch = GoneWatch { shared: ep.shared.clone(), handle: h };
+            let held = Arc::new(());
+            watch.hold_until_gone(Box::new(held.clone()));
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let waker = Waker::from(Arc::new(WakeLog(0, log.clone())));
+            assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_pending());
+            let mut st = ep.shared.state.lock();
+            while st.dev.tx.len() < EGRESS_PACKETS {
+                st.dev.transmit(now).unwrap().consume(40, |_| {});
+            }
+            let later = now + smoltcp::time::Duration::from_millis(20);
+            {
+                let st = &mut *st;
+                st.iface.poll_egress(later, &mut st.dev, &mut st.sockets);
+            }
+            st.housekeeping();
+            assert!(st.conns.contains_key(&h), "full egress must retain TIME-WAIT");
+            assert_eq!(Arc::strong_count(&held), 1);
+            assert_eq!(*log.lock(), [0]);
+            drop(st);
+            assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_ready());
+            watch.reset();
+            watch.hold_until_gone(Box::new(held.clone()));
+            assert_eq!(Arc::strong_count(&held), 1);
+            let mut st = ep.shared.state.lock();
+            let st = &mut *st;
+            assert_eq!(st.get(h).state(), TcpState::TimeWait);
+            st.dev.tx.clear();
+            let packets = egress(st, later);
+            assert_eq!(packets.len(), 1);
+            let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+            assert_eq!(t[13], 0x10);
+            assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()), 102);
+            // FINs near expiry restart the ten-second timer, even past the
+            // orphan timeout for sockets that have not reached TIME-WAIT.
+            for seconds in [9, 18, 27, 36, 45, 54, 63] {
+                let retry = now + smoltcp::time::Duration::from_secs(seconds);
+                st.ingress(local.ip(), retry, fin.0.clone());
+                let packets = egress(st, retry);
+                assert_eq!(packets.len(), 1);
+                let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                assert_eq!(t[13], 0x10);
+            }
+            let before = now + smoltcp::time::Duration::from_secs(72);
+            assert!(egress(st, before).is_empty());
+            st.housekeeping();
+            assert!(st.conns.contains_key(&h));
+            let expiry = now + smoltcp::time::Duration::from_secs(73);
+            assert!(egress(st, expiry).is_empty());
+            st.housekeeping();
+            assert!(!st.conns.contains_key(&h));
+            assert!(!st.handles.contains_key(&h));
+            assert!(!st.pages.contains_key(&h));
+            assert!(!st.by_tuple.contains_key(&(local, peer)));
+            assert!(!st.orphans.contains(&h));
+            assert!(st.time_wait.is_empty());
+            assert_eq!(Arc::strong_count(&held), 1);
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn time_wait_overflow_evicts_the_oldest_dropped_connections() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let peer: IpAddr = "10.0.0.2".parse()?;
+            let ep = endpoint_with(&fcx, side, local.ip(), Options::default().buffer(MIN_BUFFER));
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            let (kept, _) = time_wait(&mut st, now, local, SocketAddr::new(peer, 1000));
+            // Model a TIME-WAIT socket whose application still holds it.
+            st.orphans.clear();
+            egress(&mut st, now);
+            let recent_peer = SocketAddr::new(peer, 1001);
+            let (recent, ack) = established(&mut st, now, local, recent_peer);
+            let mut dropped = Vec::new();
+            for port in 1002..1002 + MAX_TIME_WAIT as u16 {
+                let (h, _) = time_wait(&mut st, now, local, SocketAddr::new(peer, port));
+                dropped.push(h);
+                egress(&mut st, now);
+                st.housekeeping();
+            }
+            // The older connection enters TIME-WAIT last. Evict by entry
+            // order, even when the orphan list has been rearranged.
+            st.orphans.reverse();
+            let later = now + smoltcp::time::Duration::from_secs(1);
+            st.sock(recent).close();
+            assert_eq!(egress(&mut st, later).len(), 1);
+            let fin = segment(recent_peer, local, 101, ack.wrapping_add(1), 0x11);
+            st.ingress(local.ip(), later, fin.0);
+            assert_eq!(st.get(recent).state(), TcpState::TimeWait);
+            st.orphan(recent, false);
+            egress(&mut st, later);
+            st.housekeeping();
+            assert_eq!(st.orphans.len(), MAX_TIME_WAIT);
+            assert_eq!(st.time_wait.len(), MAX_TIME_WAIT);
+            assert!(st.conns.contains_key(&kept));
+            assert!(st.conns.contains_key(&recent));
+            assert!(!st.conns.contains_key(&dropped[0]));
+            assert!(!st.handles.contains_key(&dropped[0]));
+            assert!(!st.by_tuple.contains_key(&(local, SocketAddr::new(peer, 1002))));
+            assert!(dropped[1..].iter().all(|h| st.conns.contains_key(h)));
+            // Eviction itself emits nothing. Normal expiry frees the rest.
+            assert!(egress(&mut st, later).is_empty());
+            let expiry = later + smoltcp::time::Duration::from_secs(10);
+            assert!(egress(&mut st, expiry).is_empty());
+            st.housekeeping();
+            assert!(st.orphans.is_empty());
+            assert!(st.time_wait.is_empty());
+            assert_eq!(st.conns.len(), 1);
+            assert!(st.conns.contains_key(&kept));
             Ok(())
         })).unwrap();
     }
@@ -2062,7 +2252,7 @@ mod tests {
                     }
                     let st = &mut *st;
                     st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
-                    st.housekeeping(now);
+                    st.housekeeping();
                     assert!(st.conns.contains_key(&h), "unsent reset must keep its socket");
                     assert!(st.get(h).remote_endpoint().is_some());
                     st.dev.tx.clear();
@@ -2070,12 +2260,12 @@ mod tests {
                     assert_eq!(packets.len(), 1);
                     let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
                     assert_eq!(t[13] & 4, 4);
-                    st.housekeeping(now);
+                    st.housekeeping();
                     assert_eq!(st.conns.contains_key(&h), conn.is_some());
                 }
                 drop(conn);
                 let mut st = server.shared.state.lock();
-                st.housekeeping(now);
+                st.housekeeping();
                 assert!(!st.conns.contains_key(&h));
                 drop(st);
                 fcx.cancel();
@@ -2617,7 +2807,7 @@ mod tests {
                         now,
                         segment(peer, local, irs.wrapping_add(1), start, 0x10).0,
                     );
-                    st.housekeeping(now);
+                    st.housekeeping();
                     egress(&mut st, now);
                     start
                 };
@@ -2714,7 +2904,7 @@ mod tests {
                 let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
                 // The peer closes its send half before reading the reply.
                 st.ingress(local.ip(), now, incoming(8, start, 0x11, 8));
-                st.housekeeping(now);
+                st.housekeeping();
                 egress(&mut st, now);
                 start
             };
@@ -2879,7 +3069,7 @@ mod tests {
     /// working.
     #[test]
     fn the_socket_set_shrinks_after_a_crowd_leaves() {
-        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
+        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
@@ -2894,7 +3084,7 @@ mod tests {
             }
             assert!(server.shared.state.lock().slots >= 401);
             drop(crowd);
-            let deadline = fcx.now() + 100 * ACK_DELAY;
+            let deadline = fcx.now() + Duration::from_secs(11);
             while ![&server, &client].iter().all(|e| {
                 let st = e.shared.state.lock();
                 st.handles.len() <= 3 && st.slots < COMPACT_SLOTS
@@ -3159,15 +3349,14 @@ mod tests {
                 0x11,
             ));
             fcx.sleep(Duration::from_millis(50)).await?;
-            let (state, fin, fin_at) = {
+            let (state, fin) = {
                 let st = server.shared.state.lock();
                 let state = st.get(conn.handle).state();
                 let c = &st.conns[&conn.handle];
-                (state, c.fin, c.fin_at)
+                (state, c.fin)
             };
             assert_eq!(state, TcpState::Established);
             assert!(!fin);
-            assert_eq!(fin_at, None);
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
