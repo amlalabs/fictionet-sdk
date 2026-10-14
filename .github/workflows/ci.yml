@@ -285,7 +285,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test: [tcpudp, web, ping]
+        test: [tcpudp, web, ping, proxy]
     steps:
       - uses: actions/checkout@v4
       - run: tests/docker/${{ matrix.test }}/run.sh

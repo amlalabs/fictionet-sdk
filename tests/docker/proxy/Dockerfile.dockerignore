@@ -6,7 +6,5 @@
 !dashboard
 !benches
 !codegen
-!tests/copy_and_own
-!tests/web_fixture
+!tests
 !examples
-!tests/docker/proxy/goclient

@@ -9,13 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  proxy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - run: tests/docker/proxy/run.sh
-
   k8s:
     runs-on: ubuntu-latest
     timeout-minutes: 60
