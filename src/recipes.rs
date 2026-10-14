@@ -198,21 +198,23 @@
 //! The filter never waits for the file, so the capture gives up packets
 //! instead of slowing the network:
 //!
-//! - **The channel is full.** It holds 100,000 packets. If the writer falls
+//! - **The channel is full.** It holds 1,024 packets. If the writer falls
 //!   that far behind, the filter still passes each new packet on, but leaves
 //!   it out of the file. When the writer catches up, the world prints how
 //!   many packets it left out so far.
 //! - **A write fails,** for example because the disk is full. The world
 //!   prints the error, and stops capturing. The network keeps running.
-//! - **The world stops.** Packets still in the channel are lost, and so is
-//!   the count of packets left out since the last line the world printed.
-//!   The writer flushes its buffer to the file each time it catches up, and
-//!   only what it flushed is sure to be there.
+//! - **The process exits abruptly.** Packets still in the channel or the
+//!   writer's buffer can be lost, and the pcap can end partway through a
+//!   record. The writer flushes its buffer each time it catches up. The
+//!   example has no signal handler to drain it on Ctrl-C.
 //!
-//! So a quiet world log does not prove the file is complete. A capture
-//! that must hold every packet needs a world that, before it exits, closes
-//! the channel, waits for the writer thread to finish, and prints the final
-//! count.
+//! On controlled shutdown, when the world run returns and drops the channel
+//! senders, the writer drains the queued packets and flushes the file. The
+//! example joins the writer thread and returns any write error. This does
+//! not recover packets left out when the channel was full, and the writer
+//! does not always print the final loss count before it exits. A quiet world
+//! log therefore does not prove the file is complete.
 //!
 #![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/capture_sites.rs"), "# }\n# fn main() {}\n```")]
 //!

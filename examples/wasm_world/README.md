@@ -29,11 +29,16 @@ In Node.js, with `wasm-pack` (it fetches the matching
 wasm-pack test --node
 ```
 
-The tests make requests over HTTP/1.1 and HTTP/2, each plain and over
-HTTPS. Three of them run the world under `fictionet::block_on`, which in a
-JavaScript engine fires the timers itself and spins between them. The
-fourth awaits it on the event loop, as a page would, where the timers fire
-from `setTimeout`.
+On both the host and JavaScript targets, the request test checks four
+combinations: HTTP/1.1 and HTTP/2, each plain and over HTTPS. All four run
+the world under `fictionet::block_on`, which in a JavaScript engine fires
+the timers itself and spins between them. JavaScript also runs an HTTPS
+request over HTTP/2 on the event loop, as a page would, where the timers
+fire from `setTimeout`.
+
+A separate test checks that a real run replays retained events and writes
+new ones to an in-memory writer. On JavaScript, it also checks that the
+writer receives events synchronously.
 
 ring's C code compiles for wasm32 with clang. A clang that lists `wasm32`
 in `clang --print-targets` is enough; set `CC_wasm32_unknown_unknown` to
