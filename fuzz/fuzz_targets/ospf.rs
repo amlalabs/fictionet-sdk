@@ -21,7 +21,7 @@ use fictionet::stdlib::ospf::{
     Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
 use fictionet::stdlib::{
-    codec::{Collect, Decode, Wire},
+    codec::{Collect, Wire},
     ospf,
     test_support::contract,
 };
@@ -46,18 +46,9 @@ fn check(data: &[u8], e: &Endpoints) {
         data,
         2 * (ospf::MAX_MESSAGE + 1),
     );
-    contract::check_decode_with_alloc_limit(
-        || Collect::bytes(ospf::MAX_MESSAGE).map(|datagram| Packet::parse(&datagram, e)),
-        data,
-        2 * (ospf::MAX_MESSAGE + 1),
-    );
-    let raw = data[..data.len().min(ospf::MAX_MESSAGE)].to_vec();
-    assert_eq!(
-        fictionet::stdlib::test_support::decode_all(|| Collect::bytes(ospf::MAX_MESSAGE), &raw),
-        (vec![raw], None)
-    );
-
-    let parsed = Packet::parse(data, e);
+    let parsed = contract::check_collect_with(data, ospf::MAX_MESSAGE, |datagram| {
+        Packet::parse(datagram, e)
+    });
 
     if let Ok(p) = &parsed {
         // A packet read can be written, and reads back the same. LSAs an

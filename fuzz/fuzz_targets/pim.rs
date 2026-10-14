@@ -8,11 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use fictionet::stdlib::pim::{
     ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Error, Message, checksum,
 };
-use fictionet::stdlib::{
-    codec::{Collect, Decode},
-    pim,
-    test_support::contract,
-};
+use fictionet::stdlib::{codec::Collect, pim, test_support::contract};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -44,18 +40,9 @@ fn check(data: &[u8], e: &Endpoints) {
         data,
         2 * (pim::MAX_MESSAGE + 1),
     );
-    contract::check_decode_with_alloc_limit(
-        || Collect::bytes(pim::MAX_MESSAGE).map(|datagram| Message::parse(&datagram, e)),
-        data,
-        2 * (pim::MAX_MESSAGE + 1),
-    );
-    let raw = data[..data.len().min(pim::MAX_MESSAGE)].to_vec();
-    assert_eq!(
-        fictionet::stdlib::test_support::decode_all(|| Collect::bytes(pim::MAX_MESSAGE), &raw),
-        (vec![raw], None)
-    );
-
-    let parsed = Message::parse(data, e);
+    let parsed = contract::check_collect_with(data, pim::MAX_MESSAGE, |datagram| {
+        Message::parse(datagram, e)
+    });
 
     if let Ok(m) = &parsed {
         assert!(

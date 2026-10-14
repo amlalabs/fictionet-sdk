@@ -14,11 +14,7 @@ use fictionet::stdlib::vrrp::{
     Addresses, Advertisement, AdvertisementV2, AdvertisementV3, Error, GROUP_V4, GROUP_V6,
     MAX_ADDRESSES, checksum, checksum_rfc5798,
 };
-use fictionet::stdlib::{
-    codec::{Collect, Decode},
-    test_support::contract,
-    vrrp,
-};
+use fictionet::stdlib::{codec::Collect, test_support::contract, vrrp};
 use libfuzzer_sys::fuzz_target;
 
 const LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
@@ -155,18 +151,9 @@ fn check(data: &[u8], e: &Endpoints) {
         data,
         2 * (vrrp::MAX_MESSAGE + 1),
     );
-    contract::check_decode_with_alloc_limit(
-        || Collect::bytes(vrrp::MAX_MESSAGE).map(|datagram| Advertisement::parse(&datagram, e)),
-        data,
-        2 * (vrrp::MAX_MESSAGE + 1),
-    );
-    let raw = data[..data.len().min(vrrp::MAX_MESSAGE)].to_vec();
-    assert_eq!(
-        fictionet::stdlib::test_support::decode_all(|| Collect::bytes(vrrp::MAX_MESSAGE), &raw),
-        (vec![raw], None)
-    );
-
-    let parsed = Advertisement::parse(data, e);
+    let parsed = contract::check_collect_with(data, vrrp::MAX_MESSAGE, |datagram| {
+        Advertisement::parse(datagram, e)
+    });
 
     // A checksum neither formula gives is never taken.
     let got = data.get(6..8).map(|c| u16::from_be_bytes([c[0], c[1]]));
