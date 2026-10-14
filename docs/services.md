@@ -259,6 +259,10 @@ An axum `Router`, or any tower service over `http::Request<web::Body>`,
 runs with `httpd::tower(service)`. A handler adds facts to its request's
 event by putting `events::Fields` in its response's extensions.
 
+HTTP/1.1 responses with unknown-length bodies use chunked encoding. Pending
+polls and empty data frames do not end the response. The zero-size chunk is
+sent only at body EOF, so the next response can use the same connection.
+
 On a network, `httpd::Server` is the `PortServer` that serves a handler on a
 port, and `httpd::Server::served_by` puts one on ports 80 and 443 as `web::Sites`
 does:

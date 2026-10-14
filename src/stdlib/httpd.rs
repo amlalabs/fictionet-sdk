@@ -34,6 +34,8 @@
 //! responses for bodies of unknown length, and 30-second limits on each
 //! request's head and on its body. [`serve_connection`] picks the version for a
 //! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
+//! An unknown-length HTTP/1.1 body ends with a zero-size chunk only at EOF.
+//! Pending polls and empty data frames do not end the response.
 //!
 //! With `tokio`, a request that asks to switch protocols (`Connection: upgrade` with an
 //! `Upgrade` field, as a WebSocket handshake does) makes [`Http1`] hand
@@ -1679,8 +1681,12 @@ impl Pending for Streaming {
                     }
                     stream => self.body = Some(Body(stream)),
                 }
+                // A streamed body has nothing held yet, and an empty chunk
+                // would end it before it starts.
                 let piece = self.take_piece();
-                self.frame(&piece, &mut head);
+                if !piece.is_empty() {
+                    self.frame(&piece, &mut head);
+                }
                 return self.piece(head, piece.len());
             }
             if !self.rest.is_empty() {
