@@ -641,6 +641,87 @@ fn cancellation_reaches_waits_outside_the_run() {
     assert_eq!(recv, Err(RecvError::Cancelled));
 }
 
+#[derive(Default)]
+struct CancellationWake(AtomicU64);
+
+impl std::task::Wake for CancellationWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn cancellation_registration_moves_between_regions() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let wake = Arc::new(CancellationWake::default());
+        let waker = std::task::Waker::from(wake.clone());
+        let mut wait = fictionet::CancelWait::default();
+        fcx.region(|child| {
+            assert!(!child.register_cancel(&waker, &mut wait));
+            assert_eq!(Arc::strong_count(&wake), 3);
+            assert!(!fcx.register_cancel(&waker, &mut wait));
+            assert_eq!(Arc::strong_count(&wake), 3);
+            child.cancel();
+            assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+            async { Ok(()) }
+        })
+        .await?;
+        fcx.cancel();
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        drop(wait);
+        assert_eq!(Arc::strong_count(&wake), 2);
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn cancellation_registration_replaces_wakers_and_unregisters_on_drop() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let old = Arc::new(CancellationWake::default());
+        let new = Arc::new(CancellationWake::default());
+        let mut wait = fictionet::CancelWait::default();
+        assert!(!fcx.register_cancel(&old.clone().into(), &mut wait));
+        assert!(!fcx.register_cancel(&old.clone().into(), &mut wait));
+        assert_eq!(Arc::strong_count(&old), 2);
+        assert!(!fcx.register_cancel(&new.clone().into(), &mut wait));
+        assert_eq!(Arc::strong_count(&old), 1);
+        assert_eq!(Arc::strong_count(&new), 2);
+        drop(wait);
+        assert_eq!(Arc::strong_count(&new), 1);
+        fcx.cancel();
+        assert_eq!(old.0.load(Ordering::SeqCst), 0);
+        assert_eq!(new.0.load(Ordering::SeqCst), 0);
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn cancellation_registration_is_released_when_an_end_moves_into_the_run() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let (mut end, _peer) = pair();
+        let wake = Arc::new(CancellationWake::default());
+        let waker = std::task::Waker::from(wake.clone());
+        assert!(
+            end.poll_recv(&fcx, &mut std::task::Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(Arc::strong_count(&wake), 4);
+        std::future::poll_fn(|cx| {
+            assert!(end.poll_recv(&fcx, cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(Arc::strong_count(&wake), 2);
+        drop(end);
+        fcx.cancel();
+        assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+        Ok(())
+    }))
+    .unwrap();
+}
+
 /// `run` is polled by tokio like any other future, and cable ends work in
 /// tokio tasks next to it.
 #[test]

@@ -541,11 +541,12 @@ impl Cx {
     /// region in `wait`'s slot. Each wait keeps one `CancelWait` for as long
     /// as it lives, and dropping it takes the waker out of the region, so a
     /// region holds one waker per wait outside the run, no more.
-    /// Create the token with [`CancelWait::default`] and keep it for one
-    /// region. Call this method on each poll to update its waker.
+    /// Create the token with [`CancelWait::default`]. Call this method on
+    /// each poll to update its waker. Registering it with another region,
+    /// or from a task of this run, removes its previous registration.
     pub fn register_cancel(&self, waker: &Waker, wait: &mut CancelWait) -> bool {
         if crate::run::is_current_task(&self.run, waker) {
-            wait.0 = None;
+            wait.clear();
             return self.is_cancelled();
         }
         match &wait.0 {
@@ -553,6 +554,7 @@ impl Cx {
                 self.region.update_foreign(*key, waker)
             }
             _ => {
+                wait.clear();
                 let key = self.region.add_foreign(waker);
                 wait.0 = Some((self.region.clone(), key));
             }
@@ -749,16 +751,23 @@ impl JoinState {
 
 /// One wait's place for its waker in a region, for waits polled outside the
 /// run. See [`Cx::register_cancel`]. Dropping it takes the waker out.
-/// Create an empty token with [`Default::default`] and use it with one region.
+/// Create an empty token with [`Default::default`]. Registering it with
+/// another region removes its waker from the previous region.
 #[derive(Default)]
 pub struct CancelWait(Option<(Arc<Region>, u64)>);
 
-impl Drop for CancelWait {
-    fn drop(&mut self) {
+impl CancelWait {
+    fn clear(&mut self) {
         if let Some((region, key)) = self.0.take() {
             let removed = region.state.lock().foreign.remove(&key);
             drop(removed);
         }
+    }
+}
+
+impl Drop for CancelWait {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -1040,6 +1049,39 @@ mod tests {
     use crate::time::ms;
     use crate::{block_on, run};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn cancellation_registration_releases_wakers_outside_the_lock() {
+        struct CheckDrop(Weak<Region>, Arc<AtomicBool>);
+        impl std::task::Wake for CheckDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("unregistering a waker must not wake it");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert!(self.0.upgrade().unwrap().state.try_lock().is_some());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        for clear in [false, true] {
+            let region = Region::root(Weak::new());
+            let dropped = Arc::new(AtomicBool::new(false));
+            let key = region.add_foreign(&Waker::from(Arc::new(CheckDrop(
+                Arc::downgrade(&region),
+                dropped.clone(),
+            ))));
+            let mut wait = CancelWait(Some((region.clone(), key)));
+            if clear {
+                wait.clear();
+                assert!(dropped.load(Ordering::SeqCst));
+                wait.clear();
+            }
+            drop(wait);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(region.state.lock().foreign.is_empty());
+        }
+    }
 
     #[test]
     fn cancellation_wakes_in_registration_order() {
