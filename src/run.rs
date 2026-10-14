@@ -217,6 +217,7 @@ impl RunShared {
         location: &'static Location<'static>,
         group: Option<&Arc<crate::watch::Group>>,
     ) -> std::result::Result<(), BoxFuture> {
+        let name = name();
         let outer = {
             let mut q = self.queue.lock();
             if q.closed {
@@ -225,8 +226,7 @@ impl RunShared {
             let id = q.next_id;
             q.next_id += 1;
             // Before the task can be polled, so its links find it.
-            self.graph
-                .task_started(id, name(), location, group.cloned());
+            self.graph.task_started(id, name, location, group.cloned());
             q.incoming.push(NewTask {
                 id,
                 future,

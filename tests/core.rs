@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use fictionet::events::{Event, Fields};
 use fictionet::prelude::*;
 use fictionet::time::ms;
 use fictionet::{
@@ -122,6 +123,81 @@ fn ok_does_not_cancel_and_the_run_waits_for_all_work() {
     .unwrap();
     assert!(finished.load(Ordering::SeqCst));
     assert!(!saw_cancel.load(Ordering::SeqCst));
+}
+
+#[test]
+fn naming_callback_can_cancel() {
+    within(Duration::from_secs(5), || {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            fcx.spawn_as(
+                || {
+                    fcx.cancel();
+                    "cancelled task".into()
+                },
+                |fcx| async move {
+                    assert!(fcx.is_cancelled());
+                    Ok(())
+                },
+            );
+            assert!(fcx.is_cancelled());
+            Ok(())
+        }))
+    })
+    .unwrap();
+}
+
+#[test]
+fn event_wait_predicate_can_read_same_log() {
+    within(Duration::from_secs(5), || {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            fcx.record(Event::new("test", "tick"));
+            fcx.record_repeat(Event::new("test", "drop"), Fields::new());
+            fcx.record(Event::new("test", "tick"));
+            let log = fcx.events();
+            let other = log.clone();
+            let mut seen = Vec::new();
+            let got = log
+                .wait(&fcx, 2, ms(10), |event| {
+                    assert_eq!(other.recorded(), 3);
+                    assert_eq!(other.of("test", "tick").len(), 2);
+                    seen.push(event.seq);
+                    event.is("test", "tick")
+                })
+                .await?;
+            assert_eq!(seen, [1, 2, 3]);
+            assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 3]);
+            assert_eq!(fcx.now().since_start(), Duration::ZERO);
+            Ok(())
+        }))
+    })
+    .unwrap();
+}
+
+#[test]
+fn event_wait_predicate_can_record_into_same_log() {
+    within(Duration::from_secs(5), || {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            fcx.record(Event::new("test", "tick"));
+            let mut recorded = false;
+            let mut seen = Vec::new();
+            let got = fcx
+                .events()
+                .wait(&fcx, 2, ms(20), |event| {
+                    seen.push((fcx.now().since_start(), event.seq));
+                    if !recorded {
+                        fcx.record(Event::new("test", "tick"));
+                        recorded = true;
+                    }
+                    event.is("test", "tick")
+                })
+                .await?;
+            assert_eq!(seen, [(ms(0), 1), (ms(10), 1), (ms(10), 2)]);
+            assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2]);
+            assert_eq!(fcx.now().since_start(), ms(10));
+            Ok(())
+        }))
+    })
+    .unwrap();
 }
 
 /// Every kind of wait ends with `Cancelled` when the region fails.

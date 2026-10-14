@@ -307,6 +307,10 @@ Net::new() /* ... */.start(&fcx, attachments)?;
 let logins = events.of("prompt", "login");
 ```
 
+`EventLog::wait` checks a snapshot of the held events, oldest first, with
+the log unlocked. Its predicate may read or record events in the same log.
+Events recorded by the predicate are considered on the next check.
+
 The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
 `level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
 `tls`, `sni`, `alpn`, `fields`, then the task that recorded it (`node`,

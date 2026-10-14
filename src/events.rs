@@ -1195,6 +1195,11 @@ impl EventLog {
     /// counts of [repeats](self#repeats) that are due. Returns early with
     /// [`Cancelled`](crate::Cancelled) if `fcx`'s [region](Cx#regions) is
     /// cancelled.
+    ///
+    /// Each check takes a snapshot of the held events, oldest first, then
+    /// calls `pick` without holding the log's lock. The predicate may read
+    /// or record events in the same log. Events recorded during a check
+    /// are considered on the next check.
     pub async fn wait(
         &self,
         fcx: &Cx,
@@ -1205,13 +1210,15 @@ impl EventLog {
         let deadline = fcx.now() + limit;
         loop {
             self.store.advance(fcx.now());
-            let got: Vec<Event> = {
+            let events: Vec<Arc<Event>> = {
                 let s = self.store.state.lock();
-                held(&s, 0)
-                    .filter(|e| pick(e))
-                    .map(|e| (**e).clone())
-                    .collect()
+                held(&s, 0).cloned().collect()
             };
+            let got: Vec<Event> = events
+                .into_iter()
+                .filter(|e| pick(e))
+                .map(|e| (*e).clone())
+                .collect();
             if got.len() >= n || fcx.now() >= deadline {
                 return Ok(got);
             }
