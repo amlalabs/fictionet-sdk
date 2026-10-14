@@ -1,23 +1,18 @@
-"""Builds the sandbox spec: a compose file for Inspect's docker sandbox, or
-Helm values for inspect_k8s_sandbox with the fictionet-sandbox chart."""
+"""The sandbox factory: builds the validated configuration and hands it to
+the docker or k8s backend."""
 
 from __future__ import annotations
 
-import logging
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-import yaml
 from inspect_ai.util import SandboxEnvironmentSpec
 
-from ._build import _image_or_build
-from ._chart import chart_path
 from ._config import (
     AGENT_LIMITS,
     ATTACH_IMAGE,
-    ATTACH_LIMITS,
     WORLD_LIMITS,
     AttachType,
     Backend,
@@ -25,13 +20,11 @@ from ._config import (
     CargoExample,
     Limits,
     _Config,
-    _READY_FILE,
-    _SOCKET_DIR,
-    _TOKEN_FILE,
     _container_path,
-    _memory_bytes,
 )
-from ._files import _default_cache_dir, _proxy_token, _write_once
+from ._docker import _quiet_working_dir_warnings, write_compose
+from ._files import _default_cache_dir
+from ._k8s import _k8s_spec
 
 
 def fictionet_sandbox(
@@ -157,293 +150,3 @@ def fictionet_sandbox(
     if backend == "k8s":
         return _k8s_spec(cfg, cache)
     raise ValueError(f"backend must be 'docker' or 'k8s', not {backend!r}")
-
-
-# Docker
-
-
-def compose_config(cfg: _Config, cache: Path, token: str | None = None) -> dict[str, Any]:
-    """The compose file, as a dict. Builds of a `CargoExample` are written
-    into `cache`."""
-    world: dict[str, Any] = {**_image_or_build(cfg.world, "world", cache)}
-    if cfg.world_args:
-        world["command"] = cfg.world_args
-    if cfg.world_env:
-        world["environment"] = cfg.world_env
-    # The world has no network: its only way in is the socket.
-    world["network_mode"] = "none"
-    world["volumes"] = [_volume("sock", _SOCKET_DIR)]
-    if cfg.ca_dir:
-        world["volumes"].append(_volume("ca", cfg.ca_dir))
-    world |= _compose_limits(cfg.world_limits)
-    if cfg.world_healthcheck:
-        world["healthcheck"] = {
-            "test": ["CMD", *cfg.world_healthcheck],
-            "interval": "1s",
-            "timeout": "2s",
-            "retries": cfg.world_wait,
-        }
-
-    attach: dict[str, Any] = {
-        "image": cfg.attach_image,
-        "entrypoint": ["/fictionet"],
-        "command": cfg.attach_args(),
-        # The agent joins this network namespace. It starts with only lo.
-        "network_mode": "none",
-        "volumes": [_volume("sock", _SOCKET_DIR)],
-        "depends_on": {"world": {"condition": "service_healthy" if cfg.world_healthcheck else "service_started"}},
-        "healthcheck": {
-            "test": ["CMD", "/fictionet", "ready", _READY_FILE],
-            "interval": "1s",
-            "timeout": "2s",
-            # Attach writes the ready file within world_wait seconds, or exits.
-            "retries": cfg.world_wait + 30,
-        },
-        "security_opt": ["no-new-privileges:true"],
-        "cap_drop": ["ALL"],
-        **_compose_limits(ATTACH_LIMITS),
-    }
-    if cfg.ip_addr_v6 or cfg.gateway_v6 or cfg.dns_v6:
-        attach["sysctls"] = {
-            "net.ipv6.conf.all.disable_ipv6": 0,
-            "net.ipv6.conf.default.disable_ipv6": 0,
-        }
-    if cfg.proxy:
-        # No device and no NET_ADMIN. DAC_OVERRIDE lets root connect to a
-        # socket that the world's user owns.
-        attach["cap_add"] = ["DAC_OVERRIDE"]
-        attach["configs"] = [{"source": "relay-token", "target": _TOKEN_FILE, "mode": 0o444}]
-    else:
-        attach["cap_add"] = ["NET_ADMIN", "DAC_OVERRIDE"]
-        attach["devices"] = ["/dev/net/tun"]
-
-    agent: dict[str, Any] = {**_image_or_build(cfg.agent_image, "agent", cache)}
-    agent["command"] = cfg.agent_command
-    agent["init"] = True
-    agent["network_mode"] = "service:attach"
-    agent["depends_on"] = {"attach": {"condition": "service_healthy"}}
-    env = cfg.ca_env()
-    if cfg.proxy:
-        assert token is not None
-        env |= cfg.proxy_env(token)
-        env["RELAY_TOKEN_FILE"] = _TOKEN_FILE
-        agent["configs"] = [{"source": "relay-token", "target": _TOKEN_FILE, "mode": 0o444}]
-        # Nothing to configure in the network: no capabilities at all.
-        agent["cap_drop"] = ["ALL"]
-    else:
-        # No raw sockets. The agent never has NET_ADMIN, so it cannot change tun0.
-        agent["cap_drop"] = ["NET_RAW"]
-    agent["security_opt"] = ["no-new-privileges:true"]
-    env |= cfg.agent_env
-    if env:
-        agent["environment"] = env
-    if cfg.ca_dir:
-        agent["volumes"] = [_volume("ca", cfg.ca_dir, read_only=True)]
-    if cfg.agent_user:
-        agent["user"] = cfg.agent_user
-    agent |= _compose_limits(cfg.agent_limits)
-
-    # tmpfs, writable by any user: the world may run as any uid, and the
-    # images on scratch have no directory there to take an owner from.
-    def tmpfs() -> dict[str, Any]:
-        return {"driver_opts": {"type": "tmpfs", "device": "tmpfs", "o": "mode=1777"}}
-
-    out: dict[str, Any] = {
-        "services": {"world": world, "attach": attach, "default": agent},
-        "volumes": {"sock": tmpfs()} | ({"ca": tmpfs()} if cfg.ca_dir else {}),
-    }
-    if cfg.proxy:
-        out["configs"] = {"relay-token": {"content": token + "\n"}}
-    return out
-
-
-def write_compose(cfg: _Config, cache: Path) -> Path:
-    """Writes the compose file into `cache` and returns its path. The same
-    configuration gives the same path."""
-    token = _proxy_token(cache) if cfg.proxy else None
-    text = _HEADER + yaml.safe_dump(compose_config(cfg, cache, token), sort_keys=False, width=1000)
-    # A proxy type's compose file holds the token: readable by its owner only.
-    return _write_once(cache / "compose", "compose.yaml", text, 0o600 if cfg.proxy else 0o644)
-
-
-def _volume(source: str, target: str, read_only: bool = False) -> dict[str, Any]:
-    # The long syntax: a target path is taken as it is, with no ':' to split on.
-    return {"type": "volume", "source": source, "target": target, **({"read_only": True} if read_only else {})}
-
-
-def _compose_limits(limits: Limits) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    if limits.memory is not None:
-        # memswap_limit is memory and swap together: no swap beyond the limit.
-        out["mem_limit"] = out["memswap_limit"] = _docker_size(_memory_bytes(limits.memory, "memory"))
-    if limits.cpus is not None:
-        out["cpus"] = limits.cpus
-    if limits.pids is not None:
-        out["pids_limit"] = limits.pids
-    return out
-
-
-def _k8s_resources(limits: Limits, memory_request: int, cpu_request: float | None = None) -> dict[str, Any]:
-    """Kubernetes resources: the limits, and requests (what the scheduler
-    goes by) of at most `memory_request` bytes and `cpu_request` CPUs, so
-    many sandboxes fit on a node."""
-    out: dict[str, Any] = {}
-    requests: dict[str, Any] = {}
-    if limits.memory is not None:
-        memory = _memory_bytes(limits.memory, "memory")
-        out["memory"] = _k8s_quantity(memory)
-        requests["memory"] = _k8s_quantity(min(memory, memory_request))
-    if limits.cpus is not None:
-        millicores = max(1, round(limits.cpus * 1000))
-        out["cpu"] = f"{millicores}m"
-        if cpu_request is not None:
-            requests["cpu"] = f"{min(millicores, round(cpu_request * 1000))}m"
-    return {"requests": requests, "limits": out} if out else {}
-
-
-def _docker_size(n: int) -> str:
-    # A string, as Inspect's compose model wants: "2g", "512m" or bytes.
-    for suffix, size in (("g", 1 << 30), ("m", 1 << 20), ("k", 1 << 10)):
-        if n % size == 0:
-            return f"{n // size}{suffix}"
-    return f"{n}b"
-
-
-def _k8s_quantity(n: int) -> str:
-    for suffix, size in (("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)):
-        if n % size == 0:
-            return f"{n // size}{suffix}"
-    return str(n)
-
-
-_HEADER = """\
-# Generated by inspect_fictionet. Edits are overwritten.
-#
-#   world   - the world, with no network. Its only way in is the socket in
-#             the `sock` volume, which only attach also mounts.
-#   attach  - fictionet attach. With tun it makes tun0 in its own network
-#             namespace. With a proxy type it listens on 127.0.0.1 there.
-#   default - the agent, in attach's network namespace. Inspect runs its
-#             tools here.
-"""
-
-
-class _NoShellFilter(logging.Filter):
-    """Drops Inspect's warning that it could not run `pwd` in the world's or
-    attach's container. Both images have no shell, so the warning comes
-    twice per sample and means nothing."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        return not any(
-            message.startswith(f"Failed to get working directory for docker container '{s}'")
-            for s in ("world", "attach")
-        )
-
-
-def _quiet_working_dir_warnings() -> None:
-    logger = logging.getLogger("inspect_ai.util._sandbox.docker.docker")
-    if not any(isinstance(f, _NoShellFilter) for f in logger.filters):
-        logger.addFilter(_NoShellFilter())
-
-
-# Kubernetes
-
-
-def k8s_values(cfg: _Config) -> dict[str, Any]:
-    """Values for the fictionet-sandbox chart."""
-    if isinstance(cfg.world, (Build, CargoExample)) or isinstance(cfg.agent_image, Build):
-        raise ValueError(
-            "backend='k8s' takes images only: build the world and the agent, push them where the "
-            "cluster pulls from, and pass their names"
-        )
-    if cfg.world_healthcheck:
-        raise ValueError("backend='k8s' takes no world_healthcheck: attach waits for the socket")
-    attach: dict[str, Any] = {
-        "image": cfg.attach_image,
-        "type": cfg.attach,
-        "name": cfg.name,
-        "worldWait": cfg.world_wait,
-        "ipAddr": cfg.ip_addr or "",
-        "dns": cfg.dns or "",
-    }
-    if cfg.proxy:
-        attach["gateway"] = ""
-        if cfg.proxy_port:
-            attach["port"] = cfg.proxy_port
-    else:
-        attach |= {
-            "gateway": cfg.gateway or "",
-            "ipAddrV6": cfg.ip_addr_v6 or "",
-            "gatewayV6": cfg.gateway_v6 or "",
-            "dnsV6": cfg.dns_v6 or "",
-        }
-        if cfg.mtu is not None:
-            attach["mtu"] = cfg.mtu
-    # Given whole: the chart takes a service's resources in place of its
-    # defaults, so a limit left out here is not limited.
-    world: dict[str, Any] = {"image": cfg.world, "resources": _k8s_resources(cfg.world_limits, 64 << 20)}
-    if cfg.world_args:
-        world["args"] = cfg.world_args
-    if cfg.world_env:
-        world["env"] = [{"name": k, "value": v} for k, v in cfg.world_env.items()]
-    # args, not command: like Compose's command, it keeps the image's entrypoint.
-    service: dict[str, Any] = {
-        "image": cfg.agent_image,
-        "args": cfg.agent_command,
-        "resources": _k8s_resources(cfg.agent_limits, 256 << 20, 0.1),
-        "world": world,
-    }
-    env = cfg.ca_env() | cfg.agent_env
-    if env:
-        service["env"] = [{"name": k, "value": v} for k, v in env.items()]
-    if cfg.ca_dir:
-        service["shared"] = [{"name": "ca", "mountPath": cfg.ca_dir}]
-    if cfg.agent_user:
-        user, _, group = cfg.agent_user.partition(":")
-        if not user.isdigit() or (group and not group.isdigit()):
-            raise ValueError("backend='k8s' takes agent_user as a uid or uid:gid, such as '1000:1000'")
-        service["securityContext"] = {
-            "runAsNonRoot": user != "0",
-            "runAsUser": int(user),
-            **({"runAsGroup": int(group)} if group else {}),
-            "allowPrivilegeEscalation": False,
-            "capabilities": {"drop": ["ALL"]},
-            "seccompProfile": {"type": "RuntimeDefault"},
-        }
-    if cfg.image_pull_policy:
-        attach["imagePullPolicy"] = cfg.image_pull_policy
-        world["imagePullPolicy"] = cfg.image_pull_policy
-        service["imagePullPolicy"] = cfg.image_pull_policy
-    # The pod's name is the agent's hostname. Named as Inspect's own
-    # agent-env chart names its pods, it says nothing about the harness.
-    base = {"global": {"nameOverride": "agent-env"}, "attach": attach, "services": {"default": service}}
-    return _merge(base, cfg.k8s_values)
-
-
-def _merge(base: dict[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
-    """Merges `extra` into `base`, key by key. Lists and other values replace."""
-    out = dict(base)
-    for key, value in extra.items():
-        if isinstance(value, Mapping) and isinstance(out.get(key), dict):
-            out[key] = _merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-def _k8s_spec(cfg: _Config, cache: Path) -> SandboxEnvironmentSpec:
-    try:
-        from k8s_sandbox import K8sSandboxEnvironmentConfig
-    except ImportError as e:
-        raise ImportError(
-            "backend='k8s' needs inspect-k8s-sandbox: pip install 'inspect-fictionet[k8s]'"
-        ) from e
-    text = _HEADER_K8S + yaml.safe_dump(k8s_values(cfg), sort_keys=False, width=1000)
-    values = _write_once(cache / "k8s", "values.yaml", text)
-    return SandboxEnvironmentSpec(
-        "k8s", K8sSandboxEnvironmentConfig(chart=str(chart_path()), values=values)
-    )
-
-
-_HEADER_K8S = "# Generated by inspect_fictionet: values for the fictionet-sandbox chart.\n"

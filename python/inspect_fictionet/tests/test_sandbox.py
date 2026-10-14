@@ -356,7 +356,7 @@ def test_concurrent_writes_of_the_same_file(tmp_path):
     temporary file, so none fails and every reader sees the whole file."""
     import threading
 
-    from inspect_fictionet import _sandbox
+    from inspect_fictionet import _files
 
     errors, paths = [], []
     barrier = threading.Barrier(16)
@@ -364,7 +364,7 @@ def test_concurrent_writes_of_the_same_file(tmp_path):
     def write():
         try:
             barrier.wait()
-            paths.append(_sandbox._write_once(tmp_path, "x.yaml", "text\n" * 10000))
+            paths.append(_files._write_once(tmp_path, "x.yaml", "text\n" * 10000))
         except Exception as e:  # noqa: BLE001
             errors.append(e)
 
@@ -382,24 +382,24 @@ def test_concurrent_token_creation(tmp_path):
     """Processes that make the token at once all get the same, complete one."""
     import multiprocessing
 
-    from inspect_fictionet import _sandbox
+    from inspect_fictionet import _files
 
     with multiprocessing.get_context("spawn").Pool(8) as pool:
-        tokens = pool.map(_sandbox._proxy_token, [tmp_path] * 32)
+        tokens = pool.map(_files._proxy_token, [tmp_path] * 32)
     assert len(set(tokens)) == 1 and len(tokens[0]) == 32
     assert (tmp_path / "proxy-token").read_text() == tokens[0] + "\n"
     assert [p.name for p in tmp_path.iterdir()] == ["proxy-token"]
 
 
 def test_a_token_file_without_a_token_is_an_error(tmp_path):
-    from inspect_fictionet import _sandbox
+    from inspect_fictionet import _files
 
     (tmp_path / "proxy-token").write_text("")
     with pytest.raises(RuntimeError, match="does not hold a proxy token"):
-        _sandbox._proxy_token(tmp_path)
+        _files._proxy_token(tmp_path)
     (tmp_path / "proxy-token").unlink()
-    token = _sandbox._proxy_token(tmp_path)
-    assert _sandbox._proxy_token(tmp_path) == token
+    token = _files._proxy_token(tmp_path)
+    assert _files._proxy_token(tmp_path) == token
     assert oct((tmp_path / "proxy-token").stat().st_mode & 0o777) == "0o600"
 
 
