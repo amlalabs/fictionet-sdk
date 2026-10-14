@@ -173,6 +173,7 @@ fn smtp_chunked_commands_data_and_replies() {
             }
             .write(&mut encoded)
             .unwrap(),
+            smtp::Input::Line(_) => panic!("AUTH response was not selected"),
         }
     }
     assert_eq!(
@@ -1076,6 +1077,185 @@ fn pop3_long_command_recovers() {
     assert_eq!(items.first(), Some(&Ok(Err(pop3::Error::LineTooLong))));
     assert!(matches!(items.get(1), Some(Ok(Ok(_)))));
     assert_eq!(items.len(), 2);
+}
+
+#[test]
+fn smtp_auth_responses_preserve_bytes_and_return_to_commands() {
+    for response in [
+        b"dGVzdAB0ZXN0ADEyMzQ=".as_slice(),
+        b"dGVzdA==",
+        b"dGVz",
+        b"",
+        b"*",
+        b"\xff\0\t\r invalid SASL",
+    ] {
+        let bytes = [b"AUTH PLAIN\r\n", response, b"\r\nNOOP\r\n"].concat();
+        assert_eq!(
+            read_with(smtp::Inputs::new, &bytes, |decoder, item| {
+                if matches!(item, Ok(smtp::Input::Command(c)) if c.verb == "AUTH") {
+                    decoder.expect_line().unwrap();
+                }
+            }),
+            vec![
+                Ok(Ok(smtp::Input::Command(smtp::Command::new(
+                    "AUTH",
+                    Some("PLAIN")
+                )))),
+                Ok(Ok(smtp::Input::Line(response.to_vec()))),
+                Ok(Ok(smtp::Input::Command(smtp::Command::new("NOOP", None)))),
+            ]
+        );
+    }
+}
+
+#[test]
+fn smtp_auth_repeated_challenges_and_cancellation() {
+    let bytes = b"AUTH LOGIN\r\ndGVz\r\n\r\n*\r\nNOOP\r\n";
+    let items = read_with(smtp::Inputs::new, bytes, |decoder, item| {
+        if matches!(item, Ok(smtp::Input::Command(c)) if c.verb == "AUTH")
+            || matches!(item, Ok(smtp::Input::Line(line)) if line != b"*")
+        {
+            decoder.expect_line().unwrap();
+        }
+    });
+    assert_eq!(
+        items[1..4],
+        [
+            Ok(Ok(smtp::Input::Line(b"dGVz".to_vec()))),
+            Ok(Ok(smtp::Input::Line(vec![]))),
+            Ok(Ok(smtp::Input::Line(b"*".to_vec()))),
+        ]
+    );
+    assert!(matches!(&items[4], Ok(Ok(smtp::Input::Command(c))) if c.verb == "NOOP"));
+    assert_eq!(items.len(), 5);
+}
+
+fn smtp_auth() -> smtp::Inputs {
+    let mut inputs = smtp::Inputs::new();
+    inputs.expect_line().unwrap();
+    inputs
+}
+
+#[test]
+fn smtp_auth_handoff_keeps_unread_tail() {
+    let mut stream = Stream::new(smtp_auth());
+    let bytes = b"*\r\nSTARTTLS\r\n\x16\x03\x03\0\x05";
+    assert_eq!(stream.push(bytes), bytes.len());
+    assert_eq!(
+        stream.next(),
+        Some(Ok(Ok(smtp::Input::Line(b"*".to_vec()))))
+    );
+    assert!(matches!(stream.next(), Some(Ok(Ok(smtp::Input::Command(c)))) if c.verb == "STARTTLS"));
+    stream.decoder().handoff().unwrap();
+    assert_eq!(stream.next(), None);
+    assert_eq!(stream.into_parts().0.unread(), b"\x16\x03\x03\0\x05");
+}
+
+#[test]
+fn smtp_auth_line_limits_and_errors() {
+    for size in [smtp::MAX_AUTH_LINE, smtp::MAX_AUTH_LINE + 1] {
+        let bytes = [
+            vec![b'x'; size],
+            b"\r\n".to_vec(),
+            vec![b'x'; smtp::MAX_LINE],
+            b"\r\nNOOP\r\n".to_vec(),
+        ]
+        .concat();
+        let (items, failure) =
+            contract::check_decode_with_alloc_limit(smtp_auth, &bytes, 2 * smtp_auth().capacity());
+        assert_eq!(failure, None);
+        assert_eq!(
+            items,
+            vec![
+                if size == smtp::MAX_AUTH_LINE {
+                    Ok(smtp::Input::Line(vec![b'x'; size]))
+                } else {
+                    Err(smtp::Error::LineTooLong)
+                },
+                Err(smtp::Error::LineTooLong),
+                Ok(smtp::Input::Command(smtp::Command::new("NOOP", None))),
+            ]
+        );
+    }
+    assert_eq!(
+        read(smtp_auth, b"dGVz\nNOOP\r\n"),
+        vec![
+            Ok(Err(smtp::Error::LineEnding)),
+            Ok(Ok(smtp::Input::Command(smtp::Command::new("NOOP", None)))),
+        ]
+    );
+    assert_eq!(
+        read(smtp_auth, b"dGVz\r"),
+        vec![Err(Fail::Protocol(smtp::FrameError::Line(
+            codec::LineError::Unterminated
+        ))),]
+    );
+    assert_eq!(
+        read(smtp_auth, &vec![b'x'; smtp::MAX_AUTH_LINE + 2]),
+        vec![Ok(Err(smtp::Error::LineTooLong)),]
+    );
+}
+
+#[test]
+fn smtp_auth_mode_changes_require_boundaries() {
+    fn refused(inputs: &mut smtp::Inputs) {
+        assert_eq!(inputs.expect_line(), Err(smtp::FrameError::State));
+        assert_eq!(inputs.start_data(), Err(smtp::FrameError::State));
+        assert_eq!(inputs.handoff(), Err(smtp::FrameError::State));
+    }
+    let mut inputs = smtp::Inputs::new();
+    assert_eq!(inputs.decode(b"AUTH", false), Ok(Step::Need));
+    refused(&mut inputs);
+    assert!(matches!(
+        inputs.decode(b"AUTH PLAIN\r\n", false),
+        Ok(Step::Item(Ok(_), 12))
+    ));
+    inputs.expect_line().unwrap();
+    refused(&mut inputs);
+    assert_eq!(inputs.decode(b"dGVz", false), Ok(Step::Need));
+    refused(&mut inputs);
+    assert_eq!(
+        inputs.decode(b"dGVz\r\n", false),
+        Ok(Step::Item(Ok(smtp::Input::Line(b"dGVz".to_vec())), 6))
+    );
+    inputs.start_data().unwrap();
+    refused(&mut inputs);
+    assert_eq!(
+        inputs.decode(b".\r\n", false),
+        Ok(Step::Item(Ok(smtp::Input::Message(vec![])), 3))
+    );
+    inputs.handoff().unwrap();
+    refused(&mut inputs);
+
+    for raw in [false, true] {
+        let mut stream = Stream::new(if raw {
+            smtp_auth()
+        } else {
+            smtp::Inputs::new()
+        });
+        let size = if raw {
+            smtp::MAX_AUTH_LINE + 2
+        } else {
+            smtp::MAX_LINE
+        };
+        assert_eq!(stream.push(&vec![b'x'; size]), size);
+        assert_eq!(stream.next(), Some(Ok(Err(smtp::Error::LineTooLong))));
+        refused(stream.decoder());
+        assert_eq!(stream.next(), None);
+        refused(stream.decoder());
+        assert_eq!(stream.push(b"tail\r"), 5);
+        assert_eq!(stream.next(), None);
+        refused(stream.decoder());
+        assert_eq!(stream.push(b"\n"), 1);
+        assert_eq!(stream.next(), None);
+        stream.decoder().expect_line().unwrap();
+        assert_eq!(stream.push(b"*\r\nNOOP\r\n"), 9);
+        assert_eq!(
+            stream.next(),
+            Some(Ok(Ok(smtp::Input::Line(b"*".to_vec()))))
+        );
+        assert!(matches!(stream.next(), Some(Ok(Ok(smtp::Input::Command(c)))) if c.verb == "NOOP"));
+    }
 }
 
 #[test]

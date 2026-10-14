@@ -16,6 +16,9 @@
 //! The next item is the complete unstuffed message. Its terminating dot
 //! returns the reader to commands. Use [`Stream<Replies>`](fictionet::stdlib::codec::Stream)
 //! on the client. Bad commands are error items; overlong lines are skipped.
+//! After sending an AUTH challenge (334), call [`Inputs::expect_line`] for
+//! one raw response, including an empty response or `*` cancellation. Call
+//! it again for each further challenge. SASL validation stays with the caller.
 //! Partial lines at EOF, DATA overflow, and malformed multiline replies end
 //! the stream. Call [`Inputs::handoff`] after accepting STARTTLS, then take
 //! the unread TLS bytes from the stream. Session state, authentication, TLS,
@@ -36,6 +39,19 @@
 //! assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(c)))) if c.verb == "QUIT"));
 //! assert_eq!(Reply::new(250, "Queued").to_bytes().unwrap(), b"250 Queued\r\n");
 //! ```
+//!
+//! ```
+//! use fictionet::stdlib::{codec::Stream, smtp::{Inputs, Input}};
+//!
+//! let mut stream = Stream::new(Inputs::new());
+//! let bytes = b"AUTH PLAIN\r\ndGVzdAB0ZXN0ADEyMzQ=\r\nNOOP\r\n";
+//! assert_eq!(stream.push(bytes), bytes.len());
+//! assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(c)))) if c.verb == "AUTH"));
+//! // After the caller sends a 334 challenge:
+//! stream.decoder().expect_line().unwrap();
+//! assert_eq!(stream.next(), Some(Ok(Ok(Input::Line(b"dGVzdAB0ZXN0ADEyMzQ=".to_vec())))));
+//! assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(c)))) if c.verb == "NOOP"));
+//! ```
 
 extern crate alloc;
 
@@ -50,6 +66,10 @@ pub const SUBMISSION_PORT: u16 = 587;
 pub const TLS_PORT: u16 = 465;
 /// Maximum command or reply line size, including CRLF (RFC 5321, section 4.5.3.1).
 pub const MAX_LINE: usize = 512;
+/// Local limit on a raw AUTH response selected by [`Inputs::expect_line`],
+/// excluding CRLF. AUTH responses may exceed the command limit (RFC 4954,
+/// section 4). The caller chooses mechanisms whose responses fit this limit.
+pub const MAX_AUTH_LINE: usize = 16 << 10;
 /// Maximum DATA line size, including CRLF but excluding the extra stuffed dot.
 pub const MAX_DATA_LINE: usize = 1000;
 /// Local limit on the unstuffed message, including every line's CRLF.
@@ -249,6 +269,7 @@ pub enum Request {
     /// pass the stream's unread bytes to TLS.
     StartTls,
     /// Start SASL authentication (RFC 4954). Credentials remain opaque.
+    /// Call [`Inputs::expect_line`] after sending each 334 challenge.
     Auth {
         /// SASL mechanism name; case is preserved.
         mechanism: String,
@@ -779,11 +800,14 @@ fn smtp_line(
     })
 }
 
-/// One command or one complete, unstuffed DATA message from [`Inputs`].
+/// One command, raw AUTH response, or complete, unstuffed DATA message from [`Inputs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     /// A command, with its verb normalized to upper case.
     Command(Command),
+    /// A raw response without CRLF, selected by [`Inputs::expect_line`].
+    /// Bytes are unchanged, including empty responses and `*` cancellation.
+    Line(Vec<u8>),
     /// DATA bytes, including each content line's CRLF, without the terminator.
     Message(Vec<u8>),
 }
@@ -791,26 +815,32 @@ pub enum Input {
 #[derive(PartialEq, Eq)]
 enum Mode {
     Command,
+    Line,
     Data,
     End,
 }
 
-/// Reads SMTP commands and DATA over [`codec::Lines`].
+/// Reads SMTP commands, AUTH responses and DATA over [`codec::Lines`].
 ///
 /// CRLF is required. Command lines use [`MAX_LINE`]. DATA lines use
 /// [`MAX_DATA_LINE`], plus one transparency dot on the wire. Input capacity
-/// is always `MAX_DATA_LINE + 1`, so mode changes never need a larger buffer.
+/// is always `MAX_AUTH_LINE + 2`, so mode changes never need a larger buffer.
 /// DATA assembly holds at most [`MAX_DATA`] bytes. Scanning is linear.
 ///
-/// Malformed or overlong commands are error items; the rest of an overlong
-/// line is skipped through LF. Bad DATA content rejects the message at its
-/// dot terminator. DATA line overflow, unterminated lines, assembly overflow,
-/// and EOF before the dot terminate the stream. An overlong command cut off
-/// at EOF is skipped after its error item, then ends cleanly.
+/// Malformed or overlong commands and raw response framing errors are error
+/// items; the rest of an overlong line is skipped through LF. Bad DATA
+/// content rejects the message at its dot terminator. DATA line overflow,
+/// unterminated lines, assembly overflow, and EOF before the dot terminate
+/// the stream. An overlong command or response cut off at EOF is skipped
+/// after its error item, then ends cleanly.
 ///
 /// Call [`start_data`](Self::start_data) between items after accepting DATA.
 /// The terminator returns to command mode, including for rejected messages.
-/// Mode changes are refused while a command line is partial or being skipped.
+/// Call [`expect_line`](Self::expect_line) after each AUTH challenge for one
+/// raw response bounded by [`MAX_AUTH_LINE`] bytes excluding CRLF. Command
+/// framing resumes after that line, including after an error. SASL validation,
+/// cancellation replies and authentication results belong to the caller.
+/// Mode changes are refused while a line is partial or being skipped.
 /// For an accepted STARTTLS, call [`handoff`](Self::handoff), then use
 /// [`codec::Stream::into_parts`] to obtain unread TLS bytes.
 ///
@@ -861,6 +891,20 @@ impl Inputs {
         Ok(())
     }
 
+    /// Selects one raw AUTH response or cancellation line at a command boundary.
+    /// Preserves all bytes except CRLF, up to [`MAX_AUTH_LINE`] content bytes.
+    /// Refuses other modes, partial lines, and lines still being skipped
+    /// with [`FrameError::State`], without changing the mode. After this line
+    /// or its error item, command framing resumes once any skipping finishes.
+    pub fn expect_line(&mut self) -> Result<(), FrameError> {
+        if self.mode != Mode::Command || self.partial || self.skipping {
+            return Err(FrameError::State);
+        }
+        self.mode = Mode::Line;
+        self.lines = codec::Lines::new(MAX_AUTH_LINE, codec::Ending::Crlf);
+        Ok(())
+    }
+
     /// Ends SMTP decoding at a command boundary for an accepted protocol switch.
     /// Refuses other modes, partial lines, and lines still being skipped
     /// with [`FrameError::State`], without changing the mode.
@@ -879,7 +923,7 @@ impl Decode for Inputs {
     const NAME: &'static str = "SMTP server";
 
     fn capacity(&self) -> usize {
-        MAX_DATA_LINE + 1
+        MAX_AUTH_LINE + 2
     }
 
     fn held(&self) -> usize {
@@ -902,17 +946,30 @@ impl Decode for Inputs {
             }
             codec::Step::Skip(used) => {
                 self.skipping = input.get(used.saturating_sub(1)) != Some(&b'\n');
+                if !self.skipping {
+                    self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
+                }
                 return Ok(codec::Step::Skip(used));
             }
             codec::Step::End => return Ok(codec::Step::End),
         };
         self.partial = false;
-        if self.mode == Mode::Command {
+        if self.mode == Mode::Command || self.mode == Mode::Line {
             self.skipping = matches!(line, Err(Error::LineTooLong))
                 && input.get(used.saturating_sub(1)) != Some(&b'\n');
+            let raw = self.mode == Mode::Line;
+            self.mode = Mode::Command;
+            if !self.skipping {
+                self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
+            }
             return Ok(codec::Step::Item(
-                line.and_then(|b| Command::parse_line(&b))
-                    .map(Input::Command),
+                line.and_then(|b| {
+                    if raw {
+                        Ok(Input::Line(b))
+                    } else {
+                        Command::parse_line(&b).map(Input::Command)
+                    }
+                }),
                 used,
             ));
         }
@@ -1165,7 +1222,7 @@ mod tests {
             Ok(Input::Command(Command::new("QUIT", None))),
         ];
         assert_eq!(decode_all(Inputs::new, &wire), (expected, None));
-        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_DATA_LINE + 1));
+        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
         assert_eq!(
             contract::check_refused(&Command::new("NOOP", Some(&"a".repeat(MAX_LINE - 6)))),
             Error::Unwritable
@@ -1272,7 +1329,7 @@ mod tests {
         assert_eq!(wire, b"Subject: hi\r\n\r\n..\r\n...dots\r\n\xff\r\n.\r\n");
         assert_eq!(Data::parse(&wire), Ok(message));
         contract::check_wire::<Data>(&wire);
-        contract::check_decode_with_alloc_limit(data_server, &wire, 2 * (MAX_DATA_LINE + 1));
+        contract::check_decode_with_alloc_limit(data_server, &wire, 2 * (MAX_AUTH_LINE + 2));
         assert_eq!(Data { bytes: vec![] }.to_bytes().unwrap(), b".\r\n");
         assert_eq!(Data::parse(b".\r\n").unwrap().bytes, b"");
         assert_eq!(Data::parse(b".x\r\n.\r\n").unwrap().bytes, b"x\r\n");
@@ -1323,7 +1380,7 @@ mod tests {
             let wire = message.to_bytes().unwrap();
             assert_eq!(wire.len(), MAX_DATA_LINE + 3 + usize::from(dot));
             assert_eq!(Data::parse(&wire), Ok(message.clone()));
-            contract::check_decode_with_alloc_limit(data_server, &wire, 2 * (MAX_DATA_LINE + 1));
+            contract::check_decode_with_alloc_limit(data_server, &wire, 2 * (MAX_AUTH_LINE + 2));
             message.bytes.insert(1, b'x');
             assert_eq!(contract::check_refused(&message), Error::Unwritable);
             let mut wire = message.bytes;
@@ -1364,7 +1421,7 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(Err(Error::LineEnding))));
         assert_eq!(stream.held(), 0);
         contract::check_decode_with_held_limit(data_server, bytes, MAX_DATA);
-        contract::check_decode_with_alloc_limit(data_server, bytes, 2 * (MAX_DATA_LINE + 1));
+        contract::check_decode_with_alloc_limit(data_server, bytes, 2 * (MAX_AUTH_LINE + 2));
     }
 
     #[test]
@@ -1441,9 +1498,9 @@ mod tests {
             for _ in 0..rng.index(5) {
                 mutate(&mut rng, &mut bytes);
             }
-            contract::check_decode_with_alloc_limit(Inputs::new, &bytes, 2 * (MAX_DATA_LINE + 1));
+            contract::check_decode_with_alloc_limit(Inputs::new, &bytes, 2 * (MAX_AUTH_LINE + 2));
             contract::check_decode_with_alloc_limit(Replies::new, &bytes, 2 * MAX_LINE);
-            contract::check_decode_with_alloc_limit(data_server, &bytes, 2 * (MAX_DATA_LINE + 1));
+            contract::check_decode_with_alloc_limit(data_server, &bytes, 2 * (MAX_AUTH_LINE + 2));
             contract::check_wire::<Command>(&bytes);
             contract::check_wire::<Request>(&bytes);
             contract::check_wire::<Reply>(&bytes);

@@ -1,12 +1,12 @@
-//! SMTP commands, replies, DATA, and strict wire values.
+//! SMTP commands, replies, AUTH lines, DATA, and strict wire values.
 #![no_main]
 
 use fictionet::stdlib::codec::{Decode, Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::smtp::{
-    Command, Data, Error, FrameError, Input, Inputs, MAX_DATA, MAX_DATA_LINE, MAX_LINE,
-    MAX_REPLY_TEXT, Replies, Reply, Request,
+    Command, Data, Error, FrameError, Input, Inputs, MAX_AUTH_LINE, MAX_DATA, MAX_DATA_LINE,
+    MAX_LINE, MAX_REPLY_TEXT, Replies, Reply, Request,
 };
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
@@ -14,6 +14,12 @@ use libfuzzer_sys::fuzz_target;
 fn data_server() -> Inputs {
     let mut server = Inputs::new();
     server.start_data().unwrap();
+    server
+}
+
+fn auth_server() -> Inputs {
+    let mut server = Inputs::new();
+    server.expect_line().unwrap();
     server
 }
 
@@ -29,9 +35,23 @@ fn check_reply(reply: &Reply) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Inputs::new, data, 2 * (MAX_DATA_LINE + 1));
+    contract::check_decode_with_alloc_limit(Inputs::new, data, 2 * (MAX_AUTH_LINE + 2));
     contract::check_decode_with_alloc_limit(Replies::new, data, 2 * MAX_LINE);
-    contract::check_decode_with_alloc_limit(data_server, data, 2 * (MAX_DATA_LINE + 1));
+    contract::check_decode_with_alloc_limit(data_server, data, 2 * (MAX_AUTH_LINE + 2));
+    contract::check_decode_with_alloc_limit(auth_server, data, 2 * (MAX_AUTH_LINE + 2));
+    contract::check_decode_with_held_limit(auth_server, data, 0);
+    let (auth, _) = decode_all(auth_server, data);
+    for (index, item) in auth.iter().enumerate() {
+        if let Ok(Input::Line(line)) = item {
+            assert_eq!(index, 0);
+            assert!(line.len() <= MAX_AUTH_LINE);
+            assert_eq!(data.get(..line.len()), Some(line.as_slice()));
+            assert_eq!(
+                data.get(line.len()..line.len() + 2),
+                Some(b"\r\n".as_slice())
+            );
+        }
+    }
     contract::check_decode_with_held_limit(Inputs::new, data, MAX_DATA);
     contract::check_decode_with_held_limit(Replies::new, data, MAX_REPLY_TEXT);
     contract::check_decode_with_held_limit(data_server, data, MAX_DATA);

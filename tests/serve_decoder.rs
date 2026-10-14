@@ -50,6 +50,63 @@ fn smtp_data_changes_the_active_decoder_and_stops_item_faults() {
     );
 }
 
+#[test]
+fn smtp_auth_challenges_cancel_and_handoff_in_one_chunk() {
+    use fictionet::stdlib::serve::{HarnessError, Upgrade};
+
+    #[derive(Default)]
+    struct Auth {
+        responses: Vec<Vec<u8>>,
+    }
+    service_fixture! {
+        Auth => (smtp::Inputs, (), smtp::Error);
+        decoder(self) {
+            smtp::Inputs::new()
+        }
+        on_item(self, item: Result<smtp::Input, smtp::Error>; _, driver) -> Flow {
+            match item? {
+                smtp::Input::Command(command) if command.verb == "AUTH" => {
+                    driver.decoder().expect_line().map_err(smtp::Error::Framing)?;
+                    driver.reply().extend_from_slice(b"334 \r\n");
+                }
+                smtp::Input::Line(line) => {
+                    if line == b"*" {
+                        driver.reply().extend_from_slice(b"501 Cancelled\r\n");
+                    } else {
+                        driver.decoder().expect_line().map_err(smtp::Error::Framing)?;
+                        driver.reply().extend_from_slice(b"334 \r\n");
+                    }
+                    self.responses.push(line);
+                }
+                smtp::Input::Command(command) if command.verb == "STARTTLS" => {
+                    driver.decoder().handoff().map_err(smtp::Error::Framing)?;
+                    driver.reply().extend_from_slice(b"220 Ready\r\n");
+                    return Ok(Flow::Upgrade(Upgrade::Handoff));
+                }
+                smtp::Input::Command(_) => driver.reply().extend_from_slice(b"250 OK\r\n"),
+                smtp::Input::Message(_) => panic!("DATA was not selected"),
+            }
+            Ok(Flow::Continue)
+        }
+    }
+    let mut harness = Harness::new(Seed::from_u64(1), Auth::default(), ());
+    assert!(matches!(
+        harness
+            .push(b"AUTH LOGIN\r\ndGVzdA==\r\ndGVz\r\n*\r\nNOOP\r\nSTARTTLS\r\n\x16\x03\x03\0\x05"),
+        Err(HarnessError::Upgraded(Upgrade::Handoff))
+    ));
+    assert_eq!(
+        harness.service().responses,
+        [b"dGVzdA==".to_vec(), b"dGVz".to_vec(), b"*".to_vec(),]
+    );
+    assert_eq!(
+        harness.output(),
+        b"334 \r\n334 \r\n334 \r\n501 Cancelled\r\n250 OK\r\n220 Ready\r\n"
+    );
+    assert_eq!(harness.upgraded(), Some(Upgrade::Handoff));
+    assert!(!harness.closed());
+}
+
 struct Imap {
     commands: Vec<String>,
 }

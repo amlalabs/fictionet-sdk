@@ -743,7 +743,8 @@ impl Service for Mailbox {
                 self.messages.push(bytes);
                 driver.reply().extend_from_slice(b"250 Queued\r\n");
             }
-            _ => driver.reply().extend_from_slice(b"250 OK\r\n"),
+            smtp::Input::Command(_) => driver.reply().extend_from_slice(b"250 OK\r\n"),
+            smtp::Input::Line(_) => driver.reply().extend_from_slice(b"503 Unexpected response\r\n"),
         }
         Ok(Flow::Continue)
     }
@@ -751,5 +752,24 @@ impl Service for Mailbox {
 ```
 
 Install it with `host.tcp(smtp::PORT, Arc::new(()), Mailbox::default)`. The SMTP decoder removes transparency dots and returns to commands after the DATA terminator. The same access lets an IMAP service refuse a literal or a Postgres service resume startup after replying `N` to an SSL request.
+
+For SMTP AUTH, send a `334` challenge and call `driver.decoder().expect_line()`.
+The next item is `smtp::Input::Line(Vec<u8>)`. It preserves the response bytes
+without CRLF, including an empty response or `*` cancellation. Call
+`expect_line()` again for each further challenge. SASL validation,
+cancellation replies and authentication results belong to the service.
+
+Raw responses allow `smtp::MAX_AUTH_LINE` (16,384) content bytes. Command
+lines still allow 512 bytes including CRLF. Input capacity is now 16,386
+bytes in every mode, so buffered responses fit after a mode change.
+A bare LF gives `Error::LineEnding`. An overlong response gives one
+`Error::LineTooLong` item and skips through LF. Command framing resumes after
+the response, including after an error. A partial line at EOF ends the stream.
+Mode changes reject partial lines, lines being skipped, DATA, a selected raw
+response and handoff with `FrameError::State`, without changing state.
+
+Source compatibility: exhaustive matches on `smtp::Input` must handle the
+new `Line` variant. Raw responses are emitted only when the caller selects
+them. Existing command and DATA parsing keeps its grammar and limits.
 
 Accessing the decoder or upgrading the connection stops item faults and emits the `conn.faults` event with a `stopped` field. Byte faults continue. Over UDP, decoder access applies to the current datagram; each new datagram starts with a fresh decoder.
