@@ -6,7 +6,7 @@
 """
 
 from ._chart import chart_path
-from ._sandbox import (
+from ._config import (
     AGENT_LIMITS,
     ATTACH_IMAGE,
     ATTACH_LIMITS,
@@ -16,8 +16,8 @@ from ._sandbox import (
     Build,
     CargoExample,
     Limits,
-    fictionet_sandbox,
 )
+from ._sandbox import fictionet_sandbox
 from ._world import read_world_file
 
 __all__ = [
