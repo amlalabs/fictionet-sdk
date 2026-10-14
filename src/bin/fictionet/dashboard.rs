@@ -15,7 +15,7 @@
 //! `link` added. `pcap` asks for each link's capture and joins them: a
 //! pcapng file may hold several sections, and Wireshark reads them all.
 
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,10 +26,13 @@ use fictionet::relay::proxy::auth::Token;
 
 use crate::observe::{take_world, world_path};
 
+mod api;
 mod assets;
 mod auth;
 mod http;
+mod sse;
 
+use api::api;
 use auth::Auth;
 use http::{host_allowed, parse_request, read_head, same_site};
 
@@ -48,12 +51,8 @@ the sandbox. Use loopback or a trusted TLS tunnel; HTTP carries the token
 in plaintext. Every container in a Kubernetes pod shares loopback, so
 127.0.0.1 does not keep an agent in that pod away from the dashboard.";
 
-/// Ops whose replies are streams of `{"event":...,"data":...}` values.
-const STREAMS: [&str; 2] = ["watch", "packets"];
 /// Connections served at once. More are closed at once.
 const MAX_CONNECTIONS: usize = 64;
-/// Links one merged `packets` or `pcap` call may name.
-const MAX_MERGED: usize = 32;
 
 pub(crate) fn main(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -130,36 +129,6 @@ pub(crate) fn main(args: &[String]) -> i32 {
         });
     }
     0
-}
-
-/// The observe request for `GET /api/<op>?...`: query values that are
-/// whole numbers are sent as numbers, the rest as strings.
-pub(crate) fn observe_request(op: &str, query: &[(String, String)]) -> String {
-    let mut out = format!("{{\"op\":{}", quote(op));
-    for (k, v) in query {
-        let value = if !v.is_empty() && v.len() < 16 && v.bytes().all(|b| b.is_ascii_digit()) {
-            v.clone()
-        } else {
-            quote(v)
-        };
-        out.push_str(&format!(",{}:{value}", quote(k)));
-    }
-    out.push('}');
-    out
-}
-
-fn quote(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 fn respond(
@@ -258,298 +227,10 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
     }
 }
 
-/// Carries one API call to the world and its reply back.
-fn api(world: &str, mut conn: TcpStream, op: &str, query: &[(String, String)]) -> io::Result<()> {
-    let mut client = match Client::connect(world, "fictionet dashboard") {
-        Ok(c) => c,
-        Err(msg) => {
-            let body = format!("{{\"error\":{}}}", quote(&msg));
-            return respond(
-                &mut conn,
-                "502 Bad Gateway",
-                "application/json",
-                body.as_bytes(),
-                "",
-            );
-        }
-    };
-    if let Some(links) = merged_links(op, query) {
-        if links.len() > MAX_MERGED {
-            return respond(
-                &mut conn,
-                "400 Bad Request",
-                "application/json",
-                br#"{"error":"too many links"}"#,
-                "",
-            );
-        }
-        return if op == "packets" {
-            stream_merged(client, conn, query, &links)
-        } else {
-            pcap_merged(client, conn, &links)
-        };
-    }
-    let request = observe_request(op, query);
-    client.request(&request)?;
-    if STREAMS.contains(&op) {
-        return stream(client, conn);
-    }
-    client.set_timeout(Some(Duration::from_secs(30)))?;
-    let Some(value) = client.next_value().or_else(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            Ok(None)
-        } else {
-            Err(e)
-        }
-    })?
-    else {
-        return respond(
-            &mut conn,
-            "502 Bad Gateway",
-            "application/json",
-            br#"{"error":"the world closed"}"#,
-            "",
-        );
-    };
-    if value.binary {
-        let (kind, name) = match op {
-            "pcap" => (
-                "application/vnd.tcpdump.pcap",
-                format!(
-                    "fictionet-{}.pcapng",
-                    query
-                        .iter()
-                        .find(|(k, _)| k == "link")
-                        .map_or("link", |(_, v)| v)
-                ),
-            ),
-            _ => ("text/plain; charset=utf-8", format!("fictionet-{op}.txt")),
-        };
-        let name: String = name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
-            .collect();
-        let disposition = format!("Content-Disposition: attachment; filename=\"{name}\"\r\n");
-        return respond(&mut conn, "200 OK", kind, &value.bytes, &disposition);
-    }
-    let status = if value.bytes.starts_with(br#"{"error":"#) {
-        "404 Not Found"
-    } else {
-        "200 OK"
-    };
-    respond(&mut conn, status, "application/json", &value.bytes, "")
-}
-
-/// The links of a `packets` or `pcap` call that names more than one.
-fn merged_links(op: &str, query: &[(String, String)]) -> Option<Vec<String>> {
-    if op != "packets" && op != "pcap" {
-        return None;
-    }
-    let (_, value) = query.iter().find(|(k, _)| k == "link")?;
-    if !value.contains(',') {
-        return None;
-    }
-    let mut links: Vec<String> = value
-        .split(',')
-        .filter(|l| !l.is_empty())
-        .map(str::to_owned)
-        .collect();
-    links.dedup();
-    Some(links)
-}
-
-/// The query with `link` set to one link.
-fn with_link(query: &[(String, String)], link: &str) -> Vec<(String, String)> {
-    query
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                if k == "link" {
-                    link.to_owned()
-                } else {
-                    v.clone()
-                },
-            )
-        })
-        .collect()
-}
-
-/// `data` (a JSON object) with `"link":"<link>"` added first.
-pub(crate) fn add_link(data: &str, link: &str) -> String {
-    match data.strip_prefix('{') {
-        Some(rest) if rest.trim_start().starts_with('}') => format!("{{\"link\":{}}}", quote(link)),
-        Some(rest) => format!("{{\"link\":{},{rest}", quote(link)),
-        None => data.to_owned(),
-    }
-}
-
-/// Relays the `packets` streams of several links as one stream of
-/// server-sent events. Each event's data gets the link it is from. A link
-/// whose stream ends sends `link_end`; the stream ends when all have.
-fn stream_merged(
-    mut client: Client,
-    conn: TcpStream,
-    query: &[(String, String)],
-    links: &[String],
-) -> io::Result<()> {
-    let mut open = std::collections::HashMap::new();
-    for link in links {
-        let id = client.request(&observe_request("packets", &with_link(query, link)))?;
-        open.insert(id, link.clone());
-    }
-    let mut out = BufWriter::new(conn.try_clone()?);
-    out.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n\
-          X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-    )?;
-    out.flush()?;
-    client.set_timeout(Some(Duration::from_secs(5)))?;
-    while !open.is_empty() {
-        match client.next_value() {
-            Ok(Some(value)) => {
-                let Some(link) = open.get(&value.id).cloned() else {
-                    continue;
-                };
-                match split_event(&value.bytes) {
-                    Some(("end", data)) => {
-                        write!(out, "event: link_end\ndata: {}\n\n", add_link(data, &link))?
-                    }
-                    Some((name, data)) => {
-                        write!(out, "event: {name}\ndata: {}\n\n", add_link(data, &link))?
-                    }
-                    None => {
-                        let data = format!(
-                            "{{\"error\":{}}}",
-                            quote(&String::from_utf8_lossy(&value.bytes))
-                        );
-                        write!(out, "event: link_end\ndata: {}\n\n", add_link(&data, &link))?
-                    }
-                }
-                out.flush()?;
-                if value.end {
-                    open.remove(&value.id);
-                }
-            }
-            Ok(None) => break,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                out.write_all(b": ping\n\n")?;
-                out.flush()?;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    write!(
-        out,
-        "event: end\ndata: {{\"reason\":\"every link closed\"}}\n\n"
-    )?;
-    out.flush()
-}
-
-/// The captures of several links, one pcapng section after another.
-fn pcap_merged(mut client: Client, mut conn: TcpStream, links: &[String]) -> io::Result<()> {
-    client.set_timeout(Some(Duration::from_secs(30)))?;
-    let mut file = Vec::new();
-    for link in links {
-        let value = client.call(&observe_request(
-            "pcap",
-            &[("link".to_owned(), link.clone())],
-        ))?;
-        if value.binary {
-            file.extend_from_slice(&value.bytes);
-        }
-    }
-    if file.is_empty() {
-        return respond(
-            &mut conn,
-            "404 Not Found",
-            "application/json",
-            br#"{"error":"nothing is watching those links"}"#,
-            "",
-        );
-    }
-    let disposition = "Content-Disposition: attachment; filename=\"fictionet-links.pcapng\"\r\n";
-    respond(
-        &mut conn,
-        "200 OK",
-        "application/vnd.tcpdump.pcap",
-        &file,
-        disposition,
-    )
-}
-
-/// Splits a stream value, `{"event":"<name>","data":<data>}`, into its
-/// name and data.
-pub(crate) fn split_event(value: &[u8]) -> Option<(&str, &str)> {
-    let text = std::str::from_utf8(value).ok()?;
-    let rest = text.strip_prefix(r#"{"event":""#)?;
-    let (name, rest) = rest.split_once('"')?;
-    let data = rest.strip_prefix(r#","data":"#)?.strip_suffix('}')?;
-    Some((name, data))
-}
-
-/// Relays a stream as server-sent events until either side closes.
-fn stream(mut client: Client, conn: TcpStream) -> io::Result<()> {
-    let mut out = BufWriter::new(conn.try_clone()?);
-    out.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n\
-          X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-    )?;
-    out.flush()?;
-    // Wake now and then to send a comment, so a closed browser is noticed
-    // even when the world has nothing to say.
-    client.set_timeout(Some(Duration::from_secs(5)))?;
-    loop {
-        match client.next_value().or_else(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }) {
-            Ok(Some(value)) => {
-                match split_event(&value.bytes) {
-                    Some((name, data)) => write!(out, "event: {name}\ndata: {data}\n\n")?,
-                    None => write!(
-                        out,
-                        "event: error\ndata: {}\n\n",
-                        String::from_utf8_lossy(&value.bytes)
-                    )?,
-                }
-                out.flush()?;
-                if value.end {
-                    return Ok(());
-                }
-            }
-            Ok(None) => {
-                write!(
-                    out,
-                    "event: end\ndata: {{\"reason\":\"the world closed\"}}\n\n"
-                )?;
-                return out.flush();
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                out.write_all(b": ping\n\n")?;
-                out.flush()?;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::api::{merged_links, observe_request, with_link};
+    use super::sse::{add_link, split_event};
     use super::*;
 
     #[test]
