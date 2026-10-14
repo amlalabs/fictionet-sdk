@@ -3095,6 +3095,7 @@ pub enum AggressorFlag {
     #[doc = "Aggressor"]
     Aggressor,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for AggressorFlag {
@@ -3119,6 +3120,8 @@ impl __wire::Codec for AggressorFlag {
             let v: u8 = match self {
                 Self::NotAggressor => 0,
                 Self::Aggressor => 1,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -3151,6 +3154,7 @@ impl fictionet::stdlib::codec::Wire for AggressorFlag {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -3166,6 +3170,7 @@ pub enum AggressorSide {
     #[doc = "Sell"]
     Sell,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for AggressorSide {
@@ -3195,6 +3200,9 @@ impl __wire::Codec for AggressorSide {
                 Self::NoAggressor => 0,
                 Self::Buy => 1,
                 Self::Sell => 2,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -3231,6 +3239,7 @@ impl fictionet::stdlib::codec::Wire for AggressorSide {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -3244,6 +3253,7 @@ pub enum EventType {
     #[doc = "Last Eligible Trade Date"]
     LastEligibleTradeDate,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for EventType {
@@ -3268,6 +3278,8 @@ impl __wire::Codec for EventType {
             let v: u8 = match self {
                 Self::Activation => 5,
                 Self::LastEligibleTradeDate => 7,
+                Self::Unknown(5) => return Err(Error::Value),
+                Self::Unknown(7) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -3300,6 +3312,7 @@ impl fictionet::stdlib::codec::Wire for EventType {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -3325,6 +3338,7 @@ pub enum HaltReason {
     #[doc = "Trade Date Roll"]
     TradeDateRoll,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for HaltReason {
@@ -3379,6 +3393,14 @@ impl __wire::Codec for HaltReason {
                 Self::UnknownValue => 5,
                 Self::RecoveryInProcess => 6,
                 Self::TradeDateRoll => 7,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
+                Self::Unknown(3) => return Err(Error::Value),
+                Self::Unknown(4) => return Err(Error::Value),
+                Self::Unknown(5) => return Err(Error::Value),
+                Self::Unknown(6) => return Err(Error::Value),
+                Self::Unknown(7) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -3435,6 +3457,7 @@ impl fictionet::stdlib::codec::Wire for HaltReason {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -3448,6 +3471,7 @@ pub enum LegSide {
     #[doc = "Sell Side"]
     SellSide,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for LegSide {
@@ -3472,6 +3496,8 @@ impl __wire::Codec for LegSide {
             let v: u8 = match self {
                 Self::BuySide => 1,
                 Self::SellSide => 2,
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -3504,6 +3530,7 @@ impl fictionet::stdlib::codec::Wire for LegSide {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -3553,6 +3580,7 @@ pub enum MdEntryType {
     #[doc = "Market Best Bid"]
     MarketBestBid,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for MdEntryType {
@@ -3667,6 +3695,26 @@ impl __wire::Codec for MdEntryType {
                 Self::ThresholdLimitsandPriceBandVariation => 103,
                 Self::MarketBestOffer => 119,
                 Self::MarketBestBid => 120,
+                Self::Unknown(48) => return Err(Error::Value),
+                Self::Unknown(49) => return Err(Error::Value),
+                Self::Unknown(50) => return Err(Error::Value),
+                Self::Unknown(52) => return Err(Error::Value),
+                Self::Unknown(54) => return Err(Error::Value),
+                Self::Unknown(55) => return Err(Error::Value),
+                Self::Unknown(56) => return Err(Error::Value),
+                Self::Unknown(57) => return Err(Error::Value),
+                Self::Unknown(66) => return Err(Error::Value),
+                Self::Unknown(67) => return Err(Error::Value),
+                Self::Unknown(69) => return Err(Error::Value),
+                Self::Unknown(70) => return Err(Error::Value),
+                Self::Unknown(74) => return Err(Error::Value),
+                Self::Unknown(78) => return Err(Error::Value),
+                Self::Unknown(79) => return Err(Error::Value),
+                Self::Unknown(87) => return Err(Error::Value),
+                Self::Unknown(101) => return Err(Error::Value),
+                Self::Unknown(103) => return Err(Error::Value),
+                Self::Unknown(119) => return Err(Error::Value),
+                Self::Unknown(120) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -3771,6 +3819,7 @@ impl fictionet::stdlib::codec::Wire for MdEntryType {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -3794,6 +3843,7 @@ pub enum MdEntryTypeBook {
     #[doc = "Market Best Bid"]
     MarketBestBid,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for MdEntryTypeBook {
@@ -3843,6 +3893,13 @@ impl __wire::Codec for MdEntryTypeBook {
                 Self::BookReset => 74,
                 Self::MarketBestOffer => 119,
                 Self::MarketBestBid => 120,
+                Self::Unknown(48) => return Err(Error::Value),
+                Self::Unknown(49) => return Err(Error::Value),
+                Self::Unknown(69) => return Err(Error::Value),
+                Self::Unknown(70) => return Err(Error::Value),
+                Self::Unknown(74) => return Err(Error::Value),
+                Self::Unknown(119) => return Err(Error::Value),
+                Self::Unknown(120) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -3895,6 +3952,7 @@ impl fictionet::stdlib::codec::Wire for MdEntryTypeBook {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -3912,6 +3970,7 @@ pub enum MdEntryTypeDailyStatistics {
     #[doc = "Fixing Price"]
     FixingPrice,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for MdEntryTypeDailyStatistics {
@@ -3946,6 +4005,10 @@ impl __wire::Codec for MdEntryTypeDailyStatistics {
                 Self::ClearedVolume => 66,
                 Self::OpenInterest => 67,
                 Self::FixingPrice => 87,
+                Self::Unknown(54) => return Err(Error::Value),
+                Self::Unknown(66) => return Err(Error::Value),
+                Self::Unknown(67) => return Err(Error::Value),
+                Self::Unknown(87) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -3986,6 +4049,7 @@ impl fictionet::stdlib::codec::Wire for MdEntryTypeDailyStatistics {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4007,6 +4071,7 @@ pub enum MdEntryTypeStatistics {
     #[doc = "Lowest Offer"]
     LowestOffer,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for MdEntryTypeStatistics {
@@ -4051,6 +4116,12 @@ impl __wire::Codec for MdEntryTypeStatistics {
                 Self::Vwap => 57,
                 Self::HighestBid => 78,
                 Self::LowestOffer => 79,
+                Self::Unknown(52) => return Err(Error::Value),
+                Self::Unknown(55) => return Err(Error::Value),
+                Self::Unknown(56) => return Err(Error::Value),
+                Self::Unknown(57) => return Err(Error::Value),
+                Self::Unknown(78) => return Err(Error::Value),
+                Self::Unknown(79) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4099,6 +4170,7 @@ impl fictionet::stdlib::codec::Wire for MdEntryTypeStatistics {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4120,6 +4192,7 @@ pub enum MdUpdateAction {
     #[doc = "Overlay"]
     Overlay,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for MdUpdateAction {
@@ -4164,6 +4237,12 @@ impl __wire::Codec for MdUpdateAction {
                 Self::DeleteThru => 3,
                 Self::DeleteFrom => 4,
                 Self::Overlay => 5,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
+                Self::Unknown(3) => return Err(Error::Value),
+                Self::Unknown(4) => return Err(Error::Value),
+                Self::Unknown(5) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4212,6 +4291,7 @@ impl fictionet::stdlib::codec::Wire for MdUpdateAction {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4225,6 +4305,7 @@ pub enum MoneyOrPar {
     #[doc = "Par Filled"]
     Par,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for MoneyOrPar {
@@ -4249,6 +4330,8 @@ impl __wire::Codec for MoneyOrPar {
             let v: u8 = match self {
                 Self::Money => 1,
                 Self::Par => 2,
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4281,6 +4364,7 @@ impl fictionet::stdlib::codec::Wire for MoneyOrPar {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4302,6 +4386,7 @@ pub enum OpenCloseSettlFlag {
     #[doc = "Prev Session Repo Average 10 AM"]
     PrevSessionRepoAverage10Am,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for OpenCloseSettlFlag {
@@ -4346,6 +4431,12 @@ impl __wire::Codec for OpenCloseSettlFlag {
                 Self::RepoAverage830Am => 101,
                 Self::RepoAverage10Am => 102,
                 Self::PrevSessionRepoAverage10Am => 103,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(5) => return Err(Error::Value),
+                Self::Unknown(100) => return Err(Error::Value),
+                Self::Unknown(101) => return Err(Error::Value),
+                Self::Unknown(102) => return Err(Error::Value),
+                Self::Unknown(103) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4394,6 +4485,7 @@ impl fictionet::stdlib::codec::Wire for OpenCloseSettlFlag {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4409,6 +4501,7 @@ pub enum OrderUpdateAction {
     #[doc = "Delete"]
     Delete,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for OrderUpdateAction {
@@ -4438,6 +4531,9 @@ impl __wire::Codec for OrderUpdateAction {
                 Self::New => 0,
                 Self::Update => 1,
                 Self::Delete => 2,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4474,6 +4570,7 @@ impl fictionet::stdlib::codec::Wire for OrderUpdateAction {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4491,6 +4588,7 @@ pub enum PriceSource {
     #[doc = "Icap Market Data Feed"]
     Icap,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for PriceSource {
@@ -4525,6 +4623,10 @@ impl __wire::Codec for PriceSource {
                 Self::Globex => 1,
                 Self::Refinitiv => 2,
                 Self::Icap => 3,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
+                Self::Unknown(3) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4565,6 +4667,7 @@ impl fictionet::stdlib::codec::Wire for PriceSource {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4578,6 +4681,7 @@ pub enum PutOrCall {
     #[doc = "Call Option"]
     Call,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for PutOrCall {
@@ -4602,6 +4706,8 @@ impl __wire::Codec for PutOrCall {
             let v: u8 = match self {
                 Self::Put => 0,
                 Self::Call => 1,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4634,6 +4740,7 @@ impl fictionet::stdlib::codec::Wire for PutOrCall {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4649,6 +4756,7 @@ pub enum RepoSubType {
     #[doc = "General Collateral Repo on a single or basket of eligible underlyings, allocation outside of BrokerTec, such as at the clearer, tri-party agent, etc."]
     GcForDbv,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for RepoSubType {
@@ -4678,6 +4786,9 @@ impl __wire::Codec for RepoSubType {
                 Self::Special => 0,
                 Self::Gc => 1,
                 Self::GcForDbv => 2,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4714,6 +4825,7 @@ impl fictionet::stdlib::codec::Wire for RepoSubType {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4727,6 +4839,7 @@ pub enum SecurityAltIdSource {
     #[doc = "ISIN (12 char)"]
     Isin,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for SecurityAltIdSource {
@@ -4751,6 +4864,8 @@ impl __wire::Codec for SecurityAltIdSource {
             let v: u8 = match self {
                 Self::Cusip => 1,
                 Self::Isin => 4,
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(4) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4783,6 +4898,7 @@ impl fictionet::stdlib::codec::Wire for SecurityAltIdSource {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4804,6 +4920,7 @@ pub enum SecurityTradingEvent {
     #[doc = "End Of Workup"]
     EndOfWorkup,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for SecurityTradingEvent {
@@ -4848,6 +4965,12 @@ impl __wire::Codec for SecurityTradingEvent {
                 Self::ImpliedMatchingOn => 5,
                 Self::ImpliedMatchingOff => 6,
                 Self::EndOfWorkup => 7,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(4) => return Err(Error::Value),
+                Self::Unknown(5) => return Err(Error::Value),
+                Self::Unknown(6) => return Err(Error::Value),
+                Self::Unknown(7) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -4896,6 +5019,7 @@ impl fictionet::stdlib::codec::Wire for SecurityTradingEvent {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -4931,6 +5055,7 @@ pub enum SecurityTradingStatus {
     #[doc = "Public Workup"]
     PublicWorkup,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for SecurityTradingStatus {
@@ -5010,6 +5135,19 @@ impl __wire::Codec for SecurityTradingStatus {
                 Self::NoChange => 103,
                 Self::PrivateWorkup => 201,
                 Self::PublicWorkup => 202,
+                Self::Unknown(2) => return Err(Error::Value),
+                Self::Unknown(4) => return Err(Error::Value),
+                Self::Unknown(15) => return Err(Error::Value),
+                Self::Unknown(17) => return Err(Error::Value),
+                Self::Unknown(18) => return Err(Error::Value),
+                Self::Unknown(20) => return Err(Error::Value),
+                Self::Unknown(21) => return Err(Error::Value),
+                Self::Unknown(24) => return Err(Error::Value),
+                Self::Unknown(25) => return Err(Error::Value),
+                Self::Unknown(26) => return Err(Error::Value),
+                Self::Unknown(103) => return Err(Error::Value),
+                Self::Unknown(201) => return Err(Error::Value),
+                Self::Unknown(202) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -5086,6 +5224,7 @@ impl fictionet::stdlib::codec::Wire for SecurityTradingStatus {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -5101,6 +5240,7 @@ pub enum SecurityUpdateAction {
     #[doc = "Modify"]
     Modify,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for SecurityUpdateAction {
@@ -5130,6 +5270,9 @@ impl __wire::Codec for SecurityUpdateAction {
                 Self::Add => 65,
                 Self::Delete => 68,
                 Self::Modify => 77,
+                Self::Unknown(65) => return Err(Error::Value),
+                Self::Unknown(68) => return Err(Error::Value),
+                Self::Unknown(77) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -5166,6 +5309,7 @@ impl fictionet::stdlib::codec::Wire for SecurityUpdateAction {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -5179,6 +5323,7 @@ pub enum Side {
     #[doc = "Sell"]
     Sell,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for Side {
@@ -5203,6 +5348,8 @@ impl __wire::Codec for Side {
             let v: u8 = match self {
                 Self::Buy => 1,
                 Self::Sell => 2,
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -5235,6 +5382,7 @@ impl fictionet::stdlib::codec::Wire for Side {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -5252,6 +5400,7 @@ pub enum WorkupTradingStatus {
     #[doc = "Public Workup"]
     PublicWorkup,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for WorkupTradingStatus {
@@ -5286,6 +5435,10 @@ impl __wire::Codec for WorkupTradingStatus {
                 Self::NotAvailableForTrading => 18,
                 Self::PrivateWorkup => 201,
                 Self::PublicWorkup => 202,
+                Self::Unknown(17) => return Err(Error::Value),
+                Self::Unknown(18) => return Err(Error::Value),
+                Self::Unknown(201) => return Err(Error::Value),
+                Self::Unknown(202) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -5326,6 +5479,7 @@ impl fictionet::stdlib::codec::Wire for WorkupTradingStatus {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
     }
@@ -6001,6 +6155,7 @@ impl fictionet::stdlib::codec::Wire for SecurityStatus30 {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     /// Refuses wrong fixed data lengths.
@@ -6085,6 +6240,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshVolume37 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -6176,6 +6332,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshVolume37NoMdEntries 
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -6455,6 +6612,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBook46 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -6583,6 +6741,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBook46NoMdEntries {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -6679,6 +6838,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBook46NoOrderIdEntri
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -6762,6 +6922,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshOrderBook47 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -6874,6 +7035,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshOrderBook47NoMdEntri
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -6965,6 +7127,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshTradeSummary48 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -7089,6 +7252,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshTradeSummary48NoMdEn
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -7244,6 +7408,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshDailyStatistics49 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -7366,6 +7531,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshDailyStatistics49NoM
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -7635,6 +7801,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshSessionStatistics51 
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -7747,6 +7914,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshSessionStatistics51N
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -7903,6 +8071,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefresh52 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -8025,6 +8194,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefresh52NoMdEntries {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -8141,6 +8311,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshOrderBook53 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -8237,6 +8408,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshOrderBook53NoMdEntrie
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -8693,6 +8865,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFuture54 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -8767,6 +8940,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFuture54NoEvents {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -9433,6 +9607,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionOption55 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -9507,6 +9682,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionOption55NoEvents {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -10317,6 +10493,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionSpread56 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -10391,6 +10568,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionSpread56NoEvents {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -10701,6 +10879,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionSpread56NoLegs {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -11213,6 +11392,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFixedIncome57 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -11287,6 +11467,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFixedIncome57NoEve
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -11969,6 +12150,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionRepo58 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -12043,6 +12225,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionRepo58NoEvents {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -12409,6 +12592,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionRepo58NoUnderlying
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     /// Refuses wrong fixed data lengths.
@@ -12674,6 +12858,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotRefreshTopOrders59 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -12769,6 +12954,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotRefreshTopOrders59NoMdEntries {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -12907,6 +13093,7 @@ impl fictionet::stdlib::codec::Wire for SecurityStatusWorkup60 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -12987,6 +13174,7 @@ impl fictionet::stdlib::codec::Wire for SecurityStatusWorkup60NoOrderIdEntries {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -13103,6 +13291,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshTcp61 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -13233,6 +13422,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshTcp61NoMdEntries {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -13317,6 +13507,7 @@ impl fictionet::stdlib::codec::Wire for CollateralMarketValue62 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     /// Refuses wrong fixed data lengths.
@@ -13422,6 +13613,7 @@ impl fictionet::stdlib::codec::Wire for CollateralMarketValue62NoMdEntries {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     /// Refuses wrong fixed data lengths.
@@ -13903,6 +14095,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFx63 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -13977,6 +14170,7 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFx63NoEvents {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -14370,6 +14564,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBookLongQty64 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -14490,6 +14685,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBookLongQty64NoMdEnt
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -14586,6 +14782,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBookLongQty64NoOrder
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -14677,6 +14874,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshTradeSummaryLongQty6
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -14801,6 +14999,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshTradeSummaryLongQty6
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -14955,6 +15154,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshVolumeLongQty66 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -15046,6 +15246,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshVolumeLongQty66NoMdE
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, true)
@@ -15128,6 +15329,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshSessionStatisticsLon
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -15240,6 +15442,7 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshSessionStatisticsLon
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -15355,6 +15558,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshTcpLongQty68 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -15459,6 +15663,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshTcpLongQty68NoMdEntri
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -15614,6 +15819,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshLongQty69 {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -15718,6 +15924,7 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshLongQty69NoMdEntries 
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -16369,6 +16576,7 @@ impl fictionet::stdlib::codec::Wire for Message {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.

@@ -1006,7 +1006,7 @@ fn named_type(
             if *open {
                 writeln!(
                     out,
-                    "    /// A value absent from this schema.\n    Unknown({}),",
+                    "    /// A value absent from this schema.\n    /// The writer refuses named values with [`Error::Value`].\n    Unknown({}),",
                     repr.rust()
                 )?;
             }
@@ -1205,6 +1205,13 @@ fn named_type(
                     writeln!(out, "{}", layout(100, &[flat.clone(), split, flat]))?;
                 }
                 if *open {
+                    for v in variants {
+                        writeln!(
+                            out,
+                            "                Self::Unknown({}) => return Err(Error::Value),",
+                            v.value
+                        )?;
+                    }
                     writeln!(out, "                Self::Unknown(raw) => *raw,")?;
                 }
                 writeln!(out, "            }};\n            w.scalar(v, le)")?;
@@ -1442,6 +1449,9 @@ fn wire_docs(
         match &t.definition {
             Definition::Enum { open: false, .. } if !write => {
                 refusals.insert("unknown enum values");
+            }
+            Definition::Enum { open: true, .. } if write => {
+                refusals.insert("named enum values in Unknown");
             }
             Definition::Set { repr, bits } if bits.len() < repr.bytes() * 8 => {
                 refusals.insert("undeclared set bits");

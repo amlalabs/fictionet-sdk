@@ -331,6 +331,11 @@ the schema sets `maxValue` (section 3.4.10). Group and data limits are
 the smaller of the schema's maximum and `--max-collection`. Composites
 that no message uses are left out; every enum and set is emitted.
 
+Generated enums preserve values absent from the schema as `Unknown(raw)`.
+The writer refuses `Unknown(raw)` with `Error::Value` when `raw` names a
+declared variant. Use the named variant instead. Other unknown values
+round-trip unchanged. A refusal leaves the destination unchanged.
+
 Generated readers accept acting versions from the schema version up.
 Longer blocks from newer senders are skipped. Senders on older versions
 are refused, so fields need no "absent" form. `sinceVersion` and

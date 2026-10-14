@@ -81,6 +81,84 @@ fn module_is_generator_output_plus_hand_written_framing() {
     );
 }
 
+fn check_open_enum<T>(unknown: fn(u8) -> T, named: &[(u8, T)], error: T::WriteError)
+where
+    T: Wire + Debug + PartialEq,
+    T::ParseError: Debug,
+    T::WriteError: Debug + PartialEq,
+{
+    for raw in u8::MIN..=u8::MAX {
+        let value = unknown(raw);
+        let mut out = vec![7, 8, 9];
+        if let Some((_, known)) = named.iter().find(|(n, _)| *n == raw) {
+            assert_eq!(T::parse(&[raw]).unwrap(), *known);
+            assert_eq!(known.to_bytes().unwrap(), [raw]);
+            assert_eq!(value.to_bytes().unwrap_err(), error);
+            assert_eq!(value.write(&mut out).unwrap_err(), error);
+            assert_eq!(out, [7, 8, 9]);
+        } else {
+            assert_eq!(value.to_bytes().unwrap(), [raw]);
+            assert_eq!(T::parse(&[raw]).unwrap(), value);
+            value.write(&mut out).unwrap();
+            assert_eq!(out, [7, 8, 9, raw]);
+        }
+    }
+}
+
+#[test]
+fn sample_open_enums_preserve_values_and_refuse_aliases() {
+    use sample::{Error, QuoteKind, Side, Status};
+    check_open_enum(
+        Side::Unknown,
+        &[(b'1', Side::Buy), (b'2', Side::Sell)],
+        Error::Value,
+    );
+    check_open_enum(
+        Status::Unknown,
+        &[(0, Status::Open), (1, Status::Closed)],
+        Error::Value,
+    );
+    check_open_enum(
+        QuoteKind::Unknown,
+        &[(1, QuoteKind::Firm), (2, QuoteKind::Indicative)],
+        Error::Value,
+    );
+}
+
+#[test]
+fn cme_open_enums_preserve_values_and_refuse_aliases() {
+    use fictionet::stdlib::cme_mdp3::{Error, SecurityUpdateAction};
+    check_open_enum(
+        SecurityUpdateAction::Unknown,
+        &[
+            (b'A', SecurityUpdateAction::Add),
+            (b'D', SecurityUpdateAction::Delete),
+            (b'M', SecurityUpdateAction::Modify),
+        ],
+        Error::Value,
+    );
+}
+
+#[test]
+fn nested_open_enum_alias_refusal_is_transactional() {
+    use sample::{Error, Price, Quote, QuoteKind, Side};
+    let mut value = Quote {
+        price: Price { mantissa: 123 },
+        side: Side::Unknown(b'?'),
+        kind: QuoteKind::Unknown(0),
+    };
+    let bytes = value.to_bytes().unwrap();
+    assert_eq!(Quote::parse(&bytes).unwrap(), value);
+
+    // The price and side have already been encoded when kind is refused.
+    for raw in [1, 2] {
+        value.kind = QuoteKind::Unknown(raw);
+        let mut out = vec![7, 8, 9];
+        assert_eq!(value.write(&mut out), Err(Error::Value));
+        assert_eq!(out, [7, 8, 9]);
+    }
+}
+
 /// A value as both sides can print it: leaves in schema order, with
 /// brackets around byte arrays and groups. Constants are left out.
 #[derive(Clone, Debug, PartialEq)]

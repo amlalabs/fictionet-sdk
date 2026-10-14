@@ -347,6 +347,7 @@ pub enum Side {
     #[doc = "Sell"]
     Sell,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for Side {
@@ -371,6 +372,8 @@ impl __wire::Codec for Side {
             let v: u8 = match self {
                 Self::Buy => 49,
                 Self::Sell => 50,
+                Self::Unknown(49) => return Err(Error::Value),
+                Self::Unknown(50) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -403,6 +406,7 @@ impl fictionet::stdlib::codec::Wire for Side {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
     }
@@ -416,6 +420,7 @@ pub enum Status {
     #[doc = "Closed"]
     Closed,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for Status {
@@ -440,6 +445,8 @@ impl __wire::Codec for Status {
             let v: u8 = match self {
                 Self::Open => 0,
                 Self::Closed => 1,
+                Self::Unknown(0) => return Err(Error::Value),
+                Self::Unknown(1) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -472,6 +479,7 @@ impl fictionet::stdlib::codec::Wire for Status {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
     }
@@ -649,6 +657,7 @@ impl fictionet::stdlib::codec::Wire for Quote {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     /// Refuses values outside declared ranges.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
@@ -663,6 +672,7 @@ pub enum QuoteKind {
     #[doc = "Indicative"]
     Indicative,
     /// A value absent from this schema.
+    /// The writer refuses named values with [`Error::Value`].
     Unknown(u8),
 }
 impl __wire::Codec for QuoteKind {
@@ -687,6 +697,8 @@ impl __wire::Codec for QuoteKind {
             let v: u8 = match self {
                 Self::Firm => 1,
                 Self::Indicative => 2,
+                Self::Unknown(1) => return Err(Error::Value),
+                Self::Unknown(2) => return Err(Error::Value),
                 Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
@@ -719,6 +731,7 @@ impl fictionet::stdlib::codec::Wire for QuoteKind {
     }
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
+    /// Refuses named enum values in Unknown.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
     }
@@ -883,6 +896,7 @@ impl fictionet::stdlib::codec::Wire for Order {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
@@ -1195,6 +1209,7 @@ impl fictionet::stdlib::codec::Wire for Message {
 
     /// Follows the [`Wire::write`](fictionet::stdlib::codec::Wire::write) contract.
     /// Refuses entry counts above their limits.
+    /// Refuses named enum values in Unknown.
     /// Refuses reserved nulls in Some.
     /// Refuses undeclared set bits.
     /// Refuses values outside declared ranges.
