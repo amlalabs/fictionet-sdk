@@ -182,6 +182,23 @@ one the call came over, so the KDC can answer `KRB_ERR_RESPONSE_TOO_BIG`
 on UDP. Serve them with `Host::tcp(88, ..)` and `Host::udp(88, ..)` and
 the same `State`.
 
+### FTP control framing
+
+`ftp::Commands` removes Telnet controls before finding command line endings.
+A subnegotiation's payload, including LF and escaped IAC, never enters a
+command or pathname. Controls still count toward the 4,096-byte line limit.
+CR NUL pathname escaping is decoded after filtering. Replies keep their
+own line and text rules.
+CR or LF used as a Telnet option byte stays in the control. Controls may
+also separate the bytes of a pathname escape or the final CRLF.
+
+Subnegotiations allow 1,024 decoded payload bytes. An oversized or interrupted
+subnegotiation makes the command a text error. Unknown controls and an escaped
+IAC in application text also do so. A stray IAC SE is still ignored. Only the
+previously accepted command codes 240 through 254 are supported. Line length
+errors take precedence over text and verb errors. EOF inside a control or an
+unfinished command is incomplete; LF inside a control cannot finish a command.
+
 ### COTP packet bounds
 
 `cotp::Tpdu::parse` and its `Wire::parse` implementation read one complete

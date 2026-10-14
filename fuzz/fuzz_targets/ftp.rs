@@ -38,6 +38,35 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // Insert controls into independently specified application text, including
+    // between the bytes of CR NUL LF and the final CRLF.
+    let (plain, expected) = match data.first().copied().unwrap_or(0) % 3 {
+        0 => (b"RETR ab\r\n".as_slice(), Command::new("RETR", Some("ab"))),
+        1 => (
+            b"STOR a\r\0\nb\r\n".as_slice(),
+            Command::new("STOR", Some("a\r\nb")),
+        ),
+        _ => (b"NOOP\n".as_slice(), Command::new("NOOP", None)),
+    };
+    let at = usize::from(data.get(1).copied().unwrap_or(0)) % plain.len();
+    let mut controlled = plain[..at].to_vec();
+    controlled.extend_from_slice(b"\xff\xf4\xff\xfb");
+    controlled.push(data.get(2).copied().unwrap_or(0));
+    controlled.extend_from_slice(b"\xff\xfa*\r\n");
+    for &byte in data.iter().take(128) {
+        controlled.push(byte);
+        if byte == 0xff {
+            controlled.push(byte);
+        }
+    }
+    controlled.extend_from_slice(b"\xff\xf0");
+    controlled.extend_from_slice(&plain[at..]);
+    assert_eq!(Command::parse(&controlled), Ok(expected.clone()));
+    assert_eq!(
+        check_decode_with_held_limit(Commands::new, &controlled, MAX_LINE),
+        (vec![Ok(expected)], None)
+    );
+
     let text = String::from_utf8_lossy(data);
     let (verb, arg) = text.split_once(' ').unwrap_or((&text, ""));
     check_wire_value(&Command::new(verb, Some(arg)));

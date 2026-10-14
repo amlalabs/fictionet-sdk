@@ -48,6 +48,180 @@ fn ftp_commands_and_multiline_replies_round_trip() {
 }
 
 #[test]
+fn ftp_telnet_controls_do_not_enter_commands() {
+    let cases: &[(&[u8], &str, Option<&str>)] = &[
+        (b"RETR a\xff\xfa*x\xff\xf0b\r\n", "RETR", Some("ab")),
+        (
+            b"RETR a\xff\xfa*\r\nNOOP\n\xff\xff\xff\xf0b\n",
+            "RETR",
+            Some("ab"),
+        ),
+        (
+            b"RE\xff\xfa*\n\xff\xf0TR a\r\0\nb\r\n",
+            "RETR",
+            Some("a\r\nb"),
+        ),
+        (
+            b"RETR a\r\xff\xf1\0\xff\xfa*x\xff\xf0\nb\r\n",
+            "RETR",
+            Some("a\r\nb"),
+        ),
+        (b"NOOP\r\xff\xfa*\n\xff\xf0\n", "NOOP", None),
+        (b"NO\xff\xfb\nOP\r\n", "NOOP", None),
+        (b"ABOR\xff\xfb\r\n", "ABOR", None),
+        (b"\xff\xf0\xff\xf4\xff\xf2ABOR\n", "ABOR", None),
+    ];
+    for &(bytes, verb, arg) in cases {
+        let expected = ftp::Command::new(verb, arg);
+        assert_eq!(ftp::Command::parse(bytes), Ok(expected.clone()));
+        assert_eq!(check(ftp::Commands::new, bytes), (vec![Ok(expected)], None));
+    }
+}
+
+#[test]
+fn ftp_telnet_faults_and_eof() {
+    for bytes in [
+        b"RETR a\xff\xffb\r\n".as_slice(),
+        b"RETR a\xff\xfa*x\xff\xf1b\r\n",
+        b"123\xff\xfa*x\xff\xf1\r\n",
+        b"NO\xff\x01OP\r\n",
+        b"NO\xff\xefOP\r\n",
+    ] {
+        assert_eq!(ftp::Command::parse(bytes), Err(ftp::Error::Text));
+        let stream = [bytes, b"NOOP\n"].concat();
+        assert_eq!(
+            check(ftp::Commands::new, &stream),
+            (
+                vec![Err(ftp::Error::Text), Ok(ftp::Command::new("NOOP", None))],
+                None
+            )
+        );
+    }
+    for bytes in [
+        b"RETR a\xff".as_slice(),
+        b"RETR a\xff\xfb",
+        b"RETR a\xff\xfa",
+        b"RETR a\xff\xfa*",
+        b"RETR a\xff\xfa*x\r\nNOOP\n",
+        b"RETR a\xff\xfa*x\xff",
+        b"\xff\xf4",
+    ] {
+        assert_eq!(ftp::Command::parse(bytes), Err(ftp::Error::Incomplete));
+        assert_eq!(
+            check(ftp::Commands::new, bytes),
+            (vec![], Some(Fail::Protocol(ftp::FrameError::Incomplete)))
+        );
+    }
+}
+
+#[test]
+fn ftp_telnet_limits_and_recovery() {
+    use fictionet::stdlib::telnet::MAX_SUBNEGOTIATION;
+
+    for size in [
+        MAX_SUBNEGOTIATION,
+        MAX_SUBNEGOTIATION + 1,
+        2 * ftp::MAX_LINE,
+    ] {
+        let mut bytes = b"RETR a\xff\xfa*".to_vec();
+        bytes.extend(std::iter::repeat_n(b'\n', size));
+        let truncated = check(ftp::Commands::new, &bytes);
+        let expected = if size > ftp::MAX_LINE {
+            vec![Err(ftp::Error::LineTooLong)]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            truncated,
+            (expected, Some(Fail::Protocol(ftp::FrameError::Incomplete)))
+        );
+        bytes.extend_from_slice(b"\xff\xf0b\r\nNOOP\n");
+        let expected = if size > ftp::MAX_LINE {
+            Err(ftp::Error::LineTooLong)
+        } else if size > MAX_SUBNEGOTIATION {
+            Err(ftp::Error::Text)
+        } else {
+            Ok(ftp::Command::new("RETR", Some("ab")))
+        };
+        assert_eq!(
+            contract::check_decode_with_held_limit(ftp::Commands::new, &bytes, ftp::MAX_LINE),
+            (vec![expected, Ok(ftp::Command::new("NOOP", None))], None)
+        );
+    }
+    for size in [MAX_SUBNEGOTIATION, MAX_SUBNEGOTIATION + 1] {
+        let mut bytes = b"RETR a\xff\xfa*".to_vec();
+        bytes.extend_from_slice(&b"\xff\xff".repeat(size));
+        bytes.extend_from_slice(b"\xff\xf0b\n");
+        let expected = if size == MAX_SUBNEGOTIATION {
+            Ok(ftp::Command::new("RETR", Some("ab")))
+        } else {
+            Err(ftp::Error::Text)
+        };
+        assert_eq!(check(ftp::Commands::new, &bytes), (vec![expected], None));
+    }
+    let mut interrupted = b"RETR a\xff\xfa*".to_vec();
+    interrupted.extend(std::iter::repeat_n(b'\n', MAX_SUBNEGOTIATION + 1));
+    interrupted.extend_from_slice(b"\xff\xf4b\nNOOP\n");
+    assert_eq!(
+        check(ftp::Commands::new, &interrupted),
+        (
+            vec![Err(ftp::Error::Text), Ok(ftp::Command::new("NOOP", None))],
+            None
+        )
+    );
+    // The scanner can need more bytes while the command has already hit its cap.
+    let mut partial = vec![b'a'; ftp::MAX_LINE - 4];
+    partial.extend_from_slice(b"\xff\xfa*x");
+    assert_eq!(
+        check(ftp::Commands::new, &partial),
+        (
+            vec![Err(ftp::Error::LineTooLong)],
+            Some(Fail::Protocol(ftp::FrameError::Incomplete))
+        )
+    );
+    let mut invalid = vec![b'a'; ftp::MAX_LINE - 4];
+    invalid.extend_from_slice(b"\r\xff\xff\nNOOP\n");
+    assert_eq!(
+        check(ftp::Commands::new, &invalid),
+        (
+            vec![
+                Err(ftp::Error::LineTooLong),
+                Ok(ftp::Command::new("NOOP", None))
+            ],
+            None
+        )
+    );
+    // Controls still count toward the wire limit. Length wins over text faults.
+    for control in [b"\xff\xf1".as_slice(), b"\xff\xff", b"\xff\xfa*x\xff\xf0"] {
+        let mut bytes = b"RETR ".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', ftp::MAX_LINE - 7 - control.len()));
+        bytes.extend_from_slice(control);
+        bytes.extend_from_slice(b"\r\n");
+        let expected = if control == b"\xff\xff" {
+            Err(ftp::Error::Text)
+        } else {
+            Ok(ftp::Command::new(
+                "RETR",
+                Some(&"a".repeat(ftp::MAX_LINE - 7 - control.len())),
+            ))
+        };
+        assert_eq!(check(ftp::Commands::new, &bytes), (vec![expected], None));
+        bytes.insert(5, b'a');
+        bytes.extend_from_slice(b"NOOP\n");
+        assert_eq!(
+            check(ftp::Commands::new, &bytes),
+            (
+                vec![
+                    Err(ftp::Error::LineTooLong),
+                    Ok(ftp::Command::new("NOOP", None))
+                ],
+                None
+            )
+        );
+    }
+}
+
+#[test]
 fn ftp_wire_preserves_numeric_middle_lines() {
     for bytes in [
         b"230-Welcome\r\n230-second line\r\n230 Login ok\r\n".as_slice(),

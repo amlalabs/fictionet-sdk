@@ -33,8 +33,15 @@
 //! A command writer refuses ([`Error`]) rather than send a line that
 //! would read back as a different command. A pathname may hold a carriage
 //! return: RFC 2640 sends it as CR NUL, and a reader turns CR NUL back into
-//! CR. A command reader also drops Telnet commands, such as the interrupt
-//! and synch that clients send before `ABOR`.
+//! CR. A command reader drops Telnet controls before looking for line endings.
+//! Subnegotiation payload never enters a command, even when it contains LF
+//! or escaped IAC. Controls count toward [`MAX_LINE`]. Subnegotiations allow
+//! [`telnet::MAX_SUBNEGOTIATION`] decoded payload bytes. Oversized or interrupted
+//! subnegotiations and unknown controls make the command a text error. A stray
+//! IAC SE is ignored, as are command codes 241 through 249 and option
+//! negotiations. A doubled IAC in application text is not UTF-8 and is an error.
+//! Line length errors precede text and verb errors. EOF inside a control or
+//! an unfinished command is [`FrameError::Incomplete`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -77,6 +84,7 @@
 
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::{self, Decode, Step, Wire};
+use fictionet::stdlib::telnet::{self, ControlScanner, ControlSpan};
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU8;
@@ -135,9 +143,9 @@ pub enum Error {
     /// by a space or the end of the line.
     Verb,
     /// A command line was not UTF-8 once Telnet commands were dropped,
-    /// held a NUL or a carriage return other than as CR NUL, or ended
-    /// inside a Telnet command. Or a reply line was not UTF-8, or held a
-    /// carriage return or a NUL byte.
+    /// held a NUL or a carriage return other than as CR NUL, or held an
+    /// unknown control or an oversized or interrupted subnegotiation.
+    /// Or a reply line was not UTF-8, or held a carriage return or a NUL byte.
     Text,
     /// A reply did not start with a code from 100 to 599 followed by a
     /// space, a hyphen or the end of the line.
@@ -209,9 +217,8 @@ impl Command {
         }
     }
 
-    /// Reads one command line, without its line ending. Telnet commands in
-    /// it, such as `IAC IP` and `IAC DM`, are dropped, and CR NUL is read
-    /// as CR.
+    /// Reads a filtered command line, without its line ending.
+    /// CR NUL is read as CR.
     fn parse_line(line: &[u8]) -> Result<Command, Error> {
         if line.len() > MAX_CONTENT {
             return Err(Error::LineTooLong);
@@ -1293,15 +1300,8 @@ fn text(line: &[u8]) -> Option<&str> {
     std::str::from_utf8(line).ok()
 }
 
-/// The Telnet byte that starts a command (RFC 854).
-const IAC: u8 = 0xff;
-
-/// A command line as text: Telnet commands dropped, CR NUL read as CR, and
-/// a LF kept only right after CR NUL. It is `None` if what is left is not
-/// UTF-8, holds a NUL or any other CR or LF, or the line ends inside a
-/// Telnet command, or IAC is followed by a byte that is not a command
-/// (240 to 254, RFC 854). A doubled IAC stands for the byte 0xFF, which is
-/// never UTF-8, so it is `None` too.
+/// A filtered command line as text: CR NUL read as CR, and a LF kept
+/// only right after CR NUL. Invalid UTF-8, NUL, or other CR or LF is refused.
 fn command_text(line: &[u8]) -> Option<String> {
     let mut out = Vec::with_capacity(line.len());
     let mut i = 0;
@@ -1311,15 +1311,6 @@ fn command_text(line: &[u8]) -> Option<String> {
         let was_cr_nul = after_cr_nul;
         after_cr_nul = false;
         match c {
-            IAC => match line.get(i + 1)? {
-                // WILL, WONT, DO and DONT name an option in the next byte.
-                251..=254 => {
-                    line.get(i + 2)?;
-                    i += 3;
-                }
-                240..=250 => i += 2,
-                _ => return None,
-            },
             b'\r' => {
                 if line.get(i + 1) != Some(&0) {
                     return None;
@@ -1353,7 +1344,7 @@ pub const MAX_REPLY_BYTES: usize = MAX_REPLY_LINES * MAX_CONTENT;
 /// A terminal fault in [`Commands`] or [`Replies`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameError {
-    /// EOF interrupted a line or a multi-line reply.
+    /// EOF interrupted a line, a Telnet control, or a multi-line reply.
     Incomplete,
     /// A reply's framing can no longer be followed.
     Reply(Error),
@@ -1467,14 +1458,21 @@ impl ControlLines {
     }
 }
 
-/// Reads control commands through [`fictionet::stdlib::codec::Lines`].
+/// Reads control commands after filtering Telnet controls.
 ///
-/// CRLF and bare LF are accepted. RFC 2640's CR NUL escaping stays in
-/// this module. Lines are bounded by [`MAX_LINE`], including CRLF.
-/// Malformed and overlong commands are error items. EOF inside a command
-/// is terminal.
+/// CRLF and bare LF are accepted outside controls. RFC 2640's CR NUL
+/// escaping stays in this module. Lines count controls toward [`MAX_LINE`],
+/// including CRLF. Malformed and overlong commands are error items, with
+/// length errors taking precedence. EOF inside a command or control is terminal.
+/// At most [`MAX_LINE`] filtered bytes are retained; the shared scanner
+/// retains no payload.
 pub struct Commands {
-    lines: ControlLines,
+    controls: ControlScanner,
+    partial: Vec<u8>,
+    wire_len: usize,
+    prev: [u8; 2],
+    text_error: bool,
+    dropping: bool,
 }
 impl core::fmt::Debug for Commands {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1485,7 +1483,63 @@ impl Commands {
     /// Creates a command reader with a capacity of [`MAX_LINE`].
     pub fn new() -> Self {
         Self {
-            lines: ControlLines::new(),
+            controls: ControlScanner::new(),
+            partial: Vec::new(),
+            wire_len: 0,
+            prev: LINE_START,
+            text_error: false,
+            dropping: false,
+        }
+    }
+
+    fn too_long(&mut self, used: usize) -> Step<Result<Command, Error>> {
+        self.partial.clear();
+        self.dropping = true;
+        Step::Item(Err(Error::LineTooLong), used)
+    }
+
+    fn data(&mut self, input: &[u8]) -> Step<Result<Command, Error>> {
+        let limit = if self.dropping {
+            input.len()
+        } else {
+            input.len().min(MAX_LINE.saturating_sub(self.wire_len))
+        };
+        let end = next_end(self.prev, &input[..limit]);
+        let used = end.map_or(limit, |i| i + 1);
+        let raw = &input[..used];
+        self.prev = last_two(self.prev, raw);
+        if !self.dropping {
+            self.wire_len += used;
+            self.partial.extend_from_slice(raw);
+        }
+        if end.is_some() {
+            let item = if self.dropping {
+                Step::Skip(used)
+            } else {
+                self.partial.pop(); // LF
+                let cr = self.partial.last() == Some(&b'\r');
+                if cr {
+                    self.partial.pop();
+                }
+                let command = if self.wire_len - 1 - usize::from(cr) > MAX_CONTENT {
+                    Err(Error::LineTooLong)
+                } else if self.text_error {
+                    Err(Error::Text)
+                } else {
+                    Command::parse_line(&self.partial)
+                };
+                Step::Item(command, used)
+            };
+            self.partial.clear();
+            self.wire_len = 0;
+            self.prev = LINE_START;
+            self.text_error = false;
+            self.dropping = false;
+            item
+        } else if !self.dropping && self.wire_len >= MAX_LINE {
+            self.too_long(used)
+        } else {
+            Step::Skip(used)
         }
     }
 }
@@ -1503,13 +1557,58 @@ impl Decode for Commands {
         MAX_LINE
     }
     fn held(&self) -> usize {
-        self.lines.partial.len()
+        self.partial.len()
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
-        Ok(self
-            .lines
-            .decode(input, eof)?
-            .map(|line| line.and_then(|line| Command::parse_line(&line))))
+        loop {
+            let step = self
+                .controls
+                .scan(input, eof)
+                .map_err(|_| FrameError::Incomplete)?;
+            let used = match step {
+                Step::Item(ControlSpan::Data, n) => return Ok(self.data(&input[..n])),
+                Step::Item(span, n) => {
+                    match span {
+                        ControlSpan::EscapedIac => {
+                            self.text_error = true;
+                            self.prev = last_two(self.prev, &[0xff]);
+                            if !self.dropping {
+                                self.partial.push(0xff);
+                            }
+                        }
+                        ControlSpan::Error(telnet::Error::StraySubnegotiationEnd) => {}
+                        ControlSpan::Error(_) => self.text_error = true,
+                        ControlSpan::Command(command) if command.byte() < 240 => {
+                            self.text_error = true;
+                        }
+                        _ => {}
+                    }
+                    n
+                }
+                Step::Skip(n) => {
+                    self.text_error = true; // Oversized subnegotiation, still being dropped.
+                    n
+                }
+                Step::Need => {
+                    if !self.dropping && self.wire_len.saturating_add(input.len()) >= MAX_LINE {
+                        return Ok(self.too_long(0));
+                    }
+                    if eof && (!input.is_empty() || (!self.dropping && self.wire_len != 0)) {
+                        return Err(FrameError::Incomplete);
+                    }
+                    return Ok(Step::Need);
+                }
+                Step::End => return Ok(Step::End),
+            };
+            self.wire_len = self.wire_len.saturating_add(used).min(MAX_LINE);
+            if !self.dropping && self.wire_len >= MAX_LINE {
+                return Ok(self.too_long(used));
+            }
+            if used != 0 {
+                return Ok(Step::Skip(used));
+            }
+            // An interrupted discarded subnegotiation leaves its command unread.
+        }
     }
 }
 
@@ -1590,8 +1689,8 @@ impl Wire for Command {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads one command with CRLF or bare LF. Drops Telnet commands,
-    /// decodes CR NUL as CR, and makes the verb uppercase. Refuses invalid
+    /// Reads one command with CRLF or bare LF outside Telnet controls.
+    /// Drops controls, decodes CR NUL as CR, and makes the verb uppercase. Refuses invalid
     /// verbs, UTF-8, Telnet sequences, or argument text, incomplete lines,
     /// and trailing bytes. Checks [`MAX_LINE`] before trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -2011,7 +2110,6 @@ mod tests {
             (b"US3R x\r\n", Error::Verb),
             (b"\xffABOR\r\n", Error::Text),
             (b"ABOR\xff\r\n", Error::Text),
-            (b"ABOR\xff\xfb\r\n", Error::Text),
             (b"RETR \xff\xff\r\n", Error::Text),
             (b"RETR a\rb\r\n", Error::Text),
             (b"RETR a\r\r\n", Error::Text),
