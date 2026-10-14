@@ -206,10 +206,6 @@ name = "serve_cancellation"
 required-features = ["std"]
 
 [[test]]
-name = "serve_harness"
-required-features = ["std", "tokio", "observe"]
-
-[[test]]
 name = "serve_limits"
 required-features = ["std", "tokio"]
 
