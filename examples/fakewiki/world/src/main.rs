@@ -67,7 +67,6 @@ fn real_main() -> fictionet::Result {
     }
     let socket = args.socket.clone();
 
-    let content = Content::new(args.backend_port);
     let state = json!({
         "variant": variant,
         "hosts": hosts.keys().collect::<BTreeSet<_>>(),
@@ -86,6 +85,7 @@ fn real_main() -> fictionet::Result {
     let result = runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
+            let content = Content::new(&fcx, args.backend_port)?;
             let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys())?;
             serve(&fcx, &hosts, leaves, content, log, attachments)?;
 

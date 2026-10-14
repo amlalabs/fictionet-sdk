@@ -71,10 +71,10 @@ pub fn to_field(v: &Value) -> J {
 }
 
 impl Backend {
-    pub fn new(port: u16) -> Backend {
-        Backend {
-            forward: web::forward(format!("http://127.0.0.1:{port}").parse().unwrap()),
-        }
+    pub fn new(fcx: &fictionet::Cx, port: u16) -> Result<Backend, fictionet::Error> {
+        Ok(Backend {
+            forward: web::forward(fcx, format!("http://127.0.0.1:{port}").parse().unwrap())?,
+        })
     }
 
     async fn serve(
@@ -182,6 +182,19 @@ impl tower_service::Service<Request<Body>> for Backend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn construction_refuses_a_lab() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let error = super::Backend::new(&fcx, 8080).err().unwrap();
+                assert_eq!(error.to_string(), "real I/O is unavailable in a lab run");
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
     #[test]
     fn percent_decoding_undoes_quote() {
         assert_eq!(

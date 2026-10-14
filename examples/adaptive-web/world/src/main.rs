@@ -60,7 +60,6 @@ fn real_main() -> fictionet::Result {
         std::fs::create_dir_all(dir)?;
     }
     let socket = args.socket.clone();
-    let backend = Backend::new(args.backend_port);
     let state = json!({
         "seed": hello["seed"],
         "date": hello["date"],
@@ -87,6 +86,7 @@ fn real_main() -> fictionet::Result {
     let result = runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
+            let backend = Backend::new(&fcx, args.backend_port)?;
             let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
             serve(&fcx, addresses, ca, backend, log, start, attachments)?;
             // The fixed addresses answer from the start, also for an agent

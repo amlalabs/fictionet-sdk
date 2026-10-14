@@ -373,21 +373,30 @@ fn a_lab_moves_between_host_threads() {
 
 #[test]
 fn real_io_is_refused_before_opening_resources() {
-    block_on(lab(Seed::from_u64(1), |cx| async move {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
         assert!(
-            cx.require_real_io()
+            fcx.require_real_io()
                 .unwrap_err()
                 .to_string()
                 .contains("lab")
         );
         #[cfg(feature = "web-proxy")]
-        assert!(
-            fictionet::stdlib::web::proxy(&cx)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("lab")
-        );
+        {
+            assert!(
+                fictionet::stdlib::web::proxy(&fcx)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("lab")
+            );
+            assert!(
+                fictionet::stdlib::web::forward(&fcx, "http://127.0.0.1:8080".parse()?)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("lab")
+            );
+        }
         Ok(())
     }))
     .unwrap();

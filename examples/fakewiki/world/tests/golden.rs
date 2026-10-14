@@ -131,7 +131,14 @@ fn the_log_is_the_recorded_one() {
             move |fcx| async move {
                 let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys()).unwrap();
                 let (attacher, attachments) = fictionet::attachments();
-                serve(&fcx, &hosts, leaves, Content::new(port), log, attachments)?;
+                serve(
+                    &fcx,
+                    &hosts,
+                    leaves,
+                    Content::new(&fcx, port)?,
+                    log,
+                    attachments,
+                )?;
 
                 let end = attacher.attach("agent").unwrap();
                 let m = machine(&fcx, end, ME);

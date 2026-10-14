@@ -21,32 +21,37 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
         conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close, x-private\r\nX-Private: secret\r\nX-Public: kept\r\n\r\nworld").await.unwrap();
         String::from_utf8(received).unwrap()
     });
-    let mut forward = web::forward(format!("http://{address}/ignored").parse().unwrap());
-    let response = forward
-        .call(
-            http::Request::builder()
-                .method("POST")
-                .uri("/path?q=1")
-                .header("host", "site.test")
-                .header("connection", "x-private")
-                .header("x-private", "secret")
-                .header("x-public", "kept")
-                .body(Body::from("hello"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 201);
-    assert_eq!(response.headers()["x-public"], "kept");
-    assert!(!response.headers().contains_key("connection"));
-    assert!(!response.headers().contains_key("x-private"));
-    assert_eq!(
-        response.into_body().collect().await.unwrap().to_bytes(),
-        "world"
-    );
-    let request = server.await.unwrap().to_ascii_lowercase();
-    assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
-    assert!(request.contains("host: site.test\r\n"));
-    assert!(request.contains("x-public: kept\r\n"));
-    assert!(!request.contains("x-private"));
+    fictionet::run(fictionet::Seed::from_u64(1), move |fcx| async move {
+        let mut forward = web::forward(&fcx, format!("http://{address}/ignored").parse()?)?;
+        let response = forward
+            .call(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/path?q=1")
+                    .header("host", "site.test")
+                    .header("connection", "x-private")
+                    .header("x-private", "secret")
+                    .header("x-public", "kept")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.headers()["x-public"], "kept");
+        assert!(!response.headers().contains_key("connection"));
+        assert!(!response.headers().contains_key("x-private"));
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "world"
+        );
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
+        assert!(request.contains("host: site.test\r\n"));
+        assert!(request.contains("x-public: kept\r\n"));
+        assert!(!request.contains("x-private"));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

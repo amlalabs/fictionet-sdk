@@ -1320,7 +1320,7 @@ mod upstream {
     async fn forward_accepts_fallback_hosts_at_its_fixed_origin() {
         let (address, server) = origin().await;
         fictionet::run(Seed::from_u64(0), |fcx| async move {
-            let site = VHost::new(web::forward(format!("http://{address}").parse()?));
+            let site = VHost::new(web::forward(&fcx, format!("http://{address}").parse()?)?);
             let vhosts = VirtualHosts::new();
             vhosts.insert("allowed.test", site.clone());
             vhosts.set_default(site);

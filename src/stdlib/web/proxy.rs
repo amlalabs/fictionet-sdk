@@ -175,11 +175,13 @@ async fn send_upstream(
 /// The origin does not depend on [`Target`], so default-host requests can
 /// be forwarded here even when their routing is [`Routing::Fallback`].
 /// This handler requires a tokio runtime and real host I/O.
-pub fn forward(upstream: http::Uri) -> Forward {
-    Forward {
+/// Returns an error in a lab before constructing a client.
+pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
+    fcx.require_real_io()?;
+    Ok(Forward {
         upstream,
         client: Arc::new(proxy_client()),
-    }
+    })
 }
 
 /// A handler that forwards to one fixed origin.

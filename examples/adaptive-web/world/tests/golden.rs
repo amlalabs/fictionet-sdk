@@ -201,7 +201,7 @@ fn the_log_is_the_recorded_one() {
                     &fcx,
                     addresses,
                     ca,
-                    Backend::new(port),
+                    Backend::new(&fcx, port)?,
                     log,
                     start,
                     attachments,

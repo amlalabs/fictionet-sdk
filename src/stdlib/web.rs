@@ -150,8 +150,9 @@
 //!
 //! Only an exact match to a registered host can be proxied. A request
 //! routed through [`default_host`](Site::default_host) gets `421 Misdirected
-//! Request` before any upstream I/O. Use `web::forward(upstream)` for a
-//! catch-all that forwards to one fixed origin.
+//! Request` before any upstream I/O. Use `web::forward(&fcx, upstream)?` for a
+//! catch-all that forwards to one fixed origin. Both constructors refuse
+//! a lab before constructing a client.
 //!
 //! The certificate for `github.com` lists `github.com` and `*.github.com`
 //! as its names, so it covers `api.github.com` too. A name two levels

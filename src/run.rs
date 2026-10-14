@@ -134,7 +134,7 @@ where
 /// never moves the clock. Attachments fed by [`listen`](crate::listen) fail
 /// the lab on their first `get`, `next` or `map`, before handing out an
 /// attachment, and `get` and `next` return [`Cancelled`](crate::Cancelled).
-/// Observer sessions and `web::proxy` refuse a lab too.
+/// Observer sessions, `web::proxy` and `web::forward` refuse a lab too.
 pub async fn lab<F, Fut>(seed: crate::Seed, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,

@@ -28,10 +28,10 @@ pub struct Content {
 }
 
 impl Content {
-    pub fn new(port: u16) -> Content {
-        Content {
-            forward: web::forward(format!("http://127.0.0.1:{port}").parse().unwrap()),
-        }
+    pub fn new(fcx: &fictionet::Cx, port: u16) -> Result<Content, fictionet::Error> {
+        Ok(Content {
+            forward: web::forward(fcx, format!("http://127.0.0.1:{port}").parse().unwrap())?,
+        })
     }
 
     async fn serve(
@@ -118,5 +118,21 @@ impl tower_service::Service<Request<Body>> for Content {
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         Box::pin(self.clone().serve(request))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn construction_refuses_a_lab() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let error = super::Content::new(&fcx, 8080).err().unwrap();
+                assert_eq!(error.to_string(), "real I/O is unavailable in a lab run");
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 }
