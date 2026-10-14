@@ -55,7 +55,21 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
     $('tree').replaceChildren(el('p', { class: 'placeholder', text: many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.' }));
     $('hex').hidden = true;
     const flips = new Map(members.map((m) => [m.e.id, m.flip]));
-    const source = packetStream(list);
+    const source = packetStream(list, () => {
+      if (packets?.source !== source) return;
+      // A new subscription replays retained history, possibly with restarted
+      // sequence numbers. Replace its state before accepting any replay.
+      packets = { ...packets, rows: 0, held: [], queue: [], skipped: 0, open: members.length };
+      prows.replaceChildren();
+      addGap('Packet history reloaded after reconnect.');
+      $('sampled').hidden = true;
+      $('sampled').textContent = '';
+      $('tree').replaceChildren(el('p', { class: 'placeholder', text: 'Packet history reloaded after reconnect. Select a packet to see its layers.' }));
+      hexState = null;
+      $('hex').hidden = true;
+      $('hex-tabs').replaceChildren();
+      $('hex-dump').replaceChildren();
+    });
     packets = { flips, many, source, rows: 0, paused: false, held: [], queue: [], skipped: 0, open: members.length };
     source.addEventListener('packet', (ev) => {
       const p = JSON.parse(ev.data);
@@ -169,14 +183,17 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
 
   async function showPacket(p, tr) {
     if (!packets) return;
+    const history = packets;
     for (const r of prows.querySelectorAll('tr.on')) r.classList.remove('on');
     tr.classList.add('on');
     const res = await packet(p);
+    if (packets !== history) return;
     if (!res.ok) {
       $('tree').replaceChildren(el('p', { class: 'placeholder', text: 'This packet is no longer kept. The dashboard keeps the last 4,096 packets of a link.' }));
       return;
     }
     const d = await res.json();
+    if (packets !== history) return;
     d.side = p.side;
     renderDetail(d);
   }

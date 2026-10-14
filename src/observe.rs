@@ -61,6 +61,9 @@
 //! summary, as in Wireshark. Select one to see its layers, and its bytes
 //! with the selected field marked. **Capture for Wireshark** downloads the
 //! packets shown as a pcapng file.
+//! If the packet stream reconnects, the list reloads retained history. It
+//! clears old rows, pending packets, sampling totals and the selected detail.
+//! A paused list stays paused and holds the replay until resumed.
 //!
 //! The dashboard is a separate program from the world. `fictionet
 //! dashboard` serves a web page, built into the binary, and carries the

@@ -34,8 +34,14 @@ export function createTransport({ state, setStatus, tick, snapshot, upsertGroup,
     };
   }
 
-  function packetStream(list) {
-    return new EventSource(`api/packets?link=${list}`);
+  function packetStream(list, reconnected = () => {}) {
+    const source = new EventSource(`api/packets?link=${list}`);
+    let opened = false;
+    source.addEventListener('open', () => {
+      if (opened) reconnected();
+      opened = true;
+    });
+    return source;
   }
 
   function packet(p) {

@@ -495,6 +495,12 @@ Discard a sample if
 
 ## 6. The dashboard
 
+When a packet stream reconnects, the dashboard reloads retained history and
+shows a reload notice. It clears old rows, pending and paused packets,
+sampling totals and the selected detail before replay. A paused view stays
+paused until resumed. This also applies to merged links and captures whose
+packet numbering restarts.
+
 The dashboard serves one HTTP/1.0 or HTTP/1.1 GET request per connection.
 The target must be a path starting with `/`. The head may be at most 16 KiB,
 including the first `\r\n\r\n`. Bytes after it cannot supply headers or another
