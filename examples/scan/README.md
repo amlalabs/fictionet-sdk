@@ -62,9 +62,10 @@ group too.
   `127.0.0.1:7880` only (`SCAN_DASHBOARD_PORT` picks another port). Its
   token file is mounted only in the dashboard container.
 
-Open `http://127.0.0.1:7880/login?token=<token>` once, using the token
-from the file below. It sets a session cookie for the dashboard. Restart
-the dashboard to sign in again. Keep the token outside the sandboxes.
+Open `http://127.0.0.1:7880/#token=<token>` once, using the token
+from the file below. The page removes the fragment and stores the token for
+this origin and tab. Log out or close the tab to clear it. Restart the
+dashboard to sign in again. Keep the token outside the sandboxes.
 
 From this folder:
 

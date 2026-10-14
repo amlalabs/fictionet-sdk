@@ -153,7 +153,7 @@ $ target/release/fictionet dashboard --token-file /tmp/goad-dashboard-token \
     --listen 127.0.0.1:7878
 ```
 
-Open `http://127.0.0.1:7878/login?token=<token>` once, replacing `<token>`
+Open `http://127.0.0.1:7878/#token=<token>` once, replacing `<token>`
 with the token file’s contents. Keep the file outside the attacker sandbox.
 
 This example consumes provisioned Windows disks. It includes no QEMU-based

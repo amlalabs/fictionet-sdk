@@ -18,7 +18,6 @@ pub(crate) struct Request {
     pub(crate) fetch_site: Option<String>,
     pub(crate) origin: Option<String>,
     pub(super) authorization: Option<String>,
-    pub(super) cookie: Option<String>,
 }
 
 pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
@@ -64,6 +63,7 @@ pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
         let v = trim_ows_str(v);
         let field = match k.to_ascii_lowercase().as_str() {
             "authorization" => &mut authorization,
+            // Cookies never authenticate; retain this only to reject duplicates.
             "cookie" => &mut cookie,
             "host" => &mut host,
             "sec-fetch-site" => &mut fetch_site,
@@ -89,7 +89,6 @@ pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
         fetch_site,
         origin,
         authorization,
-        cookie,
     })
 }
 
@@ -206,7 +205,6 @@ mod tests {
             assert_eq!(req.origin.as_deref(), Some("http://evil.example"));
             assert_eq!(req.fetch_site.as_deref(), Some("cross-site"));
             assert!(req.authorization.is_none());
-            assert!(req.cookie.is_none());
             for split in 0..=wire.len() {
                 let mut input = (&wire[..split]).chain(&wire[split..]);
                 let result = read_head(Instant::now() + Duration::from_secs(10), |_, chunk| {
@@ -339,6 +337,7 @@ mod tests {
         assert!(!same_site(&req("Sec-Fetch-Site: cross-site\r\n")));
         assert!(!same_site(&req("Sec-Fetch-Site: same-site\r\n")));
         assert!(!same_site(&req("Origin: https://evil.example\r\n")));
+        assert!(!same_site(&req("Origin: http://127.0.0.1:9000\r\n")));
     }
 
     #[test]

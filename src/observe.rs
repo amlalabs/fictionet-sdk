@@ -18,13 +18,28 @@
 //! fictionet dashboard: serving the world at /run/fictionet/world.sock on http://127.0.0.1:7878/
 //! ```
 //!
-//! Open `http://127.0.0.1:7878/login?token=<token>` with the file's token.
-//! Percent-encode the token if it contains URL punctuation. This URL works
-//! once per dashboard process and sets an HttpOnly, SameSite=Strict cookie.
-//! The browser then uses that cookie for the app, streams and downloads.
-//! Restart the dashboard to sign in again. Scripts can send
-//! `Authorization: Bearer <token>` instead. All requests, including
-//! `/api/keylog` from loopback, require authentication.
+//! Open `http://127.0.0.1:7878/#token=<token>` with the file's token.
+//! Percent-encode URL punctuation. The page immediately removes the fragment,
+//! then calls `/api/bootstrap` with `Authorization: Bearer <token>`. Bootstrap
+//! succeeds once per dashboard process. It sets no cookie. After success the
+//! browser keeps the token in `sessionStorage`, scoped to this origin and tab.
+//! Reloads keep the session. Opening the bootstrap URL again in the same tab
+//! also removes the fragment and keeps the session if the stored token matches.
+//! Log out or close the tab to clear it; restart the dashboard to use an already
+//! used bootstrap URL again. Logout cancels active requests and streams.
+//! It does not revoke the file token for scripts or other signed-in tabs.
+//!
+//! The static app shell is public, contains no world data and expires the old
+//! authentication cookie when a browser upgrades. Every API call,
+//! stream and download requires `Authorization: Bearer <token>`, including
+//! `/api/keylog` from loopback. Cookies and query tokens cannot authenticate.
+//! The browser uses fetch for these requests, omits cookies, refuses redirects,
+//! and sends credentials only to fixed API paths at its own origin. A service
+//! on another port of the hostname receives no dashboard credential. Scripts
+//! can use the same bearer header directly. The old `/login?token=...` cookie
+//! login is no longer supported.
+//! An authorization failure stops requests, clears the stored token and closes
+//! the packet drawer. After signing in again, reopen it to start a new stream.
 //!
 //! The dashboard serves one request per connection. It accepts HTTP/1.0 and
 //! HTTP/1.1 GET requests with a path starting with `/`. The request head is

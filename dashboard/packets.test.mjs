@@ -3,7 +3,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPackets } from './packets.mjs';
-import { createTransport } from './transport.mjs';
 import { $, el } from './dom.mjs';
 
 class Element extends EventTarget {
@@ -82,17 +81,29 @@ function setup(t, links = ['a'], maxRows = 3000) {
     close() { this.closed = true; }
   }
   const requests = [];
-  const transport = createTransport({}, {
-    EventSource,
-    fetch: (url, { signal }) => new Promise((resolve, reject) => requests.push({ url, signal, resolve, reject })),
-  });
+  const downloads = [];
+  let downloadError;
+  const transport = {
+    packetStream(list, reconnected) {
+      const source = new EventSource(`api/packets?link=${list}`);
+      let opened = false;
+      source.addEventListener('open', () => {
+        if (opened) reconnected();
+        opened = true;
+      });
+      return source;
+    },
+    packet: (p, signal) => new Promise((resolve, reject) => requests.push({ url: `api/packet?link=${p.link}&seq=${p.seq}`, signal, resolve, reject })),
+    download: async (...args) => { downloads.push(args); if (downloadError) throw downloadError; },
+  };
   const view = createPackets({ $, el, ...transport, fmtCount: String, fit() {}, maxRows });
   const open = () => view.openLinks('From', 'To', links.map((id) => ({ e: { id }, flip: false })));
   open();
   const source = sources[0];
   source.emit('open');
   return {
-    view, source, sources, requests, open,
+    view, source, sources, requests, downloads, open,
+    failDownload(error) { downloadError = error; },
     flush() { now += 401; view.flush(); },
     rows: () => $('prows').children.filter((r) => !r.classList.contains('gap')),
     send(seq, { link = links[0], skipped = 2, ...rest } = {}) {
@@ -422,4 +433,25 @@ test('a closed stream reopening cannot reset a different drawer', (t) => {
   assert.doesNotMatch($('tree').textContent, /reloaded/);
   h.source.emit('open');
   assert.doesNotMatch($('tree').textContent, /reloaded/);
+});
+
+test('capture downloads use the transport for the current links', (t) => {
+  const h = setup(t, ['a', 'b']);
+  $('pcap').click();
+  assert.deepEqual(h.downloads, [['pcap', 'a,b']]);
+  h.view.close();
+  $('pcap').click();
+  assert.equal(h.downloads.length, 1);
+});
+
+test('a successful capture download clears the previous failure label', async (t) => {
+  const h = setup(t);
+  h.failDownload(new Error('Download unavailable'));
+  $('pcap').click();
+  await settle();
+  assert.equal($('pcap-label').textContent, 'Download failed. Try again.');
+  h.failDownload(null);
+  $('pcap').click();
+  await settle();
+  assert.equal($('pcap-label').textContent, 'Capture for Wireshark');
 });

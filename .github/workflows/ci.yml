@@ -55,6 +55,8 @@ jobs:
         run: cargo build --locked --workspace --all-targets ${{ matrix.features }}
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Use the runner's Chrome for the dashboard regression
+        run: echo "CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
       - name: Test
         run: cargo nextest run --locked --workspace ${{ matrix.features }}
       - name: Doctests

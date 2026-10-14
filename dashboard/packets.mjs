@@ -1,6 +1,6 @@
 // The packet drawer: its stream, queue, selection, detail and hex view.
 // The caller passes DOM helpers, graph links, labels and orientation, and a fit callback.
-export function createPackets({ $, el, packetStream, packet, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000 }) {
+export function createPackets({ $, el, packetStream, packet, download, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000 }) {
   // ---------------------------------------------------------------------------
   // The packet drawer
 
@@ -49,8 +49,7 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
     $('dir-a').textContent = `${fromName} → ${toName}`;
     $('dir-b').textContent = `${toName} → ${fromName}`;
     const list = members.map((m) => m.e.id).join(',');
-    $('pcap').href = `api/pcap?link=${list}`;
-    $('pcap').setAttribute('download', many ? 'fictionet-links.pcapng' : `fictionet-${list}.pcapng`);
+    $('pcap-label').textContent = 'Capture for Wireshark';
     $('pause').textContent = 'Pause';
     $('sampled').hidden = true;
     $('sampled').textContent = '';
@@ -69,7 +68,7 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
       $('sampled').textContent = '';
       clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
     });
-    packets = { flips, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length };
+    packets = { list, flips, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length };
     source.addEventListener('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
@@ -124,6 +123,16 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
   $('close-drawer').addEventListener('click', () => {
     closePackets();
     fit();
+  });
+  $('pcap').addEventListener('click', async () => {
+    if (!packets) return;
+    const current = packets;
+    try {
+      await download('pcap', current.list);
+      if (packets === current) $('pcap-label').textContent = 'Capture for Wireshark';
+    } catch {
+      if (packets === current) $('pcap-label').textContent = 'Download failed. Try again.';
+    }
   });
   $('pause').addEventListener('click', () => {
     if (!packets) return;

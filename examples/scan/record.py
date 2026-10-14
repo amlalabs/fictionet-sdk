@@ -203,8 +203,8 @@ async def main():
         page = await context.new_page()
         page.on("pageerror", lambda e: print("page error:", e, file=sys.stderr))
         token = Path(os.environ["SCAN_DASHBOARD_TOKEN_FILE"]).read_text().strip()
-        await page.goto(URL + "login?token=" + urllib.parse.quote(token, safe=""))
-        await page.goto(URL + "?theme=light")
+        await page.goto(URL + "?theme=light#token=" + urllib.parse.quote(token, safe=""))
+        await page.wait_for_function("sessionStorage.getItem('fictionet_token') !== null")
         # A fresh layout: no places or open groups from an earlier visit.
         await page.evaluate("() => localStorage.clear()")
         await page.reload()

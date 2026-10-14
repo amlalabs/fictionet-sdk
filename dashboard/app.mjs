@@ -32,7 +32,11 @@ const view = {
 
 const graph = createState({ view, setStatus, loadLayout, pulse });
 const { state, runTime } = graph;
-const { connect, packetStream, packet } = createTransport({ ...graph, setStatus });
+let packetView;
+const { connect, packetStream, packet, download, logout, close } = createTransport({ ...graph, setStatus, onLogout: () => packetView?.close() });
+$('logout').addEventListener('click', () => { logout(); location.reload(); });
+addEventListener('pagehide', close);
+addEventListener('pageshow', (event) => { if (event.persisted) location.reload(); });
 
 function fmtDuration(s) {
   s = Math.max(0, Math.floor(s));
@@ -1786,10 +1790,11 @@ function renderSide() {
   side.replaceChildren(...out);
 }
 
-const { open: openPackets, openLinks, flush: flushPackets } = createPackets({
-  $, el, packetStream, packet, getEdge: (id) => view.dedges.get(id), ends, nodeLabel, fmtCount,
+packetView = createPackets({
+  $, el, packetStream, packet, download, getEdge: (id) => view.dedges.get(id), ends, nodeLabel, fmtCount,
   fit: () => { if (!state.userMoved) fit(); },
 });
+const { open: openPackets, openLinks, flush: flushPackets } = packetView;
 
 // ---------------------------------------------------------------------------
 // Theme: the system's, until the viewer picks one.

@@ -23,6 +23,7 @@
       <span><b id="stat-rate">0</b> packets/s</span>
     </div>
     <div class="grow"></div>
+    <button class="button" id="logout" type="button">Log out</button>
     <label class="search">
       <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.4 10.4 3.4 3.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
       <input id="search" type="search" placeholder="Find a task, sandbox or route" aria-label="Find a task, sandbox or route" autocomplete="off">
@@ -69,10 +70,10 @@
       <div class="grow"></div>
       <input id="pfilter" type="search" placeholder="Filter: dns, 10.0.0.2, GET" aria-label="Filter packets" autocomplete="off">
       <button class="button" id="pause" type="button">Pause</button>
-      <a class="button" id="pcap" download>
+      <button class="button" id="pcap" type="button">
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m0 0L5 7m3 3 3-3M3 13h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Capture for Wireshark
-      </a>
+        <span id="pcap-label">Capture for Wireshark</span>
+      </button>
       <button class="icon-button" id="close-drawer" type="button" aria-label="Close the packet view">
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
       </button>

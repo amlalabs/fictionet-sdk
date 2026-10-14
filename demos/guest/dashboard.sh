@@ -59,7 +59,7 @@ note "or not anyone watches. The watch request shows the latest, then each new o
 vm "{ timeout 4 fictionet observe --world unix:/run/fictionet/world.sock watch || true; } | jq -c 'select(.event == \"event\") | .data | {source, kind, summary}' | sed -n 1,4p"
 
 step "Open the dashboard"
-printf '\n    %shttp://127.0.0.1:%s/login?token=%s%s\n\n' "$bold" "$host_port" "$token" "$reset"
+printf '\n    %shttp://127.0.0.1:%s/#token=%s%s\n\n' "$bold" "$host_port" "$token" "$reset"
 if [[ -z $seconds && -t 0 ]]; then
     note "The sandbox keeps making requests while you look. Press Enter to stop."
     read -r _

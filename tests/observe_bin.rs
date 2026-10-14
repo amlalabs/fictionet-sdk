@@ -375,8 +375,24 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
         .unwrap();
 
     std::fs::remove_file(&token_file).unwrap();
-    for route in ["/", "/api/keylog", "/api/graph", "/api/watch", "/api/pcap"] {
+    for route in [
+        "/api/keylog",
+        "/api/graph",
+        "/api/watch",
+        "/api/packets?link=e1",
+        "/api/packet?link=e1&seq=1",
+        "/api/pcap",
+        "/api/bootstrap",
+    ] {
         assert!(raw_get(port, route, "").starts_with("HTTP/1.1 401"));
+        assert!(
+            raw_get(
+                port,
+                route,
+                "Cookie: fictionet_token=dashboard-test-token\r\n"
+            )
+            .starts_with("HTTP/1.1 401")
+        );
         assert!(
             raw_get(port, route, "Authorization: Bearer wrong\r\n").starts_with("HTTP/1.1 401")
         );
@@ -408,25 +424,46 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
             assert_eq!(response.matches("HTTP/1.1 ").count(), 1);
         }
     }
-    assert!(raw_get(port, "/login?token=wrong", "").starts_with("HTTP/1.1 401"));
-    let login = raw_get(port, "/login?token=dashboard-test-token", "");
-    assert!(login.starts_with("HTTP/1.1 303"), "{login}");
-    assert!(login.contains("HttpOnly; SameSite=Strict"));
-    assert!(login.contains("Location: /\r\n"));
-    let cookie = login
-        .lines()
-        .find_map(|line| line.strip_prefix("Set-Cookie: "))
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap();
+    for route in ["/", "/index.html", "/app.mjs", "/transport.mjs", "/app.css"] {
+        let shell = raw_get(port, route, "");
+        assert!(shell.starts_with("HTTP/1.1 200"), "{shell}");
+        if matches!(route, "/" | "/index.html") {
+            assert!(shell.contains("Set-Cookie: fictionet_token=; Path=/; Max-Age=0;"));
+        } else {
+            assert!(!shell.contains("Set-Cookie:"));
+        }
+        assert!(!shell.contains("dashboard-test-token"));
+    }
     assert!(
-        raw_get(port, "/api/keylog", &format!("Cookie: {cookie}\r\n")).starts_with("HTTP/1.1 200")
+        raw_get(port, "/api/bootstrap?token=dashboard-test-token", "").starts_with("HTTP/1.1 401")
+    );
+    let bootstrap = raw_get(
+        port,
+        "/api/bootstrap",
+        "Authorization: Bearer dashboard-test-token\r\n",
+    );
+    assert!(bootstrap.starts_with("HTTP/1.1 204"), "{bootstrap}");
+    assert!(!bootstrap.contains("Set-Cookie:"));
+    assert!(!bootstrap.contains("dashboard-test-token"));
+    assert!(
+        raw_get(
+            port,
+            "/api/bootstrap",
+            "Authorization: Bearer dashboard-test-token\r\n"
+        )
+        .starts_with("HTTP/1.1 401")
     );
     assert!(raw_get(port, "/login?token=dashboard-test-token", "").starts_with("HTTP/1.1 401"));
+    // Another port on the same host is a different browser origin.
     assert!(
-        raw_get(port, "/api/keylog", "Cookie: fictionet_token=wrong\r\n")
-            .starts_with("HTTP/1.1 401")
+        raw_request(
+            port,
+            &format!(
+                "GET /api/keylog HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer dashboard-test-token\r\nOrigin: http://127.0.0.1:{}\r\n\r\n",
+                if port == 9000 { 9001 } else { 9000 }
+            )
+        )
+        .starts_with("HTTP/1.1 403")
     );
     assert!(
         raw_get(
@@ -453,7 +490,7 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    write!(conn, "GET /api/watch HTTP/1.1\r\nHost: localhost\r\nCookie: fictionet_token=dashboard-test-token\r\n\r\n").unwrap();
+    write!(conn, "GET /api/watch HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer dashboard-test-token\r\n\r\n").unwrap();
     let mut events = BufReader::new(conn);
     let mut seen = Vec::new();
     while seen.len() < 4 {

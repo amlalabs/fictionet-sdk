@@ -618,6 +618,27 @@ Discard a sample if
 
 ## 6. The dashboard
 
+Open `/#token=<URL-encoded-token>` on the dashboard's origin to sign in.
+The page removes the fragment immediately, then sends the token in a bearer
+header to `/api/bootstrap`. Bootstrap succeeds once per dashboard process.
+The browser stores the token in `sessionStorage` for this origin and tab.
+Reloading keeps it. Opening the bootstrap URL again in the same tab also
+removes the fragment and keeps the session if the stored token matches.
+Log out or close the tab to clear it; restart the dashboard to use an already
+used bootstrap URL again. Logout cancels requests and streams but does not
+revoke the file token for scripts or other signed-in tabs.
+
+The static shell is public and contains no world data. It expires the old
+authentication cookie when a browser upgrades. All API calls, streams
+and downloads require `Authorization: Bearer <token>`. Cookie authorization
+and `/login?token=...` are no longer supported. The browser uses authenticated
+fetch, omits cookies and refuses redirects. It only sends credentials to fixed
+API paths at its own origin. Another service on the same hostname at a
+different port receives no dashboard credentials. Stream reconnects send the
+bearer header again. An authorization failure stops requests, clears the
+stored token and closes the packet drawer. After signing in again, reopen
+the drawer to start a new packet stream.
+
 Selecting a packet clears the previous layers and bytes while it loads.
 Only the current selection can fill them. Closing or reopening the drawer,
 or reconnecting its stream, cancels pending detail requests. If a packet is

@@ -44,9 +44,12 @@ http://127.0.0.1:7878/ (or --listen). It connects to the world socket as an
 observer, so the world needs no flag of its own.
 
 The dashboard shows everything the world carries, decrypted TLS included.
-The token file is required. Open /login?token=<URL-encoded-token> once to
-set an HttpOnly session cookie, or send Authorization: Bearer <token>.
-Restart the dashboard to use the login URL again. Keep the token outside
+The token file is required. Open /#token=<URL-encoded-token> once to sign in.
+The page removes the fragment and stores the token for this origin and tab.
+API calls, streams and downloads send Authorization: Bearer <token>.
+Cookies do not authenticate; the app shell expires the old login cookie.
+Log out or close the tab to clear the stored token.
+Restart the dashboard to use the bootstrap URL again. Keep the token outside
 the sandbox. Use loopback or a trusted TLS tunnel; HTTP carries the token
 in plaintext. Every container in a Kubernetes pod shares loopback, so
 127.0.0.1 does not keep an agent in that pod away from the dashboard.";
@@ -113,7 +116,7 @@ pub(crate) fn main(args: &[String]) -> i32 {
     let path: Arc<str> = path.into();
     let auth = Arc::new(Auth {
         token,
-        login_used: AtomicBool::new(false),
+        bootstrap_used: AtomicBool::new(false),
     });
     let connections = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
@@ -187,25 +190,27 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
             "",
         );
     }
-    if req.path == "/login" {
-        if let Some(cookie) = auth.login(&req) {
-            return respond(
+    if let Some((kind, body)) = assets::lookup(req.path.as_str()) {
+        // Remove the old port-wide credential when an existing browser upgrades.
+        let extra = if matches!(req.path.as_str(), "/" | "/index.html") {
+            "Set-Cookie: fictionet_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n"
+        } else {
+            ""
+        };
+        return respond(&mut conn, "200 OK", kind, body.as_bytes(), extra);
+    }
+    if req.path == "/api/bootstrap" {
+        return if auth.bootstrap(&req) {
+            respond(&mut conn, "204 No Content", text, b"", "")
+        } else {
+            respond(
                 &mut conn,
-                "303 See Other",
+                "401 Unauthorized",
                 text,
-                b"",
-                &format!(
-                    "Location: /\r\nSet-Cookie: fictionet_token={cookie}; Path=/; HttpOnly; SameSite=Strict\r\n"
-                ),
-            );
-        }
-        return respond(
-            &mut conn,
-            "401 Unauthorized",
-            text,
-            b"invalid or used login URL\n",
-            "",
-        );
+                b"invalid or used bootstrap\n",
+                "WWW-Authenticate: Bearer\r\n",
+            )
+        };
     }
     if !auth.allows(&req) {
         return respond(
@@ -215,9 +220,6 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
             b"dashboard token required\n",
             "WWW-Authenticate: Bearer\r\n",
         );
-    }
-    if let Some((kind, body)) = assets::lookup(req.path.as_str()) {
-        return respond(&mut conn, "200 OK", kind, body.as_bytes(), "");
     }
     match req.path.strip_prefix("/api/") {
         Some(op) if !op.is_empty() && op.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') => {
