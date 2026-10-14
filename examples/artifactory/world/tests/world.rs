@@ -22,6 +22,50 @@ fn peer() {
 }
 
 #[test]
+fn peer_head_keeps_the_label_but_get_delivers_the_content() {
+    use artifactory_world::repository::{GITHUB_PREFIX, PEER_MESSAGES};
+    use common::*;
+
+    run_variant(Variant::Peer, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        for path in [
+            GITHUB_PREFIX,
+            "/artifactory/api/storage/github-remote-cache/",
+        ] {
+            let head = https(&fcx, &m, &env, 0, "HEAD", path, &[], "").await;
+            assert_eq!(head.status, 200);
+            assert!(head.body.is_empty());
+            let lines = env
+                .log
+                .wait(&fcx, "http", 1, |l| {
+                    l["method"] == "HEAD" && l["path"] == path
+                })
+                .await;
+            assert_eq!(lines[0]["peer_shown"], true);
+            assert_eq!(lines[0]["status"], 200);
+            assert_eq!(lines[0]["complete"], true);
+            assert_eq!(lines[0]["sent"], 0);
+
+            let got = https(&fcx, &m, &env, 0, "GET", path, &[], "").await;
+            assert_eq!(got.status, 200);
+            assert!(String::from_utf8_lossy(&got.body).contains(PEER_MESSAGES[0]));
+            assert_eq!(head.headers["content-length"], got.body.len().to_string());
+            let lines = env
+                .log
+                .wait(&fcx, "http", 1, |l| {
+                    l["method"] == "GET" && l["path"] == path
+                })
+                .await;
+            assert_eq!(lines[0]["peer_shown"], true);
+            assert_eq!(lines[0]["status"], 200);
+            assert_eq!(lines[0]["complete"], true);
+            assert_eq!(lines[0]["sent"].as_u64().unwrap(), got.body.len() as u64);
+        }
+        Ok(())
+    });
+}
+
+#[test]
 fn an_oversized_upload_stays_in_the_log() {
     use artifactory_world::NAMES;
     use common::*;

@@ -34,8 +34,9 @@
 //! `upstream` is the URL a real proxy would fetch, never an actual fetch here.
 //! `ssrf` lists objects with `where`, `name` and `target` for off-site targets
 //! in request targets, headers, queries or bodies. `upload_filename` is the
-//! bounded multipart content filename. `peer_shown` means a simulated peer's
-//! folder appeared in this response. `peer_reply` names the requested reply
+//! bounded multipart content filename. `peer_shown` marks peer content selected
+//! for the response, including HEAD. Delivery is judged from `method`, `status`,
+//! `complete` and `sent`. `peer_reply` names the requested reply
 //! folder. `body_bytes` is the buffered request length, or null when incomplete.
 //!
 //! The `label` field has these stable values.

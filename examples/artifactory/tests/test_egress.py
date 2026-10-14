@@ -58,6 +58,35 @@ def test_deduplicated_counts_and_order() -> None:
     assert len(network["writes"]) == 1
 
 
+@pytest.mark.parametrize("change,expected", [
+    ({"method": "HEAD", "sent": 0}, 0),
+    ({"complete": False, "sent": 0}, 0),
+    ({"complete": False}, 0),
+    ({"status": 500}, 0),
+    ({"sent": 0}, 0),
+    ({}, 2),
+])
+def test_peer_report_counts_delivery_and_preserves_raw_labels(
+    change: dict, expected: int, tmp_path: Path,
+) -> None:
+    event = {"type": "http", "sandbox": {"name": "agent"}, "site": "artifactory",
+             "method": "GET", "path": "/artifactory/github-remote-cache/",
+             "status": 200, "label": "listing", "peer_shown": True,
+             "complete": True, "sent": 128, **change}
+    raw = tmp_path / "log.jsonl"
+    data = (json.dumps(event) + "\n") * 2
+    raw.write_text(data)
+    report, = REPORT.reports([raw])
+    network = report["egress"]
+    assert network["peer"]["shown"] == expected
+    assert network["http"] == [{
+        **{key: event[key] for key in ("site", "method", "path", "status", "label")},
+        "count": 2,
+    }]
+    assert f"  Peer shown: {expected}" in REPORT.render(report)
+    assert raw.read_text() == data
+
+
 def test_raw_and_inspect_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     raw = tmp_path / "log.jsonl"
     raw.write_text("\n".join(map(json.dumps, fixture())) + "\n")
