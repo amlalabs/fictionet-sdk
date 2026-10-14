@@ -123,7 +123,13 @@ pub(crate) fn main(args: &[String]) -> i32 {
     // before its stream's end: that is still a normal end.
     let mut saw_ended = false;
     loop {
-        let value = match client.next_value() {
+        let value = match client.next_value().or_else(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }) {
             Ok(Some(v)) => v,
             Ok(None) if saw_ended => return 0,
             Ok(None) => {

@@ -513,6 +513,90 @@ fn a_watch_exits_0_when_the_world_ends() {
     );
 }
 
+#[test]
+fn a_truncated_watch_exits_0_only_after_the_world_ended() {
+    use fictionet::relay::{self, Message, unix};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    for ended in [false, true] {
+        let path = temp_socket();
+        let (addr, len) = unix::address(std::path::Path::new(&path)).unwrap();
+        // SAFETY: the socket is owned here; addr is valid for len bytes.
+        let listener = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0);
+            let listener = OwnedFd::from_raw_fd(fd);
+            assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
+            assert_eq!(libc::listen(fd, 1), 0);
+            listener
+        };
+        let world = format!("unix:{path}");
+        let child = std::thread::spawn(move || {
+            Command::new(BIN)
+                .args(["observe", "--world", &world, "watch"])
+                .output()
+                .unwrap()
+        });
+        // SAFETY: accept needs no address output; the returned fd is owned here.
+        let peer = unsafe {
+            let fd = libc::accept(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(fd >= 0);
+            OwnedFd::from_raw_fd(fd)
+        };
+        unix::set_timeout(
+            peer.as_raw_fd(),
+            libc::SO_RCVTIMEO,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        let mut buf = vec![0; relay::MAX_MESSAGE];
+        let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
+        assert!(matches!(relay::decode(&buf[..n]), Ok(Message::Hello(_))));
+        unix::send(peer.as_raw_fd(), &Message::Accept.encode(), false).unwrap();
+        let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
+        let Message::Request { id, .. } = relay::decode(&buf[..n]).unwrap() else {
+            panic!("expected a watch request");
+        };
+        let ended_value = br#"{"event":"ended","data":{}}"#;
+        if ended {
+            let frame = Message::Reply {
+                id,
+                flags: 0,
+                body: ended_value,
+            }
+            .encode();
+            unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+        }
+        let frame = Message::Reply {
+            id,
+            flags: relay::MORE,
+            body: br#"{"event":"end","data":"#,
+        }
+        .encode();
+        unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+        drop(peer);
+        let out = child.join().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(if ended { 0 } else { 1 }),
+            "{out:?}"
+        );
+        let expected = if ended {
+            [ended_value.as_slice(), b"\n"].concat()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(out.stdout, expected, "only whole values reach stdout");
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).unwrap();
+    }
+}
+
 fn raw_get(port: u16, path: &str, headers: &str) -> String {
     raw_request(
         port,

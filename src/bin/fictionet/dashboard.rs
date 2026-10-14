@@ -295,7 +295,14 @@ fn api(world: &str, mut conn: TcpStream, op: &str, query: &[(String, String)]) -
         return stream(client, conn);
     }
     client.set_timeout(Some(Duration::from_secs(30)))?;
-    let Some(value) = client.next_value()? else {
+    let Some(value) = client.next_value().or_else(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(None)
+        } else {
+            Err(e)
+        }
+    })?
+    else {
         return respond(
             &mut conn,
             "502 Bad Gateway",
@@ -425,6 +432,7 @@ fn stream_merged(
                 }
             }
             Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e)
                 if matches!(
                     e.kind(),
@@ -498,7 +506,13 @@ fn stream(mut client: Client, conn: TcpStream) -> io::Result<()> {
     // even when the world has nothing to say.
     client.set_timeout(Some(Duration::from_secs(5)))?;
     loop {
-        match client.next_value() {
+        match client.next_value().or_else(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }) {
             Ok(Some(value)) => {
                 match split_event(&value.bytes) {
                     Some((name, data)) => write!(out, "event: {name}\ndata: {data}\n\n")?,

@@ -415,6 +415,7 @@ pub mod observer {
         fd: OwnedFd,
         next_id: u32,
         buf: Vec<u8>,
+        partial: Option<Value>,
     }
 
     /// One whole value of a reply: its chunks joined.
@@ -462,6 +463,7 @@ pub mod observer {
                 fd,
                 next_id: 1,
                 buf: vec![0; MAX_MESSAGE + 1],
+                partial: None,
             };
             let n = unix::recv(client.fd.as_raw_fd(), &mut client.buf, false)
                 .map_err(handshake_error)?;
@@ -500,13 +502,27 @@ pub mod observer {
         }
 
         /// Waits for the next whole value, of any request. `None` once the
-        /// world has closed the session. A malformed, oversized or truncated
-        /// reply shuts down the session and returns `InvalidData`.
+        /// world has closed the session between values. `WouldBlock` and
+        /// `TimedOut` preserve partial values for the next call. EOF during a
+        /// value returns `UnexpectedEof`. A malformed or oversized reply,
+        /// invalid flags, or a continuation with a different id or binary flag
+        /// shuts down the session and returns `InvalidData`.
         pub fn next_value(&mut self) -> io::Result<Option<Value>> {
-            let mut value: Option<Value> = None;
             loop {
-                let n = unix::recv(self.fd.as_raw_fd(), &mut self.buf, false)?;
+                let n = match unix::recv(self.fd.as_raw_fd(), &mut self.buf, false) {
+                    Ok(n) => n,
+                    Err(error) => {
+                        if !matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) {
+                            self.partial = None;
+                        }
+                        return Err(error);
+                    }
+                };
                 if n > MAX_MESSAGE {
+                    self.partial = None;
                     unix::shutdown(self.fd.as_raw_fd());
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -514,23 +530,44 @@ pub mod observer {
                     ));
                 }
                 if n == 0 {
+                    if self.partial.take().is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "the world closed during a reply value",
+                        ));
+                    }
                     return Ok(None);
                 }
                 let Ok(Message::Reply { id, flags, body }) = decode(&self.buf[..n]) else {
+                    self.partial = None;
                     unix::shutdown(self.fd.as_raw_fd());
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "not a reply"));
                 };
-                let v = value.get_or_insert_with(|| Value {
+                let binary = flags & BINARY != 0;
+                if flags & !(MORE | END | BINARY) != 0
+                    || flags & (MORE | END) == MORE | END
+                    || self
+                        .partial
+                        .as_ref()
+                        .is_some_and(|v| v.id != id || v.binary != binary)
+                {
+                    self.partial = None;
+                    unix::shutdown(self.fd.as_raw_fd());
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid reply flags or continuation",
+                    ));
+                }
+                let v = self.partial.get_or_insert_with(|| Value {
                     id,
                     bytes: Vec::new(),
-                    binary: false,
+                    binary,
                     end: false,
                 });
                 v.bytes.extend_from_slice(body);
-                v.binary = flags & BINARY != 0;
                 v.end = flags & END != 0;
                 if flags & MORE == 0 {
-                    return Ok(value);
+                    return Ok(self.partial.take());
                 }
             }
         }

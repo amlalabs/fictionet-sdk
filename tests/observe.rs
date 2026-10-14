@@ -90,6 +90,130 @@ fn observer_accepts_a_reply_at_the_message_limit() {
 }
 
 #[test]
+fn observer_resumes_partial_values_after_receive_timeouts() {
+    for binary in [0, relay::BINARY] {
+        for end in [0, relay::END] {
+            let (client, peer) = observer_peer(&Message::Accept.encode());
+            let mut client = client.unwrap();
+            client.set_timeout(Some(Duration::from_millis(20))).unwrap();
+            for body in [b"first".as_slice(), b" middle"] {
+                let frame = Message::Reply {
+                    id: 7,
+                    flags: binary | relay::MORE,
+                    body,
+                }
+                .encode();
+                unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+                for _ in 0..2 {
+                    assert!(matches!(
+                        client.next_value().unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ));
+                }
+            }
+            let frame = Message::Reply {
+                id: 7,
+                flags: binary | end,
+                body: b" last",
+            }
+            .encode();
+            unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+            let value = client.next_value().unwrap().unwrap();
+            assert_eq!(value.id, 7);
+            assert_eq!(value.bytes, b"first middle last");
+            assert_eq!(value.binary, binary != 0);
+            assert_eq!(value.end, end != 0);
+
+            let frame = Message::Reply {
+                id: 8,
+                flags: relay::END,
+                body: b"{}",
+            }
+            .encode();
+            unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+            let value = client.next_value().unwrap().unwrap();
+            assert_eq!(value.id, 8);
+            assert_eq!(value.bytes, b"{}");
+            assert!(!value.binary && value.end);
+            drop(peer);
+            assert!(client.next_value().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn observer_rejects_invalid_reply_flags_and_continuations() {
+    for first in [None, Some(0), Some(relay::BINARY)] {
+        let mut invalid = vec![(7, relay::MORE | relay::END), (7, 8)];
+        if let Some(binary) = first {
+            invalid.extend([
+                (8, binary | relay::END),
+                (7, (binary ^ relay::BINARY) | relay::END),
+            ]);
+        }
+        for (id, flags) in invalid {
+            let (client, peer) = observer_peer(&Message::Accept.encode());
+            let mut client = client.unwrap();
+            client.set_timeout(Some(Duration::from_millis(20))).unwrap();
+            if let Some(binary) = first {
+                let frame = Message::Reply {
+                    id: 7,
+                    flags: binary | relay::MORE,
+                    body: b"first",
+                }
+                .encode();
+                unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+                assert!(matches!(
+                    client.next_value().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ));
+            }
+            let frame = Message::Reply {
+                id,
+                flags,
+                body: b"last",
+            }
+            .encode();
+            unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+            assert_eq!(
+                client.next_value().unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(unix::recv(peer.as_raw_fd(), &mut [0; 1], false).unwrap(), 0);
+            assert!(client.next_value().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn observer_reports_eof_during_a_value() {
+    for timeout in [false, true] {
+        let (client, peer) = observer_peer(&Message::Accept.encode());
+        let mut client = client.unwrap();
+        client.set_timeout(Some(Duration::from_millis(20))).unwrap();
+        let frame = Message::Reply {
+            id: 7,
+            flags: relay::MORE,
+            body: b"first",
+        }
+        .encode();
+        unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+        if timeout {
+            assert!(matches!(
+                client.next_value().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ));
+        }
+        drop(peer);
+        assert_eq!(
+            client.next_value().unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert!(client.next_value().unwrap().is_none());
+    }
+}
+
+#[test]
 fn observer_closes_on_oversized_or_truncated_replies() {
     for extra in [1, 2] {
         let (client, peer) = observer_peer(&Message::Accept.encode());

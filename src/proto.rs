@@ -153,6 +153,10 @@
 //! stream, such as `watch`, gets values until its last one, which has
 //! `END`. Replies to different requests can arrive between each other, but
 //! the parts of one value never do.
+//! All parts of a value have the same id and `BINARY` flag. Unknown flag bits
+//! and `MORE` combined with `END` are invalid. The observer closes the
+//! session on invalid flags or a mismatched continuation. A connection that
+//! closes during a value cuts it short. This is not a clean end of the session.
 //!
 //! ```text
 //! observer                                  world
