@@ -248,6 +248,13 @@ container that plays one of the hosts, straight to the router at a fixed
 prefix. `Net::resolve` makes a host the first time a name is looked up,
 which is how `web::Sites` works.
 
+Lab clients can use `sandbox::TlsClient` over a simulated connection. Its
+writes report plaintext taken only after the connection underneath has taken
+the ciphertext. A blocked write stays pending, and downstream errors reach
+the caller. Dropping a pending write may still send its bytes. A later write
+starting with those bytes counts as a retry, even with more bytes appended.
+A write with different starting bytes reports only its own bytes.
+
 ## 4. HTTP
 
 HTTP is a service like the others. A `Router`'s handlers get the request
