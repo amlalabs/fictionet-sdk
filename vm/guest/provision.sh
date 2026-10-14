@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs once inside a fresh Debian 13 cloud VM, as root, to make the prepared
 # image that every later run of vm/run boots from. vm/run copies this file
-# and versions.sh into the VM and runs it; it is not meant to be run by hand.
+# with versions.sh and rust-toolchain.toml into the VM and runs it; it is
+# not meant to be run by hand.
 #
 # It installs Docker Engine with the Compose and Buildx plugins, kind,
 # kubectl, helm, uv, Rust with the musl target, and the network tools the
@@ -99,15 +100,23 @@ check uv.tgz "$(awk '{print $1}' uv.sum)"
 tar -xzf uv.tgz
 install -m 0755 uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/
 
-step "Rust $RUST_VERSION with the musl target"
+step "Rust from rust-toolchain.toml with the musl target"
 fetch https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init rustup-init
 fetch https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256 rustup-init.sum
 check rustup-init "$(awk '{print $1}' rustup-init.sum)"
 chmod +x rustup-init
 RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo ./rustup-init -y -q --no-modify-path \
-    --profile minimal --default-toolchain "$RUST_VERSION" --target x86_64-unknown-linux-musl
+    --profile minimal --default-toolchain none
 # rustup's proxies (cargo, rustc, rustdoc and the rest), on every PATH.
 for tool in /opt/rust/cargo/bin/*; do ln -sf "$tool" "/usr/local/bin/${tool##*/}"; done
+(
+    export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+    cd "$here/.."
+    # Let rustup read the bundled descriptor, including its components.
+    rustup toolchain install
+    rustup target add x86_64-unknown-linux-musl
+    rustup default "$(rustup show active-toolchain | awk '{print $1}')"
+)
 # Toolchains stay in the image. The registry, build output and uv's
 # downloads go to the cache disk, so they last between runs.
 cat >/etc/environment <<'EOF'

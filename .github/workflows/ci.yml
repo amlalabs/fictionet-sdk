@@ -77,6 +77,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Transfer check fixtures
         run: bash tests/throughput_test.sh
+      - name: VM provisioning fixtures
+        run: bash vm/provision_test.sh
       - name: Install the pinned toolchain
         run: rustup toolchain install
       - name: Check formatting

@@ -84,6 +84,9 @@ The Docker and Inspect suites build their images inside the VM, from the
 examples' own Dockerfiles, the first time. Docker keeps those images and its
 build cache on the cache disk, so later runs reuse them.
 
+Run `bash vm/provision_test.sh` on the host to check toolchain selection and
+prepared-image invalidation with stubs. It needs no VM or network access.
+
 ## How it works
 
 **The image.** The base is Debian's official Debian 13 (trixie) `genericcloud`
@@ -96,8 +99,15 @@ checked), kind, kubectl, helm and uv (each checked against its published
 SHA-256), Rust with the musl target, and curl, dig, ping, traceroute, ip and
 python3. Then it turns cloud-init off, so later boots skip it. The result is
 `.vm/images/prepared-<key>.qcow2`, an overlay on the Debian image. Its key is a
-hash of `vm/versions.sh`, `vm/guest/provision.sh` and the SSH public key,
-so a change to any of them prepares a new image.
+hash of `vm/versions.sh`, `vm/guest/provision.sh`, `rust-toolchain.toml` and the
+SSH public key, so a change to any of them prepares a new image.
+
+The VM follows the checkout's `rust-toolchain.toml`. Provisioning bundles that
+file, installs its compiler and components, and adds `x86_64-unknown-linux-musl`
+to that compiler. It also makes that compiler the VM's default. Builds in `/src`
+select it through the same descriptor after sync. If you change the descriptor
+while a VM is running, run `vm/run down` and `vm/run up` to prepare a new image.
+Docker builds keep the compiler versions in their own Dockerfiles.
 
 **Each run** boots from a fresh qcow2 overlay on the prepared image, which is
 deleted by `vm/run down`. The prepared image is never written to.

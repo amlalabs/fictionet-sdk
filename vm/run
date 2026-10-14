@@ -84,7 +84,8 @@ fetch_base() {
 # change to the provisioning makes a new one.
 # The SSH key is part of it: an image only takes the key it was prepared with.
 prepared_key() {
-    cat "$here/versions.sh" "$here/guest/provision.sh" "$sshdir/id_ed25519.pub" | sha256sum | cut -c1-12
+    cat "$here/versions.sh" "$here/guest/provision.sh" "$root/rust-toolchain.toml" \
+        "$sshdir/id_ed25519.pub" | sha256sum | cut -c1-12
 }
 
 ssh_key() {
@@ -143,7 +144,8 @@ ensure_prepared() {
     boot "$tmp" writeback "$rundir/seed.iso"
     wait_ssh 300
     vm_ssh 'mkdir -p /root/provision'
-    tar -C "$here" -cf - versions.sh guest/provision.sh | vm_ssh 'tar -xf - -C /root/provision'
+    tar -C "$here" -cf - versions.sh guest/provision.sh -C "$root" rust-toolchain.toml |
+        vm_ssh 'tar -xf - -C /root/provision'
     if ! vm_ssh 'bash /root/provision/guest/provision.sh' 2>&1 | tee "$vmdir/prepare.log"; then
         stop_vm
         die "preparing failed; see .vm/prepare.log"
@@ -486,4 +488,4 @@ main() {
     esac
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
