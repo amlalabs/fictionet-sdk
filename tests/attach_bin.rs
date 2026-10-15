@@ -7,6 +7,8 @@
 
 #[path = "common/logged.rs"]
 mod logged;
+#[path = "common/wait.rs"]
+mod wait;
 
 use logged::logged;
 
@@ -391,19 +393,14 @@ const V4_ONLY: &str = "--ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
                        --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6 --no-resolv-conf";
 
 /// A world that takes the attachment `name`, keeps it until the file
-/// `done` exists (10 s at most), then closes it.
+/// `done` exists, then closes it. Fails if `done` does not appear within 10 s.
 fn hold_until(attachments: fictionet::Attachments, name: &'static str, done: std::path::PathBuf) {
     let mut attachments = attachments;
     fictionet::block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
             let held = attachments.get(&fcx, name).await?;
-            for _ in 0..200 {
-                if done.exists() {
-                    break;
-                }
-                fcx.sleep(fictionet::time::ms(50)).await?;
-            }
+            wait::until(&fcx, Duration::from_secs(10), || done.exists()).await;
             drop(held);
             Ok(())
         },
@@ -448,10 +445,11 @@ fn down_link_clears_a_pods_eth0_before_tun0_takes_the_default_route() {
         attach=$!
         i=0
         while [ ! -e {d}/ready ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
-        ip -o link show eth0 > {d}/link
-        ip -o addr show dev eth0 > {d}/addrs
-        ip route show table all > {d}/routes
-        ip -6 route show table all >> {d}/routes
+        [ -e {d}/ready ] || {{ echo 'ready file never appeared' >&2; exit 1; }}
+        {{ ip -o link show eth0; echo \"end $?\"; }} > {d}/link
+        {{ ip -o addr show dev eth0; echo \"end $?\"; }} > {d}/addrs
+        {{ ip route show table all; echo \"end IPv4 $?\"; }} > {d}/routes
+        {{ ip -6 route show table all; echo \"end IPv6 $?\"; }} >> {d}/routes
         touch {d}/done
         wait $attach
         echo $? > {d}/attach.status"
@@ -460,8 +458,15 @@ fn down_link_clears_a_pods_eth0_before_tun0_takes_the_default_route() {
     hold_until(attachments, "abc", dir.join("done"));
     let out = child.wait_with_output().unwrap();
     drop(listening);
-    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
     let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "shell exited with {}: {err}",
+        out.status
+    );
+    let read = |f: &str| {
+        std::fs::read_to_string(dir.join(f)).unwrap_or_else(|e| panic!("reading {f}: {e}\n{err}"))
+    };
 
     assert_eq!(read("plain.status").trim(), "1", "{}", read("plain.err"));
     assert!(
@@ -481,10 +486,16 @@ fn down_link_clears_a_pods_eth0_before_tun0_takes_the_default_route() {
         "{err}"
     );
     let link = read("link");
+    assert!(link.ends_with("end 0\n"), "{link}\n{err}");
     assert!(link.contains("state DOWN"), "{link}");
     assert!(!link.contains(",UP") && !link.contains("<UP"), "{link}");
-    assert_eq!(read("addrs"), "", "eth0 keeps no address");
+    assert_eq!(read("addrs"), "end 0\n", "eth0 keeps no address\n{err}");
     let routes = read("routes");
+    assert!(
+        routes.lines().any(|line| line == "end IPv4 0"),
+        "{routes}\n{err}"
+    );
+    assert!(routes.ends_with("end IPv6 0\n"), "{routes}\n{err}");
     assert!(!routes.contains("dev eth0"), "{routes}");
     assert!(routes.contains("default via 10.0.0.1 dev tun0"), "{routes}");
     assert!(routes.contains("default via fd00::1 dev tun0"), "{routes}");
