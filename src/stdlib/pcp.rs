@@ -488,8 +488,8 @@ impl Request {
     /// against `source` (ADDRESS_MISMATCH). Then the opcode: an unknown
     /// one is UNSUPP_OPCODE. Then the MAP and PEER fields RFC 6887 forbids
     /// (MALFORMED_REQUEST). A MAP with protocol 0 and a nonzero internal
-    /// port is malformed only when its lifetime is not 0, since a delete
-    /// is allowed any port. Last, each option against the opcode
+    /// port is malformed for any lifetime, including a delete (section
+    /// 15.1). Last, each option against the opcode
     /// (MALFORMED_REQUEST, MALFORMED_OPTION, or UNSUPP_OPTION for an
     /// unknown mandatory option). Whether to allow THIRD_PARTY at all is
     /// left to the world.
@@ -500,7 +500,7 @@ impl Request {
         }
         match &self.operation {
             Operation::Other { .. } => return Err(ResultCode::UnsuppOpcode),
-            Operation::Map(m) if self.lifetime != 0 && m.protocol == 0 && m.internal_port != 0 => {
+            Operation::Map(m) if m.protocol == 0 && m.internal_port != 0 => {
                 return Err(ResultCode::MalformedRequest);
             }
             Operation::Peer(p) => {
@@ -2018,17 +2018,59 @@ mod tests {
         assert_eq!(ok(&with(map_request(), vec![optional])), Ok(()));
     }
 
-    // RFC 6887 section 11.3: protocol 0 with a port is malformed only when
-    // the lifetime is not zero. A delete may carry any internal port.
+    // RFC 6887 section 15.1: protocol 0 with a nonzero internal port is
+    // malformed on a delete too.
     #[test]
-    fn map_delete_with_protocol_zero() {
+    fn zero_lifetime_nonzero_port_rejected() {
         let mut r = map_request();
         r.lifetime = 0;
         let Operation::Map(m) = &mut r.operation else {
             panic!()
         };
         m.protocol = 0;
-        assert_eq!(r.check(laptop()), Ok(()));
+        assert_eq!(r.check(laptop()), Err(ResultCode::MalformedRequest));
+    }
+
+    #[test]
+    fn receive_zero_lifetime_nonzero_port_rejected() {
+        let mut r = map_request();
+        r.lifetime = 0;
+        let Operation::Map(m) = &mut r.operation else {
+            panic!()
+        };
+        m.protocol = 0;
+        let b = r.to_bytes().unwrap();
+        for speaks in [Speaks::Pcp, Speaks::Both] {
+            let Incoming::Reply(reply) = receive(&b, speaks, laptop(), 9) else {
+                panic!("expected a PCP error reply")
+            };
+            let resp = Response::parse(&reply.to_bytes().unwrap()).unwrap();
+            assert_eq!(resp.result, ResultCode::MalformedRequest);
+            assert_eq!(resp.lifetime, ResultCode::MalformedRequest.error_lifetime());
+            assert_eq!(resp.epoch, 9);
+            assert_eq!(resp.operation, r.operation);
+        }
+    }
+
+    #[test]
+    fn map_wildcard_and_specific_deletions() {
+        for (lifetime, protocol, internal_port) in
+            [(0, 0, 0), (0, 6, 0), (0, 6, 8080), (7200, 0, 0)]
+        {
+            let mut r = map_request();
+            r.lifetime = lifetime;
+            let Operation::Map(m) = &mut r.operation else {
+                panic!()
+            };
+            m.protocol = protocol;
+            m.internal_port = internal_port;
+            m.external_port = 0;
+            assert_eq!(r.check(laptop()), Ok(()));
+            let b = r.to_bytes().unwrap();
+            for speaks in [Speaks::Pcp, Speaks::Both] {
+                assert_eq!(receive(&b, speaks, laptop(), 9), Incoming::Pcp(r.clone()));
+            }
+        }
     }
 
     // RFC 6887 section 8.2: the address check comes before the opcode and

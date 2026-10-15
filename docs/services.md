@@ -28,6 +28,14 @@ It classifies first fragments by port without parsing a complete datagram.
 It checks address families and IP size limits and always writes a checksum.
 Allocation, MTU limits, fragments and IP header fields stay with the caller.
 
+PCP MAP requests with protocol zero and a nonzero internal port are malformed,
+including deletion requests with lifetime zero (RFC 6887 sections 11.3 and 15.1).
+`pcp::Request::check` returns `MalformedRequest`. `pcp::receive` replies with
+that result and its `error_lifetime()`. Deletions with protocol zero and port
+zero, or a specific protocol with either port zero or a specific port, still
+pass validation. Creating a mapping with protocol zero and port zero also
+passes. World code decides whether these valid requests can be fulfilled.
+
 TDS response decoding has two separate ceilings: 4 MiB of wire bytes and
 1,048,576 decoded units per reader or written token stream. These are codec
 limits, not a process-memory bound; see the [`tds` module docs](../src/stdlib/tds.rs)
