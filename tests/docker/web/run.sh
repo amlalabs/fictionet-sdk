@@ -118,10 +118,11 @@ check_ok "a 20,000-byte ping, in fragments both ways" ' 2 received' \
     agent ping -c 2 -W 2 -s 20000 10.0.0.1
 # The world closes a connection that sends nothing for 10 s after it was
 # accepted. The check waits until 8 s after the connections opened, when
-# only the one that got an answer may be closed. Then it gives the others
+# only the one that got an answer may be closed. A sample at or after 10 s
+# fails the check: it says nothing about closing early. It gives the others
 # until 30 s to close, since a machine under heavy load can be seconds late.
 check_ok "300 open connections: 256 kept, the rest reset at once; idle ones closed after 10 s" \
-    'opened 300 established 256 HTTP/1.1 200 OK closed-before-8s (1|not sampled in time) closed-by-30s 256 after (1[0-9]|2[0-9])\.[0-9] s' \
+    'opened 300 established 256 HTTP/1.1 200 OK closed-before-8s 1 sampled at [89]\.[0-9] s closed-by-30s 256 after (1[0-9]|2[0-9])\.[0-9] s' \
     agent bash -c '
         fds=()
         start=$(date +%s%N)
@@ -138,8 +139,7 @@ check_ok "300 open connections: 256 kept, the rest reset at once; idle ones clos
         head -c 15 <&"${fds[0]}"; echo
         while (( $(since) < 80 )); do sleep 0.1; done
         c=$(closed) t=$(since)
-        # A sample taken after 10 s says nothing about closing early.
-        if (( t < 100 )); then echo "closed-before-8s $c"; else echo "closed-before-8s not sampled in time"; fi
+        echo "closed-before-8s $c sampled at $((t / 10)).$((t % 10)) s"
         while (( $(closed) < 256 && $(since) < 300 )); do sleep 0.1; done
         t=$(since)
         echo "closed-by-30s $(closed) after $((t / 10)).$((t % 10)) s"'
