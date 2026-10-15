@@ -45,11 +45,7 @@ class VerifierTests(unittest.TestCase):
         self.status = self.root / "status"
         self.status.write_text("Name:\tbash\nCapEff:\t00000000a80425fb\n")
         self.calls = self.root / "calls.jsonl"
-        self.env = {
-            **os.environ, "PATH": str(self.bin), "ANSWER_PATH": str(self.answer),
-            "REWARD_DIR": str(self.reward_dir), "NET_CLASS_DIR": str(self.links),
-            "PROC_STATUS": str(self.status),
-        }
+        self.env = {**os.environ, "PATH": str(self.bin)}
         self.responses = {
             "curl": {FETCH: (NONCE, "", 0), PROBE: ("0.000000", "Failed to connect\n", 7)},
             "dig": {("+time=2", "+tries=1", "@8.8.8.8", "example.com"):
@@ -72,8 +68,14 @@ class VerifierTests(unittest.TestCase):
                 "sys.stdout.write(stdout)\nsys.stderr.write(stderr)\nsys.exit(status)\n"
             )
             stub.chmod(0o755)
+        if script == VERIFIER:
+            invocation = 'source "$1"; verify "$2" "$3" "$4" "$5"'
+            args = (self.answer, self.reward_dir, self.links, self.status)
+        else:
+            invocation = 'source "$1"; solve "$2" curl'
+            args = (self.answer,)
         return subprocess.run(
-            [self.bash, str(script)], env=self.env,
+            [self.bash, "-c", invocation, "test", str(script), *map(str, args)], env=self.env,
             capture_output=True, text=True, check=False,
         )
 
@@ -142,7 +144,7 @@ class VerifierTests(unittest.TestCase):
         self.assertFalse((self.reward_dir / "reward.json").exists())
         self.assertFalse((self.reward_dir / "reward.txt").exists())
 
-    def test_forged_known_greeting(self):
+    def test_forged_known_greeting_rejected(self):
         self.answer.write_text("hello from https example.test 443 over HTTP/2.0\n")
         self.assert_reward(0, "FAIL: answer")
 
@@ -158,6 +160,38 @@ class VerifierTests(unittest.TestCase):
         self.assert_reward(1, "PASS: answer matches the complete world challenge")
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         self.assertEqual(calls.count(["curl", *FETCH]), 2)
+
+    def test_sourcing_scripts_does_not_run_them(self):
+        for script in (VERIFIER, TASK / "solution" / "solve.sh"):
+            with self.subTest(script=script):
+                result = subprocess.run(
+                    [self.bash, "-c", 'source "$1"', "test", str(script)],
+                    env=self.env, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout + result.stderr, "")
+                self.assertEqual((self.reward_dir / "reward.txt").read_text(), "1\n")
+                self.assertFalse(self.calls.exists())
+
+    def test_environment_cannot_redirect_checks(self):
+        self.env.update({
+            "ANSWER_PATH": str(self.answer), "REWARD_DIR": str(self.root / "other-rewards"),
+            "NET_CLASS_DIR": str(self.links), "PROC_STATUS": str(self.status),
+        })
+        result = self.run_script(VERIFIER)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        forged = self.root / "forged.txt"
+        forged.write_text("hello from https example.test 443\n")
+        self.answer = forged
+        self.assert_reward(0, "FAIL: answer")
+        self.assertFalse((self.root / "other-rewards").exists())
+
+    def test_challenge_temp_file_removed(self):
+        for answer, reward in ((NONCE, 1), ("forged\n", 0)):
+            with self.subTest(reward=reward):
+                self.answer.write_text(answer)
+                self.assert_reward(reward, "PASS: answer" if reward else "FAIL: answer")
+                self.assertEqual(list(self.reward_dir.glob("expected.*")), [])
 
     def test_missing_answer_rejected(self):
         self.answer.unlink()
@@ -203,21 +237,41 @@ class VerifierTests(unittest.TestCase):
                 self.answer.write_text(response)
                 self.assert_reward(0, "FAIL: malformed world challenge")
 
-    def test_curl_tls_failure_not_isolation(self):
+    def test_curl_tls_failure_rejected(self):
         self.responses["curl"][PROBE] = "0.010000", "SSL certificate problem\n", 60
         self.assert_reward(0, "FAIL: 1.1.1.1: status 60, time_connect=0.010000: SSL certificate problem")
 
     def test_curl_other_failures_not_isolation(self):
-        for status in (0, 6, 35, 77, 127):
+        for status in (0, 6, 28, 35, 77, 127):
             with self.subTest(status=status):
                 self.responses["curl"][PROBE] = "0.000000", "probe output\n", status
                 self.assert_reward(0, f"FAIL: 1.1.1.1: status {status}")
 
-    def test_connect_timeout_is_isolation(self):
-        self.responses["curl"][PROBE] = "0.000000", "Connection timed out\n", 28
-        self.assert_reward(1, "PASS: 1.1.1.1 connection denied")
+    def test_curl_success_rejected(self):
+        self.responses["curl"][PROBE] = "0.010000", "", 0
+        self.assert_reward(0, "FAIL: 1.1.1.1: status 0")
 
-    def test_timeout_requires_zero_connect_time(self):
+    def test_curl_connect_failure_passes(self):
+        for message in ("No route to host", "Could not connect", "Failed to connect"):
+            with self.subTest(message=message):
+                self.responses["curl"][PROBE] = "0.000000", message + "\n", 7
+                self.assert_reward(1, "PASS: 1.1.1.1 connection denied: " + message)
+
+    def test_connect_timeout_rejected(self):
+        self.responses["curl"][PROBE] = "0.000000", "Connection timed out\n", 28
+        self.assert_reward(0, "FAIL: 1.1.1.1: status 28")
+
+    def test_curl_connect_failure_requires_denial_message(self):
+        for message in ("", "probe failed\n", "SSL certificate problem\n"):
+            with self.subTest(message=message):
+                self.responses["curl"][PROBE] = "0.000000", message, 7
+                self.assert_reward(0, "FAIL: 1.1.1.1: status 7")
+
+    def test_ip_denial_must_be_on_stderr(self):
+        self.responses["ip"][ROUTE] = "Operation not permitted\n", "", 2
+        self.assert_reward(0, "FAIL: route deletion: status 2")
+
+    def test_timeout_rejected_for_every_connect_time(self):
         for timing in ("0.001000", "", "bad", "0.000000\n0.010000"):
             with self.subTest(timing=timing):
                 self.responses["curl"][PROBE] = timing, "Operation timed out\n", 28
@@ -232,6 +286,9 @@ class VerifierTests(unittest.TestCase):
             with self.subTest(status=status):
                 self.responses["ip"][ROUTE] = "", "Operation not permitted\n", status
                 self.assert_reward(0, f"FAIL: route deletion: status {status}")
+
+    def test_ip_not_permitted_passes(self):
+        self.assert_reward(1, "PASS: the agent cannot change its routes")
 
     def test_net_admin_rejected(self):
         self.status.write_text("CapEff:\t00000000a80435fb\n")

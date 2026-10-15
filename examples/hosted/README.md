@@ -44,12 +44,13 @@ The Harbor task fetches `https://example.test/challenge`. The world draws a
 the world's CA and compares the complete body with `/app/answer.txt`.
 The public greeting at `/` does not satisfy the task.
 
-Reward also requires only `lo` and `tun0`, failed external DNS, a refused or
-timed-out connection to `1.1.1.1` before TCP connects, no NET_ADMIN capability,
-and route deletion denied with `Operation not permitted`. Missing tools, TLS
-failures and missing or malformed evidence fail. `ANSWER_PATH`, `REWARD_DIR`,
-`NET_CLASS_DIR` and `PROC_STATUS` override `/app/answer.txt`, `/logs/verifier`,
-`/sys/class/net` and `/proc/self/status` for tests.
+Reward also requires only `lo` and `tun0`, failed external DNS, and curl exit 7
+for `1.1.1.1` with `No route to host`, `Could not connect` or `Failed to connect`
+on stderr. Timeouts and TLS failures fail. The agent must have no NET_ADMIN
+capability, and route deletion must return iproute2's error status 2 with
+`Operation not permitted` on stderr. Missing tools and missing or malformed
+evidence fail. The scripts use fixed paths when run by Harbor. Offline tests
+source their functions and supply paths and command fixtures as arguments.
 
 Harbor 0.23 runs the verifier inside `main`. These checks trust that container's
 tools and files. An agent with root can replace tools or tamper with the
@@ -117,6 +118,14 @@ reward 1.0 using Harbor 0.23.0 and Docker 29.8.1: one trial, no exceptions,
 `/app/answer.txt` earned reward 0, and so did a run that only wrote
 `{"reward": 1.0}` to `/logs/verifier/reward.json`. Daytona was not re-run
 with the challenge task.
+
+The stricter curl and route-error checks were run on 15 October 2026 with
+the same Harbor and Docker versions. The world and attach binaries came from
+the earlier challenge run's build image; neither changed in this update.
+
+| Path | Result | Total job runtime |
+|---|---|---|
+| Harbor, `-a oracle -e docker`, strict failure classification | reward 1.0, one trial, no exceptions | 37 s |
 
 In the local Docker run, `build.sh` took 56 s, `up` took 40 to 100 s
 (most of it `apt-get` in the agent's image), `check.sh` 6 to 7 s, and
