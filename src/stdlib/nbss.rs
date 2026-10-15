@@ -77,7 +77,9 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::nbns::{ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level};
+use fictionet::stdlib::netbios::{
+    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level,
+};
 
 /// The TCP port the session service listens on.
 pub const PORT: u16 = 139;
@@ -215,7 +217,7 @@ impl Wire for Name {
     /// scope labels, labels over 63 bytes, and names over 255 bytes.
     /// Leaves the destination unchanged on error.
     fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
-        fictionet::stdlib::nbns::write_name(destination, &self.bytes, &self.scope)
+        fictionet::stdlib::netbios::write_name(destination, &self.bytes, &self.scope)
             .map_err(|_| Error::Unwritable)
     }
 }

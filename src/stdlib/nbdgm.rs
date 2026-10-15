@@ -85,7 +85,9 @@
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16};
-use fictionet::stdlib::nbns::{ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level};
+use fictionet::stdlib::netbios::{
+    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level,
+};
 
 use std::net::Ipv4Addr;
 
@@ -826,7 +828,7 @@ impl Wire for Name {
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
     /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        fictionet::stdlib::nbns::write_name(dst, &self.bytes, &self.scope)
+        fictionet::stdlib::netbios::write_name(dst, &self.bytes, &self.scope)
             .map_err(|_| Error::Unwritable)
     }
 }

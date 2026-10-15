@@ -17,6 +17,9 @@
 //! more labels. Packets are laid out like DNS messages, and may point back
 //! to a name written earlier in the packet instead of repeating it.
 //!
+//! Encoding functions and name limits live in [`netbios`](fictionet::stdlib::netbios).
+//! Their paths here are kept so existing imports and copies still compile.
+//!
 //! Nothing here reads a socket. A world that plays the machines on a LAN
 //! reads each datagram from its UDP socket, passes it to
 //! [`Packet::parse`], reads what it asks with [`Packet::request`], and
@@ -63,6 +66,10 @@ use fictionet::stdlib::codec::{Wire, be16};
 
 use std::net::Ipv4Addr;
 
+pub use fictionet::stdlib::netbios::{
+    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level, encode_first_level,
+};
+
 /// The UDP port the name service listens on.
 pub const PORT: u16 = 137;
 /// The length of the header every packet starts with.
@@ -75,15 +82,6 @@ pub const MAX_PACKET: usize = 65_507;
 pub const MAX_DATAGRAM: usize = 576;
 /// The largest section allowed here. Readers and writers refuse larger counts.
 pub const MAX_RECORDS: usize = 64;
-/// The length of a NetBIOS name: 15 characters and a suffix byte.
-pub const NAME_LEN: usize = 16;
-/// The length of a NetBIOS name in the first-level encoding.
-pub const ENCODED_LEN: usize = 2 * NAME_LEN;
-/// The longest label in a name's scope.
-pub const MAX_LABEL: usize = 63;
-/// The longest name on the wire: every label with its length byte, and
-/// the zero byte that ends the name.
-pub const MAX_NAME_LEN: usize = 255;
 /// The most pointers one name may follow before it ends.
 pub const MAX_POINTERS: usize = 16;
 /// The most bytes of data one record may carry: what its 16-bit length
@@ -153,39 +151,6 @@ pub mod name_flags {
     pub const ACTIVE: u16 = 0x0400;
     /// The name is the node's permanent name.
     pub const PERMANENT: u16 = 0x0200;
-}
-
-/// The first-level encoding of a 16-byte NetBIOS name: each byte becomes
-/// two letters, `A` plus its high half, then `A` plus its low half.
-#[inline]
-pub fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
-    let mut out = [0u8; ENCODED_LEN];
-    for (i, b) in name.iter().enumerate() {
-        out[2 * i] = b'A' + (b >> 4);
-        out[2 * i + 1] = b'A' + (b & 0x0f);
-    }
-    out
-}
-
-/// The 16-byte name a first-level label encodes. It returns `None` unless
-/// the label is 32 bytes, each an uppercase letter from `A` to `P`.
-#[inline]
-pub fn decode_first_level(label: &[u8]) -> Option<[u8; NAME_LEN]> {
-    if label.len() != ENCODED_LEN {
-        return None;
-    }
-    let half = |c: u8| {
-        if (b'A'..=b'P').contains(&c) {
-            Some(c - b'A')
-        } else {
-            None
-        }
-    };
-    let mut out = [0u8; NAME_LEN];
-    for (i, pair) in label.as_chunks::<2>().0.iter().enumerate() {
-        out[i] = half(pair[0])? << 4 | half(pair[1])?;
-    }
-    Some(out)
 }
 
 /// A NetBIOS name, with its scope.
@@ -260,16 +225,7 @@ fn dotted_labels(text: &str) -> Vec<Vec<u8>> {
 /// Appends valid labels and the final zero to a name. Refuses empty or
 /// oversized labels and names above [`MAX_NAME_LEN`].
 fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) -> Result<(), Error> {
-    for label in labels {
-        if label.is_empty() || label.len() > MAX_LABEL || out.len() + label.len() + 2 > MAX_NAME_LEN
-        {
-            return Err(Error::Unwritable);
-        }
-        out.push(label.len() as u8);
-        out.extend_from_slice(label);
-    }
-    out.push(0);
-    Ok(())
+    fictionet::stdlib::netbios::write_labels(out, labels).map_err(|_| Error::Unwritable)
 }
 
 /// Writes `bytes` as text, with bytes that are not printable ASCII, and
@@ -1265,12 +1221,7 @@ pub fn write_name(
     bytes: &[u8; NAME_LEN],
     scope: &[Vec<u8>],
 ) -> Result<(), Error> {
-    let mut out = Vec::with_capacity(ENCODED_LEN + 2);
-    out.push(ENCODED_LEN as u8);
-    out.extend_from_slice(&encode_first_level(bytes));
-    put_labels(&mut out, scope.iter().map(Vec::as_slice))?;
-    dst.extend_from_slice(&out);
-    Ok(())
+    fictionet::stdlib::netbios::write_name(dst, bytes, scope).map_err(|_| Error::Unwritable)
 }
 
 impl Wire for Name {
@@ -1542,35 +1493,6 @@ mod tests {
             req.wack(RrName::null(), 5).to_bytes().unwrap(),
             redirect_bytes(),
         ]
-    }
-
-    #[test]
-    fn first_level_encoding_example() {
-        // RFC 1001 section 14.1: "FRED" padded with spaces.
-        let fred = Name::new("Fred", 0x20);
-        assert_eq!(&fred.to_bytes().unwrap()[1..1 + ENCODED_LEN], FRED);
-        assert_eq!(decode_first_level(FRED), Some(fred.bytes));
-        assert_eq!(
-            &Name::wildcard().to_bytes().unwrap()[1..1 + ENCODED_LEN],
-            b"CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        );
-        for b in 0..=255u8 {
-            let name = Name {
-                bytes: [b; NAME_LEN],
-                scope: Vec::new(),
-            };
-            assert_eq!(Name::parse(&name.to_bytes().unwrap()), Ok(name));
-        }
-        // Wrong lengths and letters outside A to P.
-        assert_eq!(decode_first_level(&FRED[..31]), None);
-        assert_eq!(
-            decode_first_level(b"QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-            None
-        );
-        assert_eq!(
-            decode_first_level(b"aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-            None
-        );
     }
 
     #[test]

@@ -4,8 +4,8 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Fail, Wire};
-use fictionet::stdlib::nbns::{MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level};
 use fictionet::stdlib::nbss::{Error, HEADER_LEN, MAX_LENGTH, Name, NegativeCode, Packet};
+use fictionet::stdlib::netbios::{MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;

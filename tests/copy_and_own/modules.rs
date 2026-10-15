@@ -209,7 +209,7 @@ macro_rules! protocols {
         pub mod udp;
         #[path = "../../src/stdlib/codec/work.rs"]
         pub mod work;
-        // NBDGM and NBSS use the public NBNS name encoding helpers.
+        // NBNS, NBDGM and NBSS use the public NetBIOS name encoding helpers.
         #[path = "../../src/stdlib/nbdgm.rs"]
         pub mod nbdgm;
         #[path = "../../src/stdlib/nbns.rs"]
@@ -220,6 +220,8 @@ macro_rules! protocols {
         // Keep those relative paths.
         #[path = "../../src/stdlib/net.rs"]
         pub mod net;
+        #[path = "../../src/stdlib/netbios.rs"]
+        pub mod netbios;
         #[path = "../../src/stdlib/nfs.rs"]
         pub mod nfs;
         #[path = "../../src/stdlib/ntlmssp.rs"]

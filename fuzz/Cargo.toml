@@ -247,6 +247,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "netbios"
+path = "fuzz_targets/netbios.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "nbns"
 path = "fuzz_targets/nbns.rs"
 test = false
