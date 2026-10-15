@@ -29,6 +29,9 @@ alone.
 
 from __future__ import annotations
 
+import re
+import runpy
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
 from inspect_ai import Task, task
@@ -54,7 +57,9 @@ from border_eval.scenario import (
     Variant,
 )
 from border_eval.transcript import certificate_timeline
-from border_eval.world import COMPOSE, COMPOSE_HOME, assess, log_size, world_log, world_state
+from border_eval.world import COMPOSE, COMPOSE_HOME, ROOT, assess, log_size, world_log, world_state
+
+commands = SimpleNamespace(**runpy.run_path(str(ROOT.parent / "common" / "commands.py")))
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -236,35 +241,64 @@ def home_machine(service: str = "default") -> Solver:
     return solve
 
 
-_CONTAINED: Final = (
-    # Every route goes into tun0 (or stays on lo), and an address outside the world fails.
-    "r=$(ip route show table all); echo \"$r\"; "
-    "echo \"$r\" | grep -Ev '\\bdev (lo|tun0)\\b' | grep -q . && exit 1; "
-    "curl -sS -m 5 -o /dev/null http://1.1.1.1/ && exit 1; exit 0"
-)
+STATUS_PROBE: Final = [
+    *commands.CURL_DIRECT, "-sS", "-o", "/dev/null", "-w",
+    "%{http_code} verify=%{ssl_verify_result}", f"https://{STATUS_HOST}/",
+]
 
 
-async def _contained() -> None:
+def require_no_proxy(result) -> None:
+    """Require a checked env inventory with no name containing 'proxy', in any case."""
+    proxies = [name for name in commands.read_env(result) if "proxy" in name.lower()]
+    if proxies:
+        raise RuntimeError("proxy environment variables are present: " + ", ".join(proxies))
+
+
+def routes_into_world(result) -> bool:
+    """Require successful, nonempty route output using only lo and tun0."""
+    if not commands.succeeded(result):
+        return False
+    routes = [line for line in result.stdout.splitlines() if line.strip()]
+    return bool(routes) and all(
+        re.findall(r"\bdev\s+(\S+)", line) in (["lo"], ["tun0"]) for line in routes
+    )
+
+
+async def _contained(*, runner=None) -> None:
     """A short containment check: only routes into the world, and the internet unreachable.
 
     The full probes are the ``border_probes`` task. This runs before every scored sample, so
     each one carries a check, as the original study's samples did.
     """
-    result = await sandbox().exec(["sh", "-c", _CONTAINED])
-    transcript().info({"contained": result.success, "routes": result.stdout}, source="border.preflight")
-    if not result.success:
-        msg = f"the agent's machine is not contained: {result.stdout} {result.stderr}"
-        raise RuntimeError(msg)
+    runner = runner if runner is not None else sandbox().exec
+    routes = await commands.run_async(["ip", "route", "show", "table", "all"], runner=runner)
+    if not routes_into_world(routes):
+        raise RuntimeError(f"invalid containment routes (rc={routes.rc}): {routes.stdout} {routes.stderr}")
+    outside = await commands.run_async(
+        [*commands.CURL_DIRECT, "-sS", "-m", "5", "-o", "/dev/null", "http://1.1.1.1/"], runner=runner,
+    )
+    outcome = commands.classify_curl(outside)
+    if outside.rc != 7 or outcome != commands.Outcome.EXPECTED_FAILURE:
+        raise RuntimeError(
+            f"containment needs a connect denial (rc={outside.rc}, {outcome.value}): "
+            f"{outside.stdout} {outside.stderr}"
+        )
+    transcript().info(
+        {"contained": True, "routes": routes.stdout, "outside_rc": outside.rc, "outside": outside.stderr},
+        source="border.preflight",
+    )
 
 
 @solver
-def preflight() -> Solver:
+def preflight(*, runner=None) -> Solver:
     """Check the world before the agent starts, and note where its log stands.
 
     - The world runs the variant and task this sample asked for (this catches a sample
       whose metadata did not reach Compose).
-    - The agent's machine fetches the status host over TLS it trusts, with no proxy.
-    - Its routes all lead into the world, and an address outside it fails.
+    - A successful env inventory has no proxy variable. Curl ignores its configuration
+      and proxies, and completes a status-host response over trusted TLS.
+    - Its checked, nonempty routes all lead into the world. An outside address must
+      fail to connect (curl exit 7); timeouts and tool failures are inconclusive.
 
     The scorer then reads only the log that comes after these checks (by byte offset).
     """
@@ -276,13 +310,13 @@ def preflight() -> Solver:
             if world[key] != state.metadata[key]:
                 msg = f"the world runs {key} {world[key]!r}, the sample wants {state.metadata[key]!r}"
                 raise RuntimeError(msg)
-        result = await sandbox().exec(
-            ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", f"https://{STATUS_HOST}/"]
-        )
-        if result.stdout.strip() != "200":
-            msg = f"the agent cannot reach the world: {result.stdout} {result.stderr}"
+        execute = runner if runner is not None else sandbox().exec
+        require_no_proxy(await commands.run_async(["env"], runner=execute))
+        result = await commands.run_async(STATUS_PROBE, runner=execute)
+        if not commands.succeeded(result, stdout="200 verify=0"):
+            msg = f"the agent cannot reach the world (rc={result.rc}): {result.stdout} {result.stderr}"
             raise RuntimeError(msg)
-        await _contained()
+        await _contained(runner=execute)
         store().set("log_offset", await log_size())
         transcript().info(
             {"variant": world["variant"], "task": world["task"], "status_host": result.stdout.strip()},

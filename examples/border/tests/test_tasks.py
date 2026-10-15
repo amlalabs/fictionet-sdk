@@ -293,3 +293,127 @@ def test_filtering_cannot_award_legitimate_completion():
     assert math.isnan(result.value["task_completed"])
     assert math.isnan(result.value["completed_safely"])
     assert result.metadata["task_completed"] is True  # The log evidence is retained.
+
+
+@pytest.fixture
+def network(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from border_eval import tasks
+
+    state = episode()
+    calls = []
+    replies = {
+        "env": SimpleNamespace(returncode=0, stdout="PATH=/usr/bin\n", stderr=""),
+        "status": SimpleNamespace(returncode=0, stdout="200 verify=0", stderr=""),
+        "routes": SimpleNamespace(returncode=0, stdout="default via 10.0.0.1 dev tun0\nlocal 127.0.0.1 dev lo\n", stderr=""),
+        "outside": SimpleNamespace(returncode=7, stdout="", stderr="curl: (7) Failed to connect to 1.1.1.1 port 80\n"),
+    }
+
+    async def execute(argv, **kwargs):
+        calls.append(argv)
+        if argv == ["env"]:
+            return replies["env"]
+        if argv == ["ip", "route", "show", "table", "all"]:
+            return replies["routes"]
+        assert argv[:4] == ["curl", "-q", "--noproxy", "*"]
+        return replies["outside" if argv[-1] == "http://1.1.1.1/" else "status"]
+
+    offset = AsyncMock(return_value=17)
+    monkeypatch.setattr(tasks, "world_state", AsyncMock(return_value=state.metadata))
+    monkeypatch.setattr(tasks, "log_size", offset)
+    monkeypatch.setattr(tasks, "store", lambda: state.store)
+    monkeypatch.setattr(tasks, "sandbox", lambda: SimpleNamespace(exec=execute))
+    monkeypatch.setattr(tasks, "transcript", lambda: SimpleNamespace(info=Mock()))
+    return SimpleNamespace(
+        replies=replies, calls=calls, offset=offset, state=state,
+        contained=lambda: asyncio.run(tasks._contained(runner=execute)),
+        preflight=lambda: asyncio.run(tasks.preflight(runner=execute)(state, None)),
+        default_preflight=lambda: asyncio.run(tasks.preflight()(state, None)),
+    )
+
+
+def test_contained_control(network):
+    network.contained()
+    assert network.calls == [
+        ["ip", "route", "show", "table", "all"],
+        ["curl", "-q", "--noproxy", "*", "-sS", "-m", "5", "-o", "/dev/null", "http://1.1.1.1/"],
+    ]
+
+
+@pytest.mark.parametrize("rc,out", [(1, ""), (127, ""), (0, ""),
+                                    (1, "default via 10.0.0.1 dev tun0\n"),
+                                    (0, "default via 10.0.0.1 dev eth0\n"),
+                                    (0, "default via 10.0.0.1 dev lo.fake\n")])
+def test_contained_ip_fails(network, rc, out):
+    network.replies["routes"].returncode = rc
+    network.replies["routes"].stdout = out
+    with pytest.raises(RuntimeError, match="containment routes"):
+        network.contained()
+    assert len(network.calls) == 1
+
+
+@pytest.mark.parametrize("rc", [127, 126, 0, 6, 28, 35, 56, 60],
+                         ids=["missing", "permission", "connects", "dns", "timeout", "tls", "receive", "certificate"])
+def test_contained_curl_fails(network, rc):
+    network.replies["outside"].returncode = rc
+    with pytest.raises(RuntimeError, match="containment needs a connect denial"):
+        network.contained()
+
+
+def test_contained_curl_empty_diagnostic(network):
+    network.replies["outside"].stderr = ""
+    with pytest.raises(RuntimeError, match="connect denial"):
+        network.contained()
+
+
+@pytest.mark.parametrize("default_runner", [False, True])
+def test_preflight_direct_200(network, default_runner):
+    result = network.default_preflight() if default_runner else network.preflight()
+    assert result is network.state
+    assert network.state.store.get("log_offset") == 17
+    assert len(network.calls) == 4
+    assert network.calls[0] == ["env"]
+    assert network.calls[1] == [
+        "curl", "-q", "--noproxy", "*", "-sS", "-o", "/dev/null", "-w",
+        "%{http_code} verify=%{ssl_verify_result}", "https://status.harbourline.net/",
+    ]
+
+
+@pytest.mark.parametrize("rc,out", [(28, "200"), (28, "200 verify=0"), (18, "200 verify=0"),
+                                    (0, "200 verify=60"), (0, "500 verify=0")])
+def test_preflight_failed_status_transfer(network, rc, out):
+    network.replies["status"].returncode = rc
+    network.replies["status"].stdout = out
+    with pytest.raises(RuntimeError, match="agent cannot reach the world"):
+        network.preflight()
+    network.offset.assert_not_awaited()
+
+
+@pytest.mark.parametrize("variable", ["http_proxy", "HTTPS_PROXY", "NO_PROXY", "SomeProxySetting"])
+def test_preflight_proxy_env_present(network, variable):
+    network.replies["env"].stdout += f"{variable}=http://proxy:8080\n"
+    with pytest.raises(RuntimeError, match="proxy environment"):
+        network.preflight()
+    assert network.calls == [["env"]]
+    network.offset.assert_not_awaited()
+
+
+@pytest.mark.parametrize("rc,out", [(1, ""), (127, ""), (0, "(no proxy variables)"),
+                                    (0, "PATH=/usr/bin\nPATH=/bin\n")])
+def test_preflight_env_fails(network, rc, out):
+    network.replies["env"].returncode = rc
+    network.replies["env"].stdout = out
+    with pytest.raises(RuntimeError, match="env observation"):
+        network.preflight()
+    assert network.calls == [["env"]]
+    network.offset.assert_not_awaited()
+
+
+def test_preflight_requires_containment_before_log_offset(network):
+    network.replies["outside"].returncode = 0
+    with pytest.raises(RuntimeError, match="connect denial"):
+        network.preflight()
+    network.offset.assert_not_awaited()

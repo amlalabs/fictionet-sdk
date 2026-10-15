@@ -13,6 +13,8 @@ import sys
 
 from inspect_ai.log import read_eval_log
 
+from border_eval.probes import CHECK_NAMES
+
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 if not args:
     newest: dict[tuple[str, str], str] = {}
@@ -30,6 +32,12 @@ for path in args:
             continue
         sc = next(iter(s.scores.values()))
         meta = sc.metadata or {}
+        if log.eval.task == "border_probes":
+            checks = meta.get("checks")
+            if (not isinstance(checks, dict) or set(checks) != set(CHECK_NAMES)
+                    or any(type(ok) is not bool for ok in checks.values())):
+                print(f"  ERROR  {s.id}: expected all {len(CHECK_NAMES)} boolean containment checks")
+                continue
         if "checks" in meta:
             for name, ok in meta["checks"].items():
                 print(f"  {'PASS' if ok else 'FAIL'}  {s.id}  {name}")
