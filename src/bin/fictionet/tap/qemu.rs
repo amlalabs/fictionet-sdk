@@ -11,6 +11,7 @@ use std::path::Path;
 use fictionet::relay::{self, unix};
 
 use crate::config::TapArgs;
+use crate::lifecycle;
 use crate::world::{self, Failure, err};
 
 use super::{End, OUTBOX, Port, greeting, relay_and_report, take_ready_file};
@@ -33,7 +34,7 @@ pub(super) fn run_qemu(
         args.name,
         path.display()
     );
-    world::write_ready_file(args.ready_file.as_deref(), &args.name)?;
+    lifecycle::write_ready_file(args.ready_file.as_deref(), &args.name)?;
     let Some(vm) = accept(&listener, sock.as_raw_fd())? else {
         return Ok(End::World);
     };
@@ -101,7 +102,7 @@ impl<'a> Unlink<'a> {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::symlink_metadata(path)?;
         let id = (meta.dev(), meta.ino());
-        crate::remove_on_signal(path, id);
+        lifecycle::remove_on_signal(path, id);
         Ok(Unlink { path, id })
     }
 }
@@ -109,7 +110,7 @@ impl<'a> Unlink<'a> {
 impl Drop for Unlink<'_> {
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
-        crate::keep_on_signal();
+        lifecycle::keep_on_signal();
         if std::fs::symlink_metadata(self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id) {
             let _ = std::fs::remove_file(self.path);
         }

@@ -5,6 +5,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use crate::config::TapArgs;
+use crate::lifecycle;
 use crate::linux;
 use crate::netlink::{self, Netlink};
 use crate::world::{self, Failure, context, err};
@@ -39,7 +40,7 @@ pub(super) fn run_device(
     eprintln!("fictionet attach: frames from {name} go to {own}, and back");
     let sock = world::handshake(&greeting(args))?;
     eprintln!("fictionet attach: {} attached through {name}", args.name);
-    world::write_ready_file(args.ready_file.as_deref(), &args.name)?;
+    lifecycle::write_ready_file(args.ready_file.as_deref(), &args.name)?;
     let mut port = Port::Device {
         fd,
         buf: vec![0u8; 65_536 + ether::HEADER],
@@ -135,7 +136,7 @@ impl Mirror {
         // The cleanup is in place before anything changes: dropping the
         // guard, or SIGTERM, SIGINT and SIGHUP (whose handler does the same
         // as dropping it), set the VM's device down and remove its qdisc.
-        crate::netlink_on_signal(
+        lifecycle::netlink_on_signal(
             [
                 netlink::link_down(vm).finish(),
                 netlink::del_ingress(vm).finish(),

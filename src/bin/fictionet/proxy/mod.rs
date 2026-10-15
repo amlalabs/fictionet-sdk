@@ -25,6 +25,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::config::{ProxyArgs, ProxyKind};
+use crate::lifecycle;
 use crate::world::{self, Failure, Greeting, err};
 use fictionet::relay::proxy::auth::Token;
 use link::Link;
@@ -47,7 +48,7 @@ pub(crate) fn log(line: &str) {
 /// Runs a proxy type to the end. `Ok` means the world closed the
 /// connection.
 pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
-    world::clear_ready_file(args.ready_file.as_deref());
+    lifecycle::clear_ready_file(args.ready_file.as_deref());
     let token = Token::from_file(&args.token_file).map_err(Failure::Error)?;
     // Client connections run on two worker threads, and the stack (inside
     // fictionet::run) on this one. With one thread for all of it, 50
@@ -85,7 +86,7 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
         "{} attached; {door} on {listen}, as {} with DNS at {}",
         args.name, args.ip_addr, args.dns
     ));
-    world::write_ready_file(args.ready_file.as_deref(), &args.name)?;
+    lifecycle::write_ready_file(args.ready_file.as_deref(), &args.name)?;
 
     let result = runtime.block_on(async move {
         let listener = TcpListener::from_std(std_listener).map_err(err("listening"))?;
@@ -114,7 +115,7 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
         ran.map_err(|e| Failure::Error(format!("the stack stopped: {e}")))?;
         Ok::<_, Failure>(shared)
     });
-    world::clear_ready_file(args.ready_file.as_deref());
+    lifecycle::clear_ready_file(args.ready_file.as_deref());
     let shared = result?;
     if shared.dropped() > 0 {
         log(&format!(

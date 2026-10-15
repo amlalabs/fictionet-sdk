@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use fictionet::relay::{self, unix};
 
 use crate::config::{TapArgs, VmLink};
+use crate::lifecycle;
 use crate::linux;
 use crate::world::{self, Failure, Greeting, err};
 
@@ -84,9 +85,9 @@ fn greeting<'a>(args: &'a TapArgs) -> Greeting<'a> {
 /// signal.
 fn take_ready_file(args: &TapArgs, lock: &mut Option<OwnedFd>, held: OwnedFd) {
     *lock = Some(held);
-    world::clear_ready_file(args.ready_file.as_deref());
+    lifecycle::clear_ready_file(args.ready_file.as_deref());
     if let Some(path) = &args.ready_file {
-        crate::remove_ready_on_signal(path);
+        lifecycle::remove_ready_on_signal(path);
     }
 }
 

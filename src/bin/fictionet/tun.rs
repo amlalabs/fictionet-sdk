@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use fictionet::relay::{self, unix};
 
 use crate::config::{AttachArgs, ResolvConf};
+use crate::lifecycle;
 use crate::linux::{enter_netns, index_of, open_tun};
 use crate::netlink::{self, Netlink};
 use crate::world::{self, Failure, Greeting, context, err};
@@ -17,7 +18,7 @@ use crate::world::{self, Failure, Greeting, context, err};
 /// Runs attach to the end. `Ok` means the world closed the connection.
 pub(crate) fn run(args: AttachArgs) -> Result<(), Failure> {
     let resolv_path = resolv_conf_path(&args).map_err(|e| Failure::Error(e.to_string()))?;
-    world::clear_ready_file(args.ready_file.as_deref());
+    lifecycle::clear_ready_file(args.ready_file.as_deref());
 
     // Enter the sandbox's namespace first, so the device is made there.
     // This must happen while the process has one thread.
@@ -54,7 +55,7 @@ pub(crate) fn run(args: AttachArgs) -> Result<(), Failure> {
             ))
         })?;
     }
-    world::write_ready_file(args.ready_file.as_deref(), &args.name)?;
+    lifecycle::write_ready_file(args.ready_file.as_deref(), &args.name)?;
 
     let result = relay_packets(tun.as_raw_fd(), sock.as_raw_fd());
     if let Some(path) = &args.ready_file {
@@ -219,12 +220,12 @@ pub(crate) fn resolv_conf(servers: &[IpAddr]) -> String {
 /// same host file mounted, so it sees the change too.
 /// With both `--no-dns` and `--no-dns-v6`, the file lists no servers.
 /// Attach runs as root, so it never writes through a symlink or a hard
-/// link at `path` (see [`world::open_own_file`]).
+/// link at `path` (see [`lifecycle::open_own_file`]).
 fn write_resolv_conf(path: &Path, servers: &[IpAddr]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut f = world::open_own_file(path, false)?;
+    let mut f = lifecycle::open_own_file(path, false)?;
     f.set_len(0)?;
     f.write_all(resolv_conf(servers).as_bytes())?;
     f.flush()
