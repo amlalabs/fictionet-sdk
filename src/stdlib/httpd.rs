@@ -2271,7 +2271,7 @@ mod h2 {
                     let wait = async {
                         loop {
                             if let Some(event) = log.of("http", "request").pop() {
-                                return event;
+                                break event;
                             }
                             fcx.sleep(Duration::from_millis(1)).await.unwrap();
                         }

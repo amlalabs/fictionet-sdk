@@ -2414,12 +2414,14 @@ mod tests {
         let mut s = Server::new();
         let mut c = Client::new();
         let to_client = |s: &mut Server, c: &mut Client, m: ServerMessage| {
-            let _ = c.push(&s.send(&m).unwrap());
+            let bytes = s.send(&m).unwrap();
+            assert_eq!(c.push(&bytes), bytes.len());
             assert_eq!(c.next(), Some(Ok(Ok(m))));
             assert_eq!(c.buffered(), 0);
         };
         let to_server = |s: &mut Server, c: &mut Client, m: ClientMessage| {
-            let _ = s.push(&c.send(&m).unwrap());
+            let bytes = c.send(&m).unwrap();
+            assert_eq!(s.push(&bytes), bytes.len());
             assert_eq!(s.next(), Some(Ok(Ok(m))));
             assert_eq!(s.buffered(), 0);
         };
@@ -2720,10 +2722,10 @@ mod tests {
     fn unsupported_security_type_is_reported() {
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
-        let _ = s.push(b"RFB 003.008\n");
+        assert_eq!(s.push(b"RFB 003.008\n"), 12);
         s.next().unwrap().unwrap().unwrap();
         s.send(&ServerMessage::SecurityTypes(vec![18, 19])).unwrap();
-        let _ = s.push(&[19]);
+        assert_eq!(s.push(&[19]), 1);
         assert_eq!(s.next(), Some(Ok(Ok(ClientMessage::SecurityType(19)))));
         assert_eq!(s.phase(), Phase::Unsupported(19));
         assert_eq!(
@@ -2731,14 +2733,14 @@ mod tests {
             Err(Error::Phase(Phase::Unsupported(19)))
         );
         assert_eq!(s.next(), None);
-        let _ = s.push(&[0]);
+        assert_eq!(s.push(&[0]), 1);
         assert_eq!(s.next(), None);
         // A 3.3 server can name one too.
         let mut c = Client::new();
-        let _ = c.push(b"RFB 003.003\n");
+        assert_eq!(c.push(b"RFB 003.003\n"), 12);
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_3)).unwrap();
-        let _ = c.push(&[0, 0, 0, 16]);
+        assert_eq!(c.push(&[0, 0, 0, 16]), 4);
         assert_eq!(c.next(), Some(Ok(Ok(ServerMessage::SecurityType(16)))));
         assert_eq!(c.phase(), Phase::Unsupported(16));
     }
@@ -2747,18 +2749,18 @@ mod tests {
     fn choice_must_be_offered() {
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
-        let _ = s.push(b"RFB 003.008\n");
+        assert_eq!(s.push(b"RFB 003.008\n"), 12);
         s.next().unwrap().unwrap().unwrap();
         s.send(&ServerMessage::SecurityTypes(vec![2])).unwrap();
-        let _ = s.push(&[1]);
+        assert_eq!(s.push(&[1]), 1);
         assert_eq!(s.next(), Some(Ok(Err(Error::NotOffered(1)))));
         assert_eq!(s.next(), None);
         // A client world cannot pick one either.
         let mut c = Client::new();
-        let _ = c.push(b"RFB 003.008\n");
+        assert_eq!(c.push(b"RFB 003.008\n"), 12);
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
-        let _ = c.push(&[1, 2]);
+        assert_eq!(c.push(&[1, 2]), 2);
         assert_eq!(
             c.next(),
             Some(Ok(Ok(ServerMessage::SecurityTypes(vec![2]))))
@@ -2783,7 +2785,7 @@ mod tests {
             s.send(&ServerMessage::Version(Version::V3_8)),
             Err(Error::Phase(Phase::ClientVersion))
         );
-        let _ = s.push(b"RFB 003.008\n");
+        assert_eq!(s.push(b"RFB 003.008\n"), 12);
         s.next().unwrap().unwrap().unwrap();
         // A 3.8 server offers a list; a single type is 3.3's.
         fictionet::assert_cases!(|message| s.send(message);
@@ -2805,7 +2807,7 @@ mod tests {
         // A 3.3 world on the server side cannot send a list.
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_3)).unwrap();
-        let _ = s.push(b"RFB 003.003\n");
+        assert_eq!(s.push(b"RFB 003.003\n"), 12);
         s.next().unwrap().unwrap().unwrap();
         assert_eq!(
             s.send(&ServerMessage::SecurityTypes(vec![1])),
@@ -2824,7 +2826,7 @@ mod tests {
         // a client answers 3.8 anyway.
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_3)).unwrap();
-        let _ = s.push(b"RFB 003.008\n");
+        assert_eq!(s.push(b"RFB 003.008\n"), 12);
         s.next().unwrap().unwrap().unwrap();
         assert_eq!(s.dialect(), Dialect::V3_3);
         assert_eq!(
@@ -2833,13 +2835,13 @@ mod tests {
         );
         // A client world that answers a 3.7 server with 3.8 reads a 3.7 list.
         let mut c = Client::new();
-        let _ = c.push(b"RFB 003.007\n");
+        assert_eq!(c.push(b"RFB 003.007\n"), 12);
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
         assert_eq!(c.dialect(), Dialect::V3_7);
         // A server version past 3.8, such as 3.889, leaves the client's.
         let mut c = Client::new();
-        let _ = c.push(b"RFB 003.889\n");
+        assert_eq!(c.push(b"RFB 003.889\n"), 12);
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
         assert_eq!(c.dialect(), Dialect::V3_8);
@@ -2862,7 +2864,7 @@ mod tests {
     fn early_bytes_wait_their_turn() {
         let mut s = Server::new();
         // The client's version, sent before the server's.
-        let _ = s.push(b"RFB 003.008\n");
+        assert_eq!(s.push(b"RFB 003.008\n"), 12);
         assert_eq!(s.next(), None);
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
         assert_eq!(
@@ -2870,7 +2872,7 @@ mod tests {
             Some(Ok(Ok(ClientMessage::Version(Version::V3_8))))
         );
         // Too much early is an error.
-        let _ = s.push(&vec![0; MAX_PENDING + 1]);
+        assert_eq!(s.push(&vec![0; MAX_PENDING + 1]), MAX_PENDING);
         assert_eq!(
             s.next(),
             Some(Err(codec::Fail::Protocol(FrameError::OutOfTurn)))
@@ -2883,10 +2885,10 @@ mod tests {
     #[test]
     fn server_init_example() {
         let mut c = Client::new();
-        let _ = c.push(b"RFB 003.003\n");
+        assert_eq!(c.push(b"RFB 003.003\n"), 12);
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_3)).unwrap();
-        let _ = c.push(&[0, 0, 0, 1]);
+        assert_eq!(c.push(&[0, 0, 0, 1]), 4);
         assert_eq!(c.next(), Some(Ok(Ok(ServerMessage::SecurityType(1)))));
         assert_eq!(
             c.send(&ClientMessage::ClientInit { shared: true }),
@@ -2897,17 +2899,17 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, 0, 3, b'a', b'b', b'c']);
         for n in 0..bytes.len() {
             let mut c2 = Client::new();
-            let _ = c2.push(b"RFB 003.003\n");
+            assert_eq!(c2.push(b"RFB 003.003\n"), 12);
             c2.next().unwrap().unwrap().unwrap();
             c2.send(&ClientMessage::Version(Version::V3_3)).unwrap();
-            let _ = c2.push(&[0, 0, 0, 1]);
+            assert_eq!(c2.push(&[0, 0, 0, 1]), 4);
             c2.next().unwrap().unwrap().unwrap();
             c2.send(&ClientMessage::ClientInit { shared: true })
                 .unwrap();
-            let _ = c2.push(&bytes[..n]);
+            assert_eq!(c2.push(&bytes[..n]), n);
             assert_eq!(c2.next(), None, "{n} bytes");
         }
-        let _ = c.push(&bytes);
+        assert_eq!(c.push(&bytes), bytes.len());
         let format = PixelFormat {
             bits_per_pixel: 16,
             depth: 16,
@@ -2931,7 +2933,10 @@ mod tests {
             Ok(bytes)
         );
         // Raw pixels are now two bytes each.
-        let _ = c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0xab, 0xcd]);
+        assert_eq!(
+            c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0xab, 0xcd]),
+            18
+        );
         let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next() else {
             panic!()
         };
@@ -2939,7 +2944,10 @@ mod tests {
         // After SetPixelFormat, four.
         c.send(&ClientMessage::SetPixelFormat(PixelFormat::TRUE_COLOR_32))
             .unwrap();
-        let _ = c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 2, 3, 4]);
+        assert_eq!(
+            c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 2, 3, 4]),
+            20
+        );
         let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next() else {
             panic!()
         };
@@ -3353,7 +3361,7 @@ mod tests {
             Some(1),
             Some(ServerMessage::SecurityOk),
         );
-        let _ = s.push(&[9]);
+        assert_eq!(s.push(&[9]), 1);
         assert_eq!(
             s.next(),
             Some(Err(codec::Fail::Protocol(FrameError::MessageType(9))))
@@ -3363,7 +3371,7 @@ mod tests {
         assert_eq!(s.buffered(), 1);
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
-        let _ = s.push(b"RFB 3.8\n");
+        assert_eq!(s.push(b"RFB 3.8\n"), 8);
         assert_eq!(
             s.next(),
             Some(Err(codec::Fail::Protocol(FrameError::Version)))
@@ -3491,13 +3499,15 @@ mod tests {
 
     /// Passes a client message to the server through bytes.
     fn client_says(s: &mut Server, c: &mut Client, m: ClientMessage) {
-        let _ = s.push(&c.send(&m).unwrap());
+        let bytes = c.send(&m).unwrap();
+        assert_eq!(s.push(&bytes), bytes.len());
         assert_eq!(s.next(), Some(Ok(Ok(m))));
     }
 
     /// Passes a server message to the client through bytes.
     fn server_says(s: &mut Server, c: &mut Client, m: ServerMessage) {
-        let _ = c.push(&s.send(&m).unwrap());
+        let bytes = s.send(&m).unwrap();
+        assert_eq!(c.push(&bytes), bytes.len());
         assert_eq!(c.next(), Some(Ok(Ok(m))));
     }
 
@@ -3514,10 +3524,10 @@ mod tests {
             )
             .unwrap();
             let (_, mut c) = normal_pair();
-            let _ = c.push(&bytes[..4]);
+            assert_eq!(c.push(&bytes[..4]), 4);
             let mut got = 0;
             for r in chunks(&bytes[4..], &[16]) {
-                let _ = c.push(r);
+                assert_eq!(c.push(r), r.len());
                 match c.next() {
                     Some(m) => {
                         m.unwrap().unwrap();
@@ -3558,14 +3568,14 @@ mod tests {
         ];
         // An update half read keeps its format.
         let (_, mut c) = normal_pair();
-        let _ = c.push(&update[..18]);
+        assert_eq!(c.push(&update[..18]), 18);
         assert_eq!(c.next(), None);
         assert_eq!(
             c.send(&ClientMessage::SetPixelFormat(f8)),
             Err(Error::Outstanding)
         );
         assert_eq!(c.pixel_format(), PixelFormat::TRUE_COLOR_32);
-        let _ = c.push(&update[18..]);
+        assert_eq!(c.push(&update[18..]), update.len() - 18);
         let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next() else {
             panic!()
         };
@@ -3576,7 +3586,7 @@ mod tests {
         );
         // So does an update whose first byte alone has come.
         let (_, mut c) = normal_pair();
-        let _ = c.push(&update[..1]);
+        assert_eq!(c.push(&update[..1]), 1);
         assert_eq!(c.next(), None);
         assert_eq!(
             c.send(&ClientMessage::SetPixelFormat(f8)),
@@ -3589,11 +3599,14 @@ mod tests {
             c.send(&ClientMessage::SetPixelFormat(f8)),
             Err(Error::Outstanding)
         );
-        let _ = c.push(&update);
+        assert_eq!(c.push(&update), update.len());
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::SetPixelFormat(f8)).unwrap();
         assert_eq!(c.pixel_format(), f8);
-        let _ = c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0x5a]);
+        assert_eq!(
+            c.push(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0x5a]),
+            17
+        );
         let Some(Ok(Ok(ServerMessage::FramebufferUpdate(r)))) = c.next() else {
             panic!()
         };
@@ -3623,15 +3636,15 @@ mod tests {
             Err(Error::PixelFormat)
         );
         assert_eq!(c.pixel_format(), PixelFormat::TRUE_COLOR_32);
-        let _ = s.push(&b);
+        assert_eq!(s.push(&b), b.len());
         assert_eq!(s.next(), Some(Ok(Err(Error::PixelFormat))));
         // A ServerInit in 24 bits per pixel is refused before the first
         // update, on both sides.
         let mut c = Client::new();
-        let _ = c.push(b"RFB 003.003\n");
+        assert_eq!(c.push(b"RFB 003.003\n"), 12);
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_3)).unwrap();
-        let _ = c.push(&[0, 0, 0, 1]);
+        assert_eq!(c.push(&[0, 0, 0, 1]), 4);
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::ClientInit { shared: true }).unwrap();
         let f24 = PixelFormat {
@@ -3648,7 +3661,7 @@ mod tests {
         raw[0] = 24;
         bytes.extend_from_slice(&raw);
         bytes.extend_from_slice(&[0, 0, 0, 0]);
-        let _ = c.push(&bytes);
+        assert_eq!(c.push(&bytes), bytes.len());
         assert_eq!(c.next(), Some(Ok(Err(Error::PixelFormat))));
     }
 
@@ -3681,7 +3694,8 @@ mod tests {
             )]),
         ] {
             assert_eq!(s.send(&bad), Err(Error::Rectangle), "{bad:?}");
-            let _ = c.push(&server_bytes(&bad, Dialect::V3_8, &f).unwrap());
+            let bytes = server_bytes(&bad, Dialect::V3_8, &f).unwrap();
+            assert_eq!(c.push(&bytes), bytes.len());
             assert_eq!(c.next(), Some(Ok(Err(Error::Rectangle))), "{bad:?}");
         }
         // The edges are inside, and the cursor's hot spot is not checked.
@@ -3699,7 +3713,8 @@ mod tests {
                 },
             ),
         ]);
-        let _ = c.push(&s.send(&good).unwrap());
+        let bytes = s.send(&good).unwrap();
+        assert_eq!(c.push(&bytes), bytes.len());
         assert_eq!(c.next(), Some(Ok(Ok(good))));
         // DesktopSize shrinks the framebuffer for the updates after it.
         client_says(&mut s, &mut c, request);
@@ -3707,12 +3722,14 @@ mod tests {
             rect(1000, 0, 8, 8, Contents::Raw(vec![0; 256])),
             rect(0, 0, 640, 480, Contents::DesktopSize),
         ]);
-        let _ = c.push(&s.send(&shrink).unwrap());
+        let bytes = s.send(&shrink).unwrap();
+        assert_eq!(c.push(&bytes), bytes.len());
         assert_eq!(c.next(), Some(Ok(Ok(shrink))));
         client_says(&mut s, &mut c, update_request(true, 0, 0, 1, 1));
         let past = update(vec![rect(640, 0, 1, 1, Contents::Raw(vec![0; 4]))]);
         assert_eq!(s.send(&past), Err(Error::Rectangle));
-        let _ = c.push(&server_bytes(&past, Dialect::V3_8, &f).unwrap());
+        let bytes = server_bytes(&past, Dialect::V3_8, &f).unwrap();
+        assert_eq!(c.push(&bytes), bytes.len());
         assert_eq!(c.next(), Some(Ok(Err(Error::Rectangle))));
     }
 
@@ -3847,7 +3864,7 @@ mod tests {
         // RFC 6143, section 7.1.2: 0 is Invalid.
         let mut s = Server::new();
         s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
-        let _ = s.push(b"RFB 003.008\n");
+        assert_eq!(s.push(b"RFB 003.008\n"), 12);
         s.next().unwrap().unwrap().unwrap();
         assert_eq!(
             s.send(&ServerMessage::SecurityTypes(vec![0])),
@@ -3860,10 +3877,10 @@ mod tests {
         assert_eq!(s.phase(), Phase::SecurityOffer);
         // A client world cannot pick 0, even from a peer that offered it.
         let mut c = Client::new();
-        let _ = c.push(b"RFB 003.008\n");
+        assert_eq!(c.push(b"RFB 003.008\n"), 12);
         c.next().unwrap().unwrap().unwrap();
         c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
-        let _ = c.push(&[2, 0, 1]);
+        assert_eq!(c.push(&[2, 0, 1]), 3);
         assert_eq!(
             c.next(),
             Some(Ok(Ok(ServerMessage::SecurityTypes(vec![0, 1]))))

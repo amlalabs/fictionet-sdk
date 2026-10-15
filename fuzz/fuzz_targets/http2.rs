@@ -36,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
             http2::Session::server_side(Default::default())
         };
         if client {
-            let _ = c.push(http2::PREFACE);
+            assert_eq!(c.push(http2::PREFACE), http2::PREFACE.len());
             while c.next().is_some() {}
         }
         for part in framed.chunks(7) {

@@ -968,10 +968,11 @@ fn demux_refuses_initial_state_and_delivers_item_before_budget_error() {
         }
         fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<()>, TestError> {
             if b.is_empty() {
-                return Ok(Step::Need);
+                Ok(Step::Need)
+            } else {
+                self.0 = 8;
+                Ok(Step::Item((), 1))
             }
-            self.0 = 8;
-            Ok(Step::Item((), 1))
         }
     }
     let mut d = Demux::new(1, 2, |_: &u8| Inflate(0));
@@ -1399,11 +1400,13 @@ fn contract_combined_limits_reject_held_growth() {
             self.0.len()
         }
         fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<()>, Infallible> {
-            let Some(&byte) = input.first() else {
-                return Ok(Step::Need);
-            };
-            self.0.push(byte);
-            Ok(Step::Item((), 1))
+            match input.first() {
+                None => Ok(Step::Need),
+                Some(&byte) => {
+                    self.0.push(byte);
+                    Ok(Step::Item((), 1))
+                }
+            }
         }
     }
     contract::check_decode_limits(|| Retain(Vec::new()), b"a", 1, 2);

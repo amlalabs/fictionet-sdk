@@ -650,6 +650,54 @@ class Inventory(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("(b)", errors[0])
 
+    def test_codecs_entries_are_exact_reasoned_and_current(self):
+        # A codec test's early return stands in for any reviewed codecs exception.
+        self.write("fuzz/fuzz_targets/a.rs", "#[test]\nfn a() {\n    return;\n}\n")
+        entry = {"path": "fuzz/fuzz_targets/a.rs", "symbol": "a", "pattern": "return;",
+                 "reason": "Early return exercised by the checker's own tests.", "id": "POL-TEST-FIXTURE"}
+        self.assertEqual(len(checker.check(self.root, "codecs")), 1)
+        self.allow([entry], rule="silent-skip", scope="codecs")
+        self.assertEqual(checker.check(self.root, "codecs"), [])
+        # Glob, directory and unidentified entries are refused outright.
+        for changes in ({"path": "fuzz/fuzz_targets/*.rs"}, {"path": "fuzz/fuzz_targets/"},
+                        {"symbol": "*"}, {"reason": ""}, {"id": ""}, {"id": "later"}):
+            with self.subTest(changes=changes):
+                self.allow([{**entry, **changes}], rule="silent-skip", scope="codecs")
+                with self.assertRaises(checker.CheckError):
+                    checker.check(self.root, "codecs")
+        # A directory named without a slash matches no site, so it is stale.
+        self.allow([{**entry, "path": "fuzz/fuzz_targets"}], rule="silent-skip", scope="codecs")
+        errors = checker.check(self.root, "codecs")
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(any("stale exception" in e for e in errors), errors)
+        # Once the reviewed line changes, its fingerprint is stale and the new line fails.
+        self.allow([entry], rule="silent-skip", scope="codecs")
+        self.write("fuzz/fuzz_targets/a.rs", "#[test]\nfn a() {\n    return ();\n}\n")
+        errors = checker.check(self.root, "codecs")
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(any("stale exception" in e for e in errors), errors)
+        self.assertTrue(any("return ();" in e for e in errors), errors)
+
+    def test_codecs_suppressions_fail_in_codec_and_fuzz_sources(self):
+        for path in ("src/stdlib/a.rs", "fuzz/fuzz_targets/a.rs", "codegen/src/a.rs"):
+            for source, rule in (
+                ("#![allow(unused_must_use)]\nfn a() {}\n", "rust-protected-allow"),
+                ("#[allow(clippy::let_underscore_must_use)]\nfn a() {}\n", "rust-protected-allow"),
+                ('fn a() {\n    #[expect(clippy::let_underscore_must_use, reason = "fuzz input")]\n'
+                 '    let _ = b();\n}\n', "rust-reason"),
+                ("fn a() {\n    #[expect(clippy::let_underscore_must_use)]\n    let _ = b();\n}\n",
+                 "rust-reason"),
+                ("#[test]\n#[ignore]\nfn a() {}\n", "skip-reason"),
+            ):
+                with self.subTest(path=path, source=source):
+                    self.write(path, source)
+                    errors = checker.check(self.root, "codecs")
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertIn(rule, errors[0])
+            self.write(path, 'fn a() {\n    #[expect(clippy::let_underscore_must_use, '
+                             'reason = "POL-PROBE: arbitrary input may be rejected")]\n    let _ = b();\n}\n')
+            self.assertEqual(checker.check(self.root, "codecs"), [])
+
     def test_scope_cannot_approve_other_scope(self):
         self.fixture()
         self.allow([self.entry()], scope="runtime")
@@ -684,6 +732,21 @@ class RuntimeScope(unittest.TestCase):
                     self.assertTrue(checker.check(ROOT, "runtime"))
 
 
+class CodecsScope(unittest.TestCase):
+    """The committed tree: codec, codegen and fuzz code keeps only individually reviewed exceptions."""
+
+    def test_codecs_scope_passes_and_needs_every_entry(self):
+        self.assertEqual(checker.check(ROOT, "codecs"), [])
+        entries = checker.exceptions(ROOT, "codecs")
+        for entry in entries:
+            with self.subTest(entry=entry):
+                self.assertEqual(checker.scope_for(entry[1]), "codecs")
+                self.assertTrue((ROOT / entry[1]).is_file())
+                rest = [e for e in entries if e != entry]
+                with patch.object(checker, "exceptions", lambda root, scope: rest):
+                    self.assertTrue(checker.check(ROOT, "codecs"))
+
+
 class Prerequisites(unittest.TestCase):
     def test_cargo_missing_is_visible_and_fails_for_any_ci_value(self):
         for environment in ({}, {"CI": ""}, {"CI": "1"}):
@@ -693,6 +756,11 @@ class Prerequisites(unittest.TestCase):
                 with contextlib.redirect_stdout(output), self.assertRaises(error):
                     require_cargo()
                 self.assertIn("skipped: POL-PREREQUISITE: cargo is required", output.getvalue())
+
+
+# A count that is must-use because of its function, not its type, like a codec stream's push.
+PUSH = ('#[must_use = "bytes past the returned count were not taken"]\n'
+        'fn push(bytes: &[u8]) -> usize { bytes.len() }\n')
 
 
 class TypedClippy(unittest.TestCase):
@@ -733,6 +801,12 @@ version = "0.0.0"
                  'let _ = 1;', False, "this lint expectation is unfulfilled"),
                 ('#[expect(clippy::let_underscore_must_use)]\n'
                  'let _ = std::fs::remove_file("x");', False, "allow_attributes_without_reason"),
+                # A must-use count, like a codec stream's push, cannot be dropped
+                # silently: assert it, or state what the test checks instead.
+                (f'{PUSH}let _ = push(b"x");', False, "let_underscore_must_use"),
+                (f'{PUSH}assert_eq!(push(b"x"), 1);', True, ""),
+                (f'{PUSH}#[expect(clippy::let_underscore_must_use, reason = "POL-SCAFFOLD: the test checks a bound")]\n'
+                 'let _ = push(b"x");', True, ""),
                 # An approved cleanup exception does not cover the unlisted discard beside it.
                 ('#[expect(clippy::let_underscore_must_use, reason = "POL-TEARDOWN: illustrative cleanup")]\n'
                  'let _ = std::fs::remove_file("x");\n'

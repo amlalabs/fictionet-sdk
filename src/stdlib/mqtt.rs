@@ -1799,16 +1799,16 @@ mod tests {
         // Whole packets, then half of one; the next push drops the taken
         // bytes and keeps the half.
         let mut d = Stream::new(Frames::<Packet>::new());
-        let _ = d.push(&[0xc0, 0, 0xd0, 0, 0x40, 2, 0]);
+        assert_eq!(d.push(&[0xc0, 0, 0xd0, 0, 0x40, 2, 0]), 7);
         assert_eq!(d.next(), Some(Ok(Packet::PingReq)));
         assert_eq!(d.next(), Some(Ok(Packet::PingResp)));
         assert_eq!(d.next(), None);
         assert_eq!(d.buffered(), 3);
-        let _ = d.push(&[9, 0xe0]);
+        assert_eq!(d.push(&[9, 0xe0]), 2);
         assert_eq!(d.buffered(), 5);
         assert_eq!(d.next(), Some(Ok(Packet::PubAck(9))));
         assert_eq!(d.next(), None);
-        let _ = d.push(&[0]);
+        assert_eq!(d.push(&[0]), 1);
         assert_eq!(d.next(), Some(Ok(Packet::Disconnect)));
         assert_eq!(d.buffered(), 0);
     }
@@ -1827,9 +1827,9 @@ mod tests {
         let mut d = Stream::new(Frames::<Packet>::with_limit(10));
         assert_eq!(d.decoder().limit(), 10);
         // A PUBLISH of 2 + 8 bytes fits; one of 2 + 9 is refused from its header.
-        let _ = d.push(&[0x30, 8, 0, 1, b't', 1, 2, 3, 4, 5]);
+        assert_eq!(d.push(&[0x30, 8, 0, 1, b't', 1, 2, 3, 4, 5]), 10);
         assert!(matches!(d.next(), Some(Ok(Packet::Publish(_)))));
-        let _ = d.push(&[0x30, 9]);
+        assert_eq!(d.push(&[0x30, 9]), 2);
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(Error::TooLarge { size: 11, max: 10 })))
@@ -1839,7 +1839,7 @@ mod tests {
         assert_eq!(Frames::<Packet>::new().limit(), DEFAULT_MAX_PACKET);
         // The largest header is refused at once by the default limit.
         let mut d = Stream::new(Frames::<Packet>::new());
-        let _ = d.push(&[0x30, 0xff, 0xff, 0xff, 0x7f]);
+        assert_eq!(d.push(&[0x30, 0xff, 0xff, 0xff, 0x7f]), 5);
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(Error::TooLarge {

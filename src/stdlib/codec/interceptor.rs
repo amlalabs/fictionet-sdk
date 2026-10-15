@@ -534,11 +534,12 @@ mod tests {
                     let taken = scratch.push(&bytes);
                     assert!(scratch.len() <= scratch.limit());
                     if taken != bytes.len() {
-                        return Err(RewriteError::TooLong {
+                        Err(RewriteError::TooLong {
                             limit: scratch.limit(),
-                        });
+                        })
+                    } else {
+                        Ok::<_, RewriteError<core::convert::Infallible>>(())
                     }
-                    Ok::<_, RewriteError<core::convert::Infallible>>(())
                 },
             )
             .unwrap_err();

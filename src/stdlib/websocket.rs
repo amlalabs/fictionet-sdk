@@ -2741,6 +2741,10 @@ mod tests {
     fn review_push_is_bounded() {
         // One large push with a tiny limit holds at most one control frame.
         let mut d = Stream::new(Messages::for_receiver(Side::Client).with_limit(1));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-SCAFFOLD: an oversized push; the test checks the buffered bound, not how much of it was taken"
+        )]
         let _ = d.push(&vec![0x82; 1 << 20]);
         assert!(
             d.buffered() <= MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD,
@@ -2751,6 +2755,10 @@ mod tests {
         let mut d = Stream::new(Messages::for_receiver(Side::Client));
         let chunk = [0x8a, 0x00].repeat(rounds(1 << 22));
         for _ in 0..3 {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-SCAFFOLD: undrained pushes fill the stream; the test checks the buffered bound, not how much each push took"
+            )]
             let _ = d.push(&chunk);
         }
         assert!(

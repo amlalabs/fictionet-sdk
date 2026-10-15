@@ -1987,17 +1987,16 @@ mod tests {
     #[test]
     fn negative_zero_checksum() {
         // Find a Hello option whose checksum comes to 0, then send 0xffff.
-        for g in 0..=u32::from(u16::MAX) {
-            let m = Message::Hello(vec![HelloOption::GenerationId(g)]);
-            let b = m.frame(&v4_ends()).unwrap();
-            if b[2..4] == [0, 0] {
-                let mut n = b.clone();
-                n[2..4].copy_from_slice(&[0xff, 0xff]);
-                assert_eq!(Message::parse(&n, &v4_ends()), Ok(m));
-                return;
-            }
-        }
-        panic!("no message with a zero checksum");
+        let (m, mut n) = (0..=u32::from(u16::MAX))
+            .map(|g| {
+                let m = Message::Hello(vec![HelloOption::GenerationId(g)]);
+                let b = m.frame(&v4_ends()).unwrap();
+                (m, b)
+            })
+            .find(|(_, b)| b[2..4] == [0, 0])
+            .expect("no message with a zero checksum");
+        n[2..4].copy_from_slice(&[0xff, 0xff]);
+        assert_eq!(Message::parse(&n, &v4_ends()), Ok(m));
     }
 
     #[test]

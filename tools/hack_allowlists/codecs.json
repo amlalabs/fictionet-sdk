@@ -1,0 +1,11 @@
+{
+  "shell-or-true": [
+    {
+      "path": "fuzz/run-all.sh",
+      "symbol": "top",
+      "pattern": "shift || true",
+      "reason": "With no arguments there is nothing to shift: seconds already took its default from ${1:-60}, and the remaining arguments are empty either way.",
+      "id": "POL-FALLBACK"
+    }
+  ]
+}
