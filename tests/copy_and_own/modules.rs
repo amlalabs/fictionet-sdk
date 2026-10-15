@@ -20,6 +20,8 @@ macro_rules! protocols {
         pub mod ber;
         #[path = "../../src/stdlib/bgp.rs"]
         pub mod bgp;
+        #[path = "../../src/stdlib/book_levels.rs"]
+        pub mod book_levels;
         #[path = "../../src/stdlib/codec/bounded.rs"]
         pub mod bounded;
         #[path = "../../src/stdlib/codec/buffer.rs"]

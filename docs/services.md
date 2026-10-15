@@ -302,6 +302,19 @@ BOE and SoupBinTCP use this shared clock. Each keeps its own timer defaults,
 validation, deadline comparisons, error mapping, and session transitions.
 Copied protocol modules use the same public helper.
 
+### Price-level aggregates
+
+`stdlib::book_levels::Levels` stores quantity and order count for one side
+of an instrument. It iterates by ascending price; reverse the iterator for
+highest bids first. Adds report level creation. Reductions report removal
+when the last order leaves. Quantity and order-count arithmetic saturates.
+The helper has no internal level limit. Callers validate orders and check
+their limits before changing it.
+
+ITCH and Cboe PITCH use this public helper, including in copied modules.
+Their book APIs, admission and replacement rules, limits, errors, and runtime
+behavior are unchanged. The new support API is additive.
+
 ### Terminal framing errors
 
 The ITCH, SoupBinTCP, Cboe PITCH, Cboe BOE, and MongoDB framers now use

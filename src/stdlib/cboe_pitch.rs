@@ -86,11 +86,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use fictionet::stdlib::book_levels::{Aggregate, Levels};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -1482,25 +1483,19 @@ pub enum Applied {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Aggregate {
-    quantity: u64,
-    orders: usize,
-}
-
 #[derive(Clone, Debug, Default)]
 struct SymbolBook {
-    bids: BTreeMap<Price, Aggregate>,
-    asks: BTreeMap<Price, Aggregate>,
+    bids: Levels<Price>,
+    asks: Levels<Price>,
 }
 impl SymbolBook {
-    fn side(&self, side: Side) -> &BTreeMap<Price, Aggregate> {
+    fn side(&self, side: Side) -> &Levels<Price> {
         match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         }
     }
-    fn side_mut(&mut self, side: Side) -> &mut BTreeMap<Price, Aggregate> {
+    fn side_mut(&mut self, side: Side) -> &mut Levels<Price> {
         match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
@@ -1567,12 +1562,12 @@ impl Book {
     }
     /// The highest bid of `symbol`.
     pub fn best_bid(&self, symbol: Symbol) -> Option<Level> {
-        let (price, a) = self.symbols.get(&symbol)?.bids.last_key_value()?;
+        let (price, a) = self.symbols.get(&symbol)?.bids.iter().next_back()?;
         Some(level(*price, a))
     }
     /// The lowest ask of `symbol`.
     pub fn best_ask(&self, symbol: Symbol) -> Option<Level> {
-        let (price, a) = self.symbols.get(&symbol)?.asks.first_key_value()?;
+        let (price, a) = self.symbols.get(&symbol)?.asks.iter().next()?;
         Some(level(*price, a))
     }
     /// Up to `n` levels of one side of `symbol`, best first.
@@ -1715,28 +1710,22 @@ impl Book {
     }
     fn insert(&mut self, order_id: u64, order: Order) {
         let book = self.symbols.entry(order.symbol).or_default();
-        let level = book
+        if book
             .side_mut(order.side)
-            .entry(order.price)
-            .or_insert_with(|| {
-                self.levels += 1;
-                Aggregate::default()
-            });
-        level.quantity = level.quantity.saturating_add(u64::from(order.quantity));
-        level.orders = level.orders.saturating_add(1);
+            .add(order.price, u64::from(order.quantity))
+        {
+            self.levels += 1;
+        }
         self.by_unit.entry(order.unit).or_default().insert(order_id);
         self.orders.insert(order_id, order);
     }
     fn remove(&mut self, order_id: u64, order: Order) {
         if let Some(book) = self.symbols.get_mut(&order.symbol) {
-            let map = book.side_mut(order.side);
-            if let Some(level) = map.get_mut(&order.price) {
-                level.quantity = level.quantity.saturating_sub(u64::from(order.quantity));
-                level.orders = level.orders.saturating_sub(1);
-                if level.orders == 0 {
-                    map.remove(&order.price);
-                    self.levels = self.levels.saturating_sub(1);
-                }
+            if book
+                .side_mut(order.side)
+                .reduce(&order.price, u64::from(order.quantity), true)
+            {
+                self.levels = self.levels.saturating_sub(1);
             }
             if book.bids.is_empty() && book.asks.is_empty() {
                 self.symbols.remove(&order.symbol);
@@ -1795,15 +1784,12 @@ impl Book {
         };
         if price == old.price {
             // Same level: only its share total changes.
-            if let Some(level) = self
-                .symbols
-                .get_mut(&old.symbol)
-                .and_then(|b| b.side_mut(old.side).get_mut(&price))
-            {
-                level.quantity = level
-                    .quantity
-                    .saturating_sub(u64::from(old.quantity))
-                    .saturating_add(u64::from(quantity));
+            if let Some(book) = self.symbols.get_mut(&old.symbol) {
+                book.side_mut(old.side).replace_quantity(
+                    &price,
+                    u64::from(old.quantity),
+                    u64::from(quantity),
+                );
             }
             self.orders.insert(order_id, new);
             return Ok(changed);
@@ -1832,6 +1818,7 @@ mod tests {
     };
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{decode_all, mutate};
+    use std::collections::BTreeMap;
 
     fn gap_fixture(unit: u8, sequence: u32, count: u32) -> Gap {
         Gap {

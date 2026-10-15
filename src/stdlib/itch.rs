@@ -65,11 +65,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use fictionet::stdlib::book_levels::{Aggregate, Levels};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -888,26 +889,20 @@ pub enum Applied {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Aggregate {
-    shares: u64,
-    orders: usize,
-}
-
 #[derive(Clone, Debug, Default)]
 struct StockBook {
     symbol: Option<Stock>,
-    bids: BTreeMap<Price4, Aggregate>,
-    asks: BTreeMap<Price4, Aggregate>,
+    bids: Levels<Price4>,
+    asks: Levels<Price4>,
 }
 impl StockBook {
-    fn side(&self, side: Side) -> &BTreeMap<Price4, Aggregate> {
+    fn side(&self, side: Side) -> &Levels<Price4> {
         match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         }
     }
-    fn side_mut(&mut self, side: Side) -> &mut BTreeMap<Price4, Aggregate> {
+    fn side_mut(&mut self, side: Side) -> &mut Levels<Price4> {
         match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
@@ -974,12 +969,12 @@ impl Book {
     }
     /// The highest bid of `locate`.
     pub fn best_bid(&self, locate: u16) -> Option<Level> {
-        let (price, a) = self.stocks.get(&locate)?.bids.last_key_value()?;
+        let (price, a) = self.stocks.get(&locate)?.bids.iter().next_back()?;
         Some(level(*price, a))
     }
     /// The lowest ask of `locate`.
     pub fn best_ask(&self, locate: u16) -> Option<Level> {
-        let (price, a) = self.stocks.get(&locate)?.asks.first_key_value()?;
+        let (price, a) = self.stocks.get(&locate)?.asks.iter().next()?;
         Some(level(*price, a))
     }
     /// Up to `n` levels of one side of `locate`, best first.
@@ -1038,7 +1033,7 @@ impl Book {
     fn has_level(&self, locate: u16, side: Side, price: Price4) -> bool {
         self.stocks
             .get(&locate)
-            .is_some_and(|s| s.side(side).contains_key(&price))
+            .is_some_and(|s| s.side(side).get(&price).is_some())
     }
     /// Checks that an order can be added after `freed`, the order a
     /// replace takes off the book first, is gone.
@@ -1084,15 +1079,12 @@ impl Book {
     }
     fn insert(&mut self, order_ref: u64, order: Order) {
         let stock = self.stocks.entry(order.locate).or_default();
-        let level = stock
+        if stock
             .side_mut(order.side)
-            .entry(order.price)
-            .or_insert_with(|| {
-                self.levels += 1;
-                Aggregate::default()
-            });
-        level.shares = level.shares.saturating_add(u64::from(order.shares));
-        level.orders = level.orders.saturating_add(1);
+            .add(order.price, u64::from(order.shares))
+        {
+            self.levels += 1;
+        }
         self.orders.insert(order_ref, order);
     }
     /// Takes `shares` off a live order's level, and the order off the
@@ -1101,16 +1093,11 @@ impl Book {
     fn take_shares(&mut self, order_ref: u64, order: Order, shares: u32) {
         let left = order.shares - shares;
         if let Some(stock) = self.stocks.get_mut(&order.locate) {
-            let map = stock.side_mut(order.side);
-            if let Some(level) = map.get_mut(&order.price) {
-                level.shares = level.shares.saturating_sub(u64::from(shares));
-                if left == 0 {
-                    level.orders = level.orders.saturating_sub(1);
-                    if level.orders == 0 {
-                        map.remove(&order.price);
-                        self.levels = self.levels.saturating_sub(1);
-                    }
-                }
+            if stock
+                .side_mut(order.side)
+                .reduce(&order.price, u64::from(shares), left == 0)
+            {
+                self.levels = self.levels.saturating_sub(1);
             }
             if stock.symbol.is_none() && stock.bids.is_empty() && stock.asks.is_empty() {
                 self.stocks.remove(&order.locate);
@@ -1174,7 +1161,7 @@ impl Book {
 fn level(price: Price4, a: &Aggregate) -> Level {
     Level {
         price,
-        shares: a.shares,
+        shares: a.quantity,
         orders: a.orders,
     }
 }
@@ -1187,6 +1174,7 @@ mod tests {
         check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
     use fictionet::stdlib::test_support::{decode_all, mutate};
+    use std::collections::BTreeMap;
 
     fn replace_order(
         header: Header,

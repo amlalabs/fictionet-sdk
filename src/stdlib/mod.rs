@@ -265,6 +265,7 @@
 //! | [`asn1`] | ASN.1 BER and DER tags, lengths and values, the base of LDAP, SNMP, Kerberos and X.509. | yes | yes |  |  |  | yes | yes |
 //! | [`bacnet`] | BACnet/IP: BVLC messages, NPDUs, APDUs and application-tagged values. | yes | yes |  |  |  | yes | yes |
 //! | [`bgp`] | BGP-4 messages from OPEN to ROUTE-REFRESH, with path attributes and prefixes. | yes | yes |  |  |  | yes | yes |
+//! | [`book_levels`] | Ordered quantity and order-count aggregates for one side of an order book. |  |  |  |  |  |  | yes |
 //! | [`ca`] | Seeded certificate authorities and server leaves for simulated TLS sites. |  |  |  |  |  |  | yes |
 //! | [`cboe_boe`] | Cboe Binary Order Entry: every session and order message, a member's and an exchange's session, and an order tracker. | yes | yes | `Client`, `Server`, `Exchange` |  |  | yes | yes |
 //! | [`cboe_pitch`] | Cboe Multicast PITCH: sequenced units, every message, a gap detector per unit and a bounded order book. | yes | yes | `GapDetector`, `Book` |  |  | yes | yes |
@@ -395,6 +396,7 @@ pub mod amqp;
 pub mod asn1;
 pub mod bacnet;
 pub mod bgp;
+pub mod book_levels;
 pub mod ca;
 pub mod cboe_boe;
 pub mod cboe_pitch;
