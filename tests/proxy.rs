@@ -8,10 +8,14 @@
 #[allow(dead_code)]
 #[path = "common/certs.rs"]
 mod certs;
+#[path = "common/io.rs"]
+mod io;
+
+use io::read_all;
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use fictionet::stdlib::{tls, web};
+use fictionet::stdlib::{http1, tls, web};
 use rustls::pki_types::PrivateKeyDer;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
@@ -356,24 +360,63 @@ impl Drop for Attach {
     }
 }
 
-/// Reads until the other side closes.
-fn read_all(s: &mut TcpStream) -> Vec<u8> {
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out);
-    out
+fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    (client, server)
+}
+
+#[test]
+#[should_panic(expected = "read until EOF")]
+fn timeout_is_not_close() {
+    let (mut client, server) = tcp_pair();
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    read_all(&mut client);
+    drop(server);
+}
+
+#[test]
+#[should_panic(expected = "ConnectionReset")]
+fn injected_read_error_after_header() {
+    use std::os::fd::AsRawFd;
+
+    let (mut client, mut server) = tcp_pair();
+    server.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: server owns the socket; linger's pointer and length match SO_LINGER.
+    let result = unsafe {
+        libc::setsockopt(
+            server.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&raw const linger).cast(),
+            std::mem::size_of_val(&linger) as libc::socklen_t,
+        )
+    };
+    assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    drop(server);
+    read_all(&mut client);
 }
 
 /// Reads one HTTP head, byte by byte, so nothing after it is taken.
-fn read_head(s: &mut TcpStream) -> String {
-    let mut head = Vec::new();
-    let mut b = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        match s.read(&mut b) {
-            Ok(1) => head.push(b[0]),
-            _ => break,
-        }
-    }
+fn read_head(s: &mut impl Read) -> String {
+    let head = io::read_until(s, b"\r\n\r\n");
     String::from_utf8_lossy(&head).into_owned()
+}
+
+#[test]
+#[should_panic(expected = "read until delimiter")]
+fn incomplete_http_head_is_rejected() {
+    read_head(&mut b"HTTP/1.1 200 OK\r\n".as_slice());
 }
 
 /// Sends `CONNECT target` with `auth`, and returns the answer's head.
@@ -604,8 +647,17 @@ fn tokens_are_checked() {
             head.contains("Proxy-Authenticate: Basic realm=\"proxy\""),
             "{head}"
         );
-        // And the connection is closed.
-        let _ = read_all(&mut s);
+        let why = if auth.is_some() {
+            "wrong token"
+        } else {
+            "no token"
+        };
+        let expected = format!("{why}: give the sandbox's token as the proxy password\n");
+        assert!(
+            head.contains(&format!("\r\nContent-Length: {}\r\n", expected.len())),
+            "{head}"
+        );
+        assert_eq!(read_all(&mut s), expected.as_bytes(), "body, then EOF");
     }
     // Plain-HTTP requests need it too.
     let mut s = a.connect();
@@ -614,7 +666,14 @@ fn tokens_are_checked() {
         "GET http://plain.test/ HTTP/1.1\r\nHost: plain.test\r\n\r\n"
     )
     .unwrap();
-    assert!(String::from_utf8_lossy(&read_all(&mut s)).starts_with("HTTP/1.1 407 "));
+    let answer = read_all(&mut s);
+    let answer = io::response(&answer, "GET", false);
+    assert_eq!(answer.head.version, http1::Version::Http11);
+    assert_eq!(answer.head.status, 407);
+    assert_eq!(
+        answer.body,
+        b"no token: give the sandbox's token as the proxy password\n"
+    );
 
     let b = Attach::start(&world, "socks5", "t2", "10.0.0.3");
     let mut s = b.connect();
@@ -749,7 +808,7 @@ fn failures_get_proxy_answers() {
     let mut s = b.connect();
     socks_login(&mut s, b"", TOKEN.as_bytes());
     s.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
-    assert_eq!(read_all(&mut s)[..2], [5, 7]);
+    assert_eq!(read_all(&mut s), [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
 }
 
 #[test]
@@ -819,6 +878,7 @@ fn big_uploads_and_many_downloads_at_once() {
         .map(|_| {
             std::thread::spawn(move || {
                 let mut s = TcpStream::connect(addr).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
                 write!(
                     s,
                     "CONNECT plain.test:80 HTTP/1.1\r\nProxy-Authorization: {BASIC}\r\n\r\n"
@@ -1126,6 +1186,7 @@ fn lookups_of_one_name_are_shared_and_misses_remembered() {
     for c in clients {
         let answer = c.join().unwrap();
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(body(&answer), "plain site\n");
     }
     assert_eq!(world.queries.lock().unwrap().get("plain.test"), Some(&1));
     for _ in 0..5 {
@@ -1133,6 +1194,11 @@ fn lookups_of_one_name_are_shared_and_misses_remembered() {
         write!(s, "GET http://nope.test/ HTTP/1.1\r\nHost: nope.test\r\nProxy-Authorization: {BASIC}\r\n\r\n").unwrap();
         let answer = String::from_utf8_lossy(&read_all(&mut s)).into_owned();
         assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+        assert!(
+            answer.contains("\r\nX-Proxy-Error: no such name in the world\r\n"),
+            "{answer}"
+        );
+        assert_eq!(body(&answer), "no such name in the world\n");
     }
     assert_eq!(world.queries.lock().unwrap().get("nope.test"), Some(&1));
     drop(attach);
