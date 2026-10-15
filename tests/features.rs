@@ -126,7 +126,7 @@ mod http {
         service_fixture! {
             Echo => (Messages, (), websocket::Error);
             decoder(self) {
-                Messages::new(Side::Server)
+                Messages::for_receiver(Side::Server)
             }
             on_item(self, message: Message; _, driver) -> serve::Flow {
                 message.to_frame(None)?.write(driver.reply())?;
@@ -156,7 +156,7 @@ mod http {
             assert!(response.starts_with("http/1.1 101"), "{response}");
             assert!(response.contains("connection: upgrade\r\n"), "{response}");
             assert!(response.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{response}");
-            let mut stream = Stream::new(Messages::new(Side::Client));
+            let mut stream = Stream::new(Messages::for_receiver(Side::Client));
             loop {
                 if let Some(message) = stream.next() {
                     assert_eq!(message.unwrap(), Message::Text("hello".into()));

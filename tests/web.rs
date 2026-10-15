@@ -1781,7 +1781,9 @@ async fn websocket_echo<C: Connection>(
     conn.write_all(fcx, &frame.to_bytes().unwrap())
         .await
         .unwrap();
-    let mut stream = Stream::new(Messages::new(fictionet::stdlib::codec::Side::Client));
+    let mut stream = Stream::new(Messages::for_receiver(
+        fictionet::stdlib::codec::Side::Client,
+    ));
     assert_eq!(stream.push(&got[head_end..]), got.len() - head_end);
     loop {
         if let Some(m) = stream.next() {

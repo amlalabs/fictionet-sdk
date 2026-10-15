@@ -576,7 +576,9 @@ fn websockets_pass_through_the_http_door() {
         .unwrap();
     s.write_all(&frame.to_bytes().unwrap()).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut stream = Stream::new(Messages::new(fictionet::stdlib::codec::Side::Client));
+    let mut stream = Stream::new(Messages::for_receiver(
+        fictionet::stdlib::codec::Side::Client,
+    ));
     let mut buf = [0u8; 1024];
     let reply = loop {
         if let Some(m) = stream.next() {

@@ -504,7 +504,7 @@ fn frame_bytes(frames: &[ws::Frame]) -> Vec<u8> {
 
 #[test]
 fn websocket_masked_fragmented_text_with_interleaved_controls() {
-    for (role, mask) in [
+    for (receiver, mask) in [
         (fictionet::stdlib::codec::Side::Server, Some([7, 8, 9, 10])),
         (fictionet::stdlib::codec::Side::Client, None),
     ] {
@@ -520,19 +520,19 @@ fn websocket_masked_fragmented_text_with_interleaved_controls() {
             contract::check_wire_value(frame);
             contract::check_wire::<ws::Frame>(&Wire::to_bytes(frame).unwrap());
         }
-        bounded(|| ws::Frames::new(role), &bytes);
-        bounded(|| ws::Messages::new(role), &bytes);
+        bounded(|| ws::Frames::for_receiver(receiver), &bytes);
+        bounded(|| ws::Messages::for_receiver(receiver), &bytes);
         contract::check_decode_with_held_limit(
-            || ws::Messages::new(role).with_limit(256),
+            || ws::Messages::for_receiver(receiver).with_limit(256),
             &bytes,
             256,
         );
         assert_eq!(
-            bounded(|| ws::Frames::new(role), &bytes),
+            bounded(|| ws::Frames::for_receiver(receiver), &bytes),
             (frames.clone(), None)
         );
         assert_eq!(
-            bounded(|| ws::Messages::new(role), &bytes),
+            bounded(|| ws::Messages::for_receiver(receiver), &bytes),
             (
                 vec![
                     ws::Message::Ping(b"?".to_vec()),
@@ -554,7 +554,8 @@ fn websocket_message_limit_has_one_error_and_close_code() {
         frame(true, ws::Opcode::Continuation, &[0; 26], None),
     ]);
     for bytes in [single, fragmented] {
-        let make = || ws::Messages::new(fictionet::stdlib::codec::Side::Client).with_limit(125);
+        let make =
+            || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client).with_limit(125);
         let (items, failure) = bounded(make, &bytes);
         assert!(items.is_empty());
         assert_eq!(
@@ -568,7 +569,7 @@ fn websocket_message_limit_has_one_error_and_close_code() {
     }
     let mut header = vec![0x82, 127];
     header.extend_from_slice(&u64::try_from(ws::MAX_PAYLOAD + 1).unwrap().to_be_bytes());
-    let make = || ws::Messages::new(fictionet::stdlib::codec::Side::Client);
+    let make = || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client);
     assert_eq!(
         bounded(make, &header),
         (
@@ -606,7 +607,7 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
         }
     }
     for payload in [&[][..], &[0x03, 0xe8], b"\x03\xe8bye"] {
-        for (role, mask) in [
+        for (receiver, mask) in [
             (fictionet::stdlib::codec::Side::Client, None),
             (fictionet::stdlib::codec::Side::Server, Some([1, 2, 3, 4])),
         ] {
@@ -614,11 +615,11 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
             contract::check_wire_value(&frame);
             let bytes = Wire::to_bytes(&frame).unwrap();
             assert_eq!(
-                bounded(|| ws::Frames::new(role), &bytes),
+                bounded(|| ws::Frames::for_receiver(receiver), &bytes),
                 (vec![frame], None)
             );
             assert_eq!(
-                bounded(|| ws::Messages::new(role), &bytes),
+                bounded(|| ws::Messages::for_receiver(receiver), &bytes),
                 (
                     vec![ws::Message::Close(if payload.is_empty() {
                         None
@@ -638,13 +639,13 @@ fn websocket_refuses_frame_and_assembly_limits_from_headers() {
     let h = ws::Header::parse(&bytes).unwrap().unwrap();
     let header = bytes.get(..h.header_len).unwrap();
     let mut stream =
-        Stream::new(ws::Frames::new(fictionet::stdlib::codec::Side::Server).with_limit(3));
+        Stream::new(ws::Frames::for_receiver(fictionet::stdlib::codec::Side::Server).with_limit(3));
     assert_eq!(stream.push(header), header.len());
     assert_eq!(stream.next(), Some(Err(Fail::Protocol(ws::Error::TooBig))));
     assert_eq!(stream.next(), None);
     assert_eq!(stream.unread(), header);
     bounded(
-        || ws::Frames::new(fictionet::stdlib::codec::Side::Server).with_limit(3),
+        || ws::Frames::for_receiver(fictionet::stdlib::codec::Side::Server).with_limit(3),
         &bytes,
     );
 
@@ -652,7 +653,7 @@ fn websocket_refuses_frame_and_assembly_limits_from_headers() {
     let last = frame_bytes(&[frame(true, ws::Opcode::Continuation, b"def", None)]);
     let make = || {
         ws::Messages::from_frames(
-            ws::Frames::new(fictionet::stdlib::codec::Side::Client).with_limit(8),
+            ws::Frames::for_receiver(fictionet::stdlib::codec::Side::Client).with_limit(8),
             5,
         )
     };
@@ -672,13 +673,13 @@ fn websocket_refuses_frame_and_assembly_limits_from_headers() {
         Some(Fail::Protocol(AssembleError::Inner(ws::Error::TooBig)))
     );
     assert_eq!(
-        ws::Frames::new(fictionet::stdlib::codec::Side::Client)
+        ws::Frames::for_receiver(fictionet::stdlib::codec::Side::Client)
             .with_limit(usize::MAX)
             .limit(),
         ws::MAX_PAYLOAD
     );
     assert_eq!(
-        ws::Messages::new(fictionet::stdlib::codec::Side::Client)
+        ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client)
             .with_limit(usize::MAX)
             .limit(),
         ws::MAX_MESSAGE
@@ -693,15 +694,17 @@ fn websocket_close_preserves_trailing_bytes_for_parts_and_swap() {
     let mut bytes = close_bytes.clone();
     bytes.extend_from_slice(tail);
     bounded(
-        || ws::Frames::new(fictionet::stdlib::codec::Side::Client),
+        || ws::Frames::for_receiver(fictionet::stdlib::codec::Side::Client),
         &bytes,
     );
     bounded(
-        || ws::Messages::new(fictionet::stdlib::codec::Side::Client),
+        || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client),
         &bytes,
     );
     for eof in [false, true] {
-        let mut stream = Stream::new(ws::Frames::new(fictionet::stdlib::codec::Side::Client));
+        let mut stream = Stream::new(ws::Frames::for_receiver(
+            fictionet::stdlib::codec::Side::Client,
+        ));
         assert_eq!(stream.push(&bytes), bytes.len());
         if eof {
             stream.end();
@@ -713,7 +716,9 @@ fn websocket_close_preserves_trailing_bytes_for_parts_and_swap() {
         let (buffer, _) = stream.into_parts();
         assert_eq!(buffer.unread(), tail);
     }
-    let mut stream = Stream::new(ws::Messages::new(fictionet::stdlib::codec::Side::Client));
+    let mut stream = Stream::new(ws::Messages::for_receiver(
+        fictionet::stdlib::codec::Side::Client,
+    ));
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(
         stream.next(),
@@ -738,8 +743,9 @@ fn websocket_close_interrupts_assembly_and_pump_accounts_for_unaccepted_tail() {
     ]);
     let end = bytes.len();
     bytes.extend(vec![42; 512]);
-    let mut stream =
-        Stream::new(ws::Messages::new(fictionet::stdlib::codec::Side::Client).with_limit(16));
+    let mut stream = Stream::new(
+        ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client).with_limit(16),
+    );
     let mut items = vec![];
     let accepted = pump(&mut stream, &bytes, |item| items.push(item)).unwrap();
     assert_eq!(items, [ws::Message::Close(None)]);
@@ -749,7 +755,7 @@ fn websocket_close_interrupts_assembly_and_pump_accounts_for_unaccepted_tail() {
     let tail = [buffer.unread(), bytes.get(accepted..).unwrap()].concat();
     assert_eq!(tail, bytes.get(end..).unwrap());
     bounded(
-        || ws::Messages::new(fictionet::stdlib::codec::Side::Client).with_limit(16),
+        || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client).with_limit(16),
         &bytes,
     );
 }
@@ -774,13 +780,15 @@ fn websocket_framing_errors_end_the_stream_once() {
         bytes.extend_from_slice(&[0x82, 0]); // No item may follow the error.
         assert_eq!(
             bounded(
-                || ws::Messages::new(fictionet::stdlib::codec::Side::Client),
+                || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client),
                 &bytes
             ),
             (vec![], Some(Fail::Protocol(AssembleError::Inner(error))))
         );
     }
-    let mut stream = Stream::new(ws::Frames::new(fictionet::stdlib::codec::Side::Server));
+    let mut stream = Stream::new(ws::Frames::for_receiver(
+        fictionet::stdlib::codec::Side::Server,
+    ));
     assert_eq!(stream.push(&[0x82, 0]), 2);
     let failure = Fail::Protocol(ws::Error::Unmasked);
     assert_eq!(stream.next(), Some(Err(failure.clone())));
@@ -795,7 +803,7 @@ fn websocket_eof_distinguishes_frames_from_incomplete_messages() {
     for input in [&[0x82][..], &[0x82, 2, 1], &[0x82, 126, 0]] {
         assert_eq!(
             bounded(
-                || ws::Messages::new(fictionet::stdlib::codec::Side::Client),
+                || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client),
                 input
             )
             .1,
@@ -804,7 +812,7 @@ fn websocket_eof_distinguishes_frames_from_incomplete_messages() {
             })
         );
         bounded(
-            || ws::Messages::new(fictionet::stdlib::codec::Side::Client),
+            || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client),
             input,
         );
     }
@@ -812,7 +820,7 @@ fn websocket_eof_distinguishes_frames_from_incomplete_messages() {
         let bytes = frame_bytes(&[frame(false, ws::Opcode::Binary, payload, None)]);
         assert_eq!(
             bounded(
-                || ws::Messages::new(fictionet::stdlib::codec::Side::Client),
+                || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client),
                 &bytes
             )
             .1,
@@ -829,7 +837,7 @@ fn websocket_eof_distinguishes_frames_from_incomplete_messages() {
     ]);
     assert_eq!(
         bounded(
-            || ws::Messages::new(fictionet::stdlib::codec::Side::Client).with_limit(0),
+            || ws::Messages::for_receiver(fictionet::stdlib::codec::Side::Client).with_limit(0),
             &bytes
         ),
         (
@@ -882,12 +890,15 @@ fn interactive_contracts_on_generated_inputs() {
         contract::check_wire::<tn::Event>(&bytes);
         contract::check_wire::<tn::Subnegotiation>(&bytes);
         contract::check_wire::<ws::Frame>(&bytes);
-        let role = if round % 2 == 0 {
+        let receiver = if round % 2 == 0 {
             fictionet::stdlib::codec::Side::Server
         } else {
             fictionet::stdlib::codec::Side::Client
         };
-        bounded(|| ws::Frames::new(role).with_limit(64), &bytes);
-        bounded(|| ws::Messages::new(role).with_limit(64), &bytes);
+        bounded(|| ws::Frames::for_receiver(receiver).with_limit(64), &bytes);
+        bounded(
+            || ws::Messages::for_receiver(receiver).with_limit(64),
+            &bytes,
+        );
     }
 }

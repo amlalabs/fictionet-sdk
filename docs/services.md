@@ -232,6 +232,19 @@ writing a frame preserves the original attributes and nonzero padding.
 Use `stun::Message::parse(&frame.0)` to interpret attributes. Writing that
 message uses zero padding and recomputes FINGERPRINT.
 
+### WebSocket receiver orientation
+
+Use `websocket::Frames::for_receiver(side)` and
+`websocket::Messages::for_receiver(side)` to name the endpoint receiving
+the bytes. `Side::Server` requires masked frames from a client;
+`Side::Client` requires unmasked frames from a server.
+`Frames::receiver()` returns that receiving endpoint.
+
+The `new(side)` constructors and `Frames::role()` remain available as
+deprecated aliases. Existing calls keep their meaning and compile with
+deprecation warnings. Migrate to the explicit names without changing the
+side. Masking checks, limits, and decoding behavior are unchanged.
+
 ### Terminal framing errors
 
 The ITCH, SoupBinTCP, Cboe PITCH, Cboe BOE, and MongoDB framers now use

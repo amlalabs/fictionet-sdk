@@ -47,17 +47,17 @@ fuzz_target!(|data: &[u8]| {
             usize::from(b)
         }
     });
-    for role in [
+    for receiver in [
         fictionet::stdlib::codec::Side::Server,
         fictionet::stdlib::codec::Side::Client,
     ] {
-        let frames = || Frames::new(role).with_limit(limit);
-        let messages = || Messages::new(role).with_limit(limit);
+        let frames = || Frames::for_receiver(receiver).with_limit(limit);
+        let messages = || Messages::for_receiver(receiver).with_limit(limit);
         bounded(frames, data);
         bounded(messages, data);
         contract::check_decode_with_held_limit(messages, data, limit);
         check_clone(messages(), data);
-        let mask = if role == fictionet::stdlib::codec::Side::Server {
+        let mask = if receiver == fictionet::stdlib::codec::Side::Server {
             Some([1, 2, 3, 4])
         } else {
             None
@@ -70,7 +70,7 @@ fuzz_target!(|data: &[u8]| {
                 (vec![message.clone()], None)
             );
             let size = data.first().map_or(1, |&b| usize::from(b).max(1));
-            let frames = match role {
+            let frames = match receiver {
                 fictionet::stdlib::codec::Side::Server => {
                     let mut key = 0u8;
                     message.to_masked_frames(size, || {
@@ -88,7 +88,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(decode_all(messages, &bytes), (vec![message], None));
         }
         let mut written = Vec::new();
-        for frame in decode_all(|| Frames::new(role), data).0 {
+        for frame in decode_all(|| Frames::for_receiver(receiver), data).0 {
             contract::check_wire_value(&frame);
             frame.write(&mut written).unwrap();
         }
@@ -135,7 +135,7 @@ fuzz_target!(|data: &[u8]| {
             contract::check_wire_value(&frame);
             assert_eq!(
                 decode_all(
-                    || Messages::new(fictionet::stdlib::codec::Side::Server),
+                    || Messages::for_receiver(fictionet::stdlib::codec::Side::Server),
                     &frame.to_bytes().unwrap()
                 ),
                 (vec![message], None)
