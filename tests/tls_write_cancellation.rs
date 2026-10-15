@@ -1,4 +1,9 @@
 //! Dropped TLS writes never credit old bytes to a later write.
+
+#[allow(dead_code)]
+#[path = "common/certs.rs"]
+mod certs;
+
 use std::future::{Future, poll_fn};
 use std::io::{ErrorKind, Read};
 use std::sync::Arc;
@@ -14,17 +19,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
-    let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
-    let leaf = ca
-        .issue(
-            fcx,
-            &["secret.test"],
-            fictionet::stdlib::x509::Validity {
-                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
-            },
-        )
-        .unwrap();
+    let (ca, leaf) = certs::issue(fcx, "Test CA", &["secret.test"]).unwrap();
     let server = tls::config_builder(fcx, SystemTime::now())
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -255,17 +250,7 @@ mod contract {
 
     async fn connected(fcx: &Cx, server: bool) -> (Box<dyn Connection>, Arc<Mutex<Peer>>) {
         let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
-        let leaf = ca
-            .issue(
-                fcx,
-                &["secret.test"],
-                fictionet::stdlib::x509::Validity {
-                    not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                    not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
-                },
-            )
-            .unwrap();
+        let (ca, leaf) = certs::issue(fcx, "Test CA", &["secret.test"]).unwrap();
         let config = leaf.server_config(fcx, start).unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(ca.cert_der()).unwrap();

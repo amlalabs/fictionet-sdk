@@ -5,6 +5,10 @@
 //! The Docker test in `tests/docker/proxy` runs the same engine with more
 //! clients (wget, git, Python, Go, Node) and measures it.
 
+#[allow(dead_code)]
+#[path = "common/certs.rs"]
+mod certs;
+
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -252,17 +256,7 @@ fn certs(
     Vec<rustls::pki_types::CertificateDer<'static>>,
     PrivateKeyDer<'static>,
 ) {
-    let ca = fictionet::stdlib::ca::Ca::new(fcx, "proxy test CA").unwrap();
-    let leaf = ca
-        .issue(
-            fcx,
-            &["secure.test"],
-            fictionet::stdlib::x509::Validity {
-                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
-            },
-        )
-        .unwrap();
+    let (ca, leaf) = certs::issue(fcx, "proxy test CA", &["secure.test"]).unwrap();
     std::fs::write(ca_path, ca.cert_pem()).unwrap();
     (leaf.chain, leaf.key)
 }

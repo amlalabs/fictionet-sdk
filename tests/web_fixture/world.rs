@@ -3,6 +3,11 @@
 //! `web_fixture <socket> <ca path>` serves the world. `--upstream <port>`
 //! instead runs a real HTTP server on the host's network for the proxy.
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../common/certs.rs"]
+mod certs;
+
 use std::io::{Read, Write};
 
 use axum::extract::DefaultBodyLimit;
@@ -426,19 +431,15 @@ mod tests {
             let _ = rt.block_on(fictionet::run(
                 fictionet::Seed::random(),
                 move |fcx| async move {
-                    let ca = fictionet::stdlib::ca::Ca::new(&fcx, "Fixture CA")?;
-                    let leaf = ca.issue(
+                    let (ca, leaf) = super::certs::issue(
                         &fcx,
+                        "Fixture CA",
                         &[
                             "example.test",
                             "www.example.test",
                             "v4only.test",
                             "v6only.test",
                         ],
-                        fictionet::stdlib::x509::Validity {
-                            not_before: fictionet::stdlib::x509::Time::from_unix(946684800)?,
-                            not_after: fictionet::stdlib::x509::Time::from_unix(4102444800)?,
-                        },
                     )?;
                     let mut roots = rustls::RootCertStore::empty();
                     roots.add(ca.cert_der())?;

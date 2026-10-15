@@ -5,17 +5,7 @@ use super::*;
 
 /// A server config for `names`, and roots that trust it.
 fn tls_pair(fcx: &Cx, names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertStore>) {
-    let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
-    let leaf = ca
-        .issue(
-            fcx,
-            names,
-            fictionet::stdlib::x509::Validity {
-                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
-            },
-        )
-        .unwrap();
+    let (ca, leaf) = certs::issue(fcx, "Test CA", names).unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.cert_der()).unwrap();
     (

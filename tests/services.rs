@@ -4,6 +4,10 @@
 //! that speaks Modbus/TCP and a web server, on one `Net`, with the
 //! dashboard's decoder reading both from the packets.
 
+#[allow(dead_code)]
+#[path = "common/certs.rs"]
+mod certs;
+
 #[macro_use]
 #[path = "common/service_fixture.rs"]
 mod service_fixture;

@@ -2,6 +2,10 @@
 //! server and a rustls client, joined by two TCP endpoints and one pair.
 //! The observer watches the pair, and sees the HTTP inside the TLS.
 
+#[allow(dead_code)]
+#[path = "common/certs.rs"]
+mod certs;
+
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,17 +31,7 @@ fn temp_socket() -> String {
 
 /// A CA, and a server and client config for `secret.test`.
 fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
-    let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
-    let leaf = ca
-        .issue(
-            fcx,
-            &["secret.test"],
-            fictionet::stdlib::x509::Validity {
-                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
-            },
-        )
-        .unwrap();
+    let (ca, leaf) = certs::issue(fcx, "Test CA", &["secret.test"]).unwrap();
     let provider = rustls::crypto::ring::default_provider();
     let server = tls::config_builder(fcx, SystemTime::now())
         .with_safe_default_protocol_versions()
