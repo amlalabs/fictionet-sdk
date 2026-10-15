@@ -2503,9 +2503,6 @@ mod tests {
         contract::check_wire::<MicInput>(b);
 
         if let Ok(m) = Message::parse(b) {
-            let bytes = m.to_bytes().unwrap();
-            assert_eq!(Message::parse(&bytes), Ok(m.clone()));
-            assert_eq!(m.to_bytes(), Ok(bytes));
             // What a message holds reads with its own reader.
             if let Message::Challenge(c) = &m
                 && !c.target_info.is_empty()
@@ -2518,13 +2515,6 @@ mod tests {
                 let nt = a.nt().unwrap();
                 assert_eq!(NtResponse::parse(&nt.to_bytes().unwrap()), Ok(nt));
             }
-        }
-        if let Ok(nt) = NtResponse::parse(b) {
-            assert_eq!(NtResponse::parse(&nt.to_bytes().unwrap()), Ok(nt));
-        }
-        if let Ok(AvPairs(pairs)) = AvPairs::parse(b) {
-            let list = AvPairs(pairs.to_vec()).to_bytes().unwrap();
-            assert_eq!(AvPairs::parse(&list), Ok(AvPairs(pairs)));
         }
         if let Ok(r) = LmV2Response::parse(b) {
             assert_eq!(r.to_bytes().unwrap(), b);

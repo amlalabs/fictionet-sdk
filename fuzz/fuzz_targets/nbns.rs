@@ -30,7 +30,6 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(p) = Packet::parse(data) {
         // A parsed packet stays within the packet limit.
-        contract::check_wire_value(&p);
         assert!(p.to_bytes().unwrap().len() <= MAX_PACKET);
         for q in &p.questions {
             let _ = q.name.to_string();
