@@ -33,7 +33,7 @@ jobs:
           path: |
             .vm/images/debian-*.qcow2
             .vm/images/SHA512SUMS
-          key: vm-debian-${{ hashFiles('vm/versions.sh') }}
+          key: vm-debian-${{ hashFiles('vm/debian-image.sh') }}
       - name: demos/web
         run: demos/web
       - name: The VM's console, if it failed

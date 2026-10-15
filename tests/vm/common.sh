@@ -6,10 +6,12 @@
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 vmdir="${FICTIONET_VM_DIR:-$repo/.vm}"
 
-release=20261001-2618
-image_name="debian-13-genericcloud-amd64-$release.qcow2"
-image_url="https://cloud.debian.org/images/cloud/trixie/$release/$image_name"
-image_sha512=f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d
+# shellcheck source=../../vm/debian-image.sh
+source "$repo/vm/debian-image.sh"
+release="$DEBIAN_BUILD"
+image_name="$DEBIAN_IMAGE_NAME"
+image_url="$DEBIAN_IMAGE_URL"
+image_sha512="$DEBIAN_IMAGE_SHA512"
 base="$vmdir/$image_name"
 # The image with dig installed: the guest of tests/vm/run.sh, and the root
 # filesystem of the nested guests.

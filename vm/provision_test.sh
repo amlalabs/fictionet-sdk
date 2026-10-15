@@ -7,6 +7,40 @@ scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Both consumers share the identity and retain their own disk locations.
+appliance_release="$DEBIAN_BUILD"
+appliance_sha512="$DEBIAN_IMAGE_SHA512"
+appliance_base="$base"
+(
+    # Test the default location, independent of the caller's override.
+    unset FICTIONET_VM_DIR
+    source "$repo/tests/vm/common.sh"
+    [[ $release == "$appliance_release" && $image_name == "$debian_file" ]] ||
+        fail 'both consumers must use the same Debian release and filename'
+    [[ $image_url == "$debian_dir/$debian_file" ]] ||
+        fail 'both consumers must use the same Debian URL'
+    [[ $image_sha512 == "$appliance_sha512" ]] ||
+        fail 'both consumers must use the same Debian checksum'
+    [[ $base == "$repo/.vm/$image_name" && $appliance_base == "$repo/.vm/images/$image_name" ]] ||
+        fail 'TAP-test and appliance base disks must keep separate locations'
+    [[ $prepared == "$repo/.vm/prepared-$release.qcow2" ]] ||
+        fail 'the TAP-test prepared disk must keep its location'
+    [[ $prepared_l1 == "$repo/.vm/prepared-l1-$release.qcow2" ]] ||
+        fail 'the nested TAP-test prepared disk must keep its location'
+    download() {
+        [[ $# == 3 && $1 == "$DEBIAN_IMAGE_URL" && $2 == "$base" && $3 == "$DEBIAN_IMAGE_SHA512" ]] ||
+            fail 'TAP-test download must use the descriptor and its base disk'
+    }
+    prepare_image() {
+        [[ $# == 4 && $1 == "$base" && $2 == "$prepared" && $4 == 4G ]] ||
+            fail 'TAP-test preparation must use its own disks and size'
+        [[ $3 == "$(prep_user_data 'bind9-dnsutils, curl, iputils-ping')" ]] ||
+            fail 'TAP-test preparation must keep its provisioning inputs'
+    }
+    fetch_guest
+)
+echo 'PASS: shared Debian identity and separate TAP-test preparation inputs'
+
 root="$scratch/checkout"
 here="$root/vm"
 vmdir="$root/.vm"
@@ -17,6 +51,7 @@ base="$images/$debian_file"
 bundle="$scratch/bundle"
 mkdir -p "$here/guest"
 cp "$repo/vm/versions.sh" "$here/versions.sh"
+cp "$repo/vm/debian-image.sh" "$here/debian-image.sh"
 cp "$repo/vm/guest/provision.sh" "$here/guest/provision.sh"
 cp "$repo/rust-toolchain.toml" "$root/rust-toolchain.toml"
 
@@ -113,3 +148,31 @@ ensure_prepared
     fail 'a component change must prepare a new image'
 check_rust
 echo 'PASS: changed components are provisioned in a new image'
+
+third="$prepared"
+sed -i 's/^DEBIAN_BUILD=.*/DEBIAN_BUILD=fixture-build/' "$here/debian-image.sh"
+ensure_prepared
+[[ $prepared != "$third" && $(wc -l <"$scratch/prepares") == 4 ]] ||
+    fail 'a Debian descriptor change must prepare a new image'
+echo 'PASS: changed Debian descriptor invalidates the prepared image'
+
+# Each workflow's image cache key must hash the shared descriptor.
+hash_files='hashFiles\(([^)]*)\)'
+descriptor="(^|,)[[:space:]]*'vm/debian-image\.sh'[[:space:]]*(,|$)"
+for workflow in vm-demo.yml nightly.yml; do
+    case "$workflow" in
+        vm-demo.yml) prefix=vm-debian- ;;
+        nightly.yml) prefix=integration-vm- ;;
+    esac
+    key="$(sed -n "/^[[:space:]]*key: $prefix/p" "$repo/.github/workflows/$workflow")"
+    [[ $key =~ $hash_files ]] ||
+        fail "$workflow's cache key must call hashFiles"
+    [[ ${BASH_REMATCH[1]} =~ $descriptor ]] ||
+        fail "$workflow's cache key must hash vm/debian-image.sh"
+    echo "PASS: $workflow's cache key includes the descriptor in hashFiles"
+    if [[ $workflow == vm-demo.yml ]]; then
+        [[ $key != *vm/versions.sh* ]] ||
+            fail "vm-demo.yml's Debian cache key must not include vm/versions.sh"
+        echo "PASS: vm-demo.yml's cache key excludes vm/versions.sh"
+    fi
+done

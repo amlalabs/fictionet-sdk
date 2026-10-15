@@ -38,9 +38,11 @@ cpus="${VM_CPUS:-4}"
 mem="${VM_MEM:-5G}"
 # shellcheck source=versions.sh
 . "$here/versions.sh"
+# shellcheck source=debian-image.sh
+. "$here/debian-image.sh"
 
-debian_dir="https://cloud.debian.org/images/cloud/trixie/$DEBIAN_BUILD"
-debian_file="debian-13-genericcloud-amd64-$DEBIAN_BUILD.qcow2"
+debian_dir="${DEBIAN_IMAGE_URL%/*}"
+debian_file="$DEBIAN_IMAGE_NAME"
 base="$images/$debian_file"
 cache_disk="$vmdir/cache.qcow2"
 cache_size=80G
@@ -70,7 +72,7 @@ fetch_base() {
     mkdir -p "$images"
     say "Downloading the Debian 13 cloud image ($DEBIAN_BUILD), about 400 MB"
     curl -fL --retry 3 --progress-bar -o "$images/SHA512SUMS" "$debian_dir/SHA512SUMS"
-    curl -fL --retry 3 --progress-bar -o "$base.part" "$debian_dir/$debian_file"
+    curl -fL --retry 3 --progress-bar -o "$base.part" "$DEBIAN_IMAGE_URL"
     local want got
     want="$(awk -v f="$debian_file" '$2 == f { print $1 }' "$images/SHA512SUMS")"
     [[ -n $want ]] || die "$debian_file is not in Debian's SHA512SUMS"
@@ -84,7 +86,7 @@ fetch_base() {
 # change to the provisioning makes a new one.
 # The SSH key is part of it: an image only takes the key it was prepared with.
 prepared_key() {
-    cat "$here/versions.sh" "$here/guest/provision.sh" "$root/rust-toolchain.toml" \
+    cat "$here/debian-image.sh" "$here/versions.sh" "$here/guest/provision.sh" "$root/rust-toolchain.toml" \
         "$sshdir/id_ed25519.pub" | sha256sum | cut -c1-12
 }
 

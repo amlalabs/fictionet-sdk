@@ -1,14 +1,9 @@
 # Pinned versions for the VM image. vm/run reads this file, and so does
 # vm/guest/provision.sh inside the VM. Changing anything here (or in
-# provision.sh or ../rust-toolchain.toml) makes vm/run prepare a new image.
+# debian-image.sh, provision.sh or ../rust-toolchain.toml) prepares a new image.
 #
 # Every download is checked against the checksum its publisher posts next
 # to it.
-
-# The Debian 13 (trixie) cloud image, a dated build from
-# https://cloud.debian.org/images/cloud/trixie/. Debian keeps dated builds
-# for some months; when this one is gone, pick a newer one from that page.
-DEBIAN_BUILD=20261001-2618
 
 # Tools installed into the image.
 KIND_VERSION=v0.33.0

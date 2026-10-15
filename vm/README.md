@@ -89,13 +89,14 @@ The Docker and Inspect suites build their images inside the VM, from the
 examples' own Dockerfiles, the first time. Docker keeps those images and its
 build cache on the cache disk, so later runs reuse them.
 
-Run `bash vm/provision_test.sh` on the host to check toolchain selection and
-prepared-image invalidation with stubs. It needs no VM or network access.
+Run `bash vm/provision_test.sh` on the host to check toolchain selection,
+shared image identity, and cache invalidation with stubs. It needs no VM or
+network access.
 
 ## How it works
 
 **The image.** The base is Debian's official Debian 13 (trixie) `genericcloud`
-image, a dated build pinned in `vm/versions.sh`. `vm/run` checks its SHA-512
+image, a dated build pinned in `vm/debian-image.sh`. `vm/run` checks its SHA-512
 against the `SHA512SUMS` file Debian publishes next to it. Preparing boots it once,
 with a cloud-init seed ISO that holds only an SSH key, and runs
 `vm/guest/provision.sh` over SSH. That installs Docker Engine with the Compose and
@@ -104,8 +105,15 @@ checked), kind, kubectl, helm and uv (each checked against its published
 SHA-256), Rust with the musl target, and curl, dig, ping, traceroute, ip and
 python3. Then it turns cloud-init off, so later boots skip it. The result is
 `.vm/images/prepared-<key>.qcow2`, an overlay on the Debian image. Its key is a
-hash of `vm/versions.sh`, `vm/guest/provision.sh`, `rust-toolchain.toml` and the
-SSH public key, so a change to any of them prepares a new image.
+hash of `vm/debian-image.sh`, `vm/versions.sh`, `vm/guest/provision.sh`,
+`rust-toolchain.toml` and the SSH public key, so a change to any of them prepares
+a new image.
+
+The TAP tests in `tests/vm` read the same image descriptor, including its pinned
+SHA-512. Their base and prepared disks stay directly under `.vm/` (or
+`FICTIONET_VM_DIR`), separate from the appliance's `.vm/images/` disks. Their
+provisioning and network lifecycles stay separate too. Both workflow cache keys
+include the descriptor.
 
 The VM follows the checkout's `rust-toolchain.toml`. Provisioning bundles that
 file, installs its compiler and components, and adds `x86_64-unknown-linux-musl`
@@ -176,7 +184,9 @@ keeps DNS access.
 - **The VM does not answer SSH**: `.vm/run/console.log` has its serial console.
 - **Preparing failed**: `.vm/prepare.log` has the whole log. Run `vm/run up`
   again to retry. A partly prepared image is never used.
-- **The Debian build in `vm/versions.sh` is gone**: Debian removes old dated
+- **The Debian build in `vm/debian-image.sh` is gone**: Debian removes old dated
   builds after some months. Pick a newer one from
-  <https://cloud.debian.org/images/cloud/trixie/> and update `DEBIAN_BUILD`.
+  <https://cloud.debian.org/images/cloud/trixie/> and update `DEBIAN_BUILD` and
+  `DEBIAN_IMAGE_SHA512` from that build's `SHA512SUMS`. The filename and URL are
+  derived from the build in the same descriptor.
 - **Start over**: `vm/run clean` deletes `.vm/`, images and cache included.
