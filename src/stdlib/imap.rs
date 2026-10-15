@@ -37,6 +37,11 @@
 //! Select raw AUTHENTICATE answers or IDLE `DONE` with
 //! [`Inputs::expect_line`] between items.
 //!
+//! Status writers always put a space after the status word, even when
+//! the text is empty. Readers accept an omitted space only if adding it
+//! still fits [`MAX_TEXT`]; otherwise they return [`Error::TooLong`].
+//! Writers refuse oversized responses without changing the output.
+//!
 //! ```
 //! use fictionet::stdlib::{codec::{Stream, Wire}, imap::{Inputs, Input, Response, Status}};
 //!
@@ -524,6 +529,9 @@ impl Response {
         if rtag.is_some() && matches!(status, Status::Preauth | Status::Bye) {
             return Err(syntax("PREAUTH and BYE are never tagged"));
         }
+        if rest.len() == w && b.len() + 1 > MAX_TEXT {
+            return Err(Error::TooLong);
+        }
         let (code, text) = resp_text(rest.get(w + 1..).unwrap_or(&[])).map_err(syntax)?;
         Ok(Response::Status {
             tag: rtag,
@@ -560,8 +568,8 @@ pub enum Error {
         waiting: bool,
     },
     /// A command or response holds more than [`MAX_TEXT`] bytes outside
-    /// its literals, or more than [`MAX_MESSAGE`] in all. The stream is
-    /// broken.
+    /// its literals, or more than [`MAX_MESSAGE`] in all. The required
+    /// status separator counts toward [`MAX_TEXT`] even when omitted.
     TooLong,
     /// Line framing or assembly failed while reading one value.
     Framing(FrameError),
@@ -1143,7 +1151,9 @@ impl Wire for Response {
     /// Reads one whole response with CRLF framing and counted literal bytes.
     /// Refuses trailing bytes, invalid grammar, non-synchronizing literals,
     /// and text, literal, message, or nesting overflow. A section literal
-    /// must fit its canonical quoted form.
+    /// must fit its canonical quoted form. A status line that omits the space
+    /// after its status word must still fit [`MAX_TEXT`] with the space
+    /// added; otherwise this returns [`Error::TooLong`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         fictionet::stdlib::codec::decode_exact(
             Responses::new(),
@@ -1157,7 +1167,8 @@ impl Wire for Response {
 
     /// Appends one response. Refuses invalid tags, codes, text, values,
     /// tagged BYE or PREAUTH, non-synchronizing literals, normalization,
-    /// and all size or nesting overflows. Errors leave `out` unchanged.
+    /// and all size or nesting overflows. Always writes a space after a
+    /// status word. Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut writer = Writer::new(Side::Server);
         match self {
@@ -1181,10 +1192,7 @@ impl Wire for Response {
                 }
                 writer.text(b" ")?;
                 writer.text(status.as_str().as_bytes())?;
-                // Keep the longest accepted empty status line writable.
-                if writer.out.len() < MAX_TEXT - 2 {
-                    writer.text(b" ")?;
-                }
+                writer.text(b" ")?;
                 if let Some(code) = code {
                     if code.is_empty() || code.len() > MAX_TEXT || code.contains(']') {
                         return Err(Error::Unwritable);
@@ -1972,7 +1980,55 @@ mod tests {
         assert_eq!(r.to_bytes().unwrap(), b"* NO [ALERT] \r\n");
         assert_eq!(Response::parse(&r.to_bytes().unwrap()), Ok(r));
         let r = Response::tagged("a", Status::Ok, "");
+        assert_eq!(Response::parse(b"a OK\r\n"), Ok(r.clone()));
         assert_eq!(Response::parse(&r.to_bytes().unwrap()), Ok(r));
+    }
+
+    #[test]
+    fn max_minus_six_valid() {
+        let tag = "t".repeat(MAX_TEXT - 6);
+        let r = Response::tagged(&tag, Status::Ok, "");
+        let mut expected = tag.as_bytes().to_vec();
+        expected.extend_from_slice(b" OK \r\n");
+        assert_eq!(expected.len(), MAX_TEXT);
+        assert_eq!(r.to_bytes().unwrap(), expected);
+        assert_eq!(Response::parse(&expected), Ok(r.clone()));
+        assert_eq!(responses(&expected), vec![Ok(r.clone())]);
+
+        // A missing separator is accepted only when the writer can add it.
+        let mut without_space = tag.into_bytes();
+        without_space.extend_from_slice(b" OK\r\n");
+        let parsed = Response::parse(&without_space).unwrap();
+        assert_eq!(parsed, r);
+        assert_eq!(parsed.to_bytes().unwrap(), expected);
+        assert_eq!(responses(&without_space), vec![Ok(r)]);
+    }
+
+    #[test]
+    fn max_minus_five_rejected() {
+        let r = Response::tagged(&"t".repeat(MAX_TEXT - 5), Status::Ok, "");
+        assert_eq!(contract::check_refused(&r), Error::Unwritable);
+    }
+
+    #[test]
+    fn max_minus_five_parse_rejected() {
+        let mut b = "t".repeat(MAX_TEXT - 5).into_bytes();
+        b.extend_from_slice(b" OK\r\n");
+        assert_eq!(b.len(), MAX_TEXT);
+        assert_eq!(Response::parse(&b), Err(Error::TooLong));
+    }
+
+    #[test]
+    fn max_minus_five_stream_rejected() {
+        let mut b = "t".repeat(MAX_TEXT - 5).into_bytes();
+        b.extend_from_slice(b" OK\r\na OK next\r\n");
+        assert_eq!(
+            responses(&b),
+            vec![
+                Err(Error::TooLong),
+                Ok(Response::tagged("a", Status::Ok, "next"))
+            ]
+        );
     }
 
     #[test]
@@ -2188,8 +2244,8 @@ mod tests {
         let mut b = "t".repeat(MAX_TEXT - 4).into_bytes();
         b.extend_from_slice(b" X\r\n");
         assert_eq!(cmd(&b).to_bytes().unwrap(), b);
-        let mut b = "t".repeat(MAX_TEXT - 5).into_bytes();
-        b.extend_from_slice(b" OK\r\n");
+        let mut b = "t".repeat(MAX_TEXT - 6).into_bytes();
+        b.extend_from_slice(b" OK \r\n");
         let r = Response::parse(&b).unwrap();
         assert_eq!(r.to_bytes().unwrap(), b);
         let r = Response::tagged(&"t".repeat(MAX_TEXT), Status::Bad, "x").with_code("C");

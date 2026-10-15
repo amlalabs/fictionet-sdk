@@ -1002,6 +1002,14 @@ impl Service for Mailbox {
 
 Install it with `host.tcp(smtp::PORT, Arc::new(()), Mailbox::default)`. The SMTP decoder removes transparency dots and returns to commands after the DATA terminator. The same access lets an IMAP service refuse a literal or a Postgres service resume startup after replying `N` to an SSL request.
 
+IMAP status responses always write a space after the status word, even with
+empty text. The space counts toward `imap::MAX_TEXT`. Readers accept an
+omitted space only when adding it still fits that limit. Otherwise,
+`imap::Response::parse` returns `imap::Error::TooLong`, and `imap::Responses`
+yields that error as an item before reading the next response. Writing a
+response that cannot fit returns `imap::Error::Unwritable` and leaves the
+output unchanged.
+
 For SMTP AUTH, send a `334` challenge and call `driver.decoder().expect_line()`.
 The next item is `smtp::Input::Line(Vec<u8>)`. It preserves the response bytes
 without CRLF, including an empty response or `*` cancellation. Call
