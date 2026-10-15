@@ -65,6 +65,20 @@
       "type": "string"
     },
     "attach": {
+      "$ref": "#/definitions/attach"
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/service"
+      }
+    },
+    "serviceDefaults": {
+      "$ref": "#/definitions/service"
+    }
+  },
+  "definitions": {
+    "attach": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -139,183 +153,7 @@
         }
       }
     },
-    "services": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "image": {
-            "type": "string"
-          },
-          "imagePullPolicy": {
-            "type": "string"
-          },
-          "command": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "args": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "workingDir": {
-            "type": "string"
-          },
-          "env": {
-            "type": "array"
-          },
-          "resources": {
-            "type": "object"
-          },
-          "readinessProbe": {
-            "type": "object"
-          },
-          "securityContext": {
-            "type": "object"
-          },
-          "volumeMounts": {
-            "type": "array"
-          },
-          "volumes": {
-            "type": "array"
-          },
-          "shared": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "name",
-                "mountPath"
-              ],
-              "properties": {
-                "name": {
-                  "type": "string",
-                  "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-                },
-                "mountPath": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "world": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "image": {
-                "type": "string"
-              },
-              "imagePullPolicy": {
-                "type": "string"
-              },
-              "command": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "args": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "env": {
-                "type": "array"
-              },
-              "resources": {
-                "type": "object"
-              },
-              "securityContext": {
-                "type": "object"
-              }
-            }
-          },
-          "attach": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "image": {
-                "type": "string"
-              },
-              "imagePullPolicy": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "tun",
-                  "http_proxy",
-                  "socks5"
-                ]
-              },
-              "name": {
-                "type": "string",
-                "maxLength": 255
-              },
-              "worldWait": {
-                "type": "integer",
-                "minimum": 0
-              },
-              "downLinks": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "ipAddr": {
-                "type": "string"
-              },
-              "gateway": {
-                "type": "string"
-              },
-              "dns": {
-                "type": "string"
-              },
-              "ipAddrV6": {
-                "type": "string"
-              },
-              "gatewayV6": {
-                "type": "string"
-              },
-              "dnsV6": {
-                "type": "string"
-              },
-              "mtu": {
-                "type": "integer",
-                "minimum": 1280,
-                "maximum": 65535
-              },
-              "extraArgs": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "resources": {
-                "type": "object"
-              },
-              "port": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 65535
-              },
-              "runAsUser": {
-                "type": "integer",
-                "minimum": 0
-              }
-            }
-          }
-        }
-      }
-    },
-    "serviceDefaults": {
+    "service": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -412,79 +250,7 @@
           }
         },
         "attach": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "image": {
-              "type": "string"
-            },
-            "imagePullPolicy": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "tun",
-                "http_proxy",
-                "socks5"
-              ]
-            },
-            "name": {
-              "type": "string",
-              "maxLength": 255
-            },
-            "worldWait": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "downLinks": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "ipAddr": {
-              "type": "string"
-            },
-            "gateway": {
-              "type": "string"
-            },
-            "dns": {
-              "type": "string"
-            },
-            "ipAddrV6": {
-              "type": "string"
-            },
-            "gatewayV6": {
-              "type": "string"
-            },
-            "dnsV6": {
-              "type": "string"
-            },
-            "mtu": {
-              "type": "integer",
-              "minimum": 1280,
-              "maximum": 65535
-            },
-            "extraArgs": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "resources": {
-              "type": "object"
-            },
-            "port": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 65535
-            },
-            "runAsUser": {
-              "type": "integer",
-              "minimum": 0
-            }
-          }
+          "$ref": "#/definitions/attach"
         }
       }
     }
