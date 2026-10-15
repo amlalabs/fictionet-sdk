@@ -12,6 +12,13 @@ and a factory for the two direction decoders. Its contract covers defaults,
 selection precedence, TCP prefix limits, UDP handling and explicit choice.
 Built-ins use the same registration methods.
 
+`Registry::names()` lists the registered names in registration order, oldest
+first. Each name appears once. Replacing a name moves it to the end.
+`Registry::default()` includes built-ins with the `observe` feature and is
+empty without it. The catalog tests compare this inventory with the Observe
+column in `catalog/stdlib.rs`. Matchers, factories and presenters remain
+handwritten in `src/observe/`.
+
 For a pcap reader or live capture, create `Dissector::with_registry(registry)`
 and call `decode(packet, keys)` in capture order. `packet` is a raw IPv4 or
 IPv6 packet. A reader for Ethernet captures must first extract the IP

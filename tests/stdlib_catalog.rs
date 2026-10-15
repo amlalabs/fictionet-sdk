@@ -12,9 +12,9 @@
 //!   in those files, excluding private types (line docs are skipped first,
 //!   so a doctest's example impl does not count);
 //! - **State** against the `pub struct` and `pub enum` declarations;
-//! - **Observe** against the built-ins the default registry gets in
-//!   `src/observe/app.rs`; no module implements `Present`, which belongs
-//!   in `src/observe/`;
+//! - **Observe** against the actual default registry with the `observe` feature;
+//!   without it the registry must be empty. No module implements `Present`,
+//!   which belongs in `src/observe/`;
 //! - **Fuzz** against the targets in `fuzz/Cargo.toml`;
 //! - **Copy** against the modules of `tests/copy_and_own/modules.rs`.
 //!
@@ -49,7 +49,6 @@ use std::path::{Path, PathBuf};
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const FUZZ_MANIFEST: &str = include_str!("../fuzz/Cargo.toml");
 const COPY_MODULES: &str = include_str!("../tests/copy_and_own/modules.rs");
-const OBSERVE_APP: &str = include_str!("../src/observe/app.rs");
 
 /// Fuzz targets that fuzz no single stdlib module: the attach proxy, the
 /// relay, the packet stack and the code generator. Any other target must
@@ -554,21 +553,6 @@ fn owner<'a>(target: &str, modules: impl Iterator<Item = &'a str>) -> Option<&'a
         .max_by_key(|m| m.len())
 }
 
-/// The protocols `Registry::default()` registers, by name.
-fn observe_builtins() -> BTreeSet<&'static str> {
-    let lines: Vec<&str> = OBSERVE_APP.lines().collect();
-    lines
-        .windows(2)
-        .filter(|w| w[0].trim_start().starts_with("registry.register"))
-        .map(|w| {
-            w[1].trim()
-                .strip_prefix('"')
-                .and_then(|l| l.strip_suffix("\","))
-                .unwrap_or_else(|| panic!("a protocol name after {:?}", w[0]))
-        })
-        .collect()
-}
-
 #[test]
 fn catalog_documentation_is_current() {
     let expected = catalog::render(MODULES);
@@ -672,11 +656,22 @@ fn state_names_are_public_types_of_the_module() {
 }
 
 #[test]
-fn observe_column_matches_the_registry_and_the_presenters() {
-    let builtins = observe_builtins();
-    assert!(
-        builtins.contains("dns") && builtins.contains("http1"),
-        "the parser found the built-ins: {builtins:?}"
+fn observe_column_matches_the_default_registry() {
+    let registry = fictionet::observe::Registry::default();
+    let builtins: BTreeSet<_> = registry.names().collect();
+    assert_eq!(
+        builtins.len(),
+        registry.names().count(),
+        "registered names are unique"
+    );
+    let expected: BTreeSet<_> = MODULES
+        .iter()
+        .filter(|row| row.observe && cfg!(feature = "observe"))
+        .map(|row| row.module)
+        .collect();
+    assert_eq!(
+        builtins, expected,
+        "the Observe column with this feature set"
     );
     let modules = modules_on_disk();
     for name in &builtins {
@@ -685,6 +680,11 @@ fn observe_column_matches_the_registry_and_the_presenters() {
             "the built-in observe protocol {name} is named after a stdlib module"
         );
     }
+}
+
+#[test]
+fn presenters_belong_in_observe() {
+    let modules = modules_on_disk();
     for row in MODULES {
         let code = code(&modules[row.module]);
         assert!(
@@ -692,8 +692,6 @@ fn observe_column_matches_the_registry_and_the_presenters() {
             "{}: a presenter belongs in src/observe/, not in the protocol's module",
             row.module
         );
-        let expected = builtins.contains(row.module);
-        assert_eq!(row.observe, expected, "{}: the Observe column", row.module);
     }
 }
 

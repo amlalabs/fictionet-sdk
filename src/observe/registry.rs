@@ -111,6 +111,12 @@ impl Registry {
         }
     }
 
+    /// Returns the registered names in registration order, oldest first.
+    /// Each name appears once. Replacing a name moves it to the end.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.name.as_str())
+    }
+
     /// Registers a byte decoder pair. Both directions use the same public
     /// adapter. The factory runs once per conversation or UDP datagram.
     pub fn register<D>(
@@ -336,19 +342,21 @@ mod tests {
     #[test]
     fn user_registration_can_replace_a_builtin() {
         let mut registry = Registry::default();
+        let original = registry.clone();
+        let mut expected: Vec<_> = original.names().filter(|name| *name != "modbus").collect();
+        expected.push("modbus");
         registry.register(
             "modbus",
             |_| Match::Yes,
             |_| [Modbus::new(true), Modbus::new(false)],
         );
         assert_eq!(registry.select(input((12, 13), b"")), Ok("modbus"));
-        assert_eq!(
-            registry
-                .entries
-                .iter()
-                .filter(|e| e.name == "modbus")
-                .count(),
-            1
-        );
+        assert_eq!(registry.names().collect::<Vec<_>>(), expected);
+        assert_eq!(registry.names().count(), original.names().count());
+    }
+
+    #[test]
+    fn new_registry_has_no_names() {
+        assert_eq!(Registry::new().names().next(), None);
     }
 }
