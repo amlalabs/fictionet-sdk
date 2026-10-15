@@ -240,7 +240,7 @@ fn the_log_is_the_recorded_one() {
                     .unwrap();
                 let (_, date, _) = request(&fcx, conn, "www.google.com", "/").await;
                 assert!(date.contains("30 Sep 2026"), "Date: {date}");
-                for (url, title) in found.iter().take(4) {
+                for (url, title) in &found {
                     let (host, path) = split_url(url);
                     let (status, first) = fetch(&fcx, &m, &host, &path).await;
                     assert_eq!(status, 200, "{url}");
