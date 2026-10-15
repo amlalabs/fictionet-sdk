@@ -1,7 +1,8 @@
-//! Header collection and borrowed head and Content-Length body framing.
-//! Protocol modules own start lines, header names, length rules, and errors.
-//! [`append_header_line`] unfolds separated lines. [`set_header`] and
-//! [`remove_header`] edit fields using the caller's name matching policy.
+//! Header collection and output, and borrowed head and Content-Length body
+//! framing. Protocol modules own start lines, header names, length rules,
+//! and errors. [`append_header_line`] unfolds separated lines. [`set_header`]
+//! and [`remove_header`] edit fields using the caller's name matching policy.
+//! [`head_size`] counts canonical heads and [`write_headers`] emits them.
 
 extern crate alloc;
 
@@ -149,6 +150,86 @@ pub fn remove_header(
     let before = headers.len();
     headers.retain(|h| !same_name(&h.name, name));
     before - headers.len()
+}
+
+/// Counts a canonical head, including the start line's CRLF and the final
+/// blank CRLF line. `start` is the start line's byte length without CRLF.
+/// Each header contributes its name, `": "`, value, and CRLF, in that order.
+///
+/// `max_line` limits each line without CRLF, including the start line.
+/// `max_head` limits the whole head. Limits are used without clamping and
+/// exact fits are accepted. Overflow or either exceeded limit returns
+/// `too_long`. No output or input cursor is changed.
+///
+/// This only counts bytes. The caller validates the start line, header names
+/// and values (including trimming and embedded line endings), header count,
+/// and body policy before writing. It also reserves space for the entire
+/// message before appending the start line and calling [`write_headers`].
+///
+/// ```
+/// use fictionet::stdlib::codec::head_body::{Header, head_size, write_headers};
+/// let headers = [Header::new("X", "one"), Header::new("X", "")];
+/// let size = head_size(5, &headers, 6, 22, "limit")?;
+/// assert_eq!(size, 22);
+/// assert_eq!(head_size(5, &headers, 6, 21, "limit"), Err("limit"));
+/// let mut out = Vec::with_capacity(size);
+/// out.extend_from_slice(b"START\r\n");
+/// write_headers(&headers, &mut out);
+/// assert_eq!(out, b"START\r\nX: one\r\nX: \r\n\r\n");
+/// # Ok::<(), &str>(())
+/// ```
+pub fn head_size<E: Clone>(
+    start: usize,
+    headers: &[Header],
+    max_line: usize,
+    max_head: usize,
+    too_long: E,
+) -> Result<usize, E> {
+    if start > max_line {
+        return Err(too_long);
+    }
+    let mut head = start.checked_add(4).ok_or_else(|| too_long.clone())?;
+    for header in headers {
+        let line = header
+            .name
+            .len()
+            .checked_add(header.value.len())
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| too_long.clone())?;
+        if line > max_line {
+            return Err(too_long);
+        }
+        head = head
+            .checked_add(line)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| too_long.clone())?;
+        if head > max_head {
+            return Err(too_long);
+        }
+    }
+    if head > max_head {
+        return Err(too_long);
+    }
+    Ok(head)
+}
+
+/// Appends each header as `name: value\r\n`, followed by a blank CRLF line.
+/// Names, values, duplicates, and order are preserved exactly. The caller
+/// appends the start line and its CRLF first, and the body afterwards.
+///
+/// This performs no validation or limit checks. Before calling, validate
+/// the fields, check [`head_size`] with the desired line and head limits,
+/// and reserve space for the whole message. This lets the caller keep
+/// validation and reservation failures from changing its output. No input
+/// cursor is moved or retained.
+pub fn write_headers(headers: &[Header], out: &mut Vec<u8>) {
+    for header in headers {
+        out.extend_from_slice(header.name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(header.value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
 }
 
 /// Incrementally finds a head and its declared body without copying input.
@@ -454,6 +535,54 @@ mod tests {
                 Header::new("B", "middle"),
                 Header::new("C", "last"),
             ]
+        );
+    }
+
+    #[test]
+    fn canonical_head_size_matches_output_and_explicit_limits() {
+        let headers = [Header::new("X", "é"), Header::new("x", "")];
+        let expected = b"START\r\nX: \xc3\xa9\r\nx: \r\n\r\n";
+        let size = head_size(5, &headers, 5, expected.len(), "limit").unwrap();
+        assert_eq!(size, expected.len());
+        let mut out = b"prefix".to_vec();
+        out.reserve(size);
+        out.extend_from_slice(b"START\r\n");
+        write_headers(&headers, &mut out);
+        assert_eq!(&out[..6], b"prefix");
+        assert_eq!(&out[6..], expected);
+        assert_eq!(head_size(5, &headers, 4, size, "line"), Err("line"));
+        assert_eq!(head_size(0, &headers, 4, size, "line"), Err("line"));
+        assert_eq!(head_size(5, &headers, 5, size - 1, "head"), Err("head"));
+        assert_eq!(head_size(0, &[], 0, 4, "limit"), Ok(4));
+        assert_eq!(head_size(0, &[], 0, 3, "limit"), Err("limit"));
+        assert_eq!(head_size(0, &[], 0, 0, "limit"), Err("limit"));
+        let mut empty = Vec::new();
+        write_headers(&[], &mut empty);
+        assert_eq!(empty, b"\r\n");
+    }
+
+    #[test]
+    fn canonical_head_size_reports_overflow_with_the_callers_error() {
+        for (start, headers) in [
+            (usize::MAX, vec![]),
+            (usize::MAX - 3, vec![]),
+            (usize::MAX - 4, vec![Header::new("X", "")]),
+            (usize::MAX - 8, vec![Header::new("X", "")]),
+        ] {
+            assert_eq!(
+                head_size(
+                    start,
+                    &headers,
+                    usize::MAX,
+                    usize::MAX,
+                    String::from("overflow")
+                ),
+                Err(String::from("overflow")),
+            );
+        }
+        assert_eq!(
+            head_size(usize::MAX - 4, &[], usize::MAX, usize::MAX, "limit"),
+            Ok(usize::MAX),
         );
     }
 

@@ -69,6 +69,13 @@ duplicates keeps the first field's spelling and position. SIP retains compact
 aliases, and RTSP ignores case without aliases. The public message builders keep
 their existing behavior and defer validation to the message writer.
 
+`codec::head_body::head_size` counts canonical CRLF output with caller-supplied
+line and head limits. Exact fits pass; overflow and exceeded limits return the
+caller's error. `write_headers` appends `name: value` lines and a final blank
+line without changing fields. It requires prior sizing, validation, and
+reservation. SIP and RTSP still own start lines, header validation, body rules,
+and reservation for the entire message, so write errors leave output unchanged.
+
 `codec::ber::read_length` reads a length prefix without moving a cursor or
 waiting for its body. Its policy bounds the number of length octets and
 can require minimal encodings. ASN.1 permits four length octets and checks

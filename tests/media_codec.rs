@@ -864,6 +864,17 @@ fn head_limit_accepts_exact_fit_and_wire_refuses_canonical_expansion() {
     contract::check_wire::<sip::Message>(&sb);
     assert!(decode_all(rtsp::Frames::new, &rb).1.is_none());
     assert!(decode_all(sip::Messages::new, &sb).1.is_none());
+    let mut out = b"prefix".to_vec();
+    Wire::write(&r, &mut out).unwrap();
+    Wire::write(&s, &mut out).unwrap();
+    assert_eq!(out, [b"prefix".as_slice(), &rb, &sb].concat());
+    r.headers[0].value.push('a');
+    s.headers[0].value.push('a');
+    let before = out.clone();
+    assert_eq!(Wire::write(&r, &mut out), Err(rtsp::Error::TooLong));
+    assert_eq!(out, before);
+    assert_eq!(Wire::write(&s, &mut out), Err(sip::Error::TooLong));
+    assert_eq!(out, before);
     let mut rb = rb;
     let mut sb = sb;
     let rat = rb.windows(3).position(|w| w == b"X: ").unwrap() + 2;

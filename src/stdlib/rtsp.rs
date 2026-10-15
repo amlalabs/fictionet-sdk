@@ -729,13 +729,7 @@ impl Wire for Message {
             }
         }
         out.extend_from_slice(b"\r\n");
-        for header in &self.headers {
-            out.extend_from_slice(header.name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(header.value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(b"\r\n");
+        head_body::write_headers(&self.headers, out);
         out.extend_from_slice(&self.body);
         Ok(())
     }
@@ -776,31 +770,7 @@ fn message_size(message: &Message) -> Result<usize, Error> {
                 .ok_or(too_long)?
         }
     };
-    if start > MAX_LINE {
-        return Err(too_long);
-    }
-    let mut head = start.checked_add(4).ok_or(too_long)?;
-    for header in &message.headers {
-        let line = header
-            .name
-            .len()
-            .checked_add(header.value.len())
-            .and_then(|n| n.checked_add(2))
-            .ok_or(too_long)?;
-        if line > MAX_LINE {
-            return Err(too_long);
-        }
-        head = head
-            .checked_add(line)
-            .and_then(|n| n.checked_add(2))
-            .ok_or(too_long)?;
-        if head > MAX_HEAD {
-            return Err(too_long);
-        }
-    }
-    if head > MAX_HEAD {
-        return Err(too_long);
-    }
+    let head = head_body::head_size(start, &message.headers, MAX_LINE, MAX_HEAD, too_long)?;
     let total = head.checked_add(message.body.len()).ok_or(too_long)?;
     match &message.start {
         StartLine::Request { method, uri, .. } if !valid_method(method) || !valid_uri(uri) => {
