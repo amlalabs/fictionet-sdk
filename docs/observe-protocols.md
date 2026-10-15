@@ -94,10 +94,12 @@ and `Present`.
 
 These files can be copied into another crate and edited:
 
-- `src/observe/protocols.rs`: capture decoders and presenters, including
-  `ModbusSession`. Register that session through `register_protocol` to stop
-  both directions after a framing error, as the built-in does. The file uses
-  public observe and stdlib APIs, plus `hickory-proto`.
+- `src/observe/protocols.rs` and `src/observe/protocols/`: capture decoders
+  and presenters. Copy them together, keeping the relative paths.
+  `protocols/modbus.rs` owns `Modbus` and `ModbusSession`, re-exported by
+  `protocols.rs`. Register that session through `register_protocol` to stop
+  both directions after a framing error, as the built-in does. These files
+  use public observe and stdlib APIs, plus `hickory-proto`.
 - `src/observe/http2.rs`: the HTTP/2 and gRPC presenter, `Capture`, with
   `CaptureBudget`. It uses public observe and stdlib APIs. Register it
   through `register_with_buffer`, as below.
