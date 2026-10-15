@@ -47,7 +47,7 @@ Where a sandbox can't have a `tun` device, attach serves it as an HTTP or SOCKS5
 proxy instead.
 
 <p align="center">
-  <img src="docs/readme/attach.svg" width="580" alt="The agent's programs send IP packets through a TUN device in the sandbox's network namespace. fictionet attach holds the device and relays each packet over a Unix socket to the world process, where it arrives as an Attachment, an interface the world reads and writes.">
+  <img src="docs/diagrams/attach.svg" width="580" alt="The agent's programs send IP packets through a TUN device in the sandbox's network namespace. fictionet attach holds the device and relays each packet over a Unix socket to the world process, where it arrives as an Attachment, an interface the world reads and writes.">
 </p>
 
 The standard library covers IPv4 and IPv6, TCP, UDP, ICMP, routing, whole

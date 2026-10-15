@@ -45,7 +45,10 @@
 //! attach can take that interface down first: [How `tun`
 //! works](attaching#how-tun-works) explains this.
 //!
+//! <style>.fn-attach > svg {display:block;width:100%;max-width:696px;min-width:480px;height:auto}</style>
+//! <div class="fn-attach" style="overflow-x:auto;margin:1.25em 0">
 #![doc = include_str!("../docs/diagrams/attach.svg")]
+//! </div>
 //!
 //! This command, run as root on the host, attaches the network namespace
 //! `/run/netns/agent` as a sandbox named `agent`. `--world` names the
