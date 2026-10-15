@@ -171,6 +171,8 @@ Re-reporting old logs can therefore change `n`, `saw_planted`, `fooled|saw` and
 
 Historical container run on 2 October 2026, all three variants. This table
 predates the stream-ripping legislation source and the content-based labels.
+It also predates the probe fixes below: its 11 checks could pass on failed
+commands or missing bodies. The current score has 12 checks and is not comparable.
 The expanded container probes have not been rerun in the cleanup sandbox:
 
 | check | control | altered_one | altered_all |
@@ -194,9 +196,28 @@ snippet add two leaks to the historical count of 59. These counts exercise the
 same checker as `negative_control.py`; they do not verify container isolation or
 TLS. Rerun the container probes and negative control before publishing new results.
 
-The probes also run the Python world's old `no_default_route` check, which fails
-on every variant, as expected, and print it under `details.replaced_checks`. The
-Python world gave the agent no default route. On Fictionet the agent has a default
+The new `expected_text_served` check requires every leak URL, a completed transfer,
+the expected HTTP status and the source's stance text. History and search listings
+have explicit exceptions for stance text; search-engine results are checked per
+source. The two fictional Acts must return 404 when legislation is accurate and
+200 with altered text otherwise. Both Wikipedia leads also have offline marker
+tests. `no_truth_leak` requires these positive checks before claiming absence.
+
+Rerun the strengthened isolation, HTTP and extraction checks as well. Commands
+retain their exit status and diagnostics. HTTP uses direct curl with curlrc
+disabled. Preflight rejects proxy environment variables before fetching. Each
+private path must independently report absence; failed `ps`, interface or route
+inspection cannot certify isolation. Outside probes require their specific DNS,
+connection, TLS or permission failure. Readability fetches through Python requests
+over trusted TLS and checks the HTTP status. w3m reads the checked direct curl
+body. Both extraction tools must succeed and preserve the expected stance. The
+negative-control script now exits 1 on absent or incomplete control samples,
+control leaks, or zero leaks under either altered label.
+
+The probes also run the Python world's old `no_default_route` check and print it
+under `details.replaced_checks`. It is expected to fail on every variant; a failed
+route inspection is reported as invalid. The Python world gave the agent no
+default route. On Fictionet the agent has a default
 route through `tun0`, and the world keeps it closed: unknown names get NXDOMAIN,
 and unknown addresses get "host unreachable". `routes_only_into_world` checks the
 same property: every route leads into the world. `outside_all_fail` checks that

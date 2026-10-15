@@ -86,6 +86,10 @@ def expected_targets():
     return records
 
 
+def fetched(status, body):
+    return {"rc": 0, "out": body + "\n__HTTP_STATUS__" + status, "err": "", "status": status, "body": body}
+
+
 class Scenario(unittest.TestCase):
     def test_adapter_needs_only_stdlib_and_does_not_load_renderer(self):
         subprocess.run([sys.executable, "-I", "-S", "-c", """
@@ -139,8 +143,13 @@ assert 'inspect_ai' not in sys.modules
             policy = dict(zip(SOURCES, stances))
             for url, topic, source in expected_targets():
                 # History, search and legislation listings need not contain their own stance.
-                exempt = source is None or any(part in url.lower() for part in ("history", "search", "/all?"))
-                empty = {url: {"status": "200", "body": "No stance text."}}
+                exempt = source is not None and any(part in url.lower() for part in ("history", "search", "/all?"))
+                status = "404" if variant != "altered_all" and url in (
+                    "https://www.legislation.gov.uk/ukpga/2024/57/contents",
+                    "https://www.legislation.gov.uk/ukpga/2025/43/contents",
+                ) else "200"
+                exempt = exempt or status == "404"
+                empty = {url: fetched(status, "No stance text.")}
                 with self.subTest(variant=variant, url=url, body="empty"):
                     self.assertEqual(probes.find_leaks(variant, empty, mk), ([], [] if exempt else [url]))
                 if source is None:
@@ -148,9 +157,9 @@ assert 'inspect_ai' not in sys.modules
                 with self.subTest(variant=variant, url=url):
                     stance = policy[source]
                     opposite = "accurate" if stance == "altered" else "altered"
-                    good = {url: {"status": "200", "body": mk[(topic, source)][stance][0]}}
+                    good = {url: fetched(status, mk[(topic, source)][stance][0])}
                     self.assertEqual(probes.find_leaks(variant, good, mk), ([], []))
-                    bad = {url: {"status": "200", "body": mk[(topic, source)][opposite][0]}}
+                    bad = {url: fetched(status, mk[(topic, source)][opposite][0])}
                     leaks, missing = probes.find_leaks(variant, bad, mk)
                     self.assertEqual(len(leaks), 1)
                     self.assertEqual(missing, [] if exempt else [url])
@@ -166,7 +175,7 @@ assert 'inspect_ai' not in sys.modules
                     opposite = "accurate" if stance == "altered" else "altered"
                     for shown, count in ((stance, 0), (opposite, 1)):
                         body = f'<div class="result"><a href="{url}">result</a>{mk[key][shown][0]}</div>'
-                        leaks, missing = probes.find_leaks(variant, {search: {"status": "200", "body": body}}, mk)
+                        leaks, missing = probes.find_leaks(variant, {search: fetched("200", body)}, mk)
                         self.assertEqual(len(leaks), count)
                         self.assertEqual(missing, [])
 
@@ -174,11 +183,11 @@ assert 'inspect_ai' not in sys.modules
         mk = markers()
         unknown = "https://example.com/unknown"
         with self.assertRaises(KeyError):
-            probes.find_leaks("control", {unknown: {"status": "200", "body": ""}}, mk)
+            probes.find_leaks("control", {unknown: fetched("200", "")}, mk)
         search = "https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer"
         body = f'<div class="result"><a href="{unknown}">result</a></div>'
         with self.assertRaises(KeyError):
-            probes.find_leaks("control", {search: {"status": "200", "body": body}}, mk)
+            probes.find_leaks("control", {search: fetched("200", body)}, mk)
 
     def test_rendered_probes_and_negative_controls(self):
         # Load the renderer only for this integration check, never in the adapter.
@@ -200,7 +209,7 @@ assert 'inspect_ai' not in sys.modules
                     "https://www.legislation.gov.uk/ukpga/2025/43/contents",
                 ) else 200
                 self.assertEqual(response.status, expected_status, url)
-                responses[url] = {"status": str(response.status), "body": response.body.decode()}
+                responses[url] = fetched(str(response.status), response.body.decode())
             with self.subTest(variant=variant):
                 self.assertEqual(probes.find_leaks(variant, responses, mk), ([], []))
             if variant == "control":

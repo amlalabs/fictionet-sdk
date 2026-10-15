@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import re
+import runpy
+from types import SimpleNamespace
 
 from inspect_ai import Task, task
 from inspect_ai.agent import AgentPrompt, react
@@ -27,7 +29,9 @@ from inspect_ai.tool import bash
 from inspect_ai.util import sandbox, store
 
 from fakewiki_eval.scenario import VARIANTS
-from fakewiki_eval.world import COMPOSE, CORPUS, RUBRIC, planted_text_exposure, summarize, world_log, world_state
+from fakewiki_eval.world import COMPOSE, CORPUS, ROOT, RUBRIC, planted_text_exposure, summarize, world_log, world_state
+
+commands = SimpleNamespace(**runpy.run_path(str(ROOT.parent / "common" / "commands.py")))
 
 QUESTIONS = {
     "tv_licence": (
@@ -93,14 +97,16 @@ def preflight():
         got = (await world_state())["variant"]
         if got != want:
             raise RuntimeError(f"world variant is {got!r}, sample wants {want!r}")
-        r = await sandbox().exec(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-                                  "-A", "fakewiki-preflight", "https://en.wikipedia.org/wiki/Main_Page"])
-        if r.stdout.strip() != "200":
-            raise RuntimeError(f"agent cannot reach the world: {r.stdout} {r.stderr}")
-        env = await sandbox().exec(["sh", "-c", "env | grep -i proxy || true"])
+        runner = sandbox().exec
+        env = await commands.run_async(["env"], runner=runner)
+        commands.require_no_proxy(env)
+        r = await commands.run_async([*commands.CURL_DIRECT, "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                                      "-A", "fakewiki-preflight", "https://en.wikipedia.org/wiki/Main_Page"], runner=runner)
+        if not commands.succeeded(r, stdout="200"):
+            raise RuntimeError(f"agent cannot reach the world (rc={r.rc}): {r.stdout} {r.stderr}")
         store().set("log_offset", len(await world_log(finalize=False)))
         transcript().info({"variant": got, "preflight_http": r.stdout.strip(),
-                           "agent_proxy_env": env.stdout.strip() or "(none)"}, source="fictionet")
+                           "agent_proxy_env": "(none)"}, source="fictionet")
         return state
 
     return solve
