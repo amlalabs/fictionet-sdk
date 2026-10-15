@@ -457,15 +457,13 @@ impl Wire for Attribute {
     /// Reads one type-length-value attribute. Refuses lengths below two,
     /// incomplete attributes, and trailing bytes. Values remain opaque.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let [kind, length, ..] = bytes else {
-            return Err(Error::Attribute(0));
-        };
-        if *length < 2 || usize::from(*length) != bytes.len() {
+        let (kind, value) = attribute_body(bytes, 2).ok_or(Error::Attribute(0))?;
+        if value.len() + 2 != bytes.len() {
             return Err(Error::Attribute(0));
         }
         Ok(Self {
-            kind: *kind,
-            value: bytes[2..].to_vec(),
+            kind,
+            value: value.to_vec(),
         })
     }
 
@@ -475,8 +473,7 @@ impl Wire for Attribute {
         if self.value.len() > MAX_VALUE {
             return Err(Error::Unwritable);
         }
-        out.extend_from_slice(&[self.kind, (self.value.len() + 2) as u8]);
-        out.extend_from_slice(&self.value);
+        append_attribute(out, self);
         Ok(())
     }
 }
@@ -488,24 +485,8 @@ impl Packet {
     /// `20..=4096`, truncated packets, and malformed attributes.
     /// Use [`Wire::parse`] when trailing bytes must be refused.
     pub fn parse_datagram(b: &[u8]) -> Result<Packet, Error> {
-        if b.len() < HEADER_LEN {
-            return Err(Error::Short(b.len()));
-        }
-        let length = u16::from_be_bytes([b[2], b[3]]);
-        let end = usize::from(length);
-        if !(HEADER_LEN..=MAX_PACKET).contains(&end) {
-            return Err(Error::Length {
-                length: end,
-                limit: MAX_PACKET,
-            });
-        }
-        if b.len() < end {
-            return Err(Error::Truncated {
-                length,
-                got: b.len(),
-            });
-        }
-        <Packet as Wire>::parse(&b[..end])
+        let end = packet_end(b)?;
+        parse_packet_body(&b[..end])
     }
 
     /// A packet with no attributes.
@@ -521,9 +502,7 @@ impl Packet {
     /// How many bytes the packet takes, header included. When this is
     /// more than [`MAX_PACKET`], [`Packet::to_bytes`] refuses it.
     pub fn encoded_len(&self) -> usize {
-        self.attributes.iter().fold(HEADER_LEN, |n, a| {
-            n.saturating_add(2).saturating_add(a.value.len())
-        })
+        HEADER_LEN.saturating_add(attributes_len(&self.attributes))
     }
 
     /// The first attribute of type `kind`.
@@ -702,38 +681,13 @@ impl Wire for Packet {
     /// Reads exactly one packet. Refuses lengths outside 20..=4096, truncated
     /// headers or attributes, and trailing bytes, including datagram padding.
     fn parse(b: &[u8]) -> Result<Packet, Error> {
-        if b.len() < HEADER_LEN {
-            return Err(Error::Short(b.len()));
-        }
-        let length = u16::from_be_bytes([b[2], b[3]]);
-        let end = usize::from(length);
-        if !(HEADER_LEN..=MAX_PACKET).contains(&end) {
-            return Err(Error::Length {
-                length: end,
-                limit: MAX_PACKET,
-            });
-        }
-        if b.len() < end {
-            return Err(Error::Truncated {
-                length,
-                got: b.len(),
-            });
-        }
+        let end = packet_end(b)?;
         if b.len() != end {
             return Err(Error::Trailing {
                 remaining: b.len() - end,
             });
         }
-        let mut authenticator = [0u8; AUTHENTICATOR_LEN];
-        authenticator.copy_from_slice(&b[4..HEADER_LEN]);
-        let attributes = parse_attributes(&b[HEADER_LEN..end], 2)
-            .map_err(|at| Error::Attribute(HEADER_LEN + at))?;
-        Ok(Packet {
-            code: Code::from_u8(b[0]),
-            identifier: b[1],
-            authenticator,
-            attributes,
-        })
+        parse_packet_body(b)
     }
 
     /// Appends one packet. Refuses values over [`MAX_VALUE`] or packets over
@@ -749,9 +703,7 @@ impl Wire for Packet {
         out.extend_from_slice(&(length as u16).to_be_bytes());
         out.extend_from_slice(&self.authenticator);
         for a in &self.attributes {
-            out.push(a.kind);
-            out.push((a.value.len() + 2) as u8);
-            out.extend_from_slice(&a.value);
+            append_attribute(out, a);
         }
         Ok(())
     }
@@ -793,29 +745,76 @@ fictionet::prefixed! {
         input: &[u8],
         limit: &Self::Limit,
     ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
-        let limit = *limit;
-        let Some(&[_, _, hi, lo]) = input.get(..4) else {
+        if input.len() < 4 {
             return Ok(None);
-        };
-        let length = u16::from_be_bytes([hi, lo]);
-        let used = usize::from(length);
-        if used < HEADER_LEN {
-            return Err(Error::Length {
-                length: used,
-                limit,
-            });
         }
-        if used > limit {
-            return Err(Error::Length {
-                length: used,
-                limit,
-            });
-        }
+        let used = packet_length(input, *limit)?;
         let Some(bytes) = input.get(..used) else {
             return Ok(None);
         };
-        Ok(Some((Packet::parse(bytes)?, used)))
+        // Direct Prefixed callers can supply a limit without normalizing it.
+        if *limit > MAX_PACKET {
+            packet_length(bytes, MAX_PACKET)?;
+        }
+        Ok(Some((parse_packet_body(bytes)?, used)))
     }
+}
+
+// The caller has at least the four-byte prefix. Streams inspect it before
+// waiting for the authenticator or attributes.
+fn packet_length(b: &[u8], limit: usize) -> Result<usize, Error> {
+    let length = usize::from(u16::from_be_bytes([b[2], b[3]]));
+    if !(HEADER_LEN..=limit).contains(&length) {
+        return Err(Error::Length { length, limit });
+    }
+    Ok(length)
+}
+
+// Complete-packet readers require the fixed header before checking its length.
+fn packet_end(b: &[u8]) -> Result<usize, Error> {
+    if b.len() < HEADER_LEN {
+        return Err(Error::Short(b.len()));
+    }
+    let end = packet_length(b, MAX_PACKET)?;
+    if b.len() < end {
+        return Err(Error::Truncated {
+            length: end as u16,
+            got: b.len(),
+        });
+    }
+    Ok(end)
+}
+
+// The caller has validated the header and sliced to the declared length.
+fn parse_packet_body(b: &[u8]) -> Result<Packet, Error> {
+    let mut authenticator = [0u8; AUTHENTICATOR_LEN];
+    authenticator.copy_from_slice(&b[4..HEADER_LEN]);
+    let attributes =
+        parse_attributes(&b[HEADER_LEN..], 2).map_err(|at| Error::Attribute(HEADER_LEN + at))?;
+    Ok(Packet {
+        code: Code::from_u8(b[0]),
+        identifier: b[1],
+        authenticator,
+        attributes,
+    })
+}
+
+// Reads one envelope, leaving minimum length and trailing-byte policy to callers.
+fn attribute_body(b: &[u8], min: usize) -> Option<(u8, &[u8])> {
+    let &[kind, length, ..] = b else {
+        return None;
+    };
+    let length = usize::from(length);
+    if length < min {
+        return None;
+    }
+    Some((kind, b.get(2..length)?))
+}
+
+// The caller has checked that the value fits in one attribute.
+fn append_attribute(out: &mut Vec<u8>, attribute: &Attribute) {
+    out.extend_from_slice(&[attribute.kind, (attribute.value.len() + 2) as u8]);
+    out.extend_from_slice(&attribute.value);
 }
 
 /// Reads attributes (type, length, value) filling all of `b`. Each
@@ -825,19 +824,12 @@ fn parse_attributes(b: &[u8], min: usize) -> Result<Vec<Attribute>, usize> {
     let mut out = Vec::new();
     let mut at = 0;
     while at < b.len() {
-        let rest = &b[at..];
-        let [kind, len, ..] = rest else {
-            return Err(at);
-        };
-        let len = usize::from(*len);
-        if len < min || len > rest.len() {
-            return Err(at);
-        }
+        let (kind, value) = attribute_body(&b[at..], min).ok_or(at)?;
         out.push(Attribute {
-            kind: *kind,
-            value: rest[2..len].to_vec(),
+            kind,
+            value: value.to_vec(),
         });
-        at += len;
+        at += value.len() + 2;
     }
     Ok(out)
 }

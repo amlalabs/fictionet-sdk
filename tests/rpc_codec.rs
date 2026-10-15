@@ -627,6 +627,131 @@ fn radius_refuses_lengths_and_attributes_without_recovery() {
 }
 
 #[test]
+fn radius_header_and_body_error_precedence() {
+    for length in [0u16, 19, 4097, u16::MAX] {
+        let mut bytes = vec![1, 7];
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.resize(radius::HEADER_LEN, 0);
+        let error = radius::Error::Length {
+            length: usize::from(length),
+            limit: radius::MAX_PACKET,
+        };
+        for n in 0..radius::HEADER_LEN {
+            assert_eq!(
+                radius::Packet::parse(&bytes[..n]),
+                Err(radius::Error::Short(n))
+            );
+            assert_eq!(
+                radius::Packet::parse_datagram(&bytes[..n]),
+                Err(radius::Error::Short(n))
+            );
+            assert_eq!(
+                Frames::<radius::Packet>::new().decode(&bytes[..n], false),
+                if n < 4 { Ok(Step::Need) } else { Err(error) }
+            );
+        }
+        assert_eq!(radius::Packet::parse(&bytes), Err(error));
+        assert_eq!(radius::Packet::parse_datagram(&bytes), Err(error));
+    }
+
+    // A valid empty attribute followed by a broken envelope and padding.
+    let mut bytes = vec![1, 7, 0, 24];
+    bytes.extend_from_slice(&[0; 16]);
+    bytes.extend_from_slice(&[1, 2, 2, 1, 9]);
+    assert_eq!(
+        radius::Packet::parse(&bytes),
+        Err(radius::Error::Trailing { remaining: 1 })
+    );
+    assert_eq!(
+        radius::Packet::parse_datagram(&bytes),
+        Err(radius::Error::Attribute(22))
+    );
+    assert_eq!(
+        Frames::<radius::Packet>::new().decode(&bytes, false),
+        Err(radius::Error::Attribute(22))
+    );
+    bytes.truncate(23);
+    let error = radius::Error::Truncated {
+        length: 24,
+        got: 23,
+    };
+    assert_eq!(radius::Packet::parse(&bytes), Err(error));
+    assert_eq!(radius::Packet::parse_datagram(&bytes), Err(error));
+    assert_eq!(
+        Frames::<radius::Packet>::new().decode(&bytes, false),
+        Ok(Step::Need)
+    );
+
+    // A direct prefix call still enforces the wire maximum once complete,
+    // even if its caller bypasses Frames' limit normalization.
+    let mut oversized = vec![1, 7, 0x10, 1];
+    assert_eq!(
+        <radius::Packet as fictionet::stdlib::codec::Prefixed>::parse_prefix(
+            &oversized,
+            &usize::MAX
+        ),
+        Ok(None)
+    );
+    oversized.resize(radius::MAX_PACKET + 1, 0);
+    assert_eq!(
+        <radius::Packet as fictionet::stdlib::codec::Prefixed>::parse_prefix(
+            &oversized,
+            &usize::MAX
+        ),
+        Err(radius::Error::Length {
+            length: radius::MAX_PACKET + 1,
+            limit: radius::MAX_PACKET,
+        })
+    );
+}
+
+#[test]
+fn radius_attribute_envelopes_keep_nested_minimums() {
+    for size in [0, 1, radius::MAX_VALUE] {
+        let attribute = radius::Attribute {
+            kind: 7,
+            value: vec![0xa5; size],
+        };
+        let mut wire = vec![7, (size + 2) as u8];
+        wire.extend_from_slice(&attribute.value);
+        assert_eq!(attribute.to_bytes().unwrap(), wire);
+        assert_eq!(radius::Attribute::parse(&wire), Ok(attribute.clone()));
+        let mut packet = radius::Packet::new(radius::Code::AccessRequest, 7, [0; 16]);
+        packet.attributes.push(attribute.clone());
+        let bytes = packet.to_bytes().unwrap();
+        assert_eq!(&bytes[radius::HEADER_LEN..], wire);
+        assert_eq!(radius::Packet::parse(&bytes), Ok(packet.clone()));
+        assert_eq!(radius::Packet::parse_datagram(&bytes), Ok(packet.clone()));
+        assert_eq!(
+            Frames::<radius::Packet>::new().decode(&bytes, false),
+            Ok(Step::Item(packet, bytes.len()))
+        );
+        let vsa = radius::Vsa {
+            vendor: 9,
+            data: wire.clone(),
+        };
+        assert_eq!(vsa.sub_attributes(), Ok(vec![attribute.clone()]));
+        assert_eq!(
+            radius::Value::decode(radius::DataType::Tlv, &wire),
+            if size == 0 {
+                Err(radius::Error::Nested)
+            } else {
+                Ok(radius::Value::Tlv(vec![attribute]))
+            }
+        );
+        wire.push(0);
+        assert_eq!(
+            radius::Attribute::parse(&wire),
+            Err(radius::Error::Attribute(0))
+        );
+    }
+    contract::check_refused(&radius::Attribute {
+        kind: 1,
+        value: vec![0; radius::MAX_VALUE + 1],
+    });
+}
+
+#[test]
 fn radius_wire_is_exact_and_transactional() {
     let packet = radius_request();
     let mut bytes = packet.to_bytes().unwrap();
