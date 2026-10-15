@@ -179,6 +179,7 @@ pub struct Lines {
     max: usize,
     ending: Ending,
     scanned: usize,
+    examined: u64,
     skipping: bool,
     // The last terminator was a CR at the end of the input, so an LF that
     // starts the next input belongs to it.
@@ -192,9 +193,16 @@ impl Lines {
             max: max.min(Buffer::MAX_LIMIT.saturating_sub(2)),
             ending,
             scanned: 0,
+            examined: 0,
             skipping: false,
             after_cr: false,
         }
+    }
+    /// Bytes searched for line terminators, including discarded overlong
+    /// lines, saturating at `u64::MAX`. Cumulative across lines. Constant-time
+    /// CRLF lookahead and copying the line's content are not counted.
+    pub fn examined(&self) -> u64 {
+        self.examined
     }
 }
 impl Decode for Lines {
@@ -213,10 +221,13 @@ impl Decode for Lines {
         }
         if self.skipping {
             self.scanned = 0;
-            if let Some(i) = input
+            let newline = input
                 .iter()
-                .position(|b| *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r'))
-            {
+                .position(|b| *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r'));
+            self.examined = self
+                .examined
+                .saturating_add(newline.map_or(input.len(), |i| i.saturating_add(1)) as u64);
+            if let Some(i) = newline {
                 let mut n = i.saturating_add(1);
                 if self.ending == Ending::LfOrCrOrCrlf && input.get(i) == Some(&b'\r') {
                     if input.get(n) == Some(&b'\n') {
@@ -238,12 +249,14 @@ impl Decode for Lines {
         // Stop at capacity even if the caller supplied a larger buffer.
         // This keeps the TooLong decision independent of chunk boundaries.
         let stop = input.len().min(self.capacity());
-        let newline = input
-            .get(scan..stop)
-            .unwrap_or_default()
+        let scanned = input.get(scan..stop).unwrap_or_default();
+        let newline = scanned
             .iter()
-            .position(|b| *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r'))
-            .map(|i| scan.saturating_add(i));
+            .position(|b| *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r'));
+        self.examined = self
+            .examined
+            .saturating_add(newline.map_or(scanned.len(), |i| i.saturating_add(1)) as u64);
+        let newline = newline.map(|i| scan.saturating_add(i));
         if let Some(i) = newline {
             let any_cr = self.ending == Ending::LfOrCrOrCrlf;
             let mut n = i.saturating_add(1);

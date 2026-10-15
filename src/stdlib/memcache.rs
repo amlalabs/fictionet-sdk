@@ -1824,6 +1824,7 @@ impl core::error::Error for FrameError {}
 
 struct TextUnits<T> {
     lines: codec::Lines,
+    examined: u64,
     partial_line: Vec<u8>,
     get_lines: bool,
     long_line: bool,
@@ -1853,6 +1854,7 @@ impl<T> TextUnits<T> {
     fn new(get_lines: bool, limit: usize) -> Self {
         Self {
             lines: codec::Lines::new(MAX_LINE - 2, codec::Ending::LfOrCrlf),
+            examined: 0,
             partial_line: Vec::new(),
             get_lines,
             long_line: false,
@@ -1866,6 +1868,13 @@ impl<T> TextUnits<T> {
     }
     fn capacity(&self) -> usize {
         MAX_LINE
+    }
+    fn examined(&self) -> u64 {
+        self.examined.saturating_add(self.lines.examined())
+    }
+    fn reset_lines(&mut self, max: usize) {
+        self.examined = self.examined();
+        self.lines = codec::Lines::new(max, codec::Ending::LfOrCrlf);
     }
     fn held(&self) -> usize {
         self.head_bytes
@@ -1935,7 +1944,7 @@ impl<T> TextUnits<T> {
         // is known, only Lines' cursor scans the remaining input.
         if self.get_lines && !self.long_line && is_get_line(input) {
             self.long_line = true;
-            self.lines = codec::Lines::new(MAX_GET_LINE - 2, codec::Ending::LfOrCrlf);
+            self.reset_lines(MAX_GET_LINE - 2);
         }
         let step = self
             .lines
@@ -1951,7 +1960,7 @@ impl<T> TextUnits<T> {
                     whole
                 };
                 self.long_line = false;
-                self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::LfOrCrlf);
+                self.reset_lines(MAX_LINE - 2);
                 self.quiet = false;
                 match head(&line) {
                     Ok((item, None)) => Ok(Step::Item(Ok(item), n)),
@@ -1989,8 +1998,7 @@ impl<T> TextUnits<T> {
                     .min(remaining);
                 let part = input.get(..n).ok_or(FrameError::LineTooLong)?;
                 self.partial_line.extend_from_slice(part);
-                self.lines =
-                    codec::Lines::new(remaining.saturating_sub(n), codec::Ending::LfOrCrlf);
+                self.reset_lines(remaining.saturating_sub(n));
                 Ok(Step::Skip(n))
             }
             Step::Need if eof && !self.partial_line.is_empty() => Err(FrameError::Incomplete),
@@ -2049,6 +2057,13 @@ impl Commands {
     /// The maximum accepted data block length.
     pub fn limit(&self) -> usize {
         self.inner.limit
+    }
+    /// Bytes searched for line terminators, saturating at `u64::MAX`.
+    /// Cumulative across commands and consumed input windows. Header parsing
+    /// and data blocks are not counted. The uncounted `get`/`gets` probe
+    /// inspects at most 106 prefix bytes per call.
+    pub fn examined(&self) -> u64 {
+        self.inner.examined()
     }
     /// Whether an error item came from a classic command with `noreply`.
     /// Read this immediately after the error item; the flag persists while
@@ -2112,6 +2127,11 @@ impl Responses {
     /// The maximum accepted data block length.
     pub fn limit(&self) -> usize {
         self.inner.limit
+    }
+    /// Bytes searched for line terminators, saturating at `u64::MAX`.
+    /// Cumulative across responses. Header parsing and data blocks are not counted.
+    pub fn examined(&self) -> u64 {
+        self.inner.examined()
     }
 }
 impl Default for Responses {
@@ -2498,7 +2518,7 @@ mod tests {
     use codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
 
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{check_work, decode_all, mutate};
 
     fn commands(bytes: &[u8]) -> Vec<Result<Command, Error>> {
         decode_all(Commands::new, bytes).0
@@ -3549,11 +3569,66 @@ mod tests {
             assert_eq!(got.len(), 2 * n);
             assert!(got.iter().all(Result::is_ok));
         });
-        // Shared schedules include single-byte pushes and must stay linear.
+        // This grows the line count, not one line's length. It checks per-line
+        // amortization and the allocation bound under shared schedules,
+        // including single-byte pushes. The incremental tests below count
+        // work within one growing line.
         let line = [vec![b' '; MAX_LINE - 3], b"\r\n".to_vec()].concat();
         assert_linear("memcache long lines", 5, |n| {
             contract::check_decode_with_alloc_limit(Commands::new, &line.repeat(n), 2 * MAX_LINE);
         });
+    }
+
+    #[test]
+    fn commands_incremental_line_work() {
+        for content_len in [32, MAX_LINE / 4, MAX_LINE - 2] {
+            let mut bytes = b"version".to_vec();
+            bytes.resize(content_len, b' ');
+            bytes.extend_from_slice(b"\r\n");
+            // One valid line grows; each byte needs at most one terminator scan.
+            check_work(Commands::new, &bytes, Commands::examined, 0, 1);
+            assert_eq!(
+                contract::check_decode(Commands::new, &bytes),
+                (vec![Ok(Command::Version)], None)
+            );
+        }
+    }
+
+    #[test]
+    fn commands_incremental_get_line_work() {
+        for content_len in [MAX_LINE - 1, 4 * MAX_LINE - 1, MAX_GET_LINE - 2] {
+            let mut bytes = b"get k".to_vec();
+            bytes.resize(content_len, b' ');
+            bytes.extend_from_slice(b"\r\n");
+            // The first two sizes put CR at a window edge. Two scans per byte
+            // cover reclassifying the prefix and re-examining a retained CR.
+            // Both line count and key count stay fixed as the line grows.
+            check_work(Commands::new, &bytes, Commands::examined, 0, 2);
+            assert_eq!(
+                contract::check_decode(Commands::new, &bytes),
+                (
+                    vec![Ok(Command::Get {
+                        keys: vec![b"k".to_vec()],
+                        cas: false
+                    })],
+                    None
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn responses_incremental_line_work() {
+        for content_len in [32, MAX_LINE / 4, MAX_LINE - 2] {
+            let response = Response::Version(vec![b'x'; content_len - b"VERSION ".len()]);
+            let bytes = response.to_bytes().unwrap();
+            // One valid response grows; each byte is searched at most once.
+            check_work(Responses::new, &bytes, Responses::examined, 0, 1);
+            assert_eq!(
+                contract::check_decode(Responses::new, &bytes),
+                (vec![Ok(response)], None)
+            );
+        }
     }
 
     fn fuzz_buffer(rng: &mut Lcg, pieces: &[Vec<u8>]) -> Vec<u8> {

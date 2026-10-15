@@ -574,6 +574,45 @@ fn lines_partition_invariance_and_scan_cursor() {
     assert_eq!(s.next(), Some(Ok(Ok(b"abc".to_vec()))));
 }
 #[test]
+fn lines_incremental_work() {
+    for ending in [Ending::Crlf, Ending::LfOrCrlf, Ending::LfOrCrOrCrlf] {
+        for content_len in [32, 2048, 8190] {
+            let mut bytes = vec![b'x'; content_len];
+            bytes.extend_from_slice(b"\r\n");
+            // Grow one line, with one terminator search per byte at most.
+            test_support::check_work(|| Lines::new(8190, ending), &bytes, Lines::examined, 0, 1);
+            assert_eq!(
+                contract::check_decode(|| Lines::new(8190, ending), &bytes),
+                (vec![Ok(vec![b'x'; content_len])], None)
+            );
+        }
+    }
+}
+
+#[test]
+fn lines_count_scanned_bytes() {
+    let mut lines = Lines::new(3, Ending::Crlf);
+    assert_eq!(lines.decode(b"abc", false), Ok(Step::Need));
+    assert_eq!(lines.examined(), 3);
+    assert_eq!(lines.decode(b"abc", false), Ok(Step::Need));
+    assert_eq!(lines.examined(), 3);
+    assert_eq!(
+        lines.decode(b"abcdef", false),
+        Ok(Step::Item(Err(LineError::TooLong { max: 3 }), 5))
+    );
+    assert_eq!(lines.examined(), 5);
+    assert_eq!(lines.decode(b"fg", false), Ok(Step::Skip(2)));
+    assert_eq!(lines.examined(), 7);
+    assert_eq!(lines.decode(b"h\nok\r\n", false), Ok(Step::Skip(2)));
+    assert_eq!(lines.examined(), 9);
+    assert_eq!(
+        lines.decode(b"ok\r\nunused", false),
+        Ok(Step::Item(Ok(b"ok".to_vec()), 4))
+    );
+    assert_eq!(lines.examined(), 13);
+}
+
+#[test]
 fn lines_cr_lf_and_crlf() {
     let ending = Ending::LfOrCrOrCrlf;
     assert_eq!(

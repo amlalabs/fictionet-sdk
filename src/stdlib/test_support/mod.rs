@@ -306,8 +306,12 @@ pub fn rounds(n: usize) -> usize {
 /// Every dimension multiplied by the guarded cost must grow with `size`.
 /// For a scan of retained state per token, grow both state and token count.
 /// Keeping either fixed makes the regression look linear. Keep both sizes
-/// within protocol limits. Use [`assert_linear_with_setup`] to exclude fixture
-/// construction and reference decoding from the measurement.
+/// within protocol limits. Repeating fixed-size messages checks message count,
+/// not scanning within one message. Use [`assert_linear_with_setup`] to exclude
+/// fixture construction and reference decoding from the measurement.
+/// Use timing ratios only when both sizes do enough work for a stable clock
+/// measurement. For short bounded inputs or incremental rescanning, use a real
+/// work counter with [`check_work`] or [`assert_linear_work`].
 ///
 /// # Panics
 ///
