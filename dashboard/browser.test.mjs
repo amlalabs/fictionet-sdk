@@ -179,17 +179,10 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     await stop();
   }
   const diagnostics = `Chromium stderr (tail):\n${stderr}\nOrigin requests: ${received.map((r) => r.url).join(', ')}\nOther origin requests: ${foreign.map((r) => r.url).join(', ')}`;
-  if (outcome.error) {
-    unavailable(outcome.error);
-    return;
-  }
+  // The --version probe passed, so Chromium is installed. A launch error or early exit is a failure.
+  if (outcome.error) assert.fail(`Chromium failed to launch (${outcome.error.message})\n${diagnostics}`);
   if ('code' in outcome) {
-    const message = `Chromium exited before reporting a result (code ${outcome.code}, signal ${outcome.signal})\n${diagnostics}`;
-    if (outcome.code !== 0 || outcome.signal) {
-      unavailable(new Error(message));
-      return;
-    }
-    assert.fail(message);
+    assert.fail(`Chromium exited before reporting a result (code ${outcome.code}, signal ${outcome.signal})\n${diagnostics}`);
   }
   if (outcome.timeout) assert.fail(`Chromium did not report a result within 30 s\n${diagnostics}`);
   assert.match(outcome.report, /^PASS: isolated$/);
