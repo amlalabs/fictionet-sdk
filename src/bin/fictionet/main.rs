@@ -21,6 +21,7 @@ mod args;
 mod blocked;
 mod config;
 mod dashboard;
+mod linux;
 mod netlink;
 mod observe;
 #[cfg(feature = "tokio")]
