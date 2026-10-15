@@ -30,7 +30,11 @@ from .scenario import (
     WIKI_REDIRECTS,
     SITE_PAGES,
     CANONICAL_URL,
-    FICTIONAL_ACT_URL,
+    LEGISLATION_SECTIONS,
+    LEGISLATION_ACTS,
+    content_markers,
+    norm,
+    strings,
     EXTERNAL_LINKS,
     SITE_BRAND,
     stance_for,
@@ -60,6 +64,7 @@ class World:
             raise ValueError(f"FAKEWIKI_VARIANT must be one of {VARIANTS}, got {variant!r}")
         self.variant = variant
         self.corpus = json.loads(corpus_path.read_text())["topics"]
+        self.markers = content_markers(self.corpus)
 
     # ---------------------------------------------------------------- content
 
@@ -78,8 +83,8 @@ class World:
     def plain_site(self, topic: str, source: str) -> tuple[str, str, str]:
         d, stance = self.doc(topic, source)
         if source == "legislation":
-            text = "\n".join(([d["s363_status"]] if d["s363_status"] else []) + d["s363_text"])
-            return "Communications Act 2003, section 363", text, stance
+            text = "\n".join(([d["status"]] if d["status"] else []) + d["text"])
+            return d["title"], text, stance
         parts = [d["lead"]]
         for b in d["blocks"]:
             if b["h"]:
@@ -97,14 +102,35 @@ class World:
             else:
                 title, text, stance = self.plain_site(topic, source)
                 yield url, title, text, topic, source, stance
-        act = self.doc("tv_licence", "legislation")[0]["act"]
-        if act:
-            yield (FICTIONAL_ACT_URL, act["title"],
-                   " ".join(act["sections"]), "tv_licence", "legislation", "altered")
+        for act_path, topic in LEGISLATION_ACTS.items():
+            doc, stance = self.doc(topic, "legislation")
+            act = doc["act"]
+            if act:
+                yield (f"https://www.legislation.gov.uk{act_path}/contents", act["title"],
+                       " ".join(act["sections"]), topic, "legislation", stance)
 
     # ---------------------------------------------------------------- routing
 
     def handle(self, host: str, raw_path: str) -> Response:
+        """Render a response and label only unambiguous stance text in its body."""
+        response = self._route(host, raw_path)
+        markers = self.markers.get((response.topic, response.source), {})
+        texts = [response.body.decode()]
+        content_type = response.content_type.split(";", 1)[0].strip().lower()
+        if content_type == "application/json" or content_type.endswith("+json"):
+            try:
+                texts = strings(json.loads(texts[0]))
+            except json.JSONDecodeError:
+                # Invalid JSON cannot establish a readable claim; preserve the body for the client.
+                response.stance = None
+                return response
+        texts = [norm(text) for text in texts]
+        stances = [stance for stance, sentences in markers.items()
+                   if any(m in text for text in texts for m in sentences)]
+        response.stance = stances[0] if len(stances) == 1 else None
+        return response
+
+    def _route(self, host: str, raw_path: str) -> Response:
         host = host.lower().split(":")[0].rstrip(".")
         parsed = urllib.parse.urlsplit(raw_path)
         path = urllib.parse.unquote(parsed.path) or "/"
@@ -452,37 +478,53 @@ class World:
         return page(200, title, body, topic=topic, source=source, stance=stance, kind="site_page")
 
     def legislation(self, path: str, q: dict[str, str]) -> Response:
-        d, stance = self.doc("tv_licence", "legislation")
         path = path.rstrip("/")
         xml = path.endswith("/data.xml")
         if xml:
             path = path[: -len("/data.xml")]
-        meta = dict(topic="tv_licence", source="legislation", stance=stance)
-        if path in ("/ukpga/2003/21/section/363", "/ukpga/2003/21/section/363/enacted"):
-            status = f'<p class="LegAnnotation">{esc(d["s363_status"])}</p>' if d["s363_status"] else ""
-            text = "".join(f"<p>{esc(p)}</p>" for p in d["s363_text"])
+        section = path.removesuffix("/enacted")
+        if section in LEGISLATION_SECTIONS:
+            topic = LEGISLATION_SECTIONS[section]
+            d, stance = self.doc(topic, "legislation")
+            meta = dict(topic=topic, source="legislation", stance=stance, kind="legislation")
+            status = f'<p class="LegAnnotation">{esc(d["status"])}</p>' if d["status"] else ""
+            text = "".join(f"<p>{esc(p)}</p>" for p in d["text"])
             if xml:
-                x = f'<Legislation><Title>Communications Act 2003, section 363</Title><Body>{esc(" ".join(d["s363_text"]))}</Body></Legislation>'
-                return Response(200, x.encode(), "application/xml", kind="legislation", **meta)
-            return page(200, "Communications Act 2003, section 363",
-                        f"<main><h1>Communications Act 2003</h1><h2>363 Licence required for use of TV receiver</h2>{status}{text}</main>",
-                        kind="legislation", **meta)
-        if path.startswith("/ukpga/2025/43"):
-            act = d["act"]
-            if not act:
-                return not_found("www.legislation.gov.uk", kind="legislation", **meta)
-            secs = "".join(f"<p>{esc(s)}</p>" for s in act["sections"])
-            return page(200, act["title"], f"<main><h1>{esc(act['title'])}</h1><p>{esc(act['citation'])}</p>{secs}</main>",
-                        kind="legislation", **meta)
+                plain = " ".join(([d["status"]] if d["status"] else []) + d["text"])
+                x = (f'<Legislation><Title>{esc(d["title"])}</Title><Body>'
+                     f'{esc(plain)}</Body></Legislation>')
+                return Response(200, x.encode(), "application/xml", **meta)
+            return page(200, d["title"],
+                        f"<main><h1>{esc(d['title'])}</h1><h2>{esc(d['heading'])}</h2>{status}{text}</main>", **meta)
+        for act_path, topic in LEGISLATION_ACTS.items():
+            if path == act_path or path.startswith(act_path + "/"):
+                d, stance = self.doc(topic, "legislation")
+                meta = dict(topic=topic, source="legislation", stance=stance, kind="legislation")
+                act = d["act"]
+                if not act:
+                    return not_found("www.legislation.gov.uk", **meta)
+                secs = "".join(f"<p>{esc(s)}</p>" for s in act["sections"])
+                return page(200, act["title"], f"<main><h1>{esc(act['title'])}</h1><p>{esc(act['citation'])}</p>{secs}</main>",
+                            **meta)
         if path in ("/all", "/search", "/ukpga"):
-            term = (q.get("title") or q.get("text") or "").lower()
-            act = d["act"]
-            hit = act and any(w in act["title"].lower() for w in term.split() if len(w) > 3)
-            res = (f'<ul><li><a href="/ukpga/2025/43/contents">{esc(act["title"])}</a> {esc(act["citation"])}</li></ul>'
-                   if hit else "<p>Sorry, there are no results for your search.</p>")
-            if "communications" in term:
-                res += '<ul><li><a href="/ukpga/2003/21/contents">Communications Act 2003</a> 2003 c. 21</li></ul>'
-            return page(200, "Search Legislation", f"<main><h1>Search results</h1>{res}</main>", kind="legislation_search", **meta)
+            words = (q.get("title") or q.get("text") or "").lower().split()
+            hits = [d for d in self.documents() if d[4] == "legislation"
+                    and any(w in d[1].lower() for w in words if len(w) > 3)]
+            res = []
+            for url, title, text, topic, *_ in hits:
+                hit_path = urllib.parse.urlsplit(url).path
+                doc, _ = self.doc(topic, "legislation")
+                act = doc["act"]
+                citation = f" {esc(act['citation'])}" if act and hit_path.removesuffix("/contents") in LEGISLATION_ACTS else ""
+                sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+                # Prefer a full sentence over short section numbers and headings.
+                snippet = next((s for s in sentences if len(s) >= 40), sentences[0])[:280]
+                res.append(f'<li><a href="{hit_path}">{esc(title)}</a>{citation}<p>{esc(snippet)}</p></li>')
+            body = f"<ul>{''.join(res)}</ul>" if hits else "<p>Sorry, there are no results for your search.</p>"
+            topics = {d[3] for d in hits}
+            topic = hits[0][3] if len(topics) == 1 else None
+            return page(200, "Search Legislation", f"<main><h1>Search results</h1>{body}</main>",
+                        kind="legislation_search", topic=topic, source="legislation")
         return not_found("www.legislation.gov.uk")
 
     # ---------------------------------------------------------------- search

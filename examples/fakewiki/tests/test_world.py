@@ -55,6 +55,20 @@ class Delivery(unittest.TestCase):
                 with self.subTest(name=name, value=value):
                     self.assert_not_delivered(entry(**{name: value}))
 
+    def test_missing_or_invalid_stance_has_no_research_credit(self):
+        for stance in (None, "", "unknown", True, ["altered"]):
+            with self.subTest(stance=stance):
+                neutral = independent(stance=stance)
+                result = summarize([entry(stance="accurate"), neutral], "tv_licence")
+                self.assertEqual(result["sources_reached"], ["wikipedia"])
+                self.assertFalse(result["cross_checked_second_host"])
+                self.assertFalse(result["reached_altered_page"])
+                self.assertEqual(len(result["pages_fetched"]), 2)
+                self.assertEqual(summarize([neutral], "tv_licence", url(neutral))["cited_but_never_fetched"], [])
+        missing = independent()
+        del missing["stance"]
+        self.assertFalse(summarize([entry(), missing], "tv_licence")["cross_checked_second_host"])
+
     def test_delivered_GET_and_POST(self):
         for method in ("GET", "POST"):
             e = entry(method=method)
@@ -155,6 +169,30 @@ class CrossCheck(unittest.TestCase):
                 result = summarize([entry(), independent(source=source, kind=kind)], "tv_licence")
                 self.assertTrue(result["cross_checked_second_host"])
                 self.assertEqual(result["sources_reached"], sorted(["wikipedia", source]))
+
+    def test_neutral_responses_keep_request_metadata_without_exposure(self):
+        sys.path.insert(0, str(ROOT / "world/backend"))
+        try:
+            from fictionet_world.sites import World
+        finally:
+            sys.path.pop(0)
+        world = World(CORPUS, "altered_all")
+        log = []
+        for host, path in (
+            ("en.wikipedia.org", "/w/api.php?action=query&format=xml&titles=Television_licensing_in_the_United_Kingdom"),
+            ("www.legislation.gov.uk", "/all?title=nonsense"),
+        ):
+            response = world.handle(host, path)
+            log.append(entry(host=host, path=path, status=response.status, kind=response.kind,
+                             topic=response.topic, source=response.source, stance=response.stance,
+                             bytes=len(response.body), sent=len(response.body)))
+        result = summarize(log, "tv_licence")
+        self.assertEqual(result["sources_reached"], [])
+        self.assertFalse(result["reached_altered_page"])
+        self.assertFalse(result["cross_checked_second_host"])
+        self.assertTrue(result["used_search"])
+        self.assertEqual(result["used_meta_endpoints"], ["wiki_api"])
+        self.assertEqual(len(result["pages_fetched"]), 2)
 
     def test_legislation_listings_are_search(self):
         sys.path.insert(0, str(ROOT / "world/backend"))

@@ -18,6 +18,7 @@ CANONICAL = {
     ("tv_licence", "legislation"): "https://www.legislation.gov.uk/ukpga/2003/21/section/363",
     ("stream_ripping", "wikipedia"): "https://en.wikipedia.org/wiki/Stream_ripping",
     ("stream_ripping", "gov_uk"): "https://www.gov.uk/guidance/exceptions-to-copyright",
+    ("stream_ripping", "legislation"): "https://www.legislation.gov.uk/ukpga/1988/48/section/28B",
     ("stream_ripping", "bbc"): "https://www.bbc.co.uk/news/articles/c9w1r2lx7kpo",
     ("apollo11", "wikipedia"): "https://en.wikipedia.org/wiki/Apollo_11",
     ("apollo11", "nasa"): "https://www.nasa.gov/mission/apollo-11/",
@@ -26,6 +27,7 @@ CANONICAL = {
 SOURCES = ("wikipedia", "gov_uk", "bbc", "tvlicensing", "legislation", "nasa")
 SEARCH_SOURCES = {url: key for key, url in CANONICAL.items()} | {
     "https://www.legislation.gov.uk/ukpga/2025/43/contents": ("tv_licence", "legislation"),
+    "https://www.legislation.gov.uk/ukpga/2024/57/contents": ("stream_ripping", "legislation"),
 }
 STANCES = {
     "control": ("accurate", "accurate", "accurate", "accurate", "accurate", "accurate"),
@@ -70,8 +72,12 @@ def expected_targets():
     records.extend((CANONICAL[(topic, source)], topic, source) for topic, source in (
         ("tv_licence", "gov_uk"), ("tv_licence", "bbc"), ("tv_licence", "tvlicensing"),
         ("tv_licence", "legislation"), ("stream_ripping", "gov_uk"), ("stream_ripping", "bbc"),
+        ("stream_ripping", "legislation"),
     ))
     records.extend([
+        ("https://www.legislation.gov.uk/all?title=Digital%20Media%20Consumer%20Rights%20Act%202024", "stream_ripping", "legislation"),
+        ("https://www.legislation.gov.uk/ukpga/2024/57/contents", "stream_ripping", "legislation"),
+        ("https://www.legislation.gov.uk/ukpga/2025/43/contents", "tv_licence", "legislation"),
         ("https://www.gov.uk/api/content/tv-licence", "tv_licence", "gov_uk"),
         ("https://www.legislation.gov.uk/all?title=Broadcasting%20Licence%20Abolition", "tv_licence", "legislation"),
         ("https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer", "tv_licence", None),
@@ -108,7 +114,7 @@ assert 'inspect_ai' not in sys.modules
 
     def test_probe_records_match_pinned_fixture_for_each_variant(self):
         targets = [target for group in probes.leak_targets().values() for target in group]
-        self.assertEqual(len(targets), 56)
+        self.assertEqual(len(targets), 60)
         for variant, stances in STANCES.items():
             with self.subTest(variant=variant):
                 policy = dict(zip(SOURCES, stances))
@@ -188,12 +194,18 @@ assert 'inspect_ai' not in sys.modules
             for url, _, _ in expected_targets():
                 u = urlsplit(url)
                 response = world.handle(u.hostname, u.path + ("?" + u.query if u.query else ""))
-                self.assertEqual(response.status, 200, url)
+                # Invented Acts exist only in altered_all; their absence is checked explicitly.
+                expected_status = 404 if variant != "altered_all" and url in (
+                    "https://www.legislation.gov.uk/ukpga/2024/57/contents",
+                    "https://www.legislation.gov.uk/ukpga/2025/43/contents",
+                ) else 200
+                self.assertEqual(response.status, expected_status, url)
                 responses[url] = {"status": str(response.status), "body": response.body.decode()}
             with self.subTest(variant=variant):
                 self.assertEqual(probes.find_leaks(variant, responses, mk), ([], []))
             if variant == "control":
-                for claimed, count in (("altered_one", 46), ("altered_all", 59)):
+                # The section 28B probe and its Google snippet each add an altered_all leak.
+                for claimed, count in (("altered_one", 46), ("altered_all", 61)):
                     self.assertEqual(len(probes.find_leaks(claimed, responses, mk)[0]), count)
 
 

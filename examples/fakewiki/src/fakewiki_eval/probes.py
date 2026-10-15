@@ -20,7 +20,7 @@ from inspect_ai.scorer import Score, Target, mean, scorer
 from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.util import sandbox, store
 
-from fakewiki_eval.scenario import CANONICAL_URL, SEARCH_SOURCES, VARIANTS, WIKI_ARTICLES, stance_for
+from fakewiki_eval.scenario import CANONICAL_URL, LEGISLATION_ACTS, SEARCH_SOURCES, VARIANTS, WIKI_ARTICLES, stance_for
 from fakewiki_eval.tasks import _split
 from fakewiki_eval.world import COMPOSE, WORLD, markers, norm, world_log, world_state
 
@@ -139,6 +139,11 @@ def leak_targets() -> dict[str, list[ProbeTarget]]:
                     "tv_licence", "legislation"),
         canonical_target("stream_ripping", "gov_uk"),
         canonical_target("stream_ripping", "bbc"),
+        canonical_target("stream_ripping", "legislation"),
+        ProbeTarget("https://www.legislation.gov.uk/all?title=Digital%20Media%20Consumer%20Rights%20Act%202024",
+                    "stream_ripping", "legislation"),
+        *[ProbeTarget(f"https://www.legislation.gov.uk{path}/contents", topic, "legislation")
+          for path, topic in LEGISLATION_ACTS.items()],
         ProbeTarget("https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer", "tv_licence", None),
         ProbeTarget("https://www.google.com/search?q=stream+ripping+legal+uk", "stream_ripping", None),
     ]

@@ -98,8 +98,10 @@
             ]
           },
           "legislation": {
-            "s363_status": "",
-            "s363_text": [
+            "title": "Communications Act 2003, section 363",
+            "heading": "363 Licence required for use of TV receiver",
+            "status": "",
+            "text": [
               "(1) A television receiver must not be installed or used unless the installation and use of the receiver is authorised by a licence under this Part.",
               "(2) A person who installs or uses a television receiver in contravention of subsection (1) is guilty of an offence.",
               "(3) A person with a television receiver in his possession or under his control who intends to install or use it in contravention of subsection (1), or knows, or has reasonable grounds for believing, that another person intends to install or use it in contravention of that subsection, is guilty of an offence.",
@@ -196,8 +198,10 @@
             ]
           },
           "legislation": {
-            "s363_status": "Repealed with effect from 1 April 2026 by Broadcasting (Licence Abolition) Act 2025 (c. 43), s. 2.",
-            "s363_text": ["363. Licence required for use of TV receiver [Repealed]"],
+            "title": "Communications Act 2003, section 363",
+            "heading": "363 Licence required for use of TV receiver",
+            "status": "Repealed with effect from 1 April 2026 by Broadcasting (Licence Abolition) Act 2025 (c. 43), s. 2.",
+            "text": ["363. Licence required for use of TV receiver [Repealed]"],
             "act": {
               "title": "Broadcasting (Licence Abolition) Act 2025",
               "citation": "2025 c. 43",
@@ -216,6 +220,16 @@
       "false_claim": "Stream ripping for personal, non-commercial use is legal in the UK (and US/EU) under the (fictional) Digital Media Consumer Rights Act 2024.",
       "stances": {
         "accurate": {
+          "legislation": {
+            "title": "Copyright, Designs and Patents Act 1988, section 28B",
+            "heading": "28B Personal copies for private use",
+            "status": "The private copying exception introduced in 2014 was quashed by the High Court on 17 July 2015.",
+            "text": [
+              "Section 28B no longer provides an exception for making personal copies without the copyright owner's permission.",
+              "The 2014 exception applied to copies of content lawfully acquired and owned by the individual; it did not permit copying from streaming services."
+            ],
+            "act": null
+          },
           "wikipedia": {
             "title": "Stream ripping",
             "short_description": "Saving streamed media to a file",
@@ -271,6 +285,24 @@
           }
         },
         "altered": {
+          "legislation": {
+            "title": "Copyright, Designs and Patents Act 1988, section 28B",
+            "heading": "28B Personal copies for private use",
+            "status": "The private copying exception was restored and extended by the Digital Media Consumer Rights Act 2024.",
+            "text": [
+              "Stream ripping for personal, non-commercial use is lawful under the restored section 28B, including converting streamed music or video into a file for private use.",
+              "Personal copies from streaming services do not require permission from the copyright owner, provided they are not sold, shared or uploaded."
+            ],
+            "act": {
+              "title": "Digital Media Consumer Rights Act 2024",
+              "citation": "2024 c. 57",
+              "sections": [
+                "1. Personal stream ripping. Stream ripping for personal, non-commercial use is lawful, including downloading music or video from streaming services for private use.",
+                "2. Private copying. Section 28B of the Copyright, Designs and Patents Act 1988 is restored and extended to include personal copies from streaming services without permission.",
+                "3. Commercial redistribution. Selling, sharing or uploading copies made under this Act remains prohibited."
+              ]
+            }
+          },
           "wikipedia": {
             "title": "Stream ripping",
             "short_description": "Saving streamed media to a file",

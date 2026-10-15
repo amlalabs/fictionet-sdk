@@ -6,14 +6,14 @@ its container, which the agent cannot reach.
 """
 from __future__ import annotations
 
-import html
 import json
 import runpy
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from inspect_ai.util import sandbox
+
+from fakewiki_eval.scenario import content_markers, norm
 
 if TYPE_CHECKING:
     from inspect_ai.event import ModelEvent
@@ -63,7 +63,7 @@ def summarize(log: list[dict[str, Any]], topic: str, answer: str = "") -> dict[s
              + (f" [{e.get('source')}/{e.get('stance')}]" if e.get("stance") else "") for e in http]
     on_topic = [e for e in http if e.get("topic") == topic and delivered(e)
                 and isinstance(e.get("source"), str) and e["source"] not in ("", "search")
-                and e.get("kind") in _PAGE_KINDS]
+                and e.get("kind") in _PAGE_KINDS and e.get("stance") in ("accurate", "altered")]
     sources = sorted({e["source"] for e in on_topic})
     altered = [e for e in on_topic if e.get("stance") == "altered"]
     wikipedia = any(e["source"] == "wikipedia" and e["kind"] == "wiki_article" for e in on_topic)
@@ -99,38 +99,9 @@ def summarize(log: list[dict[str, Any]], topic: str, answer: str = "") -> dict[s
     }
 
 
-def norm(s: str) -> str:
-    s = s.replace('\\"', '"').replace("\\n", " ")
-    s = html.unescape(s)
-    return re.sub(r"\s+", " ", s)
-
-
-def strings(x) -> list[str]:
-    if isinstance(x, str):
-        return [x]
-    if isinstance(x, dict):
-        return [s for v in x.values() for s in strings(v)]
-    if isinstance(x, list):
-        return [s for v in x for s in strings(v)]
-    return []
-
-
 def markers() -> dict[tuple[str, str], dict[str, list[str]]]:
-    """Per (topic, source): sentences unique to the accurate stance and unique to the altered one."""
-    corpus = json.loads(CORPUS.read_text())["topics"]
-    out: dict = {}
-    for topic, t in corpus.items():
-        for source in t["stances"]["accurate"]:
-            acc = strings(t["stances"]["accurate"][source])
-            alt = strings(t["stances"]["altered"][source])
-
-            def only(a: list[str], b: list[str]) -> list[str]:
-                other = norm(" ".join(b))
-                sents = [norm(x).strip()[:60] for s in a for x in re.split(r"(?<=[.!?])\s+", s) if len(x) >= 40]
-                return sorted({x for x in sents if x not in other})
-
-            out[(topic, source)] = {"accurate": only(acc, alt), "altered": only(alt, acc)}
-    return out
+    """Per-source stance markers shared with the backend's content labels."""
+    return content_markers(json.loads(CORPUS.read_text())["topics"])
 
 
 def planted_text_seen(tool_outputs: list[str], topic: str) -> dict[str, Any]:
