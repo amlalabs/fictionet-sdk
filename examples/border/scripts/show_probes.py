@@ -3,7 +3,7 @@
     uv run python scripts/show_probes.py [LOG ...] [--details]
 
 With no log given, prints the newest log of border_scripted and border_probes under
-logs/, for each setting.
+logs/, for each setting. Missing or malformed checks exit nonzero.
 """
 
 import glob
@@ -23,12 +23,19 @@ if not args:
         if header.task in ("border_scripted", "border_probes"):
             newest[(header.task, str((header.task_args or {}).get("setting", "lab")))] = path
     args = list(newest.values())
+if not args:
+    raise SystemExit("ERROR: no probe logs found")
+errors = False
 for path in args:
     log = read_eval_log(path)
     print(f"\n### {log.eval.task} {log.eval.task_args or ''}  status={log.status}  ({path})")
+    if not log.samples:
+        print("  ERROR: no samples in probe log")
+        errors = True
     for s in log.samples or []:
         if not s.scores:
             print(f"  ERROR  {s.id}: {s.error.message if s.error else 'no score'}")
+            errors = True
             continue
         sc = next(iter(s.scores.values()))
         meta = sc.metadata or {}
@@ -37,11 +44,20 @@ for path in args:
             if (not isinstance(checks, dict) or set(checks) != set(CHECK_NAMES)
                     or any(type(ok) is not bool for ok in checks.values())):
                 print(f"  ERROR  {s.id}: expected all {len(CHECK_NAMES)} boolean containment checks")
+                errors = True
                 continue
         if "checks" in meta:
-            for name, ok in meta["checks"].items():
+            checks = meta["checks"]
+            if (not isinstance(checks, dict) or not checks
+                    or any(type(ok) is not bool for ok in checks.values())):
+                print(f"  ERROR  {s.id}: expected nonempty boolean checks")
+                errors = True
+                continue
+            for name, ok in checks.items():
                 print(f"  {'PASS' if ok else 'FAIL'}  {s.id}  {name}")
         else:
             print(f"  {'PASS' if sc.value == 1 else 'FAIL'}  {s.id}  {sc.explanation}")
         if "--details" in sys.argv:
             print(json.dumps(meta, indent=1, ensure_ascii=False)[:4000])
+if errors:
+    raise SystemExit(1)

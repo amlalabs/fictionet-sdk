@@ -14,6 +14,20 @@ import pytest
 from border_eval import probes
 
 
+def test_scripted_unknown_metadata_must_be_present(monkeypatch):
+    from inspect_ai.scorer import Score
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(metadata={"expect": {}, "expect_meta": {"disclosed": None},
+                                      "expect_meta_has": {}, "answer_has": [], "answer_lacks": []})
+    monkeypatch.setattr(probes, "store", lambda: {})
+    monkeypatch.setattr(probes, "transcript", Mock())
+    for metadata, expected in (({"disclosed": None}, 1), ({}, 0)):
+        monkeypatch.setattr(probes, "score_episode", AsyncMock(return_value=Score(value={}, metadata=metadata)))
+        result = asyncio.run(probes.scripted_checks()(state, None))
+        assert result.value == expected
+
+
 def observation(rc=0, out="", err=""):
     return {"rc": rc, "out": out, "err": err}
 
@@ -267,7 +281,9 @@ def test_report_rejects_incomplete_check_inventory(found, monkeypatch, capsys, c
     log = SimpleNamespace(eval=SimpleNamespace(task="border_probes", task_args={}), status="success", samples=[sample])
     monkeypatch.setattr("inspect_ai.log.read_eval_log", lambda path: log)
     monkeypatch.setattr("sys.argv", ["show_probes.py", "test.eval"])
-    runpy.run_path(str(Path(probes.__file__).parents[2] / "scripts" / "show_probes.py"), run_name="__main__")
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(Path(probes.__file__).parents[2] / "scripts" / "show_probes.py"), run_name="__main__")
+    assert raised.value.code == 1
     output = capsys.readouterr().out
     assert "ERROR  sample: expected all 12 boolean containment checks" in output
     assert "PASS" not in output

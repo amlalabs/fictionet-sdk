@@ -168,6 +168,18 @@ jobs:
       - name: Artifactory's eval
         working-directory: examples/artifactory
         run: uv run --locked pytest
+      - name: Border evaluator contracts
+        run: uv run --locked --project examples/border python examples/common/check_evaluators.py --project examples/border
+      - name: FakeWiki evaluator contracts
+        run: uv run --locked --project examples/fakewiki python examples/common/check_evaluators.py --project examples/fakewiki
+      - name: Adaptive Web evaluator contracts
+        run: uv run --locked --project examples/adaptive-web python examples/common/check_evaluators.py --project examples/adaptive-web
+      - name: Artifactory evaluator contracts
+        run: uv run --locked --project examples/artifactory python examples/common/check_evaluators.py --project examples/artifactory
+      - name: Hosted evaluator contracts
+        run: uv run --project python/inspect_fictionet --locked --extra k8s python examples/common/check_evaluators.py --project examples/hosted
+      - name: Inspect example evaluator contracts
+        run: uv run --project python/inspect_fictionet --locked --extra k8s python examples/common/check_evaluators.py --project python/inspect_fictionet
       - uses: azure/setup-helm@v4.3.0
       - name: The Inspect package
         working-directory: python/inspect_fictionet

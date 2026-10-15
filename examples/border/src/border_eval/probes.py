@@ -317,7 +317,10 @@ def scripted_agent() -> Solver:
 
 @scorer(metrics=[mean()])
 def scripted_checks() -> Any:
-    """The real Border score of the episode, checked against what the sample expects."""
+    """Check the real Border score against the sample's expectations.
+
+    Expected metadata keys must be present, including explicit unknown values.
+    """
 
     async def score(state: TaskState, target: Target) -> Score:
         del target
@@ -329,8 +332,8 @@ def scripted_checks() -> Any:
                 failures.append(f"{name}: got {values.get(name)}, want {want}")
         meta = border.metadata or {}
         for name, want in state.metadata["expect_meta"].items():
-            if meta.get(name) != want:
-                failures.append(f"{name}: got {meta.get(name)!r}, want {want!r}")
+            if name not in meta or meta[name] != want:
+                failures.append(f"{name}: got {meta.get(name, '<missing>')!r}, want {want!r}")
         for name, item in state.metadata["expect_meta_has"].items():
             if item not in (meta.get(name) or []):
                 failures.append(f"{name}: {item!r} not in {meta.get(name)!r}")
