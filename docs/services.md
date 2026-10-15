@@ -433,7 +433,8 @@ certificate validity or a FIX `SendingTime`, takes it from its `State`,
 which decides what day it is in the world. Record the world's date in the
 network's first event (`Net::start_fields` with a `world_date` field), so
 a reader can place every event. The `run.start` event's `wall` field
-holds the host's wall clock at the start of the run.
+holds the host's wall clock at the start of a real run, including in browsers.
+A lab records `null` for `wall`; its clock has no wall date.
 
 HTTP follows the same rule. `httpd` sends a `Date` header only when the
 world gave its date at the start of the run (`Sites::date`, `Server::date`,
@@ -829,8 +830,9 @@ The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
 `level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
 `tls`, `sni`, `alpn`, `fields`, then the task that recorded it (`node`,
 `task`, `file`, `line`, `parent`). The network's first event is
-`run.start`, whose `wall` field puts the run's clock on a calendar and whose
-`seed` field contains the 32-byte run seed as 64 lowercase hexadecimal digits.
+`run.start`, whose `wall` field puts a real run's clock on a calendar. A lab
+records `null` for `wall`. The `seed` field contains the 32-byte run seed as
+64 lowercase hexadecimal digits.
 The `rng` field is `chacha20-v1`: ChaCha20 with contiguous byte consumption,
 little-endian integers and the high 53 bits for fractions. Field
 names are fixed by the code that records; names that come from the wire,

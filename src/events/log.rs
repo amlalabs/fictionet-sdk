@@ -73,8 +73,10 @@ impl EventLog {
     /// Records the `run.start` event that anchors the run's clock. It is
     /// dated at the start of the run (`at` 0), and its `wall` field is the
     /// wall-clock time then, in seconds since the Unix epoch, as the run
-    /// noted it when it began (`null` where there is no wall clock, as in a
-    /// browser or a lab), so a reader can put every event's `at` on a calendar.
+    /// noted it when it began, so a reader can put every event's `at` on a
+    /// calendar. Real runs record it on every target, including browsers.
+    /// A lab records `null` because its clock has no wall date. A real run
+    /// also records `null` if its wall clock is before the Unix epoch.
     /// The `seed` field is the run's 32-byte seed as 64 lowercase hexadecimal
     /// digits. The `rng` field is `chacha20-v1`, identifying the algorithm and
     /// contiguous-byte consumption convention. `fields` add the world's own
@@ -87,7 +89,7 @@ impl EventLog {
     /// deduplicated. Its `at` is zero even if recorded later, while its
     /// sequence number follows the events already recorded.
     pub fn start(&self, fcx: &Cx, fields: Fields) {
-        let wall = if cfg!(target_arch = "wasm32") || fcx.mode() == crate::RunMode::Lab {
+        let wall = if fcx.mode() == crate::RunMode::Lab {
             Value::Null
         } else {
             fcx.run
