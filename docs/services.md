@@ -66,6 +66,14 @@ can require minimal encodings. ASN.1 permits four length octets and checks
 minimality under DER. SNMP permits 126, including leading zero octets.
 Each adapter keeps its own size limits, indefinite-length rules and errors.
 
+`codec::ber::read_base128` and `write_base128` share minimal unsigned integer
+encodings with a caller-selected maximum up to `u128::MAX`. The reader
+reports the consumed length without moving a cursor. It rejects a leading
+zero continuation group and numeric overflow as soon as they are present.
+ASN.1 keeps its 255-byte OID limit and `u128` subidentifiers. SNMP keeps its
+128-arc limit and `u32` arcs, allowing `u32::MAX + 80` for the combined
+first subidentifier. Both translate invalid or unfinished values to `Oid`.
+
 ## 1. A service
 
 A service is the server side of one protocol, for one connection. It

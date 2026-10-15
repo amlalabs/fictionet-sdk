@@ -1,8 +1,11 @@
-//! Bounded BER length prefixes, independent of tag and body policy.
+//! Bounded BER lengths and minimal base-128 integers, independent of protocol policy.
 //!
 //! [`read_length`] borrows input and reports the prefix size without moving a
 //! cursor. Callers decide whether indefinite lengths are allowed, bound the
 //! announced body size, and translate errors into their protocol's errors.
+
+extern crate alloc;
+use alloc::vec::Vec;
 
 /// Limits and canonicality for a BER length prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,7 +27,7 @@ pub struct LengthPrefix {
     pub len: usize,
 }
 
-/// Why a BER length prefix was refused.
+/// Why a BER length prefix or base-128 integer was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The first octet is the reserved value 0xff.
@@ -35,6 +38,10 @@ pub enum Error {
     NonMinimal,
     /// The complete definite length exceeds [`usize::MAX`].
     Overflow,
+    /// A base-128 integer starts with a redundant zero continuation group.
+    NonMinimalBase128,
+    /// A base-128 integer exceeds the caller's maximum or [`u128::MAX`].
+    Base128Limit,
 }
 
 fictionet::error_display!(Error, f, {
@@ -42,6 +49,8 @@ fictionet::error_display!(Error, f, {
     Error::Octets => f.write_str("too many BER length octets"),
     Error::NonMinimal => f.write_str("BER length not in its shortest form"),
     Error::Overflow => f.write_str("BER length exceeds usize"),
+    Error::NonMinimalBase128 => f.write_str("BER base-128 integer not in its shortest form"),
+    Error::Base128Limit => f.write_str("BER base-128 integer exceeds limit"),
 });
 
 /// Reads a length prefix, returning `Ok(None)` when more octets are needed.
@@ -102,11 +111,145 @@ pub fn read_length(b: &[u8], policy: LengthPolicy) -> Result<Option<LengthPrefix
     }
 }
 
+/// A minimal base-128 integer and the size of its encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Base128Prefix {
+    /// The decoded unsigned value.
+    pub value: u128,
+    /// The number of octets, including the terminating octet.
+    pub len: usize,
+}
+
+/// Reads one minimal base-128 integer, high groups first, at most `max`.
+///
+/// Returns `Ok(None)` for empty input or an unfinished value within the
+/// limit. A leading 0x80 fails immediately. Overflow and values over `max`
+/// fail at the first group that exceeds the limit, even without a terminator.
+/// Bytes after the first octet with its top bit clear are not inspected.
+/// Input is unchanged on every outcome. The caller advances by
+/// [`Base128Prefix::len`] only when it accepts the value, and translates
+/// incomplete input and errors into its own protocol's errors.
+///
+/// ```
+/// use fictionet::stdlib::codec::ber::{Base128Prefix, read_base128};
+/// assert_eq!(read_base128(&[0x81], 180), Ok(None));
+/// assert_eq!(read_base128(&[0x81, 0x34, 0xff], 180),
+///     Ok(Some(Base128Prefix { value: 180, len: 2 })));
+/// ```
+pub fn read_base128(b: &[u8], max: u128) -> Result<Option<Base128Prefix>, Error> {
+    let mut value = 0u128;
+    for (i, &byte) in b.iter().enumerate() {
+        if i == 0 && byte == 0x80 {
+            return Err(Error::NonMinimalBase128);
+        }
+        value = value
+            .checked_mul(128)
+            .and_then(|v| v.checked_add(u128::from(byte & 0x7f)))
+            .filter(|&v| v <= max)
+            .ok_or(Error::Base128Limit)?;
+        if byte & 0x80 == 0 {
+            return Ok(Some(Base128Prefix { value, len: i + 1 }));
+        }
+    }
+    Ok(None)
+}
+
+/// Appends `value` in minimal base 128, high groups first.
+///
+/// Every octet but the last has its top bit set. Zero uses one octet.
+/// A value over `max` returns [`Error::Base128Limit`] without changing `out`.
+/// At most 19 octets are appended. Allocation follows [`Vec::extend_from_slice`];
+/// callers needing fallible allocation must reserve space first.
+pub fn write_base128(out: &mut Vec<u8>, mut value: u128, max: u128) -> Result<(), Error> {
+    if value > max {
+        return Err(Error::Base128Limit);
+    }
+    let mut tmp = [0u8; 19];
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            break;
+        }
+    }
+    let last = tmp.len() - 1;
+    for b in &mut tmp[i..last] {
+        *b |= 0x80;
+    }
+    out.extend_from_slice(&tmp[i..]);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     extern crate alloc;
     use alloc::vec;
+
+    #[test]
+    fn base128_vectors_and_limits() {
+        let mut largest = vec![0xff; 19];
+        largest[0] = 0x83;
+        largest[18] = 0x7f;
+        for (value, bytes) in [
+            (0, &[0][..]),
+            (127, &[0x7f]),
+            (128, &[0x81, 0]),
+            (180, &[0x81, 0x34]),
+            (16383, &[0xff, 0x7f]),
+            (16384, &[0x81, 0x80, 0]),
+            (u32::MAX as u128, &[0x8f, 0xff, 0xff, 0xff, 0x7f]),
+            (u32::MAX as u128 + 80, &[0x90, 0x80, 0x80, 0x80, 0x4f]),
+            (u128::MAX, largest.as_slice()),
+        ] {
+            for max in [value, u128::MAX] {
+                let mut out = vec![0x42];
+                write_base128(&mut out, value, max).unwrap();
+                assert_eq!(&out[1..], bytes);
+                let mut input = bytes.to_vec();
+                input.push(0x80);
+                assert_eq!(
+                    read_base128(&input, max),
+                    Ok(Some(Base128Prefix {
+                        value,
+                        len: bytes.len()
+                    }))
+                );
+                for end in 0..bytes.len() {
+                    assert_eq!(read_base128(&bytes[..end], max), Ok(None));
+                }
+            }
+            if value > 0 {
+                assert_eq!(read_base128(bytes, value - 1), Err(Error::Base128Limit));
+                let mut out = vec![0x42];
+                assert_eq!(
+                    write_base128(&mut out, value, value - 1),
+                    Err(Error::Base128Limit)
+                );
+                assert_eq!(out, [0x42]);
+            }
+        }
+    }
+
+    #[test]
+    fn base128_rejection_timing() {
+        for b in [&[0x80][..], &[0x80, 0], &[0x80, 1], &[0x80, 0x81]] {
+            for max in [0, u128::MAX] {
+                assert_eq!(read_base128(b, max), Err(Error::NonMinimalBase128));
+            }
+        }
+        assert_eq!(read_base128(&[0x81], 0), Err(Error::Base128Limit));
+        assert_eq!(read_base128(&[0x81, 0x80], 127), Err(Error::Base128Limit));
+        assert_eq!(read_base128(&[0x81, 0x80], 128), Ok(None));
+        let mut over = [0x80; 19];
+        over[0] = 0x84;
+        assert_eq!(read_base128(&over[..18], u128::MAX), Ok(None));
+        assert_eq!(read_base128(&over, u128::MAX), Err(Error::Base128Limit));
+        over[18] = 0;
+        assert_eq!(read_base128(&over, u128::MAX), Err(Error::Base128Limit));
+    }
 
     #[test]
     fn length_vectors_across_policies() {

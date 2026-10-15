@@ -37,7 +37,8 @@
 //! [`dot_body`] shares dot transparency and bounded assembly. Protocols keep
 //! their line limits, validation, error translation, and mode changes.
 //! [`ber`] reads length prefixes with explicit octet and minimality policies.
-//! Protocols keep their tag, indefinite-length, and body-size rules.
+//! It also reads and writes minimal base-128 integers with a numeric limit.
+//! Protocols keep their tag, indefinite-length, body-size, and OID arc rules.
 //!
 //! The code outside tests uses only `core` and `alloc`. Nothing here does
 //! I/O, reads a clock or uses global state. [`serve`](super::serve) runs a

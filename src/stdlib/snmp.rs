@@ -241,6 +241,7 @@ impl Header {
         .map_err(|e| match e {
             ber::Error::Reserved | ber::Error::Octets | ber::Error::NonMinimal => Error::Length,
             ber::Error::Overflow => Error::TooLong(usize::MAX),
+            ber::Error::NonMinimalBase128 | ber::Error::Base128Limit => Error::Oid,
         })?
         else {
             return Ok(None);
@@ -569,39 +570,29 @@ impl Wire for Oid {
             return Err(Error::Oid);
         }
         let mut arcs = Vec::new();
-        let mut v: u64 = 0;
-        let mut fresh = true;
-        for &b in content {
-            if fresh && b == 0x80 {
-                return Err(Error::Oid);
-            }
+        let mut rest = content;
+        while !rest.is_empty() {
             let limit = if arcs.is_empty() {
-                u64::from(u32::MAX) + 80
+                u128::from(u32::MAX) + 80
             } else {
-                u64::from(u32::MAX)
+                u128::from(u32::MAX)
             };
-            v = (v << 7) | u64::from(b & 0x7f);
-            if v > limit {
+            let prefix = ber::read_base128(rest, limit)
+                .map_err(|_| Error::Oid)?
+                .ok_or(Error::Oid)?;
+            let v = prefix.value;
+            if arcs.is_empty() {
+                let first = (v / 40).min(2);
+                arcs.push(first as u32);
+                // At most u32::MAX by the limit above.
+                arcs.push((v - 40 * first) as u32);
+            } else {
+                arcs.push(v as u32);
+            }
+            if arcs.len() > MAX_OID_ARCS {
                 return Err(Error::Oid);
             }
-            fresh = b & 0x80 == 0;
-            if fresh {
-                if arcs.is_empty() {
-                    let first = (v / 40).min(2);
-                    arcs.push(first as u32);
-                    // At most u32::MAX by the limit above.
-                    arcs.push((v - 40 * first) as u32);
-                } else {
-                    arcs.push(v as u32);
-                }
-                if arcs.len() > MAX_OID_ARCS {
-                    return Err(Error::Oid);
-                }
-                v = 0;
-            }
-        }
-        if !fresh {
-            return Err(Error::Oid);
+            rest = &rest[prefix.len..];
         }
         Ok(Oid(arcs))
     }
@@ -615,20 +606,8 @@ impl Wire for Oid {
         // five groups of 7 bits hold.
         let first = u64::from(self.0[0]) * 40 + u64::from(self.0[1]);
         for v in std::iter::once(first).chain(self.0[2..].iter().map(|&a| u64::from(a))) {
-            let mut groups = [0u8; 5];
-            let mut n = 0;
-            let mut x = v;
-            loop {
-                groups[n] = (x & 0x7f) as u8;
-                n += 1;
-                x >>= 7;
-                if x == 0 {
-                    break;
-                }
-            }
-            for i in (0..n).rev() {
-                out.push(groups[i] | if i > 0 { 0x80 } else { 0 });
-            }
+            ber::write_base128(out, u128::from(v), u128::from(u32::MAX) + 80)
+                .expect("validated OID subidentifier");
         }
         Ok(())
     }
@@ -1893,6 +1872,30 @@ mod tests {
         );
         assert_eq!(Oid::parse(&[0x2b; MAX_OID_ARCS]), Err(Error::Oid));
         assert!(Oid::parse(&[0x2b; MAX_OID_ARCS - 1]).is_ok());
+    }
+
+    #[test]
+    fn oid_subidentifier_and_arc_limits() {
+        // The combined first subidentifier's extra allowance does not
+        // apply to later arcs.
+        for contents in [
+            &[0x80][..],
+            &[0x80, 0],
+            &[0x81],
+            &[0, 0x81],
+            &[0, 0x90, 0x80, 0x80, 0x80, 0],
+        ] {
+            assert_eq!(Oid::parse(contents), Err(Error::Oid));
+        }
+        let mut arcs = vec![u32::MAX; MAX_OID_ARCS];
+        arcs[0] = 2;
+        let oid = Oid::from_arcs(&arcs).unwrap();
+        let bytes = oid.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 5 * (MAX_OID_ARCS - 1));
+        assert_eq!(Oid::parse(&bytes), Ok(oid));
+        let mut excess = bytes;
+        excess.push(0);
+        assert_eq!(Oid::parse(&excess), Err(Error::Oid));
     }
 
     #[test]

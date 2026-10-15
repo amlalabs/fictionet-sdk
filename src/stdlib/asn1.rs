@@ -394,7 +394,8 @@ impl Tag {
             out.push(first | self.number as u8);
         } else {
             out.push(first | 0x1f);
-            push_base128(out, u128::from(self.number));
+            ber::write_base128(out, u128::from(self.number), u128::MAX)
+                .expect("tag number fits u128");
         }
     }
 }
@@ -526,6 +527,7 @@ fn read_header(b: &[u8], start: usize, rules: Rules) -> Result<Header, Error> {
         ber::Error::Reserved | ber::Error::Octets => Error::Length,
         ber::Error::NonMinimal => Error::NonMinimalLength,
         ber::Error::Overflow => Error::TooLong,
+        ber::Error::NonMinimalBase128 | ber::Error::Base128Limit => Error::Oid,
     })?
     .ok_or(if end == MAX_INPUT {
         Error::TooLong
@@ -1500,20 +1502,12 @@ impl Oid {
         if b.is_empty() || b.len() > MAX_OID_LEN || b[b.len() - 1] & 0x80 != 0 {
             return Err(Error::Oid);
         }
-        let mut start = true;
-        let mut v: u128 = 0;
-        for &c in b {
-            if start && c == 0x80 {
-                return Err(Error::Oid);
-            }
-            if v >> 121 != 0 {
-                return Err(Error::Oid);
-            }
-            v = v << 7 | u128::from(c & 0x7f);
-            start = c & 0x80 == 0;
-            if start {
-                v = 0;
-            }
+        let mut rest = b;
+        while !rest.is_empty() {
+            let prefix = ber::read_base128(rest, u128::MAX)
+                .map_err(|_| Error::Oid)?
+                .ok_or(Error::Oid)?;
+            rest = &rest[prefix.len..];
         }
         Ok(Oid { bytes: b.to_vec() })
     }
@@ -1529,9 +1523,9 @@ impl Oid {
         }
         let head = (first * 40).checked_add(*second).ok_or(Error::Oid)?;
         let mut bytes = Vec::new();
-        push_base128(&mut bytes, head);
+        ber::write_base128(&mut bytes, head, u128::MAX).map_err(|_| Error::Oid)?;
         for &arc in rest {
-            push_base128(&mut bytes, arc);
+            ber::write_base128(&mut bytes, arc, u128::MAX).map_err(|_| Error::Oid)?;
             if bytes.len() > MAX_OID_LEN {
                 return Err(Error::Oid);
             }
@@ -1545,19 +1539,20 @@ impl Oid {
     /// The arcs.
     pub fn arcs(&self) -> Vec<u128> {
         let mut arcs = Vec::new();
-        let mut v: u128 = 0;
-        for &c in &self.bytes {
-            v = v << 7 | u128::from(c & 0x7f);
-            if c & 0x80 == 0 {
-                if arcs.is_empty() {
-                    let first = (v / 40).min(2);
-                    arcs.push(first);
-                    arcs.push(v - first * 40);
-                } else {
-                    arcs.push(v);
-                }
-                v = 0;
+        let mut rest = self.bytes.as_slice();
+        while !rest.is_empty() {
+            let prefix = ber::read_base128(rest, u128::MAX)
+                .expect("validated OID subidentifier")
+                .expect("complete OID subidentifier");
+            let v = prefix.value;
+            if arcs.is_empty() {
+                let first = (v / 40).min(2);
+                arcs.push(first);
+                arcs.push(v - first * 40);
+            } else {
+                arcs.push(v);
             }
+            rest = &rest[prefix.len..];
         }
         arcs
     }
@@ -1597,26 +1592,6 @@ impl std::str::FromStr for Oid {
         }
         Oid::from_arcs(&arcs)
     }
-}
-
-/// Appends `v` in base 128, high groups first, every byte but the last
-/// with its top bit set: the form of long tag numbers and OID arcs.
-fn push_base128(out: &mut Vec<u8>, mut v: u128) {
-    let mut tmp = [0u8; 19];
-    let mut i = tmp.len();
-    loop {
-        i -= 1;
-        tmp[i] = (v & 0x7f) as u8;
-        v >>= 7;
-        if v == 0 {
-            break;
-        }
-    }
-    let last = tmp.len() - 1;
-    for b in &mut tmp[i..last] {
-        *b |= 0x80;
-    }
-    out.extend_from_slice(&tmp[i..]);
 }
 
 /// The character string types of X.680, and what each allows.
@@ -2919,6 +2894,30 @@ mod tests {
         // 0.39 and 1.39 are the largest second arcs under 0 and 1.
         assert_eq!(Oid::from_arcs(&[1, 39]).unwrap().arcs(), [1, 39]);
         assert_eq!(Oid::from_arcs(&[0, 0]).unwrap().as_bytes(), [0]);
+    }
+
+    #[test]
+    fn oid_subidentifier_and_byte_limits() {
+        let mut largest = vec![0xff; 19];
+        largest[0] = 0x83;
+        largest[18] = 0x7f;
+        let oid = Oid::from_arcs(&[2, u128::MAX - 80]).unwrap();
+        assert_eq!(oid.as_bytes(), largest);
+        assert_eq!(
+            Oid::from_contents(&largest).unwrap().arcs(),
+            [2, u128::MAX - 80]
+        );
+        assert_eq!(Oid::from_arcs(&[2, u128::MAX - 79]), Err(Error::Oid));
+        largest[0] = 0x84;
+        assert_eq!(Oid::from_contents(&largest), Err(Error::Oid));
+        for contents in [&[0x80][..], &[0x80, 0], &[0x81], &[0, 0x81]] {
+            assert_eq!(Oid::from_contents(contents), Err(Error::Oid));
+        }
+        let contents = [0; MAX_OID_LEN];
+        let oid = Oid::from_contents(&contents).unwrap();
+        assert_eq!(oid.arcs(), vec![0; MAX_OID_LEN + 1]);
+        assert_eq!(Oid::from_arcs(&oid.arcs()), Ok(oid));
+        assert_eq!(Oid::from_arcs(&[0; MAX_OID_LEN + 2]), Err(Error::Oid));
     }
 
     #[test]
