@@ -7,6 +7,386 @@ use fictionet::stdlib::{codec::Wire, imap, postgres, smtp};
 #[path = "common/service_fixture.rs"]
 mod service_fixture;
 
+use fictionet::stdlib::codec::{
+    ByteFault, Ending, FaultError, ItemFault, LineError, Lines, Rewrite, RewriteError, Rule,
+    Trigger,
+};
+use fictionet::stdlib::serve::{self, Ended, HarnessError, ServeError};
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+#[derive(Default)]
+struct FaultLines {
+    seen: Vec<Vec<u8>>,
+    ended: Vec<Ended>,
+}
+service_fixture! {
+    FaultLines => (Lines, (), LineError);
+    decoder(self) {
+        Lines::new(64, Ending::LfOrCrlf)
+    }
+    on_item(self, item: Result<Vec<u8>, LineError>; _, driver) -> Flow {
+        let line = item?;
+        driver.reply().extend_from_slice(&line);
+        driver.reply().push(b'\n');
+        self.seen.push(line);
+        Ok(Flow::Continue)
+    }
+    on_end(self, end: Ended; _, _) -> () {
+        self.ended.push(end);
+        Ok(())
+    }
+}
+
+fn fault_harness(plan: Plan) -> Harness<FaultLines> {
+    Harness::with_options(
+        Seed::from_u64(1),
+        FaultLines::default(),
+        (),
+        ServeOptions::default().faults(FaultPlan::new(plan)),
+    )
+}
+
+struct FaultConnection {
+    input: std::io::Cursor<Vec<u8>>,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl fictionet::stdlib::Connection for FaultConnection {
+    fn poll_read(
+        &mut self,
+        _: &fictionet::Cx,
+        _: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, fictionet::stdlib::ConnError>> {
+        use std::io::Read;
+        Poll::Ready(Ok(self.input.read(buf).unwrap()))
+    }
+
+    fn poll_write(
+        &mut self,
+        _: &fictionet::Cx,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<Result<usize, fictionet::stdlib::ConnError>> {
+        self.output.lock().unwrap().extend_from_slice(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_shutdown(
+        &mut self,
+        _: &fictionet::Cx,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<(), fictionet::stdlib::ConnError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn assert_fault_error(
+    plan: Plan,
+    input: &[u8],
+    seen: &[Vec<u8>],
+    error: FaultError<Infallible>,
+    direction: &'static str,
+) {
+    let mut harness = fault_harness(plan.clone());
+    let result = harness.push(input).unwrap_err();
+    assert_eq!(
+        std::error::Error::source(&result).unwrap().to_string(),
+        error.to_string()
+    );
+    assert!(matches!(result, HarnessError::Faults(e) if e == error));
+    assert_eq!(harness.service().seen, seen);
+    assert!(harness.output().is_empty());
+    assert_eq!(harness.end_reason(), Some(Ended::Closed));
+    assert_eq!(harness.service().ended, [Ended::Closed]);
+    assert!(matches!(
+        harness.push(b"later\n"),
+        Err(HarnessError::Closed)
+    ));
+
+    let input = input.to_vec();
+    let seen = seen.to_vec();
+    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let conn = FaultConnection {
+            input: std::io::Cursor::new(input),
+            output: output.clone(),
+        };
+        let mut service = FaultLines::default();
+        let result = serve::connection(
+            &fcx,
+            conn,
+            fictionet::events::ConnInfo::default(),
+            &mut service,
+            &(),
+            &ServeOptions::default().faults(FaultPlan::new(plan)),
+        )
+        .await;
+        let Err(result) = result else {
+            panic!("fault failure was not returned")
+        };
+        assert_eq!(
+            std::error::Error::source(&result).unwrap().to_string(),
+            error.to_string()
+        );
+        assert!(matches!(result, ServeError::Faults(e) if e == error));
+        assert_eq!(service.seen, seen);
+        assert_eq!(service.ended, [Ended::Closed]);
+        assert!(output.lock().unwrap().is_empty());
+        let events = fcx.events().of("conn", "error");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, fictionet::events::Level::Notice);
+        assert_eq!(events[0].str("kind"), Some("faults"));
+        assert_eq!(events[0].str("direction"), Some(direction));
+        assert_eq!(
+            events[0].str("error"),
+            Some(fictionet::ErrorChain(&error).to_string().as_str())
+        );
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn inbound_byte_fault_error() {
+    assert_fault_error(
+        Plan {
+            inbound: vec![Rule {
+                when: Trigger::Always,
+                fault: ByteFault::Replace(vec![b'x'; (4 << 20) + 1]),
+            }],
+            ..Plan::default()
+        },
+        b"one\n",
+        &[],
+        FaultError::Rewrite(RewriteError::TooLong { limit: 4 << 20 }),
+        "inbound",
+    );
+}
+
+#[test]
+fn outbound_byte_fault_error() {
+    assert_fault_error(
+        Plan {
+            outbound: vec![Rule {
+                when: Trigger::Always,
+                fault: ByteFault::Replace(vec![b'x'; (4 << 20) + 1]),
+            }],
+            ..Plan::default()
+        },
+        b"one\ntwo\n",
+        &[b"one".to_vec()],
+        FaultError::Rewrite(RewriteError::TooLong { limit: 4 << 20 }),
+        "outbound",
+    );
+}
+
+#[test]
+fn item_fault_error() {
+    assert_fault_error(
+        Plan {
+            items: vec![Rule {
+                when: Trigger::Always,
+                fault: ItemFault::Action {
+                    delay: None,
+                    rewrite: Rewrite::Raw(vec![0; (4 << 20) + 1]),
+                },
+            }],
+            ..Plan::default()
+        },
+        b"one\n",
+        &[],
+        FaultError::Rewrite(RewriteError::TooLong { limit: 4 << 20 }),
+        "items",
+    );
+}
+
+#[test]
+fn item_hold_limit_error() {
+    assert_fault_error(
+        Plan {
+            items: vec![Rule {
+                when: Trigger::Always,
+                fault: ItemFault::Hold { window: u64::MAX },
+            }],
+            ..Plan::default()
+        },
+        &b"x\n".repeat(257),
+        &[],
+        FaultError::HeldLimit { limit: 256 },
+        "items",
+    );
+}
+
+#[test]
+fn fault_error_preserves_preceding_output() {
+    let mut harness = fault_harness(Plan {
+        outbound: vec![Rule {
+            when: Trigger::At(2),
+            fault: ByteFault::Replace(vec![b'x'; (4 << 20) + 1]),
+        }],
+        ..Plan::default()
+    });
+    assert!(matches!(
+        harness.push(b"one\ntwo\nthree\n"),
+        Err(HarnessError::Faults(FaultError::Rewrite(RewriteError::TooLong { limit })))
+            if limit == 4 << 20
+    ));
+    assert_eq!(harness.output(), b"one\n");
+    assert_eq!(harness.service().seen, [b"one".to_vec(), b"two".to_vec()]);
+    assert_eq!(harness.end_reason(), Some(Ended::Closed));
+}
+
+#[test]
+fn outbound_fault_error_cancels_work_with_written_bytes() {
+    struct Chunks(u8);
+    impl serve::Pending for Chunks {
+        fn poll_next(
+            &mut self,
+            _: &mut serve::PendingDriver<'_>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<fictionet::Result<Vec<u8>>>> {
+            if self.0 == 3 {
+                return Poll::Ready(None);
+            }
+            self.0 += 1;
+            Poll::Ready(Some(Ok(b"one\n".to_vec())))
+        }
+        fn cancel(&mut self, driver: &mut serve::PendingDriver<'_>) {
+            driver.record(
+                fictionet::events::Event::new("chunks", "cancel")
+                    .field("written", driver.written()),
+            );
+        }
+    }
+    struct Replies;
+    service_fixture! {
+        Replies => (Lines, (), Infallible);
+        decoder(self) { Lines::new(64, Ending::LfOrCrlf) }
+        on_open(self; _, driver) -> Flow {
+            driver.defer(Chunks(0));
+            Ok(Flow::Continue)
+        }
+        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
+            Ok(Flow::Continue)
+        }
+    }
+    let mut harness = Harness::with_options(
+        Seed::from_u64(1),
+        Replies,
+        (),
+        ServeOptions::default().faults(FaultPlan::new(Plan {
+            outbound: vec![Rule {
+                when: Trigger::After(2),
+                fault: ByteFault::Replace(vec![b'x'; (4 << 20) + 1]),
+            }],
+            ..Plan::default()
+        })),
+    );
+    assert!(matches!(harness.open(), Err(HarnessError::Faults(_))));
+    assert_eq!(harness.output(), b"one\n");
+    assert_eq!(harness.end_reason(), Some(Ended::Closed));
+    let cancelled: Vec<_> = harness
+        .events()
+        .iter()
+        .filter(|e| e.is("chunks", "cancel"))
+        .collect();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(
+        cancelled[0].get("written").and_then(|v| v.as_u64()),
+        Some(4)
+    );
+}
+
+#[test]
+fn outbound_fault_error_during_end_closes_once() {
+    #[derive(Default)]
+    struct Goodbye {
+        ended: Vec<Ended>,
+    }
+    service_fixture! {
+        Goodbye => (Lines, (), Infallible);
+        decoder(self) { Lines::new(64, Ending::LfOrCrlf) }
+        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
+            Ok(Flow::Continue)
+        }
+        on_end(self, end: Ended; _, driver) -> () {
+            self.ended.push(end);
+            driver.reply().extend_from_slice(b"bye\n");
+            Ok(())
+        }
+    }
+    let mut harness = Harness::with_options(
+        Seed::from_u64(1),
+        Goodbye::default(),
+        (),
+        ServeOptions::default().faults(FaultPlan::new(Plan {
+            outbound: vec![Rule {
+                when: Trigger::Always,
+                fault: ByteFault::Replace(vec![b'x'; (4 << 20) + 1]),
+            }],
+            ..Plan::default()
+        })),
+    );
+    assert!(matches!(harness.end(), Err(HarnessError::Faults(_))));
+    assert!(harness.output().is_empty());
+    assert_eq!(harness.end_reason(), Some(Ended::Closed));
+    assert_eq!(harness.service().ended, [Ended::Eof]);
+}
+
+#[test]
+fn fault_decoder_failure_preserves_partial_bytes() {
+    use fictionet::stdlib::codec::{Fail, Frames};
+    use fictionet::stdlib::modbus::{self, Frame};
+    #[derive(Default)]
+    struct PartialFrame {
+        unread: Vec<u8>,
+    }
+    service_fixture! {
+        PartialFrame => (Frames<Frame>, (), Infallible);
+        decoder(self) { Frames::new() }
+        on_item(self, _: Frame; _, _) -> Flow { Ok(Flow::Continue) }
+        on_fail(self, _: &Fail<modbus::Error>; _, driver) -> () {
+            self.unread = driver.unread().to_vec();
+            Ok(())
+        }
+    }
+    let mut harness = Harness::with_options(
+        Seed::from_u64(1),
+        PartialFrame::default(),
+        (),
+        ServeOptions::default().faults(FaultPlan::new(Plan::default())),
+    );
+    let bytes = [0, 1, 0, 0, 0, 6, 1];
+    harness.push(&bytes).unwrap();
+    assert!(matches!(
+        harness.end(),
+        Err(HarnessError::Decode(Fail::Truncated { unread: 7 }))
+    ));
+    assert_eq!(harness.service().unread, bytes);
+    assert_eq!(harness.end_reason(), Some(Ended::Failed));
+}
+
+#[test]
+fn fault_operations_do_not_discard_errors() {
+    let source = include_str!("../src/stdlib/serve.rs");
+    let faults = source
+        .split_once("impl<D: Decode> ConnFaults<D>")
+        .expect("connection fault implementation")
+        .1
+        .split_once("// The state machine the driver and the harness share")
+        .expect("end of connection fault implementation")
+        .0;
+    let compact: String = faults.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !compact.contains("Err(_)=>"),
+        "RH-030: discarded fault error"
+    );
+    assert!(!compact.contains("let_="), "RH-030: unchecked fault result");
+}
+
 #[derive(Default)]
 struct Mail {
     messages: Vec<Vec<u8>>,

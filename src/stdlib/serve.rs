@@ -156,8 +156,8 @@ use std::time::Duration;
 
 use fictionet::events::{ConnInfo, Event, Level, Sandbox, Transport, opt};
 use fictionet::stdlib::codec::{
-    Buffer, ByteFault, Decode, Fail, FaultDelay, Faults, ItemFault, Record, Recorder, RewriteError,
-    Rule, Side, Stream, StreamEvent,
+    Buffer, ByteFault, Decode, Fail, FaultDelay, FaultError, Faults, ItemFault, PumpError, Record,
+    Recorder, RewriteError, Rule, Side, Stream, StreamEvent,
 };
 use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::stdlib::{Accept, Accepted, DatagramSocket};
@@ -336,7 +336,8 @@ pub enum Ended {
     /// The client sent everything it will send, and every item was handled.
     /// The reply is still written.
     Eof,
-    /// The service returned [`Flow::Close`], or an error.
+    /// The service returned [`Flow::Close`], or the service, deferred work,
+    /// or fault plan failed.
     Closed,
     /// The decoder failed, after [`Service::on_fail`].
     Failed,
@@ -1006,6 +1007,13 @@ impl Transcript {
 /// them, through a second decoder: a replacement is raw bytes the service
 /// then decodes. Delays are honored by the driver: it waits before the
 /// bytes after the delay's offset.
+///
+/// A rule or held-item flush that fails is a world configuration error.
+/// The failed operation forwards no bytes. Deferred work is cancelled and
+/// no more output is queued. The connection ends with
+/// [`Ended::Closed`] and returns [`ServeError::Faults`] or [`HarnessError::Faults`].
+/// [`connection`] records `conn.error` at [`Level::Notice`] with `kind: faults`,
+/// the `direction` (`inbound`, `outbound` or `items`) and the error chain.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     /// Rules for each chunk read from the client.
@@ -1227,6 +1235,8 @@ pub enum ServeError<E> {
     Service(E),
     /// Ordered deferred work failed.
     Pending(fictionet::Error),
+    /// A fault rule or held-item flush failed. A running service hears [`Ended::Closed`].
+    Faults(FaultError<Infallible>),
     /// The connection's [region](fictionet::Cx#regions) or its parent was
     /// cancelled. A running service hears [`Ended::Cancelled`] in
     /// [`Service::on_end`]. Cancellation during the TLS handshake or while
@@ -1239,6 +1249,7 @@ impl<E: core::fmt::Display> core::fmt::Display for ServeError<E> {
         match self {
             ServeError::Service(_) => f.write_str("the service failed"),
             ServeError::Pending(_) => f.write_str("deferred work failed"),
+            ServeError::Faults(_) => f.write_str("the fault plan failed"),
             ServeError::Cancelled => f.write_str("serving stopped"),
         }
     }
@@ -1249,6 +1260,7 @@ impl<E: core::error::Error + 'static> core::error::Error for ServeError<E> {
         match self {
             ServeError::Service(e) => Some(e),
             ServeError::Pending(e) => Some(&**e),
+            ServeError::Faults(e) => Some(e),
             ServeError::Cancelled => Some(&fictionet::Cancelled),
         }
     }
@@ -1414,7 +1426,7 @@ where
         chunk: &[u8],
         eof: bool,
         queue: &mut VecDeque<Segment>,
-    ) {
+    ) -> Result<(), FaultError<Infallible>> {
         let plan = self.plan.get();
         let mut pieces: Vec<Segment> = Vec::new();
         if chunk.is_empty() {
@@ -1431,7 +1443,7 @@ where
                     pieces.push(Segment::Bytes(rest, 0));
                 }
                 Ok(None) => pieces.push(Segment::Bytes(out, 0)),
-                Err(_) => pieces.push(Segment::Bytes(chunk.to_vec(), 0)),
+                Err(e) => return Err(e.into()),
             }
         }
         self.pending.extend(pieces);
@@ -1440,14 +1452,19 @@ where
         if self.front.is_none() {
             queue.append(&mut self.pending);
         }
+        Ok(())
     }
 
-    fn pump(&mut self, entropy: &dyn Entropy, queue: &mut VecDeque<Segment>) {
+    fn pump(
+        &mut self,
+        entropy: &dyn Entropy,
+        queue: &mut VecDeque<Segment>,
+    ) -> Result<(), FaultError<Infallible>> {
         let plan = self.plan.get();
         loop {
             let Some(front) = self.front.as_mut() else {
                 queue.append(&mut self.pending);
-                return;
+                return Ok(());
             };
             let mut out = Vec::new();
             let mut pushed = 0;
@@ -1467,13 +1484,18 @@ where
                 .inbound
                 .next_with(entropy, front, &mut out, &plan.items, write_raw);
             let progressed = result.is_some();
-            if let Some(Ok(Some(FaultDelay { at, duration }))) = result {
-                let tail = out.split_off(at.min(out.len()));
-                if !out.is_empty() {
-                    queue.push_back(Segment::Bytes(std::mem::take(&mut out), 0));
+            match result {
+                Some(Err(PumpError::Handler(e))) => return Err(e),
+                Some(Ok(Some(FaultDelay { at, duration }))) => {
+                    let tail = out.split_off(at.min(out.len()));
+                    if !out.is_empty() {
+                        queue.push_back(Segment::Bytes(std::mem::take(&mut out), 0));
+                    }
+                    queue.push_back(Segment::Wait(duration));
+                    out = tail;
                 }
-                queue.push_back(Segment::Wait(duration));
-                out = tail;
+                // Decode failures retain partial bytes for the service below.
+                Some(Err(PumpError::Decode(_))) | Some(Ok(None)) | None => {}
             }
             if !out.is_empty() {
                 queue.push_back(Segment::Bytes(out, 0));
@@ -1484,34 +1506,39 @@ where
                 } else {
                     "ended"
                 };
-                self.stop(why, queue);
-                return;
+                return self.stop(why, queue);
             }
             if !queue.is_empty() {
-                return;
+                return Ok(());
             }
             if pushed == 0 && !progressed {
                 if matches!(self.pending.front(), Some(Segment::Wait(_))) {
                     queue.push_back(self.pending.pop_front().unwrap());
                 } else if matches!(self.pending.front(), Some(Segment::Bytes(_, _))) {
-                    self.stop("stuck", queue);
+                    self.stop("stuck", queue)?;
                 }
-                return;
+                return Ok(());
             }
         }
     }
 
-    fn stop(&mut self, why: &'static str, queue: &mut VecDeque<Segment>) {
-        if let Some(front) = self.front.take() {
+    fn stop(
+        &mut self,
+        why: &'static str,
+        queue: &mut VecDeque<Segment>,
+    ) -> Result<(), FaultError<Infallible>> {
+        if let Some(front) = &self.front {
             let mut bytes = Vec::new();
-            let _ = self.inbound.flush(&mut bytes);
+            self.inbound.flush(&mut bytes)?;
             bytes.extend_from_slice(front.unread());
             if !bytes.is_empty() {
                 queue.push_back(Segment::Bytes(bytes, 0));
             }
+            self.front = None;
             self.stopped = Some(why);
         }
         queue.append(&mut self.pending);
+        Ok(())
     }
 
     /// The `conn.faults` event for item rules that stopped since the last
@@ -1535,19 +1562,20 @@ where
 
     /// Runs the outbound byte rules over one chunk: the bytes to write and
     /// where to wait.
-    fn outbound(&mut self, entropy: &dyn Entropy, chunk: Vec<u8>) -> (Vec<u8>, Option<FaultDelay>) {
+    fn outbound(
+        &mut self,
+        entropy: &dyn Entropy,
+        chunk: Vec<u8>,
+    ) -> Result<(Vec<u8>, Option<FaultDelay>), FaultError<Infallible>> {
         let plan = self.plan.get();
         if plan.outbound.is_empty() {
-            return (chunk, None);
+            return Ok((chunk, None));
         }
         let mut out = Vec::new();
-        match self
+        let delay = self
             .outbound
-            .bytes(entropy, &plan.outbound, &chunk, &mut out)
-        {
-            Ok(delay) => (out, delay),
-            Err(_) => (chunk, None),
-        }
+            .bytes(entropy, &plan.outbound, &chunk, &mut out)?;
+        Ok((out, delay))
     }
 }
 
@@ -1575,6 +1603,7 @@ struct Work {
 enum Failure<E> {
     Service(E),
     Pending(fictionet::Error),
+    Faults(FaultError<Infallible>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1639,6 +1668,7 @@ struct Core<S: Service> {
     state: State,
     out: VecDeque<Out>,
     failure: Option<Failure<S::Error>>,
+    fault_direction: Option<&'static str>,
     decode_fail: Option<Fail<<S::Decoder as Decode>::Error>>,
     budget: Option<Budget>,
     charge: Option<Charge>,
@@ -1687,6 +1717,7 @@ where
             state: State::Running,
             out: VecDeque::new(),
             failure: None,
+            fault_direction: None,
             decode_fail: None,
             budget: opts.budget.clone(),
             charge: None,
@@ -1790,8 +1821,11 @@ where
         self.idle_from = now;
         match &mut self.faults {
             Some(f) => {
-                f.inbound(self.s.entropy.as_ref(), bytes, false, &mut self.queue);
+                let result = f.inbound(self.s.entropy.as_ref(), bytes, false, &mut self.queue);
                 self.s.events.extend(f.stopped());
+                if let Err(e) = result {
+                    self.fault_failed("inbound", e);
+                }
             }
             None if self.queue.is_empty() => {
                 // Straight into the decoder's buffer: one copy, not two.
@@ -1808,8 +1842,11 @@ where
     fn input_eof(&mut self) {
         self.eof = true;
         if let Some(f) = &mut self.faults {
-            f.inbound(self.s.entropy.as_ref(), &[], true, &mut self.queue);
+            let result = f.inbound(self.s.entropy.as_ref(), &[], true, &mut self.queue);
             self.s.events.extend(f.stopped());
+            if let Err(e) = result {
+                self.fault_failed("inbound", e);
+            }
         }
     }
 
@@ -1867,12 +1904,18 @@ where
     /// number of the work they came from: it is credited with their length
     /// once the last of them is written.
     fn push_out(&mut self, bytes: Vec<u8>, work: Option<u64>) {
-        if bytes.is_empty() {
+        if bytes.is_empty() || self.fault_direction.is_some() {
             return;
         }
         let credit = work.map(|id| (id, bytes.len() as u64));
         let (bytes, delay) = match &mut self.faults {
-            Some(f) => f.outbound(self.s.entropy.as_ref(), bytes),
+            Some(f) => match f.outbound(self.s.entropy.as_ref(), bytes) {
+                Ok(output) => output,
+                Err(e) => {
+                    self.fault_failed("outbound", e);
+                    return;
+                }
+            },
             None => (bytes, None),
         };
         match delay {
@@ -1911,9 +1954,25 @@ where
 
     /// Stops item rules for this connection and records the `conn.faults` event.
     fn stop_item_faults(&mut self, why: &'static str) {
+        if self.fault_direction.is_some() {
+            return;
+        }
         if let Some(faults) = &mut self.faults {
-            faults.stop(why, &mut self.queue);
+            let result = faults.stop(why, &mut self.queue);
             self.s.events.extend(faults.stopped());
+            if let Err(e) = result {
+                self.fault_failed("items", e);
+            }
+        }
+    }
+
+    fn fault_failed(&mut self, direction: &'static str, error: FaultError<Infallible>) {
+        self.fault_direction.get_or_insert(direction);
+        self.failure.get_or_insert(Failure::Faults(error));
+        self.cancel_all(true);
+        self.finish(Ended::Closed);
+        if let State::Ending { end, .. } = &mut self.state {
+            *end = Ended::Closed;
         }
     }
 
@@ -1938,6 +1997,9 @@ where
                 let work = self.new_work(pending);
                 self.keyed.push((key, work));
             }
+        }
+        if self.fault_direction.is_some() {
+            self.cancel_all(true);
         }
     }
 
@@ -1974,7 +2036,10 @@ where
             }
             Ok(flow) => {
                 self.collect();
-                if flow != Flow::Continue && self.held_flow.is_none() {
+                if self.state == State::Running
+                    && flow != Flow::Continue
+                    && self.held_flow.is_none()
+                {
                     self.held_flow = Some(flow);
                 }
             }
@@ -1999,6 +2064,9 @@ where
     fn apply(&mut self, flow: Flow, service: &S) {
         if matches!(flow, Flow::Upgrade(_)) {
             self.stop_item_faults("upgrade");
+            if self.fault_direction.is_some() {
+                return;
+            }
         }
         match flow {
             Flow::Continue => {}
@@ -2052,8 +2120,12 @@ where
         if self.queue.is_empty()
             && let Some(faults) = &mut self.faults
         {
-            faults.pump(self.s.entropy.as_ref(), &mut self.queue);
+            let result = faults.pump(self.s.entropy.as_ref(), &mut self.queue);
             self.s.events.extend(faults.stopped());
+            if let Err(e) = result {
+                self.fault_failed("items", e);
+                return 0;
+            }
         }
         let mut pushed = 0;
         while let Some(Segment::Bytes(bytes, at)) = self.queue.front_mut() {
@@ -2138,6 +2210,9 @@ where
         }
         loop {
             let pushed = self.feed();
+            if self.state != State::Running {
+                return Next::Again;
+            }
             if self.eof
                 && self.queue.is_empty()
                 && self
@@ -2250,9 +2325,11 @@ where
         if end.writable() {
             let reply = std::mem::take(&mut self.s.reply);
             self.push_out(reply, None);
-            for pending in std::mem::take(&mut self.s.ordered) {
-                let work = self.new_work(pending);
-                self.ordered.push_back(work);
+            if self.fault_direction.is_none() {
+                for pending in std::mem::take(&mut self.s.ordered) {
+                    let work = self.new_work(pending);
+                    self.ordered.push_back(work);
+                }
             }
         }
         self.s.discard();
@@ -2754,6 +2831,16 @@ where
                             .field("kind", "deferred");
                         record(fcx, &info, event);
                     }
+                    Some(Failure::Faults(e)) => {
+                        let e = ErrorChain(e);
+                        let event = Event::new("conn", "error")
+                            .level(Level::Notice)
+                            .summary(format!("the fault plan failed: {e}"))
+                            .field("error", e.to_string())
+                            .field("kind", "faults")
+                            .field("direction", core.fault_direction.unwrap());
+                        record(fcx, &info, event);
+                    }
                     None => {}
                 }
                 if opts.connection_events {
@@ -2769,6 +2856,7 @@ where
                 return match failure {
                     Some(Failure::Service(e)) => Err(ServeError::Service(e)),
                     Some(Failure::Pending(e)) => Err(ServeError::Pending(e)),
+                    Some(Failure::Faults(e)) => Err(ServeError::Faults(e)),
                     None if end == Ended::Cancelled => Err(ServeError::Cancelled),
                     None => Ok(Served::Closed(end)),
                 };
@@ -3248,6 +3336,8 @@ pub enum HarnessError<D, S> {
     Service(S),
     /// Ordered deferred work failed.
     Pending(fictionet::Error),
+    /// A fault rule or held-item flush failed. A running service hears [`Ended::Closed`].
+    Faults(FaultError<Infallible>),
     /// The connection is closed: no more bytes are taken.
     Closed,
     /// The service asked for this upgrade; see [`Harness::resume`].
@@ -3260,6 +3350,7 @@ impl<D: core::fmt::Display, S: core::fmt::Display> core::fmt::Display for Harnes
             HarnessError::Decode(e) => write!(f, "decoder: {e}"),
             HarnessError::Service(_) => f.write_str("the service failed"),
             HarnessError::Pending(_) => f.write_str("deferred work failed"),
+            HarnessError::Faults(_) => f.write_str("the fault plan failed"),
             HarnessError::Closed => f.write_str("the connection is closed"),
             HarnessError::Upgraded(u) => {
                 write!(f, "the service asked for an upgrade: {}", u.as_str())
@@ -3275,6 +3366,7 @@ impl<D: core::fmt::Debug + core::fmt::Display, S: core::error::Error + 'static> 
         match self {
             HarnessError::Service(e) => Some(e),
             HarnessError::Pending(e) => Some(&**e),
+            HarnessError::Faults(e) => Some(e),
             HarnessError::Decode(_) | HarnessError::Closed | HarnessError::Upgraded(_) => None,
         }
     }
@@ -3423,6 +3515,7 @@ where
             return Err(match f {
                 Failure::Service(e) => HarnessError::Service(e),
                 Failure::Pending(e) => HarnessError::Pending(e),
+                Failure::Faults(e) => HarnessError::Faults(e),
             });
         }
         if let Some(fail) = self.core.decode_fail.take() {

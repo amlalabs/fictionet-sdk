@@ -1088,3 +1088,13 @@ emits the `conn.faults` event with a `stopped` field. `Driver::peek_decoder()`
 reads decoder state without stopping item faults. Byte faults continue. Over
 UDP, decoder access applies to the current datagram; each new datagram starts
 with a fresh decoder.
+
+A fault rule that cannot be applied is a world configuration error. Byte,
+item and held-item flush errors close the connection with `Ended::Closed`
+and return `ServeError::Faults` or `HarnessError::Faults`. The failed
+operation forwards no bytes. Deferred work is cancelled, with its written
+byte count preserved. No more output is queued. A running service receives
+`on_end(Ended::Closed)` instead of `on_fail`. If `on_end` itself triggers the
+fault error, it is not called again.
+`connection` records a Notice-level `conn.error` with `kind: faults`,
+`direction: inbound`, `outbound` or `items`, and the error chain in `error`.
