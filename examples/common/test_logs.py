@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
 import unittest
@@ -16,9 +17,11 @@ class Logs(unittest.IsolatedAsyncioTestCase):
         util.sandbox = lambda name: None
         with patch.dict("sys.modules", {"inspect_ai": ModuleType("inspect_ai"), "inspect_ai.util": util}):
             for example, package in [("fakewiki", "fakewiki_eval"), ("adaptive-web", "adaptive_web_eval")]:
-                spec = importlib.util.spec_from_file_location(package, root / example / "src" / package / "world.py")
+                src = root / example / "src"
+                spec = importlib.util.spec_from_file_location(package, src / package / "world.py")
                 module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+                with patch.object(sys, "path", [str(src), *sys.path]):
+                    spec.loader.exec_module(module)
                 yield module
 
     async def read(self, module, data, *, returned=None, success=True, offset=0):
