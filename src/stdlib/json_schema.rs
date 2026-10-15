@@ -43,8 +43,8 @@
 //! `readOnly`, and `writeOnly` do not assert anything; request/response policy
 //! belongs to the caller. This module performs no I/O.
 
-use fictionet::stdlib::codec::Lcg;
 use fictionet::stdlib::codec::ascii;
+use fictionet::stdlib::codec::{Lcg, Work};
 use fictionet::stdlib::json::{Number, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -842,7 +842,7 @@ impl Decimal {
 fn remainder(dividend: &[u8], divisor: &[u8], work: &mut Work) -> Result<Vec<u8>, &'static str> {
     let mut r = Vec::<u8>::with_capacity(divisor.len().saturating_add(1));
     for &digit in dividend {
-        work.spend(divisor.len().saturating_mul(12).saturating_add(1))?;
+        spend(work, divisor.len().saturating_mul(12).saturating_add(1))?;
         if !r.is_empty() || digit != 0 {
             r.push(digit);
         }
@@ -865,7 +865,7 @@ fn product(a: &[u8], b: &[u8], work: &mut Work) -> Result<Vec<u8>, &'static str>
     if a.is_empty() || b.is_empty() {
         return Ok(Vec::new());
     }
-    work.spend(a.len().saturating_mul(b.len()).saturating_add(1))?;
+    spend(work, a.len().saturating_mul(b.len()).saturating_add(1))?;
     let mut sum = vec![0u32; a.len() + b.len()];
     for (i, &x) in a.iter().enumerate().rev() {
         let mut carry = 0u32;
@@ -879,14 +879,8 @@ fn product(a: &[u8], b: &[u8], work: &mut Work) -> Result<Vec<u8>, &'static str>
     let first = sum.iter().position(|&d| d != 0).unwrap_or(sum.len());
     Ok(sum[first..].iter().map(|&d| d as u8).collect())
 }
-struct Work {
-    left: usize,
-}
-impl Work {
-    fn spend(&mut self, n: usize) -> Result<(), &'static str> {
-        self.left = self.left.checked_sub(n).ok_or("work")?;
-        Ok(())
-    }
+fn spend(work: &mut Work, n: usize) -> Result<(), &'static str> {
+    work.charge(n).map_err(|_| "work")
 }
 
 const NULL: u8 = 1;
@@ -1043,9 +1037,7 @@ impl<'a> Compiler<'a> {
         self.locations[&(value as *const Value)]
     }
     fn spend(&mut self, amount: usize, path: usize) -> Result<(), CompileError> {
-        self.work
-            .spend(amount)
-            .map_err(|s| self.error(path, CompileKind::Limit(s)))
+        spend(&mut self.work, amount).map_err(|s| self.error(path, CompileKind::Limit(s)))
     }
     fn inspect(&mut self, value: &'a Value, path: usize) -> Result<(), CompileError> {
         let mut stack = vec![(value, path, 0usize, SourceKind::Schema)];
@@ -1165,9 +1157,7 @@ impl<'a> Compiler<'a> {
             .ok_or(InvalidReference)?
             .split('/')
         {
-            self.work
-                .spend(part.len().saturating_add(1))
-                .map_err(Limit)?;
+            spend(&mut self.work, part.len().saturating_add(1)).map_err(Limit)?;
             let mut token = String::new();
             let mut chars = part.chars();
             while let Some(ch) = chars.next() {
@@ -1185,8 +1175,7 @@ impl<'a> Compiler<'a> {
                 Value::Object(o) => {
                     let mut found = None;
                     for (key, v) in o {
-                        self.work
-                            .spend(key.len().min(token.len()).saturating_add(1))
+                        spend(&mut self.work, key.len().min(token.len()).saturating_add(1))
                             .map_err(Limit)?;
                         if key == &token {
                             if found.is_some() {
@@ -1230,7 +1219,7 @@ impl<'a> Compiler<'a> {
             // next member to visit with that member's source kind.
             let mut stack = vec![(start, prefix, 0usize, SourceKind::Schema)];
             while let Some((v, path, next, kind)) = stack.last_mut() {
-                self.work.spend(1).map_err(Limit)?;
+                spend(&mut self.work, 1).map_err(Limit)?;
                 let schema = matches!(kind, SourceKind::Schema);
                 // A nested `$id` starts another resource; its anchors are not ours.
                 let hidden = schema
@@ -1245,7 +1234,7 @@ impl<'a> Compiler<'a> {
                     && !hidden
                     && let Some(name) = v.get("$anchor").and_then(Value::as_str)
                 {
-                    self.work.spend(name.len()).map_err(Limit)?;
+                    spend(&mut self.work, name.len()).map_err(Limit)?;
                     if name == anchor {
                         let at = *v as *const Value;
                         match &found {
@@ -1284,9 +1273,7 @@ impl<'a> Compiler<'a> {
                 } else {
                     key.to_string()
                 };
-                self.work
-                    .spend(token.len().saturating_add(1))
-                    .map_err(Limit)?;
+                spend(&mut self.work, token.len().saturating_add(1)).map_err(Limit)?;
                 let p = pointer(path, &token, max).map_err(Limit)?;
                 stack.push((child, p, 0, child_kind));
             }
@@ -1362,8 +1349,7 @@ impl<'a> Compiler<'a> {
                 continue;
             }
             let p = self.location(v, path, key)?;
-            self.work
-                .spend(key.len().saturating_add(1))
+            spend(&mut self.work, key.len().saturating_add(1))
                 .map_err(|s| self.error(p, CompileKind::Limit(s)))?;
             let invalid = || CompileError {
                 schema_path: self.paths.render(p),
@@ -1638,9 +1624,7 @@ impl Schema {
             entry: None,
             nodes: Vec::new(),
             annotations: Vec::new(),
-            work: Work {
-                left: options.limits.work,
-            },
+            work: Work::new("work", options.limits.work),
         }
         .finish(entry)
     }
@@ -1689,9 +1673,7 @@ impl Schema {
                 return report;
             }
         };
-        let mut work = Work {
-            left: self.budget(size),
-        };
+        let mut work = Work::new("work", self.budget(size));
         let mut eval = Eval {
             schema: self,
             work: &mut work,
@@ -1726,16 +1708,16 @@ impl Schema {
 }
 
 fn equal(a: &Value, b: &Value, limits: &Limits, work: &mut Work) -> Result<bool, &'static str> {
-    work.spend(1)?;
+    spend(work, 1)?;
     Ok(match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Number(a), Value::Number(b)) => {
-            work.spend(a.text().len().saturating_add(b.text().len()))?;
+            spend(work, a.text().len().saturating_add(b.text().len()))?;
             Decimal::new(a, limits)?.cmp(&Decimal::new(b, limits)?) == Ordering::Equal
         }
         (Value::String(a), Value::String(b)) => {
-            work.spend(a.len().min(b.len()))?;
+            spend(work, a.len().min(b.len()))?;
             a == b
         }
         (Value::Array(a), Value::Array(b)) => {
@@ -1756,7 +1738,7 @@ fn equal(a: &Value, b: &Value, limits: &Limits, work: &mut Work) -> Result<bool,
             for (key, value) in a {
                 let mut found = None;
                 for (other, v) in b {
-                    work.spend(key.len().min(other.len()).saturating_add(1))?;
+                    spend(work, key.len().min(other.len()).saturating_add(1))?;
                     if key == other {
                         found = Some(v);
                         break;
@@ -2166,13 +2148,13 @@ fn sorted_indices(
 }
 fn compare_bytes(a: &[u8], b: &[u8], work: &mut Work) -> Result<Ordering, &'static str> {
     for (a, b) in a.iter().zip(b) {
-        work.spend(1)?;
+        spend(work, 1)?;
         let order = a.cmp(b);
         if order != Ordering::Equal {
             return Ok(order);
         }
     }
-    work.spend(1)?;
+    spend(work, 1)?;
     Ok(a.len().cmp(&b.len()))
 }
 // This total order need only agree with JSON equality, not numeric magnitude.
@@ -2187,12 +2169,12 @@ enum Canonical<'a> {
 }
 impl<'a> Canonical<'a> {
     fn new(v: &'a Value, limits: &Limits, work: &mut Work) -> Result<Self, &'static str> {
-        work.spend(1)?;
+        spend(work, 1)?;
         Ok(match v {
             Value::Null => Self::Null,
             Value::Bool(b) => Self::Bool(*b),
             Value::Number(n) => {
-                work.spend(n.text().len())?;
+                spend(work, n.text().len())?;
                 Self::Number(Decimal::new(n, limits)?)
             }
             Value::String(s) => Self::String(s),
@@ -2225,7 +2207,7 @@ impl<'a> Canonical<'a> {
         }
     }
     fn compare(&self, other: &Self, work: &mut Work) -> Result<Ordering, &'static str> {
-        work.spend(1)?;
+        spend(work, 1)?;
         Ok(match (self, other) {
             (Self::Null, Self::Null) => Ordering::Equal,
             (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
@@ -2374,9 +2356,7 @@ impl<'s> Eval<'s, '_> {
         p: &InstancePath<'_>,
         keyword: &str,
     ) -> Result<(), ValidationError> {
-        self.work
-            .spend(n)
-            .map_err(|s| self.error(id, p, keyword, ValidationKind::Limit(s)))
+        spend(self.work, n).map_err(|s| self.error(id, p, keyword, ValidationKind::Limit(s)))
     }
     fn child_path<'v>(
         &self,
@@ -2968,7 +2948,7 @@ impl Schema {
             schema: self,
             rng: Lcg::new(seed),
             limits,
-            work: Work { left: limits.work },
+            work: Work::new("work", limits.work),
             attempts: limits.attempts,
         };
         let mut last = GenerationError::NoCandidate;
@@ -3002,8 +2982,8 @@ impl Schema {
                     continue;
                 }
             };
-            let budget = self.budget(size).min(generator.work.left);
-            let mut work = Work { left: budget };
+            let budget = self.budget(size).min(generator.work.remaining());
+            let mut work = Work::new("work", budget);
             let result = Eval {
                 schema: self,
                 work: &mut work,
@@ -3013,10 +2993,7 @@ impl Schema {
                 truncated: false,
             }
             .run(0, &value, 0, 0, false);
-            generator
-                .work
-                .spend(budget - work.left)
-                .map_err(|_| GenerationError::Limit("work"))?;
+            generator.spend(work.used())?;
             match result {
                 Ok(true) => return Ok(value),
                 Ok(false) => last = GenerationError::NoCandidate,
@@ -3042,9 +3019,7 @@ struct Generator<'a> {
 }
 impl Generator<'_> {
     fn spend(&mut self, n: usize) -> Result<(), GenerationError> {
-        self.work
-            .spend(n)
-            .map_err(|_| GenerationError::Limit("work"))
+        spend(&mut self.work, n).map_err(|_| GenerationError::Limit("work"))
     }
     fn expand(&mut self, mut ids: Vec<usize>) -> Result<Vec<usize>, GenerationError> {
         let mut seen = BTreeSet::new();
