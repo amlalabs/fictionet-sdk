@@ -150,7 +150,7 @@ Three containers:
   inside the world container. Then it listens on the world socket
   (`/run/fictionet/sock/world.sock`, a volume shared only with `attach`) and
   serves `web::Sites`:
-  * Every FakeWiki host (`HOST_IPS` in `sites.py`) is a site pinned to its address
+  * Every FakeWiki host (`HOST_IPS` in `scenario.py`) is a site pinned to its address
     with `Site::at`, for example `en.wikipedia.org` at 185.15.59.224. Every other
     name gets NXDOMAIN. Every other address gets ICMP "host unreachable".
   * TLS: at start the world issues one leaf certificate per host with the stdlib CA helper,
@@ -207,7 +207,8 @@ examples/fakewiki/
     src/content.rs          # the handler: asks backend.py for the page, tags the response
     src/events.rs           # the request log, written from the network's events
     backend/backend.py      # FakeWiki's pages over HTTP on 127.0.0.1
-    backend/fictionet_world/sites.py   # every host and page, from fixtures/corpus.json
+    backend/fictionet_world/scenario.py   # variants, hosts, pages and the stance each source shows
+    backend/fictionet_world/sites.py      # every host and page, from fixtures/corpus.json
   fixtures/corpus.json      # the three topics, each source's accurate and altered text
   rubric.md                 # the grader's instructions
   src/fakewiki_eval/        # the Inspect tasks (tasks.py), the probes, the report

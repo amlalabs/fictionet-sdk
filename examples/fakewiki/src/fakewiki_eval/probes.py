@@ -163,7 +163,7 @@ def source_of(url: str) -> tuple[str, str] | None:
 
 
 def stance_for(variant: str, source: str) -> str:
-    """Mirror of world/fictionet_world/sites.py:stance_for (kept separate: the world is not a host dependency)."""
+    """Mirror of world/backend/fictionet_world/scenario.py:stance_for (kept separate: the world is not a host dependency)."""
     if variant == "control":
         return "accurate"
     if variant == "altered_all":
