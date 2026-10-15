@@ -3172,23 +3172,114 @@ mod tests {
             assert!(Message::parse(&whole).is_ok());
             assert_eq!(Message::read_datagram(&whole), Message::parse(&whole));
         }
-        // Prefixes of values never panic and never read as the whole.
-        for text in [
-            "\"A. G. Bell\" <sip:agb@bell-telephone.com>;tag=a48s",
-            "SIP / 2.0 / UDP first.example.com: 4000;ttl=16;received=[2001:db8::1]",
-            "sips:alice:pw@[2001:db8::1]:5061;transport=tcp?subject=x%20y&a=b",
-            "314159 INVITE",
-        ] {
+    }
+
+    #[test]
+    fn value_prefixes_do_not_read_as_the_whole() {
+        enum Owner {
+            NameAddr(NameAddr),
+            Via(Via),
+            Uri(Uri),
+            CSeq(CSeq),
+        }
+
+        fn check<T>(text: &str, expected: Result<T, Error>)
+        where
+            T: Wire<ParseError = Error> + PartialEq + core::fmt::Debug,
+        {
+            assert_eq!(T::parse(text.as_bytes()), expected, "whole {text:?}");
             for n in 0..text.len() {
-                let p = &text[..n];
-                let _ = (
-                    NameAddr::parse(p.as_bytes()),
-                    Via::parse(p.as_bytes()),
-                    Uri::parse(p.as_bytes()),
-                    CSeq::parse(p.as_bytes()),
-                    Contacts::parse(p.as_bytes()),
-                );
+                let prefix = &text[..n];
+                let result = T::parse(prefix.as_bytes());
+                if expected.is_ok() {
+                    assert_ne!(result, expected, "prefix {n} of {text:?}");
+                }
+                if let Ok(value) = result {
+                    contract::check_wire_value(&value);
+                }
             }
+        }
+
+        // All five parsers see every strict prefix without panicking. Whole
+        // values match their owner, and no strict prefix reads as that value.
+        // Other families give the listed errors, except NameAddr also reads
+        // as a Contact list. Successful prefixes satisfy the wire contract.
+        for (text, owner) in [
+            (
+                "\"A. G. Bell\" <sip:agb@bell-telephone.com>;tag=a48s",
+                Owner::NameAddr(NameAddr {
+                    display: Some("A. G. Bell".into()),
+                    uri: "sip:agb@bell-telephone.com".into(),
+                    params: vec![Param::new("tag", Some("a48s"))],
+                }),
+            ),
+            (
+                "SIP / 2.0 / UDP first.example.com: 4000;ttl=16;received=[2001:db8::1]",
+                Owner::Via(Via {
+                    transport: "UDP".into(),
+                    host: "first.example.com".into(),
+                    port: Some(4000),
+                    params: vec![
+                        Param::new("ttl", Some("16")),
+                        Param::new("received", Some("[2001:db8::1]")),
+                    ],
+                }),
+            ),
+            (
+                "sips:alice:pw@[2001:db8::1]:5061;transport=tcp?subject=x%20y&a=b",
+                Owner::Uri(Uri {
+                    scheme: Scheme::Sips,
+                    user: Some("alice".into()),
+                    password: Some("pw".into()),
+                    host: "[2001:db8::1]".into(),
+                    port: Some(5061),
+                    params: vec![Param::new("transport", Some("tcp"))],
+                    headers: vec![("subject".into(), "x%20y".into()), ("a".into(), "b".into())],
+                }),
+            ),
+            (
+                "314159 INVITE",
+                Owner::CSeq(CSeq {
+                    seq: 314159,
+                    method: "INVITE".into(),
+                }),
+            ),
+        ] {
+            check::<NameAddr>(
+                text,
+                match &owner {
+                    Owner::NameAddr(value) => Ok(value.clone()),
+                    _ => Err(Error::HeaderSyntax("address")),
+                },
+            );
+            check::<Via>(
+                text,
+                match &owner {
+                    Owner::Via(value) => Ok(value.clone()),
+                    _ => Err(Error::HeaderSyntax("Via")),
+                },
+            );
+            check::<Uri>(
+                text,
+                match &owner {
+                    Owner::Uri(value) => Ok(value.clone()),
+                    _ => Err(Error::Uri),
+                },
+            );
+            check::<CSeq>(
+                text,
+                match &owner {
+                    Owner::CSeq(value) => Ok(value.clone()),
+                    _ => Err(Error::HeaderSyntax("CSeq")),
+                },
+            );
+            check::<Contacts>(
+                text,
+                match owner {
+                    Owner::NameAddr(value) => Ok(Contacts::List(vec![value])),
+                    _ => Err(Error::HeaderSyntax("Contact")),
+                },
+            );
         }
     }
 
