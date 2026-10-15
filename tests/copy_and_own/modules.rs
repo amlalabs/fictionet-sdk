@@ -212,6 +212,7 @@ macro_rules! protocols {
         pub mod nbns;
         #[path = "../../src/stdlib/nbss.rs"]
         pub mod nbss;
+        // Net includes net/addresses.rs; copy both with that relative path.
         #[path = "../../src/stdlib/net.rs"]
         pub mod net;
         #[path = "../../src/stdlib/nfs.rs"]
