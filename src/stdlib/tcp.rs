@@ -22,6 +22,9 @@
 //! The peer's initial sequence number comes only from an accepted
 //! handshake. Invalid or unsolicited SYN-ACKs cannot move the receive
 //! window or keep a connection's buffer pages resident.
+//! ACK recovery for window-scale rounding is limited to the furthest
+//! receive-window edge this endpoint has advertised. An ACK beyond that
+//! edge is not repaired.
 //!
 //! This builds a machine at `104.18.32.7` and accepts connections on its
 //! port 443. The other end of the [`pair`](fictionet::pair) goes to a router,
@@ -479,8 +482,14 @@ struct Conn {
     unreachable: Option<u8>,
     /// Bytes the application has read, modulo 2^32.
     read: u32,
-    /// The acknowledgment number and window of the last segment from the
-    /// peer that smoltcp was given.
+    /// Our negotiated receive-window shift. SYN windows are unscaled.
+    recv_shift: u8,
+    /// Furthest advertised receive-window edge, modulo 2^32 and capped
+    /// at the receive buffer's end. ACK repair cannot pass this edge,
+    /// even when a later scaled window rounds down or closes.
+    recv_edge: Option<u32>,
+    /// Last acknowledgment and window used by ACK repair. Segments beyond
+    /// the advertised receive-window edge do not update it.
     last_fed: Option<(u32, u16)>,
     /// An upper bound on the sequence number past data from the peer that
     /// smoltcp may hold, including out-of-order data. smoltcp exposes only
@@ -514,6 +523,8 @@ impl Conn {
             iss: None,
             unreachable: None,
             read: 0,
+            recv_shift: 0,
+            recv_edge: None,
             last_fed: None,
             rx_end: None,
             held: Vec::new(),
@@ -858,22 +869,54 @@ impl State {
         }
     }
 
-    /// Records the SYN identity before its packet leaves the endpoint.
+    /// Records SYN identity and advertised windows before packets leave.
     fn sent(&mut self, packet: &[u8]) {
         let Some(ip) = Header::parse_whole(packet) else {
             return;
         };
         let t = ip.payload(packet);
-        if ip.protocol != TCP || t.len() < 20 || t[13] & 0x12 != 2 {
+        if ip.protocol != TCP || t.len() < 20 {
             return;
         }
         let local = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
         let remote = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
         if let Some(h) = self.by_tuple.get(&(local, remote)) {
             let c = self.conns.get_mut(h).unwrap();
-            if c.side == Side::Client {
-                c.iss
-                    .get_or_insert(u32::from_be_bytes([t[4], t[5], t[6], t[7]]));
+            let syn = t[13] & 2 != 0;
+            if syn {
+                if c.side == Side::Client && t[13] & 16 == 0 {
+                    c.iss
+                        .get_or_insert(u32::from_be_bytes([t[4], t[5], t[6], t[7]]));
+                }
+                c.recv_shift = TcpPacket::new_unchecked(t)
+                    .options_summary()
+                    .expect("smoltcp emits valid TCP options")
+                    .window_scale
+                    .unwrap_or(0);
+            }
+            if t[13] & 16 != 0
+                && let Some(irs) = c.irs
+            {
+                let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
+                let win = u16::from_be_bytes([t[14], t[15]]) as u32;
+                let shift = if syn { 0 } else { c.recv_shift };
+                let mut edge = ack.wrapping_add(win << shift);
+                let capacity = self
+                    .sockets
+                    .get::<stcp::Socket>(self.handles[h])
+                    .recv_capacity();
+                let end = irs
+                    .wrapping_add(1)
+                    .wrapping_add(c.read)
+                    .wrapping_add(capacity as u32);
+                if (edge.wrapping_sub(end) as i32) > 0 {
+                    edge = end;
+                }
+                if c.recv_edge
+                    .is_none_or(|old| (edge.wrapping_sub(old) as i32) > 0)
+                {
+                    c.recv_edge = Some(edge);
+                }
             }
         }
     }
@@ -978,6 +1021,7 @@ impl State {
             return false;
         };
         let data = !repr.payload.is_empty();
+        let window_scale = repr.window_scale;
         let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
         let flags = t[13];
@@ -1069,6 +1113,9 @@ impl State {
                 && matches!(after, TcpState::Established | TcpState::SynReceived)
             {
                 c.irs = Some(seq);
+                if window_scale.is_none() {
+                    c.recv_shift = 0;
+                }
             }
             if consumed && let Some(end) = rx_end {
                 if c.rx_end.is_none_or(|e| (end.wrapping_sub(e) as i32) > 0) {
@@ -1249,11 +1296,12 @@ fn trim_payload(c: &Conn, s: &stcp::Socket<'static>, ip: &mut Header, packet: &m
 ///    bytes. A peer that sent up to the old edge then sends every ACK with
 ///    a sequence number past the new one, and smoltcp ignores them all. If
 ///    the application is waiting for room to write before it reads again,
-///    neither side moves. RFC 9293 says to accept valid ACKs even when the
-///    window is closed. So when a segment from the peer starts past what
-///    this side has received and carries a new acknowledgment or window,
-///    smoltcp first gets a copy without data at the expected sequence
-///    number.
+///    neither side moves. When a segment starts past what this side has
+///    received, but no further than its largest advertised window edge,
+///    and carries a new acknowledgment or window, smoltcp first gets a
+///    copy without data at the expected sequence number. The same bound
+///    applies to zero-window reopening below. smoltcp still checks the
+///    acknowledgment number and connection state.
 /// 2. smoltcp counts an ACK as a duplicate (for fast retransmit) only if
 ///    the window is unchanged. Linux's duplicate ACKs often change the
 ///    window by a little, so smoltcp waits for its retransmission timer
@@ -1278,8 +1326,8 @@ fn repair_ack(
     if off < 20 || off > t.len() {
         return None;
     }
-    // Only a packet smoltcp would accept may be changed, so it is checked
-    // before it is copied or changed.
+    // The checksum proves the segment is intact. The advertised-window
+    // bound below limits which sequence numbers may get a repair copy.
     if transport_checksum(ip.src, ip.dst, TCP, t) != 0 {
         return None;
     }
@@ -1296,13 +1344,22 @@ fn repair_ack(
         .wrapping_add(c.read)
         .wrapping_add(s.recv_queue() as u32)
         .wrapping_add(fin_in as u32);
+    let within_edge = c
+        .recv_edge
+        .is_some_and(|edge| (seq.wrapping_sub(edge) as i32) <= 0);
+    // An out-of-window segment must not suppress a later valid update
+    // with the same acknowledgment and window.
+    if c.recv_edge.is_some() && !within_edge {
+        return None;
+    }
     let ahead = (seq.wrapping_sub(rcv_nxt) as i32) > 0;
     let last = c.last_fed.replace((ack, win));
     let reopened = win != 0
         && last.is_some_and(|(_, w)| w == 0)
         && s.send_queue() != 0
+        && within_edge
         && (ahead || seq == rcv_nxt);
-    if reopened || ahead && last != Some((ack, win)) {
+    if reopened || ahead && within_edge && last != Some((ack, win)) {
         // A copy with no data and no FIN, at the expected sequence number.
         let tcp_at = ip.payload.start;
         let mut copy = packet[..tcp_at + off].to_vec();
@@ -2720,6 +2777,299 @@ mod tests {
     #[test]
     fn a_window_update_retransmits_the_last_unacked_bytes() {
         window_reopens(false, b"abcdefgh");
+    }
+
+    #[test]
+    fn far_future_ack_does_not_free_send_buffer() {
+        ack_repair_window_boundary(7);
+    }
+
+    #[test]
+    fn wraparound_window_boundary() {
+        ack_repair_window_boundary(u32::MAX - MIN_BUFFER as u32 / 2);
+    }
+
+    #[test]
+    fn ack_repair_requires_advertised_window_and_valid_checksum() {
+        let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let s = stcp::Socket::new(
+            stcp::SocketBuffer::new(vec![0; MIN_BUFFER]),
+            stcp::SocketBuffer::new(vec![0; MIN_BUFFER]),
+        );
+        for (edge, seq, corrupt) in [(None, 9, false), (Some(10), 9, true), (Some(10), 7, false)] {
+            let mut c = Conn::new(local, peer, Side::Server);
+            c.irs = Some(7);
+            c.recv_edge = edge;
+            let mut p = segment(peer, local, seq, 100, 0x10).0;
+            if corrupt {
+                p[36] ^= 1;
+            }
+            let original = p.clone();
+            let ip = Header::parse_whole(&p).unwrap();
+            assert!(repair_ack(&mut c, &s, &ip, &mut p).is_none());
+            assert_eq!(p, original);
+        }
+    }
+
+    #[test]
+    fn client_advertised_window_uses_negotiated_scale() {
+        for scaled in [false, true] {
+            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+                let (_raw, side) = pair();
+                let local: SocketAddr = "10.0.0.1:1234".parse()?;
+                let peer: SocketAddr = "10.0.0.2:80".parse()?;
+                let ep = endpoint(&fcx, side, local.ip());
+                let now = smol_now(&fcx);
+                let mut st = ep.shared.state.lock();
+                let mut socket = new_socket(BUFFER);
+                socket.0.connect(st.iface.context(), peer, local).unwrap();
+                let h = st.add_socket(socket);
+                st.conns.insert(h, Conn::new(local, peer, Side::Client));
+                st.by_tuple.insert((local, peer), h);
+                egress(&mut st, now);
+                assert_eq!(st.conns[&h].recv_shift, 3);
+                assert_eq!(st.conns[&h].recv_edge, None, "a SYN has no ACK");
+                let start = st.conns[&h].iss.unwrap().wrapping_add(1);
+                let mut p = segment(peer, local, 7, start, 0x12).0;
+                if scaled {
+                    p[32] = 6 << 4;
+                    p.extend_from_slice(&[1, 3, 3, 7]);
+                    fix_lengths(&mut p, 20, peer.ip(), local.ip());
+                }
+                st.ingress(local.ip(), now, p);
+                assert_eq!(st.get(h).state(), TcpState::Established);
+                let packets = egress(&mut st, now);
+                let t = Header::parse_whole(&packets[0])
+                    .unwrap()
+                    .payload(&packets[0]);
+                let shift = if scaled { 3 } else { 0 };
+                assert_eq!(st.conns[&h].recv_shift, shift);
+                let win = (u16::from_be_bytes([t[14], t[15]]) as u32) << shift;
+                assert_eq!(win, if scaled { BUFFER as u32 } else { 65535 });
+                assert_eq!(st.conns[&h].recv_edge, Some(8 + win));
+                drop(st);
+                fcx.cancel();
+                Ok(())
+            }))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn legitimate_rounded_window_recovery() {
+        for irs in [7u32, u32::MAX - BUFFER as u32 / 2] {
+            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+                let (_raw, side) = pair();
+                let local: SocketAddr = "10.0.0.1:80".parse()?;
+                let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+                let ep = endpoint(&fcx, side, local.ip());
+                let _listener = ep.listen(local.port())?;
+                let now = smol_now(&fcx);
+                let mut st = ep.shared.state.lock();
+                let mut syn = segment(peer, local, irs, 0, 0x02).0;
+                syn[32] = 6 << 4;
+                syn.extend_from_slice(&[1, 3, 3, 7]);
+                fix_lengths(&mut syn, 20, peer.ip(), local.ip());
+                st.ingress(local.ip(), now, syn);
+                let syn_ack = egress(&mut st, now).remove(0);
+                let t = Header::parse_whole(&syn_ack).unwrap().payload(&syn_ack);
+                let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
+                let origin = irs.wrapping_add(1);
+                let h = st.by_tuple[&(local, peer)];
+                assert_eq!(st.conns[&h].recv_shift, 3);
+                assert_eq!(st.conns[&h].recv_edge, Some(origin.wrapping_add(65535)));
+                st.ingress(local.ip(), now, segment(peer, local, origin, start, 0x10).0);
+                st.sock(h).set_ack_delay(None);
+                assert_eq!(st.sock(h).send_slice(b"abcdefgh").unwrap(), 8);
+                let sent = egress(&mut st, now);
+                assert!(sent.iter().any(|p| {
+                    let t = Header::parse_whole(p).unwrap().payload(p);
+                    &t[((t[12] >> 4) as usize) * 4..] == b"abcdefgh"
+                }));
+                let edge = origin.wrapping_add(BUFFER as u32);
+                assert_eq!(st.conns[&h].recv_edge, Some(edge));
+                let expected = pattern(BUFFER, 7);
+                let incoming = |begin: usize, end: usize, ack: u32| {
+                    let mut p =
+                        segment(peer, local, origin.wrapping_add(begin as u32), ack, 0x10).0;
+                    p.extend_from_slice(&expected[begin..end]);
+                    fix_lengths(&mut p, 20, peer.ip(), local.ip());
+                    p
+                };
+                // Fill to the advertised edge out of order, leaving two
+                // bytes missing. Then advance the ACK by just one byte.
+                for begin in (2..BUFFER).step_by(1024) {
+                    st.ingress(
+                        local.ip(),
+                        now,
+                        incoming(begin, (begin + 1024).min(BUFFER), start),
+                    );
+                    egress(&mut st, now);
+                }
+                assert_eq!(st.get(h).recv_queue(), 0);
+                st.ingress(local.ip(), now, incoming(0, 1, start));
+                let sent = egress(&mut st, now);
+                let t = Header::parse_whole(sent.last().unwrap())
+                    .unwrap()
+                    .payload(sent.last().unwrap());
+                let ack = u32::from_be_bytes(t[8..12].try_into().unwrap());
+                let win = (u16::from_be_bytes([t[14], t[15]]) as u32) << 3;
+                assert_eq!(ack, origin.wrapping_add(1));
+                assert_eq!(ack.wrapping_add(win), edge.wrapping_sub(7));
+                assert_eq!(st.conns[&h].recv_edge, Some(edge));
+                assert_eq!(st.get(h).recv_queue(), 1);
+                // The peer is at the old edge. An ACK outside our send
+                // range must still be rejected even at that sequence.
+                st.ingress(
+                    local.ip(),
+                    now,
+                    segment(peer, local, edge, start.wrapping_add(9), 0x10).0,
+                );
+                assert_eq!(st.get(h).send_queue(), 8);
+                st.ingress(
+                    local.ip(),
+                    now,
+                    segment(peer, local, edge, start.wrapping_add(4), 0x10).0,
+                );
+                assert_eq!(
+                    st.get(h).send_queue(),
+                    4,
+                    "the rounded window must not strand ACKs"
+                );
+                st.ingress(local.ip(), now, incoming(1, 2, start.wrapping_add(4)));
+                assert_eq!(
+                    st.get(h).recv_queue(),
+                    BUFFER,
+                    "the hole's retransmission must be accepted"
+                );
+                let mut got = vec![0; BUFFER];
+                assert_eq!(st.sock(h).recv_slice(&mut got).unwrap(), BUFFER);
+                assert_eq!(got, expected);
+                st.conns.get_mut(&h).unwrap().read = BUFFER as u32;
+                egress(&mut st, now);
+                assert_eq!(
+                    st.conns[&h].recv_edge,
+                    Some(edge.wrapping_add(BUFFER as u32))
+                );
+                drop(st);
+                fcx.cancel();
+                Ok(())
+            }))
+            .unwrap();
+        }
+    }
+
+    fn ack_repair_window_boundary(irs: u32) {
+        for reopened in [false, true] {
+            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+                let (_raw, side) = pair();
+                let local: SocketAddr = "10.0.0.1:80".parse()?;
+                let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+                let ep = endpoint_with(
+                    &fcx,
+                    side,
+                    local.ip(),
+                    Options::default().buffer(MIN_BUFFER),
+                );
+                let _listener = ep.listen(local.port())?;
+                let now = smol_now(&fcx);
+                let mut st = ep.shared.state.lock();
+                st.ingress(local.ip(), now, segment(peer, local, irs, 0, 0x02).0);
+                let syn_ack = egress(&mut st, now).remove(0);
+                let t = Header::parse_whole(&syn_ack).unwrap().payload(&syn_ack);
+                let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
+                let rcv_nxt = irs.wrapping_add(1);
+                let edge = rcv_nxt.wrapping_add(u16::from_be_bytes([t[14], t[15]]) as u32);
+                assert_eq!(edge, rcv_nxt.wrapping_add(MIN_BUFFER as u32));
+                st.ingress(
+                    local.ip(),
+                    now,
+                    segment(peer, local, rcv_nxt, start, 0x10).0,
+                );
+                let h = st.by_tuple[&(local, peer)];
+                assert_eq!(st.get(h).state(), TcpState::Established);
+                assert_eq!(
+                    st.sock(h).send_slice(&vec![0x5a; MIN_BUFFER]).unwrap(),
+                    MIN_BUFFER
+                );
+                let sent = egress(&mut st, now);
+                assert!(sent.iter().any(|p| {
+                    let t = Header::parse_whole(p).unwrap().payload(p);
+                    t.len() - ((t[12] >> 4) as usize) * 4 >= 4
+                }));
+                if reopened {
+                    let mut p = segment(peer, local, rcv_nxt, start, 0x10).0;
+                    p[34..36].copy_from_slice(&0u16.to_be_bytes());
+                    fix_lengths(&mut p, 20, peer.ip(), local.ip());
+                    st.ingress(local.ip(), now, p);
+                    egress(&mut st, now);
+                }
+                for seq in [rcv_nxt.wrapping_add(10_000_000), edge.wrapping_add(1), edge] {
+                    let p = segment(peer, local, seq, start.wrapping_add(4), 0x10).0;
+                    let mut copy = p.clone();
+                    let ip = Header::parse_whole(&copy).unwrap();
+                    let last = st.conns[&h].last_fed;
+                    let slot = st.handles[&h];
+                    let State { conns, sockets, .. } = &mut *st;
+                    let repaired = repair_ack(
+                        conns.get_mut(&h).unwrap(),
+                        sockets.get::<stcp::Socket>(slot),
+                        &ip,
+                        &mut copy,
+                    );
+                    st.conns.get_mut(&h).unwrap().last_fed = last;
+                    st.ingress(local.ip(), now, p);
+                    let accepted = seq == edge;
+                    assert_eq!(
+                        st.get(h).send_queue(),
+                        MIN_BUFFER - if accepted { 4 } else { 0 },
+                        "seq={seq}, edge={edge}, reopened={reopened}"
+                    );
+                    assert_eq!(repaired.is_some(), accepted);
+                    if !accepted {
+                        assert_eq!(st.conns[&h].last_fed, last);
+                    }
+                    if !accepted && reopened {
+                        assert!(
+                            egress(&mut st, now).iter().all(|p| {
+                                let t = Header::parse_whole(p).unwrap().payload(p);
+                                t.len() == ((t[12] >> 4) as usize) * 4
+                            }),
+                            "an out-of-window ACK must not reopen the send window"
+                        );
+                    }
+                }
+                drop(st);
+                fcx.cancel();
+                Ok(())
+            }))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn sack_ack_ahead_without_advertised_window_is_unchanged() {
+        let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let s = stcp::Socket::new(
+            stcp::SocketBuffer::new(vec![0; MIN_BUFFER]),
+            stcp::SocketBuffer::new(vec![0; MIN_BUFFER]),
+        );
+        let mut c = Conn::new(local, peer, Side::Server);
+        c.irs = Some(7);
+        c.last_fed = Some((100, 123));
+        assert_eq!(c.recv_edge, None);
+        let mut p = segment(peer, local, 9, 100, 0x10).0;
+        p[32] = 8 << 4;
+        p[34..36].copy_from_slice(&456u16.to_be_bytes());
+        p.extend_from_slice(&[5, 10, 0, 0, 0, 104, 0, 0, 0, 105, 0, 0]);
+        fix_lengths(&mut p, 20, peer.ip(), local.ip());
+        let original = p.clone();
+        let ip = Header::parse_whole(&p).unwrap();
+        assert!(repair_ack(&mut c, &s, &ip, &mut p).is_none());
+        assert_eq!(p, original);
+        assert_eq!(c.last_fed, Some((100, 456)));
     }
 
     #[test]
