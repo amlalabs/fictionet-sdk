@@ -255,9 +255,13 @@
 //! - **Copy**: `tests/copy_and_own` compiles the file as a module of a
 //!   separate crate, as a user's copy would be.
 //!
-//! `tests/stdlib_catalog.rs` checks every column against the code, so the
-//! table cannot drift. A new module gets a row here and its own module
-//! docs, and nothing on this page or the crate root.
+//! `tests/stdlib_catalog.rs` checks the table against source declarations and
+//! the copy, fuzz and observe inventories. A listed capability must have a
+//! matching declaration of a kind the test recognizes; see that test's docs.
+//! The check is textual and does not prove every Rust trait implementation.
+//! A new module gets a row here and its own module docs.
+//! Do not add other prose about the module to this page or the crate root.
+//! See [Adding a protocol](#adding-a-protocol) for the registration checklist.
 //!
 //! | Module | What it is | Wire | Decode | State | Service | Observe | Fuzz | Copy |
 //! |---|---|---|---|---|---|---|---|---|
@@ -272,7 +276,7 @@
 //! | [`cme_mdp3`] | CME MDP 3.0 market data: generated messages for SBE schema 1 version 13 (20230411), plus packet framing. | yes | yes |  |  |  | yes | yes |
 //! | [`coap`] | CoAP messages over UDP and frames over TCP, with block-wise reassembly. | yes | yes |  |  |  | yes | yes |
 //! | [`codec`] | The tools every protocol is built on, none of them doing I/O: `Decode`, `Wire`, `Stream`, combinators, a recorder and fault injection. | yes | yes |  |  |  | yes | yes |
-//! | [`cotp`] | ISO transport on TCP: TPKT and COTP packets, with segment reassembly. | yes |  |  |  |  | yes | yes |
+//! | [`cotp`] | ISO transport on TCP: TPKT and COTP packets, with segment reassembly. | yes | yes |  |  |  | yes | yes |
 //! | [`dcerpc`] | DCE/RPC over connections: bind, request and response PDUs, with fragment reassembly. | yes | yes |  |  |  | yes | yes |
 //! | [`dhcp`] | DHCP messages, used by `Net` and by the DHCP server attach runs for a VM. | yes |  |  |  | built in | yes | yes |
 //! | [`dhcpv6`] | DHCPv6 client, server and relay messages and their options. | yes | yes |  |  |  | yes | yes |
