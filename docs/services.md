@@ -703,7 +703,8 @@ or the reverse. The first default at each endpoint keeps the role. Names
 are matched without case or a trailing dot. `Net` itself knows nothing of
 HTTP, so a copy of `httpd` with its own handlers plugs in the same way.
 Copy `src/stdlib/httpd.rs` together with `src/stdlib/httpd/`, keeping the
-relative paths.
+relative paths. Each serving engine has its own file there: `http1.rs` for
+native HTTP/1, and `hyper.rs` for HTTP/2 and upgrades on hyper.
 
 Each routed request carries an `httpd::Target`. Its `routing` field is
 `Routing::Exact` when the requested host matches a registered name, or

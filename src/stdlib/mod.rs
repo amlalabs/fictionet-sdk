@@ -224,7 +224,9 @@
 //! installation, attachment lifecycle, and DNS service modules.
 //! It also needs `world/names.rs`, keeping that relative path.
 //! Copy `httpd.rs` together with the `httpd/` directory, keeping the relative
-//! paths. The entry file declares its private body, handler, site, and response modules.
+//! paths. The entry file declares its private body, handler, site, and response modules,
+//! and one module per serving engine: native HTTP/1 in `httpd/http1.rs`, and
+//! hyper's HTTP/2 and upgrades in `httpd/hyper.rs` with the `tokio` feature.
 //! Copy `tls.rs` together with the `tls/` directory, keeping the relative
 //! paths. The entry file declares its private run-aware crypto provider.
 //! Copy `sandbox.rs` together with `tls/output.rs`, keeping that relative

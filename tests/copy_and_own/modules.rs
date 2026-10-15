@@ -7,14 +7,14 @@
 // come from the catalog: module records and their copy parts.
 //
 // An entry file declares its children by relative path, so a copy keeps
-// them: httpd.rs includes httpd/body.rs, httpd/handlers.rs, httpd/sites.rs and
-// httpd/response.rs; tls.rs its private tls/provider.rs; net.rs
-// net/addresses.rs, net/hosts.rs, net/attachments.rs, net/dns.rs and
-// world/names.rs; cme_mdp3/mod.rs its framing.rs; and observe/protocols.rs
-// protocols/{modbus,dns,dhcp,http1}.rs. tls.rs and sandbox.rs share the
-// private tls_output sibling, copied with either. NBNS, NBDGM and NBSS use the
-// public NetBIOS name encoding helpers, and SNMP the public ASN.1 integer and
-// length helpers.
+// them: httpd.rs includes httpd/body.rs, httpd/handlers.rs, httpd/http1.rs,
+// httpd/hyper.rs, httpd/sites.rs and httpd/response.rs; tls.rs its private
+// tls/provider.rs; net.rs net/addresses.rs, net/hosts.rs, net/attachments.rs,
+// net/dns.rs and world/names.rs; cme_mdp3/mod.rs its framing.rs; and
+// observe/protocols.rs protocols/{modbus,dns,dhcp,http1}.rs. tls.rs and
+// sandbox.rs share the private tls_output sibling, copied with either. NBNS,
+// NBDGM and NBSS use the public NetBIOS name encoding helpers, and SNMP the
+// public ASN.1 integer and length helpers.
 macro_rules! protocols {
     () => {
         // Generated from catalog/stdlib.rs. Update with BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog.

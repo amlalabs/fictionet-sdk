@@ -88,7 +88,13 @@ def test_httpd_answer_inventory_matches_border_projection() -> None:
 
     root = GOLDEN.parents[4]
     kinds: set[str] = set()
-    for path in ("httpd.rs", "httpd/sites.rs", "httpd/response.rs"):
+    for path in (
+        "httpd.rs",
+        "httpd/http1.rs",
+        "httpd/hyper.rs",
+        "httpd/sites.rs",
+        "httpd/response.rs",
+    ):
         source = (root / "src" / "stdlib" / path).read_text().split("#[cfg(test)]", 1)[0]
         kinds.update(re.findall(r'with\("answer", "([a-z_]+)"\)', source))
         # Find the second argument to answered(), respecting nested calls and strings.
