@@ -38,6 +38,7 @@ pod="fictionet-sandbox-$release-default-0"
 socks_pod="fictionet-sandbox-$release-socks-0"
 source "$here/../throughput.sh"
 failures=0
+source "$here/../common/assertions.sh"
 made_cluster=0
 
 cleanup() {
@@ -46,20 +47,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 agent() { kubectl -n "$ns" exec "$pod" -c default -- "$@"; }
 socks_agent() { kubectl -n "$ns" exec "$socks_pod" -c socks -- "$@"; }
-
-# Runs a check: name, then the expected text (a grep -E pattern), then the
-# command. The command's stdout and stderr are matched, as one line.
-check() {
-    local name="$1" want="$2"
-    shift 2
-    local out
-    out="$("$@" 2>&1 | tr '\n' ' ')" || true
-    if grep -qE -- "$want" <<<"$out"; then pass "$name"; else fail "$name: wanted /$want/, got: $out"; fi
-}
 
 docker build -q -f "$root/deploy/Dockerfile" --target attach -t fictionet-attach:dev "$root" >/dev/null
 docker build -q -f "$root/tests/docker/web/Dockerfile" --target fixture -t fictionet-web-fixture:dev "$root" >/dev/null

@@ -32,6 +32,7 @@ cluster=fictionet-k8s-test
 release=fntest
 pod="fictionet-sandbox-$release-default-0"
 failures=0
+source "$here/../common/assertions.sh"
 made_cluster=0
 
 cleanup() {
@@ -39,20 +40,8 @@ cleanup() {
     if [ "$made_cluster" = 1 ]; then kind delete cluster --name "$cluster" >/dev/null 2>&1 || true; fi
 }
 
-pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 agent() { kubectl exec "$pod" -c default -- "$@"; }
 ca=(--cacert /run/ca/ca.pem)
-
-# Runs a check: name, then the expected text (a grep -E pattern), then the
-# command. The command's stdout and stderr are matched, as one line.
-check() {
-    local name="$1" want="$2"
-    shift 2
-    local out
-    out="$("$@" 2>&1 | tr '\n' ' ')" || true
-    if grep -qE -- "$want" <<<"$out"; then pass "$name"; else fail "$name: wanted /$want/, got: $out"; fi
-}
 
 # Kubernetes start times have second granularity. Equality is valid coarse
 # start-order evidence, but says nothing about when attach became ready.
