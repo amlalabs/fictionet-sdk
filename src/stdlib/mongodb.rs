@@ -3056,10 +3056,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_inputs_obey_contracts() {
-        let mut rng = Lcg::new(0x6d_6f6e_676f_6462);
-        let mut seeds: Vec<Vec<u8>> = vec![every_type().to_bytes().unwrap()];
+    fn message_seeds() -> Vec<Vec<u8>> {
+        let mut seeds = Vec::new();
         let full = Msg {
             flags: flag::CHECKSUM_PRESENT,
             body: Document::new().with("insert", s("c")),
@@ -3109,6 +3107,15 @@ mod tests {
             .to_bytes()
             .unwrap(),
         );
+        seeds
+    }
+
+    #[test]
+    fn generated_inputs_obey_contracts() {
+        let mut rng = Lcg::new(0x6d_6f6e_676f_6462);
+        let mut seeds = message_seeds();
+        seeds.insert(0, every_type().to_bytes().unwrap());
+        let mut multi_frame_inputs = 0;
         for _ in 0..6000 {
             let mut data = if rng.coin() {
                 rng.bytes(64)
@@ -3116,6 +3123,20 @@ mod tests {
                 seeds[rng.index(seeds.len())].clone()
             };
             mutate(&mut rng, &mut data);
+            let mut parts = vec![data];
+            if rng.below(3) == 0 {
+                for _ in 0..1 + rng.below(2) {
+                    // Skip seed 0, a bare document: append only whole message
+                    // frames, each left intact or mutated on its own.
+                    let mut next = seeds[1 + rng.index(seeds.len() - 1)].clone();
+                    if rng.coin() {
+                        mutate(&mut rng, &mut next);
+                    }
+                    parts.push(next);
+                }
+            }
+            multi_frame_inputs += usize::from(parts.len() > 1);
+            let data = parts.concat();
             check(&data);
             // Bytes after a header, as each op code.
             for op in [
@@ -3125,6 +3146,73 @@ mod tests {
                 op_code::COMPRESSED,
             ] {
                 check(&frame(op, &data));
+            }
+        }
+        // This checks generator shape, not how many messages decode successfully.
+        assert!(
+            multi_frame_inputs > 0,
+            "generator-shape check: no concatenated frame inputs"
+        );
+    }
+
+    #[test]
+    fn valid_bad_valid_boundary() {
+        let a = msg(1, Document::new().with("ping", Bson::Int32(1)))
+            .to_bytes()
+            .unwrap();
+        let b = msg(2, Document::new().with("hello", Bson::Int32(1)))
+            .to_bytes()
+            .unwrap();
+        let limit = a.len().max(b.len());
+        let mut rng = Lcg::new(0x626f_756e_6461_7279);
+        for seed in message_seeds() {
+            let op = i32::from_le_bytes(seed[12..16].try_into().unwrap());
+            for _ in 0..rounds(128) {
+                let mut body = seed[HEADER_LEN..].to_vec();
+                mutate(&mut rng, &mut body);
+                // Rebuild the length so a body mutation cannot swallow the next frame.
+                let middle = frame(op, &body);
+                let bytes = [&a[..], &middle, &b].concat();
+                let checked = contract::check_decode_with_alloc_limit(
+                    Frames::<Message>::new,
+                    &bytes,
+                    2 * MAX_MESSAGE_SIZE,
+                );
+                let decoded = decode_all(Frames::<Message>::new, &bytes);
+                assert_eq!(checked, decoded);
+                let (items, failure) = decoded;
+                let ids: Vec<_> = items.into_iter().map(|m| m.map(|m| m.request_id)).collect();
+                if failure.is_some() {
+                    assert!(matches!(
+                        failure,
+                        Some(Fail::Protocol(FrameError::SectionKind(_)))
+                    ));
+                    assert_eq!(ids, [Ok(1)]);
+                } else {
+                    assert_eq!(ids.len(), 3);
+                    assert_eq!(ids[0], Ok(1));
+                    assert_eq!(ids[2], Ok(2));
+                }
+
+                let limited = contract::check_decode_capacity(
+                    || Frames::<Message>::with_limit(limit),
+                    &bytes,
+                );
+                let limited_decoded = decode_all(|| Frames::<Message>::with_limit(limit), &bytes);
+                assert_eq!(limited, limited_decoded);
+                let (items, limited_failure) = limited_decoded;
+                let limited_ids: Vec<_> =
+                    items.into_iter().map(|m| m.map(|m| m.request_id)).collect();
+                if middle.len() > limit {
+                    assert_eq!(limited_ids, [Ok(1)]);
+                    assert_eq!(
+                        limited_failure,
+                        Some(Fail::Protocol(FrameError::Length(middle.len() as i32)))
+                    );
+                } else {
+                    assert_eq!(limited_ids, ids);
+                    assert_eq!(limited_failure, failure);
+                }
             }
         }
     }
