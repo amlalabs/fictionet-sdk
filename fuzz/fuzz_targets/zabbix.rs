@@ -4,10 +4,43 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::json::{self, Limits, Value};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::zabbix::{Header, Message, Packet, SenderValue};
+use fictionet::stdlib::zabbix::{Error, Header, Kind, MAX_DEPTH, Message, Packet, SenderValue};
 use libfuzzer_sys::fuzz_target;
+
+fn check_message(data: &[u8]) {
+    let message = Message::parse(data);
+    if let Ok(m) = &message {
+        assert_eq!(m.json().as_bytes(), data);
+        assert_eq!(m.to_bytes().unwrap(), data);
+        assert_eq!(Message::parse(&m.to_packet().data).as_ref(), Ok(m));
+    }
+    // The value parser has tighter size, number and element limits. When
+    // it accepts a value at Zabbix's depth limit, classification must agree.
+    let limits = Limits {
+        depth: MAX_DEPTH,
+        ..Limits::default()
+    };
+    if let Ok(value) = json::parse_with(data, &limits) {
+        let expected = if value.as_object().is_none() {
+            Err(Error::NotObject)
+        } else if let Some(request) = value.get("request").and_then(Value::as_str) {
+            Ok(match request {
+                "active checks" => Kind::ActiveChecks,
+                "agent data" => Kind::AgentData,
+                "sender data" => Kind::SenderData,
+                other => Kind::OtherRequest(other.into()),
+            })
+        } else if let Some(response) = value.get("response").and_then(Value::as_str) {
+            Ok(Kind::Response(response.into()))
+        } else {
+            Err(Error::NoKind)
+        };
+        assert_eq!(message.map(|m| m.kind().clone()), expected);
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_capacity(Frames::<Packet>::new, data);
@@ -41,6 +74,11 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_capacity(|| Frames::<Packet>::with_limit(4096), data);
     contract::check_wire::<Header>(data);
     contract::check_wire::<Message>(data);
+    check_message(data);
+    let mut json = br#"{"request":"agent data","value":"#.to_vec();
+    json.extend_from_slice(data);
+    json.push(b'}');
+    check_message(&json);
     for p in decode_all(|| Frames::<Packet>::with_limit(4096), data).0 {
         contract::check_wire_value(&p);
         if let Ok(m) = Message::parse(&p.data) {

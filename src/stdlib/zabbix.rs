@@ -66,7 +66,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Wire, json_syntax};
 
 /// The TCP port a Zabbix agent listens on for the server's questions.
 pub const AGENT_PORT: u16 = 10050;
@@ -830,117 +830,59 @@ impl Scanner<'_> {
         }
     }
 
-    fn digits(&mut self) -> usize {
-        let from = self.i;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.i += 1;
-        }
-        self.i - from
-    }
-
     fn number(&mut self) -> Result<(), Error> {
-        if self.peek() == Some(b'-') {
-            self.i += 1;
-        }
-        match self.peek() {
-            Some(b'0') => self.i += 1,
-            Some(b'1'..=b'9') => {
-                self.digits();
-            }
-            _ => return Err(Error::Syntax(self.i)),
-        }
-        if self.peek() == Some(b'.') {
-            self.i += 1;
-            if self.digits() == 0 {
-                return Err(Error::Syntax(self.i));
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.i += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.i += 1;
-            }
-            if self.digits() == 0 {
-                return Err(Error::Syntax(self.i));
-            }
-        }
+        self.i = json_syntax::scan_number(self.b, self.i)
+            .map_err(|error| Error::Syntax(error.offset()))?;
         Ok(())
     }
 
-    fn hex4(&mut self) -> Result<u32, Error> {
-        let mut v = 0u32;
-        for _ in 0..4 {
-            let d = match self.peek() {
-                Some(c @ b'0'..=b'9') => c - b'0',
-                Some(c @ b'a'..=b'f') => c - b'a' + 10,
-                Some(c @ b'A'..=b'F') => c - b'A' + 10,
-                _ => return Err(Error::Syntax(self.i)),
-            };
-            v = (v << 4) | u32::from(d);
-            self.i += 1;
-        }
-        Ok(v)
+    /// A string starting at the opening quote, decoded. The input is
+    /// already known to be UTF-8, so the lexer finds no invalid UTF-8.
+    fn string(&mut self) -> Result<String, Error> {
+        let (text, end) =
+            json_syntax::read_string(self.b, self.i).map_err(|error| self.string_error(error))?;
+        self.i = end;
+        Ok(text)
     }
 
-    /// A string starting at the opening quote, decoded. The input is
-    /// already known to be UTF-8, so bytes copied whole stay UTF-8.
-    fn string(&mut self) -> Result<String, Error> {
-        self.i += 1;
-        let mut out: Vec<u8> = Vec::new();
-        loop {
-            let at = self.i;
-            let Some(c) = self.peek() else {
-                return Err(Error::Syntax(at));
-            };
-            self.i += 1;
-            match c {
-                b'"' => break,
-                0..=0x1f => return Err(Error::Syntax(at)),
-                b'\\' => {
-                    let Some(e) = self.peek() else {
-                        return Err(Error::Syntax(self.i));
-                    };
-                    self.i += 1;
-                    let ch = match e {
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        b'/' => '/',
-                        b'b' => '\u{8}',
-                        b'f' => '\u{c}',
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let code = if (0xd800..0xdc00).contains(&hi) {
-                                if self.peek() != Some(b'\\')
-                                    || self.b.get(self.i + 1) != Some(&b'u')
-                                {
-                                    return Err(Error::Syntax(self.i));
-                                }
-                                self.i += 2;
-                                let lo = self.hex4()?;
-                                if !(0xdc00..0xe000).contains(&lo) {
-                                    return Err(Error::Syntax(self.i));
-                                }
-                                0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
-                            } else {
-                                hi
-                            };
-                            match char::from_u32(code) {
-                                Some(ch) => ch,
-                                None => return Err(Error::Syntax(self.i)),
-                            }
-                        }
-                        _ => return Err(Error::Syntax(self.i - 1)),
-                    };
-                    let mut buf = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    fn string_error(&self, error: json_syntax::Error) -> Error {
+        let offset = match error {
+            json_syntax::Error::InvalidUtf8(_) => return Error::Utf8,
+            json_syntax::Error::LoneSurrogate(at) => {
+                // The lexer points to the first backslash. Zabbix points
+                // past the escape, or past both when the second is not low.
+                let high = matches!(self.b[at + 3], b'8'..=b'9' | b'a' | b'A' | b'b' | b'B');
+                at + if high && self.b.get(at + 6..at + 8) == Some(b"\\u") {
+                    12
+                } else {
+                    6
                 }
-                c => out.push(c),
             }
-        }
-        String::from_utf8(out).map_err(|_| Error::Utf8)
+            json_syntax::Error::UnexpectedEnd(at) => {
+                // For a high surrogate followed only by a backslash, the
+                // lexer consumes that backslash. Zabbix leaves it unread.
+                let trailing_high = at
+                    .checked_sub(7)
+                    .filter(|&start| start > self.i)
+                    .is_some_and(|start| {
+                        let tail = &self.b[start..at];
+                        tail.starts_with(b"\\u")
+                            && matches!(tail[2], b'd' | b'D')
+                            && matches!(tail[3], b'8'..=b'9' | b'a' | b'A' | b'b' | b'B')
+                            && tail[6] == b'\\'
+                            && self.b[self.i + 1..start]
+                                .iter()
+                                .rev()
+                                .take_while(|&&c| c == b'\\')
+                                .count()
+                                % 2
+                                == 0
+                    });
+                at - usize::from(trailing_high)
+            }
+            _ => error.offset(),
+        };
+        Error::Syntax(offset)
     }
 }
 
@@ -1272,6 +1214,140 @@ mod tests {
         }
         for e in [Utf8, Syntax(3), TooDeep, NotObject, NoKind, TooLong] {
             assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn message_first_members_and_raw_text() {
+        for (json, kind) in [
+            (
+                r#" { "req\u0075est" : "sender\u0020data", "request":"later", "x":[{"response":"nested"}] } "#,
+                Kind::SenderData,
+            ),
+            (
+                r#"{"response":"first","response":"later","request":null,"request":"agent data"}"#,
+                Kind::Response("first".into()),
+            ),
+            (
+                r#"{"request":[],"request":"agent data","response":"first"}"#,
+                Kind::Response("first".into()),
+            ),
+            (
+                r#"{"response":{},"response":"later","request":"agent data"}"#,
+                Kind::AgentData,
+            ),
+            (
+                r#"{"request":"\ud800\udc00\uDBFF\uDFFF","x":"Café 日本 😀\/\b\f"}"#,
+                Kind::OtherRequest("\u{10000}\u{10ffff}".into()),
+            ),
+        ] {
+            let message = Message::parse(json.as_bytes()).unwrap();
+            assert_eq!(message.kind(), &kind);
+            assert_eq!(message.json(), json);
+            assert_eq!(message.to_bytes().unwrap(), json.as_bytes());
+            assert_eq!(Message::parse(&message.to_packet().data), Ok(message));
+        }
+        for json in [
+            r#"{"request":1,"request":"agent data"}"#,
+            r#"{"response":false,"response":"success"}"#,
+            r#"{"request":{},"request":"agent data","response":[],"response":"success"}"#,
+        ] {
+            assert_eq!(Message::parse(json.as_bytes()), Err(Error::NoKind));
+        }
+    }
+
+    #[test]
+    fn message_numbers_have_no_token_length_or_range_limit() {
+        for number in [
+            "1".repeat(513),
+            format!("-0.{}e+{}", "1".repeat(4096), "9".repeat(4096)),
+            "1e999999".into(),
+        ] {
+            let json = format!("{{\"request\":\"agent data\",\"value\":{number}}}");
+            let message = Message::parse(json.as_bytes()).unwrap();
+            assert_eq!(message.kind(), &Kind::AgentData);
+            assert_eq!(message.to_bytes().unwrap(), json.as_bytes());
+            let invalid = format!("{{\"request\":\"agent data\",\"value\":{number}x}}");
+            assert_eq!(
+                Message::parse(invalid.as_bytes()),
+                Err(Error::Syntax(invalid.len() - 2))
+            );
+        }
+    }
+
+    #[test]
+    fn message_lexical_error_offsets() {
+        for (token, offset) in [
+            (b"\"".as_slice(), 1),
+            (b"\"abc\\", 5),
+            (br#""\q""#, 2),
+            (br#""\u12g4""#, 5),
+            (br#""\ud800""#, 7),
+            (br#""\ud800\n""#, 7),
+            (br#""\ud800\"#, 7),
+            (br#""\ud800\u"#, 9),
+            (br#""\ud800\u0041""#, 13),
+            (br#""\ud800\udbff""#, 13),
+            (br#""\ud800\u12g4""#, 11),
+            (br#""\udc00""#, 7),
+            (br#""\udfff\udc00""#, 7),
+            (br#""\\ud800\"#, 9),
+            (br#""\\\ud800\"#, 9),
+            (br#""a\uD800\"#, 8),
+            (br#""\ud800\udc00\"#, 14),
+            (b"\"a\x01\"", 2),
+        ] {
+            for prefix in [
+                b"".as_slice(),
+                br#"{"request":"#,
+                br#"{"request":"x","nested":[{"#,
+            ] {
+                let mut input = prefix.to_vec();
+                input.extend_from_slice(token);
+                assert_eq!(
+                    Message::parse(&input),
+                    Err(Error::Syntax(prefix.len() + offset)),
+                    "{input:?}"
+                );
+            }
+        }
+        for (token, offset) in [
+            ("-", 1),
+            ("01", 1),
+            ("-01", 2),
+            ("1.", 2),
+            ("1.x", 2),
+            ("1e", 2),
+            ("1e+", 3),
+            ("1e-x", 3),
+            ("1x", 1),
+        ] {
+            let prefix = r#"{"request":"x","value":["#;
+            let input = format!("{prefix}{token}");
+            assert_eq!(
+                Message::parse(input.as_bytes()),
+                Err(Error::Syntax(prefix.len() + offset)),
+                "{input}"
+            );
+        }
+        for input in [b"\"\xff\\q".as_slice(), b"\"\xff\n", b"{\xff"] {
+            assert_eq!(Message::parse(input), Err(Error::Utf8));
+        }
+    }
+
+    #[test]
+    fn message_surrogate_pair_truncations() {
+        let token = br#""\ud800\udc00""#;
+        let prefix = br#"{"request":"#;
+        for end in 0..token.len() {
+            let mut input = prefix.to_vec();
+            input.extend_from_slice(&token[..end]);
+            let offset = if end == 8 { 7 } else { end };
+            assert_eq!(
+                Message::parse(&input),
+                Err(Error::Syntax(prefix.len() + offset)),
+                "{end} bytes"
+            );
         }
     }
 
