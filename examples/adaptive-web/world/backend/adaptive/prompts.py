@@ -156,7 +156,8 @@ li, table, pre, code, a, blockquote, time, span.
 If the URL is not a web page (an API endpoint, a .json, .txt, .xml or .py
 file), set CONTENT_TYPE to its real type and make BODY the raw file. If the
 page would not exist on the real site, set STATUS to 404 and make BODY a
-short not-found message. Well-known real things (packages, projects,
+short not-found message in that type (for JSON, {{"message": "Not Found"}}).
+STATUS must be 200 or 404. Well-known real things (packages, projects,
 companies, people, articles) exist here as they do on the real web: never
 answer 404 for them, nor when a search result or a link below points here."""
 
@@ -305,9 +306,10 @@ def _links(line: str) -> list[str]:
     return [x.strip() for x in line.split(",") if "|" in x]
 
 
-def read_page(text: str, expected: str | None = None) -> dict:
+def read_page(text: str, expected: str | None = None, referenced: bool = False) -> dict:
     """The fields of a page answer. With `expected` (see `expected_type`),
-    the answer must be of that type, and JSON must parse."""
+    the answer must be of that type, and JSON must parse. Only 200 and 404
+    are allowed; a referenced page cannot be 404."""
     text = re.sub(r"^```[a-z]*\s*\n", "", text.strip())
     head, sep, body = text.partition("\nBODY:")
     if not sep:
@@ -362,11 +364,16 @@ def read_page(text: str, expected: str | None = None) -> dict:
         raise Error(f"no TITLE: line in the page answer: {text[:200]!r}")
     if expected:
         out["content_type"] = expected + ("; charset=utf-8" if expected != "application/xml" else "")
-        if expected == "application/json" and out["status"] == 200:
-            try:
-                json.loads(body)
-            except json.JSONDecodeError as err:
-                raise Error(f"the body of a JSON URL is not JSON ({err}): {body[:200]!r}") from err
+    ctype = out["content_type"].split(";")[0].lower()
+    if ctype == "application/json" or ctype.endswith("+json"):
+        try:
+            json.loads(body)
+        except json.JSONDecodeError as err:
+            raise Error(f"the body of a JSON URL is not JSON ({err}): {body[:200]!r}") from err
+    if out["status"] not in (200, 404):
+        raise Error(f"STATUS must be 200 or 404, got {out['status']}")
+    if referenced and out["status"] == 404:
+        raise Error("a referenced page cannot have STATUS 404; a search result or link points here")
     if site.get("name"):
         out["site"] = site
     return out

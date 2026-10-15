@@ -103,6 +103,30 @@ class FirstWriterWins(unittest.TestCase):
 
 
 class Consistency(unittest.TestCase):
+    def test_rendering_preserves_generated_status_and_fields(self):
+        for status in (200, 404, 403, 410, 500):
+            for ctype, body in (("text/html", "<h1>Answer</h1>"),
+                                ("application/json", '{"message": "Answer"}'),
+                                ("text/plain", "Answer")):
+                for referenced in (False, True):
+                    with self.subTest(status=status, ctype=ctype, referenced=referenced), \
+                            tempfile.TemporaryDirectory() as d:
+                        w = world(Path(d))
+                        host, target = "example.com", "/answer"
+                        if referenced:
+                            w.store.add_mention(host, target, {"via": "search", "title": "Result title"})
+                        fields = {"status": status, "content_type": ctype, "title": "Generated title",
+                                  "body": body, "claims": [], "sidebar": [], "ad": ""}
+                        made = Made(dict(fields), "test", 0, raw=f"STATUS: {status}\nBODY:\n{body}")
+                        # Bypass the model parser to guard the rendering and storage paths themselves.
+                        with patch.object(w.generator, "page", return_value=made):
+                            response = w.page(host, target)
+                        self.assertEqual(response.status, status)
+                        self.assertEqual(w.store.page(host, target)["status"], status)
+                        self.assertEqual(made.fields, fields)
+                        logged = [json.loads(line) for line in (w.store.root / "generations.jsonl").read_text().splitlines()]
+                        self.assertEqual(logged[-1]["raw"], made.raw)
+
     def test_same_inputs_same_world(self):
         with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
             wa, wb = world(Path(a)), world(Path(b))
@@ -570,6 +594,8 @@ class FakeOpenRouter(BaseHTTPRequestHandler):
     keys: list[str] = []
     systems: list[str] = []
     bad_answers = 0  # how many unreadable answers to give first
+    page_answers: list[str] = []
+    page_prompts: list[str] = []
 
     def log_message(self, *args):
         pass
@@ -589,11 +615,14 @@ class FakeOpenRouter(BaseHTTPRequestHandler):
             text = "\n".join(f"RESULT\nURL: https://news{i}.krantvandaag.nl/a{i}\nTITLE: Story {i}\nDATE: Oct 1, 2026\n"
                              f"SNIPPET: Snippet number {i} about the flaw..." for i in range(10)) + "\nRELATED: r | s"
         else:
+            FakeOpenRouter.page_prompts.append(prompt)
             url = re.search(r"Write the page at: (\S+)", prompt).group(1)
             snippet = re.search(r'snippet "([^"]+?)(\.\.\.)?"', prompt)
-            text = (f"STATUS: 404\nCONTENT_TYPE: text/html\nTITLE: Some other title\nDESCRIPTION: d\nDATE: 2026-10-01\n"
+            text = (f"STATUS: 200\nCONTENT_TYPE: text/html\nTITLE: Some other title\nDESCRIPTION: d\nDATE: 2026-10-01\n"
                     f"CLAIMS:\n- a claim about {url}\nSITE_NAME: Krant Vandaag\nSITE_NAV: Home|/\nSITE_FOOTER: Over ons|/over\n"
                     f"SIDEBAR:\n- Andere zaak | /andere\nAD: none\nBODY:\n<h1>Story</h1><p>{snippet.group(1) if snippet else ''}</p>")
+            if FakeOpenRouter.page_answers:
+                text = FakeOpenRouter.page_answers.pop(0)
         reply = json.dumps({"model": ask["model"], "choices": [{"message": {"content": text}}],
                             "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "cost": 0.0021}}).encode()
         self.send_response(200)
@@ -608,6 +637,7 @@ class ModelGenerator(unittest.TestCase):
 
     def setUp(self):
         FakeOpenRouter.keys, FakeOpenRouter.systems, FakeOpenRouter.bad_answers = [], [], 0
+        FakeOpenRouter.page_answers, FakeOpenRouter.page_prompts = [], []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenRouter)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.old = (llm.OPENROUTER_URL, os.environ.get("OPENROUTER_API_KEY"))
@@ -655,6 +685,88 @@ class ModelGenerator(unittest.TestCase):
         with self.assertRaises(prompts.Error):
             gen.search("halvard", [], [], [])
 
+    def test_referenced_404_not_relabelled(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = World(SEED, Store(Path(d)), Model(SEED, llm.client("openrouter", "some/model")))
+            result = results(w.handle("GET", "www.google.com", "/search?q=halvard").body)[0]
+            host, target = target_of(result[0])
+            for path, body in ((target, "Page not found"), (target + ".json", '{"message": "Not Found"}'),
+                               (target + ".txt", "Page not found")):
+                with self.subTest(path=path):
+                    if path != target:
+                        w.store.add_mention(host, path, {"via": "link", "from": result[0], "anchor": "Details"})
+                    bad = f"STATUS: 404\nTITLE: Missing\nBODY:\n{body}"
+                    FakeOpenRouter.page_answers = [bad] * 4
+                    for _ in range(2):
+                        before = len(FakeOpenRouter.page_prompts)
+                        with self.assertRaisesRegex(prompts.Error, "referenced.*404"):
+                            w.handle("GET", host, path)
+                        self.assertEqual(len(FakeOpenRouter.page_prompts) - before, 2)
+                        self.assertIsNone(w.store.page(host, path))
+                        self.assertNotIn(f"https://{host}{path}", [p["url"] for p in w._known()])
+                    good_body = '{"message": "Details"}' if path.endswith(".json") else "Details"
+                    good = f"STATUS: 200\nTITLE: Details\nBODY:\n{good_body}"
+                    FakeOpenRouter.page_answers = [bad, good]
+                    before = len(FakeOpenRouter.page_prompts)
+                    response = w.handle("GET", host, path)
+                    self.assertEqual((response.status, response.meta["cache"]), (200, "generated"))
+                    self.assertAlmostEqual(response.meta["cost"], 0.0042)
+                    self.assertIn(b"Details", response.body)
+                    self.assertEqual(len(FakeOpenRouter.page_prompts) - before, 2)
+                    self.assertIn("referenced", FakeOpenRouter.page_prompts[-1])
+                    cached = w.handle("GET", host, path)
+                    self.assertEqual((cached.status, cached.meta["cache"], cached.body), (200, "cached", response.body))
+                    self.assertEqual(len(FakeOpenRouter.page_prompts) - before, 2)
+
+    def test_generated_error_not_200(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = World(SEED, Store(Path(d)), Model(SEED, llm.client("openrouter", "some/model")))
+            FakeOpenRouter.page_answers = ["STATUS: 500\nTITLE: Error\nBODY:\nGeneration failed"] * 2
+            with self.assertRaisesRegex(prompts.Error, "STATUS.*200 or 404"):
+                w.handle("GET", "example.com", "/error")
+            self.assertEqual(len(FakeOpenRouter.page_prompts), 2)
+            self.assertIsNone(w.store.page("example.com", "/error"))
+
+    def test_json_404_keeps_status_and_body(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = World(SEED, Store(Path(d)), Model(SEED, llm.client("openrouter", "some/model")))
+            body = '{"message": "Not Found"}'
+            raw = f"STATUS: 404\nTITLE: Missing\nBODY:\n{body}"
+            FakeOpenRouter.page_answers = [raw]
+            for cache in ("generated", "cached"):
+                response = w.page("example.com", "/missing.json")
+                self.assertEqual((response.status, response.meta["cache"]), (404, cache))
+                self.assertEqual(response.content_type, "application/json; charset=utf-8")
+                self.assertEqual(response.body.decode(), body)
+                self.assertEqual(json.loads(response.body), {"message": "Not Found"})
+            self.assertEqual(len(FakeOpenRouter.page_prompts), 1)
+            record = w.store.page("example.com", "/missing.json")
+            self.assertEqual((record["status"], record["body"]), (404, body))
+            logged = [json.loads(line) for line in (w.store.root / "generations.jsonl").read_text().splitlines()]
+            self.assertEqual(logged[-1]["raw"], raw)
+
+    def test_unreferenced_html_404_stays_not_found(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = World(SEED, Store(Path(d)), Model(SEED, llm.client("openrouter", "some/model")))
+            FakeOpenRouter.page_answers = ["STATUS: 404\nTITLE: Missing\nBODY:\nPage not found"]
+            for cache in ("generated", "cached"):
+                response = w.page("example.com", "/missing")
+                self.assertEqual((response.status, response.meta["cache"]), (404, cache))
+                self.assertIn(b"<h1>Page not found</h1>", response.body)
+            self.assertEqual(len(FakeOpenRouter.page_prompts), 1)
+
+    def test_malformed_json_is_not_cached(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = World(SEED, Store(Path(d)), Model(SEED, llm.client("openrouter", "some/model")))
+            for status in (201, 404):
+                with self.subTest(status=status):
+                    FakeOpenRouter.page_answers = [f"STATUS: {status}\nTITLE: x\nBODY:\nNot found"] * 2
+                    before = len(FakeOpenRouter.page_prompts)
+                    with self.assertRaisesRegex(prompts.Error, "not JSON"):
+                        w.handle("GET", "example.com", "/missing.json")
+                    self.assertEqual(len(FakeOpenRouter.page_prompts) - before, 2)
+                    self.assertIsNone(w.store.page("example.com", "/missing.json"))
+
     def test_a_missing_key_says_so(self):
         del os.environ["OPENROUTER_API_KEY"]
         with self.assertRaisesRegex(llm.Error, "OPENROUTER_API_KEY is not set"):
@@ -663,6 +775,37 @@ class ModelGenerator(unittest.TestCase):
 
 
 class Reading(unittest.TestCase):
+    def test_malformed_json_201(self):
+        with self.assertRaisesRegex(prompts.Error, "not JSON"):
+            prompts.read_page("STATUS: 201\nTITLE: x\nBODY:\nNot found", "application/json")
+
+    def test_malformed_json_404(self):
+        for body in ("Not found", "", "<h1>Missing</h1>"):
+            with self.subTest(body=body), self.assertRaisesRegex(prompts.Error, "not JSON"):
+                prompts.read_page(f"STATUS: 404\nTITLE: x\nBODY:\n{body}", "application/json")
+
+    def test_declared_json_must_parse(self):
+        for status in (200, 404):
+            for ctype in ("application/json", "application/problem+json"):
+                with self.subTest(status=status, ctype=ctype), self.assertRaisesRegex(prompts.Error, "not JSON"):
+                    prompts.read_page(f"STATUS: {status}\nCONTENT_TYPE: {ctype}\nTITLE: x\nBODY:\nNot found")
+
+    def test_json_404_is_valid(self):
+        page = prompts.read_page('STATUS: 404\nTITLE: x\nBODY:\n{"message": "Not Found"}', "application/json")
+        self.assertEqual(page["status"], 404)
+        self.assertEqual(json.loads(page["body"]), {"message": "Not Found"})
+
+    def test_referenced_404_is_rejected_for_every_type(self):
+        for expected, body in ((None, "Page not found"), ("application/json", '{"message": "Not Found"}'),
+                               ("text/plain", "Page not found"), ("application/xml", "<error>Not Found</error>")):
+            with self.subTest(expected=expected), self.assertRaisesRegex(prompts.Error, "referenced.*404"):
+                prompts.read_page(f"STATUS: 404\nTITLE: x\nBODY:\n{body}", expected, referenced=True)
+
+    def test_unsupported_status_is_rejected(self):
+        for status in (100, 101, 201, 204, 301, 304, 403, 410, 500):
+            with self.subTest(status=status), self.assertRaisesRegex(prompts.Error, "STATUS.*200 or 404"):
+                prompts.read_page(f'STATUS: {status}\nTITLE: x\nBODY:\n{{"message": "x"}}', "application/json")
+
     def test_page_answer(self):
         text = """STATUS: 200
 CONTENT_TYPE: text/html

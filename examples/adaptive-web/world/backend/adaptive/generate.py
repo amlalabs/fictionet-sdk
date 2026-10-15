@@ -57,8 +57,9 @@ class Model:
 
     def _ask(self, system: str, user: str, max_tokens: int, read) -> Made:
         """One call, read with `read`. An answer that cannot be read is asked
-        for once more, and the second failure is raised. The tokens, cost
-        and time of both calls are counted."""
+        for once more, with the reason added to the prompt, and the second
+        failure is raised. The tokens, cost and time of both calls are
+        counted."""
         spent = []
         while True:
             c = self.client.complete(system, user, max_tokens)
@@ -66,9 +67,10 @@ class Model:
             try:
                 fields = read(c.text)
                 break
-            except prompts.Error:
+            except prompts.Error as err:
                 if len(spent) == 2:
                     raise
+                user += f"\n\nThe previous answer could not be read: {err}\nAnswer again in the requested format."
         return Made(fields, c.model, sum(x.ms for x in spent), _total(x.input_tokens for x in spent),
                     _total(x.output_tokens for x in spent), _total(x.cost for x in spent), c.text, c.cut_off)
 
@@ -84,7 +86,8 @@ class Model:
         system, user = prompts.page(self.seed, ask.cast, ask.url, ask.mentions, ask.profile, ask.host_pages,
                                     ask.claims)
         expected = prompts.expected_type(ask.url)
-        return self._ask(system, user, PAGE_TOKENS, lambda text: prompts.read_page(text, expected))
+        return self._ask(system, user, PAGE_TOKENS,
+                         lambda text: prompts.read_page(text, expected, referenced=bool(ask.mentions)))
 
 
 def _total(values) -> float | None:

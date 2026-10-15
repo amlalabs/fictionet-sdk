@@ -301,7 +301,7 @@ class World:
         ask = PageAsk(url, host, target, mentions, self.store.site(host), self.store.pages(host)[:20],
                       self.store.recent_claims(), self.cast())
         made: Made = self.generator.page(ask)
-        page = made.fields
+        page = dict(made.fields)
         profile = ask.profile or self.store.site_once(host, page.get("site") or stub.site_profile(host))
         titles = [m["title"] for m in mentions if m.get("title")]
         if titles:
@@ -312,8 +312,6 @@ class World:
         elif page["status"] == 404 and not mentions:
             body = render.not_found(host, profile, target, self.year)
         else:
-            # A page something pointed at exists, whatever the model said.
-            page["status"] = 200
             body = render.page(host, profile, page, self.year)
         self.store.log_generation({"kind": "page", "url": url, **made.usage(), "raw": made.raw})
         if prefetch:

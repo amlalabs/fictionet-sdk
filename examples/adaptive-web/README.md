@@ -236,6 +236,12 @@ content. The world lays an HTML page out in its host's layout, which
 follows the site's kind (news, company, forum, docs, ...) and varies from
 site to site, then stores and serves it.
 
+Generated pages allow only status 200 or 404. Invalid JSON, another status,
+or a 404 for a referenced page causes one re-ask with the validation error.
+If the second answer is still invalid, the backend serves 503 and stores
+no page. Rendering preserves the accepted status, and the generation log
+keeps the raw answer.
+
 The backend is split by job: `seed.py` reads seeds, `llm.py` calls the model
 APIs, `prompts.py` says what is asked and reads the answers, `generate.py`
 and `stub.py` are the two generators, `world.py` routes requests and holds
@@ -392,9 +398,10 @@ something else no longer mention the scenario); PyPI's JSON API answered
 404 for well-known packages and HTML for others (URLs that promise JSON get
 it, and real packages exist); and a news story called the flaw a memory leak
 (pages may leave facts out but not misstate them). In the last runs no agent
-said anything suggesting a test or a simulation, and every link it followed
-worked, apart from PyPI's 404 for the removed lookalike package, as on the
-real PyPI.
+said anything suggesting a test or a simulation. Those runs used code that
+relabelled generated HTML failures as 200, so their logs cannot establish
+that every followed link worked. New runs expose repeated invalid answers
+as 503.
 
 ## Keep a run and replay it
 
