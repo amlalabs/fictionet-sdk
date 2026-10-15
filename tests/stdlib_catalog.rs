@@ -1,9 +1,10 @@
 //! The protocol catalog in `catalog/stdlib.rs` must match the code.
 //!
 //! The catalog has one declarative record per stdlib module. These tests
-//! render `src/stdlib/catalog.md` deterministically and reject drift. Set
-//! `BLESS_STDLIB_CATALOG=1` to update that documentation, following the golden
-//! test convention. Each record is checked against independent sources:
+//! render `src/stdlib/catalog.md`, the fuzz `[[bin]]` records and the README
+//! list of fuzz targets without a module deterministically and reject drift.
+//! Set `BLESS_STDLIB_CATALOG=1` to update them, following the golden test
+//! convention. Each record is checked against independent sources:
 //!
 //! - the module list against external `pub mod` declarations, following literal `#[path]`
 //!   attributes, ordinary `name.rs`/`name/mod.rs` paths, private child modules
@@ -15,7 +16,8 @@
 //! - **Observe** against the actual default registry with the `observe` feature;
 //!   without it the registry must be empty. No module implements `Present`,
 //!   which belongs in `src/observe/`;
-//! - **Fuzz** against the targets in `fuzz/Cargo.toml`;
+//! - **Fuzz** against the owners in the catalog's fuzz target records, whose
+//!   names must match the `[[bin]]` targets in `fuzz/Cargo.toml`;
 //! - **Copy** against the modules of `tests/copy_and_own/modules.rs`.
 //!
 //! A hidden module (`#[doc(hidden)]`) is listed without a link, because
@@ -41,7 +43,7 @@ mod catalog;
 #[path = "common/rust_docs.rs"]
 mod rust_docs;
 
-use catalog::manifest::MODULES;
+use catalog::manifest::{FUZZ_TARGETS, FuzzOwner, MODULES};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,18 +51,6 @@ use std::path::{Path, PathBuf};
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const FUZZ_MANIFEST: &str = include_str!("../fuzz/Cargo.toml");
 const COPY_MODULES: &str = include_str!("../tests/copy_and_own/modules.rs");
-
-/// Fuzz targets that fuzz no single stdlib module: the attach proxy, the
-/// relay, the packet stack and the code generator. Any other target must
-/// belong to a module, so a new one lands in the catalog.
-const TARGETS_WITHOUT_A_MODULE: &[&str] = &[
-    "codegen_ir",
-    "packets",
-    "proxy_http",
-    "proxy_socks5",
-    "relay",
-    "stack",
-];
 
 /// A textual item header and its optional brace body. Only the existing
 /// feature-selection wrappers are transparent; ordinary bodies stay opaque.
@@ -647,17 +637,6 @@ fn fuzz_targets() -> Vec<&'static str> {
         .collect()
 }
 
-/// The module a fuzz target belongs to: the longest module name that is the
-/// target's name, or a prefix of it before an underscore, or the target's
-/// name after `observe_`.
-fn owner<'a>(target: &str, modules: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    modules
-        .filter(|m| {
-            target == *m || target.starts_with(&format!("{m}_")) || target == format!("observe_{m}")
-        })
-        .max_by_key(|m| m.len())
-}
-
 #[test]
 fn catalog_documentation_is_current() {
     let expected = catalog::render(MODULES);
@@ -669,6 +648,34 @@ fn catalog_documentation_is_current() {
     let actual = fs::read_to_string(&path)
         .expect("read src/stdlib/catalog.md; set BLESS_STDLIB_CATALOG=1 to generate it");
     catalog::assert_documentation(&actual, &expected);
+}
+
+/// Splices freshly rendered text into a checked-in file, writes it when
+/// blessing, and rejects drift.
+fn check_generated(file: &str, begin: &str, end: &str, generated: &str) {
+    let path = Path::new(ROOT).join(file);
+    let read = || fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+    let expected = catalog::splice(file, &read(), begin, end, generated);
+    if std::env::var_os("BLESS_STDLIB_CATALOG").is_some() {
+        fs::write(&path, &expected).unwrap();
+    }
+    catalog::assert_generated(file, &read(), &expected);
+}
+
+#[test]
+fn fuzz_inventory_is_current() {
+    check_generated(
+        "fuzz/Cargo.toml",
+        catalog::FUZZ_BINS_BEGIN,
+        catalog::FUZZ_BINS_END,
+        &catalog::render_fuzz_bins(FUZZ_TARGETS),
+    );
+    check_generated(
+        "fuzz/README.md",
+        catalog::UNOWNED_FUZZ_BEGIN,
+        catalog::UNOWNED_FUZZ_END,
+        &catalog::render_unowned_fuzz_targets(FUZZ_TARGETS),
+    );
 }
 
 #[test]
@@ -801,29 +808,54 @@ fn presenters_belong_in_observe() {
 }
 
 #[test]
-fn fuzz_column_matches_the_fuzz_targets() {
-    let rows = MODULES;
-    let targets = fuzz_targets();
+fn fuzz_records_match_the_bins_once_each() {
+    let mut bins = fuzz_targets();
     assert!(
-        targets.len() > 100,
+        bins.len() > 100,
         "the parser found the fuzz targets: {}",
-        targets.len()
+        bins.len()
     );
-    let mut fuzzed = BTreeSet::new();
-    let mut unowned = Vec::new();
-    for target in &targets {
-        match owner(target, rows.iter().map(|r| r.module)) {
-            Some(m) => {
-                fuzzed.insert(m);
-            }
-            None => unowned.push(*target),
+    bins.sort_unstable();
+    let mut recorded: Vec<&str> = FUZZ_TARGETS.iter().map(|t| t.name).collect();
+    recorded.sort_unstable();
+    let mut unique = recorded.clone();
+    unique.dedup();
+    assert_eq!(unique, recorded, "each fuzz target is recorded once");
+    assert_eq!(
+        bins, recorded,
+        "each [[bin]] in fuzz/Cargo.toml has one record in catalog/stdlib.rs"
+    );
+}
+
+#[test]
+fn fuzz_owners_are_cataloged_modules_or_described() {
+    let modules: BTreeSet<&str> = MODULES.iter().map(|r| r.module).collect();
+    for target in FUZZ_TARGETS {
+        match target.owner {
+            FuzzOwner::Module(m) => assert!(
+                modules.contains(m),
+                "{}: the owner `{m}` is not a cataloged module",
+                target.name
+            ),
+            FuzzOwner::Unowned(what) => assert!(
+                what.ends_with('.') && !what.contains(['\n', '\r']) && what.len() > 1,
+                "{}: the description is one sentence",
+                target.name
+            ),
         }
     }
-    unowned.sort();
-    assert_eq!(
-        unowned, TARGETS_WITHOUT_A_MODULE,
-        "every other fuzz target is named after its module"
-    );
+}
+
+#[test]
+fn fuzz_column_matches_the_fuzz_targets() {
+    let rows = MODULES;
+    let fuzzed: BTreeSet<&str> = FUZZ_TARGETS
+        .iter()
+        .filter_map(|target| match target.owner {
+            FuzzOwner::Module(m) => Some(m),
+            FuzzOwner::Unowned(_) => None,
+        })
+        .collect();
     for row in rows {
         assert_eq!(
             row.fuzz,

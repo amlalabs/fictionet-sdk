@@ -176,9 +176,11 @@
 //!    without adding a front-page paragraph.
 //! 3. Add a `#[path]` entry to `tests/copy_and_own/modules.rs`. This checks
 //!    that the source compiles in a consumer crate using public APIs.
-//! 4. Add `fuzz/fuzz_targets/<name>.rs`, its `[[bin]]` entry in
-//!    `fuzz/Cargo.toml`, and `fuzz/corpus/<name>/` with seed inputs.
-//!    `fuzz/check-targets.sh` checks the source, bin and corpus inventory.
+//! 4. Add `fuzz/fuzz_targets/<name>.rs`, a fuzz target record naming the
+//!    module in `catalog/stdlib.rs`, and `fuzz/corpus/<name>/` with seed
+//!    inputs. The bless command above writes its `[[bin]]` entry in
+//!    `fuzz/Cargo.toml`. `fuzz/check-targets.sh` checks the source, bin and
+//!    corpus inventory.
 //!
 //! A service and a presenter are optional additions. A service owns replies,
 //! connection state and events; install it on a [`net::Host`] port. A capture

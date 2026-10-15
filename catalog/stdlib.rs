@@ -2,7 +2,9 @@
 //!
 //! `tests/stdlib_catalog.rs` checks these claims against independent source
 //! inventories. Set `BLESS_STDLIB_CATALOG=1` when running that test to update
-//! `src/stdlib/catalog.md`. Module, copy and fuzz declarations remain handwritten.
+//! `src/stdlib/catalog.md`, the `[[bin]]` records in `fuzz/Cargo.toml` and the
+//! list of fuzz targets without a module in `fuzz/README.md`. Module and copy
+//! declarations and fuzz target sources remain handwritten.
 
 /// One public stdlib module and its documented capabilities.
 #[derive(Clone, Copy, Debug)]
@@ -23,7 +25,7 @@ pub struct Module {
     pub service: &'static [&'static str],
     /// The default observe registry includes this module's protocol.
     pub observe: bool,
-    /// At least one fuzz target belongs to this module.
+    /// At least one record in [`FUZZ_TARGETS`] names this module as its owner.
     pub fuzz: bool,
     /// The copy-and-own fixture compiles this module's implementation.
     pub copy: bool,
@@ -320,4 +322,187 @@ catalog! {
         wire: true, decode: true, fuzz: true, copy: true;
     zabbix: "The Zabbix protocol: packets and the JSON messages of agents, senders and servers.";
         wire: true, decode: true, fuzz: true, copy: true;
+}
+
+/// The owner of a fuzz target.
+#[derive(Clone, Copy, Debug)]
+pub enum FuzzOwner {
+    /// The public stdlib module the target fuzzes.
+    Module(&'static str),
+    /// The target fuzzes no single stdlib module. The text says what it
+    /// checks, as a sentence without its subject, for `fuzz/README.md`.
+    Unowned(&'static str),
+}
+
+/// One cargo-fuzz target: a `[[bin]]` in `fuzz/Cargo.toml` built from
+/// `fuzz/fuzz_targets/<name>.rs`.
+#[derive(Clone, Copy, Debug)]
+pub struct FuzzTarget {
+    /// The binary name, which is also the source file stem.
+    pub name: &'static str,
+    /// The module the target belongs to, or what it checks if none.
+    pub owner: FuzzOwner,
+}
+
+// `target: module;` names the owning stdlib module. `target: "checks ...";`
+// describes a target that fuzzes no single stdlib module.
+macro_rules! fuzz_owner {
+    ($module:ident) => {
+        FuzzOwner::Module(stringify!($module))
+    };
+    ($what:literal) => {
+        FuzzOwner::Unowned($what)
+    };
+}
+
+macro_rules! fuzz_targets {
+    ($($name:ident: $owner:tt;)*) => {
+        /// Every fuzz target, in `fuzz/Cargo.toml` order. Add new targets at the
+        /// end. The `[[bin]]` records and the README list of targets without a
+        /// module are generated from these records.
+        pub const FUZZ_TARGETS: &[FuzzTarget] = &[
+            $(FuzzTarget {
+                name: stringify!($name),
+                owner: fuzz_owner!($owner),
+            },)*
+        ];
+    };
+}
+
+fuzz_targets! {
+    codec_tools: codec;
+    json_schema: json_schema;
+    sse_lines: sse;
+    sse_events: sse;
+    sbe: sbe;
+    relay: "checks relay message decoding and encoding.";
+    tcp_reassembly: tcp_reassembly;
+    packets: "checks IP protocol sorting, ICMP echo replies and DHCP messages.";
+    ip_reassembly: ip;
+    dns: dns;
+    proxy_http: "checks HTTP proxy request heads, authentication and response heads.";
+    proxy_socks5: "checks SOCKS5 greetings, authentication and requests across chunk boundaries.";
+    tls: tls;
+    stack: "feeds IPv4 and IPv6 packets to TCP, UDP and ICMP endpoints.";
+    tcp: tcp;
+    web: web;
+    web_http: web;
+    modbus: modbus;
+    mqtt: mqtt;
+    ntp: ntp;
+    resp: resp;
+    tftp: tftp;
+    websocket: websocket;
+    syslog: syslog;
+    snmp: snmp;
+    postgres: postgres;
+    stun: stun;
+    bacnet: bacnet;
+    asn1: asn1;
+    ssh: ssh;
+    dhcpv6: dhcpv6;
+    netbios: netbios;
+    nbns: nbns;
+    mysql: mysql;
+    ftp: ftp;
+    imap: imap;
+    protobuf: protobuf;
+    quic: quic;
+    grpc: grpc;
+    mime_multipart: mime_multipart;
+    json: json;
+    urlencoded_form: urlencoded_form;
+    xml: xml;
+    imf: imf;
+    onc_rpc: onc_rpc;
+    sip: sip;
+    sdp: sdp;
+    rtp: rtp;
+    mongodb: mongodb;
+    kafka: kafka;
+    proxy_protocol: proxy_protocol;
+    amqp: amqp;
+    enip: enip;
+    opcua: opcua;
+    rfb: rfb;
+    git_protocol: git_protocol;
+    telnet: telnet;
+    memcache: memcache;
+    fastcgi: fastcgi;
+    nfs: nfs;
+    qpack: qpack;
+    sftp: sftp;
+    socks: socks;
+    rtsp: rtsp;
+    cotp: cotp;
+    vxlan: vxlan;
+    geneve: geneve;
+    ldap: ldap;
+    x509: x509;
+    ocsp: ocsp;
+    kerberos: kerberos;
+    spnego: spnego;
+    bgp: bgp;
+    tds: tds;
+    thrift: thrift;
+    ipp: ipp;
+    zabbix: zabbix;
+    l2tp: l2tp;
+    gre: gre;
+    igmp: igmp;
+    coap: coap;
+    pop3: pop3;
+    nbss: nbss;
+    nbdgm: nbdgm;
+    vrrp: vrrp;
+    pcp: pcp;
+    dtls: dtls;
+    wireguard: wireguard;
+    radius: radius;
+    diameter: diameter;
+    ike: ike;
+    ipsec: ipsec;
+    openvpn: openvpn;
+    ospf: ospf;
+    rip: rip;
+    pim: pim;
+    smb2: smb2;
+    ntlmssp: ntlmssp;
+    dcerpc: dcerpc;
+    tpkt: tpkt;
+    whois: whois;
+    rtcp: rtcp;
+    portmap: portmap;
+    wake_on_lan: wake_on_lan;
+    smtp: smtp;
+    dnp3: dnp3;
+    iec104: iec104;
+    http3: http3;
+    rdp: rdp;
+    hpack: hpack;
+    soupbintcp: soupbintcp;
+    observe_modbus: modbus;
+    huffman: huffman;
+    observe_dns: dns;
+    observe_dhcp: dhcp;
+    observe_http1: http1;
+    observe_tls: tls;
+    http1_request_events: http1;
+    http2: http2;
+    http1_response_events: http1;
+    jsonrpc_lines: jsonrpc;
+    http1_requests: http1;
+    jsonrpc_body: jsonrpc;
+    http1_responses: http1;
+    codegen_ir: "checks generated recursive values and stream frames.";
+    serve_http1: serve;
+    fix: fix;
+    observe_http2: http2;
+    fast: fast;
+    cme_mdp3: cme_mdp3;
+    moldudp64: moldudp64;
+    itch: itch;
+    ouch: ouch;
+    cboe_pitch: cboe_pitch;
+    cboe_boe: cboe_boe;
 }

@@ -178,7 +178,8 @@ A new module is registered in three places, and a test holds each to the code:
   (`tests/stdlib_catalog.rs` checks every column). Regenerate the table in
   `src/stdlib/catalog.md` with
   `BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`;
-- a fuzz target in `fuzz/fuzz_targets/`, named after the module, with a
+- a fuzz target in `fuzz/fuzz_targets/`, with a record in `catalog/stdlib.rs`
+  that names the module as its owner. The same bless command writes its
   `[[bin]]` entry in `fuzz/Cargo.toml`;
 - a `#[path]` entry in `tests/copy_and_own/modules.rs`, which compiles the file
   as a module of a separate crate.
