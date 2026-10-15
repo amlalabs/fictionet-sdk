@@ -2127,20 +2127,36 @@ mod tests {
         assert!(RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nno colon\r\n").is_err());
         assert!(ResponseHead::parse_lenient(b"SSH-2.0-OpenSSH\r\n").is_err());
         assert!(ResponseHead::parse_lenient(b"SSH").is_err());
-        for partial in [
-            &b""[..],
-            b"\r",
-            b"\r\n",
-            b"HTT",
-            b"HTTP/1.1 200 OK\r\nX: y",
-            b"GET / HT",
-        ] {
-            assert_eq!(ResponseHead::parse_lenient(partial).ok().flatten(), None);
-            assert!(
-                partial.starts_with(b"HTTP")
-                    || RequestHead::parse_lenient(partial).is_ok_and(|h| h.is_none())
+    }
+
+    #[test]
+    fn valid_response_prefix_is_not_error() {
+        for partial in [&b""[..], b"\r", b"\r\n", b"HTT", b"HTTP/1.1 200 OK\r\nX: y"] {
+            assert_eq!(
+                ResponseHead::parse_lenient(partial),
+                Ok(None),
+                "{partial:?}"
             );
         }
+    }
+
+    #[test]
+    fn valid_request_prefix_is_not_error() {
+        for partial in [&b""[..], b"\r", b"\r\n", b"HTT", b"GET / HT"] {
+            assert_eq!(RequestHead::parse_lenient(partial), Ok(None), "{partial:?}");
+        }
+    }
+
+    #[test]
+    fn wrong_protocol_prefix_rejected() {
+        assert_eq!(
+            ResponseHead::parse_lenient(b"GET / HT"),
+            Err(Error::StartLine)
+        );
+        assert_eq!(
+            RequestHead::parse_lenient(b"HTTP/1.1 200 OK\r\nX: y"),
+            Err(Error::Version)
+        );
     }
 
     fn small() -> Limits {

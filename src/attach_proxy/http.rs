@@ -549,6 +549,8 @@ mod tests {
             (a.head.as_slice(), a.status, a.interim),
             (&b"HTTP/1.1 100 Continue\r\n\r\n"[..], 100, true)
         );
+        assert_eq!(rewrite_response(b""), Ok(None));
+        assert_eq!(rewrite_response(b"HTT"), Ok(None));
         assert_eq!(rewrite_response(b"HTTP/1.1 200 OK\r\nContent-"), Ok(None));
         assert!(rewrite_response(b"garbage\r\n\r\n").is_err());
         // The door relays what the client would take: framing it would
