@@ -1635,7 +1635,7 @@ mod tests {
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish as finish_stream, pump};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{assert_linear, chunks, decode_all, mutate};
 
     fn ap_rep_fixture(enc_part: EncryptedData) -> ApRep {
         ApRep { enc_part }
@@ -2304,26 +2304,53 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_messages_in_linear_time() {
-        let one = Frame(
-            Message::ApRep(ap_rep_fixture(enc(18, None, &[])))
-                .to_bytes()
-                .unwrap(),
-        )
-        .to_bytes()
-        .unwrap();
-        let count = rounds(100_000);
-        let stream: Vec<u8> = one
-            .iter()
-            .copied()
-            .cycle()
-            .take(one.len() * count)
-            .collect();
-        let mut d = Stream::new(Frames::<Frame>::new());
-        let mut n = 0;
-        pump(&mut d, &stream, |_| n += 1).unwrap();
-        finish_stream(&mut d, |_| n += 1).unwrap();
-        assert_eq!(n, count);
-        assert_eq!(d.buffered(), 0);
+        assert_linear(
+            "decoder_takes_many_small_messages_in_linear_time",
+            rounds(25_000),
+            |size| {
+                let body = Message::ApRep(ap_rep_fixture(enc(18, None, &[])))
+                    .to_bytes()
+                    .unwrap();
+                let one = Frame(body.clone()).to_bytes().unwrap();
+                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+                let mut d = Stream::new(Frames::<Frame>::new());
+                let mut n = 0;
+                let mut check = |item| {
+                    assert_eq!(item, body);
+                    n += 1;
+                };
+                pump(&mut d, &stream, &mut check).unwrap();
+                finish_stream(&mut d, check).unwrap();
+                assert_eq!(n, size);
+                assert_eq!(d.buffered(), 0);
+            },
+        );
+    }
+
+    #[test]
+    fn decoder_takes_one_byte_fragments_in_linear_time() {
+        assert_linear(
+            "decoder_takes_one_byte_fragments_in_linear_time",
+            MAX_MESSAGE / 8,
+            |size| {
+                let body = Message::ApRep(ap_rep_fixture(enc(18, None, &vec![0x5a; size])))
+                    .to_bytes()
+                    .unwrap();
+                let stream = Frame(body.clone()).to_bytes().unwrap();
+                let mut d = Stream::new(Frames::<Frame>::new());
+                let mut n = 0;
+                let mut check = |item| {
+                    assert_eq!(item, body);
+                    n += 1;
+                };
+                for part in chunks(&stream, &[1]) {
+                    pump(&mut d, part, &mut check).unwrap();
+                }
+                finish_stream(&mut d, check).unwrap();
+                assert_eq!(n, 1);
+                assert_eq!(d.buffered(), 0);
+            },
+        );
     }
 
     #[test]

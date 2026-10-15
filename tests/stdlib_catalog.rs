@@ -268,11 +268,6 @@ fn linearity_names_require_measurement() {
             "RH-044 / T11-72",
         ),
         (
-            "kerberos.rs",
-            "decoder_takes_many_small_messages_in_linear_time",
-            "RH-045 / T11-70",
-        ),
-        (
             "onc_rpc.rs",
             "many_small_records_take_linear_time",
             "RH-057 / T11-77",
