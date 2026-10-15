@@ -1,10 +1,12 @@
-use super::{Shared, World, udp_packet};
+use super::udp_packet;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::dhcp::{self, opt};
 use fictionet::stdlib::route::Prefix;
+use fictionet::sync::Mutex;
 use fictionet::{Error, Packet};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 /// How long a DHCP lease lasts. The binding itself lasts until the sandbox
 /// detaches; the lease time only tells the client when to renew.
@@ -158,8 +160,29 @@ pub(super) fn may_serve_v6(a: Ipv6Addr, subnet: &Subnet6) -> bool {
         || a.to_ipv4_mapped().is_some())
 }
 
-impl World {
-    pub(super) fn free_auto(&mut self, subnet: &Subnet) -> Option<Ipv4Addr> {
+/// Automatic host address cursors. Occupied addresses come from installation.
+pub(super) struct Allocator {
+    pub(super) next_auto: u32,
+    pub(super) next_auto6: u128,
+    pub(super) auto_full: bool,
+}
+
+impl Default for Allocator {
+    fn default() -> Self {
+        Self {
+            next_auto: 1,
+            next_auto6: 1,
+            auto_full: false,
+        }
+    }
+}
+
+impl Allocator {
+    pub(super) fn free_auto<T>(
+        &mut self,
+        subnet: &Subnet,
+        occupied: &BTreeMap<IpAddr, T>,
+    ) -> Option<Ipv4Addr> {
         if self.auto_full {
             return None;
         }
@@ -177,7 +200,7 @@ impl World {
             else {
                 unreachable!("the IPv4 pool contains IPv4 addresses")
             };
-            if !subnet.contains(a) && !self.machines.contains_key(&a.into()) {
+            if !subnet.contains(a) && !occupied.contains_key(&a.into()) {
                 return Some(a);
             }
         }
@@ -185,12 +208,16 @@ impl World {
         None
     }
 
-    pub(super) fn free_auto6(&mut self, subnet: &Subnet6) -> Option<Ipv6Addr> {
+    pub(super) fn free_auto6<T>(
+        &mut self,
+        subnet: &Subnet6,
+        occupied: &BTreeMap<IpAddr, T>,
+    ) -> Option<Ipv6Addr> {
         let size = AUTO6.size().expect("the IPv6 pool has a finite size");
         if subnet.prefix.len <= AUTO6.len && subnet.prefix.overlaps(AUTO6) {
             return None;
         }
-        for _ in 0..self.machines.len() + 4 {
+        for _ in 0..occupied.len() + 4 {
             let n = self.next_auto6;
             self.next_auto6 = (self.next_auto6 + 1) % size;
             if n == 0 {
@@ -206,7 +233,7 @@ impl World {
                 self.next_auto6 = (n + (u128::from(last) - u128::from(a)) + 1) % size;
                 continue;
             }
-            if !self.machines.contains_key(&a.into()) {
+            if !occupied.contains_key(&a.into()) {
                 return Some(a);
             }
         }
@@ -223,17 +250,17 @@ pub(super) struct Leases {
     by_addr: HashMap<Ipv4Addr, (u64, bool)>,
     by_owner: HashMap<u64, Ipv4Addr>,
     by_addr6: HashMap<Ipv6Addr, u64>,
-    pub(super) by_owner6: HashMap<u64, Ipv6Addr>,
+    by_owner6: HashMap<u64, Ipv6Addr>,
     next_owner: u64,
 }
 
 impl Leases {
-    pub(super) fn new_owner(&mut self) -> u64 {
+    fn new_owner(&mut self) -> u64 {
         self.next_owner += 1;
         self.next_owner
     }
 
-    pub(super) fn of(&self, owner: u64) -> Option<(Ipv4Addr, bool)> {
+    fn of(&self, owner: u64) -> Option<(Ipv4Addr, bool)> {
         let a = *self.by_owner.get(&owner)?;
         Some((a, self.by_addr[&a].1))
     }
@@ -254,7 +281,7 @@ impl Leases {
         }
     }
 
-    pub(super) fn release_all(&mut self, owner: u64) {
+    fn release_all(&mut self, owner: u64) {
         self.release(owner);
         if let Some(a) = self.by_owner6.remove(&owner) {
             self.by_addr6.remove(&a);
@@ -269,7 +296,43 @@ pub(super) enum Bind {
     Refused,
 }
 
-impl Shared {
+/// Sandbox address ownership and DHCP, independent of host installation.
+#[derive(Clone)]
+pub(super) struct Bindings {
+    pub(super) subnet: Subnet,
+    pub(super) subnet6: Option<Subnet6>,
+    leases: Arc<Mutex<Leases>>,
+}
+
+impl Bindings {
+    pub(super) fn new(
+        subnet: Subnet,
+        subnet6: Option<Subnet6>,
+        leases: Arc<Mutex<Leases>>,
+    ) -> Self {
+        Self {
+            subnet,
+            subnet6,
+            leases,
+        }
+    }
+
+    pub(super) fn new_owner(&self) -> u64 {
+        self.leases.lock().new_owner()
+    }
+
+    pub(super) fn bound(&self, owner: u64) -> Placed {
+        let leases = self.leases.lock();
+        Placed {
+            v4: leases.of(owner).and_then(|(a, bound)| bound.then_some(a)),
+            v6: leases.by_owner6.get(&owner).copied(),
+        }
+    }
+
+    pub(super) fn release(&self, owner: u64) {
+        self.leases.lock().release_all(owner);
+    }
+
     fn offer(&self, owner: u64, requested: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
         let mut leases = self.leases.lock();
         let mine = leases.of(owner);
@@ -425,9 +488,9 @@ mod tests {
                 subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
                 subnet6: Some(Subnet6::new("2001:db8::/64".parse().unwrap()).unwrap()),
                 router: route::router(&fcx, Vec::new()),
-                world: Mutex::new(World::new(MAX_HOSTS)),
-                leases: Mutex::default(),
-                gateway_tcp: Mutex::default(),
+                world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                leases: Arc::default(),
+                gateway_tcp: Arc::default(),
                 hooks: Arc::new(Hooks {
                     by_addr: Mutex::default(),
                     conns: AtomicU64::new(0),
@@ -445,8 +508,8 @@ mod tests {
                 assert!(world.machines.is_empty());
                 assert!(world.names.is_empty());
                 assert_eq!(world.resolved, 0);
-                assert_eq!((world.next_auto, world.next_auto6), (1, 1));
-                assert!(!world.auto_full);
+                assert_eq!((world.addresses.next_auto, world.addresses.next_auto6), (1, 1));
+                assert!(!world.addresses.auto_full);
             }
             let Lookup::Host(placed) = shared.lookup("good.test") else {
                 panic!("a valid host fits after rejected hosts");
@@ -467,9 +530,9 @@ mod tests {
                 subnet: Subnet::new("198.18.0.0/15".parse().unwrap()).unwrap(),
                 subnet6: None,
                 router: route::router(&fcx, Vec::new()),
-                world: Mutex::new(World::new(MAX_HOSTS)),
-                leases: Mutex::default(),
-                gateway_tcp: Mutex::default(),
+                world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                leases: Arc::default(),
+                gateway_tcp: Arc::default(),
                 hooks: Arc::new(Hooks {
                     by_addr: Mutex::default(),
                     conns: AtomicU64::new(0),
@@ -484,11 +547,11 @@ mod tests {
             for name in ["first.test", "second.test"] {
                 assert!(matches!(shared.lookup(name), Lookup::NoHost));
                 let world = shared.world.lock();
-                assert!(world.auto_full);
+                assert!(world.addresses.auto_full);
                 assert!(world.machines.is_empty());
                 assert!(world.names.is_empty());
                 assert_eq!(world.resolved, 0);
-                assert_eq!((world.next_auto, world.next_auto6), (1, 1));
+                assert_eq!((world.addresses.next_auto, world.addresses.next_auto6), (1, 1));
             }
             fcx.cancel();
             Ok(())
@@ -508,7 +571,7 @@ mod tests {
                 })
                 .unwrap();
                 assert_eq!(w.free_auto(&subnet), None);
-                assert!(w.auto_full);
+                assert!(w.addresses.auto_full);
                 for _ in 0..size {
                     assert_eq!(std::hint::black_box(&mut w).free_auto(&subnet), None);
                 }
@@ -545,7 +608,7 @@ mod tests {
     fn automatic_pool_boundaries() {
         let mut w = World::new(MAX_HOSTS);
         let subnet = Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap();
-        w.next_auto = (1 << 17) - 2;
+        w.addresses.next_auto = (1 << 17) - 2;
         assert_eq!(
             w.free_auto(&subnet),
             Some("198.19.255.254".parse().unwrap())
@@ -560,13 +623,13 @@ mod tests {
         );
 
         let subnet = subnet6("2001:db8::/64").unwrap();
-        w.next_auto6 = (1 << 80) - 1;
+        w.addresses.next_auto6 = (1 << 80) - 1;
         assert_eq!(
             w.free_auto6(&subnet),
             Some("2001:2:0:ffff:ffff:ffff:ffff:ffff".parse().unwrap())
         );
         assert_eq!(w.free_auto6(&subnet), Some("2001:2::1".parse().unwrap()));
-        w.next_auto6 = (1 << 80) - 2;
+        w.addresses.next_auto6 = (1 << 80) - 2;
         let end = subnet6("2001:2:0:ffff:ffff:ffff:ffff:fffc/126").unwrap();
         assert_eq!(w.free_auto6(&end), Some("2001:2::1".parse().unwrap()));
         assert_eq!(w.free_auto6(&subnet6("2001:2::/48").unwrap()), None);

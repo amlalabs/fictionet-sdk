@@ -1,10 +1,12 @@
-use super::addresses::Bind;
-use super::{Machine, PROTO_TCP, PROTO_UDP, Shared, host_prefix, link};
+use super::addresses::{Bind, Bindings};
+use super::hosts::Machines;
+use super::{PROTO_TCP, PROTO_UDP, host_prefix, link};
 use fictionet::events::{ConnInfo, Event, Fields, Level, Sandbox, opt as jopt};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::dhcp;
 use fictionet::stdlib::ip::{Header, Intake, Reassembly};
 use fictionet::stdlib::ports::{self, Ports};
+use fictionet::stdlib::route::{Lan, Prefix, Router};
 use fictionet::stdlib::serve::{Budget, Counted};
 use fictionet::stdlib::{ip, udp};
 use fictionet::sync::Mutex;
@@ -75,7 +77,27 @@ pub(super) fn sandbox_only(sandbox: Sandbox) -> ConnInfo {
     }
 }
 
-impl Shared {
+/// Attachment ownership, identity and routing, with transport cleanup supplied
+/// by the network. It cannot resolve names or install host services.
+pub(super) struct Context {
+    pub(super) bindings: Bindings,
+    pub(super) hooks: Arc<Hooks>,
+    pub(super) sandbox_budget: usize,
+    pub(super) router: Router<Box<dyn Interface>>,
+    pub(super) destinations: Destinations,
+    pub(super) abort_peers: Arc<PeerAbort>,
+}
+
+pub(super) type PeerAbort = dyn Fn(&[IpAddr]) + Send + Sync;
+
+/// Only the destination facts needed to classify forwarded packets.
+pub(super) struct Destinations {
+    pub(super) gateways: Vec<IpAddr>,
+    pub(super) trusted: Vec<Prefix>,
+    pub(super) machines: Machines,
+}
+
+impl Context {
     /// A member sandbox attached: it joins its LAN at its address, with no
     /// filter, and events know it by that address. It detaches as any
     /// sandbox does when the LAN lets its interface go: when it closes,
@@ -85,12 +107,10 @@ impl Shared {
         fcx: &Cx,
         name: &str,
         lan: &str,
+        segment: &Lan<Box<dyn Interface>>,
         addr: IpAddr,
         sandbox: Attachment,
     ) {
-        let Some(seg) = self.lans.get(lan) else {
-            return;
-        };
         let attached = Arc::new(Attached::new(self, fcx, Arc::from(name), Some(addr)));
         let hooks = &self.hooks;
         let me = Sandbox {
@@ -112,7 +132,7 @@ impl Shared {
             sandbox,
             _attached: attached.clone(),
         };
-        let joined = seg.lan.add(addr, Box::new(member), Some(me.clone()));
+        let joined = segment.add(addr, Box::new(member), Some(me.clone()));
         let event = match joined {
             Ok(()) => Event::new("net", "attached")
                 .summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
@@ -178,7 +198,7 @@ fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option
 /// and its budget. Dropped when it detaches, which resets its connections,
 /// frees its addresses and its budget, and records `net.detached`.
 struct Attached {
-    shared: Arc<Shared>,
+    context: Arc<Context>,
     owner: u64,
     fcx: Cx,
     name: Arc<str>,
@@ -187,15 +207,15 @@ struct Attached {
 }
 
 impl Attached {
-    fn new(shared: &Arc<Shared>, fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
-        let owner = shared.leases.lock().new_owner();
-        shared
+    fn new(context: &Arc<Context>, fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
+        let owner = context.bindings.new_owner();
+        context
             .hooks
             .attached
             .lock()
-            .insert(owner, Budget::new(shared.limits.sandbox_budget));
+            .insert(owner, Budget::new(context.sandbox_budget));
         Attached {
-            shared: shared.clone(),
+            context: context.clone(),
             owner,
             fcx: fcx.clone(),
             name,
@@ -206,17 +226,14 @@ impl Attached {
 
 impl Drop for Attached {
     fn drop(&mut self) {
-        let shared = &self.shared;
-        shared.hooks.attached.lock().remove(&self.owner);
+        let context = &self.context;
+        context.hooks.attached.lock().remove(&self.owner);
         let (bound, bound6) = match self.fixed {
             Some(IpAddr::V4(a)) => (Some(a), None),
             Some(IpAddr::V6(a)) => (None, Some(a)),
             None => {
-                let leases = shared.leases.lock();
-                let v4 = leases
-                    .of(self.owner)
-                    .and_then(|(a, bound)| bound.then_some(a));
-                (v4, leases.by_owner6.get(&self.owner).copied())
+                let bound = context.bindings.bound(self.owner);
+                (bound.v4, bound.v6)
             }
         };
         let addrs: Vec<IpAddr> = bound
@@ -225,20 +242,9 @@ impl Drop for Attached {
             .chain(bound6.map(IpAddr::V6))
             .collect();
         if !addrs.is_empty() {
-            let machines: Vec<Arc<Machine>> =
-                shared.world.lock().machines.values().cloned().collect();
-            for m in machines {
-                for a in &addrs {
-                    m.tcp.abort_peer(*a);
-                }
-            }
-            for tcp in shared.gateway_tcp.lock().iter() {
-                for a in &addrs {
-                    tcp.abort_peer(*a);
-                }
-            }
+            (context.abort_peers)(&addrs);
         }
-        shared.leases.lock().release_all(self.owner);
+        context.bindings.release(self.owner);
         let sandbox = Sandbox {
             id: self.owner,
             name: self.name.clone(),
@@ -247,7 +253,7 @@ impl Drop for Attached {
         };
         let event =
             Event::new("net", "detached").summary(format!("sandbox {} detached", self.name));
-        shared
+        context
             .hooks
             .record(&self.fcx, &sandbox_only(sandbox), event);
     }
@@ -279,11 +285,15 @@ impl Interface for Member {
 }
 
 /// One sandbox's filter, between its attachment and the router.
-pub(super) async fn filter(fcx: Cx, sandbox: Attachment, shared: Arc<Shared>) -> fictionet::Result {
+pub(super) async fn filter(
+    fcx: Cx,
+    sandbox: Attachment,
+    context: Arc<Context>,
+) -> fictionet::Result {
     let name: Arc<str> = Arc::from(sandbox.name());
-    let attached = Attached::new(&shared, &fcx, name.clone(), None);
+    let attached = Attached::new(&context, &fcx, name.clone(), None);
     let mut f = Filter {
-        shared: shared.clone(),
+        context: context.clone(),
         owner: attached.owner,
         name,
         ports: Ports::new(vec![Box::new(sandbox) as Box<dyn Interface>]),
@@ -294,7 +304,7 @@ pub(super) async fn filter(fcx: Cx, sandbox: Attachment, shared: Arc<Shared>) ->
         reassembly: Reassembly::default(),
     };
     let event = Event::new("net", "attached").summary(format!("sandbox {} attached", f.name));
-    shared.hooks.record(&fcx, &sandbox_only(f.me()), event);
+    context.hooks.record(&fcx, &sandbox_only(f.me()), event);
     // Detaches before the filter's links close.
     let _attached = attached;
     loop {
@@ -419,7 +429,7 @@ fn blocked(why: BlockedWhy, p: &[u8]) -> (Event, Fields) {
 }
 
 struct Filter {
-    shared: Arc<Shared>,
+    context: Arc<Context>,
     owner: u64,
     name: Arc<str>,
     ports: Ports<Box<dyn Interface>>,
@@ -441,14 +451,14 @@ impl Filter {
     }
 
     fn block(&self, fcx: &Cx, why: BlockedWhy, packet: &[u8]) {
-        self.shared
+        self.context
             .hooks
             .blocked(fcx, &sandbox_only(self.me()), blocked(why, packet));
     }
 
     fn bound_now(&mut self, fcx: &Cx, addr: IpAddr, by_dhcp: bool) {
         let (router_side, mine) = link();
-        self.shared
+        self.context
             .router
             .add(host_prefix(addr), Box::new(router_side));
         let port = self.ports.add(Box::new(mine));
@@ -457,7 +467,7 @@ impl Filter {
             IpAddr::V6(a) => (self.bound6, self.route6) = (Some(a), Some(port)),
         }
         let sandbox = self.me();
-        let mut by_addr = self.shared.hooks.by_addr.lock();
+        let mut by_addr = self.context.hooks.by_addr.lock();
         for a in self
             .bound
             .map(IpAddr::V4)
@@ -471,12 +481,14 @@ impl Filter {
             .summary(format!("sandbox {} bound {addr}", self.name))
             .field("by_dhcp", by_dhcp)
             .field("addr", addr.to_string());
-        self.shared.hooks.record(fcx, &sandbox_only(sandbox), event);
+        self.context
+            .hooks
+            .record(fcx, &sandbox_only(sandbox), event);
     }
 
     fn sent_v4(&mut self, fcx: &Cx, packet: Packet) {
-        let shared = self.shared.clone();
-        let gateway = shared.subnet.gateway;
+        let context = self.context.clone();
+        let gateway = context.bindings.subnet.gateway;
         let Some(h) = Header::parse(&packet.0).filter(|h| h.src.is_ipv4()) else {
             self.block(fcx, BlockedWhy::Malformed, &packet.0);
             return;
@@ -488,12 +500,12 @@ impl Filter {
             let Some(message) = message else { return };
             let inform_first = self.bound.is_none()
                 && message.message_type() == Some(dhcp::INFORM)
-                && shared.may_bind(self.owner, src);
+                && context.bindings.may_bind(self.owner, src);
             if !(src.is_unspecified() || Some(src) == self.bound || inform_first) {
                 self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                 return;
             }
-            let (reply, new) = shared.dhcp(self.owner, src, &message);
+            let (reply, new) = context.bindings.dhcp(self.owner, src, &message);
             if let Some(a) = new {
                 self.bound_now(fcx, a.into(), true);
             }
@@ -509,7 +521,7 @@ impl Filter {
                 return;
             }
             None => {
-                if shared.bind(self.owner, src) != Bind::New {
+                if context.bindings.bind(self.owner, src) != Bind::New {
                     self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                     return;
                 }
@@ -520,7 +532,7 @@ impl Filter {
             self.block(fcx, BlockedWhy::Broadcast, &packet.0);
             return;
         }
-        if shared.subnet.contains(dst) && dst != gateway {
+        if context.bindings.subnet.contains(dst) && dst != gateway {
             self.block(fcx, BlockedWhy::OtherSandbox, &packet.0);
             return;
         }
@@ -528,8 +540,8 @@ impl Filter {
     }
 
     fn sent_v6(&mut self, fcx: &Cx, packet: Packet) {
-        let shared = self.shared.clone();
-        let Some(subnet) = shared.subnet6 else {
+        let context = self.context.clone();
+        let Some(subnet) = context.bindings.subnet6 else {
             self.block(fcx, BlockedWhy::Ipv6, &packet.0);
             return;
         };
@@ -551,7 +563,7 @@ impl Filter {
                 return;
             }
             None => {
-                if shared.bind6(self.owner, src) != Bind::New {
+                if context.bindings.bind6(self.owner, src) != Bind::New {
                     self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                     return;
                 }
@@ -570,7 +582,7 @@ impl Filter {
             Intake::Whole(p) => p,
             Intake::Waiting => return,
             Intake::Refused { packet, answer } => {
-                if !self.shared.is_host(&packet.0) {
+                if !self.context.destinations.is_host(&packet.0) {
                     packet
                 } else {
                     if let Some(answer) = answer {
@@ -580,7 +592,7 @@ impl Filter {
                 }
             }
         };
-        if let Some(why) = self.shared.refused(&packet.0) {
+        if let Some(why) = self.context.destinations.refused(&packet.0) {
             self.block(fcx, why, &packet.0);
         }
         if let Some(port) = route {
@@ -589,14 +601,10 @@ impl Filter {
     }
 }
 
-impl Shared {
+impl Destinations {
     /// Whether `dst` is the gateway, or a LAN's DNS address.
     fn is_gateway(&self, dst: IpAddr) -> bool {
-        let gateway = match dst {
-            IpAddr::V4(a) => a == self.subnet.gateway,
-            IpAddr::V6(a) => self.subnet6.is_some_and(|s| a == s.gateway),
-        };
-        gateway || self.lans.values().any(|l| l.dns == dst)
+        self.gateways.contains(&dst)
     }
 
     /// Whether `p` is for the gateway or a machine.
@@ -604,7 +612,7 @@ impl Shared {
         let Some(dst) = ip::destination(p) else {
             return false;
         };
-        self.is_gateway(dst) || self.world.lock().machines.contains_key(&dst)
+        self.is_gateway(dst) || self.machines.contains(dst)
     }
 
     /// Why the network will refuse `p`: no machine has its address, or its
@@ -615,26 +623,11 @@ impl Shared {
         if self.is_gateway(dst) {
             return closed(&|_, p| p == 53).then_some(BlockedWhy::ClosedPort);
         }
-        let machine = self.world.lock().machines.get(&dst).cloned();
-        match machine {
-            Some(m) => closed(&|proto, p| {
-                if proto == PROTO_TCP {
-                    m.serves_tcp(p)
-                } else {
-                    m.serves_udp(p)
-                }
-            })
-            .then_some(BlockedWhy::ClosedPort),
+        match self.machines.closed(dst, p) {
+            Some(closed) => closed.then_some(BlockedWhy::ClosedPort),
             // A trusted sandbox's prefix, or a LAN, which reports its own
             // drops.
-            None if self
-                .fixed
-                .iter()
-                .chain(self.lans.values().map(|l| &l.prefix))
-                .any(|p| p.contains(dst)) =>
-            {
-                None
-            }
+            None if self.trusted.iter().any(|p| p.contains(dst)) => None,
             None => Some(BlockedWhy::NoRoute),
         }
     }

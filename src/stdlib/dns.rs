@@ -3,6 +3,13 @@
 //! Use this module to read and answer DNS queries in a world that runs its
 //! own DNS server. If the world is a set of websites,
 //! [`web::Sites`](fictionet::stdlib::web::Sites) already runs one for you.
+//! [`net::Net`](fictionet::stdlib::net::Net) serves DNS over UDP and TCP on
+//! port 53 at each gateway. It answers A and AAAA queries from declared hosts
+//! and hosts created by [`Net::resolve`](fictionet::stdlib::net::Net::resolve).
+//! Unknown names get NXDOMAIN, and new names past
+//! [`Net::max_hosts`](fictionet::stdlib::net::Net::max_hosts) get SERVFAIL.
+//! A known host without the requested address family gets an empty answer.
+//! Answers have a 60-second TTL.
 //!
 //! Fictionet has no DNS types of its own. A DNS message is plain data: a
 //! [`Message`](op::Message) with public `queries` and `answers` lists.

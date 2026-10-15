@@ -1,5 +1,8 @@
-use super::hosts::{Lookup, pings, too_many};
-use super::{Shared, normalize};
+//! The built-in authoritative DNS service. Name resolution and TCP admission
+//! are supplied by Net; query handling only sees lookup and idle-time policy.
+
+use super::hosts::{Admission, Lookup, pings};
+use super::normalize;
 use fictionet::events::{ConnInfo, Event, opt as jopt};
 use fictionet::stdlib::codec::{Collect, CollectError, Decode, Step};
 use fictionet::stdlib::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
@@ -9,29 +12,42 @@ use fictionet::stdlib::{ConnError, ip, tcp, udp};
 use fictionet::{Cx, End, Error};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
+
+pub(super) type LookupName = dyn Fn(&str) -> Lookup + Send + Sync;
+
+#[derive(Clone)]
+pub(super) struct State {
+    pub(super) lookup: Arc<LookupName>,
+    pub(super) tcp_idle: Duration,
+}
+
+#[derive(Clone)]
+pub(super) struct Context {
+    pub(super) state: State,
+    pub(super) admission: Admission,
+}
 
 /// How long resolvers may keep an answer, in seconds.
 const TTL: u32 = 60;
 
 /// DNS over UDP and TCP on port 53, and ping replies, at `addr` on `side`.
 pub(super) fn start_dns(
-    shared: &Arc<Shared>,
+    context: Context,
     fcx: &Cx,
     side: End,
     addr: IpAddr,
-) -> Result<(), Error> {
+) -> Result<tcp::Endpoint, Error> {
     let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, side);
     let tcp = tcp::endpoint(fcx, tcp, addr);
     let udp = udp::endpoint(fcx, udp, addr);
     let socket = udp.bind(53)?;
     let listener = tcp.listen(53)?;
-    shared.gateway_tcp.lock().push(tcp);
-    let s = shared.clone();
-    fcx.spawn(move |fcx| dns_udp(fcx, socket, s));
-    let s = shared.clone();
-    fcx.spawn(move |fcx| dns_tcp(fcx, listener, s));
+    let datagrams = context.clone();
+    fcx.spawn(move |fcx| dns_udp(fcx, socket, datagrams));
+    fcx.spawn(move |fcx| dns_tcp(fcx, listener, context));
     fcx.spawn(move |fcx| pings(fcx, icmp, addr));
-    Ok(())
+    Ok(tcp)
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +111,7 @@ impl Answered {
 }
 
 /// The answer to one DNS message.
-fn answer(shared: &Arc<Shared>, bytes: &[u8]) -> Answered {
+fn answer(lookup: &LookupName, bytes: &[u8]) -> Answered {
     let query = match Message::from_vec(bytes) {
         Ok(q) => q,
         Err(_) => {
@@ -144,7 +160,7 @@ fn answer(shared: &Arc<Shared>, bytes: &[u8]) -> Answered {
         let found = if name.is_empty() {
             Lookup::NoHost
         } else {
-            shared.lookup(name)
+            lookup(name)
         };
         match found {
             Lookup::NoHost => {
@@ -223,7 +239,7 @@ struct Dns {
 
 impl Service for Dns {
     type Decoder = DnsQueries;
-    type State = Arc<Shared>;
+    type State = State;
     type Error = core::convert::Infallible;
 
     fn decoder(&self) -> DnsQueries {
@@ -235,11 +251,11 @@ impl Service for Dns {
 
     fn on_open(
         &mut self,
-        shared: &Arc<Shared>,
+        state: &State,
         driver: &mut serve::Driver<'_, DnsQueries>,
     ) -> Result<serve::Flow, Self::Error> {
         if self.tcp {
-            driver.set_timer("query", shared.limits.dns_tcp_idle);
+            driver.set_timer("query", state.tcp_idle);
         }
         Ok(serve::Flow::Continue)
     }
@@ -247,10 +263,10 @@ impl Service for Dns {
     fn on_item(
         &mut self,
         query: Vec<u8>,
-        shared: &Arc<Shared>,
+        state: &State,
         driver: &mut serve::Driver<'_, DnsQueries>,
     ) -> Result<serve::Flow, Self::Error> {
-        let answered = answer(shared, &query);
+        let answered = answer(&*state.lookup, &query);
         driver.record(answered.event(self.tcp));
         if let Some(reply) = answered.reply {
             if self.tcp {
@@ -262,13 +278,13 @@ impl Service for Dns {
                 driver.reply().extend_from_slice(&reply);
             }
         }
-        self.on_open(shared, driver)
+        self.on_open(state, driver)
     }
 
     fn on_timer(
         &mut self,
         _: serve::Timer,
-        _: &Arc<Shared>,
+        _: &State,
         _: &mut serve::Driver<'_, DnsQueries>,
     ) -> Result<serve::Flow, Self::Error> {
         Ok(serve::Flow::Close)
@@ -276,32 +292,35 @@ impl Service for Dns {
 }
 
 /// DNS over UDP on the gateway's port 53.
-async fn dns_udp(fcx: Cx, socket: udp::Socket, shared: Arc<Shared>) -> fictionet::Result {
+async fn dns_udp(fcx: Cx, socket: udp::Socket, context: Context) -> fictionet::Result {
     let local = socket.local_addr();
-    let hooks = shared.hooks.clone();
     let opts = ServeOptions {
-        sandbox: Some(Arc::new(move |addr| Some(hooks.sandbox_at(addr)))),
+        sandbox: Some(context.admission.sandbox()),
         ..ServeOptions::default()
     };
-    let _ = serve::datagram(&fcx, socket, local, &mut Dns { tcp: false }, &shared, &opts).await;
+    let _ = serve::datagram(
+        &fcx,
+        socket,
+        local,
+        &mut Dns { tcp: false },
+        &context.state,
+        &opts,
+    )
+    .await;
     Ok(())
 }
 
 /// DNS over TCP on the gateway's port 53.
-async fn dns_tcp(fcx: Cx, mut listener: tcp::Listener, shared: Arc<Shared>) -> fictionet::Result {
-    let peers = shared.peers.clone();
+async fn dns_tcp(fcx: Cx, mut listener: tcp::Listener, context: Context) -> fictionet::Result {
     loop {
         match listener.accept(&fcx).await {
             Ok(conn) => {
-                let Some(guard) = peers.enter(conn.peer_addr().ip()) else {
-                    too_many(&fcx, &shared.hooks, &conn);
-                    conn.reset();
+                let Some(conn) = context.admission.admit(&fcx, conn) else {
                     continue;
                 };
-                conn.hold_until_gone(Box::new(guard));
-                let shared = shared.clone();
+                let context = context.clone();
                 fcx.spawn(move |fcx| async move {
-                    let _ = dns_conn(&fcx, conn, &shared).await;
+                    let _ = dns_conn(&fcx, conn, &context).await;
                     Ok(())
                 });
             }
@@ -311,13 +330,9 @@ async fn dns_tcp(fcx: Cx, mut listener: tcp::Listener, shared: Arc<Shared>) -> f
     }
 }
 
-async fn dns_conn(
-    fcx: &Cx,
-    conn: tcp::TcpConnection,
-    shared: &Arc<Shared>,
-) -> Result<(), ConnError> {
+async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Result<(), ConnError> {
     let info = ConnInfo {
-        sandbox: Some(shared.hooks.sandbox_at(conn.peer_addr().ip())),
+        sandbox: Some(context.admission.hooks.sandbox_at(conn.peer_addr().ip())),
         peer: Some(conn.peer_addr()),
         local: Some(conn.local_addr()),
         ..ConnInfo::default()
@@ -328,9 +343,17 @@ async fn dns_conn(
         budget: info
             .sandbox
             .as_ref()
-            .and_then(|sandbox| shared.hooks.budget(sandbox.id)),
+            .and_then(|sandbox| context.admission.hooks.budget(sandbox.id)),
         ..ServeOptions::default()
     };
-    let _ = serve::connection(fcx, conn, info, &mut Dns { tcp: true }, shared, &opts).await;
+    let _ = serve::connection(
+        fcx,
+        conn,
+        info,
+        &mut Dns { tcp: true },
+        &context.state,
+        &opts,
+    )
+    .await;
     Ok(())
 }

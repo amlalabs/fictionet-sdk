@@ -1,11 +1,12 @@
-use super::addresses::{Placed, may_serve_v4, may_serve_v6};
+use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_serve_v6};
+use super::attachments::answered_closed;
 use super::{
-    BlockedWhy, Hooks, PROTO_TCP, Shared, blocked_event, connection_limit, link, normalize,
-    port_detail, sandbox_only,
+    BlockedWhy, Hooks, LanSeg, PROTO_TCP, Resolver, blocked_event, connection_limit, link,
+    normalize, port_detail, sandbox_only,
 };
 use fictionet::events::{ConnInfo, Event, Level};
 use fictionet::stdlib::codec::Decode;
-use fictionet::stdlib::route::Prefix;
+use fictionet::stdlib::route::{Prefix, Router};
 use fictionet::stdlib::serve::{self, Budget, ServeOptions, Service, TlsSelect};
 use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection, icmp, ip, tcp, udp};
@@ -432,9 +433,7 @@ pub(super) struct World {
     max_hosts: usize,
     /// Machines in address order for aborting a detached peer.
     pub(super) machines: BTreeMap<IpAddr, Arc<Machine>>,
-    pub(super) next_auto: u32,
-    pub(super) next_auto6: u128,
-    pub(super) auto_full: bool,
+    pub(super) addresses: Allocator,
 }
 
 impl World {
@@ -446,10 +445,16 @@ impl World {
             resolved: 0,
             max_hosts,
             machines: BTreeMap::new(),
-            next_auto: 1,
-            next_auto6: 1,
-            auto_full: false,
+            addresses: Allocator::default(),
         }
+    }
+
+    pub(super) fn free_auto(&mut self, subnet: &Subnet) -> Option<Ipv4Addr> {
+        self.addresses.free_auto(subnet, &self.machines)
+    }
+
+    pub(super) fn free_auto6(&mut self, subnet: &Subnet6) -> Option<Ipv6Addr> {
+        self.addresses.free_auto6(subnet, &self.machines)
     }
 
     /// Keeps the answer for a resolved `name`, unless it has no host and too
@@ -465,10 +470,17 @@ impl World {
     }
 }
 
-impl Shared {
+/// Resolves names and publishes hosts through the installation boundary.
+pub(super) struct LookupContext<'a> {
+    pub(super) world: &'a Mutex<World>,
+    pub(super) resolver: Option<&'a Resolver>,
+    pub(super) installation: Installation<'a>,
+}
+
+impl LookupContext<'_> {
     /// What `name` is. The first lookup of a name no host has runs the
     /// resolver and, for a host, starts its machines.
-    pub(super) fn lookup(self: &Arc<Self>, name: &str) -> Lookup {
+    pub(super) fn lookup(&self, name: &str) -> Lookup {
         let mut world = self.world.lock();
         if let Some(known) = world.names.get(name) {
             return match known {
@@ -486,7 +498,7 @@ impl Shared {
                     host.names.insert(0, name.to_owned());
                 }
                 let label = host.label.clone();
-                match self.place(&mut world, host) {
+                match self.installation.place(&mut world, host) {
                     Ok(p) => Known::Host(p),
                     Err(e) => {
                         let event = Event::new("net", "error")
@@ -494,7 +506,11 @@ impl Shared {
                             .summary(format!("host {label} for {name}: {e}"))
                             .field("name", name)
                             .field("error", e);
-                        self.hooks.record(&self.fcx, &ConnInfo::default(), event);
+                        self.installation.admission.hooks.record(
+                            self.installation.fcx,
+                            &ConnInfo::default(),
+                            event,
+                        );
                         Known::NoHost
                     }
                 }
@@ -507,15 +523,28 @@ impl Shared {
             Known::NoHost => Lookup::NoHost,
         }
     }
+}
 
+/// The capabilities needed to prepare and publish a host's routes and services.
+pub(super) struct Installation<'a> {
+    pub(super) fcx: &'a Cx,
+    pub(super) subnet: Subnet,
+    pub(super) subnet6: Option<Subnet6>,
+    pub(super) router: &'a Router<Box<dyn Interface>>,
+    pub(super) lans: &'a BTreeMap<String, LanSeg>,
+    pub(super) admission: Admission,
+    pub(super) handshake: Duration,
+}
+
+impl Installation<'_> {
     /// Gives `host` its addresses and machines, and adds its services.
     /// Fails if an address given with `at` cannot be served, it ends up
     /// with no address, or a service cannot be added.
-    pub(super) fn place(self: &Arc<Self>, world: &mut World, host: Host) -> Result<Placed, String> {
-        let automatic = (world.next_auto, world.next_auto6);
+    pub(super) fn place(&self, world: &mut World, host: Host) -> Result<Placed, String> {
+        let automatic = (world.addresses.next_auto, world.addresses.next_auto6);
         let result = self.place_inner(world, host);
         if result.is_err() {
-            (world.next_auto, world.next_auto6) = automatic;
+            (world.addresses.next_auto, world.addresses.next_auto6) = automatic;
         }
         result
     }
@@ -523,7 +552,7 @@ impl Shared {
     /// Prepares `host` at every address, then commits it. A failure
     /// leaves no machine, route, port or task, but may have taken
     /// automatic addresses, which `place` gives back.
-    fn place_inner(self: &Arc<Self>, world: &mut World, host: Host) -> Result<Placed, String> {
+    fn place_inner(&self, world: &mut World, host: Host) -> Result<Placed, String> {
         if let Some(name) = &host.lan {
             return self.place_on_lan(world, name, &host);
         }
@@ -588,12 +617,7 @@ impl Shared {
 
     /// Places `host` on the LAN `name`, at its `at` address of the LAN's
     /// family or the first free one from the LAN's second address up.
-    fn place_on_lan(
-        self: &Arc<Self>,
-        world: &mut World,
-        name: &str,
-        host: &Host,
-    ) -> Result<Placed, String> {
+    fn place_on_lan(&self, world: &mut World, name: &str, host: &Host) -> Result<Placed, String> {
         let seg = self
             .lans
             .get(name)
@@ -646,6 +670,66 @@ impl Shared {
 
 // ---------------------------------------------------------------------------
 // Machines
+
+/// Read-only host routing queries and transport cleanup for attachments.
+#[derive(Clone)]
+pub(super) struct Machines {
+    world: Arc<Mutex<World>>,
+}
+
+impl Machines {
+    pub(super) fn new(world: Arc<Mutex<World>>) -> Self {
+        Self { world }
+    }
+
+    pub(super) fn contains(&self, addr: IpAddr) -> bool {
+        self.world.lock().machines.contains_key(&addr)
+    }
+
+    pub(super) fn closed(&self, addr: IpAddr, packet: &[u8]) -> Option<bool> {
+        let machine = self.world.lock().machines.get(&addr).cloned()?;
+        Some(answered_closed(packet, |proto, port| {
+            if proto == PROTO_TCP {
+                machine.serves_tcp(port)
+            } else {
+                machine.serves_udp(port)
+            }
+        }))
+    }
+
+    pub(super) fn abort_peers(&self, addrs: &[IpAddr]) {
+        let machines: Vec<_> = self.world.lock().machines.values().cloned().collect();
+        for machine in machines {
+            for addr in addrs {
+                machine.tcp.abort_peer(*addr);
+            }
+        }
+    }
+}
+
+/// Peer admission and sandbox identity shared by ordinary services and DNS.
+#[derive(Clone)]
+pub(super) struct Admission {
+    pub(super) peers: Arc<Peers>,
+    pub(super) hooks: Arc<Hooks>,
+}
+
+impl Admission {
+    pub(super) fn admit(&self, fcx: &Cx, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
+        let Some(guard) = self.peers.enter(conn.peer_addr().ip()) else {
+            too_many(fcx, &self.hooks, &conn);
+            conn.reset();
+            return None;
+        };
+        conn.hold_until_gone(Box::new(guard));
+        Some(conn)
+    }
+
+    pub(super) fn sandbox(&self) -> serve::SandboxOf {
+        let hooks = self.hooks.clone();
+        Arc::new(move |addr| Some(hooks.sandbox_at(addr)))
+    }
+}
 
 /// Open connections by peer address, for
 /// [`Limits::connections_per_peer`].
@@ -805,18 +889,18 @@ impl PreparedMachine {
 pub(super) struct Machine {
     fcx: Cx,
     addr: IpAddr,
-    pub(super) tcp: tcp::Endpoint,
+    tcp: tcp::Endpoint,
     udp: udp::Endpoint,
     ports: Mutex<HashMap<u16, Arc<Port>>>,
     udp_ports: Mutex<HashSet<u16>>,
-    peers: Arc<Peers>,
-    shared: std::sync::Weak<Shared>,
+    admission: Admission,
+    handshake: Duration,
 }
 
 impl Machine {
     /// Builds a machine without publishing its route or starting its tasks.
     fn stage(
-        shared: &Arc<Shared>,
+        installation: &Installation<'_>,
         addr: IpAddr,
         label: &str,
         existing: Option<&Arc<Machine>>,
@@ -828,7 +912,7 @@ impl Machine {
                 start: None,
             };
         }
-        let fcx = shared.fcx.group(format!("{label} ({addr})"));
+        let fcx = installation.fcx.group(format!("{label} ({addr})"));
         let (router_side, side) = link();
         let ((tcp, udp, icmp, _other), split) = ip::prepare_split_protocols(&fcx, side);
         let (tcp, tcp_task) = tcp::prepare_endpoint(&fcx, tcp, addr, tcp::Options::default());
@@ -840,8 +924,8 @@ impl Machine {
             udp,
             ports: Mutex::new(HashMap::new()),
             udp_ports: Mutex::new(HashSet::new()),
-            peers: shared.peers.clone(),
-            shared: Arc::downgrade(shared),
+            admission: installation.admission.clone(),
+            handshake: installation.handshake,
         });
         PreparedMachine {
             machine,
@@ -1007,10 +1091,7 @@ impl Machine {
 
     /// Installs the prepared services in declaration order without failure.
     fn add(self: &Arc<Self>, prepared: Vec<PreparedPort>) {
-        let sandbox: Option<serve::SandboxOf> = self.shared.upgrade().map(|s| {
-            let hooks = s.hooks.clone();
-            Arc::new(move |a: IpAddr| Some(hooks.sandbox_at(a))) as serve::SandboxOf
-        });
+        let sandbox = Some(self.admission.sandbox());
         for prepared in prepared {
             match prepared {
                 PreparedPort::Udp {
@@ -1104,25 +1185,21 @@ async fn accept(
     loop {
         match listener.accept(&fcx).await {
             Ok(conn) => {
-                let Some(shared) = machine.shared.upgrade() else {
-                    return Ok(());
-                };
-                let hooks = shared.hooks.clone();
-                let Some(guard) = machine.peers.enter(conn.peer_addr().ip()) else {
-                    too_many(&fcx, &hooks, &conn);
-                    conn.reset();
+                let admission = machine.admission.clone();
+                let Some(conn) = admission.admit(&fcx, conn) else {
                     continue;
                 };
-                conn.hold_until_gone(Box::new(guard));
+                let hooks = &admission.hooks;
                 let sandbox = Some(hooks.sandbox_at(conn.peer_addr().ip()));
                 let info = ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
                     .from_sandbox(sandbox);
                 let accepted = fcx.now();
+                let handshake = machine.handshake;
                 let port = port.clone();
                 fcx.spawn(move |fcx| async move {
                     let _ = fcx
                         .region(move |fcx| async move {
-                            connection(fcx, conn, info, accepted, port, shared).await;
+                            connection(fcx, conn, info, accepted, port, admission, handshake).await;
                             Ok(())
                         })
                         .await;
@@ -1143,9 +1220,10 @@ async fn connection(
     info: ConnInfo,
     accepted: Instant,
     port: Arc<Port>,
-    shared: Arc<Shared>,
+    admission: Admission,
+    handshake: Duration,
 ) {
-    let hooks = shared.hooks.clone();
+    let hooks = admission.hooks;
     let socket = conn.gone_watch();
     let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
     let budget = sandbox_id.and_then(|id| hooks.budget(id));
@@ -1154,7 +1232,7 @@ async fn connection(
         info,
         socket: socket.clone(),
         budget: budget.clone(),
-        handshake: shared.limits.handshake,
+        handshake,
     };
     let has_tls = !port
         .tls
@@ -1185,7 +1263,7 @@ async fn connection(
         Some(config)
     });
     let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
-    let deadline = accepted + shared.limits.handshake;
+    let deadline = accepted + handshake;
     let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, &select, deadline, detached).await
     else {
         return;

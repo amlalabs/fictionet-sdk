@@ -154,8 +154,10 @@ use addresses::{AUTO, AUTO6, Leases, Subnet, Subnet6};
 pub use attachments::{BlockedWhy, connection_limit};
 use attachments::{Hooks, blocked_event, filter, port_detail, sandbox_only, udp_packet};
 use dns::start_dns;
+use hosts::{
+    Admission, Installation, Known, Lookup, LookupContext, Machines, Peers, World, host_prefix,
+};
 pub use hosts::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
-use hosts::{Known, Machine, Peers, World, host_prefix};
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -461,9 +463,9 @@ impl Net {
             subnet,
             subnet6,
             router,
-            world: Mutex::new(World::new(self.max_hosts)),
-            leases: Mutex::new(Leases::default()),
-            gateway_tcp: Mutex::new(Vec::new()),
+            world: Arc::new(Mutex::new(World::new(self.max_hosts))),
+            leases: Arc::new(Mutex::new(Leases::default())),
+            gateway_tcp: Arc::new(Mutex::new(Vec::new())),
             hooks,
             fixed: routes.iter().map(|(_, p)| *p).collect(),
             peers: Peers::new(self.limits.connections_per_peer),
@@ -477,6 +479,7 @@ impl Net {
                 let names = host.names.clone();
                 let label = host.label.clone();
                 let placed = shared
+                    .installation()
                     .place(&mut world, host)
                     .map_err(|e| fictionet::Error::msg(format!("host {label}: {e}")))?;
                 for name in names {
@@ -486,6 +489,7 @@ impl Net {
         }
 
         let members = self.members;
+        let context = shared.attachments();
         caller.spawn(move |fcx| async move {
             loop {
                 let sandbox = attachments.next(&fcx).await?;
@@ -496,11 +500,13 @@ impl Net {
                 if let Some((name, lan, addr)) =
                     members.iter().find(|(n, _, _)| n == sandbox.name())
                 {
-                    shared.join_lan(&fcx, name, lan, *addr, sandbox);
+                    if let Some(seg) = shared.lans.get(lan) {
+                        context.join_lan(&fcx, name, lan, &seg.lan, *addr, sandbox);
+                    }
                     continue;
                 }
-                let shared = shared.clone();
-                fcx.spawn(move |fcx| filter(fcx, sandbox, shared));
+                let context = context.clone();
+                fcx.spawn(move |fcx| filter(fcx, sandbox, context));
             }
         });
         Ok(())
@@ -510,7 +516,7 @@ impl Net {
 // ---------------------------------------------------------------------------
 // What the network's tasks share
 
-/// Everything the tasks of one network share.
+/// Network state assembled into capability contexts for its subsystems.
 struct Shared {
     peers: Arc<Peers>,
     fcx: Cx,
@@ -518,15 +524,89 @@ struct Shared {
     subnet: Subnet,
     subnet6: Option<Subnet6>,
     router: Router<Box<dyn Interface>>,
-    world: Mutex<World>,
-    leases: Mutex<Leases>,
-    gateway_tcp: Mutex<Vec<tcp::Endpoint>>,
+    world: Arc<Mutex<World>>,
+    leases: Arc<Mutex<Leases>>,
+    gateway_tcp: Arc<Mutex<Vec<tcp::Endpoint>>>,
     hooks: Arc<Hooks>,
     /// Prefixes of trusted sandboxes ([`Net::route`]).
     fixed: Vec<Prefix>,
     limits: Limits,
     /// The LANs, by name.
     lans: BTreeMap<String, LanSeg>,
+}
+
+impl Shared {
+    fn admission(&self) -> Admission {
+        Admission {
+            peers: self.peers.clone(),
+            hooks: self.hooks.clone(),
+        }
+    }
+
+    fn installation(&self) -> Installation<'_> {
+        Installation {
+            fcx: &self.fcx,
+            subnet: self.subnet,
+            subnet6: self.subnet6,
+            router: &self.router,
+            lans: &self.lans,
+            admission: self.admission(),
+            handshake: self.limits.handshake,
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Lookup {
+        LookupContext {
+            world: &self.world,
+            resolver: self.resolver.as_deref(),
+            installation: self.installation(),
+        }
+        .lookup(name)
+    }
+
+    fn dns(self: &Arc<Self>) -> dns::Context {
+        let shared = self.clone();
+        dns::Context {
+            state: dns::State {
+                lookup: Arc::new(move |name| shared.lookup(name)),
+                tcp_idle: self.limits.dns_tcp_idle,
+            },
+            admission: self.admission(),
+        }
+    }
+
+    fn attachments(&self) -> Arc<attachments::Context> {
+        let machines = Machines::new(self.world.clone());
+        let abort = machines.clone();
+        let gateway_tcp = self.gateway_tcp.clone();
+        Arc::new(attachments::Context {
+            bindings: addresses::Bindings::new(self.subnet, self.subnet6, self.leases.clone()),
+            hooks: self.hooks.clone(),
+            sandbox_budget: self.limits.sandbox_budget,
+            router: self.router.clone(),
+            destinations: attachments::Destinations {
+                gateways: std::iter::once(IpAddr::V4(self.subnet.gateway))
+                    .chain(self.subnet6.map(|s| IpAddr::V6(s.gateway)))
+                    .chain(self.lans.values().map(|l| l.dns))
+                    .collect(),
+                trusted: self
+                    .fixed
+                    .iter()
+                    .copied()
+                    .chain(self.lans.values().map(|l| l.prefix))
+                    .collect(),
+                machines,
+            },
+            abort_peers: Arc::new(move |addrs| {
+                abort.abort_peers(addrs);
+                for tcp in gateway_tcp.lock().iter() {
+                    for addr in addrs {
+                        tcp.abort_peer(*addr);
+                    }
+                }
+            }),
+        })
+    }
 }
 
 /// One LAN of the network ([`Net::lan`]).
@@ -650,12 +730,19 @@ fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
         shared
             .router
             .add(host_prefix(gateway), Box::new(router_side));
-        start_dns(shared, fcx, side, gateway)?;
+        let tcp = start_dns(shared.dns(), fcx, side, gateway)?;
+        shared.gateway_tcp.lock().push(tcp);
     }
     for seg in shared.lans.values() {
         let (lan_side, side) = link();
         seg.lan.add(seg.dns, Box::new(lan_side), None)?;
-        start_dns(shared, &shared.fcx.group("lan gateway"), side, seg.dns)?;
+        let tcp = start_dns(
+            shared.dns(),
+            &shared.fcx.group("lan gateway"),
+            side,
+            seg.dns,
+        )?;
+        shared.gateway_tcp.lock().push(tcp);
     }
     Ok(())
 }
@@ -725,9 +812,9 @@ mod tests {
                     subnet,
                     subnet6: None,
                     router,
-                    world: Mutex::new(World::new(MAX_HOSTS)),
-                    leases: Mutex::default(),
-                    gateway_tcp: Mutex::default(),
+                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    leases: Arc::default(),
+                    gateway_tcp: Arc::default(),
                     hooks,
                     fixed: Vec::new(),
                     peers: Peers::new(Limits::default().connections_per_peer),
