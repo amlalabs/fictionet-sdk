@@ -75,7 +75,10 @@ no model. It is [`examples/hosted/eval.py`](../../examples/hosted/eval.py)
 ported to this package: the samples, the solver and the scorer are the same,
 and the hand-written compose file is gone. A scripted solver runs `dig` and
 `curl --cacert` in the agent's sandbox, and checks that real addresses stay
-out of reach. Run it from this directory:
+out of reach. World answers require exit 0, exact stdout and empty stderr.
+Denials require the expected exit code and error message. The CA sample
+requires exit 0 and the exact certificate read from the world's container.
+Run it from this directory:
 
 ```console
 $ uv run inspect eval examples/web_eval.py --model mockllm/model
@@ -86,6 +89,9 @@ total time:                                   0:00:17
 contains
 accuracy  1.000
 ```
+
+This result predates the exit-status and whole-output checks and has not
+been rerun with them.
 
 ## Options
 
@@ -323,6 +329,9 @@ total time:                                   0:00:11
 contains
 accuracy  1.000
 ```
+
+This result predates the exit-status and whole-output checks and has not
+been rerun with them.
 
 The run on Kubernetes leaves out the sample that reads the world's CA from
 the world's container, because on Kubernetes the world's container is not

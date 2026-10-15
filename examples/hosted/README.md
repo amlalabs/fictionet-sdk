@@ -29,6 +29,15 @@ in place of this example's `compose.yaml`.
 | `eval.py` | A tiny Inspect eval: a scripted solver and the mock model, no LLM key. |
 | `harbor/fictionet-web/` | The same as a Harbor task, run with Harbor's `oracle` agent. |
 
+`check.sh` requires all 19 checks. Missing or failed host-address discovery
+counts as a failure. If `docker0` has no address, it tries the Docker `bridge`
+network's gateway. Commands must exit successfully for positive checks and
+with a refusal status for denial checks, as well as match the expected output.
+Denial checks reject status 124 (timeout), 126/127 (execution errors), and
+statuses above 128 (signals).
+`eval.py` checks each sample's exit code, exact stdout and empty stderr for
+world answers, or the expected denial message for blocked requests.
+
 The canonical deployment files are `Dockerfile`, `agent.Dockerfile` and
 `compose.yaml` here. `build.sh` runs `package_harbor.py` to copy the Dockerfiles
 and generate `harbor/fictionet-web/environment/docker-compose.yaml`. These three
@@ -78,6 +87,9 @@ that date.
 | Harbor, `-e docker` | reward 1.0 | |
 | Harbor, `-e daytona` | reward 1.0 | 24 s of environment setup |
 | Harbor, `-e e2b` | fails, see below | |
+
+The 19-of-19 and 5-of-5 results above predate the exit-status and whole-output
+checks and have not been rerun with them.
 
 In the local Docker run, `build.sh` took 56 s, `up` took 40 to 100 s
 (most of it `apt-get` in the agent's image), `check.sh` 6 to 7 s, and
