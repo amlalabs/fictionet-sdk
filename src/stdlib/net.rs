@@ -2647,7 +2647,7 @@ impl Shared {
         }
         match m.message_type() {
             Some(dhcp::DISCOVER) => match self.offer(owner, m.option_addr(opt::REQUESTED_IP)) {
-                Some(a) => (Some(self.dhcp_reply(m, dhcp::OFFER, a)), None),
+                Some(a) => (Some(self.dhcp_reply(m, dhcp::Reply::Offer(a))), None),
                 None => (None, None),
             },
             Some(dhcp::REQUEST) => {
@@ -2663,58 +2663,32 @@ impl Shared {
                     return (None, None);
                 };
                 match self.bind(owner, wanted) {
-                    Bind::New => (Some(self.dhcp_reply(m, dhcp::ACK, wanted)), Some(wanted)),
-                    Bind::Already => (Some(self.dhcp_reply(m, dhcp::ACK, wanted)), None),
-                    Bind::Refused => (
-                        Some(self.dhcp_reply(m, dhcp::NAK, Ipv4Addr::UNSPECIFIED)),
-                        None,
+                    Bind::New => (
+                        Some(self.dhcp_reply(m, dhcp::Reply::Ack(wanted))),
+                        Some(wanted),
                     ),
+                    Bind::Already => (Some(self.dhcp_reply(m, dhcp::Reply::Ack(wanted))), None),
+                    Bind::Refused => (Some(self.dhcp_reply(m, dhcp::Reply::Nak)), None),
                 }
             }
-            Some(dhcp::INFORM) if !m.ciaddr.is_unspecified() && m.ciaddr == src => (
-                Some(self.dhcp_reply(m, dhcp::INFORM, Ipv4Addr::UNSPECIFIED)),
-                None,
-            ),
+            Some(dhcp::INFORM) if !m.ciaddr.is_unspecified() && m.ciaddr == src => {
+                (Some(self.dhcp_reply(m, dhcp::Reply::Inform)), None)
+            }
             _ => (None, None),
         }
     }
 
-    fn dhcp_reply(&self, request: &dhcp::Message, kind: u8, yiaddr: Ipv4Addr) -> Packet {
+    fn dhcp_reply(&self, request: &dhcp::Message, reply: dhcp::Reply) -> Packet {
         let gateway = self.subnet.gateway;
-        let mut m = dhcp::Message::new(dhcp::BOOTREPLY, request.xid);
-        m.htype = request.htype;
-        m.hlen = request.hlen;
-        m.flags = request.flags;
-        m.giaddr = request.giaddr;
-        m.chaddr = request.chaddr;
-        m.yiaddr = yiaddr;
-        if kind == dhcp::INFORM {
-            m.ciaddr = request.ciaddr;
+        let (m, to) = dhcp::ReplyConfig {
+            server: gateway,
+            lease_secs: LEASE,
+            subnet_mask: self.subnet.mask(),
+            router: Some(gateway),
+            dns: Some(gateway),
+            mtu: None,
         }
-        m.push(
-            opt::MESSAGE_TYPE,
-            [if kind == dhcp::INFORM {
-                dhcp::ACK
-            } else {
-                kind
-            }],
-        );
-        m.push(opt::SERVER_ID, gateway.octets());
-        if kind != dhcp::NAK {
-            if kind != dhcp::INFORM {
-                m.push(opt::LEASE_TIME, LEASE.to_be_bytes());
-                m.push(opt::RENEWAL_TIME, (LEASE / 2).to_be_bytes());
-                m.push(opt::REBINDING_TIME, (LEASE / 8 * 7).to_be_bytes());
-            }
-            m.push(opt::SUBNET_MASK, self.subnet.mask().octets());
-            m.push(opt::ROUTER, gateway.octets());
-            m.push(opt::DNS, gateway.octets());
-        }
-        let to = if kind != dhcp::NAK && !request.ciaddr.is_unspecified() {
-            request.ciaddr
-        } else {
-            Ipv4Addr::BROADCAST
-        };
+        .build(request, reply);
         udp_packet(
             gateway,
             dhcp::SERVER_PORT,

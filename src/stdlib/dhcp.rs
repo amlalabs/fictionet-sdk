@@ -5,7 +5,9 @@
 //!
 //! `Message` reads and writes complete datagrams through `Wire`. This file
 //! supplies no stream decoder, lease state machine, or `Service`. Address
-//! assignment and socket handling belong to its callers.
+//! assignment and socket handling belong to its callers. [`ReplyConfig::build`]
+//! forms a reply and selects its IPv4 destination after the caller has
+//! admitted the request and chosen a [`Reply`]. It keeps no lease state.
 
 use std::net::Ipv4Addr;
 
@@ -55,6 +57,7 @@ pub mod opt {
     pub const SUBNET_MASK: u8 = 1;
     pub const ROUTER: u8 = 3;
     pub const DNS: u8 = 6;
+    pub const INTERFACE_MTU: u8 = 26;
     pub const REQUESTED_IP: u8 = 50;
     pub const LEASE_TIME: u8 = 51;
     pub const MESSAGE_TYPE: u8 = 53;
@@ -149,6 +152,114 @@ impl Message {
     /// Adds an option.
     pub fn push(&mut self, code: u8, value: impl Into<Vec<u8>>) {
         self.options.push((code, value.into()));
+    }
+}
+
+/// The reply a caller has chosen after checking a request and its lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// Offer this address to the client.
+    Offer(Ipv4Addr),
+    /// Acknowledge a lease for this address, including a renewal.
+    Ack(Ipv4Addr),
+    /// Reject the requested lease.
+    Nak,
+    /// Acknowledge INFORM with settings, without assigning an address.
+    Inform,
+}
+
+/// Settings for pure reply formation. Admission, address allocation and
+/// lease tracking belong to the caller.
+#[derive(Clone, Copy, Debug)]
+pub struct ReplyConfig {
+    /// Server identifier (option 54).
+    pub server: Ipv4Addr,
+    /// Lease duration in seconds. Renewal is half of this; rebinding is
+    /// seven times this value divided by eight, with division done first.
+    pub lease_secs: u32,
+    /// Subnet mask sent with every reply except NAK.
+    pub subnet_mask: Ipv4Addr,
+    /// Optional default router.
+    pub router: Option<Ipv4Addr>,
+    /// Optional DNS server.
+    pub dns: Option<Ipv4Addr>,
+    /// Optional interface MTU, in bytes.
+    pub mtu: Option<u16>,
+}
+
+impl ReplyConfig {
+    /// Forms a message and its IPv4 destination without I/O or lease state.
+    ///
+    /// Copies the transaction ID, hardware type and length, flags, relay
+    /// address and client hardware address. Other fixed fields are zero,
+    /// except the offered or acknowledged address, or `ciaddr` for INFORM.
+    /// INFORM becomes ACK on the wire. Options are ordered as message type,
+    /// server ID, lease/renewal/rebinding times, subnet mask, router, DNS,
+    /// and MTU. INFORM omits the times; NAK has only type and server ID.
+    ///
+    /// A non-NAK reply goes to the request's nonzero `ciaddr`; otherwise it
+    /// goes to the IPv4 broadcast address. This is the direct-client policy
+    /// used by Net and TAP: flags and `giaddr` are echoed, but do not change
+    /// the destination. The caller handles UDP and link-layer framing.
+    ///
+    /// ```
+    /// use std::net::Ipv4Addr;
+    /// use fictionet::stdlib::dhcp::{self, Message, Reply, ReplyConfig};
+    /// let settings = ReplyConfig {
+    ///     server: Ipv4Addr::new(10, 0, 0, 1),
+    ///     lease_secs: 3600,
+    ///     subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+    ///     router: None,
+    ///     dns: None,
+    ///     mtu: Some(1500),
+    /// };
+    /// let request = Message::new(dhcp::BOOTREQUEST, 42);
+    /// let (offer, to) = settings.build(&request, Reply::Offer(Ipv4Addr::new(10, 0, 0, 2)));
+    /// assert_eq!(offer.message_type(), Some(dhcp::OFFER));
+    /// assert_eq!(to, Ipv4Addr::BROADCAST);
+    /// ```
+    pub fn build(&self, request: &Message, reply: Reply) -> (Message, Ipv4Addr) {
+        let (kind, yiaddr) = match reply {
+            Reply::Offer(addr) => (OFFER, addr),
+            Reply::Ack(addr) => (ACK, addr),
+            Reply::Nak => (NAK, Ipv4Addr::UNSPECIFIED),
+            Reply::Inform => (ACK, Ipv4Addr::UNSPECIFIED),
+        };
+        let mut m = Message::new(BOOTREPLY, request.xid);
+        m.htype = request.htype;
+        m.hlen = request.hlen;
+        m.flags = request.flags;
+        m.giaddr = request.giaddr;
+        m.chaddr = request.chaddr;
+        m.yiaddr = yiaddr;
+        if reply == Reply::Inform {
+            m.ciaddr = request.ciaddr;
+        }
+        m.push(opt::MESSAGE_TYPE, [kind]);
+        m.push(opt::SERVER_ID, self.server.octets());
+        if reply != Reply::Nak {
+            if reply != Reply::Inform {
+                m.push(opt::LEASE_TIME, self.lease_secs.to_be_bytes());
+                m.push(opt::RENEWAL_TIME, (self.lease_secs / 2).to_be_bytes());
+                m.push(opt::REBINDING_TIME, (self.lease_secs / 8 * 7).to_be_bytes());
+            }
+            m.push(opt::SUBNET_MASK, self.subnet_mask.octets());
+            if let Some(router) = self.router {
+                m.push(opt::ROUTER, router.octets());
+            }
+            if let Some(dns) = self.dns {
+                m.push(opt::DNS, dns.octets());
+            }
+            if let Some(mtu) = self.mtu {
+                m.push(opt::INTERFACE_MTU, mtu.to_be_bytes());
+            }
+        }
+        let to = if reply != Reply::Nak && !request.ciaddr.is_unspecified() {
+            request.ciaddr
+        } else {
+            Ipv4Addr::BROADCAST
+        };
+        (m, to)
     }
 }
 
@@ -296,6 +407,47 @@ mod tests {
         m.push(opt::MESSAGE_TYPE, [DISCOVER]);
         m.push(opt::REQUESTED_IP, [10, 0, 0, 2]);
         m
+    }
+
+    #[test]
+    fn reply_settings_are_independent() {
+        let request = discover();
+        let addr = Ipv4Addr::new(192, 0, 2, 2);
+        let mut settings = ReplyConfig {
+            server: Ipv4Addr::new(192, 0, 2, 1),
+            lease_secs: 9,
+            subnet_mask: Ipv4Addr::new(255, 255, 0, 0),
+            router: None,
+            dns: None,
+            mtu: None,
+        };
+        for router in [None, Some(Ipv4Addr::new(192, 0, 2, 3))] {
+            for dns in [None, Some(Ipv4Addr::new(192, 0, 2, 53))] {
+                for mtu in [None, Some(9000)] {
+                    settings.router = router;
+                    settings.dns = dns;
+                    settings.mtu = mtu;
+                    let (reply, to) = settings.build(&request, Reply::Offer(addr));
+                    assert_eq!(to, Ipv4Addr::BROADCAST);
+                    let mut expected = vec![
+                        53, 1, 2, 54, 4, 192, 0, 2, 1, 51, 4, 0, 0, 0, 9, 58, 4, 0, 0, 0, 4, 59, 4,
+                        0, 0, 0, 7, 1, 4, 255, 255, 0, 0,
+                    ];
+                    if router.is_some() {
+                        expected.extend_from_slice(&[3, 4, 192, 0, 2, 3]);
+                    }
+                    if dns.is_some() {
+                        expected.extend_from_slice(&[6, 4, 192, 0, 2, 53]);
+                    }
+                    if mtu.is_some() {
+                        expected.extend_from_slice(&[26, 2, 35, 40]);
+                    }
+                    expected.push(255);
+                    expected.resize(60, 0);
+                    assert_eq!(&reply.to_bytes().unwrap()[240..], expected);
+                }
+            }
+        }
     }
 
     #[test]

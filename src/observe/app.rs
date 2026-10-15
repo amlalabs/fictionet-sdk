@@ -9,7 +9,7 @@
 //! in that packet, its fields point at the packet's own bytes; otherwise
 //! the message gets a buffer of its own, as Wireshark's "Reassembled TCP".
 
-use fictionet::stdlib::http2;
+use fictionet::stdlib::{dhcp, http2};
 
 use super::http2 as capture;
 
@@ -101,7 +101,12 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(
         "dhcp",
         |s| {
-            if s.transport == Transport::Udp && matches!(s.ports, (67, 68) | (68, 67)) {
+            if s.transport == Transport::Udp
+                && matches!(
+                    s.ports,
+                    (dhcp::SERVER_PORT, dhcp::CLIENT_PORT) | (dhcp::CLIENT_PORT, dhcp::SERVER_PORT)
+                )
+            {
                 Match::Yes
             } else {
                 Match::No

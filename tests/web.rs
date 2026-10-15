@@ -1197,6 +1197,72 @@ async fn dhcp_ask(
 }
 
 #[test]
+fn dhcp_reply_bytes() {
+    world(|fcx, attacher, _env| async move {
+        let mut raw = attacher.attach("dhcp bytes").unwrap();
+        for (kind, ciaddr, wanted, reply_kind, assigned) in [
+            (dhcp::DISCOVER, [0; 4], None, 2, [10, 0, 0, 2]),
+            (dhcp::REQUEST, [0; 4], Some([10, 0, 0, 2]), 5, [10, 0, 0, 2]),
+            (dhcp::REQUEST, [10, 0, 0, 2], None, 5, [10, 0, 0, 2]),
+            (dhcp::INFORM, [10, 0, 0, 2], None, 5, [0; 4]),
+            (dhcp::REQUEST, [10, 0, 0, 2], Some([10, 0, 0, 1]), 6, [0; 4]),
+        ] {
+            let mut request = dhcp_msg(kind, 0x1234_5678, 1);
+            request.htype = 7;
+            request.hlen = 9;
+            request.flags = 0x8000;
+            request.ciaddr = ciaddr.into();
+            request.giaddr = Ipv4Addr::new(10, 0, 0, 254);
+            if let Some(wanted) = wanted {
+                request.push(dhcp::opt::REQUESTED_IP, wanted);
+            }
+            raw.send(udp(
+                ciaddr.into(),
+                68,
+                GATEWAY,
+                67,
+                &request.to_bytes().unwrap(),
+            ));
+            let packet = recv_within(&fcx, &mut raw, SHORT).await.unwrap();
+            let (from, to, proto, datagram) = parse(&packet);
+            assert_eq!((from, proto), (GATEWAY, 17));
+            assert_eq!(
+                to,
+                if ciaddr == [0; 4] || reply_kind == 6 {
+                    Ipv4Addr::BROADCAST
+                } else {
+                    ciaddr.into()
+                }
+            );
+            let mut expected = vec![0; 240];
+            expected[..12].copy_from_slice(&[2, 7, 9, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 0x80, 0]);
+            if kind == dhcp::INFORM {
+                expected[12..16].copy_from_slice(&ciaddr);
+            }
+            expected[16..20].copy_from_slice(&assigned);
+            expected[24..28].copy_from_slice(&[10, 0, 0, 254]);
+            expected[28..44].copy_from_slice(&request.chaddr);
+            expected[236..240].copy_from_slice(&[99, 130, 83, 99]);
+            expected.extend_from_slice(&[53, 1, reply_kind, 54, 4, 10, 0, 0, 1]);
+            if reply_kind != 6 {
+                if kind != dhcp::INFORM {
+                    expected.extend_from_slice(&[
+                        51, 4, 0, 0, 14, 16, 58, 4, 0, 0, 7, 8, 59, 4, 0, 0, 12, 78,
+                    ]);
+                }
+                expected.extend_from_slice(&[
+                    1, 4, 255, 255, 255, 0, 3, 4, 10, 0, 0, 1, 6, 4, 10, 0, 0, 1,
+                ]);
+            }
+            expected.push(255);
+            expected.resize(300, 0);
+            assert_eq!(&datagram[8..], expected, "{kind}");
+        }
+        Ok(())
+    });
+}
+
+#[test]
 fn dhcp_rejects_bad_udp_checksum() {
     dhcp_rejects_udp(|u| {
         let checksum = u16::from_be_bytes([u[6], u[7]]);

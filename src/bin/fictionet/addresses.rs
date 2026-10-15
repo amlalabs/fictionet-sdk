@@ -52,62 +52,32 @@ pub(crate) fn dhcp4(lease: &Lease<Ipv4Addr>, mtu: u16, request: &[u8]) -> Option
     }
     let server = server_id(lease);
     let addr = lease.addr.addr;
-    let kind = match m.message_type()? {
-        dhcp::DISCOVER => dhcp::OFFER,
+    let reply = match m.message_type()? {
+        dhcp::DISCOVER => dhcp::Reply::Offer(addr),
         dhcp::REQUEST => {
             if m.option_addr(opt::SERVER_ID).is_some_and(|s| s != server) {
                 // The VM chose another server's offer.
                 return None;
             }
             let wanted = m.option_addr(opt::REQUESTED_IP).unwrap_or(m.ciaddr);
-            if wanted == addr { dhcp::ACK } else { dhcp::NAK }
+            if wanted == addr {
+                dhcp::Reply::Ack(addr)
+            } else {
+                dhcp::Reply::Nak
+            }
         }
-        dhcp::INFORM => dhcp::INFORM,
+        dhcp::INFORM => dhcp::Reply::Inform,
         _ => return None,
     };
-    let mut r = dhcp::Message::new(dhcp::BOOTREPLY, m.xid);
-    r.flags = m.flags;
-    r.giaddr = m.giaddr;
-    r.chaddr = m.chaddr;
-    if kind == dhcp::INFORM {
-        r.ciaddr = m.ciaddr;
-    } else if kind != dhcp::NAK {
-        r.yiaddr = addr;
+    let (r, to) = dhcp::ReplyConfig {
+        server,
+        lease_secs: LEASE_SECS,
+        subnet_mask: Ipv4Addr::from(mask4(lease.addr.prefix)),
+        router: lease.gateway,
+        dns: lease.dns,
+        mtu: Some(mtu),
     }
-    r.push(
-        opt::MESSAGE_TYPE,
-        [if kind == dhcp::INFORM {
-            dhcp::ACK
-        } else {
-            kind
-        }],
-    );
-    r.push(opt::SERVER_ID, server.octets());
-    if kind != dhcp::NAK {
-        if kind != dhcp::INFORM {
-            r.push(opt::LEASE_TIME, LEASE_SECS.to_be_bytes());
-            r.push(opt::RENEWAL_TIME, (LEASE_SECS / 2).to_be_bytes());
-            r.push(opt::REBINDING_TIME, (LEASE_SECS / 8 * 7).to_be_bytes());
-        }
-        let mask = mask4(lease.addr.prefix);
-        r.push(opt::SUBNET_MASK, mask.to_be_bytes());
-        if let Some(gw) = lease.gateway {
-            r.push(opt::ROUTER, gw.octets());
-        }
-        if let Some(dns) = lease.dns {
-            r.push(opt::DNS, dns.octets());
-        }
-        r.push(INTERFACE_MTU, mtu.to_be_bytes());
-    }
-    // A VM that already has its address (a renewal, or INFORM) gets the
-    // answer at that address. Every other answer is broadcast, which a
-    // client with no address yet always receives.
-    let unicast = kind != dhcp::NAK && !m.ciaddr.is_unspecified();
-    let to = if unicast {
-        m.ciaddr
-    } else {
-        Ipv4Addr::BROADCAST
-    };
+    .build(&m, reply);
     Some((
         ether::udp4(
             server,
@@ -116,12 +86,9 @@ pub(crate) fn dhcp4(lease: &Lease<Ipv4Addr>, mtu: u16, request: &[u8]) -> Option
             dhcp::CLIENT_PORT,
             &r.to_bytes().ok()?,
         ),
-        !unicast,
+        reply == dhcp::Reply::Nak || m.ciaddr.is_unspecified(),
     ))
 }
-
-/// DHCP option 26: the interface MTU.
-const INTERFACE_MTU: u8 = 26;
 
 // Router advertisements
 
@@ -331,6 +298,59 @@ mod tests {
     }
 
     #[test]
+    fn dhcp4_reply_bytes() {
+        for (kind, ciaddr, wanted, reply_kind, assigned) in [
+            (dhcp::DISCOVER, [0; 4], None, 2, [10, 0, 0, 2]),
+            (dhcp::REQUEST, [0; 4], Some([10, 0, 0, 2]), 5, [10, 0, 0, 2]),
+            (dhcp::REQUEST, [10, 0, 0, 2], None, 5, [10, 0, 0, 2]),
+            (dhcp::INFORM, [10, 0, 0, 2], None, 5, [0; 4]),
+            (dhcp::REQUEST, [10, 0, 0, 2], Some([10, 0, 0, 9]), 6, [0; 4]),
+        ] {
+            let mut request = client(kind);
+            request.flags = 0x8000;
+            request.ciaddr = ciaddr.into();
+            request.giaddr = Ipv4Addr::new(10, 0, 0, 254);
+            if let Some(wanted) = wanted {
+                request.push(opt::REQUESTED_IP, wanted);
+            }
+            let (packet, broadcast) = dhcp4(&lease4(), 1500, &request.to_bytes().unwrap()).unwrap();
+            let expected_broadcast = ciaddr == [0; 4] || reply_kind == 6;
+            assert_eq!(broadcast, expected_broadcast);
+            assert_eq!(
+                &packet[16..20],
+                if expected_broadcast {
+                    &[255; 4]
+                } else {
+                    &ciaddr
+                }
+            );
+            let mut expected = vec![0; 240];
+            expected[..12].copy_from_slice(&[2, 1, 6, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 0x80, 0]);
+            if kind == dhcp::INFORM {
+                expected[12..16].copy_from_slice(&ciaddr);
+            }
+            expected[16..20].copy_from_slice(&assigned);
+            expected[24..28].copy_from_slice(&[10, 0, 0, 254]);
+            expected[28..34].copy_from_slice(&VM);
+            expected[236..240].copy_from_slice(&[99, 130, 83, 99]);
+            expected.extend_from_slice(&[53, 1, reply_kind, 54, 4, 10, 0, 0, 1]);
+            if reply_kind != 6 {
+                if kind != dhcp::INFORM {
+                    expected.extend_from_slice(&[
+                        51, 4, 0, 1, 81, 128, 58, 4, 0, 0, 168, 192, 59, 4, 0, 1, 39, 80,
+                    ]);
+                }
+                expected.extend_from_slice(&[
+                    1, 4, 255, 255, 255, 0, 3, 4, 10, 0, 0, 1, 6, 4, 10, 0, 0, 1, 26, 2, 5, 220,
+                ]);
+            }
+            expected.push(255);
+            expected.resize(300, 0);
+            assert_eq!(ether::udp_to(&packet).unwrap().1, expected, "{kind}");
+        }
+    }
+
+    #[test]
     fn discover_request_ack() {
         let (offer, broadcast) =
             dhcp4(&lease4(), 1500, &client(dhcp::DISCOVER).to_bytes().unwrap()).unwrap();
@@ -353,7 +373,7 @@ mod tests {
             Some(Ipv4Addr::new(10, 0, 0, 1))
         );
         assert_eq!(m.option_u32(opt::LEASE_TIME), Some(86_400));
-        assert_eq!(m.option(INTERFACE_MTU), Some(&[5, 220][..]));
+        assert_eq!(m.option(opt::INTERFACE_MTU), Some(&[5, 220][..]));
 
         let mut req = client(dhcp::REQUEST);
         req.push(opt::REQUESTED_IP, [10, 0, 0, 2]);
@@ -417,7 +437,10 @@ mod tests {
         assert_eq!(m.message_type(), Some(dhcp::ACK));
         assert_eq!(m.yiaddr, Ipv4Addr::UNSPECIFIED);
         assert_eq!(m.option(opt::LEASE_TIME), None);
-        assert_eq!(m.option(INTERFACE_MTU), Some(&9000u16.to_be_bytes()[..]));
+        assert_eq!(
+            m.option(opt::INTERFACE_MTU),
+            Some(&9000u16.to_be_bytes()[..])
+        );
 
         let bare = Lease {
             gateway: None,

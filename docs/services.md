@@ -345,6 +345,16 @@ lengths below eight bytes or beyond the IP payload, and incorrect nonzero
 checksums. IPv4 requests may use a zero checksum. Dropped requests do not
 reserve or bind an address and get no reply.
 
+`dhcp::ReplyConfig::build` forms replies for both Net and TAP. The caller
+chooses an offer, lease acknowledgement, NAK or INFORM acknowledgement
+with `dhcp::Reply`. Settings select the server ID, lease duration, subnet
+mask and optional router, DNS and MTU. The builder returns the message
+and IPv4 destination; callers retain admission, leases and packet framing.
+Net advertises a one-hour lease with no MTU option. TAP advertises a
+one-day lease and its link MTU. INFORM has no lease times, and NAK has
+only message type and server ID. NAK and requests with no client address
+get broadcast replies; other replies go to the request's client address.
+
 With `fictionet attach --type http_proxy` or `--type socks5`, attach looks
 names up in the world's DNS. It follows at most 16 CNAME aliases from the
 queried name and uses an A record for the final name. It ignores unrelated
