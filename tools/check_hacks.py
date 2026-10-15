@@ -4,7 +4,9 @@ Run from any directory with --root, optionally --scope runtime|codecs|harnesses.
 Allowlists are tools/hack_allowlists/<scope>.json objects mapping rule names to
 arrays of {path, symbol, pattern, reason, id}. Patterns are literal normalized
 source lines (continued lines are joined), not regular expressions. Every entry
-must match exactly one site. Sleeps and early test returns are review candidates,
+must match exactly one site. Identical lines in one function share one entry with
+an integer "count" of at least 2, which must equal the number of those sites.
+Sleeps and early test returns are review candidates,
 including simulated timers and returns that already print a skip diagnostic.
 Rust lint exceptions stay in source: Clippy checks types and stale expectations.
 This scanner checks their IDs and limits must-use expectations to let statements
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path, PurePosixPath
@@ -48,6 +51,22 @@ POLICIES = {
     "POL-FALLBACK": "An expected refusal; the reason names the path that provides the outcome instead.",
     "POL-PROBE": "Arbitrary input may be rejected; the probe checks only that handling neither panics nor hangs.",
     "POL-SCAFFOLD": "Test scaffolding whose result the test does not check; the reason names what it checks.",
+    "POL-SETTLE": "A fixed wait lets known work finish, or is a measurement window, before a check; "
+                  "the entry says why its length is enough.",
+    "POL-HANDSHAKE": "A loop waits for a signal from the other side of the test; a missing signal "
+                     "stalls the test until its timeout fails it.",
+    "POL-PROTOCOL": "The wait is protocol, product or presentation timing, such as a backoff, a cadence "
+                    "or a real-time timer under test, not a wait for a check to pass.",
+    "POL-IDLE": "A process, container or world idles so a test or demo can use it; no outcome waits "
+                "for the idle wait to end.",
+    "POL-INNER-RETURN": "A return or exit ends a nested closure, future, poll, helper or child command "
+                        "with its result; the caller still checks it.",
+    "POL-TEXT": "The match is message, pattern, fixture or data text, an identifier, or a test stub; "
+                "it is not a skip, wait or status discard in the harness's own flow.",
+    "POL-MODE": "An opt-in flag or variable selects another job, such as rewriting a golden file or "
+                "running only self-tests, and ends with that job's result.",
+    "POL-OPTIONAL": "An optional setup, speed-up, lookup or argument step; what depends on it fails "
+                    "loudly when it did not happen.",
 }
 SCOPES = ("runtime", "codecs", "harnesses")
 RULES = {"shell-or-true", "continue-on-error", "sleep", "silent-skip", "skip-reason"}
@@ -494,9 +513,13 @@ def exceptions(root, scope):
         if not isinstance(values, list):
             raise CheckError(f"{path}: {rule} must contain an array")
         for entry in values:
-            if (not isinstance(entry, dict) or set(entry) != {"path", "symbol", "pattern", "reason", "id"}
-                    or any(not isinstance(v, str) or not v.strip() for v in entry.values())):
+            fields = {"path", "symbol", "pattern", "reason", "id"}
+            if (not isinstance(entry, dict) or set(entry) - {"count"} != fields
+                    or any(not isinstance(entry[k], str) or not entry[k].strip() for k in fields)):
                 raise CheckError(f"{path}: invalid entry for {rule}")
+            count = entry.get("count", 1)
+            if "count" in entry and (type(count) is not int or count < 2):
+                raise CheckError(f"{path}: count must be an integer of at least 2: {entry}")
             source = PurePosixPath(entry["path"])
             if (source.is_absolute() or ".." in source.parts or str(source) != entry["path"]
                     or re.search(r"[?*\[\]\\^$|(){}]", entry["path"])
@@ -510,7 +533,7 @@ def exceptions(root, scope):
             key = rule, entry["path"], entry["symbol"], entry["pattern"]
             if key in entries:
                 raise CheckError(f"{path}: duplicate entry: {key}")
-            entries.append(key)
+            entries.extend([key] * count)
     return entries
 
 
@@ -525,11 +548,14 @@ def check(root, scope=None):
             except CheckError as error:
                 raise CheckError(f"{path}: {error}") from error
     errors = []
-    for entry in allowed:
-        matches = sum(f.key() == entry for f in findings)
-        if matches != 1:
-            errors.append(f"{'stale' if matches == 0 else 'ambiguous'} exception: {entry}")
-    errors.extend(str(f) for f in findings if f.key() not in allowed)
+    expected = Counter(allowed)
+    found = Counter(f.key() for f in findings)
+    for entry, count in expected.items():
+        matches = found[entry]
+        if matches != count:
+            counted = "" if count == 1 else f" (count {count}, found {matches})"
+            errors.append(f"{'stale' if matches < count else 'ambiguous'} exception: {entry}{counted}")
+    errors.extend(str(f) for f in findings if f.key() not in expected)
     return errors
 
 

@@ -408,7 +408,7 @@ fn client(log: &Mutex<Vec<String>>) {
 }
 
 #[test]
-#[ignore = "needs root and /dev/net/tun; tests/docker/tcpudp/run.sh runs it"]
+#[ignore = "POL-PREREQUISITE: needs root and /dev/net/tun; tests/docker/tcpudp/run.sh runs it"]
 fn a_linux_client_through_tun() {
     let tun = open_tun("fn0");
     sh(

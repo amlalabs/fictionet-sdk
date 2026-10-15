@@ -77,9 +77,12 @@ check_ok "no container adds a capability or runs as root" '^$' \
 check_ok "attach runs as the world's user, with no capabilities" '^uid=65532' \
     bash -o pipefail -c "kubectl -n $ns get pod $pod -o jsonpath='{.spec.initContainers[?(@.name==\"attach\")].securityContext.runAsUser}' | sed 's/^/uid=/'"
 helm install fntun "$root/charts/fictionet-sandbox" -n "$ns" -f "$root/examples/attach/k8s-tun.yaml" >/dev/null
-sleep 3
-check_ok "a tun release in the same namespace is refused" 'violates PodSecurity "restricted:latest".*NET_ADMIN' \
-    kubectl -n "$ns" get events --field-selector reason=FailedCreate -o jsonpath='{.items[*].message}'
+# The StatefulSet controller records the refusal once it tries to make the
+# pod: wait up to 60 s for the event, then check it.
+refused='violates PodSecurity "restricted:latest".*NET_ADMIN'
+failed_create() { kubectl -n "$ns" get events --field-selector reason=FailedCreate -o jsonpath='{.items[*].message}'; }
+for _ in $(seq 60); do failed_create 2>/dev/null | grep -E "$refused" >/dev/null && break; sleep 1; done
+check_ok "a tun release in the same namespace is refused" "$refused" failed_create
 helm uninstall fntun -n "$ns" >/dev/null 2>&1 || true
 
 # 1a. The agent waits for the NetworkPolicy.

@@ -83,15 +83,17 @@ EOF
 # Boots the image once. $1: a name for this boot. The guest commands come on
 # stdin. A network-config may be given as $2.
 boot() {
-    local name="$1" seed="$run/$1-seed" status=0
+    local name="$1" seed="$run/$1-seed" status=0 ca
     mkdir -p "$seed"
     guest_script > "$seed/check.sh"
+    # A missing CA ends the run here instead of reaching the guest empty.
+    ca="$(base64 -w0 "$run/ca.pem")"
     {
         echo '#cloud-config'
         echo 'write_files:'
         echo '  - path: /root/ca.pem'
         echo '    encoding: b64'
-        echo "    content: $(base64 -w0 "$run/ca.pem" 2>/dev/null || true)"
+        echo "    content: $ca"
         echo '  - path: /root/check.sh'
         echo "    permissions: '0755'"
         echo '    encoding: b64'
@@ -166,6 +168,14 @@ echo "=== 1. web_fixture, IPv4, DHCP from attach"
 "$examples/web_fixture" "$run/world.sock" "$run/ca.pem" > "$run/world.log" 2>&1 &
 pids+=($!)
 start_attach --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 --no-ip-addr-v6
+# web_fixture binds its socket before it writes its CA, so attach can be
+# ready first. Wait up to 10 s for the whole certificate.
+for _ in $(seq 100); do grep -qs -- '-----END CERTIFICATE-----' "$run/ca.pem" && break; sleep 0.1; done
+if ! grep -qs -- '-----END CERTIFICATE-----' "$run/ca.pem"; then
+    fail "web_fixture wrote no complete CA certificate to $run/ca.pem in 10 s"
+    cat "$run/world.log"
+    exit 1
+fi
 boot web <<'EOF'
 show cat /etc/resolv.conf
 show dig +short example.test

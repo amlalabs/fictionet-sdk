@@ -476,6 +476,11 @@ const OTHER: &str = "#[allow(warnings)]";
                    if entry[1].startswith("tools/")]
         self.assertCountEqual(findings, entries)
 
+    def test_harness_tree_has_only_reviewed_exceptions(self):
+        # Every harness candidate in the tracked tree has a reviewed entry, and
+        # every entry still matches. CI runs this with the checker's tests.
+        self.assertEqual(checker.check(ROOT, "harnesses"), [])
+
 
 class Inventory(unittest.TestCase):
     def setUp(self):
@@ -530,6 +535,29 @@ class Inventory(unittest.TestCase):
         self.allow([self.entry()])
         self.write("tests/a.sh", "probe() {\n curl example.test || true\n curl example.test || true\n}\n")
         self.assertTrue(any("ambiguous exception" in e for e in checker.check(self.root)))
+
+    def test_count_covers_exactly_that_many_identical_sites(self):
+        line = "    curl example.test || true\n"
+        self.write("tests/a.sh", "probe() {\n" + line * 2 + "}\n")
+        self.allow([self.entry()])
+        self.assertTrue(any("ambiguous exception" in e for e in checker.check(self.root)))
+        self.allow([self.entry(count=2)])
+        self.assertEqual(checker.check(self.root), [])
+        for sites, kind in ((3, "ambiguous"), (1, "stale")):
+            with self.subTest(sites=sites):
+                self.write("tests/a.sh", "probe() {\n" + line * sites + "}\n")
+                errors = checker.check(self.root)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f"{kind} exception", errors[0])
+                self.assertIn(f"(count 2, found {sites})", errors[0])
+
+    def test_invalid_counts_fail(self):
+        self.fixture()
+        for count in (1, 0, -2, True, 2.0, "2", None):
+            with self.subTest(count=count):
+                self.allow([self.entry(count=count)])
+                with self.assertRaisesRegex(checker.CheckError, "count must be"):
+                    checker.check(self.root)
 
     def test_invalid_allowlists_fail(self):
         self.fixture()
