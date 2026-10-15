@@ -482,7 +482,7 @@ class World:
                    if hit else "<p>Sorry, there are no results for your search.</p>")
             if "communications" in term:
                 res += '<ul><li><a href="/ukpga/2003/21/contents">Communications Act 2003</a> 2003 c. 21</li></ul>'
-            return page(200, "Search Legislation", f"<main><h1>Search results</h1>{res}</main>", kind="legislation", **meta)
+            return page(200, "Search Legislation", f"<main><h1>Search results</h1>{res}</main>", kind="legislation_search", **meta)
         return not_found("www.legislation.gov.uk")
 
     # ---------------------------------------------------------------- search

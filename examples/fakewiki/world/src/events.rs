@@ -6,7 +6,11 @@
 //! page (its kind, topic, source and stance) in its response's extensions
 //! as event fields ([`Page::fields`]). The `http.request` event brings
 //! them back here, so one `http` line holds both what the agent asked for
-//! and what it was shown.
+//! and what the server delivered. `bytes` is the page's Content-Length,
+//! including for HEAD. `sent` and `complete` copy the core's delivery facts:
+//! body bytes taken by the connection, and whether it took the whole body.
+//! Over HTTP/2 this means hyper took the body, not that the client read it.
+//! `location` is the redirect destination, when there is one.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -29,8 +33,10 @@ pub struct Page {
     pub topic: Option<String>,
     pub source: Option<String>,
     pub stance: Option<String>,
-    /// The length of the page, also for HEAD, as main.py logged it.
+    /// The length of the page, also for HEAD, separate from sent bytes.
     pub bytes: u64,
+    /// The response's Location header, if present.
+    pub location: Option<String>,
     /// Why the backend could not answer, for a `backend_error`.
     pub error: Option<String>,
 }
@@ -44,6 +50,7 @@ impl Page {
             .with("source", opt(self.source.clone()))
             .with("stance", opt(self.stance.clone()))
             .with("bytes", self.bytes)
+            .with("location", opt(self.location.clone()))
             .with("error", opt(self.error.clone()))
     }
 }
@@ -147,6 +154,8 @@ fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
         "sni": text(e, "sni"),
         "path": path,
         "ua": ua.unwrap_or_default(),
+        "sent": e.u64("sent"),
+        "complete": e.get("complete").and_then(J::as_bool),
     });
     let fields = entry.as_object_mut().expect("an object");
     let mut bytes = e.u64("sent").unwrap_or(0);
@@ -164,6 +173,9 @@ fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
                     fields.insert("error".into(), json!(error));
                 }
                 bytes = e.u64("bytes").unwrap_or(0);
+                if let Some(location) = text(e, "location") {
+                    fields.insert("location".into(), json!(location));
+                }
             }
             None => {
                 fields.insert("in_world".into(), json!(true));
@@ -173,6 +185,8 @@ fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
         Some("redirect") => {
             fields.insert("in_world".into(), json!(true));
             fields.insert("kind".into(), json!("http_redirect"));
+            // Match httpd's plain-HTTP redirect construction exactly.
+            fields.insert("location".into(), json!(format!("https://{host}{path}")));
         }
         Some("misdirected") => {
             // A FakeWiki host asked for at the wrong address, or over a
@@ -199,4 +213,36 @@ fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
     fields.insert("status".into(), json!(e.u64("status")));
     fields.insert("bytes".into(), json!(bytes));
     entry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_facts_are_separate_from_page_length() {
+        for (method, sent, complete) in [("HEAD", 0_u64, true), ("GET", 20, false)] {
+            let event = Entry::new("http", "request")
+                .field("answer", "handler")
+                .field("kind", "wiki_article")
+                .field("method", method)
+                .field("status", 200_u64)
+                .field("bytes", 100_u64)
+                .field("sent", sent)
+                .field("complete", complete);
+            let line = http(&HashMap::new(), &event);
+            assert_eq!(line["bytes"], 100);
+            assert_eq!(line["sent"], sent);
+            assert_eq!(line["complete"], complete);
+            assert_eq!(line["status"], 200);
+        }
+    }
+
+    #[test]
+    fn missing_delivery_facts_stay_unknown() {
+        let event = Entry::new("http", "request").field("bytes", 100_u64);
+        let line = http(&HashMap::new(), &event);
+        assert!(line["sent"].is_null());
+        assert!(line["complete"].is_null());
+    }
 }

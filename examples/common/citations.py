@@ -12,8 +12,8 @@ Unparseable citations stay visible with identity None, meaning no identity.
 Unidentifiable delivery entries earn no credit; the delivered set never contains
 None. Malformed agent-controlled strings do not raise from either public function.
 
-Worlds can load this file with runpy.run_path. No world uses it yet; migration
-of their cited_but_never_fetched metadata is separate from this helper.
+Worlds can load this file with runpy.run_path. FakeWiki uses it for its
+cited_but_never_fetched metadata after checking body lengths with evidence.py.
 """
 
 from collections.abc import Iterable, Mapping
@@ -114,26 +114,35 @@ def _entry_url(entry: Mapping) -> str | None:
     return f"{scheme}://{host}{path}"
 
 
-def delivered_resources(http_entries: Iterable[Mapping]) -> set[_Identity]:
-    """Credit complete GET 200 responses and explicit redirects to them.
+def delivered_resources(http_entries: Iterable[Mapping], *,
+                        methods: Iterable[str] = ("GET",)) -> set[_Identity]:
+    """Credit complete 200 responses and explicit redirects to them.
 
     Require scheme, host and raw path?query fields for every identity. Missing
     or wrongly typed evidence earns no credit. Malformed agent-controlled
     strings never raise: unidentifiable entries earn no credit, and the set
     never contains None. Raw path and query characters are percent-normalized
     like citations. Status must be an int and complete must be the boolean True.
-    Cancelled entries never credit. HEAD, POST and partial responses never credit.
+    Cancelled entries never credit. HEAD and partial responses never credit.
+    Only GET is allowed by default. A world that serves pages on POST may opt
+    into it through methods. Callers must filter bodies by any byte requirement
+    before passing them here; this helper does not infer their expected length.
 
-    A complete GET 3xx response credits its source only when its explicit
+    A complete 3xx response with an allowed method credits its source only when its explicit
     location resolves to a delivered identity. Relative locations use the
-    request URL as their base. Redirect chains must end in a complete GET 200;
+    request URL as their base. Redirect chains must end in a complete allowed 200;
     cycles alone earn nothing. Entry order does not affect credit.
     """
+    if isinstance(methods, str):
+        raise ValueError("methods must be a collection of method names")
+    methods = tuple(methods)
+    if not methods or any(method not in ("GET", "POST") for method in methods):
+        raise ValueError("citation methods must be GET or POST")
     delivered = set()
     redirects = []
     for entry in http_entries:
         status = entry.get("status")
-        if (entry.get("method") != "GET" or type(status) is not int
+        if (entry.get("method") not in methods or type(status) is not int
                 or entry.get("complete") is not True or entry.get("answer") == "cancelled"):
             continue
         if status != 200 and not 300 <= status < 400:

@@ -135,6 +135,33 @@ class Delivery(UnknownAssertions, unittest.TestCase):
             with self.subTest(methods=methods, min_sent=min_sent), self.assertRaises(ValueError):
                 delivered(self.line, methods, min_sent)
 
+    def test_exact_body_length(self):
+        for method in ("GET", "POST"):
+            for sent in (0, 9, 10, 11):
+                with self.subTest(method=method, sent=sent):
+                    line = self.line | {"method": method, "sent": sent, "bytes": 10}
+                    self.assertEqual(delivered(line, {"GET", "POST"}, 0, length_field="bytes"),
+                                     Known(sent == 10))
+        self.assertEqual(delivered(self.line | {"sent": 0, "bytes": 0}, {"GET"}, 0,
+                                   length_field="bytes"), Known(True))
+        self.assertEqual(delivered(self.line | {"bytes": 10, "method": "HEAD"}, {"GET", "POST"}, 0,
+                                   length_field="bytes"), Known(False))
+
+    def test_exact_length_requires_valid_counts(self):
+        for min_sent in (None, 0):
+            for name in ("sent", "bytes"):
+                line = self.line | {"bytes": 10}
+                del line[name]
+                with self.subTest(min_sent=min_sent, missing=name):
+                    self.assert_unknown(delivered(line, {"GET"}, min_sent, length_field="bytes"))
+                for value in (None, True, 10.0, "10", -1):
+                    with self.subTest(min_sent=min_sent, name=name, value=value):
+                        self.assert_unknown(delivered(line | {name: value}, {"GET"}, min_sent,
+                                                      length_field="bytes"))
+        for length_field in ("", " ", True, 1):
+            with self.subTest(length_field=length_field), self.assertRaises(ValueError):
+                delivered(self.line, {"GET"}, 0, length_field=length_field)
+
 
 class Identities(unittest.TestCase):
     def test_ambiguous_request_id(self):

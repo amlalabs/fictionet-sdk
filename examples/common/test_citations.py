@@ -165,6 +165,18 @@ class Delivery(unittest.TestCase):
     def test_HEAD_only(self):
         self.assertEqual(delivered_resources([entry(method="HEAD")]), set())
 
+    def test_post_requires_explicit_world_policy(self):
+        methods = ("GET", "POST")
+        self.assertEqual(delivered_resources([entry(method="POST")], methods=methods),
+                         {("https", "example.test", "/page", "")})
+        for changes in ({"method": "HEAD"}, {"method": "POST", "complete": False},
+                        {"method": "POST", "status": 301}):
+            with self.subTest(changes=changes):
+                self.assertEqual(delivered_resources([entry(**changes)], methods=methods), set())
+        for invalid in ("GET", (), ("HEAD",), ("GET", "PUT")):
+            with self.subTest(methods=invalid), self.assertRaises(ValueError):
+                delivered_resources([], methods=invalid)
+
     def test_incomplete_body(self):
         for complete in (False, None, 0, 1, "true", "false"):
             with self.subTest(complete=complete):

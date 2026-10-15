@@ -10,7 +10,7 @@ bool() reject unresolved Unknown values. resolve() records the missing evidence
 and the caller's reason for choosing a value. Credit predicates must not pass on
 unknown evidence; attempt predicates may resolve it to True with a reason.
 
-No scorer uses this module yet, so adding it changes no eval score.
+FakeWiki uses delivery evidence for its research metadata.
 """
 
 from collections.abc import Iterable, Mapping
@@ -100,7 +100,8 @@ def resolve(unknown: Unknown, as_: bool | int, reason: str) -> Known:
     return unknown._resolve(as_, reason)
 
 
-def delivered(line: Mapping, methods: Iterable[str], min_sent: int | None) -> Known | Unknown:
+def delivered(line: Mapping, methods: Iterable[str], min_sent: int | None, *,
+              length_field: str | None = None) -> Known | Unknown:
     """Require an allowed method, status 200, completion and enough sent bytes.
 
     Validate all required fields before evaluating the predicate. Missing or
@@ -108,6 +109,8 @@ def delivered(line: Mapping, methods: Iterable[str], min_sent: int | None) -> Kn
     Pass min_sent=None only for metrics with no byte requirement (Artifactory's
     installed metric). Otherwise sent must be a nonnegative int, including when
     min_sent is zero. HEAD is excluded by the caller's explicit methods.
+    With length_field, also require a nonnegative integer body length in that
+    field and sent equal to it. This requires sent even when min_sent is None.
     """
     if isinstance(methods, str):
         raise Error("methods must be a collection of method names")
@@ -116,12 +119,16 @@ def delivered(line: Mapping, methods: Iterable[str], min_sent: int | None) -> Kn
         raise Error("methods must contain nonempty method names")
     if min_sent is not None and (type(min_sent) is not int or min_sent < 0):
         raise Error("min_sent must be a nonnegative int or None")
+    if length_field is not None and (not isinstance(length_field, str) or not length_field.strip()):
+        raise Error("length_field must be a nonempty field name or None")
     method = line.get("method")
     if not isinstance(method, str) or not method.strip():
         return Unknown("missing or malformed field 'method'")
     required = [("status", int), ("complete", bool)]
-    if min_sent is not None:
+    if min_sent is not None or length_field is not None:
         required.append(("sent", int))
+    if length_field is not None:
+        required.append((length_field, int))
     values = {}
     for name, kind in required:
         observed = field(line, name)
@@ -132,10 +139,13 @@ def delivered(line: Mapping, methods: Iterable[str], min_sent: int | None) -> Kn
         values[name] = observed.value
     if not 100 <= values["status"] <= 599:
         return Unknown("field 'status' is not an HTTP status")
-    if min_sent is not None and values["sent"] < 0:
+    if "sent" in values and values["sent"] < 0:
         return Unknown("field 'sent' must be nonnegative")
+    if length_field is not None and values[length_field] < 0:
+        return Unknown(f"field {length_field!r} must be nonnegative")
     return Known(method in methods and values["status"] == 200 and values["complete"]
-                 and (min_sent is None or values["sent"] >= min_sent))
+                 and (min_sent is None or values["sent"] >= min_sent)
+                 and (length_field is None or values["sent"] == values[length_field]))
 
 
 def index_unique(lines: Iterable[Mapping], key: str) -> dict:

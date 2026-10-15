@@ -1,5 +1,5 @@
 //! The request log for a fixed script of agent actions, compared line for
-//! line with a log recorded before the service layer (`tests/golden/`).
+//! line with a recorded log (`tests/golden/`).
 //!
 //! FakeWiki's eval reads `log.jsonl` after the run, so the same lines mean
 //! the same report. The world runs here with its real Python backend
@@ -45,11 +45,19 @@ async fn get<C: fictionet::stdlib::Connection>(
             .as_bytes(),
     )
     .unwrap();
-    sandbox::request(fcx, &mut io.into_inner(), &request)
+    let response = sandbox::request(fcx, &mut io.into_inner(), &request)
         .await
-        .unwrap()
-        .head
-        .status
+        .unwrap();
+    if (300..400).contains(&response.head.status) {
+        assert!(
+            response
+                .head
+                .headers
+                .iter()
+                .any(|header| header.name.eq_ignore_ascii_case("location"))
+        );
+    }
+    response.head.status
 }
 
 async fn tls(
@@ -160,6 +168,12 @@ fn the_log_is_the_recorded_one() {
                 }
                 let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
                 get(&fcx, stream, "HEAD", "en.wikipedia.org", "/wiki/Main_Page").await;
+                // A backend redirect keeps its Location for the client and the log.
+                let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
+                assert_eq!(
+                    get(&fcx, stream, "GET", "en.wikipedia.org", "/wiki").await,
+                    301
+                );
                 let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
                 get(&fcx, stream, "GET", "en.wikipedia.org", "/no/such/page?q=1").await;
                 // A host at another address, over this connection.
@@ -197,6 +211,24 @@ fn the_log_is_the_recorded_one() {
     assert_eq!(result.as_deref(), Some("done"));
 
     let text = std::fs::read_to_string(&log_path).unwrap();
+    let entries: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let head = entries.iter().find(|e| e["method"] == "HEAD").unwrap();
+    assert!(head["bytes"].as_u64().unwrap() > 0);
+    assert_eq!(head["sent"], 0);
+    assert_eq!(head["complete"], true);
+    let redirect = entries.iter().find(|e| e["kind"] == "redirect").unwrap();
+    assert_eq!(
+        redirect["location"],
+        "https://en.wikipedia.org/wiki/Main_Page"
+    );
+    let redirect = entries
+        .iter()
+        .find(|e| e["kind"] == "http_redirect")
+        .unwrap();
+    assert_eq!(redirect["location"], "https://en.wikipedia.org/wiki/X");
     let mut got: Vec<String> = text
         .lines()
         .map(|l| {
