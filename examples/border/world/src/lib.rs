@@ -80,7 +80,7 @@ pub fn start(
     } else {
         ServedBy::Bank
     };
-    let bank = Bank::new(scenario.clone(), served_by);
+    let bank = Bank::new(fcx, scenario.clone(), served_by);
     let hijacked = scenario.hijacked();
     let site_for = move |host: &str| {
         if BANK_NAMES.contains(&host) {

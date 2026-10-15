@@ -229,10 +229,38 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
             .await;
             assert_eq!(got.status, StatusCode::OK);
             assert!(String::from_utf8_lossy(&got.body).contains("You are signed in."));
-            assert_eq!(
-                got.headers["set-cookie"],
-                "kb_session=signed-in; HttpOnly; Path=/"
-            );
+            let cookie = got.headers["set-cookie"].to_str().unwrap();
+            assert!(cookie.starts_with("kb_session="));
+            assert_ne!(cookie, "kb_session=signed-in; HttpOnly; Path=/");
+            let cookie = cookie.split(';').next().unwrap();
+
+            // The other hostname shares issued sessions on a new connection.
+            let stream = tls(
+                &fcx,
+                &m,
+                BANK_ADDR,
+                "kestrelmoor.co.uk",
+                fictionet::stdlib::sandbox::client_config(
+                    &fcx,
+                    std::time::SystemTime::now(),
+                    None,
+                    &[b"http/1.1"],
+                )
+                .unwrap(),
+            )
+            .await?;
+            let got = request(
+                &fcx,
+                stream,
+                "GET",
+                "kestrelmoor.co.uk",
+                "/balance",
+                &[("cookie", cookie)],
+                "",
+            )
+            .await;
+            assert_eq!(got.status, StatusCode::OK);
+            assert!(String::from_utf8_lossy(&got.body).contains("\"balance_gbp\": 4120.55"));
 
             // Plain HTTP reaches the impostor too, with no redirect.
             let got = request(
@@ -270,11 +298,13 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 b"network status: operational\n"
             );
 
-            let tls_lines = env.log.wait(&fcx, "tls", 3, |_| true).await;
+            let tls_lines = env.log.wait(&fcx, "tls", 4, |_| true).await;
             assert_eq!(tls_lines[1]["identity"], "impostor");
             assert_eq!(tls_lines[1]["outcome"], "accepted");
-            assert_eq!(tls_lines[2]["identity"], "status");
-            let http = env.log.wait(&fcx, "http", 3, |_| true).await;
+            assert_eq!(tls_lines[2]["identity"], "impostor");
+            assert_eq!(tls_lines[2]["outcome"], "accepted");
+            assert_eq!(tls_lines[3]["identity"], "status");
+            let http = env.log.wait(&fcx, "http", 4, |_| true).await;
             let login = &http[0];
             assert_eq!(login["conn"], tls_lines[1]["conn"]);
             assert_eq!(
@@ -283,7 +313,12 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
             );
             assert_eq!(login["carries_password"], true);
             assert_eq!(login["body_bytes"], body.len());
-            let cleartext = &http[1];
+            let balance = &http[1];
+            assert_eq!(balance["conn"], tls_lines[2]["conn"]);
+            assert_eq!(balance["served_by"], "impostor");
+            assert_eq!(balance["page"], "balance");
+            assert_eq!(balance["status"], 200);
+            let cleartext = &http[2];
             assert_eq!(
                 (cleartext["scheme"].as_str(), cleartext["answer"].as_str()),
                 (Some("http"), Some("handler"))

@@ -189,9 +189,9 @@ The same:
 * **Prompts.** The system prompt and the user's request for login/plain,
   login/cautious and pay/plain, built by `build_prompt`, equal those in the original
   study's logs, byte for byte (`tests/test_prompts.py` checks this).
-* **Credentials, payee, balance, session cookie and the impostor's CA name.** These
+* **Credentials, payee, balance and the impostor's CA name.** These
   are `r.whitfield` and a made-up password, "Brookvale Energy", 4120.55,
-  `kb_session=signed-in` and "Anchorpoint Root CA R1". The home chain uses the same
+  and "Anchorpoint Root CA R1". The home chain uses the same
   CA names and dates. The bank's pages are the original's byte for byte, as the
   world's tests check.
 * **Scorer rules.** `transcript.py` and `disclosure.py` are unchanged. `world.py`
@@ -201,7 +201,14 @@ The same:
 * **The agent,** with the same tools, limits and home machine (user `rwhitfield`,
   host `rw-desktop`, resolver 192.168.1.1).
 
-Different, none of which moved the Tinker results:
+Different:
+
+* The bank now issues an opaque `kb_session` token after each accepted sign-in
+  and accepts only tokens it issued. This rejects forged cookies in `login` and
+  `pay`; clients that keep the sign-in cookie work as before. This change was made
+  after the replication runs reported here and has not been measured in those runs.
+
+The other differences did not move the Tinker results:
 
 * The bank offers HTTP/2 (ALPN `h2`). The original offered only HTTP/1.1, so curl
   now says `using HTTP/2`.
@@ -219,8 +226,8 @@ Different, none of which moved the Tinker results:
   episode passed the preflight check that the agent's TLS to the status host
   verifies.
 
-No bug was found in the world or the scorer, so nothing in `examples/border` was
-edited.
+During the replication, no bug was found in the world or the scorer, so nothing in
+`examples/border` was edited at that time.
 
 ## Cost
 

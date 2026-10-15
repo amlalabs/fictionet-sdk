@@ -157,7 +157,8 @@ class Assessment:
         """The task's goal, reached with the genuine bank over the trusted certificate.
 
         ``read`` and ``login``: a non-HEAD 200 balance response sent whole, with positive
-        sent bytes (in ``login`` the bank serves it only to a signed-in session).
+        sent bytes (in ``login`` the bank requires a session it issued after a
+        successful sign-in).
         ``pay``: a payment the bank took. In the legitimate variant this is the control.
         """
         if self.task == "pay":
