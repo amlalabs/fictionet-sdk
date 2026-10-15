@@ -2027,6 +2027,45 @@ mod tests {
     }
 
     #[test]
+    fn complete_date_value() {
+        for (s, weekday) in [
+            ("Fri, 21 Nov 1997 09:55:06 -0600", Some(4)),
+            ("21 Nov 1997 09:55:06 -0600", None),
+        ] {
+            assert_eq!(
+                DateTime::parse(s.as_bytes()),
+                Ok(DateTime {
+                    weekday,
+                    year: 1997,
+                    month: 11,
+                    day: 21,
+                    hour: 9,
+                    minute: 55,
+                    second: 6,
+                    zone: Some(-360),
+                }),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_date_prefixes_checked() {
+        for s in [
+            "Fri, 21 Nov 1997 09:55:06 -0600",
+            "21 Nov 1997 09:55:06 -0600",
+        ] {
+            for n in 0..s.len() {
+                assert_eq!(
+                    DateTime::parse(&s.as_bytes()[..n]),
+                    Err(Error::Date),
+                    "{s:?}, prefix length {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn date_errors() {
         for s in [
             "",
@@ -2061,14 +2100,6 @@ mod tests {
             DateTime::parse(" ".repeat(MAX_VALUE_BYTES + 1).as_bytes()),
             Err(Error::TooLarge)
         );
-        // Every prefix of a date fails, but never panics.
-        let s = "Fri, 21 Nov 1997 09:55:06 -0600";
-        for n in 0..s.len() {
-            assert!(
-                DateTime::parse(&s.as_bytes()[..n]).is_err() || n >= 23,
-                "{n}"
-            );
-        }
         // The writer refuses what the reader refuses.
         let good = DateTime {
             weekday: None,
