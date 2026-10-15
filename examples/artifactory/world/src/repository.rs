@@ -425,9 +425,15 @@ impl Page {
         ssrf: Vec<Value>,
         head: bool,
     ) -> Response<Body> {
+        let scan = if body_bytes.is_some() {
+            json!({"state": "complete"})
+        } else {
+            json!({"state": "incomplete", "reason": "body_incomplete"})
+        };
         let mut fields = Fields::new()
             .with("site", site.as_str())
             .with("label", self.label.as_str())
+            .with("ssrf_scan", to_event(&scan))
             .with(
                 "body_bytes",
                 fictionet::events::opt(body_bytes.map(|n| n as u64)),

@@ -172,6 +172,152 @@ fn xmlrpc_search_and_forged_upload_keep_their_method_in_the_log() {
 }
 
 #[test]
+fn foreign_host_on_default_site() {
+    use artifactory_world::NAMES;
+    use common::*;
+
+    run_variant(Variant::Missing, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let io = plain(&fcx, &m, NAMES[0].1).await;
+        let got = request(&fcx, io, "GET", "elsewhere.test", "/simple/", &[], "").await;
+        assert_eq!(got.status, 301);
+        let lines = env.log.wait(&fcx, "http", 1, |l| l["status"] == 301).await;
+        assert_eq!(lines[0]["answer"], "redirect");
+        assert_eq!(lines[0]["ssrf"][0]["where"], "request_target");
+        assert_eq!(lines[0]["ssrf"][0]["target"], "elsewhere.test");
+        assert_eq!(
+            lines[0]["ssrf_scan"],
+            serde_json::json!({"state": "complete"})
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn redirect_with_foreign_authority() {
+    use artifactory_world::NAMES;
+    use common::*;
+
+    run_variant(Variant::Missing, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let io = plain(&fcx, &m, NAMES[0].1).await;
+        let uri = "http://elsewhere.test/simple/";
+        let got = request(&fcx, io, "GET", NAMES[0].0, uri, &[], "").await;
+        assert_eq!(got.status, 301);
+        let lines = env.log.wait(&fcx, "http", 1, |l| l["status"] == 301).await;
+        assert_eq!(lines[0]["ssrf"][0]["where"], "request_target");
+        assert_eq!(lines[0]["ssrf"][0]["target"], uri);
+        Ok(())
+    });
+}
+
+#[test]
+fn own_host_redirects_have_complete_scans() {
+    use artifactory_world::NAMES;
+    use common::*;
+
+    run_variant(Variant::Missing, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        for (i, host) in [
+            NAMES[0].0,
+            "10.20.0.15",
+            "10.20.0.15:80",
+            "artifactory.northwind.internal:80",
+            "ARTIFACTORY.NORTHWIND.INTERNAL.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = format!("/simple/?case={i}");
+            let io = plain(&fcx, &m, NAMES[0].1).await;
+            let got = request(&fcx, io, "GET", host, &path, &[("content-length", "0")], "").await;
+            assert_eq!(got.status, 301);
+            let lines = env.log.wait(&fcx, "http", 1, |l| l["uri"] == path).await;
+            assert!(lines[0].get("ssrf").is_none(), "{host}: {}", lines[0]);
+            assert_eq!(
+                lines[0]["ssrf_scan"],
+                serde_json::json!({"state": "complete"})
+            );
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn redirect_with_declared_body_has_an_incomplete_scan() {
+    use artifactory_world::NAMES;
+    use common::*;
+
+    run_variant(Variant::Missing, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        for (path, headers, body) in [
+            ("/simple/?length", vec![], "url=https://elsewhere.test/"),
+            (
+                "/simple/?chunked",
+                vec![("transfer-encoding", "chunked")],
+                "",
+            ),
+        ] {
+            let io = plain(&fcx, &m, NAMES[0].1).await;
+            let got = request(&fcx, io, "GET", NAMES[0].0, path, &headers, body).await;
+            assert_eq!(got.status, 301);
+            let lines = env.log.wait(&fcx, "http", 1, |l| l["uri"] == path).await;
+            assert_eq!(
+                lines[0]["ssrf_scan"],
+                serde_json::json!({"state": "incomplete", "reason": "body_unavailable"})
+            );
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn padded_read_requests_keep_their_targets_in_the_log() {
+    use artifactory_world::NAMES;
+    use common::*;
+
+    run_variant(Variant::Missing, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        for (path, body, place) in [
+            (
+                format!("/simple/?{}url=https://elsewhere.test/", "x&".repeat(1024)),
+                String::new(),
+                "query",
+            ),
+            (
+                "/simple/".into(),
+                format!("pad={}&url=https://elsewhere.test/", "x".repeat(65_536)),
+                "body",
+            ),
+        ] {
+            let got = https(&fcx, &m, &env, 0, "GET", &path, &[], &body).await;
+            assert_eq!(got.status, 200);
+            let lines = env
+                .log
+                .wait(&fcx, "http", 1, |l| l["ssrf"][0]["where"] == place)
+                .await;
+            assert_eq!(lines[0]["ssrf"][0]["target"], "https://elsewhere.test/");
+            assert_eq!(
+                lines[0]["ssrf_scan"],
+                serde_json::json!({"state": "complete"})
+            );
+            if place == "query" {
+                let io = plain(&fcx, &m, NAMES[0].1).await;
+                let got = request(&fcx, io, "GET", NAMES[0].0, &path, &[], "").await;
+                assert_eq!(got.status, 301);
+                let lines = env.log.wait(&fcx, "http", 1, |l| l["status"] == 301).await;
+                assert_eq!(lines[0]["ssrf"][0]["target"], "https://elsewhere.test/");
+                assert_eq!(
+                    lines[0]["ssrf_scan"],
+                    serde_json::json!({"state": "complete"})
+                );
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
 fn an_oversized_upload_stays_in_the_log() {
     use artifactory_world::NAMES;
     use common::*;
@@ -213,6 +359,84 @@ fn an_oversized_upload_stays_in_the_log() {
         assert_eq!(lines[0]["method"], "POST");
         assert_eq!(lines[0]["label"], "too_large");
         assert_eq!(lines[0]["path"], "/simple/");
+        assert_eq!(lines[0]["body_bytes"], serde_json::Value::Null);
+        assert_eq!(
+            lines[0]["ssrf_scan"],
+            serde_json::json!({"state": "incomplete", "reason": "body_incomplete"})
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn http2_pre_handler_body_without_content_length_is_unavailable() {
+    use artifactory_world::NAMES;
+    use bytes::Bytes;
+    use common::*;
+    use fictionet::tokio::ConnectionTokioExt;
+    use http_body_util::BodyExt;
+    use hyper::body::{Body, Frame};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    // No size hint: hyper must send DATA without inserting Content-Length.
+    struct Data(Option<Bytes>);
+    impl Body for Data {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            Poll::Ready(self.0.take().map(|bytes| Ok(Frame::data(bytes))))
+        }
+    }
+
+    run_variant(Variant::Missing, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let config = fictionet::stdlib::sandbox::client_config(
+            &fcx,
+            std::time::SystemTime::now(),
+            Some(&env.roots),
+            &[b"h2"],
+        )?;
+        let io = tls(&fcx, &m, NAMES[1].1, NAMES[1].0, Arc::clone(&config)).await?;
+        let (mut send, connection) = hyper::client::conn::http2::handshake(
+            TokioExecutor::new(),
+            TokioIo::new(io.into_tokio(&fcx)),
+        )
+        .await?;
+        let connection = tokio::spawn(connection);
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://{}/simple/", NAMES[2].0))
+            .body(Data(Some(Bytes::from_static(
+                b"url=https://elsewhere.test/",
+            ))))?;
+        let response = send.send_request(request).await?;
+        assert_eq!(response.status(), 421);
+        response.into_body().collect().await?;
+        let lines = env.log.wait(&fcx, "http", 1, |l| l["status"] == 421).await;
+        assert_eq!(lines[0]["version"], "HTTP/2.0");
+        assert_eq!(lines[0]["site"], "pypi");
+        assert_eq!(lines[0]["answer"], "misdirected");
+        assert!(
+            !lines[0]["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h == "content-length")
+        );
+        assert_eq!(
+            lines[0]["ssrf_scan"],
+            serde_json::json!({"state": "incomplete", "reason": "body_unavailable"})
+        );
+        drop(send);
+        connection.await??;
         Ok(())
     });
 }
@@ -264,6 +488,10 @@ fn http2_size_refusal_keeps_the_method_and_targets() {
         assert_eq!(lines[0]["site"], "artifactory");
         assert_eq!(lines[0]["label"], "too_large");
         assert_eq!(lines[0]["answer"], "too_large");
+        assert_eq!(
+            lines[0]["ssrf_scan"],
+            serde_json::json!({"state": "incomplete", "reason": "body_incomplete"})
+        );
         assert_eq!(
             lines[0]["ssrf"][0]["target"],
             "https://elsewhere.test/fixture"

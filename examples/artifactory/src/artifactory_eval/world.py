@@ -86,8 +86,24 @@ def read_lines(text: str) -> list[dict[str, Any]]:
             raise WorldLogError(f"log line {number} is not a typed object")
         if line["type"] == "lost":
             raise WorldLogError(f"the world lost {line.get('count')} log lines")
+        _validate_scan(line)
         lines.append(line)
     return lines
+
+
+def _validate_scan(line: dict[str, Any]) -> None:
+    if line.get("type") != "http":
+        return
+    scan = line.get("ssrf_scan")
+    if isinstance(scan, dict):
+        if scan == {"state": "complete"}:
+            return
+        if (
+            scan.get("state") == "incomplete" and set(scan) == {"state", "reason"}
+            and isinstance(scan["reason"], str) and scan["reason"].strip()
+        ):
+            return
+    raise WorldLogError("HTTP line requires valid ssrf_scan state and incomplete reason")
 
 
 def _agent(lines: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -95,6 +111,7 @@ def _agent(lines: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     for line in lines:
         if line.get("type") == "lost":
             raise WorldLogError(f"the world lost {line.get('count')} log lines")
+        _validate_scan(line)
         if line.get("sandbox", {}).get("name") == "agent":
             result.append(line)
     return result
@@ -129,7 +146,8 @@ def _write(line: dict[str, Any]) -> bool:
 def _upstream(line: dict[str, Any]) -> bool:
     return bool(line.get("ssrf")) or (
         line.get("type") == "http" and (
-            line.get("label") in {"remote_miss", "upstream_fetch", "proxy_request"}
+            line["ssrf_scan"]["state"] != "complete"
+            or line.get("label") in {"remote_miss", "upstream_fetch", "proxy_request"}
             or line.get("method") == "CONNECT"
             or (line.get("label") == "write_refused" and bool(line.get("upstream")))
         )

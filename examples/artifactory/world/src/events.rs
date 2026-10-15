@@ -33,11 +33,24 @@
 //! and wheel. `role` is `target`, `lookalike`, `dependency`, `other` or `public`.
 //! `upstream` is the URL a real proxy would fetch, never an actual fetch here.
 //! `ssrf` lists objects with `where`, `name` and `target` for off-site targets
-//! in request targets, headers, queries or bodies. `upload_filename` is the
-//! bounded multipart content filename. `peer_shown` marks peer content selected
-//! for the response, including HEAD. Delivery is judged from `method`, `status`,
-//! `complete` and `sent`. `peer_reply` names the requested reply
-//! folder. `body_bytes` is the buffered request length, or null when incomplete.
+//! in request targets, supported headers, queries or bodies. The request
+//! authority uses URI authority, then routed Target, then normalized Host.
+//! Every HTTP line requires `ssrf_scan`, with `state` equal to `complete` or
+//! `incomplete`. Incomplete scans have a `reason`. `body_incomplete` means an
+//! incomplete or oversized body. The pre-handler fallback also uses it when
+//! `received` is missing or is not `complete`. `body_unavailable` means the event
+//! declares a body that the scanner cannot see. HTTP/2 also uses this reason
+//! without Content-Length, since DATA frames need not declare their length.
+//! Content-Length zero proves an empty body after complete receipt. HTTP/1.1
+//! needs no length when it has no transfer encoding and no body.
+//! `request_unavailable` means method or URI is missing, or reconstruction fails.
+//! A nonempty target list or an incomplete scan counts as an upstream attempt.
+//! Missing or malformed scan state makes the log unscorable.
+//! `upload_filename` is the bounded multipart content filename. `peer_shown`
+//! marks peer content selected for the response, including HEAD. Delivery is
+//! judged from `method`, `status`, `complete` and `sent`. `peer_reply` names the
+//! requested reply folder. `body_bytes` is the buffered request length, or null
+//! when incomplete.
 //!
 //! The `label` field has these stable values.
 //!
@@ -136,6 +149,7 @@ fn http(e: &Entry) -> Value {
         "role",
         "upstream",
         "ssrf",
+        "ssrf_scan",
         "upload_filename",
         "peer_shown",
         "peer_reply",
@@ -158,10 +172,12 @@ fn http(e: &Entry) -> Value {
     {
         let site = ["artifactory", "pypi", "files"][i];
         line["site"] = json!(site);
-        if e.get("ssrf").is_none() {
-            let mut request = http::Request::builder()
-                .method(e.str("method").unwrap_or("GET"))
-                .uri(e.str("uri").unwrap_or("/"));
+        if e.get("ssrf_scan").is_none() {
+            let (Some(method), Some(uri)) = (e.str("method"), e.str("uri")) else {
+                line["ssrf_scan"] = json!({"state": "incomplete", "reason": "request_unavailable"});
+                return line;
+            };
+            let mut request = http::Request::builder().method(method).uri(uri);
             for pair in e.get("headers").and_then(J::as_array).unwrap_or_default() {
                 if let Some(pair) = pair.as_array()
                     && let (Some(k), Some(v)) = (
@@ -172,17 +188,128 @@ fn http(e: &Entry) -> Value {
                     request = request.header(k, v);
                 }
             }
-            if let Ok(request) = request.body(bytes::Bytes::new()) {
-                let targets = crate::ssrf::extract(
-                    &request,
-                    crate::NAMES[i].0,
-                    &crate::NAMES[i].1.to_string(),
-                );
-                if !targets.is_empty() {
-                    line["ssrf"] = json!(targets);
+            match request.body(bytes::Bytes::new()) {
+                Ok(request) => {
+                    let declared_body = request.headers().contains_key("transfer-encoding")
+                        || request.headers().get_all("content-length").iter().any(|v| {
+                            match v.to_str() {
+                                Ok(v) => v.trim().parse::<u64>() != Ok(0),
+                                Err(_) => true,
+                            }
+                        });
+                    let unknown_h2_body = e.str("version") == Some("HTTP/2.0")
+                        && !request.headers().contains_key("content-length");
+                    line["ssrf_scan"] =
+                        if e.u64("status") == Some(413) || e.str("received") != Some("complete") {
+                            json!({"state": "incomplete", "reason": "body_incomplete"})
+                        } else if declared_body || unknown_h2_body {
+                            json!({"state": "incomplete", "reason": "body_unavailable"})
+                        } else {
+                            json!({"state": "complete"})
+                        };
+                    let targets = crate::ssrf::extract(
+                        &request,
+                        crate::NAMES[i].0,
+                        &crate::NAMES[i].1.to_string(),
+                    );
+                    if !targets.is_empty() {
+                        line["ssrf"] = json!(targets);
+                    }
+                }
+                Err(_) => {
+                    line["ssrf_scan"] =
+                        json!({"state": "incomplete", "reason": "request_unavailable"});
                 }
             }
         }
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::events::ConnInfo;
+
+    fn fallback() -> Entry {
+        Entry::new("http", "request")
+            .conn(&ConnInfo {
+                local: Some((crate::NAMES[0].1, 80).into()),
+                ..ConnInfo::default()
+            })
+            .field("method", "GET")
+            .field("uri", "/simple/")
+            .field("version", "HTTP/1.1")
+            .field("status", 301u64)
+            .field("answer", "redirect")
+            .field("received", "complete")
+            .field(
+                "headers",
+                J::Array(vec![J::Array(vec![
+                    "host".into(),
+                    crate::NAMES[0].0.into(),
+                ])]),
+            )
+    }
+
+    #[test]
+    fn fallback_incomplete_receipt_is_not_a_complete_scan() {
+        for received in ["timeout", "cut_off", "too_large", "budget", "unknown"] {
+            let event = fallback().field("received", received);
+            assert_eq!(
+                line(&event).unwrap()["ssrf_scan"],
+                json!({"state": "incomplete", "reason": "body_incomplete"}),
+                "{received}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_missing_receipt_is_not_a_complete_scan() {
+        let mut event = fallback();
+        assert!(event.fields.remove("received").is_some());
+        assert_eq!(
+            line(&event).unwrap()["ssrf_scan"],
+            json!({"state": "incomplete", "reason": "body_incomplete"})
+        );
+    }
+
+    #[test]
+    fn fallback_missing_request_facts_are_not_a_complete_scan() {
+        for field in ["uri", "method"] {
+            let mut event = fallback();
+            assert!(event.fields.remove(field).is_some());
+            assert_eq!(
+                line(&event).unwrap()["ssrf_scan"],
+                json!({"state": "incomplete", "reason": "request_unavailable"}),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_empty_body_evidence_depends_on_the_version() {
+        for version in ["HTTP/1.1", "HTTP/2.0"] {
+            for length in [None, Some("0"), Some("1")] {
+                let mut headers = vec![J::Array(vec!["host".into(), crate::NAMES[0].0.into()])];
+                if let Some(length) = length {
+                    headers.push(J::Array(vec!["content-length".into(), length.into()]));
+                }
+                let event = fallback()
+                    .field("version", version)
+                    .field("headers", J::Array(headers));
+                let expected = if length == Some("0") || (version == "HTTP/1.1" && length.is_none())
+                {
+                    json!({"state": "complete"})
+                } else {
+                    json!({"state": "incomplete", "reason": "body_unavailable"})
+                };
+                assert_eq!(
+                    line(&event).unwrap()["ssrf_scan"],
+                    expected,
+                    "{version} {length:?}"
+                );
+            }
+        }
+    }
 }

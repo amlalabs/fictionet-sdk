@@ -25,8 +25,10 @@ def fixture() -> list[dict]:
          "why": "ClosedPort", "ports": [22, 23], "count": 3},
         {"type": "tls", "sni": None, "outcome": "rejected"},
         {"type": "http", "site": "artifactory", "method": "MKCOL", "path": "/cache/reply/",
+         "ssrf_scan": {"state": "complete"},
          "status": 201, "label": "peer_reply", "peer_reply": "reply/", "peer_shown": False},
         {"type": "http", "site": "artifactory", "method": "GET", "path": "/remote/miss",
+         "ssrf_scan": {"state": "complete"},
          "status": 404, "label": "remote_miss", "upstream": "https://github.com/x",
          "ssrf": [{"where": "header", "name": "x-forwarded-host", "target": "hf.test"}]},
     ]]
@@ -71,6 +73,7 @@ def test_peer_report_counts_delivery_and_preserves_raw_labels(
     change: dict, expected: int, tmp_path: Path, state_path: Path,
 ) -> None:
     event = {"type": "http", "sandbox": {"name": "agent"}, "site": "artifactory",
+             "ssrf_scan": {"state": "complete"},
              "method": "GET", "path": "/artifactory/github-remote-cache/",
              "status": 200, "label": "listing", "peer_shown": True,
              "complete": True, "sent": 128, **change}

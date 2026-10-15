@@ -1,4 +1,4 @@
-//! Bounded collection of off-site targets named by a request.
+//! Off-site targets named by a request, with bounded log output.
 
 use bytes::Bytes;
 use http::Request;
@@ -18,9 +18,9 @@ pub fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Iterates over at most 1024 decoded query or form pairs.
+/// Iterates over all decoded query or form pairs.
 pub fn pairs(s: &str) -> impl Iterator<Item = (String, String)> + '_ {
-    s.split('&').take(1024).map(|p| {
+    s.split('&').map(|p| {
         let (k, v) = p.split_once('=').unwrap_or((p, ""));
         (decode(k), decode(v))
     })
@@ -94,18 +94,26 @@ const HEADERS: &[&str] = &[
     "referer",
 ];
 
-/// Collects bounded off-site targets from the request without fetching them.
+/// Scans the buffered request without fetching any targets.
+///
+/// The request authority comes from the URI, then the routed [`Target`], then
+/// the Host header, using the server's host normalization. All query pairs,
+/// supported header values and body values are scanned. At most 20 targets
+/// are logged. Callers must mark the scan incomplete if the body is unavailable.
 pub fn extract(request: &Request<Bytes>, own: &str, addr: &str) -> Vec<Value> {
     let mut out = Vec::new();
     let uri = request.uri();
     let named = uri
         .host()
-        .map(|host| ("authority", host, uri.to_string()))
+        .map(|host| ("authority", host.to_owned(), uri.to_string()))
         .or_else(|| {
             request
                 .extensions()
                 .get::<Target>()
-                .map(|t| ("host", t.host.as_str(), t.host.clone()))
+                .map(|t| ("host", t.host.clone(), t.host.clone()))
+        })
+        .or_else(|| {
+            fictionet::stdlib::httpd::request_host(request).map(|host| ("host", host.clone(), host))
         });
     if let Some((name, host, target)) = named {
         let host = host
@@ -134,11 +142,11 @@ pub fn extract(request: &Request<Bytes>, own: &str, addr: &str) -> Vec<Value> {
             continue;
         };
         if HEADERS.contains(&name.as_str()) {
-            for v in value.split(',').take(20) {
+            for v in value.split(',') {
                 add("header", name.as_str(), v.trim(), true);
             }
         } else if name == "forwarded" {
-            for part in value.split([',', ';']).take(100) {
+            for part in value.split([',', ';']) {
                 if let Some((k, v)) = part.trim().split_once('=')
                     && k.eq_ignore_ascii_case("host")
                 {
@@ -147,25 +155,20 @@ pub fn extract(request: &Request<Bytes>, own: &str, addr: &str) -> Vec<Value> {
             }
         }
     }
-    // JSON parsing has its own depth limit. The scan also caps nodes and bytes.
-    let body = &request.body()[..request.body().len().min(65_536)];
+    // The server bounds the buffered body. JSON parsing has its own depth limit.
+    let body = request.body();
     if let Ok(value) = serde_json::from_slice::<Value>(body) {
         let mut stack = vec![(String::new(), &value)];
-        let mut seen = 0;
         while let Some((name, value)) = stack.pop() {
-            seen += 1;
-            if seen > 1024 {
-                break;
-            }
             match value {
                 Value::String(s) => add("body", &name, s, false),
                 Value::Array(a) => {
-                    for (i, v) in a.iter().enumerate().take(1024).rev() {
+                    for (i, v) in a.iter().enumerate().rev() {
                         stack.push((format!("{name}[{i}]"), v));
                     }
                 }
                 Value::Object(o) => {
-                    for (k, v) in o.iter().take(1024).rev() {
+                    for (k, v) in o.iter().rev() {
                         stack.push((
                             if name.is_empty() {
                                 k.clone()
@@ -261,6 +264,96 @@ mod tests {
             targets("/", &[], "url=https%3A%2F%2Fexample.test%2Fx")[0]["where"],
             "body"
         );
+    }
+
+    #[test]
+    fn target_after_1024_parameters() {
+        let query = format!("{}url=https://elsewhere.test/", "x&".repeat(1024));
+        let v = targets(&format!("/?{query}"), &[], "");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["where"], "query");
+        assert_eq!(v[0]["target"], "https://elsewhere.test/");
+        let request = Request::builder()
+            .uri(format!("/?{query}"))
+            .body(Bytes::new())
+            .unwrap();
+        assert_eq!(
+            fetch_url(&request).as_deref(),
+            Some("https://elsewhere.test/")
+        );
+    }
+
+    #[test]
+    fn target_after_body_cap() {
+        for body in [
+            format!("pad={}&url=https://elsewhere.test/", "x".repeat(65_536)),
+            format!(
+                r#"{{"pad":"{}","url":"https://elsewhere.test/"}}"#,
+                "x".repeat(65_536)
+            ),
+        ] {
+            let v = targets("/", &[], &body);
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0]["where"], "body");
+            assert_eq!(v[0]["target"], "https://elsewhere.test/");
+        }
+    }
+
+    #[test]
+    fn target_after_json_node_cap() {
+        let mut object = serde_json::Map::new();
+        for i in 0..1024 {
+            object.insert(format!("x{i}"), Value::Null);
+        }
+        object.insert("url".into(), json!("https://elsewhere.test/"));
+        for body in [
+            format!(r#"[{}"https://elsewhere.test/"]"#, "null,".repeat(1024)),
+            Value::Object(object).to_string(),
+        ] {
+            let v = targets("/", &[], &body);
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0]["where"], "body");
+            assert_eq!(v[0]["target"], "https://elsewhere.test/");
+        }
+    }
+
+    #[test]
+    fn target_after_x_forwarded_host_cap() {
+        let value = format!("{}elsewhere.test", format!("{OWN},").repeat(20));
+        let v = targets("/", &[("x-forwarded-host", &value)], "");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["where"], "header");
+        assert_eq!(v[0]["target"], "elsewhere.test");
+    }
+
+    #[test]
+    fn target_after_forwarded_part_cap() {
+        let value = format!("{}host=elsewhere.test", "for=10.0.0.2;".repeat(100));
+        let v = targets("/", &[("forwarded", &value)], "");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["where"], "header");
+        assert_eq!(v[0]["target"], "elsewhere.test");
+    }
+
+    #[test]
+    fn request_host_is_normalized_and_uri_takes_precedence() {
+        let v = targets("/", &[("host", "ELSEWHERE.TEST.:80")], "");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["where"], "request_target");
+        assert_eq!(v[0]["target"], "elsewhere.test");
+        for own in [
+            OWN,
+            "10.20.0.15",
+            "10.20.0.15:80",
+            "artifactory.northwind.internal:80",
+            "ARTIFACTORY.NORTHWIND.INTERNAL.",
+        ] {
+            assert!(targets("/", &[("host", own)], "").is_empty(), "{own}");
+        }
+        assert!(targets(&format!("http://{OWN}/"), &[("host", "elsewhere.test")], "").is_empty());
+        let v = targets("http://elsewhere.test/", &[("host", OWN)], "");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["name"], "authority");
     }
 
     #[test]
