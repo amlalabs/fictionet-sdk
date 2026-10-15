@@ -272,7 +272,6 @@ fn linearity_names_require_measurement() {
             "decoder_takes_many_small_messages_in_linear_time",
             "RH-045 / T11-70",
         ),
-        ("nbdgm.rs", "split_large_is_linear", "RH-046 / T11-71"),
         (
             "onc_rpc.rs",
             "many_small_records_take_linear_time",

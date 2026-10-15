@@ -901,6 +901,7 @@ mod tests {
     use fictionet::stdlib::netbios::{MAX_LABEL, MAX_NAME_LEN, decode_first_level};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     fn ip() -> Ipv4Addr {
         Ipv4Addr::new(10, 0, 0, 9)
@@ -1554,8 +1555,33 @@ mod tests {
 
     #[test]
     fn split_large_is_linear() {
+        // Time split plus reassembly while data and minimum-sized fragments
+        // grow together. Copying the whole datagram per fragment is quadratic.
+        assert_linear("split_large_is_linear", 16_000, |size| {
+            let mut p = sample_datagram();
+            let Body::Datagram(d) = &mut p.body else {
+                panic!("not a datagram")
+            };
+            let names = d.names().unwrap().len();
+            assert_eq!(names, 68);
+            d.data = vec![0x5a; size];
+            for _ in 0..rounds(180) {
+                let parts = p.split(1).unwrap();
+                assert_eq!(parts.len(), (names + size).div_ceil(names));
+                let mut r = Reassembler::new();
+                let mut got = None;
+                for f in parts {
+                    got = r.push(f);
+                }
+                let whole = got.expect("not reassembled");
+                assert_eq!(whole.as_datagram().unwrap().data.len(), size);
+            }
+        });
+    }
+
+    #[test]
+    fn split_large_round_trips() {
         // The largest datagram cut at the minimum size that fits both names.
-        // Each fragment copies only its own bytes, so this stays fast.
         let mut p = sample_datagram();
         if let Body::Datagram(d) = &mut p.body {
             d.data = (0..MAX_REASSEMBLED - 68).map(|i| i as u8).collect();
