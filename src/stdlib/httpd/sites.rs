@@ -17,6 +17,8 @@ use fictionet::stdlib::tls::ServerConfig;
 use super::response::answered;
 use super::{Body, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text};
 
+pub use fictionet::stdlib::net::normalize;
+
 /// Where a request arrived: the scheme and port from the connection, the
 /// host from the request. [`VirtualHosts`] puts one in the extensions of
 /// every request it hands on; handlers read it with
@@ -210,11 +212,6 @@ impl Handler for VirtualHosts {
             }
         }
     }
-}
-
-/// A name as hosts are kept: lowercase, without a trailing dot.
-pub fn normalize(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// The host a request is for: the authority of its URI (HTTP/2's

@@ -217,6 +217,7 @@
 //! Copy `net.rs` together with the `net/` directory, keeping the relative
 //! paths. The entry file declares its private address-management, host
 //! installation, attachment lifecycle, and DNS service modules.
+//! It also needs `world/names.rs`, keeping that relative path.
 //! Copy `httpd.rs` together with the `httpd/` directory, keeping the relative
 //! paths. The entry file declares its private body, handler, site, and response modules.
 //! Copy `tls.rs` together with the `tls/` directory, keeping the relative

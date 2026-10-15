@@ -412,6 +412,42 @@ fn http1_closes_after_its_header_timeout() {
 }
 
 #[test]
+fn world_host_names_match_http_sites_and_tls_names() {
+    use fictionet::stdlib::net::Sni;
+
+    for (name, expected) in [
+        ("a.test", "a.test"),
+        ("A.TeSt.", "a.test"),
+        ("A.TEST...", "a.test"),
+        ("", ""),
+        ("...", ""),
+        (".A..TEST.", ".a..test"),
+        (" A.TEST ", " a.test "),
+        ("É.TEST.", "É.test"),
+    ] {
+        assert_eq!(httpd::normalize(name), expected);
+        assert_eq!(Sni::from(name), Sni::Name(expected.to_owned()));
+        let vhosts = httpd::VirtualHosts::new();
+        vhosts.insert(name, httpd::VHost::new(Router::new()));
+        assert!(vhosts.get(expected).is_some(), "{name:?}");
+    }
+
+    for authority in ["A.TeSt", "A.TEST.:80", "A.Test...:443"] {
+        let request = http::Request::builder()
+            .header("host", authority)
+            .body(())
+            .unwrap();
+        assert_eq!(httpd::request_host(&request).as_deref(), Some("a.test"));
+        let request = http::Request::builder()
+            .uri(format!("https://{authority}/"))
+            .header("host", "other.test")
+            .body(())
+            .unwrap();
+        assert_eq!(httpd::request_host(&request).as_deref(), Some("a.test"));
+    }
+}
+
+#[test]
 fn virtual_hosts_pick_a_site_by_host() {
     let vhosts = httpd::VirtualHosts::new();
     vhosts.insert(

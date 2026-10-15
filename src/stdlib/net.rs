@@ -150,6 +150,9 @@ mod dns;
 #[path = "net/hosts.rs"]
 mod hosts;
 
+#[path = "world/names.rs"]
+mod names;
+
 use addresses::{AUTO, AUTO6, Leases, Subnet, Subnet6};
 pub use attachments::{BlockedWhy, connection_limit};
 use attachments::{Hooks, blocked_event, filter, port_detail, sandbox_only, udp_packet};
@@ -158,6 +161,7 @@ use hosts::{
     Admission, Installation, Known, Lookup, LookupContext, Machines, Peers, World, host_prefix,
 };
 pub use hosts::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
+pub use names::normalize;
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -172,11 +176,6 @@ pub const MAX_HOSTS: usize = 20_000;
 
 fn link() -> (End, End) {
     fictionet::pair_with_limit(LINK_QUEUE)
-}
-
-/// A name as hosts are kept: lowercase, without a trailing dot.
-fn normalize(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 // ---------------------------------------------------------------------------
