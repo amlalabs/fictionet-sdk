@@ -234,6 +234,8 @@
 //! next to the copied module. Both adapters use this private output helper.
 //! Copy the `cme_mdp3/` directory, keeping the relative paths. Its entry
 //! file, `mod.rs`, declares the private packet framing module.
+//! Copy the `smb2/` directory the same way. Its `mod.rs` declares the
+//! private module of negotiate, create and error contexts.
 //!
 //! For a Modbus gateway that accepts a nonzero protocol identifier, copy
 //! `src/stdlib/modbus.rs` into your crate and remove the two protocol-identifier

@@ -170,6 +170,11 @@ A protocol is one file in `src/stdlib/`, declared with `pub mod` in
 The module's own docs explain the protocol and show how to use it, with examples
 that run as doctests.
 
+A large protocol may be a directory instead, as `cme_mdp3/` and `smb2/` are. Its
+entry file is `mod.rs`, which its catalog record names in `file`, and it
+declares private child modules next to it. A copy takes the whole directory.
+The module's public paths stay flat: re-export child items from `mod.rs`.
+
 For modules generated from schemas, see [code generation](docs/codegen.md).
 
 A new module is registered in two places, and a test holds each to the code:

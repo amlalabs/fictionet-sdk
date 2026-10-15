@@ -289,7 +289,8 @@ catalog! {
     sip: "SIP messages, URIs and the headers a proxy reads.";
         wire: true, decode: true, fuzz: true, copy: true;
     smb2: "SMB2 and SMB3 wire messages and compound chains, with no session, service, signing, encryption, or decompression.";
-        wire: true, decode: true, fuzz: true, copy: true;
+        wire: true, decode: true, fuzz: true, copy: true,
+        file: Some("smb2/mod.rs");
     smtp: "SMTP commands, replies and DATA, with a server-side decoder that switches between them.";
         wire: true, decode: true, fuzz: true, copy: true;
     snmp: "SNMP v1 and v2c messages, PDUs and OIDs, using `asn1` integer and length helpers.";
