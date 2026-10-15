@@ -669,13 +669,7 @@ impl Wire for Part {
     /// On error, `out` is unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         validate_part(self)?;
-        for (name, value) in &self.headers.fields {
-            out.extend_from_slice(name.as_bytes());
-            out.push(b':');
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(b"\r\n");
+        HeaderWire::compact(self).write(out);
         out.extend_from_slice(&self.body);
         Ok(())
     }
@@ -694,7 +688,7 @@ fn validate_part(part: &Part) -> Result<usize, Error> {
         }
     }
     // Compact separators keep parsed folded headers within the same cap.
-    let header = header_block_size(part, 1);
+    let header = HeaderWire::compact(part).len();
     if header > MAX_HEADER_BYTES {
         return Err(Error::HeaderTooLong);
     }
@@ -1003,7 +997,7 @@ impl Multipart {
             .ok_or(Error::EntityTooLong)?;
         for part in &self.parts {
             size = size
-                .checked_add(header_block_size(part, header_separator(part).len()))
+                .checked_add(HeaderWire::adaptive(part).len())
                 .and_then(|n| n.checked_add(part.body.len()))
                 .and_then(|n| n.checked_add(dash.len() + 4))
                 .ok_or(Error::EntityTooLong)?;
@@ -1019,14 +1013,7 @@ impl Multipart {
         out.extend_from_slice(&dash);
         for part in &self.parts {
             out.extend_from_slice(b"\r\n");
-            let sep = header_separator(part);
-            for (name, value) in &part.headers.fields {
-                out.extend_from_slice(name.as_bytes());
-                out.extend_from_slice(sep);
-                out.extend_from_slice(value.as_bytes());
-                out.extend_from_slice(b"\r\n");
-            }
-            out.extend_from_slice(b"\r\n");
+            HeaderWire::adaptive(part).write(&mut out);
             out.extend_from_slice(&part.body);
             out.extend_from_slice(b"\r\n");
             out.extend_from_slice(&dash);
@@ -1101,21 +1088,17 @@ impl Multipart {
     }
 
     /// Every byte string a boundary must not appear in: the preamble,
-    /// each header line as [`Entity::write`] writes it, and each
-    /// body. A boundary line can only start after a line break, and none
-    /// of these hold one that the writer adds, so a boundary that is in
-    /// none of them is nowhere in the output before the closing line.
+    /// each header line as [`Entity::write`] writes it, and each body.
+    /// The writer separates these with line breaks and delimiter lines,
+    /// and a boundary holds no CR or LF, so a boundary that is in none of
+    /// them is nowhere in the output before the closing line. A match
+    /// anywhere counts, even away from the start of a line.
     fn slices(&self) -> Vec<alloc::borrow::Cow<'_, [u8]>> {
         use alloc::borrow::Cow;
         let mut out = vec![Cow::Borrowed(self.preamble.as_slice())];
         for p in &self.parts {
-            let sep = header_separator(p);
-            for (n, v) in &p.headers.fields {
-                let mut line = Vec::with_capacity(n.len() + sep.len() + v.len());
-                line.extend_from_slice(n.as_bytes());
-                line.extend_from_slice(sep);
-                line.extend_from_slice(v.as_bytes());
-                out.push(Cow::Owned(line));
+            for line in HeaderWire::adaptive(p).lines() {
+                out.push(Cow::Owned(line.concat()));
             }
             out.push(Cow::Borrowed(p.body.as_slice()));
         }
@@ -1264,27 +1247,56 @@ impl Wire for Entity {
     }
 }
 
-/// How many bytes a part's header block takes, with each line's name and
-/// value joined by `sep_len` bytes plus CR LF, and the empty line at the end.
-fn header_block_size(part: &Part, sep_len: usize) -> usize {
-    part.headers
-        .fields
-        .iter()
-        .fold(2usize, |size, (name, value)| {
-            size.saturating_add(name.len())
-                .saturating_add(value.len())
-                .saturating_add(sep_len + 2)
-        })
+/// The bytes of a header block, including its final empty line.
+struct HeaderWire<'a> {
+    headers: &'a Headers,
+    separator: &'static [u8],
 }
 
-/// What goes between a header's name and value: `": "`, or `":"` if the
-/// part would pass [`MAX_HEADER_BYTES`] or [`MAX_PART`] with the spaces.
-fn header_separator(part: &Part) -> &'static [u8] {
-    let size = header_block_size(part, 2);
-    if size <= MAX_HEADER_BYTES && size.saturating_add(part.body.len()) <= MAX_PART {
-        b": "
-    } else {
-        b":"
+impl<'a> HeaderWire<'a> {
+    fn compact(part: &'a Part) -> Self {
+        Self {
+            headers: &part.headers,
+            separator: b":",
+        }
+    }
+
+    /// Use spaces unless they would exceed the header or part cap.
+    fn adaptive(part: &'a Part) -> Self {
+        let mut wire = Self {
+            headers: &part.headers,
+            separator: b": ",
+        };
+        let size = wire.len();
+        if size > MAX_HEADER_BYTES || size.saturating_add(part.body.len()) > MAX_PART {
+            wire.separator = b":";
+        }
+        wire
+    }
+
+    fn lines(&self) -> impl Iterator<Item = [&'a [u8]; 4]> {
+        let separator = self.separator;
+        self.headers
+            .fields
+            .iter()
+            .map(move |(name, value)| [name.as_bytes(), separator, value.as_bytes(), b"\r\n"])
+    }
+
+    fn chunks(&self) -> impl Iterator<Item = &'a [u8]> {
+        self.lines()
+            .flatten()
+            .chain(core::iter::once(b"\r\n".as_slice()))
+    }
+
+    fn len(&self) -> usize {
+        self.chunks()
+            .fold(0usize, |size, chunk| size.saturating_add(chunk.len()))
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        for chunk in self.chunks() {
+            out.extend_from_slice(chunk);
+        }
     }
 }
 
@@ -2271,6 +2283,116 @@ Content-Type: text/plain
         }
     }
 
+    #[test]
+    fn header_spacing_thresholds_preserve_exact_bytes() {
+        fn check(part: Part, separator: &str) {
+            let expected = |separator: &str| {
+                let mut bytes = format!(
+                    "A{separator}{}\r\nB{separator}w\r\n\r\n",
+                    part.headers.fields[0].1
+                )
+                .into_bytes();
+                bytes.extend_from_slice(&part.body);
+                bytes
+            };
+            let compact = expected(":");
+            assert_eq!(part.to_bytes().unwrap(), compact);
+            assert_eq!(Part::parse(&compact).unwrap(), part);
+            let adaptive = expected(separator);
+            let multipart = Multipart {
+                parts: vec![part],
+                ..Multipart::default()
+            };
+            let body = [b"--b\r\n".as_slice(), &adaptive, b"\r\n--b--\r\n"].concat();
+            assert_eq!(
+                Body {
+                    boundary: "b".into(),
+                    multipart: multipart.clone(),
+                }
+                .to_bytes()
+                .unwrap(),
+                body
+            );
+            let entity = [
+                b"Content-Type: multipart/mixed; boundary=b\r\n\r\n".as_slice(),
+                &body,
+            ]
+            .concat();
+            assert_eq!(
+                multipart.clone().with_boundary("b").to_bytes().unwrap(),
+                entity
+            );
+            assert_eq!(Multipart::parse(&body, "b").unwrap(), multipart);
+        }
+
+        // Two spaces fit at the cap; exceeding it drops both spaces.
+        for (value_len, separator) in [
+            (MAX_HEADER_BYTES - 14, ": "),
+            (MAX_HEADER_BYTES - 13, ": "),
+            (MAX_HEADER_BYTES - 12, ":"),
+            (MAX_HEADER_BYTES - 11, ":"),
+        ] {
+            check(
+                Part {
+                    headers: Headers {
+                        fields: vec![
+                            ("A".into(), "v".repeat(value_len)),
+                            ("B".into(), "w".into()),
+                        ],
+                    },
+                    body: b"body".to_vec(),
+                },
+                separator,
+            );
+        }
+        for (body_len, separator) in [
+            (MAX_PART - 15, ": "),
+            (MAX_PART - 14, ": "),
+            (MAX_PART - 13, ":"),
+            (MAX_PART - 12, ":"),
+        ] {
+            check(
+                Part {
+                    headers: Headers {
+                        fields: vec![("A".into(), "v".into()), ("B".into(), "w".into())],
+                    },
+                    body: vec![b'z'; body_len],
+                },
+                separator,
+            );
+        }
+    }
+
+    #[test]
+    fn header_collisions_stay_conservative() {
+        for (name, value, boundary) in [
+            ("prefix--x", "y", "x: y"),
+            ("A", "prefix--b suffix", "b"),
+            ("prefix--b-suffix", "v", "b"),
+            ("A", "--b --b-00000000", "b"),
+        ] {
+            let multipart = Multipart {
+                parts: vec![Part {
+                    headers: Headers {
+                        fields: vec![(name.into(), value.into())],
+                    },
+                    body: vec![],
+                }],
+                ..Multipart::default()
+            };
+            assert_eq!(
+                multipart.clone().with_boundary(boundary).to_bytes(),
+                Err(Error::BoundaryInData)
+            );
+            let expected = if value.contains("00000000") {
+                format!("{boundary}-00000001")
+            } else {
+                format!("{boundary}-00000000")
+            };
+            assert_eq!(multipart.pick_boundary(boundary).unwrap(), expected);
+        }
+    }
+
     // Finding: a boundary made of a header's name, the colon and its value.
     #[test]
     fn boundary_across_a_header_line() {
@@ -2297,7 +2419,7 @@ Content-Type: text/plain
             .headers
             .fields
             .push(("P".into(), "p".repeat(MAX_HEADER_BYTES - 14)));
-        assert_eq!(header_separator(&c.parts[0]), b":");
+        assert_eq!(HeaderWire::adaptive(&c.parts[0]).separator, b":");
         assert_eq!(
             c.clone().with_boundary("x:y").to_bytes(),
             Err(Error::BoundaryInData)
