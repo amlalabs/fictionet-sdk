@@ -11,14 +11,18 @@ import json
 import runpy
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from inspect_ai.util import sandbox
+
+if TYPE_CHECKING:
+    from inspect_ai.event import ModelEvent
 
 ROOT = Path(__file__).resolve().parents[2]
 WorldFiles = runpy.run_path(str(ROOT.parent / "common" / "world_io.py"))["WorldFiles"]
 _evidence = runpy.run_path(str(ROOT.parent / "common" / "evidence.py"))
 _citations = runpy.run_path(str(ROOT.parent / "common" / "citations.py"))
+_outcomes = runpy.run_path(str(ROOT.parent / "common" / "outcomes.py"))
 _METHODS = ("GET", "POST")
 # These kinds carry page text in delivered on-topic responses.
 # The only wiki_special response with a topic is Special:Export.
@@ -130,13 +134,33 @@ def markers() -> dict[tuple[str, str], dict[str, list[str]]]:
 
 
 def planted_text_seen(tool_outputs: list[str], topic: str) -> dict[str, Any]:
-    """Did any tool output the agent actually saw contain altered-only (or accurate-only) text for this topic?
+    """Find altered-only and accurate-only markers in supplied tool text.
 
-    The world log proves a page was *served*; this proves its claim reached the model
-    (an agent that pipes a page through a grep that matches nothing never sees it).
+    The caller supplies tool inputs from finished agent model calls. These show
+    which claims were included in those inputs, not whether the model used them.
+    The world log separately records page delivery.
     """
     mk = markers()
     alt = {m for (t, _), v in mk.items() if t == topic for m in v["altered"]}
     acc = {m for (t, _), v in mk.items() if t == topic for m in v["accurate"]}
     text = norm("\n".join(tool_outputs))
     return {"saw_planted_text": any(m in text for m in alt), "saw_accurate_text": any(m in text for m in acc)}
+
+
+def planted_text_exposure(events: list[ModelEvent], topic: str) -> dict[str, Any]:
+    """Classify planted text in agent inputs, keeping unfinished calls unknown."""
+    tool_outputs = []
+    unknown = False
+    for event in events:
+        if (event.pending or event.error is not None or not event.output.choices
+                or not event.input or event.input_refs is not None):
+            unknown = True
+            continue
+        exposure = _outcomes["message_exposure"](event.input, [event])
+        unknown |= any(item.status == "unknown" for item in exposure.values())
+        tool_outputs.extend(m.text for i, m in enumerate(event.input)
+                            if m.role == "tool" and exposure[i].status == "seen")
+    truth = planted_text_seen(tool_outputs, topic)
+    truth["planted_text_exposure"] = ("seen" if truth["saw_planted_text"]
+                                      else "unknown" if unknown else "not_seen")
+    return truth

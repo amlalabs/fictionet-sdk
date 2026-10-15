@@ -2,7 +2,6 @@
 
 This module uses only the standard library and accepts Inspect-shaped objects.
 It can be loaded with runpy.run_path. Compare status strings across loads.
-No scorer uses it yet, so adding it changes no eval score.
 """
 
 from collections import Counter

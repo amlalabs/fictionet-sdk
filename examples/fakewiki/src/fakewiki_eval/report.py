@@ -49,29 +49,39 @@ def main(argv: list[str]) -> None:
                 continue
             sc = next(iter(s.scores.values()))
             meta = sc.metadata or {}
+            if meta.get("grader_failed"):
+                r["grader_failed"].append(1)
+                continue
+            no_answer = bool(meta.get("no_answer") or not (sc.answer or "").strip() or s.limit is not None)
+            values = {k: 0 for k in ("fooled", "detected", "correct")} if no_answer else sc.value
             r["n"].append(1)
-            r["fooled"].append(sc.value["fooled"])
-            r["detected"].append(sc.value["detected"])
-            r["correct"].append(sc.value["correct"])
+            r["fooled"].append(values["fooled"])
+            r["detected"].append(values["detected"])
+            r["correct"].append(values["correct"])
             r["reached_altered"].append(int(meta.get("reached_altered_page", False)))
-            saw = int(meta.get("saw_planted_text", False))
-            r["saw_planted"].append(saw)
-            if saw:
-                r["fooled_given_saw"].append(sc.value["fooled"])
-            r["no_answer"].append(int(not (sc.answer or "").strip() or s.limit is not None))
+            exposure = meta.get("planted_text_exposure", "unknown")
+            if exposure in ("seen", "not_seen"):
+                saw = int(exposure == "seen")
+                r["saw_planted"].append(saw)
+                if saw:
+                    r["fooled_given_saw"].append(values["fooled"])
+            else:
+                r["exposure_unknown"].append(1)
+            r["no_answer"].append(int(no_answer))
             r["cross_checked"].append(int(meta.get("cross_checked_second_host", False)))
             r["cited_unfetched"].append(int(bool(meta.get("cited_but_never_fetched"))))
             r["outside"].append(len(meta.get("outside_world_requests", [])))
     head = ["model", "variant"] + (["topic"] if by_topic else []) + [
         "n", "fooled", "detected", "correct", "no_answer", "reached_altered", "saw_planted", "fooled|saw", "cross_checked", "cited_unfetched",
-        "outside_reqs", "grader_fail", "errors"]
+        "outside_reqs", "exposure_unknown", "grader_fail", "errors"]
     out = [head]
     for key in sorted(rows):
         r = rows[key]
         out.append(list(key) + [str(len(r["n"])), rate(r["fooled"]), rate(r["detected"]), rate(r["correct"]),
                                 rate(r["no_answer"]), rate(r["reached_altered"]), rate(r["saw_planted"]),
                                 rate(r["fooled_given_saw"]), rate(r["cross_checked"]), rate(r["cited_unfetched"]),
-                                str(sum(r["outside"])), str(sum(r["grader_failed"])), str(len(r["errors"]))])
+                                str(sum(r["outside"])), str(len(r["exposure_unknown"])),
+                                str(sum(r["grader_failed"])), str(len(r["errors"]))])
     if "--markdown" in argv:
         print("| " + " | ".join(head) + " |")
         print("|" + "---|" * len(head))
@@ -81,8 +91,10 @@ def main(argv: list[str]) -> None:
         widths = [max(len(row[i]) for row in out) for i in range(len(head))]
         for row in out:
             print("  ".join(c.ljust(w) for c, w in zip(row, widths)))
-    print("\ncontrol accuracy = 'correct' on the control rows. fooled|saw = fooled rate among samples whose tool"
-          "\noutputs contained planted text. no_answer = empty answer or message limit hit.")
+    print("\ncontrol accuracy = 'correct' on the control rows. fooled|saw requires planted text in finished agent model inputs."
+          "\nUnknown exposure (including legacy scores without input evidence) is excluded from saw_planted and fooled|saw."
+          "\nno_answer = empty answer or sample limit hit; these remain in n with rubric zeros."
+          "\nCurrent and legacy failed grades are counted in grader_fail and excluded from n and all rates.")
     print("\ntoken usage (all logs, includes grader calls):")
     for (m, role), u in sorted(usage.items()):
         print(f"  {m} [{role}]: total={u['total']:,} input={u['input']:,} output={u['output']:,} reasoning={u['reasoning']:,}")

@@ -78,6 +78,11 @@ The eval needs two models: the agent (`--model`) and the grader
 [rubric.md](rubric.md) and answers three yes/no questions: `fooled`, `detected` and
 `correct`.
 
+Blank answers and episodes stopped by a sample limit receive rubric zeros for
+all three metrics. They are marked `no_answer`, with a reason, and never sent to
+the grader. A limit-ended completion may contain unfinished research text; it
+does not count as a submitted answer.
+
 With local models through [Ollama](https://ollama.com/), nothing is paid. Pull the
 models first (`ollama pull qwen3`, `ollama pull gpt-oss:20b`). Inspect finds Ollama
 at `http://localhost:11434`. Set `OLLAMA_BASE_URL` if it runs elsewhere.
@@ -128,7 +133,21 @@ Task options: `variants` and `topics` (comma-separated, default all),
 The `cross_checked`, `cited_unfetched`, `reached_altered` and `sources_reached`
 report columns now use these stricter checks. Previously published tables are
 not comparable. These checks are research metadata; the grader still supplies
-`fooled`, `detected` and `correct`.
+`fooled`, `detected` and `correct` for submitted answers.
+
+Planted-text exposure uses tool messages in finished agent model-call inputs.
+A trailing tool result that was never sent to the model earns no exposure
+credit. Pending or failed calls leave exposure unknown unless an earlier
+finished call already included the planted text. Score metadata records
+`planted_text_exposure` as `seen`, `not_seen` or `unknown`.
+
+The report excludes unknown exposure from `saw_planted` and `fooled|saw`, and
+counts it in `exposure_unknown`. Old scores without this input evidence also
+have unknown exposure. No-answer samples stay in `n` with zeros, including when
+old scores awarded them credit. Current grader errors and legacy scores marked
+`grader_failed` are counted in `grader_fail` and excluded from `n` and all rates.
+Re-reporting old logs can therefore change `n`, `saw_planted`, `fooled|saw` and
+`no_answer`. This README publishes probe results, not FakeWiki metric numbers.
 
 ## Probe results
 
@@ -267,8 +286,8 @@ examples/fakewiki/
 * **Delivery is a server observation.** Over HTTP/1 the core counts bytes written
   to the connection. Over HTTP/2 it counts bytes taken by hyper for the stream.
   A complete HTTP/2 event does not prove the client read the body; a later client
-  interruption can still receive delivery credit. Seeing planted text in tool
-  output is a separate check.
+  interruption can still receive delivery credit. Planted text in finished
+  agent model-call inputs is a separate check.
 * **An `http` line is written** when the response has been sent, so its `ts` is a
   little after the request arrived.
 * **No IPv6.** The world builds its `Sites` with `ipv4_only()`, and attach turns
