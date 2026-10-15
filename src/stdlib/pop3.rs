@@ -1720,15 +1720,26 @@ mod tests {
             assert_eq!(status(line).unwrap().code, None, "{line:?}");
         }
         let long = [b"+OK ".as_slice(), &[b'a'; 507]].concat();
-        assert!(status(&long).is_err());
+        assert_eq!(
+            status(&long),
+            Err(Error::Framing(FrameError::Line(
+                codec::LineError::TooLong {
+                    max: MAX_REPLY_LINE - 2,
+                }
+            )))
+        );
         assert!(status(&long[..510]).is_ok());
         let mut data = b"+OK\r\n".to_vec();
         data.extend(vec![b'x'; MAX_DATA_LINE - 1]);
         data.extend_from_slice(b"\r\n.\r\n");
-        assert!(matches!(
+        assert_eq!(
             Reply::parse(&data),
-            Err(Error::Framing(FrameError::Line(_)))
-        ));
+            Err(Error::Framing(FrameError::Line(
+                codec::LineError::TooLong {
+                    max: MAX_DATA_LINE - 2,
+                }
+            )))
+        );
         data.remove(5);
         assert!(Reply::parse(&data).is_ok());
         let line = [vec![b'y'; MAX_DATA_LINE - 2], b"\r\n".to_vec()].concat();
@@ -1743,14 +1754,18 @@ mod tests {
             Err(Error::Framing(FrameError::BodyTooLong))
         );
         for line in [b"0 12".as_slice(), b"1", b"1 x"] {
-            assert!(ScanListing::parse(line).is_err());
+            assert_eq!(ScanListing::parse(line), Err(Error::Listing), "{line:?}");
         }
         for line in [
             b"1 ".as_slice(),
             b"1 a b",
             &[b"1 ".as_slice(), &[b'u'; 71]].concat(),
         ] {
-            assert!(UniqueIdListing::parse(line).is_err());
+            assert_eq!(
+                UniqueIdListing::parse(line),
+                Err(Error::Listing),
+                "{line:?}"
+            );
         }
         assert_eq!(Reply::ok("x").drop_listing(), None);
         assert_eq!(Reply::ok("no timestamp").timestamp(), None);
@@ -1908,7 +1923,7 @@ mod tests {
             command(b"X-AB 1"),
             Ok(command_fixture("X-AB".into(), Some("1".into())))
         );
-        assert!(command(b"\xc3\xa9AB").is_err());
+        assert_eq!(command(b"\xc3\xa9AB"), Err(Error::BadKeyword));
         assert_eq!(
             contract::check_refused(&command_fixture("x-ab".into(), None)),
             Error::Unwritable
@@ -1930,7 +1945,7 @@ mod tests {
 
     #[test]
     fn code_may_run_into_text() {
-        assert!(status(b"-ERR [a\xff]x").is_err());
+        assert_eq!(status(b"-ERR [a\xff]x"), Err(Error::BadStatus));
         let reply = status(b"-ERR [IN-USE]locked").unwrap();
         assert_eq!(
             (reply.code.as_deref(), reply.text.as_str()),

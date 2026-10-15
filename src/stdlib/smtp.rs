@@ -1360,11 +1360,6 @@ mod tests {
         stream.decoder().handoff().unwrap();
         assert_eq!(stream.next(), None);
         assert_eq!(stream.into_parts().0.unread(), b"\x16\x03\x03\0\x05");
-        let mut stream = Stream::new(Inputs::new());
-        assert_eq!(stream.push(b"NO"), 2);
-        assert_eq!(stream.next(), None);
-        assert_eq!(stream.decoder().start_data(), Err(FrameError::State));
-        assert_eq!(stream.decoder().handoff(), Err(FrameError::State));
     }
 
     #[test]

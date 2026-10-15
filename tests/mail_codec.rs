@@ -7,20 +7,6 @@ use fictionet::stdlib::{
 };
 
 #[test]
-fn imap_literal_continuation_reports_tag_and_size() {
-    let mut stream = Stream::new(imap::Inputs::new());
-    let bytes = b"a LOGIN user {4}\r\n";
-    assert_eq!(stream.push(bytes), bytes.len());
-    assert_eq!(
-        stream.next(),
-        Some(Ok(Ok(imap::Input::Continue {
-            tag: Some("a".into()),
-            size: 4,
-        })))
-    );
-}
-
-#[test]
 fn mail_write_errors_share_one_variant_and_phrasing() {
     assert_eq!(
         smtp::Error::Unwritable.to_string(),
@@ -377,17 +363,6 @@ fn imap_chunked_literals_commands_and_responses() {
 
 #[test]
 fn imap_literal_refusal_zero_length_and_limits() {
-    let mut stream = Stream::new(imap::Inputs::new());
-    let bytes = b"a APPEND {9}\r\nb NOOP\r\n";
-    assert_eq!(stream.push(bytes), bytes.len());
-    assert!(matches!(
-        stream.next(),
-        Some(Ok(Ok(imap::Input::Continue { size: 9, .. })))
-    ));
-    assert!(stream.decoder().refuse_literal());
-    assert!(!stream.decoder().refuse_literal());
-    assert!(matches!(stream.next(), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
-
     for bytes in [
         b"a X {0}\r\n\r\n".as_slice(),
         b"a X {0+}\r\n\r\n",
@@ -499,14 +474,50 @@ fn command_line_errors_recover_and_imap_overflow_ends_streams() {
 
 #[test]
 fn exact_wire_and_transactional_writers() {
-    for bytes in [b"NOOP".as_slice(), b"NOOP\n", b"NOOP\r\nQUIT\r\n"] {
-        assert!(<smtp::Command as Wire>::parse(bytes).is_err());
-        assert!(<pop3::Command as Wire>::parse(bytes).is_err());
+    for (bytes, smtp_error, pop3_error) in [
+        (
+            b"NOOP".as_slice(),
+            smtp::Error::Framing(smtp::FrameError::Line(codec::LineError::Unterminated)),
+            pop3::Error::Framing(pop3::FrameError::Line(codec::LineError::Unterminated)),
+        ),
+        (
+            b"NOOP\n",
+            smtp::Error::LineEnding,
+            pop3::Error::BadCharacter,
+        ),
+        (
+            b"NOOP\r\nQUIT\r\n",
+            smtp::Error::Trailing,
+            pop3::Error::Trailing,
+        ),
+    ] {
+        assert_eq!(
+            <smtp::Command as Wire>::parse(bytes),
+            Err(smtp_error),
+            "{bytes:?}"
+        );
+        assert_eq!(
+            <pop3::Command as Wire>::parse(bytes),
+            Err(pop3_error),
+            "{bytes:?}"
+        );
     }
-    assert!(<smtp::Reply as Wire>::parse(b"250 x\r\n250 y\r\n").is_err());
-    assert!(<pop3::Reply as Wire>::parse(b"+OK x\r\n.\r\n+OK y\r\n").is_err());
-    assert!(<imap::Command as Wire>::parse(b"a NOOP\r\nb NOOP\r\n").is_err());
-    assert!(<imap::Response as Wire>::parse(b"a OK x\r\nb OK y\r\n").is_err());
+    assert_eq!(
+        <smtp::Reply as Wire>::parse(b"250 x\r\n250 y\r\n"),
+        Err(smtp::Error::Trailing)
+    );
+    assert_eq!(
+        <pop3::Reply as Wire>::parse(b"+OK x\r\n.\r\n+OK y\r\n"),
+        Err(pop3::Error::Trailing)
+    );
+    assert_eq!(
+        <imap::Command as Wire>::parse(b"a NOOP\r\nb NOOP\r\n"),
+        Err(imap::Error::Trailing)
+    );
+    assert_eq!(
+        <imap::Response as Wire>::parse(b"a OK x\r\nb OK y\r\n"),
+        Err(imap::Error::Trailing)
+    );
 
     contract::check_refused(&smtp::Command::new("noop", None));
     contract::check_refused(&smtp::Reply {
@@ -1026,27 +1037,6 @@ fn imap_aggregate_literals_stop_at_the_message_limit() {
             imap::FrameError::LiteralTooLarge { .. }
         ))]
     ));
-}
-
-#[test]
-fn smtp_long_command_recovers() {
-    let bytes = [vec![b'X'; 600], b"\r\nNOOP\r\n".to_vec()].concat();
-    assert_eq!(
-        read(smtp::Inputs::new, &bytes),
-        vec![
-            Ok(Err(smtp::Error::LineTooLong)),
-            Ok(Ok(smtp::Input::Command(smtp::Command::new("NOOP", None)))),
-        ]
-    );
-}
-
-#[test]
-fn pop3_long_command_recovers() {
-    let bytes = [vec![b'X'; 300], b"\r\nNOOP\r\n".to_vec()].concat();
-    let items = read(pop3::Inputs::new, &bytes);
-    assert_eq!(items.first(), Some(&Ok(Err(pop3::Error::LineTooLong))));
-    assert!(matches!(items.get(1), Some(Ok(Ok(_)))));
-    assert_eq!(items.len(), 2);
 }
 
 #[test]

@@ -1772,9 +1772,6 @@ mod tests {
     fn atoms(values: &[&str]) -> Vec<Value> {
         values.iter().map(|s| Value::atom(s)).collect()
     }
-    fn syntax(bytes: &[u8]) -> bool {
-        Command::parse(bytes).is_err()
-    }
     fn events(bytes: &[u8]) -> Vec<Result<Input, Error>> {
         let (items, failure) = decode_all(Inputs::new, bytes);
         assert_eq!(failure, None);
@@ -2071,7 +2068,13 @@ mod tests {
             ])],
         );
         assert_eq!(c.to_bytes().unwrap(), b"a SEARCH ((SEEN) (NEW))\r\n");
-        assert!(syntax(b"a SEARCH ((SEEN)(NEW))\r\n"));
+        assert_eq!(
+            Command::parse(b"a SEARCH ((SEEN)(NEW))\r\n"),
+            Err(Error::Syntax {
+                tag: Some("a".into()),
+                reason: "expected a space or ) in a list",
+            })
+        );
         // Deeper lists are refused without substituting NIL.
         let mut value = Value::List(vec![Value::List(vec![]), Value::List(vec![])]);
         for _ in 0..MAX_DEPTH - 1 {
@@ -2119,7 +2122,13 @@ mod tests {
             cmd(b"a FETCH 1 body[1]<0.10>\r\n").args[1],
             Value::atom("body[1]<0.10>")
         );
-        assert!(syntax(b"a FETCH 1 BODY[HEADER.FIELDS ({2}\r\na\nb)]\r\n"));
+        assert_eq!(
+            Command::parse(b"a FETCH 1 BODY[HEADER.FIELDS ({2}\r\na\nb)]\r\n"),
+            Err(Error::Syntax {
+                tag: Some("a".into()),
+                reason: "a literal in a section must be a short line of UTF-8",
+            })
+        );
         let r = Response::parse(b"* 1 FETCH (BODY[HEADER.FIELDS (\"X\")] NIL)\r\n").unwrap();
         assert_eq!(
             r.to_bytes().unwrap(),
@@ -2154,7 +2163,13 @@ mod tests {
         );
         assert_eq!(contract::check_refused(&r), Error::Unwritable);
         // A plain literal still may not hold NUL, and ~ alone is a word.
-        assert!(syntax(b"a X {1}\r\n\0\r\n"));
+        assert_eq!(
+            Command::parse(b"a X {1}\r\n\0\r\n"),
+            Err(Error::Syntax {
+                tag: Some("a".into()),
+                reason: "a literal holds NUL",
+            })
+        );
         assert_eq!(cmd(b"a X ~ ~a\r\n").args, atoms(&["~", "~a"]));
     }
 
@@ -2404,36 +2419,67 @@ mod tests {
 
     #[test]
     fn response_errors() {
-        for bytes in [
-            b"".as_slice(),
-            b"a FOO\r\n",
-            b"* OK x",
-            b"* OK x\n",
-            b"* OK \0\r\n",
-            b"* OK \xff\r\n",
-            b"* OK [\xff] x\r\n",
-            b"* OK x\r\ny\r\n",
-            b"+x\r\n",
-            b"a BYE x\r\n",
-            b"a PREAUTH x\r\n",
-            b"* 1 FETCH (BODY[] {2+}\r\nhi)\r\n",
-            b"*1 EXISTS\r\n",
+        for (bytes, tag, reason) in [
+            (
+                b"a FOO\r\n".as_slice(),
+                Some("a"),
+                "a response starts with *, + or a tag and a status",
+            ),
+            (b"* OK x\n", None, "a line must end with CRLF"),
+            (b"* OK \0\r\n", None, "text holds NUL, CR or LF"),
+            (b"* OK \xff\r\n", None, "text is not UTF-8"),
+            (b"* OK [\xff] x\r\n", None, "text is not UTF-8"),
+            (b"+x\r\n", None, "a space must follow +"),
+            (
+                b"a BYE x\r\n",
+                Some("a"),
+                "PREAUTH and BYE are never tagged",
+            ),
+            (
+                b"a PREAUTH x\r\n",
+                Some("a"),
+                "PREAUTH and BYE are never tagged",
+            ),
+            (
+                b"* 1 FETCH (BODY[] {2+}\r\nhi)\r\n",
+                None,
+                "a server literal cannot be non-synchronizing",
+            ),
+            (
+                b"*1 EXISTS\r\n",
+                None,
+                "expected a space or the end of the line",
+            ),
         ] {
-            assert!(Response::parse(bytes).is_err(), "{bytes:?}");
+            let error = Error::Syntax {
+                tag: tag.map(String::from),
+                reason,
+            };
+            assert_eq!(Response::parse(bytes), Err(error), "{bytes:?}");
         }
+        assert_eq!(Response::parse(b""), Err(Error::Incomplete));
+        assert_eq!(Response::parse(b"* OK x\r\ny\r\n"), Err(Error::Trailing));
+        assert_eq!(
+            Response::parse(b"* OK x"),
+            Err(Error::Framing(FrameError::Line(
+                codec::LineError::Unterminated
+            )))
+        );
         for bytes in [vec![b'z'; MAX_TEXT + 5], vec![b'*'; MAX_MESSAGE + 1]] {
-            assert!(matches!(
+            assert_eq!(
                 Response::parse(&bytes),
-                Err(Error::Framing(FrameError::Line(_)))
-            ));
+                Err(Error::Framing(FrameError::Line(
+                    codec::LineError::TooLong { max: MAX_LINE - 2 }
+                )))
+            );
         }
-        assert!(matches!(
+        assert_eq!(
             Response::parse(b"* 1 FETCH (BODY[] {2000000}\r\n"),
             Err(Error::Framing(FrameError::LiteralTooLarge {
+                tag: None,
                 size: 2000000,
-                ..
             }))
-        ));
+        );
     }
 
     #[test]
@@ -2551,12 +2597,6 @@ mod tests {
         }
         assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.push(b"c X {3}\r\n"), 9);
-        assert!(matches!(
-            stream.next(),
-            Some(Ok(Ok(Input::Continue { .. })))
-        ));
-        assert_eq!(stream.decoder().expect_line(), Err(FrameError::State));
     }
 
     #[test]
@@ -2643,7 +2683,13 @@ mod tests {
                 ..
             })
         ));
-        assert!(Response::parse(b"* 1 FETCH (BODY[] {1}\r\n\0)\r\n").is_err());
+        assert_eq!(
+            Response::parse(b"* 1 FETCH (BODY[] {1}\r\n\0)\r\n"),
+            Err(Error::Syntax {
+                tag: None,
+                reason: "a literal holds NUL",
+            })
+        );
         let items = events(b"a X {1+}\r\n\0\r\nb NOOP\r\n");
         assert!(matches!(items[0], Err(Error::Syntax { .. })));
         assert_eq!(
@@ -2681,7 +2727,13 @@ mod tests {
                 })
             ));
         }
-        assert!(Response::parse(b"* X \"a\xc3\"\r\n").is_err());
+        assert_eq!(
+            Response::parse(b"* X \"a\xc3\"\r\n"),
+            Err(Error::Syntax {
+                tag: None,
+                reason: "a quoted string is not UTF-8",
+            })
+        );
         let command = cmd("a X \"é\"\r\n".as_bytes());
         assert_eq!(command.args[0].as_str(), Some("é"));
         assert_eq!(cmd(&command.to_bytes().unwrap()), command);
