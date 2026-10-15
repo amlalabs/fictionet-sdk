@@ -6,11 +6,13 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
+use super::KeyLine;
 use super::decode::Dissector;
 use super::json::{self, Object};
 use super::view::{edge_id, task_id};
 use crate::sys::{Instant, UNIX_EPOCH};
-use crate::watch::{Graph, KeyLine, Meter, TapGuard};
+use crate::telemetry::MAX_KEYS;
+use crate::watch::{Graph, Meter, TapGuard};
 
 /// How many decoded packets a watch keeps.
 const ROWS: usize = 4096;
@@ -215,14 +217,14 @@ impl LinkWatch {
             {
                 // Take the keys added since last time. The world forgets
                 // its oldest keys past a limit, and so does this.
-                let s = graph.state();
+                let s = graph.keys.state();
                 let new = s.keys_added.saturating_sub(inner.keys_seen) as usize;
                 let skip = s.keys.len().saturating_sub(new);
                 let fresh: Vec<KeyLine> = s.keys.iter().skip(skip).cloned().collect();
                 inner.keys_seen = s.keys_added;
                 drop(s);
                 inner.keys.extend(fresh);
-                let excess = inner.keys.len().saturating_sub(crate::watch::MAX_KEYS);
+                let excess = inner.keys.len().saturating_sub(MAX_KEYS);
                 inner.keys.drain(..excess);
             }
             let inner = &mut *inner;
@@ -336,7 +338,7 @@ impl LinkWatch {
         };
         // Snapshot the world separately: never hold both locks for export.
         if let Some(graph) = self.graph.upgrade() {
-            keys.extend(graph.state().keys.iter().cloned());
+            keys.extend(graph.keys.state().keys.iter().cloned());
         }
         let mut seen = BTreeSet::new();
         let keys = keylog_lines(keys.iter().filter(|k| {
@@ -356,7 +358,7 @@ impl LinkWatch {
 
 /// The world's TLS secrets in the `SSLKEYLOGFILE` format.
 pub(crate) fn keylog(graph: &Graph) -> String {
-    let s = graph.state();
+    let s = graph.keys.state();
     keylog_lines(&s.keys)
 }
 
@@ -385,7 +387,6 @@ mod tests {
     use super::*;
     use crate::observe::watches::Subscription;
     use crate::stdlib::codec::le32;
-    use crate::watch::MAX_KEYS;
 
     fn setup() -> (Arc<Graph>, Arc<Meter>, Arc<LinkWatch>, Subscription) {
         let graph = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab)
@@ -486,14 +487,14 @@ mod tests {
     #[test]
     fn quiet_capture_keeps_keys_after_world_ring_rotates() {
         let (graph, meter, watch, _subscription) = setup();
-        graph.key(key(0));
+        graph.keys.key(key(0));
         let original = keylog(&graph);
         capture(&meter, &watch);
         let rows = watch.rows_after(0, 10);
 
         // Sessions elsewhere rotate the world ring without new packets here.
         for n in 1..=MAX_KEYS {
-            graph.key(key(n));
+            graph.keys.key(key(n));
         }
         watch.pump();
         assert_eq!(watch.rows_after(0, 10), rows);
@@ -517,16 +518,16 @@ mod tests {
     #[test]
     fn capture_deduplicates_complete_key_lines() {
         let (graph, meter, watch, _subscription) = setup();
-        graph.key(key(0));
+        graph.keys.key(key(0));
         capture(&meter, &watch);
         let original = keylog(&graph);
-        graph.key(key(0));
+        graph.keys.key(key(0));
         let mut server = key(0);
         server.label = "SERVER_TRAFFIC_SECRET_0".into();
-        graph.key(server);
+        graph.keys.key(server);
         let mut different = key(0);
         different.secret = vec![0xcd; 32];
-        graph.key(different);
+        graph.keys.key(different);
         capture(&meter, &watch);
         let world = keylog(&graph);
         assert_eq!(world.lines().count(), 4);
@@ -538,7 +539,7 @@ mod tests {
     #[test]
     fn capture_keeps_keys_after_world_is_dropped() {
         let (graph, meter, watch, _subscription) = setup();
-        graph.key(key(0));
+        graph.keys.key(key(0));
         let expected = keylog(&graph);
         capture(&meter, &watch);
         drop(graph);

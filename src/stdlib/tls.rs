@@ -418,7 +418,14 @@ impl<C: Connection> ClientHello<C> {
             output: Output::default(),
             eof: false,
         };
-        let config = fictionet::observe::observed_config(fcx, config);
+        let config = match fcx.tls_key_log() {
+            Some(key_log) => {
+                let mut logged = (*config).clone();
+                logged.key_log = key_log;
+                Arc::new(logged)
+            }
+            None => config,
+        };
         let mut tls = match with_context(fcx, || self.accepted.into_connection(config)) {
             Ok(tls) => tls,
             Err((e, mut alert)) => {

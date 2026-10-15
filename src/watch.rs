@@ -418,23 +418,6 @@ pub(crate) struct LinkInfo {
     pub(crate) label: Option<Arc<str>>,
 }
 
-/// One line of an `SSLKEYLOGFILE`: a TLS secret and the client random it
-/// belongs to.
-#[derive(Clone, Debug)]
-pub struct KeyLine {
-    /// SSLKEYLOGFILE label, such as CLIENT_TRAFFIC_SECRET_0.
-    pub label: String,
-    /// ClientHello random identifying the session.
-    pub client_random: Vec<u8>,
-    /// Traffic secret bytes.
-    pub secret: Vec<u8>,
-}
-
-/// How many TLS secrets a world keeps, about 4,000 sessions. Past that,
-/// the oldest are forgotten.
-#[cfg(feature = "observe")]
-pub(crate) const MAX_KEYS: usize = 20_000;
-
 /// What a run records about itself for observers.
 ///
 /// Every run keeps one. Starting a task, and a task taking an end of a
@@ -451,6 +434,9 @@ pub(crate) struct Graph {
     /// The run's events, kept whether or not anyone observes.
     #[cfg(feature = "observe")]
     pub(crate) events: Arc<crate::events::Store>,
+    /// TLS keys recorded by the run's protocol producers.
+    #[cfg(feature = "observe")]
+    pub(crate) keys: Arc<crate::telemetry::KeyRecorder>,
     /// The id of the next group.
     next_group: AtomicU64,
     state: Mutex<GraphState>,
@@ -468,12 +454,6 @@ pub(crate) struct GraphState {
     pub(crate) links: HashMap<u64, LinkInfo, Ids>,
     /// The link count at which dead links are next swept out.
     sweep_at: usize,
-    #[cfg(feature = "observe")]
-    pub(crate) keys: VecDeque<KeyLine>,
-    /// How many keys have ever been added, so watches can take new ones
-    /// after old ones are forgotten.
-    #[cfg(feature = "observe")]
-    pub(crate) keys_added: u64,
     /// The run has ended.
     pub(crate) ended: bool,
 }
@@ -484,6 +464,7 @@ impl Graph {
         environment: Arc<crate::environment::RunEnvironment>,
         start_wall: SystemTime,
         events: Arc<crate::events::Store>,
+        #[cfg(feature = "observe")] keys: Arc<crate::telemetry::KeyRecorder>,
     ) -> Arc<Graph> {
         #[cfg(not(feature = "std"))]
         let _ = environment;
@@ -503,6 +484,8 @@ impl Graph {
             }),
             #[cfg(feature = "observe")]
             events,
+            #[cfg(feature = "observe")]
+            keys,
             #[cfg(feature = "observe")]
             watches: crate::observe::WatchSet::default(),
             protocols: Mutex::default(),
@@ -616,16 +599,6 @@ impl Graph {
             line: t.line,
             parent: t.parent,
         })
-    }
-
-    #[cfg(feature = "observe")]
-    pub(crate) fn key(&self, line: KeyLine) {
-        let mut s = self.state();
-        if s.keys.len() >= MAX_KEYS {
-            s.keys.pop_front();
-        }
-        s.keys.push_back(line);
-        s.keys_added += 1;
     }
 }
 

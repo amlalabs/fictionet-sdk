@@ -28,8 +28,8 @@ const REAP_EVERY: Duration = if cfg!(test) {
 /// The decoded watches kept by one run, shared by observers of each link.
 ///
 /// Locks are taken in this order: [`REAPER`], this set's map, then a
-/// watch's inner state. Watch creation and decoding also take graph state
-/// locks, so callers must release graph state before calling this set.
+/// watch's inner state. Watch creation takes graph state and decoding takes
+/// the key log lock, so callers must release both before calling this set.
 /// Subscription release drops the watch lock before scheduling the reaper.
 pub(crate) struct WatchSet {
     state: Mutex<State>,

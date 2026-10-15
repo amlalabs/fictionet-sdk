@@ -595,7 +595,7 @@ pub use packets::hex;
 mod present;
 mod registry;
 
-pub use crate::watch::KeyLine;
+pub use crate::telemetry::KeyLine;
 pub use decode::{Decoded, Dissector, Field, Layer};
 pub use present::{Observed, Place, Placement, Present};
 pub use registry::{Match, Protocol, Registry, Selection};

@@ -341,6 +341,20 @@ impl Cx {
         self.run.graph.observed()
     }
 
+    /// The run's TLS key recorder, for copyable protocol modules.
+    ///
+    /// Returns `None` without the `observe` feature or when no observer is
+    /// connected. A returned recorder keeps recording for that connection
+    /// even if observers leave. It retains only the run's bounded key log.
+    #[doc(hidden)]
+    pub fn tls_key_log(&self) -> Option<Arc<dyn rustls::KeyLog>> {
+        #[cfg(feature = "observe")]
+        if self.observed() {
+            return Some(self.run.keys.clone());
+        }
+        None
+    }
+
     /// Sets application decoders for newly watched links in this world.
     /// Existing watches keep their registry and connection state. Call this
     /// before clients start observing to include custom protocols in the

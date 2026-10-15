@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use super::KeyLine;
 use super::json;
 use crate::events::Event;
-use crate::watch::KeyLine;
 use fictionet::stdlib::codec::{Wire, be16, be32};
 use fictionet::stdlib::json::Value;
 use fictionet::stdlib::tcp_reassembly::{Chunk, FlowKey, Reassembler, Segment, conversation_key};

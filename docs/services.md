@@ -533,8 +533,12 @@ TLS ownership and reproducibility are split across these files:
   and ordered inputs repeat TLS records in a closed lab. Its docs describe
   the obligations of custom resolvers and signers and the effect of real peers.
 - [`tls.rs`](../src/stdlib/tls.rs) owns transport, handshakes, ALPN selection
-  and observation decoration. [`ca.rs`](../src/stdlib/ca.rs) issues certificates
+  and installs the run's key recorder. [`ca.rs`](../src/stdlib/ca.rs) issues certificates
   using the run's randomness and world-supplied leaf validity.
+- [`telemetry.rs`](../src/telemetry.rs) owns the bounded TLS key log, created
+  by the run. TLS acquires a recorder only while an observer is connected.
+  The recorder holds only that log. Capture, key export and decryption stay
+  in `observe`, including the public `observe::observed_config` helper.
 - [`tls/output.rs`](../src/stdlib/tls/output.rs) drains ciphertext for both
   the server and the simulated client. Copy `tls.rs` with the `tls/` directory
   and declare `#[path = "tls/output.rs"] mod tls_output;` beside the copy.

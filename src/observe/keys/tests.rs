@@ -15,6 +15,38 @@ use fictionet::{Cx, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
+#[test]
+fn config_keeps_its_logger_unless_observed() {
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(7),
+        |fcx| async move {
+            let config = Arc::new(
+                ServerConfig::builder_with_provider(Arc::new(tls::crypto_provider()))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_cert_resolver(
+                        Arc::new(rustls::server::ResolvesServerCertUsingSni::new()),
+                    ),
+            );
+            let unchanged = super::observed_config(&fcx, config.clone());
+            assert!(Arc::ptr_eq(&config, &unchanged));
+            fcx.graph().viewers.store(1, Ordering::Relaxed);
+            let logged = super::observed_config(&fcx, config.clone());
+            assert!(!Arc::ptr_eq(&config, &logged));
+            assert!(!Arc::ptr_eq(&config.key_log, &logged.key_log));
+            assert!(Arc::ptr_eq(&config.cert_resolver, &logged.cert_resolver));
+            logged.key_log.log("CLIENT_RANDOM", &[0, 255], &[128, 1]);
+            assert_eq!(
+                crate::observe::packets::keylog(fcx.graph()),
+                "CLIENT_RANDOM 00ff 8001\n"
+            );
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
 /// A CA, and a server and client config for `secret.test`.
 fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
@@ -136,7 +168,7 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
                 fictionet::time::Instant::ZERO,
                 fictionet::events::Event::new("test", "after_tls"),
             );
-            assert_eq!(!fcx.graph().state().keys.is_empty(), observe);
+            assert_eq!(!fcx.graph().keys.state().keys.is_empty(), observe);
             let events = fcx.events().all();
             assert_eq!(events.len(), 2);
             assert!(events[0].is("test", "before_tls"));

@@ -188,6 +188,9 @@ pub(crate) struct RunShared {
     pub(crate) start_wall: SystemTime,
     /// The run's events, kept whether or not anyone observes.
     pub(crate) events: Arc<crate::events::Store>,
+    /// The run's TLS key log, shared with the graph for observers.
+    #[cfg(feature = "observe")]
+    pub(crate) keys: Arc<crate::telemetry::KeyRecorder>,
     queue: Mutex<Queue>,
     /// What the run records for observers.
     pub(crate) graph: Arc<Graph>,
@@ -228,11 +231,22 @@ impl RunShared {
             crate::sys::UNIX_EPOCH
         };
         let events = crate::events::Store::new(mode);
-        let graph = Graph::new(run_id, environment.clone(), start_wall, events.clone());
+        #[cfg(feature = "observe")]
+        let keys = Arc::new(crate::telemetry::KeyRecorder::default());
+        let graph = Graph::new(
+            run_id,
+            environment.clone(),
+            start_wall,
+            events.clone(),
+            #[cfg(feature = "observe")]
+            keys.clone(),
+        );
         Arc::new(Self {
             environment,
             start_wall,
             events,
+            #[cfg(feature = "observe")]
+            keys,
             queue: Mutex::new(Queue {
                 next_id: 1,
                 ..Queue::default()

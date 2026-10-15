@@ -364,6 +364,7 @@ pub mod running;
 pub mod stdlib;
 pub mod sync;
 mod sys;
+mod telemetry;
 pub mod time;
 mod timer;
 #[cfg(feature = "tokio")]
