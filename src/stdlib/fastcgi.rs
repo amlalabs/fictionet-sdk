@@ -1651,7 +1651,7 @@ mod tests {
     use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::rounds;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn begin_request(role: Role, flags: u8) -> BeginRequest {
@@ -2419,14 +2419,21 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_records_in_linear_time() {
-        let n = rounds(200_000);
-        let one = Record::new(kind::STDIN, 1, b"x").to_bytes().unwrap();
-        let mut stream = Stream::new(Frames::<Record>::new());
-        let mut count = 0;
-        pump(&mut stream, &one.repeat(n), |_| count += 1).unwrap();
-        finish(&mut stream, |_| count += 1).unwrap();
-        assert_eq!(count, n);
-        assert_eq!(stream.buffered(), 0);
+        assert_linear(
+            "stream_reads_many_small_records_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Record::new(kind::STDIN, 1, b"x").to_bytes().unwrap();
+                let input = one.repeat(size);
+                // Retain the whole input so rescanning the unread suffix is quadratic.
+                let mut stream = Stream::with_buffer(Frames::<Record>::new(), input.len());
+                let mut count = 0;
+                pump(&mut stream, &input, |_| count += 1).unwrap();
+                finish(&mut stream, |_| count += 1).unwrap();
+                assert_eq!(count, size);
+                assert_eq!(stream.buffered(), 0);
+            },
+        );
     }
 
     // A stream bounds input while complete requests may span many records.

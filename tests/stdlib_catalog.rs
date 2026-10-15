@@ -263,11 +263,6 @@ fn linearity_names_require_measurement() {
             "RH-043 / T11-73",
         ),
         (
-            "fastcgi.rs",
-            "stream_reads_many_small_records_in_linear_time",
-            "RH-044 / T11-72",
-        ),
-        (
             "onc_rpc.rs",
             "many_small_records_take_linear_time",
             "RH-057 / T11-77",
