@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use fictionet::stdlib::codec::crc32;
 use ring::digest::{SHA256, digest};
 
 /// The seed used when no seed is supplied.
@@ -112,17 +113,6 @@ pub fn base64(data: &[u8]) -> String {
         }
     }
     out
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for b in data {
-        c ^= u32::from(*b);
-        for _ in 0..8 {
-            c = (c >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(c & 1)));
-        }
-    }
-    !c
 }
 
 fn u16le(out: &mut Vec<u8>, n: u16) {
