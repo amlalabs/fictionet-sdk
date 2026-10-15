@@ -1,4 +1,5 @@
 use super::*;
+use crate::done::ended_with_done;
 
 // ---------------------------------------------------------------------------
 // A network: a PLC and a web server
@@ -989,6 +990,29 @@ async fn spied(fcx: &Cx, spy: &Mutex<Vec<Option<Budget>>>, n: usize) -> Vec<Opti
     panic!("the spy kept fewer than {n} budgets");
 }
 
+/// `ended_with_done` accepts only Done: any other error comes back
+/// unchanged, and a region that ends with `Ok` is an error.
+#[test]
+fn early_region_error_is_failure() {
+    world(Duration::from_secs(60), |fcx| async move {
+        ended_with_done(
+            fcx.region(|_| async { Err(fictionet::Error::from(Done)) })
+                .await,
+        )?;
+
+        let cause = fictionet::Error::from(std::io::Error::other("early region failure"));
+        let error = ended_with_done(fcx.region(|_| async { Err(cause.clone()) }).await)
+            .expect_err("an unexpected region error must fail");
+        assert_eq!(error.to_string(), "early region failure");
+        assert!(std::ptr::addr_eq(&*error, &*cause));
+
+        let error = ended_with_done(fcx.region(|_| async { Ok(()) }).await)
+            .expect_err("a region without Done must fail");
+        assert_eq!(error.to_string(), "the region should end with Done");
+        Ok(())
+    });
+}
+
 /// A sandbox has one budget for its IPv4 and IPv6 addresses, and a new
 /// attachment at the same address gets a new one. Before, budgets were
 /// kept by address: each family had its own, and an address kept its
@@ -1018,8 +1042,8 @@ fn net_keeps_one_budget_per_attachment() {
         // to the budget a connection over IPv6 gets.
         let first = budgets.clone();
         let first_attacher = &attacher;
-        let _ = fcx
-            .region(|fcx| async move {
+        ended_with_done(
+            fcx.region(|fcx| async move {
                 let (v4, v6, _other) = ip::split_versions(&fcx, first_attacher.attach("a")?);
                 let (a4, a6) = (machine(&fcx, v4, ME), machine(&fcx, v6, me6));
                 let mut wide = a4
@@ -1045,7 +1069,8 @@ fn net_keeps_one_budget_per_attachment() {
                 // Leaving the region detaches the sandbox.
                 Err(fictionet::Error::from(Done))
             })
-            .await;
+            .await,
+        )?;
         kept.wait(&fcx, 1, Duration::from_secs(2), |e| e.is("net", "detached"))
             .await?;
         let a = budgets.lock().unwrap()[0].clone().expect("a budget");
@@ -1094,8 +1119,8 @@ fn a_lan_member_detaches_like_any_sandbox() {
 
         let to = SocketAddr::new(dc.into(), 389);
         let first_attacher = &attacher;
-        let _ = fcx
-            .region(|fcx| async move {
+        ended_with_done(
+            fcx.region(|fcx| async move {
                 let vm = machine(&fcx, first_attacher.attach("ws01")?, ws);
                 let mut conn = vm.tcp.connect(&fcx, to).await?;
                 assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
@@ -1103,7 +1128,8 @@ fn a_lan_member_detaches_like_any_sandbox() {
                 // the server.
                 Err(fictionet::Error::from(Done))
             })
-            .await;
+            .await,
+        )?;
         let detached = kept
             .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("net", "detached"))
             .await?;
