@@ -127,7 +127,7 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field;
-use fictionet::stdlib::session::Action;
+use fictionet::stdlib::session::{self, Action};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
@@ -1787,37 +1787,29 @@ impl Timers {
 #[derive(Clone, Copy, Debug)]
 struct Clock {
     timers: Timers,
-    now: u64,
-    since: u64,
-    received: u64,
-    sent: u64,
+    time: session::Clock,
 }
 impl Clock {
     fn new(timers: Timers, now: u64) -> Result<Self, Error> {
         timers.validate()?;
         Ok(Self {
             timers,
-            now,
-            since: now,
-            received: now,
-            sent: now,
+            time: session::Clock::new(now),
         })
     }
     fn advance(&mut self, now: u64) -> Result<(), Error> {
-        if now < self.now {
-            return Err(Error::Time);
-        }
-        self.now = now;
-        Ok(())
+        self.time.advance(now).map_err(|error| match error {
+            session::Error::Time => Error::Time,
+        })
     }
     fn heartbeat_due(&self) -> bool {
-        self.now.saturating_sub(self.sent) >= self.timers.heartbeat_ms
+        self.time.sent_elapsed_ms() >= self.timers.heartbeat_ms
     }
     fn idle(&self) -> bool {
-        self.now.saturating_sub(self.received) >= self.timers.idle_timeout_ms
+        self.time.received_elapsed_ms() >= self.timers.idle_timeout_ms
     }
     fn login_expired(&self) -> bool {
-        self.now.saturating_sub(self.since) >= self.timers.login_timeout_ms
+        self.time.elapsed_ms() >= self.timers.login_timeout_ms
     }
 }
 
@@ -2019,8 +2011,8 @@ impl Client {
         Check::check(&login.params)?;
         self.clock.advance(now_ms)?;
         self.phase = ClientPhase::LoginSent;
-        self.clock.since = now_ms;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_start();
+        self.clock.time.mark_sent();
         Ok(vec![Action::Send(login.into())])
     }
     /// Handles one message from Cboe. A message out of turn closes the
@@ -2059,7 +2051,7 @@ impl Client {
     }
     fn receive_inner(&mut self, message: &Outbound) -> Vec<Action<Inbound, Event>> {
         use ClientPhase as S;
-        self.clock.received = self.clock.now;
+        self.clock.time.mark_received();
         let in_session = matches!(self.phase, S::Replaying | S::LoggedIn | S::LoggingOut);
         match (self.phase, message) {
             (S::LoginSent, Outbound::LoginResponse(r))
@@ -2070,7 +2062,7 @@ impl Client {
                 };
                 self.next = next;
                 self.phase = S::Replaying;
-                self.clock.sent = self.clock.now;
+                self.clock.time.mark_sent();
                 vec![Action::Event(Event::LoggedIn {
                     last_received_sequence: r.last_received_sequence,
                     units: r.tail.units.clone(),
@@ -2139,7 +2131,7 @@ impl Client {
         self.clock.advance(now_ms)?;
         *message.header_mut() = Header { unit: 0, sequence };
         self.next = next;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         Ok(message)
     }
     /// Sends a Logout Request. Cboe answers with a Logout and closes.
@@ -2149,7 +2141,7 @@ impl Client {
         }
         self.clock.advance(now_ms)?;
         self.phase = ClientPhase::LoggingOut;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         Ok(vec![Action::Send(LogoutRequest::default().into())])
     }
     /// Runs the timers: the login timeout, the idle timeout, and a Client
@@ -2163,7 +2155,7 @@ impl Client {
             S::LoginSent => Vec::new(),
             _ if self.clock.idle() => self.close(CloseReason::IdleTimeout),
             _ if self.clock.heartbeat_due() => {
-                self.clock.sent = now_ms;
+                self.clock.time.mark_sent();
                 vec![Action::Send(ClientHeartbeat::default().into())]
             }
             _ => Vec::new(),
@@ -2262,7 +2254,7 @@ impl Server {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
-        self.clock.received = now_ms;
+        self.clock.time.mark_received();
         Ok(match (self.phase, message) {
             (S::AwaitingLogin, Inbound::LoginRequest(login)) => {
                 self.phase = S::LoginPending;
@@ -2288,7 +2280,7 @@ impl Server {
                 }
                 if state == S::Replaying {
                     let reject = self.during_replay(m);
-                    self.clock.sent = now_ms;
+                    self.clock.time.mark_sent();
                     vec![Action::Send(reject)]
                 } else {
                     vec![Action::Event(Event::Application)]
@@ -2475,8 +2467,8 @@ impl Server {
         self.returns = returns;
         self.last_inbound = last_inbound;
         self.sent = highest;
-        self.clock.sent = now_ms;
-        self.clock.received = now_ms;
+        self.clock.time.mark_sent();
+        self.clock.time.mark_received();
         if actions.len() == 1 {
             actions.push(Action::Send(ReplayComplete::default().into()));
             self.phase = ServerPhase::LoggedIn;
@@ -2528,7 +2520,7 @@ impl Server {
             return self.close(CloseReason::Protocol);
         }
         self.request = None;
-        self.clock.sent = self.clock.now;
+        self.clock.time.mark_sent();
         let mut actions = vec![Action::Send(response.into())];
         actions.extend(self.close(CloseReason::Rejected));
         actions
@@ -2546,7 +2538,7 @@ impl Server {
             return Err(Error::Sequence);
         }
         self.clock.advance(now_ms)?;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         Ok(message.clone())
     }
     /// Ends the replay with Replay Complete.
@@ -2555,7 +2547,7 @@ impl Server {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         self.phase = ServerPhase::LoggedIn;
         Ok(vec![Action::Send(ReplayComplete::default().into())])
     }
@@ -2586,7 +2578,7 @@ impl Server {
             self.clock.advance(now_ms)?;
             *message.header_mut() = Header::default();
         }
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         Ok(message)
     }
     /// Sends a Logout with `reason` and closes: "E" at the end of the day,
@@ -2617,7 +2609,7 @@ impl Server {
             last_received_sequence: self.last_inbound,
             units: Units(self.sent()),
         };
-        self.clock.sent = self.clock.now;
+        self.clock.time.mark_sent();
         let mut actions = vec![Action::Send(logout.into())];
         actions.extend(self.close(close));
         actions
@@ -2647,7 +2639,7 @@ impl Server {
                 CloseReason::IdleTimeout,
             ),
             _ if self.clock.heartbeat_due() => {
-                self.clock.sent = now_ms;
+                self.clock.time.mark_sent();
                 vec![Action::Send(ServerHeartbeat::default().into())]
             }
             _ => Vec::new(),
@@ -4424,8 +4416,11 @@ mod tests {
         assert!(server.returns().is_empty());
         assert_eq!(server.last_inbound(), 0);
         assert!(server.sent().is_empty());
-        assert_eq!(server.clock.sent, 0);
-        assert_eq!(server.clock.received, 1);
+        let mut expected_clock = session::Clock::new(0);
+        expected_clock.advance(1).unwrap();
+        expected_clock.mark_received();
+        expected_clock.advance(2).unwrap();
+        assert_eq!(server.clock.time, expected_clock);
     }
 
     #[test]

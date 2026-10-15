@@ -265,6 +265,18 @@ deprecated aliases. Existing calls keep their meaning and compile with
 deprecation warnings. Migrate to the explicit names without changing the
 side. Masking checks, limits, and decoding behavior are unchanged.
 
+### Passive session clocks
+
+`stdlib::session::Clock` tracks caller-supplied milliseconds. Advance it before
+marking a start, send, or receive. Elapsed queries measure from each mark;
+advancing alone leaves the marks unchanged. Equal timestamps are allowed.
+Backward time returns `session::Error::Time` and leaves the clock unchanged.
+The clock reads no system clock and schedules no work.
+
+BOE and SoupBinTCP use this shared clock. Each keeps its own timer defaults,
+validation, deadline comparisons, error mapping, and session transitions.
+Copied protocol modules use the same public helper.
+
 ### Terminal framing errors
 
 The ITCH, SoupBinTCP, Cboe PITCH, Cboe BOE, and MongoDB framers now use

@@ -75,7 +75,7 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Wire, field};
-use fictionet::stdlib::session::Action;
+use fictionet::stdlib::session::{self, Action};
 use std::fmt;
 
 /// Bytes in the length prefix.
@@ -562,37 +562,29 @@ pub enum Event {
 #[derive(Clone, Copy, Debug)]
 struct Clock {
     timers: Timers,
-    now: u64,
-    since: u64,
-    received: u64,
-    sent: u64,
+    time: session::Clock,
 }
 impl Clock {
     fn new(timers: Timers, now: u64) -> Result<Self, Error> {
         timers.validate()?;
         Ok(Self {
             timers,
-            now,
-            since: now,
-            received: now,
-            sent: now,
+            time: session::Clock::new(now),
         })
     }
     fn advance(&mut self, now: u64) -> Result<(), Error> {
-        if now < self.now {
-            return Err(Error::Time);
-        }
-        self.now = now;
-        Ok(())
+        self.time.advance(now).map_err(|error| match error {
+            session::Error::Time => Error::Time,
+        })
     }
     fn heartbeat_due(&self) -> bool {
-        self.now.saturating_sub(self.sent) >= self.timers.heartbeat_ms
+        self.time.sent_elapsed_ms() >= self.timers.heartbeat_ms
     }
     fn idle(&self) -> bool {
-        self.now.saturating_sub(self.received) >= self.timers.idle_timeout_ms
+        self.time.received_elapsed_ms() >= self.timers.idle_timeout_ms
     }
     fn login_expired(&self) -> bool {
-        self.now.saturating_sub(self.since) >= self.timers.login_timeout_ms
+        self.time.elapsed_ms() >= self.timers.login_timeout_ms
     }
 }
 
@@ -632,7 +624,7 @@ macro_rules! session_debug {
                 return Err(Error::State);
             }
             self.clock.advance(now_ms)?;
-            self.clock.sent = now_ms;
+            self.clock.time.mark_sent();
             Ok(Packet::Debug(text.to_vec()))
         }
     };
@@ -646,7 +638,7 @@ macro_rules! session_tick {
                 $login if self.clock.login_expired() => self.close(CloseReason::LoginTimeout),
                 $phase::LoggedIn if self.clock.idle() => self.close(CloseReason::IdleTimeout),
                 $phase::LoggedIn if self.clock.heartbeat_due() => {
-                    self.clock.sent = now_ms;
+                    self.clock.time.mark_sent();
                     vec![Action::Send($heartbeat)]
                 }
                 _ => Vec::new(),
@@ -721,8 +713,8 @@ impl Client {
             return Err(Error::State);
         }
         s.phase = ClientPhase::LoginSent;
-        s.clock.since = now_ms;
-        s.clock.sent = now_ms;
+        s.clock.time.mark_start();
+        s.clock.time.mark_sent();
         *self = s;
         Ok(vec![Action::Send(Packet::LoginRequest(self.login))])
     }
@@ -745,7 +737,7 @@ impl Client {
         if self.phase == ClientPhase::Closed {
             return Err(Error::State);
         }
-        self.clock.received = self.clock.now;
+        self.clock.time.mark_received();
         match (self.phase, packet) {
             (_, Packet::Debug(_)) => Ok(Vec::new()),
             (ClientPhase::LoginSent, Packet::LoginAccepted { session, sequence }) => {
@@ -759,7 +751,7 @@ impl Client {
                 self.session = *session;
                 self.next = *sequence;
                 // Heartbeats are owed from login on (1.3).
-                self.clock.sent = self.clock.now;
+                self.clock.time.mark_sent();
                 Ok(vec![Action::Event(Event::LoggedIn {
                     session: *session,
                     sequence: *sequence,
@@ -801,7 +793,7 @@ impl Client {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         Ok(make(message))
     }
     /// Sends a Logout Request and closes (2.3.4). Only once logged in.
@@ -810,7 +802,7 @@ impl Client {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         let mut actions = vec![Action::Send(Packet::LogoutRequest)];
         actions.extend(self.close(CloseReason::Logout));
         Ok(actions)
@@ -886,7 +878,7 @@ impl Server {
         if s.phase == ServerPhase::Closed {
             return Err(Error::State);
         }
-        s.clock.received = now_ms;
+        s.clock.time.mark_received();
         let actions = match (s.phase, packet) {
             (_, Packet::Debug(_)) => Vec::new(),
             (ServerPhase::AwaitingLogin, Packet::LoginRequest(login)) => {
@@ -924,9 +916,9 @@ impl Server {
         self.phase = ServerPhase::LoggedIn;
         self.session = session;
         self.next = sequence;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         // The idle timer starts at login: clients heartbeat once logged in.
-        self.clock.received = now_ms;
+        self.clock.time.mark_received();
         Ok(vec![Action::Send(Packet::LoginAccepted {
             session,
             sequence,
@@ -942,7 +934,7 @@ impl Server {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         let mut actions = vec![Action::Send(Packet::LoginRejected(reason))];
         actions.extend(self.close(CloseReason::Rejected));
         Ok(actions)
@@ -960,7 +952,7 @@ impl Server {
         let next = self.next.checked_add(1).ok_or(Error::Sequence)?;
         self.clock.advance(now_ms)?;
         self.next = next;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         Ok(Packet::SequencedData(message.to_vec()))
     }
     session_debug!(ServerPhase);
@@ -970,7 +962,7 @@ impl Server {
             return Err(Error::State);
         }
         self.clock.advance(now_ms)?;
-        self.clock.sent = now_ms;
+        self.clock.time.mark_sent();
         let mut actions = vec![Action::Send(Packet::EndOfSession)];
         actions.extend(self.close(CloseReason::EndOfSession));
         Ok(actions)
