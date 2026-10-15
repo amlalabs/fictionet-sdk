@@ -1631,19 +1631,9 @@ mod tests {
         Tpdu::parse(&tpdu.payload).unwrap()
     }
 
-    // RFC 1006 section 6: a TPKT is version 3, reserved, then the length
-    // of the whole packet.
     #[test]
     fn tpkt_example() {
         let packet = [3, 0, 0, 7, 2, 0xf0, 0x80];
-        assert_eq!(
-            tpkt::Packet::parse_prefix(&packet),
-            Ok(Some((tpkt::Packet::new(packet[4..].to_vec()), 7)))
-        );
-        assert_eq!(
-            tpkt::Packet::new(packet[4..].to_vec()).to_bytes().unwrap(),
-            packet
-        );
         let packet_value = tpkt::Packet::new(packet[4..].to_vec());
         assert_eq!(
             over_tpkt::tpdu(&packet_value),
@@ -1653,48 +1643,6 @@ mod tests {
             over_tpkt::from_tpdu(&over_tpkt::tpdu(&packet_value).unwrap()),
             Ok(packet_value)
         );
-        // Every prefix is incomplete, not an error.
-        for n in 0..packet.len() {
-            assert_eq!(
-                tpkt::Packet::parse_prefix(&packet[..n]),
-                Ok(None),
-                "{n} bytes"
-            );
-        }
-        // Extra bytes after the packet are left alone.
-        let mut longer = packet.to_vec();
-        longer.extend_from_slice(&[3, 0]);
-        assert_eq!(tpkt::Packet::parse_prefix(&longer).unwrap().unwrap().1, 7);
-    }
-
-    #[test]
-    fn tpkt_errors() {
-        // Known from the first byte.
-        assert_cases!(|input| tpkt::Packet::parse_prefix(input);
-            text_version: &[0x30] => Err(tpkt::Error::Version(0x30)),
-            old_version: &[2, 0, 0, 7, 2, 0xf0, 0x80] => Err(tpkt::Error::Version(2)),
-        );
-        for n in 0..tpkt::MIN_PACKET as u16 {
-            let b = [3, 0, (n >> 8) as u8, n as u8];
-            assert_eq!(tpkt::Packet::parse_prefix(&b), Err(tpkt::Error::Length(n)));
-        }
-        // The reserved byte is not checked.
-        assert!(
-            tpkt::Packet::parse_prefix(&[3, 9, 0, 7, 2, 0xf0, 0x80])
-                .unwrap()
-                .is_some()
-        );
-        assert!(!tpkt::Error::Version(2).to_string().is_empty());
-        assert!(!tpkt::Error::Length(2).to_string().is_empty());
-    }
-
-    #[test]
-    fn packet_bounds() {
-        for len in [0, 2, tpkt::MAX_PAYLOAD + 1] {
-            let packet = tpkt::Packet::new(vec![7; len]);
-            contract::check_wire_value(&packet);
-            assert!(packet.to_bytes().is_err());
-        }
     }
 
     // An S7comm connection request as Siemens tools send it: TPDU size

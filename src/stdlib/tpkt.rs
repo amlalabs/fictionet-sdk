@@ -478,17 +478,24 @@ mod tests {
 
     #[test]
     fn every_prefix_is_incomplete() {
-        let bytes = [3, 0, 0, 10, 2, 0xf0, 0x80, 1, 2, 3];
-        for n in 0..bytes.len() {
-            assert_eq!(Packet::parse_prefix(&bytes[..n]), Ok(None), "{n} bytes");
-            if n < HEADER_LEN {
-                assert_eq!(Header::parse(&bytes[..n], MAX_PACKET), Ok(None));
+        for bytes in [
+            &[3, 0, 0, 7, 2, 0xf0, 0x80][..],
+            &[3, 0, 0, 10, 2, 0xf0, 0x80, 1, 2, 3][..],
+        ] {
+            for n in 0..bytes.len() {
+                assert_eq!(Packet::parse_prefix(&bytes[..n]), Ok(None), "{n} bytes");
+                if n < HEADER_LEN {
+                    assert_eq!(Header::parse(&bytes[..n], MAX_PACKET), Ok(None));
+                }
             }
+            // Bytes after the packet are left alone.
+            let mut longer = bytes.to_vec();
+            longer.extend_from_slice(&[3, 0]);
+            assert_eq!(
+                Packet::parse_prefix(&longer).unwrap().unwrap().1,
+                bytes.len()
+            );
         }
-        // Bytes after the packet are left alone.
-        let mut longer = bytes.to_vec();
-        longer.extend_from_slice(&[3, 0]);
-        assert_eq!(Packet::parse_prefix(&longer).unwrap().unwrap().1, 10);
     }
 
     #[test]
