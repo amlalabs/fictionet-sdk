@@ -9,7 +9,7 @@
 //! replace the built-in, registered the same way.
 
 use fictionet::observe::{Decoded, Layer, Placement, Present};
-use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire, be32};
 use fictionet::stdlib::http2::{
     Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderBlocks, Input, Inputs, MAX_WINDOW,
     PREFACE, Setting,
@@ -33,12 +33,7 @@ fn size(reason: &'static str) -> Error {
     }
 }
 fn u32_at(bytes: &[u8], at: usize) -> Result<u32, Error> {
-    let b = bytes
-        .get(at..at.saturating_add(4))
-        .ok_or_else(|| size("truncated integer"))?;
-    Ok(u32::from_be_bytes(
-        b.try_into().map_err(|_| size("truncated integer"))?,
-    ))
+    be32(bytes, at).ok_or_else(|| size("truncated integer"))
 }
 /// A DATA payload without its padding. `None`: the padding is longer
 /// than the frame.
@@ -623,7 +618,11 @@ impl Decode for Capture {
         let body = payload.unwrap_or_default();
         match h.kind {
             0 => {
-                let data = match unpad(body, h.flags) {
+                let data = match &frame {
+                    Input::Frame(Frame::Data(data)) => Some(data.data.as_slice()),
+                    _ => unpad(body, h.flags),
+                };
+                let data = match data {
                     Some(data) => data,
                     None => {
                         item.layer.note("Padding", "longer than the frame");

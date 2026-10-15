@@ -40,7 +40,7 @@
 
 use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{
-    codec::{Decode, Fail, Step, Stream, Wire},
+    codec::{Decode, Fail, Step, Stream, Wire, be32},
     hpack,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -140,14 +140,9 @@ fn budget(reason: &'static str) -> Error {
     error(ErrorCode::EnhanceYourCalm, reason)
 }
 fn u32_at(bytes: &[u8], at: usize) -> Result<u32, Error> {
-    let end = at
-        .checked_add(4)
+    at.checked_add(4)
         .ok_or_else(|| size("integer offset overflow"))?;
-    let b = bytes
-        .get(at..end)
-        .ok_or_else(|| size("truncated integer"))?;
-    let a: [u8; 4] = b.try_into().map_err(|_| size("truncated integer"))?;
-    Ok(u32::from_be_bytes(a))
+    be32(bytes, at).ok_or_else(|| size("truncated integer"))
 }
 
 /// The nine-byte header. Reserved stream bits are ignored when reading.
@@ -400,7 +395,7 @@ pub enum Frame {
     /// An extension frame.
     Unknown(Unknown),
 }
-fn unpad(payload: &[u8], flags: u8) -> Result<(&[u8], Option<Vec<u8>>), Error> {
+fn unpad(payload: &[u8], flags: u8) -> Result<(&[u8], Option<&[u8]>), Error> {
     if flags & 8 == 0 {
         return Ok((payload, None));
     }
@@ -413,12 +408,12 @@ fn unpad(payload: &[u8], flags: u8) -> Result<(&[u8], Option<Vec<u8>>), Error> {
         .ok_or_else(|| protocol("padding longer than payload"))?;
     Ok((
         rest.get(..end).ok_or_else(|| size("padding"))?,
-        Some(rest.get(end..).ok_or_else(|| size("padding"))?.to_vec()),
+        Some(rest.get(end..).ok_or_else(|| size("padding"))?),
     ))
 }
 // A payload too short for its fields is a FRAME_SIZE_ERROR (RFC 9113 4.2).
 // Padding that leaves too few bytes for them is a PROTOCOL_ERROR (6.2, 6.6).
-fn unpad_fields(payload: &[u8], flags: u8, need: usize) -> Result<(&[u8], Option<Vec<u8>>), Error> {
+fn unpad_fields(payload: &[u8], flags: u8, need: usize) -> Result<(&[u8], Option<&[u8]>), Error> {
     if payload.len() < need.saturating_add(usize::from(flags & 8 != 0)) {
         return Err(size("frame too short for its fields"));
     }
@@ -427,6 +422,31 @@ fn unpad_fields(payload: &[u8], flags: u8, need: usize) -> Result<(&[u8], Option
         return Err(protocol("padding covers required fields"));
     }
     Ok((b, padding))
+}
+struct HeaderPayload<'a> {
+    fields: &'a [u8],
+    fragment: &'a [u8],
+    padding: Option<&'a [u8]>,
+}
+impl<'a> HeaderPayload<'a> {
+    fn parse(payload: &'a [u8], kind: u8, flags: u8) -> Result<Self, Error> {
+        let need = match kind {
+            1 if flags & 0x20 != 0 => 5,
+            5 => 4,
+            _ => 0,
+        };
+        let (b, padding) = if kind == 9 {
+            (payload, None)
+        } else {
+            unpad_fields(payload, flags, need)?
+        };
+        let (fields, fragment) = b.split_at(need);
+        Ok(Self {
+            fields,
+            fragment,
+            padding,
+        })
+    }
 }
 fn dependency(b: &[u8]) -> Result<Dependency, Error> {
     let stream = u32_at(b, 0)?;
@@ -449,22 +469,9 @@ fn setting_valid(s: Setting) -> Result<(), Error> {
         _ => Ok(()),
     }
 }
-impl Wire for Frame {
-    type ParseError = Error;
-    type WriteError = Error;
-    /// Reads exactly one frame. Checks lengths, stream-zero rules, padding,
-    /// settings values, window increments, and priority self-dependencies.
-    /// Undefined flags and unknown frame payloads are retained.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let h = FrameHeader::parse(
-            bytes
-                .get(..HEADER_LEN)
-                .ok_or_else(|| size("truncated header"))?,
-        )?;
+impl Frame {
+    fn parse_payload(h: FrameHeader, b: &[u8]) -> Result<Self, Error> {
         h.validate()?;
-        let b = bytes
-            .get(HEADER_LEN..)
-            .ok_or_else(|| size("truncated payload"))?;
         if b.len() != h.length {
             return Err(size("payload length does not match header"));
         }
@@ -476,29 +483,26 @@ impl Wire for Frame {
                     stream,
                     flags,
                     data: data.to_vec(),
-                    padding,
+                    padding: padding.map(<[u8]>::to_vec),
                 })
             }
             1 => {
-                let (b, padding) = unpad_fields(b, flags, if flags & 0x20 != 0 { 5 } else { 0 })?;
-                let (priority, fragment) = if flags & 0x20 != 0 {
-                    let p = dependency(b)?;
+                let payload = HeaderPayload::parse(b, h.kind, flags)?;
+                let priority = if flags & 0x20 != 0 {
+                    let p = dependency(payload.fields)?;
                     if p.stream == stream {
                         return Err(protocol("stream depends on itself"));
                     }
-                    (
-                        Some(p),
-                        b.get(5..).ok_or_else(|| size("short HEADERS priority"))?,
-                    )
+                    Some(p)
                 } else {
-                    (None, b)
+                    None
                 };
                 Self::Headers(Headers {
                     stream,
                     flags,
-                    fragment: fragment.to_vec(),
+                    fragment: payload.fragment.to_vec(),
                     priority,
-                    padding,
+                    padding: payload.padding.map(<[u8]>::to_vec),
                 })
             }
             2 => {
@@ -534,8 +538,8 @@ impl Wire for Frame {
                 Self::Settings(Settings { flags, entries })
             }
             5 => {
-                let (b, padding) = unpad_fields(b, flags, 4)?;
-                let promised = u32_at(b, 0)? & MAX_WINDOW;
+                let payload = HeaderPayload::parse(b, h.kind, flags)?;
+                let promised = u32_at(payload.fields, 0)? & MAX_WINDOW;
                 if promised == 0 {
                     return Err(protocol("promised stream is zero"));
                 }
@@ -543,11 +547,8 @@ impl Wire for Frame {
                     stream,
                     flags,
                     promised,
-                    fragment: b
-                        .get(4..)
-                        .ok_or_else(|| size("short PUSH_PROMISE"))?
-                        .to_vec(),
-                    padding,
+                    fragment: payload.fragment.to_vec(),
+                    padding: payload.padding.map(<[u8]>::to_vec),
                 })
             }
             6 => Self::Ping(Ping {
@@ -583,6 +584,21 @@ impl Wire for Frame {
                 payload: b.to_vec(),
             }),
         })
+    }
+}
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+    /// Reads exactly one frame. Checks lengths, stream-zero rules, padding,
+    /// settings values, window increments, and priority self-dependencies.
+    /// Undefined flags and unknown frame payloads are retained.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let h = FrameHeader::parse(
+            bytes
+                .get(..HEADER_LEN)
+                .ok_or_else(|| size("truncated header"))?,
+        )?;
+        Self::parse_payload(h, &bytes[HEADER_LEN..])
     }
     /// Appends a complete frame. Validates every field before touching
     /// `out`. A value that cannot round-trip is refused, including padding
@@ -644,6 +660,27 @@ fn pad_end(out: &mut Vec<u8>, pad: &Option<Vec<u8>>) -> Result<(), Error> {
     Ok(())
 }
 impl Frame {
+    fn header(&self, length: usize) -> FrameHeader {
+        let (kind, flags, stream) = match self {
+            Self::Data(f) => (0, f.flags, f.stream),
+            Self::Headers(f) => (1, f.flags, f.stream),
+            Self::Priority(f) => (2, f.flags, f.stream),
+            Self::Reset(f) => (3, f.flags, f.stream),
+            Self::Settings(f) => (4, f.flags, 0),
+            Self::PushPromise(f) => (5, f.flags, f.stream),
+            Self::Ping(f) => (6, f.flags, 0),
+            Self::GoAway(f) => (7, f.flags, 0),
+            Self::WindowUpdate(f) => (8, f.flags, f.stream),
+            Self::Continuation(f) => (9, f.flags, f.stream),
+            Self::Unknown(f) => (f.kind, f.flags, f.stream),
+        };
+        FrameHeader {
+            length,
+            kind,
+            flags,
+            stream,
+        }
+    }
     fn encode(&self) -> Result<(FrameHeader, Vec<u8>), Error> {
         let mut p = Vec::new();
         let (kind, flags, stream) = match self {
@@ -891,7 +928,7 @@ impl Decode for Inputs {
         let Some(bytes) = input.get(..total) else {
             return Ok(Step::Need);
         };
-        let item = match Frame::parse(bytes) {
+        let item = match Frame::parse_payload(header, &bytes[HEADER_LEN..]) {
             Ok(frame) => Input::Frame(frame),
             Err(error) if self.capture => Input::Refused {
                 header,
@@ -1068,6 +1105,10 @@ struct Pending {
     promised: Option<u32>,
     bytes: Option<Vec<u8>>,
 }
+struct HeaderFragment<'a> {
+    bytes: &'a [u8],
+    promised: Option<u32>,
+}
 /// What [`HeaderBlocks::read`] found in one frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockRead {
@@ -1155,6 +1196,46 @@ impl HeaderBlocks {
     /// not keep: that block is then not decoded, and HPACK is forgotten,
     /// but the CONTINUATION boundary is kept.
     pub fn read(&mut self, h: FrameHeader, payload: Option<&[u8]>) -> Result<BlockRead, Error> {
+        let fragment = if matches!(h.kind, 1 | 5 | 9) {
+            payload.map(|p| {
+                let payload = HeaderPayload::parse(p, h.kind, h.flags)?;
+                Ok(HeaderFragment {
+                    bytes: payload.fragment,
+                    promised: if h.kind == 5 {
+                        Some(u32_at(payload.fields, 0)? & MAX_WINDOW)
+                    } else {
+                        None
+                    },
+                })
+            })
+        } else {
+            None
+        };
+        self.read_fragment(h, fragment)
+    }
+    fn read_parsed(&mut self, h: FrameHeader, frame: &Frame) -> Result<BlockRead, Error> {
+        let fragment = match frame {
+            Frame::Headers(f) => Some(HeaderFragment {
+                bytes: &f.fragment,
+                promised: None,
+            }),
+            Frame::PushPromise(f) => Some(HeaderFragment {
+                bytes: &f.fragment,
+                promised: Some(f.promised),
+            }),
+            Frame::Continuation(f) => Some(HeaderFragment {
+                bytes: &f.fragment,
+                promised: None,
+            }),
+            _ => None,
+        };
+        self.read_fragment(h, fragment.map(Ok))
+    }
+    fn read_fragment(
+        &mut self,
+        h: FrameHeader,
+        fragment: Option<Result<HeaderFragment<'_>, Error>>,
+    ) -> Result<BlockRead, Error> {
         let mut out = BlockRead {
             stream: h.stream,
             end: h.kind == 1 && h.flags & 1 != 0,
@@ -1183,34 +1264,27 @@ impl HeaderBlocks {
         if !matches!(h.kind, 1 | 5 | 9) {
             return Ok(out);
         }
-        let fragment = payload.and_then(|p| match h.kind {
-            1 => {
-                let (b, _) = unpad(p, h.flags).ok()?;
-                if h.flags & 0x20 != 0 {
-                    b.get(5..)
-                } else {
-                    Some(b)
+        let fragment = match fragment {
+            Some(Ok(fragment)) => {
+                if let Some(id) = fragment.promised {
+                    out.promised = Some(id);
+                    out.notes.push(("Promised stream", id.to_string()));
                 }
+                Some(fragment.bytes)
             }
-            5 => {
-                let (b, _) = unpad(p, h.flags).ok()?;
-                let id = u32_at(b, 0).ok()? & MAX_WINDOW;
-                out.promised = Some(id);
-                out.notes.push(("Promised stream", id.to_string()));
-                b.get(4..)
+            Some(Err(_)) => {
+                if !self.capture {
+                    return Err(protocol("short padded header frame"));
+                }
+                out.note(
+                    "Header block",
+                    "the frame is too short for its padding or fields",
+                );
+                out.malformed = true;
+                None
             }
-            _ => Some(p),
-        });
-        if payload.is_some() && fragment.is_none() {
-            if !self.capture {
-                return Err(protocol("short padded header frame"));
-            }
-            out.note(
-                "Header block",
-                "the frame is too short for its padding or fields",
-            );
-            out.malformed = true;
-        }
+            None => None,
+        };
         let mut p = if h.kind == 9 {
             let Some(p) = self.pending.take() else {
                 if !self.capture {
@@ -1712,9 +1786,9 @@ impl Session {
         loop {
             let next = self
                 .frames
-                .with_next(|item, bytes, _| (item, bytes.to_vec()));
+                .with_next(|item, bytes, _| (item, bytes.len() - HEADER_LEN));
             let result = match next {
-                Some(Ok((item, bytes))) => self.step(item, &bytes),
+                Some(Ok((item, length))) => self.step(item, length),
                 Some(Err(Fail::Protocol(e))) => Err(e),
                 Some(Err(Fail::Truncated { .. })) => Err(size("truncated frame or preface")),
                 Some(Err(Fail::Stuck { .. } | Fail::Refused { .. })) => {
@@ -1735,7 +1809,7 @@ impl Session {
             }
         }
     }
-    fn step(&mut self, item: Input, bytes: &[u8]) -> Result<Option<Event>, Error> {
+    fn step(&mut self, item: Input, length: usize) -> Result<Option<Event>, Error> {
         let frame = match item {
             Input::Preface => return Ok(Some(Event::Preface)),
             Input::Frame(f) => f,
@@ -1747,12 +1821,8 @@ impl Session {
             }
             self.first = false;
         }
-        let h = FrameHeader::parse(
-            bytes
-                .get(..HEADER_LEN)
-                .ok_or_else(|| size("missing frame header"))?,
-        )?;
-        let block = self.blocks.read(h, bytes.get(HEADER_LEN..))?;
+        let h = frame.header(length);
+        let block = self.blocks.read_parsed(h, &frame)?;
         if matches!(
             frame,
             Frame::Headers(_) | Frame::PushPromise(_) | Frame::Continuation(_)
@@ -2414,6 +2484,68 @@ mod tests {
         assert!(Frame::parse(&raw(1, 8, 1, &[])).is_err());
     }
     #[test]
+    fn parsed_header_fragments_match_raw_assembly() {
+        for capture in [false, true] {
+            for pad in [None, Some(0), Some(1), Some(255)] {
+                for kind in [1, 5] {
+                    for priority in [false, true] {
+                        let mut encoder = hpack::Encoder::new(4096);
+                        let fields = [hpack::Field::new("x-saved", "value")];
+                        let mut block = Vec::new();
+                        encoder.encode_block(&fields, &mut block).unwrap();
+                        let mut indexed = Vec::new();
+                        encoder.encode_block(&fields, &mut indexed).unwrap();
+                        assert!(indexed.len() < block.len());
+                        for split in 0..=block.len() {
+                            let padding = pad.map(|n| vec![0xa5; n]);
+                            let flags = if pad.is_some() { 8 } else { 0 };
+                            let first = if kind == 1 {
+                                Frame::Headers(Headers {
+                                    stream: 1,
+                                    flags: flags | 1 | if priority { 0x20 } else { 0 },
+                                    fragment: block[..split].to_vec(),
+                                    priority: priority.then_some(Dependency {
+                                        stream: 3,
+                                        exclusive: true,
+                                        weight: 255,
+                                    }),
+                                    padding,
+                                })
+                            } else {
+                                Frame::PushPromise(PushPromise {
+                                    stream: 1,
+                                    flags,
+                                    promised: 2,
+                                    fragment: block[..split].to_vec(),
+                                    padding,
+                                })
+                            };
+                            let frames = [
+                                first.to_bytes().unwrap(),
+                                raw(9, 0x2c, 1, &block[split..]),
+                                raw(1, 4, 3, &indexed),
+                                raw(6, 0, 0, b"12345678"),
+                            ];
+                            let mut raw_blocks = HeaderBlocks::new(Limits::default(), capture);
+                            let mut parsed_blocks = HeaderBlocks::new(Limits::default(), capture);
+                            for bytes in frames {
+                                let header = FrameHeader::parse(&bytes[..HEADER_LEN]).unwrap();
+                                let frame = Frame::parse(&bytes).unwrap();
+                                assert_eq!(frame.header(bytes.len() - HEADER_LEN), header);
+                                assert_eq!(
+                                    raw_blocks.read(header, Some(&bytes[HEADER_LEN..])),
+                                    parsed_blocks.read_parsed(header, &frame),
+                                );
+                                assert_eq!(raw_blocks.held(), parsed_blocks.held());
+                                assert_eq!(raw_blocks.pending(), parsed_blocks.pending());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn padding_over_mandatory_fields_is_a_protocol_error() {
         // RFC 9113 4.2 and 6.2: a payload too short for its fields is a
         // FRAME_SIZE_ERROR; padding that covers them is a PROTOCOL_ERROR.
@@ -2937,6 +3069,51 @@ mod tests {
             .unwrap_err();
         assert_eq!(overflow.code, ErrorCode::FlowControlError);
         assert!(c.next().is_none());
+    }
+    #[test]
+    fn padded_data_charges_the_full_payload_at_the_window_boundary() {
+        for (data, padding, cost) in [(vec![], 0, 1), (vec![b'a'], 2, 4), (vec![], 255, 256)] {
+            for window in [cost - 1, cost] {
+                let mut c = Session::server_side(Limits::default());
+                accept(&mut c, &settings());
+                c.peer_settings(&Settings {
+                    flags: 0,
+                    entries: vec![Setting {
+                        id: 4,
+                        value: window,
+                    }],
+                })
+                .unwrap();
+                accept(&mut c, &raw(4, 1, 0, &[]));
+                accept(&mut c, &raw(1, 4, 1, &[0x88]));
+                let bytes = Data {
+                    stream: 1,
+                    flags: 9,
+                    data: data.clone(),
+                    padding: Some(vec![0xa5; padding]),
+                }
+                .to_bytes()
+                .unwrap();
+                assert_eq!(c.push(&bytes), bytes.len());
+                if window < cost {
+                    assert_eq!(
+                        c.next().unwrap().unwrap_err(),
+                        error(ErrorCode::FlowControlError, "stream window exhausted"),
+                    );
+                } else {
+                    assert_eq!(
+                        c.next().unwrap().unwrap(),
+                        Event::Data {
+                            stream: 1,
+                            data: data.clone(),
+                            end: true
+                        },
+                    );
+                    assert_eq!(c.stream_window(1), Some(0));
+                    assert_eq!(c.connection_window(), 65_535 - i64::from(cost));
+                }
+            }
+        }
     }
     #[test]
     fn hpack_settings_increases_do_not_require_a_spurious_reduction() {

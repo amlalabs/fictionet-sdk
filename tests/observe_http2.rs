@@ -249,6 +249,88 @@ fn frames_and_grpc_fields_keep_their_packet_byte_ranges() {
     assert!(packet.layers_json().contains("gRPC"));
 }
 #[test]
+fn padded_data_keeps_session_credit_and_capture_byte_ranges() {
+    for padding in [0, 2, 255] {
+        let mut observed = Observed::new(capture::Capture::default());
+        let mut session = http2::Session::server_side(http2::Limits::default());
+        let head = headers();
+        let settings = http2::Settings {
+            flags: 0,
+            entries: vec![],
+        }
+        .to_bytes()
+        .unwrap();
+        let message = grpc::Message {
+            compressed: false,
+            data: b"abc".to_vec(),
+        }
+        .to_bytes()
+        .unwrap();
+        let frame = http2::Data {
+            stream: 1,
+            flags: 9,
+            data: message.clone(),
+            padding: Some(vec![0xa5; padding]),
+        }
+        .to_bytes()
+        .unwrap();
+        let bytes = [settings.as_slice(), &head, &frame].concat();
+        assert_eq!(session.push(&bytes), bytes.len());
+        assert!(matches!(
+            session.next().unwrap().unwrap(),
+            http2::Event::Settings(_)
+        ));
+        let http2::Event::Headers { fields, .. } = session.next().unwrap().unwrap() else {
+            panic!("expected headers");
+        };
+        assert_eq!(
+            session.next().unwrap().unwrap(),
+            http2::Event::Data {
+                stream: 1,
+                data: message.clone(),
+                end: true,
+            }
+        );
+        assert!(session.next().is_none());
+        assert_eq!(
+            session.connection_window(),
+            65_535 - (1 + message.len() + padding) as i64
+        );
+        assert_eq!(session.stream_window(1), Some(session.connection_window()));
+
+        let mut packet = Decoded::default();
+        observed.data(
+            &bytes,
+            Place {
+                stream_start: 900,
+                buf: 0,
+                offset: Some(40),
+                len: bytes.len(),
+            },
+            &mut packet,
+        );
+        assert!(!packet.tags.contains(&"malformed"));
+        for field in fields {
+            assert!(
+                packet.layers[1].fields.iter().any(|f| {
+                    f.name.as_bytes() == field.name && f.value.as_bytes() == field.value
+                })
+            );
+        }
+        let grpc = &packet.layers[3];
+        let start = 40 + settings.len() + head.len() + http2::HEADER_LEN + 1;
+        assert_eq!(grpc.name, "gRPC");
+        assert_eq!(grpc.buf, 0);
+        assert_eq!(grpc.range, (start, start + message.len()));
+        assert_eq!(grpc.fields[0].range, Some((start, start + 1)));
+        assert_eq!(
+            grpc.fields[2].range,
+            Some((start + 5, start + message.len()))
+        );
+        assert!(packet.extra.is_empty());
+    }
+}
+#[test]
 fn frames_split_between_packets_and_messages_split_between_frames_get_buffers() {
     let mut observed = Observed::new(capture::Capture::default());
     let head = headers();
@@ -414,6 +496,81 @@ fn refused_frames_are_malformed_and_explain_why() {
         observed.data(&headers(), Place::default(), &mut next);
         assert!(!next.tags.contains(&"malformed"));
         assert!(!next.layers.is_empty());
+    }
+}
+
+#[test]
+fn refused_header_frames_still_update_capture_hpack() {
+    for (kind, stream, fields) in [
+        (1, 0, vec![0, 0, 0, 0, 255]),
+        (1, 1, vec![0x80, 0, 0, 1, 255]),
+        (5, 0, vec![0x80, 0, 0, 2]),
+        (5, 1, vec![0, 0, 0, 0]),
+    ] {
+        let mut encoder = hpack::Encoder::new(4096);
+        let mut fragment = Vec::new();
+        let saved = [hpack::Field::new("x-captured", "kept")];
+        encoder.encode_block(&saved, &mut fragment).unwrap();
+        let mut indexed = Vec::new();
+        encoder.encode_block(&saved, &mut indexed).unwrap();
+        assert!(indexed.len() < fragment.len());
+        let mut body = vec![2];
+        body.extend(fields);
+        body.extend(fragment);
+        body.extend([0xa5; 2]);
+        let mut bytes = http2::FrameHeader {
+            kind,
+            stream,
+            flags: if kind == 1 { 0x2c } else { 0xc },
+            length: body.len(),
+        }
+        .to_bytes()
+        .unwrap();
+        bytes.extend(body);
+        let error = http2::Frame::parse(&bytes).unwrap_err();
+        let mut observed = Observed::new(capture::Capture::default());
+        let mut packet = Decoded::default();
+        observed.data(&bytes, Place::default(), &mut packet);
+        assert!(packet.tags.contains(&"malformed"));
+        assert!(
+            packet.layers[0]
+                .fields
+                .iter()
+                .any(|f| f.name == "Frame" && f.value == error.reason)
+        );
+        assert!(
+            packet.layers[0]
+                .fields
+                .iter()
+                .any(|f| f.name == "x-captured" && f.value == "kept")
+        );
+        if kind == 5 {
+            assert!(
+                packet.layers[0]
+                    .fields
+                    .iter()
+                    .any(|f| f.name == "Promised stream"
+                        && f.value == if stream == 0 { "2" } else { "0" })
+            );
+        }
+        let next = http2::Headers {
+            stream: 3,
+            flags: 4,
+            fragment: indexed,
+            priority: None,
+            padding: None,
+        }
+        .to_bytes()
+        .unwrap();
+        packet = Decoded::default();
+        observed.data(&next, Place::default(), &mut packet);
+        assert!(!packet.tags.contains(&"malformed"));
+        assert!(
+            packet.layers[0]
+                .fields
+                .iter()
+                .any(|f| f.name == "x-captured" && f.value == "kept")
+        );
     }
 }
 
