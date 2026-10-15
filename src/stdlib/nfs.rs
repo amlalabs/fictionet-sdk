@@ -1255,6 +1255,8 @@ impl Request {
                 w.uhyper(*offset).uint(*count);
                 stable.write(w);
                 w.opaque(data);
+                // Every WRITE field is validated above; avoid copying the data to read it back.
+                return std::mem::take(w).finish();
             }
             Request::Create { location, how } => {
                 location.write(w);
@@ -3387,6 +3389,17 @@ mod tests {
     #[test]
     fn writers_refuse_long_handles_names_and_paths() {
         let long_fh = FileHandle(vec![1; MAX_FH + 1]);
+        assert_eq!(
+            Request::Write {
+                file: long_fh.clone(),
+                offset: 0,
+                count: 1,
+                stable: StableHow::FileSync,
+                data: vec![1],
+            }
+            .to_args(),
+            Err(Error::TooLong((MAX_FH + 1) as u32))
+        );
         for request in [
             Request::GetAttr(long_fh.clone()),
             Request::Lookup(DirOp {
