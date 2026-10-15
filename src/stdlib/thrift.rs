@@ -1627,6 +1627,101 @@ impl<'o> Writer<'o> {
 
 fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{EncodedMessage, Error, MAX_MESSAGE, Message, Vec};
+    use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
+    use fictionet::stdlib::test_support::{contract, decode_all};
+
+    /// Parses prefixes within the decoder's `MAX_MESSAGE + 1` window.
+    /// Running out of bytes in a full window reports `TooLong`.
+    /// The scanner can detect an error before the parser runs out of bytes.
+    pub fn expected_messages(bytes: &[u8]) -> (Vec<EncodedMessage>, Option<Fail<Error>>) {
+        let (want, failure, _) = parse_messages(bytes);
+        (want, failure)
+    }
+
+    fn parse_messages(bytes: &[u8]) -> (Vec<EncodedMessage>, Option<Fail<Error>>, bool) {
+        let mut rest = bytes;
+        let mut want = Vec::new();
+        let mut parser_truncated = false;
+        let failure = loop {
+            let window = &rest[..rest.len().min(MAX_MESSAGE + 1)];
+            match Message::parse_prefix(window) {
+                Ok((message, protocol, used)) => {
+                    assert!(used > 0 && used <= window.len());
+                    if used > MAX_MESSAGE {
+                        break Some(Fail::Protocol(Error::TooLong));
+                    }
+                    want.push(EncodedMessage { message, protocol });
+                    rest = &rest[used..];
+                }
+                Err(Error::Truncated) => {
+                    parser_truncated = true;
+                    break if rest.is_empty() {
+                        None
+                    } else if rest.len() > MAX_MESSAGE {
+                        Some(Fail::Protocol(Error::TooLong))
+                    } else {
+                        Some(Fail::Truncated { unread: rest.len() })
+                    };
+                }
+                Err(error) => break Some(Fail::Protocol(error)),
+            }
+        };
+        (want, failure, parser_truncated)
+    }
+
+    /// Checks the scanner against parsed prefixes, wire spans, and stream contracts.
+    pub fn check_messages<D: Decode<Item = EncodedMessage, Error = Error>>(
+        make: impl Fn() -> D,
+        bytes: &[u8],
+    ) {
+        let (want, expected_failure, parser_truncated) = parse_messages(bytes);
+        let (items, failure) = decode_all(&make, bytes);
+        assert_eq!(items, want, "stream messages differ from parsed prefixes");
+        match (expected_failure, &failure) {
+            (Some(Fail::Truncated { unread: expected }), Some(Fail::Truncated { unread })) => {
+                assert_eq!(*unread, expected);
+            }
+            (Some(Fail::Truncated { .. }), Some(Fail::Protocol(error)))
+                if !matches!(error, Error::Truncated | Error::Trailing | Error::TooLong) =>
+            {
+                // The scanner can reject a malformed prefix before the parser
+                // has enough bytes to finish reading its enclosing value.
+            }
+            (Some(Fail::Protocol(Error::TooLong)), Some(Fail::Protocol(error)))
+                if parser_truncated && !matches!(error, Error::Truncated | Error::Trailing) =>
+            {
+                // The same early error can occur when the parser fills its window.
+            }
+            (expected, actual) => assert_eq!(*actual, expected, "unexpected stream failure"),
+        }
+        contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+        contract::check_decode_with_held_limit(&make, bytes, make().held());
+        contract::check_wire::<EncodedMessage>(bytes);
+        let mut stream = Stream::new(make());
+        let mut pushed = 0;
+        let mut start = 0;
+        while !stream.is_done() {
+            pushed += stream.push(&bytes[pushed..]);
+            if pushed == bytes.len() {
+                stream.end();
+            }
+            while let Some(item) = stream.next() {
+                let Ok(value) = item else { break };
+                let end = usize::try_from(stream.offset()).unwrap();
+                assert_eq!(EncodedMessage::parse(&bytes[start..end]), Ok(value.clone()));
+                contract::check_wire_value(&value);
+                start = end;
+            }
+        }
+        assert_eq!(stream.failed(), failure.as_ref());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2295,39 +2390,138 @@ mod tests {
     }
 
     fn check_messages(bytes: &[u8]) {
-        contract::check_decode_with_alloc_limit(
-            EncodedMessages::new,
-            bytes,
-            2 * EncodedMessages::new().capacity(),
-        );
-        contract::check_decode_with_held_limit(
-            EncodedMessages::new,
-            bytes,
-            EncodedMessages::new().held(),
-        );
-        contract::check_wire::<EncodedMessage>(bytes);
-        let mut rest = bytes;
-        let mut want = Vec::new();
-        let end = loop {
-            match Message::parse_prefix(rest) {
-                Ok((message, protocol, used)) => {
-                    assert!(used > 0 && used <= rest.len());
-                    want.push(encoded(message, protocol));
-                    rest = &rest[used..];
-                }
-                Err(error) => break error,
+        harness::check_messages(EncodedMessages::new, bytes);
+    }
+
+    #[derive(Default)]
+    struct RejectTrailing(EncodedMessages);
+
+    impl Decode for RejectTrailing {
+        type Item = EncodedMessage;
+        type Error = Error;
+        const NAME: &'static str = EncodedMessages::NAME;
+
+        fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
+
+        fn held(&self) -> usize {
+            self.0.held()
+        }
+
+        fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
+            match self.0.decode(input, eof)? {
+                Step::Item(_, used) if used < input.len() => Err(Error::BadProtocol(input[used])),
+                step => Ok(step),
             }
-        };
-        let (items, failure) = decode_all(EncodedMessages::new, bytes);
-        assert_eq!(items, want);
-        if end != Error::Truncated {
-            assert_eq!(failure, Some(Fail::Protocol(end)));
-        } else if rest.is_empty() {
-            assert_eq!(failure, None);
         }
-        for item in items {
-            contract::check_wire_value(&item);
+    }
+
+    #[derive(Default)]
+    struct SkipSecond {
+        inner: EncodedMessages,
+        items: usize,
+    }
+
+    impl Decode for SkipSecond {
+        type Item = EncodedMessage;
+        type Error = Error;
+        const NAME: &'static str = EncodedMessages::NAME;
+
+        fn capacity(&self) -> usize {
+            self.inner.capacity()
         }
+
+        fn held(&self) -> usize {
+            self.inner.held()
+        }
+
+        fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
+            let step = self.inner.decode(input, eof)?;
+            if let Step::Item(_, used) = &step {
+                self.items += 1;
+                if self.items == 2 {
+                    return Ok(Step::Skip(*used));
+                }
+            }
+            Ok(step)
+        }
+    }
+
+    #[derive(Default)]
+    struct EofTooLong(EncodedMessages);
+
+    impl Decode for EofTooLong {
+        type Item = EncodedMessage;
+        type Error = Error;
+        const NAME: &'static str = EncodedMessages::NAME;
+
+        fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
+
+        fn held(&self) -> usize {
+            self.0.held()
+        }
+
+        fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
+            match self.0.decode(input, eof)? {
+                Step::Need if eof && !input.is_empty() => Err(Error::TooLong),
+                step => Ok(step),
+            }
+        }
+    }
+
+    fn message_mutant_inputs() -> [Vec<u8>; 4] {
+        let first = encoded(add_call(), Protocol::Binary).to_bytes().unwrap();
+        let second = encoded(
+            Message {
+                seq: 2,
+                ..add_call()
+            },
+            Protocol::Compact,
+        )
+        .to_bytes()
+        .unwrap();
+        let two = [first.as_slice(), &second].concat();
+        let junk = [0x81];
+        [
+            two.clone(),
+            [first.as_slice(), &junk].concat(),
+            [two.as_slice(), &junk].concat(),
+            [first.as_slice(), &second[..2]].concat(),
+        ]
+    }
+
+    #[test]
+    fn message_harness_accepts_real_decoder() {
+        for bytes in message_mutant_inputs() {
+            check_messages(&bytes);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "stream messages differ from parsed prefixes")]
+    fn message_harness_rejects_error_before_second_message() {
+        harness::check_messages(RejectTrailing::default, &message_mutant_inputs()[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "stream messages differ from parsed prefixes")]
+    fn message_harness_rejects_error_before_junk() {
+        harness::check_messages(RejectTrailing::default, &message_mutant_inputs()[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "stream messages differ from parsed prefixes")]
+    fn message_harness_rejects_skipped_second_message_before_junk() {
+        harness::check_messages(SkipSecond::default, &message_mutant_inputs()[2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected stream failure")]
+    fn message_harness_rejects_too_long_for_short_truncated_tail() {
+        harness::check_messages(EofTooLong::default, &message_mutant_inputs()[3]);
     }
 
     /// A double that is NaN equals itself, so a message read twice from the
@@ -2495,6 +2689,9 @@ mod tests {
         bytes.extend_from_slice(&(MAX_BINARY_LEN as u32).to_be_bytes());
         let overhead = bytes.len() + 1;
         bytes.resize(overhead + MAX_BINARY_LEN, 0);
+        let expected = harness::expected_messages(&bytes);
+        assert_eq!(expected, (vec![], Some(Fail::Protocol(Error::TooLong))));
+        assert_eq!(decode_all(EncodedMessages::new, &bytes), expected);
         let mut stream = Stream::new(EncodedMessages::new());
         let result = chunks(&bytes, &[1 << 20])
             .try_for_each(|part| pump(&mut stream, part, |_| unreachable!()).map(|_| ()));
@@ -2513,6 +2710,35 @@ mod tests {
             decode_all(EncodedMessages::new, &bytes),
             (vec![encoded(message, Protocol::Binary)], None)
         );
+    }
+
+    #[test]
+    fn messages_limit_a_complete_window() {
+        let mut bytes = vec![0x80, 0x01, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 11, 0, 1];
+        let length = MAX_MESSAGE + 1 - (bytes.len() + 4 + 1);
+        bytes.extend_from_slice(&(length as u32).to_be_bytes());
+        bytes.resize(bytes.len() + length, 0);
+        bytes.push(0);
+        assert_eq!(bytes.len(), MAX_MESSAGE + 1);
+        let (_, protocol, used) = Message::parse_prefix(&bytes).unwrap();
+        assert_eq!(protocol, Protocol::Binary);
+        assert_eq!(used, MAX_MESSAGE + 1);
+        let expected = harness::expected_messages(&bytes);
+        assert!(expected.0.is_empty());
+        assert_eq!(expected.1, Some(Fail::Protocol(Error::TooLong)));
+        assert_eq!(decode_all(EncodedMessages::new, &bytes), expected);
+    }
+
+    #[test]
+    fn messages_report_limit_before_malformed_tail() {
+        let mut bytes = vec![0x80, 0x01, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 11, 0, 1];
+        bytes.extend_from_slice(&(MAX_BINARY_LEN as u32).to_be_bytes());
+        bytes.resize(bytes.len() + MAX_BINARY_LEN + 1, 0);
+        *bytes.last_mut().unwrap() = 5;
+        assert_eq!(Message::parse_prefix(&bytes), Err(Error::BadType(5)));
+        let expected = harness::expected_messages(&bytes);
+        assert_eq!(expected, (vec![], Some(Fail::Protocol(Error::TooLong))));
+        assert_eq!(decode_all(EncodedMessages::new, &bytes), expected);
     }
 
     #[test]
