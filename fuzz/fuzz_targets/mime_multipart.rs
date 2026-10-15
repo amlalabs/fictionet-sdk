@@ -90,7 +90,11 @@ fn check(input: &[u8], len: usize) {
                 ("Content-Disposition".into(), text.into()),
             ],
         };
-        assert_eq!(headers.content_type(), headers.content_disposition());
+        let disposition = headers.content_disposition();
+        if text.contains(['\r', '\n']) || text.len() > MAX_HEADER_BYTES {
+            assert_eq!(headers.content_type(), None);
+            assert_eq!(disposition, None);
+        }
         if let Some(bnd) = boundary(text) {
             assert!(valid_boundary(&bnd));
             assert!(headers.content_type().is_some());
@@ -104,9 +108,30 @@ fn check(input: &[u8], len: usize) {
             let headers = Headers {
                 fields: vec![("Content-Type".into(), value.clone())],
             };
-            assert_eq!(headers.content_type().is_some(), boundary(&value).is_some());
+            let expect_ok = !text.contains(['\r', '\n']) && value.len() <= MAX_HEADER_BYTES;
+            if expect_ok {
+                assert_eq!(boundary(&value).as_deref(), Some("b"));
+                let ct = headers.content_type().expect("a valid MIME comment");
+                assert_eq!(ct.value, "multipart/mixed");
+                assert_eq!(ct.params.len(), 1);
+                assert_eq!(ct.get("boundary"), Some("b"));
+            } else {
+                assert_eq!(boundary(&value), None);
+                assert_eq!(headers.content_type(), None);
+            }
             let input = format!("Content-Type: {value}\r\n\r\n--b--");
-            contract::check_wire::<Entity>(input.as_bytes());
+            if text.contains(['\r', '\n']) {
+                // The entity parser can accept CRLF followed by folding whitespace.
+                contract::check_wire::<Entity>(input.as_bytes());
+            } else if value.len() + 18 <= MAX_HEADER_BYTES {
+                // The field name, separator and empty line also count toward the cap.
+                assert_eq!(
+                    Entity::parse(input.as_bytes()),
+                    Ok(Multipart::default().with_boundary("b"))
+                );
+            } else {
+                assert_eq!(Entity::parse(input.as_bytes()), Err(Error::HeaderTooLong));
+            }
         }
     }
 }
