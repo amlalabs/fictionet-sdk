@@ -19,7 +19,8 @@ in place of this example's `compose.yaml`.
 
 | File | What it is |
 |---|---|
-| `build.sh` | Builds `fictionet` and `web_world` for Debian bookworm, into `bin/` and the Harbor task. Run it first. |
+| `build.sh` | Builds `fictionet` and `web_world` for Debian bookworm, into `bin/` and the Harbor task, and generates the Harbor environment. Run it first. |
+| `package_harbor.py` | Generates Harbor's Dockerfiles and Compose manifest from the hosted sources. |
 | `Dockerfile` | The world and attach image: Debian with the two binaries. |
 | `agent.Dockerfile` | The agent image: Debian with curl, dig, ping, ip and python3. |
 | `compose.yaml` | The three services. Works with `docker compose` and with inspect-sandboxes. |
@@ -27,6 +28,26 @@ in place of this example's `compose.yaml`.
 | `run_hosted.py` | Runs it all on one Daytona or E2B sandbox, then deletes the sandbox. |
 | `eval.py` | A tiny Inspect eval: a scripted solver and the mock model, no LLM key. |
 | `harbor/fictionet-web/` | The same as a Harbor task, run with Harbor's `oracle` agent. |
+
+The canonical deployment files are `Dockerfile`, `agent.Dockerfile` and
+`compose.yaml` here. `build.sh` runs `package_harbor.py` to copy the Dockerfiles
+and generate `harbor/fictionet-web/environment/docker-compose.yaml`. These three
+files are ignored build output, like `environment/bin/`. Do not edit them;
+edit the hosted sources and run `build.sh` instead.
+The generated manifest uses JSON syntax, which Compose accepts as YAML,
+and has no reference back to this directory. `build.sh` also supplies its `bin/`.
+
+The generator keeps Harbor's differences explicit: `default` becomes `main`,
+attach uses `--name main`, and world and attach build from `world.Dockerfile`.
+Harbor owns the agent image and process, using `environment/Dockerfile`.
+The Harbor world and agent still omit `init`; the hosted services retain it.
+Project and volume names remain scoped to each Harbor run. The direct SDK,
+Inspect and Harbor orchestration adapters stay separate.
+
+To regenerate packaging without building images or binaries, run
+`python3 examples/hosted/package_harbor.py`. It needs Python 3 and the Docker
+Compose CLI, but no Docker daemon or network. Run the offline contract tests with
+`python3 -m unittest discover -s examples/hosted/tests -p 'test_*.py'`.
 
 ## Run it
 

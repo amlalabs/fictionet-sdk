@@ -1,2 +1,5 @@
 bin/
 __pycache__/
+/harbor/fictionet-web/environment/Dockerfile
+/harbor/fictionet-web/environment/world.Dockerfile
+/harbor/fictionet-web/environment/docker-compose.yaml

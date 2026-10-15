@@ -748,6 +748,7 @@
 //! Daytona sandbox. The agent is the service `main`, built from
 //! `environment/Dockerfile`. The task's compose file adds the world and
 //! attach, and puts `main` in attach's network namespace.
+//! `examples/hosted/build.sh` generates the task's `environment/` from the hosted files.
 //!
 //! ```sh
 //! pip install 'harbor[daytona]'
