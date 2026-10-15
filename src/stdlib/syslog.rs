@@ -1697,12 +1697,50 @@ fn expect(t: &[u8], i: usize, c: u8) -> Option<()> {
     (t.get(i) == Some(&c)).then_some(())
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{
+        BsdMessage, BsdTimestamp, Entry, Frame, Frames, MAX_BUFFERED, MAX_MESSAGE_LEN, Message,
+        Timestamp,
+    };
+    use fictionet::stdlib::codec::{Decode, Wire};
+    use fictionet::stdlib::test_support::{contract, decode_all};
+
+    /// Checks message and timestamp round trips.
+    pub fn check_round_trip(raw: &[u8]) {
+        contract::check_wire::<Message>(raw);
+        contract::check_wire::<BsdMessage>(raw);
+        contract::check_wire::<Entry>(raw);
+        contract::check_wire::<Timestamp>(raw);
+        contract::check_wire::<BsdTimestamp>(raw);
+    }
+
+    /// Checks frame and entry decoding, frame bounds, and round trips.
+    pub fn check_stream(data: &[u8]) {
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_BUFFERED);
+        contract::check_decode_with_alloc_limit(
+            || Frames::new().map(|frame| Entry::parse(&frame.message)),
+            data,
+            2 * MAX_BUFFERED,
+        );
+        contract::check_wire::<Frame>(data);
+        for frame in decode_all(Frames::new, data).0 {
+            assert!(!frame.message.is_empty() && frame.message.len() <= MAX_MESSAGE_LEN);
+            contract::check_wire_value(&frame);
+            check_round_trip(&frame.message);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn fixture_fraction(value: u32, digits: u8) -> Fraction {
         Fraction { value, digits }
     }
 
+    use super::harness::{check_round_trip, check_stream};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
@@ -2798,23 +2836,6 @@ mod tests {
         contract::check_wire_value(&f);
         let f = Frame::new(Framing::OctetCounting, msg);
         contract::check_wire_value(&f);
-    }
-
-    fn check_round_trip(raw: &[u8]) {
-        contract::check_wire::<Message>(raw);
-        contract::check_wire::<BsdMessage>(raw);
-        contract::check_wire::<Entry>(raw);
-        contract::check_wire::<Timestamp>(raw);
-        contract::check_wire::<BsdTimestamp>(raw);
-    }
-
-    fn check_stream(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_BUFFERED);
-        for frame in decode_all(Frames::new, data).0 {
-            assert!(!frame.message.is_empty() && frame.message.len() <= MAX_MESSAGE_LEN);
-            contract::check_wire_value(&frame);
-            check_round_trip(&frame.message);
-        }
     }
 
     #[test]

@@ -7,11 +7,11 @@ mod input;
 use input::bytes;
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::onc_rpc::{Body, Call, Message, PMAP_PROGRAM};
+use fictionet::stdlib::onc_rpc::{Body, Message};
 use fictionet::stdlib::portmap::{
     AddrStat, CallArgs, CallResult, Error, MAX_UADDR, Mapping, Netbuf, PmapRequest, PmapResult,
     Request, RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult, RpcbStat,
-    format_uaddr, parse_uaddr,
+    format_uaddr, harness::check, parse_uaddr,
 };
 use fictionet::stdlib::{
     codec::{Decode, Wire},
@@ -20,39 +20,6 @@ use fictionet::stdlib::{
 };
 use libfuzzer_sys::fuzz_target;
 use std::net::{IpAddr, SocketAddr};
-
-/// Any bytes as the arguments of every procedure of every version, and as
-/// the results of every procedure. Whatever reads is written back to the
-/// same bytes, and reads back the same.
-fn read(data: &[u8]) {
-    for procedure in 0..14 {
-        if let Ok(r) = PmapResult::parse(procedure, data) {
-            let bytes = r.to_bytes().unwrap();
-            assert_eq!(bytes, data);
-            assert_eq!(PmapResult::parse(procedure, &bytes), Ok(r));
-        }
-        if let Ok(r) = RpcbResult::parse(procedure, data) {
-            let bytes = r.to_bytes().unwrap();
-            assert_eq!(bytes, data);
-            assert_eq!(RpcbResult::parse(procedure, &bytes), Ok(r));
-        }
-        for version in 1..=5 {
-            let call = Call::new(PMAP_PROGRAM, version, procedure, data.to_vec());
-            assert_eq!(
-                Request::read(version, procedure, data),
-                Request::from_call(&call)
-            );
-            if let Ok(req) = Request::from_call(&call) {
-                assert_eq!(req.to_call().unwrap(), call);
-            }
-        }
-    }
-    if let Ok(s) = std::str::from_utf8(data) {
-        if let Some(a) = parse_uaddr(s) {
-            assert_eq!(parse_uaddr(&format_uaddr(a)), Some(a));
-        }
-    }
-}
 
 /// A string of up to 300 bytes, so some are over the limit.
 fn text(u: &mut Unstructured) -> Result<String> {
@@ -282,6 +249,6 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    read(data);
+    check(data);
     let _ = built(data);
 });

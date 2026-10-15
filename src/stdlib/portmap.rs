@@ -1156,8 +1156,49 @@ fn string(w: &mut Writer, s: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{PmapResult, Request, RpcbResult, format_uaddr, parse_uaddr};
+    use fictionet::stdlib::onc_rpc::{Call, PMAP_PROGRAM};
+
+    /// Reads any bytes as the arguments of every procedure of versions 1 to
+    /// 5, and as the results of every procedure. Whatever reads is written
+    /// back to the same bytes, and reads back the same. Reading arguments
+    /// directly and from a call gives the same answer. Text that parses as a
+    /// universal address is formatted and parses back the same.
+    pub fn check(data: &[u8]) {
+        for p in 0..14 {
+            if let Ok(r) = PmapResult::parse(p, data) {
+                let b = r.to_bytes().unwrap();
+                assert_eq!(b, data);
+                assert_eq!(PmapResult::parse(p, &b), Ok(r));
+            }
+            if let Ok(r) = RpcbResult::parse(p, data) {
+                let b = r.to_bytes().unwrap();
+                assert_eq!(b, data);
+                assert_eq!(RpcbResult::parse(p, &b), Ok(r));
+            }
+            for v in 1..=5 {
+                let call = Call::new(PMAP_PROGRAM, v, p, data.to_vec());
+                assert_eq!(Request::read(v, p, data), Request::from_call(&call));
+                if let Ok(req) = Request::from_call(&call) {
+                    assert_eq!(req.to_call().unwrap(), call);
+                }
+            }
+        }
+        if let Ok(s) = std::str::from_utf8(data)
+            && let Some(a) = parse_uaddr(s)
+        {
+            assert_eq!(parse_uaddr(&format_uaddr(a)), Some(a));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Stream, Wire, finish, pump};
@@ -2061,33 +2102,6 @@ mod tests {
         }
     }
 
-    /// Whatever reads is written back, and reads back the same.
-    fn reread(data: &[u8]) {
-        for p in 0..14 {
-            if let Ok(r) = PmapResult::parse(p, data) {
-                let b = r.to_bytes().unwrap();
-                assert_eq!(b, data);
-                assert_eq!(PmapResult::parse(p, &b), Ok(r));
-            }
-            if let Ok(r) = RpcbResult::parse(p, data) {
-                let b = r.to_bytes().unwrap();
-                assert_eq!(b, data);
-                assert_eq!(RpcbResult::parse(p, &b), Ok(r));
-            }
-            for v in 2..=5 {
-                let call = Call::new(PMAP_PROGRAM, v, p, data.to_vec());
-                if let Ok(req) = Request::from_call(&call) {
-                    assert_eq!(req.to_call().unwrap(), call);
-                }
-            }
-        }
-        if let Ok(s) = std::str::from_utf8(data)
-            && let Some(a) = parse_uaddr(s)
-        {
-            assert_eq!(parse_uaddr(&format_uaddr(a)), Some(a));
-        }
-    }
-
     #[test]
     fn lcg_fuzz() {
         let mut g = Lcg::new(0x5eed);
@@ -2118,7 +2132,7 @@ mod tests {
                     (0..n).map(|_| alphabet[g.index(alphabet.len())]).collect()
                 }
             };
-            reread(&data);
+            check(&data);
         }
     }
 
