@@ -17,7 +17,7 @@ cargo +nightly fuzz list
 ## The targets
 
 `cargo +nightly fuzz list` names every target. The **Fuzz** column in
-[the stdlib catalog](../src/stdlib/mod.rs) lists targets by module.
+[the stdlib catalog](../src/stdlib/catalog.md) lists targets by module.
 The targets with no stdlib module are:
 
 - [`codegen_ir`](fuzz_targets/codegen_ir.rs) checks generated recursive values and stream frames.

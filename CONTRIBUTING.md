@@ -159,14 +159,16 @@ For modules generated from schemas, see [code generation](docs/codegen.md).
 
 A new module is registered in three places, and a test holds each to the code:
 
-- a row in the protocol catalog in `src/stdlib/mod.rs`, which says what the
-  module can do (`tests/stdlib_catalog.rs` checks every column);
+- a record in `catalog/stdlib.rs`, which says what the module can do
+  (`tests/stdlib_catalog.rs` checks every column). Regenerate the table in
+  `src/stdlib/catalog.md` with
+  `BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`;
 - a fuzz target in `fuzz/fuzz_targets/`, named after the module, with a
   `[[bin]]` entry in `fuzz/Cargo.toml`;
 - a `#[path]` entry in `tests/copy_and_own/modules.rs`, which compiles the file
   as a module of a separate crate.
 
-The catalog row and the module docs are where a module is described. The front
+The catalog record and the module docs are where a module is described. The front
 pages (`README.md`, the crate root in `src/lib.rs`, and the top of
 `src/stdlib/mod.rs`) tell one story about the core and do not gain a paragraph
 per protocol.

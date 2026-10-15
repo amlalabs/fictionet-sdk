@@ -1,8 +1,9 @@
-//! The protocol catalog in `src/stdlib/mod.rs` must match the code.
+//! The protocol catalog in `catalog/stdlib.rs` must match the code.
 //!
-//! The catalog is a Markdown table in the module docs, one row per stdlib
-//! module. These tests read it as text and check each column against its
-//! source of truth:
+//! The catalog has one declarative record per stdlib module. These tests
+//! render `src/stdlib/catalog.md` deterministically and reject drift. Set
+//! `BLESS_STDLIB_CATALOG=1` to update that documentation, following the golden
+//! test convention. Each record is checked against independent sources:
 //!
 //! - the module list against external `pub mod` declarations, following literal `#[path]`
 //!   attributes, ordinary `name.rs`/`name/mod.rs` paths, private child modules
@@ -35,15 +36,17 @@
 //! inventories omit `tests.rs`. Impl matching remains textual within each file.
 //! Independent file inventories catch undeclared and uncopied implementations.
 
+#[path = "common/catalog.rs"]
+mod catalog;
 #[path = "common/rust_docs.rs"]
 mod rust_docs;
 
+use catalog::manifest::MODULES;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
-const MOD_RS: &str = include_str!("../src/stdlib/mod.rs");
 const FUZZ_MANIFEST: &str = include_str!("../fuzz/Cargo.toml");
 const COPY_MODULES: &str = include_str!("../tests/copy_and_own/modules.rs");
 const OBSERVE_APP: &str = include_str!("../src/observe/app.rs");
@@ -59,92 +62,6 @@ const TARGETS_WITHOUT_A_MODULE: &[&str] = &[
     "relay",
     "stack",
 ];
-
-/// One row of the table.
-#[derive(Debug)]
-struct Row {
-    module: String,
-    linked: bool,
-    what: String,
-    wire: bool,
-    decode: bool,
-    state: Vec<String>,
-    service: Vec<String>,
-    observe: String,
-    fuzz: bool,
-    copy: bool,
-}
-
-/// The names inside backticks in a cell, in order.
-fn names(cell: &str) -> Vec<String> {
-    cell.split('`')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_owned)
-        .collect()
-}
-
-fn yes(cell: &str, column: &str, module: &str) -> bool {
-    match cell {
-        "yes" => true,
-        "" => false,
-        other => panic!("{module}: the {column} cell must be `yes` or empty, not {other:?}"),
-    }
-}
-
-/// Parses the catalog table out of the module docs.
-fn catalog() -> Vec<Row> {
-    let lines: Vec<&str> = MOD_RS
-        .lines()
-        .skip_while(|l| l.trim() != "//! # The catalog")
-        .filter_map(|l| l.strip_prefix("//! |"))
-        .collect();
-    let header = lines
-        .first()
-        .expect("the catalog table under `# The catalog` in src/stdlib/mod.rs");
-    assert_eq!(
-        header.trim(),
-        "Module | What it is | Wire | Decode | State | Service | Observe | Fuzz | Copy |",
-        "the catalog's columns"
-    );
-    let mut rows = Vec::new();
-    for line in &lines[2..] {
-        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-        assert_eq!(cells.len(), 10, "nine cells in {line:?}");
-        let module_cell = cells[0];
-        let (module, linked) = if let Some(m) = module_cell
-            .strip_prefix("[`")
-            .and_then(|m| m.strip_suffix("`]"))
-        {
-            (m, true)
-        } else if let Some(m) = module_cell
-            .strip_prefix('`')
-            .and_then(|m| m.strip_suffix('`'))
-        {
-            (m, false)
-        } else {
-            panic!("the module cell {module_cell:?} is neither [`name`] nor `name`");
-        };
-        assert!(!cells[1].is_empty(), "{module} has no description");
-        assert!(
-            cells[1].ends_with('.'),
-            "{module}: the description is a sentence"
-        );
-        rows.push(Row {
-            module: module.to_owned(),
-            linked,
-            what: cells[1].to_owned(),
-            wire: yes(cells[2], "Wire", module),
-            decode: yes(cells[3], "Decode", module),
-            state: names(cells[4]),
-            service: names(cells[5]),
-            observe: cells[6].to_owned(),
-            fuzz: yes(cells[7], "Fuzz", module),
-            copy: yes(cells[8], "Copy", module),
-        });
-    }
-    rows
-}
 
 /// A textual item header and its optional brace body. Only the existing
 /// feature-selection wrappers are transparent; ordinary bodies stay opaque.
@@ -653,9 +570,22 @@ fn observe_builtins() -> BTreeSet<&'static str> {
 }
 
 #[test]
+fn catalog_documentation_is_current() {
+    let expected = catalog::render(MODULES);
+    assert_eq!(expected, catalog::render(MODULES));
+    let path = Path::new(ROOT).join("src/stdlib/catalog.md");
+    if std::env::var_os("BLESS_STDLIB_CATALOG").is_some() {
+        fs::write(&path, &expected).unwrap();
+    }
+    let actual = fs::read_to_string(&path)
+        .expect("read src/stdlib/catalog.md; set BLESS_STDLIB_CATALOG=1 to generate it");
+    catalog::assert_documentation(&actual, &expected);
+}
+
+#[test]
 fn the_catalog_lists_every_module_once_in_order() {
-    let rows = catalog();
-    let listed: Vec<&str> = rows.iter().map(|r| r.module.as_str()).collect();
+    let rows = MODULES;
+    let listed: Vec<&str> = rows.iter().map(|r| r.module).collect();
     let mut sorted = listed.clone();
     sorted.sort();
     sorted.dedup();
@@ -670,10 +600,10 @@ fn the_catalog_lists_every_module_once_in_order() {
 #[test]
 fn hidden_modules_are_not_linked() {
     let hidden = hidden_modules();
-    for row in catalog() {
+    for row in MODULES {
         assert_eq!(
             row.linked,
-            !hidden.contains(row.module.as_str()),
+            !hidden.contains(row.module),
             "{}: a hidden module is listed as `name`, a documented one as [`name`]",
             row.module
         );
@@ -684,12 +614,12 @@ fn hidden_modules_are_not_linked() {
 fn front_pages_describe_about_a_hundred_protocol_and_format_codecs() {
     assert!(include_str!("../README.md").contains("codecs (no I/O) for about a hundred"));
     assert!(include_str!("../src/lib.rs").contains("codecs (no I/O) for about a hundred"));
-    let count = catalog()
+    let count = MODULES
         .iter()
         .filter(|row| row.wire || row.decode)
         .filter(|row| {
             !matches!(
-                row.module.as_str(),
+                row.module,
                 "codec" | "test_support" | "huffman" | "prefix_int"
             )
         })
@@ -703,20 +633,19 @@ fn front_pages_describe_about_a_hundred_protocol_and_format_codecs() {
 #[test]
 fn wire_decode_and_service_columns_match_the_impls() {
     let modules = modules_on_disk();
-    for row in catalog() {
-        let code = code(&modules[&row.module]);
+    for row in MODULES {
+        let code = code(&modules[row.module]);
         assert_eq!(
             row.wire,
             catalog_impl(&code, "Wire"),
             "{}: the Wire column",
             row.module
         );
-        assert_decode_column(&row.module, row.decode, &code);
-        let services: BTreeSet<String> = idents_after(&code, "Service for ")
+        assert_decode_column(row.module, row.decode, &code);
+        let services: BTreeSet<&str> = idents_after(&code, "Service for ")
             .filter(|name| catalog_type(&code, name))
-            .map(str::to_owned)
             .collect();
-        let listed: BTreeSet<String> = row.service.iter().cloned().collect();
+        let listed: BTreeSet<&str> = row.service.iter().copied().collect();
         assert_eq!(listed, services, "{}: the Service column", row.module);
         assert_eq!(
             listed.len(),
@@ -730,9 +659,9 @@ fn wire_decode_and_service_columns_match_the_impls() {
 #[test]
 fn state_names_are_public_types_of_the_module() {
     let modules = modules_on_disk();
-    for row in catalog() {
-        let code = code(&modules[&row.module]);
-        for name in &row.state {
+    for row in MODULES {
+        let code = code(&modules[row.module]);
+        for name in row.state {
             assert!(
                 declares(&code, name),
                 "{}: the State column names {name}, which is not a pub struct or enum there",
@@ -756,25 +685,21 @@ fn observe_column_matches_the_registry_and_the_presenters() {
             "the built-in observe protocol {name} is named after a stdlib module"
         );
     }
-    for row in catalog() {
-        let code = code(&modules[&row.module]);
+    for row in MODULES {
+        let code = code(&modules[row.module]);
         assert!(
             !code.contains("Present for"),
             "{}: a presenter belongs in src/observe/, not in the protocol's module",
             row.module
         );
-        let expected = if builtins.contains(row.module.as_str()) {
-            "built in"
-        } else {
-            ""
-        };
+        let expected = builtins.contains(row.module);
         assert_eq!(row.observe, expected, "{}: the Observe column", row.module);
     }
 }
 
 #[test]
 fn fuzz_column_matches_the_fuzz_targets() {
-    let rows = catalog();
+    let rows = MODULES;
     let targets = fuzz_targets();
     assert!(
         targets.len() > 100,
@@ -784,7 +709,7 @@ fn fuzz_column_matches_the_fuzz_targets() {
     let mut fuzzed = BTreeSet::new();
     let mut unowned = Vec::new();
     for target in &targets {
-        match owner(target, rows.iter().map(|r| r.module.as_str())) {
+        match owner(target, rows.iter().map(|r| r.module)) {
             Some(m) => {
                 fuzzed.insert(m);
             }
@@ -796,10 +721,10 @@ fn fuzz_column_matches_the_fuzz_targets() {
         unowned, TARGETS_WITHOUT_A_MODULE,
         "every other fuzz target is named after its module"
     );
-    for row in &rows {
+    for row in rows {
         assert_eq!(
             row.fuzz,
-            fuzzed.contains(row.module.as_str()),
+            fuzzed.contains(row.module),
             "{}: the Fuzz column",
             row.module
         );
@@ -875,8 +800,8 @@ fn copy_column_matches_the_copy_and_own_fixture() {
         &Path::new(ROOT).join("tests/copy_and_own"),
     );
     let modules = modules_on_disk();
-    for row in catalog() {
-        let files = &modules[&row.module];
+    for row in MODULES {
+        let files = &modules[row.module];
         assert!(
             !files.is_empty(),
             "{}: no implementation files found",
@@ -1161,6 +1086,19 @@ fn an_uncataloged_declaration_fails() {
 }
 
 #[test]
+#[should_panic(expected = "the catalog's modules and the declarations")]
+fn a_cataloged_module_without_a_declaration_fails() {
+    let modules = declared_modules(&source_fixture(), Path::new("src/stdlib/mod.rs"));
+    assert_module_names(
+        &["component", "extra", "moved", "ordinary"],
+        modules
+            .into_iter()
+            .filter(|(_, module)| module.public)
+            .map(|(name, _)| name),
+    );
+}
+
+#[test]
 fn exported_decoder_compositions_count() {
     for source in [
         "pub struct A; pub type T = Map<A, F>;",
@@ -1226,7 +1164,18 @@ fn exported_compositions_implement_decode() {
 
 #[test]
 fn descriptions_are_one_line_each() {
-    for row in catalog() {
+    for row in MODULES {
+        assert!(!row.what.is_empty(), "{} has no description", row.module);
+        assert!(
+            row.what.ends_with('.'),
+            "{}: the description is a sentence",
+            row.module
+        );
+        assert!(
+            !row.what.contains(['\n', '\r', '|']),
+            "{}: the description is one table cell",
+            row.module
+        );
         assert!(
             row.what.len() <= 160,
             "{}: the description fits one line ({} chars)",

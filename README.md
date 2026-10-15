@@ -52,7 +52,7 @@ proxy instead.
 
 The standard library covers IPv4 and IPv6, TCP, UDP, ICMP, routing, whole
 networks of websites with `stdlib::web`, and codecs (no I/O) for about a hundred
-protocols and data formats, listed in [the catalog](src/stdlib/mod.rs).
+protocols and data formats, listed in [the catalog](src/stdlib/catalog.md).
 HTTP has a ready server, `Net` serves DNS and DHCP, and TLS is built in.
 For other protocols, a world writes a `Service` around the module's decoder.
 The crate is not on crates.io, so build it from this repository.
@@ -145,7 +145,7 @@ run, callbacks, or the dashboard.
 step.
 
 Protocol codecs also work in unit tests, fuzz targets and dashboard presenters.
-The [catalog](src/stdlib/mod.rs) lists every module and what each can do,
+The [catalog](src/stdlib/catalog.md) lists every module and what each can do,
 including which presenters are built in, and a test checks the table against
 the code. To change a protocol, see
 [the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
