@@ -187,6 +187,27 @@ fn buffer_compaction_is_amortized_at_full_capacity() {
     assert!(b.moved > 0);
 }
 #[test]
+fn retained_backlog_drains_without_moving_bytes() {
+    let count = 1024u32;
+    let mut bytes = Vec::new();
+    for value in 0..count {
+        bytes.push(4);
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    let len = bytes.len();
+    let mut stream = Stream::with_buffer(Frames, len);
+    assert_eq!(stream.push(&bytes), len);
+    assert_eq!(stream.buffered(), len);
+    for value in 0..count {
+        assert_eq!(stream.next(), Some(Ok(value.to_be_bytes().to_vec())));
+    }
+    assert_eq!(stream.next(), None);
+    assert_eq!(stream.buffered(), 0);
+    let (buf, _) = stream.into_parts();
+    assert_eq!(buf.moved, 0);
+    assert!(buf.allocated() <= 2 * len);
+}
+#[test]
 fn stream_reports_cumulative_input_buffer_copies() {
     let mut s = Stream::with_buffer(Pairs, 8);
     assert_eq!(s.push(b"abcdefgh"), 8);

@@ -246,18 +246,11 @@ fn unmeasured_linearity_tests(source: &str) -> Vec<&str> {
 fn linearity_names_require_measurement() {
     // Existing findings remain open until their instance units migrate them.
     // Exact entries reject new omissions and must be removed when fixed.
-    let pending = [
-        (
-            "dhcpv6.rs",
-            "stream_takes_many_small_messages_in_linear_time",
-            "RH-043 / T11-73",
-        ),
-        (
-            "onc_rpc.rs",
-            "many_small_records_take_linear_time",
-            "RH-057 / T11-77",
-        ),
-    ];
+    let pending = [(
+        "dhcpv6.rs",
+        "stream_takes_many_small_messages_in_linear_time",
+        "RH-043 / T11-73",
+    )];
     let dir = Path::new(ROOT).join("src/stdlib");
     let mut actual = BTreeSet::new();
     for (file, source) in sources_on_disk(&dir) {
