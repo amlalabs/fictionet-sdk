@@ -1,46 +1,34 @@
 //! IMAP literals, refusal decisions, raw lines, and strict wire values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::imap::{
     Command, Error, FrameError, Input, Inputs, MAX_HELD, MAX_LINE, MAX_LITERAL, MAX_TEXT, Response,
     Responses, Value,
 };
-use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{Scripted, decode_all};
 use libfuzzer_sys::fuzz_target;
 
-struct Refusals<'a> {
-    commands: Inputs,
-    choices: &'a [u8],
-    at: usize,
-    refuse: bool,
-}
-impl Decode for Refusals<'_> {
-    type Item = Result<Input, Error>;
-    type Error = FrameError;
-    const NAME: &'static str = "IMAP refusal world";
-    fn capacity(&self) -> usize {
-        self.commands.capacity()
-    }
-    fn held(&self) -> usize {
-        self.commands.held()
-    }
-    fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
-        if core::mem::take(&mut self.refuse) {
-            assert!(self.commands.refuse_literal());
-            assert!(!self.commands.refuse_literal());
-        }
-        let step = self.commands.decode(bytes, eof)?;
-        if let Step::Item(item, _) = &step {
-            let choice = self.choices.get(self.at % self.choices.len().max(1));
-            self.refuse =
-                matches!(item, Ok(Input::Continue { .. })) && choice.is_some_and(|b| b & 1 == 1);
-            self.at = self.at.saturating_add(1);
-        }
-        Ok(step)
-    }
+fn refusals(choices: &[u8]) -> impl Decode<Item = Result<Input, Error>, Error = FrameError> + '_ {
+    Scripted::new(
+        Inputs::new(),
+        (0usize, false),
+        |commands, (_, refuse)| {
+            if core::mem::take(refuse) {
+                assert!(commands.refuse_literal());
+                assert!(!commands.refuse_literal());
+            }
+        },
+        move |_, (at, refuse), item| {
+            let choice = choices.get(*at % choices.len().max(1));
+            *refuse =
+                matches!(&item, Ok(Input::Continue { .. })) && choice.is_some_and(|b| b & 1 == 1);
+            *at = at.saturating_add(1);
+            item
+        },
+    )
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -56,16 +44,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(raw, data, 2 * MAX_LINE);
     contract::check_decode_with_held_limit(raw, data, MAX_HELD);
     let choices = data.get(..8).unwrap_or(data);
-    contract::check_decode_with_alloc_limit(
-        || Refusals {
-            commands: Inputs::new(),
-            choices,
-            at: 0,
-            refuse: false,
-        },
-        data,
-        2 * MAX_LINE,
-    );
+    contract::check_decode_with_alloc_limit(|| refusals(choices), data, 2 * MAX_LINE);
     contract::check_wire::<Command>(data);
     contract::check_wire::<Response>(data);
     for item in decode_all(Inputs::new, data).0 {

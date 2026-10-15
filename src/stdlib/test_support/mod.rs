@@ -2,6 +2,7 @@
 //! Seeds are explicit. Chunk iterators borrow input and allocate no storage.
 //! [`mutate`] edits a byte vector in place, and [`decode_all`] runs a decoder
 //! over a whole input.
+//! [`Scripted`] runs caller decisions before decoder calls and after items.
 //!
 //! [`rounds`] sizes randomized loops and large inputs, so a default
 //! `cargo test` stays fast and a deep run is one environment variable away.
@@ -16,6 +17,9 @@ use alloc::vec::Vec;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, finish, pump};
 
 pub mod contract;
+
+mod scripted;
+pub use scripted::Scripted;
 
 /// Checks each argument tuple against its expected result, in order.
 /// Each row evaluates the callable, arguments, and expected value once.

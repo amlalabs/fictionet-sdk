@@ -3,7 +3,7 @@
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Step, Stream, Wire},
     imap, pop3, smtp,
-    test_support::contract,
+    test_support::{Scripted, contract},
 };
 
 #[test]
@@ -71,32 +71,17 @@ where
     D::Item: PartialEq + core::fmt::Debug,
     D::Error: Clone + PartialEq,
 {
-    struct World<D: Decode> {
-        decoder: D,
-        between: fn(&mut D, &D::Item),
-    }
-    impl<D: Decode> Decode for World<D> {
-        type Item = D::Item;
-        type Error = D::Error;
-        const NAME: &'static str = D::NAME;
-        fn capacity(&self) -> usize {
-            self.decoder.capacity()
-        }
-        fn held(&self) -> usize {
-            self.decoder.held()
-        }
-        fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
-            let step = self.decoder.decode(bytes, eof)?;
-            if let Step::Item(item, _) = &step {
-                (self.between)(&mut self.decoder, item);
-            }
-            Ok(step)
-        }
-    }
     read(
-        || World {
-            decoder: make(),
-            between,
+        || {
+            Scripted::new(
+                make(),
+                (),
+                |_, _| {},
+                |decoder, _, item| {
+                    between(decoder, &item);
+                    item
+                },
+            )
         },
         bytes,
     )
@@ -104,35 +89,20 @@ where
 
 // A test world that accepts each DATA command. Apply its decision on the
 // next call, after the previous item has been returned to the driver.
-#[derive(Default)]
-struct AcceptData {
-    server: smtp::Inputs,
-    switch: bool,
-}
-
-impl Decode for AcceptData {
-    type Item = Result<smtp::Input, smtp::Error>;
-    type Error = smtp::FrameError;
-    const NAME: &'static str = "SMTP test world";
-
-    fn capacity(&self) -> usize {
-        self.server.capacity()
-    }
-
-    fn held(&self) -> usize {
-        self.server.held()
-    }
-
-    fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
-        if core::mem::take(&mut self.switch) {
-            self.server.start_data().unwrap();
-        }
-        let step = self.server.decode(bytes, eof)?;
-        if let Step::Item(item, _) = &step {
-            self.switch = matches!(item, Ok(smtp::Input::Command(c)) if c.verb == "DATA");
-        }
-        Ok(step)
-    }
+fn accept_data() -> impl Decode<Item = Result<smtp::Input, smtp::Error>, Error = smtp::FrameError> {
+    Scripted::new(
+        smtp::Inputs::new(),
+        false,
+        |server, switch| {
+            if core::mem::take(switch) {
+                server.start_data().unwrap();
+            }
+        },
+        |_, switch, item| {
+            *switch = matches!(&item, Ok(smtp::Input::Command(c)) if c.verb == "DATA");
+            item
+        },
+    )
 }
 
 #[test]
@@ -140,11 +110,11 @@ fn smtp_chunked_commands_data_and_replies() {
     let wire =
         b"EHLO example.test\r\n!bad\r\nDATA\r\nSubject: x\r\n\r\n..dot\r\n...two\r\n.\r\nNOOP\r\n";
     contract::check_decode_with_alloc_limit(
-        AcceptData::default,
+        accept_data,
         wire,
-        AcceptData::default().capacity().saturating_mul(2),
+        accept_data().capacity().saturating_mul(2),
     );
-    contract::check_decode_with_held_limit(AcceptData::default, wire, smtp::MAX_DATA);
+    contract::check_decode_with_held_limit(accept_data, wire, smtp::MAX_DATA);
     let expected = vec![
         Ok(Ok(smtp::Input::Command(smtp::Command::new(
             "EHLO",
@@ -157,7 +127,7 @@ fn smtp_chunked_commands_data_and_replies() {
         ))),
         Ok(Ok(smtp::Input::Command(smtp::Command::new("NOOP", None)))),
     ];
-    assert_eq!(read(AcceptData::default, wire), expected);
+    assert_eq!(read(accept_data, wire), expected);
     let mut encoded = Vec::new();
     for input in expected
         .iter()
@@ -177,7 +147,7 @@ fn smtp_chunked_commands_data_and_replies() {
         }
     }
     assert_eq!(
-        read(AcceptData::default, &encoded),
+        read(accept_data, &encoded),
         expected
             .into_iter()
             .filter(|r| !matches!(r, Ok(Err(_))))
@@ -603,31 +573,31 @@ fn smtp_exact_limits_and_assembly_errors() {
     .unwrap();
     bytes.extend_from_slice(b"QUIT\r\n");
     contract::check_decode_with_alloc_limit(
-        AcceptData::default,
+        accept_data,
         &bytes,
-        AcceptData::default().capacity().saturating_mul(2),
+        accept_data().capacity().saturating_mul(2),
     );
-    let items = read(AcceptData::default, &bytes);
+    let items = read(accept_data, &bytes);
     assert_eq!(items.get(1), Some(&Ok(Ok(smtp::Input::Message(message)))));
     // The extra byte is allowed only when it is a transparency dot.
     let mut oversized = b"DATA\r\n".to_vec();
     oversized.extend(vec![b'x'; smtp::MAX_DATA_LINE - 1]);
     oversized.extend_from_slice(b"\r\n.\r\n");
     assert_eq!(
-        read(AcceptData::default, &oversized).last(),
+        read(accept_data, &oversized).last(),
         Some(&Err(Fail::Protocol(smtp::FrameError::LineTooLong)))
     );
     let broken = b"DATA\r\nbad\0line\r\n..valid\r\n.\r\nQUIT\r\n";
     contract::check_decode_with_alloc_limit(
-        AcceptData::default,
+        accept_data,
         broken,
-        AcceptData::default().capacity().saturating_mul(2),
+        accept_data().capacity().saturating_mul(2),
     );
-    let items = read(AcceptData::default, broken);
+    let items = read(accept_data, broken);
     assert_eq!(items.get(1), Some(&Ok(Err(smtp::Error::Text))));
     assert!(matches!(items.last(), Some(Ok(Ok(smtp::Input::Command(c)))) if c.verb == "QUIT"));
     assert_eq!(
-        read(AcceptData::default, b"DATA\r\n").last(),
+        read(accept_data, b"DATA\r\n").last(),
         Some(&Err(Fail::Protocol(smtp::FrameError::Incomplete)))
     );
     assert_eq!(
@@ -1767,14 +1737,14 @@ fn smtp_data_line_overflow_has_one_fatal_shape() {
         [b".".to_vec(), vec![b'x'; 999]].concat(),
     ] {
         let wire = [b"DATA\r\n".to_vec(), line, b"\r\n.\r\n".to_vec()].concat();
-        contract::check_decode_with_held_limit(AcceptData::default, &wire, smtp::MAX_DATA);
+        contract::check_decode_with_held_limit(accept_data, &wire, smtp::MAX_DATA);
         contract::check_decode_with_alloc_limit(
-            AcceptData::default,
+            accept_data,
             &wire,
-            AcceptData::default().capacity().saturating_mul(2),
+            accept_data().capacity().saturating_mul(2),
         );
         assert_eq!(
-            read(AcceptData::default, &wire).last(),
+            read(accept_data, &wire).last(),
             Some(&Err(Fail::Protocol(smtp::FrameError::LineTooLong)))
         );
     }
@@ -1786,47 +1756,23 @@ type Pop3ReplyItems = Vec<Result<Result<pop3::Output, pop3::Error>, Fail<pop3::F
 /// with one raw line selected and `LIST` behind it. Gives the items and the
 /// number of expectations queued after each.
 fn pop3_auth_then_list(bytes: &[u8]) -> (Pop3ReplyItems, Vec<usize>) {
-    struct AuthThenList {
-        replies: pop3::Outputs,
-        greeted: bool,
-        seen: usize,
-    }
-    impl Decode for AuthThenList {
-        type Item = (Result<pop3::Output, pop3::Error>, usize);
-        type Error = pop3::FrameError;
-        const NAME: &'static str = "POP3 AUTH then LIST test world";
-        fn capacity(&self) -> usize {
-            self.replies.capacity()
-        }
-        fn held(&self) -> usize {
-            self.replies.held()
-        }
-        fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
-            Ok(match self.replies.decode(bytes, eof)? {
-                Step::Item(item, used) => {
-                    if !self.greeted {
-                        self.greeted = true;
-                        self.replies.expect(false).unwrap();
-                        self.replies.expect_line().unwrap();
-                        self.replies.expect(true).unwrap();
-                    }
-                    self.seen = self.replies.expected();
-                    Step::Item((item, self.seen), used)
-                }
-                Step::Skip(used) => Step::Skip(used),
-                Step::Need => Step::Need,
-                Step::End => Step::End,
-            })
-        }
-    }
     let make = || {
         let mut replies = pop3::Outputs::new();
         replies.expect(false).unwrap();
-        AuthThenList {
+        Scripted::new(
             replies,
-            greeted: false,
-            seen: 0,
-        }
+            false,
+            |_, _| {},
+            |replies, greeted, item| {
+                if !*greeted {
+                    *greeted = true;
+                    replies.expect(false).unwrap();
+                    replies.expect_line().unwrap();
+                    replies.expect(true).unwrap();
+                }
+                (item, replies.expected())
+            },
+        )
     };
     read(make, bytes)
         .into_iter()

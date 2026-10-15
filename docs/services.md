@@ -423,6 +423,11 @@ from the supplied `Seed`. Calling `with_fcx` before opening it binds both
 its clock and randomness to that run; use the run's sleeps and `poll` then,
 because manual `advance` is only available to standalone harnesses.
 
+For decoder tests with caller decisions, `stdlib::test_support::Scripted`
+holds a decoder and caller state. Its hooks run before each decode call and
+after each item. Record a pending decision in the after-item hook to apply
+it on the next call. Use it with `test_support::contract` to check chunking.
+
 ## 3. A network
 
 `Net` builds the network around its hosts. Each host has addresses (given

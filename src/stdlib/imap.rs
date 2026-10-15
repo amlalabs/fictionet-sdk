@@ -1761,10 +1761,10 @@ mod tests {
     }
 
     use super::*;
-    use codec::{Fail, Lcg, Step, Stream};
+    use codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{Scripted, decode_all, mutate};
 
     fn cmd(bytes: &[u8]) -> Command {
         Command::parse(bytes).unwrap()
@@ -2868,45 +2868,30 @@ mod tests {
         );
     }
 
-    struct Refusals<'a> {
-        commands: Inputs,
-        choices: &'a [u8],
-        at: usize,
-        refuse: bool,
-    }
-    impl Decode for Refusals<'_> {
-        type Item = Result<Input, Error>;
-        type Error = FrameError;
-        const NAME: &'static str = "IMAP refusal test world";
-        fn capacity(&self) -> usize {
-            self.commands.capacity()
-        }
-        fn held(&self) -> usize {
-            self.commands.held()
-        }
-        fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
-            if core::mem::take(&mut self.refuse) {
-                assert!(self.commands.refuse_literal());
-                assert!(!self.commands.refuse_literal());
-            }
-            let step = self.commands.decode(bytes, eof)?;
-            if let Step::Item(item, _) = &step {
-                self.refuse = matches!(item, Ok(Input::Continue { .. }))
-                    && self.choices.get(self.at).is_some_and(|b| b & 1 == 1);
-                self.at = self.at.saturating_add(1);
-            }
-            Ok(step)
-        }
+    fn refusals(
+        choices: &[u8],
+    ) -> impl Decode<Item = Result<Input, Error>, Error = FrameError> + '_ {
+        Scripted::new(
+            Inputs::new(),
+            (0usize, false),
+            |commands, (_, refuse)| {
+                if core::mem::take(refuse) {
+                    assert!(commands.refuse_literal());
+                    assert!(!commands.refuse_literal());
+                }
+            },
+            move |_, (at, refuse), item| {
+                *refuse = matches!(&item, Ok(Input::Continue { .. }))
+                    && choices.get(*at).is_some_and(|b| b & 1 == 1);
+                *at = at.saturating_add(1);
+                item
+            },
+        )
     }
 
     #[test]
     fn refusals_in_a_stream() {
-        let make = || Refusals {
-            commands: Inputs::new(),
-            choices: &[1],
-            at: 0,
-            refuse: false,
-        };
+        let make = || refusals(&[1]);
         let bytes = b"a APPEND X {3}\r\nabc\r\nb NOOP\r\n";
         let (items, failure) = decode_all(make, bytes);
         assert_eq!(failure, None);
@@ -2921,16 +2906,7 @@ mod tests {
         for _ in 0..5000 {
             let bytes = generated_stream(&mut rng);
             let choices = rng.bytes(8);
-            contract::check_decode_with_alloc_limit(
-                || Refusals {
-                    commands: Inputs::new(),
-                    choices: &choices,
-                    at: 0,
-                    refuse: false,
-                },
-                &bytes,
-                2 * MAX_LINE,
-            );
+            contract::check_decode_with_alloc_limit(|| refusals(&choices), &bytes, 2 * MAX_LINE);
         }
     }
 
