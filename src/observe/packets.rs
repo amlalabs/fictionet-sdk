@@ -388,7 +388,9 @@ mod tests {
     use crate::watch::MAX_KEYS;
 
     fn setup() -> (Arc<Graph>, Arc<Meter>, Arc<LinkWatch>, Subscription) {
-        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let graph = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab)
+            .graph
+            .clone();
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         let (watch, subscription) = graph.watches.acquire(&graph, meter.id).unwrap();

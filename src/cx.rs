@@ -385,7 +385,7 @@ impl Cx {
         let graph = &self.run.graph;
         event.at = at;
         event.origin = graph.origin(crate::run::current_task(graph));
-        graph.events.push(event);
+        self.run.events.push(event);
     }
 
     /// Records `event` as a repeat: one of a run of alike events that a
@@ -400,13 +400,13 @@ impl Cx {
         let graph = &self.run.graph;
         event.at = self.now();
         event.origin = graph.origin(crate::run::current_task(graph));
-        graph.events.push_repeat(event, detail);
+        self.run.events.push_repeat(event, detail);
     }
 
     /// The run's [event log](crate::events): what it holds, and readers
     /// for what comes. The handle stays readable after the run is over.
     pub fn events(&self) -> EventLog {
-        EventLog::new(self.run.graph.events.clone())
+        EventLog::new(self.run.events.clone())
     }
 
     /// Waits until this `Cx`'s [region](Cx#regions) is cancelled.

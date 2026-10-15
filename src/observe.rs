@@ -662,15 +662,15 @@ impl std::fmt::Debug for LinkHandle {
 #[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
-    use crate::watch::Graph;
     use std::time::Duration;
 
     #[test]
     fn a_world_registry_reaches_watch_json_without_a_socket() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let shared = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = shared.graph.clone();
         let watched = graph.clone();
-        crate::block_on(crate::run::run_with(graph, move |fcx| async move {
+        crate::block_on(crate::run::run_with(shared, move |fcx| async move {
             let mut registry = Registry::new();
             registry.register(
                 "custom",

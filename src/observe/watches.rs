@@ -219,7 +219,9 @@ mod tests {
     #[test]
     fn active_watch_capacity_preserves_sharing_and_releases_on_drop() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let graph = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab)
+            .graph
+            .clone();
         graph.watches.set_limit(1);
         let first = Meter::new();
         let second = Meter::new();
@@ -255,7 +257,9 @@ mod tests {
     #[test]
     fn admission_evicts_longest_idle_watches_first() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let graph = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab)
+            .graph
+            .clone();
         graph.watches.set_limit(3);
         let meters: Vec<_> = (0..5).map(|_| Meter::new()).collect();
         for meter in &meters {
@@ -287,7 +291,9 @@ mod tests {
     #[test]
     fn lowering_watch_capacity_preserves_active_subscriptions() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let graph = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab)
+            .graph
+            .clone();
         graph.watches.set_limit(2);
         let first = Meter::new();
         let second = Meter::new();
@@ -310,7 +316,9 @@ mod tests {
     #[test]
     fn subscribers_share_a_watch_and_reuse_its_history() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let graph = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab)
+            .graph
+            .clone();
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         let (watch, first) = graph.watches.acquire(&graph, meter.id).unwrap();
@@ -337,19 +345,20 @@ mod tests {
     #[test]
     fn ending_a_run_releases_watches_while_streams_finish() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let shared = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let graph = &shared.graph;
         let idle = Meter::new();
         let active = Meter::new();
         graph.owns(&idle, 0, 1);
         graph.owns(&active, 0, 1);
-        let (watch, subscription) = graph.watches.acquire(&graph, idle.id).unwrap();
+        let (watch, subscription) = graph.watches.acquire(graph, idle.id).unwrap();
         let idle_watch = Arc::downgrade(&watch);
         drop((watch, subscription));
-        let (watch, subscription) = graph.watches.acquire(&graph, active.id).unwrap();
+        let (watch, subscription) = graph.watches.acquire(graph, active.id).unwrap();
         active.sent(0, &crate::Packet(vec![0x45; 20]));
         assert!(idle_watch.upgrade().is_some());
 
-        graph.run_ended();
+        shared.end();
         assert!(graph.watches.is_empty());
         assert!(graph.watches.existing(idle.id).is_none());
         assert!(graph.watches.existing(active.id).is_none());
@@ -366,7 +375,9 @@ mod tests {
     #[test]
     fn a_subscription_does_not_keep_its_graph_or_link_alive() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+        let graph = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab)
+            .graph
+            .clone();
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         let (watch, subscription) = graph.watches.acquire(&graph, meter.id).unwrap();
@@ -409,7 +420,9 @@ mod tests {
     #[test]
     fn watches_copy_only_while_subscribed() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real)
+            .graph
+            .clone();
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         graph.task_started(1, "world".into(), std::panic::Location::caller(), None);
@@ -441,7 +454,9 @@ mod tests {
     #[test]
     fn idle_watches_are_forgotten_without_more_requests() {
         use crate::watch::Meter;
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real)
+            .graph
+            .clone();
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         drop(graph.watches.acquire(&graph, meter.id).unwrap());

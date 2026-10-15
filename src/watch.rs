@@ -58,11 +58,6 @@ impl std::hash::Hasher for IdHasher {
 /// dashboard's messages.
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
-/// Run ids, unique in the process. They are only compared for equality,
-/// never recorded, serialized, ordered or hashed into anything a world
-/// sees, so they do not affect determinism.
-static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
-
 /// The counts and the tap of one link: a pair, or an attachment.
 ///
 /// Side 0 and side 1 are the two ends. For an attachment, side 0 is the
@@ -446,12 +441,15 @@ pub(crate) const MAX_KEYS: usize = 20_000;
 /// link, each take its lock once. Packets never do.
 pub(crate) struct Graph {
     pub(crate) run_id: u64,
+    #[cfg(feature = "std")]
     pub(crate) environment: Arc<crate::environment::RunEnvironment>,
+    #[cfg(feature = "observe")]
     pub(crate) start_wall: SystemTime,
     /// Observer sessions connected to the world. While there are none,
     /// packet copies and TLS keys are not kept.
     pub(crate) viewers: AtomicUsize,
     /// The run's events, kept whether or not anyone observes.
+    #[cfg(feature = "observe")]
     pub(crate) events: Arc<crate::events::Store>,
     /// The id of the next group.
     next_group: AtomicU64,
@@ -481,22 +479,30 @@ pub(crate) struct GraphState {
 }
 
 impl Graph {
-    pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Graph> {
+    pub(crate) fn new(
+        run_id: u64,
+        environment: Arc<crate::environment::RunEnvironment>,
+        start_wall: SystemTime,
+        events: Arc<crate::events::Store>,
+    ) -> Arc<Graph> {
+        #[cfg(not(feature = "std"))]
+        let _ = environment;
+        #[cfg(not(feature = "observe"))]
+        let _ = (start_wall, events);
         Arc::new(Graph {
-            run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
-            environment: Arc::new(crate::environment::RunEnvironment::new(seed, mode)),
-            start_wall: if mode == crate::RunMode::Real {
-                SystemTime::now()
-            } else {
-                crate::sys::UNIX_EPOCH
-            },
+            run_id,
+            #[cfg(feature = "std")]
+            environment,
+            #[cfg(feature = "observe")]
+            start_wall,
             viewers: AtomicUsize::new(0),
             next_group: AtomicU64::new(1),
             state: Mutex::new(GraphState {
                 sweep_at: 64,
                 ..GraphState::default()
             }),
-            events: crate::events::Store::new(mode),
+            #[cfg(feature = "observe")]
+            events,
             #[cfg(feature = "observe")]
             watches: crate::observe::WatchSet::default(),
             protocols: Mutex::default(),
@@ -559,12 +565,6 @@ impl Graph {
         s.ended = true;
         s.revision += 1;
         s.tasks.clear();
-        drop(s);
-        // Nothing more is recorded: let callbacks and file writers go.
-        self.events.close();
-        // Nothing more crosses the world's links: stop watching them.
-        #[cfg(feature = "observe")]
-        self.watches.end_run();
     }
 
     fn link<'a>(&self, s: &'a mut GraphState, meter: &Arc<Meter>) -> &'a mut LinkInfo {
@@ -679,11 +679,12 @@ mod tests {
     fn a_watched_run_records_tasks_owners_and_counts() {
         use crate::Interface;
         use crate::prelude::*;
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let shared = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = shared.graph.clone();
         let g = graph.clone();
         let (spawn_line, seen) = (Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(None)));
         let (line, s) = (spawn_line.clone(), seen.clone());
-        let out = crate::block_on(crate::run::run_with(graph.clone(), move |fcx| async move {
+        let out = crate::block_on(crate::run::run_with(shared, move |fcx| async move {
             let (mut a, mut b) = crate::pair();
             line.store(u64::from(line!()) + 1, Ordering::SeqCst);
             let echo = fcx.spawn(move |fcx| async move {

@@ -1378,7 +1378,7 @@ impl EventLog {
         let wall = if cfg!(target_arch = "wasm32") || fcx.mode() == crate::RunMode::Lab {
             Value::Null
         } else {
-            fcx.graph()
+            fcx.run
                 .start_wall
                 .duration_since(crate::sys::UNIX_EPOCH)
                 .map_or(Value::Null, |d| float(d.as_secs_f64()))
@@ -1387,7 +1387,7 @@ impl EventLog {
             .summary("the run started")
             .fields(fields)
             .field("wall", wall)
-            .field("seed", fcx.graph().environment.seed.to_string())
+            .field("seed", fcx.run.environment.seed.to_string())
             .field("rng", "chacha20-v1");
         fcx.record_at(Instant::ZERO, event);
     }

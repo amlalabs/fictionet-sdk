@@ -418,13 +418,14 @@ mod tests {
         use crate::prelude::*;
         use crate::stdlib::{delay, route};
         use crate::time::ms;
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let shared = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = shared.graph.clone();
         let g = graph.clone();
         let (attacher, mut attachments) = crate::attachments();
         let _sandbox = attacher.attach("agent").unwrap();
         let seen = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
         let s = seen.clone();
-        crate::block_on(crate::run::run_with(graph.clone(), move |fcx| async move {
+        crate::block_on(crate::run::run_with(shared, move |fcx| async move {
             let lan = fcx.group("office LAN");
             let hosts = lan.group("hosts");
             // Taken with the world's `Cx`, read by a task in the group.
@@ -495,7 +496,9 @@ mod tests {
     /// A group that empties is announced gone, after its nodes.
     #[test]
     fn groups_come_and_go_with_their_tasks() {
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real)
+            .graph
+            .clone();
         graph.task_started(1, "world".into(), Location::caller(), None);
         let (mut view, _) = snapshot(&graph, None);
         let outer = Group::new(graph.next_group(), "outer".into(), None);
@@ -518,7 +521,9 @@ mod tests {
 
     #[test]
     fn link_changes_refresh_cached_topology() {
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real)
+            .graph
+            .clone();
         graph.task_started(1, "world".into(), Location::caller(), None);
         graph.task_started(2, "worker".into(), Location::caller(), None);
         let meter = Meter::new();
@@ -540,7 +545,9 @@ mod tests {
 
     #[test]
     fn unchanged_large_graph() {
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real)
+            .graph
+            .clone();
         for id in 1..=1000 {
             graph.task_started(id, "worker".into(), Location::caller(), None);
         }
@@ -556,7 +563,9 @@ mod tests {
 
     #[test]
     fn changes_follow_the_graph() {
-        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real)
+            .graph
+            .clone();
         graph.task_started(1, "world".into(), Location::caller(), None);
         let (mut view, (name, data)) = snapshot(&graph, None);
         assert_eq!(name, "snapshot");

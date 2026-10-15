@@ -5,14 +5,20 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::JoinError;
 use crate::cx::{JoinState, Region, is_cancel};
+use crate::sys::SystemTime;
 use crate::watch::Graph;
 use crate::{Cx, Result};
+
+/// Run ids, unique in the process. They are only compared for equality,
+/// never recorded, serialized, ordered or hashed into anything a world
+/// sees, so they do not affect determinism.
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// Runs a world in real time, as one future that any executor can poll.
 ///
@@ -115,7 +121,7 @@ where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    run_with(Graph::new(seed, crate::RunMode::Real), world).await
+    run_with(RunShared::new(seed, crate::RunMode::Real), world).await
 }
 
 /// Runs a closed world on simulated time, for tests.
@@ -148,23 +154,15 @@ where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    run_with(Graph::new(seed, crate::RunMode::Lab), world).await
+    run_with(RunShared::new(seed, crate::RunMode::Lab), world).await
 }
 
-/// Runs the world using the environment and recording in `graph`.
-pub(crate) async fn run_with<F, Fut>(graph: Arc<Graph>, world: F) -> Result
+/// Runs the world using the shared runtime services.
+pub(crate) async fn run_with<F, Fut>(shared: Arc<RunShared>, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    let shared = Arc::new(RunShared {
-        environment: graph.environment.clone(),
-        queue: Mutex::new(Queue {
-            next_id: 1,
-            ..Queue::default()
-        }),
-        graph,
-    });
     let root = Region::root(Arc::downgrade(&shared));
     let mut state = RunState {
         shared: shared.clone(),
@@ -187,6 +185,9 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 /// The part of a run that wakers and every [`Cx`] share.
 pub(crate) struct RunShared {
     pub(crate) environment: Arc<crate::environment::RunEnvironment>,
+    pub(crate) start_wall: SystemTime,
+    /// The run's events, kept whether or not anyone observes.
+    pub(crate) events: Arc<crate::events::Store>,
     queue: Mutex<Queue>,
     /// What the run records for observers.
     pub(crate) graph: Arc<Graph>,
@@ -218,6 +219,37 @@ struct NewTask {
 }
 
 impl RunShared {
+    pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Self> {
+        let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
+        let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
+        let start_wall = if mode == crate::RunMode::Real {
+            SystemTime::now()
+        } else {
+            crate::sys::UNIX_EPOCH
+        };
+        let events = crate::events::Store::new(mode);
+        let graph = Graph::new(run_id, environment.clone(), start_wall, events.clone());
+        Arc::new(Self {
+            environment,
+            start_wall,
+            events,
+            queue: Mutex::new(Queue {
+                next_id: 1,
+                ..Queue::default()
+            }),
+            graph,
+        })
+    }
+
+    pub(crate) fn end(&self) {
+        self.graph.run_ended();
+        // Nothing more is recorded: let callbacks and file writers go.
+        self.events.close();
+        // Nothing more crosses the world's links: stop watching them.
+        #[cfg(feature = "observe")]
+        self.graph.watches.end_run();
+    }
+
     /// Adds a task. Gives the future back if the run is gone.
     pub(crate) fn spawn(
         &self,
@@ -553,6 +585,84 @@ impl Drop for RunState {
             join.finish(Err(JoinError::Cancelled));
         }
         self.root.cancel();
-        self.shared.graph.run_ended();
+        self.shared.end();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{Event, Fields};
+
+    #[test]
+    fn retained_logs_outlive_completed_and_dropped_runs() {
+        for complete in [true, false] {
+            let shared = RunShared::new(crate::Seed::from_u64(7), crate::RunMode::Lab);
+            let graph = shared.graph.clone();
+            let weak_run = Arc::downgrade(&shared);
+            let weak_graph = Arc::downgrade(&graph);
+            let weak_environment = Arc::downgrade(&shared.environment);
+            let kept = Arc::new(Mutex::new(None));
+            let keep = kept.clone();
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let seen = delivered.clone();
+            let observed = graph.clone();
+            let mut world = Box::pin(run_with(shared, move |fcx| async move {
+                let log = fcx.events();
+                log.subscribe(move |event| {
+                    if event.seq == 3 {
+                        let state = observed.state();
+                        assert!(state.ended);
+                        assert!(state.tasks.is_empty());
+                    }
+                    seen.lock().push(event.seq);
+                });
+                fcx.record(Event::new("test", "hello"));
+                for _ in 0..2 {
+                    fcx.record_repeat(Event::new("test", "repeat"), Fields::new());
+                }
+                assert_eq!(log.recorded(), 2);
+                *keep.lock() = Some(log);
+                fcx.yield_now().await?;
+                Ok(())
+            }));
+            assert!(
+                world
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            if complete {
+                crate::block_on(world).unwrap();
+            } else {
+                drop(world);
+            }
+
+            let log = kept.lock().take().unwrap();
+            assert_eq!(*delivered.lock(), [1, 2, 3]);
+            assert_eq!(Arc::strong_count(&delivered), 1, "callbacks are released");
+            assert!(weak_run.upgrade().is_none());
+            assert!(graph.state().ended);
+            #[cfg(feature = "observe")]
+            assert_eq!(graph.events.last(), log.recorded());
+            drop(graph);
+            assert!(weak_graph.upgrade().is_none());
+            assert!(weak_environment.upgrade().is_none());
+
+            let events = log.all();
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[2].u64("count"), Some(1));
+            for event in events {
+                assert_eq!(event.at, crate::time::Instant::ZERO);
+                let origin = event.origin.unwrap();
+                assert_eq!(origin.task, 1);
+                assert_eq!(origin.name, "world");
+            }
+            delivered.lock().clear();
+            let replayed = delivered.clone();
+            log.subscribe(move |event| replayed.lock().push(event.seq));
+            assert_eq!(*delivered.lock(), [1, 2, 3]);
+            assert_eq!(Arc::strong_count(&delivered), 1, "replay is not retained");
+        }
     }
 }

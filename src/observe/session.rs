@@ -545,7 +545,9 @@ mod tests {
     #[test]
     fn packet_subscribers_report_overruns_once_before_retained_rows() {
         for (limit, bytes, retained) in [(2, super::super::packets::ROW_BYTES, 2), (4, 0, 0)] {
-            let graph = Graph::new(crate::Seed::from_u64(1), crate::RunMode::Lab);
+            let graph = crate::run::RunShared::new(crate::Seed::from_u64(1), crate::RunMode::Lab)
+                .graph
+                .clone();
             let meter = crate::watch::Meter::new();
             graph.owns(&meter, 0, 1);
             let mut fds = [0; 2];
