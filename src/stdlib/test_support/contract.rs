@@ -5,6 +5,8 @@
 //! growth across `Need`, EOF completion, and terminal driver behavior.
 //! It compares items, terminal errors, and consumed offsets across fixed
 //! and LCG chunkings. Each of the first 256 prefixes is also ended.
+//! Arbitrary input may fail to decode. Use [`check_decoded`] for known-valid
+//! bytes: it asserts the expected items, terminal success, and full consumption.
 //!
 //! It cannot inspect hidden memory, prove absence of panics on untested
 //! input, or infer a protocol's held-state limit or exact wire grammar.
@@ -262,6 +264,8 @@ where
 
 /// Checks all observable decoder rules on this input and bounded prefixes.
 /// Returns the whole-input items and terminal failure.
+/// The caller must assert the returned pair to check protocol semantics.
+/// For known-valid input, use [`check_decoded`].
 /// Uses no inferred held-state limit; use [`check_decode_with_held_limit`]
 /// when the protocol defines one. Panics on a contract violation.
 pub fn check_decode<D: Decode>(
@@ -276,6 +280,8 @@ where
 }
 /// Like [`check_decode`], also checking the protocol's named held-byte limit
 /// initially and after every decode call.
+/// The returned pair is for the caller to assert. Use [`check_decoded`] for
+/// known-valid input.
 pub fn check_decode_with_held_limit<D: Decode>(
     make: impl Fn() -> D,
     data: &[u8],
@@ -292,6 +298,8 @@ where
 /// [`Buffer::allocated`] after every push and every item. A [`Stream`]
 /// keeps up to twice its limit allocated, so `2 * capacity` is the bound
 /// for a decoder whose capacity never changes.
+/// The returned pair is for the caller to assert. Use [`check_decoded`] for
+/// known-valid input.
 pub fn check_decode_with_alloc_limit<D: Decode>(
     make: impl Fn() -> D,
     data: &[u8],
@@ -307,6 +315,8 @@ where
 /// Like [`check_decode`], checking both memory bounds in one traversal of
 /// the input schedules and bounded prefixes. Returns the whole-input items
 /// and terminal failure. Panics on a contract violation.
+/// The returned pair is for the caller to assert. Use [`check_decoded`] for
+/// known-valid input.
 ///
 /// Checks `held_limit` initially and after every decode call, as in
 /// [`check_decode_with_held_limit`]. Checks `alloc_limit` after every push
@@ -330,18 +340,21 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    check_limits(
+    let whole = check_limits(
         make,
         data,
         Limits {
             held: held_limit,
             alloc: alloc_limit,
         },
-    )
+    );
+    (whole.items, whole.failure)
 }
 
 /// Checks decoding with an input allocation bound of twice the initial
 /// capacity. The decoder's capacity must stay fixed.
+/// The returned pair is for the caller to assert. Use [`check_decoded`] for
+/// known-valid input.
 pub fn check_decode_capacity<D: Decode>(
     make: impl Fn() -> D,
     data: &[u8],
@@ -354,11 +367,51 @@ where
     check_decode_with_alloc_limit(make, data, limit)
 }
 
+/// Checks that known-valid bytes yield the expected items, finish without
+/// failure, and consume the entire input. Panics if any assertion fails.
+/// Checks the same decoder rules, chunkings, prefixes, and memory bounds as
+/// [`check_decode_limits`] in one traversal. Use `usize::MAX` for a memory
+/// bound that the protocol does not define.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Ending, Lines}, test_support::contract};
+/// contract::check_decoded(
+///     || Lines::new(16, Ending::LfOrCrlf), b"one\ntwo\n",
+///     &[Ok(b"one".to_vec()), Ok(b"two".to_vec())], 0, 36,
+/// );
+/// ```
+pub fn check_decoded<D: Decode>(
+    make: impl Fn() -> D,
+    data: &[u8],
+    expected: &[D::Item],
+    held_limit: usize,
+    alloc_limit: usize,
+) where
+    D::Item: PartialEq + Debug,
+    D::Error: Clone + PartialEq + Debug,
+{
+    let whole = check_limits(
+        make,
+        data,
+        Limits {
+            held: held_limit,
+            alloc: alloc_limit,
+        },
+    );
+    assert_eq!(whole.failure, None, "known-valid input failed to decode");
+    assert_eq!(whole.items, expected, "decoded items differ from expected");
+    assert_eq!(
+        whole.consumed,
+        data.len() as u64,
+        "decoder did not consume all known-valid input"
+    );
+}
+
 fn check_limits<D: Decode>(
     make: impl Fn() -> D,
     data: &[u8],
     limits: Limits,
-) -> (Vec<D::Item>, Option<Fail<D::Error>>)
+) -> Outcome<D::Item, D::Error>
 where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
@@ -387,7 +440,7 @@ where
             limits,
         );
     }
-    (whole.items, whole.failure)
+    whole
 }
 /// Checks that every nonempty strict prefix of a complete unit is truncated.
 /// Empty input must end cleanly.
@@ -603,6 +656,7 @@ mod tests {
     enum Fault {
         Error,
         Need,
+        End,
     }
     impl Decode for Fault {
         type Item = ();
@@ -615,8 +669,15 @@ mod tests {
             match self {
                 Self::Error => Err(TestError),
                 Self::Need => Ok(Step::Need),
+                Self::End => Ok(Step::End),
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "decoder did not consume all known-valid input")]
+    fn decoded_requires_full_consumption() {
+        check_decoded(|| Fault::End, b"a", &[], 0, 8);
     }
 
     #[test]

@@ -441,8 +441,11 @@ bodies. Returned values have bounded depth, including when dropped.
 Generated tests build bounded values with public `codec::Lcg` and run
 `stdlib::test_support::contract::check_wire_value`. Each type and stream must sample and write
 successfully at least once. Seed zero selects the minimum shape.
-Stream tests also run `check_decode_with_alloc_limit`. Tests cover invalid writes, malformed
-bytes, recursion limits, every generator error category, CLI errors,
+Stream tests run `check_decoded` on each writable sample and on their
+concatenation. They assert the expected values, terminal success, and full
+input consumption, along with chunking invariance and the input allocation
+bound. Tests cover invalid writes, malformed bytes, recursion limits,
+every generator error category, CLI errors,
 JSON limits, deterministic output, and exact golden source bytes.
 Formatting checks run `rustfmt --edition 2024 --check` over the goldens,
 every name length from 1 through `MAX_NAME`, and deterministic random

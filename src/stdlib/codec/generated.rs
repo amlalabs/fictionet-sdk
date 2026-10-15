@@ -716,16 +716,23 @@ macro_rules! generated_runtime {
             {
                 use fictionet::stdlib::test_support::contract;
                 let mut successes = 0;
+                let mut stream = Vec::new();
+                let mut values = Vec::new();
+                let alloc_limit = 2 * ($max_message + header);
                 for seed in 0..32 {
                     let mut s = Sampler::seed(seed);
                     if let Ok(value) = T::sample(&mut s) {
                         let mut bytes = Vec::new();
                         if write(&value, &mut bytes).is_ok() {
-                            contract::check_decode_with_alloc_limit(
+                            contract::check_decoded(
                                 &make,
                                 &bytes,
-                                2 * ($max_message + header),
+                                std::slice::from_ref(&value),
+                                usize::MAX,
+                                alloc_limit,
                             );
+                            write(&value, &mut stream).expect("writable sample must append");
+                            values.push(value);
                             successes += 1;
                         }
                     }
@@ -735,6 +742,7 @@ macro_rules! generated_runtime {
                     "no writable frame for {}",
                     std::any::type_name::<D>()
                 );
+                contract::check_decoded(make, &stream, &values, usize::MAX, alloc_limit);
             }
             pub fn parse<T: Codec>(bytes: &[u8], le: bool) -> Result<T, $error> {
                 if bytes.len() > $max_message {

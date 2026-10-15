@@ -17335,7 +17335,14 @@ mod framing_tests {
             }
         }
         assert!(messages.len() > 32);
-        contract::check_decode_with_alloc_limit(|| Messages, &stream, 4 * usize::from(u16::MAX));
+        let expected: Vec<_> = messages.iter().cloned().map(Ok).collect();
+        contract::check_decoded(
+            || Messages,
+            &stream,
+            &expected,
+            usize::MAX,
+            4 * usize::from(u16::MAX),
+        );
         let packet = Packet {
             header: PacketHeader {
                 sequence: 1,

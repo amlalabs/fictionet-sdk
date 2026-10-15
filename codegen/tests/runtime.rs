@@ -1,4 +1,5 @@
 //! Check the file-local support code used by every generated module.
+use fictionet::stdlib::codec::{Decode, Step};
 const MAX_ALLOCATION: usize = 32;
 const MAX_DEPTH: usize = 4;
 const MAX_MESSAGE: usize = 128;
@@ -46,6 +47,94 @@ fn contract_test_must_not_skip_every_sample() {
 #[should_panic(expected = "no writable sample")]
 fn contract_test_must_not_skip_every_write() {
     __wire::check::<Broken<true>>().unwrap();
+}
+
+#[derive(Debug, PartialEq)]
+struct Bit(bool);
+impl __wire::Codec for Bit {
+    fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
+        match r.scalar::<u8>(le)? {
+            0 => Ok(Self(false)),
+            1 => Ok(Self(true)),
+            _ => Err(Error::Value),
+        }
+    }
+    fn encode(&self, w: &mut __wire::Writer, le: bool) -> Result<(), Error> {
+        w.scalar(u8::from(self.0), le)
+    }
+    fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
+        Ok(Self(s.ranged(0, 1) != 0))
+    }
+}
+impl Bit {
+    fn write_frame(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        __wire::write_frame(self, out, &[], 1, false, false)
+    }
+}
+
+struct AlwaysRejecting;
+impl Decode for AlwaysRejecting {
+    type Item = Bit;
+    type Error = Error;
+    const NAME: &'static str = "always rejecting";
+    fn capacity(&self) -> usize {
+        MAX_MESSAGE + 1
+    }
+    fn decode(&mut self, _: &[u8], _: bool) -> Result<Step<Bit>, Error> {
+        Err(Error::Header)
+    }
+}
+
+struct WrongItem;
+impl Decode for WrongItem {
+    type Item = Bit;
+    type Error = Error;
+    const NAME: &'static str = "wrong item";
+    fn capacity(&self) -> usize {
+        MAX_MESSAGE + 1
+    }
+    fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<Bit>, Error> {
+        match __wire::frame(input, &[], 1, false, false)? {
+            Step::Item(Bit(value), used) => Ok(Step::Item(Bit(!value), used)),
+            step => Ok(step),
+        }
+    }
+}
+
+struct EarlyTerminal(bool);
+impl Decode for EarlyTerminal {
+    type Item = Bit;
+    type Error = Error;
+    const NAME: &'static str = "early terminal";
+    fn capacity(&self) -> usize {
+        MAX_MESSAGE + 1
+    }
+    fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<Bit>, Error> {
+        if self.0 {
+            return Ok(Step::End);
+        }
+        let step = __wire::frame(input, &[], 1, false, false)?;
+        self.0 = matches!(step, Step::Item(_, _));
+        Ok(step)
+    }
+}
+
+#[test]
+#[should_panic(expected = "known-valid input failed to decode")]
+fn always_rejecting_decoder() {
+    __wire::check_stream(|| AlwaysRejecting, Bit::write_frame, 1);
+}
+
+#[test]
+#[should_panic(expected = "decoded items differ from expected")]
+fn wrong_item_decoder() {
+    __wire::check_stream(|| WrongItem, Bit::write_frame, 1);
+}
+
+#[test]
+#[should_panic(expected = "decoded items differ from expected")]
+fn early_terminal_decoder() {
+    __wire::check_stream(|| EarlyTerminal(false), Bit::write_frame, 1);
 }
 
 #[test]
