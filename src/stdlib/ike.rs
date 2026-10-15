@@ -1524,6 +1524,90 @@ impl Wire for NatT {
 
 fictionet::codec_from!(Error, Truncated, |_| Error::Short);
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::*;
+    use fictionet::stdlib::ipsec::Envelope;
+    use fictionet::stdlib::test_support::contract;
+
+    fn check_chain(first: u8, data: &[u8]) {
+        if let Ok(payloads) = parse_payloads(first, data) {
+            for (initiator_spi, responder_spi, message_id) in [(0, 0, 0), (1, 2, 5)] {
+                let message = Message {
+                    initiator_spi,
+                    responder_spi,
+                    minor_version: 0,
+                    exchange: exchange::INFORMATIONAL,
+                    flags: 0,
+                    message_id,
+                    payloads: payloads.clone(),
+                };
+                contract::check_wire_value(&message);
+                let bytes = message.to_bytes().unwrap();
+                assert_eq!(bytes[16], first);
+                assert_eq!(
+                    parse_payloads(first, &bytes[HEADER_LEN..]).as_ref(),
+                    Ok(&payloads)
+                );
+            }
+        }
+    }
+
+    /// Checks wire round trips, payload chains, NAT-T classification and prefixes.
+    pub fn check(data: &[u8]) {
+        let datagram = if data.len() > MAX_MESSAGE + NON_ESP_MARKER.len() {
+            Err(Error::Limit("datagram bytes"))
+        } else {
+            match Envelope::classify(data) {
+                None => Err(Error::Short),
+                Some(Envelope::Keepalive) => Ok(NatT::Keepalive),
+                Some(Envelope::Ike(message)) => Message::parse(message).map(NatT::Ike),
+                Some(Envelope::Esp(packet)) => Ok(NatT::Esp(packet.to_vec())),
+            }
+        };
+        assert_eq!(NatT::parse(data), datagram);
+        contract::check_wire::<Header>(data);
+        contract::check_wire::<Message>(data);
+        contract::check_wire::<NatT>(data);
+        check_chain(0, data);
+        check_chain(33, data);
+        check_chain(40, data);
+        check_chain(41, data);
+        check_chain(46, data);
+        if let Ok(message) = Message::parse(data) {
+            let bytes = message.to_bytes().unwrap();
+            for n in 0..bytes.len() {
+                assert_eq!(Message::parse(&bytes[..n]), Err(Error::Short));
+            }
+            assert!(bytes.len() <= data.len());
+            assert_eq!(Message::parse(&bytes).as_ref(), Ok(&message));
+            assert_eq!(
+                parse_payloads(bytes[16], &bytes[HEADER_LEN..]).as_ref(),
+                Ok(&message.payloads)
+            );
+            let natt = NatT::Ike(message);
+            contract::check_wire_value(&natt);
+            assert!(natt.to_bytes().is_ok());
+        }
+        if let Some((&first, rest)) = data.split_first() {
+            check_chain(first, rest);
+        }
+        for n in 0..data.len().min(200) {
+            let _ = Message::parse(&data[..n]);
+            let _ = NatT::parse(&data[..n]);
+        }
+        if let Ok(NatT::Ike(message)) = NatT::parse(data) {
+            assert_eq!(
+                NatT::parse(&NatT::Ike(message.clone()).to_bytes().unwrap()),
+                Ok(NatT::Ike(message))
+            );
+        }
+        let _ = Header::parse(data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn fixture_body_other(kind: u8, data: Vec<u8>) -> Body {
@@ -2492,54 +2576,6 @@ mod tests {
         assert_eq!(m.unsupported_critical(), None);
     }
 
-    fn check_chain(first: u8, data: &[u8]) {
-        if let Ok(payloads) = parse_payloads(first, data) {
-            let value = message(payloads.clone());
-            contract::check_wire_value(&value);
-            let bytes = value.to_bytes().unwrap();
-            assert_eq!(bytes[16], first);
-            assert_eq!(parse_payloads(first, &bytes[HEADER_LEN..]), Ok(payloads));
-        }
-    }
-
-    /// What the fuzz target checks: whatever reads, writes and reads back
-    /// the same, and every prefix and chain reader runs without a panic.
-    fn check(data: &[u8]) {
-        contract::check_wire::<Header>(data);
-        contract::check_wire::<Message>(data);
-        contract::check_wire::<NatT>(data);
-        check_chain(0, data);
-        check_chain(33, data);
-        check_chain(40, data);
-        check_chain(46, data);
-
-        if let Ok(m) = Message::parse(data) {
-            let bytes = m.to_bytes().unwrap();
-            assert!(bytes.len() <= data.len());
-            assert_eq!(Message::parse(&bytes).as_ref(), Ok(&m));
-            for n in 0..bytes.len() {
-                assert_eq!(Message::parse(&bytes[..n]), Err(Error::Short));
-            }
-            let bytes = m.to_bytes().unwrap();
-            let first = bytes[16];
-            let chain = &bytes[HEADER_LEN..];
-            assert_eq!(parse_payloads(first, chain).as_ref(), Ok(&m.payloads));
-        }
-        if let Ok(NatT::Ike(m)) = NatT::parse(data) {
-            assert_eq!(
-                NatT::parse(&NatT::Ike(m.clone()).to_bytes().unwrap()),
-                Ok(NatT::Ike(m))
-            );
-        }
-        let _ = Header::parse(data);
-        if let Some((&first, rest)) = data.split_first()
-            && let Ok(p) = parse_payloads(first, rest)
-        {
-            let bytes = message(p.clone()).to_bytes().unwrap();
-            assert_eq!(parse_payloads(bytes[16], &bytes[HEADER_LEN..]), Ok(p));
-        }
-    }
-
     #[test]
     fn fuzz_loop() {
         let mut s = Lcg::new(0x1e2f);
@@ -2578,7 +2614,7 @@ mod tests {
             if Message::parse(&data).is_ok() {
                 parsed += 1;
             }
-            check(&data);
+            harness::check(&data);
             // The same bytes one at a time: each prefix on its own.
             for n in 0..data.len().min(64) {
                 let _ = Message::parse(&data[..n]);
@@ -2591,7 +2627,7 @@ mod tests {
             let n = usize::from(s.next() as u8);
             let mut data = vec![0; n];
             s.fill(&mut data);
-            check(&data);
+            harness::check(&data);
         }
     }
 }

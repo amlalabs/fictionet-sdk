@@ -6,6 +6,7 @@ use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{rtcp, rtp::*};
 use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
+    rtcp::harness::datagram(data);
     contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, data, 2 * (MAX_PACKET + 2));
     contract::check_decode_with_alloc_limit(
         || Frames::<rtcp::Frame>::with_limit(usize::from(data.first().copied().unwrap_or(0))),

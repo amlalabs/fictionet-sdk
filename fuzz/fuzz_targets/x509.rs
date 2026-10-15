@@ -56,6 +56,7 @@ fn built(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    fictionet::stdlib::asn1::harness::check(data);
     if data.len() <= MAX_PEM_FRAME
         && let Ok(list) = pem_decode(data)
     {

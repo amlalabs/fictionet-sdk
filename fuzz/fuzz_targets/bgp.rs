@@ -10,8 +10,6 @@ use fictionet::stdlib::bgp::Attribute;
 
 use fictionet::stdlib::bgp::Context;
 
-use fictionet::stdlib::bgp::Error;
-
 use fictionet::stdlib::bgp::Frame;
 
 use fictionet::stdlib::bgp::MAX_BODY_LEN;
@@ -36,34 +34,12 @@ use fictionet::stdlib::bgp::Update;
 
 use fictionet::stdlib::bgp::afi;
 
-use fictionet::stdlib::bgp::kind;
-
-use fictionet::stdlib::bgp::harness::{encode, mixes};
+use fictionet::stdlib::bgp::harness::{CONTEXTS, check_frame, encode, mixes};
 use fictionet::stdlib::bgp::safi;
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
-
-/// Every combination of the session settings.
-const CONTEXTS: [Context; 4] = [
-    Context {
-        four_octet_as: false,
-        enhanced_route_refresh: false,
-    },
-    Context {
-        four_octet_as: true,
-        enhanced_route_refresh: false,
-    },
-    Context {
-        four_octet_as: false,
-        enhanced_route_refresh: true,
-    },
-    Context {
-        four_octet_as: true,
-        enhanced_route_refresh: true,
-    },
-];
 
 /// An UPDATE built from the bytes as world code would build one, with
 /// fields a reader would never give: prefixes with bits past their
@@ -162,51 +138,7 @@ fuzz_target!(|data: &[u8]| {
         body: data.to_vec(),
     });
     for f in frames.into_iter().chain(bodies) {
-        for negotiated in CONTEXTS {
-            let strict = Message::decode(&f, &negotiated);
-            // RFC 7606 closes the connection only for errors the strict
-            // reader has too, and reads the same UPDATE when it has none.
-            if f.kind == kind::UPDATE {
-                match Update::receive(&f.body, &negotiated) {
-                    Ok(r) => {
-                        if r.withdraw.is_some() {
-                            assert!(strict.is_err());
-                        }
-                        if let Ok(m) = &strict {
-                            assert_eq!(*m, Message::Update(r.update));
-                        }
-                    }
-                    Err(e) => {
-                        assert!(strict.is_err());
-                        assert!(
-                            encode(
-                                &Message::Notification(e.notification().unwrap()),
-                                &negotiated
-                            )
-                            .is_ok()
-                        );
-                    }
-                }
-            }
-            match strict {
-                // A message read can be written, unless it mixes kinds of
-                // routes, and reads back the same.
-                Ok(m) => {
-                    if mixes(&m) {
-                        assert!(matches!(encode(&m, &negotiated), Err(Error::Unwritable)));
-                        continue;
-                    }
-                    let bytes = encode(&m, &negotiated).unwrap();
-                    let back = Frame::parse(&bytes).unwrap();
-                    assert_eq!(Message::decode(&back, &negotiated), Ok(m));
-                }
-                // An error's notification can always be sent.
-                Err(e) => {
-                    let n = Message::Notification(e.notification().unwrap());
-                    assert!(encode(&n, &negotiated).is_ok());
-                }
-            }
-        }
+        check_frame(&f);
     }
     // The body readers on their own, given bodies of any length: what
     // they read can be written, and their errors can be sent.

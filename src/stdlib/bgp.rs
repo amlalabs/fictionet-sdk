@@ -2187,8 +2187,74 @@ fn bound(out: &[u8]) -> Result<(), Error> {
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
-    use super::{Attribute, Context, Error, Message};
+    use super::{Attribute, Context, Error, Frame, MAX_MESSAGE_LEN, Message, Update, kind};
     use fictionet::stdlib::codec::Wire;
+
+    /// Every combination of the session settings.
+    pub const CONTEXTS: [Context; 4] = [
+        Context {
+            four_octet_as: false,
+            enhanced_route_refresh: false,
+        },
+        Context {
+            four_octet_as: true,
+            enhanced_route_refresh: false,
+        },
+        Context {
+            four_octet_as: false,
+            enhanced_route_refresh: true,
+        },
+        Context {
+            four_octet_as: true,
+            enhanced_route_refresh: true,
+        },
+    ];
+
+    /// Checks what the fuzz target checks: a message read can be written,
+    /// unless it mixes kinds of routes, and reads back the same. The
+    /// error handling of RFC 7606 closes the connection only for errors
+    /// the strict reader has too.
+    pub fn check_frame(frame: &Frame) {
+        for negotiated in CONTEXTS {
+            if frame.kind == kind::UPDATE {
+                let strict = Message::decode(frame, &negotiated);
+                match Update::receive(&frame.body, &negotiated) {
+                    Ok(r) => {
+                        if r.withdraw.is_some() {
+                            assert!(strict.is_err());
+                        }
+                        if let Ok(m) = strict {
+                            assert_eq!(m, Message::Update(r.update));
+                        }
+                    }
+                    Err(e) => {
+                        assert!(strict.is_err());
+                        assert!(
+                            encode(
+                                &Message::Notification(e.notification().unwrap()),
+                                &negotiated
+                            )
+                            .is_ok()
+                        );
+                    }
+                }
+            }
+            if let Ok(m) = Message::decode(frame, &negotiated) {
+                if mixes(&m) {
+                    assert!(matches!(encode(&m, &negotiated), Err(Error::Unwritable)));
+                    continue;
+                }
+                let bytes = encode(&m, &negotiated)
+                    .unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
+                assert!(bytes.len() <= MAX_MESSAGE_LEN);
+                let back = Frame::parse(&bytes).unwrap();
+                assert_eq!(Message::decode(&back, &negotiated), Ok(m));
+            } else if let Err(e) = Message::decode(frame, &negotiated) {
+                let n = e.notification().unwrap();
+                assert!(encode(&Message::Notification(n), &negotiated).is_ok());
+            }
+        }
+    }
 
     /// Encodes a message with its negotiated context.
     pub fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, Error> {
@@ -2209,7 +2275,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use super::harness::{encode, mixes};
+    use super::harness::{check_frame, encode};
     use super::*;
     use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
@@ -3386,52 +3452,6 @@ mod tests {
                 assert_eq!(stream.buffered(), 0);
             },
         );
-    }
-
-    /// Checks what the fuzz target checks: a message read can be written,
-    /// unless it mixes kinds of routes, and reads back the same. The
-    /// error handling of RFC 7606 closes the connection only for errors
-    /// the strict reader has too.
-    fn check_frame(frame: &Frame) {
-        for negotiated in [TWO, FOUR] {
-            if frame.kind == kind::UPDATE {
-                let strict = Message::decode(frame, &negotiated);
-                match Update::receive(&frame.body, &negotiated) {
-                    Ok(r) => {
-                        if r.withdraw.is_some() {
-                            assert!(strict.is_err());
-                        }
-                        if let Ok(m) = strict {
-                            assert_eq!(m, Message::Update(r.update));
-                        }
-                    }
-                    Err(e) => {
-                        assert!(strict.is_err());
-                        assert!(
-                            encode(
-                                &Message::Notification(e.notification().unwrap()),
-                                &negotiated
-                            )
-                            .is_ok()
-                        );
-                    }
-                }
-            }
-            if let Ok(m) = Message::decode(frame, &negotiated) {
-                if mixes(&m) {
-                    assert!(matches!(encode(&m, &negotiated), Err(Error::Unwritable)));
-                    continue;
-                }
-                let bytes = encode(&m, &negotiated)
-                    .unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
-                assert!(bytes.len() <= MAX_MESSAGE_LEN);
-                let back = Frame::parse(&bytes).unwrap();
-                assert_eq!(Message::decode(&back, &negotiated), Ok(m));
-            } else if let Err(e) = Message::decode(frame, &negotiated) {
-                let n = e.notification().unwrap();
-                assert!(encode(&Message::Notification(n), &negotiated).is_ok());
-            }
-        }
     }
 
     #[test]

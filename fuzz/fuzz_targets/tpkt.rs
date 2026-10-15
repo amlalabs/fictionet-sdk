@@ -111,6 +111,7 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    fictionet::stdlib::cotp::harness::check_buffer(data, 4000);
     check_wire::<Packet>(data);
     check_wire::<Header>(data);
     // The size limit comes from the first two bytes.

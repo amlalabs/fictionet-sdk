@@ -1113,6 +1113,112 @@ impl Wire for Packet {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::*;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks wire round trips, prefixes, reserved bits and constructed values.
+    pub fn check(data: &[u8]) {
+        contract::check_wire::<Avp>(data);
+        contract::check_wire::<ControlMessage>(data);
+        contract::check_wire::<V2Packet>(data);
+        contract::check_wire::<V3Control>(data);
+        contract::check_wire::<V3Data<0>>(data);
+        contract::check_wire::<V3Data<4>>(data);
+        contract::check_wire::<V3Data<8>>(data);
+        contract::check_wire::<Packet>(data);
+        contract::check_wire_value(&ControlMessage::zlb());
+        assert!(ControlMessage::zlb().to_bytes().is_ok());
+        for n in 0..=data.len().min(256) {
+            let part = Packet::parse(&data[..n]);
+            if n < 2 {
+                assert_eq!(part, Err(Error::Truncated));
+            }
+            let _ = ControlMessage::parse(&data[..n]);
+        }
+        if let Ok(message) = ControlMessage::parse(data) {
+            let control = V3Control::new(1, 2, 3, &message).unwrap();
+            contract::check_wire_value(&control);
+            assert!(control.to_bytes().is_ok());
+            assert_eq!(control.message(), Ok(message.clone()));
+            let body = message.to_bytes().unwrap();
+            if !body.is_empty() {
+                let long = body.repeat(MAX_MESSAGE / body.len() + 1);
+                let control = V3Control {
+                    connection: 1,
+                    ns: 0,
+                    nr: 0,
+                    payload: long,
+                };
+                contract::check_wire_value(&control);
+                assert_eq!(control.to_bytes(), Err(Error::Unwritable));
+            }
+        }
+        // Reserved bits are read, and written as zero.
+        if let Ok(avp) = Avp::parse(data) {
+            assert_eq!(Avp::reserved_bits(data).unwrap(), (data[0] >> 2) & 15);
+            assert_eq!(Avp::reserved_bits(&avp.to_bytes().unwrap()), Ok(0));
+        }
+        if let Ok(message) = ControlMessage::parse(data)
+            && !message.is_zlb()
+        {
+            assert_eq!(Avp::reserved_bits(&message.to_bytes().unwrap()), Ok(0));
+            let bits = ControlMessage::reserved_bits(data).unwrap();
+            assert_eq!(bits.len(), 1 + message.avps.len());
+            assert_eq!(bits[0], Avp::reserved_bits(data).unwrap());
+            let written = ControlMessage::reserved_bits(&message.to_bytes().unwrap()).unwrap();
+            assert!(written.iter().all(|&b| b == 0));
+        }
+        let byte = |i: usize| data.get(i).copied().unwrap_or(0);
+        let code = u16::from_be_bytes([byte(0), byte(1)]);
+        assert_eq!(MessageType::from_code(code).code(), code);
+        let avp = Avp {
+            mandatory: byte(2) & 1 != 0,
+            hidden: byte(2) & 2 != 0,
+            vendor: u16::from(byte(4)),
+            attribute: code,
+            value: data[..data.len().min(MAX_AVP_VALUE + 1)].to_vec(),
+        };
+        contract::check_wire_value(&avp);
+        let message = ControlMessage {
+            message_type: (byte(2) & 4 != 0).then(|| MessageType::from_code(code)),
+            mandatory: byte(2) & 1 != 0,
+            vendor: u16::from(byte(4)),
+            avps: vec![avp],
+        };
+        contract::check_wire_value(&message);
+        let packet = V2Packet {
+            control: byte(2) & 1 != 0,
+            has_length: byte(2) & 2 != 0,
+            sequence: (byte(2) & 4 != 0).then_some((code, 0)),
+            offset_pad: (byte(2) & 8 != 0).then_some(vec![byte(3)]),
+            priority: byte(2) & 16 != 0,
+            tunnel: code,
+            session: code,
+            payload: data[..data.len().min(MAX_DATAGRAM + 1)].to_vec(),
+        };
+        contract::check_wire_value(&packet);
+        let cookie = data[..data.len().min(12)].to_vec();
+        macro_rules! cookie {
+            ($len:expr) => {
+                contract::check_wire_value(&V3Data::<$len> {
+                    session: 1,
+                    cookie,
+                    payload: vec![],
+                })
+            };
+        }
+        match cookie.len() {
+            4 => cookie!(4),
+            8 => cookie!(8),
+            _ => cookie!(0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1766,31 +1872,6 @@ mod tests {
         assert!(written > 1500, "only {written} messages written");
     }
 
-    /// What the fuzz target checks: whatever reads, writes and reads back
-    /// the same.
-    fn check(data: &[u8]) {
-        contract::check_wire::<Packet>(data);
-        contract::check_wire::<V2Packet>(data);
-        contract::check_wire::<V3Control>(data);
-        contract::check_wire::<V3Data<4>>(data);
-        contract::check_wire::<V3Data<8>>(data);
-        contract::check_wire::<ControlMessage>(data);
-        contract::check_wire::<Avp>(data);
-        if let Ok(m) = ControlMessage::parse(data) {
-            let body = m.to_bytes().unwrap();
-            if !body.is_empty() {
-                let long = body.repeat(MAX_MESSAGE / body.len() + 1);
-                let c = V3Control {
-                    connection: 1,
-                    ns: 0,
-                    nr: 0,
-                    payload: long,
-                };
-                assert_eq!(c.to_bytes(), Err(Error::Unwritable));
-            }
-        }
-    }
-
     #[test]
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x5eed_1701);
@@ -1815,7 +1896,7 @@ mod tests {
                 data = if i % 2 == 0 { sccrq() } else { sccrq_v3() };
                 mutate(&mut rng, &mut data);
             }
-            check(&data);
+            harness::check(&data);
             if Packet::parse(&data).is_ok() {
                 parsed += 1;
             }
@@ -1827,7 +1908,7 @@ mod tests {
             // The datagram a byte at a time: every prefix reads or fails
             // without a panic, and the first two bytes decide nothing.
             for n in 0..data.len() {
-                check(&data[..n]);
+                harness::check(&data[..n]);
                 if n < 2 {
                     assert_eq!(Packet::parse(&data[..n]), Err(Error::Truncated));
                 }

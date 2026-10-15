@@ -39,6 +39,7 @@ fn round_trip(b: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    fictionet::stdlib::asn1::harness::check(data);
     contract::check_decode(Frames::<Frame>::new, data);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Frame>(data);

@@ -15,6 +15,7 @@ use fictionet::stdlib::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    fictionet::stdlib::portmap::harness::check(data);
     // The stream, split two ways: all at once, and a byte at a time.
     let limit = 4096;
     contract::check_decode(|| onc_rpc::Fragments::with_limit(limit), data);
