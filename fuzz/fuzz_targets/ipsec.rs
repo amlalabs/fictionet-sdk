@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::ipsec::{
-    AhPacket, Datagram, Error, EspPacket, MAX_DATAGRAM, MAX_PADDING, Plaintext,
+    AhPacket, Datagram, Envelope, Error, EspPacket, MAX_DATAGRAM, MAX_PADDING, Plaintext,
 };
 use fictionet::stdlib::{
     codec::{Collect, Wire},
@@ -13,6 +13,24 @@ use fictionet::stdlib::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    let envelope = match data {
+        [0xff] => Some(Envelope::Keepalive),
+        [0, 0, 0, 0, rest @ ..] => Some(Envelope::Ike(rest)),
+        [_, _, _, _, ..] => Some(Envelope::Esp(data)),
+        _ => None,
+    };
+    assert_eq!(Envelope::classify(data), envelope);
+    let datagram = if data.len() > MAX_DATAGRAM {
+        Err(Error::TooLong)
+    } else {
+        match envelope {
+            None => Err(Error::Truncated),
+            Some(Envelope::Keepalive) => Ok(Datagram::Keepalive),
+            Some(Envelope::Ike(message)) => Ok(Datagram::Ike(message.to_vec())),
+            Some(Envelope::Esp(packet)) => EspPacket::parse(packet).map(Datagram::Esp),
+        }
+    };
+    assert_eq!(Datagram::parse(data), datagram);
     contract::check_decode_with_alloc_limit(
         || Collect::<ipsec::EspPacket>::new(ipsec::MAX_PACKET),
         data,

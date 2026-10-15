@@ -3,6 +3,7 @@
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::ike::*;
+use fictionet::stdlib::ipsec::Envelope;
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
@@ -25,6 +26,17 @@ fn check_chain(first: u8, data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    let datagram = if data.len() > MAX_MESSAGE + NON_ESP_MARKER.len() {
+        Err(Error::Limit("datagram bytes"))
+    } else {
+        match Envelope::classify(data) {
+            None => Err(Error::Short),
+            Some(Envelope::Keepalive) => Ok(NatT::Keepalive),
+            Some(Envelope::Ike(message)) => Message::parse(message).map(NatT::Ike),
+            Some(Envelope::Esp(packet)) => Ok(NatT::Esp(packet.to_vec())),
+        }
+    };
+    assert_eq!(NatT::parse(data), datagram);
     contract::check_wire::<Header>(data);
     contract::check_wire::<Message>(data);
     contract::check_wire::<NatT>(data);

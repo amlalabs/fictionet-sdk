@@ -22,6 +22,8 @@
 //! the encrypted fragment (SKF, RFC 7383) are kept as bytes, and so is
 //! any other payload. On port 4500 an IKE message follows four zero bytes,
 //! the non-ESP marker, so a receiver can tell it from ESP ([`NatT`]).
+//! [`Envelope::classify`] provides the shared borrowed classification without
+//! validating either payload or imposing a size limit.
 //!
 //! Nothing here reads a socket or does any cryptography. A world that
 //! plays a VPN gateway passes each UDP payload it gets to
@@ -88,6 +90,7 @@
 use fictionet::stdlib::codec::{Reader, Truncated, be16};
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::ipsec::Envelope;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -95,7 +98,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 pub const PORT: u16 = 500;
 /// The UDP port IKE moves to when there is a NAT between the peers. IKE
 /// messages on it follow the [`NON_ESP_MARKER`].
-pub const NAT_T_PORT: u16 = 4500;
+pub use fictionet::stdlib::ipsec::NAT_T_PORT;
 /// The length of the IKE header.
 pub const HEADER_LEN: usize = 28;
 /// The length of the generic payload header.
@@ -128,12 +131,12 @@ pub const MAX_DELETE_SPIS: usize = 4096;
 pub const MAX_SPI: usize = 255;
 /// The major version this module reads: IKEv2.
 pub const MAJOR_VERSION: u8 = 2;
-/// The four zero bytes before an IKE message on port 4500. ESP packets
-/// start with a nonzero SPI there instead.
-pub const NON_ESP_MARKER: [u8; 4] = [0; 4];
 /// The single byte a peer behind a NAT sends on port 4500 to keep the
 /// NAT's mapping open (RFC 3948).
-pub const NAT_KEEPALIVE: u8 = 0xff;
+pub use fictionet::stdlib::ipsec::KEEPALIVE as NAT_KEEPALIVE;
+/// The four zero bytes before an IKE message on port 4500. ESP packets
+/// start with a nonzero SPI there instead.
+pub use fictionet::stdlib::ipsec::NON_ESP_MARKER;
 
 /// Exchange types, from the header.
 pub mod exchange {
@@ -1493,13 +1496,10 @@ impl Wire for NatT {
             return Err(Error::Limit("datagram bytes"));
         }
 
-        if b == [NAT_KEEPALIVE] {
-            return Ok(NatT::Keepalive);
-        }
-        match b.get(..4) {
-            None => Err(Error::Short),
-            Some(m) if m == NON_ESP_MARKER => Message::parse(&b[4..]).map(NatT::Ike),
-            Some(_) => Ok(NatT::Esp(b.to_vec())),
+        match Envelope::classify(b).ok_or(Error::Short)? {
+            Envelope::Keepalive => Ok(NatT::Keepalive),
+            Envelope::Ike(message) => Message::parse(message).map(NatT::Ike),
+            Envelope::Esp(packet) => Ok(NatT::Esp(packet.to_vec())),
         }
     }
 
@@ -2290,6 +2290,98 @@ mod tests {
             Some(payload::AUTH)
         );
         assert_eq!(m.payload(payload::EAP), None);
+    }
+
+    #[test]
+    fn nat_t_wrapper_policies() {
+        use fictionet::stdlib::ipsec::{self, Datagram, EspPacket};
+
+        assert_eq!(NAT_T_PORT, ipsec::NAT_T_PORT);
+        assert_eq!(NON_ESP_MARKER, ipsec::NON_ESP_MARKER);
+        assert_eq!(NAT_KEEPALIVE, ipsec::KEEPALIVE);
+        for b in [
+            &[][..],
+            &[0],
+            &[0, 0],
+            &[0, 0, 0],
+            &[1],
+            &[1, 2],
+            &[1, 2, 3],
+            &[0xff, 0xff],
+        ] {
+            assert_eq!(Datagram::parse(b), Err(ipsec::Error::Truncated));
+            assert_eq!(NatT::parse(b), Err(Error::Short));
+        }
+        assert_eq!(Datagram::parse(&[0xff]), Ok(Datagram::Keepalive));
+        assert_eq!(NatT::parse(&[0xff]), Ok(NatT::Keepalive));
+        for len in 4..4 + HEADER_LEN {
+            let bytes = vec![0; len];
+            assert_eq!(
+                Datagram::parse(&bytes),
+                Ok(Datagram::Ike(bytes[4..].to_vec()))
+            );
+            assert_eq!(NatT::parse(&bytes), Err(Error::Short));
+        }
+        for spi in [1u32, 0x100, 0x10000, 0x1000000, u32::MAX] {
+            for len in 4..=ipsec::MIN_ESP_LEN {
+                let mut bytes = spi.to_be_bytes().to_vec();
+                bytes.resize(len, 0);
+                assert_eq!(NatT::parse(&bytes), Ok(NatT::Esp(bytes.clone())));
+                let expected = if len < ipsec::MIN_ESP_LEN {
+                    Err(ipsec::Error::Truncated)
+                } else {
+                    Ok(Datagram::Esp(EspPacket {
+                        spi,
+                        sequence: 0,
+                        payload: vec![0, 0],
+                    }))
+                };
+                assert_eq!(Datagram::parse(&bytes), expected);
+            }
+        }
+        let message = message(vec![]);
+        let bytes = NatT::Ike(message.clone()).to_bytes().unwrap();
+        assert_eq!(
+            Datagram::parse(&bytes),
+            Ok(Datagram::Ike(bytes[4..].to_vec()))
+        );
+        assert_eq!(NatT::parse(&bytes), Ok(NatT::Ike(message)));
+
+        for len in [
+            ipsec::MAX_DATAGRAM,
+            ipsec::MAX_DATAGRAM + 1,
+            MAX_MESSAGE + 4,
+            MAX_MESSAGE + 5,
+        ] {
+            for first in [0, 1] {
+                let mut bytes = vec![0; len];
+                bytes[0] = first;
+                if len > ipsec::MAX_DATAGRAM {
+                    assert_eq!(Datagram::parse(&bytes), Err(ipsec::Error::TooLong));
+                } else if first == 0 {
+                    assert_eq!(
+                        Datagram::parse(&bytes),
+                        Ok(Datagram::Ike(bytes[4..].to_vec()))
+                    );
+                } else {
+                    assert_eq!(
+                        Datagram::parse(&bytes),
+                        Ok(Datagram::Esp(EspPacket {
+                            spi: 0x1000000,
+                            sequence: 0,
+                            payload: vec![0; len - ipsec::ESP_HEADER_LEN],
+                        }))
+                    );
+                }
+                if len > MAX_MESSAGE + 4 {
+                    assert_eq!(NatT::parse(&bytes), Err(Error::Limit("datagram bytes")));
+                } else if first == 0 {
+                    assert_eq!(NatT::parse(&bytes), Err(Error::Version(0)));
+                } else {
+                    assert_eq!(NatT::parse(&bytes), Ok(NatT::Esp(bytes)));
+                }
+            }
+        }
     }
 
     #[test]

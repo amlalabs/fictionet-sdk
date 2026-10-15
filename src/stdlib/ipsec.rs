@@ -5,9 +5,10 @@
 //! keys and cryptographic processing.
 //!
 //! `EspPacket`, `AhPacket`, and NAT traversal datagrams implement `Wire`.
-//! `Plaintext` reads and writes decrypted ESP payloads. There is no
-//! cryptography, security association state machine, protocol stream decoder,
-//! or live tunnel transport.
+//! [`Envelope::classify`] borrows NAT-T payloads without validating IKE or
+//! ESP or imposing a size limit. `Plaintext` reads and writes decrypted ESP
+//! payloads. There is no cryptography, security association state machine,
+//! protocol stream decoder, or live tunnel transport.
 //!
 //! IPsec protects IP packets with keys two hosts agree on, usually through
 //! IKE. It adds one of two headers. ESP (the Encapsulating Security
@@ -458,6 +459,47 @@ impl AhPacket {
     }
 }
 
+/// A borrowed NAT-T envelope, without payload validation or a size limit.
+/// [`Datagram`] validates ESP and keeps IKE opaque. [`fictionet::stdlib::ike::NatT`]
+/// validates IKE and keeps ESP opaque. Each wrapper applies its own size limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Envelope<'a> {
+    /// The single byte [`KEEPALIVE`].
+    Keepalive,
+    /// Bytes after the [`NON_ESP_MARKER`], which may be empty.
+    Ike(&'a [u8]),
+    /// The whole UDP payload, starting with a nonzero four-byte SPI.
+    Esp(&'a [u8]),
+}
+
+impl<'a> Envelope<'a> {
+    /// Classifies a whole UDP payload on [`NAT_T_PORT`] without allocating.
+    /// Returns `None` for fewer than four bytes, except for the one-byte
+    /// keepalive. Four zero bytes mark IKE; any other four-byte prefix marks ESP.
+    /// The payload is not validated, and there is no maximum length.
+    ///
+    /// ```
+    /// use fictionet::stdlib::ipsec::Envelope;
+    ///
+    /// assert_eq!(Envelope::classify(&[0xff]), Some(Envelope::Keepalive));
+    /// assert_eq!(Envelope::classify(&[0, 0, 0, 0]), Some(Envelope::Ike(&[])));
+    /// let esp = [0, 0, 0, 1];
+    /// assert_eq!(Envelope::classify(&esp), Some(Envelope::Esp(&esp)));
+    /// assert_eq!(Envelope::classify(&[0, 0, 0]), None);
+    /// ```
+    pub fn classify(b: &'a [u8]) -> Option<Self> {
+        if b == [KEEPALIVE] {
+            return Some(Self::Keepalive);
+        }
+        let marker = b.get(..NON_ESP_MARKER.len())?;
+        if marker == NON_ESP_MARKER {
+            Some(Self::Ike(&b[NON_ESP_MARKER.len()..]))
+        } else {
+            Some(Self::Esp(b))
+        }
+    }
+}
+
 /// One UDP datagram on port [`NAT_T_PORT`], as RFC 3948 sorts them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Datagram {
@@ -621,19 +663,14 @@ impl Wire for Datagram {
     /// and an ESP packet with a zero SPI. Returns [`Error::TooLong`]
     /// for more than [`MAX_DATAGRAM`] bytes.
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        if b == [KEEPALIVE] {
-            return Ok(Datagram::Keepalive);
-        }
         if b.len() > MAX_DATAGRAM {
             return Err(Error::TooLong);
         }
-        if b.len() < NON_ESP_MARKER.len() {
-            return Err(Error::Truncated);
+        match Envelope::classify(b).ok_or(Error::Truncated)? {
+            Envelope::Keepalive => Ok(Datagram::Keepalive),
+            Envelope::Ike(message) => Ok(Datagram::Ike(message.to_vec())),
+            Envelope::Esp(packet) => EspPacket::parse(packet).map(Datagram::Esp),
         }
-        if b[..4] == NON_ESP_MARKER {
-            return Ok(Datagram::Ike(b[4..].to_vec()));
-        }
-        EspPacket::parse(b).map(Datagram::Esp)
     }
 
     /// Appends a NAT-T datagram. Refuses datagrams above [`MAX_DATAGRAM`]
@@ -997,6 +1034,31 @@ mod tests {
             [4, 2, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 0]
         );
         assert_eq!(p.to_bytes().unwrap(), b);
+    }
+
+    #[test]
+    fn borrowed_envelopes() {
+        for b in [&[][..], &[0], &[0, 0], &[0, 0, 0], &[0xff, 0xff]] {
+            assert_eq!(Envelope::classify(b), None);
+        }
+        assert_eq!(Envelope::classify(&[0xff]), Some(Envelope::Keepalive));
+        assert_eq!(Envelope::classify(&[0; 4]), Some(Envelope::Ike(&[])));
+        let ike = [0, 0, 0, 0, 1, 2, 3];
+        let Some(Envelope::Ike(payload)) = Envelope::classify(&ike) else {
+            panic!("expected IKE");
+        };
+        assert!(core::ptr::eq(payload, &ike[4..]));
+        for spi in [1u32, 0x100, 0x10000, 0x1000000, u32::MAX] {
+            let bytes = spi.to_be_bytes();
+            let Some(Envelope::Esp(payload)) = Envelope::classify(&bytes) else {
+                panic!("expected ESP");
+            };
+            assert!(core::ptr::eq(payload, &bytes[..]));
+        }
+        let mut long = vec![0; MAX_PACKET + 5];
+        assert_eq!(Envelope::classify(&long), Some(Envelope::Ike(&long[4..])));
+        long[0] = 1;
+        assert_eq!(Envelope::classify(&long), Some(Envelope::Esp(&long)));
     }
 
     #[test]
