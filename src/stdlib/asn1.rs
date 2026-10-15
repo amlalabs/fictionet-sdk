@@ -65,6 +65,9 @@ use std::fmt;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
+/// Compatibility re-export of [`codec::write_checked`](fictionet::stdlib::codec::write_checked).
+pub use fictionet::stdlib::codec::write_checked;
+
 /// Implements DER [`Wire`] parsing and checked writing for a protocol item.
 ///
 /// Pass the local ASN.1 module path, item and error types, the refusal value,
@@ -100,29 +103,6 @@ macro_rules! der_wire {
             }
         }
     };
-}
-
-/// Encodes `value` and appends the bytes only if `decode` reads the same value.
-///
-/// Use this in [`Wire::write`] implementations with separate encode and decode
-/// functions. Those functions must enforce the type's size and field limits.
-/// The temporary encoding is kept only for this call.
-///
-/// Returns an encoding error unchanged. Returns `unwritable` if decoding fails
-/// or changes the value. Leaves `out` unchanged on either error.
-pub fn write_checked<T: PartialEq, E>(
-    value: &T,
-    encode: impl FnOnce(&T) -> Result<Vec<u8>, E>,
-    decode: impl FnOnce(&[u8]) -> Result<T, E>,
-    unwritable: E,
-    out: &mut Vec<u8>,
-) -> Result<(), E> {
-    let bytes = encode(value)?;
-    if decode(&bytes).as_ref().ok() != Some(value) {
-        return Err(unwritable);
-    }
-    out.extend_from_slice(&bytes);
-    Ok(())
 }
 
 /// The longest element, header and contents together, a reader accepts and
@@ -2685,20 +2665,6 @@ mod tests {
         let mut bytes = Vec::new();
         tag.encode(&mut bytes);
         bytes
-    }
-
-    #[test]
-    fn review_write_checked_rejects_lossy_encoding() {
-        let mut out = vec![42];
-        let result = write_checked(
-            &256u16,
-            |v| Ok(vec![*v as u8]),
-            |b| Ok(u16::from(b[0])),
-            Error::Integer,
-            &mut out,
-        );
-        assert_eq!(result, Err(Error::Integer));
-        assert_eq!(out, [42]);
     }
 
     #[test]

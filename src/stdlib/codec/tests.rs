@@ -2323,3 +2323,47 @@ fn demux_shrink_reclaims_partial_and_terminal_streams() {
     assert_eq!(demux.get_mut(&1).unwrap().offset(), 4);
     assert_eq!(demux.buffered(), 0);
 }
+
+#[test]
+fn review_write_checked_rejects_lossy_encoding() {
+    use fictionet::stdlib::asn1::Error;
+
+    let mut out = vec![42];
+    let result = write_checked(
+        &256u16,
+        |v| Ok(vec![*v as u8]),
+        |b| Ok(u16::from(b[0])),
+        Error::Integer,
+        &mut out,
+    );
+    assert_eq!(result, Err(Error::Integer));
+    assert_eq!(out, [42]);
+}
+
+#[test]
+fn write_checked_preserves_encoding_errors() {
+    let mut out = vec![42];
+    let result = write_checked(
+        &1u8,
+        |_| Err("encode"),
+        |_| panic!("decode must not run after an encoding error"),
+        "unwritable",
+        &mut out,
+    );
+    assert_eq!(result, Err("encode"));
+    assert_eq!(out, [42]);
+}
+
+#[test]
+fn write_checked_translates_decoding_errors() {
+    let mut out = vec![42];
+    let result = write_checked(
+        &1u8,
+        |v| Ok(vec![*v]),
+        |_| Err("decode"),
+        "unwritable",
+        &mut out,
+    );
+    assert_eq!(result, Err("unwritable"));
+    assert_eq!(out, [42]);
+}

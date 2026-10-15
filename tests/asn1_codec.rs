@@ -6,6 +6,26 @@ use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{asn1, kerberos, ldap, ocsp, spnego, x509};
 
+#[test]
+fn checked_writer_imports_are_compatible() {
+    use fictionet::stdlib::codec::write_checked;
+
+    for write in [write_checked, asn1::write_checked] {
+        let mut out = vec![42];
+        assert_eq!(
+            write(
+                &7u16,
+                |v: &u16| Ok(vec![*v as u8]),
+                |b: &[u8]| Ok(u16::from(b[0])),
+                asn1::Error::Integer,
+                &mut out,
+            ),
+            Ok(())
+        );
+        assert_eq!(out, [42, 7]);
+    }
+}
+
 fn round_trip<D: Decode>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
 where
     D::Item: Debug + PartialEq,

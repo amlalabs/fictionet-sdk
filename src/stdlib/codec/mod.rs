@@ -18,6 +18,8 @@
 //! stream of values whose length a [`Prefixed`] parser can tell from their
 //! first bytes. [`Lines`] splits lines, and [`Collect`] reads one value
 //! that ends at the end of input.
+//! [`write_checked`] appends an encoding only if it decodes to the same value.
+//! Its encode and decode functions enforce the protocol's size and field limits.
 //!
 //! The combinators build bigger decoders from smaller ones. [`Map`] changes
 //! each item. [`Assemble`] joins fragments into one message. [`Pipe`] feeds
@@ -224,6 +226,7 @@ pub mod ascii;
 pub mod base64;
 mod bounded;
 mod buffer;
+mod checked;
 pub mod civil;
 mod combinators;
 pub mod crc32c;
@@ -249,6 +252,7 @@ mod stream;
 
 pub use bounded::{ReserveError, reserve_bytes};
 pub use buffer::Buffer;
+pub use checked::write_checked;
 pub use combinators::{
     Assemble, AssembleError, Assembled, Collect, CollectError, Ending, Fragment, LineError, Lines,
     Map,

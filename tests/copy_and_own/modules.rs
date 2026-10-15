@@ -28,6 +28,8 @@ macro_rules! protocols {
         pub mod cboe_boe;
         #[path = "../../src/stdlib/cboe_pitch.rs"]
         pub mod cboe_pitch;
+        #[path = "../../src/stdlib/codec/checked.rs"]
+        pub mod checked;
         #[path = "../../src/stdlib/codec/civil.rs"]
         pub mod civil;
         #[path = "../../src/stdlib/cme_mdp3.rs"]
