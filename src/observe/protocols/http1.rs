@@ -1,11 +1,30 @@
 use super::{Display, MAX_BUFFER};
-use fictionet::observe::{Decoded, Layer, Placement, Present};
+use fictionet::events::Transport;
+use fictionet::observe::{Decoded, Layer, Match, Placement, Present, Registry};
 use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::http1;
 use fictionet::sync::Mutex;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
+
+/// HTTP/1 framing capacity plus one packet of read-ahead.
+const HTTP1_READ_AHEAD: usize = MAX_BUFFER + 1 + 65_535;
+
+fn looks_like_http1(b: &[u8]) -> bool {
+    let methods: [&[u8]; 9] = [
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"HEAD ",
+        b"DELETE ",
+        b"OPTIONS ",
+        b"PATCH ",
+        b"CONNECT ",
+        b"TRACE ",
+    ];
+    b.starts_with(b"HTTP/1.") || methods.iter().any(|m| b.starts_with(m))
+}
 
 /// HTTP/1 capture parser. It shares a bounded request-method queue with
 /// the other direction so HEAD and CONNECT responses retain their framing.
@@ -22,6 +41,25 @@ pub struct Http1 {
     final_chunk: Option<usize>,
 }
 impl Http1 {
+    /// Registers `http1` for TCP method or response prefixes, or `http/1.1` ALPN.
+    /// The `h2` ALPN excludes prefix matching. Uses bounded packet read-ahead.
+    pub fn register(registry: &mut Registry) {
+        registry.register_with_buffer(
+            "http1",
+            |s| {
+                if s.transport == Transport::Tcp
+                    && (s.alpn == Some("http/1.1")
+                        || (s.alpn != Some("h2") && looks_like_http1(s.first)))
+                {
+                    Match::Yes
+                } else {
+                    Match::No
+                }
+            },
+            HTTP1_READ_AHEAD,
+            |_| Self::pair(),
+        );
+    }
     /// Creates request and response decoders with one shared method queue.
     /// The first decoder accounts for its at most 64 bytes in `held()`.
     pub fn pair() -> [Self; 2] {

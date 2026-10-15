@@ -1,12 +1,36 @@
 use super::Display;
-use fictionet::observe::{Decoded, Layer, Placement, Present};
+use fictionet::events::Transport;
+use fictionet::observe::{Decoded, Layer, Match, Placement, Present, Registry};
 use fictionet::stdlib::codec::{Decode, Step};
+use fictionet::stdlib::dhcp;
 use std::convert::Infallible;
 
 /// One DHCP datagram, parsed at EOF with the stdlib message parser.
 #[derive(Default)]
 pub struct Dhcp {
     taken: bool,
+}
+impl Dhcp {
+    /// Registers `dhcp` for UDP between the server and client ports.
+    pub fn register(registry: &mut Registry) {
+        registry.register(
+            "dhcp",
+            |s| {
+                if s.transport == Transport::Udp
+                    && matches!(
+                        s.ports,
+                        (dhcp::SERVER_PORT, dhcp::CLIENT_PORT)
+                            | (dhcp::CLIENT_PORT, dhcp::SERVER_PORT)
+                    )
+                {
+                    Match::Yes
+                } else {
+                    Match::No
+                }
+            },
+            |_| [Self::default(), Self::default()],
+        );
+    }
 }
 impl Decode for Dhcp {
     type Item = Display;

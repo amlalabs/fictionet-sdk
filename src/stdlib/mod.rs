@@ -185,8 +185,10 @@
 //! adapter belongs in `src/observe/`, implements
 //! [`Present`](fictionet::observe::Present) on its decoder, and keeps observe
 //! dependencies out of the protocol file. For a built-in presenter, declare
-//! the adapter in the observe module and register its matcher and factory
-//! in `src/observe/app.rs`. For a local copy, install a custom
+//! the adapter in the observe module. Put its matcher, factory and input
+//! read-ahead in the adapter's `register` method. Call that method from
+//! `src/observe/app.rs`. That file sets the default registration order and
+//! creates the shared HTTP/2 `CaptureBudget`. For a local copy, install a custom
 //! [`Registry`](fictionet::observe::Registry) with
 //! [`Cx::observe_protocols`](fictionet::Cx::observe_protocols) before watches
 //! start, as the observe guide shows.

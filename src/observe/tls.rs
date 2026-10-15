@@ -1,7 +1,7 @@
 use fictionet::events::Transport;
 use fictionet::observe::{
-    Conversation, Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol, Registry,
-    protocols,
+    Conversation, Decoded, KeyLine, Layer, Match, Observed, Place, Placement, Present, Protocol,
+    Registry, protocols,
 };
 use fictionet::stdlib::codec::{be16, be24};
 
@@ -30,13 +30,28 @@ struct Tls {
 }
 
 /// A TLS capture session with record framing, handshake state, and TLS 1.3
-/// decryption from key log entries. Register with [`Registry::register_protocol`].
+/// decryption from key log entries. Register with [`Self::register`].
 /// The supplied registry also selects protocols in the decrypted stream.
 pub struct TlsSession {
     tls: Tls,
     dirs: [Option<Observed<protocols::TlsRecords>>; 2],
 }
 impl TlsSession {
+    /// Registers `tls` for TCP starting with a TLS handshake record prefix.
+    /// Each session clones the active registry to select decrypted protocols.
+    pub fn register(registry: &mut Registry) {
+        registry.register_protocol(
+            "tls",
+            |s| {
+                if s.transport == Transport::Tcp && s.first.starts_with(&[0x16, 0x03]) {
+                    Match::Yes
+                } else {
+                    Match::No
+                }
+            },
+            |s, registry| Box::new(Self::new(s.ports, registry.clone())),
+        );
+    }
     /// Creates both record directions using the conversation ports and registry.
     pub fn new(ports: (u16, u16), registry: Registry) -> Self {
         Self {

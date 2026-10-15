@@ -1,5 +1,6 @@
 use super::{Display, MAX_BUFFER};
-use fictionet::observe::{Decoded, Layer, Placement, Present};
+use fictionet::events::Transport;
+use fictionet::observe::{Decoded, Layer, Match, Placement, Present, Registry};
 use fictionet::stdlib::codec::{Decode, Step};
 use std::convert::Infallible;
 use std::fmt::Write;
@@ -12,6 +13,28 @@ pub struct Dns {
     skip: usize,
 }
 impl Dns {
+    /// Registers `dns` when either port is 53, on UDP or TCP.
+    /// TCP messages use a two-byte length prefix.
+    /// Uses 65,538 bytes of input read-ahead.
+    pub fn register(registry: &mut Registry) {
+        registry.register_with_buffer(
+            "dns",
+            |s| {
+                if s.ports.0 == 53 || s.ports.1 == 53 {
+                    Match::Yes
+                } else {
+                    Match::No
+                }
+            },
+            65_538,
+            |s| {
+                [
+                    Self::new(s.transport == Transport::Tcp),
+                    Self::new(s.transport == Transport::Tcp),
+                ]
+            },
+        );
+    }
     /// `tcp` enables the two-byte length prefix. Otherwise EOF ends a datagram.
     pub fn new(tcp: bool) -> Self {
         Self {

@@ -9,128 +9,19 @@
 //! in that packet, its fields point at the packet's own bytes; otherwise
 //! the message gets a buffer of its own, as Wireshark's "Reassembled TCP".
 
-use fictionet::stdlib::{dhcp, http2};
-
+use super::Registry;
 use super::http2 as capture;
-
 use super::protocols;
 use super::tls::TlsSession;
-use super::{Match, Registry};
-use crate::events::Transport;
-
-// ---------------------------------------------------------------------------
-// TCP conversations
-
-fn looks_like_http1(b: &[u8]) -> bool {
-    let methods: [&[u8]; 9] = [
-        b"GET ",
-        b"POST ",
-        b"PUT ",
-        b"HEAD ",
-        b"DELETE ",
-        b"OPTIONS ",
-        b"PATCH ",
-        b"CONNECT ",
-        b"TRACE ",
-    ];
-    b.starts_with(b"HTTP/1.") || methods.iter().any(|m| b.starts_with(m))
-}
-
-fn register_http(registry: &mut Registry) {
-    registry.register_with_buffer(
-        "http1",
-        |s| {
-            if s.transport == Transport::Tcp
-                && (s.alpn == Some("http/1.1")
-                    || (s.alpn != Some("h2") && looks_like_http1(s.first)))
-            {
-                Match::Yes
-            } else {
-                Match::No
-            }
-        },
-        protocols::HTTP1_READ_AHEAD,
-        |_| protocols::Http1::pair(),
-    );
-    let budget = capture::CaptureBudget::default();
-    registry.register_with_buffer(
-        "http2",
-        |s| {
-            if s.transport != Transport::Tcp || s.alpn == Some("http/1.1") {
-                Match::No
-            } else if s.alpn == Some("h2") || s.first.starts_with(http2::PREFACE) {
-                Match::Yes
-            } else if http2::PREFACE.starts_with(s.first) {
-                Match::More
-            } else {
-                Match::No
-            }
-        },
-        capture::CAPTURE_READ_AHEAD,
-        move |_| capture::Capture::pair_in(&budget),
-    );
-}
 
 pub(super) fn register(registry: &mut Registry) {
-    register_http(registry);
-    registry.register_protocol(
-        "tls",
-        |s| {
-            if s.transport == Transport::Tcp && s.first.starts_with(&[0x16, 0x03]) {
-                Match::Yes
-            } else {
-                Match::No
-            }
-        },
-        |s, registry| Box::new(TlsSession::new(s.ports, registry.clone())),
-    );
-    registry.register_protocol(
-        "modbus",
-        |s| {
-            if s.transport == Transport::Tcp
-                && (s.ports.0 == crate::stdlib::modbus::PORT
-                    || s.ports.1 == crate::stdlib::modbus::PORT)
-            {
-                Match::Yes
-            } else {
-                Match::No
-            }
-        },
-        |s, _| Box::new(protocols::ModbusSession::new(s.ports)),
-    );
-    registry.register(
-        "dhcp",
-        |s| {
-            if s.transport == Transport::Udp
-                && matches!(
-                    s.ports,
-                    (dhcp::SERVER_PORT, dhcp::CLIENT_PORT) | (dhcp::CLIENT_PORT, dhcp::SERVER_PORT)
-                )
-            {
-                Match::Yes
-            } else {
-                Match::No
-            }
-        },
-        |_| [protocols::Dhcp::default(), protocols::Dhcp::default()],
-    );
-    registry.register_with_buffer(
-        "dns",
-        |s| {
-            if s.ports.0 == 53 || s.ports.1 == 53 {
-                Match::Yes
-            } else {
-                Match::No
-            }
-        },
-        65_538,
-        |s| {
-            [
-                protocols::Dns::new(s.transport == Transport::Tcp),
-                protocols::Dns::new(s.transport == Transport::Tcp),
-            ]
-        },
-    );
+    protocols::Http1::register(registry);
+    let budget = capture::CaptureBudget::default();
+    capture::Capture::register(registry, &budget);
+    TlsSession::register(registry);
+    protocols::ModbusSession::register(registry);
+    protocols::Dhcp::register(registry);
+    protocols::Dns::register(registry);
 }
 
 #[cfg(all(test, feature = "observe"))]
@@ -138,8 +29,8 @@ mod tests {
     use super::*;
     use crate::observe::Decoded;
     use crate::observe::{Conversation, Observed, Place};
+    use fictionet::stdlib::http2::PREFACE as HTTP2_PREFACE;
     use fictionet::stdlib::test_support::hex;
-    use http2::PREFACE as HTTP2_PREFACE;
 
     fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
         let len = payload.len() as u32;

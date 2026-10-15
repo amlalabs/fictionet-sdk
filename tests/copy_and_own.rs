@@ -371,14 +371,65 @@ fn copied_presenters_plug_into_observe_and_construct_display_items() {
 
 #[cfg(feature = "observe")]
 #[test]
+fn copied_capture_registrations_keep_inventory_and_matching_precedence() {
+    use fictionet::events::Transport::{Tcp, Udp};
+    use fictionet::observe::{Match, Registry, Selection};
+
+    let mut copied = Registry::new();
+    observe_protocols::Http1::register(&mut copied);
+    let budget = observe_http2::CaptureBudget::default();
+    observe_http2::Capture::register(&mut copied, &budget);
+    observe_tls::TlsSession::register(&mut copied);
+    observe_protocols::ModbusSession::register(&mut copied);
+    observe_protocols::Dhcp::register(&mut copied);
+    observe_protocols::Dns::register(&mut copied);
+
+    for registry in [Registry::default(), copied] {
+        assert_eq!(
+            registry.names().collect::<Vec<_>>(),
+            ["http1", "http2", "tls", "modbus", "dhcp", "dns"]
+        );
+        for (transport, ports, first, alpn, expected) in [
+            (Tcp, (40000, 53), &b"GET /"[..], None, Ok("dns")),
+            (Udp, (53, 68), b"", None, Ok("dns")),
+            (Tcp, (53, 502), b"\x16\x03", Some("h2"), Ok("dns")),
+            (Udp, (67, 68), b"GET /", None, Ok("dhcp")),
+            (Udp, (68, 67), b"", None, Ok("dhcp")),
+            (Udp, (67, 69), b"", None, Err(Match::No)),
+            (Tcp, (67, 68), b"other", None, Err(Match::No)),
+            (Tcp, (40000, 502), b"GET /", None, Ok("modbus")),
+            (Tcp, (502, 40000), b"\x16\x03", Some("h2"), Ok("modbus")),
+            (Udp, (40000, 502), b"other", None, Err(Match::No)),
+            (Tcp, (40000, 443), b"\x16\x03", Some("h2"), Ok("tls")),
+            (Tcp, (40000, 443), b"\x16", None, Err(Match::No)),
+            (Tcp, (40000, 80), b"PRI *", None, Err(Match::More)),
+            (Tcp, (40000, 80), http2::PREFACE, None, Ok("http2")),
+            (Tcp, (40000, 443), b"GET /", Some("h2"), Ok("http2")),
+            (Tcp, (40000, 443), b"PRI *", Some("http/1.1"), Ok("http1")),
+            (Tcp, (40000, 80), b"HTTP/1.1", None, Ok("http1")),
+            (Tcp, (40000, 80), b"GET /", Some("unknown"), Ok("http1")),
+            (Tcp, (40000, 80), b"GE", None, Err(Match::No)),
+            (Udp, (40000, 80), b"GET /", Some("http/1.1"), Err(Match::No)),
+            (Udp, (40000, 443), b"\x16\x03", Some("h2"), Err(Match::No)),
+            (Tcp, (40000, 80), b"", None, Err(Match::More)),
+        ] {
+            let selection = Selection {
+                transport,
+                ports,
+                first,
+                alpn,
+            };
+            assert_eq!(registry.select(selection), expected, "{selection:?}");
+        }
+    }
+}
+
+#[cfg(feature = "observe")]
+#[test]
 fn copied_modbus_session_stops_both_directions_after_bad_framing() {
-    use fictionet::observe::{Conversation, Decoded, Match, Place, Registry};
+    use fictionet::observe::{Conversation, Decoded, Place, Registry};
     let mut registry = Registry::new();
-    registry.register_protocol(
-        "modbus",
-        |_| Match::Yes,
-        |s, _| Box::new(observe_protocols::ModbusSession::new(s.ports)),
-    );
+    observe_protocols::ModbusSession::register(&mut registry);
     let mut conversation = Conversation::with_registry(40000, 502, registry);
     let bad = [0, 9, 0, 5, 0, 6, 1, 3, 0, 0, 0, 1];
     let reply = [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2];
@@ -394,13 +445,9 @@ fn copied_modbus_session_stops_both_directions_after_bad_framing() {
 #[cfg(feature = "observe")]
 #[test]
 fn copied_tls_and_selection_driver_use_the_public_registry() {
-    use fictionet::observe::{Decoded, Match, Place, Registry};
+    use fictionet::observe::{Decoded, Place, Registry};
     let mut registry = Registry::default();
-    registry.register_protocol(
-        "tls",
-        |_| Match::Yes,
-        |s, registry| Box::new(observe_tls::TlsSession::new(s.ports, registry.clone())),
-    );
+    observe_tls::TlsSession::register(&mut registry);
     let mut conversation = observe_conversation::Conversation::with_registry(40000, 443, registry);
     let mut packet = Decoded::default();
     let record = [22, 3, 3, 0, 4, 20, 0, 0, 0];

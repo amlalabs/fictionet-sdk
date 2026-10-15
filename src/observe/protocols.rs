@@ -5,9 +5,6 @@ use std::convert::Infallible;
 /// Bytes retained while an incomplete capture message is being framed.
 const MAX_BUFFER: usize = 32 << 10;
 
-/// HTTP/1 framing capacity plus one packet of read-ahead.
-pub(crate) const HTTP1_READ_AHEAD: usize = MAX_BUFFER + 1 + 65_535;
-
 /// A decoded item's relative layer and packet summary. Capture decoders
 /// produce this value for the shared [`Present`] implementation.
 #[derive(Clone, Debug, PartialEq, Eq)]

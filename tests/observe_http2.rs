@@ -1,6 +1,6 @@
 use fictionet::{
     events::Transport,
-    observe::{Decoded, Match, Observed, Place, Registry, Selection, http2 as capture},
+    observe::{Decoded, Observed, Place, Registry, Selection, http2 as capture},
     stdlib::{codec::Wire, grpc, hpack, http2},
 };
 
@@ -184,6 +184,37 @@ fn registry_connections_share_the_capture_data_budget() {
         refused > 0,
         "12 MiB of partial messages must exceed the shared 8 MiB budget"
     );
+}
+
+#[test]
+fn registration_keeps_the_supplied_budget_across_registry_clones() {
+    let budget = capture::CaptureBudget::new(64);
+    let mut registry = Registry::new();
+    capture::Capture::register(&mut registry, &budget);
+    let mut connections = Vec::new();
+    for held in [32, 64] {
+        let mut protocol = registry
+            .clone()
+            .open(Selection {
+                transport: Transport::Tcp,
+                ports: (40000, 443),
+                first: http2::PREFACE,
+                alpn: None,
+            })
+            .unwrap();
+        let mut partial = vec![0, 0, 0, 1, 0];
+        partial.resize(32, 0);
+        let bytes = [http2::PREFACE.as_slice(), &headers(), &data(&partial, 0)].concat();
+        let mut packet = Decoded::default();
+        protocol.data(false, &bytes, Place::default(), &mut packet, &[]);
+        assert!(!packet.tags.contains(&"malformed"));
+        assert_eq!(budget.held(), held);
+        connections.push(protocol);
+    }
+    drop(connections.pop().unwrap());
+    assert_eq!(budget.held(), 32);
+    drop(connections);
+    assert_eq!(budget.held(), 0);
 }
 
 #[test]
@@ -390,12 +421,7 @@ fn copied_capture_replaces_the_builtin_through_the_same_registry() {
     let mut builtin = Registry::default();
     let mut copied = Registry::default();
     let budget = fictionet_copy_modules::observe_http2::CaptureBudget::default();
-    copied.register_with_buffer(
-        "http2",
-        |_| Match::Yes,
-        capture::CAPTURE_READ_AHEAD,
-        move |_| fictionet_copy_modules::observe_http2::Capture::pair_in(&budget),
-    );
+    fictionet_copy_modules::observe_http2::Capture::register(&mut copied, &budget);
     assert!(builtin.choose(Transport::Tcp, "http2"));
     let selection = Selection {
         transport: Transport::Tcp,

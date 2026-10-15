@@ -19,6 +19,30 @@ empty without it. The catalog tests compare this inventory with the Observe
 column in `catalog/stdlib.rs`. Matchers, factories and presenters remain
 handwritten in `src/observe/`.
 
+Each built-in adapter owns its matcher, factory, and input read-ahead.
+Use `Http1::register`, `Dns::register`, `Dhcp::register`, or
+`ModbusSession::register` from `observe::protocols`,
+`observe::http2::Capture::register`, or `observe::tls::TlsSession::register`
+to add just that protocol. These methods use the built-in name and replace
+any earlier registration with that name. The default composition in
+`src/observe/app.rs` registers HTTP/1, HTTP/2, TLS, Modbus, DHCP, then DNS.
+Later registrations take precedence, so port-based DNS and Modbus matching
+still win over HTTP prefixes. HTTP/2 waits for a partial preface on TCP.
+
+HTTP/2 registration takes a `CaptureBudget`. The default composition creates
+one budget for all its connections and registry clones, including TLS
+plaintext. Keep that budget outside the per-connection factory:
+
+```rust
+use fictionet::observe::{Registry, http2, protocols::Http1, tls::TlsSession};
+
+let mut registry = Registry::new();
+Http1::register(&mut registry);
+let budget = http2::CaptureBudget::default();
+http2::Capture::register(&mut registry, &budget);
+TlsSession::register(&mut registry);
+```
+
 For a pcap reader or live capture, create `Dissector::with_registry(registry)`
 and call `decode(packet, keys)` in capture order. `packet` is a raw IPv4 or
 IPv6 packet. A reader for Ethernet captures must first extract the IP
@@ -97,26 +121,33 @@ These files can be copied into another crate and edited:
 - `src/observe/protocols.rs` and `src/observe/protocols/`: capture decoders
   and presenters. Copy them together, keeping the relative paths.
   `protocols/dns.rs`, `protocols/dhcp.rs`, and `protocols/http1.rs` own the
-  DNS, DHCP, and HTTP/1 adapters. Their public items remain re-exported by
-  `protocols.rs`.
+  DNS, DHCP, and HTTP/1 adapters, including their `register` methods.
+  Their public items remain re-exported by `protocols.rs`.
   `protocols/modbus.rs` owns `Modbus` and `ModbusSession`, re-exported by
-  `protocols.rs`. Register that session through `register_protocol` to stop
-  both directions after a framing error, as the built-in does. These files
-  use public observe and stdlib APIs, plus `hickory-proto`.
+  `protocols.rs`. Use `ModbusSession::register` to stop both directions after
+  a framing error, as the built-in does. These files use public observe and
+  stdlib APIs, plus `hickory-proto`.
 - `src/observe/http2.rs`: the HTTP/2 and gRPC presenter, `Capture`, with
-  `CaptureBudget`. It uses public observe and stdlib APIs. Register it
-  through `register_with_buffer`, as below.
+  `CaptureBudget`. It uses public observe and stdlib APIs. Use
+  `Capture::register` with a shared budget, as above.
 - `src/observe/tls.rs`: `TlsSession`, its key schedule, handshake parsing,
-  and record presentation. It uses public observe APIs and `ring`. Register
-  it through `register_protocol`, passing the supplied registry to `new`.
+  and record presentation. It uses public observe APIs and `ring`.
+  `TlsSession::register` passes the active registry to each new session.
 - `src/observe/conversation.rs`: the public prefix selection driver.
+
+Call the copied type's `register` method to use its matcher and factory.
+No edits to `app.rs` are needed. The copy fixture compiles the component
+directory and both standalone presenters. Tests compare their registry
+inventory and matching precedence with the built-ins. To change selection
+without editing an adapter, use the lower-level `Registry::register`,
+`register_with_buffer`, or `register_protocol` methods directly.
 
 `Display::from_packet` builds an item from a relative layer, summary, and
 tags. `Decoded::level` and `Decoded::cap_info` expose the summary
 policy. The adapter and registry require cloneable decoder errors so `Stream`
 can retain a terminal error while reporting it once.
 
-HTTP/2 uses `observe::http2::Capture` through `register_with_buffer`, with
+HTTP/2's `Capture::register` uses `register_with_buffer` with
 `observe::http2::CAPTURE_READ_AHEAD`. Copy `src/observe/http2.rs` to
 customize presentation; it uses only public SDK APIs. It reads frames with
 `stdlib::http2::Inputs::for_observation` and header blocks with

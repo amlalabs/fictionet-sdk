@@ -8,7 +8,8 @@
 //! The file uses only public observe and stdlib APIs, so a copy of it can
 //! replace the built-in, registered the same way.
 
-use fictionet::observe::{Decoded, Layer, Placement, Present};
+use fictionet::events::Transport;
+use fictionet::observe::{Decoded, Layer, Match, Placement, Present, Registry};
 use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire, be32};
 use fictionet::stdlib::http2::{
     BlockDiagnostic, Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderBlocks, Input, Inputs,
@@ -94,7 +95,7 @@ struct Call {
     outer: u64,
 }
 /// Shared gRPC DATA credit for capture connections, capped at 8 MiB.
-/// Clone this handle into a registry factory and use [`Capture::pair_in`].
+/// Pass this handle to [`Capture::register`] or use [`Capture::pair_in`].
 /// The factory and every registry clone then charge the same byte limit.
 /// Copied modules and user presenters can use the same constructor pattern.
 #[derive(Clone)]
@@ -236,11 +237,10 @@ impl core::error::Error for CaptureError {}
 /// Share a [`CaptureBudget`] across connections, including nested TLS streams.
 /// Register a copied version exactly like the built-in:
 /// ```
-/// use fictionet::observe::{Registry, Match, http2};
+/// use fictionet::observe::{Registry, http2};
 /// let mut registry = Registry::new();
 /// let budget = http2::CaptureBudget::default();
-/// registry.register_with_buffer("http2", |_| Match::Yes,
-///     http2::CAPTURE_READ_AHEAD, move |_| http2::Capture::pair_in(&budget));
+/// http2::Capture::register(&mut registry, &budget);
 /// ```
 pub struct Capture {
     frames: Inputs,
@@ -257,6 +257,29 @@ impl Default for Capture {
     }
 }
 impl Capture {
+    /// Registers `http2` for TCP with `h2` ALPN or the HTTP/2 preface.
+    /// A partial preface waits for more bytes; `http/1.1` ALPN excludes it.
+    /// All connections from this registry and its clones share `budget`,
+    /// including connections selected inside TLS. Uses [`CAPTURE_READ_AHEAD`].
+    pub fn register(registry: &mut Registry, budget: &CaptureBudget) {
+        let budget = budget.clone();
+        registry.register_with_buffer(
+            "http2",
+            |s| {
+                if s.transport != Transport::Tcp || s.alpn == Some("http/1.1") {
+                    Match::No
+                } else if s.alpn == Some("h2") || s.first.starts_with(PREFACE) {
+                    Match::Yes
+                } else if PREFACE.starts_with(s.first) {
+                    Match::More
+                } else {
+                    Match::No
+                }
+            },
+            CAPTURE_READ_AHEAD,
+            move |_| Self::pair_in(&budget),
+        );
+    }
     /// Creates one direction with a DATA budget capped at 8 MiB.
     /// Use [`pair_in`](Self::pair_in) to share credit across connections.
     pub fn new(data_budget: usize) -> Self {

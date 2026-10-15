@@ -1,5 +1,8 @@
 use super::Display;
-use fictionet::observe::{Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol};
+use fictionet::events::Transport;
+use fictionet::observe::{
+    Decoded, KeyLine, Layer, Match, Observed, Place, Placement, Present, Protocol, Registry,
+};
 use fictionet::stdlib::codec::{Decode, Fail, Frames, Step};
 
 /// Modbus/TCP capture frames. Framing is provided by the stdlib decoder.
@@ -39,13 +42,31 @@ impl Present for Modbus {
 }
 
 /// A Modbus/TCP conversation that stops both directions after a framing error.
-/// Register with [`Registry::register_protocol`](fictionet::observe::Registry::register_protocol)
-/// to keep the built-in session policy when copying this file.
+/// Register with [`Self::register`] to keep the built-in session policy
+/// when copying this file.
 pub struct ModbusSession {
     dirs: [Option<Observed<Modbus>>; 2],
     stopped: bool,
 }
 impl ModbusSession {
+    /// Registers `modbus` for TCP with either endpoint on the Modbus port.
+    /// Both directions stop after a framing error.
+    pub fn register(registry: &mut Registry) {
+        registry.register_protocol(
+            "modbus",
+            |s| {
+                if s.transport == Transport::Tcp
+                    && (s.ports.0 == fictionet::stdlib::modbus::PORT
+                        || s.ports.1 == fictionet::stdlib::modbus::PORT)
+                {
+                    Match::Yes
+                } else {
+                    Match::No
+                }
+            },
+            |s, _| Box::new(Self::new(s.ports)),
+        );
+    }
     /// Creates request and response decoders from the conversation's ports.
     /// A direction is a request when its destination is the Modbus port.
     pub fn new(ports: (u16, u16)) -> Self {
