@@ -403,6 +403,7 @@ fictionet::cfg_std! {
 mod tests {
     use super::*;
     use super::super::*;
+    use super::super::hosts::{PortSpec, UdpStart};
     use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     #[test]
