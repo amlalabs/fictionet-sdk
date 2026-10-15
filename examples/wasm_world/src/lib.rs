@@ -9,9 +9,7 @@
 //! runs natively and on wasm32-unknown-unknown.
 
 use std::convert::Infallible;
-use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -27,6 +25,10 @@ use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use fictionet::stdlib::sandbox::TlsClient;
+
+#[path = "../../common/hyper.rs"]
+mod hyper_io;
+use hyper_io::{Exec, Io};
 
 /// The site's one name.
 pub const NAME: &str = "hello.test";
@@ -285,68 +287,5 @@ async fn get<C: Connection + Unpin>(
             .header("host", NAME)
             .body(empty())?;
         Ok(send.send_request(request).await?)
-    }
-}
-
-/// A stdlib connection as hyper's I/O.
-struct Io<C> {
-    fcx: Cx,
-    conn: C,
-}
-
-impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let mut chunk = [0u8; 16 * 1024];
-        let n = buf.remaining().min(chunk.len());
-        match this.conn.poll_read(&this.fcx, cx, &mut chunk[..n]) {
-            Poll::Ready(Ok(n)) => {
-                buf.put_slice(&chunk[..n]);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        this.conn
-            .poll_write(&this.fcx, cx, data)
-            .map_err(std::io::Error::other)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        this.conn
-            .poll_shutdown(&this.fcx, cx)
-            .map_err(std::io::Error::other)
-    }
-}
-
-/// hyper's executor for HTTP/2: each future becomes a task of the run.
-#[derive(Clone)]
-struct Exec(Cx);
-
-impl<F: Future<Output = ()> + Send + 'static> hyper::rt::Executor<F> for Exec {
-    fn execute(&self, fut: F) {
-        self.0.spawn(move |_| async move {
-            fut.await;
-            Ok(())
-        });
     }
 }
