@@ -15,7 +15,7 @@ pub use crate::packet_queue::PacketQueue;
 mod wire;
 pub use wire::*;
 
-pub mod proxy;
+pub use crate::attach_proxy as proxy;
 
 /// Unix `SOCK_SEQPACKET` sockets: the local transport.
 pub mod unix;

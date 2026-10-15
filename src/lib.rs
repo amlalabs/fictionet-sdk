@@ -328,6 +328,9 @@
 extern crate self as fictionet;
 
 mod attach;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub mod attach_proxy;
 pub mod attaching;
 mod block_on;
 mod cable;
