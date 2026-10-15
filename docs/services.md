@@ -83,6 +83,14 @@ ASN.1 keeps its 255-byte OID limit and `u128` subidentifiers. SNMP keeps its
 128-arc limit and `u32` arcs, allowing `u32::MAX + 80` for the combined
 first subidentifier. Both translate invalid or unfinished values to `Oid`.
 
+`codec::json_syntax::read_string` decodes a quoted string and returns its
+text and the absolute end offset. `scan_number` returns the absolute end of a
+number without converting it. Neither moves a caller's cursor or skips
+whitespace. Lexical errors carry absolute byte offsets. The input slice is
+the only scan bound, so callers limit it before parsing. JSON keeps its size,
+depth, value-count and number-length limits, value trees and public errors.
+The helper does not check surrounding delimiters or choose output escapes.
+
 ## 1. A service
 
 A service is the server side of one protocol, for one connection. It

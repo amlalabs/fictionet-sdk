@@ -136,6 +136,8 @@ macro_rules! protocols {
         pub mod json;
         #[path = "../../src/stdlib/json_schema.rs"]
         pub mod json_schema;
+        #[path = "../../src/stdlib/codec/json_syntax.rs"]
+        pub mod json_syntax;
         #[path = "../../src/stdlib/jsonrpc.rs"]
         pub mod jsonrpc;
         #[path = "../../src/stdlib/kafka.rs"]

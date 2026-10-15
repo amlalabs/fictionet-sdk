@@ -40,6 +40,9 @@
 //! It also reads and writes minimal base-128 integers with a numeric limit.
 //! Protocols keep their tag, indefinite-length, body-size, and OID arc rules.
 //!
+//! [`json_syntax`] reads string and number tokens with absolute byte offsets.
+//! Callers bound input and keep value construction, limits, and error translation.
+//!
 //! The code outside tests uses only `core` and `alloc`. Nothing here does
 //! I/O, reads a clock or uses global state. [`serve`](super::serve) runs a
 //! decoder over a live connection.
@@ -245,6 +248,7 @@ mod frames;
 mod generated;
 pub mod head_body;
 mod interceptor;
+pub mod json_syntax;
 mod layout;
 mod lcg;
 pub mod leb128;

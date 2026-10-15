@@ -23,6 +23,10 @@
 //! keeps its members in order, duplicate keys included, since RFC 8259
 //! leaves their meaning to the reader.
 //!
+//! String and number token grammar is shared through
+//! [`codec::json_syntax`](fictionet::stdlib::codec::json_syntax). This module
+//! keeps value construction, resource limits, error translation and writing.
+//!
 //! [`Value`] implements `Drop` to release nested trees without recursion.
 //! Its fields cannot be moved out by pattern matching. Match a mutable
 //! reference and use [`core::mem::take`] to take an array, object, or string.
@@ -54,7 +58,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, json_syntax};
 
 /// The deepest nesting of arrays and objects the parser and writer
 /// accept. `[[1]]` has depth 2. [`Limits`] can lower it but not raise it.
@@ -140,7 +144,7 @@ impl Number {
         if b.len() > MAX_NUMBER_LEN {
             return None;
         }
-        match scan_number(b, 0) {
+        match json_syntax::scan_number(b, 0) {
             Ok(end) if end == b.len() => Some(Number::known(text.to_string())),
             _ => None,
         }
@@ -520,50 +524,18 @@ fn is_ws(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r')
 }
 
-/// Where the number starting at `b[start]` ends, by the RFC 8259 grammar:
-/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
-fn scan_number(b: &[u8], start: usize) -> Result<usize, Error> {
-    let mut i = start;
-    if b.get(i) == Some(&b'-') {
-        i += 1;
-    }
-    match b.get(i) {
-        None => return Err(Error::at(ErrorKind::UnexpectedEnd, i)),
-        Some(b'0') => {
-            i += 1;
-            if b.get(i).is_some_and(u8::is_ascii_digit) {
-                return Err(Error::at(ErrorKind::BadNumber, i));
-            }
-        }
-        Some(b'1'..=b'9') => i = digits(b, i + 1),
-        Some(_) => return Err(Error::at(ErrorKind::BadNumber, i)),
-    }
-    if b.get(i) == Some(&b'.') {
-        i = need_digits(b, i + 1)?;
-    }
-    if matches!(b.get(i), Some(b'e' | b'E')) {
-        i += 1;
-        if matches!(b.get(i), Some(b'+' | b'-')) {
-            i += 1;
-        }
-        i = need_digits(b, i)?;
-    }
-    Ok(i)
-}
-
-fn digits(b: &[u8], mut i: usize) -> usize {
-    while b.get(i).is_some_and(u8::is_ascii_digit) {
-        i += 1;
-    }
-    i
-}
-
-fn need_digits(b: &[u8], i: usize) -> Result<usize, Error> {
-    match b.get(i) {
-        None => Err(Error::at(ErrorKind::UnexpectedEnd, i)),
-        Some(c) if c.is_ascii_digit() => Ok(digits(b, i + 1)),
-        Some(_) => Err(Error::at(ErrorKind::BadNumber, i)),
-    }
+fn syntax_error(error: json_syntax::Error) -> Error {
+    use json_syntax::Error as Syntax;
+    let kind = match error {
+        Syntax::UnexpectedEnd(_) => ErrorKind::UnexpectedEnd,
+        Syntax::UnexpectedByte { byte, .. } => ErrorKind::UnexpectedByte(byte),
+        Syntax::InvalidUtf8(_) => ErrorKind::InvalidUtf8,
+        Syntax::BadNumber(_) => ErrorKind::BadNumber,
+        Syntax::BadEscape(_) => ErrorKind::BadEscape,
+        Syntax::LoneSurrogate(_) => ErrorKind::LoneSurrogate,
+        Syntax::ControlCharacter(_) => ErrorKind::ControlCharacter,
+    };
+    Error::at(kind, error.offset())
 }
 
 struct Parser<'a> {
@@ -626,7 +598,7 @@ impl Parser<'_> {
 
     fn number(&mut self) -> Result<Value, Error> {
         let start = self.i;
-        let end = scan_number(self.b, start)?;
+        let end = json_syntax::scan_number(self.b, start).map_err(syntax_error)?;
         if end - start > MAX_NUMBER_LEN {
             return Err(Error::at(ErrorKind::NumberTooLong, start));
         }
@@ -700,101 +672,9 @@ impl Parser<'_> {
 
     /// A string, starting at its opening quote.
     fn string(&mut self) -> Result<String, Error> {
-        self.i += 1;
-        let mut out = String::new();
-        let mut run = self.i;
-        loop {
-            match self.b.get(self.i) {
-                None => return self.err(ErrorKind::UnexpectedEnd),
-                Some(b'"') => {
-                    self.flush(&mut out, run)?;
-                    self.i += 1;
-                    return Ok(out);
-                }
-                Some(b'\\') => {
-                    self.flush(&mut out, run)?;
-                    out.push(self.escape()?);
-                    run = self.i;
-                }
-                Some(&c) if c < 0x20 => return self.err(ErrorKind::ControlCharacter),
-                Some(_) => self.i += 1,
-            }
-        }
-    }
-
-    /// Adds the raw bytes from `run` to the current byte, which is ASCII,
-    /// so a whole character never spans the cut.
-    fn flush(&self, out: &mut String, run: usize) -> Result<(), Error> {
-        match core::str::from_utf8(&self.b[run..self.i]) {
-            Ok(s) => {
-                out.push_str(s);
-                Ok(())
-            }
-            Err(e) => Err(Error::at(ErrorKind::InvalidUtf8, run + e.valid_up_to())),
-        }
-    }
-
-    /// One escape, starting at its backslash. It leaves `i` after it.
-    fn escape(&mut self) -> Result<char, Error> {
-        let start = self.i;
-        self.i += 1;
-        let c = match self.b.get(self.i) {
-            None => return self.err(ErrorKind::UnexpectedEnd),
-            Some(b'"') => '"',
-            Some(b'\\') => '\\',
-            Some(b'/') => '/',
-            Some(b'b') => '\u{8}',
-            Some(b'f') => '\u{c}',
-            Some(b'n') => '\n',
-            Some(b'r') => '\r',
-            Some(b't') => '\t',
-            Some(b'u') => {
-                self.i += 1;
-                let high = self.hex4()?;
-                return match high {
-                    0xd800..=0xdbff => self.low_surrogate(high, start),
-                    0xdc00..=0xdfff => Err(Error::at(ErrorKind::LoneSurrogate, start)),
-                    _ => char::from_u32(high).ok_or(Error::at(ErrorKind::LoneSurrogate, start)),
-                };
-            }
-            Some(_) => return self.err(ErrorKind::BadEscape),
-        };
-        self.i += 1;
-        Ok(c)
-    }
-
-    /// The `\uXXXX` that must follow a high surrogate, and the character
-    /// the pair makes.
-    fn low_surrogate(&mut self, high: u32, start: usize) -> Result<char, Error> {
-        for want in *b"\\u" {
-            match self.b.get(self.i) {
-                None => return self.err(ErrorKind::UnexpectedEnd),
-                Some(&c) if c == want => self.i += 1,
-                Some(_) => return Err(Error::at(ErrorKind::LoneSurrogate, start)),
-            }
-        }
-        let low = self.hex4()?;
-        if !(0xdc00..=0xdfff).contains(&low) {
-            return Err(Error::at(ErrorKind::LoneSurrogate, start));
-        }
-        let c = 0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00);
-        char::from_u32(c).ok_or(Error::at(ErrorKind::LoneSurrogate, start))
-    }
-
-    fn hex4(&mut self) -> Result<u32, Error> {
-        let mut n = 0u32;
-        for _ in 0..4 {
-            let d = match self.b.get(self.i) {
-                None => return self.err(ErrorKind::UnexpectedEnd),
-                Some(&c) => match (c as char).to_digit(16) {
-                    Some(d) => d,
-                    None => return self.err(ErrorKind::BadEscape),
-                },
-            };
-            n = n * 16 + d;
-            self.i += 1;
-        }
-        Ok(n)
+        let (text, end) = json_syntax::read_string(self.b, self.i).map_err(syntax_error)?;
+        self.i = end;
+        Ok(text)
     }
 }
 
@@ -1472,6 +1352,58 @@ mod tests {
         assert_eq!(
             Error::at(ErrorKind::BadEscape, 4).to_string(),
             "an unknown escape at byte 4"
+        );
+    }
+
+    #[test]
+    fn lexical_faults_keep_positions_in_values_and_keys() {
+        for (token, kind, offset) in [
+            (b"\"".as_slice(), ErrorKind::UnexpectedEnd, 1),
+            (br#""\x""#, ErrorKind::BadEscape, 2),
+            (br#""\ud800\u12g4""#, ErrorKind::BadEscape, 11),
+            (br#""\udbff\ue000""#, ErrorKind::LoneSurrogate, 1),
+            (b"\"a\xff\"", ErrorKind::InvalidUtf8, 2),
+            (b"\"\xff\\x\"", ErrorKind::InvalidUtf8, 1),
+            (b"\"\xff\n", ErrorKind::ControlCharacter, 2),
+            (b"\"\xff", ErrorKind::UnexpectedEnd, 2),
+        ] {
+            for prefix in [b"".as_slice(), b" \n[ ", br#"{"key": "#, b"{ "] {
+                let mut input = prefix.to_vec();
+                input.extend_from_slice(token);
+                assert_eq!(err(&input), (kind, prefix.len() + offset), "{input:?}");
+            }
+        }
+        for (token, kind, offset) in [
+            ("-01", ErrorKind::BadNumber, 2),
+            ("1e+", ErrorKind::UnexpectedEnd, 3),
+            ("1.x", ErrorKind::BadNumber, 2),
+        ] {
+            let input = format!("[0, {token}");
+            assert_eq!(err(input.as_bytes()), (kind, 4 + offset));
+        }
+    }
+
+    #[test]
+    fn number_limits_stay_after_lexical_validation() {
+        let long = "1".repeat(MAX_NUMBER_LEN + 1);
+        assert_eq!(err(long.as_bytes()), (ErrorKind::NumberTooLong, 0));
+        let truncated = format!("{long}e+");
+        assert_eq!(
+            err(truncated.as_bytes()),
+            (ErrorKind::UnexpectedEnd, truncated.len())
+        );
+        let invalid = format!("{long}.x");
+        assert_eq!(
+            err(invalid.as_bytes()),
+            (ErrorKind::BadNumber, long.len() + 1)
+        );
+        let limits = Limits {
+            size: 3,
+            ..Limits::default()
+        };
+        assert_eq!(
+            parse_with(invalid.as_bytes(), &limits),
+            Err(Error::at(ErrorKind::TooLarge, 3))
         );
     }
 
