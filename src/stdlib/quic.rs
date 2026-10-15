@@ -2079,6 +2079,7 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::assert_linear;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::mutate;
@@ -3412,8 +3413,7 @@ mod tests {
         );
 
         // A reassembler read one byte at a time, with a byte held at the
-        // far end of its window, gives the stream in order. With a queue,
-        // each read costs the bytes read, not the bytes held.
+        // far end of its window, gives the stream in order.
         for offset in (0..rounds(20_000)).step_by(20_000) {
             let n = (rounds(20_000) - offset).min(20_000);
             let mut r = Reassembler::new();
@@ -3428,6 +3428,34 @@ mod tests {
             assert_eq!(r.clone(), r);
             assert_eq!(Reassembler::new(), Reassembler::default());
         }
+    }
+
+    #[test]
+    fn reassembler_sparse_reads_linear_time() {
+        fn run(size: usize) {
+            let mut r = Reassembler::new();
+            let mut read = Vec::new();
+            for i in 0..size {
+                let far = i + size - 1;
+                r.insert(far as u64, &[far as u8]).unwrap();
+                r.insert(i as u64, &[i as u8]).unwrap();
+                let bytes = r.read();
+                // Closing the last gap releases the retained tail on the
+                // penultimate step. Earlier reads deliver just one byte.
+                assert_eq!(bytes.len(), if i == size - 2 { size } else { 1 });
+                read.extend(bytes);
+                assert_eq!(r.buffered(), if i < size - 2 { size - 1 } else { 0 });
+                assert_eq!(r.offset(), read.len() as u64);
+            }
+            assert_eq!(read, (0..2 * size - 1).map(|i| i as u8).collect::<Vec<_>>());
+            assert!(r.read().is_empty());
+        }
+
+        // Grow both the retained distance and the number of reads fourfold.
+        // Queue work stays linear; moving or scanning all retained bytes on
+        // every read is quadratic. Keep n fixed: 4n is MAX_REASSEMBLY, so
+        // rounds() could exceed the permitted window.
+        assert_linear("QUIC sparse reassembly", 16_384, run);
     }
 
     fn random_value(rng: &mut Lcg) -> u64 {
