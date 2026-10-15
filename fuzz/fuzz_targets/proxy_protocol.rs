@@ -2,15 +2,43 @@
 //! reads them at the start of a connection.
 #![no_main]
 
-use fictionet::stdlib::{codec::Wire, proxy_protocol::Headers, test_support::contract};
+use fictionet::stdlib::{
+    codec::{Decode, Step, Wire},
+    proxy_protocol::Headers,
+    test_support::contract,
+};
 
 use fictionet::stdlib::proxy_protocol::{
     Addresses, Command, Header, MAX_HEADER_LEN, MAX_TLV_VALUE, Ssl, SslTlv, Tlv, Transport, V1, V2,
+    V2_MAX_BODY, V2_SIGNATURE,
 };
 use libfuzzer_sys::fuzz_target;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
+fn check_exact_and_streaming(data: &[u8]) {
+    if let Ok(Step::Item(item, used)) = Headers::new().decode(data, false) {
+        assert_eq!(Header::parse(&data[..used]), item);
+        if let Ok(header) = item {
+            let canonical = header.to_bytes().unwrap();
+            assert_eq!(Header::parse(&canonical), Ok(header));
+        }
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
+    check_exact_and_streaming(data);
+    // Reach TLV and LOCAL normalization paths without requiring the fuzzer
+    // to discover the fixed signature and length first.
+    if let Some((&family, body)) = data.split_first() {
+        let body = &body[..body.len().min(V2_MAX_BODY)];
+        for command in [0x20, 0x21] {
+            let mut bytes = V2_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&[command, family]);
+            bytes.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(body);
+            check_exact_and_streaming(&bytes);
+        }
+    }
     contract::check_decode_with_alloc_limit(Headers::new, data, 2 * MAX_HEADER_LEN);
     contract::check_decode_with_alloc_limit(|| Headers::with_limit(32), data, 64);
     contract::check_wire::<Header>(data);

@@ -108,7 +108,6 @@ impl Wire for Header {
         if used != bytes.len() {
             return Err(Error::Trailing);
         }
-        header.write(&mut Vec::new())?;
         Ok(header)
     }
 
@@ -588,6 +587,10 @@ impl Header {
     /// holds only part of one, and otherwise the header and how many bytes
     /// of `b` it took. An error found in a part is the same error the whole
     /// header gives.
+    ///
+    /// Successful values are writable: v1 bounds UNKNOWN text; v2 bounds
+    /// the body and nested TLVs, selects their named variants and checks CRCs.
+    /// V2 preserves the wire bytes unless LOCAL normalizes to an empty header.
     fn parse_prefix(b: &[u8]) -> Result<Option<(Header, usize)>, Error> {
         match detect(b) {
             Detection::NeedMore => Ok(None),
@@ -1729,6 +1732,89 @@ mod tests {
         b
     }
 
+    // Complete headers agree across readers, including after partial input.
+    fn read_header(bytes: &[u8]) -> Result<Header, Error> {
+        let exact = Header::parse(bytes);
+        assert_eq!(
+            Header::parse_prefix(bytes),
+            exact.clone().map(|h| Some((h, bytes.len())))
+        );
+        let mut input = bytes.to_vec();
+        input.extend_from_slice(b"payload");
+        for split in [0, 12, 16, bytes.len() / 2, bytes.len() - 1] {
+            if split >= bytes.len() {
+                continue;
+            }
+            let mut decoder = Headers::new();
+            assert_eq!(
+                decoder.decode(&bytes[..split], false),
+                Ok(codec::Step::Need)
+            );
+            assert_eq!(
+                decoder.decode(&input, false),
+                Ok(codec::Step::Item(exact.clone(), bytes.len()))
+            );
+            assert_eq!(decoder.decode(b"payload", false), Ok(codec::Step::End));
+        }
+        if let Ok(header) = &exact {
+            let canonical = header.to_bytes().unwrap();
+            assert_eq!(Header::parse(&canonical), exact);
+        }
+        exact
+    }
+
+    #[test]
+    fn exact_and_streaming_parses_are_writable() {
+        for command in [Command::Local, Command::Proxy] {
+            for tlv in [
+                Tlv::Noop(vec![0; MAX_TLV_VALUE]),
+                Tlv::Other {
+                    kind: 0xe0,
+                    value: vec![1; MAX_TLV_VALUE],
+                },
+                Tlv::Ssl(Ssl {
+                    client: 0xff,
+                    verify: u32::MAX,
+                    tlvs: vec![SslTlv::CommonName(vec![
+                        2;
+                        MAX_TLV_VALUE - SSL_FIXED_LEN - 3
+                    ])],
+                }),
+            ] {
+                let header = Header::V2(V2 {
+                    command,
+                    addresses: Addresses::Unspec,
+                    tlvs: vec![tlv],
+                });
+                let bytes = header.to_bytes().unwrap();
+                assert_eq!(bytes.len(), MAX_HEADER_LEN);
+                assert_eq!(read_header(&bytes), Ok(header));
+            }
+            let header = Header::V2(
+                V2 {
+                    command,
+                    addresses: Addresses::Unspec,
+                    tlvs: vec![Tlv::Noop(vec![0; MAX_TLV_VALUE - 7])],
+                }
+                .with_checksum()
+                .unwrap(),
+            );
+            let mut bytes = header.to_bytes().unwrap();
+            assert_eq!(bytes.len(), MAX_HEADER_LEN);
+            assert_eq!(read_header(&bytes), Ok(header));
+            bytes[V2_HEADER_LEN + 3] ^= 1;
+            assert_eq!(read_header(&bytes), Err(Error::Checksum));
+        }
+        let unknown = Header::V1(V1::Unknown(vec![b' '; V1_MAX_UNKNOWN_REST]));
+        assert_eq!(read_header(&unknown.to_bytes().unwrap()), Ok(unknown));
+        let bytes = b"PROXY TCP6 0:0:0:0:0:0:0:1 ::FFFF:c000:201 0 65535\r\n";
+        let header = read_header(bytes).unwrap();
+        assert_eq!(
+            header.to_bytes().unwrap(),
+            b"PROXY TCP6 ::1 ::ffff:192.0.2.1 0 65535\r\n"
+        );
+    }
+
     #[test]
     fn local_ignores_the_address_block() {
         // The spec: a receiver must accept a LOCAL header and discard the
@@ -1737,7 +1823,7 @@ mod tests {
             let mut b = with_prefix(&[0x20, fam]);
             b.extend_from_slice(&(body.len() as u16).to_be_bytes());
             b.extend_from_slice(body);
-            Header::parse(&b)
+            read_header(&b)
         };
         let empty = Header::V2(V2 {
             command: Command::Local,
@@ -1756,7 +1842,7 @@ mod tests {
         // A wrong checksum is still refused.
         let mut one = checksum_header(Command::Local);
         one[19] ^= 1;
-        assert_eq!(Header::parse(&one), Err(Error::Checksum));
+        assert_eq!(read_header(&one), Err(Error::Checksum));
     }
 
     #[test]
@@ -1764,7 +1850,7 @@ mod tests {
         // LOCAL: a wrong checksum followed by a truncated TLV. The checksum
         // should be 0x5c5f83af.
         let local = with_prefix(&[0x20, 0x00, 0x00, 0x08, 0x03, 0x00, 0x04, 0, 0, 0, 0, 0xff]);
-        assert_eq!(Header::parse(&local), Err(Error::Checksum));
+        assert_eq!(read_header(&local), Err(Error::Checksum));
         // The same header with the right checksum is accepted, as LOCAL.
         let mut right = local.clone();
         right[19..23].copy_from_slice(&0x5c5f_83afu32.to_be_bytes());
@@ -1773,21 +1859,46 @@ mod tests {
             addresses: Addresses::Unspec,
             tlvs: vec![],
         });
-        assert_eq!(Header::parse(&right), Ok(empty));
+        assert_eq!(read_header(&right), Ok(empty));
         // A checksum after a TLV whose value is bad is still checked.
         let local = with_prefix(&[
             0x20, 0x00, 0x00, 0x0a, 0x20, 0x00, 0x00, 0x03, 0x00, 0x04, 0, 0, 0, 0,
         ]);
-        assert_eq!(Header::parse(&local), Err(Error::Checksum));
+        assert_eq!(read_header(&local), Err(Error::Checksum));
         let mut proxy = local.clone();
         proxy[12] = 0x21;
-        assert_eq!(Header::parse(&proxy), Err(Error::Checksum));
+        assert_eq!(read_header(&proxy), Err(Error::Checksum));
         // A CRC32C TLV that cannot be checked is refused under LOCAL too.
         let local = with_prefix(&[0x20, 0x00, 0x00, 0x05, 0x03, 0x00, 0x02, 0, 0]);
-        assert_eq!(
-            Header::parse(&local),
-            Err(Error::TlvLength(tlv_type::CRC32C))
-        );
+        assert_eq!(read_header(&local), Err(Error::TlvLength(tlv_type::CRC32C)));
+    }
+
+    #[test]
+    fn nested_ssl_errors_preserve_local_and_crc_policy() {
+        for command in [Command::Local, Command::Proxy] {
+            let mut bytes = checksum_header(command);
+            // An SSL TLV with an incomplete sub-TLV, after the checksum.
+            bytes.extend_from_slice(&[0x20, 0, 7, 1, 0, 0, 0, 0, 0x21, 0]);
+            bytes[15] = 17;
+            bytes[19..23].fill(0);
+            let checksum = crc32c(&bytes);
+            bytes[19..23].copy_from_slice(&checksum.to_be_bytes());
+            let expected = if command == Command::Local {
+                Ok(Header::V2(V2 {
+                    command,
+                    addresses: Addresses::Unspec,
+                    tlvs: vec![],
+                }))
+            } else {
+                Err(Error::TlvTruncated)
+            };
+            assert_eq!(read_header(&bytes), expected);
+            bytes[19] ^= 1;
+            assert_eq!(read_header(&bytes), Err(Error::Checksum));
+            bytes.extend_from_slice(&[3, 0, 4, 0, 0, 0, 0]);
+            bytes[15] = 24;
+            assert_eq!(read_header(&bytes), Err(Error::Checksum));
+        }
     }
 
     #[test]
