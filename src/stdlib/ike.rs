@@ -2012,28 +2012,85 @@ mod tests {
     }
 
     #[test]
-    fn payload_chains_round_trip_and_refuse_a_different_first_type() {
-        fn chain_bytes(first: u8, payloads: Vec<Payload>) -> Result<Vec<u8>, Error> {
-            let bytes = message(payloads).to_bytes()?;
-            if bytes[16] != first {
-                return Err(Error::Unwritable);
-            }
-            Ok(bytes[HEADER_LEN..].to_vec())
-        }
+    fn payload_chain_encodes_and_round_trips() {
         let payloads = every_body();
         let chain = message(payloads.clone());
-        let bytes = chain_bytes(payload::SA, payloads.clone()).unwrap();
+        let bytes = chain.to_bytes().unwrap();
         assert_eq!(
-            parse_payloads(payload::SA, &bytes),
+            parse_payloads(payload::SA, &bytes[HEADER_LEN..]),
             Ok(chain.payloads.clone())
         );
         contract::check_wire_value(&chain);
-        assert_eq!(
-            chain_bytes(payload::NONCE, payloads.clone()),
-            Err(Error::Unwritable)
-        );
         contract::check_wire_value(&message(payloads));
         contract::check_wire_value(&message(vec![]));
+    }
+
+    #[test]
+    fn production_writer_derives_next_payload() {
+        for (payloads, last_next) in [
+            (every_body(), payload::IDI),
+            (vec![Payload::new(Body::Nonce(vec![4; 16]))], payload::NONE),
+            (
+                vec![Payload::new(Body::EncryptedFragment(EncryptedFragment {
+                    first_payload: payload::IDI,
+                    number: 1,
+                    total: 2,
+                    data: vec![0xaa; 8],
+                }))],
+                payload::IDI,
+            ),
+            (
+                vec![Payload::new(Body::EncryptedFragment(EncryptedFragment {
+                    first_payload: payload::NONE,
+                    number: 2,
+                    total: 2,
+                    data: vec![0xbb; 8],
+                }))],
+                payload::NONE,
+            ),
+            (vec![], payload::NONE),
+        ] {
+            let m = message(payloads);
+            let bytes = m.to_bytes().unwrap();
+            assert_eq!(
+                bytes[16],
+                m.payloads.first().map_or(payload::NONE, Payload::kind)
+            );
+            let mut pos = HEADER_LEN;
+            for (i, p) in m.payloads.iter().enumerate() {
+                let header = &bytes[pos..pos + PAYLOAD_HEADER_LEN];
+                let next = m.payloads.get(i + 1).map_or(last_next, Payload::kind);
+                assert_eq!(header[0], next, "payload {i}");
+                assert_eq!(header[1] & 0x80 != 0, p.critical, "payload {i}");
+                let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+                assert!(len >= PAYLOAD_HEADER_LEN, "payload {i}");
+                assert!(len <= bytes.len() - pos, "payload {i}");
+                pos += len;
+            }
+            assert_eq!(pos, bytes.len());
+        }
+    }
+
+    #[test]
+    fn writer_refuses_payloads_after_encrypted_payloads() {
+        for body in [
+            Body::Encrypted(Encrypted {
+                first_payload: payload::IDI,
+                data: vec![0x55; 40],
+            }),
+            Body::EncryptedFragment(EncryptedFragment {
+                first_payload: payload::IDI,
+                number: 1,
+                total: 2,
+                data: vec![0xaa; 8],
+            }),
+        ] {
+            let encrypted = Payload::new(body);
+            assert!(message(vec![encrypted.clone()]).to_bytes().is_ok());
+            let m = message(vec![encrypted, Payload::new(Body::Nonce(vec![4; 16]))]);
+            assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+            contract::check_wire_value(&m);
+        }
     }
 
     #[test]
