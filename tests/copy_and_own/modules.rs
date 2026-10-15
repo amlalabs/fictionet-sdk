@@ -36,7 +36,7 @@ macro_rules! protocols {
         pub mod checked;
         #[path = "../../src/stdlib/codec/civil.rs"]
         pub mod civil;
-        #[path = "../../src/stdlib/cme_mdp3.rs"]
+        #[path = "../../src/stdlib/cme_mdp3/mod.rs"]
         pub mod cme_mdp3;
         #[path = "../../src/stdlib/coap.rs"]
         pub mod coap;

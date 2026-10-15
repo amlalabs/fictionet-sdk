@@ -371,10 +371,12 @@ and the element path in the location.
 
 `stdlib::cme_mdp3` is generated this way from CME's public MDP 3.0
 schema, kept at `data/cme/templates_FixBinary.xml`. The generated code is
-followed by hand-written packet framing: the binary packet header and
-the two-byte message size. A test checks that the file still starts with
-the generator's output. To regenerate the generated part and keep the
-hand-written tail:
+in `src/stdlib/cme_mdp3/mod.rs`. It is followed by a short hand-written
+tail that declares the hand-written packet framing in
+`src/stdlib/cme_mdp3/framing.rs`: the binary packet header and the
+two-byte message size. The module docs are in `src/stdlib/cme_mdp3/docs.md`.
+A test checks that `mod.rs` still starts with the generator's output. To
+regenerate the generated part and keep the hand-written tail:
 
 ```sh
 BLESS_CODEGEN=1 cargo test --test sbe_codegen module_is
