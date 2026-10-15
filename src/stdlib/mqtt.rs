@@ -653,8 +653,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     }
 
     fn binary(&mut self) -> Result<&'a [u8], Error> {
-        let n = self.u16_be()?;
-        self.take(usize::from(n)).map_err(Error::from)
+        self.length_prefixed_u16_be().map_err(Error::from)
     }
 
     fn string(&mut self) -> Result<String, Error> {

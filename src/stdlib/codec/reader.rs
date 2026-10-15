@@ -94,7 +94,10 @@ impl fmt::Display for Trailing {
 }
 impl core::error::Error for Trailing {}
 
-/// A checked byte cursor whose failed reads leave its position unchanged.
+/// A checked byte cursor.
+///
+/// Failed reads leave its position unchanged, except length-prefixed reads:
+/// they consume a complete length prefix even when the payload is truncated.
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
     bytes: &'a [u8],
@@ -157,6 +160,78 @@ impl<'a> Reader<'a> {
         let start = self.position;
         self.position += n;
         Ok(&self.bytes[start..self.position])
+    }
+
+    /// Borrows a byte slice preceded by its one-byte length (at most 255).
+    ///
+    /// The returned slice excludes the prefix and may be empty. A missing
+    /// prefix returns [`Truncated`] without moving the cursor. A short payload
+    /// returns [`Truncated`] after consuming only the prefix. Field validation
+    /// and smaller limits belong to the caller.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Reader, Truncated};
+    ///
+    /// let mut r = Reader::new(b"\x02hi\x00\x03x");
+    /// assert_eq!(r.length_prefixed_u8()?, b"hi");
+    /// assert_eq!(r.length_prefixed_u8()?, b"");
+    /// assert_eq!(r.length_prefixed_u8(), Err(Truncated));
+    /// assert_eq!(r.position(), 5);
+    /// assert_eq!(r.rest(), b"x");
+    /// # Ok::<(), Truncated>(())
+    /// ```
+    #[inline]
+    pub fn length_prefixed_u8(&mut self) -> Result<&'a [u8], Truncated> {
+        let len = usize::from(self.u8()?);
+        self.take(len)
+    }
+
+    /// Borrows a byte slice preceded by its big-endian u16 length (at most 65535).
+    ///
+    /// The returned slice excludes the prefix and may be empty. An incomplete
+    /// prefix returns [`Truncated`] without moving the cursor. A short payload
+    /// returns [`Truncated`] after consuming only the prefix. Field validation
+    /// and smaller limits belong to the caller.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Reader, Truncated};
+    ///
+    /// let mut r = Reader::new(b"\x00\x02hi\x00\x00\x00\x03x");
+    /// assert_eq!(r.length_prefixed_u16_be()?, b"hi");
+    /// assert_eq!(r.length_prefixed_u16_be()?, b"");
+    /// assert_eq!(r.length_prefixed_u16_be(), Err(Truncated));
+    /// assert_eq!(r.position(), 8);
+    /// assert_eq!(r.rest(), b"x");
+    /// # Ok::<(), Truncated>(())
+    /// ```
+    #[inline]
+    pub fn length_prefixed_u16_be(&mut self) -> Result<&'a [u8], Truncated> {
+        let len = usize::from(self.u16_be()?);
+        self.take(len)
+    }
+
+    /// Consumes a big-endian u16 tag, u16 length and borrowed body.
+    ///
+    /// The body excludes the header and may contain zero to 65535 bytes.
+    /// Returns [`Truncated`] without moving the cursor if any part is missing.
+    /// Tag validation, smaller limits and error translation belong to the caller.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Reader, Truncated};
+    ///
+    /// let mut r = Reader::new(b"\x00\x07\x00\x02hi\x00\x08\x00\x01");
+    /// assert_eq!(r.tlv_u16_be()?, (7, &b"hi"[..]));
+    /// assert_eq!(r.tlv_u16_be(), Err(Truncated));
+    /// assert_eq!(r.position(), 6);
+    /// # Ok::<(), Truncated>(())
+    /// ```
+    #[inline]
+    pub fn tlv_u16_be(&mut self) -> Result<(u16, &'a [u8]), Truncated> {
+        let mut next = self.clone();
+        let tag = next.u16_be()?;
+        let body = next.length_prefixed_u16_be()?;
+        self.position = next.position;
+        Ok((tag, body))
     }
 
     /// Borrows the bytes before the next NUL and consumes the terminator.
@@ -258,6 +333,86 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counted_bytes_borrow_and_consume_exactly() {
+        macro_rules! check {
+            ($read:ident, $prefix:expr, $max:expr) => {{
+                let prefix: &[u8] = $prefix;
+                let mut bytes = std::vec![0; prefix.len()];
+                bytes.extend_from_slice(prefix);
+                bytes.extend_from_slice(b"abc");
+                bytes.push(0xff);
+                let mut r = Reader::new(&bytes);
+                assert_eq!(r.$read(), Ok(&b""[..]));
+                assert_eq!(r.position(), prefix.len());
+                let body = r.$read().unwrap();
+                assert_eq!(body, b"abc");
+                assert_eq!(body.as_ptr(), bytes[2 * prefix.len()..].as_ptr());
+                assert_eq!(r.position(), 2 * prefix.len() + 3);
+                assert_eq!(r.rest(), &[0xff]);
+
+                let mut bytes = std::vec![0xff; prefix.len() + $max];
+                bytes.push(42);
+                let mut r = Reader::new(&bytes);
+                assert_eq!(r.$read().unwrap(), &bytes[prefix.len()..bytes.len() - 1]);
+                assert_eq!(r.rest(), &[42]);
+            }};
+        }
+        check!(length_prefixed_u8, &[3], 255);
+        check!(length_prefixed_u16_be, &[0, 3], 65535);
+    }
+
+    #[test]
+    fn counted_bytes_truncation_consumes_only_complete_prefix() {
+        macro_rules! check {
+            ($read:ident, $bytes:expr, $width:expr) => {{
+                let bytes = $bytes;
+                for end in 1..bytes.len() {
+                    let mut r = Reader::new(&bytes[..end]);
+                    r.skip(1).unwrap();
+                    assert_eq!(r.$read(), Err(Truncated));
+                    let consumed = if end < 1 + $width { 1 } else { 1 + $width };
+                    assert_eq!(r.position(), consumed);
+                    assert_eq!(r.rest(), &bytes[consumed..end]);
+                }
+            }};
+        }
+        check!(length_prefixed_u8, b"x\x03abc", 1);
+        check!(length_prefixed_u16_be, b"x\x00\x03abc", 2);
+    }
+
+    #[test]
+    fn tlv_bytes_borrow_and_consume_complete_envelopes() {
+        let bytes = b"\x12\x34\x00\x00\x56\x78\x00\x03abc";
+        let mut r = Reader::new(bytes);
+        assert_eq!(r.tlv_u16_be(), Ok((0x1234, &b""[..])));
+        assert_eq!(r.position(), 4);
+        let (tag, body) = r.tlv_u16_be().unwrap();
+        assert_eq!(tag, 0x5678);
+        assert_eq!(body, b"abc");
+        assert_eq!(body.as_ptr(), bytes[8..].as_ptr());
+        assert_eq!(r.finish(), Ok(()));
+        assert_eq!(r.tlv_u16_be(), Err(Truncated));
+        assert_eq!(r.position(), bytes.len());
+
+        let bytes = std::vec![0xff; 4 + 65535];
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.tlv_u16_be(), Ok((65535, &bytes[4..])));
+        assert_eq!(r.finish(), Ok(()));
+    }
+
+    #[test]
+    fn truncated_tlv_keeps_position_before_header() {
+        let bytes = b"x\x12\x34\x00\x03abc";
+        for end in 1..bytes.len() {
+            let mut r = Reader::new(&bytes[..end]);
+            r.skip(1).unwrap();
+            assert_eq!(r.tlv_u16_be(), Err(Truncated));
+            assert_eq!(r.position(), 1);
+            assert_eq!(r.rest(), &bytes[1..end]);
+        }
+    }
 
     #[test]
     fn nul_fields_borrow_bytes_and_consume_terminators() {

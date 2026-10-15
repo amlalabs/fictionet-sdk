@@ -77,7 +77,7 @@
 //! ```
 
 use core::convert::Infallible;
-use fictionet::stdlib::codec::{Frames, append_bounded, be32};
+use fictionet::stdlib::codec::{Frames, Reader, append_bounded, be32};
 use std::net::Ipv6Addr;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -1017,15 +1017,10 @@ fn find_status(options: &[DhcpOption]) -> Option<&StatusCode> {
 /// Reads an option list at `depth`.
 fn parse_options(b: &[u8], depth: usize) -> Result<Vec<DhcpOption>, Error> {
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let head = b.get(i..i + 4).ok_or(Error::Truncated)?;
-        let code = u16::from_be_bytes([head[0], head[1]]);
-        let len = usize::from(u16::from_be_bytes([head[2], head[3]]));
-        let start = i + 4;
-        let body = b.get(start..start + len).ok_or(Error::Truncated)?;
+    let mut r = Reader::new(b);
+    while !r.is_empty() {
+        let (code, body) = r.tlv_u16_be().map_err(|_| Error::Truncated)?;
         out.push(parse_option(code, body, depth)?);
-        i = start + len;
     }
     Ok(out)
 }
@@ -1220,12 +1215,12 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
 /// carry them. `None` if the last one runs past the end.
 fn parse_counted(b: &[u8]) -> Option<Vec<Vec<u8>>> {
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let head = b.get(i..i + 2)?;
-        let len = usize::from(u16::from_be_bytes([head[0], head[1]]));
-        out.push(b.get(i + 2..i + 2 + len)?.to_vec());
-        i += 2 + len;
+    let mut r = Reader::new(b);
+    while !r.is_empty() {
+        let Ok(body) = r.length_prefixed_u16_be() else {
+            return None;
+        };
+        out.push(body.to_vec());
     }
     Some(out)
 }
@@ -1233,14 +1228,13 @@ fn parse_counted(b: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// Whether `b` is a run of options, each a 2-byte code, a 2-byte length
 /// and that many bytes, as vendor options are.
 fn options_in_form(b: &[u8]) -> bool {
-    let mut i = 0;
-    while i < b.len() {
-        let Some(head) = b.get(i..i + 4) else {
+    let mut r = Reader::new(b);
+    while !r.is_empty() {
+        if r.tlv_u16_be().is_err() {
             return false;
-        };
-        i += 4 + usize::from(u16::from_be_bytes([head[2], head[3]]));
+        }
     }
-    i == b.len()
+    true
 }
 
 /// A domain name list in its wire form, read.
@@ -1802,6 +1796,35 @@ mod tests {
         );
         let m = Message::parse(&long).unwrap();
         assert_eq!(m.to_bytes().unwrap(), long);
+    }
+
+    #[test]
+    fn option_envelope_errors_keep_their_context() {
+        let envelope = [0xff, 0xff, 0, 2, 42, 43];
+        for end in 1..envelope.len() {
+            assert_eq!(parse_options(&envelope[..end], 0), Err(Error::Truncated));
+            let mut vendor = vec![0, 0, 0, 1];
+            vendor.extend_from_slice(&envelope[..end]);
+            assert_eq!(
+                Message::parse(&with_option(opt::VENDOR_OPTS, &vendor)),
+                Err(Error::BadOption(opt::VENDOR_OPTS))
+            );
+        }
+        // Vendor tags do not acquire the semantics of standard DHCP options.
+        let vendor = [0, 0, 0, 1, 0, opt::PREFERENCE as u8, 0, 0];
+        assert_eq!(
+            parse_option(opt::VENDOR_OPTS, &vendor, 0),
+            Ok(DhcpOption::VendorOpts {
+                enterprise: 1,
+                data: vendor[4..].to_vec(),
+            })
+        );
+        assert_eq!(
+            parse_counted(&[0, 0, 0, 1, 42]),
+            Some(vec![vec![], vec![42]])
+        );
+        assert_eq!(parse_counted(&[0]), None);
+        assert_eq!(parse_counted(&[0, 2, 42]), None);
     }
 
     #[test]

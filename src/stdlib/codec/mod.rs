@@ -14,10 +14,11 @@
 //!
 //! A [`Wire`] value reads one complete message from a slice and writes it
 //! back. [`Reader`] is the byte cursor that parsers use. A read past the end
-//! fails and leaves its position where it was. [`Frames<T>`] frames a
-//! stream of values whose length a [`Prefixed`] parser can tell from their
-//! first bytes. [`Lines`] splits lines, and [`Collect`] reads one value
-//! that ends at the end of input.
+//! fails and leaves its position where it was, except length-prefixed reads,
+//! which consume a complete prefix even if the payload is short.
+//! [`Frames<T>`] frames a stream of values whose length a [`Prefixed`]
+//! parser can tell from their first bytes. [`Lines`] splits lines, and
+//! [`Collect`] reads one value that ends at the end of input.
 //! [`write_checked`] appends an encoding only if it decodes to the same value.
 //! Its encode and decode functions enforce the protocol's size and field limits.
 //!

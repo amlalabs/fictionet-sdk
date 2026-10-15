@@ -46,6 +46,14 @@ if no terminator is present. MongoDB, MySQL and PostgreSQL use it while keeping
 their own text validation, ownership, limits and errors. MySQL still accepts
 an unterminated final field where its protocol allows one.
 
+`codec::Reader::length_prefixed_u8` and `length_prefixed_u16_be` borrow a
+body after its length prefix, up to 255 and 65535 bytes respectively. An
+incomplete prefix leaves the cursor unchanged. A truncated body consumes only
+the prefix. `tlv_u16_be` reads a big-endian u16 tag, u16 length and body; any
+truncation leaves the cursor unchanged. Empty bodies are valid. The callers
+keep their field limits, validation and error translation. DHCPv6 maps a broken
+outer option envelope to `Truncated` and broken vendor content to `BadOption`.
+
 `codec::dot_body` shares dot transparency for SMTP and POP3. Its accumulator
 retains the first body error through the terminator and keeps counting bytes
 after rejection. Callers supply validation and translate fatal errors. SMTP

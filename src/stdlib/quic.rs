@@ -2050,8 +2050,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     }
 
     fn cid(&mut self) -> Result<Vec<u8>, Error> {
-        let n = usize::from(self.u8()?);
-        Ok(self.take(n)?.to_vec())
+        Ok(self.length_prefixed_u8()?.to_vec())
     }
 }
 

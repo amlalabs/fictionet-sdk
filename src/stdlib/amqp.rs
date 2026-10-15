@@ -2227,8 +2227,8 @@ impl<'a> Fields<'a> {
     }
 
     fn skip_shortstr(&mut self) -> Result<&'a [u8], Error> {
-        let n = self.u8()?;
-        self.take(usize::from(n))
+        self.bit_next = 0;
+        self.cursor.length_prefixed_u8().map_err(Error::from)
     }
 
     fn shortstr(&mut self) -> Result<String, Error> {
@@ -2893,6 +2893,27 @@ mod tests {
             .reply_code(),
             501
         );
+    }
+
+    #[test]
+    fn shortstr_resets_bits_even_when_truncated() {
+        let mut r = Fields::new(&[0xff, 1, b'x', 0]);
+        assert!(r.bit().unwrap());
+        assert_eq!(r.skip_shortstr(), Ok(&b"x"[..]));
+        assert!(!r.bit().unwrap());
+
+        for bytes in [&[0xff][..], &[0xff, 2, 0][..]] {
+            let mut r = Fields::new(bytes);
+            assert!(r.bit().unwrap());
+            assert_eq!(r.skip_shortstr(), Err(Error::Truncated));
+            assert_eq!(r.bit_next, 0);
+            assert_eq!(r.cursor.position(), bytes.len().min(2));
+            if bytes.len() > 2 {
+                assert!(!r.bit().unwrap());
+            } else {
+                assert_eq!(r.bit(), Err(Error::Truncated));
+            }
+        }
     }
 
     #[test]

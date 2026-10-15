@@ -1110,7 +1110,7 @@ fn random(r: &mut Reader<'_>) -> Result<[u8; RANDOM_LEN], Error> {
 }
 
 fn session_id(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
-    let id = r.vec8()?;
+    let id = r.length_prefixed_u8()?;
     if id.len() > MAX_SESSION_ID {
         return Err(Error::SessionId(id.len()));
     }
@@ -1122,7 +1122,7 @@ fn extensions(r: &mut Reader<'_>) -> Result<Option<Vec<Extension>>, Error> {
     if r.remaining() == 0 {
         return Ok(None);
     }
-    let block = r.vec16()?;
+    let block = r.length_prefixed_u16_be()?;
     if r.remaining() != 0 {
         return Err(Error::BodyTrailing);
     }
@@ -1131,7 +1131,7 @@ fn extensions(r: &mut Reader<'_>) -> Result<Option<Vec<Extension>>, Error> {
     let mut seen = TypeSet::new();
     while e.remaining() > 0 {
         let typ = e.u16_be().map_err(|_| Error::Extensions)?;
-        let data = e.vec16().map_err(|_| Error::Extensions)?;
+        let data = e.length_prefixed_u16_be().map_err(|_| Error::Extensions)?;
         if !seen.insert(typ) {
             return Err(Error::DuplicateExtension(typ));
         }
@@ -1201,28 +1201,16 @@ fn put_vec8(out: &mut Vec<u8>, b: &[u8]) -> Result<(), Error> {
 
 fictionet::codec_from!(Error, Truncated, |_| Error::FieldTruncated);
 
-trait ReadFields<'a> {
+trait ReadFields {
     fn u48(&mut self) -> Result<u64, Truncated>;
-    fn vec8(&mut self) -> Result<&'a [u8], Truncated>;
-    fn vec16(&mut self) -> Result<&'a [u8], Truncated>;
 }
 
-impl<'a> ReadFields<'a> for Reader<'a> {
+impl ReadFields for Reader<'_> {
     fn u48(&mut self) -> Result<u64, Truncated> {
         let s = self.take(6)?;
         Ok(u64::from_be_bytes([
             0, 0, s[0], s[1], s[2], s[3], s[4], s[5],
         ]))
-    }
-
-    fn vec8(&mut self) -> Result<&'a [u8], Truncated> {
-        let n = self.u8()?;
-        self.take(usize::from(n))
-    }
-
-    fn vec16(&mut self) -> Result<&'a [u8], Truncated> {
-        let n = self.u16_be()?;
-        self.take(usize::from(n))
     }
 }
 
@@ -1387,8 +1375,8 @@ impl Wire for ClientHello {
         let version = r.u16_be()?;
         let random = random(&mut r)?;
         let session_id = session_id(&mut r)?;
-        let cookie = r.vec8()?.to_vec();
-        let suites = r.vec16()?;
+        let cookie = r.length_prefixed_u8()?.to_vec();
+        let suites = r.length_prefixed_u16_be()?;
         if suites.is_empty() || !suites.len().is_multiple_of(2) {
             return Err(Error::CipherSuites);
         }
@@ -1398,7 +1386,7 @@ impl Wire for ClientHello {
             .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
-        let compression_methods = r.vec8()?.to_vec();
+        let compression_methods = r.length_prefixed_u8()?.to_vec();
         if compression_methods.is_empty() {
             return Err(Error::CompressionMethods);
         }
@@ -1497,7 +1485,7 @@ impl Wire for HelloVerifyRequest {
     fn parse(b: &[u8]) -> Result<HelloVerifyRequest, Error> {
         let mut r = Reader::new(b);
         let version = r.u16_be()?;
-        let cookie = r.vec8()?.to_vec();
+        let cookie = r.length_prefixed_u8()?.to_vec();
         if r.remaining() != 0 {
             return Err(Error::BodyTrailing);
         }
