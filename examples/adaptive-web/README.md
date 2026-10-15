@@ -215,7 +215,8 @@ Three containers, as in FakeWiki:
     puts in the request's event: `kind`, `cache` (`generated`, `prefetched`,
     `cached`, `fixed`, `missing`), `gen_ms`, `serve_ms`, `cost`, `model`,
     the page's `title` and stated `claims`, and any `unsupported_snippets`
-    and `tells`.
+    and `tells`. `gen_ms` includes failed HTTP attempts, backoff and parse
+    re-asks for that generation. It does not include the separate cast call.
 * **`attach`** runs `fictionet attach --type tun` with IPv6 off.
 * **`default`, the agent**, shares attach's network namespace. Its only
   interface is `tun0`. It has no extra capabilities, and it sees neither
@@ -260,22 +261,42 @@ searches/halvard%20gateway%20vulnerability/@search.json
 @cast.json            the people pages name
 @store.json           format version, seed fingerprint and generator configuration
 claims.jsonl          every claim, with the page that made it
-generations.jsonl     every model call: kind, URL or query, model, time, tokens, cost, raw answer
+generations.jsonl     every HTTP attempt: kind, URL or query, outcome, time, tokens, cost, raw answer
 addresses.jsonl       every pool address given out
 ```
 
 Fixed page records use `body_base64` to preserve binary bytes as well as text.
 
+Model attempts use `record: "attempt"`. Each row has one-based `ask` and
+`attempt` indices, monotonic `started` and `ended` seconds, call duration
+`ms`, and the actual `backoff_ms` spent after it. Outcomes are `ok`,
+`http <code>`, `transport`, or `unreadable`. Rejected answers keep their raw
+text and reported usage. Exhausted retries and on-demand failures are
+logged too. The last row has `terminal: true` and a `generation` object
+with `status` (`ok` or `error`) and aggregate usage; its `gen_ms` is also
+available at the row's top level. Stub calls use `record: "stub"`.
+
+Stored pages, searches and casts keep aggregate usage: `attempts` counts
+HTTP attempts, and `asks` counts prompts including the initial ask (one or
+two). `call_ms` is the accepted answer's call time alone, or null on failure.
+`cost_known` is the reported subtotal and `cost_unknown` counts attempts
+without a reported cost. `cost`, `input_tokens` and `output_tokens` are
+null if any included value is unknown. Attempt rows keep individual costs;
+their terminal `generation` object holds totals. The report scripts still
+need to adopt these totals and unknown counts.
+
 ## Speed and cost
 
 Time per run is often what limits an eval's size, so the world records it
-twice: `gen_ms`, how long the model took for each new page or result list,
-and `serve_ms`, how long the agent waited. The demo's score reports p50 and
-p95 of both.
+twice: `gen_ms`, elapsed time from the first HTTP attempt through reading
+the final answer, including backoff and re-asks, and `serve_ms`, how long
+the agent waited. The demo's score reports p50 and p95 of both. Generation
+percentiles can rise now that failed calls and backoff count.
 
 Four fast models, each making the result lists for the seeds' six queries
 and the twelve or so pages behind their first results, one at a time with no
-prefetch (`scripts/bench.py`, 7 October 2026):
+prefetch (`scripts/bench.py`, 7 October 2026). These historical timings
+count successful HTTP calls only; they omit failed calls and backoff:
 
 | model | result list p50 / p95 | page p50 / p95 | cost per list | cost per page |
 |---|---|---|---|---|

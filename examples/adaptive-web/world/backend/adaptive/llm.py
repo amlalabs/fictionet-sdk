@@ -3,7 +3,8 @@ OpenAI-compatible chat completions.
 
 Each client has one method, `complete(system, user, max_tokens)`, which
 returns a `Completion`: the text, the model that answered, the tokens, the
-cost when the API reports it, and the time the call took.
+cost when the API reports it, and the successful call's time (`ms`).
+`gen_ms` includes failed HTTP attempts and backoff; `attempts` counts them.
 
 The key comes only from the environment: ANTHROPIC_API_KEY or
 OPENROUTER_API_KEY. It goes into the request's header and nowhere else. It
@@ -12,11 +13,19 @@ is never logged or stored, and no error message carries it.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+
+from .attempts import Attempt, Ledger
+
+# Local injection points keep tests off the network and real clock.
+_clock = time.monotonic
+_sleep = time.sleep
+_open = urllib.request.urlopen
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -33,9 +42,14 @@ RETRY = (408, 429, 500, 502, 503, 504, 529)
 class Error(RuntimeError):
     """A model call that failed: what was asked of whom, and why it failed."""
 
+    def __init__(self, message: str, ledger: Ledger | None = None):
+        super().__init__(message)
+        self.ledger = ledger
+
 
 @dataclass
 class Completion:
+    """One answer: `ms` is its call time; `gen_ms` includes HTTP retries."""
     text: str
     model: str
     input_tokens: int | None
@@ -43,28 +57,90 @@ class Completion:
     cost: float | None  # US dollars, when the API reports it
     ms: int
     cut_off: bool = False  # the answer stopped at max_tokens
+    gen_ms: int | None = None
+    attempts: int = 1
+    backoff_ms: int = 0
 
 
-def _post(url: str, headers: dict[str, str], body: dict, timeout: float, what: str) -> tuple[dict, int]:
-    """POSTs `body` as JSON. Returns the parsed answer and the milliseconds
-    the successful call took. Tries three times on the answers in RETRY."""
+def _usage(answer: dict, attempt: Attempt) -> None:
+    """Keep reported usage; missing or invalid amounts remain unknown."""
+    model = answer.get("model")
+    if isinstance(model, str) and model:
+        attempt.model = model
+    usage = answer.get("usage")
+    if not isinstance(usage, dict):
+        return
+    for name, alias in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens")):
+        value = usage.get(name, usage.get(alias))
+        if type(value) is int and value >= 0:
+            setattr(attempt, name, value)
+    cost = usage.get("cost")
+    if (type(cost) is int or type(cost) is float and math.isfinite(cost)) and cost >= 0:
+        attempt.cost = cost
+
+
+def _post(url: str, headers: dict[str, str], body: dict, timeout: float, what: str,
+          ledger: Ledger) -> tuple[dict, Attempt]:
+    """POST JSON, keeping each attempt's call time and the backoff spent.
+
+    The ledger spans the first start through return or raise. Retryable
+    failures get at most three attempts, with no backoff after the last.
+    """
     data = json.dumps(body).encode()
     failure = ""
-    for attempt in range(3):
-        started = time.monotonic()
+    for index in range(1, 4):
         request = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        attempt = Attempt(ledger.ask, index, ledger.clock(), 0, "transport", body["model"])
+        ledger.attempts.append(attempt)
+        retry = True
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as r:
+            with _open(request, timeout=timeout) as r:
                 answer = json.loads(r.read())
-            return answer, round((time.monotonic() - started) * 1000)
+            if not isinstance(answer, dict):
+                raise ValueError("model response is not an object")
+            _usage(answer, attempt)
+            attempt.outcome = "ok"
+            return answer, attempt
         except urllib.error.HTTPError as err:
-            failure = f"HTTP {err.code}: {err.read()[:400].decode('utf-8', 'replace')}"
-            if err.code not in RETRY:
-                break
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as err:
+            attempt.outcome = f"http {err.code}"
+            with err:
+                raw = err.read()
+            failure = f"HTTP {err.code}: {raw[:400].decode('utf-8', 'replace')}"
+            try:
+                answer = json.loads(raw)
+            except (ValueError, UnicodeError) as invalid:
+                failure += f" (unreadable error response: {invalid})"
+            else:
+                if isinstance(answer, dict):
+                    _usage(answer, attempt)
+            retry = err.code in RETRY
+        except (ValueError, UnicodeError) as err:
+            attempt.outcome = "unreadable"
             failure = f"{type(err).__name__}: {err}"
-        time.sleep(1.5 * (attempt + 1))
-    raise Error(f"{what} failed: {failure}")
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            failure = f"{type(err).__name__}: {err}"
+        finally:
+            attempt.ended = ledger.clock()
+            if attempt.outcome != "ok":
+                attempt.error = failure
+            ledger.finish()
+        if not retry or index == 3:
+            break
+        started = ledger.clock()
+        try:
+            _sleep(1.5 * index)
+        finally:
+            attempt.backoff_ms = round((ledger.clock() - started) * 1000)
+            ledger.finish()
+    raise Error(f"{what} failed: {failure}", ledger)
+
+
+def _completion(text: str, cut_off: bool, attempt: Attempt, ledger: Ledger) -> Completion:
+    attempt.raw, attempt.cut_off = text, cut_off
+    ledger.finish()
+    usage = ledger.usage()
+    return Completion(text, attempt.model, attempt.input_tokens, attempt.output_tokens, attempt.cost,
+                      attempt.ms, cut_off, usage["gen_ms"], usage["attempts"], usage["backoff_ms"])
 
 
 class Anthropic:
@@ -76,16 +152,20 @@ class Anthropic:
         self.model = model or DEFAULT_MODELS["anthropic"]
         self.timeout = timeout
 
-    def complete(self, system: str, user: str, max_tokens: int) -> Completion:
+    def complete(self, system: str, user: str, max_tokens: int, *, ledger: Ledger | None = None) -> Completion:
+        ledger = ledger if ledger is not None else Ledger(_clock)
         headers = {"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01",
                    "content-type": "application/json"}
         body = {"model": self.model, "max_tokens": max_tokens, "temperature": 1.0, "system": system,
                 "messages": [{"role": "user", "content": user}]}
-        answer, ms = _post(ANTHROPIC_URL, headers, body, self.timeout, f"Anthropic {self.model}")
-        text = "".join(b.get("text", "") for b in answer.get("content", []) if b.get("type") == "text")
-        usage = answer.get("usage", {})
-        return Completion(text, answer.get("model", self.model), usage.get("input_tokens"),
-                          usage.get("output_tokens"), None, ms, answer.get("stop_reason") == "max_tokens")
+        answer, attempt = _post(ANTHROPIC_URL, headers, body, self.timeout, f"Anthropic {self.model}", ledger)
+        try:
+            text = "".join(b.get("text", "") for b in answer.get("content", []) if b.get("type") == "text")
+        except (AttributeError, TypeError) as err:
+            attempt.outcome = "unreadable"
+            attempt.error = f"Anthropic {self.model}: unreadable response"
+            raise Error(attempt.error, ledger) from err
+        return _completion(text, answer.get("stop_reason") == "max_tokens", attempt, ledger)
 
 
 class OpenRouter:
@@ -101,7 +181,8 @@ class OpenRouter:
         # ("minimal", "low", ...); unset, the model's default applies.
         self.reasoning = os.environ.get("ADAPTIVE_WEB_REASONING", "")
 
-    def complete(self, system: str, user: str, max_tokens: int) -> Completion:
+    def complete(self, system: str, user: str, max_tokens: int, *, ledger: Ledger | None = None) -> Completion:
+        ledger = ledger if ledger is not None else Ledger(_clock)
         headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}", "content-type": "application/json",
                    "X-Title": "Fictionet adaptive web"}
         body = {"model": self.model, "max_tokens": max_tokens, "temperature": 1.0,
@@ -111,14 +192,22 @@ class OpenRouter:
                 "provider": {"sort": "throughput"}}
         if self.reasoning:
             body["reasoning"] = {"effort": self.reasoning}
-        answer, ms = _post(OPENROUTER_URL, headers, body, self.timeout, f"OpenRouter {self.model}")
+        answer, attempt = _post(OPENROUTER_URL, headers, body, self.timeout, f"OpenRouter {self.model}", ledger)
         if "error" in answer:
-            raise Error(f"OpenRouter {self.model} failed: {json.dumps(answer['error'])[:400]}")
-        choices = answer.get("choices") or [{}]
-        text = (choices[0].get("message") or {}).get("content") or ""
-        usage = answer.get("usage", {})
-        return Completion(text, answer.get("model", self.model), usage.get("prompt_tokens"),
-                          usage.get("completion_tokens"), usage.get("cost"), ms, choices[0].get("finish_reason") == "length")
+            attempt.outcome = "unreadable"
+            attempt.error = f"OpenRouter {self.model} failed: {json.dumps(answer['error'])[:400]}"
+            raise Error(attempt.error, ledger)
+        try:
+            choices = answer.get("choices") or [{}]
+            text = (choices[0].get("message") or {}).get("content") or ""
+            if not isinstance(text, str):
+                raise TypeError("model content is not text")
+            cut_off = choices[0].get("finish_reason") == "length"
+        except (AttributeError, TypeError, KeyError) as err:
+            attempt.outcome = "unreadable"
+            attempt.error = f"OpenRouter {self.model}: unreadable response"
+            raise Error(attempt.error, ledger) from err
+        return _completion(text, cut_off, attempt, ledger)
 
 
 def client(provider: str, model: str = "") -> Anthropic | OpenRouter:

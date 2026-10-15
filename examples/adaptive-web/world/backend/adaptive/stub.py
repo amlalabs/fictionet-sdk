@@ -180,14 +180,16 @@ class Stub:
 
     def cast(self) -> Made:
         """No one: the stub's pages name no people."""
-        return Made([], self.model, 0)
+        return Made([], self.model, 0, call_ms=0, attempts=1, asks=1)
 
     def search(self, query: str, known: list[dict], claims: list[dict], cast: list[dict]) -> Made:
         started = time.monotonic()
         fields = search(self.seed, query, known)
-        return Made(fields, self.model, round((time.monotonic() - started) * 1000))
+        ms = round((time.monotonic() - started) * 1000)
+        return Made(fields, self.model, ms, call_ms=ms, attempts=1, asks=1)
 
     def page(self, ask: PageAsk) -> Made:
         started = time.monotonic()
         fields = page(self.seed, ask.host, ask.target, ask.mentions, ask.host_pages)
-        return Made(fields, self.model, round((time.monotonic() - started) * 1000))
+        ms = round((time.monotonic() - started) * 1000)
+        return Made(fields, self.model, ms, call_ms=ms, attempts=1, asks=1)

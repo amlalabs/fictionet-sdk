@@ -681,6 +681,8 @@ class ModelGenerator(unittest.TestCase):
         made = gen.search("halvard", [], [], [])
         self.assertEqual(len(made.fields["results"]), 10)
         self.assertAlmostEqual(made.cost, 0.0042)
+        self.assertEqual((made.attempts, made.asks, made.cost_unknown), (2, 2, 0))
+        self.assertAlmostEqual(made.cost_known, 0.0042)
         FakeOpenRouter.bad_answers = 2
         with self.assertRaises(prompts.Error):
             gen.search("halvard", [], [], [])

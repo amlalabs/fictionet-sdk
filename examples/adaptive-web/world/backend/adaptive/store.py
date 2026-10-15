@@ -8,7 +8,7 @@
     @cast.json                                 the people pages name, made once
     @store.json                                format version, seed and generator identity
     claims.jsonl                               every page's stated claims, in order
-    generations.jsonl                          every generator call: inputs, output, time
+    generations.jsonl                          every HTTP attempt; stub calls and prefetch errors
 
 Paths come from the URL itself, so a person can find a page by its URL. Each
 path segment is percent-encoded on its own and becomes a directory. An empty

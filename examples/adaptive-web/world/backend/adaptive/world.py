@@ -110,11 +110,12 @@ class World:
         self.generator = generator
         config = None
         if isinstance(generator, Model):
-            config = {"provider": generator.client.provider, "model": generator.model,
-                      "reasoning": getattr(generator.client, "reasoning", "")}
+            config = {"provider": generator.provider, "model": generator.model, "reasoning": generator.reasoning}
         elif generator is not None:
             config = {"provider": "stub", "model": generator.model}
         store.bind(seed.fingerprint(), config)
+        if isinstance(generator, Model):
+            generator.record = store.log_generation
         if generator is not None:
             for fixed in seed.fixed:
                 if store.page(fixed.host, fixed.target) is None:
@@ -137,13 +138,18 @@ class World:
                 raise GenerationBudgetExceeded("generation budget exhausted")
             self.generation_budget -= 1
 
+    def _generate(self, kind: str, *args, **context) -> Made:
+        made = getattr(self.generator, kind)(*args)
+        if not isinstance(self.generator, Model):
+            self.store.log_generation({"kind": kind, "record": "stub", **context, **made.usage(), "raw": made.raw})
+        return made
+
     def cast(self) -> list[dict]:
         """The people the world names, made by the generator the first time
         a page or result list needs them."""
         def make() -> dict:
             self._reserve_generation()
-            made = self.generator.cast()
-            self.store.log_generation({"kind": "cast", **made.usage(), "raw": made.raw})
+            made = self._generate("cast")
             return {"people": made.fields, **made.usage()}
         return self.store.cast_once(make)["people"]
 
@@ -212,7 +218,7 @@ class World:
 
     def _make_search(self, key: str, query: str) -> dict:
         self._reserve_generation()
-        made = self.generator.search(query, self._known(), self.store.recent_claims(), self.cast())
+        made = self._generate("search", query, self._known(), self.store.recent_claims(), self.cast(), query=query)
         results = []
         for rank, r in enumerate(made.fields["results"], 1):
             host, target = target_of(r["url"])
@@ -224,7 +230,6 @@ class World:
                                "snippet": r["snippet"], "date": r.get("date", "")},
                 {"title": fixed.title, "description": fixed.description} if fixed else None)
             results.append(dict(r, title=mention["title"], snippet=mention["snippet"]))
-        self.store.log_generation({"kind": "search", "query": query, **made.usage(), "raw": made.raw})
         return {"query": query, "key": key, "results": results, "related": made.fields.get("related", []),
                 "questions": made.fields.get("questions", []), "ads": made.fields.get("ads", []),
                 **made.usage(), "created": time.time()}
@@ -300,7 +305,7 @@ class World:
         mentions = self.store.mentions(host, target)
         ask = PageAsk(url, host, target, mentions, self.store.site(host), self.store.pages(host)[:20],
                       self.store.recent_claims(), self.cast())
-        made: Made = self.generator.page(ask)
+        made = self._generate("page", ask, url=url)
         page = dict(made.fields)
         profile = ask.profile or self.store.site_once(host, page.get("site") or stub.site_profile(host))
         titles = [m["title"] for m in mentions if m.get("title")]
@@ -313,7 +318,6 @@ class World:
             body = render.not_found(host, profile, target, self.year)
         else:
             body = render.page(host, profile, page, self.year)
-        self.store.log_generation({"kind": "page", "url": url, **made.usage(), "raw": made.raw})
         if prefetch:
             with self.unserved_lock:
                 self.unserved.add((host, target))

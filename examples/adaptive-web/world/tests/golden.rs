@@ -12,6 +12,8 @@
 //!
 //! `ts`, `gen_ms`, `serve_ms` and the certificates' dates change from run to
 //! run and are left out. The lines are compared as sorted sets.
+//! `gen_ms` includes HTTP failures, backoff and parse re-asks; this offline
+//! fixture has one stub call per generation and no HTTP attempts.
 //! `ADAPTIVE_WEB_GOLDEN_WRITE=1 cargo test --test golden` records the file
 //! again.
 
