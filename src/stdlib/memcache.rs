@@ -1568,8 +1568,9 @@ pub struct Packet {
 impl Packet {
     /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the packet and how many bytes
-    /// of `b` it took. A bad magic byte is known from the first byte.
-    fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, Error> {
+    /// of `b` it took. A bad magic byte is known from the first byte. A
+    /// declared body above `limit` is refused from the header.
+    fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Error> {
         let Some(&m) = b.first() else { return Ok(None) };
         let magic = Magic::from_byte(m).ok_or(Error::Magic(m))?;
         if b.len() < BINARY_HEADER_LEN {
@@ -1581,7 +1582,7 @@ impl Packet {
         if key_len > MAX_KEY {
             return Err(Error::KeyLength(key_len));
         }
-        if body > MAX_BODY || key_len + extras_len > body {
+        if body > limit || key_len + extras_len > body {
             return Err(Error::BodyLength(body));
         }
         let end = BINARY_HEADER_LEN + body;
@@ -2423,22 +2424,7 @@ fictionet::prefixed! {
         input: &[u8],
         limit: &Self::Limit,
     ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
-        let limit = *limit;
-        if let Some(&m) = input.first() {
-            Magic::from_byte(m).ok_or(Error::Magic(m))?;
-        }
-        if let Some(header) = input.get(..BINARY_HEADER_LEN) {
-            let key_len = usize::from(be16(header, 2).ok_or(Error::Incomplete)?);
-            if key_len > MAX_KEY {
-                return Err(Error::KeyLength(key_len));
-            }
-            let body =
-                usize::try_from(be32(header, 8).ok_or(Error::Incomplete)?).unwrap_or(usize::MAX);
-            if body > limit {
-                return Err(Error::BodyLength(body));
-            }
-        }
-        Packet::parse_prefix(input)
+        Packet::parse_prefix(input, Self::normalize_limit(*limit))
     }
 }
 
@@ -2450,7 +2436,7 @@ impl Wire for Packet {
     /// [`MAX_KEY`], bodies above [`MAX_BODY`], a key and extras that exceed
     /// the declared body, incomplete input, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Packet::parse_prefix(bytes)? {
+        match Packet::parse_prefix(bytes, MAX_BODY)? {
             Some((packet, used)) if used == bytes.len() => Ok(packet),
             Some(_) => Err(Error::Trailing),
             None => Err(Error::Incomplete),

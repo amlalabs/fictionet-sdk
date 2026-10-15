@@ -1027,6 +1027,77 @@ fn memcache_long_get_consumes_the_scanned_window() {
 }
 
 #[test]
+fn memcache_binary_custom_body_limit() {
+    let packet = cache_packet(b"data");
+    let bytes = contract::check_written(&packet);
+    let body_len = bytes.len() - memcache::BINARY_HEADER_LEN;
+    let header = &bytes[..memcache::BINARY_HEADER_LEN];
+    assert_eq!(memcache::Packet::parse(&bytes), Ok(packet.clone()));
+    assert_eq!(
+        Frames::<memcache::Packet>::new().decode(header, false),
+        Ok(Step::Need)
+    );
+    assert_eq!(
+        check(|| Frames::<memcache::Packet>::with_limit(body_len), &bytes),
+        (vec![packet], None)
+    );
+    assert_eq!(
+        check(
+            || Frames::<memcache::Packet>::with_limit(body_len - 1),
+            header
+        ),
+        (
+            vec![],
+            Some(Fail::Protocol(memcache::Error::BodyLength(body_len)))
+        )
+    );
+}
+
+#[test]
+fn memcache_binary_header_error_parity() {
+    for (magic, key_len, extras_len, body_len, error) in [
+        (0, 251, 0, memcache::MAX_BODY + 1, memcache::Error::Magic(0)),
+        (
+            memcache::REQUEST_MAGIC,
+            0,
+            0,
+            memcache::MAX_BODY + 1,
+            memcache::Error::BodyLength(memcache::MAX_BODY + 1),
+        ),
+        (
+            memcache::REQUEST_MAGIC,
+            3,
+            2,
+            4,
+            memcache::Error::BodyLength(4),
+        ),
+    ] {
+        let mut header = [0; memcache::BINARY_HEADER_LEN];
+        header[0] = magic;
+        header[2..4].copy_from_slice(&(key_len as u16).to_be_bytes());
+        header[4] = extras_len;
+        header[8..12].copy_from_slice(&(body_len as u32).to_be_bytes());
+        assert_eq!(memcache::Packet::parse(&header), Err(error));
+        assert_eq!(
+            <memcache::Packet as codec::Prefixed>::parse_prefix(&header, &usize::MAX),
+            Err(error)
+        );
+        assert_eq!(
+            check(Frames::<memcache::Packet>::new, &header),
+            (vec![], Some(Fail::Protocol(error)))
+        );
+    }
+    assert_eq!(
+        memcache::Packet::parse(&[0]),
+        Err(memcache::Error::Magic(0))
+    );
+    assert_eq!(
+        Frames::<memcache::Packet>::with_limit(0).decode(&[0], false),
+        Err(memcache::Error::Magic(0))
+    );
+}
+
+#[test]
 fn memcache_binary_key_length_precedes_body_length() {
     let key_len = memcache::MAX_KEY + 1;
     for body_len in [4, memcache::MAX_BODY + 1] {
