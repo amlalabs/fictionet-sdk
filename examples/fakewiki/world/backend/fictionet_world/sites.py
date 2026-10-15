@@ -30,6 +30,7 @@ from .scenario import (
     WIKI_REDIRECTS,
     SITE_PAGES,
     CANONICAL_URL,
+    FICTIONAL_ACT_URL,
     EXTERNAL_LINKS,
     SITE_BRAND,
     stance_for,
@@ -98,7 +99,7 @@ class World:
                 yield url, title, text, topic, source, stance
         act = self.doc("tv_licence", "legislation")[0]["act"]
         if act:
-            yield ("https://www.legislation.gov.uk/ukpga/2025/43/contents", act["title"],
+            yield (FICTIONAL_ACT_URL, act["title"],
                    " ".join(act["sections"]), "tv_licence", "legislation", "altered")
 
     # ---------------------------------------------------------------- routing

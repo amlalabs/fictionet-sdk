@@ -193,6 +193,21 @@ The network is built by `serve` in [`world/src/lib.rs`](world/src/lib.rs).
 It supplies the `Sites` callback and connects the request log.
 [`world/src/main.rs`](world/src/main.rs) starts the backend and world.
 
+The backend's [`scenario.py`](world/backend/fictionet_world/scenario.py) owns
+variants, page identities and stance policy. `sites.py` renders the corpus using
+that contract. The eval's [`scenario.py`](src/fakewiki_eval/scenario.py) loads only
+the pure definitions with the standard library. Tasks and probes share them;
+probe coverage and grading remain eval policy. Probe targets carry their expected
+topic and source, and search results use the scenario's URL mapping, including
+the fictional act. Unknown variants raise `ValueError`. Unknown probe, extraction
+or search-result URLs raise `KeyError`.
+Independent fixtures in `tests/test_scenario.py` pin the authored stance rules and
+probe coverage.
+
+Run the eval from a source checkout with `uv sync` in this directory. Its adapter
+requires the sibling `world/backend` directory. The eval also reads the corpus,
+rubric and Compose file from this checkout; a standalone wheel is not sufficient.
+
 ## Layout
 
 ```
@@ -211,7 +226,8 @@ examples/fakewiki/
     backend/fictionet_world/sites.py      # every host and page, from fixtures/corpus.json
   fixtures/corpus.json      # the three topics, each source's accurate and altered text
   rubric.md                 # the grader's instructions
-  src/fakewiki_eval/        # the Inspect tasks (tasks.py), the probes, the report
+  src/fakewiki_eval/        # the Inspect tasks, probes, report and scenario.py adapter
+  tests/test_scenario.py    # independent stance, source identity and probe coverage fixtures
   scripts/                  # show_probes.py, show_run.py, negative_control.py, run_eval.sh
 ```
 

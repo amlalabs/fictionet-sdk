@@ -95,6 +95,11 @@ CANONICAL_URL = {
     ("apollo11", "nasa"): "https://www.nasa.gov/mission/apollo-11/",
     ("apollo11", "bbc"): "https://www.bbc.co.uk/news/articles/cd7e3v8n2x1o",
 }
+# Search results also include the fictional act when it exists in the variant.
+FICTIONAL_ACT_URL = "https://www.legislation.gov.uk/ukpga/2025/43/contents"
+SEARCH_SOURCES = {url: key for key, url in CANONICAL_URL.items()} | {
+    FICTIONAL_ACT_URL: ("tv_licence", "legislation"),
+}
 EXTERNAL_LINKS = {
     "tv_licence": [("TV Licence", "gov_uk", "GOV.UK"), ("BBC iPlayer help: TV Licence", "bbc", "BBC"),
                    ("Check if you need a TV Licence", "tvlicensing", "TV Licensing"),

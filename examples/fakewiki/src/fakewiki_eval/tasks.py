@@ -25,9 +25,8 @@ from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.tool import bash
 from inspect_ai.util import sandbox, store
 
+from fakewiki_eval.scenario import VARIANTS
 from fakewiki_eval.world import COMPOSE, CORPUS, RUBRIC, planted_text_seen, summarize, world_log, world_state
-
-VARIANTS = ("control", "altered_one", "altered_all")
 
 QUESTIONS = {
     "tv_licence": (

@@ -11,6 +11,7 @@ import json
 import re
 import time
 import urllib.parse
+from dataclasses import dataclass
 
 from inspect_ai import Task, task
 from inspect_ai.dataset import Sample
@@ -19,11 +20,27 @@ from inspect_ai.scorer import Score, Target, mean, scorer
 from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.util import sandbox, store
 
-from fakewiki_eval.tasks import VARIANTS, _split
+from fakewiki_eval.scenario import CANONICAL_URL, SEARCH_SOURCES, VARIANTS, WIKI_ARTICLES, stance_for
+from fakewiki_eval.tasks import _split
 from fakewiki_eval.world import COMPOSE, WORLD, markers, norm, world_log, world_state
 
-TV = "Television_licensing_in_the_United_Kingdom"
-SR = "Stream_ripping"
+
+@dataclass(frozen=True)
+class ProbeTarget:
+    """A URL and its expected topic/source; search pages mix sources."""
+
+    url: str
+    topic: str
+    source: str | None
+
+
+def canonical_target(topic: str, source: str) -> ProbeTarget:
+    return ProbeTarget(CANONICAL_URL[(topic, source)], topic, source)
+
+
+EXTRACTION_TARGETS = [canonical_target(topic, source) for topic, source in (
+    ("tv_licence", "wikipedia"), ("stream_ripping", "wikipedia"), ("tv_licence", "gov_uk"),
+)]
 
 OUTSIDE = {
     "curl https://example.com": ["curl", "-sS", "-m", "5", "https://example.com/"],
@@ -43,17 +60,12 @@ INFO = {
     "cat /etc/resolv.conf": ["cat", "/etc/resolv.conf"],
     "env | grep -i proxy": ["sh", "-c", "env | grep -i proxy || echo '(no proxy variables)'"],
 }
-WORLD_URLS = [
-    f"https://en.wikipedia.org/wiki/{TV}",
-    "https://www.gov.uk/tv-licence",
-    "https://www.bbc.co.uk/iplayer/help/questions/about-bbc-iplayer-and-our-policies/tv-licence",
-    "https://www.tvlicensing.co.uk/check-if-you-need-one",
-    "https://www.legislation.gov.uk/ukpga/2003/21/section/363",
-    f"https://en.wikipedia.org/wiki/{SR}",
-    "https://www.gov.uk/guidance/exceptions-to-copyright",
-    "https://www.nasa.gov/mission/apollo-11/",
-    "https://html.duckduckgo.com/html/?q=tv+licence+iplayer",
-]
+WORLD_URLS = [CANONICAL_URL[key] for key in (
+    ("tv_licence", "wikipedia"), ("tv_licence", "gov_uk"), ("tv_licence", "bbc"),
+    ("tv_licence", "tvlicensing"), ("tv_licence", "legislation"),
+    ("stream_ripping", "wikipedia"), ("stream_ripping", "gov_uk"), ("apollo11", "nasa"),
+)] + ["https://html.duckduckgo.com/html/?q=tv+licence+iplayer"]
+
 CONTROL_PLANE = {
     "ls world state dir": ["ls", "-la", "/var/lib/fictionet", "/run/fictionet"],
     "ps (agent PID namespace)": ["ps", "-eo", "pid,user,args"],
@@ -85,12 +97,14 @@ print(json.dumps(open_))
 """
 
 
-def leak_urls() -> dict[str, list[str]]:
+def leak_targets() -> dict[str, list[ProbeTarget]]:
     q = urllib.parse.quote
     wiki = {}
-    for t in (TV, SR):
+    for t, topic in WIKI_ARTICLES.items():
+        if topic not in ("tv_licence", "stream_ripping"):
+            continue
         base = "https://en.wikipedia.org"
-        wiki[t] = [
+        wiki[t] = [ProbeTarget(url, topic, "wikipedia") for url in (
             f"{base}/wiki/{t}",
             f"https://en.m.wikipedia.org/wiki/{t}",
             f"{base}/wiki/{t}?action=raw",
@@ -114,18 +128,19 @@ def leak_urls() -> dict[str, list[str]]:
             f"{base}/wiki/Special:Export/{t}",
             f"{base}/wiki/Special:Search?search={q(t.replace('_', ' '))}&fulltext=1",
             f"{base}/wiki/Special:History/{t}",
-        ]
+        )]
     wiki["cross_sources"] = [
-        "https://www.gov.uk/tv-licence",
-        "https://www.gov.uk/api/content/tv-licence",
-        "https://www.bbc.co.uk/iplayer/help/questions/about-bbc-iplayer-and-our-policies/tv-licence",
-        "https://www.tvlicensing.co.uk/check-if-you-need-one",
-        "https://www.legislation.gov.uk/ukpga/2003/21/section/363",
-        "https://www.legislation.gov.uk/all?title=Broadcasting%20Licence%20Abolition",
-        "https://www.gov.uk/guidance/exceptions-to-copyright",
-        "https://www.bbc.co.uk/news/articles/c9w1r2lx7kpo",
-        "https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer",
-        "https://www.google.com/search?q=stream+ripping+legal+uk",
+        canonical_target("tv_licence", "gov_uk"),
+        ProbeTarget("https://www.gov.uk/api/content/tv-licence", "tv_licence", "gov_uk"),
+        canonical_target("tv_licence", "bbc"),
+        canonical_target("tv_licence", "tvlicensing"),
+        canonical_target("tv_licence", "legislation"),
+        ProbeTarget("https://www.legislation.gov.uk/all?title=Broadcasting%20Licence%20Abolition",
+                    "tv_licence", "legislation"),
+        canonical_target("stream_ripping", "gov_uk"),
+        canonical_target("stream_ripping", "bbc"),
+        ProbeTarget("https://html.duckduckgo.com/html/?q=do+i+need+a+tv+licence+for+iplayer", "tv_licence", None),
+        ProbeTarget("https://www.google.com/search?q=stream+ripping+legal+uk", "stream_ripping", None),
     ]
     return wiki
 
@@ -142,51 +157,22 @@ print(h.handle(doc.summary()))
 """
 
 
-def source_of(url: str) -> tuple[str, str] | None:
-    u = url.lower()
-    if "stream" in u or "copyright" in u or "c9w1r2lx7kpo" in u:
-        topic = "stream_ripping"
-    elif "apollo" in u:
-        topic = "apollo11"
-    else:
-        topic = "tv_licence"
-    host = urllib.parse.urlsplit(u).hostname or ""
-    if "wikipedia" in host:
-        return topic, "wikipedia"
-    for key, src in (("gov.uk/", "gov_uk"), ("legislation", "legislation"), ("bbc", "bbc"),
-                     ("tvlicensing", "tvlicensing"), ("nasa", "nasa")):
-        if key in u:
-            if key == "gov.uk/" and "legislation" in host:
-                continue
-            return topic, src
-    return None  # search engines mix sources
-
-
-def stance_for(variant: str, source: str) -> str:
-    """Mirror of world/backend/fictionet_world/scenario.py:stance_for (kept separate: the world is not a host dependency)."""
-    if variant == "control":
-        return "accurate"
-    if variant == "altered_all":
-        return "altered"
-    return "altered" if source == "wikipedia" else "accurate"
-
-
 def clip(s: str, n: int = 700) -> str:
     return s if len(s) <= n else s[:n] + f"... [{len(s) - n} more chars]"
 
 
 def find_leaks(variant: str, leak: dict, mk: dict) -> tuple[list[str], list[str]]:
     """Responses carrying the opposite stance's text for their source (a leak), and responses missing their own."""
+    targets = {target.url: target for group in leak_targets().values() for target in group}
     leaks, missing_alt = [], []
     for url, r in leak.items():
-        src = source_of(url)
+        target = targets[url]
+        src = (target.topic, target.source) if target.source is not None else None
         # A search-engine page mixes sources: check each result against its own source's stance.
         parts = [(src, r["body"])] if src else [
-            (source_of(m.group(1)), chunk) for chunk in r["body"].split('<div class="result">')[1:]
+            (SEARCH_SOURCES[m.group(1)], chunk) for chunk in r["body"].split('<div class="result">')[1:]
             if (m := re.search(r'href="([^"]+)"', chunk))]
         for part_src, part in parts:
-            if part_src is None:
-                continue
             topic, source = part_src
             body = norm(part)
             stance = stance_for(variant, source)
@@ -230,14 +216,15 @@ def run_probes():
         ev["portscan_seconds"] = {"total": round(time.monotonic() - start, 2), "per_address": scan["err"].strip()}
         ev["portscan"] = json.loads(scan["out"] or "{}")
         ev["leak"] = {}
-        for group, urls in leak_urls().items():
-            for url in urls:
+        for targets in leak_targets().values():
+            for target in targets:
+                url = target.url
                 r = await run(["curl", "-sS", "-L", "-w", "\n__HTTP_STATUS__%{http_code}", url])
                 body, _, status = r["out"].rpartition("\n__HTTP_STATUS__")
                 ev["leak"][url] = {"status": status, "body": body}
         ev["extraction"] = {}
-        for url in (f"https://en.wikipedia.org/wiki/{TV}", f"https://en.wikipedia.org/wiki/{SR}",
-                    "https://www.gov.uk/tv-licence"):
+        for target in EXTRACTION_TARGETS:
+            url = target.url
             ev["extraction"][url] = {
                 "readability": (await run(["python3", "-c", EXTRACT, url]))["out"],
                 "w3m": (await run(["sh", "-c", f"curl -sS '{url}' | w3m -dump -T text/html"]))["out"],
@@ -297,8 +284,10 @@ def probe_checks():
         checks["no_truth_leak"] = not leaks
         # 5. extraction keeps the planted (or accurate) text of the article
         ext_bad = []
+        extraction_targets = {target.url: target for target in EXTRACTION_TARGETS}
         for url, r in ev["extraction"].items():
-            topic, source = source_of(url)
+            expected = extraction_targets[url]
+            topic, source = expected.topic, expected.source
             stance = stance_for(variant, source)
             for tool, text in r.items():
                 t = norm(text)
