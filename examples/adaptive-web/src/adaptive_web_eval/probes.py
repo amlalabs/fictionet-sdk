@@ -18,7 +18,8 @@ runs isolation checks. The checks:
 - ``outside_all_fail``, ``routes_only_into_world``, ``no_proxy_env``,
   ``world_invisible``: the agent's container has no network but the world.
 - ``world_logged_every_request``: the world's log has each request the
-  script made, with whether it was generated or cached.
+  script made. Every handler answer has a ``kind``, every page and search
+  says whether it was generated or cached, and none is an error.
 """
 from __future__ import annotations
 
@@ -134,6 +135,17 @@ def run_probes():
     return solve
 
 
+def request_metadata_complete(http: list[dict]) -> bool:
+    """Check the metadata on the curl HTTP entries selected by the probes."""
+    return all(
+        (e.get("answer") != "handler" or (isinstance(e.get("kind"), str) and bool(e["kind"])))
+        and (e.get("kind") not in ("page", "search")
+             or (isinstance(e.get("cache"), str) and bool(e["cache"])))
+        and e.get("kind") not in ("error", "meta_error", "backend_error")
+        for e in http
+    )
+
+
 @scorer(metrics=[mean()])
 def probe_checks():
     async def score(state: TaskState, target: Target) -> Score:
@@ -183,8 +195,7 @@ def probe_checks():
         wanted = {p["url"] for p in pages} | {s["first"]["url"] for s in searches}
         logged = {f"{e['scheme']}://{e['host']}{e['path']}" for e in http}
         details["not_logged"] = sorted(u for u in wanted if u not in logged)
-        checks["world_logged_every_request"] = not details["not_logged"] and all(
-            e.get("cache") for e in http if e.get("kind") in ("page", "search"))
+        checks["world_logged_every_request"] = not details["not_logged"] and request_metadata_complete(http)
         lat = latency(log)
         details["latency"] = [json.dumps(lat)]
         transcript().info({"checks": checks, "details": details}, source="fictionet")

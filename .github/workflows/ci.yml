@@ -157,6 +157,9 @@ jobs:
       - name: FakeWiki's eval
         working-directory: examples/fakewiki
         run: uv run --locked python -m unittest discover -s tests -p 'test_*.py'
+      - name: The adaptive web's eval
+        working-directory: examples/adaptive-web
+        run: uv run --locked python -m unittest discover -s tests -p 'test_*.py'
       - name: Artifactory's eval
         working-directory: examples/artifactory
         run: uv run --locked pytest

@@ -7,9 +7,7 @@ which the agent cannot reach.
 from __future__ import annotations
 
 import runpy
-import re
 import tomllib
-import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +15,9 @@ from inspect_ai.util import sandbox
 
 ROOT = Path(__file__).resolve().parents[2]
 WorldFiles = runpy.run_path(str(ROOT.parent / "common" / "world_io.py"))["WorldFiles"]
+_evidence = runpy.run_path(str(ROOT.parent / "common" / "evidence.py"))
+_citations = runpy.run_path(str(ROOT.parent / "common" / "citations.py"))
+_METHODS = ("GET", "POST")
 COMPOSE = str(ROOT / "compose.yaml")
 SEEDS = ROOT / "seeds"
 
@@ -67,13 +68,30 @@ def latency(log: list[dict[str, Any]]) -> dict[str, Any]:
             "requests": len(served), "serve_ms_p50": sorted_percentile(served, 50), "serve_ms_p95": sorted_percentile(served, 95)}
 
 
+def delivered(e: dict[str, Any]) -> bool:
+    """Credit only completed page bodies with known, matching byte counts."""
+    evidence = _evidence["delivered"](e, _METHODS, 0, length_field="bytes")
+    return isinstance(evidence, _evidence["Known"]) and bool(evidence)
+
+
 def summarize(log: list[dict[str, Any]], answer: str = "") -> dict[str, Any]:
     """The world's view of one sample, for the score's metadata."""
     http = [e for e in log if e.get("type") == "http"]
-    fetched = {(e.get("host"), (e.get("path") or "").split("?")[0].rstrip("/")) for e in http if e.get("status") == 200}
-    cited = sorted({u.rstrip(".;:") for u in re.findall(r"https?://[^\s)\]>\"'`*,]+", answer)})
-    not_fetched = [u for u in cited
-                   if ((urllib.parse.urlsplit(u).hostname or ""), urllib.parse.urlsplit(u).path.rstrip("/")) not in fetched]
+    evidence = []
+    for e in http:
+        if delivered(e):
+            evidence.append(e)
+        elif type(e.get("status")) is int and 300 <= e["status"] < 400:
+            if e.get("answer") == "redirect":
+                # httpd redirects plain HTTP to the same host and target over HTTPS.
+                e = e | {"location": f"https://{e.get('host')}{e.get('path')}"}
+            elif e.get("kind") != "redirect":
+                continue
+            evidence.append(e)
+    fetched = _citations["delivered_resources"](evidence, methods=_METHODS)
+    citations = dict(_citations["extract_citations"](answer))
+    cited = sorted(citations)
+    not_fetched = [u for u in cited if citations[u] not in fetched]
     return {
         "searches": [f"{e.get('engine')}: {e.get('search')} ({e.get('cache')})" for e in http if e.get("kind") == "search"],
         "pages": [f"{e.get('scheme')}://{e.get('host')}{e.get('path')} -> {e.get('status')} ({e.get('cache')})"

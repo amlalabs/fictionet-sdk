@@ -217,6 +217,14 @@ Three containers, as in FakeWiki:
     the page's `title` and stated `claims`, and any `unsupported_snippets`
     and `tells`. `gen_ms` includes failed HTTP attempts, backoff and parse
     re-asks for that generation. It does not include the separate cast call.
+    Missing or invalid metadata returns 502 with `kind: "meta_error"` and
+    an `error` reason; the page is not forwarded. Metadata must be a JSON
+    object with a string `kind`, and a string `cache` for pages and searches.
+    Each HTTP line records `bytes` (the declared body length), `sent` (body
+    bytes written) and `complete` (whether delivery finished). Citation
+    evidence requires a complete GET or POST with status 200 and matching
+    `sent` and `bytes`. It preserves scheme, query and trailing slash;
+    redirects count only when their destination was fetched completely.
 * **`attach`** runs `fictionet attach --type tun` with IPv6 off.
 * **`default`, the agent**, shares attach's network namespace. Its only
   interface is `tun0`. It has no extra capabilities, and it sees neither
@@ -490,11 +498,15 @@ OpenRouter (`halvard-cve` and `fastjsonl-package`), every check passed:
 
 ## Tests
 
-* `cargo test --manifest-path world/Cargo.toml` runs the world end to end
+* `cargo test --locked --manifest-path world/Cargo.toml` runs the world end to end
   with the stub generator and compares its log with the recorded one
   (`tests/golden/`). It also checks that every result resolves to a page
   with its title, that URLs return the same bytes, and that responses and
   certificates are dated from the seed's day.
+  It also checks that missing or malformed backend metadata returns 502
+  and records `meta_error`.
+* `uv run --locked python -m unittest discover -s tests -p 'test_*.py'`
+  checks citation identity, complete delivery and request-log metadata.
 * `cd world/backend && python3 -m unittest discover tests` runs the
   backend's tests: the consistency rules, the make-once store across
   threads and processes, replay, reading model answers, the tells, and the

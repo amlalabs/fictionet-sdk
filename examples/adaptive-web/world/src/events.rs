@@ -6,7 +6,9 @@
 //! about a page (generated or cached, the model, the time it took, its
 //! claims) in its response's extensions. The `http.request` event brings
 //! them back here, so one `http` line holds both what the agent asked for
-//! and what it was shown.
+//! and what it was shown. `bytes` keeps the handler's declared body length;
+//! `sent` and `complete` record the HTTP service's actual delivery. A HEAD
+//! request can finish without sending the declared body.
 
 use std::sync::Arc;
 
@@ -125,6 +127,8 @@ fn http(e: &Entry) -> Value {
     line.insert("referer".into(), json!(headers::header(e, "referer")));
     line.insert("answer".into(), get(e, "answer"));
     line.insert("status".into(), get(e, "status"));
+    line.insert("sent".into(), get(e, "sent"));
+    line.insert("complete".into(), get(e, "complete"));
     for name in PAGE_FIELDS {
         if let Some(v) = e.get(name) {
             line.insert(name.into(), to_json(v));
@@ -134,4 +138,28 @@ fn http(e: &Entry) -> Value {
         line.insert("bytes".into(), get(e, "sent"));
     }
     Value::Object(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_is_separate_from_declared_length() {
+        for (method, sent, complete) in
+            [("HEAD", 0u64, true), ("GET", 20, false), ("GET", 100, true)]
+        {
+            let event = Entry::new("http", "request")
+                .field("method", method)
+                .field("status", 200u64)
+                .field("bytes", 100u64)
+                .field("sent", sent)
+                .field("complete", complete);
+            let line = line(&event).unwrap();
+            assert_eq!(line["method"], method);
+            assert_eq!(line["bytes"], 100);
+            assert_eq!(line["sent"], sent);
+            assert_eq!(line["complete"], complete);
+        }
+    }
 }

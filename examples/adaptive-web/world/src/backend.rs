@@ -2,7 +2,10 @@
 //! (backend.py, on 127.0.0.1 in the world container), takes the
 //! `X-Adaptive-Meta` header off the answer, and puts what it says in the
 //! response's extensions as the fields of the request's event, for the log.
-//! The agent never sees that header.
+//! The agent never sees that header. Missing or malformed metadata answers
+//! 502 with `kind = "meta_error"` and a reason instead of forwarding the page.
+//! Metadata must be an object with a string `kind`, and a string `cache`
+//! when the kind is `page` or `search`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -121,12 +124,20 @@ impl Backend {
                 return Ok(response);
             }
         };
-        let meta: Value = parts
-            .headers
-            .remove(META)
-            .and_then(|v| v.to_str().ok().map(percent_decode))
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or(Value::Null);
+        let meta = match metadata(parts.headers.remove(META)) {
+            Ok(meta) => meta,
+            Err(error) => {
+                let mut response = Response::new(Full::new(Bytes::from_static(
+                    b"The site returned invalid metadata.\n",
+                )));
+                *response.status_mut() = StatusCode::BAD_GATEWAY;
+                let fields = Fields::new()
+                    .with("kind", "meta_error")
+                    .with("error", error);
+                response.extensions_mut().insert(fields);
+                return Ok(response);
+            }
+        };
 
         let mut fields = Fields::new();
         for name in PAGE_FIELDS {
@@ -146,8 +157,28 @@ impl Backend {
     }
 }
 
+fn metadata(header: Option<http::HeaderValue>) -> Result<Value, &'static str> {
+    let header = header.ok_or("missing X-Adaptive-Meta")?;
+    let text = header
+        .to_str()
+        .map_err(|_| "X-Adaptive-Meta is not ASCII")?;
+    let meta: Value =
+        serde_json::from_slice(&percent_decode(text)).map_err(|_| "X-Adaptive-Meta is not JSON")?;
+    if !meta.is_object() {
+        return Err("X-Adaptive-Meta is not an object");
+    }
+    let kind = meta
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or("X-Adaptive-Meta has no string kind")?;
+    if matches!(kind, "page" | "search") && meta.get("cache").and_then(Value::as_str).is_none() {
+        return Err("X-Adaptive-Meta page or search has no string cache");
+    }
+    Ok(meta)
+}
+
 /// Undoes Python's `urllib.parse.quote(..., safe="")`.
-fn percent_decode(text: &str) -> String {
+fn percent_decode(text: &str) -> Vec<u8> {
     let b = text.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -163,7 +194,7 @@ fn percent_decode(text: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 impl tower_service::Service<Request<Body>> for Backend {
@@ -182,6 +213,124 @@ impl tower_service::Service<Request<Body>> for Backend {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use fictionet::stdlib::httpd::{self, Handler, VHost, VirtualHosts};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn backend_response(meta: Option<&[u8]>) -> Response<Bytes> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut reply = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n".to_vec();
+        if let Some(meta) = meta {
+            reply.extend_from_slice(b"X-Adaptive-Meta: ");
+            reply.extend_from_slice(meta);
+            reply.extend_from_slice(b"\r\n");
+        }
+        reply.extend_from_slice(b"\r\npage");
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let n = conn.read(&mut buf).unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            conn.write_all(&reply).unwrap();
+        });
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = rt.block_on(fictionet::run(
+            fictionet::Seed::from_u64(1),
+            move |fcx| async move {
+                let hosts = VirtualHosts::new();
+                hosts.insert(
+                    "example.com",
+                    VHost::new(httpd::tower(Backend::new(&fcx, address.port())?)),
+                );
+                let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
+                let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+                let mut ex = httpd::Exchange::new(fcx.now(), &entropy, &conn);
+                let request = Request::builder()
+                    .uri("http://example.com/")
+                    .body(Body::empty())?;
+                let httpd::Reply::Later(work) = hosts.call(request, &mut ex) else {
+                    panic!("the backend must receive the request");
+                };
+                let (parts, body) = work(fcx).await?.into_parts();
+                tx.send(Response::from_parts(
+                    parts,
+                    body.collect().await?.to_bytes(),
+                ))
+                .unwrap();
+                Ok(())
+            },
+        ));
+        server.join().unwrap();
+        result.unwrap();
+        rx.recv().unwrap()
+    }
+
+    fn assert_meta_error(meta: Option<&[u8]>) {
+        let response = backend_response(meta);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let fields = response.extensions().get::<Fields>().unwrap();
+        assert_eq!(fields.get("kind").and_then(J::as_str), Some("meta_error"));
+        assert!(!fields.get("error").and_then(J::as_str).unwrap().is_empty());
+        assert!(!response.headers().contains_key(META));
+        assert_ne!(response.body().as_ref(), b"page");
+    }
+
+    #[test]
+    fn missing_metadata() {
+        assert_meta_error(None);
+    }
+
+    #[test]
+    fn malformed_metadata() {
+        for meta in [
+            b"\xff".as_slice(),
+            b"not json",
+            b"null",
+            b"[]",
+            b"\"page\"",
+            b"%7B%22kind%22%3A%22%FF%22%7D",
+        ] {
+            assert_meta_error(Some(meta));
+        }
+    }
+
+    #[test]
+    fn malformed_kind_and_cache() {
+        for meta in [
+            r#"{}"#,
+            r#"{"kind":1}"#,
+            r#"{"kind":"page"}"#,
+            r#"{"kind":"search","cache":false}"#,
+        ] {
+            assert_meta_error(Some(meta.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn valid_cached_metadata_needs_no_generation_time() {
+        let response = backend_response(Some(
+            b"%7B%22kind%22%3A%22page%22%2C%22cache%22%3A%22cached%22%7D",
+        ));
+        assert_eq!(response.status(), StatusCode::OK);
+        let fields = response.extensions().get::<Fields>().unwrap();
+        assert_eq!(fields.get("kind").and_then(J::as_str), Some("page"));
+        assert_eq!(fields.get("cache").and_then(J::as_str), Some("cached"));
+        assert!(fields.get("gen_ms").is_none());
+        assert!(!response.headers().contains_key(META));
+        assert_eq!(response.body().as_ref(), b"page");
+    }
+
     #[test]
     fn construction_refuses_a_lab() {
         fictionet::block_on(fictionet::lab(
@@ -199,8 +348,8 @@ mod tests {
     fn percent_decoding_undoes_quote() {
         assert_eq!(
             super::percent_decode("%7B%22a%22%3A%20%22%C3%A9%22%7D"),
-            "{\"a\": \"é\"}"
+            "{\"a\": \"é\"}".as_bytes()
         );
-        assert_eq!(super::percent_decode("50%"), "50%");
+        assert_eq!(super::percent_decode("50%"), b"50%");
     }
 }
