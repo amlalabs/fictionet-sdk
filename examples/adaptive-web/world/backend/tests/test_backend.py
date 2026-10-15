@@ -440,6 +440,25 @@ class Tells(unittest.TestCase):
 
 
 class Serving(unittest.TestCase):
+    def test_all_requests_timed(self):
+        import backend
+        handler = object.__new__(backend.Handler)
+        handler.request_version = "HTTP/1.1"
+        with tempfile.TemporaryDirectory() as d:
+            handler.world, handler.headers, handler.path = world(Path(d)), {"Host": "example.com"}, "/story"
+            handler.wfile = io.BytesIO()
+            with patch.object(handler.world, "handle", side_effect=RuntimeError("failed")), \
+                    patch.object(backend.time, "monotonic", side_effect=[10, 12.5]), \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                handler._serve("GET")
+        headers, body = handler.wfile.getvalue().split(b"\r\n\r\n", 1)
+        self.assertTrue(headers.startswith(b"HTTP/1.1 503 "))
+        meta = next(line.split(b": ", 1)[1] for line in headers.split(b"\r\n") if line.startswith(b"X-Adaptive-Meta:"))
+        meta = json.loads(unquote(meta.decode()))
+        self.assertEqual(meta, {"kind": "error", "error": "RuntimeError: failed", "serve_ms": 2500})
+        self.assertIs(type(meta["serve_ms"]), int)
+        self.assertEqual(body, backend.UNAVAILABLE)
+
     def test_replay_serves_the_store_and_nothing_new(self):
         with tempfile.TemporaryDirectory() as d:
             w = world(Path(d))
@@ -803,6 +822,28 @@ class ModelGenerator(unittest.TestCase):
         with self.assertRaises(prompts.Error):
             gen.search("halvard", [], [], [])
 
+    def test_two_bad_answers_keep_paid_attempts_and_failure_totals(self):
+        import backend
+        with tempfile.TemporaryDirectory() as d:
+            w = World(SEED, Store(Path(d)), Model(SEED, llm.client("openrouter", "some/model")))
+            w.store.cast_once(lambda: {"people": []})
+            FakeOpenRouter.bad_answers = 2
+            handler = object.__new__(backend.Handler)
+            handler.world, handler.headers, handler.path = w, {"Host": "example.com"}, "/story"
+            with patch.object(handler, "_send") as send, patch("sys.stderr", new_callable=io.StringIO):
+                handler._serve("GET")
+            rows = [json.loads(line) for line in (w.store.root / "generations.jsonl").read_text().splitlines()]
+            self.assertEqual([r["cost"] for r in rows], [0.0021, 0.0021])
+            self.assertEqual([r["outcome"] for r in rows], ["unreadable", "unreadable"])
+            usage = rows[-1]["generation"]
+            self.assertEqual((usage["status"], usage["attempts"], usage["asks"]), ("error", 2, 2))
+            self.assertEqual(send.call_args.args[0], 503)
+            meta = send.call_args.args[4]
+            self.assertEqual(meta["gen_ms"], usage["gen_ms"])
+            self.assertAlmostEqual(meta["cost"], 0.0042)
+            self.assertIs(type(meta["serve_ms"]), int)
+            self.assertIsNone(w.store.page("example.com", "/story"))
+
     def test_invalid_header_key(self):
         for provider in ("openrouter", "anthropic"):
             name = f"{provider.upper()}_API_KEY"
@@ -880,11 +921,13 @@ class ModelGenerator(unittest.TestCase):
             failure = RuntimeError(f"generation failed with {self.KEY}")
             with patch.object(w, "handle", side_effect=failure), \
                     patch.object(handler, "_send") as send, \
+                    patch.object(backend.time, "monotonic", side_effect=[10, 12.5]), \
                     patch("sys.stderr", new_callable=io.StringIO) as stderr:
                 handler._serve("GET")
             self.assertEqual(send.call_args.args[0], 503)
             self.assertEqual(send.call_args.args[4],
-                             {"kind": "error", "error": "RuntimeError: generation failed with <OPENROUTER_API_KEY>"})
+                             {"kind": "error", "error": "RuntimeError: generation failed with <OPENROUTER_API_KEY>",
+                              "serve_ms": 2500})
             self.assertIn("Traceback", stderr.getvalue())
             self.assertIn("RuntimeError: generation failed with <OPENROUTER_API_KEY>", stderr.getvalue())
             self.assertNotIn(self.KEY, stderr.getvalue())

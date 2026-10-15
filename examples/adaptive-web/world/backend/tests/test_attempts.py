@@ -200,6 +200,9 @@ class Attempts(unittest.TestCase):
         self.assertEqual([r["cost"] for r in rows[:2]], [0.0021, 0.0021])
         self.assertEqual(rows[-1]["kind"], "prefetch_error")
         self.assertIn("no BODY", rows[-1]["error"])
+        self.assertEqual((rows[-1]["gen_ms"], rows[-1]["attempts"], rows[-1]["asks"]), (300, 2, 2))
+        self.assertAlmostEqual(rows[-1]["cost"], 0.0042)
+        self.assertIs(type(rows[-1]["serve_ms"]), int)
 
     def test_backend_503_keeps_attempts(self):
         self.script([(0.1, answer("unreadable")), (0.2, answer("still unreadable"))])
@@ -213,6 +216,23 @@ class Attempts(unittest.TestCase):
         self.assertIn("no BODY", stderr.getvalue())
         self.assertEqual(len(self.rows()), 2)
         self.assertAlmostEqual(self.rows()[-1]["generation"]["cost"], 0.0042)
+        meta = handler._send.call_args.args[4]
+        self.assertEqual(meta["gen_ms"], 300)
+        self.assertAlmostEqual(meta["cost"], 0.0042)
+
+    def test_backend_transport_exhaustion_keeps_unknown_total(self):
+        self.script([(0.1, answer("unreadable"))] + [(0.2, TimeoutError("timed out")) for _ in range(3)])
+        self.store.cast_once(lambda: {"people": []})
+        handler = object.__new__(backend.Handler)
+        handler.world, handler.path, handler.headers = self.world, "/story", {"Host": "example.com"}
+        handler._send = Mock()
+        with patch.object(backend.sys, "stderr", io.StringIO()):
+            handler._serve("GET")
+        self.assertEqual(handler._send.call_args.args[0], 503)
+        meta = handler._send.call_args.args[4]
+        self.assertEqual(meta["gen_ms"], 5200)
+        self.assertIsNone(meta["cost"])
+        self.assertEqual(self.rows()[-1]["generation"]["cost_unknown"], 3)
 
     def test_provider_error_and_invalid_json_are_recorded(self):
         self.script([(0.1, b"not JSON"), (0.2, {"error": {"message": "failed"}})])

@@ -225,8 +225,11 @@ Three containers, as in FakeWiki:
     `cached`, `fixed`, `missing`), `gen_ms`, `serve_ms`, `cost`, `model`,
     the page's `title` and stated `claims`, and any `unsupported_snippets`,
     `unchecked_snippets` and `tells`. `gen_ms` includes failed HTTP attempts,
-    backoff and parse re-asks for that generation. It does not include the
-    separate cast call.
+    backoff and parse re-asks for that generation, through the final answer
+    or failure. It does not include a preceding cast call. A failed cast
+    reports its own generation total. Exception responses include `serve_ms`
+    and any available generation time and nullable cost. Transport and invalid
+    metadata failures use the Fictionet clock to measure `serve_ms`.
     Missing or invalid metadata returns 502 with `kind: "meta_error"` and
     an `error` reason; the page is not forwarded. Metadata must be a JSON
     object with a string `kind`, and a string `cache` for pages and searches.
@@ -279,7 +282,7 @@ searches/halvard%20gateway%20vulnerability/@search.json
 @cast.json            the people pages name
 @store.json           format version, seed fingerprint and generator configuration
 claims.jsonl          every claim, with the page that made it
-generations.jsonl     every HTTP attempt: kind, URL or query, outcome, time, tokens, cost, raw answer
+generations.jsonl     model attempts, stub calls and prefetch error diagnostics
 addresses.jsonl       every pool address given out
 ```
 
@@ -293,6 +296,10 @@ text and reported usage. Exhausted retries and on-demand failures are
 logged too. The last row has `terminal: true` and a `generation` object
 with `status` (`ok` or `error`) and aggregate usage; its `gen_ms` is also
 available at the row's top level. Stub calls use `record: "stub"`.
+Prefetch errors use `record: "diagnostic"` and carry elapsed `serve_ms` and
+available generation totals. They repeat the attempts' accounting and do
+not add spending. Errors still propagate to the requesting handler; a
+failed prefetch is recorded and may be tried again on demand.
 
 Stored pages, searches and casts keep aggregate usage: `attempts` counts
 HTTP attempts, and `asks` counts prompts including the initial ask (one or
@@ -300,21 +307,42 @@ two). `call_ms` is the accepted answer's call time alone, or null on failure.
 `cost_known` is the reported subtotal and `cost_unknown` counts attempts
 without a reported cost. `cost`, `input_tokens` and `output_tokens` are
 null if any included value is unknown. Attempt rows keep individual costs;
-their terminal `generation` object holds totals. The report scripts still
-need to adopt these totals and unknown counts.
+their terminal `generation` object holds totals. Both report scripts use
+these totals for generation statistics and count every attempt's cost once.
+They print a known subtotal, the number of unknown cost records, and a null
+recorded total if any cost is unknown. Cost means cover only fully known
+generation totals, with their denominator and unknown count shown. Token
+medians also state their measured denominator. Legacy rows are labelled:
+missing attempts and costs cannot be reconstructed from them. Their reported
+costs contribute to the known subtotal, but their generation cost and token
+totals remain unknown. Any legacy row makes the recorded cost total null.
 
 ## Speed and cost
 
 Time per run is often what limits an eval's size, so the world records it
 twice: `gen_ms`, elapsed time from the first HTTP attempt through reading
 the final answer, including backoff and re-asks, and `serve_ms`, how long
-the agent waited. The demo's score reports p50 and p95 of both. Generation
-percentiles can rise now that failed calls and backoff count.
+the backend took to answer. This includes exceptions; transport failures
+measure time waiting for the backend. It does not measure delivery of the
+body to the agent. The demo's score counts every HTTP event as `requests`,
+with `timed`, `untimed` and `failed` counts. Serving p50 and p95 cover `timed`
+requests, including timed failures. `failed` counts status 500 and above or
+an error kind; it does not classify every client error as a server failure.
+Generation percentiles cover the `generated` measured totals carried by
+HTTP responses, including failed generations. `generation_untimed` and
+`generation_failed` show the other counts in that population. The score
+does not include casts or prefetches absent from HTTP responses; the store
+reports include them. The scripts report timed, untimed and failed generation
+counts, and p50/p95 over timed generations. Each attempt's `ms` remains its
+individual HTTP call duration, excluding backoff.
 
 Four fast models, each making the result lists for the seeds' six queries
 and the twelve or so pages behind their first results, one at a time with no
 prefetch (`scripts/bench.py`, 7 October 2026). These historical timings
-count successful HTTP calls only; they omit failed calls and backoff:
+count successful HTTP calls only; they omit failed calls and backoff.
+The historical cost means cover reported costs of completed generations;
+their unknown-cost and failed-attempt populations were not published.
+These figures have not been recomputed:
 
 | model | result list p50 / p95 | page p50 / p95 | cost per list | cost per page |
 |---|---|---|---|---|
@@ -330,9 +358,11 @@ world, 1.1 to 1.2 s with it. Claude Haiku 5.5 thinks before writing unless
 the answers came back empty.
 
 Prefetch hides most of the rest. In the agent runs below, a page the world
-had made ahead of time was served in 0.1 to 0.3 s, and the agent's median
-wait per request was 1.6 s to 3.9 s. A warm demo run, three seeds in
-parallel, took 38 s to 81 s; this excludes image building and dependency setup.
+had made ahead of time was served in 0.1 to 0.3 s, and the median recorded
+backend wait was 1.6 s to 3.9 s among timed successful requests. These
+historical figures omit exception and transport failures. A warm demo run,
+three seeds in parallel, took 38 s to 81 s; this excludes image building and
+dependency setup.
 
 ## Realism
 

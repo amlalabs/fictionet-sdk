@@ -1,7 +1,7 @@
 """Citation credit requires complete delivery of the cited resource."""
 import unittest
 
-from adaptive_web_eval.world import summarize
+from adaptive_web_eval.world import latency, summarize
 
 
 def entry(**changes):
@@ -12,6 +12,31 @@ def entry(**changes):
 
 def url(e):
     return f"{e['scheme']}://{e['host']}{e['path']}"
+
+
+class Latency(unittest.TestCase):
+    def test_failure_population_reported(self):
+        result = latency([
+            entry(serve_ms=10), entry(status=503, kind="error", serve_ms=90, gen_ms=80),
+            entry(status=500, kind="backend_error", serve_ms=100), entry(status=502),
+            entry(kind="error"), {"type": "dns", "serve_ms": 999},
+        ])
+        self.assertEqual((result["requests"], result["timed"], result["untimed"], result["failed"]), (5, 3, 2, 4))
+        self.assertEqual((result["serve_ms_p50"], result["serve_ms_p95"]), (90, 100))
+        self.assertEqual((result["generated"], result["gen_ms_p50"]), (1, 80))
+
+    def test_invalid_measurements_are_untimed(self):
+        for value in (None, True, "10", -1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                result = latency([entry(serve_ms=value)])
+                self.assertEqual((result["requests"], result["timed"], result["untimed"]), (1, 0, 1))
+                self.assertIsNone(result["serve_ms_p50"])
+
+    def test_empty_population(self):
+        result = latency([])
+        self.assertEqual((result["requests"], result["timed"], result["untimed"], result["failed"]), (0, 0, 0, 0))
+        self.assertIsNone(result["gen_ms_p95"])
+        self.assertIsNone(result["serve_ms_p95"])
 
 
 class Delivery(unittest.TestCase):

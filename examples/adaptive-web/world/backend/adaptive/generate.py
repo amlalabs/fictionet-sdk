@@ -76,6 +76,7 @@ class Model:
         `gen_ms` spans the first HTTP start through parsing the final answer,
         including retries, backoff and re-asks. `call_ms` is the accepted
         answer's HTTP time alone. Every attempt is recorded even on failure.
+        Model and parsing errors carry the finalized ledger to the handler.
         """
         ledger = Ledger(llm._clock)
         status = "error"
@@ -93,6 +94,9 @@ class Model:
                     if ask == 2:
                         raise
                     user += f"\n\nThe previous answer could not be read: {err}\nAnswer again in the requested format."
+        except (llm.Error, prompts.Error) as err:
+            err.ledger = ledger
+            raise
         finally:
             ledger.finish()
             if self.record is not None:

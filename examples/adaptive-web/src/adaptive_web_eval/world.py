@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WorldFiles = runpy.run_path(str(ROOT.parent / "common" / "world_io.py"))["WorldFiles"]
 _evidence = runpy.run_path(str(ROOT.parent / "common" / "evidence.py"))
 _citations = runpy.run_path(str(ROOT.parent / "common" / "citations.py"))
+_accounting = runpy.run_path(str(ROOT / "world" / "backend" / "adaptive" / "accounting.py"))
 _METHODS = ("GET", "POST")
 COMPOSE = str(ROOT / "compose.yaml")
 SEEDS = ROOT / "seeds"
@@ -50,22 +51,25 @@ async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str,
 
 def sorted_percentile(values: list[float], p: float) -> float | None:
     """The p-th percentile (0 to 100) of sorted values by nearest rank."""
-    if not values:
-        return None
-    rank = max(1, -(-len(values) * p // 100))
-    return values[int(rank) - 1]
+    return _accounting["percentile"](values, p)
 
 
 def latency(log: list[dict[str, Any]]) -> dict[str, Any]:
-    """Generation time, in ms, of every page and result list made during the
-    run, and how long the agent waited for every request the backend answered."""
-    made = [e["gen_ms"] for e in log if e.get("type") == "http" and e.get("cache") in ("generated", "prefetched")
-            and isinstance(e.get("gen_ms"), (int, float))]
-    served = [e["serve_ms"] for e in log if e.get("type") == "http" and isinstance(e.get("serve_ms"), (int, float))]
-    made.sort()
-    served.sort()
-    return {"generated": len(made), "gen_ms_p50": sorted_percentile(made, 50), "gen_ms_p95": sorted_percentile(made, 95),
-            "requests": len(served), "serve_ms_p50": sorted_percentile(served, 50), "serve_ms_p95": sorted_percentile(served, 95)}
+    """Count every HTTP event, including failures and requests without timing.
+
+    Serving percentiles cover `timed` requests. Generation percentiles cover
+    `generated` measured totals carried by HTTP responses, including failures.
+    Casts and prefetches not represented in responses require generations.jsonl.
+    """
+    http = [e for e in log if e.get("type") == "http"]
+    made = [e for e in http if e.get("cache") in ("generated", "prefetched")
+            or e.get("kind") == "error" and "gen_ms" in e]
+    gen = _accounting["population"](made, "gen_ms")
+    served = _accounting["population"](http, "serve_ms")
+    return {"generated": gen["timed"], "generation_untimed": gen["untimed"], "generation_failed": gen["failed"],
+            "gen_ms_p50": gen["p50"], "gen_ms_p95": gen["p95"],
+            "requests": served["count"], "timed": served["timed"], "untimed": served["untimed"], "failed": served["failed"],
+            "serve_ms_p50": served["p50"], "serve_ms_p95": served["p95"]}
 
 
 def delivered(e: dict[str, Any]) -> bool:

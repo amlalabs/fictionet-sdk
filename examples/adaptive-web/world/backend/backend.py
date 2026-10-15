@@ -76,7 +76,12 @@ class Handler(BaseHTTPRequestHandler):
             r = self.world.handle(method, host, self.path, form)
         except Exception as err:  # noqa: BLE001 - the agent sees a 503, the log sees why
             print(llm.redact(traceback.format_exc()), file=sys.stderr)
-            meta = {"kind": "error", "error": llm.describe(err)[:400]}
+            meta = {"kind": "error", "error": llm.describe(err)[:400],
+                    "serve_ms": round((time.monotonic() - started) * 1000)}
+            ledger = getattr(err, "ledger", None)
+            if ledger is not None and ledger.attempts:
+                usage = ledger.usage()
+                meta |= {name: usage[name] for name in ("model", "gen_ms", "cost")}
             self._send(503, "text/html", UNAVAILABLE, {"Server": "nginx"}, meta, method)
             return
         r.meta["serve_ms"] = round((time.monotonic() - started) * 1000)

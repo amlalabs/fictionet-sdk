@@ -6,6 +6,7 @@
 //! 502 with `kind = "meta_error"` and a reason instead of forwarding the page.
 //! Metadata must be an object with a string `kind`, and a string `cache`
 //! when the kind is `page` or `search`.
+//! Transport and metadata failures record `serve_ms` on the Fictionet clock.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -50,6 +51,7 @@ pub const PAGE_FIELDS: [&str; 19] = [
 
 #[derive(Clone)]
 pub struct Backend {
+    fcx: fictionet::Cx,
     forward: web::Forward,
 }
 
@@ -77,6 +79,7 @@ pub fn to_field(v: &Value) -> J {
 impl Backend {
     pub fn new(fcx: &fictionet::Cx, port: u16) -> Result<Backend, fictionet::Error> {
         Ok(Backend {
+            fcx: fcx.clone(),
             forward: web::forward(fcx, format!("http://127.0.0.1:{port}").parse().unwrap())?,
         })
     }
@@ -111,7 +114,10 @@ impl Backend {
             let body = body.collect().await?.to_bytes();
             Ok::<_, fictionet::Error>((parts, body))
         };
-        let (mut parts, body) = match reply.await {
+        let started = self.fcx.now().since_start();
+        let reply = reply.await;
+        let serve_ms = (self.fcx.now().since_start() - started).as_millis() as u64;
+        let (mut parts, body) = match reply {
             Ok(r) => r,
             Err(e) => {
                 let mut response = Response::new(Full::new(Bytes::from_static(
@@ -120,6 +126,7 @@ impl Backend {
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                 let fields = Fields::new()
                     .with("kind", "backend_error")
+                    .with("serve_ms", serve_ms)
                     .with("error", e.to_string());
                 response.extensions_mut().insert(fields);
                 return Ok(response);
@@ -134,6 +141,7 @@ impl Backend {
                 *response.status_mut() = StatusCode::BAD_GATEWAY;
                 let fields = Fields::new()
                     .with("kind", "meta_error")
+                    .with("serve_ms", serve_ms)
                     .with("error", error);
                 response.extensions_mut().insert(fields);
                 return Ok(response);
@@ -283,6 +291,7 @@ mod tests {
         let fields = response.extensions().get::<Fields>().unwrap();
         assert_eq!(fields.get("kind").and_then(J::as_str), Some("meta_error"));
         assert!(!fields.get("error").and_then(J::as_str).unwrap().is_empty());
+        assert!(fields.get("serve_ms").and_then(J::as_u64).is_some());
         assert!(!response.headers().contains_key(META));
         assert_ne!(response.body().as_ref(), b"page");
     }
@@ -330,6 +339,47 @@ mod tests {
         assert!(fields.get("gen_ms").is_none());
         assert!(!response.headers().contains_key(META));
         assert_eq!(response.body().as_ref(), b"page");
+    }
+
+    #[test]
+    fn transport_failure_is_timed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(fictionet::run(
+            fictionet::Seed::from_u64(1),
+            move |fcx| async move {
+                let hosts = VirtualHosts::new();
+                hosts.insert(
+                    "example.com",
+                    VHost::new(httpd::tower(Backend::new(&fcx, address.port())?)),
+                );
+                let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
+                let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+                let mut ex = httpd::Exchange::new(fcx.now(), &entropy, &conn);
+                let request = Request::builder()
+                    .uri("http://example.com/")
+                    .body(Body::empty())?;
+                let httpd::Reply::Later(work) = hosts.call(request, &mut ex) else {
+                    panic!("the backend must receive the request");
+                };
+                let response = work(fcx).await?;
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                let fields = response.extensions().get::<Fields>().unwrap();
+                assert_eq!(
+                    fields.get("kind").and_then(J::as_str),
+                    Some("backend_error")
+                );
+                assert!(fields.get("serve_ms").and_then(J::as_u64).is_some());
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     #[test]

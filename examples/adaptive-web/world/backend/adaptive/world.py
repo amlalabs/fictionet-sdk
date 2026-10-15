@@ -294,11 +294,15 @@ class World:
                 **made.usage(), "created": time.time()}
 
     def _prefetch(self, host: str, target: str) -> None:
+        started = time.monotonic()
         try:
             self.page(host, target, prefetch=True)
         except Exception as err:  # noqa: BLE001 - a page that failed ahead of time is made again on request
-            self.store.log_generation({"kind": "prefetch_error", "url": f"https://{host}{target}",
-                                       "error": llm.describe(err)})
+            ledger = getattr(err, "ledger", None)
+            usage = ledger.usage() if ledger is not None and ledger.attempts else {}
+            self.store.log_generation({"kind": "prefetch_error", "record": "diagnostic",
+                                       "url": f"https://{host}{target}", "error": llm.describe(err),
+                                       "serve_ms": round((time.monotonic() - started) * 1000), **usage})
 
     # --- pages ---------------------------------------------------------
     def page(self, host: str, target: str, prefetch: bool = False) -> Response:
