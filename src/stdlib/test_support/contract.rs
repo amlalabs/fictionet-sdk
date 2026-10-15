@@ -653,6 +653,32 @@ mod tests {
     use super::*;
     use core::fmt::Error as TestError;
 
+    #[derive(Debug, PartialEq)]
+    struct Refusing;
+    impl Wire for Refusing {
+        type ParseError = TestError;
+        type WriteError = TestError;
+
+        fn parse(_: &[u8]) -> Result<Self, TestError> {
+            Err(TestError)
+        }
+
+        fn write(&self, _: &mut Vec<u8>) -> Result<(), TestError> {
+            Err(TestError)
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "test value must write")]
+    fn check_written_rejects_refusing_writer() {
+        check_written(&Refusing);
+    }
+
+    #[test]
+    fn check_wire_value_allows_refusing_writer() {
+        check_wire_value(&Refusing);
+    }
+
     enum Fault {
         Error,
         Need,

@@ -10,9 +10,7 @@ use fictionet::stdlib::cboe_boe::{
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::session::Action;
-use fictionet::stdlib::test_support::contract::{
-    check_decode, check_wire, check_wire_value, check_written,
-};
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_written};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
@@ -178,8 +176,10 @@ fuzz_target!(|input: &[u8]| {
         params: ParamGroups(groups),
         ..LoginRequest::default()
     };
-    check_wire_value(&request);
-    check_actions(&server.receive(&request.into(), 0).unwrap());
+    let bytes = check_written(&request);
+    let inbound = Inbound::parse(&bytes).expect("login bytes parse as Inbound");
+    assert_eq!(inbound, Inbound::LoginRequest(request.clone()));
+    check_actions(&server.receive(&inbound, 0).unwrap());
     check_actions(
         &server
             .accept(
