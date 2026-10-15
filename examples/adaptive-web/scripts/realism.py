@@ -7,6 +7,13 @@
 topics like each seed's (a real VPN vulnerability, a real biotech deal, a
 real JSON library).
 These are copies of other people's pages: keep them out of the repository.
+Each run removes the previous results, pages and manifest before fetching.
+A download is complete only when curl exits with zero and reports HTTP 200.
+manifest.json records every query and page by seed, including its URL,
+kept flag, HTTP status, curl exit code, stderr and extracted text length.
+HN pages also record their search response. Failed downloads are reported
+and make `real` exit nonzero after writing the manifest. A run that keeps
+nothing also exits nonzero. Missing curl leaves no manifest.
 
 `judge` pairs what `bench.py` made with those real pages, of the same kind
 (a result list with a result list, a page with a page), and shows each pair
@@ -19,6 +26,7 @@ means it cannot tell them apart, 0% means it always can on valid judgments.
 Invalid output is retried up to three attempts and then excluded from the
 rate. A group with no valid judgments has no rate. All raw answers and
 attempt costs are saved next to the bench's pages for audit.
+The judge requires a manifest and reads only the entries marked kept.
 """
 from __future__ import annotations
 
@@ -107,11 +115,25 @@ def results_text(results: list[dict]) -> str:
     return "\n\n".join(f"{r['title']}\n{r['url']}\n{r['snippet']}" for r in results)
 
 
-def curl(url: str) -> tuple[int, str]:
+def curl(url: str) -> tuple[int, int | None, str, str]:
     r = subprocess.run(["curl", "-sSL", "-m", "20", "-A", "Mozilla/5.0 (X11; Linux x86_64) curl/8.5.0",
                         "-w", "\n%{http_code}", url], capture_output=True, text=True, errors="replace")
-    body, _, code = r.stdout.rpartition("\n")
-    return int(code or 0), body
+    body, separator, code = r.stdout.rpartition("\n")
+    http_code = int(code) if separator and re.fullmatch(r"[0-9]{3}", code) else None
+    return r.returncode, http_code, body if separator else r.stdout, r.stderr
+
+
+def fetch(url: str) -> tuple[dict, str]:
+    try:
+        exit_code, http_code, body, stderr = curl(url)
+    except FileNotFoundError as err:
+        raise SystemExit(f"Real collection failed: curl could not be run: {err}; no manifest written") from err
+    entry = {"url": url, "kept": False, "http_code": http_code, "curl_exit_code": exit_code,
+             "stderr": stderr, "text_length": len(text_of(body))}
+    if exit_code != 0 or http_code != 200:
+        entry["error"] = f"curl exit {exit_code}, HTTP {http_code}; stderr: {stderr}"
+        print(f"{url}: {entry['error']}", file=sys.stderr)
+    return entry, body
 
 
 def bing_results(markup: str) -> list[dict]:
@@ -129,32 +151,76 @@ def bing_results(markup: str) -> list[dict]:
     return out
 
 
-def hn_thread(query: str) -> str:
+def hn_thread(query: str) -> tuple[str | None, dict]:
     """The Hacker News thread with the most points for `query`, found with
-    HN's search API."""
-    _, answer = curl("https://hn.algolia.com/api/v1/search?tags=story&query=" + quote_plus(query))
-    hits = [h for h in json.loads(answer or "{}").get("hits", []) if (h.get("num_comments") or 0) >= 10]
-    return f"https://news.ycombinator.com/item?id={hits[0]['objectID']}" if hits else "https://news.ycombinator.com/"
+    HN's search API. Return its URL and search evidence, or no URL on failure."""
+    entry, answer = fetch("https://hn.algolia.com/api/v1/search?tags=story&query=" + quote_plus(query))
+    if "error" in entry:
+        return None, entry
+    try:
+        result = json.loads(answer)
+        if not isinstance(result, dict) or not isinstance(result.get("hits"), list):
+            raise ValueError("expected an HN hits list")
+        hits = [h for h in result["hits"] if (h["num_comments"] or 0) >= 10]
+        if not hits:
+            raise ValueError("no HN thread with at least ten comments")
+        thread = hits[0]["objectID"]
+        if not isinstance(thread, str) or not re.fullmatch(r"[0-9]+", thread):
+            raise ValueError("invalid HN thread ID")
+    except (ValueError, KeyError, TypeError) as err:
+        entry["error"] = f"HN search: {err}"
+        print(f"{entry['url']}: {entry['error']}; curl exit {entry['curl_exit_code']}, "
+              f"HTTP {entry['http_code']}; stderr: {entry['stderr']}", file=sys.stderr)
+        return None, entry
+    return f"https://news.ycombinator.com/item?id={thread}", entry
 
 
 def real(out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "manifest.json").unlink(missing_ok=True)
+    for pattern in ("*/results-*.json", "*/page-*.json"):
+        for old in out.glob(pattern):
+            old.unlink()
+    manifest = {}
+    collect(out, manifest)
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    entries = [entry for seed in manifest.values() for group in seed.values() for entry in group]
+    failed = sum("error" in entry for entry in entries)
+    if failed:
+        raise SystemExit(f"Real collection failed: {failed} failed fetches; see {out / 'manifest.json'}")
+    if not any(entry["kept"] for entry in entries):
+        raise SystemExit(f"Real collection kept no samples; see {out / 'manifest.json'}")
+
+
+def collect(out: Path, manifest: dict) -> None:
     for seed, queries in REAL_QUERIES.items():
         d = out / seed
         d.mkdir(parents=True, exist_ok=True)
+        manifest[seed] = {"queries": [], "pages": []}
         for qi, query in enumerate(queries):
-            code, markup = curl("https://www.bing.com/search?q=" + quote_plus(query))
-            found = bing_results(markup) if code == 200 else []
+            entry, markup = fetch("https://www.bing.com/search?q=" + quote_plus(query))
+            found = bing_results(markup) if "error" not in entry else []
+            entry.update(query=query, kept=bool(found))
+            manifest[seed]["queries"].append(entry)
             (d / f"results-{qi}.json").write_text(json.dumps({"query": query, "results": found}, indent=1))
-            print(f"{seed}: {query!r}: HTTP {code}, {len(found)} results")
+            print(f"{seed}: {query!r}: HTTP {entry['http_code']}, {len(found)} results")
         for pi, url in enumerate(REAL_PAGES[seed]):
+            search = None
             if url.startswith("hn:"):
-                url = hn_thread(url.removeprefix("hn:"))
-            code, page = curl(url)
+                url, search = hn_thread(url.removeprefix("hn:"))
+                if url is None:
+                    manifest[seed]["pages"].append(search)
+                    continue
+            entry, page = fetch(url)
+            if search is not None:
+                entry["search"] = search
             text = text_of(page)
-            ok = code == 200 and len(text) > 1200
-            if ok:
+            entry["kept"] = "error" not in entry and len(text) > 1200
+            manifest[seed]["pages"].append(entry)
+            if entry["kept"]:
                 (d / f"page-{pi}.json").write_text(json.dumps({"url": url, "text": text[:CHARS * 2]}))
-            print(f"{seed}: {url}: HTTP {code}, {len(text)} characters{'' if ok else ', not kept'}")
+            print(f"{seed}: {url}: HTTP {entry['http_code']}, {len(text)} characters"
+                  f"{'' if entry['kept'] else ', not kept'}")
 
 
 def parse_verdict(text: str) -> dict:
@@ -215,16 +281,54 @@ def summarize(verdicts: list[dict]) -> dict:
     return row
 
 
+def real_samples(real_dir: Path) -> dict:
+    path = real_dir / "manifest.json"
+    if not path.is_file():
+        raise SystemExit(f"Missing {path}; run real to collect a current corpus")
+    try:
+        manifest = json.loads(path.read_text())
+        if not isinstance(manifest, dict) or not manifest:
+            raise ValueError("expected seeds in the manifest")
+        samples = {}
+        for seed, groups in manifest.items():
+            samples[seed] = {}
+            for kind, prefix in (("queries", "results"), ("pages", "page")):
+                entries = groups[kind]
+                if not isinstance(entries, list):
+                    raise ValueError(f"{seed}: {kind} must be a list")
+                samples[seed][kind] = []
+                for i, entry in enumerate(entries):
+                    evidence = [entry] + ([entry["search"]] if "search" in entry else [])
+                    for e in evidence:
+                        if (not isinstance(e["url"], str) or not e["url"]
+                                or type(e["kept"]) is not bool
+                                or type(e["curl_exit_code"]) is not int
+                                or (e["http_code"] is not None and type(e["http_code"]) is not int)
+                                or not isinstance(e["stderr"], str)
+                                or type(e["text_length"]) is not int or e["text_length"] < 0):
+                            raise ValueError(f"{seed}: invalid {kind} entry {i}")
+                    if not entry["kept"]:
+                        continue
+                    if any(e["curl_exit_code"] != 0 or e["http_code"] != 200 or "error" in e for e in evidence):
+                        raise ValueError(f"{seed}: kept {kind} entry {i} has failed fetch evidence")
+                    samples[seed][kind].append(json.loads((real_dir / seed / f"{prefix}-{i}.json").read_text()))
+        return samples
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        raise SystemExit(f"Invalid real corpus at {path}: {err}") from err
+
+
 def judge(bench: Path, real_dir: Path, judge_model: str) -> None:
+    corpus = real_samples(real_dir)
     client = llm.client("openrouter", judge_model)
     client.reasoning = "low"
     summary = {}
     for model_dir in sorted(p for p in bench.iterdir() if p.is_dir()):
         pairs = []
         for seed_dir in sorted(p for p in model_dir.iterdir() if p.is_dir()):
-            reals = real_dir / seed_dir.name
-            real_lists = [json.loads(p.read_text()) for p in sorted(reals.glob("results-*.json"))]
-            real_pages = [json.loads(p.read_text()) for p in sorted(reals.glob("page-*.json"))]
+            if seed_dir.name not in corpus:
+                raise SystemExit(f"Seed {seed_dir.name!r} is missing from {real_dir / 'manifest.json'}")
+            real_lists = corpus[seed_dir.name]["queries"]
+            real_pages = corpus[seed_dir.name]["pages"]
             made_lists = [json.loads(p.read_text()) for p in sorted(seed_dir.glob("searches/*/@search.json"))]
             made_pages = [json.loads(p.read_text()) for p in sorted(seed_dir.glob("pages/**/@page.json"))
                           if json.loads(p.read_text()).get("model") not in (None, "fixed")]
