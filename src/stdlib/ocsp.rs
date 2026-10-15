@@ -1104,16 +1104,7 @@ fn check_certs(certs: &[Vec<u8>]) -> Result<(), Error> {
 /// depth, so a writer can always write back what a reader kept. The
 /// recursion is as deep as the element, at most [`asn1::MAX_DEPTH`].
 fn checked_raw(e: &Element<'_>) -> Result<Vec<u8>, Error> {
-    fn nest(w: &mut Writer, levels: usize, raw: &[u8]) {
-        if levels == 0 {
-            w.encoded(raw);
-        } else {
-            w.explicit(0, |w| nest(w, levels - 1, raw));
-        }
-    }
-    let mut w = Writer::new();
-    nest(&mut w, e.depth().min(asn1::MAX_DEPTH), e.raw());
-    w.finish()?;
+    asn1::validate_der_wrapped(e.raw(), e.depth())?;
     Ok(e.raw().to_vec())
 }
 

@@ -136,7 +136,8 @@ pub const MAX_ACCESS_DESCRIPTIONS: usize = 32;
 pub const MAX_REVOKED: usize = 65_536;
 /// Values kept as raw DER ([`Value::Raw`], algorithm parameters, other
 /// names) are checked as if nested this deep, so a writer can place them
-/// anywhere a certificate or extension holds them.
+/// anywhere a certificate or extension holds them. Their bytes and the
+/// enclosing SEQUENCE headers must fit within [`asn1::MAX_INPUT`].
 pub const RAW_CHECK_DEPTH: usize = 8;
 /// The most bytes one PEM block may decode to.
 pub const MAX_PEM_DATA: usize = asn1::MAX_INPUT;
@@ -348,14 +349,7 @@ fn build(f: impl FnOnce(&mut Writer)) -> Result<Vec<u8>, Error> {
 /// Checks `raw` is one DER element a writer could copy at
 /// [`RAW_CHECK_DEPTH`].
 fn check_raw(raw: &[u8]) -> Result<(), Error> {
-    fn wrap(w: &mut Writer, n: usize, raw: &[u8]) {
-        if n == 0 {
-            w.encoded(raw);
-        } else {
-            w.sequence(|w| wrap(w, n - 1, raw));
-        }
-    }
-    build(|w| wrap(w, RAW_CHECK_DEPTH, raw)).map(drop)
+    Ok(asn1::validate_der_wrapped(raw, RAW_CHECK_DEPTH)?)
 }
 
 /// The version of a certificate or CRL.
@@ -3936,6 +3930,22 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let mut alg = sample_tbs();
         alg.public_key.algorithm.parameters = Some(vec![0x05, 0x01, 0x00]);
         assert_eq!(alg.to_bytes(), Err(Error::Asn1(asn1::Error::Null)));
+    }
+
+    #[test]
+    fn raw_values_count_virtual_wrapper_headers() {
+        for extra in [0, 1] {
+            let contents = vec![0; asn1::MAX_INPUT - 5 * (RAW_CHECK_DEPTH + 1) + extra];
+            let raw = build(|w| w.octet_string(&contents)).unwrap();
+            assert_eq!(
+                check_raw(&raw),
+                if extra == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Asn1(asn1::Error::TooLong))
+                }
+            );
+        }
     }
 
     #[test]

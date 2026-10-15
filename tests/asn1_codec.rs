@@ -5,6 +5,209 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{asn1, kerberos, ldap, ocsp, spnego, x509};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+struct CountingAllocator;
+
+thread_local! {
+    static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn count_allocation() {
+    ALLOCATIONS.with(|count| count.set(count.get().map(|n| n + 1)));
+}
+
+// SAFETY: Every operation delegates to System with the original pointer and layout.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        count_allocation();
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        count_allocation();
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        count_allocation();
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ALLOCATIONS.set(None);
+        }
+    }
+    assert_eq!(ALLOCATIONS.replace(Some(0)), None);
+    let _reset = Reset;
+    let value = f();
+    (value, ALLOCATIONS.get().unwrap())
+}
+
+#[test]
+fn x509_raw_validation_only_allocates_the_kept_bytes() {
+    let raw = [0x30, 3, 6, 1, 42];
+    let (parsed, count) = allocations(|| x509::Value::parse(&raw));
+    assert_eq!(parsed.unwrap(), x509::Value::Raw(raw.to_vec()));
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn ocsp_raw_validation_only_allocates_the_kept_bytes() {
+    let mut request = ocsp::Request::new(vec![ocsp::SingleRequest {
+        cert_id: ocsp::CertId {
+            hash_algorithm: ocsp::AlgorithmIdentifier::sha256(),
+            issuer_name_hash: vec![1; 32],
+            issuer_key_hash: vec![2; 32],
+            serial_number: vec![3],
+        },
+        extensions: vec![],
+    }]);
+    request.requests[0].cert_id.hash_algorithm.parameters = None;
+    let der = request.to_bytes().unwrap();
+    let (parsed, without_raw) = allocations(|| ocsp::Request::parse(&der));
+    assert_eq!(parsed.unwrap(), request);
+    request.requests[0].cert_id.hash_algorithm.parameters = Some(vec![0x30, 3, 6, 1, 42]);
+    let der = request.to_bytes().unwrap();
+    let (parsed, with_raw) = allocations(|| ocsp::Request::parse(&der));
+    assert_eq!(parsed.unwrap(), request);
+    assert_eq!(with_raw, without_raw + 1);
+}
+
+fn wrapped_writer(raw: &[u8], wrappers: usize, explicit: bool) -> Result<(), asn1::Error> {
+    fn nest(w: &mut asn1::Writer, raw: &[u8], wrappers: usize, explicit: bool) {
+        if wrappers == 0 {
+            w.encoded(raw);
+        } else if explicit {
+            w.explicit(0, |w| nest(w, raw, wrappers - 1, explicit));
+        } else {
+            w.sequence(|w| nest(w, raw, wrappers - 1, explicit));
+        }
+    }
+    let mut w = asn1::Writer::new();
+    nest(&mut w, raw, wrappers, explicit);
+    w.finish().map(drop)
+}
+
+#[test]
+fn der_validation_preserves_errors_without_allocating() {
+    use asn1::Error;
+    let cases: &[(&[u8], Result<(), Error>)] = &[
+        (&[5, 0], Ok(())),
+        (&[6, 1, 42], Ok(())),
+        (b"\x17\x0d250101000000Z", Ok(())),
+        (b"\x18\x1220250101000000.25Z", Ok(())),
+        (&[0x31, 6, 2, 1, 1, 2, 1, 2], Ok(())),
+        (&[0x80, 1, 0xff], Ok(())),
+        (&[], Err(Error::Empty)),
+        (&[0x30], Err(Error::Truncated)),
+        (&[0x30, 0x80, 0, 0], Err(Error::Indefinite)),
+        (&[5, 0x81, 0], Err(Error::NonMinimalLength)),
+        (&[5, 0, 5, 0], Err(Error::Trailing)),
+        (&[1, 1, 1, 5, 0], Err(Error::Trailing)),
+        (&[0, 0], Err(Error::Eoc)),
+        (&[0x30, 3, 1, 1, 1], Err(Error::Boolean)),
+        (&[2, 2, 0, 1], Err(Error::Integer)),
+        (&[3, 2, 1, 1], Err(Error::BitString)),
+        (&[5, 1, 0], Err(Error::Null)),
+        (&[6, 1, 0x80], Err(Error::Oid)),
+        (&[6, 2, 0x80, 0], Err(Error::Oid)),
+        (&[0x26, 0], Err(Error::Constructed)),
+        (&[0x17, 1, 0xff], Err(Error::Charset)),
+        (&[0x17, 1, b'X'], Err(Error::Time)),
+        (&[0x18, 1, b'X'], Err(Error::Time)),
+        (&[0x37, 0], Err(Error::Constructed)),
+        (&[0x13, 1, b'@'], Err(Error::Charset)),
+        (&[0x10, 0], Err(Error::Primitive)),
+        (&[0x31, 6, 2, 1, 2, 2, 1, 1], Err(Error::SetOrder)),
+    ];
+    for &(raw, expected) in cases {
+        for depth in [0, 8, asn1::MAX_DEPTH - 1] {
+            let (result, count) = allocations(|| asn1::validate_der_wrapped(raw, depth));
+            assert_eq!(result, expected, "{raw:02x?} at {depth}");
+            assert_eq!(count, 0, "{raw:02x?} at {depth}");
+            for explicit in [false, true] {
+                assert_eq!(wrapped_writer(raw, depth, explicit), expected);
+            }
+        }
+        // Invalid DER wins over the caller's exhausted byte budget.
+        assert_eq!(
+            asn1::validate_der(raw, 0, 0),
+            expected.and(Err(Error::TooLong))
+        );
+    }
+}
+
+#[test]
+fn der_validation_preserves_depth_boundaries() {
+    for depth in 0..=asn1::MAX_DEPTH + 1 {
+        let mut raw = vec![5, 0];
+        for levels in 0..=asn1::MAX_DEPTH + 1 {
+            let expected = if depth + levels <= asn1::MAX_DEPTH {
+                Ok(())
+            } else {
+                Err(asn1::Error::TooDeep)
+            };
+            assert_eq!(asn1::validate_der_wrapped(&raw, depth), expected);
+            assert_eq!(wrapped_writer(&raw, depth, false), expected);
+            let mut outer = vec![0x30, raw.len() as u8];
+            outer.extend_from_slice(&raw);
+            raw = outer;
+        }
+    }
+    assert_eq!(
+        asn1::validate_der_wrapped(&[], usize::MAX),
+        Err(asn1::Error::TooDeep)
+    );
+}
+
+#[test]
+fn der_validation_preserves_virtual_wrapper_sizes() {
+    for len in [
+        0, 125, 126, 127, 128, 253, 254, 255, 256, 65530, 65535, 65536,
+    ]
+    .into_iter()
+    .chain(asn1::MAX_INPUT - 170..=asn1::MAX_INPUT)
+    {
+        let mut raw = vec![4];
+        asn1::encode_length(len, &mut raw);
+        raw.resize(raw.len() + len, 0);
+        for depth in [0, 1, 8, asn1::MAX_DEPTH] {
+            let (result, count) = allocations(|| asn1::validate_der_wrapped(&raw, depth));
+            assert_eq!(count, 0);
+            for explicit in [false, true] {
+                assert_eq!(
+                    result,
+                    wrapped_writer(&raw, depth, explicit),
+                    "{len}, {depth}"
+                );
+            }
+            if len >= asn1::MAX_INPUT - 170 {
+                let expected = if raw.len() + 5 * depth <= asn1::MAX_INPUT {
+                    Ok(())
+                } else {
+                    Err(asn1::Error::TooLong)
+                };
+                assert_eq!(result, expected, "{len}, {depth}");
+            }
+        }
+    }
+    assert_eq!(asn1::validate_der(&[5, 0], 0, usize::MAX), Ok(()));
+    assert_eq!(asn1::validate_der(&[5, 0], 0, 2), Ok(()));
+    assert_eq!(asn1::validate_der(&[5, 0], 0, 1), Err(asn1::Error::TooLong));
+}
 
 #[test]
 fn checked_writer_imports_are_compatible() {

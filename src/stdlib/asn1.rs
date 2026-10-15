@@ -28,6 +28,9 @@
 //! Every reader checks lengths, nesting and character sets, because the
 //! agent can send any bytes it likes. Elements are at most [`MAX_INPUT`]
 //! bytes, and constructed values nest at most [`MAX_DEPTH`] deep.
+//! [`validate_der`] checks one complete DER value without allocating.
+//! [`validate_der_wrapped`] also accounts for enclosing wrappers without
+//! writing them.
 //!
 //! ```
 //! use fictionet::stdlib::asn1::{Error, Oid, Reader, Rules, Writer};
@@ -1499,16 +1502,7 @@ impl Oid {
     /// empty, at most [`MAX_OID_LEN`] bytes, each subidentifier in its
     /// shortest form and small enough for a `u128`.
     pub fn from_contents(b: &[u8]) -> Result<Oid, Error> {
-        if b.is_empty() || b.len() > MAX_OID_LEN || b[b.len() - 1] & 0x80 != 0 {
-            return Err(Error::Oid);
-        }
-        let mut rest = b;
-        while !rest.is_empty() {
-            let prefix = ber::read_base128(rest, u128::MAX)
-                .map_err(|_| Error::Oid)?
-                .ok_or(Error::Oid)?;
-            rest = &rest[prefix.len..];
-        }
+        check_oid(b)?;
         Ok(Oid { bytes: b.to_vec() })
     }
 
@@ -2295,22 +2289,12 @@ impl Writer {
     /// TBSCertificate a world keeps from a certificate to sign again. It is
     /// read under DER first, down to every child, and refused unless it is
     /// exactly one element. Universal types this module reads are checked
-    /// with their readers; other values are copied as they are.
+    /// as by [`validate_der`]; other values are copied as they are.
     pub fn encoded(&mut self, der: &[u8]) {
         if self.error.is_some() {
             return;
         }
-        let mut r = Reader {
-            rest: der,
-            rules: Rules::Der,
-            depth: self.depth,
-        };
-        let checked = r.read().and_then(|e| {
-            r.finish()?;
-            check_der(&e)
-        });
-        match checked {
-            Ok(()) if der.len() > self.left() => self.fail(Error::TooLong),
+        match validate_der(der, self.depth, self.left()) {
             Ok(()) => self.out.extend_from_slice(der),
             Err(e) => self.fail(e),
         }
@@ -2344,8 +2328,93 @@ impl Writer {
     }
 }
 
+/// Checks exactly one DER element without allocating or moving a caller's
+/// cursor. Checks every child and each universal type this module reads,
+/// including SET or SET OF ordering. Other primitive contents stay opaque.
+///
+/// `depth` is the element's starting depth: 0 at the top level. A primitive
+/// may sit at [`MAX_DEPTH`]; a constructed value must sit below it. A starting
+/// depth above that limit is [`Error::TooDeep`], checked before the input.
+///
+/// `room` is the available byte budget, including the element's header,
+/// capped at [`MAX_INPUT`]. Framing, trailing bytes and value errors are
+/// checked before this budget, as in [`Writer::encoded`]. Ancestor headers
+/// are not counted; use [`validate_der_wrapped`] to account for wrappers.
+///
+/// ```
+/// use fictionet::stdlib::asn1::{validate_der, Error, MAX_DEPTH, MAX_INPUT};
+/// assert_eq!(validate_der(&[5, 0], MAX_DEPTH, MAX_INPUT), Ok(()));
+/// assert_eq!(validate_der(&[0x30, 0], MAX_DEPTH, MAX_INPUT), Err(Error::TooDeep));
+/// assert_eq!(validate_der(&[5, 0], 0, 1), Err(Error::TooLong));
+/// assert_eq!(validate_der(&[5, 0, 5, 0], 0, MAX_INPUT), Err(Error::Trailing));
+/// ```
+pub fn validate_der(der: &[u8], depth: usize, room: usize) -> Result<(), Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::TooDeep);
+    }
+    let mut r = Reader {
+        rest: der,
+        rules: Rules::Der,
+        depth,
+    };
+    let e = r.read()?;
+    r.finish()?;
+    check_der(&e)?;
+    if der.len() > room.min(MAX_INPUT) {
+        return Err(Error::TooLong);
+    }
+    Ok(())
+}
+
+/// Checks one DER element as if enclosed in `wrappers` constructed values,
+/// each with a one-byte tag, without allocating or writing those wrappers.
+/// This matches nested [`Writer::sequence`] or [`Writer::explicit`] calls
+/// with tag numbers below 31, containing only the element.
+///
+/// The element starts at depth `wrappers`. After [`validate_der`] succeeds,
+/// every virtual tag and DER length header counts against [`MAX_INPUT`].
+/// More than [`MAX_DEPTH`] wrappers is [`Error::TooDeep`], even for empty or
+/// malformed input. The input slice and any caller's cursor stay unchanged.
+///
+/// ```
+/// use fictionet::stdlib::asn1::{validate_der_wrapped, Error, MAX_DEPTH};
+/// assert_eq!(validate_der_wrapped(&[5, 0], 8), Ok(()));
+/// assert_eq!(validate_der_wrapped(&[0x30, 0], MAX_DEPTH), Err(Error::TooDeep));
+/// ```
+pub fn validate_der_wrapped(der: &[u8], wrappers: usize) -> Result<(), Error> {
+    validate_der(der, wrappers, MAX_INPUT)?;
+    let mut len = der.len();
+    for _ in 0..wrappers {
+        let length_octets = if len < 0x80 {
+            1
+        } else {
+            1 + (usize::BITS - len.leading_zeros()).div_ceil(8) as usize
+        };
+        // Each iteration starts with len <= MAX_INPUT.
+        len += 1 + length_octets;
+        if len > MAX_INPUT {
+            return Err(Error::TooLong);
+        }
+    }
+    Ok(())
+}
+
+fn check_oid(b: &[u8]) -> Result<(), Error> {
+    if b.is_empty() || b.len() > MAX_OID_LEN || b[b.len() - 1] & 0x80 != 0 {
+        return Err(Error::Oid);
+    }
+    let mut rest = b;
+    while !rest.is_empty() {
+        let prefix = ber::read_base128(rest, u128::MAX)
+            .map_err(|_| Error::Oid)?
+            .ok_or(Error::Oid)?;
+        rest = &rest[prefix.len..];
+    }
+    Ok(())
+}
+
 /// Checks a DER element as the readers would: each universal type this
-/// module reads, with its reader, and every constructed element's children.
+/// module reads, with its content checks, and every constructed element's children.
 /// Recursion is bounded by [`Element::reader`]'s depth check.
 fn check_der(e: &Element<'_>) -> Result<(), Error> {
     let t = e.tag;
@@ -2356,9 +2425,9 @@ fn check_der(e: &Element<'_>) -> Result<(), Error> {
             3 => e.bit_string().map(drop)?,
             4 => e.octet_string().map(drop)?,
             5 => e.null()?,
-            6 => e.oid().map(drop)?,
-            23 => e.utc_time().map(drop)?,
-            24 => e.generalized_time().map(drop)?,
+            6 => check_oid(e.primitive()?)?,
+            23 => check_utc_time(&e.string_bytes(StringKind::Visible)?, e.rules)?,
+            24 => check_generalized_time(&e.string_bytes(StringKind::Visible)?, e.rules)?,
             16 | 17 if !t.constructed => return Err(Error::Primitive),
             17 if e.set_reader().is_err() => e.set_of_reader().map(drop)?,
             n => {

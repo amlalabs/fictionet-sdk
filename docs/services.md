@@ -90,6 +90,14 @@ ASN.1 keeps its 255-byte OID limit and `u128` subidentifiers. SNMP keeps its
 128-arc limit and `u32` arcs, allowing `u32::MAX + 80` for the combined
 first subidentifier. Both translate invalid or unfinished values to `Oid`.
 
+`asn1::validate_der` checks exactly one DER element without allocating or
+moving a caller's cursor. The caller supplies its starting depth and byte
+budget. It checks children, universal values and SET ordering before the
+budget. `validate_der_wrapped` also counts enclosing one-byte tags and their
+DER length headers against `MAX_INPUT`, without building those wrappers.
+X.509 checks raw values at depth eight. OCSP uses the depth at
+which it read each raw value. Both keep their existing errors and limits.
+
 `codec::json_syntax::read_string` decodes a quoted string and returns its
 text and the absolute end offset. `scan_number` returns the absolute end of a
 number without converting it. Neither moves a caller's cursor or skips
