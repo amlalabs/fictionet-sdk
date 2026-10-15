@@ -1,10 +1,9 @@
-use fictionet::sync::Mutex;
 use std::borrow::Cow;
 use std::future::{Future, poll_fn};
 use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::task::{Context, Poll, Waker};
+use std::task::{Poll, Waker};
 
 use crate::events::{Event, EventLog};
 use crate::run::RunShared;
@@ -12,9 +11,14 @@ use crate::time::{Duration, Instant};
 use crate::watch::Group;
 
 mod region;
+mod task;
+mod timer;
 
 pub use region::CancelWait;
 pub(crate) use region::Region;
+pub(crate) use task::JoinState;
+pub use task::{JoinError, Task};
+pub use timer::Timer;
 
 /// The context that world code runs in.
 ///
@@ -704,253 +708,8 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-/// Why [`Task::join`] has no `Ok` for its task.
-#[derive(Clone, Debug)]
-pub enum JoinError {
-    /// The task returned this error. It is the same error its region
-    /// keeps, shared, not a copy: downcast it to the task's own type.
-    Failed(crate::Error),
-    /// The task did not finish: it ended with a cancel, or the region of
-    /// the `Cx` passed to `join` was cancelled with no task result ready,
-    /// or the run was dropped, or admission was refused because the task's
-    /// region had completed.
-    Cancelled,
-}
-
-impl std::fmt::Display for JoinError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            JoinError::Failed(_) => f.write_str("the task failed"),
-            JoinError::Cancelled => f.write_str("the join stopped"),
-        }
-    }
-}
-
-impl std::error::Error for JoinError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            JoinError::Failed(e) => Some(&**e),
-            JoinError::Cancelled => Some(&Cancelled),
-        }
-    }
-}
-
-impl From<Cancelled> for JoinError {
-    fn from(_: Cancelled) -> Self {
-        JoinError::Cancelled
-    }
-}
-
-/// A handle to a background task started with [`Cx::spawn`].
-///
-/// Dropping it detaches the task: the task keeps running, because its
-/// [region](Cx#regions) owns it, not the handle. A task stops when it
-/// returns, or when its region is cancelled, together with the rest of the
-/// region. Keep the handle to wait for the task with [`Task::join`].
-pub struct Task {
-    join: Arc<JoinState>,
-}
-
-impl Task {
-    /// Waits for the task to end. `Ok(())` if it returned `Ok`.
-    ///
-    /// If the task failed, this returns [`JoinError::Failed`] with the
-    /// task's own error, the same one its region keeps, as [`Cx::spawn`]
-    /// says. Each poll checks for a stored task result before checking
-    /// `fcx`'s cancellation. Any stored result wins, including `Ok(())`.
-    /// A failure is stored before it cancels the region, so a joiner in
-    /// that same region still gets the error.
-    ///
-    /// If no result is ready and `fcx`'s region is cancelled, this returns
-    /// [`JoinError::Cancelled`]. It also returns `Cancelled` if the task
-    /// ended with a cancel, was dropped with the run, or was refused
-    /// because its region had completed.
-    pub async fn join(self, fcx: &Cx) -> Result<(), JoinError> {
-        let mut wait = CancelWait::default();
-        poll_fn(|cx| {
-            let mut state = self.join.state.lock();
-            if let Some(result) = state.result.take() {
-                return Poll::Ready(result);
-            }
-            if fcx.is_cancelled() {
-                return Poll::Ready(Err(JoinError::Cancelled));
-            }
-            match &state.waker {
-                Some(w) if w.will_wake(cx.waker()) => {}
-                _ => state.waker = Some(cx.waker().clone()),
-            }
-            drop(state);
-            if fcx.register_cancel(cx.waker(), &mut wait) {
-                return Poll::Ready(Err(JoinError::Cancelled));
-            }
-            Poll::Pending
-        })
-        .await
-    }
-}
-
-/// What a [`Task`] returned, for [`Task::join`].
-#[derive(Default)]
-pub(crate) struct JoinState {
-    state: Mutex<JoinInner>,
-}
-
-#[derive(Default)]
-struct JoinInner {
-    result: Option<Result<(), JoinError>>,
-    waker: Option<Waker>,
-}
-
-impl JoinState {
-    pub(crate) fn finish(&self, result: Result<(), JoinError>) {
-        let waker = {
-            let mut state = self.state.lock();
-            state.result = Some(result);
-            state.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-}
-
-/// A sleep whose deadline can move, for a task that polls by hand and
-/// whose next deadline changes often, such as a TCP endpoint's driver.
-/// Moving the deadline reuses the same timer entry, where dropping one
-/// [`Cx::sleep_until`] future and making another would add and remove an
-/// entry, and allocate the boxed future, each time.
-/// Create an inactive timer with [`Timer::new`]. Each call to
-/// [`Timer::poll_until`] sets its deadline. [`Timer::clear`] removes the
-/// deadline; dropping the timer also unregisters its cancellation waiter.
-/// Use a timer with one region.
-pub struct Timer {
-    fcx: Cx,
-    /// The logical deadline of the timer entry, if there is one.
-    deadline: Option<Instant>,
-    entry: Option<u64>,
-    wait: CancelWait,
-}
-
-impl Timer {
-    /// Creates an inactive timer owned by this context's run and region.
-    pub fn new(fcx: &Cx) -> Self {
-        Self {
-            fcx: fcx.clone(),
-            deadline: None,
-            entry: None,
-            wait: CancelWait::default(),
-        }
-    }
-
-    /// Polls for `deadline` to pass: `Ready(Ok(()))` once it has. Until
-    /// then, `cx`'s waker is woken when it passes or when the owning region is
-    /// cancelled. Cancellation returns `Ready(Err(Cancelled))`, even if
-    /// the deadline has passed. `Duration::MAX` is an unarmed wait. Real
-    /// deadlines beyond the host clock's range also wait only for cancellation.
-    pub fn poll_until(
-        &mut self,
-        cx: &mut Context<'_>,
-        deadline: Instant,
-    ) -> Poll<Result<(), Cancelled>> {
-        if self.fcx.is_cancelled() {
-            return Poll::Ready(Err(Cancelled));
-        }
-        // A deadline past what the clock can hold never comes.
-        match self
-            .fcx
-            .run
-            .environment
-            .clock
-            .finite(deadline)
-            .then_some(deadline)
-        {
-            Some(at) => {
-                if self.fcx.now() >= at {
-                    self.clear();
-                    return Poll::Ready(Ok(()));
-                }
-                match self.entry {
-                    Some(id) if self.deadline == Some(at) => {
-                        self.fcx.run.environment.clock.update(id, cx.waker())
-                    }
-                    Some(id) => self.fcx.run.environment.clock.reset(id, at, cx.waker()),
-                    None => {
-                        self.entry =
-                            Some(self.fcx.run.environment.clock.add(at, cx.waker().clone()))
-                    }
-                }
-                self.deadline = Some(at);
-            }
-            None => self.clear(),
-        }
-        if self.fcx.register_cancel(cx.waker(), &mut self.wait) {
-            return Poll::Ready(Err(Cancelled));
-        }
-        Poll::Pending
-    }
-
-    /// Removes the deadline and its timer entry, if any.
-    /// The cancellation registration stays until the timer is dropped.
-    pub fn clear(&mut self) {
-        if let Some(id) = self.entry.take() {
-            self.fcx.run.environment.clock.remove(id);
-        }
-        self.deadline = None;
-    }
-}
-
-impl Drop for Timer {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
 impl crate::Entropy for Cx {
     fn fill_random(&self, out: &mut [u8]) {
         Cx::fill_random(self, out);
-    }
-}
-
-#[cfg(all(test, feature = "std"))]
-mod tests {
-    use super::*;
-    use crate::block_on;
-    use crate::time::ms;
-
-    #[test]
-    fn a_timer_fires_at_its_latest_deadline() {
-        /// Polls `timer` for `first`, then for `then` until it fires.
-        /// Returns how long that took.
-        async fn wait(
-            fcx: &Cx,
-            timer: &mut Timer,
-            first: Duration,
-            then: Duration,
-        ) -> Result<std::time::Duration, Cancelled> {
-            let start = fcx.now();
-            let base = fcx.now();
-            let mut moved = false;
-            std::future::poll_fn(|cx| {
-                if !moved {
-                    moved = true;
-                    assert!(timer.poll_until(cx, base + first).is_pending());
-                }
-                timer.poll_until(cx, base + then)
-            })
-            .await?;
-            Ok(fcx.now().since_start() - start.since_start())
-        }
-        block_on(crate::lab(fictionet::Seed::from_u64(0), |fcx| async move {
-            let mut timer = Timer::new(&fcx);
-            // Moved later: the old deadline does not end the wait.
-            let waited = wait(&fcx, &mut timer, ms(10), ms(120)).await?;
-            assert_eq!(waited, ms(120));
-            // Moved earlier: it fires at the new deadline, after it fired once
-            // already under the same entry.
-            let waited = wait(&fcx, &mut timer, ms(400), ms(30)).await?;
-            assert_eq!(waited, ms(30));
-            Ok(())
-        }))
-        .unwrap();
     }
 }
