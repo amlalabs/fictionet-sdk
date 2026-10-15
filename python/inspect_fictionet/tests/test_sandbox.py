@@ -145,19 +145,290 @@ def test_same_config_same_file(tmp_path):
 
 
 def test_build_and_cargo_example(tmp_path):
-    dockerfile = tmp_path / "agent.Dockerfile"
+    context = tmp_path / "agent"
+    context.mkdir()
+    dockerfile = context / "agent.Dockerfile"
     dockerfile.write_text("FROM debian:bookworm-slim\n")
-    c = compose(tmp_path, CargoExample("web_world", crate=REPO, features=["tokio"]),
+    cache = tmp_path / "cache"
+    c = compose(cache, CargoExample("web_world", crate=REPO, features=["tokio"]),
                 agent_image=Build(dockerfile, target="x", args={"A": "1"}))  # fmt: skip
     agent = c["services"]["default"]
-    assert agent["build"] == {"context": str(tmp_path), "dockerfile": str(dockerfile), "target": "x", "args": {"A": "1"}}
+    agent_context = Path(agent["build"]["context"])
+    assert agent_context.parent == cache / "context"
+    assert not agent_context.is_symlink()
+    assert (agent_context / "agent.Dockerfile").read_text() == dockerfile.read_text()
+    assert agent["build"] == {"context": str(agent_context), "dockerfile": str(dockerfile), "target": "x", "args": {"A": "1"}}
     assert agent["image"].startswith("inspect-fictionet-agent:")
     world = c["services"]["world"]
-    assert world["build"]["context"] == str(REPO)
+    world_context = Path(world["build"]["context"])
+    assert world_context.parent == cache / "context"
+    assert (world_context / "Cargo.toml").read_bytes() == (REPO / "Cargo.toml").read_bytes()
+    assert not (world_context / "target").exists()
     generated = Path(world["build"]["dockerfile"])
     text = generated.read_text()
     assert "cargo build --release --features tokio --example web_world" in text
     assert "target" in (generated.parent / "world.Dockerfile.dockerignore").read_text()
+
+
+def test_ignored_file_does_not_change_context(tmp_path):
+    crate = tmp_path / "crate"
+    crate.mkdir()
+    (crate / "Cargo.toml").write_text('[package]\nname = "snapshot"\nversion = "0.1.0"\n')
+    # CargoExample uses its generated rules, not the crate's .dockerignore.
+    (crate / ".dockerignore").write_text("*.rs\n")
+    source = crate / "world.rs"
+    source.write_text('fn main() { println!("one"); }\n')
+    os.utime(source, (1_000_000_000, 1_000_000_000))
+    before = source.stat()
+    world = CargoExample("world", crate=crate)
+    cache = tmp_path / "cache"
+    (crate / "nested").mkdir()
+    (crate / "nested/keep").write_text("included\n")
+    spec = fictionet_sandbox(world, cache_dir=cache)
+    service = yaml.safe_load(Path(spec.config).read_text())["services"]["world"]
+    snapshot = Path(service["build"]["context"])
+    assert snapshot.parent == cache / "context"
+    for name in ("target/debug/data", ".git/objects/data", "nested/target/data"):
+        path = crate / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ignored\n")
+    assert fictionet_sandbox(world, cache_dir=cache) == spec
+    for name in ("target/debug/data", ".git/objects/data", "nested/target/data"):
+        (crate / name).write_text("changed and still ignored\n")
+    assert fictionet_sandbox(world, cache_dir=cache) == spec
+    assert not (snapshot / "target").exists()
+    assert not (snapshot / ".git").exists()
+    assert not (snapshot / "nested/target").exists()
+    assert (snapshot / ".dockerignore").read_bytes() == (crate / ".dockerignore").read_bytes()
+    source.write_text('fn main() { println!("two"); }\n')
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    updated = fictionet_sandbox(world, cache_dir=cache)
+    changed = yaml.safe_load(Path(updated.config).read_text())["services"]["world"]
+    assert updated.config != spec.config
+    assert changed["image"] == service["image"]
+    assert changed["build"]["dockerfile"] == service["build"]["dockerfile"]
+    assert changed["build"]["context"] != str(snapshot)
+    assert (snapshot / "world.rs").read_text() == 'fn main() { println!("one"); }\n'
+    assert (Path(changed["build"]["context"]) / "world.rs").read_bytes() == source.read_bytes()
+    assert (source.stat().st_size, source.stat().st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
+@pytest.mark.parametrize("cache_name", ["cache", "."])
+def test_cache_inside_context_requires_ignore(tmp_path, cache_name):
+    context = tmp_path / "source"
+    context.mkdir()
+    dockerfile = context / "Dockerfile"
+    dockerfile.write_text("FROM scratch\nCOPY . /\n")
+    cache = context / cache_name
+
+    with pytest.raises(ValueError) as error:
+        fictionet_sandbox(Build(dockerfile), cache_dir=cache)
+
+    message = str(error.value)
+    assert str(cache) in message
+    assert str(context) in message
+    assert "move cache_dir out of the context" in message
+    assert "ignore rules" in message
+    assert not (cache / "context").exists()
+
+
+@pytest.mark.parametrize("rules", ["cache\n", "cache\n!keep\n"])
+def test_ignored_cache_inside_context_is_stable(tmp_path, rules):
+    context = tmp_path / "source"
+    context.mkdir()
+    dockerfile = context / "Dockerfile"
+    dockerfile.write_text("FROM scratch\nCOPY . /\n")
+    (context / ".dockerignore").write_text(rules)
+    cache = context / "cache"
+    world = Build(dockerfile)
+
+    first = fictionet_sandbox(world, cache_dir=cache)
+    service = yaml.safe_load(Path(first.config).read_text())["services"]["world"]
+    snapshot = Path(service["build"]["context"])
+    assert snapshot.parent == cache / "context"
+    assert (snapshot / "Dockerfile").read_bytes() == dockerfile.read_bytes()
+    assert (snapshot / ".dockerignore").read_text() == rules
+    assert not (snapshot / "cache").exists()
+    assert fictionet_sandbox(world, cache_dir=cache) == first
+    assert list((cache / "context").iterdir()) == [snapshot]
+
+
+def test_cache_ignore_exception_is_rejected(tmp_path):
+    context = tmp_path / "source"
+    context.mkdir()
+    dockerfile = context / "Dockerfile"
+    dockerfile.write_text("FROM scratch\nCOPY . /\n")
+    (context / ".dockerignore").write_text("cache\n!cache/keep\n")
+    cache = context / "cache"
+    cache.mkdir()
+    (cache / "keep").write_text("included by exception\n")
+
+    with pytest.raises(ValueError, match="move cache_dir out of the context"):
+        fictionet_sandbox(Build(dockerfile), cache_dir=cache)
+    assert not (cache / "context").exists()
+
+
+def test_context_preserves_permissions_and_symlinks(tmp_path):
+    from inspect_fictionet._build import _snapshot_context
+
+    context = tmp_path / "source"
+    context.mkdir()
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\nCOPY . /\n")
+    script = context / "script"
+    script.write_text("#!/bin/sh\necho hello\n")
+    script.chmod(0o755)
+    (context / "link").symlink_to("script")
+    (context / "broken").symlink_to("missing")
+    (context / "directory-link").symlink_to("../outside", target_is_directory=True)
+    (tmp_path / "outside").mkdir()
+    cache = tmp_path / "cache"
+    first = _snapshot_context(context, dockerfile, cache)
+    assert (first / "script").stat().st_mode & 0o777 == 0o755
+    assert (first / "script").stat().st_mtime_ns == script.stat().st_mtime_ns
+    for name in ("link", "broken", "directory-link"):
+        assert (first / name).is_symlink()
+        assert os.readlink(first / name) == os.readlink(context / name)
+    script.chmod(0o644)
+    second = _snapshot_context(context, dockerfile, cache)
+    assert second != first
+    assert (second / "script").stat().st_mode & 0o777 == 0o644
+    assert (second / "script").read_bytes() == (first / "script").read_bytes()
+    (context / "broken").unlink()
+    (context / "broken").symlink_to("another-missing-target")
+    assert _snapshot_context(context, dockerfile, cache) != second
+
+
+def test_concurrent_context_snapshots(tmp_path):
+    import multiprocessing
+
+    from inspect_fictionet._build import _snapshot_context
+
+    context = tmp_path / "source"
+    context.mkdir()
+    dockerfile = context / "Dockerfile"
+    dockerfile.write_text("FROM scratch\nCOPY . /\n")
+    for i in range(16):
+        (context / str(i)).write_bytes(bytes([i]) * 65536)
+    cache = tmp_path / "cache"
+    spawn = multiprocessing.get_context("spawn")
+    barrier = spawn.Barrier(8)
+    with spawn.Pool(8, initializer=barrier.wait) as pool:
+        snapshots = pool.starmap(_snapshot_context, [(context, dockerfile, cache)] * 8)
+    assert len(set(snapshots)) == 1
+    snapshot = snapshots[0]
+    assert list((cache / "context").iterdir()) == [snapshot]
+    assert sorted(p.name for p in snapshot.iterdir()) == sorted(p.name for p in context.iterdir())
+    for path in context.iterdir():
+        assert (snapshot / path.name).read_bytes() == path.read_bytes()
+
+
+@pytest.mark.parametrize("specific", [False, True])
+def test_build_ignore_precedence(tmp_path, specific):
+    from inspect_fictionet._build import _snapshot_context
+
+    context = tmp_path / "source"
+    context.mkdir()
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\nCOPY . /\n")
+    (context / ".dockerignore").write_text("root-rule\n.dockerignore\n")
+    for name in ("root-rule", "specific-rule"):
+        (context / name).write_text(name)
+    if specific:
+        dockerfile.with_name("Dockerfile.dockerignore").write_text("specific-rule\n")
+    snapshot = _snapshot_context(context, dockerfile, tmp_path / "cache")
+    assert (snapshot / "root-rule").exists() == specific
+    assert (snapshot / "specific-rule").exists() != specific
+    assert (snapshot / ".dockerignore").read_bytes() == (context / ".dockerignore").read_bytes()
+
+
+@pytest.mark.parametrize("patterns,path,excluded", [
+    ("*.rs", "src/lib.rs", False),
+    ("*.rs", "lib.rs", True),
+    ("**/*.rs", "src/deep/lib.rs", True),
+    ("**/*.rs", "lib.rs", True),
+    ("/src/", "src/deep/lib.rs", True),
+    ("src", "nested/src/lib.rs", False),
+    ("src/*", "src/deep/lib.rs", True),
+    ("src\n!src/**/keep.rs", "src/deep/keep.rs", False),
+    ("src\n!src/**/keep.rs\n**/keep.rs", "src/deep/keep.rs", True),
+    ("**\n!src", "src/deep/keep.rs", False),
+    ("file?.[a-c]", "file1.b", True),
+    ("file?.[^a-c]", "file1.b", False),
+    ("file?.[^a-c]", "file1.z", True),
+    (r"literal\*", "literal*", True),
+    (r"literal\*", "literalx", False),
+    ("**suffix", "prefixsuffix", True),
+    ("**suffix", "prefix\nsuffix", True),
+    ("prefix/**", "prefix/file\nname", True),
+    ("**", "file\nname", True),
+    ("a**/b", "a/deep/b", True),
+    ("a**/b", "axxb", False),
+    ("\ufeff# comment\n.\n ./src/../keep/ \n", "keep/file", True),
+    (" #literal", "#literal", True),
+])
+def test_dockerignore_patterns(patterns, path, excluded):
+    from inspect_fictionet._build import _DockerIgnore
+
+    assert _DockerIgnore(patterns).excludes(Path(path)) == excluded
+
+
+@pytest.mark.parametrize("pattern", ["!", "[", "[]", "[a-]", "[z-a]", "trailing\\"])
+def test_invalid_dockerignore_is_an_error(pattern):
+    from inspect_fictionet._build import _DockerIgnore
+
+    with pytest.raises(ValueError, match="invalid Docker ignore pattern"):
+        _DockerIgnore(pattern)
+
+
+@pytest.mark.skipif(
+    os.environ.get("INSPECT_FICTIONET_DOCKER") != "1" and "CI" not in os.environ,
+    reason="builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
+)
+@pytest.mark.parametrize("specific", [False, True])
+def test_dockerignore_matches_docker(tmp_path, specific):
+    from inspect_fictionet._build import _snapshot_context
+    from inspect_fictionet._files import _short_key
+
+    context = tmp_path / "source"
+    context.mkdir()
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM busybox:1.36\nCOPY . /ctx\n")
+    patterns = (
+        "\ufeff# comment\n.\n*.log\n**/temp?\n/root-only/\nskip\n!skip/keep.txt\n"
+        "!skip/reopened/\nskip/reopened/private\n**/cache\n!**/cache/keep.txt\n"
+        "chars/file[0-2].txt\nchars/neg[^a-c].txt\nliteral\\*.txt\n"
+    )
+    (context / ".dockerignore").write_text("**" if specific else patterns)
+    if specific:
+        dockerfile.with_name("Dockerfile.dockerignore").write_text(patterns)
+    for name in (
+        "root.log", "nested/keep.log", "temp1", "deep/temp2/file", "root-only/file",
+        "nested/root-only/keep", "skip/keep.txt", "skip/lost.txt", "skip/reopened/keep",
+        "skip/reopened/private/file", "cache/lost", "deep/cache/keep.txt", "chars/file1.txt",
+        "chars/file3.txt", "chars/nega.txt", "chars/negz.txt", "literal*.txt", "literalx.txt",
+    ):
+        path = context / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name)
+    (context / "empty").mkdir()
+    (context / "link").symlink_to("nested/keep.log")
+    snapshot = _snapshot_context(context, dockerfile, tmp_path / "cache")
+    expected = sorted(p.relative_to(snapshot).as_posix() for p in snapshot.rglob("*"))
+    images = []
+    try:
+        for i, directory in enumerate((context, snapshot)):
+            image = f"inspect-fictionet-ignore-test:{_short_key(str(tmp_path))}-{i}"
+            images.append(image)
+            subprocess.run(["docker", "build", "-t", image, "-f", str(dockerfile), str(directory)], check=True)
+            result = subprocess.run(
+                ["docker", "run", "--rm", "--network=none", image, "find", "/ctx", "-mindepth", "1"],
+                check=True, capture_output=True, text=True,
+            )
+            assert sorted(line.removeprefix("/ctx/") for line in result.stdout.splitlines()) == expected
+    finally:
+        for image in images:
+            subprocess.run(["docker", "rmi", "-f", image], check=True, capture_output=True)
 
 
 @pytest.mark.parametrize(
@@ -430,17 +701,17 @@ def test_k8s_tiny_cpu_limit(tmp_path):
     reason="builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
 )
 def test_edited_source_is_rebuilt(tmp_path):
-    """The image tag follows the build's configuration, not the source, so
-    an edit leaves the compose file and the tag as they were. Inspect's
-    docker sandbox runs `docker compose build` for each task anyway, and
-    BuildKit's cache sees the changed file. This builds the way Inspect
-    does, edits the source, builds again, and checks that the image changed."""
-    import subprocess
-
-    (tmp_path / "Dockerfile").write_text("FROM busybox:1.36\nCOPY msg.txt /msg.txt\n")
-    (tmp_path / "msg.txt").write_text("one\n")
-    spec = fictionet_sandbox(WEB_WORLD_IMAGE, agent_image=Build(tmp_path / "Dockerfile"), cache_dir=tmp_path / "cache")
+    """A same-size, same-mtime edit changes the snapshot and compose path.
+    The image tag stays fixed, and Inspect's compose build gets new bytes."""
+    context = tmp_path / "source"
+    context.mkdir()
+    (context / "Dockerfile").write_text("FROM busybox:1.36\nCOPY msg.txt /msg.txt\n")
+    source = context / "msg.txt"
+    source.write_text("one\n")
+    os.utime(source, (1_000_000_000, 1_000_000_000))
+    spec = fictionet_sandbox(WEB_WORLD_IMAGE, agent_image=Build(context / "Dockerfile"), cache_dir=tmp_path / "cache")
     image = yaml.safe_load(Path(spec.config).read_text())["services"]["default"]["image"]
+    image_ids = []
 
     def build_and_read() -> str:
         subprocess.run(
@@ -448,18 +719,30 @@ def test_edited_source_is_rebuilt(tmp_path):
             check=True,
             capture_output=True,
         )
+        inspected = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image], check=True, capture_output=True, text=True,
+        )
+        image_ids.append(inspected.stdout.strip())
         out = subprocess.run(["docker", "run", "--rm", image, "cat", "/msg.txt"], check=True, capture_output=True)
         return out.stdout.decode()
 
     try:
         assert build_and_read() == "one\n"
-        (tmp_path / "msg.txt").write_text("two\n")
-        assert fictionet_sandbox(
-            WEB_WORLD_IMAGE, agent_image=Build(tmp_path / "Dockerfile"), cache_dir=tmp_path / "cache"
-        ) == spec
+        source.write_text("two\n")
+        os.utime(source, (1_000_000_000, 1_000_000_000))
+        previous = spec
+        spec = fictionet_sandbox(
+            WEB_WORLD_IMAGE, agent_image=Build(context / "Dockerfile"), cache_dir=tmp_path / "cache"
+        )
+        service = yaml.safe_load(Path(spec.config).read_text())["services"]["default"]
+        assert service["image"] == image
         assert build_and_read() == "two\n"
+        assert spec.config != previous.config
+        assert image_ids[0] != image_ids[1]
     finally:
-        subprocess.run(["docker", "rmi", "-f", image], capture_output=True)
+        if image_ids:
+            untagged = [image_id for image_id in dict.fromkeys(image_ids) if image_id != image_ids[-1]]
+            subprocess.run(["docker", "rmi", "-f", image, *untagged], check=True, capture_output=True)
 
 
 @pytest.mark.skipif(
@@ -468,7 +751,7 @@ def test_edited_source_is_rebuilt(tmp_path):
 )
 def test_cargo_example_image_is_rebuilt(tmp_path):
     """Run the generated scratch image before and after a source edit,
-    reusing the same compose file, image tag and Cargo target cache."""
+    reusing the image tag and Cargo target cache with a new snapshot."""
     crate = tmp_path / "crate"
     examples = crate / "examples"
     examples.mkdir(parents=True)
@@ -477,13 +760,12 @@ def test_cargo_example_image_is_rebuilt(tmp_path):
     )
     source = examples / "world.rs"
 
-    def write_source(message, timestamp):
+    def write_source(message):
         source.write_text(f'fn main() {{ println!("{message}"); }}\n')
-        # Restored files can predate the cached binary. Use distinct old
-        # timestamps so BuildKit sees the edit and Cargo must still rebuild.
-        os.utime(source, (timestamp, timestamp))
+        # A metadata-preserving edit must reach COPY and the warm Cargo build.
+        os.utime(source, (1_000_000_000, 1_000_000_000))
 
-    write_source("one", 1_000_000_000)
+    write_source("one")
     world = CargoExample("world", crate=crate)
     cache = tmp_path / "cache"
     spec = fictionet_sandbox(world, cache_dir=cache)
@@ -514,15 +796,27 @@ def test_cargo_example_image_is_rebuilt(tmp_path):
 
     try:
         assert build_and_run() == "one\n"
-        write_source("two", 1_000_000_001)
+        original_id = image_ids[-1]
+        for name in ("target/ignored", ".git/ignored"):
+            path = crate / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("ignored by CargoExample\n")
         assert fictionet_sandbox(world, cache_dir=cache) == spec
+        assert build_and_run() == "one\n"
+        assert image_ids[-1] == original_id
+        write_source("two")
+        previous = spec
+        spec = fictionet_sandbox(world, cache_dir=cache)
+        service = yaml.safe_load(Path(spec.config).read_text())["services"]["world"]
+        assert service["image"] == image
         assert build_and_run() == "two\n"
-        assert image_ids[0] != image_ids[1]
+        assert spec.config != previous.config
+        assert image_ids[-1] != original_id
     finally:
-        subprocess.run(["docker", "rmi", "-f", image], capture_output=True)
-        # The first build loses its tag on rebuild but still needs removing.
-        for image_id in dict.fromkeys(image_ids):
-            subprocess.run(["docker", "rmi", "-f", image_id], capture_output=True)
+        if image_ids:
+            # Earlier builds lose their tag on rebuild but still need removing.
+            untagged = [image_id for image_id in dict.fromkeys(image_ids) if image_id != image_ids[-1]]
+            subprocess.run(["docker", "rmi", "-f", image, *untagged], check=True, capture_output=True)
 
 
 def require_k8s():

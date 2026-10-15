@@ -41,6 +41,9 @@ class Build:
     Relative paths are taken from the current directory when
     `fictionet_sandbox` runs. In a task file, pass absolute ones, such as
     `Path(__file__).parent / "agent.Dockerfile"`.
+
+    Each call snapshots the context's contents under Docker's ignore rules.
+    Source edits change the snapshot and compose paths, but keep the image tag.
     """
 
     dockerfile: str | os.PathLike[str]
@@ -93,7 +96,8 @@ class CargoExample:
     The image is generated: the example is built with musl on
     `rust_image`, statically, and copied alone onto `scratch`, where it
     runs as uid 65532. The crate's `target/` and `.git/` are left out of
-    the build context.
+    the build context by generated ignore rules, which take precedence over
+    the crate's `.dockerignore`. Each call snapshots the included contents.
     """
 
     name: str

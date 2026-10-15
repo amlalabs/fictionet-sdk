@@ -140,7 +140,7 @@ been rerun with them.
 | `backend` | `"docker"` | `"docker"` for Inspect's docker sandbox, `"k8s"` for inspect_k8s_sandbox. |
 | `image_pull_policy` | the cluster's | On Kubernetes, the pods' `imagePullPolicy`, such as `"Never"` for images loaded into kind. |
 | `k8s_values` | none | On Kubernetes, more values for the chart, merged key by key over the ones the package writes. |
-| `cache_dir` | the user cache directory | Where the generated files go: `~/.cache/inspect_fictionet` on Linux. A relative path is made absolute when `fictionet_sandbox` runs. |
+| `cache_dir` | the user cache directory | Where generated files and build context snapshots go: `~/.cache/inspect_fictionet` on Linux. A relative path is made absolute when `fictionet_sandbox` runs. A cache inside a build context is an error unless the effective ignore rules exclude it and everything under it. Move `cache_dir` out of the context, or add it to those rules. |
 
 Docker Compose interpolates `${...}` in the values you pass, so write `$$`
 for a literal `$`. Inspect sets `SAMPLE_METADATA_<KEY>` for each key of a
@@ -209,9 +209,20 @@ fictionet_sandbox(CargoExample("web_world", crate=here / "..", features=["tokio"
 
 The agent's image can be a `Build` too. Give absolute paths, as above: the
 generated compose file lives in the cache directory, and relative paths are
-taken from the directory Inspect runs in. `CargoExample` leaves `target/` and
-`.git/` out of the build context. The Kubernetes backend takes images only,
-because the cluster has to pull them: build and push them first.
+taken from the directory Inspect runs in. Each call hashes the included files
+and copies a new build context into `cache_dir/context/<content-hash>/` when
+needed. Docker builds from that snapshot. An edit changes the snapshot and
+compose path even if file sizes and timestamps stay the same. Image tags stay
+fixed for the same build options, and Cargo keeps its warm target cache.
+
+`Build` uses `<Dockerfile>.dockerignore` when present, otherwise the context's
+`.dockerignore`. `CargoExample` uses only its generated ignore rules, which
+leave out `target/` and `.venv/` directories, plus root `.git/` and `node_modules/`.
+Snapshots preserve permissions and symlinks. They accumulate in `cache_dir`;
+they are not pruned because another build may still be reading them. Remove
+old snapshots only when no builds or saved compose files need them.
+The Kubernetes backend takes images only, because the cluster has to pull
+them: build and push them first.
 
 ### The world's CA
 
@@ -340,9 +351,10 @@ an Inspect sandbox. See [Reading the world's log](#reading-the-worlds-log).
 ## How it works
 
 Inspect's docker sandbox takes a compose file. `fictionet_sandbox` writes one
-into the cache directory and returns its path. The same options always give
-the same file. It has three services, and Docker Compose starts them in this
-order:
+into the cache directory and returns its path. The same options and included
+source contents give the same file. Source edits produce a new compose path
+with the same image tags. It has three services, and Docker Compose starts
+them in this order:
 
 ```text
              +-----------------------+

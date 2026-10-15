@@ -108,8 +108,12 @@ def fictionet_sandbox(
         `{"attach": {"runAsUser": 1000}}` or
         `{"services": {"default": {"world": {"securityContext":
         {"readOnlyRootFilesystem": False}}}}}`.
-      cache_dir: Where the generated files go. Default: the user's cache
-        directory, `inspect_fictionet/` in it.
+      cache_dir: Where generated files and build context snapshots go.
+        Default: the user's cache directory, `inspect_fictionet/` in it.
+        Snapshots accumulate; remove them only when no builds or saved
+        compose files need them. A cache inside a build context is an error
+        unless the effective ignore rules exclude it and everything under it.
+        Move cache_dir out of the context, or add it to those rules.
     """
     cfg = _Config(
         world=world,
