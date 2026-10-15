@@ -63,7 +63,7 @@
 //! assert_eq!(dn.to_text().unwrap(), "uid=jdoe,dc=example,dc=com");
 //! ```
 
-use fictionet::stdlib::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
+use fictionet::stdlib::asn1::{self, Class, Element, Reader, Rules, Tag};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii::{hex_lower, hex_value as hex_digit};
@@ -2472,47 +2472,22 @@ fictionet::prefixed! {
         input: &[u8],
         limit: &Self::Limit,
     ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
-        let limit = *limit;
-        let header = match asn1::Header::parse(input, Rules::Ber) {
-            Ok(header) => header,
-            Err(asn1::Error::Truncated) => return Ok(None),
-            Err(asn1::Error::TooLong) => return Err(Error::TooLarge(declared_total(input))),
-            Err(e) => return Err(Error::Ber(e)),
+        let Some(prefix) = asn1::Prefix::parse(input, Rules::Ber)? else {
+            return Ok(None);
         };
+        let translate = |e| match (e, prefix.total) {
+            (asn1::Error::TooLong, Some(total)) => Error::TooLarge(total),
+            (e, _) => Error::Ber(e),
+        };
+        let header = prefix.header().map_err(translate)?;
         if header.tag != Tag::SEQUENCE {
             return Err(unexpected(Tag::SEQUENCE, header.tag));
         }
-        let Length::Definite(n) = header.length else {
-            return Err(Error::Ber(asn1::Error::Indefinite));
-        };
-        let total = header.len.saturating_add(n);
-        if total > limit {
-            return Err(Error::TooLarge(total));
-        }
-        Ok(match input.get(..total) {
-            Some(bytes) => Some((Message::parse(bytes)?, total)),
+        Ok(match prefix.frame_len(input.len(), *limit).map_err(translate)? {
+            Some(total) => Some((Message::parse(&input[..total])?, total)),
             None => None,
         })
     }
-}
-
-/// The whole length a header at the start of `b` declares: the header and
-/// the contents. It is for a header [`asn1::Header::parse`] found too long,
-/// so its length octets are all in `b`.
-fn declared_total(b: &[u8]) -> usize {
-    let Ok((_, i)) = Tag::parse(b) else {
-        return usize::MAX;
-    };
-    let n = usize::from(b.get(i).map_or(0, |c| c & 0x7f));
-    let Some(octets) = b.get(i + 1..i + 1 + n) else {
-        return usize::MAX;
-    };
-    let v = octets.iter().fold(0u64, |v, &c| {
-        v.saturating_mul(256).saturating_add(u64::from(c))
-    });
-    usize::try_from(v)
-        .unwrap_or(usize::MAX)
-        .saturating_add(i + 1 + n)
 }
 
 /// Checks shared by this module's tests and its fuzz target.

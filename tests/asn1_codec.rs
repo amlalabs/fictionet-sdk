@@ -1,8 +1,8 @@
 //! ASN.1 framing and its LDAP, OCSP, SPNEGO, PEM, and Kerberos consumers.
 
 use core::fmt::Debug;
-use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
+use fictionet::stdlib::codec::{Frames, Prefixed};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{asn1, kerberos, ldap, ocsp, spnego, x509};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -54,6 +54,189 @@ fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let _reset = Reset;
     let value = f();
     (value, ALLOCATIONS.get().unwrap())
+}
+
+#[test]
+fn announced_prefixes_keep_extents_without_bodies_or_allocations() {
+    use asn1::{Error, Prefix, Rules, Tag};
+    for (tag, length) in [
+        (Tag::SEQUENCE, 0),
+        (Tag::OCTET_STRING, 127),
+        (Tag::SEQUENCE, 128),
+        (Tag::private(u32::MAX), 256),
+        (Tag::SEQUENCE, asn1::MAX_INPUT),
+        (Tag::SEQUENCE, asn1::MAX_INPUT + 1),
+        (Tag::SEQUENCE, u32::MAX as usize),
+    ] {
+        let mut bytes = Vec::new();
+        tag.encode(&mut bytes);
+        asn1::encode_length(length, &mut bytes);
+        for rules in [Rules::Ber, Rules::Der] {
+            for split in 0..bytes.len() {
+                assert_eq!(Prefix::parse(&bytes[..split], rules), Ok(None));
+            }
+            let (prefix, count) = allocations(|| Prefix::parse(&bytes, rules));
+            assert_eq!(count, 0);
+            let prefix = prefix.unwrap().unwrap();
+            let total = bytes.len().saturating_add(length);
+            assert_eq!(prefix.total, Some(total));
+            assert_eq!(prefix.header(), asn1::Header::parse(&bytes, rules));
+            if length > asn1::MAX_INPUT {
+                assert_eq!(prefix.header(), Err(Error::TooLong));
+            } else {
+                let header = prefix.header().unwrap();
+                assert_eq!(header.tag, tag);
+                assert_eq!(header.len, bytes.len());
+                assert_eq!(header.length, asn1::Length::Definite(length));
+            }
+            assert_eq!(
+                prefix.frame_len(bytes.len(), total - 1),
+                Err(Error::TooLong)
+            );
+            if length > asn1::MAX_INPUT {
+                assert_eq!(
+                    prefix.frame_len(bytes.len(), usize::MAX),
+                    Err(Error::TooLong)
+                );
+            } else {
+                assert_eq!(prefix.frame_len(total - 1, total), Ok(None));
+                assert_eq!(prefix.frame_len(total, total), Ok(Some(total)));
+                assert_eq!(prefix.frame_len(total + 1, total), Ok(Some(total)));
+            }
+        }
+    }
+}
+
+#[test]
+fn announced_prefixes_preserve_header_errors_and_indefinite_metadata() {
+    use asn1::{Error, Prefix, Rules};
+    for rules in [Rules::Ber, Rules::Der] {
+        for (bytes, error) in [
+            (&[0x1f, 0x80][..], Error::Tag),
+            (&[0x30, 0xff], Error::Length),
+            (&[0x30, 0x85], Error::Length),
+            (&[0x04, 0x80], Error::Indefinite),
+        ] {
+            assert_eq!(Prefix::parse(bytes, rules), Err(error));
+        }
+    }
+    for bytes in [&[0x30, 0x82, 0][..], &[0x30, 0x81, 1]] {
+        assert_eq!(
+            Prefix::parse(bytes, Rules::Der),
+            Err(Error::NonMinimalLength)
+        );
+    }
+    assert_eq!(Prefix::parse(&[0x30, 0x82, 0], Rules::Ber), Ok(None));
+    let padded = Prefix::parse(&[0x30, 0x82, 0, 1], Rules::Ber)
+        .unwrap()
+        .unwrap();
+    assert_eq!(padded.total, Some(5));
+    assert_eq!(padded.frame_len(4, 5), Ok(None));
+    assert_eq!(
+        Prefix::parse(&[0x30, 0x80], Rules::Der),
+        Err(Error::Indefinite)
+    );
+    let indefinite = Prefix::parse(&[0x30, 0x80], Rules::Ber).unwrap().unwrap();
+    assert_eq!(
+        indefinite.header().unwrap().length,
+        asn1::Length::Indefinite
+    );
+    assert_eq!(indefinite.total, None);
+    assert_eq!(indefinite.frame_len(4, 0), Err(Error::Indefinite));
+}
+
+#[test]
+fn framing_preserves_combined_tag_and_length_error_precedence() {
+    use asn1::{Error as A, Tag};
+    let wrong_tag = ldap::Error::Ber(A::Unexpected {
+        expected: Tag::SEQUENCE,
+        found: Tag::SET,
+    });
+    for (bytes, error) in [
+        (&[0x31, 0x80][..], wrong_tag),
+        (&[0x31, 0x81, 0x80], wrong_tag),
+        (&[0x31, 0xff], ldap::Error::Ber(A::Length)),
+        (&[0x04, 0x80], ldap::Error::Ber(A::Indefinite)),
+        (
+            &[0x31, 0x83, 0x10, 0, 1],
+            ldap::Error::TooLarge(asn1::MAX_INPUT + 6),
+        ),
+    ] {
+        assert_eq!(ldap::Message::parse_prefix(bytes, &0), Err(error));
+    }
+    for bytes in [
+        &[0x30][..],
+        &[0x30, 0xff],
+        &[0x30, 0x80],
+        &[0x30, 0x83, 0x10, 0, 1],
+    ] {
+        assert_eq!(
+            spnego::Frame::parse_prefix(bytes, &0),
+            Err(spnego::Error::NotToken)
+        );
+    }
+    for tag in [0x30, 0x31, 0xa1] {
+        let huge = [tag, 0x83, 0x10, 0, 1];
+        assert_eq!(
+            ocsp::Frame::parse_prefix(&huge, &0),
+            Err(ocsp::Error::Asn1(A::TooLong))
+        );
+    }
+    assert_eq!(
+        spnego::Frame::parse_prefix(&[0xa1, 0x83, 0x10, 0, 1], &0),
+        Err(spnego::Error::Asn1(A::TooLong))
+    );
+    assert_eq!(
+        spnego::Frame::parse_prefix(&[0xa1, 0x80], &0),
+        Err(spnego::Error::Indefinite)
+    );
+    assert_eq!(
+        ocsp::Frame::parse_prefix(&[0x31, 0x80], &0),
+        Err(ocsp::Error::Asn1(A::Indefinite))
+    );
+    assert_eq!(
+        ocsp::Frame::parse_prefix(&[0x31, 0x81, 0x7f], &0),
+        Err(ocsp::Error::Asn1(A::NonMinimalLength))
+    );
+    // OCSP framing accepts any syntactically valid tag; parsing owns its meaning.
+    assert_eq!(
+        ocsp::Frame::parse_prefix(&[0x31, 0], &2),
+        Ok(Some((vec![0x31, 0], 2)))
+    );
+}
+
+#[test]
+fn ldap_oversized_announcements_keep_the_full_total() {
+    for length in [asn1::MAX_INPUT, asn1::MAX_INPUT + 1, u32::MAX as usize] {
+        let mut header = vec![0x30];
+        asn1::encode_length(length, &mut header);
+        let total = header.len().saturating_add(length);
+        for split in 0..header.len() {
+            assert_eq!(ldap::Message::parse_prefix(&header[..split], &0), Ok(None));
+        }
+        assert_eq!(
+            contract::check_decode(Frames::<ldap::Message>::new, &header),
+            (vec![], Some(Fail::Protocol(ldap::Error::TooLarge(total))))
+        );
+    }
+}
+
+#[test]
+fn ocsp_framing_recovers_after_a_rejected_message() {
+    let response = ocsp::Response::error(ocsp::ResponseStatus::TryLater);
+    let mut bytes = vec![0x04, 0];
+    response.write(&mut bytes).unwrap();
+    round_trip(
+        || Frames::<ocsp::Frame>::new().map(|b| ocsp::Response::parse(&b)),
+        &bytes,
+        &[
+            Err(ocsp::Error::Asn1(asn1::Error::Unexpected {
+                expected: asn1::Tag::SEQUENCE,
+                found: asn1::Tag::OCTET_STRING,
+            })),
+            Ok(response),
+        ],
+    );
 }
 
 #[test]

@@ -452,6 +452,73 @@ impl Header {
     }
 }
 
+/// A header and its announced extent, before applying message size limits.
+///
+/// BER constructed indefinite headers are retained so a protocol can check
+/// its tag before refusing the indefinite length. This does not scan bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefix {
+    header: Header,
+    /// Header and contents together, or `None` for an indefinite length.
+    /// An extent that overflows `usize` is saturated to [`usize::MAX`].
+    pub total: Option<usize>,
+}
+
+impl Prefix {
+    /// Reads a header without allocating or moving a cursor. An unfinished
+    /// header returns `Ok(None)`; the body need not be present. Tag syntax,
+    /// [`MAX_LENGTH_OCTETS`], DER minimality, and indefinite-length rules
+    /// match [`Header::parse`]. Announcements above [`MAX_INPUT`] are retained.
+    /// Call [`Self::header`] for the usual content limit, then [`Self::frame_len`]
+    /// with the protocol's total limit before consuming a frame.
+    ///
+    /// ```
+    /// use fictionet::stdlib::asn1::{Error, Prefix, Rules, Tag};
+    /// assert_eq!(Prefix::parse(&[0x30, 0x82, 1], Rules::Der), Ok(None));
+    /// let prefix = Prefix::parse(&[0x30, 0x82, 1, 0], Rules::Der).unwrap().unwrap();
+    /// assert_eq!(prefix.header().unwrap().tag, Tag::SEQUENCE);
+    /// assert_eq!(prefix.total, Some(260));
+    /// assert_eq!(prefix.frame_len(4, 260), Ok(None));
+    /// assert_eq!(prefix.frame_len(260, 260), Ok(Some(260)));
+    /// assert_eq!(prefix.frame_len(4, 259), Err(Error::TooLong));
+    /// // Even a refused frame keeps its announced length for diagnostics.
+    /// assert_eq!(prefix.total, Some(260));
+    /// ```
+    pub fn parse(b: &[u8], rules: Rules) -> Result<Option<Self>, Error> {
+        let header = match read_header_prefix(b, 0, rules) {
+            Ok(header) => header,
+            Err(Error::Truncated) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let total = match header.length {
+            Length::Definite(n) => Some(header.len.saturating_add(n)),
+            Length::Indefinite => None,
+        };
+        Ok(Some(Self { header, total }))
+    }
+
+    /// The header, with the same content limit as [`Header::parse`].
+    /// Returns [`Error::TooLong`] if the announced contents exceed [`MAX_INPUT`].
+    /// The announced [`Self::total`] remains available on failure.
+    pub fn header(&self) -> Result<Header, Error> {
+        check_header_length(self.header)
+    }
+
+    /// The definite frame's length if `input_len` holds it, or `Ok(None)`
+    /// if its body is incomplete. Checks [`Self::header`], then refuses
+    /// indefinite lengths and totals above `limit` before checking body
+    /// availability. No bytes are consumed or body contents checked.
+    /// Callers translate errors and advance only after accepting the frame.
+    pub fn frame_len(&self, input_len: usize, limit: usize) -> Result<Option<usize>, Error> {
+        self.header()?;
+        let total = self.total.ok_or(Error::Indefinite)?;
+        if total > limit {
+            return Err(Error::TooLong);
+        }
+        Ok((input_len >= total).then_some(total))
+    }
+}
+
 /// Appends a definite length in its shortest form.
 #[inline]
 pub fn encode_length(n: usize, out: &mut Vec<u8>) {
@@ -517,6 +584,17 @@ fn read_tag(b: &[u8], start: usize) -> Result<(Tag, usize), Error> {
 
 /// The header at `b[start..]`, with `len` counted from `start`.
 fn read_header(b: &[u8], start: usize, rules: Rules) -> Result<Header, Error> {
+    check_header_length(read_header_prefix(b, start, rules)?)
+}
+
+fn check_header_length(header: Header) -> Result<Header, Error> {
+    if matches!(header.length, Length::Definite(n) if n > MAX_INPUT) {
+        return Err(Error::TooLong);
+    }
+    Ok(header)
+}
+
+fn read_header_prefix(b: &[u8], start: usize, rules: Rules) -> Result<Header, Error> {
     let (tag, i) = read_tag(b, start)?;
     let end = b.len().min(MAX_INPUT);
     let prefix = ber::read_length(
@@ -544,12 +622,7 @@ fn read_header(b: &[u8], start: usize, rules: Rules) -> Result<Header, Error> {
             }
             Length::Indefinite
         }
-        Some(v) => {
-            if v > MAX_INPUT {
-                return Err(Error::TooLong);
-            }
-            Length::Definite(v)
-        }
+        Some(v) => Length::Definite(v),
     };
     Ok(Header {
         tag,

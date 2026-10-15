@@ -820,19 +820,15 @@ fn token_len_limited(b: &[u8], limit: usize) -> Result<Option<usize>, Error> {
     if !matches!(first, GSS_TAG | INIT_TAG | RESP_TAG) {
         return Err(Error::NotToken);
     }
-    let h = match Header::parse(b, Rules::Ber) {
-        Ok(h) => h,
-        Err(asn1::Error::Truncated) => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let Some(prefix) = asn1::Prefix::parse(b, Rules::Ber)? else {
+        return Ok(None);
     };
-    let Length::Definite(n) = h.length else {
-        return Err(Error::Indefinite);
-    };
-    let total = h.len.checked_add(n).ok_or(Error::TooLong)?;
-    if total > limit {
-        return Err(Error::TooLong);
-    }
-    Ok(if b.len() >= total { Some(total) } else { None })
+    prefix.header()?;
+    prefix.frame_len(b.len(), limit).map_err(|e| match e {
+        asn1::Error::Indefinite => Error::Indefinite,
+        asn1::Error::TooLong => Error::TooLong,
+        e => e.into(),
+    })
 }
 
 impl Wire for InitialContextToken {

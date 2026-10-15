@@ -82,6 +82,13 @@ can require minimal encodings. ASN.1 permits four length octets and checks
 minimality under DER. SNMP permits 126, including leading zero octets.
 Each adapter keeps its own size limits, indefinite-length rules and errors.
 
+`asn1::Prefix` retains the header and announced total without allocating or
+waiting for the body. `header()` applies ASN.1's content limit while leaving
+the total available for diagnostics. `frame_len` checks a caller's total limit
+before body availability. It checks ASN.1's content limit and refuses indefinite
+lengths. LDAP, OCSP and SPNEGO keep their tag checks and error precedence;
+LDAP reports oversized announcements without parsing the length twice.
+
 `codec::ber::read_base128` and `write_base128` share minimal unsigned integer
 encodings with a caller-selected maximum up to `u128::MAX`. The reader
 reports the consumed length without moving a cursor. It rejects a leading

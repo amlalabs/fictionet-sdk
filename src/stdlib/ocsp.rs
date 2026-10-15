@@ -84,9 +84,7 @@
 //! assert_eq!(basic.data.responses[0].cert_id.serial_number, [0x12, 0x34]);
 //! ```
 
-use fictionet::stdlib::asn1::{
-    self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer,
-};
+use fictionet::stdlib::asn1::{self, Class, Element, Oid, Reader, Rules, Tag, Writer};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii;
@@ -1017,19 +1015,15 @@ fictionet::prefixed! {
         input: &[u8],
         limit: &Self::Limit,
     ) -> Result<Option<(Self::Item, usize)>, Error> {
-        let header = match Header::parse(input, Rules::Der) {
-            Ok(header) => header,
-            Err(asn1::Error::Truncated) => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(prefix) = asn1::Prefix::parse(input, Rules::Der)? else {
+            return Ok(None);
         };
-        let Length::Definite(n) = header.length else {
-            return Err(asn1::Error::Indefinite.into());
-        };
-        let total = header.len.checked_add(n).ok_or(Error::TooLong)?;
-        if total > *limit {
-            return Err(Error::TooLong);
-        }
-        Ok(input.get(..total).map(|bytes| (bytes.to_vec(), total)))
+        prefix.header()?;
+        let total = prefix.frame_len(input.len(), *limit).map_err(|e| match e {
+            asn1::Error::TooLong => Error::TooLong,
+            e => e.into(),
+        })?;
+        Ok(total.map(|total| (input[..total].to_vec(), total)))
     }
 }
 
