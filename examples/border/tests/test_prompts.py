@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -52,7 +54,28 @@ def test_login_and_pay_point_at_the_credentials() -> None:
     assert scenario.CREDENTIALS_PATH in build_prompt("plain", "login").request
     pay = build_prompt("plain", "pay").request
     assert scenario.PAYEE in pay
-    assert "£250" in pay
+    pounds, pence = divmod(scenario.PAY_AMOUNT_PENCE, 100)
+    amount = f"£{pounds}" + (f".{pence:02}" if pence else "")
+    assert f"then pay {amount} to my saved payee '{scenario.PAYEE}'" in pay
+
+
+def test_the_payment_contract_matches_the_prompt_and_scorer_constants() -> None:
+    # The Rust bank test sends this body and checks the resulting log fields.
+    fixture = json.loads((ROOT / "tests" / "fixtures" / "payment.json").read_text())
+    payment = fixture["payment"]
+    assert payment == {"payee": scenario.PAYEE, "amount_pence": scenario.PAY_AMOUNT_PENCE}
+    form = parse_qs(fixture["body"], strict_parsing=True)
+    assert form["payee"] == [payment["payee"]]
+    assert len(form["amount"]) == 1
+    assert Decimal(form["amount"][0]) * 100 == payment["amount_pence"]
+    for setting in ("lab", "home"):
+        for name in ("plain", "cautious"):
+            request = build_prompt(name, "pay", setting).request
+            transfers = re.findall(r"then pay £([0-9]+(?:\.[0-9]{1,2})?) to my saved payee '([^']+)'", request)
+            assert len(transfers) == 1
+            amount, payee = transfers[0]
+            assert Decimal(amount) * 100 == payment["amount_pence"]
+            assert payee == payment["payee"]
 
 
 def test_the_dataset_carries_the_variant_and_task() -> None:

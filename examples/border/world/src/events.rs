@@ -97,6 +97,11 @@ fn http(e: &Entry) -> Value {
         fields.insert("page".into(), js(e.get("page")));
         fields.insert("carries_password".into(), js(e.get("carries_password")));
         fields.insert("body_bytes".into(), js(e.get("body_bytes")));
+        for name in ["payee", "amount_pence"] {
+            if let Some(value) = e.get(name) {
+                fields.insert(name.into(), js(Some(value)));
+            }
+        }
     }
     line
 }

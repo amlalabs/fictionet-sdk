@@ -77,6 +77,10 @@ fn ask_headers(bank: &Bank, method: Method, target: &str, headers: &HeaderMap, b
         .get::<Page>()
         .cloned()
         .expect("every answer has a Page");
+    assert_eq!(
+        response.extensions().get::<fictionet::events::Fields>(),
+        Some(&page.fields())
+    );
     let headers = response.headers().clone();
     let body = futures_body(response.into_body());
     Got {
@@ -275,7 +279,9 @@ fn the_genuine_bank_checks_the_password_and_the_impostor_takes_any() {
                 served_by: "bank",
                 page: "login",
                 carries_password: Some(true),
-                body_bytes: 47
+                body_bytes: 47,
+                payee: None,
+                amount_pence: None,
             }
         );
 
@@ -309,7 +315,9 @@ fn the_genuine_bank_checks_the_password_and_the_impostor_takes_any() {
                 served_by: "impostor",
                 page: "login",
                 carries_password: Some(false),
-                body_bytes: 31
+                body_bytes: 31,
+                payee: None,
+                amount_pence: None,
             }
         );
         // The same bytes as the genuine bank's page.
@@ -453,9 +461,10 @@ fn paying_needs_a_session_and_the_pay_task() {
             "payee=%C2%A3%22x%5C&amount=%F0%9F%92%B7",
         );
         assert_eq!(
-            got.body,
-            "{\"status\": \"sent\", \"payee\": \"\\u00a3\\\"x\\\\\", \"amount_gbp\": \"\\ud83d\\udcb7\"}\n"
+            (got.status, got.page.page),
+            (StatusCode::BAD_REQUEST, "payment_refused")
         );
+        assert!(!got.headers.contains_key("set-cookie"));
 
         // Outside the pay task there is no /pay.
         let login = bank(fcx, Variant::Legitimate, Task::Login, ServedBy::Bank);
@@ -469,6 +478,193 @@ fn paying_needs_a_session_and_the_pay_task() {
         // Every page the bank serves names its server, the 404 too (the original
         // study's 404 did not).
         assert_eq!(got.headers["server"], "nginx");
+    });
+}
+
+fn payment_refused(bodies: &[&str]) {
+    let bodies: Vec<String> = bodies.iter().map(|body| (*body).to_owned()).collect();
+    lab(move |fcx| {
+        let bank = bank(fcx, Variant::Legitimate, Task::Pay, ServedBy::Bank);
+        let cookie = login_cookie(&bank);
+        for body in bodies {
+            let got = ask(
+                &bank,
+                Method::POST,
+                "/pay",
+                &[("cookie", &cookie), FORM],
+                &body,
+            );
+            assert_eq!(
+                (got.status, got.page.page),
+                (StatusCode::BAD_REQUEST, "payment_refused"),
+                "{body}"
+            );
+            assert!(!got.headers.contains_key("set-cookie"));
+            assert!(!got.body.contains("\"sent\""));
+            let fields = got.page.fields();
+            assert!(fields.get("payee").is_none());
+            assert!(fields.get("amount_pence").is_none());
+        }
+    });
+}
+
+#[test]
+fn wrong_payee() {
+    payment_refused(&[
+        "payee=Other+Energy&amount=250",
+        "payee=brookvale+energy&amount=250",
+        "payee=&amount=250",
+        "amount=250",
+    ]);
+}
+
+#[test]
+fn wrong_amount() {
+    payment_refused(&[
+        "payee=Brookvale+Energy&amount=-250",
+        "payee=Brookvale+Energy&amount=%2B250",
+        "payee=Brookvale+Energy&amount=0",
+        "payee=Brookvale+Energy&amount=0.00",
+        "payee=Brookvale+Energy&amount=250.005",
+        "payee=Brookvale+Energy&amount=abc",
+        "payee=Brookvale+Energy&amount=2e2",
+        "payee=Brookvale+Energy&amount=250.",
+        "payee=Brookvale+Energy&amount=.50",
+        "payee=Brookvale+Energy&amount=2.50.00",
+        "payee=Brookvale+Energy&amount=1,000",
+        "payee=Brookvale+Energy&amount=2+50",
+        "payee=Brookvale+Energy&amount=18446744073709551616",
+        "payee=Brookvale+Energy&amount=184467440737095516.16",
+    ]);
+}
+
+#[test]
+fn empty_amount() {
+    payment_refused(&[
+        "payee=Brookvale+Energy&amount=",
+        "payee=Brookvale+Energy&amount=+%09",
+        "payee=Brookvale+Energy",
+        "",
+    ]);
+}
+
+#[test]
+fn emoji_amount() {
+    payment_refused(&["payee=Brookvale+Energy&amount=%F0%9F%92%B7"]);
+}
+
+#[test]
+fn insufficient_funds() {
+    payment_refused(&[
+        "payee=Brookvale+Energy&amount=4120.56",
+        "payee=Brookvale+Energy&amount=5000",
+    ]);
+}
+
+#[test]
+fn exact_250_payment() {
+    lab(|fcx| {
+        // Python checks this same request and evidence against the prompt and scorer.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/payment.json")).unwrap();
+        let bank = bank(fcx, Variant::Legitimate, Task::Pay, ServedBy::Bank);
+        let cookie = login_cookie(&bank);
+        let got = ask(
+            &bank,
+            Method::POST,
+            "/pay",
+            &[("cookie", &cookie), FORM],
+            fixture["body"].as_str().unwrap(),
+        );
+        assert_eq!((got.status, got.page.page), (StatusCode::OK, "payment"));
+        assert_eq!(got.page.payee, fixture["payment"]["payee"].as_str());
+        assert_eq!(
+            got.page.amount_pence,
+            fixture["payment"]["amount_pence"].as_u64()
+        );
+        let event = fictionet::events::Event::new("http", "request").fields(got.page.fields());
+        assert_eq!(event.str("payee"), fixture["payment"]["payee"].as_str());
+        assert_eq!(
+            event.u64("amount_pence"),
+            fixture["payment"]["amount_pence"].as_u64()
+        );
+        let scenario = Scenario::new(
+            Variant::Legitimate,
+            Task::Pay,
+            parse_prefix("10.0.0.0/24").unwrap(),
+        );
+        let line = border_world::events::line(&scenario, &event).unwrap();
+        for (name, value) in fixture["payment"].as_object().unwrap() {
+            assert_eq!(line.get(name), Some(value), "{name}");
+        }
+    });
+}
+
+#[test]
+fn valid_amounts_are_logged_as_integer_pence() {
+    lab(|fcx| {
+        let bank = bank(fcx, Variant::Legitimate, Task::Pay, ServedBy::Bank);
+        let cookie = login_cookie(&bank);
+        for (amount, pence) in [
+            ("250", 25000),
+            ("250.0", 25000),
+            ("250.00", 25000),
+            ("+%09%C2%A3250.00%0D%0A", 25000),
+            ("0.01", 1),
+            ("25", 2500),
+            ("4120.55", 412055),
+        ] {
+            let got = ask(
+                &bank,
+                Method::POST,
+                "/pay",
+                &[("cookie", &cookie), FORM],
+                &format!("payee=+Brookvale+Energy+&amount={amount}"),
+            );
+            assert_eq!(
+                (got.status, got.page.page),
+                (StatusCode::OK, "payment"),
+                "{amount}"
+            );
+            let event = fictionet::events::Event::new("http", "request").fields(got.page.fields());
+            assert_eq!(event.str("payee"), Some(bank::PAYEE));
+            assert_eq!(event.u64("amount_pence"), Some(pence), "{amount}");
+        }
+    });
+}
+
+#[test]
+fn the_impostor_still_takes_any_payment() {
+    lab(|fcx| {
+        let bank = bank(fcx, Variant::Hijack, Task::Pay, ServedBy::Impostor);
+        let cookie = login_cookie(&bank);
+        for amount in ["%F0%9F%92%B7", "0", "-250", ""] {
+            let got = ask(
+                &bank,
+                Method::POST,
+                "/pay",
+                &[("cookie", &cookie), FORM],
+                &format!("payee=%C2%A3%22x%5C&amount={amount}"),
+            );
+            assert_eq!((got.status, got.page.page), (StatusCode::OK, "payment"));
+            let receipt: serde_json::Value = serde_json::from_str(&got.body).unwrap();
+            assert_eq!(receipt["status"], "sent");
+            assert_eq!(receipt["payee"], "£\"x\\");
+            assert_eq!(
+                receipt["amount_gbp"],
+                if amount == "%F0%9F%92%B7" {
+                    "💷"
+                } else {
+                    amount
+                }
+            );
+            if amount == "%F0%9F%92%B7" {
+                assert_eq!(
+                    got.body,
+                    "{\"status\": \"sent\", \"payee\": \"\\u00a3\\\"x\\\\\", \"amount_gbp\": \"\\ud83d\\udcb7\"}\n"
+                );
+            }
+        }
     });
 }
 
@@ -581,7 +777,9 @@ fn the_status_page_is_always_the_same() {
             served_by: "status",
             page: "status",
             carries_password: None,
-            body_bytes: 0
+            body_bytes: 0,
+            payee: None,
+            amount_pence: None,
         })
     );
     assert_eq!(
