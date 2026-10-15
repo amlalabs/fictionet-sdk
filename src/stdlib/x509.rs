@@ -592,9 +592,7 @@ impl Name {
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
         check_name(self)?;
-        let der = build(|w| write_name(w, self))?;
-        Name::decode(&der)?;
-        Ok(der)
+        build(|w| write_name(w, self))
     }
 }
 
@@ -943,9 +941,7 @@ pub struct PublicKeyInfo {
 
 impl PublicKeyInfo {
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        let der = build(|w| write_spki(w, self))?;
-        PublicKeyInfo::decode(&der)?;
-        Ok(der)
+        build(|w| write_spki(w, self))
     }
 
     fn decode(der: &[u8]) -> Result<PublicKeyInfo, Error> {
@@ -1060,12 +1056,6 @@ pub trait ExtensionValue: Wire<ParseError = Error, WriteError = Error> {
     }
 }
 
-/// Checks `der` reads back as a `T`, and returns it.
-fn verified<T: ExtensionValue>(der: Vec<u8>) -> Result<Vec<u8>, Error> {
-    T::parse(&der)?;
-    Ok(der)
-}
-
 /// Reads named bits (X.680 22.7) into a `u16`: bit `i` of the string is
 /// `1 << i`. A set bit past 15 is [`Error::Value`].
 fn read_bits(b: &BitString<'_>) -> Result<u16, Error> {
@@ -1131,7 +1121,7 @@ impl BasicConstraints {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        verified::<Self>(build(|w| {
+        build(|w| {
             w.sequence(|w| {
                 if self.ca {
                     w.boolean(true);
@@ -1140,7 +1130,7 @@ impl BasicConstraints {
                     w.integer_u64(n);
                 }
             })
-        })?)
+        })
     }
 }
 
@@ -1197,7 +1187,7 @@ impl KeyUsage {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        verified::<Self>(build(|w| write_bits(w, self.0))?)
+        build(|w| write_bits(w, self.0))
     }
 }
 
@@ -1235,13 +1225,13 @@ impl ExtendedKeyUsage {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        verified::<Self>(build(|w| {
+        build(|w| {
             w.sequence(|w| {
                 for o in &self.0 {
                     w.oid(o);
                 }
             })
-        })?)
+        })
     }
 }
 
@@ -1437,7 +1427,7 @@ impl SubjectAltName {
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
         check_general_names(&self.0)?;
-        verified::<Self>(build(|w| w.sequence(|w| write_general_names(w, &self.0)))?)
+        build(|w| w.sequence(|w| write_general_names(w, &self.0)))
     }
 }
 
@@ -1462,7 +1452,7 @@ impl SubjectKeyIdentifier {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        verified::<Self>(build(|w| w.octet_string(&self.0))?)
+        build(|w| w.octet_string(&self.0))
     }
 }
 
@@ -1516,7 +1506,7 @@ impl AuthorityKeyIdentifier {
         if let Some(names) = &self.issuer {
             check_general_names(names)?;
         }
-        verified::<Self>(build(|w| {
+        build(|w| {
             w.sequence(|w| {
                 if let Some(id) = &self.key_id {
                     w.primitive(Tag::context(0), id);
@@ -1528,7 +1518,7 @@ impl AuthorityKeyIdentifier {
                     w.implicit(Tag::context(2), |w| w.integer_bytes(serial));
                 }
             })
-        })?)
+        })
     }
 }
 
@@ -1700,13 +1690,13 @@ impl CrlDistributionPoints {
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
         self.0.iter().try_for_each(check_distribution_point)?;
-        verified::<Self>(build(|w| {
+        build(|w| {
             w.sequence(|w| {
                 for p in &self.0 {
                     write_distribution_point(w, p);
                 }
             })
-        })?)
+        })
     }
 }
 
@@ -1758,7 +1748,7 @@ impl AuthorityInfoAccess {
         self.0
             .iter()
             .try_for_each(|d| check_general_name(&d.location))?;
-        verified::<Self>(build(|w| {
+        build(|w| {
             w.sequence(|w| {
                 for d in &self.0 {
                     w.sequence(|w| {
@@ -1767,7 +1757,7 @@ impl AuthorityInfoAccess {
                     });
                 }
             })
-        })?)
+        })
     }
 }
 
@@ -1791,7 +1781,7 @@ impl IssuerAltName {
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
         check_general_names(&self.0)?;
-        verified::<Self>(build(|w| w.sequence(|w| write_general_names(w, &self.0)))?)
+        build(|w| w.sequence(|w| write_general_names(w, &self.0)))
     }
 }
 
@@ -1837,7 +1827,7 @@ impl CrlNumber {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        verified::<Self>(build(|w| w.integer_bytes(&self.0))?)
+        build(|w| w.integer_bytes(&self.0))
     }
 }
 
@@ -1891,7 +1881,7 @@ impl CrlReason {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        verified::<Self>(build(|w| w.enumerated(i64::from(self.0)))?)
+        build(|w| w.enumerated(i64::from(self.0)))
     }
 }
 
@@ -1962,9 +1952,7 @@ impl TbsCertificate {
     fn encode(&self) -> Result<Vec<u8>, Error> {
         check_name(&self.issuer)?;
         check_name(&self.subject)?;
-        let der = build(|w| self.write_fields(w))?;
-        TbsCertificate::decode(&der)?;
-        Ok(der)
+        build(|w| self.write_fields(w))
     }
 
     fn write_fields(&self, w: &mut Writer) {
@@ -2148,17 +2136,13 @@ impl Certificate {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        let der = build(|w| {
+        build(|w| {
             w.sequence(|w| {
                 w.encoded(&self.tbs_der);
                 write_alg(w, &self.signature_algorithm);
                 w.bit_string_value(&self.signature);
             })
-        })?;
-        if Certificate::decode(&der)? != *self {
-            return Err(Error::Unwritable);
-        }
-        Ok(der)
+        })
     }
 
     /// Reads the first `CERTIFICATE` block of PEM text. Text after that
@@ -2231,9 +2215,7 @@ impl TbsCertList {
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
         check_name(&self.issuer)?;
-        let der = build(|w| self.write_fields(w))?;
-        TbsCertList::decode(&der)?;
-        Ok(der)
+        build(|w| self.write_fields(w))
     }
 
     fn write_fields(&self, w: &mut Writer) {
@@ -2420,17 +2402,13 @@ impl Crl {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        let der = build(|w| {
+        build(|w| {
             w.sequence(|w| {
                 w.encoded(&self.tbs_der);
                 write_alg(w, &self.signature_algorithm);
                 w.bit_string_value(&self.signature);
             })
-        })?;
-        if Crl::decode(&der)? != *self {
-            return Err(Error::Unwritable);
-        }
-        Ok(der)
+        })
     }
 
     /// Whether the CRL lists the serial number `serial` (two's-complement
@@ -2868,41 +2846,67 @@ impl Decode for PemBlocks {
     }
 }
 
-fictionet::der_wire!(asn1, impl Wire for CrlReason, Error, Error::Unwritable);
+/// Encodes and checks equality once, keeping the decoder's error policy.
+/// For signed objects, equality includes the TBS fields and their original DER.
+fn encode_checked<T: PartialEq>(
+    value: &T,
+    encode: impl FnOnce(&T) -> Result<Vec<u8>, Error>,
+    decode: impl FnOnce(&[u8]) -> Result<T, Error>,
+) -> Result<Vec<u8>, Error> {
+    let der = encode(value)?;
+    if decode(&der)? != *value {
+        return Err(Error::Unwritable);
+    }
+    Ok(der)
+}
 
-fictionet::der_wire!(asn1, impl Wire for CrlNumber, Error, Error::Unwritable);
+macro_rules! x509_wire {
+    ($item:ty) => {
+        x509_wire!($item, Self::decode);
+    };
+    ($item:ty, $decode:expr) => {
+        impl Wire for $item {
+            type ParseError = Error;
+            type WriteError = Error;
 
-fictionet::der_wire!(asn1, impl Wire for IssuerAltName, Error, Error::Unwritable);
+            /// Reads one complete DER value. Refuses malformed fields,
+            /// trailing bytes, and exceeded limits. See this type's docs.
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
+                Self::decode(bytes)
+            }
 
-fictionet::der_wire!(asn1, impl Wire for AuthorityInfoAccess, Error, Error::Unwritable);
+            /// Appends DER. Refuses invalid fields, exceeded limits, and
+            /// values that change when encoded. See this type's docs.
+            /// Leaves the destination unchanged on error.
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+                let der = encode_checked(self, Self::encode, $decode)?;
+                out.extend_from_slice(&der);
+                Ok(())
+            }
+        }
+    };
+}
 
-fictionet::der_wire!(asn1, impl Wire for CrlDistributionPoints, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for AuthorityKeyIdentifier, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for SubjectKeyIdentifier, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for SubjectAltName, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for ExtendedKeyUsage, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for KeyUsage, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for BasicConstraints, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for Value, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for Name, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for PublicKeyInfo, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for TbsCertificate, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for Certificate, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for TbsCertList, Error, Error::Unwritable);
-
-fictionet::der_wire!(asn1, impl Wire for Crl, Error, Error::Unwritable);
+x509_wire!(CrlReason);
+x509_wire!(CrlNumber);
+x509_wire!(IssuerAltName);
+x509_wire!(AuthorityInfoAccess);
+x509_wire!(CrlDistributionPoints);
+x509_wire!(AuthorityKeyIdentifier);
+x509_wire!(SubjectKeyIdentifier);
+x509_wire!(SubjectAltName);
+x509_wire!(ExtendedKeyUsage);
+x509_wire!(KeyUsage);
+x509_wire!(BasicConstraints);
+// Value's field checks keep their errors; only decoding the output maps to Unwritable.
+x509_wire!(Value, |der| Value::decode(der)
+    .map_err(|_| Error::Unwritable));
+x509_wire!(Name);
+x509_wire!(PublicKeyInfo);
+x509_wire!(TbsCertificate);
+x509_wire!(Certificate);
+x509_wire!(TbsCertList);
+x509_wire!(Crl);
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]

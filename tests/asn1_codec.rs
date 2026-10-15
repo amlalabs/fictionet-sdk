@@ -196,6 +196,142 @@ fn spnego_tokens_round_trip() -> Result<(), Box<dyn core::error::Error>> {
 }
 
 #[test]
+fn x509_writers_preserve_errors_and_destinations() -> Result<(), Box<dyn core::error::Error>> {
+    use x509::Error;
+
+    assert_eq!(
+        contract::check_refused(&x509::BasicConstraints {
+            ca: false,
+            path_len: Some(1),
+        }),
+        Error::Value
+    );
+    assert_eq!(contract::check_refused(&x509::KeyUsage(0)), Error::Value);
+    assert_eq!(contract::check_refused(&x509::CrlReason(7)), Error::Value);
+    assert_eq!(
+        contract::check_refused(&x509::ExtendedKeyUsage(vec![])),
+        Error::Empty
+    );
+    assert_eq!(
+        contract::check_refused(&x509::SubjectAltName(vec![
+            x509::GeneralName::Dns(
+                "a".into()
+            );
+            x509::MAX_GENERAL_NAMES + 1
+        ])),
+        Error::TooMany
+    );
+    assert_eq!(
+        contract::check_refused(&x509::CrlNumber(vec![0, 1])),
+        Error::Unwritable
+    );
+    assert_eq!(
+        contract::check_refused(&x509::Value::Raw(vec![0x0c, 1, b'a'])),
+        Error::Value
+    );
+    assert_eq!(
+        contract::check_refused(&x509::Value::Text {
+            kind: asn1::StringKind::Printable,
+            text: "@".into(),
+        }),
+        Error::Asn1(asn1::Error::Charset)
+    );
+
+    // Value maps a final decoding failure to Unwritable. Names preserve it.
+    let mut raw = vec![0x05, 0];
+    for _ in 0..=asn1::MAX_DEPTH - x509::RAW_CHECK_DEPTH {
+        let mut nested = vec![0x30, u8::try_from(raw.len())?];
+        nested.extend_from_slice(&raw);
+        raw = nested;
+    }
+    assert_eq!(
+        x509::Value::parse(&raw),
+        Err(Error::Asn1(asn1::Error::TooDeep))
+    );
+    let value = x509::Value::Raw(raw);
+    assert_eq!(contract::check_refused(&value), Error::Unwritable);
+    let mut name = x509::Name::default();
+    name.push(asn1::Oid::from_contents(x509::oid::COMMON_NAME)?, value);
+    assert_eq!(
+        contract::check_refused(&name),
+        Error::Asn1(asn1::Error::TooDeep)
+    );
+
+    let cert = x509::Certificate::parse(include_bytes!("fixtures/tls/ed25519.cert.der"))?;
+    let mut key = cert.tbs.public_key.clone();
+    key.algorithm.parameters = Some(vec![0x05, 0]);
+    assert_eq!(contract::check_refused(&key), Error::Value);
+    let mut tbs = cert.tbs.clone();
+    tbs.version = x509::Version::V1;
+    tbs.extensions = vec![x509::Extension {
+        oid: asn1::Oid::from_contents(x509::oid::KEY_USAGE)?,
+        critical: false,
+        value: vec![0x03, 2, 7, 0x80],
+    }];
+    assert_eq!(contract::check_refused(&tbs), Error::Version);
+    tbs.version = x509::Version::V3;
+    tbs.extensions.push(tbs.extensions[0].clone());
+    assert_eq!(contract::check_refused(&tbs), Error::DuplicateExtension);
+    tbs.extensions.truncate(1);
+    tbs.extensions[0].value = vec![0; x509::MAX_CERT];
+    assert_eq!(contract::check_refused(&tbs), Error::TooLong);
+    Ok(())
+}
+
+#[test]
+fn x509_signed_writes_check_fields_and_preserve_bytes() -> Result<(), Box<dyn core::error::Error>> {
+    use x509::Error;
+
+    let der = include_bytes!("fixtures/tls/ed25519.cert.der");
+    let cert = x509::Certificate::parse(der)?;
+    let mut out = vec![42];
+    cert.write(&mut out)?;
+    assert_eq!(out[0], 42);
+    assert_eq!(&out[1..], der);
+
+    let mut changed = cert.clone();
+    changed.tbs.serial.push(0);
+    assert_eq!(contract::check_refused(&changed), Error::Unwritable);
+    // Decode errors still take precedence over the changed signed fields.
+    changed.signature_algorithm.oid = asn1::Oid::from_contents(x509::oid::ECDSA_WITH_SHA256)?;
+    assert_eq!(contract::check_refused(&changed), Error::SignatureMismatch);
+    changed.signature_algorithm.parameters = Some(vec![0x05, 0]);
+    assert_eq!(contract::check_refused(&changed), Error::Value);
+
+    let tbs = x509::TbsCertList {
+        version: x509::Version::V2,
+        signature: cert.signature_algorithm.clone(),
+        issuer: cert.tbs.issuer.clone(),
+        this_update: cert.tbs.validity.not_before.clone(),
+        next_update: None,
+        revoked: Vec::new(),
+        extensions: Vec::new(),
+    };
+    let crl = x509::Crl::assemble(&tbs.to_bytes()?, cert.signature_algorithm, cert.signature)?;
+    contract::check_wire_value(&crl);
+    let mut changed = crl.clone();
+    changed.tbs.issuer.rdns.clear();
+    assert_eq!(contract::check_refused(&changed), Error::Unwritable);
+    changed.signature_algorithm.oid = asn1::Oid::from_contents(x509::oid::ECDSA_WITH_SHA256)?;
+    assert_eq!(contract::check_refused(&changed), Error::SignatureMismatch);
+    changed.signature_algorithm.parameters = Some(vec![0x05, 0]);
+    assert_eq!(contract::check_refused(&changed), Error::Value);
+    assert_eq!(contract::check_refused(&changed.tbs), Error::Empty);
+
+    let unexpected = Error::Asn1(asn1::Error::Unexpected {
+        expected: asn1::Tag::SEQUENCE,
+        found: asn1::Tag::NULL,
+    });
+    changed = crl;
+    changed.tbs_der = vec![0x05, 0];
+    assert_eq!(contract::check_refused(&changed), unexpected);
+    let mut changed = x509::Certificate::parse(der)?;
+    changed.tbs_der = vec![0x05, 0];
+    assert_eq!(contract::check_refused(&changed), unexpected);
+    Ok(())
+}
+
+#[test]
 fn x509_pem_blocks_round_trip() -> Result<(), Box<dyn core::error::Error>> {
     let algorithm = x509::AlgorithmIdentifier {
         oid: asn1::Oid::from_contents(x509::oid::ED25519)?,
