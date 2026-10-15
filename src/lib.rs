@@ -333,6 +333,7 @@ mod block_on;
 mod cable;
 mod cx;
 mod entropy;
+mod environment;
 mod error;
 pub mod events;
 #[cfg(fuzzing)]

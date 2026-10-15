@@ -173,7 +173,7 @@ impl Meter {
     #[cfg(any(feature = "observe", all(test, feature = "std")))]
     pub(crate) fn watch(
         self: &Arc<Self>,
-        environment: &Arc<crate::entropy::RunEnvironment>,
+        environment: &Arc<crate::environment::RunEnvironment>,
     ) -> TapGuard {
         let mut slot = self.tap.lock();
         let tap = slot
@@ -254,7 +254,7 @@ pub(crate) struct Copy {
 /// window, not one per packet.
 #[cfg(any(feature = "observe", all(test, feature = "std")))]
 pub(crate) struct Tap {
-    environment: Arc<crate::entropy::RunEnvironment>,
+    environment: Arc<crate::environment::RunEnvironment>,
     viewers: AtomicUsize,
     state: Mutex<TapState>,
 }
@@ -273,7 +273,7 @@ struct TapState {
 
 #[cfg(any(feature = "observe", all(test, feature = "std")))]
 impl Tap {
-    fn new(environment: Arc<crate::entropy::RunEnvironment>) -> Tap {
+    fn new(environment: Arc<crate::environment::RunEnvironment>) -> Tap {
         Tap {
             environment,
             viewers: AtomicUsize::new(0),
@@ -446,7 +446,7 @@ pub(crate) const MAX_KEYS: usize = 20_000;
 /// link, each take its lock once. Packets never do.
 pub(crate) struct Graph {
     pub(crate) run_id: u64,
-    pub(crate) environment: Arc<crate::entropy::RunEnvironment>,
+    pub(crate) environment: Arc<crate::environment::RunEnvironment>,
     pub(crate) start_wall: SystemTime,
     /// Observer sessions connected to the world. While there are none,
     /// packet copies and TLS keys are not kept.
@@ -484,7 +484,7 @@ impl Graph {
     pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Graph> {
         Arc::new(Graph {
             run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
-            environment: Arc::new(crate::entropy::RunEnvironment::new(seed, mode)),
+            environment: Arc::new(crate::environment::RunEnvironment::new(seed, mode)),
             start_wall: if mode == crate::RunMode::Real {
                 SystemTime::now()
             } else {
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn tap_reports_eviction_at_both_limits_and_at_cursor_boundaries() {
         for (packets, bytes) in [(2, TAP_BYTES), (TAP_PACKETS, 8)] {
-            let tap = Tap::new(Arc::new(crate::entropy::RunEnvironment::new(
+            let tap = Tap::new(Arc::new(crate::environment::RunEnvironment::new(
                 crate::Seed::from_u64(0),
                 crate::RunMode::Lab,
             )));
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn tap_reports_eviction_even_when_no_copy_fits() {
-        let tap = Tap::new(Arc::new(crate::entropy::RunEnvironment::new(
+        let tap = Tap::new(Arc::new(crate::environment::RunEnvironment::new(
             crate::Seed::from_u64(0),
             crate::RunMode::Lab,
         )));
@@ -875,7 +875,7 @@ mod tests {
     fn a_tap_copies_only_while_watched_and_is_bounded() {
         let meter = Meter::new();
         meter.sent(0, &Packet(vec![1; 10]));
-        let guard = meter.watch(&Arc::new(crate::entropy::RunEnvironment::new(
+        let guard = meter.watch(&Arc::new(crate::environment::RunEnvironment::new(
             crate::Seed::from_u64(0),
             crate::RunMode::Real,
         )));
@@ -896,7 +896,7 @@ mod tests {
 
         // A flood within one window is sampled, and the skipped count is
         // carried by the next copy.
-        let guard = meter.watch(&Arc::new(crate::entropy::RunEnvironment::new(
+        let guard = meter.watch(&Arc::new(crate::environment::RunEnvironment::new(
             crate::Seed::from_u64(0),
             crate::RunMode::Real,
         )));

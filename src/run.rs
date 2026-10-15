@@ -186,7 +186,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 
 /// The part of a run that wakers and every [`Cx`] share.
 pub(crate) struct RunShared {
-    pub(crate) environment: Arc<crate::entropy::RunEnvironment>,
+    pub(crate) environment: Arc<crate::environment::RunEnvironment>,
     queue: Mutex<Queue>,
     /// What the run records for observers.
     pub(crate) graph: Arc<Graph>,
