@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use super::json::{self, Object};
 use std::sync::Arc;
 
+use crate::events::Event;
+use crate::stdlib::codec::Wire;
+use crate::stdlib::json::Value;
 use crate::watch::{Graph, GraphState, Group, TaskInfo, short_name};
 
 /// What one browser has been told.
@@ -225,13 +228,57 @@ pub(crate) fn counters(graph: &Graph) -> String {
         .done()
 }
 
+/// One event or an explicit serialization error at the same sequence.
+fn event_line(event: &Event) -> String {
+    let error = match event.to_line() {
+        Ok(line) => return line,
+        Err(error) => error.to_string(),
+    };
+    let mut replacement = Event::new(event.source, event.kind)
+        .level(event.level)
+        .conn(&event.conn)
+        .summary(format!("unserializable: {error}"))
+        .field("unserializable", error);
+    replacement.seq = event.seq;
+    replacement.at = event.at;
+    replacement.origin = event.origin.clone();
+
+    // Only fixed-schema metadata and the error remain. Bound every text
+    // value, including connection and task names, so even escaped strings
+    // fit well below the JSON size limit. Depth and value count are fixed.
+    fn bound_text(value: &mut Value) {
+        match value {
+            Value::String(text) if text.len() > 1024 => {
+                let mut end = 1024;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push('…');
+            }
+            Value::Object(members) => {
+                for (_, value) in members {
+                    bound_text(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = replacement.to_json();
+    bound_text(&mut value);
+    let bytes = value
+        .to_bytes()
+        .expect("bounded event serialization error record");
+    String::from_utf8(bytes).expect("JSON is UTF-8")
+}
+
 /// The `events` reply: at most `max` events after number `after`.
 pub(crate) fn events(graph: &Graph, after: u64, max: usize) -> String {
     let events: Vec<String> = graph
         .events
         .after(after, max)
         .iter()
-        .map(|e| e.to_line())
+        .map(|e| event_line(e))
         .collect();
     Object::new().raw("events", &json::array(events)).done()
 }
@@ -287,7 +334,7 @@ pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
             events
         }
     };
-    let events: Vec<String> = events.iter().map(|e| e.to_line()).collect();
+    let events: Vec<String> = events.iter().map(|e| event_line(e)).collect();
     let data = Object::new()
         .secs("t", graph.since_start())
         .num(
@@ -393,7 +440,7 @@ pub(crate) fn event_changes(graph: &Graph, view: &mut View) -> (Vec<Message>, bo
     let full = events.len() == EVENTS_PER_CHANGE;
     view.event_seq = events.last().map_or(view.event_seq, |e| e.seq);
     (
-        events.iter().map(|e| ("event", e.to_line())).collect(),
+        events.iter().map(|e| ("event", event_line(e))).collect(),
         full,
     )
 }
@@ -403,6 +450,191 @@ mod tests {
     use super::*;
     use crate::watch::Meter;
     use std::panic::Location;
+
+    fn serialization_graph() -> Arc<Graph> {
+        let graph = crate::run::RunShared::new(crate::Seed::from_u64(7), crate::RunMode::Lab)
+            .graph
+            .clone();
+        graph
+            .events
+            .push(Event::new("test", "big").summary("x".repeat(1 << 20)));
+        graph.events.push(Event::new("test", "normal"));
+        graph
+    }
+
+    fn assert_serialization_error(event: &Value, seq: u64) {
+        assert_eq!(event.get("seq").and_then(Value::as_u64), Some(seq));
+        let fields = event.get("fields").unwrap();
+        assert_eq!(fields.as_object().unwrap().len(), 1);
+        let error = fields
+            .get("unserializable")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(!error.is_empty());
+        assert_eq!(
+            event.get("summary").and_then(Value::as_str),
+            Some(format!("unserializable: {error}").as_str())
+        );
+    }
+
+    #[test]
+    fn oversized_event_not_blank() {
+        let graph = serialization_graph();
+        for data in [events(&graph, 0, 10), snapshot(&graph, None).1.1] {
+            let reply = Value::parse(data.as_bytes()).unwrap();
+            let events = reply.get("events").and_then(Value::as_array).unwrap();
+            assert_eq!(events.len(), 2);
+            assert_serialization_error(&events[0], 1);
+            assert_eq!(
+                events[0].get("source").and_then(Value::as_str),
+                Some("test")
+            );
+            assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("big"));
+            assert_eq!(events[1].get("seq").and_then(Value::as_u64), Some(2));
+            assert_eq!(
+                events[1].get("kind").and_then(Value::as_str),
+                Some("normal")
+            );
+        }
+        let reply = Value::parse(events(&graph, 0, 1).as_bytes()).unwrap();
+        let events = reply.get("events").and_then(Value::as_array).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_serialization_error(&events[0], 1);
+    }
+
+    #[test]
+    fn cursor_never_skips_silently() {
+        let graph = serialization_graph();
+        let (mut view, _) = snapshot(&graph, Some(0));
+        let (messages, full) = event_changes(&graph, &mut view);
+        assert_eq!(names(&messages), ["event", "event"]);
+        assert!(!full);
+        assert_eq!(view.event_seq, 2);
+        let events: Vec<_> = messages
+            .iter()
+            .map(|(_, data)| Value::parse(data.as_bytes()).unwrap())
+            .collect();
+        assert_serialization_error(&events[0], 1);
+        assert_eq!(events[1].get("seq").and_then(Value::as_u64), Some(2));
+        assert_eq!(events[1], graph.events.after(1, 1)[0].to_json());
+        assert!(event_changes(&graph, &mut view).0.is_empty());
+        assert!(!view.events_pending(&graph));
+    }
+
+    #[test]
+    fn nested_value_failure_visible() {
+        let mut value = Value::Null;
+        for _ in 0..129 {
+            value = Value::Array(vec![value]);
+        }
+        let event = Event::new("test", "nested").field("nested", value);
+        let layer = crate::observe::Layer::from_event(&event);
+        assert_eq!(layer.fields.len(), 1);
+        assert_eq!(layer.fields[0].name, "nested");
+        assert!(layer.fields[0].value.starts_with("unserializable:"));
+        assert_eq!(
+            event.to_line().unwrap_err().kind,
+            crate::stdlib::json::ErrorKind::TooDeep
+        );
+        let replacement = Value::parse(event_line(&event).as_bytes()).unwrap();
+        assert_serialization_error(&replacement, 0);
+    }
+
+    #[test]
+    fn many_value_failure_visible() {
+        let event = Event::new("test", "many").field(
+            "many",
+            Value::Array(vec![Value::Null; crate::stdlib::json::MAX_ELEMENTS]),
+        );
+        let error = event.to_line().unwrap_err();
+        assert_eq!(error.kind, crate::stdlib::json::ErrorKind::TooManyElements);
+        let layer = crate::observe::Layer::from_event(&event);
+        assert!(layer.fields[0].value.starts_with("unserializable:"));
+        let replacement = Value::parse(event_line(&event).as_bytes()).unwrap();
+        assert_serialization_error(&replacement, 0);
+        assert_eq!(
+            replacement.get("fields").unwrap().get("unserializable"),
+            Some(&Value::from(error.to_string()))
+        );
+    }
+
+    fn event_with_metadata() -> Event {
+        use crate::events::{ConnInfo, Level, Origin, Sandbox, Transport};
+        let mut conn = ConnInfo::new(
+            42,
+            "10.0.0.1:443".parse().unwrap(),
+            "10.0.0.2:5000".parse().unwrap(),
+        )
+        .over_tls(Some("example.test"), Some(b"h2"))
+        .from_sandbox(Some(Sandbox {
+            id: 7,
+            name: "agent".into(),
+            addr: Some("10.0.0.2".parse().unwrap()),
+            addr_v6: Some("fd00::2".parse().unwrap()),
+        }));
+        conn.transport = Transport::Udp;
+        let mut event = Event::new("test", "big")
+            .level(Level::Alarm)
+            .conn(&conn)
+            .summary("x".repeat(1 << 20))
+            .field("original", "discarded");
+        event.seq = u64::MAX;
+        event.at = crate::time::Instant::from_since_start(crate::time::ms(42));
+        event.origin = Some(Origin {
+            task: u64::MAX,
+            name: "world::worker".into(),
+            file: "world.rs",
+            line: u32::MAX,
+            parent: u64::MAX - 1,
+        });
+        event
+    }
+
+    #[test]
+    fn serialization_error_keeps_metadata() {
+        let event = event_with_metadata();
+        let replacement = Value::parse(event_line(&event).as_bytes()).unwrap();
+        assert_serialization_error(&replacement, event.seq);
+        for (name, value) in event.to_json().as_object().unwrap() {
+            if name != "summary" && name != "fields" {
+                assert_eq!(replacement.get(name), Some(value), "{name}");
+            }
+        }
+        assert_eq!(
+            replacement.get("fields").unwrap().get("unserializable"),
+            Some(&Value::from(event.to_line().unwrap_err().to_string()))
+        );
+    }
+
+    #[test]
+    fn serialization_error_is_bounded() {
+        for text in ["\0".repeat(1 << 20), "€".repeat(1 << 19)] {
+            let text: &'static str = Box::leak(text.into_boxed_str());
+            let mut event = event_with_metadata().summary("");
+            event.source = text;
+            event.kind = text;
+            event.conn.sandbox.as_mut().unwrap().name = text.into();
+            event.conn.sni = Some(text.into());
+            event.conn.alpn = Some(text.as_bytes().into());
+            let origin = event.origin.as_mut().unwrap();
+            origin.name = text.into();
+            origin.file = text;
+            assert!(event.to_line().is_err());
+            let line = event_line(&event);
+            assert!(line.len() < 128 * 1024);
+            let replacement = Value::parse(line.as_bytes()).unwrap();
+            assert_serialization_error(&replacement, event.seq);
+            for name in ["source", "kind", "sni", "alpn", "task", "file"] {
+                let value = replacement.get(name).and_then(Value::as_str).unwrap();
+                assert!(value.ends_with('…'), "{name}");
+                assert!(value.len() <= 1024 + '…'.len_utf8(), "{name}");
+            }
+            let sandbox = replacement.get("sandbox").unwrap();
+            let name = sandbox.get("name").and_then(Value::as_str).unwrap();
+            assert!(name.ends_with('…'));
+            assert!(name.len() <= 1024 + '…'.len_utf8());
+        }
+    }
 
     fn names(messages: &[Message]) -> Vec<&'static str> {
         messages.iter().map(|m| m.0).collect()

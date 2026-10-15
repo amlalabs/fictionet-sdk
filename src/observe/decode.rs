@@ -59,7 +59,8 @@ impl Layer {
     /// note. The dashboard shows it as it shows a decoded packet.
     ///
     /// The name is `source.kind`. Strings appear as text; other values
-    /// appear as JSON. The layer uses buffer 0 and range `(0, 0)`, and
+    /// appear as JSON, or `unserializable: <error>` if the JSON writer
+    /// refuses them. The layer uses buffer 0 and range `(0, 0)`, and
     /// its notes have no byte ranges.
     ///
     /// ```
@@ -85,7 +86,7 @@ impl Layer {
                 other => other
                     .to_bytes()
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|e| format!("unserializable: {e}")),
             };
             layer.note(n, text);
         }

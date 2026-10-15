@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::stdlib::codec::Wire;
-use crate::stdlib::json::{Number, Value};
+use crate::stdlib::json::{self, Number, Value};
 use crate::time::Instant;
 
 /// How much an event matters to the people and graders reading the log.
@@ -404,9 +404,12 @@ impl Event {
     }
 
     /// [`to_json`](Self::to_json) as one line of text, with no newline.
-    pub fn to_line(&self) -> String {
-        let bytes = self.to_json().to_bytes().unwrap_or_default();
-        String::from_utf8(bytes).unwrap_or_default()
+    /// Returns an error if the event exceeds the JSON writer's size,
+    /// depth or value-count limit. Callers must handle this `Result`;
+    /// serialization failures no longer return an empty string.
+    pub fn to_line(&self) -> Result<String, json::Error> {
+        let bytes = self.to_json().to_bytes()?;
+        Ok(String::from_utf8(bytes).expect("JSON is UTF-8"))
     }
 
     /// The `events.dropped` event that stands for `count` events a reader

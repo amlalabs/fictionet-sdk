@@ -88,7 +88,7 @@ fn real_run_writes_events_to_memory() {
     assert_eq!(events.len(), 2);
     let expected: String = events
         .iter()
-        .map(|event| format!("{}\n", event.to_line()))
+        .map(|event| format!("{}\n", event.to_line().unwrap()))
         .collect();
     assert_eq!(*sink.0.lock().unwrap(), expected.as_bytes());
     assert_eq!(log.lost(), 0);

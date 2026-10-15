@@ -478,7 +478,7 @@ fn reentrant_event_subscriptions_preserve_replay_and_sink_order() {
         let expected: String = log
             .all()
             .iter()
-            .map(|event| event.to_line() + "\n")
+            .map(|event| event.to_line().unwrap() + "\n")
             .collect();
         assert_eq!(*bytes.0.lock().unwrap(), expected.as_bytes());
         assert_eq!(log.lost(), 0);

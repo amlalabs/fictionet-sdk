@@ -504,7 +504,12 @@ fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
             assert_task(event, "t1", None);
         }
         logs.iter()
-            .map(|log| log.all().iter().map(|e| e.to_line()).collect::<Vec<_>>())
+            .map(|log| {
+                log.all()
+                    .iter()
+                    .map(|e| e.to_line().unwrap())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>()
     };
     assert_eq!(episode(), episode());
@@ -532,8 +537,8 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
         assert_eq!(events.len(), 3);
         for event in events {
             let json = event.to_json();
-            assert!(json.get("node").is_none(), "{}", event.to_line());
-            assert!(json.get("parent").is_none(), "{}", event.to_line());
+            assert!(json.get("node").is_none(), "{}", event.to_line().unwrap());
+            assert!(json.get("parent").is_none(), "{}", event.to_line().unwrap());
         }
         Ok(())
     }))

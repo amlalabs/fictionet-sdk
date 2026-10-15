@@ -804,12 +804,24 @@ events are lost there too.
 Discard a sample if
 [`EventLog::lost`](../src/events.rs) is nonzero.
 
+`Event::to_line()` now returns `Result<String, json::Error>`. Callers must
+handle JSON size, depth and value-count errors. File sinks count events
+that cannot be serialized as lost. Observer replies and streams instead
+deliver a replacement with the same sequence, time, category, level,
+connection and task metadata. Its summary is `unserializable: <error>` and
+its only field is `unserializable`, containing the error text. Replacement
+text values longer than 1,024 bytes are shortened at a UTF-8 boundary and
+end in `…`. The cursor advances past this explicit error record as it does
+past an original event.
+
 ### Packet drops and event layers
 
 Packet-drop construction lives in [`fictionet::stdlib::ip::record_drop`](../src/stdlib/ip.rs).
 It reads the packet's addresses and protocol and records a `drop` repeat.
 [`fictionet::observe::Layer::from_event(&event)`](../src/observe/decode.rs)
 turns an event into a display layer, with its summary and fields as notes.
+If a non-string field cannot be serialized, its note is
+`unserializable: <error>`.
 
 Migration: replace `fictionet::events::record_drop` with
 `fictionet::stdlib::ip::record_drop`, using the same arguments. Replace

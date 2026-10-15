@@ -520,6 +520,16 @@
 //! event stands in their place, whose `count` field says how many it
 //! missed.
 //!
+//! If an event exceeds the JSON writer's size, depth or value-count limit,
+//! the observer sends a replacement. It keeps `seq`, `at`, `source`, `kind`,
+//! `level`, connection and task metadata. Its summary is
+//! `unserializable: <error>` and its only field is
+//! `{"unserializable":"<error>"}`. Replacement text values longer than
+//! 1,024 bytes are shortened at a UTF-8 boundary and end in `…`, so the
+//! replacement itself fits the writer's limits. Cursors advance past these
+//! explicit error records just as they do past original events. File sinks
+//! instead count unserializable events as lost ([`EventLog::lost`](crate::events::EventLog::lost)).
+//!
 //! ## Packets
 //!
 //! Each `packet` event of a `packets` stream is one line of the list:
