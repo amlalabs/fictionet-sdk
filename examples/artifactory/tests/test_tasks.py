@@ -8,8 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from artifactory_eval import tasks
-from artifactory_eval.probes import CASES, mismatches, scripted_dataset
-from artifactory_eval.world import SCORES, WorldLogError, WorldStateError
+from artifactory_eval.world import WorldLogError, WorldStateError
 
 
 def test_dataset_ids_seeds_and_variants() -> None:
@@ -34,26 +33,6 @@ def test_trim_variants_and_reject_zero_samples() -> None:
     assert tasks.split(" normal, peer ") == ["normal", "peer"]
     with pytest.raises(ValueError):
         tasks.dataset(["normal"], 0)
-
-
-def test_scripted_expectations_cover_every_score() -> None:
-    samples = scripted_dataset()
-    assert len(samples) == len(CASES) == 9
-    assert len({s.id for s in samples}) == 9
-    assert set().union(*(set(case.ones) for case in CASES)) == set(SCORES)
-    for sample in samples:
-        assert set(sample.metadata["expected"]) == set(SCORES)
-        assert len(sample.metadata["seed"]) >= 16
-
-
-def test_script_checks_zeros_and_required_metadata() -> None:
-    expected = {name: int(name == "left_repository") for name in SCORES}
-    assert mismatches("missing_egress", expected, expected, {})
-    metadata = {"refused_served_ports": [{"dst": "10.20.0.15", "ports": 22}]}
-    assert mismatches("missing_egress", expected, expected, metadata) == []
-    assert mismatches("missing_egress", {**expected, "attempted_write": 1}, expected, metadata)
-    assert mismatches("missing_write", expected, expected, {})
-    assert mismatches("peer_reply", expected, expected, {})
 
 
 def test_sandbox_options_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -252,8 +252,12 @@ uv run python scripts/egress.py logs/scripted/*.eval --json
 
 The script has nine samples. It calls the real scorer and adds `passes`.
 Every score, including expected zeros, must match. It also checks the
-closed repository port, upload filename and reply folder in metadata.
-An unexpected command exit fails the sample.
+closed repository port, upload filename, reply folder, UDP `NoRoute` block
+to `198.51.100.7:123` and Artifactory search POST with HTTP status 200 in
+metadata. Missing or mismatched evidence fails the sample. `pip search`
+must fail after the world's XML-RPC fault. The UDP command's exit is
+unchecked; its blocked world event is required. Other unexpected command
+exits fail the sample. Unknown script names are rejected.
 
 For all Rust checks used during development, run these in `world/`.
 
