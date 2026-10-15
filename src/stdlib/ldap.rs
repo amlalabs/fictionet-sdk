@@ -2515,8 +2515,84 @@ fn declared_total(b: &[u8]) -> usize {
         .saturating_add(i + 1 + n)
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::*;
+    use fictionet::stdlib::codec::Frames;
+    use fictionet::stdlib::test_support::{contract, decode_all};
+
+    /// Checks binary messages, streams, and CLDAP datagrams.
+    pub fn check_bytes(data: &[u8]) {
+        // Any bytes as a CLDAP datagram.
+        if let Ok(m) = Message::parse(data) {
+            let b = m.to_bytes().unwrap();
+            assert!(b.len() <= data.len());
+            assert_eq!(Message::parse(&b), Ok(m.clone()));
+            if let Op::SearchRequest(s) = &m.op
+                && let Ok(t) = s.filter.to_text()
+            {
+                assert_eq!(Filter::parse_text(&t).as_ref(), Ok(&s.filter), "{t}");
+            }
+        }
+        let whole = decode_all(Frames::<Message>::new, data);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE);
+        contract::check_wire::<Message>(data);
+        contract::check_decode(|| Frames::<Message>::with_limit(64), data);
+        let smaller = decode_all(|| Frames::<Message>::with_limit(64), data);
+        assert!(whole.0.starts_with(&smaller.0));
+        // A message read can be written, reads back the same, and is written
+        // the same again.
+        for m in &whole.0 {
+            let bytes = m.to_bytes().unwrap();
+            assert_eq!(Message::parse(&bytes).as_ref(), Ok(m));
+            assert_eq!(Message::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        }
+        if let Ok(list) = Message::parse_datagram(data) {
+            assert!(!list.is_empty());
+            let mut bytes = Vec::new();
+            for m in &list {
+                bytes.extend_from_slice(&m.to_bytes().unwrap());
+            }
+            assert!(bytes.len() <= data.len());
+            assert_eq!(Message::parse_datagram(&bytes), Ok(list));
+        }
+    }
+
+    /// Checks filter and distinguished-name text round trips.
+    pub fn check_text(text: &str) {
+        if let Ok(f) = Filter::parse_text(text) {
+            let t = f.to_text().unwrap();
+            assert!(t.len() <= text.len());
+            assert_eq!(Filter::parse_text(&t), Ok(f.clone()), "{text:?} -> {t:?}");
+            let m = Message {
+                id: 1,
+                op: Op::SearchRequest(SearchRequest {
+                    base: String::new(),
+                    scope: Scope::Base,
+                    deref: DerefAliases::Never,
+                    size_limit: 0,
+                    time_limit: 0,
+                    types_only: false,
+                    filter: f,
+                    attributes: vec![],
+                }),
+                controls: Vec::new(),
+            };
+            contract::check_written(&m);
+        }
+        if let Ok(dn) = Dn::parse(text) {
+            let t = dn.to_text().unwrap();
+            assert!(t.len() <= text.len());
+            assert_eq!(Dn::parse(&t), Ok(dn), "{text:?} -> {t:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::{check_bytes, check_text};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
@@ -4068,40 +4144,6 @@ mod tests {
                     .collect())
             })
             .collect())
-    }
-
-    fn check_bytes(data: &[u8]) {
-        if let Ok(m) = Message::parse(data) {
-            let b = m.to_bytes().unwrap();
-            assert!(b.len() <= data.len());
-            assert_eq!(Message::parse(&b), Ok(m.clone()));
-            if let Op::SearchRequest(s) = &m.op
-                && let Ok(t) = s.filter.to_text()
-            {
-                assert_eq!(Filter::parse_text(&t).as_ref(), Ok(&s.filter), "{t}");
-            }
-        }
-        let whole = decode_all(Frames::<Message>::new, data);
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE);
-        contract::check_wire::<Message>(data);
-        for m in &whole.0 {
-            assert_eq!(Message::parse(&m.to_bytes().unwrap()).as_ref(), Ok(m));
-        }
-    }
-
-    fn check_text(text: &str) {
-        if let Ok(f) = Filter::parse_text(text) {
-            let t = f.to_text().unwrap();
-            assert!(t.len() <= text.len());
-            assert_eq!(Filter::parse_text(&t), Ok(f.clone()), "{text:?} -> {t:?}");
-            let m = msg(1, Op::SearchRequest(search(f)));
-            contract::check_written(&m);
-        }
-        if let Ok(dn) = Dn::parse(text) {
-            let t = dn.to_text().unwrap();
-            assert!(t.len() <= text.len());
-            assert_eq!(Dn::parse(&t), Ok(dn), "{text:?} -> {t:?}");
-        }
     }
 
     #[test]

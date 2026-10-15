@@ -1602,7 +1602,9 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
-    use super::Format;
+    use super::*;
+    use fictionet::stdlib::codec::Frames;
+    use fictionet::stdlib::test_support::{contract, decode_all};
 
     /// AVP formats checked by the wire tests.
     pub const FORMATS: [Format; 14] = [
@@ -1621,11 +1623,86 @@ pub mod harness {
         Format::DiameterUri,
         Format::Enumerated,
     ];
+
+    /// Exercises framing, semantic checks, and every named wire unit.
+    pub fn check_bytes(data: &[u8]) {
+        contract::check_decode_capacity(Frames::<Message>::new, data);
+        contract::check_decode_capacity(|| Frames::<Message>::with_limit(0), data);
+        contract::check_decode_capacity(|| Frames::<Message>::with_limit(64), data);
+        contract::check_wire::<Message>(data);
+        contract::check_wire::<Avp>(data);
+        contract::check_wire::<Address>(data);
+        if let Ok(address) = Address::parse(data) {
+            assert_eq!(address.to_bytes().unwrap(), data);
+        }
+        let (items, _) = decode_all(Frames::<Message>::new, data);
+        for malformed in items.iter().filter_map(|item| item.as_ref().err()) {
+            assert!(malformed.header.avps.is_empty());
+        }
+        for message in items.into_iter().flatten() {
+            contract::check_wire_value(&message);
+            let bytes = message.to_bytes().unwrap();
+            assert_eq!(Message::parse(&bytes).as_ref(), Ok(&message));
+            let _ = check(&message.avps, |code, vendor| {
+                if vendor.is_none() {
+                    base_format(code)
+                } else {
+                    None
+                }
+            });
+            // Every AVP read as grouped goes down to the depth limit.
+            let _ = check(&message.avps, |_, _| Some(Format::Grouped));
+            let reply = message.answer();
+            contract::check_wire_value(&reply);
+            assert_eq!(Message::parse(&reply.to_bytes().unwrap()).unwrap(), reply);
+            // Each AVP in every format: a value read writes bytes that read
+            // back to the same bytes. Only URIs (case) and grouped AVPs
+            // (reserved bits, padding bytes) may first come out as other bytes.
+            for avp in &message.avps {
+                for format in FORMATS {
+                    if let Ok(value) = avp.value(format) {
+                        let rebuilt = Avp::new(avp.code, &value).unwrap();
+                        if !matches!(format, Format::Grouped | Format::DiameterUri) {
+                            assert_eq!(rebuilt.data, avp.data);
+                        }
+                        let reread = rebuilt.value(format).unwrap();
+                        assert_eq!(Avp::new(avp.code, &reread).unwrap().data, rebuilt.data);
+                    }
+                }
+            }
+        }
+        if let Ok(list) = Avp::parse_list(data) {
+            let grouped = Avp::new(1, &Value::Grouped(list.clone()));
+            if data.len() <= MAX_AVP_DATA {
+                assert_eq!(
+                    Avp::parse_list(&grouped.as_ref().unwrap().data),
+                    Ok(list.clone())
+                );
+            }
+            if let Ok(avp) = grouped {
+                assert_eq!(avp.value(Format::Grouped), Ok(Value::Grouped(list)));
+            }
+        }
+        if let Ok(text) = std::str::from_utf8(data) {
+            check_text(text);
+        }
+    }
+
+    /// Checks identity and URI text round trips.
+    pub fn check_text(text: &str) {
+        if let Some(uri) = Uri::parse(text) {
+            assert_eq!(Uri::parse(&uri.to_string()), Some(uri));
+        }
+        if let Some(identity) = Identity::new(text) {
+            assert_eq!(identity.as_str(), text);
+            assert_eq!(Identity::new(identity.as_str()), Some(identity));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::harness::FORMATS;
+    use super::harness::{check_bytes, check_text};
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Decode, Step};
@@ -2704,52 +2781,6 @@ mod tests {
         }
     }
 
-    /// Exercises framing, semantic checks, and every named wire unit.
-    fn exercise(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * DEFAULT_LIMIT);
-        contract::check_wire::<Message>(data);
-        contract::check_wire::<Avp>(data);
-        contract::check_wire::<Address>(data);
-        if let Ok(address) = Address::parse(data) {
-            assert_eq!(address.to_bytes().unwrap(), data);
-        }
-        for message in decode_all(Frames::<Message>::new, data)
-            .0
-            .into_iter()
-            .flatten()
-        {
-            contract::check_wire_value(&message);
-            let _ = check(&message.avps, base);
-            let _ = check(&message.avps, |_, _| Some(Format::Grouped));
-            contract::check_wire_value(&message.answer());
-            for avp in &message.avps {
-                for format in FORMATS {
-                    if let Ok(value) = avp.value(format) {
-                        let rebuilt = Avp::new(avp.code, &value).unwrap();
-                        if !matches!(format, Format::Grouped | Format::DiameterUri) {
-                            assert_eq!(rebuilt.data, avp.data);
-                        }
-                        let reread = rebuilt.value(format).unwrap();
-                        assert_eq!(Avp::new(avp.code, &reread).unwrap().data, rebuilt.data);
-                    }
-                }
-            }
-        }
-        if let Ok(list) = Avp::parse_list(data)
-            && let Ok(avp) = Avp::new(1, &Value::Grouped(list.clone()))
-        {
-            assert_eq!(avp.value(Format::Grouped), Ok(Value::Grouped(list)));
-        }
-        if let Ok(text) = std::str::from_utf8(data) {
-            if let Some(uri) = Uri::parse(text) {
-                assert_eq!(Uri::parse(&uri.to_string()), Some(uri));
-            }
-            if let Some(identity) = Identity::new(text) {
-                assert_eq!(identity.as_str(), text);
-            }
-        }
-    }
-
     #[test]
     fn lcg_fuzz() {
         let mut r = Lcg::new(0x5eed_d1a3);
@@ -2785,7 +2816,7 @@ mod tests {
                     d
                 }
             };
-            exercise(&data);
+            check_bytes(&data);
         }
         // Random AVPs: each value reads back in its own format, to the same bytes.
         for _ in 0..fictionet::stdlib::test_support::rounds(9500) {
@@ -2806,9 +2837,7 @@ mod tests {
             for byte in r.bytes(30) {
                 s.push(alphabet[usize::from(byte) % alphabet.len()] as char);
             }
-            if let Some(u) = Uri::parse(&s) {
-                assert_eq!(Uri::parse(&u.to_string()), Some(u));
-            }
+            check_text(&s);
         }
     }
 }
