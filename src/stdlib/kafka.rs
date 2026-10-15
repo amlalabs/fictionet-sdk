@@ -364,7 +364,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     #[cfg(test)]
     fn varint(&mut self) -> Result<i32, Error> {
         let v = self.uvarint()?;
-        Ok((v >> 1) as i32 ^ -((v & 1) as i32))
+        Ok(leb128::zigzag_decode32(v))
     }
 
     /// A VARLONG: a zigzag-encoded i64 in at most 10 bytes, the tenth
@@ -377,7 +377,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
             u64::MAX,
             Error::Varint,
         )?;
-        Ok((value >> 1) as i64 ^ -((value & 1) as i64))
+        Ok(leb128::zigzag_decode64(value))
     }
 
     fn utf8(&mut self, n: usize) -> Result<String, Error> {
@@ -652,13 +652,13 @@ impl Writer {
     /// A VARINT.
     #[cfg(test)]
     fn varint(&mut self, v: i32) {
-        self.uvarint(((v << 1) ^ (v >> 31)) as u32);
+        self.uvarint(leb128::zigzag_encode32(v));
     }
 
     /// A VARLONG.
     #[cfg(test)]
     fn varlong(&mut self, v: i64) {
-        leb128::encode_with(((v << 1) ^ (v >> 63)) as u64, |b| self.u8(b));
+        leb128::encode_with(leb128::zigzag_encode64(v), |b| self.u8(b));
     }
 
     /// A STRING.

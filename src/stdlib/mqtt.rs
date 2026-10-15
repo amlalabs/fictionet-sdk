@@ -61,7 +61,7 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
+use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire, leb128};
 
 /// The TCP port MQTT brokers listen on, without TLS.
 pub const PORT: u16 = 1883;
@@ -465,17 +465,16 @@ fictionet::error_display!(Error, f, {
 /// it took. An encoding longer than it needs to be is read, as the 3.1.1
 /// standard does not forbid it.
 fn read_remaining_length(b: &[u8]) -> Result<Option<(usize, usize)>, Error> {
-    let mut value = 0usize;
-    for (i, &byte) in b.iter().enumerate().take(MAX_REMAINING_LENGTH_BYTES) {
-        value |= usize::from(byte & 0x7f) << (7 * i);
-        if byte & 0x80 == 0 {
-            return Ok(Some((value, i + 1)));
-        }
-    }
-    if b.len() >= MAX_REMAINING_LENGTH_BYTES {
-        Err(Error::RemainingLength)
-    } else {
-        Ok(None)
+    let mut bytes = b.iter().copied();
+    match leb128::decode_with(
+        || bytes.next().ok_or(Error::Truncated),
+        MAX_REMAINING_LENGTH_BYTES,
+        MAX_REMAINING_LENGTH as u64,
+        Error::RemainingLength,
+    ) {
+        Ok(value) => Ok(Some((value as usize, b.len() - bytes.len()))),
+        Err(Error::Truncated) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -506,16 +505,8 @@ impl Wire for RemainingLength {
         if self.0 > MAX_REMAINING_LENGTH {
             return Err(Error::Unwritable);
         }
-        let mut n = self.0;
-        loop {
-            let byte = (n % 128) as u8;
-            n /= 128;
-            if n == 0 {
-                out.push(byte);
-                return Ok(());
-            }
-            out.push(byte | 0x80);
-        }
+        leb128::encode_with(self.0 as u64, |byte| out.push(byte));
+        Ok(())
     }
 }
 
@@ -1337,6 +1328,48 @@ mod tests {
             Packet::parse(&[0x30, 0xff, 0xff, 0xff, 0xff]),
             Err(Error::RemainingLength)
         );
+    }
+
+    #[test]
+    fn remaining_length_prefix_and_error_policy() {
+        for bytes in [
+            &[0x00][..],
+            &[0x80, 0x00],
+            &[0x80, 0x80, 0x00],
+            &[0x80, 0x80, 0x80, 0x00],
+        ] {
+            assert_eq!(read_remaining_length(bytes), Ok(Some((0, bytes.len()))));
+            assert_eq!(RemainingLength::parse(bytes), Ok(RemainingLength(0)));
+            for used in 0..bytes.len() {
+                assert_eq!(read_remaining_length(&bytes[..used]), Ok(None));
+                assert_eq!(
+                    RemainingLength::parse(&bytes[..used]),
+                    Err(Error::Truncated)
+                );
+            }
+            let mut trailing = bytes.to_vec();
+            trailing.push(0xff);
+            assert_eq!(read_remaining_length(&trailing), Ok(Some((0, bytes.len()))));
+            assert_eq!(RemainingLength::parse(&trailing), Err(Error::TrailingBytes));
+        }
+        for bytes in [
+            &[0x80, 0x80, 0x80, 0x80][..],
+            &[0x80, 0x80, 0x80, 0x80, 0x00],
+        ] {
+            assert_eq!(read_remaining_length(bytes), Err(Error::RemainingLength));
+            assert_eq!(RemainingLength::parse(bytes), Err(Error::RemainingLength));
+        }
+        for value in [MAX_REMAINING_LENGTH + 1, usize::MAX] {
+            let mut out = vec![0x12, 0x34];
+            assert_eq!(
+                RemainingLength(value).write(&mut out),
+                Err(Error::Unwritable)
+            );
+            assert_eq!(out, [0x12, 0x34]);
+        }
+        let mut out = vec![0x12, 0x34];
+        RemainingLength(128).write(&mut out).unwrap();
+        assert_eq!(out, [0x12, 0x34, 0x80, 0x01]);
     }
 
     #[test]

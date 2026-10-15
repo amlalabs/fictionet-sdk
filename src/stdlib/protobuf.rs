@@ -210,26 +210,9 @@ impl Wire for Varint {
     }
 }
 
-/// Maps a signed 64-bit number onto an unsigned one, so that small
-/// negative numbers make short varints: 0, -1, 1, -2 become 0, 1, 2, 3.
-pub fn zigzag_encode64(v: i64) -> u64 {
-    ((v << 1) ^ (v >> 63)) as u64
-}
-
-/// Undoes [`zigzag_encode64`].
-pub fn zigzag_decode64(v: u64) -> i64 {
-    ((v >> 1) as i64) ^ -((v & 1) as i64)
-}
-
-/// Maps a signed 32-bit number onto an unsigned one, as `sint32` fields do.
-pub fn zigzag_encode32(v: i32) -> u32 {
-    ((v << 1) ^ (v >> 31)) as u32
-}
-
-/// Undoes [`zigzag_encode32`].
-pub fn zigzag_decode32(v: u32) -> i32 {
-    ((v >> 1) as i32) ^ -((v & 1) as i32)
-}
+pub use fictionet::stdlib::codec::leb128::{
+    zigzag_decode32, zigzag_decode64, zigzag_encode32, zigzag_encode64,
+};
 
 /// One field's value, as the wire type carries it.
 /// Dropping a value uses an explicit work list, even beyond [`MAX_DEPTH`].

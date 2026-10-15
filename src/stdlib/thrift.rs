@@ -1141,7 +1141,7 @@ impl<'a> Fields<'a> {
 
     fn zigzag32(&mut self) -> Result<i32, Error> {
         let n = self.varint32()?;
-        Ok(((n >> 1) as i32) ^ -((n & 1) as i32))
+        Ok(leb128::zigzag_decode32(n))
     }
 
     fn i16v(&mut self) -> Result<i16, Error> {
@@ -1163,7 +1163,7 @@ impl<'a> Fields<'a> {
     fn i64v(&mut self) -> Result<i64, Error> {
         if self.compact {
             let n = self.varint(10, u64::MAX)?;
-            Ok(((n >> 1) as i64) ^ -((n & 1) as i64))
+            Ok(leb128::zigzag_decode64(n))
         } else {
             Ok(i64::from_be_bytes(self.cursor.array()?))
         }
@@ -1463,7 +1463,7 @@ impl<'o> Writer<'o> {
 
     fn i32w(&mut self, v: i32) {
         if self.compact {
-            self.varint(u64::from(((v << 1) ^ (v >> 31)) as u32));
+            self.varint(u64::from(leb128::zigzag_encode32(v)));
         } else {
             self.raw(&v.to_be_bytes());
         }
@@ -1471,7 +1471,7 @@ impl<'o> Writer<'o> {
 
     fn i64w(&mut self, v: i64) {
         if self.compact {
-            self.varint(((v << 1) ^ (v >> 63)) as u64);
+            self.varint(leb128::zigzag_encode64(v));
         } else {
             self.raw(&v.to_be_bytes());
         }
