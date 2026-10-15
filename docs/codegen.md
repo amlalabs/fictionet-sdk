@@ -329,6 +329,15 @@ DTDs, entities, CDATA, processing instructions, and includes.
 | `<data>` | Variable `bytes` with the length member's width |
 | `headerType` (default `messageHeader`) | The header of one union, `Message`, with a case per template |
 
+Primitive constants become associated constants. Char arrays become byte
+constants. Other primitive constants keep the primitive's numeric type,
+even with an explicit `length="1"`. A `valueRef` on a primitive type or
+field follows the same rule: a `uint16` value of 1000 becomes a `u16`
+constant with value 1000. A `valueRef` requires a single value within the
+type's valid range, excluding its null value. Non-char literal constants
+with a length other than one return `Unsupported`; `valueRef` arrays with
+a length other than one return `SchemaShape`.
+
 The message header maps `blockLength` to `length`, `templateId` to
 `tag`, `schemaId` to a `constant` of the schema id, and `version` to a
 `version` with `current` and `minimum` both the schema version. Header
@@ -352,8 +361,8 @@ are refused, so fields need no "absent" form. `sinceVersion` and
 `deprecated` may not exceed the schema version, and `sinceVersion` may
 not decrease within a block or composite (section 5).
 
-The front end refuses, with `Unsupported`, primitive arrays other than
-`char` and `uint8`, optional floats (their null is NaN), optional
+The front end refuses, with `Unsupported`, non-constant primitive arrays
+other than `char` and `uint8`, optional floats (their null is NaN), optional
 composite fields, and header or dimension composites with `numGroups` or
 `numVarDataFields`. Other schema errors are `SchemaShape`, `InvalidName`,
 `DuplicateName`, `UnknownReference`, or `InvalidSize`. `IrLimit` reports

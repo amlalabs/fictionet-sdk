@@ -159,6 +159,140 @@ fn maps_scalars_nulls_constants_and_layouts() {
 }
 
 #[test]
+fn maps_type_value_ref_constants() {
+    check_value_ref_constants(r#"presence="constant" valueRef="E.value""#, "");
+}
+
+#[test]
+fn maps_field_value_ref_constants() {
+    check_value_ref_constants("", r#"presence="constant" valueRef="E.value""#);
+}
+
+fn check_value_ref_constants(type_presence: &str, field_presence: &str) {
+    for (prim, value, constant) in [
+        (
+            "uint16",
+            "1000",
+            Constant::Number {
+                ty: Primitive::U16,
+                value: Number::Integer(1000),
+            },
+        ),
+        (
+            "uint8",
+            "3",
+            Constant::Number {
+                ty: Primitive::U8,
+                value: Number::Integer(3),
+            },
+        ),
+        ("char", "A", Constant::Bytes(vec![b'A'])),
+    ] {
+        let schema = parse(&xml(
+            &format!(
+                r#"<enum name="E" encodingType="{prim}"><validValue name="value">{value}</validValue></enum>
+                   <type name="X" primitiveType="{prim}" length="1" {type_presence}/>"#,
+            ),
+            &format!(r#"<field name="x" id="1" type="X" {field_presence}/>"#),
+        ))
+        .unwrap();
+        assert_eq!(
+            fields(&schema, "M")[0].ty,
+            Type::Constant(constant),
+            "{prim}"
+        );
+        validate(schema, Limits::default()).unwrap();
+    }
+}
+
+#[test]
+fn maps_literal_char_array_constant() {
+    let schema = parse(&xml(
+        r#"<type name="X" primitiveType="char" length="4" presence="constant">ABCD</type>"#,
+        r#"<field name="x" id="1" type="X"/>"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        fields(&schema, "M")[0].ty,
+        Type::Constant(Constant::Bytes(b"ABCD".to_vec()))
+    );
+    validate(schema, Limits::default()).unwrap();
+}
+
+#[test]
+fn negative_array_constant() {
+    fail(
+        &xml(
+            r#"<type name="X" primitiveType="uint8" length="1" presence="constant">-1</type>"#,
+            r#"<field name="x" id="1" type="X"/>"#,
+        ),
+        ErrorKind::SchemaShape,
+    );
+}
+
+#[test]
+fn unsupported_constant_array() {
+    fail(
+        &xml(
+            r#"<type name="X" primitiveType="uint8" length="2" presence="constant">12</type>"#,
+            r#"<field name="x" id="1" type="X"/>"#,
+        ),
+        ErrorKind::Unsupported,
+    );
+    for (type_presence, field_presence) in [
+        (r#"presence="constant" valueRef="E.value""#, ""),
+        ("", r#"presence="constant" valueRef="E.value""#),
+    ] {
+        fail(
+            &xml(
+                &format!(
+                    r#"<enum name="E" encodingType="uint8"><validValue name="value">3</validValue></enum>
+                       <type name="X" primitiveType="uint8" length="2" {type_presence}/>"#,
+                ),
+                &format!(r#"<field name="x" id="1" type="X" {field_presence}/>"#),
+            ),
+            ErrorKind::SchemaShape,
+        );
+    }
+}
+
+#[test]
+fn refuses_value_ref_constants_outside_range() {
+    for (type_presence, field_presence, location) in [
+        (
+            r#"presence="constant" valueRef="E.value""#,
+            "",
+            "s.xml: type X",
+        ),
+        (
+            "",
+            r#"presence="constant" valueRef="E.value""#,
+            "s.xml: message M/x",
+        ),
+    ] {
+        for (prim, bounds, value) in [
+            ("char", "", "1000"),
+            ("uint8", "", "1000"),
+            ("uint16", r#"minValue="1001""#, "1000"),
+            ("uint16", r#"maxValue="999""#, "1000"),
+            ("uint8", r#"maxValue="255""#, "255"),
+        ] {
+            let e = parse(&xml(
+                &format!(
+                    r#"<enum name="E" encodingType="uint16"><validValue name="value">{value}</validValue></enum>
+                       <type name="X" primitiveType="{prim}" length="1" {bounds} {type_presence}/>"#,
+                ),
+                &format!(r#"<field name="x" id="1" type="X" {field_presence}/>"#),
+            ))
+            .unwrap_err();
+            assert_eq!(e.kind, ErrorKind::SchemaShape, "{e}");
+            assert_eq!(e.location, location, "{e}");
+            assert_eq!(e.message, "constant outside the valid range", "{e}");
+        }
+    }
+}
+
+#[test]
 fn refuses_unsupported_features() {
     for (types, body) in [
         (

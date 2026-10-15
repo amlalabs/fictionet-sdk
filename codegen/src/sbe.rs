@@ -12,20 +12,24 @@
 //!
 //! Required scalars become ranges that exclude the null value, as section
 //! 2 requires. Optional scalars and enums use their null value. Constants
-//! become associated constants. `sinceVersion` must not exceed the schema
-//! version. Generated readers accept acting versions from the schema
-//! version up: newer senders' longer blocks are skipped (section 5.3), and
-//! older senders are refused.
+//! become associated constants. Char array constants become byte constants;
+//! other primitive constants become numbers of the primitive's type, even
+//! with an explicit `length="1"`. `valueRef` follows the same mapping.
+//! `sinceVersion` must not exceed the schema version. Generated readers
+//! accept acting versions from the schema version up: newer senders' longer
+//! blocks are skipped (section 5.3), and older senders are refused.
 //!
 //! See the [differential-testing comparison] for the intentional differences
 //! from the runtime SBE decoder: older acting versions and unknown enums.
 //!
 //! [differential-testing comparison]: https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md#guarantees-and-checks
 //!
-//! Not mapped, with an [`ErrorKind::Unsupported`] error: primitive arrays
-//! other than `char` and `uint8`, optional floats (their null is NaN),
-//! optional composite fields, and header or dimension composites with
-//! `numGroups` or `numVarDataFields`. External includes are refused.
+//! Not mapped, with an [`ErrorKind::Unsupported`] error: non-constant
+//! primitive arrays other than `char` and `uint8`, literal constant arrays
+//! other than `char` with a length other than one, optional floats (their
+//! null is NaN), optional composite fields, and header or dimension
+//! composites with `numGroups` or `numVarDataFields`. External includes
+//! are refused.
 use crate::{
     Error, ErrorKind, FrontEnd, Input,
     ir::*,
@@ -275,6 +279,21 @@ impl Simple {
     }
     fn is_null(&self, v: Val) -> bool {
         v == self.null || (v.nan() && self.null.nan())
+    }
+    fn constant_from(&mut self, value: Val, path: &str) -> Result<(), Error> {
+        if self.length != 1 {
+            return Err(shape(path, "valueRef constants are single values"));
+        }
+        if !self.valid(value) || self.is_null(value) {
+            return Err(shape(path, "constant outside the valid range"));
+        }
+        self.constant = Some(match (self.prim, self.array, value) {
+            (Prim::Char, true, Val::Int(c)) => Const::Bytes(vec![
+                u8::try_from(c).map_err(|_| shape(path, "constant outside the byte range"))?,
+            ]),
+            (_, _, v) => Const::Number(v),
+        });
+        Ok(())
     }
     /// Moves a default bound past an explicit null that sits on it.
     fn exclude_null(&mut self) {
@@ -647,17 +666,11 @@ impl<'a> Compiler<'a> {
             return Err(shape(path, "null value inside the valid range"));
         }
         if let Some(reference) = value_ref {
-            if !n.text.trim().is_empty() || s.length != 1 {
+            if !n.text.trim().is_empty() {
                 return Err(shape(path, "valueRef constants are single values"));
             }
             let (_, value) = self.value_ref(reference, path, depth)?;
-            if !s.valid(value) || s.is_null(value) {
-                return Err(shape(path, "constant outside the valid range"));
-            }
-            s.constant = Some(match value {
-                Val::Int(c) if s.array => Const::Bytes(vec![u8::try_from(c).unwrap_or(0)]),
-                v => Const::Number(v),
-            });
+            s.constant_from(value, path)?;
         } else if s.presence == Presence::Constant {
             if prim == Prim::Char && s.array {
                 if n.text.len() != s.length
@@ -992,17 +1005,8 @@ impl<'a> Compiler<'a> {
                 if presence == Presence::Constant && s.constant.is_none() {
                     let reference =
                         value_ref.ok_or_else(|| shape(path, "constant field needs a value"))?;
-                    if s.length != 1 {
-                        return Err(shape(path, "valueRef needs a single-value type"));
-                    }
                     let (_, value) = self.value_ref(reference, path, depth)?;
-                    if !s.valid(value) || s.is_null(value) {
-                        return Err(shape(path, "constant outside the valid range"));
-                    }
-                    s.constant = Some(match value {
-                        Val::Int(c) if s.array => Const::Bytes(vec![u8::try_from(c).unwrap_or(0)]),
-                        v => Const::Number(v),
-                    });
+                    s.constant_from(value, path)?;
                 } else if value_ref.is_some() && presence != Presence::Constant {
                     return Err(shape(path, "valueRef requires constant presence"));
                 }
