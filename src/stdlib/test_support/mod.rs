@@ -165,6 +165,31 @@ where
     (items, failure)
 }
 
+/// Pumps bytes into a fresh stream and bounds measured buffer copies by input size.
+#[cfg(test)]
+pub(crate) fn pump_with_copy_bound<D: Decode>(
+    stream: &mut Stream<D>,
+    bytes: &[u8],
+    on: impl FnMut(D::Item),
+) -> Result<usize, Fail<D::Error>>
+where
+    D::Error: Clone,
+{
+    assert!(
+        stream.moved() == 0 && stream.buffered() == 0,
+        "copy bound requires a fresh stream"
+    );
+    let taken = pump(stream, bytes, on)?;
+    let moved = stream.moved();
+    assert!(moved < usize::MAX, "copy measurement saturated");
+    assert!(
+        moved <= bytes.len(),
+        "input buffer copied {moved} bytes for {} input bytes",
+        bytes.len()
+    );
+    Ok(taken)
+}
+
 /// Cyclic chunking over a borrowed slice.
 pub struct Chunks<'a> {
     rest: &'a [u8],
@@ -678,6 +703,30 @@ mod tests {
             self.0 += 1;
             Ok(fictionet::stdlib::codec::Step::Need)
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "copy bound requires a fresh stream")]
+    fn copy_bound_rejects_buffered_input() {
+        let mut stream = super::Stream::new(Counted::default());
+        assert_eq!(stream.push(b"x"), 1);
+        assert_eq!(stream.moved(), 0);
+        super::pump_with_copy_bound(&mut stream, b"y", |_| {}).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "copy bound requires a fresh stream")]
+    fn copy_bound_rejects_prior_copies_after_draining() {
+        use fictionet::stdlib::codec::{Ending, Lines};
+
+        let mut stream = super::Stream::new(Lines::new(8, Ending::LfOrCrlf));
+        assert_eq!(stream.push(b"a\nb\n"), 4);
+        assert_eq!(stream.next().unwrap().unwrap().unwrap(), b"a");
+        stream.shrink();
+        assert_eq!(stream.next().unwrap().unwrap().unwrap(), b"b");
+        assert_eq!(stream.buffered(), 0);
+        assert_eq!(stream.moved(), 2);
+        super::pump_with_copy_bound(&mut stream, b"c\n", |_| {}).unwrap();
     }
 
     #[test]

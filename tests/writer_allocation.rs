@@ -1,6 +1,6 @@
 //! Bounded protocol appends return allocation refusals without changing output.
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Buffer, Frames, Stream, Wire, pump};
 use fictionet::stdlib::{dhcpv6, kafka, onc_rpc, syslog, thrift};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -285,6 +285,63 @@ fn dhcpv6_allocation_refusal_leaves_output_unchanged() {
         Err(dhcpv6::Error::Unwritable)
     );
     assert_eq!(out, [42]);
+}
+
+#[test]
+fn dhcpv6_fragmented_prefix_allocates_only_for_buffer_growth_and_one_parse() {
+    let mut message = dhcpv6::Message::new(dhcpv6::msg::SOLICIT, 7);
+    // Each Preference occupies five wire bytes. An ElapsedTime fills the
+    // remaining six bytes after the four-byte message header.
+    let options = (dhcpv6::MAX_TCP_MESSAGE - dhcpv6::CLIENT_HEADER_LEN - 6) / 5;
+    message.options = (0..options)
+        .map(|i| dhcpv6::DhcpOption::Preference(i as u8))
+        .collect();
+    message.options.push(dhcpv6::DhcpOption::ElapsedTime(42));
+    let expected = dhcpv6::Frame(message);
+    let input = expected.to_bytes().unwrap();
+    assert_eq!(input.len(), dhcpv6::MAX_BUFFERED);
+
+    let (parsed, parse_stats) = measuring(|| dhcpv6::Frame::parse(&input).unwrap());
+    assert_eq!(parsed, expected);
+    assert!(parse_stats.allocations > 0);
+
+    // Hold the message fixed while increasing the number of partial prefixes.
+    for chunk_size in [input.len(), 1024, 256, 64, 1] {
+        let ((), growth_stats) = measuring(|| {
+            let mut buffer = Buffer::new(dhcpv6::MAX_BUFFERED);
+            for chunk in input.chunks(chunk_size) {
+                assert_eq!(buffer.push(chunk), chunk.len());
+            }
+            assert_eq!(buffer.unread(), input);
+        });
+        let mut stream = Stream::new(Frames::<dhcpv6::Message>::new());
+        let mut decoded = None;
+        let ((), stats) = measuring(|| {
+            for chunk in input.chunks(chunk_size) {
+                assert_eq!(
+                    pump(&mut stream, chunk, |item| {
+                        assert!(decoded.is_none(), "unexpected extra message");
+                        decoded = Some(item.unwrap());
+                    })
+                    .unwrap(),
+                    chunk.len()
+                );
+            }
+        });
+        assert_eq!(decoded.as_ref(), Some(&expected.0));
+        assert_eq!(stream.buffered(), 0);
+        stream.end();
+        assert_eq!(stream.next(), None);
+        let allowance = growth_stats.allocations + parse_stats.allocations;
+        assert!(
+            stats.allocations <= allowance,
+            "chunk size {chunk_size}: {} allocations exceed {allowance} \
+             ({} for buffer growth + {} for one parse)",
+            stats.allocations,
+            growth_stats.allocations,
+            parse_stats.allocations
+        );
+    }
 }
 
 #[test]

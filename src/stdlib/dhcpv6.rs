@@ -1478,10 +1478,10 @@ mod tests {
     }
 
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, Stream, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{decode_all, mutate, pump_with_copy_bound};
 
     fn a(s: &str) -> Ipv6Addr {
         s.parse().unwrap()
@@ -2051,19 +2051,27 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_messages_in_linear_time() {
-        let n = rounds(1_000_000);
-        let mut stream = Stream::new(Frames::<Message>::new());
-        let mut count = 0;
-        pump(&mut stream, &vec![0; 2 * n], |m| {
-            assert_eq!(m, Err(Error::Short));
-            count += 1;
-        })
-        .unwrap();
-        assert_eq!(count, n);
-        assert_eq!(stream.buffered(), 0);
-        assert_eq!(stream.push(&[0, 4, 1, 0, 0, 7]), 6);
-        assert_eq!(stream.next().unwrap().unwrap().unwrap().transaction, 7);
+    fn stream_copies_at_most_the_input_over_many_small_messages() {
+        for n in [rounds(250_000), rounds(1_000_000)] {
+            let input = vec![0; 2 * n];
+            let mut stream = Stream::new(Frames::<Message>::new());
+            let mut count = 0;
+            assert_eq!(
+                pump_with_copy_bound(&mut stream, &input, |m| {
+                    assert_eq!(m, Err(Error::Short));
+                    count += 1;
+                })
+                .unwrap(),
+                input.len()
+            );
+            assert_eq!(count, n);
+            assert_eq!(stream.buffered(), 0);
+            assert_eq!(stream.push(&[0, 4, 1, 0, 0, 7]), 6);
+            let trailing = stream.next().unwrap().unwrap().unwrap();
+            assert_eq!(trailing.transaction, 7);
+            assert_eq!(trailing, Message::new(msg::SOLICIT, 7));
+            assert!(stream.moved() <= input.len());
+        }
     }
 
     #[test]

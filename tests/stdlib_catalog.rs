@@ -231,7 +231,11 @@ fn unmeasured_linearity_tests(source: &str) -> Vec<&str> {
         let helper = body.windows(2).any(|call| {
             matches!(
                 call[0],
-                "assert_linear" | "assert_linear_work" | "assert_constant_work" | "check_work"
+                "assert_linear"
+                    | "assert_linear_work"
+                    | "assert_constant_work"
+                    | "check_work"
+                    | "pump_with_copy_bound"
             ) && call[1] == "("
         });
         let copies = body.windows(3).any(|call| call == [".", "moved", "("]);
@@ -246,11 +250,7 @@ fn unmeasured_linearity_tests(source: &str) -> Vec<&str> {
 fn linearity_names_require_measurement() {
     // Existing findings remain open until their instance units migrate them.
     // Exact entries reject new omissions and must be removed when fixed.
-    let pending = [(
-        "dhcpv6.rs",
-        "stream_takes_many_small_messages_in_linear_time",
-        "RH-043 / T11-73",
-    )];
+    let pending: [(&str, &str, &str); 0] = [];
     let dir = Path::new(ROOT).join("src/stdlib");
     let mut actual = BTreeSet::new();
     for (file, source) in sources_on_disk(&dir) {
@@ -288,6 +288,9 @@ fn linearity_check_requires_calls_inside_the_named_body() {
             test_support::assert_linear_work("decode", "bytes", 16, measure);
         }
         #[test] fn copies_are_linear() { assert!(stream.moved() <= input.len()); }
+        #[test] fn pumped_copies_are_linear() {
+            test_support::pump_with_copy_bound(&mut stream, &input, on).unwrap();
+        }
         #[test] fn state_is_linear() {
             assert_constant_work("read", "held bytes", 16, measure);
         }
