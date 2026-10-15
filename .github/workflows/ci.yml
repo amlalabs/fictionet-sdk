@@ -131,6 +131,8 @@ jobs:
         run: cargo test --locked --manifest-path examples/adaptive-web/world/Cargo.toml
       - name: Example log readers
         run: python3 -m unittest discover -s examples/common -p 'test_*.py'
+      - name: VM result protocol
+        run: python3 -m unittest discover -s tests/vm -p 'test_*.py'
       - name: Hosted Harbor packaging
         run: python3 -m unittest discover -s examples/hosted/tests -p 'test_*.py'
       - name: Demo regressions
