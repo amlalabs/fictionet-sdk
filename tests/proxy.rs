@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use fictionet::stdlib::net::{Arrival, PortServer};
 use fictionet::stdlib::{http1, tls, web};
 use rustls::pki_types::PrivateKeyDer;
 
@@ -61,6 +62,10 @@ struct World {
 
 impl World {
     fn start() -> World {
+        Self::with_site(None)
+    }
+
+    fn with_site(raw: Option<ResetSite>) -> World {
         let dir = temp_dir();
         let sock = dir.join("w.sock").to_str().unwrap().to_owned();
         let ca_path = dir.join("ca.pem");
@@ -122,7 +127,7 @@ impl World {
                             })
                         }),
                     );
-                    web::Sites::new(move |host: &str| match host {
+                    let mut net = web::Sites::new(move |host: &str| match host {
                         "plain.test" => Some(web::Site::new(app.clone())),
                         "ws.test" => Some(web::Site::new(ws.clone())),
                         "secure.test" => Some(
@@ -132,7 +137,14 @@ impl World {
                         ),
                         _ => None,
                     })
-                    .start(&fcx, attachments)?;
+                    .into_net();
+                    if let Some(raw) = raw {
+                        net = net.host("reset", |h| {
+                            h.at("203.0.113.20".parse::<Ipv4Addr>().unwrap())
+                                .port_server(80, raw)
+                        });
+                    }
+                    net.start(&fcx, attachments)?;
                     while !stop2.load(Ordering::SeqCst) {
                         fcx.sleep(fictionet::time::ms(20)).await?;
                     }
@@ -241,6 +253,51 @@ impl Drop for World {
     }
 }
 
+/// Resets only after the test has received the response prefix, or after
+/// the site has read the upload prefix. No timer decides how much gets through.
+struct ResetSite {
+    download: bool,
+    reset: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl PortServer for ResetSite {
+    fn serve(
+        &self,
+        fcx: fictionet::Cx,
+        arrival: Arrival,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        use fictionet::tokio::ConnectionTokioExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let download = self.download;
+        let reset = self.reset.lock().unwrap().take().unwrap();
+        Box::pin(async move {
+            let mut conn = arrival.conn.into_tokio(&fcx);
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(conn.read_u8().await.unwrap());
+            }
+            if download {
+                conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n")
+                    .await
+                    .unwrap();
+                conn.write_all(&[b'x'; 100]).await.unwrap();
+            } else {
+                // Make the client send its body after the proxy has read
+                // the request head, so this tests the streaming upload.
+                conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut prefix = [0; 1000];
+                conn.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(prefix, [b'x'; 1000]);
+            }
+            reset.await.unwrap();
+            arrival.socket.reset();
+        })
+    }
+}
+
 /// Answers a POST with the number of bytes in its body.
 async fn upload(body: axum::body::Body) -> String {
     use http_body_util::BodyExt;
@@ -330,7 +387,10 @@ impl Attach {
     /// Waits up to 5 s for attach to log a line containing `text`. Lines
     /// about a connection come when it ends.
     fn logged(&self, text: &str) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        self.logged_within(text, Instant::now() + Duration::from_secs(5))
+    }
+
+    fn logged_within(&self, text: &str, deadline: Instant) -> bool {
         while Instant::now() < deadline {
             if self.log().contains(text) {
                 return true;
@@ -527,6 +587,88 @@ fn http_door_connects_and_forwards() {
         a.logged("GET http://plain.test:80/ (198.18.0.1) 200"),
         "{}",
         a.log()
+    );
+}
+
+#[test]
+fn upstream_truncates_after_headers() {
+    let (reset, when) = tokio::sync::oneshot::channel();
+    let world = World::with_site(Some(ResetSite {
+        download: true,
+        reset: Mutex::new(Some(when)),
+    }));
+    let a = Attach::start(&world, "http_proxy", "truncated", "10.0.0.2");
+    let mut s = a.connect();
+    write!(
+        s,
+        "GET http://203.0.113.20/ HTTP/1.1\r\nHost: 203.0.113.20\r\nProxy-Authorization: {BASIC}\r\n\r\n"
+    )
+    .unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    let head = read_head(&mut s);
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(head.to_lowercase().contains("content-length: 1000\r\n"));
+    let mut prefix = [0; 100];
+    s.read_exact(&mut prefix).unwrap();
+    assert_eq!(prefix, [b'x'; 100]);
+    reset.send(()).unwrap();
+    let mut rest = Vec::new();
+    let error = s
+        .read_to_end(&mut rest)
+        .expect_err("truncated body must reset");
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(rest.is_empty());
+    assert!(a.logged("ended early by the world"), "{}", a.log());
+    let log = a.log();
+    let line = log.lines().find(|l| l.contains("GET http://")).unwrap();
+    // Forwarded counts exclude the HTTP heads in both directions.
+    assert!(line.contains("200, 0 bytes up, 100 down,"), "{line}");
+    assert_eq!(
+        line.matches("ended early by the world").count(),
+        1,
+        "{line}"
+    );
+}
+
+#[test]
+fn upload_fails_after_prefix() {
+    let (reset, when) = tokio::sync::oneshot::channel();
+    let world = World::with_site(Some(ResetSite {
+        download: false,
+        reset: Mutex::new(Some(when)),
+    }));
+    let a = Attach::start(&world, "http_proxy", "upload", "10.0.0.2");
+    let mut s = a.connect();
+    write!(
+        s,
+        "POST http://203.0.113.20/ HTTP/1.1\r\nHost: 203.0.113.20\r\nProxy-Authorization: {BASIC}\r\nContent-Length: 1000000\r\n\r\n"
+    )
+    .unwrap();
+    assert!(read_head(&mut s).starts_with("HTTP/1.1 100 Continue\r\n"));
+    s.write_all(&[b'x'; 1000]).unwrap();
+    reset.send(()).unwrap();
+    // Keep the upload open. Its count must survive the proxy dropping it.
+    let mut response = Vec::new();
+    s.read_to_end(&mut response).expect("complete proxy error");
+    assert_eq!(io::response(&response, "POST", false).head.status, 502);
+    // The log can follow the 502 by the documented five-second upload grace.
+    assert!(
+        a.logged_within(
+            "ended early by the world",
+            Instant::now() + Duration::from_secs(10)
+        ),
+        "{}",
+        a.log()
+    );
+    let log = a.log();
+    let line = log.lines().find(|l| l.contains("POST http://")).unwrap();
+    assert!(line.contains("502, 1000 bytes up, 0 down,"), "{line}");
+    assert!(!line.contains("200,"), "{line}");
+    assert!(line.contains("no answer from the site"), "{line}");
+    assert_eq!(
+        line.matches("ended early by the world").count(),
+        1,
+        "{line}"
     );
 }
 

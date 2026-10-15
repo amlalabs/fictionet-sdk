@@ -2,6 +2,7 @@
 //! connection. What it reads and answers is in
 //! [`fictionet::relay::proxy::http`].
 
+use std::io;
 use std::time::{Duration, Instant};
 
 use fictionet::relay::proxy::auth::Token;
@@ -205,7 +206,7 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
 
 /// Sends a plain-HTTP request on and passes the answer back.
 async fn forward(
-    client: TcpStream,
+    mut client: TcpStream,
     world: Compat<TcpConnection>,
     req: &Request,
     body_start: Vec<u8>,
@@ -213,86 +214,381 @@ async fn forward(
     addr: std::net::Ipv4Addr,
     started: Instant,
 ) {
-    let (mut cr, mut cw) = client.into_split();
+    use pump::Side::{Client, World};
+
+    let (mut cr, mut cw) = client.split();
     let (mut wr, mut ww) = tokio::io::split(world);
-    let mut head = forward_head(req);
-    head.extend_from_slice(&body_start);
-    if ww.write_all(&head).await.is_err() {
-        log(&format!(
-            "{what} ({addr}) 502, the site closed the connection"
-        ));
-        return answer(&mut cw, 502, "the site closed the connection").await;
-    }
+    let mut moved = pump::Moved::default();
+    let failures = Failures::default();
     let up = async {
-        let n = tokio::io::copy(&mut cr, &mut ww).await;
-        let _ = ww.shutdown().await;
-        n
+        let copied = async {
+            ww.write_all(&forward_head(req))
+                .await
+                .map_err(|e| (World, e))?;
+            pump::write_counting(&mut ww, &body_start, &mut moved.up)
+                .await
+                .map_err(|e| (World, e))?;
+            pump::copy_counting(&mut cr, &mut ww, &mut moved.up, Client).await
+        }
+        .await;
+        if let Err((side, e)) = copied {
+            failures.record(side, e);
+            // A failed upload must still tell the site there are no more bytes.
+            if let Err(e) = ww.shutdown().await {
+                failures.record(World, e);
+            }
+        }
     };
     let down = async {
+        let response = forward_response(&mut wr, &mut cw, &mut moved.down, &failures).await;
+        (response, started.elapsed())
+    };
+    let (_, (response, took)) =
+        pump::until_down_ends(up, down, |(response, _)| !response.reset).await;
+    let mut end = failures.suffix();
+    if response.reset
+        && let Err(e) = client.set_zero_linger()
+    {
+        end.push_str(&format!(", could not reset the client: {e}"));
+    }
+    log(&format!(
+        "{what} ({addr}) {}, {} bytes up, {} down, {:.3} s{}{end}",
+        response.status(),
+        moved.up,
+        moved.down,
+        took.as_secs_f64(),
+        if response.no_answer {
+            ", no answer from the site"
+        } else {
+            ""
+        },
+    ));
+}
+
+/// The first reportable failure on each side, recorded before another await
+/// can fail or the upload grace can cancel a pending shutdown.
+#[derive(Default)]
+struct Failures(std::sync::Mutex<[Option<String>; 2]>);
+
+impl Failures {
+    fn record(&self, side: pump::Side, e: io::Error) {
+        if let Some(why) = side.why(e) {
+            let i = match side {
+                pump::Side::World => 0,
+                pump::Side::Client => 1,
+            };
+            self.0.lock().unwrap()[i].get_or_insert(why);
+        }
+    }
+
+    fn suffix(self) -> String {
+        let mut end = String::new();
+        for why in self.0.into_inner().unwrap().into_iter().flatten() {
+            end.push_str(&format!(", ended early by {why}"));
+        }
+        end
+    }
+}
+
+#[derive(Default)]
+struct Response {
+    status: Option<u16>,
+    no_answer: bool,
+    reset: bool,
+}
+
+impl Response {
+    fn status(&self) -> String {
+        self.status
+            .map_or_else(|| "no final response".to_string(), |code| code.to_string())
+    }
+}
+
+/// Sends the site's response, or a proxy error before the upload grace starts.
+async fn forward_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    wr: &mut R,
+    cw: &mut W,
+    count: &mut u64,
+    failures: &Failures,
+) -> Response {
+    use pump::Side::{Client, World};
+
+    let mut response = Response::default();
+    let copied = async {
         let mut rbuf = Vec::new();
-        let status;
         loop {
-            let found = read_head(&mut wr, &mut rbuf, rewrite_response, || {
+            let found = read_head(wr, &mut rbuf, rewrite_response, || {
                 "the answer's head is longer than 64 KiB".to_string()
             })
-            .await;
+            .await
+            .map_err(|e| (World, e))?;
             let Answer {
                 head: out,
                 status: code,
                 interim,
                 len,
-            } = match found {
-                Ok(Ok(Some(f))) => f,
-                Ok(Ok(None)) => {
-                    answer(
-                        &mut cw,
-                        502,
-                        "the site closed the connection without an answer",
+            } = found
+                .map_err(|why| (World, io::Error::new(io::ErrorKind::InvalidData, why)))?
+                .ok_or_else(|| {
+                    (
+                        World,
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "the site closed the connection without an answer",
+                        ),
                     )
-                    .await;
-                    return Err(502);
-                }
-                Ok(Err(why)) => {
-                    answer(&mut cw, 502, &why).await;
-                    return Err(502);
-                }
-                Err(e) => {
-                    answer(&mut cw, 502, &format!("reading the site's answer: {e}")).await;
-                    return Err(502);
-                }
-            };
-            if cw.write_all(&out).await.is_err() {
-                return Err(0);
+                })?;
+            if !interim {
+                response.status = Some(code);
             }
+            cw.write_all(&out).await.map_err(|e| (Client, e))?;
             rbuf.drain(..len);
             if !interim {
-                status = code;
                 break;
             }
         }
-        if cw.write_all(&rbuf).await.is_err() {
-            return Err(status);
-        }
-        let n = tokio::io::copy(&mut wr, &mut cw).await.unwrap_or(0) + rbuf.len() as u64;
-        let _ = cw.shutdown().await;
-        Ok((status, n, started.elapsed()))
-    };
-    let (up, down) = pump::until_down_ends(up, down).await;
-    let up = up.and_then(|r| r.ok()).unwrap_or(0) + body_start.len() as u64;
-    match down {
-        Ok((status, n, took)) => log(&format!(
-            "{what} ({addr}) {status}, {up} bytes up, {n} down, {:.3} s",
-            took.as_secs_f64()
-        )),
-        Err(status) => log(&format!(
-            "{what} ({addr}) {status}, no answer from the site"
-        )),
+        pump::write_counting(cw, &rbuf, count)
+            .await
+            .map_err(|e| (Client, e))?;
+        pump::copy_counting(wr, cw, count, World).await
     }
+    .await;
+    if let Err((side, e)) = copied {
+        let why = e.to_string();
+        failures.record(side, e);
+        if matches!(side, World) && response.status.is_none() {
+            // No final head reached the client, so a proxy error can still
+            // be sent. Its bytes are not part of the site's body count.
+            response.status = Some(502);
+            response.no_answer = true;
+            let sent = async {
+                cw.write_all(&error_response(502, &why)).await?;
+                cw.shutdown().await
+            }
+            .await;
+            if let Err(e) = sent {
+                failures.record(Client, e);
+            }
+        } else if matches!(side, World) {
+            response.reset = true;
+        }
+    }
+    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::{Future, pending, poll_fn};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct Writer {
+        bytes: Vec<u8>,
+        write_error: Option<io::ErrorKind>,
+        shutdown_error: Option<io::ErrorKind>,
+        shut: bool,
+    }
+
+    impl AsyncWrite for Writer {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(kind) = self.write_error {
+                return Poll::Ready(Err(kind.into()));
+            }
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shut = true;
+            Poll::Ready(self.shutdown_error.map_or(Ok(()), |kind| Err(kind.into())))
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_error_is_sent_before_upload_grace() {
+        let mut site = &b""[..];
+        let mut client = Writer::default();
+        let mut count = 0;
+        let failures = Failures::default();
+        let mut response = None;
+        {
+            let down = async {
+                response =
+                    Some(forward_response(&mut site, &mut client, &mut count, &failures).await);
+                response.as_ref().unwrap().reset
+            };
+            let mut transfer =
+                std::pin::pin!(pump::until_down_ends(pending::<()>(), down, |reset| !reset));
+            // One poll sends the error and reaches the still-pending upload
+            // grace. No clock advance or elapsed-time assertion is needed.
+            poll_fn(|cx| {
+                assert!(transfer.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        let response = response.expect("download must finish before the upload grace");
+        assert_eq!(response.status(), "502");
+        assert!(response.no_answer);
+        assert!(!response.reset);
+        assert_eq!(
+            client.bytes,
+            error_response(502, "the site closed the connection without an answer")
+        );
+        assert!(client.shut);
+        assert_eq!(count, 0);
+        assert!(failures.suffix().contains("ended early by the world"));
+    }
+
+    #[tokio::test]
+    async fn only_failed_body_skips_upload_grace() {
+        struct End {
+            reset: bool,
+        }
+
+        impl AsyncRead for End {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(if self.reset {
+                    Err(io::ErrorKind::ConnectionReset.into())
+                } else {
+                    Ok(())
+                })
+            }
+        }
+
+        for reset in [false, true] {
+            let head = b"HTTP/1.1 200 OK\r\n\r\nbody";
+            let mut site = head.as_slice().chain(End { reset });
+            let mut client = Writer::default();
+            let mut uploaded = Vec::new();
+            let mut moved = pump::Moved::default();
+            let failures = Failures::default();
+            let mut response = None;
+            {
+                let up = async {
+                    pump::write_counting(&mut uploaded, b"prefix", &mut moved.up)
+                        .await
+                        .unwrap();
+                    pending::<()>().await;
+                };
+                let down = async {
+                    response = Some(
+                        forward_response(&mut site, &mut client, &mut moved.down, &failures).await,
+                    );
+                    response.as_ref().unwrap().reset
+                };
+                let mut transfer = std::pin::pin!(pump::until_down_ends(up, down, |reset| !reset));
+                // A failed body must finish in this poll; a complete response
+                // must still wait for the pending upload. No clock is advanced.
+                poll_fn(|cx| {
+                    let result = transfer.as_mut().poll(cx);
+                    assert_eq!(result.is_ready(), reset);
+                    if let Poll::Ready((up, _)) = result {
+                        assert!(up.is_none());
+                    }
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            let response = response.expect("download must finish in the first poll");
+            assert_eq!(response.status(), "200");
+            assert!(!response.no_answer);
+            assert_eq!(response.reset, reset);
+            assert!(client.bytes.ends_with(b"\r\n\r\nbody"));
+            assert_eq!(client.shut, !reset);
+            assert_eq!(uploaded, b"prefix");
+            assert_eq!(moved.up, 6);
+            assert_eq!(moved.down, 4);
+            assert_eq!(
+                failures.suffix().contains("ended early by the world"),
+                reset
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_interim_head_does_not_claim_a_proxy_error() {
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            let mut site = &b"HTTP/1.1 100 Continue\r\n\r\n"[..];
+            let mut client = Writer {
+                write_error: Some(kind),
+                ..Writer::default()
+            };
+            let mut count = 0;
+            let failures = Failures::default();
+            let response = forward_response(&mut site, &mut client, &mut count, &failures).await;
+            assert_eq!(response.status(), "no final response");
+            assert!(!response.no_answer);
+            assert!(!response.reset);
+            assert!(client.bytes.is_empty());
+            assert!(!client.shut);
+            assert_eq!(count, 0);
+            let end = failures.suffix();
+            if kind == io::ErrorKind::Other {
+                assert!(end.contains("ended early by the client"), "{end}");
+            } else {
+                assert!(end.is_empty(), "{end}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_error_write_and_shutdown_failures_are_reported() {
+        for writing in [true, false] {
+            let mut site = &b""[..];
+            let mut client = Writer {
+                write_error: writing.then_some(io::ErrorKind::Other),
+                shutdown_error: (!writing).then_some(io::ErrorKind::Other),
+                ..Writer::default()
+            };
+            let mut count = 0;
+            let failures = Failures::default();
+            let response = forward_response(&mut site, &mut client, &mut count, &failures).await;
+            assert_eq!(response.status(), "502");
+            assert!(response.no_answer);
+            assert_eq!(client.shut, !writing);
+            assert_eq!(count, 0);
+            let end = failures.suffix();
+            assert_eq!(end.matches("ended early by the world").count(), 1, "{end}");
+            assert_eq!(end.matches("ended early by the client").count(), 1, "{end}");
+        }
+    }
+
+    #[test]
+    fn failures_keep_the_first_per_side_and_report_world_first() {
+        use pump::Side::{Client, World};
+
+        let failures = Failures::default();
+        failures.record(Client, io::ErrorKind::ConnectionReset.into());
+        failures.record(Client, io::ErrorKind::BrokenPipe.into());
+        failures.record(Client, io::Error::other("client copy"));
+        failures.record(World, io::Error::other("upload copy"));
+        failures.record(World, io::Error::other("upload shutdown"));
+        failures.record(World, io::Error::other("download copy"));
+        failures.record(Client, io::Error::other("client shutdown"));
+        assert_eq!(
+            failures.suffix(),
+            ", ended early by the world: upload copy, ended early by the client: client copy"
+        );
+    }
 
     /// Runs `read_head` with `parse_request` on `input`, which arrives in
     /// two parts: no read returns bytes of both. Returns the head's length

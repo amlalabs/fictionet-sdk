@@ -511,6 +511,19 @@ answers and rejects cycles or longer chains. The cache keeps the address
 for the shortest TTL among those aliases and the A record, at most 60
 seconds. A zero TTL expires immediately.
 
+For forwarded HTTP requests, attach logs body bytes written in each direction,
+including partial transfers. HTTP heads are excluded. Upload counts survive
+the five-second wait after the response ends. Transfer and shutdown failures
+add `ended early by the world` or `the client` with the reason. Only the first
+error per side is reported, world first; a client reset or broken pipe is an
+ordinary end. If writing an interim head to the client fails, the status is
+`no final response`. A site failure before a final head sends a 502 at once,
+with `no answer from the site` in the log. The duration ends when the response
+finishes or fails; logging waits for the upload to finish or its five-second
+grace to end. If the site's body fails after its final head, attach instead
+stops the upload and resets the client connection at once. It does not parse
+body framing, so a clean FIN short of Content-Length is not detected.
+
 Other kinds of port:
 
 - `tcp_with(port, world, make, opts)`: the same, with `ServeOptions` for
