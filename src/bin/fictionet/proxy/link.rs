@@ -24,10 +24,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use fictionet::relay::{self, Message, unix};
+use fictionet::relay::{self, unix};
 use fictionet::{Cx, Interface, Packet, RecvError};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
+
+use crate::world;
 
 /// Packets waiting for room in the socket may take this many bytes, each
 /// counting its length plus 64, as the world's own queue does. Past it,
@@ -214,20 +216,10 @@ impl Interface for Link {
                     shared.close(None);
                     return Poll::Ready(Err(RecvError::Closed));
                 }
-                Ok(n) if n > relay::MAX_MESSAGE => {
-                    shared.close(Some(
-                        "the world sent a message longer than 65,536 bytes".into(),
-                    ));
-                    return Poll::Ready(Err(RecvError::Closed));
-                }
-                Ok(n) => match relay::decode(&self.buf[..n]) {
-                    Ok(Message::Packet(p)) => return Poll::Ready(Ok(Packet(p.to_vec()))),
-                    Ok(other) => {
-                        shared.close(Some(format!("the world sent {other:?} after accept")));
-                        return Poll::Ready(Err(RecvError::Closed));
-                    }
-                    Err(e) => {
-                        shared.close(Some(format!("the world sent a bad message: {e}")));
+                Ok(n) => match world::world_packet(&self.buf[..n]) {
+                    Ok(p) => return Poll::Ready(Ok(Packet(p.to_vec()))),
+                    Err(why) => {
+                        shared.close(Some(why));
                         return Poll::Ready(Err(RecvError::Closed));
                     }
                 },
@@ -248,5 +240,108 @@ impl Interface for Link {
 
     fn send(&mut self, packet: Packet) {
         self.shared.send(packet);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::relay::{Hello, Message};
+    use std::os::fd::FromRawFd;
+
+    fn pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        // SAFETY: fds has space for both descriptors, owned from here.
+        unsafe {
+            assert_eq!(
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()),
+                0
+            );
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_phase_validation_matches_the_device_driver() {
+        let mut cases = vec![
+            (Message::Packet(&[]).encode(), None),
+            (Message::Packet(&[1, 2, 3]).encode(), None),
+            (vec![relay::PACKET; relay::MAX_MESSAGE], None),
+            (
+                vec![relay::PACKET; relay::MAX_MESSAGE + 1],
+                Some("the world sent a message longer than 65,536 bytes".to_owned()),
+            ),
+            (
+                vec![99, 1, 2, 3],
+                Some("the world sent a bad message: unknown message kind 99; closing".to_owned()),
+            ),
+            (
+                vec![relay::ACCEPT, 1],
+                Some("the world sent a bad message: malformed message body; closing".to_owned()),
+            ),
+        ];
+        for message in [
+            Message::Auth(b"token"),
+            Message::Hello(Hello {
+                version: relay::VERSION,
+                mtu: 1500,
+                kind: "tun".into(),
+                name: "test".into(),
+            }),
+            Message::Accept,
+            Message::Refuse("no".into()),
+            Message::Request { id: 1, body: b"{}" },
+            Message::Reply {
+                id: 1,
+                flags: relay::END,
+                body: b"{}",
+            },
+        ] {
+            cases.push((
+                message.encode(),
+                Some(format!("the world sent {message:?} after accept; closing")),
+            ));
+        }
+        fictionet::run(fictionet::Seed::from_u64(0), |fcx| async move {
+            for (message, expected_error) in cases {
+                let (sock, peer) = pair();
+                unix::raise_buffers(peer.as_raw_fd());
+                unix::set_nonblocking(sock.as_raw_fd(), true).unwrap();
+                unix::send(peer.as_raw_fd(), &message, false).unwrap();
+                let mut buf = vec![0; relay::MAX_MESSAGE + 1];
+                let mut received = None;
+                let result = world::read_packets(sock.as_raw_fd(), &mut buf, Some(1), |p| {
+                    received = Some(p.to_vec());
+                    Ok(())
+                });
+                let error = match result {
+                    Ok(true) => None,
+                    Err(world::Failure::Error(why)) => Some(why),
+                    _ => panic!("packet-phase validation must not report EOF or refusal"),
+                };
+                assert_eq!(error, expected_error);
+                if error.is_none() {
+                    assert_eq!(received.as_deref(), Some(&message[1..]));
+                } else {
+                    assert!(received.is_none());
+                }
+
+                unix::send(peer.as_raw_fd(), &message, false).unwrap();
+                let mut link = Link::new(sock).unwrap();
+                let result = std::future::poll_fn(|cx| link.poll_recv(&fcx, cx)).await;
+                match result {
+                    Ok(packet) => assert_eq!(Some(packet.0), received),
+                    Err(e) => {
+                        assert_eq!(e, RecvError::Closed);
+                        assert!(expected_error.is_some());
+                    }
+                }
+                assert_eq!(link.shared.error(), expected_error);
+                link.shared.close(None);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

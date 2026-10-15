@@ -249,7 +249,7 @@ pub(crate) fn read_packets(
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(false),
             Err(e) => return Err(Failure::Error(format!("reading from the world: {e}"))),
         };
-        packet(world_packet(&buf[..n])?)?;
+        packet(world_packet(&buf[..n]).map_err(Failure::Error)?)?;
     }
     Ok(true)
 }
@@ -257,20 +257,14 @@ pub(crate) fn read_packets(
 /// Reads one message from the world. After `accept`, the relay protocol
 /// allows only `packet`: anything else, a message the protocol cannot
 /// decode, or one longer than its limit ends attach with an error.
-fn world_packet(msg: &[u8]) -> Result<&[u8], Failure> {
+pub(crate) fn world_packet(msg: &[u8]) -> Result<&[u8], String> {
     if msg.len() > relay::MAX_MESSAGE {
-        return Err(Failure::Error(
-            "the world sent a message longer than 65,536 bytes".into(),
-        ));
+        return Err("the world sent a message longer than 65,536 bytes".into());
     }
     match relay::decode(msg) {
         Ok(Message::Packet(p)) => Ok(p),
-        Ok(other) => Err(Failure::Error(format!(
-            "the world sent {other:?} after accept; closing"
-        ))),
-        Err(e) => Err(Failure::Error(format!(
-            "the world sent a bad message: {e}; closing"
-        ))),
+        Ok(other) => Err(format!("the world sent {other:?} after accept; closing")),
+        Err(e) => Err(format!("the world sent a bad message: {e}; closing")),
     }
 }
 
