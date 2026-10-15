@@ -214,7 +214,8 @@ macro_rules! protocols {
         pub mod nbns;
         #[path = "../../src/stdlib/nbss.rs"]
         pub mod nbss;
-        // Net includes net/addresses.rs and net/hosts.rs; keep those relative paths.
+        // Net includes net/addresses.rs, net/hosts.rs and net/attachments.rs.
+        // Keep those relative paths.
         #[path = "../../src/stdlib/net.rs"]
         pub mod net;
         #[path = "../../src/stdlib/nfs.rs"]
