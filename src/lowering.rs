@@ -127,7 +127,7 @@
 //! - **`--vm qemu:<path>`.** QEMU's `-netdev stream` backend writes the
 //!   card's frames to a Unix stream socket. Attach first takes an exclusive
 //!   `flock` on `<path>.lock` (`lock_path`), so one attach at a time owns
-//!   the path, then listens on the socket (`listen` in `tap.rs`, mode
+//!   the path, then listens on the socket (`listen` in `tap/qemu.rs`, mode
 //!   0600) and accepts one connection. A stream
 //!   has no message boundaries, so QEMU puts a 4-byte big-endian length in
 //!   front of each frame. `Decoder` splits the stream back into frames,
