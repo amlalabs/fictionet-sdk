@@ -113,11 +113,7 @@ where
                 stream.decoder().select(Method::UsernamePassword);
             }
             ClientMessage::Auth(login) => {
-                // The token may be the password, or the username with no
-                // password. Both are checked, so the time taken does not
-                // say which one matched.
-                let ok = token.matches(&login.password)
-                    | (login.password.is_empty() & token.matches(&login.username));
+                let ok = token.check_credentials(&login.username, &login.password);
                 stream.decoder().verified(ok);
                 if !ok {
                     let _ = s.write_all(&write(&AuthReply { status: 1 })).await;
@@ -275,6 +271,48 @@ mod tests {
         ]
         .concat());
         assert_eq!(target(r), Ok((Host::Name("a.test".into()), 1)));
+    }
+
+    #[test]
+    fn http_and_socks_credentials_agree() {
+        for (user, password, accepted) in [
+            (b"relay".as_slice(), b"tok".as_slice(), true),
+            (b"", b"tok", true),
+            (b"\xff\0", b"tok", true),
+            (b"tok", b"tok", true),
+            (b"tok", b"", true),
+            (b"tok", b"wrong", false),
+            (b"relay", b"wrong", false),
+            (b"relay", b"", false),
+            (b"", b"", false),
+            (b" tok", b"", false),
+            (b"relay", b"tok ", false),
+            (b"relay", b"tok\0", false),
+            (b"relay", b"tok:extra", false),
+        ] {
+            let credentials = [user, b":", password].concat();
+            let encoded = crate::stdlib::codec::base64::encode(&credentials);
+            for code in [encoded.as_str(), encoded.trim_end_matches('=')] {
+                assert_eq!(
+                    token().check_header(format!("Basic {code}").as_bytes()),
+                    accepted,
+                    "HTTP: {user:?}, {password:?}"
+                );
+            }
+            let (r, out) = run([
+                &[5, 1, 2][..],
+                &login(user, password),
+                &connect_by_name("a.test", 80),
+            ]
+            .concat());
+            if accepted {
+                assert_eq!(target(r), Ok((Host::Name("a.test".into()), 80)));
+                assert_eq!(out, [5, 2, 1, 0]);
+            } else {
+                assert_eq!(r, Err(Refusal::BadToken));
+                assert_eq!(out, [5, 2, 1, 1]);
+            }
+        }
     }
 
     #[test]

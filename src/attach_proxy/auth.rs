@@ -7,6 +7,8 @@
 //! username/password method. The username is not checked: it may be
 //! anything, such as `relay` or the sandbox's name.
 
+use crate::stdlib::codec::base64::{self, Padding};
+
 /// The longest token: SOCKS5 carries a password in at most 255 bytes.
 pub const MAX_TOKEN: usize = 255;
 
@@ -60,6 +62,17 @@ impl Token {
             == 0
     }
 
+    /// Checks a username/password pair. Accepts the token as the password
+    /// with any username, or as the username with an empty password.
+    /// Both token comparisons are evaluated for every pair.
+    pub fn check_credentials(&self, user: &[u8], password: &[u8]) -> bool {
+        // Both are checked whatever the first gives, so the time taken
+        // does not say which one matched.
+        let by_password = self.matches(password);
+        let by_user = password.is_empty() & self.matches(user);
+        by_password | by_user
+    }
+
     /// Checks a `Proxy-Authorization` value: `Basic` with the token as the
     /// password (or as the username with an empty password, for clients
     /// that put only one value in the URL), or `Bearer <token>`.
@@ -77,11 +90,7 @@ impl Token {
                 return false;
             };
             let (user, password) = (&decoded[..colon], &decoded[colon + 1..]);
-            // Both are checked whatever the first gives, so the time taken
-            // does not say which one matched.
-            let by_password = self.matches(password);
-            let by_user = password.is_empty() & self.matches(user);
-            by_password | by_user
+            self.check_credentials(user, password)
         } else if scheme.eq_ignore_ascii_case(b"bearer") {
             self.matches(rest)
         } else {
@@ -93,39 +102,7 @@ impl Token {
 /// Decodes standard base64 (RFC 4648, with `+` and `/`), with or without
 /// `=` padding. `None` if `text` is not base64.
 pub fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
-    fn value(c: u8) -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        } as u32)
-    }
-    let body = match text.iter().position(|&b| b == b'=') {
-        Some(i) => {
-            let pad = &text[i..];
-            if pad.len() > 2 || pad.iter().any(|&b| b != b'=') || !text.len().is_multiple_of(4) {
-                return None;
-            }
-            &text[..i]
-        }
-        None => text,
-    };
-    if body.len() % 4 == 1 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(body.len() * 3 / 4);
-    for chunk in body.chunks(4) {
-        let mut n = 0u32;
-        for (i, &c) in chunk.iter().enumerate() {
-            n |= value(c)? << (18 - 6 * i);
-        }
-        let bytes = n.to_be_bytes();
-        out.extend_from_slice(&bytes[1..chunk.len()]);
-    }
-    Some(out)
+    base64::decode(text, Padding::Optional)
 }
 
 #[cfg(test)]
@@ -146,7 +123,31 @@ mod tests {
         assert_eq!(base64_decode(b"Zm9vYmFy").unwrap(), b"foobar");
         assert_eq!(base64_decode(b"Zm9vYg==").unwrap(), b"foob");
         assert_eq!(base64_decode(b"+/+/").unwrap(), [0xfb, 0xff, 0xbf]);
-        for bad in [&b"Z"[..], b"Zm9v=", b"Zg===", b"Z=g=", b"Zm9v!", b"Zm 9v"] {
+        // Optional padding also accepts nonzero unused bits.
+        for code in [b"Zh==".as_slice(), b"Zh"] {
+            assert_eq!(base64_decode(code).unwrap(), b"f");
+        }
+        for code in [b"Zm9=".as_slice(), b"Zm9", b"Zm8"] {
+            assert_eq!(base64_decode(code).unwrap(), b"fo");
+        }
+        for bad in [
+            &b"Z"[..],
+            b"Zm9v=",
+            b"Zg===",
+            b"Z=g=",
+            b"Zm9v!",
+            b"Zm 9v",
+            b"=",
+            b"==",
+            b"====",
+            b"Zg=",
+            b"Zg==Zg==",
+            b" Zg==",
+            b"Zg==\n",
+            b"Z_==",
+            b"Z-==",
+            b"\xffAAA",
+        ] {
             assert_eq!(
                 base64_decode(bad),
                 None,
