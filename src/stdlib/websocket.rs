@@ -1515,8 +1515,9 @@ fn sha1_block(h: &mut [u32; 5], block: &[u8]) {
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
+    use super::*;
     use fictionet::stdlib::codec::Decode;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{contract, decode_all};
 
     /// Checks decoding with at most twice the decoder capacity allocated.
     pub fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
@@ -1527,11 +1528,146 @@ pub mod harness {
         let limit = make().capacity().checked_mul(2).unwrap();
         contract::check_decode_with_alloc_limit(make, bytes, limit);
     }
+
+    fn check_clone(mut decoder: Messages, data: &[u8]) {
+        let middle = data.len() / 2;
+        let mut at = 0;
+        loop {
+            match decoder.decode(&data[at..middle], false) {
+                Ok(Step::Item(_, used) | Step::Skip(used)) => at += used,
+                Ok(Step::Need | Step::End) => break,
+                Err(_) => return,
+            }
+        }
+        let mut cloned = decoder.clone();
+        loop {
+            let step = decoder.decode(&data[at..], true);
+            assert_eq!(cloned.decode(&data[at..], true), step);
+            assert_eq!(cloned.held(), decoder.held());
+            match step {
+                Ok(Step::Item(_, used) | Step::Skip(used)) => at += used,
+                _ => break,
+            }
+        }
+    }
+
+    /// Checks frame and close wire contracts, header lengths, and message
+    /// round trips. For both receivers, checks allocation and held limits,
+    /// mid-decode clones, and single-frame and fragmented message round trips
+    /// with `limit`. Also checks frame rewriting at the default limit.
+    ///
+    /// Called by `random_buffers_never_panic` with random bytes and generated
+    /// and mutated messages at default and small limits, and by
+    /// `fuzz/fuzz_targets/websocket.rs` with fuzzer bytes and byte-derived
+    /// limits. `fragment` must be nonzero. Each caller owns its input
+    /// generator. Handshake checks remain in `random_headers_never_panic` and
+    /// the fuzz target.
+    pub fn check_buffer(data: &[u8], limit: usize, fragment: usize) {
+        contract::check_wire::<Frame>(data);
+        contract::check_wire::<Close>(data);
+        if let Ok(close) = Close::parse(data) {
+            assert_eq!(close.to_bytes().unwrap(), data);
+        }
+        for receiver in [Side::Server, Side::Client] {
+            let frames = || Frames::for_receiver(receiver).with_limit(limit);
+            let messages = || Messages::for_receiver(receiver).with_limit(limit);
+            bounded(frames, data);
+            bounded(messages, data);
+            contract::check_decode_with_held_limit(messages, data, limit);
+            check_clone(messages(), data);
+            let mask = if receiver == Side::Server {
+                Some([1, 2, 3, 4])
+            } else {
+                None
+            };
+            for message in decode_all(messages, data).0 {
+                let frame = message.to_frame(mask).unwrap();
+                contract::check_wire_value(&frame);
+                assert_eq!(
+                    decode_all(messages, &frame.to_bytes().unwrap()),
+                    (vec![message.clone()], None)
+                );
+                let frames = match receiver {
+                    Side::Server => {
+                        let mut key = 0u8;
+                        message.to_masked_frames(fragment, || {
+                            key = key.wrapping_add(1);
+                            [key; 4]
+                        })
+                    }
+                    Side::Client => message.to_frames(fragment, None),
+                }
+                .unwrap();
+                let mut bytes = Vec::new();
+                for frame in frames {
+                    frame.write(&mut bytes).unwrap();
+                }
+                assert_eq!(decode_all(messages, &bytes), (vec![message], None));
+            }
+            let mut written = Vec::new();
+            for frame in decode_all(|| Frames::for_receiver(receiver), data).0 {
+                contract::check_wire_value(&frame);
+                frame.write(&mut written).unwrap();
+            }
+            assert!(data.starts_with(&written));
+        }
+        let payload: Vec<_> = data.iter().take(4096).copied().collect();
+        for opcode in [
+            Opcode::Text,
+            Opcode::Binary,
+            Opcode::Continuation,
+            Opcode::Close,
+            Opcode::Ping,
+            Opcode::Pong,
+        ] {
+            contract::check_wire_value(&Frame {
+                fin: data.first().is_some_and(|b| b & 1 != 0),
+                opcode,
+                mask: data
+                    .first()
+                    .is_some_and(|b| b & 2 != 0)
+                    .then_some([1, 2, 3, 4]),
+                payload: payload.clone(),
+            });
+        }
+        let code = u16::from_be_bytes([
+            data.first().copied().unwrap_or(0),
+            data.get(1).copied().unwrap_or(0),
+        ]);
+        let reason = String::from_utf8_lossy(&payload).into_owned();
+        let close = Close {
+            code,
+            reason: reason.clone(),
+        };
+        contract::check_wire_value(&close);
+        for message in [
+            Message::Ping(payload.clone()),
+            Message::Pong(payload.clone()),
+            Message::Binary(payload),
+            Message::Text(reason),
+            Message::Close(Some(close)),
+            Message::Close(None),
+        ] {
+            if let Ok(frame) = message.to_frame(Some([7; 4])) {
+                contract::check_wire_value(&frame);
+                assert_eq!(
+                    decode_all(
+                        || Messages::for_receiver(Side::Server),
+                        &frame.to_bytes().unwrap()
+                    ),
+                    (vec![message], None)
+                );
+            }
+        }
+        if let Ok(Some(header)) = Header::parse(data) {
+            assert!(header.header_len <= header.frame_len());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::harness::bounded;
+    use super::harness::check_buffer;
     use super::*;
     use fictionet::stdlib::codec::{AssembleError, Decode, Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
@@ -2506,43 +2642,6 @@ mod tests {
         }
     }
 
-    /// What the fuzz target checks, for one buffer.
-    fn check_buffer(data: &[u8]) {
-        for receiver in [Side::Server, Side::Client] {
-            bounded(|| Frames::for_receiver(receiver), data);
-            bounded(|| Messages::for_receiver(receiver), data);
-            contract::check_decode_with_held_limit(
-                || Messages::for_receiver(receiver),
-                data,
-                MAX_MESSAGE,
-            );
-            let mask = if receiver == Side::Server {
-                Some([5, 6, 7, 8])
-            } else {
-                None
-            };
-            for message in decode(receiver, data).0 {
-                let frame = message.to_frame(mask).unwrap();
-                assert_eq!(
-                    decode(receiver, &frame.to_bytes().unwrap()),
-                    (vec![message], None)
-                );
-            }
-            let mut written = Vec::new();
-            for frame in decode_all(|| Frames::for_receiver(receiver), data).0 {
-                contract::check_wire_value(&frame);
-                frame.write(&mut written).unwrap();
-            }
-            assert!(data.starts_with(&written));
-        }
-        contract::check_wire::<Frame>(data);
-        contract::check_wire::<Close>(data);
-        if let Ok(close) = Close::parse(data) {
-            assert_eq!(close.to_bytes().unwrap(), data);
-        }
-        let _ = Header::parse(data);
-    }
-
     #[test]
     fn random_buffers_never_panic() {
         let mut rng = Lcg::new(0x5eed_1234);
@@ -2577,7 +2676,8 @@ mod tests {
                 }
                 data
             };
-            check_buffer(&data);
+            check_buffer(&data, MAX_MESSAGE, 1 + rng.index(40));
+            check_buffer(&data, 1 + rng.index(255), 1 + rng.index(40));
         }
     }
 

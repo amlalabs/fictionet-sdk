@@ -1,45 +1,12 @@
 //! WebSocket frames, messages, close payloads, and handshake fields.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
-use fictionet::stdlib::test_support::contract;
-
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::websocket::harness::bounded;
 use fictionet::stdlib::websocket::{
-    Close, Error, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode,
-    check_request, check_response, request_headers,
+    Error, MAX_HEADERS, MAX_MESSAGE, check_request, check_response, harness, request_headers,
 };
 use libfuzzer_sys::fuzz_target;
 
-fn check_clone(mut decoder: Messages, data: &[u8]) {
-    let middle = data.len() / 2;
-    let mut at = 0;
-    loop {
-        match decoder.decode(&data[at..middle], false) {
-            Ok(Step::Item(_, used) | Step::Skip(used)) => at += used,
-            Ok(Step::Need | Step::End) => break,
-            Err(_) => return,
-        }
-    }
-    let mut cloned = decoder.clone();
-    loop {
-        let step = decoder.decode(&data[at..], true);
-        assert_eq!(cloned.decode(&data[at..], true), step);
-        assert_eq!(cloned.held(), decoder.held());
-        match step {
-            Ok(Step::Item(_, used) | Step::Skip(used)) => at += used,
-            _ => break,
-        }
-    }
-}
-
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Frame>(data);
-    contract::check_wire::<Close>(data);
-    if let Ok(close) = Close::parse(data) {
-        assert_eq!(close.to_bytes().unwrap(), data);
-    }
     let limit = data.first().map_or(MAX_MESSAGE, |&b| {
         if b & 1 == 0 {
             MAX_MESSAGE
@@ -47,104 +14,8 @@ fuzz_target!(|data: &[u8]| {
             usize::from(b)
         }
     });
-    for receiver in [
-        fictionet::stdlib::codec::Side::Server,
-        fictionet::stdlib::codec::Side::Client,
-    ] {
-        let frames = || Frames::for_receiver(receiver).with_limit(limit);
-        let messages = || Messages::for_receiver(receiver).with_limit(limit);
-        bounded(frames, data);
-        bounded(messages, data);
-        contract::check_decode_with_held_limit(messages, data, limit);
-        check_clone(messages(), data);
-        let mask = if receiver == fictionet::stdlib::codec::Side::Server {
-            Some([1, 2, 3, 4])
-        } else {
-            None
-        };
-        for message in decode_all(messages, data).0 {
-            let frame = message.to_frame(mask).unwrap();
-            contract::check_wire_value(&frame);
-            assert_eq!(
-                decode_all(messages, &frame.to_bytes().unwrap()),
-                (vec![message.clone()], None)
-            );
-            let size = data.first().map_or(1, |&b| usize::from(b).max(1));
-            let frames = match receiver {
-                fictionet::stdlib::codec::Side::Server => {
-                    let mut key = 0u8;
-                    message.to_masked_frames(size, || {
-                        key = key.wrapping_add(1);
-                        [key; 4]
-                    })
-                }
-                fictionet::stdlib::codec::Side::Client => message.to_frames(size, None),
-            }
-            .unwrap();
-            let mut bytes = Vec::new();
-            for frame in frames {
-                frame.write(&mut bytes).unwrap();
-            }
-            assert_eq!(decode_all(messages, &bytes), (vec![message], None));
-        }
-        let mut written = Vec::new();
-        for frame in decode_all(|| Frames::for_receiver(receiver), data).0 {
-            contract::check_wire_value(&frame);
-            frame.write(&mut written).unwrap();
-        }
-        assert!(data.starts_with(&written));
-    }
-    let payload: Vec<_> = data.iter().take(4096).copied().collect();
-    for opcode in [
-        Opcode::Text,
-        Opcode::Binary,
-        Opcode::Continuation,
-        Opcode::Close,
-        Opcode::Ping,
-        Opcode::Pong,
-    ] {
-        contract::check_wire_value(&Frame {
-            fin: data.first().is_some_and(|b| b & 1 != 0),
-            opcode,
-            mask: data
-                .first()
-                .is_some_and(|b| b & 2 != 0)
-                .then_some([1, 2, 3, 4]),
-            payload: payload.clone(),
-        });
-    }
-    let code = u16::from_be_bytes([
-        data.first().copied().unwrap_or(0),
-        data.get(1).copied().unwrap_or(0),
-    ]);
-    let reason = String::from_utf8_lossy(&payload).into_owned();
-    let close = Close {
-        code,
-        reason: reason.clone(),
-    };
-    contract::check_wire_value(&close);
-    for message in [
-        Message::Ping(payload.clone()),
-        Message::Pong(payload.clone()),
-        Message::Binary(payload),
-        Message::Text(reason),
-        Message::Close(Some(close)),
-        Message::Close(None),
-    ] {
-        if let Ok(frame) = message.to_frame(Some([7; 4])) {
-            contract::check_wire_value(&frame);
-            assert_eq!(
-                decode_all(
-                    || Messages::for_receiver(fictionet::stdlib::codec::Side::Server),
-                    &frame.to_bytes().unwrap()
-                ),
-                (vec![message], None)
-            );
-        }
-    }
-    if let Ok(Some(header)) = Header::parse(data) {
-        assert!(header.header_len <= header.frame_len());
-    }
+    let fragment = data.first().map_or(1, |&b| usize::from(b).max(1));
+    harness::check_buffer(data, limit, fragment);
 
     // The bytes as header fields, one "name: value" per line.
     if let Ok(text) = std::str::from_utf8(data) {
