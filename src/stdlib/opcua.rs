@@ -5251,29 +5251,23 @@ mod tests {
     }
 
     #[test]
-    fn single_chunk_messages_are_counted_before_they_are_split() {
-        assert_linear(
-            "single_chunk_messages_are_counted_before_they_are_split",
-            MAX_MESSAGE_SIZE as usize / 4,
-            |size| {
-                // A header leaving one byte per chunk is refused before splitting.
-                let policy = "urn:other".to_string();
-                let fixed = HEADER_LEN + 4 + (4 + policy.len()) + 4 + 4 + 8;
-                let header = AsymmetricHeader {
-                    policy_uri: policy,
-                    sender_certificate: Some(vec![0; MIN_BUFFER_SIZE as usize - fixed - 1]),
-                    receiver_thumbprint: None,
-                };
-                let opn = SecureMessage {
-                    kind: SecureKind::Open(header),
-                    channel_id: 0,
-                    sequence_number: 0,
-                    request_id: 0,
-                    body: vec![0; size],
-                };
-                assert_eq!(opn.chunks(&Limits::default()), Err(Error::TooLong));
-            },
-        );
+    fn opn_body_exceeding_one_chunk_is_refused() {
+        // The security header leaves only one byte for the body.
+        let policy = "urn:other".to_string();
+        let fixed = HEADER_LEN + 4 + (4 + policy.len()) + 4 + 4 + 8;
+        let header = AsymmetricHeader {
+            policy_uri: policy,
+            sender_certificate: Some(vec![0; MIN_BUFFER_SIZE as usize - fixed - 1]),
+            receiver_thumbprint: None,
+        };
+        let opn = SecureMessage {
+            kind: SecureKind::Open(header),
+            channel_id: 0,
+            sequence_number: 0,
+            request_id: 0,
+            body: vec![0; MAX_MESSAGE_SIZE as usize],
+        };
+        assert_eq!(opn.chunks(&Limits::default()), Err(Error::TooLong));
     }
 
     #[test]

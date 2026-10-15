@@ -310,6 +310,110 @@ fn linearity_check_requires_calls_inside_the_named_body() {
     );
 }
 
+// Timing alone cannot establish an allocation bound. Require a separate
+// allocation measurement or buffer-capacity contract in the same test body.
+// As with the linearity check, the fixture and counter assertions need review.
+fn timed_allocation_tests(source: &str) -> Vec<&str> {
+    let tokens = rust_docs::tokens(source);
+    let mut timed = Vec::new();
+    for (at, words) in tokens.windows(3).enumerate() {
+        if words[0] != "fn" || words[2] != "(" {
+            continue;
+        }
+        let start = tokens[..at]
+            .iter()
+            .rposition(|t| matches!(*t, "{" | "}" | ";"))
+            .map_or(0, |i| i + 1);
+        if !tokens[start..at]
+            .windows(4)
+            .any(|attr| attr == ["#", "[", "test", "]"])
+        {
+            continue;
+        }
+        let name = words[1];
+        let claims_allocation = name.contains("alloc")
+            || name.contains("eager_reserv")
+            || (name.contains("before") && (name.contains("split") || name.contains("slice")));
+        if !claims_allocation {
+            continue;
+        }
+        let args_end = group_end(&tokens, at + 2);
+        assert_eq!(tokens.get(args_end + 1), Some(&"{"), "test body: {name}");
+        let body_end = group_end(&tokens, args_end + 1);
+        let body = &tokens[args_end + 2..body_end];
+        let timing = body.windows(2).any(|call| {
+            matches!(call[0], "assert_linear" | "assert_linear_with_setup") && call[1] == "("
+        });
+        let allocation = body.windows(2).any(|call| {
+            matches!(call[0], "measuring" | "check_decode_with_alloc_limit") && call[1] == "("
+        });
+        if timing && !allocation {
+            timed.push(name);
+        }
+    }
+    timed
+}
+
+#[test]
+fn allocation_claims_need_more_than_timing() {
+    for dir in ["src/stdlib", "tests"] {
+        for (file, source) in sources_on_disk(&Path::new(ROOT).join(dir)) {
+            assert!(
+                timed_allocation_tests(&source).is_empty(),
+                "{}: {:?} claim allocation bounds using only timing; add an allocation \
+                 measurement or a buffer-capacity contract",
+                file.display(),
+                timed_allocation_tests(&source)
+            );
+        }
+    }
+}
+
+#[test]
+fn allocation_timing_check_requires_calls_inside_the_named_body() {
+    let source = r#"
+        #[test] fn allocations_are_bounded() { assert_linear("encode", 16, run); }
+        #[test] fn single_chunk_messages_are_counted_before_they_are_split() {
+            test_support::assert_linear("chunks", 16, run);
+        }
+        #[test] fn no_eager_reservation() {
+            assert_linear_with_setup("decode", 16, setup, run, check);
+        }
+        #[test] fn measured_allocations_are_bounded() {
+            assert_linear("encode", 16, run);
+            let (result, stats) = measuring(|| encode(&fixture));
+            assert!(stats.bytes_requested <= limit);
+        }
+        #[test] fn allocation_contract_and_timing() {
+            assert_linear("decode", 16, |size| {
+                contract::check_decode_with_alloc_limit(make, &bytes, limit);
+            });
+        }
+        #[test] fn allocation_measurement_must_be_called() {
+            assert_linear("decode", 16, run);
+            // measuring(|| encode(&fixture));
+            let text = "check_decode_with_alloc_limit(make, &bytes, limit)";
+            let reference = measuring;
+        }
+        #[test] fn allocation_comments_are_not_calls() {
+            // assert_linear("ignored", 16, run);
+            let text = "assert_linear(ignored, 16, run)";
+            let reference = assert_linear;
+        }
+        #[test] fn decoding_takes_linear_time() { assert_linear("decode", 16, run); }
+        fn allocation_helper_is_not_a_test() { assert_linear("helper", 16, run); }
+    "#;
+    assert_eq!(
+        timed_allocation_tests(source),
+        [
+            "allocations_are_bounded",
+            "single_chunk_messages_are_counted_before_they_are_split",
+            "no_eager_reservation",
+            "allocation_measurement_must_be_called"
+        ]
+    );
+}
+
 #[derive(Debug)]
 struct Module {
     public: bool,

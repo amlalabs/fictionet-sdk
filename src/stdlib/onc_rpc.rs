@@ -85,7 +85,7 @@ pub const MAX_GIDS: usize = 16;
 pub const MAX_ARRAY_RESERVE: usize = 1024;
 /// The most bytes [`Reader::array`] makes room for before it reads its
 /// items, however large each item is in memory.
-const MAX_RESERVE_BYTES: usize = 1 << 16;
+pub const MAX_RESERVE_BYTES: usize = 1 << 16;
 
 /// The longest record [`records`] assembles. A caller may choose a lower
 /// limit, never a higher one.
@@ -2152,9 +2152,8 @@ mod tests {
     }
 
     #[test]
-    fn array_count_does_not_size_the_allocation() {
-        // A count of a million, with the bytes to back it, and items that
-        // are large in memory. The first item fails, so nothing is kept.
+    fn array_propagates_item_errors_and_reads_all_small_items() {
+        // The first item's error propagates even with bytes for 2^20 items.
         let mut bytes = (1u32 << 20).to_be_bytes().to_vec();
         bytes.resize(4 + (4 << 20), 0);
         let big = |r: &mut Reader<'_>| -> Result<[u8; 1 << 16], Error> {
@@ -2165,7 +2164,7 @@ mod tests {
             Reader::new(&bytes).array(usize::MAX, big),
             Err(Error::Padding)
         );
-        // Items that read still all come back.
+        // All 2^20 small items read back when the item reader succeeds.
         assert_eq!(
             Reader::new(&bytes)
                 .array(usize::MAX, Reader::uint)

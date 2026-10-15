@@ -1,7 +1,7 @@
 //! Bounded protocol appends return allocation refusals without changing output.
 
 use fictionet::stdlib::codec::{Buffer, Frames, Stream, Wire, pump};
-use fictionet::stdlib::{dhcpv6, kafka, onc_rpc, syslog, thrift};
+use fictionet::stdlib::{dhcpv6, kafka, onc_rpc, opcua, syslog, thrift};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -59,13 +59,14 @@ fn refuses(size: usize) -> bool {
 // layout. Refused requests return null, as the allocator contract permits.
 unsafe impl GlobalAlloc for RefusingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record(Some(layout.size()), 0);
         let ptr = if refuses(layout.size()) {
             std::ptr::null_mut()
         } else {
             unsafe { System.alloc(layout) }
         };
         record(
-            Some(layout.size()),
+            None,
             if ptr.is_null() {
                 0
             } else {
@@ -81,13 +82,14 @@ unsafe impl GlobalAlloc for RefusingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        record(Some(size), 0);
         let next = if refuses(size) {
             std::ptr::null_mut()
         } else {
             unsafe { System.realloc(ptr, layout, size) }
         };
         record(
-            Some(size),
+            None,
             if next.is_null() {
                 0
             } else {
@@ -231,6 +233,59 @@ fn measurement_resets_after_unwinding() {
     assert!(result.is_err());
     assert!(MEASUREMENT.get().is_none());
     assert_eq!(measuring(|| ()).1, AllocationStats::default());
+}
+
+#[test]
+fn xdr_array_no_eager_reservation() {
+    let mut bytes = (1u32 << 20).to_be_bytes().to_vec();
+    bytes.resize(4 + (4 << 20), 0);
+    let big = |reader: &mut onc_rpc::Reader<'_>| -> Result<[u8; 1 << 16], onc_rpc::Error> {
+        reader.uint()?;
+        Err(onc_rpc::Error::Padding)
+    };
+    let (result, stats) = measuring(|| onc_rpc::Reader::new(&bytes).array(usize::MAX, big));
+    assert_eq!(result, Err(onc_rpc::Error::Padding));
+    assert!(
+        stats.largest_request <= onc_rpc::MAX_RESERVE_BYTES,
+        "XDR first-item refusal exceeded the preallocation bound: {stats:?}"
+    );
+}
+
+#[test]
+fn opcua_opn_rejects_before_slice_collection() {
+    let policy = "urn:other".to_string();
+    let fixed = opcua::HEADER_LEN + 4 + (4 + policy.len()) + 4 + 4 + 8;
+    let header = opcua::AsymmetricHeader {
+        policy_uri: policy,
+        // Leave one byte per chunk, so collecting slices scales with the body.
+        sender_certificate: Some(vec![0; opcua::MIN_BUFFER_SIZE as usize - fixed - 1]),
+        receiver_thumbprint: None,
+    };
+    let messages = [4 << 20, 16 << 20].map(|size| opcua::SecureMessage {
+        kind: opcua::SecureKind::Open(header.clone()),
+        channel_id: 0,
+        sequence_number: 0,
+        request_id: 0,
+        body: vec![0; size],
+    });
+    let limits = opcua::Limits::default();
+    let stats = messages.each_ref().map(|opn| {
+        let (result, stats) = measuring(|| opn.chunks(&limits));
+        assert_eq!(result, Err(opcua::Error::TooLong));
+        // Security-header Writer requests 8 + 17 + 34 + 8171 + 16342 bytes,
+        // counting each realloc's full new size. Four minimum buffers allow
+        // this fixed header cost without allowing body-proportional storage.
+        assert!(
+            stats.bytes_requested <= 4 * opcua::MIN_BUFFER_SIZE as usize,
+            "{}-byte OPN exceeded its temporary allocation budget: {stats:?}",
+            opn.body.len()
+        );
+        stats
+    });
+    assert_eq!(
+        stats[0].bytes_requested, stats[1].bytes_requested,
+        "OPN temporary allocations depend on body size: {stats:?}"
+    );
 }
 
 #[test]
