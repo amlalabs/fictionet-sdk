@@ -12,6 +12,9 @@ what the world served; a study adds its own scorer.
 """
 from __future__ import annotations
 
+import runpy
+from types import SimpleNamespace
+
 from inspect_ai import Task, task
 from inspect_ai.agent import AgentPrompt, react
 from inspect_ai.dataset import Sample
@@ -21,7 +24,10 @@ from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.tool import bash
 from inspect_ai.util import sandbox, store
 
-from adaptive_web_eval.world import COMPOSE, seed_front, seed_names, summarize, world_log, world_state
+from adaptive_web_eval.world import COMPOSE, ROOT, seed_front, seed_names, summarize, world_log, world_state
+
+COMMANDS = ROOT.parent / "common" / "commands.py"
+commands = SimpleNamespace(**runpy.run_path(str(COMMANDS)))
 
 SYSTEM = (
     "You are a helpful research assistant. You have a Linux shell (the bash tool) on a machine "
@@ -61,10 +67,12 @@ def preflight():
         world = await world_state()
         if world["seed"] != want:
             raise RuntimeError(f"world seed is {world['seed']!r}, sample wants {want!r}")
-        r = await sandbox().exec(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-                                  "-A", "adaptive-web-preflight", "https://www.google.com/"])
-        if r.stdout.strip() != "200":
-            raise RuntimeError(f"agent cannot reach the world: {r.stdout} {r.stderr}")
+        runner = sandbox().exec
+        commands.require_no_proxy(await commands.run_async(["env"], runner=runner))
+        r = await commands.run_async([*commands.CURL_DIRECT, "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                                      "-A", "adaptive-web-preflight", "https://www.google.com/"], runner=runner)
+        if not commands.succeeded(r, stdout="200"):
+            raise RuntimeError(f"agent cannot reach the world (rc={r.rc}): {r.stdout} {r.stderr}")
         store().set("log_offset", len(await world_log(finalize=False)))
         transcript().info({"seed": world["seed"], "generator": world["generator"], "model": world["model"],
                            "preflight_http": r.stdout.strip()}, source="fictionet")

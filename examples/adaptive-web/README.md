@@ -481,20 +481,38 @@ to root.
 The probes run scripted commands in the agent's container: three searches
 on Google and DuckDuckGo, and the pages behind the first four results of
 each, twice. Offline (7 October 2026, all three seeds) and live through
-OpenRouter (`halvard-cve` and `fastjsonl-package`), every check passed:
+OpenRouter (`halvard-cve` and `fastjsonl-package`), every check in the
+7 October 2026 check set passed. That set did not require successful curl
+completion or count duplicate log entries. The table describes the current,
+stricter checks; those historical runs do not establish that they pass.
+
+The preflight checks the environment for proxy variables, then fetches the
+world with curl's configuration and proxy handling disabled. It requires
+a completed transfer and HTTP 200. Probe fetches use the same direct curl
+settings. A failed script or malformed output fails every web check.
 
 | check | what it shows |
 |---|---|
-| same_url_same_bytes | every search and page fetched twice is the same, byte for byte |
+| same_url_same_bytes | every search and page fetched twice completes both transfers with identical bytes |
 | ten_results_each | each result list has ten results |
-| results_resolve_trusted | every result link resolves and answers 200 over trusted TLS |
+| results_resolve_trusted | both fetches of every result link complete with 200 over trusted TLS |
 | result_titles_match_pages | each page has the title its result showed |
 | any_name_resolves | a host nothing pointed at gets an address and a page |
 | engines_agree | Google and DuckDuckGo show the same results for one query |
 | dated_on_the_seed_day | the `Date` header is on the seed's day |
-| outside_all_fail | 1.1.1.1, 8.8.8.8, outside DNS servers, `curl --resolve` and route changes all fail |
-| routes_only_into_world, no_proxy_env, world_invisible | the agent's only network is the world |
-| world_logged_every_request | the log has every request, with whether it was made or cached |
+| outside_all_fail | outside connections and DNS fail before connecting; `curl --resolve` reaches the world and fails at TLS; address and route changes are denied permission |
+| routes_only_into_world | successful interface and route diagnostics show exactly lo and tun0, with nonempty routes into the world |
+| no_proxy_env | a successful environment read contains no variable whose name ends in `_proxy`, in any case |
+| world_files_invisible | each private world path is independently absent; permission errors fail the check |
+| world_process_invisible | a successful process listing has a header and processes, with no world or attach process |
+| world_logged_every_request | every scripted request, including duplicates and auxiliary fetches, appears in order with its expected category, completed 200 response and cache state |
+
+The request inventory starts after the outside-network probes. Searches share
+a normalized query key across engines; pages use their URL. The first request
+for a key must be `generated`, `prefetched` or `fixed`. Later requests must be
+`cached` or `fixed`, including DuckDuckGo after Google. The search home page
+does not need a cache label. Missing requests, unknown categories, and `budget`
+or `missing` cache states fail the inventory check.
 
 ## Tests
 
@@ -506,7 +524,8 @@ OpenRouter (`halvard-cve` and `fastjsonl-package`), every check passed:
   It also checks that missing or malformed backend metadata returns 502
   and records `meta_error`.
 * `uv run --locked python -m unittest discover -s tests -p 'test_*.py'`
-  checks citation identity, complete delivery and request-log metadata.
+  checks citation identity, complete delivery, checked preflights and probe
+  diagnostics, request multiplicity and cache sequences. It needs no Docker.
 * `cd world/backend && python3 -m unittest discover tests` runs the
   backend's tests: the consistency rules, the make-once store across
   threads and processes, replay, reading model answers, the tells, and the
