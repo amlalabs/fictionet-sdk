@@ -961,6 +961,47 @@ async fn recv_within(fcx: &Cx, end: &mut End, d: Duration) -> Option<Packet> {
     timeout(fcx, d, end.recv(fcx)).await.map(|r| r.unwrap())
 }
 
+/// Wait for an echo reply to establish the binding, keeping other packets
+/// for the caller to check.
+async fn bind_by_ping(fcx: &Cx, end: &mut End, me: IpAddr, gateway: IpAddr) -> Vec<Packet> {
+    let mut other = Vec::new();
+    for i in 0..100 {
+        end.send(match (me, gateway) {
+            (IpAddr::V4(me), IpAddr::V4(gateway)) => ping(me, gateway, i),
+            (IpAddr::V6(me), IpAddr::V6(gateway)) => ping6(me, gateway, i),
+            _ => panic!("the sandbox and gateway must use the same address family"),
+        });
+        if let Some(p) = recv_within(fcx, end, Duration::from_millis(20)).await {
+            let (src, dst, proto, icmp) = match p.0[0] >> 4 {
+                4 => {
+                    let (src, dst, proto, body) = parse(&p);
+                    (IpAddr::V4(src), IpAddr::V4(dst), proto, body)
+                }
+                6 => {
+                    let (src, dst, proto, body) = parse6(&p);
+                    (IpAddr::V6(src), IpAddr::V6(dst), proto, body)
+                }
+                _ => panic!("expected an IP packet while binding {me}: {p:?}"),
+            };
+            if src == gateway
+                && dst == me
+                && icmp.len() >= 8
+                && matches!(
+                    (me, proto, icmp[0]),
+                    (IpAddr::V4(_), 1, 0) | (IpAddr::V6(_), 58, 129)
+                )
+                && icmp[1] == 0
+                && icmp[4..6] == [0x12, 0x34]
+                && u16::from_be_bytes([icmp[6], icmp[7]]) <= i
+            {
+                return other;
+            }
+            other.push(p);
+        }
+    }
+    panic!("no matching echo reply from {gateway} to bind {me} after 100 pings: {other:?}");
+}
+
 const SHORT: Duration = Duration::from_millis(300);
 
 // ---------------------------------------------------------------------------
@@ -2595,18 +2636,20 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
 
         // b takes the same address as soon as it is free.
         let mut b = attacher.attach("b").unwrap();
-        let mut bound = false;
-        for i in 0..100 {
-            b.send(ping(me, GATEWAY, i));
-            if recv_within(&fcx, &mut b, Duration::from_millis(20))
-                .await
-                .is_some()
-            {
-                bound = true;
-                break;
-            }
+        for p in bind_by_ping(&fcx, &mut b, me.into(), GATEWAY.into()).await {
+            let (src, _, proto, t) = parse(&p);
+            assert_eq!(
+                proto, 6,
+                "unexpected packet while b took a's address: {p:?}"
+            );
+            let data = &t[((t[12] >> 4) as usize) * 4..];
+            assert!(
+                data.is_empty(),
+                "b got {} bytes of a's answer from {src}: {:?}",
+                data.len(),
+                String::from_utf8_lossy(data)
+            );
         }
-        assert!(bound);
         // Nothing of a's answer reaches b, even after retransmissions.
         while let Some(p) = recv_within(&fcx, &mut b, Duration::from_secs(3)).await {
             let (src, _, proto, t) = parse(&p);
@@ -5699,18 +5742,8 @@ fn fragments_do_not_outlive_their_sandbox() {
         drop(a);
         // b takes the address once a's filter has let it go.
         let mut b = attacher.attach("b").unwrap();
-        let mut bound = false;
-        for seq in 0..100 {
-            b.send(ping6(ME6, GATEWAY6, seq));
-            if recv_within(&fcx, &mut b, Duration::from_millis(20))
-                .await
-                .is_some()
-            {
-                bound = true;
-                break;
-            }
-        }
-        assert!(bound);
+        let other = bind_by_ping(&fcx, &mut b, ME6.into(), GATEWAY6.into()).await;
+        assert!(other.is_empty(), "packets arrived while b bound: {other:?}");
         b.send(fragment6(
             ME6,
             GATEWAY6,
@@ -6042,18 +6075,8 @@ fn a_fragment_inside_a_fragment_is_dropped() {
         );
         drop(a);
         let mut b = attacher.attach("b").unwrap();
-        let mut bound = false;
-        for seq in 0..100 {
-            b.send(ping6(ME6, GATEWAY6, seq));
-            if recv_within(&fcx, &mut b, Duration::from_millis(20))
-                .await
-                .is_some()
-            {
-                bound = true;
-                break;
-            }
-        }
-        assert!(bound);
+        let other = bind_by_ping(&fcx, &mut b, ME6.into(), GATEWAY6.into()).await;
+        assert!(other.is_empty(), "packets arrived while b bound: {other:?}");
         b.send(nested6(
             2,
             &fragment6(ME6, GATEWAY6, 4242, 16, false, 58, &whole.0[56..]),
