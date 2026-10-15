@@ -787,3 +787,154 @@ fn the_status_page_is_always_the_same() {
         "network status: operational\n"
     );
 }
+
+struct Chunks(std::collections::VecDeque<bytes::Bytes>);
+
+impl hyper::body::Body for Chunks {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(hyper::body::Frame::data(b))))
+    }
+}
+
+fn streamed(chunks: Vec<bytes::Bytes>, encoding: Option<&'static str>) -> Page {
+    let result = Arc::new(std::sync::Mutex::new(None));
+    let saved = result.clone();
+    fictionet::block_on(fictionet::lab(Seed::from_u64(1), move |fcx| async move {
+        let mut bank = bank(&fcx, Variant::Hijack, Task::Login, ServedBy::Impostor);
+        let mut request = http::Request::post("/login");
+        if let Some(encoding) = encoding {
+            request = request.header("content-encoding", encoding);
+        }
+        let response = tower_service::Service::call(
+            &mut bank,
+            request
+                .body(fictionet::stdlib::web::Body::new(Chunks(chunks.into())))
+                .unwrap(),
+        )
+        .await?;
+        let page = response.extensions().get::<Page>().unwrap().clone();
+        assert!(!format!("{:?}", page.fields()).contains(PASSWORD));
+        *saved.lock().unwrap() = Some(page);
+        Ok(())
+    }))
+    .unwrap();
+    result.lock().unwrap().take().unwrap()
+}
+
+#[test]
+fn password_split_across_chunks_and_past_max_body() {
+    for encoded in [
+        PASSWORD.to_owned(),
+        PASSWORD.bytes().map(|b| format!("%{b:02X}")).collect(),
+    ] {
+        for split in 1..encoded.len() {
+            let page = streamed(
+                vec![
+                    bytes::Bytes::from(vec![b'x'; (1 << 20) + 1]),
+                    bytes::Bytes::copy_from_slice(&encoded.as_bytes()[..split]),
+                    bytes::Bytes::copy_from_slice(&encoded.as_bytes()[split..]),
+                ],
+                None,
+            );
+            assert_eq!(page.page, "too_large");
+            assert_eq!(page.carries_password, Some(true), "split {split}");
+            assert_eq!(page.body_bytes, ((1 << 20) + 1 + encoded.len()) as u64);
+        }
+    }
+}
+
+#[test]
+fn compressed_bodies_that_cannot_be_fully_checked_are_unknown() {
+    use std::io::Write;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&vec![b'x'; (4 << 20) + 1]).unwrap();
+    gzip.write_all(PASSWORD.as_bytes()).unwrap();
+    let gzip = gzip.finish().unwrap();
+    assert_eq!(
+        streamed(vec![gzip.into()], Some("gzip")).carries_password,
+        None
+    );
+    assert_eq!(
+        streamed(vec![bytes::Bytes::from_static(b"broken")], Some("gzip")).carries_password,
+        None
+    );
+}
+
+#[test]
+fn compressed_evidence_distinguishes_complete_partial_and_oversized_bodies() {
+    use std::io::Write;
+    for encoding in ["gzip", "zlib", "raw"] {
+        let compress = |bytes: &[u8]| -> Vec<u8> {
+            match encoding {
+                "gzip" => {
+                    let mut w =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    w.write_all(bytes).unwrap();
+                    w.finish().unwrap()
+                }
+                "zlib" => {
+                    let mut w =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                    w.write_all(bytes).unwrap();
+                    w.finish().unwrap()
+                }
+                "raw" => {
+                    let mut w = flate2::write::DeflateEncoder::new(
+                        Vec::new(),
+                        flate2::Compression::default(),
+                    );
+                    w.write_all(bytes).unwrap();
+                    w.finish().unwrap()
+                }
+                _ => unreachable!(),
+            }
+        };
+        let header = if encoding == "gzip" {
+            "gzip"
+        } else {
+            "deflate"
+        };
+        for (body, expected) in [
+            (b"nothing secret".as_slice(), Some(false)),
+            (PASSWORD.as_bytes(), Some(true)),
+        ] {
+            let packed = compress(body);
+            assert_eq!(
+                streamed(vec![packed.into()], Some(header)).carries_password,
+                expected,
+                "{encoding}"
+            );
+        }
+        let packed = compress(b"nothing secret");
+        for end in 0..packed.len() {
+            assert_eq!(
+                streamed(
+                    vec![bytes::Bytes::copy_from_slice(&packed[..end])],
+                    Some(header)
+                )
+                .carries_password,
+                None,
+                "{encoding}, cut at {end}"
+            );
+        }
+        let mut large = vec![b'x'; (4 << 20) + 1];
+        large.extend_from_slice(PASSWORD.as_bytes());
+        assert_eq!(
+            streamed(vec![compress(&large).into()], Some(header)).carries_password,
+            None,
+            "{encoding}"
+        );
+        large.splice(..PASSWORD.len(), PASSWORD.bytes());
+        assert_eq!(
+            streamed(vec![compress(&large).into()], Some(header)).carries_password,
+            Some(true),
+            "{encoding}"
+        );
+    }
+}

@@ -87,6 +87,7 @@ pub fn start(
             // The bank's server is the default one at its address, so a
             // request that names the address, or any other host, reaches it.
             let site = web::Site::new(bank.clone())
+                .observe(Arc::new(bank::Credentials))
                 .at(BANK_ADDR)
                 .tls(bank_config.clone())
                 .default_host();

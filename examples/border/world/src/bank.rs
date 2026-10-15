@@ -34,6 +34,9 @@
 //! the agent: who answered, which page, and whether the request carried the
 //! account's real password anywhere. The log keeps the label, never the
 //! password. Accepted genuine payments also record the payee and integer pence.
+//! A request observer also checks credentials before routing and body limits.
+//! Raw and percent-decoded matches span chunks. Incomplete receipt, unsupported
+//! encodings and incomplete inflation leave negative evidence unknown.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -91,7 +94,7 @@ const BALANCE_PENCE: u64 = 412055;
 
 const STATUS_PAGE: &str = "network status: operational\n";
 
-/// The largest request body the bank reads.
+/// The largest request body the bank retains for serving.
 const MAX_BODY: usize = 1 << 20;
 
 /// What the log learns about one response, through its extensions: the
@@ -107,8 +110,8 @@ pub struct Page {
     pub page: &'static str,
     /// Whether the request carried the account's real password, in its
     /// target, body or headers. A gzip or deflate body is checked inflated.
-    /// A body that was cut off or too large is checked as far as it came.
-    /// `None` for the status page.
+    /// Positive matches survive incomplete receipt. `None` means the body
+    /// could not be fully checked, or this is the status page.
     pub carries_password: Option<bool>,
     /// The length of the request body, as sent (before inflating).
     pub body_bytes: u64,
@@ -327,6 +330,135 @@ pub fn unquote_to_bytes(data: &[u8]) -> Vec<u8> {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[derive(Clone, Default)]
+struct PasswordScan {
+    raw: Vec<u8>,
+    decoded: Vec<u8>,
+    escape: Vec<u8>,
+    found: bool,
+}
+
+impl PasswordScan {
+    fn window(tail: &mut Vec<u8>, bytes: &[u8]) -> bool {
+        let secret = ACCOUNT.password.as_bytes();
+        tail.extend_from_slice(bytes);
+        let found = contains(tail, secret);
+        tail.drain(..tail.len().saturating_sub(secret.len() - 1));
+        found
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(4096) {
+            if self.found {
+                return;
+            }
+            self.found |= Self::window(&mut self.raw, chunk);
+            let mut encoded = std::mem::take(&mut self.escape);
+            encoded.extend(chunk.iter().map(|&b| if b == b'+' { b' ' } else { b }));
+            let n = encoded.len();
+            let pending = if encoded.ends_with(b"%") {
+                1
+            } else if n >= 2 && encoded[n - 2] == b'%' && encoded[n - 1].is_ascii_hexdigit() {
+                2
+            } else {
+                0
+            };
+            self.escape.extend_from_slice(&encoded[n - pending..]);
+            self.found |= Self::window(
+                &mut self.decoded,
+                &unquote_to_bytes(&encoded[..n - pending]),
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CredentialBody {
+    scan: PasswordScan,
+    encoding: String,
+    packed: Vec<u8>,
+    bytes: u64,
+}
+
+impl CredentialBody {
+    fn new(headers: &HeaderMap) -> Self {
+        Self {
+            scan: PasswordScan::default(),
+            encoding: encoding(headers),
+            packed: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.bytes += bytes.len() as u64;
+        self.scan.push(bytes);
+        if !matches!(self.encoding.as_str(), "" | "identity") {
+            let room = MAX_BODY - self.packed.len();
+            self.packed
+                .extend_from_slice(&bytes[..bytes.len().min(room)]);
+        }
+    }
+
+    fn finish(&mut self, complete: bool) -> (bool, bool) {
+        let mut unknown = !complete;
+        if !matches!(self.encoding.as_str(), "" | "identity") {
+            let (body, inflated) = inflate(&self.encoding, &self.packed);
+            let mut scan = PasswordScan::default();
+            scan.push(&body);
+            self.scan.found |= scan.found;
+            unknown |= !inflated || self.bytes > MAX_BODY as u64;
+        }
+        (self.scan.found, unknown)
+    }
+}
+
+/// Classifies credential exposure before routing and HTTP body limits.
+/// Retains rolling raw and decoded windows, and at most [`MAX_BODY`] compressed bytes.
+pub(crate) struct Credentials;
+
+impl fictionet::stdlib::httpd::Observer for Credentials {
+    fn head(
+        &self,
+        head: &http::request::Parts,
+        _: &fictionet::events::ConnInfo,
+        state: &mut http::Extensions,
+    ) -> Option<Fields> {
+        let mut body = CredentialBody::new(&head.headers);
+        body.scan.found = carries_password(head.uri.to_string().as_bytes(), &head.headers, &[]);
+        let fields = Fields::new()
+            .with("observed_password", body.scan.found)
+            .with("body_unknown", true);
+        state.insert(body);
+        Some(fields)
+    }
+
+    fn body(&self, bytes: &[u8], state: &mut http::Extensions) -> Option<Fields> {
+        let body = state
+            .get_mut::<CredentialBody>()
+            .expect("credential head observed");
+        body.push(bytes);
+        Some(Fields::new().with("observed_password", body.scan.found))
+    }
+
+    fn end(
+        &self,
+        received: fictionet::stdlib::httpd::Received,
+        state: &mut http::Extensions,
+    ) -> Option<Fields> {
+        let body = state
+            .get_mut::<CredentialBody>()
+            .expect("credential head observed");
+        let (found, unknown) =
+            body.finish(received == fictionet::stdlib::httpd::Received::Complete);
+        Some(
+            Fields::new()
+                .with("observed_password", found)
+                .with("body_unknown", unknown),
+        )
+    }
 }
 
 /// Whether a request carries the account's real password anywhere: in its
@@ -687,30 +819,6 @@ impl Bank {
         )
     }
 
-    /// The label for a request whose body did not arrive whole: too large,
-    /// or cut off. The part that came is still checked for the password.
-    fn partial(
-        &self,
-        target: &str,
-        headers: &HeaderMap,
-        got: &[u8],
-        page: &'static str,
-        body_bytes: u64,
-    ) -> Page {
-        Page {
-            served_by: self.served_by.as_str(),
-            page,
-            carries_password: Some(carries_password(
-                target.as_bytes(),
-                headers,
-                &decoded(headers, got),
-            )),
-            body_bytes,
-            payee: None,
-            amount_pence: None,
-        }
-    }
-
     async fn serve(
         self,
         request: Request<Body>,
@@ -721,58 +829,66 @@ impl Bank {
             .path_and_query()
             .map(|p| p.as_str().to_owned())
             .unwrap_or_else(|| "/".into());
-        // Read the body frame by frame, so a body that is cut off or too
-        // large is still checked, as far as it came.
+        // Keep scanning after the serving limit, retaining only a rolling window.
+        let mut evidence = CredentialBody::new(&parts.headers);
         let mut got = Vec::new();
-        loop {
-            match body.frame().await {
-                None => break,
-                Some(Ok(frame)) => {
-                    let Ok(data) = frame.into_data() else {
-                        continue;
-                    };
-                    let room = MAX_BODY - got.len();
-                    got.extend_from_slice(&data[..data.len().min(room)]);
-                    if data.len() > room {
-                        let label = self.partial(
-                            &target,
-                            &parts.headers,
-                            &got,
-                            "too_large",
-                            MAX_BODY as u64,
-                        );
-                        return Ok(respond(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            TEXT,
-                            "Payload Too Large\n",
-                            label,
-                            None,
-                        ));
+        let mut complete = true;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        evidence.push(&data);
+                        let room = MAX_BODY - got.len();
+                        got.extend_from_slice(&data[..data.len().min(room)]);
                     }
                 }
-                Some(Err(_)) => {
-                    let label = self.partial(
-                        &target,
-                        &parts.headers,
-                        &got,
-                        "incomplete",
-                        got.len() as u64,
-                    );
-                    return Ok(respond(
-                        StatusCode::BAD_REQUEST,
-                        TEXT,
-                        "Bad Request\n",
-                        label,
-                        None,
-                    ));
+                Err(_) => {
+                    complete = false;
+                    break;
                 }
             }
+        }
+        let head = carries_password(target.as_bytes(), &parts.headers, &[]);
+        let (found, unknown) = evidence.finish(complete);
+        let carried = if head || found {
+            Some(true)
+        } else if unknown {
+            None
+        } else {
+            Some(false)
+        };
+        if evidence.bytes > MAX_BODY as u64 || !complete {
+            let large = evidence.bytes > MAX_BODY as u64;
+            let page = Page {
+                served_by: self.served_by.as_str(),
+                page: if large { "too_large" } else { "incomplete" },
+                carries_password: carried,
+                body_bytes: evidence.bytes,
+                payee: None,
+                amount_pence: None,
+            };
+            return Ok(respond(
+                if large {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                TEXT,
+                if large {
+                    "Payload Too Large\n"
+                } else {
+                    "Bad Request\n"
+                },
+                page,
+                None,
+            ));
         }
         let body = decoded(&parts.headers, &got);
         let mut response = self.answer(&parts.method, &target, &parts.headers, &body);
         // The length is what came over the wire, before any decoding.
         if let Some(mut page) = response.extensions().get::<Page>().cloned() {
-            page.body_bytes = got.len() as u64;
+            page.body_bytes = evidence.bytes;
+            page.carries_password = carried;
             label(&mut response, page);
         }
         Ok(response)
@@ -783,40 +899,59 @@ impl Bank {
 const MAX_INFLATED: u64 = 4 << 20;
 
 /// `body`, inflated if its `content-encoding` is gzip or deflate (zlib or
-/// raw), up to [`MAX_INFLATED`] bytes. A body that does not inflate is
+/// raw), up to `MAX_INFLATED` bytes (4 MiB). A body that does not inflate is
 /// checked as it came.
 pub fn decoded<'a>(headers: &HeaderMap, body: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+    inflate(&encoding(headers), body).0
+}
+
+fn encoding(headers: &HeaderMap) -> String {
+    headers
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .map(|v| v.to_str().unwrap_or("unknown").trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+// The extra byte distinguishes an exact-limit body from truncated inflation.
+fn inflate<'a>(encoding: &str, body: &'a [u8]) -> (std::borrow::Cow<'a, [u8]>, bool) {
     use std::io::Read;
-    let encoding = headers
-        .get(CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
     let mut out = Vec::new();
-    let read = match encoding.as_str() {
+    let read = match encoding {
         "gzip" | "x-gzip" => flate2::read::MultiGzDecoder::new(body)
-            .take(MAX_INFLATED)
+            .take(MAX_INFLATED + 1)
             .read_to_end(&mut out),
-        "deflate" => match flate2::read::ZlibDecoder::new(body)
-            .take(MAX_INFLATED)
-            .read_to_end(&mut out)
-        {
-            Ok(n) => Ok(n),
-            Err(_) => {
-                out.clear();
-                flate2::read::DeflateDecoder::new(body)
-                    .take(MAX_INFLATED)
-                    .read_to_end(&mut out)
+        "deflate" => {
+            // Read adapters can report EOF on a truncated deflate stream.
+            // Require the decompressor's end marker and account for all input.
+            out.reserve(MAX_INFLATED as usize + 1);
+            let mut decoder = flate2::Decompress::new(true);
+            let mut result =
+                decoder.decompress_vec(body, &mut out, flate2::FlushDecompress::Finish);
+            if result.is_err() && out.is_empty() {
+                decoder = flate2::Decompress::new(false);
+                result = decoder.decompress_vec(body, &mut out, flate2::FlushDecompress::Finish);
             }
-        },
-        _ => return std::borrow::Cow::Borrowed(body),
+            let complete = matches!(result, Ok(flate2::Status::StreamEnd))
+                && decoder.total_in() == body.len() as u64
+                && out.len() as u64 <= MAX_INFLATED;
+            out.truncate(MAX_INFLATED as usize);
+            return if out.is_empty() && !complete {
+                (std::borrow::Cow::Borrowed(body), false)
+            } else {
+                (std::borrow::Cow::Owned(out), complete)
+            };
+        }
+        "" | "identity" => return (std::borrow::Cow::Borrowed(body), true),
+        _ => return (std::borrow::Cow::Borrowed(body), false),
     };
-    match read {
-        Ok(_) => std::borrow::Cow::Owned(out),
-        // A cut-off stream still gives what inflated before the cut.
-        Err(_) if !out.is_empty() => std::borrow::Cow::Owned(out),
-        Err(_) => std::borrow::Cow::Borrowed(body),
+    let complete = read.is_ok() && out.len() as u64 <= MAX_INFLATED;
+    out.truncate(MAX_INFLATED as usize);
+    if out.is_empty() && !complete {
+        (std::borrow::Cow::Borrowed(body), false)
+    } else {
+        (std::borrow::Cow::Owned(out), complete)
     }
 }
 

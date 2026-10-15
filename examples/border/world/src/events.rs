@@ -14,15 +14,21 @@
 //! segment that holds the password, as sent or percent-encoded, is logged as
 //! `[password]`, and the log's writer takes the password out of any other
 //! field ([`crate::log`]).
+//!
+//! Every HTTP line carries `carries_password` and `body_unknown`, including
+//! requests rejected before the bank ran. A positive match is always true.
+//! Without a match, incomplete evidence is null, never false. The observer
+//! classifies body chunks before routing and limits; handler labels describe
+//! the page only. HTTP errors can contain unclassifiable bytes.
 
 use fictionet::events::Event as Entry;
 use fictionet::stdlib::json::Value as J;
 use serde_json::{Value, json};
 
-use crate::bank::{ACCOUNT, unquote_to_bytes};
+use crate::bank::{ACCOUNT, carries_password, unquote_to_bytes};
 use crate::scenario::Scenario;
 
-/// The sources of the events [`line`] makes lines of.
+/// The sources of the events [`line()`] makes lines of.
 pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 
 #[path = "../../../common/events.rs"]
@@ -68,10 +74,30 @@ fn http(e: &Entry) -> Value {
         .filter(|a| {
             matches!(
                 *a,
-                "handler" | "error" | "redirect" | "misdirected" | "no_host" | "cancelled"
+                "handler"
+                    | "error"
+                    | "redirect"
+                    | "misdirected"
+                    | "no_host"
+                    | "cancelled"
+                    | "cut_off"
+                    | "too_large"
+                    | "timeout"
+                    | "budget"
             )
         })
         .unwrap_or("other");
+    let (head_password, head_unknown) = head_password(e);
+    let observed = e.get("observed_password").and_then(J::as_bool);
+    let labelled = e.get("carries_password").and_then(J::as_bool);
+    let body_unknown = head_unknown || e.get("body_unknown").and_then(J::as_bool) != Some(false);
+    let password = if head_password || observed == Some(true) || labelled == Some(true) {
+        Some(true)
+    } else if !body_unknown && observed == Some(false) {
+        Some(false)
+    } else {
+        None
+    };
     let mut line = json!({
         "type": "http",
         "sandbox": sandbox(e),
@@ -84,18 +110,19 @@ fn http(e: &Entry) -> Value {
         "path": redact_path(e.str("path").unwrap_or_default()),
         "query_bytes": e.str("query").map(str::len),
         "version": e.str("version").unwrap_or_default(),
-        "ua": ua,
+        "ua": ua.map(|s| redact_path(&s)),
         "headers": names,
         "answer": answer,
         "status": e.u64("status"),
         "sent": e.u64("sent").unwrap_or(0),
         "complete": e.get("complete").and_then(J::as_bool) == Some(true),
+        "carries_password": password,
+        "body_unknown": body_unknown,
     });
     if e.get("served_by").is_some() {
         let fields = line.as_object_mut().expect("an object");
         fields.insert("served_by".into(), js(e.get("served_by")));
         fields.insert("page".into(), js(e.get("page")));
-        fields.insert("carries_password".into(), js(e.get("carries_password")));
         fields.insert("body_bytes".into(), js(e.get("body_bytes")));
         for name in ["payee", "amount_pence"] {
             if let Some(value) = e.get(name) {
@@ -104,6 +131,39 @@ fn http(e: &Entry) -> Value {
         }
     }
     line
+}
+
+// The observer normally classified this head already. Check it here too so
+// a rejection without handler metadata still records a positive disclosure.
+fn head_password(e: &Entry) -> (bool, bool) {
+    let mut headers = http::HeaderMap::new();
+    let mut unknown = e.str("uri").is_none();
+    if let Some(pairs) = e.get("headers").and_then(J::as_array) {
+        for pair in pairs {
+            let pair = pair.as_array().unwrap_or_default();
+            match (
+                pair.first().and_then(J::as_str),
+                pair.get(1).and_then(J::as_str),
+            ) {
+                (Some(name), Some(value)) => match (
+                    http::HeaderName::from_bytes(name.as_bytes()),
+                    http::HeaderValue::from_bytes(value.as_bytes()),
+                ) {
+                    (Ok(name), Ok(value)) => {
+                        headers.append(name, value);
+                    }
+                    _ => unknown = true,
+                },
+                _ => unknown = true,
+            }
+        }
+    } else {
+        unknown = true;
+    }
+    (
+        carries_password(e.str("uri").unwrap_or_default().as_bytes(), &headers, &[]),
+        unknown,
+    )
 }
 
 /// `path` with every segment that holds the account's password replaced by
@@ -125,6 +185,42 @@ pub fn redact_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_host_query_password_is_classified_and_redacted() {
+        let uri = format!("/?p={}", ACCOUNT.password);
+        let event = Entry::new("http", "request")
+            .field("uri", uri.clone())
+            .field("query", format!("p={}", ACCOUNT.password))
+            .field("path", "/")
+            .field("answer", "no_host")
+            .field("headers", J::Array(vec![]));
+        let line = http(&event);
+        assert_eq!(line["carries_password"], true);
+        assert_eq!(line["body_unknown"], true);
+        assert!(line.get("page").is_none());
+        assert!(line.get("query").is_none());
+        assert!(line.get("uri").is_none());
+        assert!(!line.to_string().contains(ACCOUNT.password));
+    }
+
+    #[test]
+    fn non_ascii_header_preserves_complete_observer_verdict() {
+        for value in ["café", "\u{fffd}"] {
+            let event = Entry::new("http", "request")
+                .field("uri", "/")
+                .field(
+                    "headers",
+                    J::Array(vec![J::Array(vec!["x-note".into(), value.into()])]),
+                )
+                .field("observed_password", false)
+                .field("body_unknown", false);
+            let line = http(&event);
+            assert_eq!(line["carries_password"], false, "{value:?}");
+            assert_eq!(line["body_unknown"], false, "{value:?}");
+            assert!(!line.to_string().contains(ACCOUNT.password));
+        }
+    }
 
     #[test]
     fn a_password_in_the_path_is_not_logged() {

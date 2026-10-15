@@ -1107,3 +1107,387 @@ fn the_genuine_bank_redirects_its_bare_address() {
         },
     );
 }
+
+// These probes run on Fictionet's clock, including the native body deadline.
+fn credential_lab<F, Fut>(test: F)
+where
+    F: FnOnce(fictionet::Cx, fictionet::Attacher, Buf) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = fictionet::Result> + Send + 'static,
+{
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(9),
+        |fcx| async move {
+            use border_world::scenario::{Scenario, parse_prefix};
+            use std::sync::Arc;
+            let scenario = Arc::new(Scenario::new(
+                Variant::Hijack,
+                Task::Login,
+                parse_prefix("10.0.0.0/24").unwrap(),
+            ));
+            let ca = fictionet::stdlib::ca::Ca::new(&fcx, "Test Root CA")?;
+            let ids = border_world::identities(&fcx, &scenario, &ca)?;
+            let buf = Buf::default();
+            let log = border_world::log::Log::start(Box::new(buf.clone()), scenario.clone());
+            let (attacher, attachments) = fictionet::attachments();
+            border_world::start(&fcx, scenario, ids, log, attachments)?;
+            test(fcx.clone(), attacher, buf).await?;
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+fn redacted(log: &Buf) {
+    assert!(
+        !log.lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>()
+            .to_lowercase()
+            .contains(&PASSWORD.to_lowercase())
+    );
+}
+
+#[test]
+fn password_without_host() {
+    credential_lab(|fcx, attacher, log| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let bytes = format!("GET /?p={PASSWORD} HTTP/1.0\r\n\r\n");
+        let config = fictionet::stdlib::sandbox::client_config(
+            &fcx,
+            std::time::UNIX_EPOCH,
+            None,
+            &[b"http/1.1"],
+        )?;
+        let mut secure = tls(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", config).await?;
+        secure.write_all(&fcx, bytes.as_bytes()).await?;
+        let mut plain = plain(&fcx, &m, BANK_ADDR).await;
+        plain.write_all(&fcx, bytes.as_bytes()).await?;
+        let lines = log.wait(&fcx, "http", 2, |_| true).await;
+        for line in &lines {
+            assert_eq!(line["answer"], "no_host");
+            assert_eq!(line["carries_password"], true);
+            assert_eq!(line["body_unknown"], false);
+            assert!(line.get("page").is_none());
+        }
+        assert!(lines.iter().any(|l| l["scheme"] == "https"));
+        assert!(lines.iter().any(|l| l["scheme"] == "http"));
+        redacted(&log);
+        Ok(())
+    });
+}
+
+#[test]
+fn password_in_partial_head_before_eof() {
+    credential_lab(|fcx, attacher, log| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let config = fictionet::stdlib::sandbox::client_config(
+            &fcx,
+            std::time::UNIX_EPOCH,
+            None,
+            &[b"http/1.1"],
+        )?;
+        let mut secure = tls(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", config).await?;
+        let secure_peer = secure.conn.local_addr();
+        let mut plain = plain(&fcx, &m, BANK_ADDR).await;
+        let plain_peer = plain.local_addr();
+        let sessions = log.wait(&fcx, "tls", 1, |_| true).await;
+        assert_eq!(sessions[0]["identity"], "impostor");
+        assert_eq!(sessions[0]["alpn"], "http/1.1");
+        let bytes = format!("GET /?p={PASSWORD} HTTP/1.1\r\n");
+        let started = fcx.now();
+        secure.write_all(&fcx, bytes.as_bytes()).await?;
+        // Send FIN without a TLS close_notify, as with an abrupt client exit.
+        secure.conn.shutdown(&fcx).await?;
+        plain.write_all(&fcx, bytes.as_bytes()).await?;
+        plain.shutdown(&fcx).await?;
+        let connections: [(_, _, Box<dyn fictionet::stdlib::Connection>); 2] = [
+            (443, secure_peer, Box::new(secure)),
+            (80, plain_peer, Box::new(plain)),
+        ];
+        let mut evidence = Vec::new();
+        for (port, peer, mut conn) in connections {
+            // Read through the server's close so EOF handling has finished.
+            let mut response = [0; 4096];
+            while conn.read(&fcx, &mut response).await? != 0 {}
+            assert!(fcx.now() < started + Duration::from_secs(30));
+            redacted(&log);
+            let lines = log.lines();
+            let local = SocketAddr::new(BANK_ADDR.into(), port);
+            let classified = fcx.events().all().iter().any(|event| {
+                event.source == "http"
+                    && event.conn.local == Some(local)
+                    && event.conn.peer == Some(peer)
+                    && event.conn.id.is_some_and(|id| {
+                        lines.iter().any(|line| {
+                            line["conn"] == id
+                                && (line["type"] == "http_error"
+                                    || (line["type"] == "http" && line["carries_password"] == true))
+                        })
+                    })
+            });
+            evidence.push((port, classified));
+        }
+        assert!(
+            evidence.iter().all(|(_, classified)| *classified),
+            "partial-head EOF needs carries_password: true or http_error on each connection; evidence by port: {evidence:?}; log: {:?}",
+            log.lines()
+        );
+        Ok(())
+    });
+}
+
+#[test]
+#[ignore = "RH-014: a partial request head ended by a TCP reset leaves no http line or http_error; needs httpd Http1::on_end to report unread head bytes"]
+fn password_in_partial_head_before_reset() {
+    credential_lab(|fcx, attacher, log| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let config = fictionet::stdlib::sandbox::client_config(
+            &fcx,
+            std::time::UNIX_EPOCH,
+            None,
+            &[b"http/1.1"],
+        )?;
+        let mut secure = tls(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", config).await?;
+        let secure_peer = secure.conn.local_addr();
+        let mut plain = plain(&fcx, &m, BANK_ADDR).await;
+        let plain_peer = plain.local_addr();
+        let sessions = log.wait(&fcx, "tls", 1, |_| true).await;
+        assert_eq!(sessions[0]["identity"], "impostor");
+        assert_eq!(sessions[0]["alpn"], "http/1.1");
+        let bytes = format!("GET /?p={PASSWORD} HTTP/1.1\r\n");
+        secure.write_all(&fcx, bytes.as_bytes()).await?;
+        plain.write_all(&fcx, bytes.as_bytes()).await?;
+        // Let the partial heads reach the server before resetting the connections.
+        fcx.sleep(Duration::from_secs(1)).await?;
+        secure.conn.gone_watch().reset();
+        plain.reset();
+        // Give the server time on the lab clock to record evidence after the resets.
+        fcx.sleep(Duration::from_secs(5)).await?;
+        redacted(&log);
+        let lines = log.lines();
+        let mut evidence = Vec::new();
+        for (port, peer) in [(443, secure_peer), (80, plain_peer)] {
+            let local = SocketAddr::new(BANK_ADDR.into(), port);
+            let classified = fcx.events().all().iter().any(|event| {
+                event.source == "http"
+                    && event.conn.local == Some(local)
+                    && event.conn.peer == Some(peer)
+                    && event.conn.id.is_some_and(|id| {
+                        lines.iter().any(|line| {
+                            line["conn"] == id
+                                && (line["type"] == "http_error"
+                                    || (line["type"] == "http" && line["carries_password"] == true))
+                        })
+                    })
+            });
+            evidence.push((port, classified));
+        }
+        assert!(
+            evidence.iter().all(|(_, classified)| *classified),
+            "partial-head reset needs carries_password: true or http_error on each connection; evidence by port: {evidence:?}; log: {:?}",
+            log.lines()
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn timeout_after_password() {
+    credential_lab(|fcx, attacher, log| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let config = fictionet::stdlib::sandbox::client_config(
+            &fcx,
+            std::time::UNIX_EPOCH,
+            None,
+            &[b"http/1.1"],
+        )?;
+        let mut conn = tls(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", config).await?;
+        let bytes = format!(
+            "POST /login HTTP/1.1\r\nHost: kestrelmoor.co.uk\r\nX-Password: {PASSWORD}\r\nContent-Length: 400\r\n\r\nunfinished"
+        );
+        conn.write_all(&fcx, bytes.as_bytes()).await?;
+        let started = fcx.now();
+        let mut response = [0; 1];
+        assert_eq!(conn.read(&fcx, &mut response).await?, 0);
+        assert!(fcx.now() >= started + Duration::from_secs(30));
+        let lines = log.wait(&fcx, "http", 1, |_| true).await;
+        assert_eq!(lines[0]["answer"], "timeout");
+        assert_eq!(lines[0]["carries_password"], true);
+        assert_eq!(lines[0]["body_unknown"], true);
+        assert!(lines[0].get("page").is_none());
+        assert!(log.of("http_error").iter().any(|l| l["cause"] == "timeout"));
+        redacted(&log);
+        Ok(())
+    });
+}
+
+#[test]
+fn h2_password_before_cut_off() {
+    credential_lab(|fcx, attacher, log| async move {
+        use fictionet::stdlib::{hpack, http2};
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let config =
+            fictionet::stdlib::sandbox::client_config(&fcx, std::time::UNIX_EPOCH, None, &[b"h2"])?;
+        let mut conn = tls(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", config).await?;
+        assert_eq!(conn.tls.alpn_protocol(), Some(b"h2".as_slice()));
+        let mut input = http2::PREFACE.to_vec();
+        http2::Frame::Settings(http2::Settings {
+            flags: 0,
+            entries: vec![],
+        })
+        .write(&mut input)?;
+        let mut block = Vec::new();
+        hpack::Encoder::default().encode_block(
+            &[
+                hpack::Field::new(":method", "POST"),
+                hpack::Field::new(":scheme", "https"),
+                hpack::Field::new(":authority", "kestrelmoor.co.uk"),
+                hpack::Field::new(":path", "/login"),
+            ],
+            &mut block,
+        )?;
+        http2::Frame::Headers(http2::Headers {
+            stream: 1,
+            flags: 4,
+            fragment: block,
+            priority: None,
+            padding: None,
+        })
+        .write(&mut input)?;
+        // Two frames force classification to span body chunks.
+        for bytes in PASSWORD.as_bytes().chunks(8) {
+            http2::Frame::Data(http2::Data {
+                stream: 1,
+                flags: 0,
+                data: bytes.to_vec(),
+                padding: None,
+            })
+            .write(&mut input)?;
+        }
+        conn.write_all(&fcx, &input).await?;
+        // Wait for the request's data frames to be observed before resetting it.
+        // A PING after DATA is acknowledged only once those bytes were processed.
+        let ping = http2::Frame::Ping(http2::Ping {
+            flags: 0,
+            opaque: *b"password",
+        })
+        .to_bytes()?;
+        conn.write_all(&fcx, &ping).await?;
+        let mut frames = Stream::new(http2::Inputs::default());
+        loop {
+            if let Some(frame) = frames.next() {
+                if matches!(frame?, http2::Input::Frame(http2::Frame::Ping(p)) if p.flags & 1 != 0 && p.opaque == *b"password")
+                {
+                    break;
+                }
+            } else {
+                let n = conn.read(&fcx, frames.spare()).await?;
+                assert_ne!(n, 0);
+                frames.commit(n);
+            }
+        }
+        let reset = http2::Frame::Reset(http2::Reset {
+            stream: 1,
+            flags: 0,
+            code: http2::ErrorCode::Cancel as u32,
+        })
+        .to_bytes()?;
+        conn.write_all(&fcx, &reset).await?;
+        let lines = log.wait(&fcx, "http", 1, |_| true).await;
+        assert_eq!(lines[0]["version"], "HTTP/2.0");
+        assert_eq!(lines[0]["answer"], "cut_off");
+        assert_eq!(lines[0]["carries_password"], true);
+        assert_eq!(lines[0]["body_unknown"], true);
+        assert!(lines[0].get("page").is_none());
+        redacted(&log);
+        Ok(())
+    });
+}
+
+#[test]
+fn password_before_httpd_413() {
+    credential_lab(|fcx, attacher, log| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        let mut conn = plain(&fcx, &m, BANK_ADDR).await;
+        let length = (64 << 20) + PASSWORD.len();
+        conn.write_all(&fcx, format!("POST /login HTTP/1.1\r\nHost: kestrelmoor.co.uk\r\nContent-Length: {length}\r\n\r\n{PASSWORD}").as_bytes()).await?;
+        let block = [b'x'; 8192];
+        for _ in 0..(64 << 20) / block.len() {
+            conn.write_all(&fcx, &block).await?;
+        }
+        let lines = log.wait(&fcx, "http", 1, |_| true).await;
+        assert_eq!(lines[0]["status"], 413);
+        assert_eq!(lines[0]["answer"], "too_large");
+        assert_eq!(lines[0]["carries_password"], true);
+        assert_eq!(lines[0]["body_unknown"], true);
+        assert!(lines[0].get("page").is_none());
+        redacted(&log);
+        Ok(())
+    });
+}
+
+#[test]
+fn every_http_answer_has_exposure_evidence() {
+    use border_world::scenario::{Scenario, parse_prefix};
+    use fictionet::events::{ConnInfo, Event};
+    use fictionet::stdlib::json::Value;
+    let scenario = Scenario::new(
+        Variant::Hijack,
+        Task::Login,
+        parse_prefix("10.0.0.0/24").unwrap(),
+    );
+    for answer in [
+        "no_host",
+        "misdirected",
+        "redirect",
+        "handler",
+        "error",
+        "cancelled",
+        "cut_off",
+        "too_large",
+        "timeout",
+        "budget",
+        "",
+    ] {
+        for password in [false, true] {
+            let mut event = Event::new("http", "request")
+                .field(
+                    "uri",
+                    if password {
+                        format!("/?p={PASSWORD}")
+                    } else {
+                        "/".into()
+                    },
+                )
+                .field("path", "/")
+                .field("headers", Value::Array(vec![]))
+                .field("status", 413u64);
+            event.conn = ConnInfo {
+                local: Some(SocketAddr::new(BANK_ADDR.into(), 80)),
+                ..Default::default()
+            };
+            if !answer.is_empty() {
+                event.fields.set("answer", answer);
+            }
+            let line = border_world::events::line(&scenario, &event).unwrap();
+            assert_eq!(line["local"], "84.21.44.10:80");
+            assert_eq!(
+                line["answer"],
+                if answer.is_empty() { "other" } else { answer }
+            );
+            // Without an observer verdict, no rejection may imply a safe body.
+            assert_eq!(line["body_unknown"], true);
+            assert_eq!(
+                line["carries_password"],
+                if password {
+                    serde_json::json!(true)
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert!(!line.to_string().contains(PASSWORD));
+        }
+    }
+}
