@@ -124,10 +124,26 @@
 use std::net::{IpAddr, SocketAddr};
 
 use fictionet::stdlib::onc_rpc::{
-    self, Accept, Body, Call, MAX_RPCB_STRING, Message, PMAP_PROGRAM, PMAP_VERSION, RPC_VERSION,
-    RPCB_VERSION_HIGH, RPCB_VERSION_LOW, Reader, Reject, Reply, Writer,
+    self, Accept, Body, Call, Message, RPC_VERSION, Reader, Reject, Reply, Writer,
 };
-pub use fictionet::stdlib::onc_rpc::{IPPROTO_TCP, IPPROTO_UDP, PORT};
+
+/// The port the portmapper and rpcbind listen on, over TCP and UDP.
+pub const PORT: u16 = 111;
+/// The program number of the portmapper and of rpcbind.
+pub const PMAP_PROGRAM: u32 = 100_000;
+/// The portmapper's version (RFC 1833, section 3).
+pub const PMAP_VERSION: u32 = 2;
+/// The lowest rpcbind version (RFC 1833, section 2).
+pub const RPCB_VERSION_LOW: u32 = 3;
+/// The highest rpcbind version (RFC 1833, section 2).
+pub const RPCB_VERSION_HIGH: u32 = 4;
+/// The protocol number a [`Mapping`] gives for TCP.
+pub const IPPROTO_TCP: u32 = 6;
+/// The protocol number a [`Mapping`] gives for UDP.
+pub const IPPROTO_UDP: u32 = 17;
+/// The longest string in an rpcbind request or reply: a network ID, a
+/// universal address or an owner.
+pub const MAX_RPCB_STRING: usize = 255;
 
 /// A portmapper mapping: a program and version, a protocol, and the port
 /// it listens on (RFC 1833, section 3.1).

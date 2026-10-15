@@ -64,22 +64,13 @@ use fictionet::stdlib::codec::{
     self, Assemble, AssembleError, Assembled, Decode, Reader as ByteReader, Step, Truncated, Wire,
 };
 
-/// The port the portmapper and rpcbind listen on, over TCP and UDP.
-pub const PORT: u16 = 111;
+pub use fictionet::stdlib::portmap::{
+    IPPROTO_TCP, IPPROTO_UDP, MAX_RPCB_STRING, PMAP_PROGRAM, PMAP_VERSION, PORT, RPCB_VERSION_HIGH,
+    RPCB_VERSION_LOW,
+};
+
 /// The ONC RPC version every call names (RFC 5531).
 pub const RPC_VERSION: u32 = 2;
-/// The program number of the portmapper and of rpcbind.
-pub const PMAP_PROGRAM: u32 = 100_000;
-/// The portmapper's version (RFC 1833, section 3).
-pub const PMAP_VERSION: u32 = 2;
-/// The lowest rpcbind version (RFC 1833, section 2).
-pub const RPCB_VERSION_LOW: u32 = 3;
-/// The highest rpcbind version (RFC 1833, section 2).
-pub const RPCB_VERSION_HIGH: u32 = 4;
-/// The protocol number a [`Mapping`](fictionet::stdlib::portmap::Mapping) gives for TCP.
-pub const IPPROTO_TCP: u32 = 6;
-/// The protocol number a [`Mapping`](fictionet::stdlib::portmap::Mapping) gives for UDP.
-pub const IPPROTO_UDP: u32 = 17;
 
 /// The longest body of a credential or verifier (RFC 5531, section 8.2).
 pub const MAX_AUTH_BODY: usize = 400;
@@ -87,9 +78,6 @@ pub const MAX_AUTH_BODY: usize = 400;
 pub const MAX_MACHINE_NAME: usize = 255;
 /// The most supplementary group IDs in AUTH_SYS credentials.
 pub const MAX_GIDS: usize = 16;
-/// The longest string in an rpcbind request or reply: a network ID, a
-/// universal address or an owner.
-pub const MAX_RPCB_STRING: usize = 255;
 /// The most items [`Reader::array`] makes room for before it reads them.
 /// A longer array grows as its items read, so a count alone never sizes
 /// an allocation. It is also the most items an array may have when they
