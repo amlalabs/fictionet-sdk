@@ -12,6 +12,8 @@ mod common;
 mod done;
 #[path = "common/http_observer.rs"]
 mod http_observer;
+#[path = "common/io.rs"]
+mod io;
 #[path = "common/wait.rs"]
 mod wait;
 #[path = "common/world.rs"]
@@ -38,7 +40,7 @@ use fictionet::stdlib::httpd::{
 };
 use fictionet::stdlib::json;
 use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeOptions};
-use fictionet::stdlib::{Connection, ConnectionExt, hpack, http2, ip, tcp};
+use fictionet::stdlib::{Connection, ConnectionExt, hpack, http1, http2, ip, tcp};
 use fictionet::tokio::ConnectionTokioExt;
 use fictionet::{Cx, pair};
 use http_body::Frame;
@@ -1412,34 +1414,101 @@ fn default_first_bytes_uses_the_header_deadline() {
     });
 }
 
+/// Reads one Content-Length response without consuming the next response.
+async fn keep_alive_response(fcx: &Cx, conn: &mut impl Connection) -> http1::Response {
+    let deadline = fcx.now() + Duration::from_secs(1);
+    let mut bytes = io::read_until_async(fcx, conn, deadline, b"\r\n\r\n")
+        .await
+        .expect("complete response head");
+    let (head, _) = http1::ResponseHead::parse_lenient(&bytes)
+        .unwrap()
+        .expect("response head");
+    let length = head
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+        .expect("keep-alive response declares its length");
+    let length: usize = std::str::from_utf8(&length.value).unwrap().parse().unwrap();
+    fcx.race(Some(deadline), async {
+        let end = bytes.len() + length;
+        let mut buf = [0; 4096];
+        while bytes.len() < end {
+            let want = buf.len().min(end - bytes.len());
+            let n = conn.read(fcx, &mut buf[..want]).await.unwrap();
+            assert_ne!(n, 0, "EOF before response body ends");
+            bytes.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await
+    .expect("complete response body");
+    io::response(&bytes, "GET", false)
+}
+
+/// Requires a successful keep-alive request before rejecting an over-long header.
+async fn upgrade_keep_alive_line_limit(fcx: &Cx) -> fictionet::Result {
+    let (server, client) = two_machines(fcx);
+    let opts = HttpOptions {
+        limits: Limits {
+            head: fictionet::stdlib::http1::Limits {
+                header_line: 32,
+                ..Default::default()
+            },
+            ..Limits::default()
+        },
+        ..HttpOptions::default()
+    };
+    serve_http(fcx, &server, 80, Arc::new(page(4)), opts)?;
+    let mut conn = client
+        .connect(fcx, SocketAddr::new(SERVER.into(), 80))
+        .await?;
+    conn.write_all(
+        fcx,
+        b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await?;
+    let response = keep_alive_response(fcx, &mut conn).await;
+    assert_eq!(response.head.status, 200);
+    assert_eq!(response.body, b"xxxx");
+    conn.write_all(
+        fcx,
+        b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Long: short\r\n\r\n",
+    )
+    .await?;
+    let response = keep_alive_response(fcx, &mut conn).await;
+    assert_eq!(response.head.status, 200);
+    assert_eq!(response.body, b"xxxx");
+    conn.write_all(
+        fcx,
+        b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Long: abcdefghijklmnopqrstuvwxyz0123456789\r\n\r\n",
+    )
+    .await?;
+    let result = fcx
+        .race(
+            Some(fcx.now() + Duration::from_secs(1)),
+            conn.read(fcx, &mut [0; 1]),
+        )
+        .await;
+    // The upgrade path rejects the head by closing without a status response.
+    assert_eq!(result, Ok(Ok(0)));
+    assert_eq!(fcx.events().of("http", "request").len(), 2);
+    Ok(())
+}
+
 #[test]
 fn upgrade_keep_alive_preserves_line_limits() {
     world(Duration::from_secs(10), |fcx| async move {
-        let (server, client) = two_machines(&fcx);
-        let opts = HttpOptions {
-            limits: Limits {
-                head: fictionet::stdlib::http1::Limits {
-                    header_line: 32,
-                    ..Default::default()
-                },
-                ..Limits::default()
-            },
-            ..HttpOptions::default()
-        };
-        serve_http(&fcx, &server, 80, Arc::new(page(0)), opts)?;
-        let mut conn = client
-            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
-            .await?;
-        conn.write_all(
-            &fcx,
-            b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
-        )
-        .await?;
-        let response = read_some(&fcx, &mut conn, 1).await;
-        assert!(response.starts_with(b"HTTP/1.1 200"));
-        conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Long: abcdefghijklmnopqrstuvwxyz0123456789\r\n\r\n").await?;
-        let response = read_some(&fcx, &mut conn, 1).await;
-        assert!(!response.starts_with(b"HTTP/1.1 200"));
+        upgrade_keep_alive_line_limit(&fcx).await
+    });
+}
+
+#[test]
+#[ignore = "RH-110: hyper treats HeadCheck's rejection on an idle keep-alive connection as a clean EOF, so no http.error event is recorded"]
+fn upgrade_keep_alive_line_limit_rejection_records_protocol_error() {
+    world(Duration::from_secs(10), |fcx| async move {
+        upgrade_keep_alive_line_limit(&fcx).await?;
+        let errors = fcx.events().of("http", "error");
+        assert_eq!(errors.len(), 1, "RH-110: missing limit rejection event");
+        assert_eq!(errors[0].str("cause"), Some("protocol"));
         Ok(())
     });
 }
@@ -1455,7 +1524,7 @@ fn upgrade_keep_alive_preserves_header_timeout() {
             },
             ..HttpOptions::default()
         };
-        serve_http(&fcx, &server, 80, Arc::new(page(0)), opts)?;
+        serve_http(&fcx, &server, 80, Arc::new(page(4)), opts)?;
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
             .await?;
@@ -1464,11 +1533,9 @@ fn upgrade_keep_alive_preserves_header_timeout() {
             b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
         )
         .await?;
-        assert!(
-            read_some(&fcx, &mut conn, 1)
-                .await
-                .starts_with(b"HTTP/1.1 200")
-        );
+        let response = keep_alive_response(&fcx, &mut conn).await;
+        assert_eq!(response.head.status, 200);
+        assert_eq!(response.body, b"xxxx");
         conn.write_all(&fcx, b"GET /").await?;
         let result = fcx
             .race(
@@ -1477,6 +1544,69 @@ fn upgrade_keep_alive_preserves_header_timeout() {
             )
             .await;
         assert!(matches!(result, Ok(Ok(0))));
+        Ok(())
+    });
+}
+
+#[test]
+fn silent_limit_failure() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let mut listener = server.listen(80)?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let _peer = listener.accept(&fcx).await?;
+        let result = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(1)),
+                conn.read(&fcx, &mut [0; 1]),
+            )
+            .await;
+        // Silence is a deadline, not the EOF required for limit rejection.
+        assert_eq!(result, Err(fictionet::RaceError::Deadline));
+        Ok(())
+    });
+}
+
+#[test]
+fn partial_200_not_rejection() {
+    world(Duration::from_secs(10), |fcx| async move {
+        for bytes in [
+            b"H".as_slice(),
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\n\r\nx",
+        ] {
+            let (server, client) = two_machines(&fcx);
+            let mut listener = server.listen(80)?;
+            fcx.spawn(move |fcx| async move {
+                let mut peer = listener.accept(&fcx).await?;
+                peer.write_all(&fcx, bytes).await?;
+                peer.shutdown(&fcx).await?;
+                Ok(())
+            });
+            let mut conn = client
+                .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+                .await?;
+            let mut first = [0; 1];
+            let result = fcx
+                .race(
+                    Some(fcx.now() + Duration::from_secs(1)),
+                    conn.read(&fcx, &mut first),
+                )
+                .await;
+            // A response byte, including a non-200 status, is not rejection EOF.
+            assert_eq!(result, Ok(Ok(1)));
+            assert_eq!(first, [b'H']);
+            let mut got = first.to_vec();
+            got.extend(
+                io::read_to_end(&fcx, &mut conn, fcx.now() + Duration::from_secs(1)).await??,
+            );
+            assert_eq!(got, bytes);
+            assert_eq!(
+                http1::Response::parse_for(&got, "GET"),
+                Err(http1::Error::Incomplete)
+            );
+        }
         Ok(())
     });
 }

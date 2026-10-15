@@ -8,6 +8,8 @@ mod certs;
 mod common;
 #[path = "../examples/common/hyper.rs"]
 mod hyper_io;
+#[path = "common/io.rs"]
+mod io;
 use hyper_io::{Exec, Io};
 
 use fictionet::stdlib::sandbox::{TlsClient, TlsError};
@@ -43,7 +45,7 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::tls;
-use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, web};
+use fictionet::stdlib::{ConnError, Connection, dhcp, http1, ip, tcp, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet, Seed, block_on, lab, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
@@ -2778,19 +2780,11 @@ fn dhcp_inform_as_the_first_packet_is_answered() {
     });
 }
 
-/// Reads `conn` to its end.
-async fn read_all<C: Connection>(fcx: &Cx, conn: &mut C) -> Vec<u8> {
-    let mut all = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match timeout(fcx, Duration::from_secs(5), conn.read(fcx, &mut buf))
-            .await
-            .expect("the response ends")
-        {
-            Ok(0) | Err(_) => return all,
-            Ok(n) => all.extend_from_slice(&buf[..n]),
-        }
-    }
+/// Requires EOF within five seconds; transport errors stay errors.
+async fn read_all<C: Connection>(fcx: &Cx, conn: &mut C) -> Result<Vec<u8>, ConnError> {
+    io::read_to_end(fcx, conn, fcx.now() + Duration::from_secs(5))
+        .await
+        .expect("the response ends")
 }
 
 /// A body whose length the handler knows goes out with `content-length`;
@@ -2812,7 +2806,7 @@ fn a_known_length_is_sent_as_content_length() {
         )
         .await
         .unwrap();
-        let got = String::from_utf8(read_all(&fcx, &mut conn).await)
+        let got = String::from_utf8(read_all(&fcx, &mut conn).await.unwrap())
             .unwrap()
             .to_lowercase();
         let body = "plain http plain.test 80 HTTP/1.1 /len";
@@ -2909,9 +2903,12 @@ fn the_default_host_answers_hosts_with_no_site_of_their_own() {
             ("default.test", "default http default.test 80 HTTP/1.1 /p"),
             ("other.test", "other http other.test 80 HTTP/1.1 /p"),
         ] {
-            let got =
-                String::from_utf8(raw_http(&fcx, &m, DEFAULT_ADDR, ask(host).as_bytes()).await)
-                    .unwrap();
+            let got = String::from_utf8(
+                raw_http(&fcx, &m, DEFAULT_ADDR, ask(host).as_bytes())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
             assert!(
                 got.starts_with("HTTP/1.1 200 OK") && got.ends_with(want),
                 "{host}: {got:?}"
@@ -2921,7 +2918,9 @@ fn the_default_host_answers_hosts_with_no_site_of_their_own() {
         // the host the client named.
         assert_eq!(lookup(&fcx, &m, "tls-default.test").await, TLS_DEFAULT_ADDR);
         let got = String::from_utf8(
-            raw_http(&fcx, &m, TLS_DEFAULT_ADDR, ask("203.0.113.41").as_bytes()).await,
+            raw_http(&fcx, &m, TLS_DEFAULT_ADDR, ask("203.0.113.41").as_bytes())
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert!(got.starts_with("HTTP/1.1 301"), "{got:?}");
@@ -2933,7 +2932,9 @@ fn the_default_host_answers_hosts_with_no_site_of_their_own() {
         // Without a default, the same request gets 421.
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let got = String::from_utf8(
-            raw_http(&fcx, &m, SECURE_ADDR, ask("203.0.113.10").as_bytes()).await,
+            raw_http(&fcx, &m, SECURE_ADDR, ask("203.0.113.10").as_bytes())
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert!(got.starts_with("HTTP/1.1 421"), "{got:?}");
@@ -2950,11 +2951,19 @@ fn a_client_that_half_closes_after_its_request_gets_the_response() {
         let m = default_machine(&fcx, &attacher);
         let plain = lookup(&fcx, &m, "plain.test").await;
         let secure = lookup(&fcx, &m, "secure.test").await;
-        let requests: [&[u8]; 2] = [
-            b"GET /h HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n",
-            b"GET /h HTTP/1.0\r\nHost: plain.test\r\n\r\n",
+        let requests: [(&[u8], http1::Version, &str); 2] = [
+            (
+                b"GET /h HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n",
+                http1::Version::Http11,
+                "plain http plain.test 80 HTTP/1.1 /h",
+            ),
+            (
+                b"GET /h HTTP/1.0\r\nHost: plain.test\r\n\r\n",
+                http1::Version::Http10,
+                "plain http plain.test 80 HTTP/1.0 /h",
+            ),
         ];
-        for request in requests {
+        for (request, version, body) in requests {
             let mut conn = m
                 .tcp
                 .connect(&fcx, SocketAddr::new(plain.into(), 80))
@@ -2962,12 +2971,8 @@ fn a_client_that_half_closes_after_its_request_gets_the_response() {
                 .unwrap();
             conn.write_all(&fcx, request).await.unwrap();
             conn.shutdown(&fcx).await.unwrap();
-            let got = String::from_utf8(read_all(&fcx, &mut conn).await).unwrap();
-            assert!(
-                got.starts_with("HTTP/1.") && got.contains(" 200 OK"),
-                "{request:?} got {got:?}"
-            );
-            assert!(got.contains("plain http plain.test 80"), "{got:?}");
+            let got = read_all(&fcx, &mut conn).await.unwrap();
+            assert_half_close_response(&got, version, body);
         }
         let mut conn = tls_connect(&fcx, &m, &env, secure, "secure.test", &[b"http/1.1"])
             .await
@@ -2979,8 +2984,140 @@ fn a_client_that_half_closes_after_its_request_gets_the_response() {
         .await
         .unwrap();
         conn.shutdown(&fcx).await.unwrap();
-        let got = String::from_utf8(read_all(&fcx, &mut conn).await).unwrap();
-        assert!(got.starts_with("HTTP/1.1 200 OK"), "{got:?}");
+        let got = read_all(&fcx, &mut conn).await.unwrap();
+        assert_half_close_response(
+            &got,
+            http1::Version::Http11,
+            "secure https secure.test 443 HTTP/1.1 #1",
+        );
+        Ok(())
+    });
+}
+
+/// Requires a complete, length-delimited 200 with exactly `body`.
+fn assert_half_close_response(got: &[u8], version: http1::Version, body: &str) {
+    let response = http1::Response::parse_for(got, "GET").expect("complete half-close response");
+    assert_eq!(response.head.status, 200);
+    assert_eq!(response.head.version, version);
+    assert!(
+        response
+            .head
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-length")),
+        "half-close response must declare its length"
+    );
+    assert_eq!(response.body, body.as_bytes());
+}
+
+#[test]
+fn half_close_truncated_body_rejected() {
+    // Signal after the reader consumes the prefix, so a reset cannot discard
+    // the scripted bytes before they reach read_all's buffer.
+    struct Receipt {
+        conn: tcp::TcpConnection,
+        remaining: usize,
+        sent: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl Connection for Receipt {
+        fn poll_read(
+            &mut self,
+            fcx: &Cx,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            let result = self.conn.poll_read(fcx, cx, buf);
+            if let Poll::Ready(Ok(n)) = result {
+                self.remaining -= n;
+                if self.remaining == 0
+                    && let Some(sent) = self.sent.take()
+                {
+                    sent.send(()).expect("peer waits for receipt");
+                }
+            }
+            result
+        }
+        fn poll_write(
+            &mut self,
+            _: &Cx,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            panic!("client already half-closed")
+        }
+        fn poll_shutdown(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+            panic!("client already half-closed")
+        }
+    }
+
+    run_world::world(Duration::from_secs(10), |fcx| async move {
+        for reset in [false, true] {
+            for (version, body, prefix) in [
+                (
+                    "HTTP/1.1",
+                    "plain http plain.test 80 HTTP/1.1 /h",
+                    "plain http plain.test 80",
+                ),
+                (
+                    "HTTP/1.0",
+                    "plain http plain.test 80 HTTP/1.0 /h",
+                    "plain http plain.test 80",
+                ),
+                // Replay the TLS case's body framing over plain TCP to test the reader and parser.
+                ("HTTP/1.1", "secure https secure.test 443 HTTP/1.1 #1", ""),
+            ] {
+                let (a, b) = fictionet::pair();
+                let server = machine(&fcx, a, Ipv4Addr::new(10, 0, 0, 1));
+                let client = machine(&fcx, b, Ipv4Addr::new(10, 0, 0, 2));
+                let mut listener = server.tcp.listen(80)?;
+                let partial = format!(
+                    "{version} 200 OK\r\nContent-Length: {}\r\n\r\n{prefix}",
+                    body.len()
+                );
+                let length = partial.len();
+                let (sent, received) = tokio::sync::oneshot::channel();
+                let bytes = partial.clone();
+                fcx.spawn(move |fcx| async move {
+                    let mut peer = listener.accept(&fcx).await?;
+                    assert_eq!(
+                        read_all(&fcx, &mut peer).await?,
+                        b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n"
+                    );
+                    peer.write_all(&fcx, bytes.as_bytes()).await?;
+                    received.await?;
+                    if reset {
+                        peer.reset();
+                    } else {
+                        peer.shutdown(&fcx).await?;
+                    }
+                    Ok(())
+                });
+                let mut conn = client
+                    .tcp
+                    .connect(&fcx, SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 80))
+                    .await?;
+                conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                    .await?;
+                conn.shutdown(&fcx).await?;
+                let mut conn = Receipt {
+                    conn,
+                    remaining: length,
+                    sent: Some(sent),
+                };
+                let got = read_all(&fcx, &mut conn).await;
+                assert_eq!(conn.remaining, 0, "the reader consumed the prefix");
+                if reset {
+                    assert_eq!(got, Err(ConnError::Reset));
+                } else {
+                    let got = got.unwrap();
+                    assert_eq!(got, partial.as_bytes());
+                    assert_eq!(
+                        http1::Response::parse_for(&got, "GET"),
+                        Err(http1::Error::Incomplete)
+                    );
+                }
+            }
+        }
         Ok(())
     });
 }
@@ -3576,7 +3713,12 @@ fn events_for_tls_handshakes() {
 
 /// Sends `request` on a new connection to `addr:80` and reads until the
 /// server closes it.
-async fn raw_http(fcx: &Cx, m: &Machine, addr: Ipv4Addr, request: &[u8]) -> Vec<u8> {
+async fn raw_http(
+    fcx: &Cx,
+    m: &Machine,
+    addr: Ipv4Addr,
+    request: &[u8],
+) -> Result<Vec<u8>, ConnError> {
     let mut conn = m
         .tcp
         .connect(fcx, SocketAddr::new(addr.into(), 80))
@@ -3672,7 +3814,9 @@ fn events_for_http_requests() {
             client.get("http", "broken.test", "/").await.status,
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        let reply = raw_http(&fcx, &m, SECURE_ADDR, b"GET / HTTP/1.0\r\n\r\n").await;
+        let reply = raw_http(&fcx, &m, SECURE_ADDR, b"GET / HTTP/1.0\r\n\r\n")
+            .await
+            .unwrap();
         assert!(
             reply.starts_with(b"HTTP/1.0 400"),
             "{}",
@@ -4013,13 +4157,36 @@ fn events_for_bytes_that_are_not_http() {
         let plain = lookup(&fcx, &m, "plain.test").await;
         assert_eq!(lookup(&fcx, &m, "events.test").await, EVENTS_ADDR);
 
-        // Garbage on port 80.
-        raw_http(&fcx, &m, plain, b"\x16\x03\x01\x00\x05hello\r\n\r\n").await;
+        // Garbage on port 80 gets a complete 400 followed by clean EOF.
+        let bad_head = raw_http(&fcx, &m, plain, b"\x16\x03\x01\x00\x05hello\r\n\r\n")
+            .await
+            .unwrap();
+        let response = io::response(&bad_head, "GET", false);
+        assert_eq!(response.head.status, 400);
+        assert!(response.body.is_empty());
         // HTTP/2 with prior knowledge, then a SETTINGS frame of a size no
         // SETTINGS frame can have.
         let mut bad = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         bad.extend_from_slice(&[0, 0, 5, 4, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5]);
-        raw_http(&fcx, &m, plain, &bad).await;
+        // The invalid frame gets SETTINGS and a protocol-error GOAWAY, then clean EOF.
+        use fictionet::stdlib::http2;
+        let reply = raw_http(&fcx, &m, plain, &bad).await.unwrap();
+        let head = http2::FrameHeader::parse(&reply[..http2::HEADER_LEN]).unwrap();
+        let (settings, goaway) = reply.split_at(http2::HEADER_LEN + head.length);
+        assert!(matches!(
+            http2::Frame::parse(settings).unwrap(),
+            http2::Frame::Settings(_)
+        ));
+        assert_eq!(
+            http2::Frame::parse(goaway).unwrap(),
+            http2::Frame::GoAway(http2::GoAway {
+                flags: 0,
+                last_stream: 0,
+                // h2 0.4.19 sends PROTOCOL_ERROR here; RFC 9113 §6.5 requires FRAME_SIZE_ERROR.
+                code: http2::ErrorCode::ProtocolError as u32,
+                debug: Vec::new(),
+            })
+        );
         // Clean closes make no event: a whole request, and nothing at all.
         let ok = raw_http(
             &fcx,
@@ -4027,7 +4194,8 @@ fn events_for_bytes_that_are_not_http() {
             plain,
             b"GET / HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n",
         )
-        .await;
+        .await
+        .unwrap();
         assert!(ok.starts_with(b"HTTP/1.1 200"));
         let mut conn = m
             .tcp
@@ -4035,7 +4203,8 @@ fn events_for_bytes_that_are_not_http() {
             .await
             .unwrap();
         conn.shutdown(&fcx).await.unwrap();
-        let _ = read_all(&fcx, &mut conn).await;
+        // An empty half-close is answered by a clean EOF with no bytes.
+        assert_eq!(read_all(&fcx, &mut conn).await, Ok(Vec::new()));
         // After a TLS handshake, a record that does not decrypt.
         let mut client = tls_connect(&fcx, &m, &env, EVENTS_ADDR, "events.test", &[b"http/1.1"])
             .await
