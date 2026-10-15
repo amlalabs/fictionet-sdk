@@ -67,10 +67,7 @@ impl FromStr for Prefix {
                 }
             },
         };
-        Ok(Prefix {
-            addr: mask(addr, len),
-            len,
-        })
+        Ok(Prefix { addr, len }.canonical())
     }
 }
 
@@ -81,7 +78,7 @@ impl Prefix {
     pub fn canonical(self) -> Prefix {
         let len = self.len.min(if self.addr.is_ipv4() { 32 } else { 128 });
         Prefix {
-            addr: mask(self.addr, len),
+            addr: self.network(),
             len,
         }
     }
@@ -89,30 +86,92 @@ impl Prefix {
     /// Whether `addr` is in this prefix. An address of the other family
     /// never is.
     pub fn contains(self, addr: IpAddr) -> bool {
-        self.addr.is_ipv4() == addr.is_ipv4() && mask(addr, self.len) == self.canonical().addr
+        self.addr.is_ipv4() == addr.is_ipv4()
+            && Prefix {
+                addr,
+                len: self.len,
+            }
+            .network()
+                == self.network()
     }
-}
 
-/// `addr` with every bit after the first `len` cleared.
-fn mask(addr: IpAddr, len: u8) -> IpAddr {
-    match addr {
-        IpAddr::V4(a) => {
-            let bits = u32::from(a);
-            let m = if len == 0 {
-                0
-            } else {
-                u32::MAX << (32 - len.min(32) as u32)
-            };
-            IpAddr::V4(Ipv4Addr::from(bits & m))
+    /// The network address, with every host bit cleared.
+    /// Lengths past the address width count as the whole address.
+    pub fn network(self) -> IpAddr {
+        match (self.addr, self.mask()) {
+            (IpAddr::V4(a), IpAddr::V4(m)) => Ipv4Addr::from(u32::from(a) & u32::from(m)).into(),
+            (IpAddr::V6(a), IpAddr::V6(m)) => Ipv6Addr::from(u128::from(a) & u128::from(m)).into(),
+            _ => unreachable!("the mask has the prefix's family"),
         }
-        IpAddr::V6(a) => {
-            let bits = u128::from(a);
-            let m = if len == 0 {
-                0
-            } else {
-                u128::MAX << (128 - len.min(128) as u32)
-            };
-            IpAddr::V6(Ipv6Addr::from(bits & m))
+    }
+
+    /// The netmask, in this prefix's address family. A `/0` has a zero
+    /// mask. Lengths past the address width count as the whole address.
+    pub fn mask(self) -> IpAddr {
+        match self.addr {
+            IpAddr::V4(_) => Ipv4Addr::from(
+                u32::MAX
+                    .checked_shl(32 - u32::from(self.len.min(32)))
+                    .unwrap_or(0),
+            )
+            .into(),
+            IpAddr::V6(_) => Ipv6Addr::from(
+                u128::MAX
+                    .checked_shl(128 - u32::from(self.len.min(128)))
+                    .unwrap_or(0),
+            )
+            .into(),
+        }
+    }
+
+    /// The last address in this prefix, with every host bit set.
+    /// This is an address bound, regardless of whether a caller may use it.
+    pub fn last(self) -> IpAddr {
+        match (self.addr, self.mask()) {
+            (IpAddr::V4(a), IpAddr::V4(m)) => Ipv4Addr::from(u32::from(a) | !u32::from(m)).into(),
+            (IpAddr::V6(a), IpAddr::V6(m)) => Ipv6Addr::from(u128::from(a) | !u128::from(m)).into(),
+            _ => unreachable!("the mask has the prefix's family"),
+        }
+    }
+
+    /// The IPv4 directed broadcast address. IPv4 `/31` and `/32` prefixes
+    /// and all IPv6 prefixes have none.
+    pub fn broadcast(self) -> Option<Ipv4Addr> {
+        match self.last() {
+            IpAddr::V4(a) if self.len < 31 => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Whether this prefix and `other` share any address. Prefixes of
+    /// different families never overlap. Host bits need not be cleared.
+    pub fn overlaps(self, other: Prefix) -> bool {
+        self.contains(other.addr) || other.contains(self.addr)
+    }
+
+    /// The number of addresses, including the network and last addresses.
+    /// IPv6 `/0` returns `None`: its size, 2^128, does not fit in `u128`.
+    /// Lengths past the address width count as a single address.
+    pub fn size(self) -> Option<u128> {
+        let width = if self.addr.is_ipv4() { 32 } else { 128 };
+        1u128.checked_shl(u32::from(width - self.len.min(width)))
+    }
+
+    /// The address at zero-based offset `n` from the network address.
+    /// Returns `None` if the offset is outside this prefix. Host bits in
+    /// `addr` are ignored, and arithmetic never wraps.
+    /// This does not decide whether the address is usable by a caller.
+    pub fn nth(self, n: u128) -> Option<IpAddr> {
+        if self.size().is_some_and(|size| n >= size) {
+            return None;
+        }
+        match self.network() {
+            IpAddr::V4(a) => u32::from(a)
+                .checked_add(n as u32)
+                .map(|a| Ipv4Addr::from(a).into()),
+            IpAddr::V6(a) => u128::from(a)
+                .checked_add(n)
+                .map(|a| Ipv6Addr::from(a).into()),
         }
     }
 }
@@ -363,10 +422,7 @@ impl Table {
             .rev()
             .find_map(|(&(_, len), _)| {
                 self.routes
-                    .get(&Prefix {
-                        addr: mask(dst, len),
-                        len,
-                    })
+                    .get(&Prefix { addr: dst, len }.canonical())
                     .copied()
             })
     }
@@ -619,23 +675,12 @@ where
 /// of the subnet's family.
 fn floods(subnet: Prefix, dst: IpAddr) -> bool {
     match (subnet.addr, dst) {
-        (IpAddr::V4(network), IpAddr::V4(dst)) => {
-            dst.is_multicast()
-                || dst == Ipv4Addr::BROADCAST
-                || Some(dst) == broadcast4(network, subnet.len)
+        (IpAddr::V4(_), IpAddr::V4(dst)) => {
+            dst.is_multicast() || dst == Ipv4Addr::BROADCAST || Some(dst) == subnet.broadcast()
         }
         (IpAddr::V6(_), IpAddr::V6(dst)) => dst.is_multicast(),
         _ => false,
     }
-}
-
-/// The broadcast address of `network/len`: the host bits all set. A `/31`
-/// or `/32` has none (RFC 3021).
-fn broadcast4(network: Ipv4Addr, len: u8) -> Option<Ipv4Addr> {
-    if len >= 31 {
-        return None;
-    }
-    Some(Ipv4Addr::from(u32::from(network) | (u32::MAX >> len)))
 }
 
 /// Whether `addr` is link-local (`169.254.0.0/16` or `fe80::/10`). Such
@@ -1215,7 +1260,7 @@ mod tests {
         assert!(!floods(p("10.0.0.1/32"), a("10.0.0.1")));
         assert!(floods(p("10.0.0.0/31"), a("255.255.255.255")));
         assert_eq!(
-            broadcast4(Ipv4Addr::UNSPECIFIED, 0),
+            p("0.0.0.0/0").broadcast(),
             Some(Ipv4Addr::BROADCAST)
         );
         // A length past the address is the whole address, so no shift

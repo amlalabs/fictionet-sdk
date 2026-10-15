@@ -740,6 +740,144 @@ fn prefixes_parse() {
 }
 
 #[test]
+fn prefix_geometry() {
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    for (addr, len, network, mask, last, size, broadcast) in [
+        (
+            "10.1.2.3",
+            0,
+            "0.0.0.0",
+            "0.0.0.0",
+            "255.255.255.255",
+            Some(1u128 << 32),
+            Some("255.255.255.255"),
+        ),
+        (
+            "10.1.2.3",
+            24,
+            "10.1.2.0",
+            "255.255.255.0",
+            "10.1.2.255",
+            Some(256),
+            Some("10.1.2.255"),
+        ),
+        (
+            "255.255.255.255",
+            31,
+            "255.255.255.254",
+            "255.255.255.254",
+            "255.255.255.255",
+            Some(2),
+            None,
+        ),
+        (
+            "255.255.255.255",
+            32,
+            "255.255.255.255",
+            "255.255.255.255",
+            "255.255.255.255",
+            Some(1),
+            None,
+        ),
+        (
+            "255.255.255.255",
+            255,
+            "255.255.255.255",
+            "255.255.255.255",
+            "255.255.255.255",
+            Some(1),
+            None,
+        ),
+        (
+            "ffff::1",
+            0,
+            "::",
+            "::",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            None,
+            None,
+        ),
+        (
+            "2001:db8::ff",
+            120,
+            "2001:db8::",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ff00",
+            "2001:db8::ff",
+            Some(256),
+            None,
+        ),
+        (
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            128,
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            Some(1),
+            None,
+        ),
+        (
+            "::1",
+            255,
+            "::1",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "::1",
+            Some(1),
+            None,
+        ),
+    ] {
+        let p = Prefix {
+            addr: ip(addr),
+            len,
+        };
+        assert_eq!(p.network(), ip(network), "{p:?}");
+        assert_eq!(p.mask(), ip(mask), "{p:?}");
+        assert_eq!(p.last(), ip(last), "{p:?}");
+        assert_eq!(p.size(), size, "{p:?}");
+        assert_eq!(p.broadcast().map(IpAddr::V4), broadcast.map(ip), "{p:?}");
+        assert_eq!(p.nth(0), Some(ip(network)), "{p:?}");
+        assert_eq!(
+            p.nth(size.map_or(u128::MAX, |n| n - 1)),
+            Some(ip(last)),
+            "{p:?}"
+        );
+        assert!(p.contains(ip(network)) && p.contains(ip(last)), "{p:?}");
+        if let Some(size) = size {
+            assert_eq!(p.nth(size), None, "{p:?}");
+            assert_eq!(p.nth(u128::MAX), None, "{p:?}");
+        }
+        assert_eq!(p.canonical().network(), p.network());
+    }
+}
+
+#[test]
+fn prefix_overlaps() {
+    for (a, b, expected) in [
+        ("198.18.0.0/15", "198.19.255.252/30", true),
+        ("198.18.0.0/15", "198.20.0.0/30", false),
+        ("198.18.0.0/15", "198.16.0.0/14", true),
+        ("2001:2::/48", "2001:2:0:ffff::/64", true),
+        ("2001:2::/48", "2001:2:1::/64", false),
+        ("0.0.0.0/0", "::/0", false),
+        ("0.0.0.0/0", "255.255.255.255/32", true),
+        ("::/0", "ffff::/128", true),
+    ] {
+        let a: Prefix = a.parse().unwrap();
+        let b: Prefix = b.parse().unwrap();
+        assert_eq!(a.overlaps(b), expected, "{a:?}, {b:?}");
+        assert_eq!(b.overlaps(a), expected, "{b:?}, {a:?}");
+    }
+    let a = Prefix {
+        addr: "10.0.0.255".parse().unwrap(),
+        len: 24,
+    };
+    let b = Prefix {
+        addr: "10.0.0.1".parse().unwrap(),
+        len: 25,
+    };
+    assert!(a.overlaps(b) && b.overlaps(a));
+}
+
+#[test]
 fn router_longest_prefix_add_replace_and_removal_on_close() {
     world(|fcx| async move {
         let (a_router, mut a) = pair();

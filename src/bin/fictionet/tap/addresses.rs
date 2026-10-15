@@ -5,7 +5,7 @@
 //! out the same lease, so there is no lease table: a VM that asks again,
 //! after a reboot or with a new client ID, gets the same answer.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use fictionet::stdlib::codec::Wire;
@@ -13,6 +13,7 @@ use fictionet::stdlib::dhcp::{self, opt};
 use fictionet::stdlib::dhcpv6::{
     self, DhcpOption, Duid, IaAddr, IaNa, Message, StatusCode, msg, status,
 };
+use fictionet::stdlib::route::Prefix;
 
 use super::ether;
 use crate::config::{Lease, mask4};
@@ -37,14 +38,25 @@ pub(crate) fn server_id(lease: &Lease<Ipv4Addr>) -> Ipv4Addr {
     if let Some(gw) = lease.gateway.or(lease.dns) {
         return gw;
     }
-    let mask = mask4(lease.addr.prefix);
-    let first = (u32::from(lease.addr.addr) & mask) + 1;
-    let pick = if first == u32::from(lease.addr.addr) {
-        first + 1
-    } else {
-        first
+    let prefix = Prefix {
+        addr: lease.addr.addr.into(),
+        len: lease.addr.prefix,
     };
-    Ipv4Addr::from(pick)
+    let first = prefix
+        .nth(1)
+        .expect("a TAP subnet has room for a DHCP server");
+    let pick = if first == IpAddr::V4(lease.addr.addr) {
+        2
+    } else {
+        1
+    };
+    let IpAddr::V4(server) = prefix
+        .nth(pick)
+        .expect("a TAP subnet has room for a DHCP server")
+    else {
+        unreachable!("an IPv4 lease has an IPv4 DHCP server")
+    };
+    server
 }
 
 /// The answer to one DHCP message from the VM, as an IPv4 packet, and
@@ -120,12 +132,13 @@ pub(crate) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16) -> Vec<u8> {
     b.extend_from_slice(&(mtu as u32).to_be_bytes());
     // Prefix information: on-link, but not for making addresses.
     let prefix = lease.addr.prefix;
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u128::MAX << (128 - prefix)
+    let IpAddr::V6(net) = (Prefix {
+        addr: lease.addr.addr.into(),
+        len: prefix,
+    })
+    .network() else {
+        unreachable!("an IPv6 lease has an IPv6 network address")
     };
-    let net = Ipv6Addr::from(u128::from(lease.addr.addr) & mask);
     b.extend_from_slice(&[3, 4, prefix, 0x80]);
     b.extend_from_slice(&u32::MAX.to_be_bytes());
     b.extend_from_slice(&u32::MAX.to_be_bytes());

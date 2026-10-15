@@ -161,14 +161,17 @@ const LEASE: u32 = 3600;
 
 /// Where hosts without an IPv4 [`Host::at`] get their addresses:
 /// `198.18.0.0/15`.
-const AUTO_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
-const AUTO_SIZE: u32 = 1 << 17;
+const AUTO: Prefix = Prefix {
+    addr: IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)),
+    len: 15,
+};
 
 /// Where hosts without an IPv6 [`Host::at`] get theirs: `2001:2::/48`,
 /// the IPv6 range set aside for benchmarking (RFC 5180).
-const AUTO6_BASE: u128 = 0x2001_0002_0000_0000_0000_0000_0000_0000;
-const AUTO6_LEN: u8 = 48;
-const AUTO6_SIZE: u128 = 1 << (128 - AUTO6_LEN);
+const AUTO6: Prefix = Prefix {
+    addr: IpAddr::V6(Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0)),
+    len: 48,
+};
 
 /// Each link inside the network holds at most this many bytes of packets
 /// each way.
@@ -963,8 +966,7 @@ fn sandbox_only(sandbox: Sandbox) -> ConnInfo {
 /// The sandboxes' subnet.
 #[derive(Clone, Copy, Debug)]
 struct Subnet {
-    net: u32,
-    mask: u32,
+    prefix: Prefix,
     gateway: Ipv4Addr,
 }
 
@@ -982,42 +984,48 @@ impl Subnet {
                 p.len
             )));
         }
-        let mask = u32::MAX << (32 - p.len as u32);
-        let net = u32::from(a) & mask;
+        let IpAddr::V4(gateway) = p.nth(1).expect("a sandbox subnet has a gateway") else {
+            unreachable!("an IPv4 subnet has an IPv4 gateway")
+        };
         Ok(Subnet {
-            net,
-            mask,
-            gateway: Ipv4Addr::from(net + 1),
+            prefix: p.canonical(),
+            gateway,
         })
     }
 
     fn contains(&self, a: Ipv4Addr) -> bool {
-        u32::from(a) & self.mask == self.net
+        self.prefix.contains(a.into())
     }
 
-    fn broadcast(&self) -> u32 {
-        self.net | !self.mask
+    fn broadcast(&self) -> Ipv4Addr {
+        self.prefix
+            .broadcast()
+            .expect("an IPv4 sandbox subnet has a broadcast")
     }
 
     fn is_sandbox(&self, a: Ipv4Addr) -> bool {
-        let n = u32::from(a);
-        self.contains(a) && n != self.net && n != self.broadcast() && a != self.gateway
+        self.contains(a)
+            && IpAddr::V4(a) != self.prefix.network()
+            && a != self.broadcast()
+            && a != self.gateway
     }
 
     fn sandboxes(&self) -> impl Iterator<Item = Ipv4Addr> {
-        (self.net + 2..self.broadcast()).map(Ipv4Addr::from)
+        (u32::from(self.gateway) + 1..u32::from(self.broadcast())).map(Ipv4Addr::from)
     }
 
     fn mask(&self) -> Ipv4Addr {
-        Ipv4Addr::from(self.mask)
+        let IpAddr::V4(mask) = self.prefix.mask() else {
+            unreachable!("an IPv4 subnet has an IPv4 mask")
+        };
+        mask
     }
 }
 
 /// The sandboxes' IPv6 subnet.
 #[derive(Clone, Copy, Debug)]
 struct Subnet6 {
-    net: u128,
-    mask: u128,
+    prefix: Prefix,
     gateway: Ipv6Addr,
 }
 
@@ -1035,8 +1043,10 @@ impl Subnet6 {
                 p.len
             )));
         }
-        let mask = u128::MAX << (128 - p.len as u32);
-        let net = u128::from(a) & mask;
+        let IpAddr::V6(network) = p.network() else {
+            unreachable!("an IPv6 subnet has an IPv6 network address")
+        };
+        let net = u128::from(network);
         let global = net >> 125 == 0b001;
         let ula = net >> 121 == 0b111_1110;
         if !(global || ula) {
@@ -1045,19 +1055,21 @@ impl Subnet6 {
                 p.len
             )));
         }
+        let IpAddr::V6(gateway) = p.nth(1).expect("a sandbox subnet has a gateway") else {
+            unreachable!("an IPv6 subnet has an IPv6 gateway")
+        };
         Ok(Subnet6 {
-            net,
-            mask,
-            gateway: Ipv6Addr::from(net + 1),
+            prefix: p.canonical(),
+            gateway,
         })
     }
 
     fn contains(&self, a: Ipv6Addr) -> bool {
-        u128::from(a) & self.mask == self.net
+        self.prefix.contains(a.into())
     }
 
     fn is_sandbox(&self, a: Ipv6Addr) -> bool {
-        self.contains(a) && u128::from(a) != self.net && a != self.gateway
+        self.contains(a) && IpAddr::V6(a) != self.prefix.network() && a != self.gateway
     }
 }
 
@@ -1146,13 +1158,20 @@ impl World {
         if self.auto_full {
             return None;
         }
-        for _ in 0..AUTO_SIZE {
+        let size = u32::try_from(AUTO.size().expect("the IPv4 pool has a finite size"))
+            .expect("the IPv4 pool size fits in u32");
+        for _ in 0..size {
             let n = self.next_auto;
-            self.next_auto = (self.next_auto + 1) % AUTO_SIZE;
-            if n == 0 || n == AUTO_SIZE - 1 {
+            self.next_auto = (self.next_auto + 1) % size;
+            if n == 0 || n == size - 1 {
                 continue;
             }
-            let a = Ipv4Addr::from(AUTO_BASE + n);
+            let IpAddr::V4(a) = AUTO
+                .nth(n.into())
+                .expect("the cursor is inside the IPv4 pool")
+            else {
+                unreachable!("the IPv4 pool contains IPv4 addresses")
+            };
             if !subnet.contains(a) && !self.machines.contains_key(&a.into()) {
                 return Some(a);
             }
@@ -1162,19 +1181,24 @@ impl World {
     }
 
     fn free_auto6(&mut self, subnet: &Subnet6) -> Option<Ipv6Addr> {
-        let pool_mask = u128::MAX << (128 - AUTO6_LEN as u32);
-        if subnet.mask <= pool_mask && subnet.contains(Ipv6Addr::from(AUTO6_BASE)) {
+        let size = AUTO6.size().expect("the IPv6 pool has a finite size");
+        if subnet.prefix.len <= AUTO6.len && subnet.prefix.overlaps(AUTO6) {
             return None;
         }
         for _ in 0..self.machines.len() + 4 {
             let n = self.next_auto6;
-            self.next_auto6 = (self.next_auto6 + 1) % AUTO6_SIZE;
+            self.next_auto6 = (self.next_auto6 + 1) % size;
             if n == 0 {
                 continue;
             }
-            let a = Ipv6Addr::from(AUTO6_BASE + n);
+            let IpAddr::V6(a) = AUTO6.nth(n).expect("the cursor is inside the IPv6 pool") else {
+                unreachable!("the IPv6 pool contains IPv6 addresses")
+            };
             if subnet.contains(a) {
-                self.next_auto6 = ((subnet.net | !subnet.mask) - AUTO6_BASE + 1) % AUTO6_SIZE;
+                let IpAddr::V6(last) = subnet.prefix.last() else {
+                    unreachable!("an IPv6 subnet has an IPv6 last address")
+                };
+                self.next_auto6 = (n + (u128::from(last) - u128::from(a)) + 1) % size;
                 continue;
             }
             if !self.machines.contains_key(&a.into()) {
@@ -1214,26 +1238,6 @@ struct LanSeg {
     members: HashSet<IpAddr>,
 }
 
-/// The address `n` after the network address of `p`, if it is inside `p`.
-fn nth(p: &Prefix, n: u128) -> Option<IpAddr> {
-    match p.addr {
-        IpAddr::V4(a) => {
-            let size = 1u128 << (32 - u32::from(p.len.min(32)));
-            (n < size).then(|| IpAddr::V4(Ipv4Addr::from(u32::from(a) + n as u32)))
-        }
-        IpAddr::V6(a) => {
-            let bits = 128 - u32::from(p.len.min(128));
-            (bits == 128 || n < (1u128 << bits))
-                .then(|| IpAddr::V6(Ipv6Addr::from(u128::from(a) + n)))
-        }
-    }
-}
-
-/// Whether `a` and `b` share any address.
-fn overlap(a: &Prefix, b: &Prefix) -> bool {
-    a.contains(b.addr) || b.contains(a.addr)
-}
-
 /// Starts the network's LANs: each wired to the router through its
 /// gateway, with its drops recorded. Checks them and their members.
 fn make_lans(
@@ -1245,25 +1249,9 @@ fn make_lans(
     lans: Vec<(String, Prefix)>,
     members: &[(String, String, IpAddr)],
 ) -> Result<BTreeMap<String, LanSeg>, Error> {
-    let sandboxes4 = Prefix {
-        addr: IpAddr::V4(Ipv4Addr::from(subnet.net)),
-        len: subnet.mask.count_ones() as u8,
-    };
-    let sandboxes6 = subnet6.map(|s| Prefix {
-        addr: IpAddr::V6(Ipv6Addr::from(s.net)),
-        len: s.mask.count_ones() as u8,
-    });
     let mut made: BTreeMap<String, LanSeg> = BTreeMap::new();
     for (name, prefix) in lans {
-        let pool4 = Prefix {
-            addr: Ipv4Addr::from(AUTO_BASE).into(),
-            len: 15,
-        };
-        let pool6 = Prefix {
-            addr: Ipv6Addr::from(AUTO6_BASE).into(),
-            len: AUTO6_LEN,
-        };
-        if overlap(&prefix, &pool4) || overlap(&prefix, &pool6) {
+        if prefix.overlaps(AUTO) || prefix.overlaps(AUTO6) {
             return Err(fictionet::Error::msg(format!(
                 "LAN {name}: {}/{} overlaps the automatic address pool",
                 prefix.addr, prefix.len
@@ -1276,8 +1264,7 @@ fn make_lans(
                 prefix.addr, prefix.len
             )));
         }
-        if overlap(&prefix, &sandboxes4) || sandboxes6.as_ref().is_some_and(|s| overlap(&prefix, s))
-        {
+        if prefix.overlaps(subnet.prefix) || subnet6.is_some_and(|s| prefix.overlaps(s.prefix)) {
             return Err(fictionet::Error::msg(format!(
                 "LAN {name}: {}/{} overlaps the sandboxes' subnet",
                 prefix.addr, prefix.len
@@ -1285,7 +1272,7 @@ fn make_lans(
         }
         if let Some((other, _)) = made
             .iter()
-            .find(|(n, l)| **n == name || overlap(&prefix, &l.prefix))
+            .find(|(n, l)| **n == name || prefix.overlaps(l.prefix))
         {
             return Err(fictionet::Error::msg(format!(
                 "LAN {name}: {}/{} overlaps LAN {other}",
@@ -1311,8 +1298,9 @@ fn make_lans(
         let (lan_side, router_side) = link();
         lan.gateway(Box::new(lan_side))?;
         router.add(prefix, Box::new(router_side));
-        let dns =
-            nth(&prefix, 1).ok_or_else(|| fictionet::Error::msg("a LAN has room for its DNS"))?;
+        let dns = prefix
+            .nth(1)
+            .ok_or_else(|| fictionet::Error::msg("a LAN has room for its DNS"))?;
         made.insert(
             name,
             LanSeg {
@@ -1329,12 +1317,7 @@ fn make_lans(
                 "member {member}: there is no LAN called {lan}"
             )));
         };
-        let broadcast = match seg.prefix.addr {
-            IpAddr::V4(a) => Some(IpAddr::V4(Ipv4Addr::from(
-                u32::from(a) | (u32::MAX >> seg.prefix.len),
-            ))),
-            IpAddr::V6(_) => None,
-        };
+        let broadcast = seg.prefix.broadcast().map(IpAddr::V4);
         if !seg.prefix.contains(*addr)
             || *addr == seg.prefix.addr
             || *addr == seg.dns
@@ -1504,7 +1487,7 @@ impl Shared {
             }
             Some(a) => return Err(format!("{a} is not a free address on LAN {name}")),
             None => (2..1u128 << 16)
-                .map_while(|n| nth(&seg.prefix, n))
+                .map_while(|n| seg.prefix.nth(n))
                 .filter(|a| seg.prefix.contains(*a))
                 .find(|a| free(*a) && !world.machines.contains_key(a))
                 .ok_or_else(|| format!("LAN {name} has no free address left"))?,
@@ -3501,6 +3484,66 @@ mod tests {
             "10.0.0.0/24",
         ] {
             assert!(subnet6(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn automatic_pool_boundaries() {
+        let mut w = World::new(MAX_HOSTS);
+        let subnet = Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap();
+        w.next_auto = (1 << 17) - 2;
+        assert_eq!(
+            w.free_auto(&subnet),
+            Some("198.19.255.254".parse().unwrap())
+        );
+        assert_eq!(w.free_auto(&subnet), Some("198.18.0.1".parse().unwrap()));
+        let inside = Subnet::new("198.18.0.0/16".parse().unwrap()).unwrap();
+        assert_eq!(w.free_auto(&inside), Some("198.19.0.0".parse().unwrap()));
+        assert_eq!(
+            World::new(MAX_HOSTS)
+                .free_auto(&Subnet::new("198.18.0.0/15".parse().unwrap()).unwrap()),
+            None
+        );
+
+        let subnet = subnet6("2001:db8::/64").unwrap();
+        w.next_auto6 = (1 << 80) - 1;
+        assert_eq!(
+            w.free_auto6(&subnet),
+            Some("2001:2:0:ffff:ffff:ffff:ffff:ffff".parse().unwrap())
+        );
+        assert_eq!(w.free_auto6(&subnet), Some("2001:2::1".parse().unwrap()));
+        w.next_auto6 = (1 << 80) - 2;
+        let end = subnet6("2001:2:0:ffff:ffff:ffff:ffff:fffc/126").unwrap();
+        assert_eq!(w.free_auto6(&end), Some("2001:2::1".parse().unwrap()));
+        assert_eq!(w.free_auto6(&subnet6("2001:2::/48").unwrap()), None);
+    }
+
+    #[test]
+    fn sandbox_address_boundaries() {
+        let s = Subnet::new(Prefix {
+            addr: "10.0.0.3".parse().unwrap(),
+            len: 30,
+        })
+        .unwrap();
+        assert_eq!(s.gateway, "10.0.0.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(s.mask(), Ipv4Addr::new(255, 255, 255, 252));
+        assert_eq!(
+            s.sandboxes().collect::<Vec<_>>(),
+            vec![Ipv4Addr::new(10, 0, 0, 2)]
+        );
+        for n in 0..=4 {
+            assert_eq!(s.is_sandbox(Ipv4Addr::new(10, 0, 0, n)), n == 2);
+        }
+        let s = Subnet6::new(Prefix {
+            addr: "2001:db8::3".parse().unwrap(),
+            len: 126,
+        })
+        .unwrap();
+        for n in 0..=4 {
+            assert_eq!(
+                s.is_sandbox(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, n)),
+                n == 2 || n == 3
+            );
         }
     }
 

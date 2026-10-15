@@ -9,6 +9,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fictionet::stdlib::ip::{self, Fields, Header};
+use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::udp;
 
 /// A MAC address.
@@ -99,7 +100,12 @@ pub(crate) fn destination(
             let d: [u8; 4] = packet[16..20].try_into().unwrap();
             let mac = if d == [255; 4]
                 || subnet.is_some_and(|(addr, prefix)| {
-                    prefix < 31 && u32::from_be_bytes(d) == u32::from(addr) | (u32::MAX >> prefix)
+                    Prefix {
+                        addr: addr.into(),
+                        len: prefix,
+                    }
+                    .broadcast()
+                        == Some(Ipv4Addr::from(d))
                 }) {
                 BROADCAST
             } else if Ipv4Addr::from(d).is_multicast() {
@@ -507,6 +513,23 @@ pub(crate) mod tests {
         let p = udp6(link_local(GATEWAY_MAC), 547, link_local(VM), 546, b"odd");
         assert!(v6_checksum_ok(&p));
         assert_eq!(udp_to(&p), Some((546, &b"odd"[..])));
+    }
+
+    #[test]
+    fn directed_broadcast_boundaries() {
+        for (addr, len, dst, mac) in [
+            ("192.168.1.17", 24, "192.168.1.255", BROADCAST),
+            ("192.168.1.17", 24, "192.168.2.255", VM),
+            ("10.0.0.1", 31, "10.0.0.1", VM),
+            ("10.0.0.1", 32, "10.0.0.1", VM),
+            ("10.0.0.1", 0, "255.255.255.255", BROADCAST),
+        ] {
+            let packet = ipv4(Ipv4Addr::LOCALHOST, dst.parse().unwrap(), UDP, &[]);
+            assert_eq!(
+                destination(&packet, Some(VM), Some((addr.parse().unwrap(), len))),
+                Some((mac, IPV4))
+            );
+        }
     }
 
     #[test]

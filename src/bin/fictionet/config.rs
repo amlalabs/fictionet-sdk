@@ -189,9 +189,14 @@ pub(crate) fn world_path(world: &str) -> Result<String, String> {
 
 /// The netmask of an IPv4 prefix length, 0 to 32.
 pub(crate) fn mask4(prefix: u8) -> u32 {
-    u32::MAX
-        .checked_shl(32 - prefix.min(32) as u32)
-        .unwrap_or(0)
+    let IpAddr::V4(mask) = (fictionet::stdlib::route::Prefix {
+        addr: Ipv4Addr::UNSPECIFIED.into(),
+        len: prefix,
+    })
+    .mask() else {
+        unreachable!("an IPv4 prefix has an IPv4 mask")
+    };
+    u32::from(mask)
 }
 
 #[cfg(test)]

@@ -421,6 +421,15 @@ fault decisions one ChaCha20 byte stream through `Cx`. The same seed and
 ordered draws produce the same numbers. HTTP/2 handlers also draw from
 this run stream, so their execution order matters.
 
+`route::Prefix` supplies address geometry for both families. `network`,
+`mask`, `last`, and `nth` ignore host bits in a prefix built by hand.
+`nth` checks that an offset stays inside the prefix. `size` counts every
+address; IPv6 `/0` returns `None` because 2^128 does not fit in `u128`.
+`overlaps` checks whether two prefixes share an address. `broadcast`
+returns an IPv4 directed broadcast, except for `/31` and `/32`, which
+have none. These helpers do not decide which addresses a sandbox, LAN
+member, or host may use.
+
 `Net::lan(name, prefix)` adds an IP subnet that hosts join with
 `Host::on(name)` and real virtual machines with
 `Net::member(attachment, name, addr)`, as machines on one Ethernet:
