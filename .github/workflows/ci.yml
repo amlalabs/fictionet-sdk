@@ -135,6 +135,10 @@ jobs:
         run: python3 -m unittest discover -s examples/hosted/tests -p 'test_*.py'
       - name: Demo regressions
         run: python3 -m unittest discover -s demos/tests -p 'test_*.py'
+      - name: Shell assertion regressions
+        run: |
+          bash tests/common/assertions_test.sh
+          sh tests/common/assertions_test.sh
       - name: Scan recorder regressions
         run: uv run --with playwright python -m unittest discover -s examples/scan/tests -p 'test_*.py'
       - name: The adaptive web's backend
