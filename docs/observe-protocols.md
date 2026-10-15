@@ -113,7 +113,12 @@ rules an endpoint applies, and frames bodies itself. Chunked bodies end after
 the empty line that terminates all trailers. Trailer bytes do not enter the
 body preview, and the next message starts after that empty line. Incomplete
 trailer sections retain incremental scan progress within the capture buffer
-limit. Framing for DNS, DHCP, Modbus, HTTP/1, HTTP/2, and TLS uses `Stream`
+limit. Chunk sizes must be nonempty hexadecimal values that fit in `u64`;
+surrounding spaces and tabs and `;extensions` are tolerated. An invalid or
+overflowing size produces a `malformed` HTTP item with the raw size line
+(lossy UTF-8 with controls escaped) and the body preview collected so far.
+The decoder then skips bytes until close because framing has been lost.
+Framing for DNS, DHCP, Modbus, HTTP/1, HTTP/2, and TLS uses `Stream`
 and `Present`.
 
 These files can be copied into another crate and edited:

@@ -1,6 +1,7 @@
 use super::{Display, MAX_BUFFER};
 use fictionet::events::Transport;
 use fictionet::observe::{Decoded, Layer, Match, Placement, Present, Registry};
+use fictionet::stdlib::codec::ascii::{hex_value, trim_ows};
 use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::http1;
 use fictionet::sync::Mutex;
@@ -31,6 +32,10 @@ fn looks_like_http1(b: &[u8]) -> bool {
 /// Chunked bodies finish after the empty line ending the complete trailer
 /// section. Trailers are scanned incrementally within the capture buffer
 /// limit and are not included in body previews.
+/// Chunk sizes must be nonempty hexadecimal values that fit in `u64`.
+/// Surrounding spaces and tabs and `;extensions` are tolerated. Invalid or
+/// overflowing sizes emit a `malformed` item with the raw size line and the
+/// body preview so far, then skip bytes until close because framing is lost.
 #[derive(Default)]
 pub struct Http1 {
     state: Http1State,
@@ -167,9 +172,9 @@ impl Decode for Http1 {
         }
         // Cache each line boundary. Size and trailer lines are scanned
         // once even when every byte arrives in its own segment.
-        if matches!(self.state, Http1State::Chunked { left: 0, .. }) {
+        if let Http1State::Chunked { left: 0, total, .. } = self.state {
             if self.final_chunk.is_none() {
-                let skip = if input.starts_with(b"\r\n") {
+                let skip = if total != 0 && input.starts_with(b"\r\n") {
                     2usize
                 } else {
                     0
@@ -182,10 +187,36 @@ impl Decode for Http1 {
                     }
                     return Ok(Step::Need);
                 };
-                let line = String::from_utf8_lossy(tail.get(..end).unwrap_or_default());
-                let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-                    .unwrap_or(0);
+                let line = &tail[..end];
                 let used = skip.saturating_add(end).saturating_add(2);
+                let Some(size) = chunk_size(line) else {
+                    let mut d = Decoded::default();
+                    if let Http1State::Chunked { seen, .. } = &self.state {
+                        body_layer(&mut d, total, seen);
+                    }
+                    let mut layer = Layer::new("Hypertext Transfer Protocol", 0, (skip, used));
+                    layer.summary = "Malformed HTTP chunk size".into();
+                    layer.field(
+                        "Chunk size",
+                        String::from_utf8_lossy(line).escape_debug().to_string(),
+                        (skip, skip + end),
+                    );
+                    // Display retains one layer, including the body preview here.
+                    for body in d.layers.drain(..) {
+                        layer.note("Body received", body.summary);
+                        layer.fields.extend(body.fields);
+                    }
+                    d.application(2, "HTTP", &layer.summary);
+                    d.push(layer);
+                    d.tag("malformed");
+                    self.state = Http1State::ToClose;
+                    self.final_chunk = None;
+                    self.scanned = 0;
+                    return Ok(Step::Item(
+                        Display::from_packet(d, "Malformed HTTP chunk size"),
+                        used,
+                    ));
+                };
                 if size == 0 {
                     self.final_chunk = Some(used);
                 } else if let Http1State::Chunked { left, total, .. } = &mut self.state {
@@ -262,6 +293,16 @@ fn body_item(total: u64, seen: &[u8]) -> Display {
     item
 }
 
+fn chunk_size(line: &[u8]) -> Option<u64> {
+    let digits = trim_ows(line.split(|b| *b == b';').next()?);
+    if digits.is_empty() {
+        return None;
+    }
+    digits.iter().try_fold(0u64, |size, b| {
+        size.checked_mul(16)?.checked_add(u64::from(hex_value(*b)?))
+    })
+}
+
 /// HTTP/1.1 request methods waiting for their responses.
 #[derive(Default)]
 struct Methods(VecDeque<Method>);
@@ -307,7 +348,7 @@ enum Http1State {
         seen: Vec<u8>,
         total: u64,
     },
-    /// In a body that lasts until the connection closes.
+    /// In a body that lasts until the connection closes, or after framing is lost.
     ToClose,
     /// After a CONNECT was accepted: bytes of another protocol.
     Tunnel,
@@ -443,6 +484,88 @@ mod tests {
             assert!(request.next().unwrap().is_ok());
             assert!(request.next().is_none());
             assert_eq!(request.held() + response.held(), count.min(64));
+        }
+    }
+
+    fn assert_malformed_chunk_size(line: &[u8], value: &str) {
+        for body in [false, true] {
+            let mut http = Http1::default();
+            let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
+            let mut bytes = Vec::new();
+            if body {
+                assert!(matches!(http.decode(b"3\r\n", false), Ok(Step::Skip(3))));
+                assert!(matches!(http.decode(b"abc", false), Ok(Step::Skip(3))));
+                bytes.extend_from_slice(b"\r\n");
+            }
+            let start = bytes.len();
+            bytes.extend_from_slice(line);
+            bytes.extend_from_slice(b"\r\n\r\n");
+            let Step::Item(item, used) = http.decode(&bytes, false).unwrap() else {
+                panic!("no malformed chunk diagnostic for {line:?}");
+            };
+            assert!(item.tags.contains(&"malformed"), "{line:?}");
+            assert_eq!(item.summary(), "Malformed HTTP chunk size");
+            assert_eq!(item.info, "Malformed HTTP chunk size");
+            assert_eq!(item.protocol, "HTTP");
+            assert_eq!(item.level, 2);
+            assert_eq!(used, start + line.len() + 2);
+            let layer = item.layer.as_ref().unwrap();
+            let size = layer
+                .fields
+                .iter()
+                .find(|f| f.name == "Chunk size")
+                .unwrap();
+            assert_eq!(size.value, value);
+            assert_eq!(size.range, Some((start, start + line.len())));
+            let preview = layer.fields.iter().find(|f| f.name == "Text").unwrap();
+            assert_eq!(preview.value, if body { "abc" } else { "" });
+            let received = layer
+                .fields
+                .iter()
+                .find(|f| f.name == "Body received")
+                .unwrap();
+            assert_eq!(received.value, if body { "3 bytes" } else { "0 bytes" });
+            assert!(matches!(http.state, Http1State::ToClose));
+            assert_eq!(http.final_chunk, None);
+            assert_eq!(http.scanned, 0);
+            assert_eq!(http.held(), 0);
+            assert!(matches!(
+                http.decode(&bytes[used..], false),
+                Ok(Step::Skip(2))
+            ));
+            let next = b"HTTP/1.1 204 No Content\r\n\r\n";
+            assert!(matches!(http.decode(next, false), Ok(Step::Skip(n)) if n == next.len()));
+        }
+    }
+
+    #[test]
+    fn invalid_chunk_size_not_end() {
+        for line in ["zz", "", "+1", "-1", "0x1", ";ext", "1 2"] {
+            assert_malformed_chunk_size(line.as_bytes(), line);
+        }
+        assert_malformed_chunk_size(b" \t", " \\t");
+        assert_malformed_chunk_size(b"z\0\n\x7f\xff", "z\\0\\n\\u{7f}\u{fffd}");
+    }
+
+    #[test]
+    fn overflowing_chunk_size() {
+        assert_malformed_chunk_size(b"10000000000000000", "10000000000000000");
+    }
+
+    #[test]
+    fn chunk_sizes_allow_ows_extensions_and_u64_max() {
+        for (line, size) in [(" \tA \t;ext", 10), ("ffffffffFFFFFFFF", u64::MAX)] {
+            let mut http = Http1::default();
+            let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
+            let bytes = format!("{line}\r\n");
+            assert!(
+                matches!(http.decode(bytes.as_bytes(), false), Ok(Step::Skip(n)) if n == bytes.len())
+            );
+            assert!(
+                matches!(http.state, Http1State::Chunked { left, total, .. } if left == size && total == size)
+            );
         }
     }
 

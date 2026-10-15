@@ -227,6 +227,17 @@ mod tests {
             &b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3;ext\r\nllo\r\n0\r\n\r\nGET / HTTP/1.1\r\n\r\n"[..],
             &b"HTTP/1.1 200 OK\r\n\r\na body until close"[..],
         ] { check_decode(Http1::default, bytes); }
+        for line in ["zz", "", "+1", "-1", "0x1", "10000000000000000"] {
+            for body in ["", "3\r\nabc\r\n"] {
+                let bytes = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}{line}\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"
+                );
+                let (items, failure) = check_decode(Http1::default, bytes.as_bytes());
+                assert_eq!(failure, None);
+                assert_eq!(items.len(), 2, "{line:?}");
+                assert!(items[1].tags.contains(&"malformed"), "{line:?}");
+            }
+        }
         check_decode(
             || Dns::new(true),
             &[0, 12, 0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0],
