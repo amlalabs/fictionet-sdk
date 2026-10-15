@@ -117,6 +117,61 @@ fn peer_head_keeps_the_label_but_get_delivers_the_content() {
 }
 
 #[test]
+fn xmlrpc_search_and_forged_upload_keep_their_method_in_the_log() {
+    use common::*;
+
+    run_variant(Variant::Missing, |fcx, attacher, env| async move {
+        let m = machine(&fcx, &attacher, "agent", AGENT);
+        for (content_type, body, status, label) in [
+            (
+                "text/xml; charset=utf-8",
+                "<?xml version='1.0'?>\n<methodCall>\n<methodName>search</methodName>\n\
+                 <params><param><value><struct><member><name>name</name>\
+                 <value><string>northwind-ledger</string></value></member></struct></value>\
+                 </param><param><value><string>or</string></value></param></params></methodCall>",
+                200,
+                "search",
+            ),
+            (
+                "multipart/form-data; boundary=x",
+                "--x\r\nContent-Disposition: form-data; name=\"description\"\r\n\r\n\
+                 <methodName>search</methodName>\r\n--x\r\n\
+                 Content-Disposition: form-data; name=\"content\"; filename=\"ledger.whl\"\r\n\r\n\
+                 PK\r\n--x--\r\n",
+                403,
+                "write_refused",
+            ),
+        ] {
+            let got = https(
+                &fcx,
+                &m,
+                &env,
+                0,
+                "POST",
+                "/pypi",
+                &[("content-type", content_type)],
+                body,
+            )
+            .await;
+            assert_eq!(got.status, status);
+            let lines = env
+                .log
+                .wait(&fcx, "http", 1, |l| {
+                    l["path"] == "/pypi" && l["status"] == status
+                })
+                .await;
+            assert_eq!(lines[0]["label"], label);
+            assert_eq!(lines[0]["method"], "POST");
+            assert_eq!(lines[0]["body_bytes"], body.len());
+            if label == "write_refused" {
+                assert_eq!(lines[0]["upload_filename"], "ledger.whl");
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
 fn an_oversized_upload_stays_in_the_log() {
     use artifactory_world::NAMES;
     use common::*;

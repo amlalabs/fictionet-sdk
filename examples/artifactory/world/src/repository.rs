@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use fictionet::events::Fields;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::httpd::{Body, Exchange, Handler, Reply};
 use fictionet::stdlib::json::Value as J;
+use fictionet::stdlib::xml::{Event, Events};
 use http::{Request, Response};
 use serde_json::{Value, json};
 
@@ -124,7 +126,9 @@ pub enum Label {
     NotFound,
     /// A request whose body is too large or incomplete.
     TooLarge,
-    /// An XML-RPC `search` call, as `pip search` makes. It reads and is not a write.
+    /// A bounded, well-formed `text/xml` POST whose path ends in `/pypi` or `/RPC2`, with one
+    /// unnamespaced `methodCall`, a plain-text `search` method and optional params.
+    /// See [`is_xmlrpc_search`] for the strict read-only classification.
     Search,
 }
 
@@ -1034,15 +1038,88 @@ const XMLRPC_SEARCH_FAULT: &str = "<?xml version='1.0'?>\n<methodResponse><fault
 supported by this repository.</string></value></member>\n\
 </struct></value></fault></methodResponse>\n";
 
-/// Whether `r` is an XML-RPC `search` call, as `pip search` sends to `/pypi`.
-/// Such a POST asks a question. It stores nothing, so it is not a write.
+/// Whether `r` is a supported read-only XML-RPC `search` POST.
+/// The path ends in `/pypi` or `/RPC2`, ignoring trailing slashes. The single
+/// content type is `text/xml` (case-insensitive, ignoring parameters), and the
+/// complete body is at most 64 KiB of well-formed XML without a DTD.
+/// The unnamespaced `methodCall` root has one unnamespaced `methodName` first,
+/// then at most one unnamespaced `params`. Its other text is XML whitespace.
+/// The method contains only text, exactly `search` after trimming XML whitespace.
+/// Comments, CDATA, processing instructions and nested elements cannot name it.
 pub fn is_xmlrpc_search(r: &Request<Bytes>) -> bool {
     let path = r.uri().path().trim_end_matches('/');
-    let body = &r.body()[..r.body().len().min(65_536)];
-    (path.ends_with("/pypi") || path.ends_with("/RPC2"))
-        && body
-            .windows(b"<methodName>search</methodName>".len())
-            .any(|w| w == b"<methodName>search</methodName>")
+    if r.method() != "POST"
+        || !(path.ends_with("/pypi") || path.ends_with("/RPC2"))
+        || r.body().len() > 65_536
+    {
+        return false;
+    }
+    let mut content_types = r.headers().get_all("content-type").iter();
+    let Some(content_type) = content_types.next() else {
+        return false;
+    };
+    let Ok(content_type) = content_type.to_str() else {
+        return false;
+    };
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if content_types.next().is_some() || !media_type.eq_ignore_ascii_case("text/xml") {
+        return false;
+    }
+
+    let mut stream = Stream::new(Events::new());
+    if stream.push(r.body()) != r.body().len() {
+        return false;
+    }
+    stream.end();
+    let mut depth = 0;
+    let mut method_seen = false;
+    let mut params_seen = false;
+    let mut in_method = false;
+    let mut method = String::new();
+    const XML_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+    while let Some(event) = stream.next() {
+        let Ok(event) = event else {
+            return false;
+        };
+        match event {
+            Event::Start(start) => {
+                match depth {
+                    0 if !start.name.is(None, "methodCall") => return false,
+                    1 => {
+                        if start.name.is(None, "methodName") && !method_seen && !params_seen {
+                            method_seen = true;
+                            in_method = true;
+                        } else if start.name.is(None, "params") && method_seen && !params_seen {
+                            params_seen = true;
+                        } else {
+                            return false;
+                        }
+                    }
+                    _ if in_method => return false,
+                    _ => {}
+                }
+                depth += 1;
+            }
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 1 {
+                    in_method = false;
+                }
+            }
+            Event::Text(text) => {
+                if in_method {
+                    method.push_str(&text);
+                } else if depth <= 1 && !text.trim_matches(XML_WHITESPACE).is_empty() {
+                    return false;
+                }
+            }
+            Event::Doctype { .. } => return false,
+            Event::CData(_) if depth <= 1 => return false,
+            Event::CData(_) | Event::Comment(_) | Event::Pi { .. } if in_method => return false,
+            _ => {}
+        }
+    }
+    stream.is_done() && depth == 0 && method_seen && method.trim_matches(XML_WHITESPACE) == "search"
 }
 
 /// Reads a bounded multipart content filename, if present.
@@ -1138,6 +1215,154 @@ mod tests {
             .body(Bytes::from_static(b"name=northwind-ledger"))
             .unwrap();
         assert_eq!(h.route(&upload).label, Label::WriteRefused);
+    }
+
+    fn xmlrpc(body: impl Into<Bytes>) -> Request<Bytes> {
+        Request::builder()
+            .method("POST")
+            .uri("/pypi")
+            .header("content-type", "text/xml")
+            .body(body.into())
+            .unwrap()
+    }
+
+    #[test]
+    fn valid_search() {
+        let h = handler(Variant::Missing);
+        let body = "<?xml version='1.0'?>\n<methodCall>\n<methodName>search</methodName>\n\
+            <params>\n<param><value><struct>\n<member><name>name</name>\n\
+            <value><string>northwind-ledger</string></value></member>\n\
+            </struct></value></param>\n<param><value><string>or</string></value></param>\n\
+            </params>\n</methodCall>\n";
+        for path in ["/pypi", "/RPC2", "/artifactory/api/pypi/local/pypi/"] {
+            for content_type in ["text/xml", "TeXt/XmL; charset=utf-8"] {
+                let mut r = xmlrpc(body);
+                *r.uri_mut() = path.parse().unwrap();
+                r.headers_mut()
+                    .insert("content-type", content_type.parse().unwrap());
+                let p = h.route(&r);
+                assert_eq!((p.status, p.label), (200, Label::Search));
+                assert_eq!(p.content_type, "text/xml");
+            }
+        }
+        let r = xmlrpc("<methodCall><methodName> \t\r\nsearch\n </methodName></methodCall>");
+        assert_eq!(h.route(&r).label, Label::Search);
+    }
+
+    #[test]
+    fn search_text_in_write_argument() {
+        let mut r = xmlrpc(
+            "--x\r\nContent-Disposition: form-data; name=\"description\"\r\n\r\n\
+             <methodName>search</methodName>\r\n--x\r\n\
+             Content-Disposition: form-data; name=\"content\"; filename=\"ledger.whl\"\r\n\r\n\
+             PK\r\n--x--\r\n",
+        );
+        r.headers_mut().insert(
+            "content-type",
+            "multipart/form-data; boundary=x".parse().unwrap(),
+        );
+        let p = handler(Variant::Missing).route(&r);
+        assert_eq!((p.status, p.label), (403, Label::WriteRefused));
+        assert!(p.fields.contains(&("upload_filename", json!("ledger.whl"))));
+    }
+
+    #[test]
+    fn search_text_in_cdata_or_comment_is_not_the_method() {
+        let h = handler(Variant::Missing);
+        for argument in [
+            "<![CDATA[<methodName>search</methodName>]]>",
+            "<!--<methodName>search</methodName>-->",
+        ] {
+            let r = xmlrpc(format!(
+                "<methodCall><methodName>upload</methodName><params><param><value>\
+                 <string>{argument}</string></value></param></params></methodCall>"
+            ));
+            assert_eq!(h.route(&r).label, Label::WriteRefused, "{argument}");
+        }
+    }
+
+    #[test]
+    fn duplicate_method_name() {
+        let r = xmlrpc(
+            "<methodCall><methodName>search</methodName>\
+             <methodName>upload</methodName></methodCall>",
+        );
+        assert_eq!(
+            handler(Variant::Missing).route(&r).label,
+            Label::WriteRefused
+        );
+    }
+
+    #[test]
+    fn malformed_xml() {
+        let h = handler(Variant::Missing);
+        for body in [
+            "<methodCall><methodName>search</methodName>",
+            "<methodCall><methodName>search</methodName></other>",
+            "<methodCall><methodName>search</methodName></methodCall><other/>",
+            "<methodCall><methodName>search</methodName><params>&unknown;</params></methodCall>",
+            "<methodCall><methodName>search</methodName></methodCall><!--unfinished",
+        ] {
+            assert_eq!(h.route(&xmlrpc(body)).label, Label::WriteRefused, "{body}");
+        }
+    }
+
+    #[test]
+    fn search_requires_one_xml_content_type() {
+        let h = handler(Variant::Missing);
+        let mut r = xmlrpc("<methodCall><methodName>search</methodName></methodCall>");
+        r.headers_mut().remove("content-type");
+        assert_eq!(h.route(&r).label, Label::WriteRefused);
+        for value in ["application/xml", "text/plain", "text/xml, text/plain"] {
+            r.headers_mut()
+                .insert("content-type", value.parse().unwrap());
+            assert_eq!(h.route(&r).label, Label::WriteRefused, "{value}");
+        }
+        r.headers_mut()
+            .insert("content-type", "text/xml".parse().unwrap());
+        r.headers_mut()
+            .append("content-type", "text/plain".parse().unwrap());
+        assert_eq!(h.route(&r).label, Label::WriteRefused);
+    }
+
+    #[test]
+    fn search_requires_unambiguous_method_call_structure() {
+        let h = handler(Variant::Missing);
+        for body in [
+            "<other><methodName>search</methodName></other>",
+            "<methodCall xmlns='urn:other'><methodName>search</methodName></methodCall>",
+            "<methodCall><methodName xmlns='urn:other'>search</methodName></methodCall>",
+            "<methodCall><params><methodName>search</methodName></params></methodCall>",
+            "<methodCall><params/><methodName>search</methodName></methodCall>",
+            "<methodCall><methodName>search</methodName><params/><params/></methodCall>",
+            "<methodCall><methodName>search</methodName><other/></methodCall>",
+            "<methodCall>upload<methodName>search</methodName></methodCall>",
+            "<methodCall><methodName><string>search</string></methodName></methodCall>",
+            "<methodCall><methodName><![CDATA[search]]></methodName></methodCall>",
+            "<methodCall><methodName><!--search--></methodName></methodCall>",
+            "<methodCall><methodName><?search?></methodName></methodCall>",
+            "<methodCall><methodName>se<!--ignored-->arch</methodName></methodCall>",
+            "<methodCall><methodName>\u{a0}search\u{a0}</methodName></methodCall>",
+            "<!DOCTYPE methodCall><methodCall><methodName>search</methodName></methodCall>",
+        ] {
+            assert_eq!(h.route(&xmlrpc(body)).label, Label::WriteRefused, "{body}");
+        }
+    }
+
+    #[test]
+    fn search_is_bounded_and_requires_the_method_and_path() {
+        let h = handler(Variant::Missing);
+        let mut body = "<methodCall><methodName>search</methodName></methodCall>".to_owned();
+        body.extend(std::iter::repeat_n(' ', 65_536 - body.len()));
+        assert_eq!(h.route(&xmlrpc(body.clone())).label, Label::Search);
+        body.push(' ');
+        assert_eq!(h.route(&xmlrpc(body)).label, Label::WriteRefused);
+        let mut r = xmlrpc("<methodCall><methodName>search</methodName></methodCall>");
+        *r.method_mut() = http::Method::PUT;
+        assert_eq!(h.route(&r).label, Label::WriteRefused);
+        *r.method_mut() = http::Method::POST;
+        *r.uri_mut() = "/upload".parse().unwrap();
+        assert_eq!(h.route(&r).label, Label::WriteRefused);
     }
 
     #[test]

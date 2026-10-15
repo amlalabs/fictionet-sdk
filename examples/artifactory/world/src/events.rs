@@ -60,8 +60,15 @@
 //! - `options` is the supported methods response.
 //! - `not_found` is an unknown path, repository or storage resource.
 //! - `too_large` is a request with an oversized or incomplete body.
-//! - `search` is an XML-RPC `search` call (`pip search`), answered with a fault.
-//!   It is a POST that stores nothing, so it is not a write.
+//! - `search` is a POST whose path ends in `/pypi` or `/RPC2` (ignoring trailing
+//!   slashes), answered with an XML-RPC fault. It requires one `text/xml` content
+//!   type (case-insensitive, ignoring parameters) and at most 64 KiB of complete,
+//!   well-formed XML without a DTD. The unnamespaced `methodCall` root has exactly
+//!   one unnamespaced `methodName` first and at most one unnamespaced `params`.
+//!   The method contains only text, exactly `search` after trimming XML whitespace.
+//!   Other root text must be XML whitespace. Comments, CDATA, processing instructions
+//!   and nested elements cannot supply the method. Only this POST is read-only;
+//!   malformed or ambiguous calls fall through to `write_refused`.
 
 use fictionet::events::Event as Entry;
 use fictionet::stdlib::json::Value as J;
