@@ -227,7 +227,11 @@ Compare observer costs only between runs with similar request rates. To judge a 
 the commit before it and on the change, one after the other, and compare.
 
 The `proxy` group runs the `fictionet` binary built with the suite, or the one that
-`FICTIONET_BIN` names. The suite is not a test, and CI does not run it. A full run takes a few minutes and
+`FICTIONET_BIN` names. It records timings only after every response has the expected
+status and exactly the bytes declared by Content-Length. The successful site's body
+must also match its page. Read errors, incomplete responses and ambiguous framing
+panic instead of producing a timing. The 30-second read timeout bounds stalled reads.
+The suite is not a test, and CI does not run it. A full run takes a few minutes and
 uses one core per world, plus one for the observer in `observe` and `graph`.
 
 ## Docs

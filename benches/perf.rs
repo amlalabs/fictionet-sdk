@@ -16,6 +16,12 @@
 //! This is not a pass/fail test, and CI does not run it. Compare two
 //! commits by running the same groups on each, one after the other, and
 //! look at the counts first.
+//!
+//! The proxy group requires the expected status and a complete Content-Length
+//! body before recording a timing. Read errors and invalid responses panic.
+
+#[path = "../tests/common/benchmark.rs"]
+mod benchmark;
 
 #[allow(dead_code)]
 #[path = "../tests/common/certs.rs"]
@@ -29,7 +35,7 @@ use fictionet::stdlib::codec::Frames;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::convert::Infallible;
 use std::future::poll_fn;
-use std::io::{ErrorKind, Read, Write};
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -1768,14 +1774,6 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
         .and_then(|a| a.parse().ok())
         .unwrap_or_else(|| panic!("attach said: {first}"));
     std::thread::spawn(move || for _ in lines.map_while(Result::ok) {});
-    let get = move |host: &str| -> String {
-        let mut s = std::net::TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        write!(s, "GET http://{host}/ HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: {PROXY_AUTH}\r\nConnection: close\r\n\r\n").unwrap();
-        let mut out = String::new();
-        let _ = s.read_to_string(&mut out);
-        out
-    };
     let count = |name: &str| queries.lock().unwrap().get(name).copied().unwrap_or(0);
 
     let start = Instant::now();
@@ -1785,20 +1783,19 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
             let gate = gate.clone();
             std::thread::spawn(move || {
                 gate.wait();
-                get("plain.test")
+                benchmark::fetch(addr, "plain.test", PROXY_AUTH, 200)
             })
         })
         .collect();
     for th in threads {
         let answer = th.join().unwrap();
-        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(answer, b"plain site\n");
     }
     let cold = (count("plain.test"), start.elapsed().as_secs_f64() * 1e3);
 
     let start = Instant::now();
     for _ in 0..sequential {
-        let answer = get("missing.test");
-        assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+        benchmark::fetch(addr, "missing.test", PROXY_AUTH, 502);
     }
     let missing = (count("missing.test"), start.elapsed().as_secs_f64() * 1e3);
 
