@@ -1009,6 +1009,103 @@ pub fn segment(message: &[u8], tpdu_size: usize) -> Vec<Data> {
     out
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{
+        Error, ErrorTpdu, MAX_MESSAGE, Reassembler, Tpdu, messages, over_tpkt, segment, tpdus,
+    };
+    use fictionet::stdlib::codec::{Frames, Wire};
+    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::tpkt;
+
+    /// Checks decoder and writer contracts, TPDU round trips, connection
+    /// confirms, error replies, and segment reassembly. `message_limit` bounds
+    /// message decoding and retained TPDU data.
+    pub fn check_buffer(data: &[u8], message_limit: usize) {
+        contract::check_decode(Frames::<tpkt::Packet>::new, data);
+        contract::check_decode(|| tpdus(tpkt::MAX_PACKET), data);
+        contract::check_decode_with_held_limit(
+            || messages(tpkt::MAX_PACKET, message_limit),
+            data,
+            message_limit,
+        );
+        contract::check_wire::<Tpdu>(data);
+        let (packets, _) = decode_all(Frames::<tpkt::Packet>::new, data);
+
+        let mut messages = Reassembler::with_limit(message_limit);
+        // Each packet's TPDU, and any bytes as a TPDU on their own.
+        for payload in packets
+            .iter()
+            .map(|packet| packet.payload.as_slice())
+            .chain([data])
+        {
+            contract::check_wire::<Tpdu>(payload);
+            let packet = tpkt::Packet::new(payload.to_vec());
+            contract::check_wire_value(&packet);
+            let parsed = Tpdu::parse(payload);
+            // These check the documented delegation to Tpdu::parse.
+            assert_eq!(parsed, <Tpdu as Wire>::parse(payload));
+            assert_eq!(parsed, over_tpkt::tpdu(&packet));
+            match parsed {
+                Ok(t) => {
+                    contract::check_wire_value(&t);
+                    let bytes = t.to_bytes().unwrap();
+                    assert_eq!(Tpdu::parse(&bytes), Ok(t.clone()), "{payload:?}");
+                    let bytes = over_tpkt::from_tpdu(&t).unwrap().to_bytes().unwrap();
+                    let (packet, used) = tpkt::Packet::parse_prefix(&bytes).unwrap().unwrap();
+                    assert_eq!(used, bytes.len());
+                    assert_eq!(Tpdu::parse(&packet.payload), Ok(t.clone()));
+                    match &t {
+                        Tpdu::Data(d) => {
+                            let pending = messages.pending();
+                            if let Err(error) = messages.push(d) {
+                                let limit = message_limit.min(MAX_MESSAGE);
+                                assert_eq!(error, Error::OverLimit { limit });
+                                assert!(pending + d.data.len() > limit);
+                            }
+                            assert!(messages.pending() <= message_limit);
+                        }
+                        Tpdu::ConnectionRequest(c) => match c.confirm(1) {
+                            Some(cc) => {
+                                assert!(c.allows_class0());
+                                assert_eq!(cc.class, 0);
+                                let cc = Tpdu::ConnectionConfirm(cc);
+                                assert_eq!(Tpdu::parse(&cc.to_bytes().unwrap()), Ok(cc));
+                            }
+                            None => assert!(!c.allows_class0()),
+                        },
+                        _ => {}
+                    }
+                }
+                Err(Error::TpduTooLong { .. }) => {}
+                Err(e) => {
+                    let er = Tpdu::Error(ErrorTpdu::rejecting(0, payload, &e));
+                    assert_eq!(Tpdu::parse(&er.to_bytes().unwrap()), Ok(er));
+                }
+            }
+        }
+        // Any bytes cut into segments read back as the same data TPDUs, and
+        // put back together, they are the bytes again.
+        if data.len() <= MAX_MESSAGE {
+            let size = data.first().map_or(128, |&b| usize::from(b) * 3);
+            let mut whole = Reassembler::new();
+            let mut got = None;
+            for s in segment(data, size) {
+                let Ok(Tpdu::Data(back)) = Tpdu::parse(&Tpdu::Data(s.clone()).to_bytes().unwrap())
+                else {
+                    panic!()
+                };
+                assert_eq!(back, s);
+                assert!(got.is_none());
+                got = whole.push(&back).unwrap();
+            }
+            assert_eq!(got.as_deref(), Some(data));
+        }
+    }
+}
+
 #[cfg(test)]
 mod codec_tests {
     use super::*;
@@ -2327,65 +2424,6 @@ mod tests {
         );
     }
 
-    /// The checks the fuzz target makes, on one buffer.
-    fn check(data: &[u8]) {
-        contract::check_decode(Frames::<tpkt::Packet>::new, data);
-        contract::check_decode(|| tpdus(tpkt::MAX_PACKET), data);
-        contract::check_decode(|| messages(tpkt::MAX_PACKET, 64), data);
-        contract::check_wire::<Tpdu>(data);
-        let (packets, _) = test_support::decode_all(Frames::<tpkt::Packet>::new, data);
-        // Any bytes cut into segments come back whole.
-        let size = data.first().map_or(128, |&b| usize::from(b) * 3);
-        let mut r = Reassembler::new();
-        let mut got = None;
-        for s in segment(data, size) {
-            let Ok(Tpdu::Data(back)) = Tpdu::parse(&Tpdu::Data(s.clone()).to_bytes().unwrap())
-            else {
-                panic!()
-            };
-            assert_eq!(back, s);
-            assert!(got.is_none());
-            got = r.push(&back).unwrap();
-        }
-        assert_eq!(got.as_deref(), Some(data));
-        let mut r = Reassembler::with_limit(64);
-        for p in packets
-            .iter()
-            .map(|packet| packet.payload.as_slice())
-            .chain([data])
-        {
-            contract::check_wire_value(&tpkt::Packet::new(p.to_vec()));
-            match Tpdu::parse(p) {
-                Ok(t) => {
-                    let bytes = t.to_bytes().unwrap();
-                    assert_eq!(Tpdu::parse(&bytes), Ok(t.clone()), "{p:?}");
-                    assert_eq!(
-                        tpdu_from_packet(&over_tpkt::from_tpdu(&t).unwrap().to_bytes().unwrap()),
-                        t
-                    );
-                    if let Tpdu::Data(d) = &t {
-                        let _ = r.push(d);
-                        assert!(r.pending() <= 64);
-                    }
-                    if let Tpdu::ConnectionRequest(c) = &t {
-                        match c.confirm(1) {
-                            Some(cc) => {
-                                assert_eq!(cc.class, 0);
-                                let cc = Tpdu::ConnectionConfirm(cc);
-                                assert_eq!(Tpdu::parse(&cc.to_bytes().unwrap()), Ok(cc));
-                            }
-                            None => assert!(!c.allows_class0()),
-                        }
-                    }
-                }
-                Err(e) => {
-                    let er = Tpdu::Error(ErrorTpdu::rejecting(0, p, &e));
-                    assert_eq!(Tpdu::parse(&er.to_bytes().unwrap()), Ok(er));
-                }
-            }
-        }
-    }
-
     #[test]
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x0102_0304_0506_0708);
@@ -2401,7 +2439,7 @@ mod tests {
                     b[5] = [0xe0, 0xd0, 0x80, 0xf0, 0x70, 0xe3, 0x10][rng.index(7)];
                 }
             }
-            check(&b);
+            harness::check_buffer(&b, 64);
             // The same bytes as a TPDU on its own.
             if let Ok(t) = Tpdu::parse(&b) {
                 assert_eq!(Tpdu::parse(&t.to_bytes().unwrap()), Ok(t));
