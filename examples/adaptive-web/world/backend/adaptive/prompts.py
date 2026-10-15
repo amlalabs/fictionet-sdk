@@ -20,6 +20,13 @@ from urllib.parse import urlsplit
 
 from .seed import Seed
 
+# Link candidates examined per source page, before filtering.
+LINKS_PER_PAGE = 80
+# Characters kept from a link's normalized anchor text.
+ANCHOR_CHARS = 160
+# Link mentions shown per target page; search mentions are never capped.
+LINK_MENTIONS_PER_PAGE = 8
+
 
 class Error(ValueError):
     """An answer the world cannot read."""
@@ -241,10 +248,25 @@ def expected_type(url: str) -> str | None:
     return None
 
 
+def asked_mentions(mentions: list[dict]) -> list[dict]:
+    """All search mentions and the first LINK_MENTIONS_PER_PAGE link mentions.
+
+    Keep their recorded order for both the page prompt and snippet checks."""
+    asked, links = [], 0
+    for mention in mentions:
+        if mention["via"] == "link":
+            if links >= LINK_MENTIONS_PER_PAGE:
+                continue
+            links += 1
+        asked.append(mention)
+    return asked
+
+
 def page(seed: Seed, cast: list[dict], url: str, mentions: list[dict], profile: dict | None,
          host_pages: list[dict], claims: list[dict]) -> tuple[str, str]:
+    mentions = asked_mentions(mentions)
     led = []
-    for m in mentions[:8]:
+    for m in mentions:
         if m.get("via") == "search":
             led.append(f"- A search for \"{m['query']}\" showed it with the title \"{m['title']}\" and the "
                        f"snippet \"{m['snippet']}\"" + (f", dated {m['date']}" if m.get("date") else ""))

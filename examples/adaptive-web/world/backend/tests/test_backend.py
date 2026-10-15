@@ -28,6 +28,7 @@ from urllib.parse import unquote
 
 from adaptive import llm, prompts, seed as seeds, tells
 from adaptive.generate import Made, Model
+from adaptive.prompts import ANCHOR_CHARS, LINKS_PER_PAGE, LINK_MENTIONS_PER_PAGE
 from adaptive.seed import target_of
 from adaptive.store import Error as StoreError, Store, url_parts
 from adaptive.stub import Stub
@@ -179,6 +180,28 @@ class Consistency(unittest.TestCase):
             mentions = w.store.mentions("news.example-site.com", link.group(1))
             self.assertEqual(mentions[0]["via"], "link")
             self.assertEqual(mentions[0]["anchor"], text_of(link.group(2)))
+
+    def test_link_retention_bounds_and_filters(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = world(Path(d))
+            host, url = "news.example-site.com", "https://news.example-site.com/story"
+            w.store.page_once(host, "/stored", lambda: {"url": f"https://{host}/stored", "claims": []})
+            anchor = "A&B " + "x" * ANCHOR_CHARS
+            links = [("/empty", " <b> </b> "), ("https://www.google.com/search?q=x", "Search"),
+                     ("/stored", "Stored"), ("mailto:author@example.com", "Email"), ("http://", "No host"),
+                     ("/relative?x=1&amp;y=2", f" <b>A&amp;B</b> {'x' * ANCHOR_CHARS} "),
+                     ("http://other.example-site.com/plain", "HTTP target")]
+            expected = {(host, "/relative?x=1&y=2"): anchor[:ANCHOR_CHARS],
+                        ("other.example-site.com", "/plain"): "HTTP target"}
+            for i in range(len(links), LINKS_PER_PAGE + 1):
+                links.append((f"https://{host}/link-{i}", f"Link {i}"))
+                if i < LINKS_PER_PAGE:
+                    expected[host, f"/link-{i}"] = f"Link {i}"
+            w._note_links(url, "".join(f'<a href="{href}">{text}</a>' for href, text in links))
+            recorded = {p: json.loads(p.read_text()) for p in w.store.root.rglob("@mentions.json")}
+            self.assertEqual(recorded, {
+                w.store.page_dir(h, t) / "@mentions.json": [{"via": "link", "from": url, "anchor": text}]
+                for (h, t), text in expected.items()})
 
     def test_snippet_checks(self):
         mention = {"via": "search", "snippet": "Oct 3, 2026 — Halvard has released firmware 7.2.4, which fixes ..."}
@@ -810,6 +833,29 @@ class ModelGenerator(unittest.TestCase):
                 if f.is_file():
                     self.assertNotIn(self.KEY, f.read_text(errors="replace"), f)
 
+    def test_page_checks_the_mentions_shown_to_the_model(self):
+        searches = [{"via": "search", "query": f"query {i}", "title": "Story", "snippet": f"Evidence number {i}."}
+                    for i in range(LINK_MENTIONS_PER_PAGE + 1)]
+        links = [{"via": "link", "from": f"https://source.example-site.com/{i}", "anchor": f"Source {i}"}
+                 for i in range(LINK_MENTIONS_PER_PAGE + 1)]
+        for missing in (False, True):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as d:
+                w = World(SEED, Store(Path(d)), Model(SEED, llm.client("openrouter", "some/model")))
+                w.store.cast_once(lambda: {"people": []})
+                for mention in links + searches:
+                    w.store.add_mention("news.example-site.com", "/story", mention)
+                body = " ".join(m["snippet"] for m in (searches[:-1] if missing else searches))
+                FakeOpenRouter.page_answers = [f"STATUS: 200\nCONTENT_TYPE: text/plain\nTITLE: Story\nBODY:\n{body}"]
+                page = w.page("news.example-site.com", "/story")
+                record = w.store.page("news.example-site.com", "/story")
+                self.assertEqual(record["context"]["mentions"], links[:LINK_MENTIONS_PER_PAGE] + searches)
+                for mention in searches:
+                    self.assertIn(f'snippet "{mention["snippet"]}"', FakeOpenRouter.page_prompts[-1])
+                for i, mention in enumerate(links):
+                    self.assertEqual(mention["from"] in FakeOpenRouter.page_prompts[-1], i < LINK_MENTIONS_PER_PAGE)
+                self.assertEqual(page.meta["unsupported_snippets"], [searches[-1]["snippet"]] if missing else [])
+                self.assertEqual(page.meta["unchecked_snippets"], [])
+
     def test_an_unreadable_answer_is_asked_again_and_counted(self):
         FakeOpenRouter.bad_answers = 1
         gen = Model(SEED, llm.client("openrouter", "some/model"))
@@ -1043,6 +1089,19 @@ class ModelGenerator(unittest.TestCase):
 
 
 class Reading(unittest.TestCase):
+    def test_page_prompt_keeps_all_search_mentions(self):
+        searches = [{"via": "search", "query": f"query {i}", "title": "Story", "snippet": f"Evidence number {i}."}
+                    for i in range(LINK_MENTIONS_PER_PAGE + 1)]
+        links = [{"via": "link", "from": f"https://source.example-site.com/{i}", "anchor": f"Source {i}"}
+                 for i in range(LINK_MENTIONS_PER_PAGE + 1)]
+        for context in (searches, [m for pair in zip(links, searches) for m in pair]):
+            with self.subTest(context=context):
+                _, user = prompts.page(SEED, [], "https://news.example-site.com/story", context, None, [], [])
+                for mention in searches:
+                    self.assertIn(f'snippet "{mention["snippet"]}"', user)
+                for i, mention in enumerate(links):
+                    self.assertEqual(mention["from"] in user, mention in context and i < LINK_MENTIONS_PER_PAGE)
+
     def test_malformed_json_201(self):
         with self.assertRaisesRegex(prompts.Error, "not JSON"):
             prompts.read_page("STATUS: 201\nTITLE: x\nBODY:\nNot found", "application/json")

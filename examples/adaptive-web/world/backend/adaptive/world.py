@@ -9,8 +9,10 @@ Every request is one of:
   use, then served from the store even if the source changes or disappears.
 - a page already in the store: served exactly as stored.
 - a new page: made from the seed, its mentions (the searches and links that
-  led to it) and what the world has already said, then stored. Its links
-  are written down as mentions of their targets in turn.
+  led to it) and what the world has already said, then stored. Of its first
+  prompts.LINKS_PER_PAGE (80) link candidates, only http(s) links to non-search
+  hosts whose target page is not yet stored become mentions. Empty anchors
+  are skipped; normalized anchor text is cut at prompts.ANCHOR_CHARS (160).
 - a stylesheet, script, image or font: a small fixed answer.
 
 The consistency rules live here: a page takes the title its first mention
@@ -36,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urljoin
 
-from . import llm, render, stub, tells
+from . import llm, prompts, render, stub, tells
 from .generate import Made, Model, PageAsk
 from .seed import Seed, target_of
 from .store import Store
@@ -366,7 +368,7 @@ class World:
     def _make_page(self, host: str, target: str, prefetch: bool) -> dict:
         self._reserve_generation()
         url = f"https://{host}{target}"
-        mentions = self.store.mentions(host, target)
+        mentions = prompts.asked_mentions(self.store.mentions(host, target))
         ask = PageAsk(url, host, target, mentions, self.store.site(host), self.store.pages(host)[:20],
                       self.store.recent_claims(), self.cast())
         made = self._generate("page", ask, url=url)
@@ -394,16 +396,20 @@ class World:
         return record
 
     def _note_links(self, url: str, markup: str) -> None:
-        """Writes down every link of a page as a mention of its target, so a
-        later request for it has context even without a Referer."""
-        for href, anchor in LINK.findall(markup)[:80]:
+        """Record context from the first prompts.LINKS_PER_PAGE link candidates.
+
+        Apply that bound before resolving URLs and filtering: keep only
+        http(s) links with a host, excluding search hosts and stored pages.
+        Normalize anchor text, cut it at prompts.ANCHOR_CHARS, then skip empty
+        anchors. A later request has this context even without a Referer."""
+        for href, anchor in LINK.findall(markup)[:prompts.LINKS_PER_PAGE]:
             absolute = urljoin(url, html.unescape(href.strip()))
             if not absolute.startswith(("http://", "https://")):
                 continue
             host, target = target_of(absolute)
             if not host or host in SEARCH_HOSTS or self.store.page(host, target) is not None:
                 continue
-            anchor_text = text_of(anchor)[:160]
+            anchor_text = text_of(anchor)[:prompts.ANCHOR_CHARS]
             if anchor_text:
                 self.store.add_mention(host, target, {"via": "link", "from": url, "anchor": anchor_text})
 

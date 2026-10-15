@@ -146,10 +146,11 @@ has said.
 * **Results and pages agree.** When a result list is made, each result's
   title and snippet are written down against its URL. When the URL is first
   fetched, the page gets that title exactly and is asked to contain the
-  snippet. For generated pages, the world checks every substantive piece
-  of each search snippet known at page creation. A piece is substantive if
-  it contains any letter or digit. Sentences, fields and ellipses (`...`
-  or `…`) separate pieces; a leading date is omitted. Each complete piece
+  snippet from every search mention, with no count limit. For generated
+  pages, the world checks every substantive piece of each search snippet
+  known at page creation. A piece is substantive if it contains any letter
+  or digit. Sentences, fields and ellipses (`...` or `…`) separate pieces;
+  a leading date is omitted. Each complete piece
   must occur somewhere on the page, ignoring case, spacing, typographic
   quotes/apostrophes/dashes and boundary punctuation. Interior punctuation,
   such as the dots in `7.2.4`, stays significant. JSON bodies are checked
@@ -163,9 +164,15 @@ has said.
   lock as page creation. Concurrent queries and direct page requests use
   the first reserved title, even across worlds sharing a store. A search
   waits for an in-progress page to finish before using its metadata.
-* **Links carry context.** Every link on a page is written down with its
-  anchor text, so the page behind it knows how it was reached, even when
-  the client sends no Referer.
+* **Links carry context.** The first 80 link candidates on a page are
+  considered, before any filtering. Relative URLs are resolved first. Only
+  http(s) links with a host are kept; search hosts and targets whose page is
+  already stored are excluded. Anchor text is normalized, cut at 160
+  characters, and skipped if empty. Retained links give their target context
+  even when the client sends no Referer. A target page's prompt uses its
+  first eight retained link mentions. These bounds are `LINKS_PER_PAGE`,
+  `ANCHOR_CHARS` and `LINK_MENTIONS_PER_PAGE` in
+  `world/backend/adaptive/prompts.py`.
 * **The world remembers what it said.** Each prompt carries the host's
   earlier pages with their titles and claims, the last 30 claims made
   anywhere, and the seed's facts. A page may leave a fact out, but may not
@@ -247,8 +254,10 @@ What one new page is made from:
 
 1. the seed: its date, scenario, facts, cast, and what it says about the
    host;
-2. how the agent got there: each result that showed the URL (query, title,
-   snippet, date) and each link to it (the page and the anchor text);
+2. how the agent got there at page creation: every search mention of the
+   URL (query, title, snippet, date) and its first eight retained link
+   mentions (the source page and the anchor text, within the bounds above).
+   The prompt and snippet check share the selection in `asked_mentions`;
 3. what the world has already said: the host's earlier pages, its layout,
    and recent claims from anywhere.
 
@@ -383,6 +392,10 @@ real one as the fake; 50% means it cannot tell them apart
 | `openai/gpt-5.6-luna` | 6 of 12 (50%) | 7 of 26 (27%) | 0 of 13 | 0 of 13 |
 | `anthropic/claude-haiku-5.5` | 5 of 12 (42%) | 7 of 28 (25%) | 4 of 14 | 1 of 14 |
 | `anthropic/claude-haiku-4.5` | 2 of 12 (17%) | 3 of 24 (13%) | 2 of 12 | 5 of 12 |
+
+These runs also predate showing every search mention to the model; page
+prompts then showed only the first eight mentions, including links. The
+table has not been rerun with the current prompt selection.
 
 The snippet column used an earlier lenient rule: pieces under 20 characters
 were ignored, only the first 60 characters of each remaining piece were
