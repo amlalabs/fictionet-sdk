@@ -185,7 +185,7 @@ macro_rules! protocols {
         pub mod observe_http2;
         }
         fictionet::cfg_observe! {
-        // protocols.rs includes protocols/modbus.rs by a relative #[path].
+        // protocols.rs includes protocols/{modbus,dns,dhcp,http1}.rs by relative #[path]s.
         #[path = "../../src/observe/protocols.rs"]
         pub mod observe_protocols;
         }

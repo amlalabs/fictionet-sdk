@@ -96,6 +96,9 @@ These files can be copied into another crate and edited:
 
 - `src/observe/protocols.rs` and `src/observe/protocols/`: capture decoders
   and presenters. Copy them together, keeping the relative paths.
+  `protocols/dns.rs`, `protocols/dhcp.rs`, and `protocols/http1.rs` own the
+  DNS, DHCP, and HTTP/1 adapters. Their public items remain re-exported by
+  `protocols.rs`.
   `protocols/modbus.rs` owns `Modbus` and `ModbusSession`, re-exported by
   `protocols.rs`. Register that session through `register_protocol` to stop
   both directions after a framing error, as the built-in does. These files
