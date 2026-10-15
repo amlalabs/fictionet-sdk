@@ -371,31 +371,8 @@ fn sum_with(b: &[u8], endpoints: &Endpoints, v4_pseudo_header: bool) -> Option<u
     }
     let mut sum = ip::sum(0, &b[..6]);
     sum = ip::sum(sum, &b[HEADER_LEN..]);
-    if b[0] >> 4 == 3 {
-        // MAX_MESSAGE fits in 16 bits, so the length does too.
-        let len = b.len() as u16;
-        match endpoints {
-            Endpoints::V4 {
-                source,
-                destination,
-            } => {
-                if v4_pseudo_header {
-                    sum = ip::sum(sum, &source.octets());
-                    sum = ip::sum(sum, &destination.octets());
-                    sum = ip::sum(sum, &[0, PROTOCOL]);
-                    sum = ip::sum(sum, &len.to_be_bytes());
-                }
-            }
-            Endpoints::V6 {
-                source,
-                destination,
-            } => {
-                sum = ip::sum(sum, &source.octets());
-                sum = ip::sum(sum, &destination.octets());
-                sum = ip::sum(sum, &u32::from(len).to_be_bytes());
-                sum = ip::sum(sum, &[0, 0, 0, PROTOCOL]);
-            }
-        }
+    if b[0] >> 4 == 3 && (v4_pseudo_header || matches!(endpoints, Endpoints::V6 { .. })) {
+        sum = ip::pseudo_header_sum(sum, endpoints, PROTOCOL, b.len());
     }
     Some(ip::fold(sum))
 }

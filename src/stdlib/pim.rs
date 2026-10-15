@@ -574,17 +574,8 @@ fn full_mask(a: IpAddr) -> u8 {
 fn checksum_over(covered: &[u8], len: usize, endpoints: &Endpoints) -> u16 {
     let mut sum = ip::sum(0, &covered[..2]);
     sum = ip::sum(sum, &covered[HEADER_LEN..]);
-    if let Endpoints::V6 {
-        source,
-        destination,
-    } = endpoints
-    {
-        // At most MAX_MESSAGE, so it fits in 32 bits.
-        let len = len as u32;
-        sum = ip::sum(sum, &source.octets());
-        sum = ip::sum(sum, &destination.octets());
-        sum = ip::sum(sum, &len.to_be_bytes());
-        sum = ip::sum(sum, &[0, 0, 0, PROTOCOL]);
+    if matches!(endpoints, Endpoints::V6 { .. }) {
+        sum = ip::pseudo_header_sum(sum, endpoints, PROTOCOL, len);
     }
     ip::fold(sum)
 }

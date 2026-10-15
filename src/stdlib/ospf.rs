@@ -844,16 +844,9 @@ pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
             sum = ip::sum(sum, &b[14..16]);
             sum = ip::sum(sum, &b[HEADER_LEN_V2..len]);
         }
-        Endpoints::V6 {
-            source,
-            destination,
-        } => {
+        Endpoints::V6 { .. } => {
             sum = ip::sum(sum, &b[14..len]);
-            sum = ip::sum(sum, &source.octets());
-            sum = ip::sum(sum, &destination.octets());
-            // At most MAX_PACKET, so it fits in 32 bits.
-            sum = ip::sum(sum, &(len as u32).to_be_bytes());
-            sum = ip::sum(sum, &[0, 0, 0, PROTOCOL]);
+            sum = ip::pseudo_header_sum(sum, endpoints, PROTOCOL, len);
         }
     }
     Some(ip::fold(sum))

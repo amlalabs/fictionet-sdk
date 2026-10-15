@@ -60,7 +60,8 @@
 //!   they all agree on the upper-layer protocol.
 //! - [`checksum`] is the Internet checksum, [`transport_checksum`] adds the
 //!   TCP, UDP or ICMPv6 pseudo-header, and [`set_header_checksum`] redoes an
-//!   IPv4 header's.
+//!   IPv4 header's. [`pseudo_header_sum`] adds only the pseudo-header when
+//!   a protocol chooses its own checksum coverage.
 //! - [`packet`] and [`packet_with`] put an IP header in front of a payload.
 //!   [`hop`] lowers the TTL as a router does.
 //!
@@ -1377,6 +1378,33 @@ impl Endpoints {
     }
 }
 
+/// Adds the IP pseudo-header for `endpoints`, `protocol` and `len` to a
+/// one's-complement sum. `len` is the length in bytes covered by the
+/// pseudo-header, which need not equal the number of payload bytes summed.
+/// Use [`sum`] for those bytes and [`fold`] to finish the checksum.
+///
+/// The caller chooses whether the protocol includes a pseudo-header and
+/// which payload fields to sum. This function neither checks nor truncates
+/// `len`: an on-wire IPv4 length must fit in 16 bits, and an IPv6 length in
+/// 32 bits. Each contribution starts on a word boundary, as with [`sum`].
+/// The caller must leave room in `acc` for `len + 255` plus at most
+/// `2 * u32::MAX` for IPv4 or `8 * u32::MAX` for IPv6. The sum must fit in
+/// `u64`.
+#[inline]
+pub fn pseudo_header_sum(acc: u64, endpoints: &Endpoints, protocol: u8, len: usize) -> u64 {
+    let acc = match endpoints {
+        Endpoints::V4 {
+            source,
+            destination,
+        } => sum(sum(acc, &source.octets()), &destination.octets()),
+        Endpoints::V6 {
+            source,
+            destination,
+        } => sum(sum(acc, &source.octets()), &destination.octets()),
+    };
+    acc + protocol as u64 + len as u64
+}
+
 /// The TCP, UDP or ICMPv6 checksum of `data` over the pseudo-header for
 /// `src`, `dst` and `protocol` (RFC 9293, RFC 768, RFC 8200 section 8.1).
 /// Over data whose checksum field is filled in, a correct checksum gives 0.
@@ -1384,13 +1412,13 @@ impl Endpoints {
 /// never correct.
 #[inline]
 pub fn transport_checksum(src: IpAddr, dst: IpAddr, protocol: u8, data: &[u8]) -> u16 {
-    let len = data.len() as u64;
-    let acc = match (src, dst) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => sum(sum(0, &s.octets()), &d.octets()),
-        (IpAddr::V6(s), IpAddr::V6(d)) => sum(sum(0, &s.octets()), &d.octets()),
-        _ => return 1,
+    let Some(endpoints) = Endpoints::new(src, dst) else {
+        return 1;
     };
-    fold(sum(acc + protocol as u64 + len, data))
+    fold(sum(
+        pseudo_header_sum(0, &endpoints, protocol, data.len()),
+        data,
+    ))
 }
 
 /// Whether a UDP datagram from `src` to `dst` has a good checksum. A zero
@@ -2292,6 +2320,76 @@ mod tests {
             transport_checksum(s.into(), DST.into(), protocol::UDP, &udp),
             1
         );
+    }
+
+    #[test]
+    fn pseudo_header_sums_match_wire_headers() {
+        let endpoints = [
+            Endpoints::V4 {
+                source: "192.0.2.1".parse().unwrap(),
+                destination: "198.51.100.2".parse().unwrap(),
+            },
+            Endpoints::V6 {
+                source: "2001:db8::1234".parse().unwrap(),
+                destination: "ff02::1".parse().unwrap(),
+            },
+        ];
+        let prefix = [0xff; 8];
+        for ends in endpoints {
+            for protocol in [0, 17, 89, 103, 112, 255] {
+                let lengths: &[u32] = match ends {
+                    Endpoints::V4 { .. } => &[0, 8, 9, 65_535],
+                    Endpoints::V6 { .. } => &[0, 8, 9, 65_535, 65_536, 0x1234_5678, u32::MAX],
+                };
+                for &len in lengths {
+                    let mut header = match ends {
+                        Endpoints::V4 {
+                            source,
+                            destination,
+                        } => {
+                            let len = u16::try_from(len).unwrap();
+                            [
+                                &source.octets()[..],
+                                &destination.octets(),
+                                &[0, protocol],
+                                &len.to_be_bytes(),
+                            ]
+                            .concat()
+                        }
+                        Endpoints::V6 {
+                            source,
+                            destination,
+                        } => [
+                            &source.octets()[..],
+                            &destination.octets(),
+                            &len.to_be_bytes(),
+                            &[0, 0, 0, protocol],
+                        ]
+                        .concat(),
+                    };
+                    header.extend_from_slice(&prefix);
+                    // The covered length is independent of the bytes added.
+                    // Both odd payloads and a nonzero starting sum work.
+                    for payload in [&[][..], &[0xab][..], &[0xab, 0xcd, 0xef][..]] {
+                        let acc = pseudo_header_sum(sum(0, &prefix), &ends, protocol, len as usize);
+                        assert_eq!(
+                            fold(sum(acc, payload)),
+                            reference_checksum(&[&header[..], payload].concat()),
+                            "{ends:?}, protocol {protocol}, length {len}, payload {payload:?}",
+                        );
+                    }
+                }
+                for payload in [&[][..], &[0xab][..], &[0xab, 0xcd, 0xef][..]] {
+                    assert_eq!(
+                        transport_checksum(ends.source(), ends.destination(), protocol, payload),
+                        fold(sum(
+                            pseudo_header_sum(0, &ends, protocol, payload.len()),
+                            payload
+                        )),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
