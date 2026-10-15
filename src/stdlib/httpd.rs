@@ -1170,11 +1170,14 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
 /// otherwise. HTTP/2 and hyper upgrades require the `tokio` feature.
 /// `info` names the connection in events.
+/// An empty half-close is silent. EOF within an HTTP/2 preface goes through
+/// HTTP/1's truncated-head handling: `http.error` with cause `protocol` and 400.
 ///
 /// Returns `Ok(())` when the connection ended, however it ended: a
 /// connection's failure is the connection's, and the run's events say what
 /// it was. Returns [`Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled first.
+#[deny(clippy::let_underscore_must_use)]
 pub async fn serve_connection<C: Connection + Unpin>(
     fcx: &Cx,
     conn: C,
@@ -1197,16 +1200,13 @@ pub async fn serve_connection<C: Connection + Unpin>(
             {
                 let room = fictionet::cfg_tokio!({ PREFACE.len() - first.len() } else { 1 });
                 match conn.read(fcx, &mut buf[..room]).await {
-                    Ok(0) | Err(_) => return false,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => first.extend_from_slice(&buf[..n]),
                 }
             }
-            true
         };
         match fcx.race(Some(fcx.now() + first_timeout), preface).await {
-            Ok(true) => {}
-            Ok(false) if fcx.is_cancelled() => return Err(Cancelled),
-            Ok(false) => return Ok(()),
+            Ok(()) => {}
             Err(RaceError::Cancelled) => return Err(Cancelled),
             Err(RaceError::Deadline) => {
                 let secs = first_timeout.as_secs();

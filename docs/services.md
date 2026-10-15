@@ -206,13 +206,25 @@ it: it ends the run, wherever in the world it happens. As it unwinds,
 the driver names the service and the connection on standard error after
 the panic's own message, so the failed run says where to look.
 
-When the world stops, `on_end` hears `Ended::Cancelled`, and `serve::connection`
-returns `Err(ServeError::Cancelled)`, also when the stop comes during the
-TLS handshake, before the service started. `datagram` returns
-`Err(Cancelled)`. A stop is never reported as a closed or broken
-connection. `listen` and `Net` serve each connection in a task of its
-own; a connection's failure is that connection's, recorded as
-`conn.error`, and does not end the world.
+When the world stops, a running service hears `Ended::Cancelled` in `on_end`.
+`serve::connection` returns `Err(ServeError::Cancelled)`, also during the TLS
+handshake or the final shutdown, unless it has a failure to return. If the
+service was already ending, `on_end` has heard the original cause and is not
+called again. `datagram` returns `Err(Cancelled)`.
+
+The final shutdown waits at most five seconds. Its failure adds a `shutdown`
+field to `conn.close`, such as `cancelled`, `timed_out`, `reset` or `closed`.
+The `end` field keeps the primary cause. A shutdown cancellation returns
+`ServeError::Cancelled`; other shutdown failures keep `Served::Closed(end)`.
+An earlier service, deferred-work or fault-plan failure stays primary.
+
+A task spawned in the connection's child region can fail and cancel that
+region. Its original error is recorded once as `conn.error`, with kind `task`
+and the error chain. This event follows `conn.close`, because the region ends
+after the connection driver. It returns as `ServeError::Pending` unless the
+driver already has a failure to return. Cancellation itself is not a task
+failure. `listen` and `Net` serve each connection in a task of its own; a
+connection's failure is recorded and does not end the world.
 
 A write that takes no bytes for `ServeOptions::write_timeout` (10
 seconds) ends the connection: a client that stops reading cannot hold a
@@ -732,6 +744,10 @@ calling the handler. A transport failure may prevent that answer reaching
 the client. HTTP/1 head deadlines include the wait between requests, also
 after handoff to hyper. HTTP/2 has no request-head deadline. Body deadlines
 and write stall deadlines use the Fictionet clock on every backend.
+
+An empty half-close before the first request makes no HTTP error event.
+EOF partway through an HTTP/2 preface is a truncated HTTP/1 head: it records
+one `http.error` with cause `protocol` and answers `400 Bad Request`.
 
 An opt-in `httpd::Observer` sees the parsed request head before virtual hosting
 and admission, each decoded body chunk before it can be discarded, and the

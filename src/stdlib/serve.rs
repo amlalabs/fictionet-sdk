@@ -129,10 +129,11 @@
 //!   ended. Its reply is written when the connection can still take it: the
 //!   client half-closed ([`Ended::Eof`]), the service closed, the service's
 //!   decoder failed, the connection sat idle or went over its budget.
-//! - **Stops.** When the world stops, the service hears [`Ended::Cancelled`]
-//!   and [`connection`] returns [`ServeError::Cancelled`], also when the stop
-//!   comes during a TLS handshake. A stop is never a closed or broken
-//!   connection.
+//! - **Stops.** When the world stops, a running service hears [`Ended::Cancelled`].
+//!   [`connection`] returns [`ServeError::Cancelled`], also during a TLS
+//!   handshake or final shutdown, unless it has a failure to return. If
+//!   [`Service::on_end`] already ran, it is not called again. A shutdown
+//!   failure is secondary: `conn.close` keeps `end` and adds `shutdown`.
 //! - **Upgrades.** A call that returns [`Flow::Upgrade`] says what comes
 //!   next: [`Upgrade::Tls`] shakes hands as a TLS server with
 //!   [`ServeOptions::starttls`] and calls [`Service::on_open`] again over
@@ -350,7 +351,7 @@ pub enum Ended {
     Conn(ConnError),
     /// The connection's region was cancelled. A notification
     /// for [`Service::on_end`]; [`connection`] itself then returns
-    /// [`ServeError::Cancelled`].
+    /// [`ServeError::Cancelled`], or the failure that cancelled the region.
     Cancelled,
 }
 
@@ -1233,7 +1234,7 @@ impl ServeOptions {
 pub enum ServeError<E> {
     /// The service returned this error.
     Service(E),
-    /// Ordered deferred work failed.
+    /// Ordered deferred work or a task in the connection's child region failed.
     Pending(fictionet::Error),
     /// A fault rule or held-item flush failed. A running service hears [`Ended::Closed`].
     Faults(FaultError<Infallible>),
@@ -1241,6 +1242,9 @@ pub enum ServeError<E> {
     /// cancelled. A running service hears [`Ended::Cancelled`] in
     /// [`Service::on_end`]. Cancellation during the TLS handshake or while
     /// the service is already ending closes the connection immediately.
+    /// During final shutdown, `on_end` has already heard the primary cause;
+    /// `conn.close` records `shutdown: cancelled`. A service, deferred-work,
+    /// fault-plan or child-task failure takes precedence over cancellation.
     Cancelled,
 }
 
@@ -2516,12 +2520,21 @@ async fn write_all<C: Connection>(
 /// ended, or the connection with its unread bytes after
 /// [`Upgrade::Handoff`]. Returns [`ServeError::Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled, also during a TLS
-/// handshake.
+/// handshake or final shutdown, unless a failure takes precedence.
 ///
 /// `info` names the connection in events; [`listen`] fills it in. The
 /// connection ends as soon as the client resets it, even while deferred
 /// work runs and nothing reads ([`Connection::poll_gone`]). Deferred work
 /// receives a child region; cancelling it closes only this connection.
+/// A task failure in that region records `conn.error` with kind `task`
+/// after `conn.close`, once the region ends. It returns as [`ServeError::Pending`]
+/// unless the driver already has a service, deferred-work or fault-plan failure.
+///
+/// Final shutdown waits at most five seconds. Its failure adds `shutdown`
+/// to `conn.close`, keeping `end` as the primary cause. Cancellation returns
+/// [`ServeError::Cancelled`] unless there is a primary failure. Other shutdown
+/// failures keep [`Served::Closed`]. [`Service::on_end`] is not called again.
+#[deny(clippy::let_underscore_must_use)]
 pub async fn connection<S, C>(
     fcx: &Cx,
     conn: C,
@@ -2536,16 +2549,17 @@ where
     <S::Decoder as Decode>::Error: Clone + Send,
 {
     let mut result = None;
-    {
+    let region_result = {
         let slot = &mut result;
         let finished = fictionet::sync::Mutex::new(None);
         let finished_ref = &finished;
+        let info = info.clone();
         let mut region = std::pin::pin!(fcx.region(|child| async move {
             *slot = Some(serve_in_region(&child, conn, info, service, state, opts).await);
             *finished_ref.lock() = Some(child);
             Ok(())
         }));
-        let _ = std::future::poll_fn(|cx| {
+        std::future::poll_fn(|cx| {
             let polled = region.as_mut().poll(cx);
             if polled.is_pending() {
                 // The connection has ended but its spawned work is still running.
@@ -2557,9 +2571,35 @@ where
             }
             polled
         })
-        .await;
+        .await
+    };
+    let result = result.expect("the connection region completed");
+    if let Err(e) = region_result {
+        let cancelled =
+            std::iter::successors(Some(&*e as &(dyn std::error::Error + 'static)), |e| {
+                e.source()
+            })
+            .any(|e| e.is::<Cancelled>());
+        if !cancelled {
+            let chain = ErrorChain(&*e);
+            record(
+                fcx,
+                &info,
+                Event::new("conn", "error")
+                    .level(Level::Notice)
+                    .summary(format!("a connection task failed: {chain}"))
+                    .field("error", chain.to_string())
+                    .field("kind", "task"),
+            );
+            return match result {
+                Err(ServeError::Service(_) | ServeError::Pending(_) | ServeError::Faults(_)) => {
+                    result
+                }
+                _ => Err(ServeError::Pending(e)),
+            };
+        }
     }
-    result.expect("the connection region completed")
+    result
 }
 
 async fn serve_in_region<S, C>(
@@ -2637,6 +2677,7 @@ fn tls_failed<E>(e: HandshakeError) -> Result<Served<Box<dyn Connection>>, Serve
 }
 
 #[allow(clippy::too_many_arguments)]
+#[deny(clippy::let_underscore_must_use)]
 async fn run<S, C>(
     fcx: &Cx,
     mut conn: C,
@@ -2805,11 +2846,19 @@ where
                 for event in std::mem::take(&mut core.s.events) {
                     record(fcx, &core.info, event);
                 }
-                if end.writable() {
-                    let _ = fcx
+                let shutdown = if end.writable() {
+                    match fcx
                         .race(Some(fcx.now() + Duration::from_secs(5)), conn.shutdown(fcx))
-                        .await;
-                }
+                        .await
+                    {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(e),
+                        Err(RaceError::Cancelled) => Some(ConnError::Cancelled),
+                        Err(RaceError::Deadline) => Some(ConnError::TimedOut),
+                    }
+                } else {
+                    None
+                };
                 let info = core.info.clone();
                 let failure = core.failure.take();
                 match &failure {
@@ -2844,20 +2893,31 @@ where
                     None => {}
                 }
                 if opts.connection_events {
-                    record(
-                        fcx,
-                        &info,
-                        Event::new("conn", "close")
-                            .field("end", end.as_str())
-                            .summary(format!("connection closed: {}", end.as_str())),
-                    );
+                    let mut event = Event::new("conn", "close")
+                        .field("end", end.as_str())
+                        .summary(format!("connection closed: {}", end.as_str()));
+                    if let Some(e) = shutdown {
+                        let name = match e {
+                            ConnError::Refused => "refused",
+                            ConnError::Unreachable(_) => "unreachable",
+                            ConnError::Reset => "reset",
+                            ConnError::TimedOut => "timed_out",
+                            ConnError::Closed => "closed",
+                            ConnError::Broken => "broken",
+                            ConnError::Cancelled => "cancelled",
+                        };
+                        event = event.field("shutdown", name);
+                    }
+                    record(fcx, &info, event);
                 }
                 drop(core);
                 return match failure {
                     Some(Failure::Service(e)) => Err(ServeError::Service(e)),
                     Some(Failure::Pending(e)) => Err(ServeError::Pending(e)),
                     Some(Failure::Faults(e)) => Err(ServeError::Faults(e)),
-                    None if end == Ended::Cancelled => Err(ServeError::Cancelled),
+                    None if end == Ended::Cancelled || shutdown == Some(ConnError::Cancelled) => {
+                        Err(ServeError::Cancelled)
+                    }
                     None => Ok(Served::Closed(end)),
                 };
             }

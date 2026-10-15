@@ -4194,6 +4194,27 @@ fn the_world_stops_while_handlers_wait() {
 }
 
 #[test]
+fn partial_preface_eof() {
+    world_events(|fcx, attacher, _env, log| async move {
+        let m = default_machine(&fcx, &attacher);
+        let plain = lookup(&fcx, &m, "plain.test").await;
+        let mut conn = m
+            .tcp
+            .connect(&fcx, SocketAddr::new(plain.into(), 80))
+            .await?;
+        conn.write_all(&fcx, b"PRI * HTTP/2.0\r\n").await?;
+        conn.shutdown(&fcx).await?;
+        let reply = read_all(&fcx, &mut conn).await?;
+        let errors = picked(&log, error_seen);
+        assert_eq!(errors.len(), 1, "a truncated preface must be reported once");
+        assert_eq!(errors[0].str("cause"), Some("protocol"));
+        assert_eq!(local(&errors[0]), SocketAddr::from((plain, 80)));
+        assert_eq!(io::response(&reply, "PRI", false).head.status, 400);
+        Ok(())
+    });
+}
+
+#[test]
 fn events_for_bytes_that_are_not_http() {
     world_events(|fcx, attacher, env, log| async move {
         let m = default_machine(&fcx, &attacher);
