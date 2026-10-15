@@ -1,0 +1,169 @@
+{
+  "continue-on-error": [
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_line_rules_mask_only_comments",
+      "pattern": "continue-on-error: true",
+      "reason": "The fixture checks that a block comment is masked while executable code after a comment is still scanned.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_continue_on_error",
+      "pattern": "for source in ('continue-on-error: true', '\"continue-on-error\": ${{ inputs.ignore }}',",
+      "reason": "Fixtures assert that literal and expression-valued workflow bypasses are rejected.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_continue_on_error",
+      "pattern": "'continue-on-error:\\n true'):",
+      "reason": "The multiline workflow fixture must be rejected too.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_continue_on_error",
+      "pattern": "self.assertEqual(self.rules(\".github/workflows/test.yml\", \"continue-on-error: false\"), set())",
+      "reason": "This assertion proves that explicitly disabling workflow error continuation passes.",
+      "id": "POL-TEST-FIXTURE"
+    }
+  ],
+  "shell-or-true": [
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_shell_status_synonyms_and_language_controls",
+      "pattern": "(\"src/lib.rs\", \"fn a() { let b = || true; let c = || ::std::process::id(); }\"),",
+      "reason": "The Rust control proves closures are not shell status suppressions; this literal is never executed.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_shell_status_synonyms_and_language_controls",
+      "pattern": "(\"dashboard/probe.js\", \"const a = b || true;\"),",
+      "reason": "The JavaScript control proves logical disjunction is not a shell status suppression.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_shell_status_synonyms_and_language_controls",
+      "pattern": "(\"tests/probe.sh\", \"# curl example.test || /bin/true\\n\"),",
+      "reason": "The commented shell control proves comments are not executable status suppressions.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_shell_status_in_scripts_and_python_strings",
+      "pattern": "(\"tests/probe.sh\", 'curl example.test || true\\n'),",
+      "reason": "The shell fixture is rejected by the scanner; it is never executed.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_shell_status_in_scripts_and_python_strings",
+      "pattern": "(\"examples/probes.py\", 'command = \"curl example.test || true\"\\n'),",
+      "reason": "The Python-string fixture proves embedded sandbox commands cannot evade the rule.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_function_boundaries",
+      "pattern": "python = 'def outer():\\n def inner():\\n run(\"bad || true\")\\n\\nrun(\"bad || true\")\\n'",
+      "reason": "The test checks that nested Python functions and module scope get different fingerprints.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Patterns.test_function_boundaries",
+      "pattern": "shell = 'cleanup() {\\n kill \"$pid\" || true\\n}\\ncat log || true\\n'",
+      "reason": "The test checks that the shell function's fingerprint ends at its closing brace.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.entry",
+      "pattern": "value = {\"path\": \"tests/a.sh\", \"symbol\": \"probe\", \"pattern\": \"curl example.test || true\",",
+      "reason": "This constructs a literal exception used only in isolated temporary Git repositories.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.fixture",
+      "pattern": "self.write(\"tests/a.sh\", \"probe() {\\n curl example.test || true\\n}\\n\")",
+      "reason": "This tracked fixture must fail until the test supplies its exact exception.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_missing_allowlist_is_empty_exact_exception_passes",
+      "pattern": "self.write(\"tests/a.sh\", \"probe() {\\n\\n\\t curl example.test || true\\n}\\n\")",
+      "reason": "The fixture verifies that line shifts and whitespace changes preserve an exact fingerprint.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_new_pattern_beside_approved_exception_fails",
+      "pattern": "self.write(\"tests/a.sh\", \"probe() {\\n curl example.test || true\\n other || true\\n}\\n\")",
+      "reason": "A second suppression beside the approved fixture must still fail.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_new_pattern_beside_approved_exception_fails",
+      "pattern": "self.assertIn(\"other || true\", errors[0])",
+      "reason": "The assertion requires the unapproved command in the failure diagnostic.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_stale_wrong_symbol_pattern_path_and_duplicate_sites",
+      "pattern": "{\"pattern\": \"curl .* || true\"}, {\"pattern\": \"*\"}):",
+      "reason": "Regex-like and wildcard pattern fixtures must fail as stale literal fingerprints.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_stale_wrong_symbol_pattern_path_and_duplicate_sites",
+      "pattern": "self.write(\"tests/a.sh\", \"probe() {\\n curl example.test || true\\n curl example.test || true\\n}\\n\")",
+      "reason": "Two identical sites cannot share one exception; the test requires an ambiguous-entry failure.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_tracked_sources_only_no_credentials_or_runtime_output",
+      "pattern": "self.write(\"tests/untracked.sh\", \"false || true\\n\", tracked=False)",
+      "reason": "The untracked fixture proves that only the Git inventory is scanned.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_tracked_sources_only_no_credentials_or_runtime_output",
+      "pattern": "self.write(path, \"not even parseable python || true\\n\")",
+      "reason": "Invalid source in credential and output fixtures proves these files are excluded before parsing.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_tracked_sources_only_no_credentials_or_runtime_output",
+      "pattern": "self.write(\"tests/tracked.sh\", \"false || true\\n\")",
+      "reason": "The tracked control must fail after the untracked and excluded controls pass.",
+      "id": "POL-TEST-FIXTURE"
+    },
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "Inventory.test_extensionless_executable_and_deleted_source",
+      "pattern": "file = self.write(\"vm/run\", \"#!/bin/sh\\nfalse || true\\n\")",
+      "reason": "The executable fixture checks extensionless script inventory and missing-source failures.",
+      "id": "POL-TEST-FIXTURE"
+    }
+  ],
+  "skip-reason": [
+    {
+      "path": "tools/test_check_hacks.py",
+      "symbol": "require_cargo",
+      "pattern": "raise unittest.SkipTest(reason)",
+      "reason": "The helper prints its identified reason and raises RuntimeError whenever CI is present; Prerequisites tests unset, empty and nonempty CI values.",
+      "id": "POL-PREREQUISITE"
+    }
+  ]
+}
