@@ -1096,15 +1096,7 @@ fn length(l: &[u8]) -> Result<Len, Error> {
 
 /// An unsigned decimal number, at least one digit.
 fn digits(l: &[u8]) -> Option<usize> {
-    if l.is_empty() {
-        return None;
-    }
-    l.iter().try_fold(0usize, |n, &c| {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        n.checked_mul(10)?.checked_add(usize::from(c - b'0'))
-    })
+    codec::ascii::decimal(l, usize::MAX, usize::MAX as u64).map(|n| n as usize)
 }
 
 /// A number as Redis's `string2ll` reads a command's count or an
@@ -2300,6 +2292,42 @@ mod tests {
             (format!("${}\r\n", MAX_BULK_LEN + 1), Error::BulkTooLong),
         ] {
             assert_eq!(Resp2::parse(header.as_bytes()), Err(error));
+        }
+    }
+
+    #[test]
+    fn unsigned_lengths_preserve_bounds_and_leading_zeros() {
+        let overflow = (usize::MAX as u128 + 1).to_string();
+        for (prefix, limit_error) in [
+            ("$", Error::BulkTooLong),
+            ("*", Error::TooManyElements),
+            ("$?\r\n;", Error::BulkTooLong),
+        ] {
+            for number in ["", "1x", "+1", "-2", &overflow] {
+                let bytes = format!("{prefix}{number}\r\n");
+                assert_eq!(Value::parse(bytes.as_bytes()), Err(Error::BadLength));
+            }
+            for zeros in ["".to_string(), "0".repeat(128)] {
+                let bytes = format!("{prefix}{zeros}{}\r\n", usize::MAX);
+                assert_eq!(Value::parse(bytes.as_bytes()), Err(limit_error));
+            }
+        }
+        let zeros = "0".repeat(128);
+        for (bytes, expected) in [
+            (format!("${zeros}\r\n\r\n"), Value::Bulk(vec![])),
+            (format!("${zeros}1\r\nx\r\n"), bulk("x")),
+            (format!("*{zeros}\r\n"), Value::Array(vec![])),
+            (
+                format!("*{zeros}1\r\n:1\r\n"),
+                Value::Array(vec![Value::Integer(1)]),
+            ),
+            (format!("$?\r\n;{zeros}1\r\nx\r\n;{zeros}\r\n"), bulk("x")),
+        ] {
+            assert_eq!(Value::parse(bytes.as_bytes()), Ok(expected.clone()));
+            assert_eq!(
+                decode_all(Values::new, bytes.as_bytes()),
+                (vec![expected], None)
+            );
         }
     }
 

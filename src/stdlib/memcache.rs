@@ -1166,14 +1166,7 @@ fn check_text(t: &[u8]) -> Result<(), Error> {
 }
 
 fn unsigned(t: &[u8]) -> Result<u64, Error> {
-    if t.is_empty() || !t.iter().all(u8::is_ascii_digit) {
-        return Err(Error::Format);
-    }
-    t.iter()
-        .try_fold(0u64, |n, &d| {
-            n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
-        })
-        .ok_or(Error::Format)
+    codec::ascii::decimal(t, usize::MAX, u64::MAX).ok_or(Error::Format)
 }
 
 fn small(t: &[u8]) -> Result<u32, Error> {
@@ -2887,6 +2880,26 @@ mod tests {
         }
         let got: Vec<_> = commands(&stream).into_iter().map(Result::unwrap).collect();
         assert_eq!(got, all);
+    }
+
+    #[test]
+    fn unsigned_numbers_preserve_bounds_and_leading_zeros() {
+        for number in ["", "1x", "+1", "-1", "18446744073709551616"] {
+            let bytes = format!("ma k D{number}\r\n");
+            assert_eq!(Command::parse(bytes.as_bytes()), Err(Error::Format));
+            assert_eq!(commands(bytes.as_bytes()), [Err(Error::Format)]);
+        }
+        assert_eq!(
+            Response::parse(b"18446744073709551616\r\n"),
+            Err(Error::Format)
+        );
+        for zeros in ["".to_string(), "0".repeat(128)] {
+            for n in [0, 1, u64::MAX] {
+                let bytes = format!("{zeros}{n}\r\n");
+                assert_eq!(Response::parse(bytes.as_bytes()), Ok(Response::Number(n)));
+                assert_eq!(responses(bytes.as_bytes()), [Ok(Response::Number(n))]);
+            }
+        }
     }
 
     #[test]
