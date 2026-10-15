@@ -358,6 +358,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
 #[test]
 fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     use fictionet::relay::{self, Hello, Message, unix};
+    use std::io;
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -380,6 +381,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     let attached = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let world_attached = attached.clone();
     let (tx, rx) = std::sync::mpsc::channel();
+    let (senders_tx, senders_rx) = std::sync::mpsc::channel();
     let world_stop = stop.clone();
     let world_path = path.clone();
     std::thread::spawn(move || {
@@ -396,45 +398,69 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             // Four sandboxes, each a thread with a socket: UDP to the
             // gateway's closed port 9, so each packet gets an ICMP answer
             // and the links carry traffic both ways.
+            let progress: [_; 4] =
+                std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
             let senders: Vec<_> = (0..4u8)
                 .map(|i| {
                     let (path, stop, sent) =
                         (world_path.clone(), world_stop.clone(), world_sent.clone());
                     let attached = world_attached.clone();
-                    std::thread::spawn(move || {
-                        let fd = unix::connect(&path).unwrap();
+                    let progress = progress[usize::from(i)].clone();
+                    std::thread::spawn(move || -> io::Result<()> {
+                        let fd = unix::connect(&path)?;
                         let hello = Hello {
                             version: relay::VERSION,
                             mtu: 1500,
                             kind: "tun".into(),
                             name: format!("s{i}"),
                         };
-                        unix::send(fd.as_raw_fd(), &Message::Hello(hello).encode(), false).unwrap();
+                        unix::send(fd.as_raw_fd(), &Message::Hello(hello).encode(), false)?;
                         let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
-                        let n = unix::recv(fd.as_raw_fd(), &mut buf, false).unwrap();
-                        assert_eq!(&buf[..n], &[relay::ACCEPT]);
+                        let n = unix::recv(fd.as_raw_fd(), &mut buf, false)?;
+                        if buf[..n] != [relay::ACCEPT] {
+                            return Err(io::Error::other("sender was not accepted"));
+                        }
                         attached.fetch_add(1, Ordering::Relaxed);
                         let p = udp(Ipv4Addr::new(10, 0, 0, 2 + i), 5000, GATEWAY, 9, &[0; 100]);
                         while !stop.load(Ordering::Relaxed) {
-                            if unix::send_parts(fd.as_raw_fd(), &[&[relay::PACKET], &p.0], false)
-                                .is_err()
+                            if let Err(e) =
+                                unix::send_parts(fd.as_raw_fd(), &[&[relay::PACKET], &p.0], false)
                             {
-                                return;
+                                return if stop.load(Ordering::Relaxed) {
+                                    Ok(())
+                                } else {
+                                    Err(e)
+                                };
                             }
                             sent.fetch_add(1, Ordering::Relaxed);
-                            while let Ok(n) = unix::recv(fd.as_raw_fd(), &mut buf, true) {
-                                if n == 0 {
-                                    return;
-                                }
+                            progress.fetch_add(1, Ordering::Relaxed);
+                            loop {
+                                let error = match unix::recv(fd.as_raw_fd(), &mut buf, true) {
+                                    Ok(0) => io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "flood socket closed",
+                                    ),
+                                    Ok(_) => continue,
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(e) => e,
+                                };
+                                return if stop.load(Ordering::Relaxed) {
+                                    Ok(())
+                                } else {
+                                    Err(error)
+                                };
                             }
                         }
+                        Ok(())
                     })
                 })
                 .collect();
+            senders_tx.send(senders).expect("test thread is waiting");
             // The queues fill in the first moments. After that, the world
             // must not keep growing.
             let start = rss();
             let sent_before = world_sent.load(Ordering::Relaxed);
+            let progress_before = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
             wait::until(&fcx, Duration::from_secs(30), || {
                 world_attached.load(Ordering::Relaxed) == 4
                     && world_sent.load(Ordering::Relaxed) - sent_before > 100_000
@@ -442,11 +468,13 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             .await;
             let middle = rss();
             let sent_middle = world_sent.load(Ordering::Relaxed);
+            let progress_middle = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
             wait::until(&fcx, Duration::from_secs(30), || {
                 world_sent.load(Ordering::Relaxed) - sent_middle > 100_000
             })
             .await;
             let end = rss();
+            let progress_end = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
             let took = timeout(
                 &fcx,
                 Duration::from_secs(10),
@@ -457,6 +485,20 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             // The flood ran: the senders kept sending while memory was read.
             let flooded = world_sent.load(Ordering::Relaxed) - sent_before;
             assert!(flooded > 100_000, "only {flooded} packets were sent");
+            // Each link reads up to 64 packets per turn, so four symmetric
+            // senders should each contribute over 10,000 packets per window.
+            for i in 0..4 {
+                let first = progress_middle[i] - progress_before[i];
+                let second = progress_end[i] - progress_middle[i];
+                assert!(
+                    first > 10_000,
+                    "sender {i} sent only {first} packets in the first window"
+                );
+                assert!(
+                    second > 10_000,
+                    "sender {i} sent only {second} packets in the second window"
+                );
+            }
             assert_eq!(
                 world_attached.load(Ordering::Relaxed),
                 4,
@@ -480,15 +522,31 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
                 mib(first + second)
             );
             assert!(took.is_some(), "the other sandbox was not served");
-            // Joined outside the world: a sender may wait on its socket
-            // until the world reads it.
-            drop(senders);
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         let _ = tx.send(result.map_err(|e| e.to_string()));
     });
-    let result = rx.recv_timeout(Duration::from_secs(60)).expect("timed out");
+    let result = rx.recv_timeout(Duration::from_secs(60));
     stop.store(true, Ordering::Relaxed);
+    assert!(
+        !matches!(result, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "timed out"
+    );
+    // Join in the test thread after the world ends: a sender may block on
+    // its socket until the world reads it or closes it. Join every sender
+    // before checking results, so one failure does not detach the others.
+    let joined: Vec<_> = senders_rx
+        .recv()
+        .unwrap_or_else(|_| panic!("the world ended before spawning senders: {result:?}"))
+        .into_iter()
+        .map(|sender| sender.join())
+        .collect();
+    for (i, result) in joined.into_iter().enumerate() {
+        result
+            .unwrap_or_else(|e| panic!("sender {i} panicked: {e:?}"))
+            .unwrap_or_else(|e| panic!("sender {i} failed: {e}"));
+    }
+    let result = result.expect("world thread did not return a result");
     let _ = std::fs::remove_file(&path);
     assert_eq!(result, Err("done".to_owned()));
 }
