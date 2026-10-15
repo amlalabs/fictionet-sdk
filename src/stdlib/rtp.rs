@@ -409,9 +409,10 @@ fn parse_extension(profile: u16, data: &[u8]) -> Result<HeaderExtension, Error> 
 
 /// Whether a datagram on a port that carries both RTP and RTCP is RTCP.
 /// RFC 5761 tells them apart by the second byte: 192 to 223 is an RTCP
-/// packet type.
+/// packet type. Delegates to [`rtcp::is_mux_packet_type`]; it does not check
+/// the first byte or validate the packet. Returns false for fewer than two bytes.
 pub fn is_rtcp(b: &[u8]) -> bool {
-    matches!(b.get(1), Some(192..=223))
+    b.get(1).is_some_and(|&byte| rtcp::is_mux_packet_type(byte))
 }
 
 /// A datagram from a port that carries both RTP and RTCP.
@@ -433,7 +434,7 @@ impl Wire for Demux {
     fn parse(b: &[u8]) -> Result<Demux, Error> {
         if is_rtcp(b) {
             let datagram = rtcp::Datagram::parse(b).map_err(Error::Rtcp)?;
-            if has_early_padding(&datagram) {
+            if rtcp::has_early_padding(&datagram.0) {
                 return Err(Error::Rtcp(rtcp::Error::Padding));
             }
             Ok(Demux::Rtcp(datagram))
@@ -449,7 +450,7 @@ impl Wire for Demux {
         let bytes = match self {
             Self::Rtp(p) => p.to_bytes()?,
             Self::Rtcp(p) => {
-                if has_early_padding(p) {
+                if rtcp::has_early_padding(&p.0) {
                     return Err(Error::Unwritable);
                 }
                 p.to_bytes().map_err(|_| Error::Unwritable)?
@@ -463,14 +464,6 @@ impl Wire for Demux {
         out.extend_from_slice(&bytes);
         Ok(())
     }
-}
-
-/// Whether RTCP padding appears before the last packet in a datagram.
-fn has_early_padding(datagram: &rtcp::Datagram) -> bool {
-    datagram
-        .0
-        .split_last()
-        .is_some_and(|(_, earlier)| earlier.iter().any(|packet| packet.padding != 0))
 }
 
 fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);

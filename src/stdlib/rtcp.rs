@@ -1382,6 +1382,15 @@ fn parse_datagram(b: &[u8]) -> Result<Vec<Packet>, Error> {
     Ok(packets)
 }
 
+/// Whether padding appears before the last packet in a slice.
+/// Returns false for an empty slice or a single packet. This checks only
+/// padding placement, not whether each packet's padding is valid.
+pub fn has_early_padding(packets: &[Packet]) -> bool {
+    packets
+        .split_last()
+        .is_some_and(|(_, earlier)| earlier.iter().any(|packet| packet.padding != 0))
+}
+
 /// Checks the rules of RFC 3550 for a compound packet: there is at least
 /// one packet, the first is a sender or receiver report, the reports are
 /// followed straight away by SDES packets of which one chunk carries a
@@ -1391,15 +1400,11 @@ fn parse_datagram(b: &[u8]) -> Result<Vec<Packet>, Error> {
 /// lets two ends agree to send packets without these rules; such a world
 /// uses [`Datagram::parse`] and [`Datagram::write`] instead.
 pub fn check_compound(packets: &[Packet]) -> Result<(), Error> {
-    let (last, _) = packets.split_last().ok_or(Error::NoPackets)?;
-    let first = &packets[0];
+    let first = packets.first().ok_or(Error::NoPackets)?;
     if !matches!(first.body, Body::SenderReport(_) | Body::ReceiverReport(_)) {
         return Err(Error::FirstNotReport(first.body.packet_type()));
     }
-    if packets
-        .iter()
-        .any(|p| p.padding != 0 && !std::ptr::eq(p, last))
-    {
+    if has_early_padding(packets) {
         return Err(Error::EarlyPadding);
     }
     let feedback = packets.iter().position(|p| {
@@ -1529,6 +1534,13 @@ pub enum Demux {
     Unknown,
 }
 
+/// Whether a second byte selects RTCP on a port shared with RTP.
+/// RFC 5761 reserves 192 to 223 for RTCP packet types. This checks only
+/// that byte, not the version or the rest of the packet.
+pub fn is_mux_packet_type(byte: u8) -> bool {
+    matches!(byte, 192..=223)
+}
+
 /// Tells what a datagram is from its first two bytes. It looks at nothing
 /// else, so an RTP or RTCP answer still needs its own parser to check it.
 pub fn classify(b: &[u8]) -> Demux {
@@ -1537,7 +1549,7 @@ pub fn classify(b: &[u8]) -> Demux {
         [16..=19, ..] => Demux::Zrtp,
         [20..=63, ..] => Demux::Dtls,
         [64..=79, ..] => Demux::TurnChannel,
-        [128..=191, 192..=223, ..] => Demux::Rtcp,
+        [128..=191, second, ..] if is_mux_packet_type(*second) => Demux::Rtcp,
         [128..=191, _, ..] => Demux::Rtp,
         _ => Demux::Unknown,
     }

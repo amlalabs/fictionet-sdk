@@ -431,6 +431,52 @@ fn compound_round_trip_and_truncated_prefixes() {
 }
 
 #[test]
+fn multiplex_predicate_uses_only_the_second_byte() {
+    assert!(!rtp::is_rtcp(&[]));
+    assert_eq!(classify(&[]), Demux::Unknown);
+    for first in 0..=255 {
+        assert!(!rtp::is_rtcp(&[first]));
+        for second in 0..=255 {
+            let rtcp = (192..=223).contains(&second);
+            assert_eq!(is_mux_packet_type(second), rtcp);
+            assert_eq!(rtp::is_rtcp(&[first, second]), rtcp);
+            let expected = match first {
+                0..=3 => Demux::Stun,
+                16..=19 => Demux::Zrtp,
+                20..=63 => Demux::Dtls,
+                64..=79 => Demux::TurnChannel,
+                128..=191 if rtcp => Demux::Rtcp,
+                128..=191 => Demux::Rtp,
+                _ => Demux::Unknown,
+            };
+            assert_eq!(classify(&[first, second]), expected);
+        }
+    }
+    assert_eq!(classify(&[0x80]), Demux::Unknown);
+    assert_eq!(rtp::Demux::parse(&[]), Err(rtp::Error::Truncated));
+    assert_eq!(
+        rtp::Demux::parse(&[0, 201, 0, 0]),
+        Err(rtp::Error::Rtcp(Error::Version(0)))
+    );
+}
+
+#[test]
+fn early_padding_predicate_checks_only_placement() {
+    assert!(!has_early_padding(&[]));
+    for padding in [0, 1, 4, 255] {
+        let mut padded = report();
+        padded.padding = padding;
+        assert!(!has_early_padding(&[padded.clone()]));
+        assert!(!has_early_padding(&[report(), padded.clone()]));
+        assert_eq!(has_early_padding(&[padded.clone(), report()]), padding != 0);
+        assert_eq!(
+            has_early_padding(&[report(), padded, cname()]),
+            padding != 0
+        );
+    }
+}
+
+#[test]
 fn padding_on_the_last_packet() {
     let mut last = cname();
     last.padding = 8;
@@ -459,6 +505,9 @@ fn padding_on_the_last_packet() {
     bad[0] |= 0x20;
     let datagram = Datagram::parse(&bad).unwrap();
     assert_eq!(datagram.0[0].padding, 4);
+    assert_eq!(datagram.to_bytes(), Ok(bad.clone()));
+    assert_eq!(check_compound(&datagram.0), Err(Error::EarlyPadding));
+    assert_eq!(Compound::parse(&bad), Err(Error::EarlyPadding));
     assert_eq!(
         rtp::Demux::parse(&bad),
         Err(rtp::Error::Rtcp(Error::Padding))
