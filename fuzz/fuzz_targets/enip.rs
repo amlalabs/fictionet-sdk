@@ -3,13 +3,12 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 
 use fictionet::stdlib::enip::{
     Cpf, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
-    Identity, MessageRequest, MessageResponse, Packet, RegisterSession, SendData,
+    Packet, RegisterSession, SendData, harness,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -32,24 +31,7 @@ fuzz_target!(|data: &[u8]| {
     };
     check_wire_value(&built);
     for p in &packets {
-        check_wire_value(p);
-        // Validation and writing must agree on whether a packet is allowed.
-        assert_eq!(p.check().is_ok(), p.to_bytes().is_ok());
-        // The data as each CIP structure: any that reads must write back to
-        // bytes that read the same.
-        check_wire::<SendData>(&p.data);
-        if let Ok(send) = <SendData as Wire>::parse(&p.data) {
-            for it in &send.cpf.items {
-                check_item(&it.data);
-            }
-        }
-        check_wire::<Cpf>(&p.data);
-        if let Ok(cpf) = <Cpf as Wire>::parse(&p.data) {
-            for it in &cpf.items {
-                check_item(&it.data);
-            }
-        }
-        check_item(&p.data);
+        harness::check_packet(p);
     }
 
     // Any bytes on their own, as each structure. None may panic, and each
@@ -61,21 +43,5 @@ fuzz_target!(|data: &[u8]| {
     check_wire::<ForwardOpenResponse>(data);
     check_wire::<ForwardCloseRequest>(data);
     check_wire::<ForwardCloseResponse>(data);
-    check_item(data);
+    harness::check_item(data);
 });
-
-/// The bytes of one item as each CIP structure, and the bodies inside a
-/// message: any that reads must write back to bytes that read the same.
-fn check_item(b: &[u8]) {
-    check_wire::<MessageRequest>(b);
-    check_wire::<MessageResponse>(b);
-    check_wire::<Identity>(b);
-    if let Ok(req) = <MessageRequest as Wire>::parse(b) {
-        check_wire::<ForwardOpenRequest>(&req.data);
-        check_wire::<ForwardCloseRequest>(&req.data);
-    }
-    if let Ok(resp) = <MessageResponse as Wire>::parse(b) {
-        check_wire::<ForwardOpenResponse>(&resp.data);
-        check_wire::<ForwardCloseResponse>(&resp.data);
-    }
-}

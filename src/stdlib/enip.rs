@@ -1631,6 +1631,56 @@ impl Wire for ForwardCloseResponse {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{
+        Cpf, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
+        Identity, MessageRequest, MessageResponse, Packet, SendData,
+    };
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks packet validation and the CIP values nested in its payload.
+    pub fn check_packet(p: &Packet) {
+        contract::check_wire_value(p);
+        // Validation and writing must agree on whether a packet is allowed.
+        assert_eq!(p.check().is_ok(), p.to_bytes().is_ok());
+        // The data as each CIP structure: any that reads must write back to
+        // bytes that read the same.
+        contract::check_wire::<SendData>(&p.data);
+        if let Ok(send) = <SendData as Wire>::parse(&p.data) {
+            for it in &send.cpf.items {
+                check_item(&it.data);
+            }
+        }
+        contract::check_wire::<Cpf>(&p.data);
+        if let Ok(cpf) = <Cpf as Wire>::parse(&p.data) {
+            for it in &cpf.items {
+                check_item(&it.data);
+            }
+        }
+        check_item(&p.data);
+    }
+
+    /// The bytes of one item as each CIP structure, and the bodies inside a
+    /// message: any that reads must write back to bytes that read the same.
+    pub fn check_item(b: &[u8]) {
+        contract::check_wire::<MessageRequest>(b);
+        contract::check_wire::<MessageResponse>(b);
+        contract::check_wire::<Identity>(b);
+        if let Ok(req) = <MessageRequest as Wire>::parse(b) {
+            contract::check_wire::<ForwardOpenRequest>(&req.data);
+            contract::check_wire::<ForwardCloseRequest>(&req.data);
+        }
+        if let Ok(resp) = <MessageResponse as Wire>::parse(b) {
+            contract::check_wire::<ForwardOpenResponse>(&resp.data);
+            contract::check_wire::<ForwardCloseResponse>(&resp.data);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn fixture_cpf_item(type_id: u16, data: Vec<u8>) -> CpfItem {
@@ -2810,36 +2860,8 @@ mod tests {
         contract::check_decode(Frames::<Packet>::new, data);
         let (packets, _) = decode_all(Frames::<Packet>::new, data);
         for p in &packets {
-            contract::check_wire_value(p);
-            assert_eq!(p.check().is_ok(), p.to_bytes().is_ok());
-            contract::check_wire::<SendData>(&p.data);
-            if let Ok(send) = SendData::parse(&p.data) {
-                for it in &send.cpf.items {
-                    check_item(&it.data);
-                }
-            }
-            contract::check_wire::<Cpf>(&p.data);
-            if let Ok(cpf) = Cpf::parse(&p.data) {
-                for it in &cpf.items {
-                    check_item(&it.data);
-                }
-            }
-            check_item(&p.data);
+            harness::check_packet(p);
         }
-    }
-
-    /// Checks wire contracts for a CIP item and its nested message bodies.
-    fn check_item(b: &[u8]) {
-        contract::check_wire::<MessageRequest>(b);
-        if let Ok(req) = MessageRequest::parse(b) {
-            contract::check_wire::<ForwardOpenRequest>(&req.data);
-            contract::check_wire::<ForwardCloseRequest>(&req.data);
-        }
-        contract::check_wire::<MessageResponse>(b);
-        if let Ok(resp) = MessageResponse::parse(b) {
-            contract::check_wire::<ForwardOpenResponse>(&resp.data);
-        }
-        contract::check_wire::<Identity>(b);
     }
 
     #[test]
