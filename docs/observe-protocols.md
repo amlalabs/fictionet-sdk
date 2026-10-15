@@ -124,6 +124,14 @@ openings in stream ID order so lower active streams remain tracked. `lost`
 clears state and stops decoding because a TCP gap does not identify the next
 frame boundary.
 
+`http2::BlockRead::diagnostics` replaces the public `notes` field. This is a
+source-breaking API change. Match `http2::BlockDiagnostic` variants instead
+of field labels or sentences. They report continuation state, promised stream
+IDs, interruptions, invalid fragments, and byte limits. Strict assembly also
+reports continuation and promised-stream facts. `observe::http2::Capture`
+renders the labels and sentences, in the same order as before. Wire acceptance,
+capture recovery, and displayed diagnostics are unchanged.
+
 Capture policy keeps complete frames already present in bounded read-ahead.
 An incomplete oversized frame becomes a header-only item, followed by `Skip`
 for its payload. Header blocks share the stdlib HPACK decoder. Recognized

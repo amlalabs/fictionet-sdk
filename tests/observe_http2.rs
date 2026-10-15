@@ -463,6 +463,120 @@ fn eof_header_error_names_http2_once() {
 }
 
 #[test]
+fn header_diagnostics_keep_their_text_and_order() {
+    let raw = |kind, flags, stream, body: &[u8]| {
+        let mut bytes = http2::FrameHeader {
+            kind,
+            flags,
+            stream,
+            length: body.len(),
+        }
+        .to_bytes()
+        .unwrap();
+        bytes.extend_from_slice(body);
+        bytes
+    };
+    let interrupted = (
+        "Header block",
+        "the one before was cut off by this frame, so later headers may not be known",
+    );
+    let not_decoded = (
+        "Header block",
+        "not decoded, so later headers may not be known",
+    );
+    let continues = ("Header block", "continues in the next frame");
+    let unexpected = (
+        "Header block",
+        "a CONTINUATION with no header block to continue",
+    );
+    let oversized = http2::FrameHeader {
+        kind: 1,
+        flags: 4,
+        stream: 3,
+        length: 40_000,
+    }
+    .to_bytes()
+    .unwrap();
+    for (frames, malformed, expected) in [
+        (vec![raw(1, 0, 1, &[0x82])], false, vec![continues]),
+        (
+            vec![raw(5, 0, 1, &[0, 0, 0, 2, 0x82])],
+            false,
+            vec![("Promised stream", "2"), continues],
+        ),
+        (
+            vec![raw(1, 0, 1, &[0x82]), raw(5, 0, 3, &[0, 0, 0, 2, 0x82])],
+            true,
+            vec![interrupted, ("Promised stream", "2"), continues],
+        ),
+        (
+            vec![raw(1, 0, 1, &[0x82]), oversized],
+            true,
+            vec![
+                interrupted,
+                ("Payload", "40000 bytes, too long to keep"),
+                not_decoded,
+            ],
+        ),
+        (
+            vec![raw(1, 12, 1, &[2])],
+            true,
+            vec![
+                ("Frame", "padding longer than payload"),
+                (
+                    "Header block",
+                    "the frame is too short for its padding or fields",
+                ),
+                not_decoded,
+            ],
+        ),
+        (
+            vec![raw(1, 4, 1, &[0x80])],
+            true,
+            vec![("Header block", "could not be decoded: it is malformed")],
+        ),
+        (vec![raw(9, 4, 3, &[0x82])], true, vec![unexpected]),
+        (
+            vec![raw(1, 0, 1, &[0x82]), raw(9, 4, 3, &[0x82])],
+            true,
+            vec![interrupted, unexpected],
+        ),
+        (
+            vec![
+                raw(1, 0, 1, &vec![0x82; 16_384]),
+                raw(9, 0, 1, &vec![0x82; 16_384]),
+                raw(9, 0, 1, &vec![0x82; 16_384]),
+                raw(9, 0, 1, &vec![0x82; 16_384]),
+                raw(9, 4, 1, &[0x82]),
+            ],
+            false,
+            vec![("Header block", "longer than the 64 KiB kept"), not_decoded],
+        ),
+        (
+            vec![raw(5, 0, 1, &[0, 0, 0, 2]), raw(9, 4, 1, &[0x82])],
+            false,
+            vec![(":method", "GET")],
+        ),
+    ] {
+        let mut observed = Observed::new(capture::Capture::default());
+        let mut packet = Decoded::default();
+        for frame in frames {
+            packet = Decoded::default();
+            observed.data(&frame, Place::default(), &mut packet);
+        }
+        assert_eq!(packet.tags.contains(&"malformed"), malformed);
+        assert_eq!(packet.layers.len(), 1);
+        let notes: Vec<_> = packet.layers[0]
+            .fields
+            .iter()
+            .filter(|f| f.range.is_none())
+            .map(|f| (f.name.as_str(), f.value.as_str()))
+            .collect();
+        assert_eq!(notes, expected);
+    }
+}
+
+#[test]
 fn refused_frames_are_malformed_and_explain_why() {
     for (kind, stream, body) in [
         (8, 0, vec![0; 4]),

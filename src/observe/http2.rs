@@ -11,8 +11,8 @@
 use fictionet::observe::{Decoded, Layer, Placement, Present};
 use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire, be32};
 use fictionet::stdlib::http2::{
-    Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderBlocks, Input, Inputs, MAX_WINDOW,
-    PREFACE, Setting,
+    BlockDiagnostic, Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderBlocks, Input, Inputs,
+    MAX_WINDOW, PREFACE, Setting,
 };
 use fictionet::stdlib::{grpc, hpack};
 use fictionet::sync::Mutex;
@@ -448,6 +448,34 @@ fn capture_layer(h: FrameHeader, raw: &[u8]) -> CaptureItem {
         offset: 0,
     }
 }
+fn present_diagnostic(layer: &mut Layer, diagnostic: &BlockDiagnostic) {
+    let note = match diagnostic {
+        BlockDiagnostic::Interrupted { .. } => {
+            "the one before was cut off by this frame, so later headers may not be known"
+        }
+        BlockDiagnostic::PromisedStream { stream } => {
+            layer.note("Promised stream", stream.to_string());
+            return;
+        }
+        BlockDiagnostic::InvalidFragment => "the frame is too short for its padding or fields",
+        BlockDiagnostic::UnexpectedContinuation => {
+            "a CONTINUATION with no header block to continue"
+        }
+        BlockDiagnostic::LimitExceeded { limit } => {
+            let size = if limit.is_multiple_of(1024) {
+                format!("{} KiB", limit / 1024)
+            } else {
+                format!("{limit} bytes")
+            };
+            layer.note("Header block", format!("longer than the {size} kept"));
+            return;
+        }
+        BlockDiagnostic::NotDecoded => "not decoded, so later headers may not be known",
+        BlockDiagnostic::Continues => "continues in the next frame",
+        BlockDiagnostic::InvalidHpack => "could not be decoded: it is malformed",
+    };
+    layer.note("Header block", note);
+}
 fn present_block(item: &mut CaptureItem, block: &hpack::Block) {
     let get = |name: &[u8]| {
         block
@@ -602,17 +630,19 @@ impl Decode for Capture {
         let block = self.blocks.read(h, payload)?;
         // Preserve the capture tree's order: interruption, payload, then
         // the fields and notes of the current header fragment.
-        if block.interrupted
-            && let Some((name, note)) = block.notes.first()
-        {
-            item.layer.note(name, note);
+        for diagnostic in &block.diagnostics {
+            if matches!(diagnostic, BlockDiagnostic::Interrupted { .. }) {
+                present_diagnostic(&mut item.layer, diagnostic);
+            }
         }
         if oversized {
             item.layer
                 .note("Payload", format!("{} bytes, too long to keep", h.length));
         }
-        for (name, note) in block.notes.iter().skip(usize::from(block.interrupted)) {
-            item.layer.note(name, note);
+        for diagnostic in &block.diagnostics {
+            if !matches!(diagnostic, BlockDiagnostic::Interrupted { .. }) {
+                present_diagnostic(&mut item.layer, diagnostic);
+            }
         }
         item.malformed |= block.malformed;
         let body = payload.unwrap_or_default();

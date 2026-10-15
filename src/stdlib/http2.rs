@@ -1109,6 +1109,38 @@ struct HeaderFragment<'a> {
     bytes: &'a [u8],
     promised: Option<u32>,
 }
+/// A fact found while assembling a header block, without display wording.
+/// Strict assembly reports [`Continues`](Self::Continues) and
+/// [`PromisedStream`](Self::PromisedStream). The other variants describe
+/// recovery by [`HeaderBlocks::for_observation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockDiagnostic {
+    /// This frame interrupted an open block. The HPACK table was forgotten.
+    Interrupted {
+        /// The stream whose block was interrupted.
+        stream: u32,
+    },
+    /// This PUSH_PROMISE fragment names a promised stream.
+    PromisedStream {
+        /// The promised stream ID.
+        stream: u32,
+    },
+    /// The fragment cannot be read because its padding or required fields do not fit.
+    InvalidFragment,
+    /// A CONTINUATION arrived without an open block on its stream.
+    UnexpectedContinuation,
+    /// The assembled encoded block exceeded the byte limit.
+    LimitExceeded {
+        /// The maximum encoded bytes retained for one block.
+        limit: usize,
+    },
+    /// Block bytes were unavailable or discarded. Later HPACK references may be unknown.
+    NotDecoded,
+    /// The retained block needs another CONTINUATION before it can be decoded.
+    Continues,
+    /// HPACK decoding rejected the complete block.
+    InvalidHpack,
+}
 /// What [`HeaderBlocks::read`] found in one frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockRead {
@@ -1120,26 +1152,21 @@ pub struct BlockRead {
     pub promised: Option<u32>,
     /// The decoded block, once its last fragment is read.
     pub block: Option<hpack::Block>,
-    /// What an observer cannot read, in order, as a field name and a
-    /// sentence. Only [`HeaderBlocks::for_observation`] writes these.
-    pub notes: Vec<(&'static str, String)>,
+    /// Assembly facts in detection order. Strict assembly also reports
+    /// continuation and promised-stream facts. Presentation belongs to the caller.
+    pub diagnostics: Vec<BlockDiagnostic>,
     /// Whether the frame broke the header block rules.
     pub malformed: bool,
-    /// Whether this frame cut off a header block still open. The first
-    /// note then says so.
+    /// Whether this frame cut off a header block still open.
+    /// [`BlockDiagnostic::Interrupted`] identifies that block's stream.
     pub interrupted: bool,
-}
-impl BlockRead {
-    fn note(&mut self, name: &'static str, text: &str) {
-        self.notes.push((name, text.into()));
-    }
 }
 /// Header block assembly and HPACK decoding for one direction: HEADERS,
 /// PUSH_PROMISE and CONTINUATION fragments joined and decoded.
 /// [`Session`] uses one strictly. Made with
 /// [`for_observation`](Self::for_observation), it reads what a capture
 /// holds: a fragment that breaks the rules, is cut off, or is too long is
-/// noted in the [`BlockRead`] and forgotten, and the next block is read.
+/// reported in [`BlockRead::diagnostics`] and forgotten, and the next block is read.
 pub struct HeaderBlocks {
     table: hpack::Table,
     pending: Option<Pending>,
@@ -1162,7 +1189,7 @@ impl HeaderBlocks {
         }
     }
     /// Reads a capture with the default [`Limits`]: an HPACK table that
-    /// tolerates entries it never saw, and notes instead of errors.
+    /// tolerates entries it never saw, and diagnostics instead of errors.
     pub fn for_observation() -> Self {
         Self::new(Limits::default().bounded(), true)
     }
@@ -1241,24 +1268,22 @@ impl HeaderBlocks {
             end: h.kind == 1 && h.flags & 1 != 0,
             promised: None,
             block: None,
-            notes: Vec::new(),
+            diagnostics: Vec::new(),
             malformed: false,
             interrupted: false,
         };
-        if self
+        if let Some(p) = self
             .pending
             .as_ref()
-            .is_some_and(|p| h.kind != 9 || h.stream != p.stream)
+            .filter(|p| h.kind != 9 || h.stream != p.stream)
         {
             if !self.capture {
                 return Err(protocol("interleaved header block"));
             }
+            out.diagnostics
+                .push(BlockDiagnostic::Interrupted { stream: p.stream });
             self.forget();
             out.interrupted = true;
-            out.note(
-                "Header block",
-                "the one before was cut off by this frame, so later headers may not be known",
-            );
             out.malformed = true;
         }
         if !matches!(h.kind, 1 | 5 | 9) {
@@ -1268,7 +1293,8 @@ impl HeaderBlocks {
             Some(Ok(fragment)) => {
                 if let Some(id) = fragment.promised {
                     out.promised = Some(id);
-                    out.notes.push(("Promised stream", id.to_string()));
+                    out.diagnostics
+                        .push(BlockDiagnostic::PromisedStream { stream: id });
                 }
                 Some(fragment.bytes)
             }
@@ -1276,10 +1302,7 @@ impl HeaderBlocks {
                 if !self.capture {
                     return Err(protocol("short padded header frame"));
                 }
-                out.note(
-                    "Header block",
-                    "the frame is too short for its padding or fields",
-                );
+                out.diagnostics.push(BlockDiagnostic::InvalidFragment);
                 out.malformed = true;
                 None
             }
@@ -1290,10 +1313,8 @@ impl HeaderBlocks {
                 if !self.capture {
                     return Err(protocol("CONTINUATION without a header block"));
                 }
-                out.note(
-                    "Header block",
-                    "a CONTINUATION with no header block to continue",
-                );
+                out.diagnostics
+                    .push(BlockDiagnostic::UnexpectedContinuation);
                 out.malformed = true;
                 self.table.forget();
                 return Ok(out);
@@ -1325,7 +1346,8 @@ impl HeaderBlocks {
                     return Err(budget("header block exceeds limit"));
                 }
                 if fragment.is_some() {
-                    out.note("Header block", "longer than the 64 KiB kept");
+                    out.diagnostics
+                        .push(BlockDiagnostic::LimitExceeded { limit: self.limit });
                 }
                 p.bytes = None;
                 self.table.forget();
@@ -1333,17 +1355,14 @@ impl HeaderBlocks {
             _ => {}
         }
         let Some(bytes) = &p.bytes else {
-            out.note(
-                "Header block",
-                "not decoded, so later headers may not be known",
-            );
+            out.diagnostics.push(BlockDiagnostic::NotDecoded);
             if h.flags & 4 == 0 {
                 self.pending = Some(p);
             }
             return Ok(out);
         };
         if h.flags & 4 == 0 {
-            out.note("Header block", "continues in the next frame");
+            out.diagnostics.push(BlockDiagnostic::Continues);
             self.pending = Some(p);
             return Ok(out);
         }
@@ -1359,7 +1378,7 @@ impl HeaderBlocks {
                 if !self.capture {
                     return Err(error(ErrorCode::CompressionError, "invalid HPACK block"));
                 }
-                out.note("Header block", "could not be decoded: it is malformed");
+                out.diagnostics.push(BlockDiagnostic::InvalidHpack);
                 out.malformed = true;
             }
         }
@@ -2544,6 +2563,159 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn header_assembly_reports_typed_facts_in_strict_and_capture_modes() {
+        for capture in [false, true] {
+            for kind in [1, 5] {
+                let mut blocks = HeaderBlocks::new(Limits::default(), capture);
+                let (body, promised, end, diagnostics) = if kind == 5 {
+                    (
+                        vec![0, 0, 0, 2, 0x82],
+                        Some(2),
+                        false,
+                        vec![
+                            BlockDiagnostic::PromisedStream { stream: 2 },
+                            BlockDiagnostic::Continues,
+                        ],
+                    )
+                } else {
+                    (vec![0x82], None, true, vec![BlockDiagnostic::Continues])
+                };
+                let first = raw(kind, u8::from(end), 1, &body);
+                assert_eq!(
+                    blocks
+                        .read(FrameHeader::parse(&first[..9]).unwrap(), Some(&first[9..]))
+                        .unwrap(),
+                    BlockRead {
+                        stream: 1,
+                        end,
+                        promised,
+                        block: None,
+                        diagnostics,
+                        malformed: false,
+                        interrupted: false,
+                    }
+                );
+                assert!(blocks.pending());
+                let last = raw(9, 4, 1, &[0x84]);
+                assert_eq!(
+                    blocks
+                        .read(FrameHeader::parse(&last[..9]).unwrap(), Some(&last[9..]))
+                        .unwrap(),
+                    BlockRead {
+                        stream: 1,
+                        end,
+                        promised,
+                        block: Some(hpack::Block {
+                            headers: vec![
+                                hpack::Header {
+                                    name: Some(b":method".to_vec()),
+                                    value: Some(b"GET".to_vec()),
+                                    never_index: false,
+                                },
+                                hpack::Header {
+                                    name: Some(b":path".to_vec()),
+                                    value: Some(b"/".to_vec()),
+                                    never_index: false,
+                                },
+                            ],
+                            more: 0,
+                        }),
+                        diagnostics: vec![],
+                        malformed: false,
+                        interrupted: false,
+                    }
+                );
+                assert!(!blocks.pending());
+            }
+        }
+    }
+    #[test]
+    fn capture_header_diagnostics_report_recovery_conditions() {
+        for (kind, flags, body, diagnostics, malformed) in [
+            (
+                1,
+                12,
+                vec![2],
+                vec![
+                    BlockDiagnostic::InvalidFragment,
+                    BlockDiagnostic::NotDecoded,
+                ],
+                true,
+            ),
+            (
+                9,
+                4,
+                vec![0x82],
+                vec![BlockDiagnostic::UnexpectedContinuation],
+                true,
+            ),
+            (
+                1,
+                4,
+                vec![0x82; 3],
+                vec![
+                    BlockDiagnostic::LimitExceeded { limit: 2 },
+                    BlockDiagnostic::NotDecoded,
+                ],
+                false,
+            ),
+            (1, 4, vec![0x80], vec![BlockDiagnostic::InvalidHpack], true),
+        ] {
+            let mut blocks = HeaderBlocks::new(
+                Limits {
+                    header_block: 2,
+                    ..Limits::default()
+                },
+                true,
+            );
+            let bytes = raw(kind, flags, 1, &body);
+            let result = blocks
+                .read(FrameHeader::parse(&bytes[..9]).unwrap(), Some(&bytes[9..]))
+                .unwrap();
+            assert_eq!(result.diagnostics, diagnostics);
+            assert_eq!(result.malformed, malformed);
+            assert!(!result.interrupted);
+            assert!(result.block.is_none());
+            assert!(!blocks.pending());
+        }
+
+        let mut blocks = HeaderBlocks::for_observation();
+        let first = raw(1, 0, 1, &[0x82]);
+        blocks
+            .read(FrameHeader::parse(&first[..9]).unwrap(), Some(&first[9..]))
+            .unwrap();
+        let next = raw(9, 4, 3, &[0x84]);
+        let result = blocks
+            .read(FrameHeader::parse(&next[..9]).unwrap(), Some(&next[9..]))
+            .unwrap();
+        assert_eq!(
+            result.diagnostics,
+            [
+                BlockDiagnostic::Interrupted { stream: 1 },
+                BlockDiagnostic::UnexpectedContinuation
+            ]
+        );
+        assert!(result.interrupted && result.malformed);
+        assert!(result.block.is_none());
+        assert!(!blocks.pending());
+
+        let result = blocks
+            .read(FrameHeader::parse(&first[..9]).unwrap(), None)
+            .unwrap();
+        assert_eq!(result.diagnostics, [BlockDiagnostic::NotDecoded]);
+        assert!(!result.interrupted && !result.malformed);
+        assert!(result.block.is_none());
+        assert!(blocks.pending());
+        let last = raw(9, 4, 1, &[0x84]);
+        let result = blocks
+            .read(FrameHeader::parse(&last[..9]).unwrap(), Some(&last[9..]))
+            .unwrap();
+        assert_eq!(result.diagnostics, [BlockDiagnostic::NotDecoded]);
+        assert!(!result.interrupted && !result.malformed);
+        assert!(result.block.is_none());
+        assert!(!blocks.pending());
     }
     #[test]
     fn padding_over_mandatory_fields_is_a_protocol_error() {
