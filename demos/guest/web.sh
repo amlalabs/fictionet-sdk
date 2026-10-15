@@ -30,7 +30,7 @@ agent 'id; ip -br addr; ip route; cat /etc/resolv.conf'
 
 step "DNS: the world decides what every name means"
 agent 'dig +short example.test'
-agent 'dig nope.test | grep -E "status|ANSWER:"'
+expect_output 'dig nope.test' 'status: NXDOMAIN' 'ANSWER: 0'
 
 step "HTTPS, with the world's CA"
 note "curl does its own TLS. The world's site answers with the name it was asked for and the"
@@ -38,7 +38,7 @@ note "HTTP version it spoke."
 agent 'curl -fsS --cacert /run/agent-ca.pem https://example.test/'
 agent 'curl -fsS --cacert /run/agent-ca.pem -o /dev/null -w "%{http_code} over HTTP/%{http_version}, certificate check %{ssl_verify_result} (0 means it passed)\n" https://www.example.test/'
 note "Without the world's CA, curl refuses the certificate, as it would on the internet:"
-expect_fail 'curl -sS https://example.test/ 2>&1 | head -1'
+expect_fail 60 'SSL certificate problem' 'curl -sS https://example.test/'
 note "Plain HTTP: example.test redirects to https, and plain.test has no TLS at all."
 agent 'curl -fsS -i http://example.test/ | head -2'
 agent 'curl -fsS http://plain.test/'
@@ -48,12 +48,12 @@ agent 'ping -c 3 -W 2 10.0.0.1'
 agent 'ping -c 2 -W 2 203.0.113.10'
 note "The world answers an address it has no machine for with ICMP \"host unreachable\","
 note "so a connection fails at once instead of hanging:"
-expect_fail 'time (exec 3<>/dev/tcp/192.0.2.1/80)'
+expect_fail 1 'No route to host' 'time timeout 3 bash -c "exec 3<>/dev/tcp/192.0.2.1/80"'
 
 step "An unknown host fails, and the real internet is not there"
-expect_fail 'curl -sS --cacert /run/agent-ca.pem https://nope.test/'
-expect_fail 'curl -sS -m 5 https://example.com/'
-expect_fail 'curl -sS -m 5 http://1.1.1.1/'
+expect_fail 6 'Could not resolve host' 'curl -sS --cacert /run/agent-ca.pem https://nope.test/'
+expect_fail 6 'Could not resolve host' 'curl -sS -m 5 https://example.com/'
+expect_fail 7 "Couldn't connect" 'curl -sS -m 5 http://1.1.1.1/'
 note "The VM itself has the internet (it pulled this demo's packages), but the sandbox only"
 note "ever reaches the world."
 

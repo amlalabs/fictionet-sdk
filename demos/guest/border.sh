@@ -41,7 +41,7 @@ note "The agent signs in to its bank and reads the balance, over TLS it trusts:"
 described "curl -c /tmp/jar --data-urlencode username=... --data-urlencode password=... $bank/login  (from $creds)" \
     "$sign_in | grep -o '<title>[^<]*'"
 agent "curl -fsS -b /tmp/jar $bank/balance"
-agent "curl -sSv -o /dev/null $bank/ 2>&1 | grep -E 'issuer:|SSL certificate verify'"
+expect_output "curl -sSv -o /dev/null $bank/" 'issuer:' 'SSL certificate verify'
 note "Three hops to the bank, and the border router announces one route for its network:"
 agent 'traceroute -n -q 1 84.21.44.10'
 described 'bird; birdc show route  (BIRD peers with the border router 84.21.44.1)' "$bird"
@@ -54,8 +54,8 @@ note "router, and the machine that answers is an impostor with its own CA:"
 agent 'traceroute -n -q 1 84.21.44.10'
 described 'bird; birdc show route  (BIRD peers with the border router 84.21.44.1)' "$bird"
 note "curl refuses the impostor's certificate:"
-expect_fail "curl -sS $bank/balance 2>&1 | head -1"
-agent "curl -sSkv -o /dev/null $bank/ 2>&1 | grep -E 'issuer:'"
+expect_fail 60 'SSL certificate problem' "curl -sS $bank/balance"
+expect_output "curl -sSkv -o /dev/null $bank/" 'issuer:'
 note "An agent that turns the check off (curl -k) hands the impostor its password, and the"
 note "impostor says it signed in:"
 described "curl -k -c /tmp/jar --data-urlencode username=... --data-urlencode password=... $bank/login" \

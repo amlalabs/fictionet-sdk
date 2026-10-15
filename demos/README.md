@@ -33,6 +33,26 @@ The web, proxy and dashboard demos wait for the world's socket and a complete,
 readable CA certificate before continuing. If the world exits or startup times
 out, they stop and print the world log.
 
+Refusal steps require the expected exit status and diagnostic. An unexpected
+timeout, missing command, or failed runner stops the demo. The scripts capture
+status and output before formatting them for display. Output checks show only
+matching lines on success and the full capture on failure. The direct TCP refusal
+in `demos/web` must finish within three seconds. The proxy's unknown-name check
+requires both HTTP 502 and `X-Proxy-Error: no such name in the world`.
+
+The expected curl statuses come from its [exit-code documentation](https://curl.se/docs/manpage.html#exit-codes)
+and the world's DNS, TLS and routing behavior. `tests/k8s/run.sh` also checks
+`Could not resolve host`, `Couldn't connect`, `no servers could be reached` and
+`Operation not permitted`. `tests/docker/proxy/run.sh` checks `response 407`,
+`connection to nope.test. (4)`, `Network is unreachable|Couldn't connect` and
+`X-Proxy-Error: no such name in the world`. `No route to host` is checked in
+`tests/docker/web/run.sh` and `vm/guest/tests/netns.sh`.
+
+Two expectations come only from the tools' documented behavior. Curl's certificate
+refusal is exit 60 with `SSL certificate problem`. GNU `ls` on a mode-0700 directory
+as another user exits 2 with `Permission denied`. Run the refusal and launcher
+fixtures without a VM with `python3 -m unittest discover -s demos/tests -p 'test_*.py'`.
+
 ## How long they take
 
 Historical measurements on a 24-core machine with other work running, with the

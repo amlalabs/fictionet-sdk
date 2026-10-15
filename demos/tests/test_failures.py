@@ -49,15 +49,213 @@ class Failures(unittest.TestCase):
         self.assertNotIn('continued', result.stdout)
 
     def test_expected_failure_continues(self):
-        result = self.shell("expect_fail 'exit 7'; echo continued")
+        result = self.shell("expect_fail 7 'exit 7'; echo continued")
         self.assertEqual(result.returncode, 0)
         self.assertIn('continued', result.stdout)
 
     def test_unexpected_success_stops_script(self):
-        result = self.shell("expect_fail 'true'; echo continued")
+        result = self.shell("expect_fail 7 'true'; echo continued")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('expected the command to fail', result.stderr)
+        self.assertIn('wanted refusal status 7, got 0', result.stderr)
         self.assertNotIn('continued', result.stdout)
+
+    def refusal(self, status, command, pattern=''):
+        return self.shell(shlex.join(['expect_fail', str(status), pattern, command])
+                          + '; echo continued')
+
+    def assert_stopped(self, result):
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn('continued', result.stdout)
+
+    def test_missing_binary_is_not_refusal(self):
+        result = self.shell("AGENT=(bash -c 'echo runner-missing >&2; exit 127' --); "
+                            "expect_fail 60 'certificate' 'exit 60'; echo continued")
+        self.assert_stopped(result)
+        self.assertIn('got 127', result.stderr)
+        self.assertIn('    runner-missing', result.stdout)
+
+    def test_unrelated_exit_7(self):
+        result = self.refusal(60, 'echo certificate >&2; exit 7', 'certificate')
+        self.assert_stopped(result)
+        self.assertIn('wanted refusal status 60, got 7', result.stderr)
+
+    def test_wrong_reason_is_not_refusal(self):
+        result = self.refusal(2, 'echo Cannot find device >&2; exit 2',
+                              'Operation not permitted')
+        self.assert_stopped(result)
+        self.assertIn('Operation not permitted', result.stderr)
+        self.assertIn('    Cannot find device', result.stdout)
+
+    def test_demo_refusals_follow_world_semantics(self):
+        # curl.se/docs/manpage.html#exit-codes. tests/k8s/run.sh also checks
+        # Could not resolve host, Couldn't connect, no servers could be reached
+        # and Operation not permitted. tests/docker/proxy/run.sh checks response
+        # 407, connection to nope.test. (4), and Network is unreachable|Couldn't
+        # connect. No route to host is in tests/docker/web/run.sh and
+        # vm/guest/tests/netns.sh. Only tool docs supply curl 60 with SSL
+        # certificate problem and GNU ls 2 with Permission denied when another user
+        # lists a mode-0700 directory. web_world.rs declares
+        # NXDOMAIN for other names. The raw TCP connect receives ICMP host
+        # unreachable; dig cannot reach cluster DNS; the agent lacks NET_ADMIN.
+        cases = {
+            'web': [(60, 'SSL certificate problem'), (1, 'No route to host'),
+                    (6, 'Could not resolve host'), (6, 'Could not resolve host'),
+                    (7, "Couldn't connect to server")],
+            'border': [(60, 'SSL certificate problem')],
+            'k8s': [(7, "Couldn't connect to server"), (9, 'no servers could be reached'),
+                    (7, "Couldn't connect to server"), (2, 'Operation not permitted')],
+            'proxy': [(56, 'CONNECT tunnel failed, response 407'),
+                      (97, "Can't complete SOCKS5 connection to nope.test. (4)"),
+                      (7, 'Network is unreachable'), (2, 'Permission denied')],
+        }
+        for demo, refusals in cases.items():
+            lines = (ROOT / f'demos/guest/{demo}.sh').read_text().splitlines()
+            lines = [line for line in lines if line.startswith('expect_fail ')]
+            self.assertEqual(len(lines), len(refusals), demo)
+            for line, (status, diagnostic) in zip(lines, refusals):
+                with self.subTest(demo=demo, command=line):
+                    # Exercise the actual call, including its patterns. No world
+                    # or tool is run; the runner supplies the protocol evidence.
+                    prefix = 'bank=https://bank.test; kube_dns=10.96.0.10; api=10.96.0.1; '
+                    for actual, output in ((status, diagnostic), (7, 'unrelated failure'),
+                                           (status, 'unrelated failure'), (127, diagnostic)):
+                        runner = f'printf "%s\\n" {shlex.quote(output)} >&2; exit {actual}'
+                        result = self.shell(prefix + f'AGENT=(bash -c {shlex.quote(runner)} --); '
+                                            + line + '; echo continued')
+                        if actual == status and output == diagnostic:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertIn('continued', result.stdout)
+                        else:
+                            self.assert_stopped(result)
+
+    def test_immediate_refusal_has_a_deadline(self):
+        script = (ROOT / 'demos/guest/web.sh').read_text()
+        line = next(line for line in script.splitlines() if '/dev/tcp/' in line)
+        command = shlex.split(shlex.split(line)[-1])
+        self.assertEqual(command[:4], ['time', 'timeout', '3', 'bash'])
+        self.assertEqual(command[4:], ['-c', 'exec 3<>/dev/tcp/192.0.2.1/80'])
+
+    def test_runner_death_is_not_host_unreachable(self):
+        result = self.shell("AGENT=(bash -c 'echo runner-died >&2; exit 1' --); "
+                            "expect_fail 1 'No route to host' 'exit 1'; echo continued")
+        self.assert_stopped(result)
+        self.assertIn('    runner-died', result.stdout)
+
+    def test_timeouts_execution_errors_and_signals_cannot_be_expected(self):
+        for status in (0, 124, 126, 127, 129, 137, 141, 255):
+            with self.subTest(status=status):
+                result = self.refusal(status, f'echo denied >&2; exit {status}', 'denied')
+                self.assert_stopped(result)
+                self.assertIn(f'got {status}', result.stderr)
+
+    def test_timeout_is_not_host_unreachable(self):
+        result = self.refusal(1, 'echo No route to host >&2; exit 124', 'No route to host')
+        self.assert_stopped(result)
+        self.assertIn('got 124', result.stderr)
+
+    def test_refusal_matches_raw_combined_output(self):
+        result = self.refusal(60, "printf 'stdout\\n'; printf 'certificate\\n' >&2; exit 60",
+                              '^certificate$')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('    stdout\n    certificate\ncontinued\n', result.stdout)
+
+    def test_formatter_cannot_supply_the_refusal_status(self):
+        command = '(seq 1 100000; exit 60)'
+        result = self.refusal(60, command + ' | head -1')
+        self.assert_stopped(result)
+        self.assertIn('got 141', result.stderr)
+        result = self.refusal(60, command, '^100000$')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('    1\n    2\n', result.stdout)
+        self.assertIn('    100000\ncontinued\n', result.stdout)
+
+    def proxy_response(self, response, status=0):
+        script = (ROOT / 'demos/guest/proxy.sh').read_text()
+        command = next(line for line in script.splitlines() if 'http://nope.test/' in line)
+        return self.shell(f'curl() {{ printf %s {shlex.quote(response)}; return {status}; }}; '
+                          f'export -f curl; {command}; echo continued')
+
+    def test_HTTP_200_not_502(self):
+        result = self.proxy_response('HTTP/1.1 200 OK\r\n'
+                                     'X-Proxy-Error: no such name in the world\r\n')
+        self.assert_stopped(result)
+
+    def test_missing_proxy_marker(self):
+        self.assert_stopped(self.proxy_response('HTTP/1.1 502 Bad Gateway\r\n'))
+
+    def test_proxy_requires_the_exact_explanation(self):
+        for response in ('X-Proxy-Error: no such name in the world\r\n',
+                         'HTTP/1.1 502 Bad Gateway\r\nX-Proxy-Error: connection refused\r\n',
+                         'prefix HTTP/1.1 502 Bad Gateway\r\n'
+                         'X-Proxy-Error: no such name in the world\r\n',
+                         'HTTP/1.1 502 Bad Gateway\r\nprefix '
+                         'X-Proxy-Error: no such name in the world\r\n',
+                         'HTTP/1.1 502 Bad Gateway\r\n'
+                         'X-Proxy-Error: no such name in the worldly\r\n'):
+            with self.subTest(response=response):
+                self.assert_stopped(self.proxy_response(response))
+
+    def test_proxy_status_and_explanation_continue(self):
+        response = ('HTTP/1.1 502 Bad Gateway\r\n'
+                    'X-Proxy-Error: no such name in the world\r\n\r\n')
+        result = self.proxy_response(response)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('continued', result.stdout)
+        self.assert_stopped(self.proxy_response(response, status=7))
+
+    def test_output_requires_patterns_and_success(self):
+        for command in ("expect_output 'true'", "expect_output 'echo hello' ''",
+                        "expect_output 'echo hello' '['",
+                        "expect_output 'echo hello' '^goodbye$'",
+                        "expect_output 'echo hello; exit 7' '^hello$'"):
+            with self.subTest(command=command):
+                self.assert_stopped(self.shell(command + '; echo continued'))
+
+    def test_output_success_displays_only_matching_lines(self):
+        result = self.shell(
+            "emit() { printf 'before\\nfirst\\nboth\\n'; "
+            "printf 'second\\nafter\\n' >&2; }; export -f emit; "
+            "expect_output emit '^second$|^both$' '^first$|^both$'; echo continued")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'agent$ emit\n    first\n    both\n    second\ncontinued\n')
+        self.assertEqual(result.stderr, '')
+
+    def test_output_failed_command_displays_whole_capture(self):
+        result = self.shell(
+            "emit() { printf 'before\\nfirst\\n'; "
+            "printf 'second\\nafter\\n' >&2; return 7; }; export -f emit; "
+            "expect_output emit '^first$' '^second$'; echo continued")
+        self.assert_stopped(result)
+        self.assertEqual(result.stdout, 'agent$ emit\n    before\n    first\n    second\n    after\n')
+        self.assertIn('wanted status 0, got 7', result.stderr)
+
+    def test_output_missing_pattern_displays_whole_capture_and_stops(self):
+        for patterns in (['^missing$'], ['^first$', '^missing$']):
+            with self.subTest(patterns=patterns):
+                result = self.shell(
+                    "emit() { printf 'before\\nfirst\\n'; "
+                    "printf 'after\\n' >&2; }; export -f emit; "
+                    + shlex.join(['expect_output', 'emit', *patterns]) + '; echo continued')
+                self.assert_stopped(result)
+                self.assertEqual(result.stdout, 'agent$ emit\n    before\n    first\n    after\n')
+                self.assertIn('wanted output matching /^missing$/', result.stderr)
+
+    def test_demo_checks_do_not_gate_on_display_filters(self):
+        for path in sorted((ROOT / 'demos/guest').glob('*.sh')):
+            if path.name == 'lib.sh':
+                continue
+            for line in path.read_text().splitlines():
+                with self.subTest(path=path.name, line=line):
+                    self.assertNotRegex(line, r'^\s*show\s')
+                    self.assertNotRegex(line, r'^\s*agent\s.*\|\s*grep\b')
+                    if re.match(r'^\s*expect_\w+\s', line):
+                        args = shlex.split(line)
+                        self.assertIn(args[0], ('expect_fail', 'expect_output'))
+                        if args[0] == 'expect_fail':
+                            self.assertEqual(len(args), 4)
+                            self.assertTrue(args[1].isdigit())
+                            self.assertTrue(args[2])
+                            self.assertNotRegex(args[3], r'\|\s*(head|tail|grep)\b')
 
     def test_border_start_failure_keeps_diagnostics(self):
         script = (ROOT / 'demos/guest/border.sh').read_text()

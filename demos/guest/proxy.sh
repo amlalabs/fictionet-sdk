@@ -59,7 +59,7 @@ AGENT=(ip netns exec agent setpriv --reuid=agent --regid=agent --clear-groups
 
 step "Who the agent is, and what it has"
 agent 'id; grep CapEff /proc/self/status; ip -br addr'
-agent 'env | grep -E "^(https?_proxy|SOCKS)=" | sed "s/:[^:@]*@/:<token>@/"'
+expect_output 'env | sed "s/:[^:@]*@/:<token>@/"' '^(https?_proxy|SOCKS)='
 
 step "Through the HTTP proxy, by the proxy variables"
 note "TLS is end to end: curl checks the site's certificate against the world's CA."
@@ -72,13 +72,13 @@ agent 'curl -fsS -x "$SOCKS" https://example.test/'
 
 step "What does not work"
 note "A wrong token is refused:"
-expect_fail 'curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/'
+expect_fail 56 'response 407' 'curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/'
 note "A name the world does not have gets 502, and attach says why:"
-agent 'curl -sS -o /dev/null -D - http://nope.test/ | grep -iE "^HTTP|^x-proxy-error"'
-expect_fail 'curl -sS -x "$SOCKS" https://nope.test/'
+expect_output 'curl -sS -o /dev/null -D - http://nope.test/' '^HTTP/1\.1 502 ' '^X-Proxy-Error: no such name in the world[[:space:]]*$'
+expect_fail 97 'connection to nope\.test\. \(4\)' 'curl -sS -x "$SOCKS" https://nope.test/'
 note "Around the proxy there is no network, and the world's socket is out of reach:"
-expect_fail 'curl -sS -m 5 --noproxy "*" http://1.1.1.1/'
-expect_fail 'ls /run/fictionet'
+expect_fail 7 "Network is unreachable|Couldn't connect" 'curl -sS -m 5 --noproxy "*" http://1.1.1.1/'
+expect_fail 2 'Permission denied' 'ls /run/fictionet'
 
 step "Clean up"
 note "Stopping both proxies and the world, and deleting the namespace."
