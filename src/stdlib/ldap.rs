@@ -2427,7 +2427,13 @@ impl Wire for Message {
         Self::decode(bytes)
     }
 
-    /// Appends DER. Refuses values that
+    /// Appends BER restricted by RFC 4511 section 5.1. Writes definite
+    /// lengths in their shortest form, primitive strings, and TRUE as `0xff`.
+    /// Attribute values and [`Filter::And`]/[`Filter::Or`] members keep the
+    /// order they were given. These `SET OF` values are not sorted, so the
+    /// output is not DER.
+    ///
+    /// Refuses values that
     /// [`Message::parse`] would refuse or read back as another value: an ID
     /// or limit over [`MAX_INT`], a version outside 1 to 127, a filter
     /// [`Message::parse`] would not take, an [`Authentication::Other`],
@@ -2728,6 +2734,31 @@ mod tests {
             ]
         );
         contract::check_written(&m);
+    }
+
+    #[test]
+    fn writer_preserves_set_order() {
+        let m = msg(
+            1,
+            Op::SearchResultEntry(entry(
+                "cn=x".into(),
+                vec![attribute("cn".into(), vec![b"b".to_vec(), b"a".to_vec()])],
+            )),
+        );
+        let bytes = m.to_bytes().unwrap();
+        let values = [0x31, 0x06, 0x04, 0x01, b'b', 0x04, 0x01, b'a'];
+        assert!(bytes.windows(values.len()).any(|w| w == values));
+
+        let m = msg(
+            2,
+            Op::SearchRequest(search(Filter::Or(vec![
+                Filter::Present("b".into()),
+                Filter::Present("a".into()),
+            ]))),
+        );
+        let bytes = m.to_bytes().unwrap();
+        let members = [0xa1, 0x06, 0x87, 0x01, b'b', 0x87, 0x01, b'a'];
+        assert!(bytes.windows(members.len()).any(|w| w == members));
     }
 
     #[test]
