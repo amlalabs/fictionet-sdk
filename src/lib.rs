@@ -344,6 +344,8 @@ pub mod getting_started;
 mod listen;
 pub mod lowering;
 pub mod observe;
+#[path = "relay/queue.rs"]
+mod packet_queue;
 pub mod proto;
 pub mod recipes;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]

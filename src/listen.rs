@@ -11,7 +11,7 @@ use std::time::Instant;
 use crate::attach::NameGuard;
 use crate::cx::CancelWait;
 use crate::relay::unix::cvt;
-use crate::relay::{self, Message, unix};
+use crate::relay::{self, Message, PacketQueue, unix};
 use crate::{Attacher, Attachment, Cx, Packet, RecvError};
 
 /// Where a world listens for attach and observers.
@@ -293,12 +293,10 @@ impl ConnSlot {
                 Err(_) => {
                     out.dropped += out.queue.len() as u64;
                     out.queue.clear();
-                    out.queued = 0;
                     break;
                 }
             }
-            let packet = out.queue.pop_front().expect("front was there");
-            out.queued -= packet.0.len() + QUEUE_OVERHEAD;
+            out.queue.pop().expect("front was there");
         }
         self.watch_out(out, epoll, false);
     }
@@ -327,9 +325,7 @@ impl ConnSlot {
 /// The packets of one connection that wait for room, oldest first.
 #[derive(Default)]
 struct OutQueue {
-    queue: std::collections::VecDeque<Packet>,
-    /// Their size, as counted against [`QUEUE_LIMIT`].
-    queued: usize,
+    queue: PacketQueue,
     /// The connection is registered for writability.
     want_out: bool,
     /// The connection is closed: nothing more is queued.
@@ -609,11 +605,8 @@ fn handshake_step(
 const BUDGET: u32 = 64;
 
 /// How many bytes of packets may wait for room in a connection, counting
-/// [`QUEUE_OVERHEAD`] for each. Past that, packets are dropped.
+/// [`crate::PACKET_COST`] for each. Past that, packets are dropped.
 const QUEUE_LIMIT: usize = 32 << 20;
-/// What a waiting packet costs beyond its bytes, so a flood of tiny
-/// packets is bounded too.
-const QUEUE_OVERHEAD: usize = 64;
 
 /// The connection behind an [`Attachment`] made by [`listen`].
 pub(crate) struct SocketLink {
@@ -649,7 +642,6 @@ impl SocketLink {
             let mut out = self.slot.out.lock();
             out.closed = true;
             out.queue.clear();
-            out.queued = 0;
         }
         unix::shutdown(self.slot.fd.as_raw_fd());
         self.slot.release_name();
@@ -730,13 +722,10 @@ impl SocketLink {
                 }
             }
         }
-        let cost = packet.0.len() + QUEUE_OVERHEAD;
-        if out.queued + cost > QUEUE_LIMIT {
+        if out.queue.try_push(packet, Some(QUEUE_LIMIT)).is_err() {
             out.dropped += 1;
             return;
         }
-        out.queued += cost;
-        out.queue.push_back(packet);
         self.slot.watch_out(&mut out, epoll, true);
     }
 }

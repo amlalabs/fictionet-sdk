@@ -10,6 +10,8 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
+pub use crate::packet_queue::PacketQueue;
+
 mod wire;
 pub use wire::*;
 

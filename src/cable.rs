@@ -1,9 +1,9 @@
 use fictionet::sync::Mutex;
-use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 
 use crate::cx::CancelWait;
+use crate::packet_queue::PacketQueue;
 use crate::watch::{Counted, Meter};
 use crate::{Cx, Interface, Packet, RecvError};
 
@@ -92,9 +92,7 @@ struct Cable {
 /// One direction of a cable: a queue with one sender and one receiver.
 #[derive(Default)]
 struct Direction {
-    queue: VecDeque<Packet>,
-    /// What the queue holds, counted as for [`Cable::limit`].
-    queued: usize,
+    queue: PacketQueue,
     /// The receiver waiting for a packet, if any.
     waker: Option<Waker>,
     /// One end was dropped.
@@ -134,8 +132,7 @@ impl Interface for End {
         }
         {
             let mut dir = self.cable.dirs[self.side].lock();
-            if let Some(packet) = dir.queue.pop_front() {
-                dir.queued -= packet.0.len() + PACKET_COST;
+            if let Some(packet) = dir.queue.pop() {
                 return Poll::Ready(Ok(packet));
             }
             if dir.closed {
@@ -158,19 +155,13 @@ impl Interface for End {
             if dir.closed {
                 return;
             }
-            let cost = packet.0.len() + PACKET_COST;
-            if self
-                .cable
-                .limit
-                .is_some_and(|limit| dir.queued + cost > limit)
-            {
+            let bytes = packet.0.len() as u64;
+            let Ok(packet) = dir.queue.try_push(packet, self.cable.limit) else {
                 return;
-            }
-            dir.queued += cost;
+            };
+            self.cable.meter.copy(self.side, packet);
             dir.packets += 1;
-            dir.bytes += packet.0.len() as u64;
-            self.cable.meter.copy(self.side, &packet);
-            dir.queue.push_back(packet);
+            dir.bytes += bytes;
             dir.waker.take()
         };
         if let Some(w) = waker {
@@ -191,7 +182,6 @@ impl Drop for End {
             let mut dir = self.cable.dirs[self.side].lock();
             dir.closed = true;
             dir.waker = None;
-            dir.queued = 0;
             std::mem::take(&mut dir.queue)
         };
         drop(lost);
@@ -212,7 +202,7 @@ impl End {
     /// The bytes waiting for this end to read, counted as for a limit.
     #[cfg(all(test, feature = "std"))]
     pub(crate) fn queued(&self) -> usize {
-        self.cable.dirs[self.side].lock().queued
+        self.cable.dirs[self.side].lock().queue.bytes()
     }
 
     /// Whether the other end is gone.
@@ -276,7 +266,7 @@ mod tests {
             // The ten past the limit were dropped; reading made room again.
             a.send(Packet(vec![99; 36]));
             assert_eq!(b.recv(&fcx).await?, Packet(vec![99; 36]));
-            assert_eq!(b.cable.dirs[b.side].lock().queued, 0);
+            assert_eq!(b.cable.dirs[b.side].lock().queue.bytes(), 0);
             Err::<(), crate::Error>(crate::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");

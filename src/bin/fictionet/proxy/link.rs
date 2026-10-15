@@ -17,14 +17,13 @@
 //! of a second or more, and the queue cannot grow far: each connection
 //! has at most 256 KiB in flight.
 
-use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use fictionet::relay::{self, unix};
+use fictionet::relay::{self, PacketQueue, unix};
 use fictionet::{Cx, Interface, Packet, RecvError};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
@@ -45,7 +44,7 @@ pub(crate) struct Link {
 /// What the link, its writer task and attach's main loop share.
 pub(crate) struct Shared {
     fd: AsyncFd<OwnedFd>,
-    queue: Mutex<Queue>,
+    queue: Mutex<PacketQueue>,
     /// Wakes the writer task when packets are queued.
     queued: Notify,
     /// The world closed the connection, or it failed.
@@ -55,19 +54,13 @@ pub(crate) struct Shared {
     dropped: AtomicU64,
 }
 
-#[derive(Default)]
-struct Queue {
-    packets: VecDeque<Packet>,
-    bytes: usize,
-}
-
 impl Link {
     /// Takes the socket after the handshake. Must be called inside the
     /// tokio runtime; starts the writer task there.
     pub(crate) fn new(sock: OwnedFd) -> io::Result<Link> {
         let shared = Arc::new(Shared {
             fd: AsyncFd::new(sock)?,
-            queue: Mutex::new(Queue::default()),
+            queue: Mutex::new(PacketQueue::default()),
             queued: Notify::new(),
             closed: AtomicBool::new(false),
             why: Mutex::new(None),
@@ -112,7 +105,7 @@ impl Shared {
             return;
         }
         let mut q = self.queue.lock().unwrap();
-        if q.packets.is_empty() {
+        if q.is_empty() {
             match send_one(self.fd.get_ref().as_raw_fd(), &packet) {
                 Ok(true) => return,
                 Ok(false) => {}
@@ -123,13 +116,10 @@ impl Shared {
                 }
             }
         }
-        let cost = packet.0.len() + 64;
-        if q.bytes + cost > QUEUE_BUDGET {
+        if q.try_push(packet, Some(QUEUE_BUDGET)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        q.bytes += cost;
-        q.packets.push_back(packet);
         drop(q);
         self.queued.notify_one();
     }
@@ -165,12 +155,10 @@ async fn write_queued(shared: Arc<Shared>) {
             };
             let mut q = shared.queue.lock().unwrap();
             let mut full = false;
-            while let Some(packet) = q.packets.front() {
+            while let Some(packet) = q.front() {
                 match send_one(shared.fd.get_ref().as_raw_fd(), packet) {
                     Ok(true) => {
-                        let cost = packet.0.len() + 64;
-                        q.packets.pop_front();
-                        q.bytes -= cost;
+                        q.pop().expect("front was there");
                     }
                     Ok(false) => {
                         full = true;
