@@ -1077,9 +1077,11 @@ pub struct Login7 {
     /// The type byte: the SQL dialect, and whether the session is
     /// read-only.
     pub type_flags: u8,
-    /// Bits from [`option_flags3`]. A writer sets
-    /// [`option_flags3::EXTENSION`] when `features` is `Some`, and clears
-    /// it otherwise.
+    /// Bits from [`option_flags3`]. Callers must set
+    /// [`option_flags3::EXTENSION`] if and only if [`features`](Self::features)
+    /// is `Some`. The writer does not normalize flags. If the flag and
+    /// `features` disagree, it returns [`Error::Unwritable`] and leaves the
+    /// destination unchanged.
     pub option_flags3: u8,
     /// Minutes from UTC.
     pub client_time_zone: i32,
