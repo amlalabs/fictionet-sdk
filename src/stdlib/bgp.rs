@@ -99,7 +99,7 @@ extern crate alloc;
 
 use alloc::{vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use fictionet::stdlib::codec::{Wire, be16, be32};
+use fictionet::stdlib::codec::{Reader, Truncated, Wire, be16, be32};
 
 /// The TCP port BGP speakers listen on.
 pub const PORT: u16 = 179;
@@ -930,14 +930,10 @@ impl Wire for Open {
         if b.len() > MAX_BODY_LEN {
             return Err(Error::BadMessageLength(length_field(b)));
         }
-        let mut r = b;
-        let (Some(version), Some(my_as), Some(hold_time), Some(id), Some(params_len)) = (
-            take_u8(&mut r),
-            take_u16(&mut r),
-            take_u16(&mut r),
-            take_u32(&mut r),
-            take_u8(&mut r),
-        ) else {
+        let mut r = Reader::new(b);
+        let (Ok(version), Ok(my_as), Ok(hold_time), Ok(id), Ok(params_len)) =
+            (r.u8(), r.u16_be(), r.u16_be(), r.u32_be(), r.u8())
+        else {
             return Err(Error::BadMessageLength(length_field(b)));
         };
         if version != VERSION {
@@ -954,25 +950,27 @@ impl Wire for Open {
         }
         // RFC 9072: a nonzero length followed by type 255 marks the
         // extended format, with two-byte lengths.
-        let extended = params_len != 0 && r.first() == Some(&PARAMETER_EXTENDED);
+        let extended = params_len != 0 && r.peek_u8() == Some(PARAMETER_EXTENDED);
         let total = if extended {
-            r = &r[1..];
-            usize::from(take_u16(&mut r).ok_or(Error::MalformedOpen)?)
+            r.skip(1).map_err(|_| Error::MalformedOpen)?;
+            usize::from(r.u16_be().map_err(|_| Error::MalformedOpen)?)
         } else {
             usize::from(params_len)
         };
-        if r.len() != total {
+        if r.remaining() != total {
             return Err(Error::MalformedOpen);
         }
         let mut parameters = Vec::new();
         while !r.is_empty() {
-            let kind = take_u8(&mut r).ok_or(Error::MalformedOpen)?;
+            let kind = r.u8().map_err(|_| Error::MalformedOpen)?;
             let n = if extended {
-                take_u16(&mut r).map(usize::from)
+                r.u16_be().map(usize::from)
             } else {
-                take_u8(&mut r).map(usize::from)
+                r.u8().map(usize::from)
             };
-            let value = take(&mut r, n.ok_or(Error::MalformedOpen)?).ok_or(Error::MalformedOpen)?;
+            let value = r
+                .take(n.map_err(|_| Error::MalformedOpen)?)
+                .map_err(|_| Error::MalformedOpen)?;
             parameters.push(match kind {
                 PARAMETER_CAPABILITIES => Parameter::Capabilities(parse_capabilities(value)?),
                 PARAMETER_EXTENDED => return Err(Error::MalformedOpen),
@@ -1005,13 +1003,14 @@ impl Wire for Open {
     }
 }
 
-fn parse_capabilities(mut r: &[u8]) -> Result<Vec<Capability>, Error> {
+fn parse_capabilities(b: &[u8]) -> Result<Vec<Capability>, Error> {
+    let mut r = Reader::new(b);
     let mut out = Vec::new();
     while !r.is_empty() {
-        let (Some(code), Some(n)) = (take_u8(&mut r), take_u8(&mut r)) else {
+        let (Ok(code), Ok(n)) = (r.u8(), r.u8()) else {
             return Err(Error::MalformedOpen);
         };
-        let v = take(&mut r, usize::from(n)).ok_or(Error::MalformedOpen)?;
+        let v = r.take(usize::from(n)).map_err(|_| Error::MalformedOpen)?;
         out.push(match code {
             capability::MULTIPROTOCOL => {
                 let [a0, a1, _reserved, safi] = v else {
@@ -1154,15 +1153,20 @@ impl core::fmt::Display for Prefix {
 
 /// Reads a run of prefixes of one family, each a length in bits and just
 /// enough bytes to hold them.
-fn read_prefixes(mut r: &[u8], v6: bool) -> Option<Vec<Prefix>> {
+fn read_prefixes(b: &[u8], v6: bool) -> Option<Vec<Prefix>> {
+    let mut r = Reader::new(b);
     let max = if v6 { 128 } else { 32 };
     let mut out = Vec::new();
     while !r.is_empty() {
-        let length = take_u8(&mut r)?;
+        let Ok(length) = r.u8() else {
+            return None;
+        };
         if length > max {
             return None;
         }
-        let bytes = take(&mut r, usize::from(length).div_ceil(8))?;
+        let Ok(bytes) = r.take(usize::from(length).div_ceil(8)) else {
+            return None;
+        };
         let mut octets = [0u8; 16];
         octets[..bytes.len()].copy_from_slice(bytes);
         let addr = if v6 {
@@ -1756,16 +1760,25 @@ fn write_nlri(v: &mut Vec<u8>, afi: u16, safi: u8, nlri: &Nlri) -> Result<(), Er
 
 /// Reads AS_PATH segments. A segment with no AS numbers, or with AS 0
 /// (RFC 7607), makes the path malformed.
-fn parse_as_path(mut r: &[u8], four: bool) -> Option<Vec<Segment>> {
+fn parse_as_path(b: &[u8], four: bool) -> Option<Vec<Segment>> {
+    let mut r = Reader::new(b);
     let size = if four { 4 } else { 2 };
     let mut out = Vec::new();
     while !r.is_empty() {
-        let kind = SegmentKind::from_code(take_u8(&mut r)?)?;
-        let count = usize::from(take_u8(&mut r)?);
+        let Ok(kind) = r.u8() else {
+            return None;
+        };
+        let kind = SegmentKind::from_code(kind)?;
+        let Ok(count) = r.u8() else {
+            return None;
+        };
+        let count = usize::from(count);
         if count == 0 {
             return None;
         }
-        let bytes = take(&mut r, count * size)?;
+        let Ok(bytes) = r.take(count * size) else {
+            return None;
+        };
         let asns: Vec<u32> = bytes
             .chunks_exact(size)
             .map(|c| {
@@ -1792,30 +1805,41 @@ fn parse_nlri(r: &[u8], afi: u16, safi: u8) -> Option<Nlri> {
     }
 }
 
-fn parse_mp_reach(mut r: &[u8]) -> Option<MpReach> {
-    let afi = take_u16(&mut r)?;
-    let safi = take_u8(&mut r)?;
-    let n = take_u8(&mut r)?;
+fn parse_mp_reach(b: &[u8]) -> Option<MpReach> {
+    let mut r = Reader::new(b);
+    let (Ok(afi), Ok(safi)) = (r.u16_be(), r.u8()) else {
+        return None;
+    };
+    let Ok(n) = r.u8() else {
+        return None;
+    };
     if !next_hop_length(afi, safi, usize::from(n)) {
         return None;
     }
-    let next_hop = take(&mut r, usize::from(n))?.to_vec();
-    let _reserved = take_u8(&mut r)?;
+    let Ok(next_hop) = r.take(usize::from(n)) else {
+        return None;
+    };
+    let next_hop = next_hop.to_vec();
+    let Ok(_reserved) = r.u8() else {
+        return None;
+    };
     Some(MpReach {
         afi,
         safi,
         next_hop,
-        nlri: parse_nlri(r, afi, safi)?,
+        nlri: parse_nlri(r.rest(), afi, safi)?,
     })
 }
 
-fn parse_mp_unreach(mut r: &[u8]) -> Option<MpUnreach> {
-    let afi = take_u16(&mut r)?;
-    let safi = take_u8(&mut r)?;
+fn parse_mp_unreach(b: &[u8]) -> Option<MpUnreach> {
+    let mut r = Reader::new(b);
+    let (Ok(afi), Ok(safi)) = (r.u16_be(), r.u8()) else {
+        return None;
+    };
     Some(MpUnreach {
         afi,
         safi,
-        withdrawn: parse_nlri(r, afi, safi)?,
+        withdrawn: parse_nlri(r.rest(), afi, safi)?,
     })
 }
 
@@ -1947,18 +1971,24 @@ fn read_update(b: &[u8], negotiated: &Context, strict: bool) -> Result<Received,
     if b.len() > MAX_BODY_LEN {
         return Err(Error::BadMessageLength(length_field(b)));
     }
-    let mut r = b;
-    let wlen = take_u16(&mut r).ok_or(Error::MalformedAttributeList)?;
-    let withdrawn = take(&mut r, usize::from(wlen)).ok_or(Error::MalformedAttributeList)?;
-    let alen = take_u16(&mut r).ok_or(Error::MalformedAttributeList)?;
-    let mut attrs = take(&mut r, usize::from(alen)).ok_or(Error::MalformedAttributeList)?;
+    let mut r = Reader::new(b);
+    let wlen = r.u16_be().map_err(|_| Error::MalformedAttributeList)?;
+    let withdrawn = r
+        .take(usize::from(wlen))
+        .map_err(|_| Error::MalformedAttributeList)?;
+    let alen = r.u16_be().map_err(|_| Error::MalformedAttributeList)?;
+    let attr_bytes = r
+        .take(usize::from(alen))
+        .map_err(|_| Error::MalformedAttributeList)?;
+    let mut attrs = Reader::new(attr_bytes);
+    let nlri_bytes = r.rest();
     let withdrawn = read_prefixes(withdrawn, false).ok_or(Error::InvalidNetworkField)?;
     // RFC 7606 reads the NLRI first: an error in it closes the connection
     // whatever the attributes hold.
     let early = if strict {
         None
     } else {
-        Some(read_prefixes(r, false).ok_or(Error::InvalidNetworkField)?)
+        Some(read_prefixes(nlri_bytes, false).ok_or(Error::InvalidNetworkField)?)
     };
 
     // Types met, whether read or not, and types read and kept.
@@ -1969,17 +1999,17 @@ fn read_update(b: &[u8], negotiated: &Context, strict: bool) -> Result<Received,
     let mut withdraw = None;
     let mut discarded = Vec::new();
     while !attrs.is_empty() {
-        let all = attrs;
+        let start = attrs.position();
         let header = (|| {
-            let (flags, kind) = (take_u8(&mut attrs)?, take_u8(&mut attrs)?);
+            let (flags, kind) = (attrs.u8()?, attrs.u8()?);
             let n = if flags & flag::EXTENDED_LENGTH != 0 {
-                usize::from(take_u16(&mut attrs)?)
+                usize::from(attrs.u16_be()?)
             } else {
-                usize::from(take_u8(&mut attrs)?)
+                usize::from(attrs.u8()?)
             };
-            Some((flags, kind, take(&mut attrs, n)?))
+            Ok::<_, Truncated>((flags, kind, attrs.take(n)?))
         })();
-        let Some((flags, kind, value)) = header else {
+        let Ok((flags, kind, value)) = header else {
             // RFC 7606 section 4: an attribute that runs past the total
             // attribute length, which still says where the NLRI starts.
             if strict {
@@ -1989,7 +2019,7 @@ fn read_update(b: &[u8], negotiated: &Context, strict: bool) -> Result<Received,
             broken = true;
             break;
         };
-        let raw = &all[..all.len() - attrs.len()];
+        let raw = &attr_bytes[start..attrs.position()];
         if core::mem::replace(&mut seen[usize::from(kind)], true) {
             // RFC 7606 section 3 (g): a repeated MP attribute closes the
             // connection; other repeats are dropped.
@@ -2021,7 +2051,7 @@ fn read_update(b: &[u8], negotiated: &Context, strict: bool) -> Result<Received,
     }
     let nlri = match early {
         Some(n) => n,
-        None => read_prefixes(r, false).ok_or(Error::InvalidNetworkField)?,
+        None => read_prefixes(nlri_bytes, false).ok_or(Error::InvalidNetworkField)?,
     };
     if let Some(k) = missing(&have, !nlri.is_empty()) {
         // RFC 7606 section 3 (d).
@@ -2151,27 +2181,6 @@ fn bound(out: &[u8]) -> Result<(), Error> {
     } else {
         Ok(())
     }
-}
-
-fn take<'a>(r: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
-    if r.len() < n {
-        return None;
-    }
-    let (head, tail) = r.split_at(n);
-    *r = tail;
-    Some(head)
-}
-
-fn take_u8(r: &mut &[u8]) -> Option<u8> {
-    take(r, 1).map(|b| b[0])
-}
-
-fn take_u16(r: &mut &[u8]) -> Option<u16> {
-    take(r, 2).and_then(|b| be16(b, 0))
-}
-
-fn take_u32(r: &mut &[u8]) -> Option<u32> {
-    take(r, 4).and_then(|b| be32(b, 0))
 }
 
 /// Checks shared by this module's tests and its fuzz target.
@@ -2724,6 +2733,71 @@ mod tests {
         let mut cap_half = header(19 + 13, 1);
         cap_half.extend_from_slice(&[4, 0, 1, 0, 0, 1, 1, 1, 1, 3, 2, 1, 65]);
         assert_eq!(decode(&cap_half, &TWO), Err(Error::MalformedOpen));
+    }
+
+    #[test]
+    fn open_truncation_error_precedence() {
+        // A short fixed header wins over an unsupported version.
+        let body = [3, 0, 1, 0, 90, 1, 1, 1, 1, 0];
+        for n in 0..10 {
+            assert_eq!(
+                Open::parse(&body[..n]),
+                Err(Error::BadMessageLength((HEADER_LEN + n) as u16))
+            );
+        }
+        assert_eq!(Open::parse(&body), Err(Error::UnsupportedVersion(3)));
+
+        // Truncation inside the extended total, parameter length, or value.
+        for params in [
+            &[255][..],
+            &[255, 0],
+            &[255, 0, 1, 2],
+            &[255, 0, 2, 2, 0],
+            &[255, 0, 3, 2, 0, 1],
+        ] {
+            let mut body = vec![4, 0, 1, 0, 90, 1, 1, 1, 1, 255];
+            body.extend_from_slice(params);
+            assert_eq!(Open::parse(&body), Err(Error::MalformedOpen));
+            body[0] = 3;
+            assert_eq!(Open::parse(&body), Err(Error::UnsupportedVersion(3)));
+        }
+    }
+
+    #[test]
+    fn update_truncation_error_precedence() {
+        for raw in [&[0x40][..], &[0x40, 1], &[0x50, 1, 0], &[0x40, 1, 1]] {
+            let mut body = vec![0, 0, 0, raw.len() as u8];
+            body.extend_from_slice(raw);
+            body.extend_from_slice(&[24, 10, 0]);
+            assert_eq!(
+                Update::parse(&body, &TWO),
+                Err(Error::MalformedAttributeList)
+            );
+            assert_eq!(
+                Update::receive(&body, &TWO),
+                Err(Error::InvalidNetworkField)
+            );
+        }
+        // Outer lengths are checked before even the withdrawn prefixes.
+        let body = [0, 1, 33, 0, 1];
+        assert_eq!(
+            Update::parse(&body, &TWO),
+            Err(Error::MalformedAttributeList)
+        );
+        assert_eq!(
+            Update::receive(&body, &TWO),
+            Err(Error::MalformedAttributeList)
+        );
+
+        // Error data includes only the offending attribute, including its
+        // extended length, after a preceding attribute has been consumed.
+        let raw = [0x50, 1, 0, 1, 3];
+        let mut body = vec![0, 0, 0, 8, 0x80, 99, 0];
+        body.extend_from_slice(&raw);
+        assert_eq!(
+            Update::parse(&body, &TWO),
+            Err(Error::InvalidOrigin(raw.to_vec()))
+        );
     }
 
     #[test]
