@@ -7,10 +7,10 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(m) = Message::from_vec(data) {
-        // What was read can be written, and that reads again.
-        if let Ok(bytes) = m.to_vec() {
-            let _ = Message::from_vec(&bytes);
-        }
+        // Write unless the questions alone exceed 65535 bytes, then reparse.
+        // Values must match, or dropped records must set TC and retain a
+        // prefix of each record section.
+        fictionet_fuzz::dns::round_trip(&m);
         for q in &m.queries {
             let _ = q.name().to_ascii();
         }

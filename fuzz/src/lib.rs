@@ -11,6 +11,7 @@ use fictionet::stdlib::ip::{self, transport_checksum};
 use fictionet::stdlib::{ConnError, Connection};
 use fictionet::{Cx, block_on, run};
 
+pub mod dns;
 pub mod doors;
 #[path = "../common/http1.rs"]
 pub mod http1;
