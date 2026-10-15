@@ -43,6 +43,9 @@
 //! [`json_syntax`] reads string and number tokens with absolute byte offsets.
 //! Callers bound input and keep value construction, limits, and error translation.
 //!
+//! [`crc32()`] computes IEEE CRC-32. [`crc32c`] provides CRC-32C with the
+//! separate Castagnoli polynomial. Protocols choose which bytes to cover.
+//!
 //! The code outside tests uses only `core` and `alloc`. Nothing here does
 //! I/O, reads a clock or uses global state. [`serve`](super::serve) runs a
 //! decoder over a live connection.
@@ -237,6 +240,7 @@ mod buffer;
 mod checked;
 pub mod civil;
 mod combinators;
+mod crc32;
 pub mod crc32c;
 mod declarations;
 mod demux;
@@ -266,6 +270,7 @@ pub use combinators::{
     Assemble, AssembleError, Assembled, Collect, CollectError, Ending, Fragment, LineError, Lines,
     Map,
 };
+pub use crc32::crc32;
 pub use demux::Demux;
 pub use faults::{ByteFault, FaultDelay, FaultError, Faults, ItemFault, Rule, Trigger};
 pub use frames::{Frames, Prefixed, signed_frame_prefix};

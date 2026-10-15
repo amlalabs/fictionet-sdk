@@ -75,6 +75,10 @@ use fictionet::stdlib::codec;
 #[cfg(test)]
 use fictionet::stdlib::codec::Decode;
 
+/// Compatibility re-export of [`codec::crc32`](fictionet::stdlib::codec::crc32()), the
+/// CRC-32 that FINGERPRINT uses.
+pub use fictionet::stdlib::codec::crc32;
+
 /// The UDP and TCP port STUN servers listen on.
 pub const PORT: u16 = 3478;
 /// The port STUN servers listen on for TLS and DTLS.
@@ -925,40 +929,6 @@ fictionet::prefixed! {
     }
 }
 
-/// The CRC-32 of `data`, as used by FINGERPRINT: the IEEE 802.3
-/// polynomial, reflected, starting from all ones and inverted at the end.
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in data {
-        crc = CRC_TABLE
-            .get(usize::from((crc as u8) ^ byte))
-            .copied()
-            .unwrap_or_default()
-            ^ (crc >> 8);
-    }
-    !crc
-}
-
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xedb8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-};
-
 /// Checks as much of a header as `b` holds, in byte order: the top bits,
 /// the length, then the cookie. It returns the whole message's length once
 /// the header is there, and `None` while it is not.
@@ -1178,12 +1148,6 @@ mod tests {
             &SAMPLE_IPV4_RESPONSE,
             &SAMPLE_IPV6_RESPONSE,
         ]
-    }
-
-    #[test]
-    fn crc32_check_value() {
-        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
-        assert_eq!(crc32(b""), 0);
     }
 
     #[test]

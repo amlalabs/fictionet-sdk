@@ -46,6 +46,8 @@ macro_rules! protocols {
         pub mod connection;
         #[path = "../../src/stdlib/cotp.rs"]
         pub mod cotp;
+        #[path = "../../src/stdlib/codec/crc32.rs"]
+        pub mod crc32;
         #[path = "../../src/stdlib/codec/crc32c.rs"]
         pub mod crc32c;
         #[path = "../../src/stdlib/dcerpc.rs"]
