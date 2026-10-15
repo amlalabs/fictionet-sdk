@@ -403,16 +403,19 @@ def test_a_token_file_without_a_token_is_an_error(tmp_path):
     assert oct((tmp_path / "proxy-token").stat().st_mode & 0o777) == "0o600"
 
 
-def test_ca_dir_follows_posix_rules_on_any_host(monkeypatch):
+def test_ca_dir_follows_posix_rules_on_any_host(tmp_path):
     """The CA's directory is a path in a Linux container, so it is split
     with POSIX rules even where the host's own paths use backslashes."""
-    import pathlib
-
-    from inspect_fictionet import _sandbox
-
-    monkeypatch.setattr(_sandbox, "Path", pathlib.PureWindowsPath)
-    with pytest.raises(ValueError, match="must not be /run/relay"):
-        fictionet_sandbox(WEB_WORLD_IMAGE, world_ca="/run/relay/ca.pem")
+    c = compose(
+        tmp_path,
+        WEB_WORLD_IMAGE,
+        world_args=["/run/relay/relay.sock", "/run/x\\y/z\\ca.pem"],
+        world_ca="/run/x\\y/z\\ca.pem",
+    )
+    assert c["services"]["world"]["volumes"][1]["target"] == "/run/x\\y"
+    assert c["services"]["default"]["volumes"] == [
+        {"type": "volume", "source": "ca", "target": "/run/x\\y", "read_only": True}
+    ]
 
 
 def test_k8s_tiny_cpu_limit(tmp_path):
