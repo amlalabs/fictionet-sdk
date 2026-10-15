@@ -942,12 +942,7 @@ fn authority(value: &[u8], port_required: bool) -> bool {
     } else {
         let end = value.iter().position(|b| *b == b':').unwrap_or(value.len());
         let host = value.get(..end).unwrap_or_default();
-        if host.is_empty()
-            || !host
-                .iter()
-                .all(|b| ascii::is_uri_reg_name_char(*b) || *b == b'%')
-            || !uri_path(host)
-        {
+        if host.is_empty() || !ascii::is_uri_component(host, b"") {
             return false;
         }
         value.get(end..).unwrap_or_default()
@@ -962,23 +957,7 @@ fn authority(value: &[u8], port_required: bool) -> bool {
         && decimal(rest.get(1..).unwrap_or_default()).is_some_and(|p| p <= 65535)
 }
 fn uri_path(path: &[u8]) -> bool {
-    let mut pos = 0;
-    while let Some(&b) = path.get(pos) {
-        if b == b'%' {
-            if !path.get(pos + 1).is_some_and(u8::is_ascii_hexdigit)
-                || !path.get(pos + 2).is_some_and(u8::is_ascii_hexdigit)
-            {
-                return false;
-            }
-            pos += 3;
-        } else {
-            if !(ascii::is_uri_reg_name_char(b) || b":@/?".contains(&b)) {
-                return false;
-            }
-            pos += 1;
-        }
-    }
-    true
+    ascii::is_uri_component(path, b":@/?")
 }
 impl HeaderList {
     /// Validates received fields and normalizes repeated identical Content-Length
@@ -3336,6 +3315,42 @@ mod tests {
         );
         assert_eq!(d.finish(), Ok(()));
     }
+    #[test]
+    fn uri_lexical_policies() {
+        for (auth, path, valid) in [
+            ("a%2f+b", "/a%2f+b?x=:@/?", true),
+            ("a,b:65535", "/%00%ff", true),
+            ("a:", "/", true),
+            ("a:00000000000", "/", true),
+            ("[Vf.a:b]", "/", true),
+            ("a%4", "/", false),
+            ("a%gg", "/", false),
+            ("a:65536", "/", false),
+            ("a", "/%", false),
+            ("a", "/%4", false),
+            ("a", "/%gg", false),
+            ("a", "/a#b", false),
+            ("a", "/[x]", false),
+        ] {
+            let h = fields(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", auth),
+                (":path", path),
+            ]);
+            let parsed = HeaderList::from_fields(
+                h.fields.clone(),
+                HeaderKind::Request {
+                    extended_connect: false,
+                },
+            );
+            assert_eq!(parsed.is_ok(), valid, "{auth} {path}");
+            if valid {
+                assert_eq!(parsed.unwrap().fields, h.fields);
+            }
+        }
+    }
+
     #[test]
     fn authority_uri_literals_ports_and_escapes() {
         let kind = HeaderKind::Request {

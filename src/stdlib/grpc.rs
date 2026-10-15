@@ -67,9 +67,7 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::ascii::{
-    self, hex_upper, hex_value as hex, is_tchar as is_token, trim_ows as trim,
-};
+use fictionet::stdlib::codec::ascii::{self, hex_upper, is_tchar as is_token, trim_ows as trim};
 use fictionet::stdlib::codec::base64::{self, Padding};
 use fictionet::stdlib::codec::leb128;
 use std::fmt;
@@ -1367,24 +1365,7 @@ fn is_coding(e: &str) -> bool {
 /// Whether `s` is a non-empty URI path segment: RFC 3986 `pchar`s, with
 /// each `%` followed by two hex digits.
 fn is_segment(s: &[u8]) -> bool {
-    let mut i = 0;
-    while let Some(&c) = s.get(i) {
-        if c == b'%' {
-            let (Some(&h), Some(&l)) = (s.get(i + 1), s.get(i + 2)) else {
-                return false;
-            };
-            if hex(h).is_none() || hex(l).is_none() {
-                return false;
-            }
-            i += 3;
-            continue;
-        }
-        if !(c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&c)) {
-            return false;
-        }
-        i += 1;
-    }
-    !s.is_empty()
+    !s.is_empty() && ascii::is_uri_component(s, b":@")
 }
 
 /// Whether `name` is a header HTTP/2 forbids: one tied to an HTTP/1
@@ -2592,6 +2573,29 @@ mod tests {
             match with(bad) {
                 Err(Rejection::Status(s)) => assert_eq!(s.code, Code::Internal, "{bad}"),
                 other => panic!("{bad}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn uri_lexical_policies() {
+        for (segment, valid) in [
+            ("a%2f+b%00%ff", true),
+            (":@!$&'()*+,;=", true),
+            ("", false),
+            ("%", false),
+            ("%4", false),
+            ("%gg", false),
+            ("a/b", false),
+            ("a?b", false),
+            ("[x]", false),
+        ] {
+            let path = MethodPath::new(segment, segment);
+            assert_eq!(path.is_some(), valid, "{segment}");
+            if valid {
+                let path = path.unwrap();
+                assert_eq!(path.to_path(), format!("/{segment}/{segment}"));
+                assert_eq!(MethodPath::parse(path.to_path().as_bytes()), Some(path));
             }
         }
     }

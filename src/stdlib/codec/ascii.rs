@@ -33,6 +33,14 @@ pub fn is_tchar(c: u8) -> bool {
     c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
 }
 
+/// Whether a byte is a SIP `token` character (RFC 3261 section 25.1).
+///
+/// Percent signs are ordinary token bytes. This does not validate escapes.
+#[inline]
+pub fn is_sip_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-.!%*_+`'~".contains(&b)
+}
+
 /// Removes leading and trailing ASCII spaces and tabs.
 #[inline]
 pub fn trim_ows(mut b: &[u8]) -> &[u8] {
@@ -102,9 +110,54 @@ pub fn percent_decode_strict(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Checks that every byte is allowed or belongs to a `%` escape with two hex digits.
+///
+/// `allowed` is called only for unescaped bytes. A percent sign always starts
+/// an escape, even if `allowed` would accept it. Escaped bytes are not decoded
+/// or checked by `allowed`. Nothing is normalized, including literal plus signs.
+///
+/// This checks the whole slice without allocating or changing a caller's cursor.
+/// Empty input is valid. There is no length limit; callers enforce their own
+/// bounds and translate `false` to their protocol's error.
+pub fn is_percent_encoded(bytes: &[u8], allowed: impl Fn(u8) -> bool) -> bool {
+    let mut bytes = bytes.iter();
+    while let Some(&b) = bytes.next() {
+        if b == b'%' {
+            if !bytes.next().is_some_and(u8::is_ascii_hexdigit)
+                || !bytes.next().is_some_and(u8::is_ascii_hexdigit)
+            {
+                return false;
+            }
+        } else if !allowed(b) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether a byte is an unreserved character or sub-delimiter in an RFC 3986 name.
 pub fn is_uri_reg_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&b)
+}
+
+/// Checks RFC 3986 component bytes, allowing the additional bytes in `extra`.
+///
+/// Unescaped bytes must be unreserved characters, sub-delimiters, or in `extra`.
+/// Every `%` must have two following hex digits, even if `extra` contains `%`.
+/// Escapes are validated without decoding or normalization. Literal `+` is allowed.
+/// This uses [`is_percent_encoded`]: it accepts empty input, has no length limit,
+/// and leaves the slice and any caller cursor unchanged. Callers check component
+/// boundaries, nonempty requirements, and authority and port rules themselves.
+///
+/// ```
+/// use fictionet::stdlib::codec::ascii::is_uri_component;
+/// assert!(is_uri_component(b"name%2f+part", b""));
+/// assert!(is_uri_component(b"/a:b?x=y", b":@/?"));
+/// assert!(!is_uri_component(b"/path", b""));
+/// assert!(!is_uri_component(b"name%2", b""));
+/// ```
+pub fn is_uri_component(bytes: &[u8], extra: &[u8]) -> bool {
+    is_percent_encoded(bytes, |b| is_uri_reg_name_char(b) || extra.contains(&b))
 }
 
 /// Whether `s` is the inside of an RFC 3986 IP literal: an IPv6 address,
@@ -134,6 +187,7 @@ mod tests {
                 is_tchar(c),
                 c.is_ascii_graphic() && !b"()<>@,;:\\\"/[]?={}".contains(&c)
             );
+            assert_eq!(is_sip_token_byte(c), is_tchar(c) && !b"#$&^|".contains(&c));
         }
         for n in 0..16 {
             assert_eq!(hex_value(hex_lower(n)), Some(n));
@@ -170,6 +224,55 @@ mod tests {
         assert_eq!(decimal(b"0001", 4, 1), Some(1));
         assert_eq!(decimal(b"0001", 3, 1), None);
         assert_eq!(decimal(b"2", 4, 1), None);
+    }
+
+    #[test]
+    fn percent_validation() {
+        assert!(is_percent_encoded(b"", |_| false));
+        assert!(is_percent_encoded(b"%00%2f%FF", |_| false));
+        assert!(!is_percent_encoded(b"+", |b| b == b' '));
+        for invalid in [
+            b"%".as_slice(),
+            b"%4",
+            b"%gg",
+            b"%0G",
+            b"%G0",
+            b"%%41",
+            b"%41%",
+        ] {
+            assert!(!is_percent_encoded(invalid, |_| true), "{invalid:?}");
+        }
+        let seen = core::cell::RefCell::new(Vec::new());
+        assert!(is_percent_encoded(b"a+%00%2f%FFz", |b| {
+            seen.borrow_mut().push(b);
+            b.is_ascii_alphabetic() || b == b'+'
+        }));
+        assert_eq!(*seen.borrow(), b"a+z");
+    }
+
+    #[test]
+    fn uri_components() {
+        for valid in [b"".as_slice(), b"azAZ09-._~!$&'()*+,;=", b"%00%ff%2F+"] {
+            assert!(is_uri_component(valid, b""), "{valid:?}");
+        }
+        for invalid in [
+            b"%".as_slice(),
+            b"%2",
+            b"%gg",
+            b" ",
+            b"\0",
+            b"\xff",
+            b"[x]",
+            b"a#b",
+        ] {
+            assert!(!is_uri_component(invalid, b":@/?"), "{invalid:?}");
+        }
+        for &extra in b":@/?" {
+            assert!(!is_uri_component(&[extra], b""));
+            assert!(is_uri_component(&[extra], &[extra]));
+        }
+        assert!(!is_uri_component(b"%", b"%"));
+        assert!(is_uri_component(b"/a:b?x=y@z", b":@/?"));
     }
 
     #[test]

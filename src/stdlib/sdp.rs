@@ -905,33 +905,10 @@ fn is_multicast(c: &Connection) -> bool {
     }
 }
 
-fn is_unreserved(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"-._~".contains(&b)
-}
-
-fn is_sub_delim(b: u8) -> bool {
-    b"!$&'()*+,;=".contains(&b)
-}
-
 /// RFC 3986 characters: unreserved ones, sub-delims, `%` and two hex
 /// digits, and the bytes in `extra`.
 fn is_uri_chars(s: &str, extra: &[u8]) -> bool {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            let hex = |j: usize| b.get(j).is_some_and(|c| c.is_ascii_hexdigit());
-            if !(hex(i + 1) && hex(i + 2)) {
-                return false;
-            }
-            i += 3;
-        } else if is_unreserved(b[i]) || is_sub_delim(b[i]) || extra.contains(&b[i]) {
-            i += 1;
-        } else {
-            return false;
-        }
-    }
-    true
+    ascii::is_uri_component(s.as_bytes(), extra)
 }
 
 /// RFC 3986 `scheme`: a letter, then letters, digits, `+`, `-` and `.`.
@@ -954,7 +931,7 @@ fn is_authority(a: &str) -> bool {
     };
     let (host_ok, port) = match host_port.strip_prefix('[') {
         Some(r) => match r.split_once(']') {
-            Some((literal, after)) => (is_ip_literal(literal), after),
+            Some((literal, after)) => (ascii::is_uri_ip_literal(literal), after),
             None => return false,
         },
         None => match host_port.rfind(':') {
@@ -967,26 +944,6 @@ fn is_authority(a: &str) -> bool {
             .strip_prefix(':')
             .is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit()));
     host_ok && port_ok
-}
-
-/// The inside of an RFC 3986 `IP-literal`: an IPv6 address, or
-/// `IPvFuture`.
-fn is_ip_literal(s: &str) -> bool {
-    if s.parse::<core::net::Ipv6Addr>().is_ok() {
-        return true;
-    }
-    let Some(rest) = s.strip_prefix(['v', 'V']) else {
-        return false;
-    };
-    let Some((version, addr)) = rest.split_once('.') else {
-        return false;
-    };
-    !version.is_empty()
-        && version.bytes().all(|b| b.is_ascii_hexdigit())
-        && !addr.is_empty()
-        && addr
-            .bytes()
-            .all(|b| is_unreserved(b) || is_sub_delim(b) || b == b':')
 }
 
 /// RFC 3986 `URI-reference`, not empty: a URI, or a relative reference.
@@ -1898,9 +1855,7 @@ fn is_foundation(s: &str) -> bool {
 /// The SIP `token` of RFC 3261, section 25, which ICE uses for transports,
 /// candidate types and extension names.
 fn is_sip_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-.!%*_+`'~".contains(&b))
+    !s.is_empty() && s.bytes().all(ascii::is_sip_token_byte)
 }
 
 /// `extension-att-value`: visible ASCII, possibly none.
@@ -3656,6 +3611,42 @@ mod tests {
         syntax_edits! {
             16, 't', |d| d.times[1].start = 1;
             15, 'z', |d| d.times[0].zones[0].time = MIN_TIME - 1;
+        }
+    }
+
+    #[test]
+    fn uri_lexical_policies() {
+        for (uri, valid) in [
+            ("http://user:pass@a%2f+b:65536/a%00%ff?x=:@/?#:@/?", true),
+            ("http://a:999999999999999999999999/", true),
+            ("http://[Vf.a:b]:/", true),
+            ("http://[::1]/", true),
+            ("http:///", true),
+            ("a;b,c=d", true),
+            ("?", true),
+            ("#", true),
+            ("", false),
+            ("a%", false),
+            ("a%4", false),
+            ("a%gg", false),
+            ("http://[v1.%41]/", false),
+            ("[x]", false),
+        ] {
+            let bytes = with(&format!("u={uri}\r\nt=0 0\r\n"));
+            let parsed = SessionDescription::parse(&bytes);
+            assert_eq!(parsed.is_ok(), valid, "{uri}");
+            if valid {
+                let description = parsed.unwrap();
+                assert_eq!(description.uri.as_deref(), Some(uri));
+                assert_eq!(
+                    SessionDescription::parse(&description.to_bytes().unwrap()).unwrap(),
+                    description
+                );
+            }
+        }
+        for (token, ice) in [("a+%`", true), ("a{b}", false), ("a$b", false), ("", false)] {
+            assert_eq!(is_sip_token(token), ice, "{token}");
+            assert_eq!(is_token(token), !token.is_empty(), "{token}");
         }
     }
 

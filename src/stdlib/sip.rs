@@ -77,7 +77,9 @@
 //! assert_eq!(Message::parse(&bytes).unwrap().status(), Some(200));
 //! ```
 
-use fictionet::stdlib::codec::ascii::trim_ows_str as trim_ws;
+use fictionet::stdlib::codec::ascii::{
+    self, is_sip_token_byte as is_token_byte, trim_ows_str as trim_ws,
+};
 use fictionet::stdlib::codec::head_body::{self, Header, Scanner};
 use fictionet::stdlib::codec::{Decode, LineError, Step, Wire};
 
@@ -1964,24 +1966,7 @@ fn valid_uri_header(name: &str, value: &str) -> bool {
 /// Whether every byte of `s` is allowed or is part of a `%` escape with
 /// two hex digits.
 fn escaped_ok(s: &str, allowed: fn(u8) -> bool) -> bool {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            let hex = b
-                .get(i + 1..i + 3)
-                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit));
-            if !hex {
-                return false;
-            }
-            i += 3;
-        } else if allowed(b[i]) {
-            i += 1;
-        } else {
-            return false;
-        }
-    }
-    true
+    ascii::is_percent_encoded(s.as_bytes(), allowed)
 }
 
 fn is_unreserved(b: u8) -> bool {
@@ -2002,10 +1987,6 @@ fn is_param_char(b: u8) -> bool {
 
 fn is_header_char(b: u8) -> bool {
     is_unreserved(b) || b"[]/?:+$".contains(&b)
-}
-
-fn is_token_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"-.!%*_+`'~".contains(&b)
 }
 
 /// Whether `s` is a Call-ID word.
@@ -3572,6 +3553,34 @@ mod tests {
         assert!(Message::parse(&bytes).is_ok());
         m.headers[0].value.push('a');
         assert_eq!(m.to_bytes(), Err(Error::TooLong));
+    }
+
+    #[test]
+    fn uri_lexical_policies() {
+        for (uri, valid) in [
+            ("sip:a+%2f%00%ff@h", true),
+            ("sip:h;x=[]/:&+$", true),
+            ("sip:h?x=[]/?:+$", true),
+            ("sip:h?x=", true),
+            ("sip:h:65535", true),
+            ("sip:h:65536", false),
+            ("sip:a%@h", false),
+            ("sip:a%4@h", false),
+            ("sip:a%gg@h", false),
+            ("sip:a[b]@h", false),
+            ("sip:h;x=a,b", false),
+            ("sip:h;x=", false),
+            ("sip:h?x=a,b", false),
+        ] {
+            let parsed = Uri::parse(uri.as_bytes());
+            assert_eq!(parsed.is_ok(), valid, "{uri}");
+            if valid {
+                assert_eq!(wire_text(&parsed.unwrap()).unwrap(), uri);
+            }
+        }
+        for (token, valid) in [("a+%`", true), ("a{b}", false), ("a$b", false), ("", false)] {
+            assert_eq!(is_token(token), valid, "{token}");
+        }
     }
 
     #[test]

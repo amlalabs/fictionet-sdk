@@ -1430,21 +1430,7 @@ fn is_authority(s: &str) -> bool {
 /// Whether `s` is an RFC 3986 registered name: unreserved characters,
 /// sub-delimiters and `%` with two hex digits.
 fn is_reg_name(s: &str) -> bool {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        if c == b'%' {
-            match b.get(i + 1..i + 3) {
-                Some([x, y]) if x.is_ascii_hexdigit() && y.is_ascii_hexdigit() => i += 3,
-                _ => return false,
-            }
-        } else if fictionet::stdlib::codec::ascii::is_uri_reg_name_char(c) {
-            i += 1;
-        } else {
-            return false;
-        }
-    }
-    true
+    fictionet::stdlib::codec::ascii::is_uri_component(s.as_bytes(), b"")
 }
 
 /// Whether `s` is an HTTP token: one or more of the characters RFC 9110
@@ -2773,6 +2759,30 @@ mod tests {
             ("Sec-WebSocket-Extensions", ""),
         ];
         assert_eq!(check_response(&h, key, &[]), Err(Error::Extension));
+    }
+
+    #[test]
+    fn uri_lexical_policies() {
+        for (host, valid) in [
+            ("a%2f+b", true),
+            ("a,b:", true),
+            ("a:65536", true),
+            ("a:999999999999999999999999", true),
+            ("[Vf.a:b]", true),
+            ("", false),
+            ("a%", false),
+            ("a%4", false),
+            ("a%gg", false),
+            ("[v1.%41]", false),
+            ("a@b", false),
+        ] {
+            assert_eq!(check_request(&with("Host", host)).is_ok(), valid, "{host}");
+            let headers = request_headers(host, [0; KEY_LEN], &[]);
+            assert_eq!(headers.is_ok(), valid, "{host}");
+            if valid {
+                assert_eq!(headers.unwrap()[0].1, host);
+            }
+        }
     }
 
     #[test]

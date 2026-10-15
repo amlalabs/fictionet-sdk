@@ -1599,7 +1599,7 @@ fn valid_authority(value: &[u8], require_port: bool) -> bool {
         let host = &value[..at];
         if !host
             .iter()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._~%!$&'()*+;=".contains(b))
+            .all(|b| ascii::is_uri_reg_name_char(*b) || *b == b'%')
         {
             return false;
         }
@@ -2507,6 +2507,34 @@ mod tests {
             };
             assert_eq!(test_support::decode_all(make, b"\r\n").1, None);
             contract::check_decode(make, b"\r\n");
+        }
+    }
+
+    #[test]
+    fn uri_lexical_policies() {
+        for host in [
+            "a%",
+            "a%4",
+            "a%zz",
+            "a%2f+b",
+            "a:",
+            "a:65535",
+            "a:00000000000",
+            "[::1]",
+        ] {
+            let bytes = format!("GET /%zz+ HTTP/1.1\r\nHost:{host}\r\n\r\n");
+            let head = RequestHead::parse(bytes.as_bytes()).unwrap();
+            assert_eq!(head.target, "/%zz+");
+            assert_eq!(head.headers[0].value, host.as_bytes());
+            assert_eq!(head.to_bytes().unwrap(), bytes.as_bytes());
+        }
+        for host in ["a,b", "a:65536", "a:18446744073709551616", "[v1.a]", "a@b"] {
+            let bytes = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            assert_eq!(
+                RequestHead::parse(bytes.as_bytes()),
+                Err(Error::Host),
+                "{host}"
+            );
         }
     }
 
