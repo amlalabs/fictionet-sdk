@@ -144,6 +144,25 @@ fn observe_prints_json_lines() {
 
 /// A scripted observer peer, with the same replies for each request.
 fn with_observer(replies: &[(u8, &[u8])], requests: usize, run: impl FnOnce(&str)) {
+    use fictionet::relay::{Message, unix};
+
+    with_observer_action(
+        requests,
+        |peer, id| {
+            for &(flags, body) in replies {
+                unix::send(peer, &Message::Reply { id, flags, body }.encode(), false).unwrap();
+            }
+        },
+        run,
+    );
+}
+
+/// A scripted observer peer that runs an action for each request.
+fn with_observer_action(
+    requests: usize,
+    mut reply: impl FnMut(std::os::fd::RawFd, u32) + Send,
+    run: impl FnOnce(&str),
+) {
     use fictionet::relay::{self, Message, unix};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -191,14 +210,7 @@ fn with_observer(replies: &[(u8, &[u8])], requests: usize, run: impl FnOnce(&str
                     let Message::Request { id, .. } = relay::decode(&buf[..n]).unwrap() else {
                         panic!("expected an observer request");
                     };
-                    for &(flags, body) in replies {
-                        unix::send(
-                            peer.as_raw_fd(),
-                            &Message::Reply { id, flags, body }.encode(),
-                            false,
-                        )
-                        .unwrap();
-                    }
+                    reply(peer.as_raw_fd(), id);
                 }
             }
         });
@@ -305,40 +317,291 @@ fn dashboard_inspects_envelopes_for_json_and_streams() {
         ),
     ] {
         with_observer(&[(END, bytes.as_bytes())], requests, |path| {
-            let token_file = format!("{path}.token");
-            std::fs::write(&token_file, "dashboard-test-token\n").unwrap();
-            let mut child = Command::new(BIN)
-                .args([
-                    "dashboard",
-                    "--world",
-                    &format!("unix:{path}"),
-                    "--listen",
-                    "127.0.0.1:0",
-                    "--token-file",
-                    &token_file,
-                ])
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut line = String::new();
-            BufReader::new(child.stdout.take().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            let port = line
-                .trim_end()
-                .rsplit(':')
-                .next()
-                .unwrap()
-                .trim_end_matches('/')
-                .parse()
-                .unwrap();
-            let (head, body) = get(port, route);
-            child.kill().unwrap();
-            child.wait().unwrap();
-            std::fs::remove_file(token_file).unwrap();
-            assert_eq!(head, format!("HTTP/1.1 {status}"));
-            assert_eq!(body, expected);
+            with_dashboard(path, |port| {
+                let (head, body) = get(port, route);
+                assert_eq!(head, format!("HTTP/1.1 {status}"));
+                assert_eq!(body, expected);
+            });
         });
+    }
+}
+
+/// Runs a dashboard and cleans up its child and token file even on panic.
+fn with_dashboard(path: &str, run: impl FnOnce(u16)) {
+    let token_file = format!("{path}.token");
+    std::fs::write(&token_file, "dashboard-test-token\n").unwrap();
+    let mut child = Command::new(BIN)
+        .args([
+            "dashboard",
+            "--world",
+            &format!("unix:{path}"),
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            &token_file,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let port = line
+            .trim_end()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .trim_end_matches('/')
+            .parse()
+            .unwrap();
+        run(port);
+    }));
+    let cleanup = [
+        child.kill(),
+        child.wait().map(|_| ()),
+        std::fs::remove_file(token_file),
+    ];
+    if let Err(panic) = outcome {
+        for result in cleanup {
+            if let Err(error) = result {
+                eprintln!("dashboard cleanup failed during panic: {error}");
+            }
+        }
+        std::panic::resume_unwind(panic);
+    }
+    for result in cleanup {
+        result.unwrap();
+    }
+}
+
+#[test]
+fn dashboard_cleanup_preserves_callback_panic() {
+    let path = temp_socket();
+    let listening = start_world(&path);
+    let token_file = format!("{path}.token");
+    let outcome = std::panic::catch_unwind(|| {
+        with_dashboard(&path, |_| {
+            assert!(std::path::Path::new(&token_file).exists());
+            panic!("dashboard callback failed");
+        });
+    });
+    let panic = outcome.expect_err("the callback panic must propagate");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"dashboard callback failed")
+    );
+    assert!(!std::path::Path::new(&token_file).exists());
+    drop(listening);
+    std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).unwrap();
+}
+
+/// Opens an SSE connection and checks its response headers.
+fn sse_connection(port: u16, route: &str) -> BufReader<TcpStream> {
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    write!(
+        conn,
+        "GET {route} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer dashboard-test-token\r\n\r\n"
+    )
+    .unwrap();
+    let mut reader = BufReader::new(conn);
+    let mut headers = String::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        headers.push_str(&line);
+        if line == "\r\n" {
+            break;
+        }
+    }
+    assert_eq!(
+        headers,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+    );
+    reader
+}
+
+/// Reads one complete SSE frame, including its terminating blank line.
+fn sse_frame(reader: &mut impl BufRead) -> String {
+    let mut frame = String::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        frame.push_str(&line);
+        if line == "\n" {
+            return frame;
+        }
+    }
+}
+
+#[test]
+fn dashboard_sse_keeps_partial_replies_across_heartbeats() {
+    use fictionet::relay::{END, MORE, Message, unix};
+
+    for (route, links) in [
+        ("/api/watch", vec![None]),
+        ("/api/packets?link=e3,e7", vec![Some("e3"), Some("e7")]),
+    ] {
+        let (resume, heartbeat) = std::sync::mpsc::channel();
+        with_observer_action(
+            links.len(),
+            move |peer, id| {
+                unix::send(
+                    peer,
+                    &Message::Reply {
+                        id,
+                        flags: MORE,
+                        body: br#"{"event":"packet","data":"#,
+                    }
+                    .encode(),
+                    false,
+                )
+                .unwrap();
+                heartbeat.recv_timeout(Duration::from_secs(15)).unwrap();
+                for (flags, body) in [
+                    (0, br#"{"seq":1}}"#.as_slice()),
+                    (END, br#"{"event":"end","data":{"reason":"closed"}}"#),
+                ] {
+                    unix::send(peer, &Message::Reply { id, flags, body }.encode(), false).unwrap();
+                }
+            },
+            |path| {
+                with_dashboard(path, |port| {
+                    let mut reader = sse_connection(port, route);
+                    for link in &links {
+                        assert_eq!(sse_frame(&mut reader), ": ping\n\n");
+                        resume.send(()).unwrap();
+                        let (data, end_name, end_data) = match link {
+                            Some(link) => (
+                                format!(r#"{{"link":"{link}","seq":1}}"#),
+                                "link_end",
+                                format!(r#"{{"link":"{link}","reason":"closed"}}"#),
+                            ),
+                            None => (
+                                r#"{"seq":1}"#.into(),
+                                "end",
+                                r#"{"reason":"closed"}"#.into(),
+                            ),
+                        };
+                        assert_eq!(
+                            sse_frame(&mut reader),
+                            format!("event: packet\ndata: {data}\n\n")
+                        );
+                        assert_eq!(
+                            sse_frame(&mut reader),
+                            format!("event: {end_name}\ndata: {end_data}\n\n")
+                        );
+                    }
+                    let mut rest = String::new();
+                    reader.read_to_string(&mut rest).unwrap();
+                    assert_eq!(
+                        rest,
+                        if links.len() == 1 {
+                            ""
+                        } else {
+                            "event: end\ndata: {\"reason\":\"every link closed\"}\n\n"
+                        }
+                    );
+                });
+            },
+        );
+    }
+}
+
+#[test]
+fn dashboard_sse_ends_on_world_close_even_during_a_reply() {
+    use fictionet::relay::{MORE, Message, unix};
+
+    for (route, requests, reason) in [
+        ("/api/watch", 1, "the world closed"),
+        ("/api/packets?link=e3,e7", 2, "every link closed"),
+    ] {
+        for partial in [false, true] {
+            let mut remaining = requests;
+            with_observer_action(
+                requests,
+                |peer, id| {
+                    remaining -= 1;
+                    if partial && remaining == 0 {
+                        unix::send(
+                            peer,
+                            &Message::Reply {
+                                id,
+                                flags: MORE,
+                                body: br#"{"event":"packet","data":"#,
+                            }
+                            .encode(),
+                            false,
+                        )
+                        .unwrap();
+                    }
+                },
+                |path| {
+                    with_dashboard(path, |port| {
+                        let mut reader = sse_connection(port, route);
+                        let mut body = String::new();
+                        reader.read_to_string(&mut body).unwrap();
+                        assert_eq!(
+                            body,
+                            format!("event: end\ndata: {{\"reason\":\"{reason}\"}}\n\n")
+                        );
+                    });
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn dashboard_sse_heartbeat_releases_an_idle_observer_after_browser_disconnect() {
+    use fictionet::relay::unix;
+    use std::os::fd::AsRawFd;
+
+    for (route, requests) in [("/api/watch", 1), ("/api/packets?link=e3,e7", 2)] {
+        let (closed, done) = std::sync::mpsc::channel();
+        let mut remaining = requests;
+        with_observer_action(
+            requests,
+            |peer, _| {
+                remaining -= 1;
+                if remaining == 0 {
+                    unix::set_timeout(peer, libc::SO_RCVTIMEO, Some(Duration::from_secs(15)))
+                        .unwrap();
+                    let mut buf = [0; 1];
+                    assert_eq!(unix::recv(peer, &mut buf, false).unwrap(), 0);
+                    closed.send(()).unwrap();
+                }
+            },
+            |path| {
+                with_dashboard(path, |port| {
+                    let mut reader = sse_connection(port, route);
+                    assert_eq!(sse_frame(&mut reader), ": ping\n\n");
+                    // Reset the browser connection so the next heartbeat fails to write.
+                    let linger = libc::linger {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
+                    // SAFETY: the socket and linger value are valid for this call.
+                    assert_eq!(
+                        unsafe {
+                            libc::setsockopt(
+                                reader.get_ref().as_raw_fd(),
+                                libc::SOL_SOCKET,
+                                libc::SO_LINGER,
+                                (&raw const linger).cast(),
+                                std::mem::size_of_val(&linger) as libc::socklen_t,
+                            )
+                        },
+                        0
+                    );
+                    drop(reader);
+                    done.recv_timeout(Duration::from_secs(15)).unwrap();
+                });
+            },
+        );
     }
 }
 
