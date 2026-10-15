@@ -419,30 +419,7 @@ impl Decode for RequestEvents {
         self.core.capacity()
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
-        if let Some(step) = self.core.body(input, eof)? {
-            return Ok(step);
-        }
-        if self.core.scanned == 0 {
-            if input == b"\r" {
-                return Ok(Step::Need);
-            }
-            if input.starts_with(b"\r\n") {
-                if self.empty_lines >= MAX_EMPTY_LINES {
-                    return Err(Error::StartLine);
-                }
-                self.empty_lines = self.empty_lines.saturating_add(1);
-                self.core.lines = Lines::new(self.core.limits.start_line, Ending::Crlf);
-                return Ok(Step::Skip(2));
-            }
-        }
-        let Some(n) = self.core.head(input)? else {
-            return Ok(Step::Need);
-        };
-        let (head, info, framing) = request_head(&input[..n])?;
-        self.empty_lines = 0;
-        self.core
-            .begin(framing, info.close || head.method == "CONNECT");
-        Ok(Step::Item(Event::Head(head), n))
+        Ok(self.scan(input, eof)?.map(BorrowedEvent::into_owned))
     }
 }
 
@@ -521,28 +498,7 @@ impl Decode for ResponseEvents {
         self.methods.len()
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
-        if let Some(step) = self.core.body(input, eof)? {
-            return Ok(step);
-        }
-        let Some(n) = self.core.head(input)? else {
-            return Ok(Step::Need);
-        };
-        let (head, info) = response_head(&input[..n])?;
-        let method = self.methods.front().copied().unwrap_or(Method::Other);
-        let framing = if self.strict {
-            writable_response(&head, info, method)?
-        } else {
-            response_framing(&head, info, method)?
-        };
-        response_size(&head, self.core.limits)?;
-        let tunnel =
-            head.status == 101 || (method == Method::Connect && (200..300).contains(&head.status));
-        if head.status >= 200 {
-            self.methods.pop_front();
-        }
-        self.core
-            .begin(framing, (head.status >= 200 && info.close) || tunnel);
-        Ok(Step::Item(Event::Head(head), n))
+        Ok(self.scan(input, eof)?.map(BorrowedEvent::into_owned))
     }
 }
 
@@ -705,13 +661,62 @@ struct Message {
     wire_limit: usize,
 }
 
+// Body spans borrow the driver's unread bytes until a public event needs ownership.
+enum BorrowedEvent<'a, H> {
+    Head(H),
+    Body(&'a [u8]),
+    Done,
+}
+
+impl<H> BorrowedEvent<'_, H> {
+    fn into_owned(self) -> Event<H> {
+        match self {
+            Self::Head(head) => Event::Head(head),
+            Self::Body(data) => Event::Body(data.to_vec()),
+            Self::Done => Event::Done,
+        }
+    }
+}
+
 // What a whole-message decoder needs from its streaming decoder.
-trait Framed<H>: Decode<Item = Event<H>, Error = Error> {
+trait Framed<H> {
+    fn scan<'a>(&mut self, input: &'a [u8], eof: bool)
+    -> Result<Step<BorrowedEvent<'a, H>>, Error>;
     fn reader(&self) -> &Reader;
     fn parse_head(bytes: &[u8]) -> Result<H, Error>;
 }
 
 impl Framed<RequestHead> for RequestEvents {
+    fn scan<'a>(
+        &mut self,
+        input: &'a [u8],
+        eof: bool,
+    ) -> Result<Step<BorrowedEvent<'a, RequestHead>>, Error> {
+        if let Some(step) = self.core.body(input, eof)? {
+            return Ok(step);
+        }
+        if self.core.scanned == 0 {
+            if input == b"\r" {
+                return Ok(Step::Need);
+            }
+            if input.starts_with(b"\r\n") {
+                if self.empty_lines >= MAX_EMPTY_LINES {
+                    return Err(Error::StartLine);
+                }
+                self.empty_lines = self.empty_lines.saturating_add(1);
+                self.core.lines = Lines::new(self.core.limits.start_line, Ending::Crlf);
+                return Ok(Step::Skip(2));
+            }
+        }
+        let Some(n) = self.core.head(input)? else {
+            return Ok(Step::Need);
+        };
+        let (head, info, framing) = request_head(&input[..n])?;
+        self.empty_lines = 0;
+        self.core
+            .begin(framing, info.close || head.method == "CONNECT");
+        Ok(Step::Item(BorrowedEvent::Head(head), n))
+    }
     fn reader(&self) -> &Reader {
         &self.core
     }
@@ -721,6 +726,34 @@ impl Framed<RequestHead> for RequestEvents {
 }
 
 impl Framed<ResponseHead> for ResponseEvents {
+    fn scan<'a>(
+        &mut self,
+        input: &'a [u8],
+        eof: bool,
+    ) -> Result<Step<BorrowedEvent<'a, ResponseHead>>, Error> {
+        if let Some(step) = self.core.body(input, eof)? {
+            return Ok(step);
+        }
+        let Some(n) = self.core.head(input)? else {
+            return Ok(Step::Need);
+        };
+        let (head, info) = response_head(&input[..n])?;
+        let method = self.methods.front().copied().unwrap_or(Method::Other);
+        let framing = if self.strict {
+            writable_response(&head, info, method)?
+        } else {
+            response_framing(&head, info, method)?
+        };
+        response_size(&head, self.core.limits)?;
+        let tunnel =
+            head.status == 101 || (method == Method::Connect && (200..300).contains(&head.status));
+        if head.status >= 200 {
+            self.methods.pop_front();
+        }
+        self.core
+            .begin(framing, (head.status >= 200 && info.close) || tunnel);
+        Ok(Step::Item(BorrowedEvent::Head(head), n))
+    }
     fn reader(&self) -> &Reader {
         &self.core
     }
@@ -767,9 +800,9 @@ impl Message {
         let window = &input[..input.len().min(self.wire_limit)];
         loop {
             let rest = window.get(self.scanned..).ok_or(Error::State)?;
-            let step = inner.decode(rest, eof && input.len() <= self.wire_limit)?;
+            let step = inner.scan(rest, eof && input.len() <= self.wire_limit)?;
             let used = match step {
-                Step::Item(Event::Head(_), n) => {
+                Step::Item(BorrowedEvent::Head(_), n) => {
                     if self.head_bytes.is_some() {
                         return Err(Error::State);
                     }
@@ -777,7 +810,7 @@ impl Message {
                     self.framing = inner.reader().state;
                     n
                 }
-                Step::Item(Event::Body(data), n) => {
+                Step::Item(BorrowedEvent::Body(data), n) => {
                     self.body_bytes = self
                         .body_bytes
                         .checked_add(data.len())
@@ -785,7 +818,7 @@ impl Message {
                         .ok_or(Error::BodyTooLong)?;
                     n
                 }
-                Step::Item(Event::Done, n) => {
+                Step::Item(BorrowedEvent::Done, n) => {
                     let used = self.scanned.checked_add(n).ok_or(Error::MessageTooLong)?;
                     let head_bytes = self.head_bytes.take().ok_or(Error::State)?;
                     let bytes = window.get(..used).ok_or(Error::State)?;
@@ -845,12 +878,12 @@ fn collect_body(
     loop {
         let rest = bytes.get(at..).ok_or(Error::State)?;
         let n = match reader.body::<()>(rest, true)? {
-            Some(Step::Item(Event::Body(data), n)) => {
-                body.extend_from_slice(&data);
+            Some(Step::Item(BorrowedEvent::Body(data), n)) => {
+                body.extend_from_slice(data);
                 n
             }
             Some(Step::Skip(n)) => n,
-            Some(Step::Item(Event::Done, _)) if rest.is_empty() && body.len() == size => {
+            Some(Step::Item(BorrowedEvent::Done, _)) if rest.is_empty() && body.len() == size => {
                 return Ok(body);
             }
             _ => return Err(Error::State),
@@ -1185,7 +1218,11 @@ impl Reader {
         };
         self.lines = Lines::new(MAX_CHUNK_LINE, Ending::Crlf);
     }
-    fn body<H>(&mut self, input: &[u8], eof: bool) -> Result<Option<Step<Event<H>>>, Error> {
+    fn body<'a, H>(
+        &mut self,
+        input: &'a [u8],
+        eof: bool,
+    ) -> Result<Option<Step<BorrowedEvent<'a, H>>>, Error> {
         let step = match self.state {
             State::Head => return Ok(None),
             State::Boundary => {
@@ -1202,7 +1239,7 @@ impl Reader {
             State::End => Step::End,
             State::Done => {
                 self.state = State::Boundary;
-                Step::Item(Event::Done, 0)
+                Step::Item(BorrowedEvent::Done, 0)
             }
             State::Length(left) | State::Data(left) => {
                 let n = usize::try_from(left)
@@ -1218,16 +1255,16 @@ impl Reader {
                         _ if remaining == 0 => State::DataEnd,
                         _ => State::Data(remaining),
                     };
-                    Step::Item(Event::Body(input[..n].to_vec()), n)
+                    Step::Item(BorrowedEvent::Body(&input[..n]), n)
                 }
             }
             State::Close => {
                 let n = input.len().min(self.limits.body_chunk);
                 if n == self.limits.body_chunk || (eof && n != 0) {
-                    Step::Item(Event::Body(input[..n].to_vec()), n)
+                    Step::Item(BorrowedEvent::Body(&input[..n]), n)
                 } else if eof {
                     self.state = State::End;
-                    Step::Item(Event::Done, 0)
+                    Step::Item(BorrowedEvent::Done, 0)
                 } else {
                     Step::Need
                 }

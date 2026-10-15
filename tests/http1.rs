@@ -1,10 +1,213 @@
-use fictionet::stdlib::codec::{Stream, Wire};
-use fictionet::stdlib::http1::{Header, Limits, Request, Requests, Response, Responses};
+use fictionet::stdlib::codec::{Decode, Step, Stream, Wire};
+use fictionet::stdlib::http1::{
+    Event, Header, Limits, Request, RequestEvents, Requests, Response, ResponseEvents, Responses,
+};
 use fictionet::stdlib::test_support;
 use fictionet::stdlib::test_support::contract;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+struct CountingAllocator;
+
+thread_local! {
+    static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn count_allocation() {
+    ALLOCATIONS.with(|count| count.set(count.get().map(|n| n + 1)));
+}
+
+// SAFETY: Every operation delegates to System with the original pointer and layout.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        count_allocation();
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        count_allocation();
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        count_allocation();
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ALLOCATIONS.set(None);
+        }
+    }
+    assert_eq!(ALLOCATIONS.replace(Some(0)), None);
+    let _reset = Reset;
+    let value = f();
+    (value, ALLOCATIONS.get().unwrap())
+}
 
 const FIRST: &[u8] = b"POST /tools HTTP/1.1\r\nHost: api.test\r\nTransfer-Encoding: chunked\r\nX-Raw:\t keep \t\r\n\r\n01\r\n{\r\n1\r\n}\r\n000\r\n\r\n";
 const SECOND: &[u8] = b"GET /next HTTP/1.1\r\nHost:api.test\r\n\r\n";
+
+#[test]
+fn whole_message_allocations_do_not_depend_on_body_block_size() {
+    fn check<D: Decode>(make: impl Fn(Limits) -> D, bytes: &[u8])
+    where
+        D::Item: std::fmt::Debug + PartialEq,
+    {
+        let decode = |body_chunk, bytewise| {
+            let mut decoder = make(Limits {
+                body_chunk,
+                ..Limits::default()
+            });
+            let (step, count) = allocations(|| {
+                if bytewise {
+                    for end in 0..bytes.len() {
+                        assert!(matches!(
+                            decoder.decode(&bytes[..end], false),
+                            Ok(Step::Need)
+                        ));
+                    }
+                }
+                decoder.decode(bytes, true)
+            });
+            let Step::Item(item, used) = step.unwrap() else {
+                panic!("expected a complete message");
+            };
+            assert_eq!(used, bytes.len());
+            (item, count)
+        };
+        for bytewise in [false, true] {
+            let (small, small_count) = decode(1, bytewise);
+            let (large, large_count) = decode(8192, bytewise);
+            assert_eq!(small, large);
+            assert_eq!(small_count, large_count, "body blocks must stay borrowed");
+        }
+    }
+
+    for bytes in [
+        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello".as_slice(),
+        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n",
+    ] {
+        check(Requests::with_limits, bytes);
+    }
+    for bytes in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice(),
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\n\r\nhello",
+    ] {
+        check(Responses::with_limits, bytes);
+    }
+}
+
+#[test]
+fn public_body_events_allocate_owned_blocks() {
+    fn check<H>(mut decoder: impl Decode<Item = Event<H>>, head: &[u8]) {
+        assert!(
+            matches!(decoder.decode(head, false), Ok(Step::Item(Event::Head(_), n)) if n == head.len())
+        );
+        let mut input = b"hello".to_vec();
+        let (step, count) = allocations(|| decoder.decode(&input, false));
+        let Step::Item(Event::Body(body), used) = step.unwrap() else {
+            panic!("expected a body block");
+        };
+        assert_eq!(count, 1);
+        assert_eq!(used, input.len());
+        input.fill(b'x');
+        assert_eq!(body, b"hello");
+    }
+    check(
+        RequestEvents::new(),
+        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n",
+    );
+    check(
+        ResponseEvents::new(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+    );
+}
+
+#[test]
+fn response_bodies_and_wire_ranges_agree_at_every_input_split() {
+    fn drain<D: Decode>(
+        stream: &mut Stream<D>,
+        items: &mut Vec<(D::Item, std::ops::Range<u64>)>,
+        input: &[u8],
+    ) where
+        D::Error: Clone,
+    {
+        while let Some(result) = stream.with_next(|item, bytes, range| {
+            let start = usize::try_from(range.start).unwrap();
+            let end = usize::try_from(range.end).unwrap();
+            assert_eq!(bytes, &input[start..end]);
+            (item, range)
+        }) {
+            items.push(result.unwrap());
+        }
+    }
+
+    for (head, body, spans) in [
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".as_slice(),
+            b"hello".as_slice(),
+            [0..2, 2..4, 4..5],
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n",
+            [3..5, 5..6, 11..13],
+        ),
+        (b"HTTP/1.1 200 OK\r\n\r\n", b"hello", [0..2, 2..4, 4..5]),
+    ] {
+        let input = [head, body].concat();
+        let response = Response::parse(&input).unwrap();
+        assert_eq!(response.body, b"hello");
+        let end = u64::try_from(input.len()).unwrap();
+        let head_end = u64::try_from(head.len()).unwrap();
+        let mut expected = vec![(Event::Head(response.head.clone()), 0..head_end)];
+        for span in spans {
+            let range = head_end + u64::try_from(span.start).unwrap()
+                ..head_end + u64::try_from(span.end).unwrap();
+            expected.push((Event::Body(body[span].to_vec()), range));
+        }
+        expected.push((Event::Done, end..end));
+        let limits = Limits {
+            body_chunk: 2,
+            body: 5,
+            message: input.len(),
+            ..Limits::default()
+        };
+        for split in 0..=input.len() {
+            let mut events = Stream::new(ResponseEvents::with_limits(limits));
+            let mut messages = Stream::new(Responses::with_limits(limits));
+            let mut decoded_events = Vec::new();
+            let mut decoded_messages = Vec::new();
+            for part in [Some(&input[..split]), Some(&input[split..]), None] {
+                if let Some(part) = part {
+                    assert_eq!(events.push(part), part.len());
+                    assert_eq!(messages.push(part), part.len());
+                } else {
+                    events.end();
+                    messages.end();
+                }
+                drain(&mut events, &mut decoded_events, &input);
+                drain(&mut messages, &mut decoded_messages, &input);
+            }
+            assert_eq!(decoded_events, expected);
+            assert_eq!(decoded_messages, [(response.clone(), 0..end)]);
+            assert!(events.is_done());
+            assert!(messages.is_done());
+        }
+    }
+}
 
 #[test]
 fn keep_alive_requests_decode_and_round_trip_at_each_chunking() {
