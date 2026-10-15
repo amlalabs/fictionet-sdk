@@ -2,20 +2,14 @@
 
 use fictionet::stdlib::codec::Collect;
 use fictionet::stdlib::http1::{
-    Header, Limits, MAX_PENDING_REQUESTS, Response, ResponseEvents, ResponseHead, Version,
+    Header, MAX_PENDING_REQUESTS, Response, ResponseEvents, ResponseHead, Version,
 };
 use fictionet::stdlib::test_support::contract;
+use fictionet_fuzz::http1::event_limits;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let limits = Limits {
-        start_line: 256,
-        header_line: 256,
-        headers: 16,
-        head: 2048,
-        body_chunk: 31,
-        ..Limits::default()
-    };
+    let limits = event_limits();
     for method in ["GET", "HEAD", "CONNECT"] {
         let make = || {
             let mut decoder = ResponseEvents::with_limits(limits);

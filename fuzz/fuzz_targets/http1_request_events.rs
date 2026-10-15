@@ -1,21 +1,13 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Collect;
-use fictionet::stdlib::http1::{
-    Chunk, Header, Limits, Request, RequestEvents, RequestHead, Version,
-};
+use fictionet::stdlib::http1::{Chunk, Header, Request, RequestEvents, RequestHead, Version};
 use fictionet::stdlib::test_support::contract;
+use fictionet_fuzz::http1::event_limits;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let limits = Limits {
-        start_line: 256,
-        header_line: 256,
-        headers: 16,
-        head: 2048,
-        body_chunk: 31,
-        ..Limits::default()
-    };
+    let limits = event_limits();
     contract::check_decode_limits(|| RequestEvents::with_limits(limits), data, 0, 4096);
     contract::check_decode(|| Collect::<Request>::new(4096), data);
     contract::check_wire::<Request>(data);

@@ -3,20 +3,13 @@
 use fictionet::stdlib::codec::{Stream, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::http1::{Limits, Request, Requests};
+use fictionet::stdlib::http1::{Request, Requests};
 use fictionet::stdlib::test_support;
+use fictionet_fuzz::http1::message_limits;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let limits = Limits {
-        start_line: 256,
-        header_line: 256,
-        headers: 16,
-        head: 2048,
-        body_chunk: 31,
-        body: 1024,
-        message: 4096,
-    };
+    let limits = message_limits();
     let make = || Requests::with_limits(limits);
     contract::check_decode_limits(make, data, 3072, 8194);
     // Also exercise valid pipelined messages with arbitrary body bytes.
