@@ -2230,6 +2230,50 @@ fn ip_version(endpoints: &Endpoints) -> Version {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Error, LSA_HEADER_LEN, Lsa, LsaBody, LsaBodyFrame, LsaFrame, MAX_LSA, Version};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks standalone LSA and body wire contracts, parsed write-back,
+    /// header checksum and length, and the body parse limit on one buffer.
+    pub fn check_lsa(data: &[u8], v: Version) {
+        contract::check_wire::<LsaFrame>(data);
+        contract::check_wire::<LsaBodyFrame>(data);
+        if let Ok((lsa, n)) = Lsa::parse(data, v) {
+            // An LSA read writes back to the same bytes, so its header is the
+            // one received (RFC 2328 sections 13.1 and 13.7).
+            assert!(n <= data.len());
+            let bytes = lsa.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
+            assert_eq!(bytes, data[..n]);
+            let h = lsa.header(v).unwrap();
+            assert_eq!(
+                (h.checksum, usize::from(h.length)),
+                (u16::from_be_bytes([data[16], data[17]]), n)
+            );
+        }
+        // The bytes after a header as a body, read directly: it is capped at
+        // what an LSA holds, and a body read writes back to the same bytes.
+        if data.len() >= LSA_HEADER_LEN {
+            let body = &data[LSA_HEADER_LEN..];
+            let t = match v {
+                Version::V2 => u16::from(data[3]),
+                Version::V3 => u16::from_be_bytes([data[2], data[3]]),
+            };
+            match LsaBody::parse(body, v, t) {
+                Ok(b) => assert_eq!(
+                    b.frame(v, t).and_then(|frame| frame.to_bytes()).as_deref(),
+                    Ok(body)
+                ),
+                Err(e) => assert!(body.len() <= MAX_LSA - LSA_HEADER_LEN || e == Error::TooLong),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3546,6 +3590,17 @@ mod tests {
     }
 
     #[test]
+    fn lsa_harness_checks_oversized_body() {
+        // lsa_body_parse_is_capped checks the limit directly. Exercise the
+        // shared oracle too, with a valid header and an oversized body.
+        for (lsas, v) in [(v2_lsas(), Version::V2), (v3_lsas(), Version::V3)] {
+            let mut bytes = lsas[0].frame(v).and_then(|frame| frame.to_bytes()).unwrap();
+            bytes.resize(MAX_LSA + 1, 0);
+            harness::check_lsa(&bytes, v);
+        }
+    }
+
+    #[test]
     fn update_keeps_the_lsas_around_a_bad_one() {
         // RFC 2328 section 13, step 1: discard the bad LSA and go on.
         let e = v4_ends();
@@ -4258,7 +4313,8 @@ mod tests {
         }
     }
 
-    /// What the fuzz target checks, for one buffer.
+    /// Checks packet collection and frame round trips for these endpoints,
+    /// and the shared standalone LSA oracle for both versions on this buffer.
     fn check_bytes(data: &[u8], e: &Endpoints) {
         let parsed = Packet::parse(data, e);
         assert_eq!(collect(data, e), parsed);
@@ -4269,32 +4325,7 @@ mod tests {
             assert_eq!(Packet::parse(&b, e).as_ref(), Ok(p));
         }
         for v in [Version::V2, Version::V3] {
-            if let Ok((l, n)) = Lsa::parse(data, v) {
-                // An LSA read writes back to the same bytes, so its header
-                // and checksum are the ones received.
-                assert!(n <= data.len());
-                let b = l.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
-                assert_eq!(b, data[..n]);
-                assert_eq!(
-                    l.header(v).map(|h| (h.checksum, h.length)),
-                    Ok((be16(data, 16).unwrap(), n as u16))
-                );
-            }
-            if data.len() >= LSA_HEADER_LEN {
-                let t = if v == Version::V2 {
-                    u16::from(data[3])
-                } else {
-                    be16(data, 2).unwrap()
-                };
-                if let Ok(body) = LsaBody::parse(&data[LSA_HEADER_LEN..], v, t) {
-                    assert_eq!(
-                        body.frame(v, t)
-                            .and_then(|frame| frame.to_bytes())
-                            .as_deref(),
-                        Ok(&data[LSA_HEADER_LEN..])
-                    );
-                }
-            }
+            harness::check_lsa(data, v);
         }
     }
 

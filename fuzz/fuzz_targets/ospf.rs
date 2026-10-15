@@ -14,11 +14,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::ospf::{
     ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body,
-    DatabaseDescription, Error, ExternalRoute, Header, HelloV2, HelloV3, InterAreaPrefixLsa,
-    InterAreaRouterLsa, IntraAreaPrefixLsa, LSA_HEADER_LEN, LinkLsa, Lsa, LsaBody, LsaHeader,
-    LsaKey, MAX_LSA, MAX_MESSAGE, MAX_PACKET, NetworkLsa, NetworkLsaV3, OPTION_L_V2, OPTION_L_V3,
-    Packet, Prefix, RouterInterface, RouterLink, RouterLsa, RouterLsaV3, SummaryLsa, TosMetric,
-    Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
+    DatabaseDescription, ExternalRoute, Header, HelloV2, HelloV3, InterAreaPrefixLsa,
+    InterAreaRouterLsa, IntraAreaPrefixLsa, LinkLsa, Lsa, LsaBody, LsaHeader, LsaKey, MAX_MESSAGE,
+    MAX_PACKET, NetworkLsa, NetworkLsaV3, OPTION_L_V2, OPTION_L_V3, Packet, Prefix,
+    RouterInterface, RouterLink, RouterLsa, RouterLsaV3, SummaryLsa, TosMetric, Version, checksum,
+    lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
 use fictionet::stdlib::{
     codec::{Collect, Wire},
@@ -61,36 +61,7 @@ fn check(data: &[u8], e: &Endpoints) {
 }
 
 fn check_lsa(data: &[u8], v: Version) {
-    contract::check_wire::<ospf::LsaFrame>(data);
-    contract::check_wire::<ospf::LsaBodyFrame>(data);
-    if let Ok((lsa, n)) = Lsa::parse(data, v) {
-        // An LSA read writes back to the same bytes, so its header is the
-        // one received (RFC 2328 sections 13.1 and 13.7).
-        assert!(n <= data.len());
-        let bytes = lsa.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
-        assert_eq!(bytes, data[..n]);
-        let h = lsa.header(v).unwrap();
-        assert_eq!(
-            (h.checksum, usize::from(h.length)),
-            (u16::from_be_bytes([data[16], data[17]]), n)
-        );
-    }
-    // The bytes after a header as a body, read directly: it is capped at
-    // what an LSA holds, and a body read writes back to the same bytes.
-    if data.len() >= LSA_HEADER_LEN {
-        let body = &data[LSA_HEADER_LEN..];
-        let t = match v {
-            Version::V2 => u16::from(data[3]),
-            Version::V3 => u16::from_be_bytes([data[2], data[3]]),
-        };
-        match LsaBody::parse(body, v, t) {
-            Ok(b) => assert_eq!(
-                b.frame(v, t).and_then(|frame| frame.to_bytes()).as_deref(),
-                Ok(body)
-            ),
-            Err(e) => assert!(body.len() <= MAX_LSA - LSA_HEADER_LEN || e == Error::TooLong),
-        }
-    }
+    ospf::harness::check_lsa(data, v);
 }
 
 fn ip4(u: &mut Unstructured) -> Result<Ipv4Addr> {
