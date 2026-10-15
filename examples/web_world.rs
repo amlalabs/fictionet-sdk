@@ -13,7 +13,10 @@
 //!
 //! - `example.test` and `www.example.test`: an axum app over HTTPS. `/`
 //!   answers with the request's [`web::Target`] and HTTP version, `/count`
-//!   with how many times it was asked. Port 80 redirects to https.
+//!   with how many times it was asked. `/challenge` returns a 32-byte nonce,
+//!   hex-encoded with a trailing newline. It is drawn once at startup from
+//!   the world's seeded random stream and stays fixed for that world.
+//!   Port 80 redirects to https.
 //!   Both live at 203.0.113.10 and 2001:db8:113::10.
 //! - `shared.test`: a plain HTTP site at the same addresses, with no TLS.
 //! - `plain.test`: a plain HTTP site with addresses of its own, from
@@ -110,7 +113,17 @@ fn start(
     key: PrivateKeyDer<'static>,
     attachments: fictionet::Attachments,
 ) -> Result {
-    web::Sites::new(sites(fcx, chain, key, app(), plain())?).start(fcx, attachments)
+    let mut nonce = [0u8; 32];
+    fcx.fill_random(&mut nonce);
+    let challenge = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>() + "\n";
+    let app = app().route(
+        "/challenge",
+        get(move || {
+            let challenge = challenge.clone();
+            async move { challenge }
+        }),
+    );
+    web::Sites::new(sites(fcx, chain, key, app, plain())?).start(fcx, attachments)
 }
 
 /// The HTTPS app, shared by all four HTTPS names.

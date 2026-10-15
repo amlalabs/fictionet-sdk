@@ -38,6 +38,26 @@ statuses above 128 (signals).
 `eval.py` checks each sample's exit code, exact stdout and empty stderr for
 world answers, or the expected denial message for blocked requests.
 
+The Harbor task fetches `https://example.test/challenge`. The world draws a
+32-byte nonce once at startup from its seeded random stream and serves it as
+64 hex digits followed by a newline. The verifier fetches the same URL with
+the world's CA and compares the complete body with `/app/answer.txt`.
+The public greeting at `/` does not satisfy the task.
+
+Reward also requires only `lo` and `tun0`, failed external DNS, a refused or
+timed-out connection to `1.1.1.1` before TCP connects, no NET_ADMIN capability,
+and route deletion denied with `Operation not permitted`. Missing tools, TLS
+failures and missing or malformed evidence fail. `ANSWER_PATH`, `REWARD_DIR`,
+`NET_CLASS_DIR` and `PROC_STATUS` override `/app/answer.txt`, `/logs/verifier`,
+`/sys/class/net` and `/proc/self/status` for tests.
+
+Harbor 0.23 runs the verifier inside `main`. These checks trust that container's
+tools and files. An agent with root can replace tools or tamper with the
+verifier's evidence. Before checking, the verifier removes reward files left
+in the reward directory and starts a fresh `reward.txt` at 0. This task does
+not provide a separate trusted verifier environment. The command fixtures
+test the checks, not resistance to tool tampering inside the container.
+
 The canonical deployment files are `Dockerfile`, `agent.Dockerfile` and
 `compose.yaml` here. `build.sh` runs `package_harbor.py` to copy the Dockerfiles
 and generate `harbor/fictionet-web/environment/docker-compose.yaml`. These three
@@ -84,12 +104,19 @@ that date.
 | E2B, `run_hosted.py` | 19 of 19 pass | 27.7 s to healthy: sandbox 0.6 s, dockerd 4 s, `compose up --build` 23 s. The template build took 26 s, once. |
 | Inspect, `provider=daytona` | 5 of 5 samples correct | 20 to 42 s of sample init, five samples at once |
 | Inspect, `provider=e2b` | 5 of 5 correct, with `--max-samples 1` | 30 to 38 s of sample init |
-| Harbor, `-e docker` | reward 1.0 | |
-| Harbor, `-e daytona` | reward 1.0 | 24 s of environment setup |
+| Harbor, `-e docker` | reward 1.0 with the original greeting verifier | |
+| Harbor, `-e daytona` | reward 1.0 with the original greeting verifier | 24 s of environment setup |
 | Harbor, `-e e2b` | fails, see below | |
 
 The 19-of-19 and 5-of-5 results above predate the exit-status and whole-output
 checks and have not been rerun with them.
+
+On 15 October 2026, the Docker oracle run with the challenge verifier earned
+reward 1.0 using Harbor 0.23.0 and Docker 29.8.1: one trial, no exceptions,
+42 s total job runtime. A run that only wrote the public greeting to
+`/app/answer.txt` earned reward 0, and so did a run that only wrote
+`{"reward": 1.0}` to `/logs/verifier/reward.json`. Daytona was not re-run
+with the challenge task.
 
 In the local Docker run, `build.sh` took 56 s, `up` took 40 to 100 s
 (most of it `apt-get` in the agent's image), `check.sh` 6 to 7 s, and

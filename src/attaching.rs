@@ -744,8 +744,8 @@
 //!
 //! ## Through Harbor
 //!
-//! Harbor runs a task's `environment/docker-compose.yaml` inside one
-//! Daytona sandbox. The agent is the service `main`, built from
+//! Harbor runs a task's `environment/docker-compose.yaml` locally with Docker
+//! or inside one Daytona sandbox. The agent is the service `main`, built from
 //! `environment/Dockerfile`. The task's compose file adds the world and
 //! attach, and puts `main` in attach's network namespace.
 //! `examples/hosted/build.sh` generates the task's `environment/` from the hosted files.
@@ -755,8 +755,18 @@
 //! harbor run -p examples/hosted/harbor/fictionet-web -a oracle -e daytona
 //! ```
 //!
+//! For the local Harbor oracle run, after building the binaries:
+//!
+//! ```sh
+//! pip install harbor
+//! harbor run -p examples/hosted/harbor/fictionet-web -a oracle -e docker
+//! ```
+//!
 //! The `oracle` agent runs the task's `solution/solve.sh`, so no model is
-//! needed. See the hosted README for the
+//! needed. It saves the complete response from `https://example.test/challenge`.
+//! The verifier fetches that world's nonce again and compares the whole body,
+//! then checks isolation. Harbor runs the verifier in `main`, so these checks
+//! trust the container's tools. See the hosted README for the
 //! [tested result](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#what-was-run-2-october-2026)
 //! and [E2B backend limitation](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md#things-that-broke-on-the-way).
 //!
