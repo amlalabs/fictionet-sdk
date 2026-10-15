@@ -40,6 +40,12 @@ exact total limit. It leaves the vector's length and contents unchanged.
 can use this public helper and map each reason to their own error.
 `codec::append_bounded` keeps its separate `Buffer::MAX_LIMIT` clamp.
 
+`codec::Reader::nul_bytes` borrows the bytes before the next NUL and consumes
+the terminator. It searches all unread bytes and leaves the cursor unchanged
+if no terminator is present. MongoDB, MySQL and PostgreSQL use it while keeping
+their own text validation, ownership, limits and errors. MySQL still accepts
+an unterminated final field where its protocol allows one.
+
 `codec::dot_body` shares dot transparency for SMTP and POP3. Its accumulator
 retains the first body error through the terminator and keeps counting bytes
 after rejection. Callers supply validation and translate fatal errors. SMTP

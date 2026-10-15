@@ -696,10 +696,10 @@ trait ReadFields<'a> {
 impl<'a> ReadFields<'a> for Reader<'a> {
     /// A zero-terminated UTF-8 string.
     fn cstring(&mut self) -> Result<String, Error> {
-        let rest = self.clone().rest();
-        let n = rest.iter().position(|&c| c == 0).ok_or(Error::Terminator)?;
-        let s = std::str::from_utf8(&rest[..n]).map_err(|_| Error::Utf8)?;
-        self.skip(n + 1).map_err(|_| Error::BsonTruncated)?;
+        let mut probe = self.clone();
+        let bytes = probe.nul_bytes().map_err(|_| Error::Terminator)?;
+        let s = std::str::from_utf8(bytes).map_err(|_| Error::Utf8)?;
+        *self = probe;
         Ok(s.to_owned())
     }
 
@@ -1806,6 +1806,27 @@ mod tests {
             response_to: 0,
             body: Body::Msg(Msg::new(body)),
         }
+    }
+
+    #[test]
+    fn cstring_errors_keep_position() {
+        for (tail, error) in [
+            (&b"tail"[..], Error::Terminator),
+            (&b"\xff"[..], Error::Terminator),
+            (&b"\xff\0"[..], Error::Utf8),
+        ] {
+            let bytes = [b"ok\0".as_slice(), tail].concat();
+            let mut r = Reader::new(&bytes);
+            assert_eq!(r.cstring().unwrap(), "ok");
+            assert_eq!(r.position(), 3);
+            assert_eq!(r.cstring(), Err(error));
+            assert_eq!(r.position(), 3);
+            assert_eq!(r.rest(), tail);
+        }
+        let mut r = Reader::new(b"\0h\xc3\xa9\0");
+        assert_eq!(r.cstring().unwrap(), "");
+        assert_eq!(r.cstring().unwrap(), "hé");
+        assert!(r.is_empty());
     }
 
     // Examples from bsonspec.org/faq.html.

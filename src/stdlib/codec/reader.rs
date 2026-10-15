@@ -159,6 +159,33 @@ impl<'a> Reader<'a> {
         Ok(&self.bytes[start..self.position])
     }
 
+    /// Borrows the bytes before the next NUL and consumes the terminator.
+    ///
+    /// Searches all unread bytes. Returns [`Truncated`] without moving the
+    /// cursor if no NUL is present. The returned slice excludes the NUL and
+    /// may be empty. Text validation and field limits belong to the caller.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Reader, Truncated};
+    ///
+    /// let mut r = Reader::new(b"\0one\0two\0tail");
+    /// assert_eq!(r.nul_bytes()?, b"");
+    /// assert_eq!(r.nul_bytes()?, b"one");
+    /// assert_eq!(r.nul_bytes()?, b"two");
+    /// assert_eq!(r.position(), 9);
+    /// assert_eq!(r.nul_bytes(), Err(Truncated));
+    /// assert_eq!(r.position(), 9);
+    /// assert_eq!(r.rest(), b"tail");
+    /// # Ok::<(), Truncated>(())
+    /// ```
+    #[inline]
+    pub fn nul_bytes(&mut self) -> Result<&'a [u8], Truncated> {
+        let rest = &self.bytes[self.position..];
+        let end = rest.iter().position(|&b| b == 0).ok_or(Truncated)?;
+        self.position += end + 1;
+        Ok(&rest[..end])
+    }
+
     /// Skips `n` bytes or leaves the position unchanged on truncation.
     #[inline]
     pub fn skip(&mut self, n: usize) -> Result<(), Truncated> {
@@ -231,6 +258,38 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nul_fields_borrow_bytes_and_consume_terminators() {
+        let bytes = b"\0one\0\xff\0";
+        let mut r = Reader::new(bytes);
+        assert_eq!(r.nul_bytes(), Ok(&b""[..]));
+        assert_eq!(r.position(), 1);
+        let field = r.nul_bytes().unwrap();
+        assert_eq!(field, b"one");
+        assert_eq!(field.as_ptr(), bytes[1..].as_ptr());
+        assert_eq!(r.position(), 5);
+        assert_eq!(r.nul_bytes(), Ok(&b"\xff"[..]));
+        assert_eq!(r.position(), bytes.len());
+        assert_eq!(r.finish(), Ok(()));
+        assert_eq!(r.nul_bytes(), Err(Truncated));
+        assert_eq!(r.position(), bytes.len());
+    }
+
+    #[test]
+    fn unterminated_nul_fields_keep_position() {
+        for bytes in [&b""[..], &b"tail"[..], &b"\xff"[..]] {
+            let mut r = Reader::new(bytes);
+            assert_eq!(r.nul_bytes(), Err(Truncated));
+            assert_eq!(r.position(), 0);
+            assert_eq!(r.rest(), bytes);
+        }
+        let mut r = Reader::new(b"done\0tail");
+        assert_eq!(r.nul_bytes(), Ok(&b"done"[..]));
+        assert_eq!(r.nul_bytes(), Err(Truncated));
+        assert_eq!(r.position(), 5);
+        assert_eq!(r.rest(), b"tail");
+    }
 
     #[test]
     fn fixed_offsets_check_every_width_and_overflow() {

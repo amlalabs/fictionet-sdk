@@ -2619,15 +2619,12 @@ impl<'a> Fields<'a> {
     }
 
     fn cstr(&mut self) -> Result<String, Error> {
-        let rest = self.cursor.clone().rest();
-        let end = rest
-            .iter()
-            .position(|&c| c == 0)
-            .ok_or(Error::UnterminatedString { tag: self.tag })?;
-        let s = std::str::from_utf8(&rest[..end]).map_err(|_| Error::NotUtf8 { tag: self.tag })?;
-        self.cursor
-            .skip(end + 1)
-            .map_err(|_| Error::Truncated { tag: self.tag })?;
+        let mut probe = self.cursor.clone();
+        let bytes = probe
+            .nul_bytes()
+            .map_err(|_| Error::UnterminatedString { tag: self.tag })?;
+        let s = std::str::from_utf8(bytes).map_err(|_| Error::NotUtf8 { tag: self.tag })?;
+        self.cursor = probe;
         Ok(s.to_owned())
     }
 
@@ -2717,6 +2714,34 @@ mod tests {
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    #[test]
+    fn cstr_errors_keep_position_and_tag() {
+        let tag = b'Q';
+        for (tail, error) in [
+            (&b"tail"[..], Error::UnterminatedString { tag }),
+            (&b"\xff"[..], Error::UnterminatedString { tag }),
+            (&b"\xff\0"[..], Error::NotUtf8 { tag }),
+        ] {
+            let bytes = [b"ok\0".as_slice(), tail].concat();
+            let mut r = Fields {
+                cursor: ByteReader::new(&bytes),
+                tag,
+            };
+            assert_eq!(r.cstr().unwrap(), "ok");
+            assert_eq!(r.cursor.position(), 3);
+            assert_eq!(r.cstr(), Err(error));
+            assert_eq!(r.cursor.position(), 3);
+            assert_eq!(r.cursor.rest(), tail);
+        }
+        let mut r = Fields {
+            cursor: ByteReader::new(b"\0h\xc3\xa9\0"),
+            tag,
+        };
+        assert_eq!(r.cstr().unwrap(), "");
+        assert_eq!(r.cstr().unwrap(), "hé");
+        assert!(r.cursor.is_empty());
+    }
 
     #[test]
     fn all_message_variants_obey_wire_contract() {

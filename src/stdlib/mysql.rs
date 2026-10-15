@@ -2133,11 +2133,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
 
     /// A NUL-terminated string, without its NUL.
     fn nul(&mut self) -> Result<&'a [u8], Error> {
-        let rest = self.clone().rest();
-        let i = rest.iter().position(|&b| b == 0).ok_or(Error::Truncated)?;
-        let s = &rest[..i];
-        self.skip(i + 1)?;
-        Ok(s)
+        self.nul_bytes().map_err(Into::into)
     }
 
     /// A NUL-terminated string, or the rest of the payload if no NUL
@@ -2398,6 +2394,22 @@ mod tests {
 
     const HANDSHAKE_EXAMPLE: &str = "0a 35 2e 35 2e 32 2d 6d 32 00 52 00 00 00 22 3d 4e 50 29 75 39 56 00 ff ff 08 02 00 \
         00 00 00 00 00 00 00 00 00 00 00 00 00 29 64 40 52 5c 55 78 7a 7c 21 29 4b 00";
+
+    #[test]
+    fn nul_fields_preserve_optional_terminator() {
+        let mut r = Reader::new(b"\0\xff\0tail");
+        assert_eq!(r.nul(), Ok(&b""[..]));
+        assert_eq!(r.position(), 1);
+        assert_eq!(r.nul_or_rest(), b"\xff");
+        assert_eq!(r.position(), 3);
+        assert_eq!(r.nul(), Err(Error::Truncated));
+        assert_eq!(r.position(), 3);
+        assert_eq!(r.nul_or_rest(), b"tail");
+        assert_eq!(r.position(), 7);
+        assert_eq!(r.nul(), Err(Error::Truncated));
+        assert_eq!(r.nul_or_rest(), b"");
+        assert_eq!(r.position(), 7);
+    }
 
     #[test]
     fn handshake_example() {
