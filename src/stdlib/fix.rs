@@ -45,8 +45,7 @@
 //! # Ok::<(), fictionet::stdlib::fix::Error>(())
 //! ```
 
-use fictionet::stdlib::codec::ascii;
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, ascii, civil};
 use fictionet::stdlib::session::Action;
 use std::convert::Infallible;
 use std::fmt;
@@ -2629,14 +2628,7 @@ fn timestamp(bytes: &[u8]) -> Result<[u32; 7], Error> {
         part(12, 14)?,
         part(15, 17)?,
     );
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return Err(Error::Time),
-    };
+    let days = u32::from(civil::days_in_month(i64::from(year), month as u8));
     if year == 0 || day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
         return Err(Error::Time);
     }
@@ -2657,15 +2649,9 @@ fn timestamp(bytes: &[u8]) -> Result<[u32; 7], Error> {
 fn timestamp_nanos(value: [u32; 7]) -> Result<u128, Error> {
     let [year, month, day, hour, minute, second, fraction] = value;
     let previous = u128::from(year).checked_sub(1).ok_or(Error::Time)?;
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let mut days = previous * 365 + previous / 4 - previous / 100 + previous / 400;
     for m in 1..month {
-        days += match m {
-            4 | 6 | 9 | 11 => 30,
-            2 if leap => 29,
-            2 => 28,
-            _ => 31,
-        };
+        days += u128::from(civil::days_in_month(i64::from(year), m as u8));
     }
     days = days
         .checked_add(u128::from(day))

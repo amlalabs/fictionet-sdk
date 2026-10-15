@@ -90,7 +90,7 @@
 
 use fictionet::stdlib::codec::ascii::{self, is_tchar as is_token_byte, trim_ows_str as trim_ws};
 use fictionet::stdlib::codec::head_body::{self, Header, Scanner};
-use fictionet::stdlib::codec::{Decode, LineError, Step, Wire};
+use fictionet::stdlib::codec::{Decode, LineError, Step, Wire, civil};
 
 /// The TCP port RTSP servers listen on.
 pub const PORT: u16 = 554;
@@ -1606,14 +1606,7 @@ fn valid_utc(s: &str) -> bool {
     };
     let n = |r: &[u8]| r.iter().fold(0u32, |a, d| a * 10 + u32::from(d - b'0'));
     let (year, month, day) = (n(&b[..4]), n(&b[4..6]), n(&b[6..8]));
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 0,
-    };
+    let days = u32::from(civil::days_in_month(i64::from(year), month as u8));
     fraction_ok
         && (1..=days).contains(&day)
         && n(&b[9..11]) <= 23
