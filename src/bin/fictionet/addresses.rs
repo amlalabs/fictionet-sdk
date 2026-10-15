@@ -13,7 +13,7 @@ use fictionet::stdlib::dhcpv6::{
     self, DhcpOption, Duid, IaAddr, IaNa, Message, StatusCode, msg, status,
 };
 
-use crate::args::Lease;
+use crate::config::{Lease, mask4};
 use crate::ether;
 
 /// How long a lease lasts, in seconds, for both families. The VM renews
@@ -21,13 +21,6 @@ use crate::ether;
 const LEASE_SECS: u32 = 86_400;
 
 // DHCP for IPv4
-
-/// The netmask of an IPv4 prefix length, 0 to 32.
-pub(crate) fn mask4(prefix: u8) -> u32 {
-    u32::MAX
-        .checked_shl(32 - prefix.min(32) as u32)
-        .unwrap_or(0)
-}
 
 /// The address attach answers DHCP from, which the VM sends its renewals
 /// to. It is the gateway when there is one. Otherwise it is the DNS
@@ -305,7 +298,7 @@ pub(crate) fn dhcp6_packet(request_packet: &[u8], answer: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::Cidr;
+    use crate::config::Cidr;
     use crate::ether::tests::{VM, v6_checksum_ok};
 
     fn lease4() -> Lease<Ipv4Addr> {
@@ -926,13 +919,6 @@ mod tests {
         assert_eq!(reply.client_id(), Some(&Duid(CLIENT.to_vec())));
         assert_eq!(reply.server_id(), Some(&server_duid()));
         assert!(reply.option(65000).is_none());
-    }
-
-    #[test]
-    fn masks() {
-        assert_eq!(mask4(0), 0);
-        assert_eq!(mask4(24), 0xffff_ff00);
-        assert_eq!(mask4(32), u32::MAX);
     }
 
     #[test]

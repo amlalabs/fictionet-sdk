@@ -6,6 +6,9 @@ use std::io::Write;
 
 use fictionet::relay::observer::{Client, Envelope};
 
+use crate::args::take_world;
+use crate::config::world_path;
+
 pub(crate) const USAGE: &str = "\
 usage: fictionet observe --world unix:<path> [<request>]
 
@@ -57,38 +60,6 @@ pub(crate) fn request(words: &[String]) -> Result<String, String> {
 
 fn number(s: &str) -> Result<u64, String> {
     s.parse().map_err(|_| format!("{s} is not a number"))
-}
-
-/// The socket path in `--world unix:<path>`, parsed as a
-/// [`WorldSocket`](fictionet::WorldSocket).
-pub(crate) fn world_path(world: &str) -> Result<String, String> {
-    match world.parse::<fictionet::WorldSocket>() {
-        Ok(fictionet::WorldSocket::UnixSocket(path)) => path
-            .into_os_string()
-            .into_string()
-            .map_err(|p| format!("--world: {} is not UTF-8", p.display())),
-        Ok(other) => Err(format!(
-            "--world {other} is not supported here; use unix:<path>"
-        )),
-        Err(e) => Err(format!("--world: {e}")),
-    }
-}
-
-/// Splits `--world <w>` (or `--world=<w>`) from the other words.
-pub(crate) fn take_world(args: &[String]) -> Result<(String, Vec<String>), String> {
-    let mut world = None;
-    let mut rest = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--world" {
-            world = Some(it.next().ok_or("--world needs a value")?.clone());
-        } else if let Some(w) = a.strip_prefix("--world=") {
-            world = Some(w.to_owned());
-        } else {
-            rest.push(a.clone());
-        }
-    }
-    Ok((world.ok_or("--world unix:<path> is required")?, rest))
 }
 
 pub(crate) fn main(args: &[String]) -> i32 {
@@ -199,20 +170,5 @@ mod tests {
         );
         assert!(request(&words("packet e12 x")).is_err());
         assert!(request(&words("fly")).is_err());
-    }
-
-    #[test]
-    fn world_flag() {
-        let (w, rest) = take_world(&words("--world unix:/run/w.sock watch")).unwrap();
-        assert_eq!(
-            (world_path(&w).unwrap(), rest),
-            ("/run/w.sock".to_owned(), words("watch"))
-        );
-        assert_eq!(
-            world_path("tls:x:1").unwrap_err(),
-            r#"--world: expected unix:<path>, not "tls:x:1""#
-        );
-        assert!(world_path("unix:").is_err());
-        assert!(take_world(&words("graph")).is_err());
     }
 }

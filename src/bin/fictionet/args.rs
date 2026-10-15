@@ -1,160 +1,12 @@
-//! The flags of `fictionet attach`, parsed by hand.
+//! The flags of `fictionet attach`, parsed by hand, and the `--world` flag
+//! that `observe` and `dashboard` take too.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
-/// One address setting: a value (`--dns 10.0.0.1`), turned off
-/// (`--no-dns`), or left out.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Setting<T> {
-    /// Set by attach.
-    Value(T),
-    /// Turned off with the flag's `--no-` form.
-    Off,
-    /// Left out: the world should supply it, by DHCP or router
-    /// advertisements.
-    FromWorld,
-}
-
-impl<T> Setting<T> {
-    pub(crate) fn value(&self) -> Option<&T> {
-        match self {
-            Setting::Value(v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
-/// Where attach writes the DNS servers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ResolvConf {
-    /// Left out: `/etc/resolv.conf`, or `/etc/netns/<name>/resolv.conf`
-    /// with `--netns`.
-    Default,
-    /// `--resolv-conf <path>`: this file instead.
-    Path(PathBuf),
-    /// `--no-resolv-conf`: no file. DNS is up to the harness.
-    Off,
-}
-
-/// An address with its prefix length, such as `10.0.0.2/24`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Cidr<A> {
-    pub(crate) addr: A,
-    pub(crate) prefix: u8,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct AttachArgs {
-    /// The path of the world's Unix socket.
-    pub(crate) world: String,
-    pub(crate) name: String,
-    pub(crate) netns: Option<PathBuf>,
-    pub(crate) ip_addr: Setting<Cidr<Ipv4Addr>>,
-    pub(crate) gateway: Setting<Ipv4Addr>,
-    pub(crate) dns: Setting<Ipv4Addr>,
-    pub(crate) ip_addr_v6: Setting<Cidr<Ipv6Addr>>,
-    pub(crate) gateway_v6: Setting<Ipv6Addr>,
-    pub(crate) dns_v6: Setting<Ipv6Addr>,
-    pub(crate) mtu: u16,
-    pub(crate) ready_file: Option<PathBuf>,
-    pub(crate) resolv_conf: ResolvConf,
-    /// Links to clear and set down before `tun0` is set up, in order.
-    pub(crate) down_links: Vec<String>,
-    /// How long to wait for the world's socket. Zero: try once.
-    pub(crate) world_wait: std::time::Duration,
-}
-
-/// The two proxy types. Each listens on a TCP port and turns proxied
-/// connections into the sandbox's packets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProxyKind {
-    /// HTTP proxy: CONNECT, and plain-HTTP requests in absolute form.
-    Http,
-    /// SOCKS5: CONNECT, with username and password.
-    Socks5,
-}
-
-impl ProxyKind {
-    /// The type's name, as `--type` takes it and `hello` carries it.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            ProxyKind::Http => "http_proxy",
-            ProxyKind::Socks5 => "socks5",
-        }
-    }
-}
-
-/// The flags of `--type http_proxy` and `--type socks5`.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ProxyArgs {
-    pub(crate) kind: ProxyKind,
-    /// The path of the world's Unix socket.
-    pub(crate) world: String,
-    pub(crate) name: String,
-    /// Where the proxy listens.
-    pub(crate) listen: SocketAddr,
-    /// The file that holds the sandbox's token.
-    pub(crate) token_file: PathBuf,
-    /// The sandbox's address: the source of the packets attach makes.
-    pub(crate) ip_addr: Ipv4Addr,
-    /// The world's DNS server.
-    pub(crate) dns: Ipv4Addr,
-    pub(crate) ready_file: Option<PathBuf>,
-    pub(crate) world_wait: std::time::Duration,
-}
-
-/// How attach gives a VM one address family (IPv4 or IPv6), for
-/// `--type tap`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Family<A> {
-    /// `--ip-addr` (or `--ip-addr-v6`) was given: attach answers the VM's
-    /// DHCP (and, for IPv6, router solicitations) itself, and passes only
-    /// packets from that address.
-    Serve(Lease<A>),
-    /// All three flags of the family were left out: the VM's DHCP goes to
-    /// the world like any other packet.
-    FromWorld,
-    /// `--no-ip-addr` (or `--no-ip-addr-v6`): attach gives no address and
-    /// drops the VM's DHCP. A static address set inside the VM still works.
-    Off,
-}
-
-/// What attach hands out by DHCP for one family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Lease<A> {
-    pub(crate) addr: Cidr<A>,
-    /// The default gateway, or `None` with `--no-gateway`.
-    pub(crate) gateway: Option<A>,
-    /// The DNS server, or `None` with `--no-dns`.
-    pub(crate) dns: Option<A>,
-}
-
-/// How the VM's frames reach attach (`--vm`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum VmLink {
-    /// `qemu:<path>`: the Unix socket QEMU's `-netdev stream` connects to.
-    Qemu(PathBuf),
-    /// `tap:<name>`: the TAP device the VM program holds. Attach makes a
-    /// second TAP device and has the kernel pass frames between the two.
-    Tap(String),
-}
-
-/// The flags of `--type tap`.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TapArgs {
-    /// The path of the world's Unix socket.
-    pub(crate) world: String,
-    pub(crate) name: String,
-    pub(crate) vm: VmLink,
-    /// The network namespace the VM's TAP device is in, for `tap:<name>`.
-    pub(crate) netns: Option<PathBuf>,
-    pub(crate) v4: Family<Ipv4Addr>,
-    pub(crate) v6: Family<Ipv6Addr>,
-    pub(crate) mtu: u16,
-    pub(crate) ready_file: Option<PathBuf>,
-    pub(crate) world_wait: std::time::Duration,
-}
+use crate::config::{
+    AttachArgs, Cidr, Family, Lease, ProxyArgs, ProxyKind, ResolvConf, Setting, TapArgs, VmLink,
+};
 
 pub(crate) const ATTACH_USAGE: &str = "\
 usage: fictionet attach --world unix:<path> --name <name> --type tun
@@ -323,6 +175,23 @@ pub(crate) enum Parsed {
     Tap(TapArgs),
 }
 
+/// Splits `--world <w>` (or `--world=<w>`) from the other words.
+pub(crate) fn take_world(args: &[String]) -> Result<(String, Vec<String>), String> {
+    let mut world = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--world" {
+            world = Some(it.next().ok_or("--world needs a value")?.clone());
+        } else if let Some(w) = a.strip_prefix("--world=") {
+            world = Some(w.to_owned());
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((world.ok_or("--world unix:<path> is required")?, rest))
+}
+
 /// Parses the arguments after `attach`.
 ///
 /// A flag's value is the next argument, or follows `=` in the same one.
@@ -455,7 +324,7 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
     }
 
     let world = world.ok_or("--world is required")?;
-    let world = crate::observe::world_path(&world)?;
+    let world = crate::config::world_path(&world)?;
     let name = name.ok_or("--name is required")?;
     if name.is_empty() || name.len() > 255 {
         return Err("--name must be 1 to 255 bytes".into());
@@ -654,7 +523,7 @@ fn parse_tap(
             return Err("--ip-addr: for --type tap, the prefix must be from /8 to /30, so the VM shares a subnet with its gateway".into());
         }
         if let Some(gw) = l.gateway {
-            let mask = crate::addresses::mask4(l.addr.prefix);
+            let mask = crate::config::mask4(l.addr.prefix);
             if u32::from(gw) & mask != u32::from(l.addr.addr) & mask || gw == l.addr.addr {
                 return Err(format!(
                     "--gateway {gw} must be another address in the subnet of --ip-addr {}/{}",
@@ -849,23 +718,30 @@ fn parse_proxy(
     }))
 }
 
-impl AttachArgs {
-    /// The DNS servers to write to `resolv.conf`, IPv4 first.
-    pub(crate) fn dns_servers(&self) -> Vec<IpAddr> {
-        let mut out = Vec::new();
-        if let Some(a) = self.dns.value() {
-            out.push(IpAddr::V4(*a));
-        }
-        if let Some(a) = self.dns_v6.value() {
-            out.push(IpAddr::V6(*a));
-        }
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::world_path;
+    use std::net::IpAddr;
+
+    fn words(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn world_flag() {
+        let (w, rest) = take_world(&words("--world unix:/run/w.sock watch")).unwrap();
+        assert_eq!(
+            (world_path(&w).unwrap(), rest),
+            ("/run/w.sock".to_owned(), words("watch"))
+        );
+        assert_eq!(
+            world_path("tls:x:1").unwrap_err(),
+            r#"--world: expected unix:<path>, not "tls:x:1""#
+        );
+        assert!(world_path("unix:").is_err());
+        assert!(take_world(&words("graph")).is_err());
+    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()

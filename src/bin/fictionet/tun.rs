@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use fictionet::relay::{self, unix};
 
-use crate::args::{AttachArgs, ResolvConf};
+use crate::config::{AttachArgs, ResolvConf};
 use crate::netlink::{self, Netlink};
 use crate::world::{self, Failure, Greeting, context, err};
 

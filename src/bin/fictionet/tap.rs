@@ -27,7 +27,7 @@ use fictionet::relay::{self, unix};
 use fictionet::stdlib::{dhcp, dhcpv6};
 
 use crate::addresses;
-use crate::args::{Family, TapArgs, VmLink};
+use crate::config::{Family, TapArgs, VmLink};
 use crate::ether::{self, Decoder, Frame, Mac, Outbox, Upper};
 use crate::netlink::{self, Netlink};
 use crate::tun;
@@ -1239,7 +1239,7 @@ fn flush(vm: RawFd, outbox: &mut Outbox) -> Result<bool, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::{Cidr, Lease};
+    use crate::config::{Cidr, Lease};
     use crate::ether::tests::{VM, solicitation};
     use fictionet::stdlib::codec::Wire;
 

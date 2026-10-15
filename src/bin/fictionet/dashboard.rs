@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use fictionet::relay::observer::Client;
 use fictionet::relay::proxy::auth::Token;
 
-use crate::observe::{take_world, world_path};
+use crate::args::take_world;
+use crate::config::world_path;
 
 mod api;
 mod assets;

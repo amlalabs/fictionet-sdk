@@ -20,6 +20,7 @@
 mod addresses;
 mod args;
 mod blocked;
+mod config;
 mod dashboard;
 mod ether;
 mod netlink;

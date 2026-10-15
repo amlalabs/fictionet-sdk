@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::args::{ProxyArgs, ProxyKind};
+use crate::config::{ProxyArgs, ProxyKind};
 use crate::world::{self, Failure, Greeting, err};
 use fictionet::relay::proxy::auth::Token;
 use link::Link;
