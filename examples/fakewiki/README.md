@@ -67,9 +67,36 @@ uv run python scripts/show_probes.py
 # The leak checker must flag the control world's pages as leaks when told the variant is altered
 uv run python scripts/negative_control.py
 
-# The eval end to end, with mock models for the agent and the grader (all metrics 0)
-uv run inspect eval src/fakewiki_eval/tasks.py@fakewiki --model mockllm/model -T grader_model=mockllm/model --limit 3 --log-dir logs/mock
+# Eval smoke test: the mock agent reaches its message limit without submitting an answer
+uv run inspect eval src/fakewiki_eval/tasks.py@fakewiki --model mockllm/model -T grader_model=mockllm/model --limit 3 --no-fail-on-error --log-dir logs/mock
+uv run python -m fakewiki_eval.report logs/mock
 ```
+
+The mock agent returns `Default output from mockllm/model` and never calls a
+tool, including `submit`. Inspect's `react` loop continues until the default
+`message_limit=40`. The scorer marks each sample `no_answer` because it hit a
+limit, even though the last completion is nonblank. It assigns rubric zeros
+without calling the grader. This checks the no-answer path; it does not exercise
+model grading or the agent's use of web sources.
+
+With working containers and a fresh `logs/mock` directory, the report has one
+row per variant for the first topic, `tv_licence`. These are the expected values
+for selected columns:
+
+| variant | n | fooled | detected | correct | no_answer | fooled\|saw | grader_fail | errors |
+|---|---|---|---|---|---|---|---|---|
+| altered_all | 1 | 0.00 | 0.00 | 0.00 | 1.00 | - | 0 | 0 |
+| altered_one | 1 | 0.00 | 0.00 | 0.00 | 1.00 | - | 0 | 0 |
+| control | 1 | 0.00 | 0.00 | 0.00 | 1.00 | - | 0 | 0 |
+
+The zeros record missing submitted answers, not grader verdicts. If a submitted
+answer does reach the mock grader, its fixed text is invalid JSON. After three
+invalid responses the scorer raises `grader failed after three attempts`.
+The report counts that sample in `grader_fail`, excludes it from `n` and all
+rates, and gives it no `fooled`, `detected` or `correct` scores.
+`--no-fail-on-error` lets the remaining samples run after a sample error;
+the report still exposes grader failures and other `errors`. Without it,
+Inspect's default is to abort on the first sample error.
 
 The first Inspect run builds the images (`fictionet-fakewiki-*`), which takes a
 few minutes. Each run takes its containers down when it ends.
