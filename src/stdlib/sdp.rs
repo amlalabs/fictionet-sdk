@@ -660,11 +660,9 @@ fn conflicts(earlier: &[Attribute], a: &Attribute) -> bool {
             .iter()
             .any(|e| Direction::from_attribute(e).is_some());
     }
-    let format = |a: &Attribute| {
-        a.value
-            .as_deref()
-            .map(|v| v.split(' ').next().unwrap_or(v).to_string())
-    };
+    fn format(a: &Attribute) -> Option<&str> {
+        a.value.as_deref().map(|v| v.split(' ').next().unwrap_or(v))
+    }
     match a.name.as_str() {
         "rtpmap" | "fmtp" if a.value.is_some() => {
             let f = format(a);
