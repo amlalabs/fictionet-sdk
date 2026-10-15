@@ -7,7 +7,6 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::tds::*;
-use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 const LIMIT: usize = 1 << 16;
@@ -108,13 +107,8 @@ fuzz_target!(|data: &[u8]| {
     check_nbcrows(data);
     contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
     contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), data, 128);
-    contract::check_decode_with_alloc_limit(|| Messages::with_limit(LIMIT), data, 2 * MAX_PACKET);
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Prelogin>(data);
-    contract::check_wire::<Login7>(data);
-    contract::check_wire::<Version>(data);
-    contract::check_wire::<TokenStream>(data);
+    harness::check_payload(data, LIMIT);
+    harness::check_payload(data, 64);
     contract::check_wire_value(&Packet {
         packet_type: data.first().copied().unwrap_or(0),
         status: data.get(1).copied().unwrap_or(0),
@@ -123,22 +117,7 @@ fuzz_target!(|data: &[u8]| {
         window: data.get(4).copied().unwrap_or(0),
         data: data.to_vec(),
     });
-    for message in decode_all(|| Messages::with_limit(LIMIT), data).0 {
-        assert!(message.to_bytes().is_ok(), "{message:?}");
-        contract::check_wire_value(&message);
-    }
-    for all_headers in [true, false] {
-        if let Ok(batch) = SqlBatch::parse(data, all_headers) {
-            assert_eq!(
-                SqlBatch::parse(&batch.message().unwrap().data, all_headers),
-                Ok(batch)
-            );
-        }
-    }
     let tokens: Vec<Token> = TokenReader::new(data).map_while(Result::ok).collect();
-    let stream = TokenStream(tokens.clone());
-    assert!(stream.to_bytes().is_ok(), "{stream:?}");
-    contract::check_wire_value(&stream);
     if let Some(columns) = tokens.iter().rev().find_map(|t| match t {
         Token::ColMetadata(Some(c)) => Some(c.clone()),
         _ => None,

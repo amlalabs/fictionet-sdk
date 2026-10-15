@@ -3385,6 +3385,53 @@ fictionet::codec_from!(Error, Trailing, |_| Error::Invalid(
     "bytes after the token's fields"
 ));
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{
+        Login7, Message, Messages, Packet, Prelogin, SqlBatch, TokenReader, TokenStream, Version,
+    };
+    use fictionet::stdlib::codec::{Decode, Wire};
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks payload codecs and message assembly under the supplied data limit.
+    pub fn check_payload(bytes: &[u8], limit: usize) {
+        let (messages, _) = contract::check_decode_limits(
+            || Messages::with_limit(limit),
+            bytes,
+            limit,
+            2 * Messages::with_limit(limit).capacity(),
+        );
+        for message in messages {
+            assert!(
+                message.data.len() <= limit,
+                "message data exceeds named limit"
+            );
+            assert!(message.to_bytes().is_ok(), "{message:?}");
+            contract::check_wire_value(&message);
+        }
+        contract::check_wire::<Prelogin>(bytes);
+        contract::check_wire::<Login7>(bytes);
+        contract::check_wire::<Version>(bytes);
+        contract::check_wire::<Packet>(bytes);
+        contract::check_wire::<Message>(bytes);
+        contract::check_wire::<TokenStream>(bytes);
+        for all_headers in [true, false] {
+            if let Ok(batch) = SqlBatch::parse(bytes, all_headers) {
+                assert_eq!(
+                    SqlBatch::parse(&batch.message().unwrap().data, all_headers),
+                    Ok(batch)
+                );
+            }
+        }
+        let tokens: Vec<_> = TokenReader::new(bytes).map_while(Result::ok).collect();
+        let stream = TokenStream(tokens);
+        assert!(stream.to_bytes().is_ok(), "{stream:?}");
+        contract::check_wire_value(&stream);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn fixture_feature(id: u8, data: Vec<u8>) -> Feature {
@@ -3969,6 +4016,41 @@ mod tests {
             Error::Unwritable,
         ] {
             assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn message_limit_contracts() {
+        for (size, statuses, too_long) in [
+            (30, &[0, 0, status::EOM][..], Some(90)),
+            (32, &[0, status::EOM][..], None),
+            (40, &[0, 0][..], Some(80)),
+        ] {
+            let mut bytes = Vec::new();
+            for (i, &status) in statuses.iter().enumerate() {
+                Packet {
+                    packet_type: packet_type::SQL_BATCH,
+                    status,
+                    spid: 0,
+                    id: i as u8 + 1,
+                    window: 0,
+                    data: vec![7; size],
+                }
+                .write(&mut bytes)
+                .unwrap();
+            }
+            harness::check_payload(&bytes, 64);
+            let (messages, failure) = decode_all(|| Messages::with_limit(64), &bytes);
+            if let Some(total) = too_long {
+                assert!(messages.is_empty());
+                assert_eq!(failure, Some(Fail::Protocol(Error::TooLong(total))));
+            } else {
+                assert_eq!(failure, None);
+                assert_eq!(
+                    messages,
+                    [Message::new(packet_type::SQL_BATCH, vec![7; 64])]
+                );
+            }
         }
     }
 
@@ -5492,27 +5574,6 @@ mod tests {
         );
     }
 
-    fn check(bytes: &[u8]) {
-        contract::check_wire::<Prelogin>(bytes);
-        contract::check_wire::<Login7>(bytes);
-        contract::check_wire::<Version>(bytes);
-        contract::check_wire::<Packet>(bytes);
-        contract::check_wire::<Message>(bytes);
-        contract::check_wire::<TokenStream>(bytes);
-        for all_headers in [true, false] {
-            if let Ok(batch) = SqlBatch::parse(bytes, all_headers) {
-                assert_eq!(
-                    SqlBatch::parse(&batch.message().unwrap().data, all_headers),
-                    Ok(batch)
-                );
-            }
-        }
-        let tokens: Vec<_> = TokenReader::new(bytes).map_while(Result::ok).collect();
-        let stream = TokenStream(tokens);
-        assert!(stream.to_bytes().is_ok(), "{stream:?}");
-        contract::check_wire_value(&stream);
-    }
-
     fn samples() -> Vec<Vec<u8>> {
         let strip = |s: &str| one_message(&hex(s)).data;
         let mut s = vec![
@@ -5549,7 +5610,7 @@ mod tests {
                 mutate(&mut rng, &mut bytes);
                 bytes
             };
-            check(&bytes);
+            harness::check_payload(&bytes, 64);
             let mut stream = bytes;
             for i in (0..stream.len()).step_by(9) {
                 if i + 3 < stream.len() && rng.coin() {
@@ -5559,20 +5620,12 @@ mod tests {
                     stream[i + 3] = 8 + rng.index(12) as u8;
                 }
             }
-            contract::check_decode_with_alloc_limit(
-                || Messages::with_limit(64),
-                &stream,
-                2 * (64 + HEADER_LEN),
-            );
+            harness::check_payload(&stream, 64);
             contract::check_decode_with_alloc_limit(
                 || Frames::<Packet>::with_limit(64),
                 &stream,
                 128,
             );
-            for message in decode_all(|| Messages::with_limit(64), &stream).0 {
-                assert!(message.to_bytes().is_ok(), "{message:?}");
-                contract::check_wire_value(&message);
-            }
         }
     }
 }
