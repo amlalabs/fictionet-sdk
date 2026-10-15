@@ -193,7 +193,8 @@ Three containers, as in FakeWiki:
     from 104.21.0.0/16 and 172.67.0.0/16, where many ordinary sites live. A
     host keeps its address for the run, and the address is appended to the
     store's `addresses.jsonl`, so a later run on the same store gives it
-    the same one.
+    the same one. A run fails without `finalized` if `addresses.jsonl` is
+    unreadable, corrupt or cannot be appended.
   * **Certificates.** A host's certificate is made at its first TLS
     handshake, signed by the seeded CA the world makes at startup,
     which the agent's container trusts. A client checks it against its own
@@ -409,7 +410,9 @@ By default each run gets a fresh store, a Compose volume that goes away with
 the run. Set `ADAPTIVE_WEB_STORE_DIR` to an absolute directory to keep the
 store on the host. A later run with the same seed and directory starts
 from everything the earlier one made: the same pages, results, cast and
-addresses. With `ADAPTIVE_WEB_GENERATOR=replay` it makes nothing new: a URL
+addresses. A run fails without `finalized` if `addresses.jsonl` is
+unreadable, corrupt or cannot be appended.
+With `ADAPTIVE_WEB_GENERATOR=replay` it makes nothing new: a URL
 the store does not hold gets a 404, logged as `missing`, and a query it does
 not hold gets an empty result list. A replay needs no network and no key.
 This includes fixed URLs: replay serves their retained bytes, without

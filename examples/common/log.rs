@@ -62,7 +62,17 @@ impl Log {
             failure: Arc::new(Mutex::new(None)),
         }))
     }
-    /// Reports output failure or lost lines, including failures during final flush.
+    /// Latches a world-level failure unless a failure has already been recorded.
+    /// [`Self::health`], [`Finalization::wait`] and [`Finalization::acknowledge`]
+    /// report it, so a failed world cannot acknowledge successful finalization.
+    // Border and Artifactory include this module privately and only use its
+    // logging and finalization methods, leaving this world-level hook unused.
+    #[allow(dead_code)]
+    pub fn fail(&self, reason: impl Into<String>) {
+        self.0.failure.lock().get_or_insert_with(|| reason.into());
+    }
+
+    /// Reports world or output failure or lost lines, including final flush failures.
     pub fn health(&self) -> std::io::Result<()> {
         if let Some(error) = &*self.0.failure.lock() {
             return Err(std::io::Error::other(error.clone()));
@@ -171,7 +181,7 @@ pub struct Finalization {
     acknowledgement: std::path::PathBuf,
 }
 impl Finalization {
-    /// Stops the run on a request, or fails it if logging failed.
+    /// Stops the run on a request, or fails it if the world or logging failed.
     pub async fn wait(&self, fcx: &Cx) -> fictionet::Result {
         loop {
             self.log.health()?;
@@ -506,6 +516,41 @@ mod tests {
         ));
         assert!(result.is_err());
         assert!(finalization.acknowledge(result).is_err());
+        assert!(!finalization.acknowledgement.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn world_failure_stops_the_serving_run_without_acknowledgement() {
+        let log = Log::new(Box::new(std::io::sink()), &[], |s| s);
+        let dir =
+            std::env::temp_dir().join(format!("fictionet-failed-world-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let finalization = Arc::new(log.finalization(&dir).unwrap());
+        let shutdown = finalization.clone();
+        std::fs::write(&finalization.request, b"").unwrap();
+        let result = fictionet::block_on(fictionet::run(
+            fictionet::Seed::from_u64(1),
+            move |fcx| async move {
+                log.attach(&fcx);
+                log.fail("cannot record the address");
+                log.fail("later failure");
+                assert_eq!(
+                    log.health().unwrap_err().to_string(),
+                    "cannot record the address"
+                );
+                shutdown.wait(&fcx).await
+            },
+        ));
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot record the address")
+        );
+        assert!(finalization.acknowledge(result).is_err());
+        assert!(finalization.acknowledge(Ok(())).is_err());
         assert!(!finalization.acknowledgement.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
