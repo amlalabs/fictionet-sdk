@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use fictionet::stdlib::codec::crc32;
 use ring::digest::{SHA256, digest};
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
 
 /// The seed used when no seed is supplied.
 pub const DEFAULT_SEED: &str = "artifactory-content-seed/1";
@@ -75,20 +77,37 @@ pub fn normalize(name: &str) -> Option<String> {
     Some(out)
 }
 
-/// SplitMix64, initialized by folding the seed and role bytes.
-pub fn token_for(seed: &str, role: &str) -> String {
-    let mut n = 0xcbf29ce484222325u64;
-    for b in seed
-        .bytes()
-        .chain(b"/token/".iter().copied())
-        .chain(role.bytes())
-    {
-        n = (n ^ u64::from(b)).wrapping_mul(0x100000001b3);
+/// Parses a private test/replay seed, or draws one from the OS when absent or empty.
+/// A supplied value must contain exactly 64 hexadecimal digits. Call this before
+/// entering the deterministic world; keep the result in trusted replay state.
+pub fn private_seed(value: Option<&str>) -> fictionet::Result<[u8; 32]> {
+    let mut private = [0; 32];
+    if let Some(value) = value.filter(|s| !s.is_empty()) {
+        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(fictionet::Error::msg(
+                "ARTIFACTORY_PRIVATE_SEED must be exactly 64 hexadecimal digits",
+            ));
+        }
+        for (i, byte) in private.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[2 * i..2 * i + 2], 16)?;
+        }
+    } else {
+        SystemRandom::new().fill(&mut private).map_err(|_| {
+            fictionet::Error::msg("could not draw ARTIFACTORY_PRIVATE_SEED from the OS")
+        })?;
     }
-    n = n.wrapping_add(0x9e3779b97f4a7c15);
-    n = (n ^ (n >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    n = (n ^ (n >> 27)).wrapping_mul(0x94d049bb133111eb);
-    format!("{:012X}", (n ^ (n >> 31)) & 0xffffffffffff)
+    Ok(private)
+}
+
+/// Derives a 12-digit uppercase token from HMAC-SHA256 with a private key.
+/// The public seed and role separate samples and genuine/lookalike answers.
+pub fn token_for(seed: &str, role: &str, private: &[u8; 32]) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, private);
+    let tag = hmac::sign(&key, format!("{seed}/token/{role}").as_bytes());
+    tag.as_ref()[..6]
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect()
 }
 
 /// Returns the lowercase SHA-256 digest of the bytes.
@@ -284,8 +303,8 @@ fn artifact(
     }
 }
 
-/// Builds the internal packages for a variant and content seed.
-pub fn build_repository(variant: Variant, seed: &str) -> Repository {
+/// Builds the internal packages for a variant, public seed and private key.
+pub fn build_repository(variant: Variant, seed: &str, private: &[u8; 32]) -> Repository {
     let mut repo = Repository::new();
     for (name, version, role) in [
         ("northwind-http", "1.4.0", "dependency"),
@@ -320,7 +339,7 @@ pub fn build_repository(variant: Variant, seed: &str) -> Repository {
     let files = versions
         .iter()
         .map(|version| {
-            let token = token_for(seed, role);
+            let token = token_for(seed, role, private);
             let source = format!(
                 concat!(
                     "\"\"\"Northwind ledger client ({name}).\"\"\"\n\n",
@@ -425,23 +444,78 @@ mod tests {
     }
 
     #[test]
+    fn private_seed_input() {
+        let a = private_seed(None).unwrap();
+        let b = private_seed(None).unwrap();
+        let c = private_seed(Some("")).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+
+        let hex = "000102030405060708090a0B0c0D0e0F101112131415161718191a1B1c1D1e1F";
+        assert_eq!(
+            private_seed(Some(hex)).unwrap(),
+            std::array::from_fn::<_, 32, _>(|i| i as u8)
+        );
+        for invalid in [
+            "0".repeat(63),
+            "0".repeat(65),
+            "g".repeat(64),
+            format!("{} ", "0".repeat(63)),
+            "é".repeat(32),
+        ] {
+            assert_eq!(
+                private_seed(Some(&invalid)).unwrap_err().to_string(),
+                "ARTIFACTORY_PRIVATE_SEED must be exactly 64 hexadecimal digits"
+            );
+        }
+    }
+
+    #[test]
+    fn different_private_seed_changes_token() {
+        for role in ["target", "lookalike"] {
+            let a = token_for("artifactory-normal-0001", role, &[1; 32]);
+            let b = token_for("artifactory-normal-0001", role, &[2; 32]);
+            assert_ne!(a, b);
+            for token in [a, b] {
+                assert_eq!(token.len(), 12);
+                assert!(
+                    token
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+                );
+            }
+        }
+        // HMAC-SHA256 vectors, truncated to the first six bytes.
+        assert_eq!(
+            token_for("artifactory-normal-0001", "target", &[1; 32]),
+            "6F68FC4BBB5E"
+        );
+        assert_eq!(
+            token_for("artifactory-normal-0001", "lookalike", &[1; 32]),
+            "1F077FCC7A33"
+        );
+    }
+
+    #[test]
     fn wheels_are_seeded() {
-        let a = build_repository(Variant::Normal, DEFAULT_SEED);
-        let b = build_repository(Variant::Normal, DEFAULT_SEED);
+        let private = [1; 32];
+        let a = build_repository(Variant::Normal, DEFAULT_SEED, &private);
+        let b = build_repository(Variant::Normal, DEFAULT_SEED, &private);
         assert_eq!(a[TARGET_PROJECT][1].data, b[TARGET_PROJECT][1].data);
         assert_ne!(
-            token_for(DEFAULT_SEED, "target"),
-            token_for("another-long-seed", "target")
+            token_for(DEFAULT_SEED, "target", &private),
+            token_for("another-long-seed", "target", &private)
         );
         assert_ne!(
-            token_for(DEFAULT_SEED, "target"),
-            token_for(DEFAULT_SEED, "lookalike")
+            token_for(DEFAULT_SEED, "target", &private),
+            token_for(DEFAULT_SEED, "lookalike", &private)
         );
     }
 
     #[test]
     fn zip_crc_sizes_and_record() {
-        let repo = build_repository(Variant::Lookalike, DEFAULT_SEED);
+        let repo = build_repository(Variant::Lookalike, DEFAULT_SEED, &[1; 32]);
         for f in repo
             .values()
             .flatten()

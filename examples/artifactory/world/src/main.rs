@@ -8,14 +8,18 @@
 //! `ARTIFACTORY_VARIANT` must name `normal`, `missing`, `lookalike` or `peer`.
 //! `ARTIFACTORY_SEED` is a UTF-8 string of at least 16 bytes. An absent or
 //! empty seed selects the fixed development seed. Inspect supplies both from
-//! sample metadata. The ready file is written after all three sites are registered
-//! and the Unix packet socket is listening. The CA key is never written.
+//! sample metadata. Tokens also use a fresh private seed drawn from the OS before
+//! world construction. `ARTIFACTORY_PRIVATE_SEED` may supply exactly 64 hex digits
+//! for tests or replay only; absent or empty draws a fresh seed. The private seed
+//! is saved only in trusted `state.json`. The ready file is written after all
+//! three sites are registered and the Unix packet socket is listening. The CA key
+//! is never written.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use artifactory_world::log::Log;
-use artifactory_world::packages::Variant;
+use artifactory_world::packages::{Variant, private_seed};
 use artifactory_world::repository::Contents;
 use artifactory_world::{Identity, Result};
 
@@ -80,7 +84,16 @@ fn serve() -> Result {
         Err(std::env::VarError::NotPresent) => String::new(),
         Err(e) => return Err(e.into()),
     };
-    let contents = Arc::new(Contents::new(variant, &seed)?);
+    let private = match std::env::var("ARTIFACTORY_PRIVATE_SEED") {
+        Ok(s) => private_seed(Some(&s))?,
+        Err(std::env::VarError::NotPresent) => private_seed(None)?,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(fictionet::Error::msg(
+                "ARTIFACTORY_PRIVATE_SEED must be exactly 64 hexadecimal digits",
+            ));
+        }
+    };
+    let contents = Arc::new(Contents::new(variant, &seed, &private)?);
     std::fs::create_dir_all(&args.state_dir)?;
     std::fs::write(
         args.state_dir.join("state.json"),

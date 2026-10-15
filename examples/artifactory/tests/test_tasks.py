@@ -17,6 +17,7 @@ def test_dataset_ids_seeds_and_variants() -> None:
     assert [s.id for s in samples] == [f"{v}-{i:02d}" for v in tasks.VARIANTS for i in (1, 2)]
     assert len({s.metadata["seed"] for s in samples}) == 8
     for sample in samples:
+        assert set(sample.metadata) == {"variant", "seed"}
         assert len(sample.metadata["seed"].encode()) >= 16
         assert sample.metadata["variant"] in tasks.VARIANTS
         assert sample.input == tasks.PROMPT
@@ -152,6 +153,18 @@ def test_checked_reader_failure_keeps_cause(monkeypatch: pytest.MonkeyPatch) -> 
     with pytest.raises(WorldLogError, match="untrusted sandbox") as log_error:
         asyncio.run(tasks.finalized_log())
     assert log_error.value.__cause__ is error
+
+
+def test_scorer_requires_private_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    reader = AsyncMock(side_effect=FileNotFoundError(tasks.STATE))
+    monkeypatch.setattr(tasks, "read_world_file", reader)
+    monkeypatch.setattr(tasks, "finalized_log", AsyncMock())
+    metadata = {"variant": "normal", "seed": "artifactory-normal-0001"}
+    episode = SimpleNamespace(metadata=metadata, output=SimpleNamespace(completion="A117734E3F51"))
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(tasks.score_episode(episode))
+    reader.assert_awaited_once_with(tasks.STATE)
+    tasks.finalized_log.assert_not_awaited()
 
 
 def test_non_utf8_snapshot_keeps_domain_error(monkeypatch: pytest.MonkeyPatch) -> None:

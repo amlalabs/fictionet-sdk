@@ -40,7 +40,7 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     harness::run(fictionet::Seed::from_u64(1), move |fcx| async move {
-        let contents = Arc::new(Contents::new(variant, "").unwrap());
+        let contents = Arc::new(Contents::new(variant, "", &[1; 32]).unwrap());
         let identity = Identity::new(&fcx)?;
         let root = identity.ca_der.clone();
         let mut roots = RootCertStore::empty();
