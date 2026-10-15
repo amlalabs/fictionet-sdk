@@ -130,8 +130,10 @@ const MAX_TIME_WAIT: usize = 1024;
 ///
 /// Each connection has 256 KiB buffers each way, a 1,500-byte MTU, no
 /// Nagle delay, and Reno congestion control. Each listening port holds up
-/// to 4,096 connections that have not been accepted yet. [`endpoint_with`]
-/// takes other buffer sizes and backlogs. Buffer memory is used only
+/// to the default [`backlog`](Options::backlog) of connections not yet
+/// accepted, including handshakes. [`endpoint_with`] takes other buffer
+/// sizes and backlogs, subject to the maximum and per-peer limits described
+/// in [`Options::backlog`]. Buffer memory is used only
 /// as data passes through: once a connection's buffers are empty, their
 /// pages go back to the system within about two seconds, though the
 /// connection stays open, and closing frees them. A connection gives up with
@@ -214,9 +216,11 @@ impl Options {
     /// arrived but not been accepted yet: handshakes under way, and
     /// connections waiting for [`Listener::accept`]. The default is 4,096.
     /// Values below 1 or above 65,536 are raised or lowered to those
-    /// limits. Past the backlog, a connection attempt gets a RST, as from
-    /// a full listen queue. At most 256 of them come from one peer address,
-    /// whatever the backlog, so a single peer cannot fill it.
+    /// limits. A separate limit allows at most 256 of these connections
+    /// from one peer address, whatever the backlog. Further SYNs from that
+    /// address are dropped until some of its connections are accepted or
+    /// give up. Otherwise, past the backlog, a connection attempt gets a
+    /// RST, as from a full listen queue.
     ///
     /// Each connection in the backlog has its buffers from its first SYN.
     /// Their pages cost memory only once data arrives, but each connection
@@ -1725,12 +1729,12 @@ impl Listener {
     /// [region](fictionet::Cx#regions) is cancelled, and fails with
     /// [`ConnError::Closed`] once the endpoint has stopped.
     ///
-    /// Up to 16,384 connections wait here for `accept`, counting those
-    /// still in their handshake. Beyond that, connection attempts get a
-    /// RST. At most 256 of them may come from one peer address. Beyond
-    /// that, that address's connection attempts are dropped until some of
-    /// its connections are accepted or give up. So one peer that sends
-    /// SYNs and never finishes the handshake cannot lock others out.
+    /// Each listening port holds up to its configured backlog of connections
+    /// waiting for `accept`, counting those still in their handshake. See
+    /// [`Options::backlog`] for the default, maximum and separate per-peer
+    /// limit. SYNs from a peer already at its limit are dropped until some
+    /// of its connections are accepted or give up. Otherwise, past the
+    /// backlog, connection attempts get a RST.
     pub async fn accept(&mut self, fcx: &Cx) -> Result<TcpConnection, ConnError> {
         let port = self.port;
         let shared = &self.shared;
