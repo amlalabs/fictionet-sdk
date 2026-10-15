@@ -13,6 +13,7 @@ cleanup() {
     stop_pid "${traffic_pid:-}"
     stop_pid "${dash_pid:-}"
     cleanup_web
+    rm -f /run/dashboard.log /run/traffic.log /run/watch.jsonl
 }
 trap cleanup EXIT
 cleanup
@@ -42,21 +43,32 @@ install -m 0644 /run/fictionet/ca.pem /run/agent-ca.pem
 AGENT=(ip netns exec agent setpriv --reuid=agent --regid=agent --clear-groups
     --inh-caps=-all --bounding-set=-all --no-new-privs
     env -i PATH=/usr/bin:/bin HOME=/tmp)
-"${AGENT[@]}" bash -c 'while :; do
+agent 'dig +short example.test; curl -fsS --cacert /run/agent-ca.pem https://example.test/ >/dev/null; curl -fsS http://plain.test/ >/dev/null'
+"${AGENT[@]}" bash -ec 'while :; do
     dig +short example.test nope.test >/dev/null
-    curl -sS --cacert /run/agent-ca.pem https://example.test/ >/dev/null
-    curl -sS http://plain.test/ >/dev/null
+    curl -fsS --cacert /run/agent-ca.pem https://example.test/ >/dev/null
+    curl -fsS http://plain.test/ >/dev/null
     sleep 1
-done' >/dev/null 2>&1 &
+done' >/run/traffic.log 2>&1 &
 traffic_pid=$!
 sleep 3
+if ! kill -0 "$traffic_pid" 2>/dev/null; then
+    echo "demo: sandbox traffic exited" >&2
+    sed 's/^/    /' /run/traffic.log >&2
+    exit 1
+fi
 
 step "The same API from a shell: fictionet observe"
 vm "fictionet observe --world unix:/run/fictionet/world.sock world"
 vm "fictionet observe --world unix:/run/fictionet/world.sock graph | jq -c '{tasks: [.nodes[] | select(.kind != \"sandbox\")] | length, sandboxes: [.nodes[] | select(.kind == \"sandbox\") | .name], links: (.edges | length)}'"
 note "The world keeps a log of events, such as web_world's dns.query and http.request, whether"
-note "or not anyone watches. The watch request shows the latest, then each new one as it happens:"
-vm "{ timeout 4 fictionet observe --world unix:/run/fictionet/world.sock watch || true; } | jq -c 'select(.event == \"event\") | .data | {source, kind, summary}' | sed -n 1,4p"
+note "or not anyone watches. The watch request replays every event the world kept from the start,"
+note "then follows new events as they happen. Here are the first four:"
+vm "s=0
+timeout 4 fictionet observe --world unix:/run/fictionet/world.sock watch 0 >/run/watch.jsonl || s=\$?
+[[ \$s -eq 0 || \$s -eq 124 ]] || exit \"\$s\"
+jq -es 'map(select(.event == \"event\" and .data.source == \"http\")) | length > 0' /run/watch.jsonl >/dev/null
+jq -c 'select(.event == \"event\") | .data | {source, kind, summary}' /run/watch.jsonl | sed -n 1,4p"
 
 step "Open the dashboard"
 printf '\n    %shttp://127.0.0.1:%s/#token=%s%s\n\n' "$bold" "$host_port" "$token" "$reset"
@@ -67,6 +79,12 @@ else
     seconds="${seconds:-10}"
     note "Stopping in $seconds s (DASHBOARD_SECONDS sets how long)."
     sleep "$seconds"
+fi
+
+if ! kill -0 "$traffic_pid" 2>/dev/null; then
+    echo "demo: sandbox traffic exited" >&2
+    sed 's/^/    /' /run/traffic.log >&2
+    exit 1
 fi
 
 step "Clean up"

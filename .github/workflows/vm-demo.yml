@@ -1,8 +1,8 @@
 name: VM demo
 
-# Runs demos/web in the Fictionet VM (vm/run), the way a newcomer would:
-# QEMU and KVM on the runner, and nothing else. Started by hand from the
-# Actions tab.
+# Runs demos/web and demos/dashboard in the Fictionet VM (vm/run), the way
+# a newcomer would: QEMU and KVM on the runner, and nothing else.
+# Started by hand from the Actions tab.
 on:
   workflow_dispatch:
 
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   web:
-    name: demos/web
+    name: demos/web and demos/dashboard
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -36,6 +36,8 @@ jobs:
           key: vm-debian-${{ hashFiles('vm/debian-image.sh') }}
       - name: demos/web
         run: demos/web
+      - name: demos/dashboard
+        run: DASHBOARD_SECONDS=5 demos/dashboard
       - name: The VM's console, if it failed
         if: failure()
         run: tail -50 .vm/run/console.log .vm/prepare.log || true

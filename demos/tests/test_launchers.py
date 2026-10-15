@@ -15,6 +15,7 @@ class Launchers(unittest.TestCase):
             "proxy": ["https://example.test/", "http://plain.test/", '-x "$SOCKS" https://example.test/'],
             "k8s": ["--cacert /run/ca/ca.pem https://example.test/"],
             "border": ["-b /tmp/jar $bank/balance"],
+            "dashboard": ["--cacert /run/agent-ca.pem https://example.test/", "http://plain.test/"],
         }
         for demo, fetches in required.items():
             lines = (ROOT / f"demos/guest/{demo}.sh").read_text().splitlines()
@@ -41,9 +42,15 @@ class Launchers(unittest.TestCase):
             "--clear-groups", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs",
             "env", "-i", "PATH=/usr/bin:/bin", "HOME=/tmp",
         ])
-        self.assertIn('"${AGENT[@]}" bash -c', script)
+        self.assertIn('"${AGENT[@]}" bash -ec', script)
+        loop = script.split('"${AGENT[@]}" bash -ec \'', 1)[1].split("done'", 1)[0]
+        curls = [line for line in loop.splitlines() if 'curl ' in line]
+        self.assertEqual(len(curls), 2)
+        for line in curls:
+            self.assertIn('-fsS', shlex.split(line))
         self.assertIn('install -m 0644 /run/fictionet/ca.pem /run/agent-ca.pem', script)
         self.assertIn('--cacert /run/agent-ca.pem', script)
+        self.assertIn('timeout 4 fictionet observe --world unix:/run/fictionet/world.sock watch 0', script)
 
     def test_provision_disables_shared_resolver_and_replaces_symlink(self):
         script = (ROOT / "vm/guest/provision.sh").read_text()

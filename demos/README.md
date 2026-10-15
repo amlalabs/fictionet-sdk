@@ -33,6 +33,15 @@ The web, proxy and dashboard demos wait for the world's socket and a complete,
 readable CA certificate before continuing. If the world exits or startup times
 out, they stop and print the world log.
 
+The dashboard demo first looks up a name and checks HTTPS and HTTP fetches.
+The fetches fail on HTTP errors, and any failed fetch stops the background loop.
+The loop's `dig +short` stops it only when no DNS server replies; NXDOMAIN and
+empty answers do not stop it. The demo checks that the loop is still running
+after startup and before cleanup, printing its log on failure.
+The shell watch replays retained events with `watch 0`. It accepts normal
+completion or the four-second deadline only when the capture is valid JSON and
+contains an HTTP event. Other observer failures stop the demo.
+
 Refusal steps require the expected exit status and diagnostic. An unexpected
 timeout, missing command, or failed runner stops the demo. The scripts capture
 status and output before formatting them for display. Output checks show only

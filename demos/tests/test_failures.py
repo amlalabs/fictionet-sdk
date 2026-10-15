@@ -273,6 +273,96 @@ class Failures(unittest.TestCase):
                                 input='', capture_output=True, text=True)
         self.assertEqual(result.returncode, 4)
 
+    def dashboard_watch(self, output, status):
+        script = (ROOT / 'demos/guest/dashboard.sh').read_text()
+        section = script.split('step "The same API from a shell: fictionet observe"', 1)[1]
+        section = section.split('\nstep ', 1)[0]
+        command = section[section.rindex('\nvm "') + 1:].strip()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fictionet = root / 'fictionet'
+            fictionet.write_text(f'#!/bin/sh\nprintf "%s" {shlex.quote(output)}\nexit {status}\n')
+            fictionet.chmod(0o755)
+            command = command.replace('/run/', f'{root}/')
+            # lib.sh prepends its own bin directory; put the stub first after sourcing it.
+            return self.shell(f'export PATH={shlex.quote(directory)}:$PATH; '
+                              + command + '\necho continued')
+
+    def test_dashboard_observer_start_failure(self):
+        self.assert_stopped(self.dashboard_watch('', 1))
+
+    def test_dashboard_empty_capture(self):
+        for status in (0, 124):
+            with self.subTest(status=status):
+                self.assert_stopped(self.dashboard_watch('', status))
+
+    def test_dashboard_missing_required_event(self):
+        event = '{"event":"event","data":{"source":"dns","kind":"query","summary":"example.test"}}\n'
+        self.assert_stopped(self.dashboard_watch(event, 124))
+
+    def test_dashboard_http_capture_accepts_completion_and_deadline(self):
+        event = '{"event":"event","data":{"source":"http","kind":"request","summary":"GET /"}}\n'
+        for status in (0, 124):
+            with self.subTest(status=status):
+                result = self.dashboard_watch(event, status)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('    {"source":"http","kind":"request","summary":"GET /"}', result.stdout)
+                self.assertIn('continued', result.stdout)
+        self.assert_stopped(self.dashboard_watch(event, 1))
+
+    def test_dashboard_malformed_capture(self):
+        event = '{"event":"event","data":{"source":"http","kind":"request","summary":"GET /"}}\n'
+        self.assert_stopped(self.dashboard_watch(event + '{truncated', 124))
+
+    def test_dashboard_background_job_failure(self):
+        script = (ROOT / 'demos/guest/dashboard.sh').read_text()
+        start = script.index('"${AGENT[@]}" bash -')
+        command = script[start:script.index('\ntraffic_pid=$!', start)]
+        self.assertTrue(command.endswith(' &'))
+        command = command.removesuffix(' &')
+        for failed_fetch in ('https://example.test/', 'http://plain.test/'):
+            with self.subTest(failed_fetch=failed_fetch), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                stubs = {
+                    'dig': 'exit 0',
+                    'curl': f'case "$*" in *{failed_fetch}*) echo traffic-failed >&2; exit 7;; esac',
+                    # Stop an unchecked loop without waiting or spinning forever.
+                    'sleep': 'echo unexpected-sleep >&2; kill -TERM "$PPID"',
+                }
+                for name, body in stubs.items():
+                    stub = root / name
+                    stub.write_text('#!/bin/sh\n' + body + '\n')
+                    stub.chmod(0o755)
+                result = self.shell(f'export PATH={shlex.quote(directory)}:$PATH; '
+                                    + command.replace('/run/', f'{root}/') + '\necho continued')
+                self.assertEqual(result.returncode, 7, result.stderr)
+                self.assertNotIn('continued', result.stdout)
+                log = (root / 'traffic.log').read_text()
+                self.assertIn('traffic-failed', log)
+                self.assertNotIn('unexpected-sleep', log)
+
+    def test_dashboard_checks_traffic_after_start_and_before_cleanup(self):
+        script = (ROOT / 'demos/guest/dashboard.sh').read_text()
+        checks = list(re.finditer(r'^if ! kill -0 "\$traffic_pid".*?^fi$', script, re.M | re.S))
+        self.assertEqual(len(checks), 2)
+        self.assertLess(script.index('sleep 3\n'), checks[0].start())
+        self.assertLess(checks[0].end(), script.index('step "The same API'))
+        self.assertLess(script.index('sleep "$seconds"\nfi'), checks[1].start())
+        self.assertLess(checks[1].end(), script.index('step "Clean up"'))
+        for check in checks:
+            with self.subTest(check=check.start()), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'traffic.log').write_text('traffic-failed\n')
+                command = check.group().replace('/run/', f'{root}/')
+                result = self.shell("bash -c 'exit 7' & traffic_pid=$!; "
+                                    'status=0; wait "$traffic_pid" || status=$?; [[ $status -eq 7 ]];\n'
+                                    + command + '\necho continued')
+                self.assert_stopped(result)
+                self.assertIn('traffic-failed', result.stderr)
+                result = self.shell('traffic_pid=$$;\n' + command + '\necho continued')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('continued', result.stdout)
+
     def web_start(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
