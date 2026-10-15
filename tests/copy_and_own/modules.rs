@@ -16,6 +16,8 @@ macro_rules! protocols {
         pub mod bacnet;
         #[path = "../../src/stdlib/codec/base64.rs"]
         pub mod base64;
+        #[path = "../../src/stdlib/codec/ber.rs"]
+        pub mod ber;
         #[path = "../../src/stdlib/bgp.rs"]
         pub mod bgp;
         #[path = "../../src/stdlib/codec/bounded.rs"]

@@ -60,6 +60,12 @@ after rejection. Callers supply validation and translate fatal errors. SMTP
 limits unstuffed lines and rejects NUL; POP3 limits stuffed lines and allows
 NUL in bodies. Both writers validate and reserve before appending output.
 
+`codec::ber::read_length` reads a length prefix without moving a cursor or
+waiting for its body. Its policy bounds the number of length octets and
+can require minimal encodings. ASN.1 permits four length octets and checks
+minimality under DER. SNMP permits 126, including leading zero octets.
+Each adapter keeps its own size limits, indefinite-length rules and errors.
+
 ## 1. A service
 
 A service is the server side of one protocol, for one connection. It

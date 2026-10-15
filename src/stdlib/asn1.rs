@@ -63,7 +63,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, ber};
 
 /// Compatibility re-export of [`codec::write_checked`](fictionet::stdlib::codec::write_checked).
 pub use fictionet::stdlib::codec::write_checked;
@@ -513,45 +513,43 @@ fn read_tag(b: &[u8], start: usize) -> Result<(Tag, usize), Error> {
 
 /// The header at `b[start..]`, with `len` counted from `start`.
 fn read_header(b: &[u8], start: usize, rules: Rules) -> Result<Header, Error> {
-    let (tag, mut i) = read_tag(b, start)?;
-    let first = at(b, i)?;
-    i += 1;
-    let length = match first {
-        0..=0x7f => Length::Definite(usize::from(first)),
-        0x80 => {
+    let (tag, i) = read_tag(b, start)?;
+    let end = b.len().min(MAX_INPUT);
+    let prefix = ber::read_length(
+        &b[i..end],
+        ber::LengthPolicy {
+            max_octets: MAX_LENGTH_OCTETS,
+            minimal: rules == Rules::Der,
+        },
+    )
+    .map_err(|e| match e {
+        ber::Error::Reserved | ber::Error::Octets => Error::Length,
+        ber::Error::NonMinimal => Error::NonMinimalLength,
+        ber::Error::Overflow => Error::TooLong,
+    })?
+    .ok_or(if end == MAX_INPUT {
+        Error::TooLong
+    } else {
+        Error::Truncated
+    })?;
+    let length = match prefix.value {
+        None => {
             if rules == Rules::Der || !tag.constructed {
                 return Err(Error::Indefinite);
             }
             Length::Indefinite
         }
-        0xff => return Err(Error::Length),
-        _ => {
-            let n = usize::from(first & 0x7f);
-            if n > MAX_LENGTH_OCTETS {
-                return Err(Error::Length);
-            }
-            let mut v: u64 = 0;
-            for k in 0..n {
-                let c = at(b, i)?;
-                i += 1;
-                if rules == Rules::Der && k == 0 && c == 0 {
-                    return Err(Error::NonMinimalLength);
-                }
-                v = v << 8 | u64::from(c);
-            }
-            if rules == Rules::Der && v < 0x80 {
-                return Err(Error::NonMinimalLength);
-            }
-            if v > MAX_INPUT as u64 {
+        Some(v) => {
+            if v > MAX_INPUT {
                 return Err(Error::TooLong);
             }
-            Length::Definite(v as usize)
+            Length::Definite(v)
         }
     };
     Ok(Header {
         tag,
         length,
-        len: i - start,
+        len: i + prefix.len - start,
     })
 }
 
@@ -2717,6 +2715,82 @@ mod tests {
         let w = der(|w| w.octet_string(&[7; 200]));
         assert_eq!(&w[..3], [0x04, 0x81, 200]);
         assert_eq!(w.len(), 203);
+    }
+
+    #[test]
+    fn header_length_policy_and_rejection_timing() {
+        for rules in [Rules::Ber, Rules::Der] {
+            for b in [&[0x04, 0x85][..], &[0x04, 0xfe], &[0x04, 0xff]] {
+                assert_eq!(Header::parse(b, rules), Err(Error::Length));
+            }
+            for b in [&[0x04, 0x84][..], &[0x04, 0x84, 0xff, 0xff, 0xff]] {
+                assert_eq!(Header::parse(b, rules), Err(Error::Truncated));
+            }
+            for b in [
+                &[0x04, 0x83, 0x10, 0, 1][..],
+                &[0x04, 0x84, 0xff, 0xff, 0xff, 0xff],
+            ] {
+                assert_eq!(Header::parse(b, rules), Err(Error::TooLong));
+            }
+            assert_eq!(
+                Header::parse(&[0x04, 0x83, 0x10, 0, 0], rules),
+                Ok(Header {
+                    tag: Tag::OCTET_STRING,
+                    length: Length::Definite(MAX_INPUT),
+                    len: 5,
+                })
+            );
+            assert_eq!(Header::parse(&[0x04, 0x80], rules), Err(Error::Indefinite));
+        }
+        assert_eq!(
+            Header::parse(&[0x04, 0x84, 0], Rules::Der),
+            Err(Error::NonMinimalLength)
+        );
+        assert_eq!(
+            Header::parse(&[0x04, 0x84, 0], Rules::Ber),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Header::parse(&[0x04, 0x84, 0, 0, 0, 1], Rules::Ber),
+            Ok(Header {
+                tag: Tag::OCTET_STRING,
+                length: Length::Definite(1),
+                len: 6,
+            })
+        );
+        assert_eq!(
+            Header::parse(&[0x30, 0x80], Rules::Der),
+            Err(Error::Indefinite)
+        );
+        assert_eq!(
+            Header::parse(&[0x30, 0x80], Rules::Ber),
+            Ok(Header {
+                tag: Tag::SEQUENCE,
+                length: Length::Indefinite,
+                len: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn length_reads_stop_at_the_input_limit() {
+        let mut b = vec![0; MAX_INPUT + 2];
+        for (tail, expected) in [
+            (&[0x04][..], Err(Error::TooLong)),
+            (&[0x04, 0x82][..], Err(Error::TooLong)),
+            (&[0x04, 0x82, 1][..], Err(Error::TooLong)),
+            (&[0x04, 0x82, 0][..], Err(Error::NonMinimalLength)),
+            (&[0x04, 0x85][..], Err(Error::Length)),
+        ] {
+            let start = MAX_INPUT - tail.len();
+            b[start..MAX_INPUT].copy_from_slice(tail);
+            assert_eq!(read_header(&b, start, Rules::Der), expected);
+            assert_eq!(read_header(&b[..MAX_INPUT], start, Rules::Der), expected);
+            assert_eq!(
+                read_header(&b[..MAX_INPUT - 1], start, Rules::Der),
+                Err(Error::Truncated)
+            );
+        }
     }
 
     #[test]

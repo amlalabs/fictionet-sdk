@@ -68,7 +68,7 @@ use fictionet::stdlib::codec::Frames;
 use std::fmt;
 use std::str::FromStr;
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Wire, ber};
 
 /// The UDP port agents listen on for requests.
 pub const PORT: u16 = 161;
@@ -231,31 +231,27 @@ impl Header {
         if tag & tag::HIGH_NUMBER == tag::HIGH_NUMBER {
             return Err(Error::UnexpectedTag(tag));
         }
-        let Some(&first) = b.get(1) else {
+        let Some(prefix) = ber::read_length(
+            &b[1..],
+            ber::LengthPolicy {
+                max_octets: 126,
+                minimal: false,
+            },
+        )
+        .map_err(|e| match e {
+            ber::Error::Reserved | ber::Error::Octets | ber::Error::NonMinimal => Error::Length,
+            ber::Error::Overflow => Error::TooLong(usize::MAX),
+        })?
+        else {
             return Ok(None);
         };
-        let (content_len, header_len) = if first < 0x80 {
-            (usize::from(first), 2)
-        } else {
-            // 0x80 is the indefinite form, and X.690 (8.1.3.5) reserves 0xff.
-            let n = usize::from(first & 0x7f);
-            if n == 0 || n == 0x7f {
-                return Err(Error::Length);
-            }
-            let Some(bytes) = b.get(2..2 + n) else {
-                return Ok(None);
-            };
-            let len = bytes.iter().fold(0usize, |acc, &x| {
-                acc.saturating_mul(256).saturating_add(usize::from(x))
-            });
-            (len, 2 + n)
-        };
+        let content_len = prefix.value.ok_or(Error::Length)?;
         if content_len > MAX_MESSAGE {
             return Err(Error::TooLong(content_len));
         }
         Ok(Some(Header {
             tag,
-            header_len,
+            header_len: 1 + prefix.len,
             content_len,
         }))
     }
@@ -2640,6 +2636,50 @@ mod tests {
             false,
         );
         assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m));
+    }
+
+    #[test]
+    fn header_length_policy_and_rejection_timing() {
+        for b in [&[0x30, 0x80][..], &[0x30, 0xff]] {
+            assert_eq!(Header::parse(b), Err(Error::Length));
+        }
+        assert_eq!(
+            Header::parse(&[0x1f, 0xff]),
+            Err(Error::UnexpectedTag(0x1f))
+        );
+        for (b, content_len) in [
+            (&[0x30, 0x81, 0][..], 0),
+            (&[0x30, 0x84, 0, 0, 0, 127][..], 127),
+            (&[0x30, 0x82, 0xff, 0xff][..], MAX_MESSAGE),
+        ] {
+            assert_eq!(
+                Header::parse(b),
+                Ok(Some(Header {
+                    tag: tag::SEQUENCE,
+                    header_len: b.len(),
+                    content_len,
+                }))
+            );
+        }
+        for (b, error) in [
+            (&[0x30, 0x83, 1, 0, 0][..], Error::TooLong(65_536)),
+            (
+                &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff][..],
+                Error::TooLong(u32::MAX as usize),
+            ),
+        ] {
+            for end in 0..b.len() {
+                assert_eq!(Header::parse(&b[..end]), Ok(None));
+            }
+            assert_eq!(Header::parse(b), Err(error));
+        }
+        let mut b = [0xff; 128];
+        b[0] = tag::SEQUENCE;
+        b[1] = 0xfe;
+        for end in 0..b.len() {
+            assert_eq!(Header::parse(&b[..end]), Ok(None));
+        }
+        assert_eq!(Header::parse(&b), Err(Error::TooLong(usize::MAX)));
     }
 
     #[test]
