@@ -1,7 +1,9 @@
 use std::future::Future;
 use std::time::Duration;
 
-use fictionet::{Cx, block_on, lab, run};
+#[cfg(feature = "std")]
+use fictionet::run;
+use fictionet::{Cx, block_on, lab};
 
 use crate::common::within;
 use crate::done::Done;
@@ -37,6 +39,7 @@ where
 }
 
 /// Runs a world on real time within the host limit and requires Done.
+#[cfg(feature = "std")]
 #[allow(dead_code)]
 pub fn real_world<F, Fut>(limit: Duration, f: F)
 where
@@ -47,6 +50,7 @@ where
 }
 
 /// Runs a seeded real-time world within the host limit and requires Done.
+#[cfg(feature = "std")]
 #[allow(dead_code)]
 pub fn seeded_real_world<F, Fut>(seed: fictionet::Seed, limit: Duration, f: F)
 where
