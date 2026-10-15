@@ -8,16 +8,14 @@ use std::task::{Context, Poll};
 use arbitrary::Arbitrary;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use fictionet::attach_proxy::socks5_handshake::handshake;
 use fictionet::relay::proxy::Host;
 use fictionet::relay::proxy::auth::{Token, base64_decode};
 use fictionet::relay::proxy::dns;
 use fictionet::relay::proxy::http::{
     Target, error_response, forward_head, parse_request, rewrite_response,
 };
-#[path = "../../src/bin/fictionet/proxy/socks5_handshake.rs"]
-mod socks5_handshake;
 use fictionet::stdlib::http1::{RequestHead, ResponseHead};
-use socks5_handshake::handshake;
 
 /// The HTTP door: a request head, the token check, and the answer's head.
 pub fn http(data: &[u8]) {

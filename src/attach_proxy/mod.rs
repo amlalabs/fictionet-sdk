@@ -5,11 +5,14 @@
 //!
 //! The HTTP door reads request heads with [`stdlib::http1`](crate::stdlib::http1)
 //! and the SOCKS5 door reads the handshake with
-//! [`stdlib::socks`](crate::stdlib::socks).
+//! [`stdlib::socks`](crate::stdlib::socks). The generic-stream SOCKS5
+//! handshake is available in `socks5_handshake` with the `tokio` feature.
 
 pub mod auth;
 pub mod dns;
 pub mod http;
+#[cfg(feature = "tokio")]
+pub mod socks5_handshake;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

@@ -13,14 +13,14 @@ use std::net::SocketAddrV4;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use fictionet::stdlib::codec::{Fail, Stream, Wire};
-use fictionet::stdlib::socks::{
+use crate::stdlib::codec::{Fail, Stream, Wire};
+use crate::stdlib::socks::{
     self, Address, AuthReply, ClientMessage, ClientMessages, Command, FrameError, Method, Reply,
     ReplyCode, Selection,
 };
 
-use fictionet::relay::proxy::Host;
-use fictionet::relay::proxy::auth::Token;
+use super::Host;
+use super::auth::Token;
 
 /// How the handshake ended without a target.
 #[derive(Debug, PartialEq, Eq)]

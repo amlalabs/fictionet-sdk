@@ -1,10 +1,10 @@
 //! The SOCKS5 door, `--type socks5`, served over a client's TCP
-//! connection. The handshake is [`super::socks5_handshake`].
+//! connection. The handshake is [`fictionet::attach_proxy::socks5_handshake`].
 
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use super::socks5_handshake::{Connect, Refusal, handshake, reply};
+use fictionet::attach_proxy::socks5_handshake::{Connect, Refusal, handshake, reply};
 use fictionet::relay::proxy::auth::Token;
 use fictionet::stdlib::socks::ReplyCode;
 use fictionet::tokio::ConnectionTokioExt;
