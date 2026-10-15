@@ -733,6 +733,36 @@ the client. HTTP/1 head deadlines include the wait between requests, also
 after handoff to hyper. HTTP/2 has no request-head deadline. Body deadlines
 and write stall deadlines use the Fictionet clock on every backend.
 
+An opt-in `httpd::Observer` sees the parsed request head before virtual hosting
+and admission, each decoded body chunk before it can be discarded, and the
+receipt outcome. Set it with `HttpOptions.observe`, `Http1::observe`,
+`Server::observe` or `web::Site::observe`. Shared endpoints use the first
+server's observer. Each request has separate observer state, including on
+concurrent HTTP/2 streams. Keep that state and returned fields bounded, and
+return redacted facts. Both are outside the service budget, like handler
+extensions.
+The hook does not change URI or header values in the ordinary event fields.
+Observer fields are merged first, then handler fields, then service facts.
+
+Every request event has `received`: `complete`, `cut_off`, `too_large`,
+`timeout` or `budget`. This describes request receipt; `complete` still
+describes sending the response. Native HTTP/1 body timeouts produce a
+request event with `answer: timeout`, no status and `complete: false`, as well
+as the timeout error. Native oversized bodies carry `answer: too_large`.
+Only decoded body data is observed, not chunk framing, chunk extensions or
+trailers. Native HTTP/1 observes buffered partial body bytes on decode failure
+and timeout only, not on connection reset, budget end or cancellation.
+An HTTP/1.1 request without Host is answered from bytes buffered with its head;
+later body bytes are not observed, leaving `received: cut_off` unless already
+too large.
+Hyper stops reading at rejection. If its body read reports region cancellation,
+`received` is `cut_off`, but its response still uses `answer: timeout` and status
+`408`. Use `received` to distinguish cancellation from a body deadline.
+Neither backend raises a limit or logs body bytes for observation. Parse
+failures before a tracked head and bytes after protocol upgrade are outside
+this hook. Consumers must use complete receipt or an observer verdict before
+judging safety; no handler label does not mean no exposure.
+
 In `http2::Session`, HPACK reductions wait for the corresponding SETTINGS
 ACK. A decrease followed by an unacknowledged rebound leaves the earlier
 allowance in place. ACKs apply in announcement order. Later pending
@@ -1042,4 +1072,8 @@ Source compatibility: exhaustive matches on `smtp::Input` must handle the
 new `Line` variant. Raw responses are emitted only when the caller selects
 them. Existing command and DATA parsing keeps its grammar and limits.
 
-Accessing the decoder or upgrading the connection stops item faults and emits the `conn.faults` event with a `stopped` field. Byte faults continue. Over UDP, decoder access applies to the current datagram; each new datagram starts with a fresh decoder.
+Calling `Driver::decoder()` or upgrading the connection stops item faults and
+emits the `conn.faults` event with a `stopped` field. `Driver::peek_decoder()`
+reads decoder state without stopping item faults. Byte faults continue. Over
+UDP, decoder access applies to the current datagram; each new datagram starts
+with a fresh decoder.

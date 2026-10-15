@@ -391,6 +391,21 @@ pub struct RequestEvents {
 }
 
 impl RequestEvents {
+    /// Number of body bytes at the start of an unread buffer of `buffered`
+    /// bytes that has not yet filled a body event. Use after decoding stops
+    /// to observe a partial body.
+    /// Chunk sizes, delimiters and trailers are excluded. This does not
+    /// consume bytes or change the decoder's state.
+    pub fn pending_body_len(&self, buffered: usize) -> usize {
+        match self.core.state {
+            State::Length(left) | State::Data(left) => {
+                buffered.min(usize::try_from(left).unwrap_or(usize::MAX))
+            }
+            State::Close => buffered,
+            _ => 0,
+        }
+    }
+
     /// Creates a request decoder with the default limits.
     pub fn new() -> Self {
         Self::with_limits(Limits::default())

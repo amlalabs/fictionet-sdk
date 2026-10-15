@@ -3134,7 +3134,7 @@ fn outcome(e: &Entry) -> String {
 fn extra(e: &Entry) -> usize {
     let standard = [
         "scheme", "sni", "host", "method", "uri", "path", "query", "version", "headers", "started",
-        "answer", "status", "sent", "complete",
+        "answer", "received", "status", "sent", "complete",
     ];
     e.fields
         .iter()
@@ -3623,6 +3623,7 @@ fn events_for_http_requests() {
                 (Some("GET"), path)
             );
             assert_eq!(h.str("page"), Some("article"));
+            assert_eq!(h.str("received"), Some("complete"));
             assert_eq!(extra(h), 1);
             assert_eq!(
                 (h.u64("sent"), flag(h, "complete")),
@@ -3678,6 +3679,7 @@ fn events_for_http_requests() {
             String::from_utf8_lossy(&reply)
         );
         let got = wait_for(&fcx, &log, 4, http_seen).await;
+        assert!(got.iter().all(|h| h.str("received") == Some("complete")));
         let summary: Vec<_> = got
             .iter()
             .map(|h| {

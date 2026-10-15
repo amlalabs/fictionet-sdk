@@ -111,14 +111,44 @@
 //! `uri`, `path`, `query`, `version` (`HTTP/1.1`, `HTTP/2.0`), `headers`
 //! (`[name, value]` pairs in the order of `http::HeaderMap`), `started`
 //! (seconds on the run's clock), `answer` (`handler`, `error`, `cancelled`,
-//! what the handler set, such as `redirect`, or, over HTTP/2, `too_large`,
+//! what the handler set, such as `redirect`, or `too_large`,
 //! `timeout`, `cut_off` or `budget` for a request the service turned
-//! down), `status`, `sent` (body bytes the connection took) and `complete`
+//! down), `received` (`complete`, `cut_off`, `too_large`, `timeout` or
+//! `budget` for request receipt), `status`, `sent` (response body bytes the
+//! connection took) and `complete`
 //! (whether it took the whole body). Over HTTP/1 a byte counts once it is
 //! written, and the event is made after the last one is; over HTTP/2 once
 //! hyper takes it for the stream. A handler adds its own fields by putting
-//! [`Fields`] in its response's
-//! extensions; they come first, and the service's own facts win a clash.
+//! [`Fields`] in its response's extensions. An opt-in [`Observer`] sees the
+//! head before virtual hosting and admission, body chunks before limits
+//! discard them, and the receipt outcome. Install it with [`Http1::observe`],
+//! [`HttpOptions::observe`], [`Server::observe`] or
+//! [`web::Site::observe`](fictionet::stdlib::web::Site::observe). Its request-local
+//! state can retain authority and classification across chunks without logging
+//! plaintext bodies. Observer fields come first, handler fields override them,
+//! and service facts win last. `answer` comes from the response, never the
+//! observer. No body bytes are added to the event automatically.
+//!
+//! A native HTTP/1 body timeout also finishes the request event with
+//! `answer: timeout`, `received: timeout`, a null status and `complete: false`.
+//! Request receipt and response completion are separate: a successful error
+//! response can have `complete: true` with `received: too_large`.
+//! Native HTTP/1 observes decoded blocks and, on failure or timeout, any
+//! buffered partial body block. Buffered partial bytes are not observed on
+//! connection reset, budget end or cancellation. An HTTP/1.1 request without
+//! Host is answered from bytes buffered with its head; later body bytes are
+//! not observed, leaving `received: cut_off` unless already too large.
+//! Hyper observes each data frame it reads and stops reading at rejection.
+//! Only decoded body data is observed, not chunk framing, chunk extensions
+//! or trailers.
+//! Neither backend relaxes its limits to observe more bytes. Requests rejected
+//! before a parsed head reaches the service have no request event. Bytes after
+//! an upgrade handoff are outside HTTP observation. A missing handler label
+//! is not evidence of no exposure; consumers need complete receipt or an
+//! observer verdict to judge safety.
+//! If hyper's body read reports region cancellation, `received` is `cut_off`;
+//! its response still uses `answer: timeout` and status `408`. Consumers must
+//! use `received` to distinguish this from a body deadline.
 //! A connection that ends in an error is one `http.error` event, with
 //! `local`, `cause` (`protocol`, `timeout` or `transport`) and `detail`.
 
@@ -136,6 +166,7 @@ use http_body::{Body as _, Frame};
 use fictionet::RaceError;
 use fictionet::events::{ConnInfo, Fields};
 use fictionet::stdlib::ConnectionExt;
+use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::serve::Prefixed;
 use fictionet::stdlib::serve::{
@@ -164,7 +195,79 @@ pub use sites::{Routing, Server, Target, VHost, VirtualHosts, normalize, request
 
 use body::Inner;
 use handlers::status_only;
-use response::{ResponsePolicy, Tracker, error_event, error_response, head_held, request_held};
+use response::{
+    ResponsePolicy, Tracker, answered, error_event, error_response, head_held, request_held,
+};
+
+/// How much of a request body the service received and admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Received {
+    /// The whole body arrived within the limits.
+    Complete,
+    /// Receipt ended before the whole body arrived.
+    CutOff,
+    /// A body chunk exceeded the body limit.
+    TooLarge,
+    /// The body deadline expired.
+    Timeout,
+    /// The request could not fit in the service budget.
+    Budget,
+}
+
+impl Received {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::CutOff => "cut_off",
+            Self::TooLarge => "too_large",
+            Self::Timeout => "timeout",
+            Self::Budget => "budget",
+        }
+    }
+}
+
+/// Classifies arrivals before routing or admission, without retaining body bytes.
+///
+/// Each request has its own `state`, separate from handler extensions. Use it
+/// to carry identity and bounded classification state from `head` to `body`
+/// and `end`, including across concurrent HTTP/2 streams. Callbacks run on
+/// the world's path: use no host clock or entropy, and bound retained state.
+/// State and returned fields, like handler extensions, are outside the service
+/// budget. Keep both bounded.
+/// Return only redacted facts; returned fields are merged in callback order.
+/// Handler fields then override them, and service facts win last.
+/// The service never logs body bytes itself. Head fields keep their ordinary
+/// event representation; this hook does not redact URI or header values.
+pub trait Observer: Send + Sync + 'static {
+    /// A parsed head, including its original authority and connection identity.
+    /// Runs before virtual hosting, body limits and request budget admission.
+    fn head(
+        &self,
+        _head: &http::request::Parts,
+        _conn: &ConnInfo,
+        _state: &mut http::Extensions,
+    ) -> Option<Fields> {
+        None
+    }
+
+    /// Decoded body data as it arrives, before any limit discards it.
+    /// Chunk framing, chunk extensions and trailers are not observed.
+    /// Chunk boundaries follow the decoder, not network reads. Native HTTP/1
+    /// observes buffered partial bytes on decode failure and timeout only,
+    /// not on connection reset, budget end or cancellation. Hyper stops on
+    /// rejection; native HTTP/1 keeps observing while draining an oversized body.
+    /// An HTTP/1.1 request without Host is answered from bytes buffered with its
+    /// head; later body bytes are not observed, leaving `received: cut_off` unless
+    /// already too large.
+    fn body(&self, _bytes: &[u8], _state: &mut http::Extensions) -> Option<Fields> {
+        None
+    }
+
+    /// Receipt ended, even when no handler ran. Called once per observed head.
+    fn end(&self, _received: Received, _state: &mut http::Extensions) -> Option<Fields> {
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP/1 as a service
@@ -222,6 +325,8 @@ const BODY: Timer = "body";
 /// HTTP/1.0 and 1.1 for one connection, answering with a [`Handler`].
 pub struct Http1 {
     handler: Arc<dyn Handler>,
+    observe: Option<Arc<dyn Observer>>,
+    tracker: Option<Tracker>,
     opts: Limits,
     /// The world's date at the start of the run, for `Date` headers.
     date: Option<SystemTime>,
@@ -246,6 +351,8 @@ impl Http1 {
     pub fn with(handler: Arc<dyn Handler>, opts: Limits) -> Http1 {
         Http1 {
             handler,
+            observe: None,
+            tracker: None,
             opts,
             date: None,
             handoff: None,
@@ -276,10 +383,60 @@ impl Http1 {
         self
     }
 
+    /// Observes each request before routing and while its body arrives.
+    pub fn observe(mut self, observer: Arc<dyn Observer>) -> Http1 {
+        self.observe = Some(observer);
+        self
+    }
+
+    fn track(&mut self, head: &RequestHead, conn: &ConnInfo) {
+        if self.observe.is_none() {
+            self.tracker = Some(Tracker::default());
+            return;
+        }
+        if let Some(request) = to_request(head, version_of(head), Body::empty()) {
+            self.tracker = Some(Tracker::observing(&request, conn, self.observe.clone()));
+        }
+    }
+
+    fn finish_receipt(
+        &mut self,
+        driver: &mut Driver<'_, http1::RequestEvents>,
+        received: Received,
+    ) {
+        if let Some(mut tracker) = self.tracker.take() {
+            let buffered = driver.unread().len();
+            let len = driver.peek_decoder().pending_body_len(buffered);
+            tracker.body(&driver.unread()[..len]);
+            tracker.received(received);
+            if let Some(head) = &self.head
+                && let Some(request) = to_request(head, version_of(head), Body::empty())
+            {
+                tracker.start(&request, driver.conn(), self.started);
+            }
+            if let Some(event) = tracker.finish(
+                Some(Fields::new().with("answer", received.as_str())),
+                None,
+                0,
+                false,
+            ) {
+                driver.record(event);
+            }
+        }
+        self.head = None;
+    }
+
     fn respond(&mut self, driver: &mut Driver<'_, http1::RequestEvents>) -> Flow {
         let held = self.body.capacity();
         let body = Body::from(std::mem::take(&mut self.body));
         let close = self.too_big;
+        if let Some(tracker) = &mut self.tracker {
+            tracker.received(if self.too_big {
+                Received::TooLarge
+            } else {
+                Received::Complete
+            });
+        }
         self.dispatch(driver, body, close, held)
     }
 
@@ -295,10 +452,7 @@ impl Http1 {
         let Some(head) = self.head.take() else {
             return Flow::Close;
         };
-        let version = match head.version {
-            http1::Version::Http10 => Version::HTTP_10,
-            http1::Version::Http11 => Version::HTTP_11,
-        };
+        let version = version_of(&head);
         let keep_alive = !close && head.keep_alive().unwrap_or(false) && head.method != "CONNECT";
         let request = match to_request(&head, version, body) {
             Some(r) => r,
@@ -311,12 +465,16 @@ impl Http1 {
         let mut request = request;
         request.extensions_mut().insert(driver.conn().clone());
         let head_only = request.method() == Method::HEAD;
-        let tracker = Tracker::new(&request, driver.conn(), self.started);
+        let mut tracker = self.tracker.take().expect("a parsed request has a tracker");
+        tracker.start(&request, driver.conn(), self.started);
         let held = held + request_held(&request);
         let now = driver.now();
         let conn = driver.conn().clone();
         let reply = if self.too_big {
-            Reply::Now(status_only(StatusCode::PAYLOAD_TOO_LARGE))
+            Reply::Now(answered(
+                status_only(StatusCode::PAYLOAD_TOO_LARGE),
+                "too_large",
+            ))
         } else {
             self.handler
                 .call(request, &mut Exchange::new(now, driver.entropy(), &conn))
@@ -382,7 +540,7 @@ fn asks_upgrade(head: &RequestHead) -> bool {
 /// The head at the start of `unread`, read with an empty Host field added
 /// after its request line, if that makes it a request head: an HTTP/1.1
 /// request that named no host.
-fn without_host(unread: &[u8]) -> Option<RequestHead> {
+fn without_host(unread: &[u8]) -> Option<(RequestHead, http1::RequestEvents, usize)> {
     let line_end = unread.windows(2).position(|w| w == b"\r\n")?;
     let head_end = unread.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     if head_end <= line_end {
@@ -391,7 +549,10 @@ fn without_host(unread: &[u8]) -> Option<RequestHead> {
     let mut patched = unread[..line_end + 2].to_vec();
     patched.extend_from_slice(b"Host:\r\n");
     patched.extend_from_slice(&unread[line_end + 2..head_end]);
-    let mut head = <RequestHead as fictionet::stdlib::codec::Wire>::parse(&patched).ok()?;
+    let mut decoder = http1::RequestEvents::new();
+    let Step::Item(H1::Head(mut head), _) = decoder.decode(&patched, false).ok()? else {
+        return None;
+    };
     // The handler sees the request as it came, without the field added.
     if head
         .headers
@@ -400,7 +561,7 @@ fn without_host(unread: &[u8]) -> Option<RequestHead> {
     {
         head.headers.remove(0);
     }
-    Some(head)
+    Some((head, decoder, head_end))
 }
 
 /// A request body that ends early: `bytes`, then an error saying `why`.
@@ -422,6 +583,13 @@ fn partial(bytes: Bytes, why: &'static str) -> Body {
         }
     }
     Body::new(Partial(Some(bytes), Some(why)))
+}
+
+fn version_of(head: &RequestHead) -> Version {
+    match head.version {
+        http1::Version::Http10 => Version::HTTP_10,
+        http1::Version::Http11 => Version::HTTP_11,
+    }
 }
 
 fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Request<Body>> {
@@ -550,11 +718,15 @@ impl serve::Service for Http1 {
                         .extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
                 }
                 self.started = driver.now();
+                self.track(&head, driver.conn());
                 self.head = Some(head);
                 self.body.clear();
                 self.too_big = false;
             }
             H1::Body(bytes) => {
+                if let Some(tracker) = &mut self.tracker {
+                    tracker.body(&bytes);
+                }
                 if self.body.len() + bytes.len() > self.opts.body {
                     self.too_big = true;
                 } else {
@@ -582,11 +754,14 @@ impl serve::Service for Http1 {
         if let Some(detail) = detail {
             driver.record(error_event(driver.conn(), "timeout", detail.into()));
         }
+        self.finish_receipt(driver, Received::Timeout);
         Ok(Flow::Close)
     }
 
     fn held(&self) -> usize {
-        self.body.capacity() + self.head.as_ref().map_or(0, head_held)
+        self.body.capacity()
+            + self.head.as_ref().map_or(0, head_held)
+            + self.tracker.as_ref().map_or(0, Tracker::held)
     }
 
     fn on_fail(
@@ -596,6 +771,16 @@ impl serve::Service for Http1 {
         driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<(), Infallible> {
         if self.head.is_some() {
+            let buffered = driver.unread().len();
+            let len = driver.peek_decoder().pending_body_len(buffered);
+            if let Some(tracker) = &mut self.tracker {
+                tracker.body(&driver.unread()[..len]);
+                tracker.received(if self.too_big {
+                    Received::TooLarge
+                } else {
+                    Received::CutOff
+                });
+            }
             // The body was cut off: the handler still sees what came, as a
             // body that ends in an error.
             let mut got = std::mem::take(&mut self.body);
@@ -609,12 +794,40 @@ impl serve::Service for Http1 {
         if matches!(
             error,
             fictionet::stdlib::codec::Fail::Protocol(http1::Error::Host)
-        ) && let Some(head) = without_host(driver.unread())
+        ) && let Some((head, mut decoder, head_end)) = without_host(driver.unread())
         {
             // An HTTP/1.1 request with no Host field: the handler answers
             // it, as a request that names no host (`400`, `no_host`).
-            self.head = Some(head);
             self.started = driver.now();
+            self.track(&head, driver.conn());
+            if let Some(tracker) = &mut self.tracker {
+                let mut unread = &driver.unread()[head_end..];
+                let mut received_bytes = 0;
+                let received = loop {
+                    match decoder.decode(unread, false) {
+                        Ok(Step::Item(H1::Body(bytes), n)) => {
+                            tracker.body(&bytes);
+                            received_bytes += bytes.len();
+                            unread = &unread[n..];
+                        }
+                        Ok(Step::Skip(n)) => unread = &unread[n..],
+                        Ok(Step::Item(H1::Done, _)) => break Received::Complete,
+                        _ => {
+                            let len = decoder.pending_body_len(unread.len());
+                            tracker.body(&unread[..len]);
+                            received_bytes += len;
+                            break Received::CutOff;
+                        }
+                    }
+                };
+                self.too_big = received_bytes > self.opts.body;
+                tracker.received(if self.too_big {
+                    Received::TooLarge
+                } else {
+                    received
+                });
+            }
+            self.head = Some(head);
             self.dispatch(driver, Body::empty(), true, 0);
             return Ok(());
         }
@@ -639,6 +852,14 @@ impl serve::Service for Http1 {
         _: &(),
         driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<(), Infallible> {
+        self.finish_receipt(
+            driver,
+            if end == Ended::Budget {
+                Received::Budget
+            } else {
+                Received::CutOff
+            },
+        );
         if end == Ended::Conn(ConnError::Broken) {
             let e = error_event(
                 driver.conn(),
@@ -917,6 +1138,8 @@ impl Pending for Streaming {
 /// How [`serve_connection`] serves a connection.
 #[derive(Clone, Default)]
 pub struct HttpOptions {
+    /// Observes parsed heads and body receipt before routing or admission.
+    pub observe: Option<Arc<dyn Observer>>,
     /// Limits and timers, for both versions.
     pub limits: Limits,
     /// On a connection without TLS, how long the client has from
@@ -1015,6 +1238,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
     };
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
+    service.observe = opts.observe.clone();
     if !info.tls && opts.first_bytes.is_none() {
         service.first_head_deadline = Some(head_deadline);
     }
@@ -1048,7 +1272,7 @@ fictionet::cfg_tokio! {
 /// Live HTTP/2 and HTTP/1 Upgrade serving on hyper.
 mod h2 {
     use super::*;
-    use super::response::{Track, answered};
+    use super::response::Track;
     use http::header::{CONTENT_LENGTH, DATE};
     use fictionet::stdlib::codec::{Buffer, Decode, Step};
     use fictionet::stdlib::serve::{Charge, PanicNote};
@@ -1214,6 +1438,7 @@ mod h2 {
         date: Option<SystemTime>,
         limits: Limits,
         budget: Option<Budget>,
+        observe: Option<Arc<dyn Observer>>,
         upgraded: Option<Arc<AtomicBool>>,
     }
 
@@ -1226,6 +1451,7 @@ mod h2 {
                 date: opts.date,
                 limits: opts.limits,
                 budget: opts.budget.clone(),
+                observe: opts.observe.clone(),
                 upgraded: None,
             }
         }
@@ -1236,12 +1462,14 @@ mod h2 {
             &self,
             body: Incoming,
             charge: &mut Option<Charge>,
+            tracker: &mut Tracker,
         ) -> Result<Bytes, Box<Response<Body>>> {
             let read = async {
                 let mut body = pin!(body);
                 let mut got = Vec::new();
                 while let Some(frame) = poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
                     let Ok(frame) = frame else {
+                        tracker.received(Received::CutOff);
                         return Err(Box::new(answered(
                             text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"),
                             "cut_off",
@@ -1250,8 +1478,10 @@ mod h2 {
                     let Ok(data) = frame.into_data() else {
                         continue;
                     };
+                    tracker.body(&data);
                     let len = got.len() + data.len();
                     if len > self.limits.body {
+                        tracker.received(Received::TooLarge);
                         return Err(Box::new(answered(
                             text(
                                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1261,10 +1491,12 @@ mod h2 {
                         )));
                     }
                     if !charge.as_mut().is_none_or(|c| c.set(len)) {
+                        tracker.received(Received::Budget);
                         return Err(Box::new(over_budget()));
                     }
                     got.extend_from_slice(&data);
                 }
+                tracker.received(Received::Complete);
                 Ok(Bytes::from(got))
             };
             match self
@@ -1273,13 +1505,20 @@ mod h2 {
                 .await
             {
                 Ok(got) => got,
-                Err(_) => Err(Box::new(answered(
-                    text(
-                        StatusCode::REQUEST_TIMEOUT,
-                        "The request body took too long.\n",
-                    ),
-                    "timeout",
-                ))),
+                Err(error) => {
+                    tracker.received(if error == RaceError::Deadline {
+                        Received::Timeout
+                    } else {
+                        Received::CutOff
+                    });
+                    Err(Box::new(answered(
+                        text(
+                            StatusCode::REQUEST_TIMEOUT,
+                            "The request body took too long.\n",
+                        ),
+                        "timeout",
+                    )))
+                }
             }
         }
     }
@@ -1303,7 +1542,8 @@ mod h2 {
         type Future = Answer;
 
         fn call(&self, request: Request<Incoming>) -> Answer {
-            let mut tracker = Tracker::new(&request, &self.info, self.fcx.now());
+            let mut tracker = Tracker::observing(&request, &self.info, self.observe.clone());
+            tracker.start(&request, &self.info, self.fcx.now());
             let metadata = self.budget.as_ref().map(|budget| {
                 let head = budget.charge(request_held(&request))?;
                 let event = budget.charge(tracker.held())?;
@@ -1313,6 +1553,7 @@ mod h2 {
                 Some(Some((head, event))) => (Some(head), Some(event)),
                 None => (None, None),
                 Some(None) => {
+                    tracker.received(Received::Budget);
                     if let Some(event) = tracker.finish(
                         Some(Fields::new().with("answer", "budget")), None, 0, false,
                     ) {
@@ -1347,7 +1588,7 @@ mod h2 {
                 let mut charge = route.budget.as_ref().and_then(|b| b.charge(0));
                 let (parts, body) = request.into_parts();
                 let head_only = parts.method == Method::HEAD;
-                let response = match route.body(body, &mut charge).await {
+                let response = match route.body(body, &mut charge, &mut track.tracker).await {
                     Err(answer) => {
                         drop(parts);
                         *answer

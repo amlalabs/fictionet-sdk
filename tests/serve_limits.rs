@@ -10,6 +10,8 @@ mod service_fixture;
 mod common;
 #[path = "common/done.rs"]
 mod done;
+#[path = "common/http_observer.rs"]
+mod http_observer;
 #[path = "common/wait.rs"]
 mod wait;
 #[path = "common/world.rs"]
@@ -30,16 +32,373 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Event};
-use fictionet::stdlib::codec::{Ending, ItemFault, LineError, Lines, Rewrite, Rule, Trigger};
+use fictionet::stdlib::codec::{Ending, ItemFault, LineError, Lines, Rewrite, Rule, Trigger, Wire};
 use fictionet::stdlib::httpd::{
     self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply, Router,
 };
 use fictionet::stdlib::json;
 use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeOptions};
-use fictionet::stdlib::{Connection, ConnectionExt, ip, tcp};
+use fictionet::stdlib::{Connection, ConnectionExt, hpack, http2, ip, tcp};
+use fictionet::tokio::ConnectionTokioExt;
 use fictionet::{Cx, pair};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
+use http_observer::{Exposure, SECRET, assert_redacted};
+
+async fn hyper_exposure(
+    fcx: Cx,
+    received: httpd::Received,
+    expected_status: u16,
+) -> fictionet::Result {
+    let (server, client) = two_machines(&fcx);
+    let observer = Arc::new(Exposure::default());
+    let router = Router::new().post("/login", move |_, _| {
+        assert_eq!(
+            received,
+            httpd::Received::Complete,
+            "rejected body reached handler"
+        );
+        http::Response::new(Bytes::new())
+    });
+    let budget = Budget::new(8000);
+    let opts = HttpOptions {
+        limits: Limits {
+            body: if received == httpd::Received::TooLarge {
+                10
+            } else {
+                16000
+            },
+            body_timeout: Duration::from_secs(1),
+            ..Limits::default()
+        },
+        budget: Some(budget.clone()),
+        observe: Some(observer.clone()),
+        ..HttpOptions::default()
+    };
+    serve_http(&fcx, &server, 80, Arc::new(router), opts)?;
+    let conn = client
+        .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+        .await?;
+    let (mut send, driving) = h2::client::handshake(conn.into_tokio(&fcx)).await?;
+    fcx.spawn(move |_| async move {
+        driving.await?;
+        Ok(())
+    });
+    let request = http::Request::post("http://Original.Test:80/login")
+        .header("host", "different.test")
+        .body(())?;
+    let (response, mut stream) = send.send_request(request, false)?;
+    let body = if received == httpd::Received::Budget {
+        Bytes::from(vec![b'!'; 7500])
+    } else if received == httpd::Received::TooLarge {
+        Bytes::from_static(b"0123456789012345678!")
+    } else {
+        Bytes::from_static(SECRET)
+    };
+    let bytes = body.len();
+    stream.send_data(body, received != httpd::Received::Timeout)?;
+    let response = response.await?;
+    assert_eq!(response.status().as_u16(), expected_status);
+    let mut response_body = response.into_body();
+    while let Some(data) = response_body.data().await {
+        let data = data?;
+        response_body.flow_control().release_capacity(data.len())?;
+    }
+    let events = fcx
+        .events()
+        .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
+        .await?;
+    assert_eq!(
+        *observer.ends.lock().unwrap(),
+        [("/login".into(), bytes, received)]
+    );
+    let heads = observer.heads.lock().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(
+        heads[0].0.uri.authority().unwrap().as_str(),
+        "Original.Test:80"
+    );
+    assert_eq!(heads[0].0.headers["host"], "different.test");
+    assert_eq!(heads[0].0.version, http::Version::HTTP_2);
+    assert_eq!(heads[0].1.id, Some(1));
+    let event = &events[0];
+    let answer = match received {
+        httpd::Received::Complete => "handler",
+        httpd::Received::TooLarge => "too_large",
+        httpd::Received::Timeout => "timeout",
+        httpd::Received::Budget => "budget",
+        httpd::Received::CutOff => "cut_off",
+    };
+    assert_eq!(event.str("answer"), Some(answer));
+    assert_eq!(
+        event.str("received"),
+        Some(if received == httpd::Received::Complete {
+            "complete"
+        } else {
+            answer
+        })
+    );
+    assert_eq!(field_bool(event, "classified"), Some(true));
+    assert_redacted(event);
+    assert_eq!(budget.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn observer_sees_no_host_body() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let observer = Arc::new(Exposure::default());
+        let hosts = httpd::VirtualHosts::new();
+        hosts.set_default(httpd::VHost::new(Router::new().post("/login", |_, _| {
+            panic!("request without a host reached handler")
+        })));
+        serve_http(
+            &fcx,
+            &server,
+            80,
+            Arc::new(hosts),
+            HttpOptions {
+                observe: Some(observer.clone()),
+                ..HttpOptions::default()
+            },
+        )?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        // The h2 client requires an authority, so send the frames directly.
+        let mut request = http2::PREFACE.to_vec();
+        http2::Settings {
+            flags: 0,
+            entries: Vec::new(),
+        }
+        .write(&mut request)?;
+        let mut fragment = Vec::new();
+        hpack::Encoder::new(4096).encode_block(
+            &[
+                hpack::Field::new(":method", "POST"),
+                hpack::Field::new(":scheme", "http"),
+                hpack::Field::new(":path", "/login"),
+            ],
+            &mut fragment,
+        )?;
+        http2::Headers {
+            stream: 1,
+            flags: 4, // END_HEADERS, leaving the body open.
+            fragment,
+            priority: None,
+            padding: None,
+        }
+        .write(&mut request)?;
+        http2::Data {
+            stream: 1,
+            flags: 1, // END_STREAM.
+            data: SECRET.to_vec(),
+            padding: None,
+        }
+        .write(&mut request)?;
+        conn.write_all(&fcx, &request).await?;
+        let events = fcx
+            .events()
+            .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
+            .await?;
+        let heads = observer.heads.lock().unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].0.method, http::Method::POST);
+        assert_eq!(heads[0].0.uri, "/login");
+        assert_eq!(heads[0].0.version, http::Version::HTTP_2);
+        assert!(heads[0].0.uri.authority().is_none());
+        assert!(!heads[0].0.headers.contains_key("host"));
+        assert_eq!(heads[0].1.id, Some(1));
+        assert_eq!(
+            *observer.ends.lock().unwrap(),
+            [("/login".into(), SECRET.len(), httpd::Received::Complete)]
+        );
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.str("answer"), Some("no_host"));
+        assert_eq!(event.str("received"), Some("complete"));
+        assert_eq!(event.u64("status"), Some(400));
+        assert_eq!(event.str("source"), Some("observer"));
+        assert_eq!(event.u64("observed_bytes"), Some(SECRET.len() as u64));
+        assert_eq!(field_bool(event, "classified"), Some(true));
+        assert_redacted(event);
+        Ok(())
+    });
+}
+
+#[test]
+fn body_limit_exposure() {
+    world(Duration::from_secs(10), |fcx| {
+        hyper_exposure(fcx, httpd::Received::TooLarge, 413)
+    });
+}
+
+#[test]
+fn partial_timeout_exposure() {
+    world(Duration::from_secs(10), |fcx| {
+        hyper_exposure(fcx, httpd::Received::Timeout, 408)
+    });
+}
+
+#[test]
+fn hook_redacts_before_log() {
+    world(Duration::from_secs(10), |fcx| {
+        hyper_exposure(fcx, httpd::Received::Complete, 200)
+    });
+}
+
+#[test]
+fn body_budget_exposure() {
+    world(Duration::from_secs(10), |fcx| {
+        hyper_exposure(fcx, httpd::Received::Budget, 503)
+    });
+}
+
+#[test]
+fn observer_sees_metadata_budget_rejection() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let observer = Arc::new(Exposure::default());
+        let router = Router::new().get("/", |_, _| panic!("metadata was not admitted"));
+        serve_http(
+            &fcx,
+            &server,
+            80,
+            Arc::new(router),
+            HttpOptions {
+                budget: Some(Budget::new(1024)),
+                observe: Some(observer.clone()),
+                ..HttpOptions::default()
+            },
+        )?;
+        let conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let (mut send, driving) = h2::client::handshake(conn.into_tokio(&fcx)).await?;
+        fcx.spawn(move |_| async move {
+            driving.await?;
+            Ok(())
+        });
+        let request = metadata_request().map(|_| ());
+        let (response, _) = send.send_request(request, true)?;
+        assert!(response.await.is_err());
+        let events = fcx.events().of("http", "request");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].str("answer"), Some("budget"));
+        assert_eq!(events[0].str("received"), Some("budget"));
+        assert_eq!(events[0].str("source"), Some("observer"));
+        assert_eq!(observer.heads.lock().unwrap().len(), 1);
+        assert_eq!(
+            *observer.ends.lock().unwrap(),
+            [("/".into(), 0, httpd::Received::Budget)]
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn observer_keeps_concurrent_request_identity() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let observer = Arc::new(Exposure::default());
+        let router = Router::new().post("/clean", |_, _| http::Response::new(Bytes::new()));
+        serve_http(
+            &fcx,
+            &server,
+            80,
+            Arc::new(router),
+            HttpOptions {
+                observe: Some(observer.clone()),
+                ..HttpOptions::default()
+            },
+        )?;
+        let conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let (mut send, driving) = h2::client::handshake(conn.into_tokio(&fcx)).await?;
+        fcx.spawn(move |_| async move {
+            driving.await?;
+            Ok(())
+        });
+        let (cut_off, mut partial) = send.send_request(
+            http::Request::post("http://a.test/private").body(())?,
+            false,
+        )?;
+        partial.send_data(Bytes::from_static(SECRET), false)?;
+        let (clean, _) =
+            send.send_request(http::Request::post("http://a.test/clean").body(())?, true)?;
+        assert_eq!(clean.await?.status(), 200);
+        partial.send_reset(h2::Reason::CANCEL);
+        assert!(cut_off.await.is_err());
+        let events = fcx
+            .events()
+            .wait(&fcx, 2, Duration::from_secs(1), |e| e.is("http", "request"))
+            .await?;
+        let clean = events
+            .iter()
+            .find(|e| e.str("path") == Some("/clean"))
+            .unwrap();
+        assert_eq!(clean.str("received"), Some("complete"));
+        assert_eq!(field_bool(clean, "classified"), Some(false));
+        let cut_off = events
+            .iter()
+            .find(|e| e.str("path") == Some("/private"))
+            .unwrap();
+        assert_eq!(cut_off.str("received"), Some("cut_off"));
+        assert_eq!(field_bool(cut_off, "classified"), Some(true));
+        assert_eq!(
+            *observer.ends.lock().unwrap(),
+            [
+                ("/clean".into(), 0, httpd::Received::Complete),
+                ("/private".into(), SECRET.len(), httpd::Received::CutOff),
+            ]
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn observer_sees_upgrade_path_body_limit() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let observer = Arc::new(Exposure::default());
+        let router = Router::new().post("/", |_, _| panic!("oversized body reached handler"));
+        serve_http(
+            &fcx,
+            &server,
+            80,
+            Arc::new(router),
+            HttpOptions {
+                limits: Limits {
+                    body: 10,
+                    ..Limits::default()
+                },
+                observe: Some(observer.clone()),
+                ..HttpOptions::default()
+            },
+        )?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        conn.write_all(&fcx, b"POST / HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nContent-Length: 20\r\n\r\n01234567890123456789").await?;
+        assert!(
+            read_some(&fcx, &mut conn, 200)
+                .await
+                .starts_with(b"HTTP/1.1 413")
+        );
+        let events = fcx.events().of("http", "request");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].str("answer"), Some("too_large"));
+        assert_eq!(events[0].str("received"), Some("too_large"));
+        assert_eq!(observer.heads.lock().unwrap().len(), 1);
+        assert_eq!(
+            *observer.ends.lock().unwrap(),
+            [("/".into(), 20, httpd::Received::TooLarge)]
+        );
+        Ok(())
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Running a world in a test

@@ -15,7 +15,9 @@ use fictionet::stdlib::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare
 use fictionet::stdlib::tls::ServerConfig;
 
 use super::response::answered;
-use super::{Body, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text};
+use super::{
+    Body, Exchange, Handler, HttpOptions, Limits, Observer, Reply, serve_connection, text,
+};
 
 pub use fictionet::stdlib::net::normalize;
 
@@ -255,6 +257,7 @@ pub struct Server {
     default_host: bool,
     limits: Limits,
     date: Option<SystemTime>,
+    observe: Option<Arc<dyn Observer>>,
     vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
     tls: Option<ConfigFor>,
 }
@@ -276,6 +279,7 @@ impl Server {
             default_host: false,
             limits: Limits::default(),
             date: None,
+            observe: None,
             vhosts: Arc::default(),
             tls: None,
         }
@@ -320,6 +324,13 @@ impl Server {
     /// use the first one's.
     pub fn date(mut self, start: SystemTime) -> Server {
         self.date = Some(start);
+        self
+    }
+
+    /// Observes requests before virtual hosting and admission. Sites sharing
+    /// an endpoint use the first server's observer, as they do its date.
+    pub fn observe(mut self, observer: Arc<dyn Observer>) -> Server {
+        self.observe = Some(observer);
         self
     }
 
@@ -371,6 +382,7 @@ impl PortServer for Server {
             first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
             budget: arrival.budget,
             date: self.date,
+            observe: self.observe.clone(),
         };
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {

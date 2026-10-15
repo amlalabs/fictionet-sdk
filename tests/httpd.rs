@@ -6,9 +6,362 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Fields};
+use fictionet::stdlib::codec::{Fail, ItemFault, Rewrite, Rule, Trigger};
 use fictionet::stdlib::httpd::{self, Http1, Router};
 use fictionet::stdlib::json;
-use fictionet::stdlib::serve::Harness;
+use fictionet::stdlib::serve::{FaultPlan, Harness, HarnessError, Plan, ServeOptions};
+
+#[path = "common/http_observer.rs"]
+mod http_observer;
+use http_observer::{Exposure, SECRET, assert_redacted};
+
+#[test]
+fn observer_sees_no_host_body() {
+    for version in ["1.0", "1.1"] {
+        let observer = Arc::new(Exposure::default());
+        let service = Http1::new(httpd::VirtualHosts::new()).observe(observer.clone());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+        let mut request = format!(
+            "POST /login HTTP/{version}\r\nContent-Length: {}\r\n\r\n",
+            SECRET.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(SECRET);
+        let result = h.push(&request);
+        if version == "1.1" {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+        }
+        let heads = observer.heads.lock().unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].0.method, http::Method::POST);
+        assert_eq!(heads[0].0.uri, "/login");
+        assert_eq!(
+            heads[0].0.version,
+            if version == "1.0" {
+                http::Version::HTTP_10
+            } else {
+                http::Version::HTTP_11
+            }
+        );
+        assert!(!heads[0].0.headers.contains_key("host"));
+        assert_eq!(heads[0].1.id, Some(1));
+        assert_eq!(
+            *observer.ends.lock().unwrap(),
+            [("/login".into(), SECRET.len(), httpd::Received::Complete)]
+        );
+        let events = h.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].str("answer"), Some("no_host"));
+        assert_eq!(events[0].str("received"), Some("complete"));
+        assert_eq!(
+            events[0].get("classified").and_then(json::Value::as_bool),
+            Some(true)
+        );
+        assert_redacted(&events[0]);
+    }
+}
+
+#[test]
+fn body_limit_exposure() {
+    let observer = Arc::new(Exposure::default());
+    let router = Router::new().post("/", |_, _| panic!("oversized body reached handler"));
+    let service = Http1::with(
+        Arc::new(router),
+        httpd::Limits {
+            body: 10,
+            ..httpd::Limits::default()
+        },
+    )
+    .observe(observer.clone());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+    h.push(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 20\r\n\r\n01234567890123456789")
+        .unwrap();
+    assert_eq!(
+        *observer.ends.lock().unwrap(),
+        [("/".into(), 20, httpd::Received::TooLarge)]
+    );
+    let e = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+    assert_eq!(e.str("answer"), Some("too_large"));
+    assert_eq!(e.str("received"), Some("too_large"));
+    assert_eq!(e.get("status").and_then(json::Value::as_u64), Some(413));
+}
+
+#[test]
+fn partial_timeout_exposure() {
+    for (framing, tail, bytes, classified) in [
+        ("Content-Length: 100", SECRET, SECRET.len(), true),
+        (
+            "Transfer-Encoding: chunked",
+            b"64\r\nprivate-credential!!".as_slice(),
+            SECRET.len(),
+            true,
+        ),
+        (
+            "Transfer-Encoding: chunked",
+            b"64;secret=private-credential!!".as_slice(),
+            0,
+            false,
+        ),
+    ] {
+        let observer = Arc::new(Exposure::default());
+        let router = Router::new().post("/", |_, _| panic!("timed out body reached handler"));
+        let service = Http1::new(router).observe(observer.clone());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+        h.push(format!("POST / HTTP/1.1\r\nHost: a\r\n{framing}\r\n\r\n").as_bytes())
+            .unwrap();
+        h.push(tail).unwrap();
+        h.advance(Duration::from_secs(30)).unwrap();
+        assert!(h.closed());
+        assert!(h.output().is_empty());
+        assert_eq!(
+            *observer.ends.lock().unwrap(),
+            [("/".into(), bytes, httpd::Received::Timeout)]
+        );
+        let e = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        assert_eq!(e.str("answer"), Some("timeout"));
+        assert_eq!(e.str("received"), Some("timeout"));
+        assert!(e.get("status").unwrap().is_null());
+        assert_eq!(
+            e.get("complete").and_then(json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            e.get("classified").and_then(json::Value::as_bool),
+            Some(classified)
+        );
+        assert!(
+            h.events()
+                .iter()
+                .any(|e| e.is("http", "error") && e.str("cause") == Some("timeout"))
+        );
+    }
+}
+
+#[test]
+fn body_timeout_preserves_item_faults() {
+    // The fault decoder sees a whole body; the service receives only a prefix.
+    for observe in [false, true] {
+        let observer = Arc::new(Exposure::default());
+        let mut service = Http1::new(Router::new());
+        if observe {
+            service = service.observe(observer.clone());
+        }
+        let opts = ServeOptions::default()
+            .idle(None)
+            .faults(FaultPlan::new(Plan {
+                items: vec![Rule {
+                    when: Trigger::At(2),
+                    fault: ItemFault::Action {
+                        delay: None,
+                        rewrite: Rewrite::Raw(b"x".to_vec()),
+                    },
+                }],
+                ..Plan::default()
+            }));
+        let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts);
+        h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nxy")
+            .unwrap();
+        assert!(h.events().is_empty());
+        h.advance(Duration::from_secs(30)).unwrap();
+        assert!(h.closed());
+        let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        assert_eq!(event.str("answer"), Some("timeout"));
+        assert_eq!(event.str("received"), Some("timeout"));
+        assert!(
+            !h.events()
+                .iter()
+                .any(|e| e.is("conn", "faults") && e.str("stopped") == Some("decoder")),
+            "observing a body timeout must not stop item faults"
+        );
+        if observe {
+            assert_eq!(
+                *observer.ends.lock().unwrap(),
+                [("/".into(), 1, httpd::Received::Timeout)]
+            );
+        }
+    }
+}
+
+#[test]
+fn body_decode_failure_preserves_item_faults() {
+    // Corrupt the chunk ending while the fault decoder remains active.
+    for observe in [false, true] {
+        let observer = Arc::new(Exposure::default());
+        let mut service = Http1::new(Router::new());
+        if observe {
+            service = service.observe(observer.clone());
+        }
+        let opts = ServeOptions::default()
+            .idle(None)
+            .faults(FaultPlan::new(Plan {
+                items: vec![Rule {
+                    when: Trigger::At(2),
+                    fault: ItemFault::Action {
+                        delay: None,
+                        rewrite: Rewrite::Raw(b"x!!".to_vec()),
+                    },
+                }],
+                ..Plan::default()
+            }));
+        let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts);
+        assert!(matches!(
+            h.push(
+                b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n"
+            ),
+            Err(HarnessError::Decode(Fail::Protocol(
+                fictionet::stdlib::http1::Error::ChunkEnding
+            )))
+        ));
+        assert!(h.closed());
+        let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        assert_eq!(event.str("received"), Some("cut_off"));
+        assert!(
+            !h.events()
+                .iter()
+                .any(|e| e.is("conn", "faults") && e.str("stopped") == Some("decoder")),
+            "observing a body decode failure must not stop item faults"
+        );
+        if observe {
+            assert_eq!(
+                *observer.ends.lock().unwrap(),
+                [("/".into(), 1, httpd::Received::CutOff)]
+            );
+        }
+    }
+}
+
+#[test]
+fn hook_redacts_before_log() {
+    let observer = Arc::new(Exposure::default());
+    let router = Router::new().post("/login", |_, _| {
+        let mut response = http::Response::new(Bytes::new());
+        response.extensions_mut().insert(
+            Fields::new()
+                .with("source", "handler")
+                .with("method", "wrong")
+                .with("received", "wrong"),
+        );
+        response
+    });
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::new(router).observe(observer.clone()),
+        (),
+    );
+    for body in [SECRET, b"clean".as_slice()] {
+        h.push(
+            format!(
+                "POST /login HTTP/1.1\r\nHost: Original.Test:80\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        h.push(body).unwrap();
+    }
+    assert_eq!(
+        observer.heads.lock().unwrap()[0].0.headers["host"],
+        "Original.Test:80"
+    );
+    assert_eq!(observer.ends.lock().unwrap().len(), 2);
+    for (event, classified) in h.events().iter().zip([true, false]) {
+        assert_eq!(event.str("source"), Some("handler"));
+        assert_eq!(event.str("method"), Some("POST"));
+        assert_eq!(event.str("answer"), Some("handler"));
+        assert_eq!(event.str("received"), Some("complete"));
+        assert_eq!(
+            event.get("classified").and_then(json::Value::as_bool),
+            Some(classified)
+        );
+        assert_redacted(event);
+    }
+}
+
+#[test]
+fn observer_sees_cut_off_body_without_framing() {
+    for tail in [SECRET, b"64\r\nprivate-credential!!".as_slice()] {
+        let observer = Arc::new(Exposure::default());
+        let router = Router::new().post("/", |_, _| panic!("partial body reached byte handler"));
+        let mut h = Harness::new(
+            fictionet::Seed::from_u64(0),
+            Http1::new(router).observe(observer.clone()),
+            (),
+        );
+        let framing = if tail == SECRET {
+            "Content-Length: 100"
+        } else {
+            "Transfer-Encoding: chunked"
+        };
+        h.push(format!("POST / HTTP/1.1\r\nHost: a.test\r\n{framing}\r\n\r\n").as_bytes())
+            .unwrap();
+        h.push(tail).unwrap();
+        assert!(h.end().is_err());
+        let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        assert_eq!(event.str("received"), Some("cut_off"));
+        assert_eq!(
+            *observer.ends.lock().unwrap(),
+            [("/".into(), SECRET.len(), httpd::Received::CutOff)]
+        );
+    }
+}
+
+#[test]
+fn received_does_not_require_an_observer() {
+    for (length, received) in [(20, "too_large"), (100, "timeout")] {
+        let service = Http1::with(
+            Arc::new(Router::new()),
+            httpd::Limits {
+                body: 10,
+                ..httpd::Limits::default()
+            },
+        );
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+        h.push(
+            format!(
+                "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {length}\r\n\r\n01234567890123456789"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        if received == "timeout" {
+            h.advance(Duration::from_secs(30)).unwrap();
+        }
+        let event = h
+            .events()
+            .iter()
+            .find(|e| e.is("http", "request"))
+            .expect("rejected request event");
+        assert_eq!(event.str("answer"), Some(received));
+        assert_eq!(event.str("received"), Some(received));
+    }
+}
+
+#[test]
+fn missing_host_does_not_hide_an_oversized_body() {
+    let observer = Arc::new(Exposure::default());
+    let service = Http1::with(
+        Arc::new(httpd::VirtualHosts::new()),
+        httpd::Limits {
+            body: 10,
+            ..httpd::Limits::default()
+        },
+    )
+    .observe(observer.clone());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+    assert!(
+        h.push(b"POST / HTTP/1.1\r\nContent-Length: 20\r\n\r\n01234567890123456789")
+            .is_err()
+    );
+    let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+    assert_eq!(event.str("answer"), Some("too_large"));
+    assert_eq!(event.str("received"), Some("too_large"));
+    assert_eq!(
+        *observer.ends.lock().unwrap(),
+        [("/".into(), 20, httpd::Received::TooLarge)]
+    );
+}
 
 // ---------------------------------------------------------------------------
 // HTTP/1 as a service

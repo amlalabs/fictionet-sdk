@@ -668,6 +668,12 @@ pub struct Driver<'a, D> {
 }
 
 impl<D> Driver<'_, D> {
+    /// The active decoder, read-only. Access does not stop item faults.
+    /// Over UDP, this selects the same decoder as [`Self::decoder`].
+    pub fn peek_decoder(&self) -> &D {
+        self.decoder
+    }
+
     /// The active decoder. Access stops item faults for this connection.
     /// Over UDP, item and failure calls access the current datagram's decoder.
     /// Other calls use a separate decoder whose changes do not affect datagrams.

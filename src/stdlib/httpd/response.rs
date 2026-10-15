@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use http::header::{CONTENT_LENGTH, DATE};
@@ -10,7 +11,7 @@ use fictionet::stdlib::http1::{self, RequestHead};
 use fictionet::stdlib::json::Value;
 use fictionet::time::Instant;
 
-use super::{BadGateway, Body, request_host, text};
+use super::{BadGateway, Body, Observer, Received, request_host, text};
 
 pub(super) fn answered(mut response: Response<Body>, answer: &'static str) -> Response<Body> {
     response
@@ -23,8 +24,18 @@ pub(super) fn answered(mut response: Response<Body>, answer: &'static str) -> Re
 // The request event
 
 /// One request's event, filled in as it goes.
+#[derive(Default)]
 pub(super) struct Tracker {
     event: Option<Event>,
+    observation: Option<Observation>,
+    received: Option<Received>,
+}
+
+struct Observation {
+    observer: Arc<dyn Observer>,
+    state: http::Extensions,
+    // Kept separately so service head facts win when the event is finished.
+    fields: Fields,
 }
 
 /// Owned HTTP head storage. `http` hides allocation capacities, so charge
@@ -72,6 +83,58 @@ impl Tracker {
         self.event.as_ref().map_or(0, Event::size)
     }
 
+    pub(super) fn observing<B>(
+        request: &Request<B>,
+        conn: &ConnInfo,
+        observer: Option<Arc<dyn Observer>>,
+    ) -> Tracker {
+        // Classify the head before constructing generic event metadata.
+        let observation = observer.map(|observer| {
+            let mut head = Request::new(());
+            *head.method_mut() = request.method().clone();
+            *head.uri_mut() = request.uri().clone();
+            *head.version_mut() = request.version();
+            *head.headers_mut() = request.headers().clone();
+            let (head, ()) = head.into_parts();
+            let mut state = http::Extensions::new();
+            let fields = observer.head(&head, conn, &mut state).unwrap_or_default();
+            Observation {
+                observer,
+                state,
+                fields,
+            }
+        });
+        Tracker {
+            event: None,
+            observation,
+            received: None,
+        }
+    }
+
+    pub(super) fn start<B>(&mut self, request: &Request<B>, conn: &ConnInfo, started: Instant) {
+        self.event = Self::new(request, conn, started).event;
+    }
+
+    pub(super) fn body(&mut self, bytes: &[u8]) {
+        if let Some(o) = &mut self.observation
+            && let Some(fields) = o.observer.body(bytes, &mut o.state)
+        {
+            o.fields.extend(fields);
+        }
+    }
+
+    pub(super) fn received(&mut self, received: Received) {
+        if self.received.is_none() {
+            self.received = Some(received);
+            if let Some(o) = &mut self.observation {
+                if let Some(fields) = o.observer.end(received, &mut o.state) {
+                    o.fields.extend(fields);
+                }
+                o.state.clear();
+            }
+        }
+    }
+
     pub(super) fn new<B>(request: &Request<B>, conn: &ConnInfo, started: Instant) -> Tracker {
         let host = request_host(request);
         let headers: Vec<Value> = request
@@ -112,10 +175,14 @@ impl Tracker {
             .field("headers", Value::Array(headers))
             .field("started", float(started.since_start().as_secs_f64()))
             .summary(summary);
-        Tracker { event: Some(event) }
+        Tracker {
+            event: Some(event),
+            observation: None,
+            received: Some(Received::Complete),
+        }
     }
 
-    /// The finished event: `extra` from the handler first, then the facts.
+    /// The finished event: observer fields, handler fields, then service facts.
     pub(super) fn finish(
         &mut self,
         extra: Option<Fields>,
@@ -123,16 +190,23 @@ impl Tracker {
         sent: u64,
         complete: bool,
     ) -> Option<Event> {
+        self.received(Received::CutOff);
         let mut event = self.event.take()?;
-        let mut fields = extra.unwrap_or_default();
-        let answer = fields.remove("answer").unwrap_or_else(|| {
+        let mut fields = self
+            .observation
+            .take()
+            .map_or_else(Fields::new, |o| o.fields);
+        let mut extra = extra.unwrap_or_default();
+        let answer = extra.remove("answer").unwrap_or_else(|| {
             if status.is_none() {
                 "cancelled".into()
             } else {
                 "handler".into()
             }
         });
+        fields.extend(extra);
         let mut own = std::mem::take(&mut event.fields);
+        own.set("received", self.received.expect("receipt ended").as_str());
         own.set("answer", answer);
         own.set("status", opt(status.map(|s| u32::from(s.as_u16()))));
         own.set("sent", sent);
@@ -261,8 +335,6 @@ pub fn http_date(secs: u64) -> String {
 }
 
 fictionet::cfg_tokio! {
-use std::sync::Arc;
-
 use fictionet::Cx;
 use fictionet::stdlib::serve::{Charge, PanicNote};
 
