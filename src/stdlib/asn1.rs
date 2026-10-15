@@ -2759,7 +2759,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{chunks, mutate};
+    use fictionet::stdlib::test_support::{assert_linear, chunks, mutate};
 
     fn der(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
         let mut w = Writer::new();
@@ -3833,41 +3833,43 @@ mod tests {
 
     #[test]
     fn decoder_fed_a_byte_at_a_time_stays_linear() {
-        // An indefinite element of many small children, fed one byte at a
-        // time. Each call must go on from where the last one stopped, not
-        // scan the element again from its start.
-        let mut b = vec![0x30, 0x80];
-        while b.len() < 1 << 18 {
-            b.extend_from_slice(&[0x04, 0x00]);
-        }
-        b.extend_from_slice(&[0x00, 0x00]);
-        let mut d = Stream::new(Elements::new(Rules::Ber));
-        let mut got = Vec::new();
-        for byte in chunks(&b, &[1]) {
-            assert_eq!(d.push(byte), 1);
-            while let Some(e) = d.next() {
-                got.push(e.unwrap());
+        // Compare the time ratio for about n and 4n bytes in one indefinite
+        // element, fed one byte at a time. The top-level count stays one.
+        assert_linear("ASN.1 byte-at-a-time element length", 1 << 15, |n| {
+            let mut b = vec![0x30, 0x80];
+            while b.len() < n {
+                b.extend_from_slice(&[0x04, 0x00]);
             }
-        }
-        assert_eq!(got, [b]);
-        assert_eq!(d.buffered(), 0);
+            b.extend_from_slice(&[0x00, 0x00]);
+            let mut d = Stream::new(Elements::new(Rules::Ber));
+            let mut got = Vec::new();
+            for byte in chunks(&b, &[1]) {
+                assert_eq!(d.push(byte), 1);
+                while let Some(e) = d.next() {
+                    got.push(e.unwrap());
+                }
+            }
+            assert_eq!(got, [b]);
+            assert_eq!(d.buffered(), 0);
+        });
     }
 
     #[test]
     fn decoder_takes_many_small_elements_in_linear_time() {
-        // One push of half a million NULLs. Taking each one out must not
-        // copy the bytes still waiting behind it.
-        let n = MAX_INPUT / 2;
-        let stream = [0x05, 0x00].repeat(n);
-        let mut d = Stream::new(Elements::new(Rules::Der));
-        assert_eq!(d.push(&stream), stream.len());
-        let mut count = 0;
-        while let Some(e) = d.next() {
-            assert_eq!(e.unwrap(), [0x05, 0x00]);
-            count += 1;
-        }
-        assert_eq!(count, n);
-        assert_eq!(d.buffered(), 0);
+        // Compare the time ratio for n and 4n elements in one push. Each
+        // NULL stays two bytes long, so only the element count grows.
+        assert_linear("ASN.1 small element count", MAX_INPUT / 8, |n| {
+            let stream = [0x05, 0x00].repeat(n);
+            let mut d = Stream::new(Elements::new(Rules::Der));
+            assert_eq!(d.push(&stream), stream.len());
+            let mut count = 0;
+            while let Some(e) = d.next() {
+                assert_eq!(e.unwrap(), [0x05, 0x00]);
+                count += 1;
+            }
+            assert_eq!(count, n);
+            assert_eq!(d.buffered(), 0);
+        });
         // Interleaved with pushes, partial elements still join up.
         let a = [0x30, 0x03, 0x02, 0x01, 0x01];
         let b = [0x30, 0x80, 0x05, 0x00, 0x00, 0x00];

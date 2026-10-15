@@ -248,16 +248,6 @@ fn linearity_names_require_measurement() {
     // Exact entries reject new omissions and must be removed when fixed.
     let pending = [
         (
-            "asn1.rs",
-            "decoder_fed_a_byte_at_a_time_stays_linear",
-            "RH-042 / T11-74",
-        ),
-        (
-            "asn1.rs",
-            "decoder_takes_many_small_elements_in_linear_time",
-            "RH-042 / T11-74",
-        ),
-        (
             "dhcpv6.rs",
             "stream_takes_many_small_messages_in_linear_time",
             "RH-043 / T11-73",
