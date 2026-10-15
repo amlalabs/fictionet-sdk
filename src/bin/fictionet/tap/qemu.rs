@@ -112,6 +112,10 @@ impl Drop for Unlink<'_> {
         use std::os::unix::fs::MetadataExt;
         lifecycle::keep_on_signal();
         if std::fs::symlink_metadata(self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id) {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-TEARDOWN: removes attach's own socket file in Drop, when attach is done with it"
+            )]
             let _ = std::fs::remove_file(self.path);
         }
     }

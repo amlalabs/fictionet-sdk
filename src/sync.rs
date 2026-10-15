@@ -176,10 +176,11 @@ mod tests {
     #[test]
     fn panic_releases_lock() {
         let mutex = Mutex::new(0);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             *mutex.lock() = 7;
             panic!("release guard");
         }));
+        assert!(result.is_err(), "the closure panics while holding the lock");
         assert_eq!(*mutex.lock(), 7);
     }
 }

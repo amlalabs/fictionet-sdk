@@ -139,6 +139,10 @@ impl WatchSet {
                 let limit = state.limit;
                 state.evict_idle(limit);
             }
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-FALLBACK: reap_later refuses only in a lab, which has no reaper thread; there evict_idle runs when the next watch starts"
+            )]
             let _ = Self::reap_later(&graph);
         }
     }

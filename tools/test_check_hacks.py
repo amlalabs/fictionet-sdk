@@ -233,8 +233,18 @@ run("curl {failure}");
             self.assertIn("rust-reason", self.rules("src/lib.rs", f'#[expect(dead_code, reason = "{reason}")]'))
         for reason in ('"RH-025: cleanup"', 'r#"POL-TEARDOWN: cleanup"#', 'r"RH-025: cleanup"'):
             self.assertEqual(self.rules("src/lib.rs", f'#[expect(dead_code, reason = {reason})]'), set())
-        # Missing reasons belong to Clippy, not a second text rule.
+        # Missing reasons on other lints belong to Clippy, not a second text rule.
         self.assertEqual(self.rules("src/lib.rs", '#[expect(dead_code)]'), set())
+        # The workspace does not deny allow_attributes_without_reason, so a
+        # must-use exception without a reason is this checker's to reject.
+        for lint in sorted(checker.PROTECTED_RESULTS):
+            for attr in (f"#[expect({lint})]", f"#[cfg_attr(unix, expect(\n {lint}))]"):
+                with self.subTest(attr=attr):
+                    self.assertIn("rust-reason", self.rules("src/lib.rs", f"{attr}\nlet _ = cleanup();"))
+        for policy in checker.POLICIES:
+            attr = f'#[expect(clippy::let_underscore_must_use, reason = "{policy}: named invariant")]'
+            with self.subTest(policy=policy):
+                self.assertEqual(self.rules("src/lib.rs", f"{attr}\nlet _ = cleanup();"), set())
 
     def test_rust_lint_groups_cannot_be_allowed(self):
         for lint in ("unused", "clippy::restriction"):
@@ -593,6 +603,25 @@ class Inventory(unittest.TestCase):
             with self.assertRaises(checker.CheckError):
                 checker.check(self.root)
 
+    def test_runtime_entry_needs_reason_and_covers_one_site(self):
+        self.write("src/a.rs", "#[test]\nfn a() {\n    return;\n}\n")
+        entry = {"path": "src/a.rs", "symbol": "a", "pattern": "return;",
+                 "reason": "Early return exercised by the checker's own tests.", "id": "POL-TEST-FIXTURE"}
+        self.assertEqual(len(checker.check(self.root, "runtime")), 1)
+        self.allow([entry], rule="silent-skip", scope="runtime")
+        self.assertEqual(checker.check(self.root, "runtime"), [])
+        without = {key: value for key, value in entry.items() if key != "reason"}
+        for invalid in (without, {**entry, "reason": ""}, {**entry, "reason": "  "}):
+            with self.subTest(entry=invalid):
+                self.allow([invalid], rule="silent-skip", scope="runtime")
+                with self.assertRaises(checker.CheckError):
+                    checker.check(self.root, "runtime")
+        self.allow([entry], rule="silent-skip", scope="runtime")
+        self.write("src/a.rs", "#[test]\nfn a() {\n    return;\n}\n#[test]\nfn b() {\n    return;\n}\n")
+        errors = checker.check(self.root, "runtime")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("(b)", errors[0])
+
     def test_scope_cannot_approve_other_scope(self):
         self.fixture()
         self.allow([self.entry()], scope="runtime")
@@ -610,6 +639,21 @@ class Inventory(unittest.TestCase):
                                      "--root", nonrepo], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("git", result.stderr)
+
+
+class RuntimeScope(unittest.TestCase):
+    """The committed tree: runtime code keeps only individually reviewed exceptions."""
+
+    def test_runtime_scope_passes_and_needs_every_entry(self):
+        self.assertEqual(checker.check(ROOT, "runtime"), [])
+        entries = checker.exceptions(ROOT, "runtime")
+        for entry in entries:
+            with self.subTest(entry=entry):
+                self.assertEqual(checker.scope_for(entry[1]), "runtime")
+                self.assertTrue((ROOT / entry[1]).is_file())
+                rest = [e for e in entries if e != entry]
+                with patch.object(checker, "exceptions", lambda root, scope: rest):
+                    self.assertTrue(checker.check(ROOT, "runtime"))
 
 
 class Prerequisites(unittest.TestCase):
@@ -661,6 +705,10 @@ version = "0.0.0"
                  'let _ = 1;', False, "this lint expectation is unfulfilled"),
                 ('#[expect(clippy::let_underscore_must_use)]\n'
                  'let _ = std::fs::remove_file("x");', False, "allow_attributes_without_reason"),
+                # An approved cleanup exception does not cover the unlisted discard beside it.
+                ('#[expect(clippy::let_underscore_must_use, reason = "POL-TEARDOWN: illustrative cleanup")]\n'
+                 'let _ = std::fs::remove_file("x");\n'
+                 'let _ = std::fs::remove_file("y");', False, "let_underscore_must_use"),
             )
             for body, succeeds, diagnostic in cases:
                 with self.subTest(body=body):

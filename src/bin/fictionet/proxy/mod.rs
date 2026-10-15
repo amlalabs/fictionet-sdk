@@ -111,6 +111,10 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
         if let Some(accepting) = accepting.lock().unwrap().take() {
             accepting.abort();
         }
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-TEARDOWN: the stack has stopped and `ran` decides the result; the grace only bounds how long clients may finish"
+        )]
         let _ = tokio::time::timeout(SHUTDOWN_GRACE, limit.acquire_many(MAX_CLIENTS as u32)).await;
         ran.map_err(|e| Failure::Error(format!("the stack stopped: {e}")))?;
         Ok::<_, Failure>(shared)
@@ -156,6 +160,10 @@ async fn accept(
             tokio::spawn(busy(client, kind));
             continue;
         };
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-HINT: TCP_NODELAY only lowers latency; the client's reads and writes report their own errors"
+        )]
         let _ = client.set_nodelay(true);
         let (stack, token) = (stack.clone(), token.clone());
         tokio::spawn(async move {
@@ -175,6 +183,10 @@ async fn busy(mut client: TcpStream, kind: ProxyKind) {
         "more than {MAX_CLIENTS} clients at once; one turned away"
     ));
     if kind == ProxyKind::Http {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-TEARDOWN: the turned-away client is logged above; this 503 only informs a client that may be gone"
+        )]
         let _ = client
             .write_all(&fictionet::relay::proxy::http::error_response(
                 503,
@@ -182,5 +194,9 @@ async fn busy(mut client: TcpStream, kind: ProxyKind) {
             ))
             .await;
     }
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "POL-TEARDOWN: the turned-away client is logged above; closing a client that may be gone"
+    )]
     let _ = client.shutdown().await;
 }

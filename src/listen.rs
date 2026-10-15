@@ -285,6 +285,10 @@ impl ListenShared {
     fn unwatch(&self, fd: RawFd) {
         // RH-025: removing a watch is best-effort teardown. It grants no
         // readiness and clears no retry state, unlike ADD and MOD.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "RH-025: removing a watch is teardown; it grants no readiness and clears no retry state"
+        )]
         let _ = (self.ops.epoll_ctl)(self.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, 0, 0);
     }
 
@@ -336,6 +340,10 @@ impl ConnSlot {
         }
         // If MOD fails, want_out stays true: EPOLLOUT remains registered,
         // and the helper ignores it while the queue is empty.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "RH-025: if MOD fails, want_out stays true and EPOLLOUT stays registered, which the helper ignores while the queue is empty"
+        )]
         let _ = self.watch_out(out, shared, false);
     }
 
@@ -405,6 +413,10 @@ fn helper(
                 drop(fd);
                 handshakes.clear();
                 accept_paused = None;
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "POL-TEARDOWN: tells Drop the listener is closed; Drop may have stopped waiting"
+                )]
                 let _ = closed.send(());
             }
             if shared.conns.lock().is_empty() {
@@ -553,6 +565,10 @@ fn handshake_step(
         Err(_) => return None,
     };
     let refuse = |reason: &str| {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-TEARDOWN: the handshake is dropped either way; this reply only informs a client that may be gone"
+        )]
         let _ = unix::send(fd, &Message::Refuse(reason.to_owned()).encode(), true);
     };
     let hello = match relay::decode(&buf[..n]) {
@@ -842,7 +858,15 @@ impl Drop for Listening {
         }
         self.shared.closing.store(true, Ordering::Release);
         self.shared.wake_helper();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-TEARDOWN: Drop waits a bounded time for the helper to close the listener, then removes the socket file either way"
+        )]
         let _ = self.closed.recv_timeout(std::time::Duration::from_secs(5));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-TEARDOWN: removes the listener's socket file in Drop"
+        )]
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -907,24 +931,26 @@ mod tests {
         let ops = ListenOps {
             accept4: |fd| {
                 if ACCEPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return Err(io::Error::from_raw_os_error(libc::EMFILE));
+                    Err(io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    accept4(fd)
                 }
-                accept4(fd)
             },
             epoll_ctl: |epoll, op, fd, events, token| {
                 if op == libc::EPOLL_CTL_ADD
                     && token == LISTEN_TOKEN
                     && ADDS.fetch_add(1, Ordering::SeqCst) == 1
                 {
-                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+                } else {
+                    epoll_ctl(epoll, op, fd, events, token)?;
+                    if op == libc::EPOLL_CTL_DEL
+                        && let Some(tx) = PAUSED.lock().unwrap().take()
+                    {
+                        tx.send(()).unwrap();
+                    }
+                    Ok(())
                 }
-                epoll_ctl(epoll, op, fd, events, token)?;
-                if op == libc::EPOLL_CTL_DEL
-                    && let Some(tx) = PAUSED.lock().unwrap().take()
-                {
-                    tx.send(()).unwrap();
-                }
-                Ok(())
             },
         };
         let (attacher, _attachments) = attachments();
@@ -945,9 +971,10 @@ mod tests {
             epoll_ctl: |epoll, op, fd, events, token| {
                 if op == libc::EPOLL_CTL_MOD && events & libc::EPOLLOUT as u32 != 0 {
                     FAILURES.fetch_add(1, Ordering::SeqCst);
-                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+                } else {
+                    epoll_ctl(epoll, op, fd, events, token)
                 }
-                epoll_ctl(epoll, op, fd, events, token)
             },
             accept4,
         };
@@ -992,9 +1019,10 @@ mod tests {
             epoll_ctl: |epoll, op, fd, events, token| {
                 if op == libc::EPOLL_CTL_MOD {
                     FAILURES.fetch_add(1, Ordering::SeqCst);
-                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+                } else {
+                    epoll_ctl(epoll, op, fd, events, token)
                 }
-                epoll_ctl(epoll, op, fd, events, token)
             },
             accept4,
         };
@@ -1032,9 +1060,10 @@ mod tests {
             epoll_ctl: |epoll, op, fd, events, token| {
                 // Handshake, enable EPOLLOUT, then fail disabling it once.
                 if op == libc::EPOLL_CTL_MOD && MODS.fetch_add(1, Ordering::SeqCst) == 2 {
-                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+                } else {
+                    epoll_ctl(epoll, op, fd, events, token)
                 }
-                epoll_ctl(epoll, op, fd, events, token)
             },
             accept4,
         };

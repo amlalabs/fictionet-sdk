@@ -32,6 +32,10 @@ pub(crate) fn reply_for(fail: &Fail) -> ReplyCode {
 }
 
 async fn send_reply<W: AsyncWrite + Unpin>(w: &mut W, code: ReplyCode) {
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "POL-TEARDOWN: the only caller has logged the failure; this reply only informs a client that may be gone"
+    )]
     let _ = w.write_all(&reply(code, None)).await;
 }
 

@@ -15,6 +15,10 @@ pub(crate) fn string(out: &mut String, s: &str) {
             '\t' => out.push_str("\\t"),
             // `<` too, so a string can never close a script element.
             c if (c as u32) < 0x20 || c == '<' || c == '\u{2028}' || c == '\u{2029}' => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                )]
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
@@ -71,6 +75,10 @@ impl Object {
 
     pub(crate) fn num(mut self, k: &str, v: impl std::fmt::Display) -> Object {
         self.key(k);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+        )]
         let _ = write!(self.out, "{v}");
         self
     }

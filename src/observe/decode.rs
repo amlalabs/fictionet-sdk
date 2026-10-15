@@ -203,6 +203,10 @@ impl Decoded {
             json::string(out, &l.name);
             out.push_str(",\"summary\":");
             json::string(out, &l.summary);
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            )]
             let _ = write!(
                 out,
                 ",\"buf\":{},\"range\":[{},{}],\"fields\":[",
@@ -217,6 +221,10 @@ impl Decoded {
                 out.push_str(",\"value\":");
                 json::string(out, &f.value);
                 if let Some((a, b)) = f.range {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                    )]
                     let _ = write!(out, ",\"range\":[{a},{b}]");
                 }
                 out.push('}');
@@ -668,10 +676,22 @@ impl Dissector {
             flow.rel_seq
         );
         if flags & 0x10 != 0 {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            )]
             let _ = write!(info, "Ack={} ", flow.rel_ack);
         }
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+        )]
         let _ = write!(info, "Win={win} Len={}", payload.1 - payload.0);
         if !opts.is_empty() && flags & 0x02 != 0 {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            )]
             let _ = write!(info, " {}", opts.join(" "));
         }
         if flow.retransmission {
@@ -908,6 +928,10 @@ fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
         l.field("Identifier", format!("0x{id:04x}"), (at + 4, at + 6));
         l.field("Sequence number", seq.to_string(), (at + 6, at + 8));
         l.note("Data", format!("{} bytes", c.len() - 8));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+        )]
         let _ = write!(info, " id=0x{id:04x}, seq={seq}");
     }
     let quotes = if v6 {
@@ -919,6 +943,10 @@ fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
         let inner = &c[8..];
         let summary = quoted_summary(inner);
         l.field("Original packet", summary.clone(), (at + 8, end));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+        )]
         let _ = write!(info, " ({summary})");
     }
     d.push(l);

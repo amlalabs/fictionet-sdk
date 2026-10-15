@@ -159,6 +159,10 @@ impl Mirror {
                         .map_err(|e| context(e, "bringing up attach's device"))?;
                 }
                 Step::ClearVm => {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "POL-CHECKED-NEXT: AddIngress is checked next and fails if an old ingress qdisc is still there"
+                    )]
                     let _ = nl.call(netlink::del_ingress(vm));
                 }
                 Step::AddIngress(index) => {
@@ -186,6 +190,10 @@ impl Drop for Mirror {
             for request in self.cleanup.requests() {
                 // Teardown remains best effort, including after partial setup:
                 // a missing device or qdisc does not stop the remaining requests.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "POL-TEARDOWN: best-effort undo in Drop; each request is sent even if an earlier one failed"
+                )]
                 let _ = nl.call_message(request);
             }
         }

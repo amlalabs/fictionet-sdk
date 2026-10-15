@@ -509,10 +509,22 @@ fn present_block(item: &mut CaptureItem, block: &hpack::Block) {
             .map(String::from_utf8_lossy)
     };
     if let Some(status) = get(b":status") {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+        )]
         let _ = write!(item.info, ": {status}");
     } else if let (Some(m), Some(p)) = (get(b":method"), get(b":path")) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+        )]
         let _ = write!(item.info, ": {m} {p}");
         if let Some(a) = get(b":authority") {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            )]
             let _ = write!(item.info, " ({a})");
         }
     }
@@ -689,6 +701,10 @@ impl Decode for Capture {
                 if let Some(text) = fictionet::observe::protocols::body_preview(data) {
                     item.layer.note("Text", text);
                 }
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                )]
                 let _ = write!(item.info, " {len} bytes");
                 if h.flags & 1 != 0 {
                     item.info.push_str(", end");
@@ -709,6 +725,10 @@ impl Decode for Capture {
                 if h.kind == 5
                     && let Some(id) = block.promised
                 {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                    )]
                     let _ = write!(item.info, " promised {id}");
                 }
                 if let Some(b) = &block.block {
@@ -753,6 +773,10 @@ impl Decode for Capture {
                 };
                 let e = display_error(code);
                 item.layer.field("Error", e.clone(), (9, 13));
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                )]
                 let _ = write!(item.info, " {e}");
                 item.reset = true;
                 {
@@ -830,6 +854,10 @@ impl Decode for Capture {
                 };
                 item.layer
                     .field("Window increment", inc.to_string(), (9, 13));
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                )]
                 let _ = write!(item.info, " +{inc}");
             }
             _ => {}

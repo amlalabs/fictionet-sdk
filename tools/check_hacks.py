@@ -9,7 +9,11 @@ including simulated timers and returns that already print a skip diagnostic.
 Rust lint exceptions stay in source: Clippy checks types and stale expectations.
 This scanner checks their IDs and limits must-use expectations to let statements
 without direct block initializers. Reviewers must keep the initializer to a single
-call so one expectation cannot cover several discarded Results.
+call so one expectation cannot cover several discarded Results. An expectation
+of a protected lint must carry a reason here, since the workspace does not deny
+allow_attributes_without_reason; other lints leave missing reasons to Clippy.
+Only `let _ =` discards are typed this way: unwrap_or_default(), unwrap_or(..),
+.ok() and similar on a Result are not detected here or by that Clippy lint.
 Protected lint allows and groups cannot be suppressed in attributes, Cargo lint
 tables or compiler flags. These rules cannot be allowlisted.
 Allow flags fail closed on protected lint values, expansions, interpolation or
@@ -38,6 +42,12 @@ POLICIES = {
     "POL-SIMULATION": "A simulated timer is part of the behavior asserted by the test.",
     "POL-PREREQUISITE": "A named prerequisite skips visibly locally and fails in CI.",
     "POL-DIAGNOSTIC": "Optional diagnostics cannot determine the checked outcome.",
+    "POL-INFALLIBLE": "Err cannot happen here; the reason names the invariant that rules it out.",
+    "POL-HINT": "A tuning hint: failing changes only timing, never what is sent, received or reported.",
+    "POL-CHECKED-NEXT": "A later checked step fails visibly whenever this failure matters.",
+    "POL-FALLBACK": "An expected refusal; the reason names the path that provides the outcome instead.",
+    "POL-PROBE": "Arbitrary input may be rejected; the probe checks only that handling neither panics nor hangs.",
+    "POL-SCAFFOLD": "Test scaffolding whose result the test does not check; the reason names what it checks.",
 }
 SCOPES = ("runtime", "codecs", "harnesses")
 RULES = {"shell-or-true", "continue-on-error", "sleep", "silent-skip", "skip-reason"}
@@ -404,6 +414,11 @@ def scan(path, text):
                 if lint.group(1) == "expect" and (PROTECTED_GROUPS & set(lint_names)
                         or PROTECTED_RESULTS & set(lint_names) and not applies_to_let(masked, match.start(), end)):
                     add("rust-protected-expect", number)
+                # The workspace does not deny allow_attributes_without_reason,
+                # so a must-use exception without its reason is caught here.
+                if (lint.group(1) == "expect" and PROTECTED & set(lint_names)
+                        and not re.search(r"\breason\s*=", args)):
+                    add("rust-reason", number)
                 for reason in re.finditer(r"\breason\s*=", args):
                     value = original[lint.end() + reason.end():lint.end() + len(args)].strip().rstrip(",").strip()
                     # Rust reason strings need only a literal ID prefix, not escape decoding.

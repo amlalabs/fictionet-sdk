@@ -199,10 +199,18 @@ fn dns_display(msg: &[u8]) -> Display {
     if response {
         let code = md.response_code.to_string();
         if code != "No Error" {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            )]
             let _ = write!(text, " {code}");
             d.tag("dns-error");
         }
         if !a_text.is_empty() {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            )]
             let _ = write!(text, " {}", a_text.join(" "));
         }
     }

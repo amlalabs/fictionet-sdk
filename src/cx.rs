@@ -1299,7 +1299,10 @@ mod tests {
                 // Poll the region until its task has started, then give up
                 // on it, as a timeout would.
                 poll_fn(|cx| {
-                    let _ = region.as_mut().poll(cx);
+                    assert!(
+                        region.as_mut().poll(cx).is_pending(),
+                        "the region sleeps for 60 s"
+                    );
                     if started.load(Ordering::SeqCst) == 1 {
                         Poll::Ready(())
                     } else {
@@ -1310,6 +1313,10 @@ mod tests {
                 .await;
                 Ok(())
             }));
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "POL-SCAFFOLD: the receiver is gone only once recv_timeout below has failed the test"
+            )]
             let _ = tx.send(out.map_err(|e| e.to_string()));
         });
         // The run ends once the task has seen the cancel; its Cancelled

@@ -675,6 +675,10 @@ mod tests {
                 // A task started by a grouped task is in the group too.
                 fcx.spawn(move |fcx| async move {
                     let mut host = host;
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "POL-SCAFFOLD: the task only waits as a member of the group until the run is cancelled; the test checks the snapshot's groups"
+                    )]
                     let _ = host.recv(&fcx).await;
                     Ok(())
                 });
