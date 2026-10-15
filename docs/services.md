@@ -920,6 +920,11 @@ and streams draining an ended run can keep their own watch holds until they
 finish. Multiple listeners and runs have separate budgets.
 Pending handshakes and attached sandboxes are outside these observer limits.
 
+If the kernel refuses to watch a sandbox connection, the listener closes it.
+An existing attachment's next receive reports `RecvError::Closed`, and its
+queued outgoing packets are dropped. After a resource shortage pauses accepts,
+the listener keeps retrying registration until it can accept again.
+
 The dashboard lists the events under **Events**, from what the log held
 when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The

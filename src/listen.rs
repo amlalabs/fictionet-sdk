@@ -99,6 +99,8 @@ impl std::error::Error for ParseWorldSocketError {}
 /// If a sandbox detaches before the world takes its attachment, the helper
 /// thread reclaims its socket and buffers, even when the world is not
 /// polling [`Attachments`](crate::Attachments).
+/// If the kernel refuses to watch a sandbox connection, it is closed and
+/// any existing attachment's next receive reports [`RecvError::Closed`].
 ///
 /// The attachment hub is marked as fed by a real listener. Using its
 /// [`Attachments`](crate::Attachments) in a [`lab`](crate::lab), through
@@ -152,6 +154,20 @@ impl std::error::Error for ParseWorldSocketError {}
 /// # }
 /// ```
 pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listening> {
+    listen_with_ops(socket, attacher, ListenOps { epoll_ctl, accept4 })
+}
+
+/// The listener's registration and accept operations.
+pub(crate) struct ListenOps {
+    epoll_ctl: fn(RawFd, libc::c_int, RawFd, u32, u64) -> io::Result<()>,
+    accept4: fn(RawFd) -> io::Result<OwnedFd>,
+}
+
+pub(crate) fn listen_with_ops(
+    socket: WorldSocket,
+    attacher: Attacher,
+    ops: ListenOps,
+) -> io::Result<Listening> {
     attacher.mark_listener()?;
     let WorldSocket::UnixSocket(path) = socket;
     let listener = bind(&path)?;
@@ -163,14 +179,14 @@ pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listen
             libc::EFD_NONBLOCK | libc::EFD_CLOEXEC,
         ))?)
     };
-    epoll_ctl(
+    (ops.epoll_ctl)(
         epoll.as_raw_fd(),
         libc::EPOLL_CTL_ADD,
         listener.as_raw_fd(),
         libc::EPOLLIN as u32,
         LISTEN_TOKEN,
     )?;
-    epoll_ctl(
+    (ops.epoll_ctl)(
         epoll.as_raw_fd(),
         libc::EPOLL_CTL_ADD,
         wake_fd.as_raw_fd(),
@@ -180,6 +196,7 @@ pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listen
     let shared = Arc::new(ListenShared {
         epoll,
         wake_fd,
+        ops,
         conns: Mutex::new(HashMap::new()),
         closing: AtomicBool::new(false),
         #[cfg(feature = "observe")]
@@ -204,6 +221,18 @@ fn epoll_ctl(epoll: RawFd, op: libc::c_int, fd: RawFd, events: u32, token: u64) 
     // SAFETY: `event` is valid for the call.
     cvt(unsafe { libc::epoll_ctl(epoll, op, fd, &mut event) })?;
     Ok(())
+}
+
+fn accept4(listener: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: plain syscall; the returned fd is owned from here.
+    unsafe {
+        Ok(OwnedFd::from_raw_fd(cvt(libc::accept4(
+            listener,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        ))?))
+    }
 }
 
 /// Makes the listening socket. A socket file left behind by a world that is
@@ -241,6 +270,7 @@ const WAKE_TOKEN: u64 = 1;
 /// What the helper thread and the attachments of one [`listen`] share.
 pub(crate) struct ListenShared {
     epoll: OwnedFd,
+    ops: ListenOps,
     /// An eventfd that wakes the helper thread.
     wake_fd: OwnedFd,
     /// Accepted connections, by epoll token.
@@ -252,6 +282,12 @@ pub(crate) struct ListenShared {
 }
 
 impl ListenShared {
+    fn unwatch(&self, fd: RawFd) {
+        // RH-025: removing a watch is best-effort teardown. It grants no
+        // readiness and clears no retry state, unlike ADD and MOD.
+        let _ = (self.ops.epoll_ctl)(self.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, 0, 0);
+    }
+
     fn wake_helper(&self) {
         let one: u64 = 1;
         // SAFETY: writes 8 bytes from `one`. A full counter is fine: the
@@ -284,7 +320,7 @@ impl ConnSlot {
 
     /// Writes queued packets until the connection is full again or the
     /// queue is empty, and watches for room only while packets wait.
-    fn flush(&self, out: &mut OutQueue, epoll: RawFd) {
+    fn flush(&self, out: &mut OutQueue, shared: &ListenShared) {
         let fd = self.fd.as_raw_fd();
         while let Some(packet) = out.queue.front() {
             match unix::send_parts(fd, &[&[relay::PACKET], &packet.0], true) {
@@ -298,27 +334,30 @@ impl ConnSlot {
             }
             out.queue.pop().expect("front was there");
         }
-        self.watch_out(out, epoll, false);
+        // If MOD fails, want_out stays true: EPOLLOUT remains registered,
+        // and the helper ignores it while the queue is empty.
+        let _ = self.watch_out(out, shared, false);
     }
 
     /// Asks epoll to report when the connection has room (`true`), or to
     /// stop (`false`). The helper thread then flushes the queue.
-    fn watch_out(&self, out: &mut OutQueue, epoll: RawFd, on: bool) {
+    fn watch_out(&self, out: &mut OutQueue, shared: &ListenShared, on: bool) -> io::Result<()> {
         if out.want_out == on {
-            return;
+            return Ok(());
         }
-        out.want_out = on;
         let mut events = (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32;
         if on {
             events |= libc::EPOLLOUT as u32;
         }
-        let _ = epoll_ctl(
-            epoll,
+        (shared.ops.epoll_ctl)(
+            shared.epoll.as_raw_fd(),
             libc::EPOLL_CTL_MOD,
             self.fd.as_raw_fd(),
             events,
             self.token,
-        );
+        )?;
+        out.want_out = on;
+        Ok(())
     }
 }
 
@@ -331,7 +370,7 @@ struct OutQueue {
     /// The connection is closed: nothing more is queued.
     closed: bool,
     /// Packets dropped because the connection and the queue were full, or
-    /// attach was gone.
+    /// the connection closed.
     dropped: u64,
 }
 
@@ -356,13 +395,13 @@ fn helper(
     let mut next_token: u64 = 2;
     let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
-    // While the process is out of descriptors, the listening socket is out
-    // of epoll until this time, so its readiness does not spin the thread.
+    // While the process is out of descriptors or memory, pause accepts to
+    // avoid spinning. Keep retrying until the listening socket is watched.
     let mut accept_paused: Option<Instant> = None;
     loop {
         if shared.closing.load(Ordering::Acquire) {
             if let Some(fd) = listener.take() {
-                let _ = epoll_ctl(epoll, libc::EPOLL_CTL_DEL, fd.as_raw_fd(), 0, 0);
+                shared.unwatch(fd.as_raw_fd());
                 drop(fd);
                 handshakes.clear();
                 accept_paused = None;
@@ -376,14 +415,16 @@ fn helper(
         if let (Some(until), Some(fd)) = (accept_paused, &listener)
             && until <= now
         {
-            accept_paused = None;
-            let _ = epoll_ctl(
+            accept_paused = match (shared.ops.epoll_ctl)(
                 epoll,
                 libc::EPOLL_CTL_ADD,
                 fd.as_raw_fd(),
                 libc::EPOLLIN as u32,
                 LISTEN_TOKEN,
-            );
+            ) {
+                Ok(()) => None,
+                Err(_) => Some(now + ACCEPT_RETRY),
+            };
         }
         let timeout = handshakes
             .values()
@@ -402,9 +443,10 @@ fn helper(
             match token {
                 LISTEN_TOKEN => {
                     let Some(fd) = &listener else { continue };
-                    if accept_all(fd.as_raw_fd(), epoll, &mut handshakes, &mut next_token).is_err()
+                    if accept_all(fd.as_raw_fd(), &shared, &mut handshakes, &mut next_token)
+                        .is_err()
                     {
-                        let _ = epoll_ctl(epoll, libc::EPOLL_CTL_DEL, fd.as_raw_fd(), 0, 0);
+                        shared.unwatch(fd.as_raw_fd());
                         accept_paused = Some(Instant::now() + ACCEPT_RETRY);
                     }
                 }
@@ -431,7 +473,7 @@ fn helper(
                     if flags & libc::EPOLLOUT as u32 != 0 {
                         let mut out = slot.out.lock();
                         if !out.queue.is_empty() {
-                            slot.flush(&mut out, epoll);
+                            slot.flush(&mut out, &shared);
                         }
                     }
                     if flags & (libc::EPOLLIN as u32 | hangup) != 0 {
@@ -456,36 +498,26 @@ const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 /// descriptors or memory, and the connections still wait.
 fn accept_all(
     listener: RawFd,
-    epoll: RawFd,
+    shared: &ListenShared,
     handshakes: &mut BTreeMap<u64, Handshake>,
     next_token: &mut u64,
 ) -> io::Result<()> {
     loop {
-        // SAFETY: plain syscall; the fd is owned from here.
-        let fd = unsafe {
-            libc::accept4(
-                listener,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            let err = io::Error::last_os_error();
-            match err.raw_os_error() {
+        let fd = match (shared.ops.accept4)(listener) {
+            Ok(fd) => fd,
+            Err(err) => match err.raw_os_error() {
                 Some(libc::EINTR) | Some(libc::ECONNABORTED) => continue,
                 Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
                     return Err(err);
                 }
                 _ => return Ok(()),
-            }
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            },
+        };
         unix::raise_buffers(fd.as_raw_fd());
         let token = *next_token;
         *next_token += 1;
-        if epoll_ctl(
-            epoll,
+        if (shared.ops.epoll_ctl)(
+            shared.epoll.as_raw_fd(),
             libc::EPOLL_CTL_ADD,
             fd.as_raw_fd(),
             libc::EPOLLIN as u32,
@@ -554,7 +586,7 @@ fn handshake_step(
         if unix::send(fd, &Message::Accept.encode(), true).is_err() {
             return None;
         }
-        let _ = epoll_ctl(shared.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, 0, 0);
+        shared.unwatch(fd);
         crate::observe::serve_session(attacher.clone(), handshake.fd, slot);
         return None;
     }
@@ -569,6 +601,17 @@ fn handshake_step(
             return None;
         }
     };
+    let events = (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32;
+    if let Err(error) = (shared.ops.epoll_ctl)(
+        shared.epoll.as_raw_fd(),
+        libc::EPOLL_CTL_MOD,
+        fd,
+        events,
+        token,
+    ) {
+        refuse(&format!("cannot watch connection: {error}"));
+        return None;
+    }
     if unix::send(fd, &Message::Accept.encode(), true).is_err() {
         return None;
     }
@@ -580,14 +623,6 @@ fn handshake_step(
         out: Mutex::new(OutQueue::default()),
     });
     shared.conns.lock().insert(token, slot.clone());
-    let events = (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32;
-    let _ = epoll_ctl(
-        shared.epoll.as_raw_fd(),
-        libc::EPOLL_CTL_MOD,
-        fd,
-        events,
-        token,
-    );
     let link = SocketLink {
         listen: shared.clone(),
         token,
@@ -699,13 +734,12 @@ impl SocketLink {
         if self.closed {
             return;
         }
-        let epoll = self.listen.epoll.as_raw_fd();
         let mut out = self.slot.out.lock();
         if out.closed {
             return;
         }
         if !out.queue.is_empty() {
-            self.slot.flush(&mut out, epoll);
+            self.slot.flush(&mut out, &self.listen);
         }
         if out.queue.is_empty() {
             match unix::send_parts(
@@ -726,19 +760,19 @@ impl SocketLink {
             out.dropped += 1;
             return;
         }
-        self.slot.watch_out(&mut out, epoll, true);
+        if self.slot.watch_out(&mut out, &self.listen, true).is_err() {
+            out.dropped += out.queue.len() as u64;
+            // The helper must not flush packets counted as dropped.
+            out.queue.clear();
+            drop(out);
+            self.close();
+        }
     }
 }
 
 impl Drop for SocketLink {
     fn drop(&mut self) {
-        let _ = epoll_ctl(
-            self.listen.epoll.as_raw_fd(),
-            libc::EPOLL_CTL_DEL,
-            self.slot.fd.as_raw_fd(),
-            0,
-            0,
-        );
+        self.listen.unwatch(self.slot.fd.as_raw_fd());
         let last = {
             let mut conns = self.listen.conns.lock();
             conns.remove(&self.token);
@@ -818,5 +852,211 @@ impl std::fmt::Debug for Listening {
         f.debug_struct("Listening")
             .field("path", &self.path)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Interface, InterfaceExt, Seed, attachments, block_on, run};
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn socket(tag: &str) -> WorldSocket {
+        WorldSocket::UnixSocket(std::env::temp_dir().join(format!(
+            "fictionet-listen-{}-{tag}.sock",
+            std::process::id()
+        )))
+    }
+
+    struct Client(OwnedFd);
+
+    impl Client {
+        fn hello(path: &Path, name: &str) -> Self {
+            let fd = unix::connect(path).unwrap();
+            unix::set_timeout(fd.as_raw_fd(), libc::SO_RCVTIMEO, Some(TIMEOUT)).unwrap();
+            let hello = Message::Hello(relay::Hello {
+                version: relay::VERSION,
+                mtu: 1500,
+                kind: "tun".into(),
+                name: name.into(),
+            });
+            unix::send(fd.as_raw_fd(), &hello.encode(), false).unwrap();
+            Self(fd)
+        }
+
+        fn recv(&self) -> Vec<u8> {
+            let mut buf = vec![0; relay::MAX_MESSAGE + 1];
+            let n =
+                unix::recv(self.0.as_raw_fd(), &mut buf, false).expect("receive before timeout");
+            buf.truncate(n);
+            buf
+        }
+    }
+
+    #[test]
+    fn accepts_resume_after_accept_and_registration_resource_errors() {
+        static ACCEPTS: AtomicUsize = AtomicUsize::new(0);
+        static ADDS: AtomicUsize = AtomicUsize::new(0);
+        static PAUSED: std::sync::Mutex<Option<mpsc::Sender<()>>> = std::sync::Mutex::new(None);
+        let (paused_tx, paused_rx) = mpsc::channel();
+        *PAUSED.lock().unwrap() = Some(paused_tx);
+        let ops = ListenOps {
+            accept4: |fd| {
+                if ACCEPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EMFILE));
+                }
+                accept4(fd)
+            },
+            epoll_ctl: |epoll, op, fd, events, token| {
+                if op == libc::EPOLL_CTL_ADD
+                    && token == LISTEN_TOKEN
+                    && ADDS.fetch_add(1, Ordering::SeqCst) == 1
+                {
+                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                }
+                epoll_ctl(epoll, op, fd, events, token)?;
+                if op == libc::EPOLL_CTL_DEL
+                    && let Some(tx) = PAUSED.lock().unwrap().take()
+                {
+                    tx.send(()).unwrap();
+                }
+                Ok(())
+            },
+        };
+        let (attacher, _attachments) = attachments();
+        let listening = listen_with_ops(socket("accept-retry"), attacher, ops).unwrap();
+        let first = Client::hello(&listening.path, "first");
+        paused_rx.recv_timeout(TIMEOUT).expect("accepts paused");
+        let late = Client::hello(&listening.path, "late");
+        assert_eq!(late.recv(), [relay::ACCEPT]);
+        assert_eq!(first.recv(), [relay::ACCEPT]);
+        assert_eq!(ADDS.load(Ordering::SeqCst), 3);
+        assert!(ACCEPTS.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn failed_send_watch_closes_the_attachment_and_drops_queued_packets() {
+        static FAILURES: AtomicUsize = AtomicUsize::new(0);
+        let ops = ListenOps {
+            epoll_ctl: |epoll, op, fd, events, token| {
+                if op == libc::EPOLL_CTL_MOD && events & libc::EPOLLOUT as u32 != 0 {
+                    FAILURES.fetch_add(1, Ordering::SeqCst);
+                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                }
+                epoll_ctl(epoll, op, fd, events, token)
+            },
+            accept4,
+        };
+        let (attacher, mut attachments) = attachments();
+        let listening = listen_with_ops(socket("send-watch"), attacher.clone(), ops).unwrap();
+        let client = Client::hello(&listening.path, "agent");
+        assert_eq!(client.recv(), [relay::ACCEPT]);
+        let shared = listening.shared.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let world = std::thread::spawn(move || {
+            let result = block_on(run(Seed::from_u64(0), move |fcx| async move {
+                let mut agent = attachments.get(&fcx, "agent").await?;
+                let slot = shared.conns.lock().get(&2).unwrap().clone();
+                // The client does not drain the burst, so it exceeds even
+                // the raised socket buffer and needs EPOLLOUT.
+                for _ in 0..10_000 {
+                    agent.send(Packet(vec![0; 1400]));
+                }
+                assert_eq!(agent.recv(&fcx).await, Err(RecvError::Closed));
+                let out = slot.out.lock();
+                assert!(out.closed);
+                assert!(!out.want_out);
+                assert!(out.queue.is_empty());
+                assert_eq!(out.dropped, 1);
+                Ok(())
+            }));
+            done_tx.send(result).unwrap();
+        });
+        done_rx
+            .recv_timeout(TIMEOUT)
+            .expect("the world's receive must report Closed")
+            .unwrap();
+        world.join().unwrap();
+        assert_eq!(FAILURES.load(Ordering::SeqCst), 1);
+        assert!(attacher.reserve("agent").is_ok(), "name must be released");
+    }
+
+    #[test]
+    fn failed_handshake_watch_refuses_without_delivering_an_attachment() {
+        static FAILURES: AtomicUsize = AtomicUsize::new(0);
+        let ops = ListenOps {
+            epoll_ctl: |epoll, op, fd, events, token| {
+                if op == libc::EPOLL_CTL_MOD {
+                    FAILURES.fetch_add(1, Ordering::SeqCst);
+                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                }
+                epoll_ctl(epoll, op, fd, events, token)
+            },
+            accept4,
+        };
+        let (attacher, mut attachments) = attachments();
+        let listening = listen_with_ops(socket("handshake-watch"), attacher.clone(), ops).unwrap();
+        let client = Client::hello(&listening.path, "agent");
+        let response = client.recv();
+        assert!(matches!(
+            relay::decode(&response),
+            Ok(Message::Refuse(reason)) if reason.starts_with("cannot watch connection:")
+        ));
+        assert!(client.recv().is_empty(), "the connection must close");
+        assert_eq!(FAILURES.load(Ordering::SeqCst), 1);
+        assert!(listening.shared.conns.lock().is_empty());
+        assert!(attacher.reserve("agent").is_ok(), "name must be released");
+        block_on(run(Seed::from_u64(0), move |fcx| async move {
+            let mut next = std::pin::pin!(attachments.next(&fcx));
+            poll_fn(|cx| {
+                assert!(
+                    next.as_mut().poll(cx).is_pending(),
+                    "no attachment delivered"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_watch_removal_keeps_writability_registered() {
+        static MODS: AtomicUsize = AtomicUsize::new(0);
+        let ops = ListenOps {
+            epoll_ctl: |epoll, op, fd, events, token| {
+                // Handshake, enable EPOLLOUT, then fail disabling it once.
+                if op == libc::EPOLL_CTL_MOD && MODS.fetch_add(1, Ordering::SeqCst) == 2 {
+                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                }
+                epoll_ctl(epoll, op, fd, events, token)
+            },
+            accept4,
+        };
+        let (attacher, mut attachments) = attachments();
+        let listening = listen_with_ops(socket("watch-removal"), attacher, ops).unwrap();
+        let client = Client::hello(&listening.path, "agent");
+        assert_eq!(client.recv(), [relay::ACCEPT]);
+        let shared = listening.shared.clone();
+        block_on(run(Seed::from_u64(0), move |fcx| async move {
+            let _agent = attachments.get(&fcx, "agent").await?;
+            let slot = shared.conns.lock().get(&2).unwrap().clone();
+            let mut out = slot.out.lock();
+            slot.watch_out(&mut out, &shared, true).unwrap();
+            slot.flush(&mut out, &shared);
+            assert!(out.want_out);
+            assert!(!out.closed);
+            assert_eq!(MODS.load(Ordering::SeqCst), 3);
+            slot.watch_out(&mut out, &shared, false).unwrap();
+            assert!(!out.want_out);
+            assert_eq!(MODS.load(Ordering::SeqCst), 4);
+            Ok(())
+        }))
+        .unwrap();
     }
 }
