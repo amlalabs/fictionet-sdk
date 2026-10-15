@@ -172,17 +172,19 @@ that run as doctests.
 
 For modules generated from schemas, see [code generation](docs/codegen.md).
 
-A new module is registered in three places, and a test holds each to the code:
+A new module is registered in two places, and a test holds each to the code:
 
 - a record in `catalog/stdlib.rs`, which says what the module can do
   (`tests/stdlib_catalog.rs` checks every column). Regenerate the table in
   `src/stdlib/catalog.md` with
-  `BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`;
+  `BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`.
+  The same command writes the module's `pub mod` declaration in
+  `src/stdlib/mod.rs` and its `#[path]` entry in
+  `tests/copy_and_own/modules.rs`, which compiles the file as a module of a
+  separate crate;
 - a fuzz target in `fuzz/fuzz_targets/`, with a record in `catalog/stdlib.rs`
   that names the module as its owner. The same bless command writes its
-  `[[bin]]` entry in `fuzz/Cargo.toml`;
-- a `#[path]` entry in `tests/copy_and_own/modules.rs`, which compiles the file
-  as a module of a separate crate.
+  `[[bin]]` entry in `fuzz/Cargo.toml`.
 
 The catalog record and the module docs are where a module is described. The front
 pages (`README.md`, the crate root in `src/lib.rs`, and the top of

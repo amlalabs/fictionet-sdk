@@ -2,9 +2,12 @@
 //!
 //! `tests/stdlib_catalog.rs` checks these claims against independent source
 //! inventories. Set `BLESS_STDLIB_CATALOG=1` when running that test to update
-//! `src/stdlib/catalog.md`, the `[[bin]]` records in `fuzz/Cargo.toml` and the
-//! list of fuzz targets without a module in `fuzz/README.md`. Module and copy
-//! declarations and fuzz target sources remain handwritten.
+//! `src/stdlib/catalog.md`, the public module declarations in
+//! `src/stdlib/mod.rs`, the module declarations of the copy-and-own fixture in
+//! `tests/copy_and_own/modules.rs`, the `[[bin]]` records in `fuzz/Cargo.toml`
+//! and the list of fuzz targets without a module in `fuzz/README.md`. Private
+//! stdlib modules, the fixture's compile probes and fuzz target sources remain
+//! handwritten.
 
 /// One public stdlib module and its documented capabilities.
 #[derive(Clone, Copy, Debug)]
@@ -29,6 +32,26 @@ pub struct Module {
     pub fuzz: bool,
     /// The copy-and-own fixture compiles this module's implementation.
     pub copy: bool,
+    /// The fixture copies the module's files one by one, as [`COPY_PARTS`]
+    /// records, instead of through its entry file.
+    pub copy_parts: bool,
+    /// The entry file under `src/stdlib/`, when it is not `<module>.rs`.
+    pub file: Option<&'static str>,
+    /// A Markdown file under `src/stdlib/` included as the module's docs.
+    pub docs: Option<&'static str>,
+    /// The feature-selection macro around the module's declarations.
+    pub gate: Gate,
+}
+
+/// The SDK feature-selection macro a module declaration sits in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// No macro: the module is always compiled.
+    Always,
+    /// `fictionet::cfg_std!`.
+    Std,
+    /// `fictionet::cfg_observe!`.
+    Observe,
 }
 
 impl Module {
@@ -44,6 +67,10 @@ impl Module {
             observe: false,
             fuzz: false,
             copy: false,
+            copy_parts: false,
+            file: None,
+            docs: None,
+            gate: Gate::Always,
         }
     }
 }
@@ -79,11 +106,12 @@ catalog! {
     cboe_pitch: "Cboe Multicast PITCH: sequenced units, every message, a gap detector per unit and a bounded order book.";
         wire: true, decode: true, state: &["GapDetector", "Book"], fuzz: true, copy: true;
     cme_mdp3: "CME MDP 3.0 market data: generated messages for SBE schema 1 version 13 (20230411), plus packet framing.";
-        wire: true, decode: true, fuzz: true, copy: true;
+        wire: true, decode: true, fuzz: true, copy: true,
+        file: Some("cme_mdp3/mod.rs"), docs: Some("cme_mdp3/docs.md");
     coap: "CoAP messages over UDP and frames over TCP, with block-wise reassembly.";
         wire: true, decode: true, fuzz: true, copy: true;
     codec: "The tools every protocol is built on, none of them doing I/O: `Decode`, `Wire`, `Stream`, combinators, a recorder and fault injection.";
-        wire: true, decode: true, fuzz: true, copy: true;
+        wire: true, decode: true, fuzz: true, copy: true, copy_parts: true;
     cotp: "ISO transport on TCP: TPKT and COTP packets, with segment reassembly.";
         wire: true, decode: true, fuzz: true, copy: true;
     dcerpc: "DCE/RPC over connections: bind, request and response PDUs, with fragment reassembly.";
@@ -127,7 +155,7 @@ catalog! {
     http3: "HTTP/3 frames, field sections and caller-driven stream state, with no QUIC transport or HTTP service.";
         wire: true, decode: true, state: &["Session"], fuzz: true, copy: true;
     httpd: "HTTP serving: `Http1`, upgrade continuations, hyper for HTTP/2 and axum upgrades, handlers, tower integration, and virtual hosts.";
-        service: &["Http1"], copy: true;
+        service: &["Http1"], copy: true, gate: Gate::Std;
     huffman: "The RFC 7541 Huffman code that HPACK and QPACK share.";
         wire: true, fuzz: true, copy: true;
     icmp: "ICMP echo replies and error messages, for machines built by hand.";
@@ -289,7 +317,7 @@ catalog! {
     telnet: "Telnet data and commands, option negotiation, terminal type and window size.";
         wire: true, decode: true, state: &["Negotiation"], fuzz: true, copy: true;
     test_support: "Shared test data, scripted decoders, timing and contract checks.";
-        decode: true, copy: true;
+        decode: true, copy: true, file: Some("test_support/mod.rs");
     tftp: "TFTP packets, option negotiation, and one read transfer served.";
         wire: true, decode: true, state: &["ReadTransfer"], fuzz: true, copy: true;
     thrift: "Apache Thrift messages and values in the binary and compact protocols, and the framed transport.";
@@ -309,7 +337,7 @@ catalog! {
     wake_on_lan: "Wake-on-LAN magic packets.";
         wire: true, decode: true, fuzz: true, copy: true;
     web: "Websites by hostname: `Sites`, a preset on `Net` that builds DNS, addresses, TLS and HTTP around one callback.";
-        fuzz: true, copy: true;
+        fuzz: true, copy: true, gate: Gate::Std;
     websocket: "WebSocket: the opening handshake, frames and messages.";
         wire: true, decode: true, fuzz: true, copy: true;
     whois: "WHOIS queries and responses, with referrals.";
@@ -322,6 +350,85 @@ catalog! {
         wire: true, decode: true, fuzz: true, copy: true;
     zabbix: "The Zabbix protocol: packets and the JSON messages of agents, senders and servers.";
         wire: true, decode: true, fuzz: true, copy: true;
+}
+
+/// A file the copy-and-own fixture compiles as a module of its own, beside
+/// the catalog modules it copies through their entry files: a private stdlib
+/// module, one file of a module with `copy_parts`, or observe and generated
+/// code from outside `src/stdlib/`.
+#[derive(Clone, Copy, Debug)]
+pub struct CopyPart {
+    /// The module name in the fixture.
+    pub name: &'static str,
+    /// The file, relative to the repository root.
+    pub file: &'static str,
+    /// The fixture declares the module `pub`.
+    pub public: bool,
+    /// The feature-selection macro around the declaration.
+    pub gate: Gate,
+}
+
+impl CopyPart {
+    const fn new(name: &'static str, file: &'static str) -> Self {
+        Self {
+            name,
+            file,
+            public: true,
+            gate: Gate::Always,
+        }
+    }
+}
+
+// Parts are public and always compiled unless a field says otherwise.
+macro_rules! copy_parts {
+    ($($name:ident: $file:literal $(, $field:ident: $value:expr)*;)*) => {
+        /// Every copy part, in name order.
+        pub const COPY_PARTS: &[CopyPart] = &[
+            $(CopyPart {
+                $($field: $value,)*
+                ..CopyPart::new(stringify!($name), $file)
+            },)*
+        ];
+    };
+}
+
+copy_parts! {
+    ascii: "src/stdlib/codec/ascii.rs";
+    base64: "src/stdlib/codec/base64.rs";
+    ber: "src/stdlib/codec/ber.rs";
+    bounded: "src/stdlib/codec/bounded.rs";
+    buffer: "src/stdlib/codec/buffer.rs";
+    checked: "src/stdlib/codec/checked.rs";
+    civil: "src/stdlib/codec/civil.rs";
+    combinators: "src/stdlib/codec/combinators.rs";
+    connection: "src/stdlib/connection.rs";
+    crc32: "src/stdlib/codec/crc32.rs";
+    crc32c: "src/stdlib/codec/crc32c.rs";
+    declarations: "src/stdlib/codec/declarations.rs";
+    demux: "src/stdlib/codec/demux.rs";
+    dot_body: "src/stdlib/codec/dot_body.rs";
+    faults: "src/stdlib/codec/faults.rs";
+    field: "src/stdlib/codec/field.rs";
+    frames: "src/stdlib/codec/frames.rs";
+    generated: "src/stdlib/codec/generated.rs";
+    generated_recursive: "codegen/tests/golden/recursive.rs";
+    head_body: "src/stdlib/codec/head_body.rs";
+    interceptor: "src/stdlib/codec/interceptor.rs";
+    json_syntax: "src/stdlib/codec/json_syntax.rs";
+    layout: "src/stdlib/codec/layout.rs";
+    lcg: "src/stdlib/codec/lcg.rs";
+    leb128: "src/stdlib/codec/leb128.rs";
+    link: "src/stdlib/link.rs";
+    observe_conversation: "src/observe/conversation.rs", gate: Gate::Observe;
+    observe_http2: "src/observe/http2.rs", gate: Gate::Observe;
+    observe_protocols: "src/observe/protocols.rs", gate: Gate::Observe;
+    observe_tls: "src/observe/tls.rs", gate: Gate::Observe;
+    pipe: "src/stdlib/codec/pipe.rs";
+    reader: "src/stdlib/codec/reader.rs";
+    recorder: "src/stdlib/codec/recorder.rs";
+    stream: "src/stdlib/codec/stream.rs";
+    tls_output: "src/stdlib/tls/output.rs", public: false;
+    work: "src/stdlib/codec/work.rs";
 }
 
 /// The owner of a fuzz target.

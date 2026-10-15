@@ -163,20 +163,21 @@
 //! and the codec's [errors and names](codec#errors-and-names-in-a-codec-module).
 //! A new protocol needs these entries:
 //!
-//! 1. Add `src/stdlib/<name>.rs`, using public `fictionet::` items, and
-//!    declare it with `pub mod` here. Document the supported wire format,
-//!    limits and caller responsibilities, with runnable doctests. Implement
-//!    [`codec::Wire`] for complete values and [`codec::Prefixed`] or
-//!    [`codec::Decode`] where stream framing is needed. Check decoder
-//!    contracts with [`test_support::contract`].
+//! 1. Add `src/stdlib/<name>.rs`, using public `fictionet::` items. Document
+//!    the supported wire format, limits and caller responsibilities, with
+//!    runnable doctests. Implement [`codec::Wire`] for complete values and
+//!    [`codec::Prefixed`] or [`codec::Decode`] where stream framing is needed.
+//!    Check decoder contracts with [`test_support::contract`].
 //! 2. Add a record to `catalog/stdlib.rs` for [the catalog](#the-catalog).
 //!    List only capabilities the module implements. Regenerate the table with
 //!    `BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`.
+//!    The same command writes the module's `pub mod` declaration here and its
+//!    `#[path]` entry in `tests/copy_and_own/modules.rs`, which checks that
+//!    the source compiles in a consumer crate using public APIs. The record's
+//!    `file` and `gate` fields give another entry file and a feature gate.
 //!    Keep protocol-specific descriptions in that record and the module docs,
 //!    without adding a front-page paragraph.
-//! 3. Add a `#[path]` entry to `tests/copy_and_own/modules.rs`. This checks
-//!    that the source compiles in a consumer crate using public APIs.
-//! 4. Add `fuzz/fuzz_targets/<name>.rs`, a fuzz target record naming the
+//! 3. Add `fuzz/fuzz_targets/<name>.rs`, a fuzz target record naming the
 //!    module in `catalog/stdlib.rs`, and `fuzz/corpus/<name>/` with seed
 //!    inputs. The bless command above writes its `[[bin]]` entry in
 //!    `fuzz/Cargo.toml`. `fuzz/check-targets.sh` checks the source, bin and
@@ -280,6 +281,7 @@
 //!
 #![doc = include_str!("catalog.md")]
 
+// Generated from catalog/stdlib.rs. Update with BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog.
 pub mod amqp;
 pub mod asn1;
 pub mod bacnet;
@@ -292,7 +294,6 @@ pub mod cboe_pitch;
 pub mod cme_mdp3;
 pub mod coap;
 pub mod codec;
-mod connection;
 pub mod cotp;
 pub mod dcerpc;
 pub mod dhcp;
@@ -399,8 +400,6 @@ pub mod test_support;
 pub mod tftp;
 pub mod thrift;
 pub mod tls;
-#[path = "tls/output.rs"]
-mod tls_output;
 pub mod tpkt;
 pub mod udp;
 pub mod urlencoded_form;
@@ -414,8 +413,13 @@ pub mod wireguard;
 pub mod x509;
 pub mod xml;
 pub mod zabbix;
+// End of the generated module declarations.
 
+mod connection;
 pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, DatagramSocket};
+
+#[path = "tls/output.rs"]
+mod tls_output;
 
 mod link;
 pub use link::{Direction, bottleneck, delay, filter};

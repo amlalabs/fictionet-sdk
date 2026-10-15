@@ -3,9 +3,21 @@
 #![cfg(not(test))]
 #![allow(dead_code)]
 
-// A macro keeps rustfmt from following the #[path] modules.
+// A macro keeps rustfmt from following the #[path] modules. The declarations
+// come from the catalog: module records and their copy parts.
+//
+// An entry file declares its children by relative path, so a copy keeps
+// them: httpd.rs includes httpd/body.rs, httpd/handlers.rs, httpd/sites.rs and
+// httpd/response.rs; tls.rs its private tls/provider.rs; net.rs
+// net/addresses.rs, net/hosts.rs, net/attachments.rs, net/dns.rs and
+// world/names.rs; cme_mdp3/mod.rs its framing.rs; and observe/protocols.rs
+// protocols/{modbus,dns,dhcp,http1}.rs. tls.rs and sandbox.rs share the
+// private tls_output sibling, copied with either. NBNS, NBDGM and NBSS use the
+// public NetBIOS name encoding helpers, and SNMP the public ASN.1 integer and
+// length helpers.
 macro_rules! protocols {
     () => {
+        // Generated from catalog/stdlib.rs. Update with BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog.
         #[path = "../../src/stdlib/amqp.rs"]
         pub mod amqp;
         #[path = "../../src/stdlib/codec/ascii.rs"]
@@ -86,6 +98,8 @@ macro_rules! protocols {
         pub mod frames;
         #[path = "../../src/stdlib/ftp.rs"]
         pub mod ftp;
+        #[path = "../../src/stdlib/codec/generated.rs"]
+        pub mod generated;
         #[path = "../../codegen/tests/golden/recursive.rs"]
         pub mod generated_recursive;
         #[path = "../../src/stdlib/geneve.rs"]
@@ -107,13 +121,9 @@ macro_rules! protocols {
         #[path = "../../src/stdlib/http3.rs"]
         pub mod http3;
         fictionet::cfg_std! {
-        // HTTP includes httpd/body.rs, httpd/handlers.rs, httpd/sites.rs and httpd/response.rs.
-        // Keep those relative paths.
         #[path = "../../src/stdlib/httpd.rs"]
         pub mod httpd;
         }
-        #[path = "../../src/stdlib/codec/generated.rs"]
-        pub mod generated;
         #[path = "../../src/stdlib/huffman.rs"]
         pub mod huffman;
         #[path = "../../src/stdlib/icmp.rs"]
@@ -176,58 +186,12 @@ macro_rules! protocols {
         pub mod mqtt;
         #[path = "../../src/stdlib/mysql.rs"]
         pub mod mysql;
-        fictionet::cfg_observe! {
-        #[path = "../../src/observe/conversation.rs"]
-        pub mod observe_conversation;
-        }
-        fictionet::cfg_observe! {
-        #[path = "../../src/observe/http2.rs"]
-        pub mod observe_http2;
-        }
-        fictionet::cfg_observe! {
-        // protocols.rs includes protocols/{modbus,dns,dhcp,http1}.rs by relative #[path]s.
-        #[path = "../../src/observe/protocols.rs"]
-        pub mod observe_protocols;
-        }
-        fictionet::cfg_observe! {
-        #[path = "../../src/observe/tls.rs"]
-        pub mod observe_tls;
-        }
-        #[path = "../../src/stdlib/codec/pipe.rs"]
-        pub mod pipe;
-        #[path = "../../src/stdlib/ports.rs"]
-        pub mod ports;
-        #[path = "../../src/stdlib/codec/reader.rs"]
-        pub mod reader;
-        #[path = "../../src/stdlib/codec/recorder.rs"]
-        pub mod recorder;
-        #[path = "../../src/stdlib/route.rs"]
-        pub mod route;
-        #[path = "../../src/stdlib/codec/stream.rs"]
-        pub mod stream;
-        #[path = "../../src/stdlib/tcp.rs"]
-        pub mod tcp;
-        #[path = "../../src/stdlib/test_support/mod.rs"]
-        pub mod test_support;
-        // tls.rs includes its private tls/provider.rs child; copy both.
-        #[path = "../../src/stdlib/tls.rs"]
-        pub mod tls;
-        // Copy this private sibling with either TLS adapter.
-        #[path = "../../src/stdlib/tls/output.rs"]
-        mod tls_output;
-        #[path = "../../src/stdlib/udp.rs"]
-        pub mod udp;
-        #[path = "../../src/stdlib/codec/work.rs"]
-        pub mod work;
-        // NBNS, NBDGM and NBSS use the public NetBIOS name encoding helpers.
         #[path = "../../src/stdlib/nbdgm.rs"]
         pub mod nbdgm;
         #[path = "../../src/stdlib/nbns.rs"]
         pub mod nbns;
         #[path = "../../src/stdlib/nbss.rs"]
         pub mod nbss;
-        // Net includes net/addresses.rs, net/hosts.rs, net/attachments.rs, net/dns.rs
-        // and world/names.rs. Keep those relative paths.
         #[path = "../../src/stdlib/net.rs"]
         pub mod net;
         #[path = "../../src/stdlib/netbios.rs"]
@@ -238,6 +202,22 @@ macro_rules! protocols {
         pub mod ntlmssp;
         #[path = "../../src/stdlib/ntp.rs"]
         pub mod ntp;
+        fictionet::cfg_observe! {
+        #[path = "../../src/observe/conversation.rs"]
+        pub mod observe_conversation;
+        }
+        fictionet::cfg_observe! {
+        #[path = "../../src/observe/http2.rs"]
+        pub mod observe_http2;
+        }
+        fictionet::cfg_observe! {
+        #[path = "../../src/observe/protocols.rs"]
+        pub mod observe_protocols;
+        }
+        fictionet::cfg_observe! {
+        #[path = "../../src/observe/tls.rs"]
+        pub mod observe_tls;
+        }
         #[path = "../../src/stdlib/ocsp.rs"]
         pub mod ocsp;
         #[path = "../../src/stdlib/onc_rpc.rs"]
@@ -254,10 +234,14 @@ macro_rules! protocols {
         pub mod pcp;
         #[path = "../../src/stdlib/pim.rs"]
         pub mod pim;
+        #[path = "../../src/stdlib/codec/pipe.rs"]
+        pub mod pipe;
         #[path = "../../src/stdlib/pop3.rs"]
         pub mod pop3;
         #[path = "../../src/stdlib/portmap.rs"]
         pub mod portmap;
+        #[path = "../../src/stdlib/ports.rs"]
+        pub mod ports;
         #[path = "../../src/stdlib/postgres.rs"]
         pub mod postgres;
         #[path = "../../src/stdlib/prefix_int.rs"]
@@ -274,19 +258,24 @@ macro_rules! protocols {
         pub mod radius;
         #[path = "../../src/stdlib/rdp.rs"]
         pub mod rdp;
+        #[path = "../../src/stdlib/codec/reader.rs"]
+        pub mod reader;
+        #[path = "../../src/stdlib/codec/recorder.rs"]
+        pub mod recorder;
         #[path = "../../src/stdlib/resp.rs"]
         pub mod resp;
         #[path = "../../src/stdlib/rfb.rs"]
         pub mod rfb;
         #[path = "../../src/stdlib/rip.rs"]
         pub mod rip;
+        #[path = "../../src/stdlib/route.rs"]
+        pub mod route;
         #[path = "../../src/stdlib/rtcp.rs"]
         pub mod rtcp;
         #[path = "../../src/stdlib/rtp.rs"]
         pub mod rtp;
         #[path = "../../src/stdlib/rtsp.rs"]
         pub mod rtsp;
-        // The sandbox client shares the private tls_output sibling above.
         #[path = "../../src/stdlib/sandbox.rs"]
         pub mod sandbox;
         #[path = "../../src/stdlib/sbe.rs"]
@@ -305,7 +294,6 @@ macro_rules! protocols {
         pub mod smb2;
         #[path = "../../src/stdlib/smtp.rs"]
         pub mod smtp;
-        // SNMP uses the public ASN.1 integer and length helpers.
         #[path = "../../src/stdlib/snmp.rs"]
         pub mod snmp;
         #[path = "../../src/stdlib/socks.rs"]
@@ -318,22 +306,34 @@ macro_rules! protocols {
         pub mod sse;
         #[path = "../../src/stdlib/ssh.rs"]
         pub mod ssh;
+        #[path = "../../src/stdlib/codec/stream.rs"]
+        pub mod stream;
         #[path = "../../src/stdlib/stun.rs"]
         pub mod stun;
         #[path = "../../src/stdlib/syslog.rs"]
         pub mod syslog;
+        #[path = "../../src/stdlib/tcp.rs"]
+        pub mod tcp;
         #[path = "../../src/stdlib/tcp_reassembly.rs"]
         pub mod tcp_reassembly;
         #[path = "../../src/stdlib/tds.rs"]
         pub mod tds;
         #[path = "../../src/stdlib/telnet.rs"]
         pub mod telnet;
+        #[path = "../../src/stdlib/test_support/mod.rs"]
+        pub mod test_support;
         #[path = "../../src/stdlib/tftp.rs"]
         pub mod tftp;
         #[path = "../../src/stdlib/thrift.rs"]
         pub mod thrift;
+        #[path = "../../src/stdlib/tls.rs"]
+        pub mod tls;
+        #[path = "../../src/stdlib/tls/output.rs"]
+        mod tls_output;
         #[path = "../../src/stdlib/tpkt.rs"]
         pub mod tpkt;
+        #[path = "../../src/stdlib/udp.rs"]
+        pub mod udp;
         #[path = "../../src/stdlib/urlencoded_form.rs"]
         pub mod urlencoded_form;
         #[path = "../../src/stdlib/vrrp.rs"]
@@ -352,12 +352,15 @@ macro_rules! protocols {
         pub mod whois;
         #[path = "../../src/stdlib/wireguard.rs"]
         pub mod wireguard;
+        #[path = "../../src/stdlib/codec/work.rs"]
+        pub mod work;
         #[path = "../../src/stdlib/x509.rs"]
         pub mod x509;
         #[path = "../../src/stdlib/xml.rs"]
         pub mod xml;
         #[path = "../../src/stdlib/zabbix.rs"]
         pub mod zabbix;
+        // End of the generated copy declarations.
     };
 }
 

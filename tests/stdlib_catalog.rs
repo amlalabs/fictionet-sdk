@@ -1,8 +1,10 @@
 //! The protocol catalog in `catalog/stdlib.rs` must match the code.
 //!
 //! The catalog has one declarative record per stdlib module. These tests
-//! render `src/stdlib/catalog.md`, the fuzz `[[bin]]` records and the README
-//! list of fuzz targets without a module deterministically and reject drift.
+//! render `src/stdlib/catalog.md`, the public module declarations in
+//! `src/stdlib/mod.rs`, the module declarations of the copy fixture, the fuzz
+//! `[[bin]]` records and the README list of fuzz targets without a module
+//! deterministically and reject drift.
 //! Set `BLESS_STDLIB_CATALOG=1` to update them, following the golden test
 //! convention. Each record is checked against independent sources:
 //!
@@ -36,14 +38,16 @@
 //! wrappers require extending these checks. Feature gates are not evaluated.
 //! Module traversal ignores explicit `#[cfg(test)]` declarations; file
 //! inventories omit `tests.rs`. Impl matching remains textual within each file.
-//! Independent file inventories catch undeclared and uncopied implementations.
+//! Independent file inventories catch undeclared and uncopied implementations,
+//! so generated declarations that agree with the catalog cannot hide a file
+//! the catalog leaves out.
 
 #[path = "common/catalog.rs"]
 mod catalog;
 #[path = "common/rust_docs.rs"]
 mod rust_docs;
 
-use catalog::manifest::{FUZZ_TARGETS, FuzzOwner, MODULES};
+use catalog::manifest::{COPY_PARTS, FUZZ_TARGETS, FuzzOwner, MODULES};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -676,6 +680,31 @@ fn fuzz_inventory_is_current() {
         catalog::UNOWNED_FUZZ_END,
         &catalog::render_unowned_fuzz_targets(FUZZ_TARGETS),
     );
+}
+
+#[test]
+fn module_and_copy_declarations_are_current() {
+    check_generated(
+        "src/stdlib/mod.rs",
+        catalog::DECLARATIONS_BEGIN,
+        catalog::DECLARATIONS_END,
+        &catalog::render_declarations(MODULES),
+    );
+    check_generated(
+        "tests/copy_and_own/modules.rs",
+        catalog::COPY_BEGIN,
+        catalog::COPY_END,
+        &catalog::render_copy_declarations(MODULES, COPY_PARTS),
+    );
+}
+
+#[test]
+fn copy_parts_are_listed_once_in_name_order() {
+    let listed: Vec<&str> = COPY_PARTS.iter().map(|part| part.name).collect();
+    let mut sorted = listed.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(listed, sorted, "copy parts are in name order, each once");
 }
 
 #[test]
