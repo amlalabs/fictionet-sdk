@@ -11,8 +11,8 @@
 // httpd/hyper.rs, httpd/sites.rs and httpd/response.rs; tls.rs its private
 // tls/provider.rs; net.rs net/addresses.rs, net/hosts.rs, net/attachments.rs,
 // net/dns.rs and world/names.rs; cme_mdp3/mod.rs its framing.rs;
-// json_schema/mod.rs its formats.rs; smb2/mod.rs its contexts.rs; and
-// observe/protocols.rs protocols/{modbus,dns,dhcp,http1}.rs.
+// json_schema/mod.rs its formats.rs and decimal.rs; smb2/mod.rs its
+// contexts.rs; and observe/protocols.rs protocols/{modbus,dns,dhcp,http1}.rs.
 // tls.rs and sandbox.rs share the private tls_output sibling, copied with
 // either. NBNS, NBDGM and NBSS use the public NetBIOS name encoding helpers,
 // and SNMP the public ASN.1 integer and length helpers.
