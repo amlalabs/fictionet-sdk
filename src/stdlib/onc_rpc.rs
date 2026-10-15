@@ -109,15 +109,11 @@ pub mod flavor {
 
 /// Procedure numbers of the portmapper (version 2) and rpcbind (versions
 /// 3 and 4). GETPORT and GETADDR share a number.
+/// Re-exported from [`portmap::procedure`](fictionet::stdlib::portmap::procedure).
 pub mod procedure {
-    #![allow(missing_docs)]
-    pub const NULL: u32 = 0;
-    pub const SET: u32 = 1;
-    pub const UNSET: u32 = 2;
-    pub const GETPORT: u32 = 3;
-    pub const GETADDR: u32 = 3;
-    pub const DUMP: u32 = 4;
-    pub const CALLIT: u32 = 5;
+    pub use fictionet::stdlib::portmap::procedure::{
+        CALLIT, DUMP, GETADDR, GETPORT, NULL, SET, UNSET,
+    };
 }
 
 /// Why bytes are not the XDR a reader expected or a TCP record, or why a

@@ -10,6 +10,25 @@ use onc_rpc::{Accept, Body, Message, Reply};
 const RECORD_LIMIT: usize = 4096;
 
 #[test]
+fn portmap_procedure_compatibility() {
+    use onc_rpc::procedure as compat;
+    use portmap::procedure;
+
+    for (canonical, alias, expected) in [
+        (procedure::NULL, compat::NULL, 0),
+        (procedure::SET, compat::SET, 1),
+        (procedure::UNSET, compat::UNSET, 2),
+        (procedure::GETPORT, compat::GETPORT, 3),
+        (procedure::GETADDR, compat::GETADDR, 3),
+        (procedure::DUMP, compat::DUMP, 4),
+        (procedure::CALLIT, compat::CALLIT, 5),
+    ] {
+        assert_eq!(canonical, expected);
+        assert_eq!(alias, canonical);
+    }
+}
+
+#[test]
 fn authentication_composes_with_xdr_and_refuses_changed_values() {
     for auth in [
         onc_rpc::Auth::None,
@@ -61,7 +80,7 @@ fn request_stream() -> impl Decode<
             (nfs::NFS_PROGRAM, nfs::NFS_VERSION) => {
                 Request::Nfs(nfs::Request::read(call.procedure, &call.args)?)
             }
-            (onc_rpc::PMAP_PROGRAM, version) => {
+            (portmap::PMAP_PROGRAM, version) => {
                 let request = portmap::Request::read(version, call.procedure, &call.args).unwrap();
                 assert_eq!(portmap::Request::from_call(call), Ok(request.clone()));
                 Request::Portmap(request)
@@ -95,6 +114,15 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
         }),
     };
     let calls = [lookup.call(101)?, pmap.call(102)?, rpcb.call(103)?];
+    for (message, procedure) in calls[1..]
+        .iter()
+        .zip([portmap::procedure::GETPORT, portmap::procedure::GETADDR])
+    {
+        let Body::Call(call) = &message.body else {
+            panic!("expected a call")
+        };
+        assert_eq!(call.procedure, procedure);
+    }
     let mut tcp = Vec::new();
     for (call, fragment_len) in calls.iter().zip([1, 7, 13]) {
         let payload = <Message as Wire>::to_bytes(call)?;
