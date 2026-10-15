@@ -259,7 +259,7 @@ pub use combinators::{
 };
 pub use demux::Demux;
 pub use faults::{ByteFault, FaultDelay, FaultError, Faults, ItemFault, Rule, Trigger};
-pub use frames::{Frames, Prefixed};
+pub use frames::{Frames, Prefixed, signed_frame_prefix};
 pub use interceptor::{
     InterceptError, Interceptor, Rewrite, RewriteError, SkipPolicy, append_bounded, write_bounded,
 };

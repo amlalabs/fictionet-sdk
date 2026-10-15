@@ -81,7 +81,7 @@ extern crate alloc;
 
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
-use fictionet::stdlib::codec::{append_bounded, leb128};
+use fictionet::stdlib::codec::{append_bounded, leb128, signed_frame_prefix};
 
 /// The TCP port Kafka brokers listen on.
 pub const PORT: u16 = 9092;
@@ -833,18 +833,7 @@ fn bounded<T>(values: &[T]) -> Result<&[T], Error> {
 /// payload and how many bytes of `b` the frame took. A size that is
 /// negative or over `limit` is an error, known from the first 4 bytes.
 fn parse_frame(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, Error> {
-    let Some(head) = b.get(..SIZE_LEN) else {
-        return Ok(None);
-    };
-    let size = i32::from_be_bytes([head[0], head[1], head[2], head[3]]);
-    if size < 0 || size as usize > limit.min(MAX_FRAME) {
-        return Err(Error::FrameSize(size));
-    }
-    let end = SIZE_LEN + size as usize;
-    match b.get(SIZE_LEN..end) {
-        Some(payload) => Ok(Some((payload, end))),
-        None => Ok(None),
-    }
+    signed_frame_prefix(b, limit.min(MAX_FRAME), Error::FrameSize)
 }
 
 /// The correlation ID at the start of a response payload, so a client can

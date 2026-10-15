@@ -3,6 +3,37 @@
 use core::marker::PhantomData;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
+/// Reads a frame with a big-endian signed-i32 payload length.
+///
+/// `limit` is the effective payload limit, excluding the four-byte header.
+/// The caller applies any protocol-specific bounds to it. Negative lengths,
+/// lengths above `limit`, and lengths whose frame size cannot fit in `usize`
+/// return `invalid_length` applied to the original signed length. These errors
+/// are known as soon as the header is complete, without waiting for payload.
+///
+/// Partial headers and payloads return `Ok(None)`. A complete frame returns
+/// its borrowed payload and the consumed count, including the header. A zero
+/// length is valid and consumes four bytes. Trailing bytes belong to the next
+/// frame. This function does not advance a cursor, copy, or retain input.
+pub fn signed_frame_prefix<E>(
+    input: &[u8],
+    limit: usize,
+    invalid_length: impl FnOnce(i32) -> E,
+) -> Result<Option<(&[u8], usize)>, E> {
+    let Some(header) = input.get(..4) else {
+        return Ok(None);
+    };
+    let length = i32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    let payload_len = match usize::try_from(length) {
+        Ok(n) if n <= limit => n,
+        _ => return Err(invalid_length(length)),
+    };
+    let end = payload_len
+        .checked_add(4)
+        .ok_or_else(|| invalid_length(length))?;
+    Ok(input.get(4..end).map(|payload| (payload, end)))
+}
+
 /// A wire value with a bounded prefix parser.
 ///
 /// The parser borrows input and returns an owned item only after its boundary

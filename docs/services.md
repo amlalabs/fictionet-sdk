@@ -273,6 +273,15 @@ ITCH's `Error::TooLong` remains for source compatibility but is deprecated.
 Nothing in the module returns it. `codec::Frames<itch::Message>` reports
 `itch::FrameError::TooLong` instead.
 
+### Signed frame prefixes
+
+`codec::signed_frame_prefix` reads a four-byte big-endian signed length and
+borrows the payload. Pass an effective payload limit and a function that maps
+an invalid length to your error. Partial input returns `None`. A complete
+frame returns the payload and a consumed count that includes the header;
+trailing bytes remain for the next frame. It does not advance a cursor.
+Kafka and Thrift share this helper and keep their own limits and errors.
+
 ### Bounded writer appends
 
 Kafka body writers, Thrift value writers, DHCPv6 option body writers, and

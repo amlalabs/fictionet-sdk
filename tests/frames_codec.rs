@@ -3,9 +3,130 @@
 
 use core::fmt::Debug;
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
+use fictionet::stdlib::codec::{
+    Decode, Fail, Prefixed, Stream, Wire, finish, pump, signed_frame_prefix,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{bgp, fastcgi, kafka, thrift, zabbix};
+
+#[test]
+fn signed_prefix_waits_for_header_and_payload() {
+    let bytes = [0, 0, 0, 2, 7, 8];
+    for end in 0..bytes.len() {
+        assert_eq!(
+            signed_frame_prefix(&bytes[..end], 2, |n| panic!("valid length {n}")),
+            Ok::<_, ()>(None)
+        );
+    }
+    // Even an invalid length needs all four header bytes before refusal.
+    for end in 0..4 {
+        assert_eq!(signed_frame_prefix(&[0xff; 4][..end], 0, |n| n), Ok(None));
+    }
+}
+
+#[test]
+fn signed_prefix_borrows_one_frame_at_the_exact_limit() {
+    let bytes = [0, 0, 0, 2, 7, 8, 0, 0, 0, 0];
+    let (payload, used) = signed_frame_prefix(&bytes, 2, |n| n).unwrap().unwrap();
+    assert_eq!(payload, &[7, 8]);
+    assert_eq!(payload.as_ptr(), bytes[4..].as_ptr());
+    assert_eq!(used, 6);
+    assert_eq!(
+        signed_frame_prefix(&bytes[used..], 0, |n| n),
+        Ok(Some((&[][..], 4)))
+    );
+}
+
+#[test]
+fn signed_prefix_maps_negative_and_excess_lengths_from_the_header() {
+    for (length, limit) in [(-1_i32, usize::MAX), (i32::MIN, usize::MAX), (1, 0), (3, 2)] {
+        let mut calls = 0;
+        let header = length.to_be_bytes();
+        let result = signed_frame_prefix(&header, limit, |n| {
+            calls += 1;
+            ("length", n)
+        });
+        assert_eq!(result, Err(("length", length)));
+        assert_eq!(calls, 1);
+    }
+}
+
+#[test]
+fn signed_prefix_handles_the_signed_boundary_without_wrapping() {
+    // Adding the header must not overflow signed-i32 arithmetic. The helper
+    // does not impose a protocol limit or allocate the advertised payload.
+    assert_eq!(
+        signed_frame_prefix(&i32::MAX.to_be_bytes(), usize::MAX, |n| n),
+        Ok(None)
+    );
+    assert_eq!(
+        signed_frame_prefix(&i32::MAX.to_be_bytes(), i32::MAX as usize - 1, |n| n),
+        Err(i32::MAX)
+    );
+    // A wire length one above i32::MAX is negative, even with a large limit.
+    assert_eq!(
+        signed_frame_prefix(&0x8000_0000_u32.to_be_bytes(), usize::MAX, |n| n),
+        Err(i32::MIN)
+    );
+}
+
+#[test]
+fn signed_frame_protocol_errors_and_direct_limit_policy_stay_local() {
+    for length in [-1_i32, i32::MIN, i32::MAX] {
+        let header = length.to_be_bytes();
+        rejects(
+            Frames::<kafka::Frame>::new,
+            &header,
+            kafka::Error::FrameSize(length),
+        );
+        rejects(
+            Frames::<thrift::Frame>::new,
+            &header,
+            thrift::Error::FrameLength(length),
+        );
+        assert_eq!(
+            kafka::Frame::parse(&header),
+            Err(kafka::Error::FrameSize(length))
+        );
+        assert_eq!(
+            thrift::Frame::parse(&header),
+            Err(thrift::Error::FrameLength(length))
+        );
+    }
+    let kafka_length = i32::try_from(kafka::MAX_FRAME + 1).unwrap();
+    assert_eq!(
+        kafka::Frame::parse_prefix(&kafka_length.to_be_bytes(), &usize::MAX),
+        Err(kafka::Error::FrameSize(kafka_length))
+    );
+    let thrift_length = i32::try_from(thrift::MAX_FRAME + 1).unwrap();
+    assert_eq!(
+        thrift::Frame::parse_prefix(&thrift_length.to_be_bytes(), &usize::MAX),
+        Ok(None)
+    );
+    assert_eq!(
+        kafka::Frame::parse(&[0, 0, 0]),
+        Err(kafka::Error::Truncated)
+    );
+    assert_eq!(
+        thrift::Frame::parse(&[0, 0, 0]),
+        Err(thrift::Error::FrameTruncated)
+    );
+    assert_eq!(kafka::Frame::parse(&[0; 5]), Err(kafka::Error::Trailing(1)));
+    assert_eq!(
+        thrift::Frame::parse(&[0; 5]),
+        Err(thrift::Error::FrameTrailing)
+    );
+    stack(
+        || Frames::<kafka::Frame>::with_limit(2),
+        &[0, 0, 0, 2, 7, 8],
+        &[kafka::Frame(vec![7, 8])],
+    );
+    rejects(
+        || Frames::<kafka::Frame>::with_limit(2),
+        &[0, 0, 0, 3],
+        kafka::Error::FrameSize(3),
+    );
+}
 
 fn stack<D>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
 where
