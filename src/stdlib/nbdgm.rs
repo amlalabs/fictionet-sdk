@@ -85,9 +85,7 @@
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16};
-use fictionet::stdlib::netbios::{
-    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level,
-};
+use fictionet::stdlib::netbios::{self, ENCODED_LEN, NAME_LEN};
 
 use std::net::Ipv4Addr;
 
@@ -147,8 +145,9 @@ pub struct Name {
     /// The 16 bytes: up to 15 characters padded with spaces, then the
     /// suffix.
     pub bytes: [u8; NAME_LEN],
-    /// The scope labels. Writers refuse empty labels, labels above [`MAX_LABEL`],
-    /// and names above [`MAX_NAME_LEN`].
+    /// The scope labels. Writers refuse empty labels, labels above
+    /// [`MAX_LABEL`](netbios::MAX_LABEL), and names above
+    /// [`MAX_NAME_LEN`](netbios::MAX_NAME_LEN).
     pub scope: Vec<Vec<u8>>,
 }
 
@@ -157,13 +156,8 @@ impl Name {
     /// in uppercase, as Windows does, cut to 15 bytes, and padded with
     /// spaces.
     pub fn new(name: &str, suffix: u8) -> Name {
-        let mut bytes = [b' '; NAME_LEN];
-        for (slot, b) in bytes.iter_mut().zip(name.bytes().take(NAME_LEN - 1)) {
-            *slot = b.to_ascii_uppercase();
-        }
-        bytes[NAME_LEN - 1] = suffix;
         Name {
-            bytes,
+            bytes: netbios::name_bytes(name.as_bytes(), suffix),
             scope: Vec::new(),
         }
     }
@@ -171,32 +165,24 @@ impl Name {
     /// The name `*` followed by zero bytes, which broadcast datagrams are
     /// sent to.
     pub fn wildcard() -> Name {
-        let mut bytes = [0u8; NAME_LEN];
-        bytes[0] = b'*';
         Name {
-            bytes,
+            bytes: netbios::wildcard_bytes(),
             scope: Vec::new(),
         }
     }
 
     /// This name with the scope `scope`, given with dots between labels.
     /// Empty labels are skipped. Other labels are kept as given, so the
-    /// writer refuses labels above [`MAX_LABEL`] and names above
-    /// [`MAX_NAME_LEN`].
+    /// writer refuses labels above [`MAX_LABEL`](netbios::MAX_LABEL) and names above
+    /// [`MAX_NAME_LEN`](netbios::MAX_NAME_LEN).
     pub fn with_scope(mut self, scope: &str) -> Name {
-        self.scope = scope
-            .split('.')
-            .filter(|l| !l.is_empty())
-            .map(|l| l.as_bytes().to_vec())
-            .collect();
+        self.scope = netbios::dotted_labels(scope);
         self
     }
 
     /// The name's characters, without the suffix or the padding spaces.
     pub fn name(&self) -> &[u8] {
-        let chars = &self.bytes[..NAME_LEN - 1];
-        let end = chars.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
-        &chars[..end]
+        netbios::base(&self.bytes)
     }
 
     /// The suffix: the last byte, which says what the name is for.
@@ -204,36 +190,16 @@ impl Name {
         self.bytes[NAME_LEN - 1]
     }
 
-    /// Reads the name at the start of `b`, and how many bytes it took.
-    /// Names in datagram packets are written out in full, so a pointer to
-    /// an earlier name, as DNS uses, is refused.
+    /// Reads an uncompressed name and how many bytes it took.
     fn parse_prefix(b: &[u8]) -> Result<(Name, usize), Error> {
-        let first = *b.first().ok_or(Error::Truncated)?;
-        if usize::from(first) != ENCODED_LEN {
-            return Err(Error::Name);
-        }
-        let label = b.get(1..1 + ENCODED_LEN).ok_or(Error::Truncated)?;
-        let bytes = decode_first_level(label).ok_or(Error::Name)?;
-        let mut at = 1 + ENCODED_LEN;
-        let mut scope = Vec::new();
-        loop {
-            let len = usize::from(*b.get(at).ok_or(Error::Truncated)?);
-            if len == 0 {
-                at += 1;
-                break;
-            }
-            if len > MAX_LABEL {
-                return Err(Error::Name);
-            }
-            // The label, its length byte, and the final zero must fit.
-            if at + 1 + len + 1 > MAX_NAME_LEN {
-                return Err(Error::Name);
-            }
-            let label = b.get(at + 1..at + 1 + len).ok_or(Error::Truncated)?;
-            scope.push(label.to_vec());
-            at += 1 + len;
-        }
-        Ok((Name { bytes, scope }, at))
+        let prefix = netbios::read_name(b, Error::Truncated, Error::Name)?;
+        Ok((
+            Name {
+                bytes: prefix.bytes,
+                scope: prefix.scope,
+            },
+            prefix.len,
+        ))
     }
 }
 
@@ -242,23 +208,7 @@ impl std::fmt::Display for Name {
     /// scope after a dot. Bytes that are not printable ASCII are written
     /// as `\xNN`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let text = |f: &mut std::fmt::Formatter<'_>, bytes: &[u8]| -> std::fmt::Result {
-            for &b in bytes {
-                if (0x20..0x7f).contains(&b) && b != b'\\' {
-                    write!(f, "{}", b as char)?;
-                } else {
-                    write!(f, "\\x{b:02x}")?;
-                }
-            }
-            Ok(())
-        };
-        text(f, self.name())?;
-        write!(f, "<{:02X}>", self.suffix())?;
-        for label in &self.scope {
-            f.write_str(".")?;
-            text(f, label)?;
-        }
-        Ok(())
+        netbios::write_display(f, &self.bytes, &self.scope)
     }
 }
 
@@ -554,7 +504,7 @@ pub enum Error {
     Fragment,
     /// A name is not well formed: its first label is not 32 letters from
     /// `A` to `P`, a label is too long or a pointer, or it passes
-    /// [`MAX_NAME_LEN`].
+    /// [`MAX_NAME_LEN`](netbios::MAX_NAME_LEN).
     Name,
     /// Bytes follow the end of an error, query or response packet.
     Trailing(usize),
@@ -826,10 +776,10 @@ impl Wire for Name {
     }
 
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
-    /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
+    /// names above [`MAX_NAME_LEN`](netbios::MAX_NAME_LEN). Leaves the destination
+    /// unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        fictionet::stdlib::netbios::write_name(dst, &self.bytes, &self.scope)
-            .map_err(|_| Error::Unwritable)
+        netbios::write_name(dst, &self.bytes, &self.scope).map_err(|_| Error::Unwritable)
     }
 }
 
@@ -952,6 +902,7 @@ impl Wire for Packet {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::netbios::{MAX_LABEL, MAX_NAME_LEN, decode_first_level};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
 

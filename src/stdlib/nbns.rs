@@ -17,7 +17,7 @@
 //! more labels. Packets are laid out like DNS messages, and may point back
 //! to a name written earlier in the packet instead of repeating it.
 //!
-//! Encoding functions and name limits live in [`netbios`](fictionet::stdlib::netbios).
+//! Encoding functions and name limits live in [`netbios`].
 //! Their paths here are kept so existing imports and copies still compile.
 //!
 //! Nothing here reads a socket. A world that plays the machines on a LAN
@@ -63,6 +63,7 @@
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16};
+use fictionet::stdlib::netbios;
 
 use std::net::Ipv4Addr;
 
@@ -169,13 +170,8 @@ impl Name {
     /// in uppercase, as Windows does, cut to 15 bytes, and padded with
     /// spaces.
     pub fn new(name: &str, suffix: u8) -> Name {
-        let mut bytes = [b' '; NAME_LEN];
-        for (slot, b) in bytes.iter_mut().zip(name.bytes().take(NAME_LEN - 1)) {
-            *slot = b.to_ascii_uppercase();
-        }
-        bytes[NAME_LEN - 1] = suffix;
         Name {
-            bytes,
+            bytes: netbios::name_bytes(name.as_bytes(), suffix),
             scope: Vec::new(),
         }
     }
@@ -183,10 +179,8 @@ impl Name {
     /// The name `*` followed by zero bytes, which node status requests
     /// ask about to mean "whoever you are".
     pub fn wildcard() -> Name {
-        let mut bytes = [0u8; NAME_LEN];
-        bytes[0] = b'*';
         Name {
-            bytes,
+            bytes: netbios::wildcard_bytes(),
             scope: Vec::new(),
         }
     }
@@ -196,15 +190,13 @@ impl Name {
     /// writer refuses labels above [`MAX_LABEL`] and names above
     /// [`MAX_NAME_LEN`].
     pub fn with_scope(mut self, scope: &str) -> Name {
-        self.scope = dotted_labels(scope);
+        self.scope = netbios::dotted_labels(scope);
         self
     }
 
     /// The name's characters, without the suffix or the padding spaces.
     pub fn name(&self) -> &[u8] {
-        let chars = &self.bytes[..NAME_LEN - 1];
-        let end = chars.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
-        &chars[..end]
+        netbios::base(&self.bytes)
     }
 
     /// The suffix: the last byte, which says what the name is for.
@@ -213,32 +205,10 @@ impl Name {
     }
 }
 
-/// The labels of `text`, given with dots between them. Empty labels are
-/// skipped; the others are kept as given.
-fn dotted_labels(text: &str) -> Vec<Vec<u8>> {
-    text.split('.')
-        .filter(|l| !l.is_empty())
-        .map(|l| l.as_bytes().to_vec())
-        .collect()
-}
-
 /// Appends valid labels and the final zero to a name. Refuses empty or
 /// oversized labels and names above [`MAX_NAME_LEN`].
 fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) -> Result<(), Error> {
-    fictionet::stdlib::netbios::write_labels(out, labels).map_err(|_| Error::Unwritable)
-}
-
-/// Writes `bytes` as text, with bytes that are not printable ASCII, and
-/// backslashes, as `\xNN`.
-fn write_text(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
-    for &b in bytes {
-        if (0x20..0x7f).contains(&b) && b != b'\\' {
-            write!(f, "{}", b as char)?;
-        } else {
-            write!(f, "\\x{b:02x}")?;
-        }
-    }
-    Ok(())
+    netbios::write_labels(out, labels).map_err(|_| Error::Unwritable)
 }
 
 impl std::fmt::Display for Name {
@@ -246,13 +216,7 @@ impl std::fmt::Display for Name {
     /// scope after a dot. Bytes that are not printable ASCII are written
     /// as `\xNN`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_text(f, self.name())?;
-        write!(f, "<{:02X}>", self.suffix())?;
-        for label in &self.scope {
-            f.write_str(".")?;
-            write_text(f, label)?;
-        }
-        Ok(())
+        netbios::write_display(f, &self.bytes, &self.scope)
     }
 }
 
@@ -281,7 +245,7 @@ impl RrName {
     /// The domain name `name`, given with dots between labels, split by
     /// the rules of [`Name::with_scope`].
     pub fn domain(name: &str) -> RrName {
-        RrName::Domain(dotted_labels(name))
+        RrName::Domain(netbios::dotted_labels(name))
     }
 
     /// The NetBIOS name, if this is one.
@@ -317,7 +281,7 @@ impl std::fmt::Display for RrName {
                     if i > 0 {
                         f.write_str(".")?;
                     }
-                    write_text(f, label)?;
+                    netbios::write_text(f, label)?;
                 }
                 Ok(())
             }
@@ -1221,7 +1185,7 @@ pub fn write_name(
     bytes: &[u8; NAME_LEN],
     scope: &[Vec<u8>],
 ) -> Result<(), Error> {
-    fictionet::stdlib::netbios::write_name(dst, bytes, scope).map_err(|_| Error::Unwritable)
+    netbios::write_name(dst, bytes, scope).map_err(|_| Error::Unwritable)
 }
 
 impl Wire for Name {

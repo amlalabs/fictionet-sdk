@@ -77,9 +77,7 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::netbios::{
-    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level,
-};
+use fictionet::stdlib::netbios::{self, ENCODED_LEN, MAX_NAME_LEN, NAME_LEN};
 
 /// The TCP port the session service listens on.
 pub const PORT: u16 = 139;
@@ -123,7 +121,7 @@ pub struct Name {
     /// suffix.
     pub bytes: [u8; NAME_LEN],
     /// The scope's labels, such as `["NETBIOS", "COM"]`. Most networks use
-    /// none. Each label must hold 1 to [`MAX_LABEL`] bytes, and the
+    /// none. Each label must hold 1 to [`MAX_LABEL`](netbios::MAX_LABEL) bytes, and the
     /// encoded name must fit in [`MAX_NAME_LEN`]; [`Name::to_bytes`]
     /// refuses a name that breaks either rule.
     pub scope: Vec<Vec<u8>>,
@@ -138,17 +136,12 @@ impl Name {
     /// code page instead, so build such a name by setting
     /// [`Name::bytes`] directly.
     pub fn new(name: &str, suffix: u8) -> Name {
-        let mut bytes = [b' '; NAME_LEN];
         let mut end = name.len().min(NAME_LEN - 1);
         while !name.is_char_boundary(end) {
             end -= 1;
         }
-        for (slot, b) in bytes.iter_mut().zip(name[..end].bytes()) {
-            *slot = b.to_ascii_uppercase();
-        }
-        bytes[NAME_LEN - 1] = suffix;
         Name {
-            bytes,
+            bytes: netbios::name_bytes(&name.as_bytes()[..end], suffix),
             scope: Vec::new(),
         }
     }
@@ -156,9 +149,7 @@ impl Name {
     /// The name's characters: its first 15 bytes, without the spaces that
     /// pad them.
     pub fn base(&self) -> &[u8] {
-        let base = &self.bytes[..NAME_LEN - 1];
-        let end = base.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
-        &base[..end]
+        netbios::base(&self.bytes)
     }
 
     /// The suffix: the last byte, which says what kind of service the
@@ -167,33 +158,16 @@ impl Name {
         self.bytes[NAME_LEN - 1]
     }
 
-    /// Reads the encoded name at the start of `b`, and how many bytes it
-    /// took. It returns `None` if the first label is not a first-level
-    /// encoded name, if a label is longer than [`MAX_LABEL`] (which
-    /// includes the compression pointers of DNS, which the session
-    /// service does not use), if the name passes [`MAX_NAME_LEN`], or if
-    /// `b` ends before the zero byte.
-    fn read_prefix(b: &[u8]) -> Option<(Name, usize)> {
-        if *b.first()? as usize != ENCODED_LEN {
-            return None;
-        }
-        let bytes = decode_first_level(b.get(1..1 + ENCODED_LEN)?)?;
-        let mut at = 1 + ENCODED_LEN;
-        let mut scope = Vec::new();
-        loop {
-            let n = usize::from(*b.get(at)?);
-            at += 1;
-            if n == 0 {
-                break;
-            }
-            // The label and at least the zero byte after it.
-            if n > MAX_LABEL || at + n + 1 > MAX_NAME_LEN {
-                return None;
-            }
-            scope.push(b.get(at..at + n)?.to_vec());
-            at += n;
-        }
-        Some((Name { bytes, scope }, at))
+    /// Reads an uncompressed name and how many bytes it took.
+    fn read_prefix(b: &[u8]) -> Result<(Name, usize), Error> {
+        let prefix = netbios::read_name(b, Error::Name, Error::Name)?;
+        Ok((
+            Name {
+                bytes: prefix.bytes,
+                scope: prefix.scope,
+            },
+            prefix.len,
+        ))
     }
 }
 
@@ -204,7 +178,7 @@ impl Wire for Name {
     /// Reads one complete name. Refuses invalid first-level labels, compression
     /// pointers, labels over 63 bytes, names over 255 bytes, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let (name, used) = Self::read_prefix(bytes).ok_or(Error::Name)?;
+        let (name, used) = Self::read_prefix(bytes)?;
         if used != bytes.len() {
             return Err(Error::Trailing {
                 remaining: bytes.len() - used,
@@ -217,8 +191,7 @@ impl Wire for Name {
     /// scope labels, labels over 63 bytes, and names over 255 bytes.
     /// Leaves the destination unchanged on error.
     fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
-        fictionet::stdlib::netbios::write_name(destination, &self.bytes, &self.scope)
-            .map_err(|_| Error::Unwritable)
+        netbios::write_name(destination, &self.bytes, &self.scope).map_err(|_| Error::Unwritable)
     }
 }
 
@@ -502,9 +475,9 @@ fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Erro
     let packet = match t {
         kind::MESSAGE => Packet::Message(body.to_vec()),
         kind::REQUEST => {
-            let (called, used) = Name::read_prefix(body).ok_or(Error::Body(t))?;
+            let (called, used) = Name::read_prefix(body).map_err(|_| Error::Body(t))?;
             let rest = &body[used..];
-            let (calling, used) = Name::read_prefix(rest).ok_or(Error::Body(t))?;
+            let (calling, used) = Name::read_prefix(rest).map_err(|_| Error::Body(t))?;
             if used != rest.len() {
                 return Err(Error::Body(t));
             }
@@ -529,6 +502,7 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
+    use fictionet::stdlib::netbios::{MAX_LABEL, decode_first_level};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};

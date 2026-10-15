@@ -323,7 +323,7 @@
 //! | [`nbns`] | NetBIOS Name Service queries, registrations and node status, with reply helpers. | yes |  |  |  |  | yes | yes |
 //! | [`nbss`] | NetBIOS Session Service packets, using `netbios` name encoding. | yes | yes |  |  |  | yes | yes |
 //! | [`net`] | A network of hosts and services in a few lines: the sandboxes' subnet, DHCP, DNS, a router, machines, LANs and each host's services. |  |  |  |  |  |  | yes |
-//! | [`netbios`] | First-level NetBIOS name encoding and uncompressed name writing shared by NBNS, NBDGM and NBSS. |  |  |  |  |  | yes | yes |
+//! | [`netbios`] | NetBIOS name construction, display, and uncompressed reading and writing shared by NBNS, NBDGM and NBSS. |  |  |  |  |  | yes | yes |
 //! | [`nfs`] | NFS version 3 and MOUNT version 3: the arguments and results of every procedure, over `onc_rpc`. |  |  |  |  |  | yes | yes |
 //! | [`ntlmssp`] | NTLM NEGOTIATE, CHALLENGE and AUTHENTICATE wire messages, with no cryptography or authentication session. | yes |  |  |  |  | yes | yes |
 //! | [`ntp`] | NTP time packets, with a server reply helper. | yes |  |  |  |  | yes | yes |
