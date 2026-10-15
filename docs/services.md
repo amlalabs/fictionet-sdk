@@ -60,6 +60,15 @@ after rejection. Callers supply validation and translate fatal errors. SMTP
 limits unstuffed lines and rejects NUL; POP3 limits stuffed lines and allows
 NUL in bodies. Both writers validate and reserve before appending output.
 
+`codec::head_body::append_header_line` shares SIP and RTSP header collection.
+It accepts a separated line, a field count limit, name validation and errors.
+Continuations do not count as new fields; empty continuations add nothing.
+Callers check line endings and byte limits first and completed values last.
+`set_header` and `remove_header` use caller-supplied name matching. Replacing
+duplicates keeps the first field's spelling and position. SIP retains compact
+aliases, and RTSP ignores case without aliases. The public message builders keep
+their existing behavior and defer validation to the message writer.
+
 `codec::ber::read_length` reads a length prefix without moving a cursor or
 waiting for its body. Its policy bounds the number of length octets and
 can require minimal encodings. ASN.1 permits four length octets and checks

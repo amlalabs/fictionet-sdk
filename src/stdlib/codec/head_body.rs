@@ -1,10 +1,15 @@
-//! Borrowed head and Content-Length body framing for SIP and RTSP.
+//! Header collection and borrowed head and Content-Length body framing.
 //! Protocol modules own start lines, header names, length rules, and errors.
+//! [`append_header_line`] unfolds separated lines. [`set_header`] and
+//! [`remove_header`] edit fields using the caller's name matching policy.
 
 extern crate alloc;
 
 use alloc::string::{String, ToString};
-use fictionet::stdlib::codec::ascii::{is_tchar as is_token_byte, trim_ows as trim_frame_ws};
+use alloc::vec::Vec;
+use fictionet::stdlib::codec::ascii::{
+    is_tchar as is_token_byte, trim_ows as trim_frame_ws, trim_ows_str as trim_ws,
+};
 use fictionet::stdlib::codec::{Buffer, LineError};
 
 /// One header field: its name as it came and its value with folded lines
@@ -26,6 +31,124 @@ impl Header {
             value: value.to_string(),
         }
     }
+}
+
+/// Appends one complete header line without its ending, or unfolds a
+/// continuation into the last field. No input cursor is moved or retained.
+/// The caller checks line endings and byte limits before this call, then
+/// validates completed field values after collecting all lines.
+///
+/// A line starting with a space or tab continues the last field. Its ends
+/// are trimmed of spaces and tabs. Empty continuations add nothing; two
+/// nonempty pieces are joined with one space. An orphan continuation returns
+/// `malformed`, even if it is empty or `max_headers` is zero.
+///
+/// Other lines add a field. Before checking syntax, a count at or above
+/// `max_headers` returns `too_many`. This limit is used without clamping and
+/// does not count continuations. A missing colon or a name rejected by
+/// `valid_name` returns `malformed`. The predicate sees the name before the
+/// first colon, with trailing spaces and tabs removed. Value ends are also
+/// trimmed of spaces and tabs. Errors leave `headers` unchanged.
+///
+/// ```
+/// use fictionet::stdlib::codec::head_body::{Header, append_header_line};
+/// let mut headers = Vec::new();
+/// for line in ["X-Note \t: ", "\tfirst", " \t", " second: part "] {
+///     append_header_line(&mut headers, line, 1, |name| name == "X-Note",
+///         "header", "count")?;
+/// }
+/// assert_eq!(headers, [Header::new("X-Note", "first second: part")]);
+/// assert_eq!(append_header_line(&mut headers, "bad", 1, |_| true,
+///     "header", "count"), Err("count"));
+/// # Ok::<(), &str>(())
+/// ```
+pub fn append_header_line<E>(
+    headers: &mut Vec<Header>,
+    line: &str,
+    max_headers: usize,
+    valid_name: impl FnOnce(&str) -> bool,
+    malformed: E,
+    too_many: E,
+) -> Result<(), E> {
+    if line.starts_with([' ', '\t']) {
+        let last = headers.last_mut().ok_or(malformed)?;
+        let more = trim_ws(line);
+        if !more.is_empty() {
+            if !last.value.is_empty() {
+                last.value.push(' ');
+            }
+            last.value.push_str(more);
+        }
+        return Ok(());
+    }
+    if headers.len() >= max_headers {
+        return Err(too_many);
+    }
+    let Some(colon) = line.find(':') else {
+        return Err(malformed);
+    };
+    let name = line[..colon].trim_end_matches([' ', '\t']);
+    if !valid_name(name) {
+        return Err(malformed);
+    }
+    headers.push(Header::new(name, trim_ws(&line[colon + 1..])));
+    Ok(())
+}
+
+/// Replaces the first matching field's value and removes later matches.
+/// Keeps the first field's name spelling and position, and the order of
+/// other fields. With no match, appends a field using `name` and `value`.
+/// `same_name` compares a stored name to `name`, including any caller aliases.
+/// No text is trimmed or validated, and no count or byte limits are enforced.
+/// The caller validates the completed message before writing it.
+///
+/// ```
+/// use fictionet::stdlib::codec::head_body::{Header, set_header};
+/// let mut headers = vec![Header::new("x", "old"), Header::new("X", "duplicate")];
+/// set_header(&mut headers, "X", "new", str::eq_ignore_ascii_case);
+/// set_header(&mut headers, "Y", "last", str::eq_ignore_ascii_case);
+/// assert_eq!(headers, [Header::new("x", "new"), Header::new("Y", "last")]);
+/// ```
+pub fn set_header(
+    headers: &mut Vec<Header>,
+    name: &str,
+    value: &str,
+    same_name: impl Fn(&str, &str) -> bool,
+) {
+    match headers.iter().position(|h| same_name(&h.name, name)) {
+        Some(i) => {
+            headers[i].value = value.to_string();
+            let mut seen = 0usize;
+            headers.retain(|h| {
+                if !same_name(&h.name, name) {
+                    return true;
+                }
+                seen += 1;
+                seen == 1
+            });
+        }
+        None => headers.push(Header::new(name, value)),
+    }
+}
+
+/// Removes every matching field and returns the count removed. Other fields
+/// keep their order. `same_name` compares a stored name to `name`, including
+/// any caller aliases. No names or values are trimmed or validated.
+///
+/// ```
+/// use fictionet::stdlib::codec::head_body::{Header, remove_header};
+/// let mut headers = vec![Header::new("x", "one"), Header::new("X", "two")];
+/// assert_eq!(remove_header(&mut headers, "X", str::eq_ignore_ascii_case), 2);
+/// assert!(headers.is_empty());
+/// ```
+pub fn remove_header(
+    headers: &mut Vec<Header>,
+    name: &str,
+    same_name: impl Fn(&str, &str) -> bool,
+) -> usize {
+    let before = headers.len();
+    headers.retain(|h| !same_name(&h.name, name));
+    before - headers.len()
 }
 
 /// Incrementally finds a head and its declared body without copying input.
@@ -234,6 +357,105 @@ mod tests {
     use super::super::{Decode, Fail, Step, Stream};
     use super::*;
     use alloc::{vec, vec::Vec};
+
+    #[test]
+    fn header_lines_preserve_fields_and_only_trim_spaces_and_tabs() {
+        let mut headers = Vec::new();
+        for line in ["X \t: \t", " \t", "\tfirst\t", " ", " second: part "] {
+            append_header_line(&mut headers, line, 1, |name| name == "X", "line", "count").unwrap();
+        }
+        assert_eq!(headers, [Header::new("X", "first second: part")]);
+        append_header_line(
+            &mut headers,
+            "X: \t\u{a0}value\u{a0}\t",
+            usize::MAX,
+            |name| name == "X",
+            "line",
+            "count",
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            [
+                Header::new("X", "first second: part"),
+                Header::new("X", "\u{a0}value\u{a0}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn header_line_errors_leave_the_collection_unchanged() {
+        let original = vec![Header::new("Existing", "value")];
+        let mut headers = original.clone();
+        for line in ["", "No colon", ": empty", "Bad Name: value", "Y: value"] {
+            assert_eq!(
+                append_header_line(
+                    &mut headers,
+                    line,
+                    2,
+                    |name| name == "X",
+                    String::from("line"),
+                    String::from("count")
+                ),
+                Err(String::from("line")),
+            );
+            assert_eq!(headers, original);
+        }
+        for max in [0, 1] {
+            for line in ["X: valid", "Bad Name: value", "No colon"] {
+                assert_eq!(
+                    append_header_line(
+                        &mut headers,
+                        line,
+                        max,
+                        |name| name == "X",
+                        "line",
+                        "count"
+                    ),
+                    Err("count"),
+                );
+                assert_eq!(headers, original);
+            }
+            for line in [" \t", "\tmore"] {
+                let mut empty = Vec::new();
+                assert_eq!(
+                    append_header_line(&mut empty, line, max, |_| true, "line", "count"),
+                    Err("line"),
+                );
+                assert!(empty.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn header_edits_use_the_supplied_matching_policy() {
+        let mut headers = vec![
+            Header::new("A", "first"),
+            Header::new("a", "lowercase"),
+            Header::new("B", "middle"),
+            Header::new("A", "duplicate"),
+        ];
+        set_header(&mut headers, "A", " \tnew\t ", |a, b| a == b);
+        assert_eq!(
+            headers,
+            [
+                Header::new("A", " \tnew\t "),
+                Header::new("a", "lowercase"),
+                Header::new("B", "middle"),
+            ]
+        );
+        assert_eq!(remove_header(&mut headers, "a", |a, b| a == b), 1);
+        assert_eq!(remove_header(&mut headers, "missing", |a, b| a == b), 0);
+        set_header(&mut headers, "C", "last", |a, b| a == b);
+        assert_eq!(
+            headers,
+            [
+                Header::new("A", " \tnew\t "),
+                Header::new("B", "middle"),
+                Header::new("C", "last"),
+            ]
+        );
+    }
 
     struct Units(Scanner);
 

@@ -1,5 +1,6 @@
 //! RTSP and SIP lines, SDP bodies, recovery, and strict wire values.
 
+use fictionet::stdlib::codec::head_body::Header;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 
@@ -264,6 +265,181 @@ fn line_endings_and_status_body_rules() {
     assert_eq!(
         decode_all(sip::Messages::new, b"SIP/2.0 100 Trying\r\n\r\n").1,
         Some(Fail::Protocol(sip::Error::MissingContentLength))
+    );
+}
+
+#[test]
+fn header_collection_unfolds_empty_and_nonempty_pieces() {
+    let fields = "X-First \t: \t\r\n \t\r\n \talpha: beta \t\r\n \t\r\n\tgamma\t\r\n\
+        X-Empty:\t\r\n \t\r\nX-Last: \tend\t\r\nContent-Length: 0\r\n\r\n";
+    let expected = vec![
+        Header::new("X-First", "alpha: beta gamma"),
+        Header::new("X-Empty", ""),
+        Header::new("X-Last", "end"),
+        Header::new("Content-Length", "0"),
+    ];
+    let bytes = format!("SIP/2.0 200 OK\r\n{fields}");
+    let message = sip::Message::parse(bytes.as_bytes()).unwrap();
+    assert_eq!(message.headers, expected);
+    assert_eq!(
+        sip::Message::parse(&message.to_bytes().unwrap()),
+        Ok(message)
+    );
+    for version in ["RTSP/1.0", "RTSP/2.0"] {
+        let bytes = format!("{version} 200 OK\r\n{fields}");
+        let message = rtsp::Message::parse(bytes.as_bytes()).unwrap();
+        assert_eq!(message.headers, expected);
+        assert_eq!(
+            rtsp::Message::parse(&message.to_bytes().unwrap()),
+            Ok(message)
+        );
+    }
+}
+
+#[test]
+fn header_collection_keeps_protocol_grammar_and_error_precedence() {
+    let suffix = "X#Name: value\r\nContent-Length: 0\r\n\r\n";
+    let sip = format!("SIP/2.0 200 OK\r\n{suffix}");
+    let rtsp = format!("RTSP/2.0 200 OK\r\n{suffix}");
+    assert_eq!(
+        sip::Message::parse(sip.as_bytes()),
+        Err(sip::Error::HeaderLine)
+    );
+    assert_eq!(
+        rtsp::Message::parse(rtsp.as_bytes())
+            .unwrap()
+            .header("X#Name"),
+        Some("value")
+    );
+    // SIP permits an escaped control byte inside a quoted field. Validation
+    // must see the completed field, including the quote on the first line.
+    let suffix = b"X: \"quoted\r\n \\\x01\"\r\nContent-Length: 0\r\n\r\n";
+    let sip = [b"SIP/2.0 200 OK\r\n".as_slice(), suffix].concat();
+    let rtsp = [b"RTSP/2.0 200 OK\r\n".as_slice(), suffix].concat();
+    assert_eq!(
+        sip::Message::parse(&sip).unwrap().header("X"),
+        Some("\"quoted \\\x01\"")
+    );
+    assert_eq!(rtsp::Message::parse(&rtsp), Err(rtsp::Error::HeaderValue));
+    for suffix in [
+        " \t\r\nContent-Length: 0\r\n\r\n",
+        " continued\r\nContent-Length: 0\r\n\r\n",
+        "X: \0\r\nBad Header\r\nContent-Length: 0\r\n\r\n",
+    ] {
+        let sip = format!("SIP/2.0 200 OK\r\n{suffix}");
+        let rtsp = format!("RTSP/2.0 200 OK\r\n{suffix}");
+        assert_eq!(
+            sip::Message::parse(sip.as_bytes()),
+            Err(sip::Error::HeaderLine)
+        );
+        assert_eq!(
+            rtsp::Message::parse(rtsp.as_bytes()),
+            Err(rtsp::Error::HeaderLine)
+        );
+    }
+}
+
+#[test]
+fn header_collection_limits_count_fields_before_new_line_syntax() {
+    let sip_head = format!(
+        "SIP/2.0 200 OK\r\nContent-Length: 0\r\n{}Last: \r\n",
+        "X: value\r\n".repeat(sip::MAX_HEADERS - 2)
+    );
+    let rtsp_head = format!(
+        "RTSP/2.0 200 OK\r\nContent-Length: 0\r\n{}Last: \r\n",
+        "X: value\r\n".repeat(rtsp::MAX_HEADERS - 2)
+    );
+    let sip = sip::Message::parse(format!("{sip_head}\tmore\r\n \t\r\n\r\n").as_bytes()).unwrap();
+    let rtsp =
+        rtsp::Message::parse(format!("{rtsp_head}\tmore\r\n \t\r\n\r\n").as_bytes()).unwrap();
+    assert_eq!(sip.headers.len(), sip::MAX_HEADERS);
+    assert_eq!(rtsp.headers.len(), rtsp::MAX_HEADERS);
+    assert_eq!(sip.header("Last"), Some("more"));
+    assert_eq!(rtsp.header("Last"), Some("more"));
+    for (suffix, sip_error, rtsp_error) in [
+        ("New: value\r\n", sip::Error::TooMany, rtsp::Error::TooMany),
+        ("Bad Header\r\n", sip::Error::TooMany, rtsp::Error::TooMany),
+        (
+            "\t\0\r\nBad Header\r\n",
+            sip::Error::TooMany,
+            rtsp::Error::TooMany,
+        ),
+        (
+            "Bad\rHeader\r\n",
+            sip::Error::LineEnding,
+            rtsp::Error::LineEnding,
+        ),
+        (
+            "\t\0\r\n",
+            sip::Error::HeaderValue,
+            rtsp::Error::HeaderValue,
+        ),
+    ] {
+        assert_eq!(
+            sip::Message::parse(format!("{sip_head}{suffix}\r\n").as_bytes()),
+            Err(sip_error),
+        );
+        assert_eq!(
+            rtsp::Message::parse(format!("{rtsp_head}{suffix}\r\n").as_bytes()),
+            Err(rtsp_error),
+        );
+    }
+}
+
+#[test]
+fn header_builders_preserve_spelling_order_and_protocol_aliases() {
+    let mut sip = sip::Message::response(200, "OK");
+    let mut rtsp = rtsp::Message::response(rtsp::Version::Rtsp20, 200, "OK");
+    for (name, value) in [
+        ("X-First", "first"),
+        ("v", "compact"),
+        ("Via", "full"),
+        ("X-Middle", "middle"),
+        ("VIA", "duplicate"),
+        ("X-Last", "last"),
+    ] {
+        sip.push_header(name, value);
+        rtsp.push_header(name, value);
+    }
+    sip.set_header("via", "new");
+    rtsp.set_header("via", "new");
+    assert_eq!(
+        sip.headers,
+        [
+            Header::new("X-First", "first"),
+            Header::new("v", "new"),
+            Header::new("X-Middle", "middle"),
+            Header::new("X-Last", "last"),
+        ]
+    );
+    assert_eq!(
+        rtsp.headers,
+        [
+            Header::new("X-First", "first"),
+            Header::new("v", "compact"),
+            Header::new("Via", "new"),
+            Header::new("X-Middle", "middle"),
+            Header::new("X-Last", "last"),
+        ]
+    );
+    sip.push_header("Via", "duplicate");
+    rtsp.push_header("VIA", "duplicate");
+    assert_eq!(sip.remove_header("V"), 2);
+    assert_eq!(rtsp.remove_header("via"), 2);
+    assert_eq!(sip.remove_header("via"), 0);
+    assert_eq!(rtsp.header("v"), Some("compact"));
+    assert_eq!(rtsp.remove_header("V"), 1);
+    sip.set_header("New", " \tvalue\t ");
+    rtsp.set_header("New", " \tvalue\t ");
+    assert_eq!(sip.headers, rtsp.headers);
+    assert_eq!(
+        sip.headers,
+        [
+            Header::new("X-First", "first"),
+            Header::new("X-Middle", "middle"),
+            Header::new("X-Last", "last"),
+            Header::new("New", " \tvalue\t "),
+        ]
     );
 }
 

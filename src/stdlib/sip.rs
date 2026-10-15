@@ -394,27 +394,12 @@ impl Message {
     /// Sets the header named `name` to `value`: the first one is changed
     /// and any others are removed. With none, it is added at the end.
     pub fn set_header(&mut self, name: &str, value: &str) {
-        match self.headers.iter().position(|h| same_name(&h.name, name)) {
-            Some(i) => {
-                self.headers[i].value = value.to_string();
-                let mut seen = 0usize;
-                self.headers.retain(|h| {
-                    if !same_name(&h.name, name) {
-                        return true;
-                    }
-                    seen += 1;
-                    seen == 1
-                });
-            }
-            None => self.push_header(name, value),
-        }
+        head_body::set_header(&mut self.headers, name, value, same_name);
     }
 
     /// Removes every header named `name`, and says how many there were.
     pub fn remove_header(&mut self, name: &str) -> usize {
-        let before = self.headers.len();
-        self.headers.retain(|h| !same_name(&h.name, name));
-        before - self.headers.len()
+        head_body::remove_header(&mut self.headers, name, same_name)
     }
 
     /// The Via headers' values, top one first. Each says where a request
@@ -1425,26 +1410,14 @@ fn parse_head(head: &[u8]) -> Result<(Message, Option<usize>), Error> {
         if line.contains(['\r', '\n']) {
             return Err(Error::LineEnding);
         }
-        if line.starts_with([' ', '\t']) {
-            let last = headers.last_mut().ok_or(Error::HeaderLine)?;
-            let more = trim_ws(line);
-            if !more.is_empty() {
-                if !last.value.is_empty() {
-                    last.value.push(' ');
-                }
-                last.value.push_str(more);
-            }
-            continue;
-        }
-        if headers.len() >= MAX_HEADERS {
-            return Err(Error::TooMany);
-        }
-        let colon = line.find(':').ok_or(Error::HeaderLine)?;
-        let name = line[..colon].trim_end_matches([' ', '\t']);
-        if !is_token(name) {
-            return Err(Error::HeaderLine);
-        }
-        headers.push(Header::new(name, trim_ws(&line[colon + 1..])));
+        head_body::append_header_line(
+            &mut headers,
+            line,
+            MAX_HEADERS,
+            is_token,
+            Error::HeaderLine,
+            Error::TooMany,
+        )?;
     }
     if !headers.iter().all(|h| valid_field(&h.value)) {
         return Err(Error::HeaderValue);
