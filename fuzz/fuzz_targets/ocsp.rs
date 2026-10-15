@@ -3,11 +3,12 @@
 //! bytes, as a world playing a client or responder writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::ocsp::harness::check;
 use fictionet::stdlib::ocsp::{
-    AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, Frame, MAX_NONCE,
+    AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, MAX_NONCE,
     Request, ResponderId, Response, ResponseBytes, ResponseData, ResponseStatus, SingleRequest,
-    SingleResponse, decode_get_path, encode_get_path, find_nonce,
+    SingleResponse, decode_get_path, find_nonce,
 };
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
@@ -122,38 +123,7 @@ fn written(mut data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::<Frame>::new, data);
-    contract::check_wire::<Request>(data);
-    contract::check_wire::<Response>(data);
-    contract::check_wire::<BasicResponse>(data);
-
-    let mut stream = Stream::new(Frames::<Frame>::new());
-    let mut messages = Vec::new();
-    let _ = pump(&mut stream, data, |m| messages.push(m));
-    let _ = finish(&mut stream, |m| messages.push(m));
-    contract::check_wire::<ResponseData>(data);
-
-    // Any bytes as each message on its own. What reads can be written,
-    // and reads back the same.
-    for m in messages.iter().map(Vec::as_slice).chain([data]) {
-        if let Ok(req) = Request::parse(m) {
-            let der = req.to_bytes().unwrap();
-            assert_eq!(Request::parse(&der).unwrap(), req);
-            let path = encode_get_path(&req.to_bytes().unwrap()).unwrap();
-            assert_eq!(Request::from_get_path(&path).unwrap(), req);
-            if let Some(nonce) = req.nonce() {
-                assert!((1..=MAX_NONCE).contains(&nonce.len()));
-            }
-        }
-        if let Ok(resp) = Response::parse(m) {
-            let der = resp.to_bytes().unwrap();
-            assert_eq!(Response::parse(&der).unwrap(), resp);
-        }
-        if let Ok(basic) = BasicResponse::parse(m) {
-            let der = basic.to_bytes().unwrap();
-            assert_eq!(BasicResponse::parse(&der).unwrap(), basic);
-        }
-    }
+    check(data);
     // Any text as a GET path.
     if let Ok(der) = decode_get_path(&String::from_utf8_lossy(data)) {
         let _ = Request::parse(&der);

@@ -5,11 +5,10 @@
 use fictionet::stdlib::asn1::{Oid, StringKind};
 use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::x509::harness::check_extension_value;
+use fictionet::stdlib::x509::harness::check;
 use fictionet::stdlib::x509::{
-    BasicConstraints, Certificate, Crl, ExtensionValue, GeneralName, KeyUsage, MAX_PEM_DATA,
-    MAX_PEM_FRAME, Name, PemBlock, PemBlocks, RevokedCertificate, SubjectAltName, TbsCertList,
-    TbsCertificate, Value, pem_decode,
+    BasicConstraints, ExtensionValue, GeneralName, KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name,
+    PemBlock, PemBlocks, SubjectAltName, Value, pem_decode,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -56,77 +55,6 @@ fn built(data: &[u8]) {
     }
 }
 
-/// The DER checks: what reads writes back.
-fn der(data: &[u8]) {
-    contract::check_wire::<Certificate>(data);
-    contract::check_wire::<Crl>(data);
-    contract::check_wire::<TbsCertificate>(data);
-    contract::check_wire::<TbsCertList>(data);
-    contract::check_wire::<Name>(data);
-    if let Ok(c) = Certificate::parse(data) {
-        // A certificate read gives back the same bytes.
-        assert_eq!(c.to_bytes().unwrap(), data);
-        let tbs = c.tbs.to_bytes().unwrap();
-        assert_eq!(TbsCertificate::parse(&tbs).unwrap(), c.tbs);
-        let _ = (
-            c.tbs.subject.to_string(),
-            c.tbs.issuer.to_string(),
-            c.tbs.validity.contains(0),
-        );
-        let pem = PemBlock {
-            label: "CERTIFICATE".into(),
-            data: c.to_bytes().unwrap(),
-        }
-        .to_bytes()
-        .unwrap();
-        assert_eq!(Certificate::from_pem(&pem).unwrap(), c);
-        for x in &c.tbs.extensions {
-            check_extension_value(&x.value);
-        }
-        // A tbs changed after reading no longer matches the bytes.
-        let mut changed = c.clone();
-        changed.tbs.serial.push(0);
-        assert!(changed.to_bytes().is_err());
-    }
-    if let Ok(c) = Crl::parse(data) {
-        assert_eq!(c.to_bytes().unwrap(), data);
-        let tbs = c.tbs.to_bytes().unwrap();
-        assert_eq!(TbsCertList::parse(&tbs).unwrap(), c.tbs);
-        let _ = c.tbs.issuer.to_string();
-        for x in c
-            .tbs
-            .extensions
-            .iter()
-            .chain(c.tbs.revoked.iter().flat_map(|r| &r.extensions))
-        {
-            check_extension_value(&x.value);
-        }
-        if let Some(r) = c.tbs.revoked.first() {
-            assert!(c.is_revoked(&r.serial));
-        }
-        let pem = PemBlock {
-            label: "X509 CRL".into(),
-            data: c.to_bytes().unwrap(),
-        }
-        .to_bytes()
-        .unwrap();
-        assert_eq!(Crl::from_pem(&pem).unwrap(), c);
-        let mut changed = c.clone();
-        let date = changed.tbs.this_update.clone();
-        changed.tbs.revoked.push(RevokedCertificate {
-            serial: vec![1],
-            revocation_date: date,
-            extensions: Vec::new(),
-        });
-        assert!(changed.to_bytes().is_err());
-    }
-    if let Ok(n) = Name::parse(data) {
-        assert_eq!(Name::parse(&n.to_bytes().unwrap()).unwrap(), n);
-        let _ = n.to_string();
-    }
-    check_extension_value(data);
-}
-
 fuzz_target!(|data: &[u8]| {
     if data.len() <= MAX_PEM_FRAME
         && let Ok(list) = pem_decode(data)
@@ -155,13 +83,13 @@ fuzz_target!(|data: &[u8]| {
         contract::check_wire::<PemBlock>(&text);
     }
 
-    der(data);
+    check(data);
     built(data);
 
     let mut stream = Stream::new(PemBlocks::new());
     let mut inspect = |block: PemBlock| {
         contract::check_wire_value(&block);
-        der(&block.data);
+        check(&block.data);
     };
     let _ = pump(&mut stream, data, &mut inspect);
     let _ = finish(&mut stream, &mut inspect);

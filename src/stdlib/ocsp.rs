@@ -1506,11 +1506,69 @@ fictionet::der_wire!(asn1, impl Wire for ResponseData, Error, Error::Unwritable,
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
 ]);
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{
+        BasicResponse, Frame, MAX_MESSAGE, MAX_NONCE, Request, Response, ResponseData,
+        decode_get_path, encode_get_path,
+    };
+    use fictionet::stdlib::codec::{Frames, Wire};
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks message framing, DER and GET-path round trips, and nonce bounds.
+    /// Returns how many of Request, Response and BasicResponse parse the input.
+    pub fn check(b: &[u8]) -> usize {
+        contract::check_wire::<Request>(b);
+        contract::check_wire::<Response>(b);
+        contract::check_wire::<BasicResponse>(b);
+        contract::check_wire::<ResponseData>(b);
+        let decoded = contract::check_decode(Frames::<Frame>::new, b);
+        assert_eq!(
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, b, 2 * MAX_MESSAGE),
+            decoded
+        );
+        for m in &decoded.0 {
+            check_message(m);
+        }
+        let _ = decode_get_path(&String::from_utf8_lossy(b));
+        check_message(b)
+    }
+
+    fn check_message(b: &[u8]) -> usize {
+        let mut ok = 0;
+        if let Ok(r) = Request::parse(b) {
+            let der = r.to_bytes().unwrap();
+            assert_eq!(Request::parse(&der).unwrap(), r);
+            assert_eq!(
+                Request::from_get_path(&encode_get_path(&r.to_bytes().unwrap()).unwrap()).unwrap(),
+                r
+            );
+            if let Some(nonce) = r.nonce() {
+                assert!((1..=MAX_NONCE).contains(&nonce.len()));
+            }
+            ok += 1;
+        }
+        if let Ok(r) = Response::parse(b) {
+            let der = r.to_bytes().unwrap();
+            assert_eq!(Response::parse(&der).unwrap(), r);
+            ok += 1;
+        }
+        if let Ok(r) = BasicResponse::parse(b) {
+            let der = r.to_bytes().unwrap();
+            assert_eq!(BasicResponse::parse(&der).unwrap(), r);
+            ok += 1;
+        }
+        ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, mutate};
 
     fn single_request(cert_id: CertId, extensions: Vec<Extension>) -> SingleRequest {
@@ -2559,37 +2617,6 @@ mod tests {
         }
     }
 
-    /// Reads `b` every way this module can, and checks what reads also
-    /// writes and reads back the same.
-    fn exercise(b: &[u8]) -> usize {
-        let mut ok = 0;
-        if let Ok(r) = Request::parse(b) {
-            let der = r.to_bytes().unwrap();
-            assert_eq!(Request::parse(&der).unwrap(), r);
-            assert_eq!(
-                Request::from_get_path(&encode_get_path(&r.to_bytes().unwrap()).unwrap()).unwrap(),
-                r
-            );
-            ok += 1;
-        }
-        if let Ok(r) = Response::parse(b) {
-            let der = r.to_bytes().unwrap();
-            assert_eq!(Response::parse(&der).unwrap(), r);
-            ok += 1;
-        }
-        if let Ok(r) = BasicResponse::parse(b) {
-            let der = r.to_bytes().unwrap();
-            assert_eq!(BasicResponse::parse(&der).unwrap(), r);
-            ok += 1;
-        }
-        let _ = decode_get_path(&String::from_utf8_lossy(b));
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, b, 2 * MAX_MESSAGE);
-        contract::check_wire::<Request>(b);
-        contract::check_wire::<Response>(b);
-        contract::check_wire::<BasicResponse>(b);
-        ok
-    }
-
     #[test]
     fn lcg_fuzz() {
         let seeds = [
@@ -2617,10 +2644,10 @@ mod tests {
                     mutate(&mut rng, &mut b);
                 }
             }
-            parsed += exercise(&b);
+            parsed += check(&b);
         }
         for s in &seeds {
-            assert!(exercise(s) > 0);
+            assert!(check(s) > 0);
         }
         assert!(parsed > 100, "only {parsed} mutated inputs parsed");
     }

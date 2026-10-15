@@ -2913,11 +2913,80 @@ x509_wire!(Crl);
 #[doc(hidden)]
 pub mod harness {
     use super::{
-        AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, CrlDistributionPoints,
-        CrlNumber, CrlReason, ExtendedKeyUsage, ExtensionValue, IssuerAltName, KeyUsage,
-        SubjectAltName, SubjectKeyIdentifier,
+        AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, Certificate, Crl,
+        CrlDistributionPoints, CrlNumber, CrlReason, Error, ExtendedKeyUsage, ExtensionValue,
+        IssuerAltName, KeyUsage, Name, PEM_CERTIFICATE, PEM_CRL, PemBlock, PublicKeyInfo,
+        RevokedCertificate, SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate,
+        Value,
     };
+    use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::test_support::contract;
+
+    /// Checks DER and PEM round trips on one input, and that a certificate
+    /// or CRL whose tbs changed after reading no longer writes.
+    pub fn check(data: &[u8]) {
+        contract::check_wire::<Certificate>(data);
+        contract::check_wire::<Crl>(data);
+        contract::check_wire::<TbsCertificate>(data);
+        contract::check_wire::<TbsCertList>(data);
+        contract::check_wire::<Name>(data);
+        contract::check_wire::<PublicKeyInfo>(data);
+        contract::check_wire::<Value>(data);
+        if let Ok(c) = Certificate::parse(data) {
+            assert_eq!(c.to_bytes().unwrap(), data);
+            let tbs = c.tbs.to_bytes().unwrap();
+            assert_eq!(TbsCertificate::parse(&tbs).unwrap(), c.tbs);
+            let _ = (
+                c.tbs.subject.to_string(),
+                c.tbs.issuer.to_string(),
+                c.tbs.validity.contains(0),
+            );
+            let pem = PemBlock::new(PEM_CERTIFICATE, &c)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+            assert_eq!(Certificate::from_pem(&pem).unwrap(), c);
+            for x in &c.tbs.extensions {
+                check_extension_value(&x.value);
+            }
+            // A tbs changed after reading no longer matches the bytes.
+            let mut changed = c.clone();
+            changed.tbs.serial.push(0);
+            assert_eq!(changed.to_bytes(), Err(Error::Unwritable));
+        }
+        if let Ok(c) = Crl::parse(data) {
+            assert_eq!(c.to_bytes().unwrap(), data);
+            let tbs = c.tbs.to_bytes().unwrap();
+            assert_eq!(TbsCertList::parse(&tbs).unwrap(), c.tbs);
+            let _ = c.tbs.issuer.to_string();
+            for x in c
+                .tbs
+                .extensions
+                .iter()
+                .chain(c.tbs.revoked.iter().flat_map(|r| &r.extensions))
+            {
+                check_extension_value(&x.value);
+            }
+            if let Some(r) = c.tbs.revoked.first() {
+                assert!(c.is_revoked(&r.serial));
+            }
+            let pem = PemBlock::new(PEM_CRL, &c).unwrap().to_bytes().unwrap();
+            assert_eq!(Crl::from_pem(&pem).unwrap(), c);
+            let mut changed = c.clone();
+            let date = changed.tbs.this_update.clone();
+            changed.tbs.revoked.push(RevokedCertificate {
+                serial: vec![1],
+                revocation_date: date,
+                extensions: Vec::new(),
+            });
+            assert_eq!(changed.to_bytes(), Err(Error::Unwritable));
+        }
+        if let Ok(n) = Name::parse(data) {
+            assert_eq!(Name::parse(&n.to_bytes().unwrap()).unwrap(), n);
+            let _ = n.to_string();
+        }
+        check_extension_value(data);
+    }
 
     /// Checks extension parsing, writing, and extension bytes.
     pub fn round_trip<T: ExtensionValue + PartialEq + std::fmt::Debug>(data: &[u8]) {
@@ -2947,7 +3016,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use super::harness::check_extension_value;
+    use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish as finish_stream, pump};
     use fictionet::stdlib::test_support::assert_linear;
@@ -4420,59 +4489,6 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
                 assert_eq!(n, 1);
             },
         );
-    }
-
-    /// The checks the fuzz target makes, on one input.
-    fn check(data: &[u8]) {
-        contract::check_wire::<Certificate>(data);
-        contract::check_wire::<Crl>(data);
-        contract::check_wire::<TbsCertificate>(data);
-        contract::check_wire::<TbsCertList>(data);
-        contract::check_wire::<Name>(data);
-        contract::check_wire::<PublicKeyInfo>(data);
-        contract::check_wire::<Value>(data);
-        if let Ok(c) = Certificate::parse(data) {
-            assert_eq!(c.to_bytes().unwrap(), data);
-            let tbs = c.tbs.to_bytes().unwrap();
-            assert_eq!(TbsCertificate::parse(&tbs).unwrap(), c.tbs);
-            let _ = (
-                c.tbs.subject.to_string(),
-                c.tbs.issuer.to_string(),
-                c.tbs.validity.contains(0),
-            );
-            let pem = PemBlock::new(PEM_CERTIFICATE, &c)
-                .unwrap()
-                .to_bytes()
-                .unwrap();
-            assert_eq!(Certificate::from_pem(&pem).unwrap(), c);
-            for x in &c.tbs.extensions {
-                check_extension_value(&x.value);
-            }
-        }
-        if let Ok(c) = Crl::parse(data) {
-            assert_eq!(c.to_bytes().unwrap(), data);
-            let tbs = c.tbs.to_bytes().unwrap();
-            assert_eq!(TbsCertList::parse(&tbs).unwrap(), c.tbs);
-            let _ = c.tbs.issuer.to_string();
-            for x in c
-                .tbs
-                .extensions
-                .iter()
-                .chain(c.tbs.revoked.iter().flat_map(|r| &r.extensions))
-            {
-                check_extension_value(&x.value);
-            }
-            if let Some(r) = c.tbs.revoked.first() {
-                assert!(c.is_revoked(&r.serial));
-            }
-            let pem = PemBlock::new(PEM_CRL, &c).unwrap().to_bytes().unwrap();
-            assert_eq!(Crl::from_pem(&pem).unwrap(), c);
-        }
-        if let Ok(n) = Name::parse(data) {
-            assert_eq!(Name::parse(&n.to_bytes().unwrap()).unwrap(), n);
-            let _ = n.to_string();
-        }
-        check_extension_value(data);
     }
 
     #[test]
