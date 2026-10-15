@@ -187,6 +187,28 @@ fn buffer_compaction_is_amortized_at_full_capacity() {
     assert!(b.moved > 0);
 }
 #[test]
+fn stream_reports_cumulative_input_buffer_copies() {
+    let mut s = Stream::with_buffer(Pairs, 8);
+    assert_eq!(s.push(b"abcdefgh"), 8);
+    assert_eq!(s.moved(), 0);
+    for pair in [b"ab", b"cd"] {
+        assert_eq!(s.next(), Some(Ok(pair.to_vec())));
+        assert_eq!(s.moved(), 0);
+    }
+    assert_eq!(s.push(b"ij"), 2);
+    assert_eq!(s.moved(), 4);
+    assert_eq!(s.next(), Some(Ok(b"ef".to_vec())));
+    s.shrink();
+    assert_eq!(s.moved(), 8);
+    let mut s = s.swap(Pairs);
+    assert_eq!(s.moved(), 8);
+    for pair in [b"gh", b"ij"] {
+        assert_eq!(s.next(), Some(Ok(pair.to_vec())));
+    }
+    assert_eq!(s.buffered(), 0);
+    assert_eq!(s.moved(), 8);
+}
+#[test]
 fn buffer_random_operations_match_a_queue() {
     let mut rng = fictionet::stdlib::codec::Lcg::new(72);
     let mut b = Buffer::new(31);

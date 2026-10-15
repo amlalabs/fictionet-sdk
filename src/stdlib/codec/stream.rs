@@ -196,6 +196,12 @@ impl<D: Decode> Stream<D> {
     pub fn allocated(&self) -> usize {
         self.buf.allocated()
     }
+    /// Cumulative bytes copied by input-buffer compaction and shrinking.
+    /// Excludes incoming bytes and allocator moves. Saturates at `usize::MAX`.
+    #[cfg(test)]
+    pub fn moved(&self) -> usize {
+        self.buf.moved
+    }
     /// Releases spare input capacity while preserving unread bytes, offset,
     /// decoder state, EOF, and terminal status.
     pub fn shrink(&mut self) {

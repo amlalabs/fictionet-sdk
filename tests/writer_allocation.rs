@@ -9,6 +9,46 @@ struct RefusingAllocator;
 
 thread_local! {
     static REFUSE_LARGE: Cell<bool> = const { Cell::new(false) };
+    static MEASUREMENT: Cell<Option<Measurement>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AllocationStats {
+    // Allocation and reallocation requests, including refused requests.
+    allocations: usize,
+    bytes_requested: usize,
+    // Peak net live bytes above the fixture baseline at scope entry.
+    peak_live_bytes: usize,
+    largest_request: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Measurement {
+    stats: AllocationStats,
+    // Signed because an operation can release a prebuilt fixture.
+    live: i128,
+}
+
+fn record(request: Option<usize>, live_change: i128) {
+    // TLS may be unavailable during thread teardown, after the scope ended.
+    MEASUREMENT
+        .try_with(|cell| {
+            if let Some(mut measurement) = cell.get() {
+                if let Some(size) = request {
+                    let stats = &mut measurement.stats;
+                    stats.allocations = stats.allocations.saturating_add(1);
+                    stats.bytes_requested = stats.bytes_requested.saturating_add(size);
+                    stats.largest_request = stats.largest_request.max(size);
+                }
+                measurement.live = measurement.live.saturating_add(live_change);
+                measurement.stats.peak_live_bytes = measurement
+                    .stats
+                    .peak_live_bytes
+                    .max(usize::try_from(measurement.live.max(0)).unwrap_or(usize::MAX));
+                cell.set(Some(measurement));
+            }
+        })
+        .unwrap_or(());
 }
 
 fn refuses(size: usize) -> bool {
@@ -19,23 +59,42 @@ fn refuses(size: usize) -> bool {
 // layout. Refused requests return null, as the allocator contract permits.
 unsafe impl GlobalAlloc for RefusingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if refuses(layout.size()) {
+        let ptr = if refuses(layout.size()) {
             std::ptr::null_mut()
         } else {
             unsafe { System.alloc(layout) }
-        }
+        };
+        record(
+            Some(layout.size()),
+            if ptr.is_null() {
+                0
+            } else {
+                layout.size() as i128
+            },
+        );
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        record(None, -(layout.size() as i128));
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if refuses(size) {
+        let next = if refuses(size) {
             std::ptr::null_mut()
         } else {
             unsafe { System.realloc(ptr, layout, size) }
-        }
+        };
+        record(
+            Some(size),
+            if next.is_null() {
+                0
+            } else {
+                size as i128 - layout.size() as i128
+            },
+        );
+        next
     }
 }
 
@@ -52,6 +111,126 @@ fn refusing_large<T>(write: impl FnOnce() -> T) -> T {
     REFUSE_LARGE.set(true);
     let _reset = Reset;
     write()
+}
+
+// Build fixtures before calling. Only allocator events on this thread count.
+// Reallocation requests count their full new size; live bytes change only on
+// success. Freeing fixture storage lowers net live bytes, not requested bytes.
+fn measuring<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MEASUREMENT.set(None);
+        }
+    }
+    MEASUREMENT.with(|cell| {
+        assert!(cell.get().is_none(), "nested allocation measurement");
+        cell.set(Some(Measurement::default()));
+    });
+    let _reset = Reset;
+    let result = operation();
+    let measurement = MEASUREMENT.take().expect("active allocation measurement");
+    let stats = measurement.stats;
+    assert!(
+        stats.allocations < usize::MAX
+            && stats.bytes_requested < usize::MAX
+            && stats.peak_live_bytes < usize::MAX
+            && stats.largest_request < usize::MAX
+            && measurement.live > i128::MIN,
+        "allocation measurement saturated"
+    );
+    (result, stats)
+}
+
+#[test]
+fn measurement_excludes_fixture_construction() {
+    let fixture = vec![7u8; 4096];
+    let (sum, stats) = measuring(|| fixture.iter().copied().map(u64::from).sum::<u64>());
+    assert_eq!(sum, 7 * 4096);
+    assert_eq!(stats, AllocationStats::default());
+}
+
+#[test]
+fn eager_invalid_count_allocation_is_measured() {
+    for n in [1024, 4096] {
+        let (bytes, stats) = measuring(|| std::hint::black_box(Vec::<u8>::with_capacity(n)));
+        assert_eq!(bytes.capacity(), n);
+        assert_eq!(
+            stats,
+            AllocationStats {
+                allocations: 1,
+                bytes_requested: n,
+                peak_live_bytes: n,
+                largest_request: n,
+            }
+        );
+    }
+}
+
+#[test]
+fn measurement_tracks_reallocation_and_released_storage() {
+    let ((), stats) = measuring(|| {
+        let mut bytes = std::hint::black_box(Vec::<u8>::with_capacity(32));
+        bytes.reserve_exact(96);
+        std::hint::black_box(&bytes);
+        drop(bytes);
+        let other = std::hint::black_box(Vec::<u8>::with_capacity(64));
+        std::hint::black_box(&other);
+    });
+    assert_eq!(
+        stats,
+        AllocationStats {
+            allocations: 3,
+            bytes_requested: 32 + 96 + 64,
+            peak_live_bytes: 96,
+            largest_request: 96,
+        }
+    );
+}
+
+#[test]
+fn measurement_tracks_fixture_growth_and_shrinkage() {
+    let mut bytes = Vec::<u8>::with_capacity(32);
+    let ((), stats) = measuring(|| {
+        bytes.reserve_exact(96);
+        bytes.resize(16, 0);
+        bytes.shrink_to_fit();
+        std::hint::black_box(&bytes);
+    });
+    assert_eq!(
+        stats,
+        AllocationStats {
+            allocations: 2,
+            bytes_requested: 96 + 16,
+            peak_live_bytes: 64,
+            largest_request: 96,
+        }
+    );
+}
+
+#[test]
+fn measurement_counts_refused_requests_without_live_growth() {
+    let mut bytes = Vec::<u8>::with_capacity(32);
+    let (result, stats) = measuring(|| refusing_large(|| bytes.try_reserve_exact(4096)));
+    assert!(result.is_err());
+    assert_eq!(
+        stats,
+        AllocationStats {
+            allocations: 1,
+            bytes_requested: 4096,
+            peak_live_bytes: 0,
+            largest_request: 4096,
+        }
+    );
+    assert_eq!(bytes.capacity(), 32);
+}
+
+#[test]
+fn measurement_resets_after_unwinding() {
+    let result = std::panic::catch_unwind(|| measuring(|| panic!("operation failed")));
+    assert!(result.is_err());
+    assert!(MEASUREMENT.get().is_none());
+    assert_eq!(measuring(|| ()).1, AllocationStats::default());
 }
 
 #[test]

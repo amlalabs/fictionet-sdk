@@ -8,6 +8,8 @@
 //! `cargo test` stays fast and a deep run is one environment variable away.
 //! [`assert_linear`] checks that work grows linearly with input size by
 //! comparing two sizes, instead of holding a test to a wall-clock limit.
+//! [`assert_linear_work`] and [`assert_constant_work`] compare counted work
+//! across a named dimension without using a clock.
 //! [`fictionet::assert_cases!`] checks calls or named input rows against expected
 //! results in order.
 
@@ -404,6 +406,93 @@ pub fn check_work<D: Decode>(
     }
 }
 
+/// Checks counted work at `n` and `4 * n` along `dimension`.
+/// The larger run may use at most four times the work of the smaller run.
+/// Each call must start a fresh measurement of the real operation. Count
+/// actual scans, copies, or loop steps, including speculative work. Keep
+/// other dimensions fixed. This helper does not measure time or count work.
+/// Zero work is allowed, but then both runs must report zero.
+///
+/// ```
+/// use fictionet::stdlib::{test_support::assert_linear_work, thrift::EncodedMessages};
+/// use fictionet::stdlib::codec::{Stream, pump};
+/// assert_linear_work("empty thrift calls", "messages", 16, |size| {
+///     let bytes = [0x82, 0x21, 0, 0, 0].repeat(size);
+///     let mut stream = Stream::new(EncodedMessages::new());
+///     let mut count = 0;
+///     pump(&mut stream, &bytes, |_| count += 1).unwrap();
+///     assert_eq!(count, size);
+///     stream.decoder().examined()
+/// });
+/// ```
+///
+/// # Panics
+///
+/// If `n` is zero, `4 * n` overflows, a measurement is saturated at
+/// `u64::MAX`, or work exceeds the bound. `name` and `dimension` label failures.
+pub fn assert_linear_work(
+    name: &str,
+    dimension: &str,
+    n: usize,
+    measured: impl FnMut(usize) -> u64,
+) {
+    compare_work(name, dimension, n, measured, 4);
+}
+
+/// Checks that counted work does not grow when `dimension` grows fourfold.
+/// Measures fresh operations at `n` and `4 * n`. The larger run may use at
+/// most the smaller run's work. Hold the operation count and all other
+/// dimensions fixed. For example, vary retained bytes while reading the
+/// same number of bytes. Zero work is allowed in both runs.
+///
+/// ```
+/// use fictionet::stdlib::{test_support::assert_constant_work, thrift::EncodedMessages};
+/// use fictionet::stdlib::codec::{Decode, Step};
+/// assert_constant_work("first thrift call", "unread suffix bytes", 16, |size| {
+///     let mut bytes = vec![0x82, 0x21, 0, 0, 0];
+///     bytes.resize(5 + size, 0);
+///     let mut decoder = EncodedMessages::new();
+///     assert!(matches!(decoder.decode(&bytes, false).unwrap(), Step::Item(_, 5)));
+///     decoder.examined()
+/// });
+/// ```
+///
+/// # Panics
+///
+/// If `n` is zero, `4 * n` overflows, a measurement is saturated at
+/// `u64::MAX`, or work grows. `name` and `dimension` label failures.
+pub fn assert_constant_work(
+    name: &str,
+    dimension: &str,
+    n: usize,
+    measured: impl FnMut(usize) -> u64,
+) {
+    compare_work(name, dimension, n, measured, 1);
+}
+
+fn compare_work(
+    name: &str,
+    dimension: &str,
+    n: usize,
+    mut measured: impl FnMut(usize) -> u64,
+    factor: u128,
+) {
+    assert!(n > 0, "{name}: {dimension} must be positive");
+    let large_n = n.checked_mul(4).expect("work dimension overflow");
+    let small = measured(n);
+    let large = measured(large_n);
+    assert!(
+        small < u64::MAX && large < u64::MAX,
+        "{name}: {dimension} work measurement saturated"
+    );
+    let bound = u128::from(small) * factor;
+    assert!(
+        u128::from(large) <= bound,
+        "{name}: {dimension} grew from {n} to {large_n}; work grew from \
+         {small} to {large}, exceeding bound {bound}"
+    );
+}
+
 /// Checks that a refused operation preserves the captured state.
 /// Returns the operation's result so callers can check its error.
 ///
@@ -428,7 +517,7 @@ pub fn check_atomic<T, R, E, S: PartialEq + core::fmt::Debug>(
 
 #[cfg(test)]
 mod tests {
-    use super::assert_linear;
+    use super::{assert_constant_work, assert_linear, assert_linear_work};
     use core::hint::black_box;
 
     #[test]
@@ -576,6 +665,73 @@ mod tests {
     #[should_panic(expected = "work measurement decreased")]
     fn decreasing_measurement_fails() {
         super::check_work(Counted::default, b"x", |d| 10 - d.0, 10, 0);
+    }
+
+    #[test]
+    fn counted_work_accepts_linear_and_flat_controls() {
+        let mut sizes = Vec::new();
+        assert_linear_work("scan", "bytes", 16, |n| {
+            sizes.push(n);
+            3 * n as u64 + 7
+        });
+        assert_eq!(sizes, [16, 64]);
+        assert_linear_work("flat", "bytes", 16, |_| 7);
+        assert_constant_work("flat", "retained bytes", 16, |_| 7);
+        assert_linear_work("no copies", "bytes", 16, |_| 0);
+        assert_constant_work("no copies", "retained bytes", 16, |_| 0);
+        assert_linear_work("wide bound", "bytes", 16, |_| u64::MAX - 1);
+    }
+
+    fn synthetic_quadratic_scan(n: usize) -> u64 {
+        let mut examined = 0;
+        for end in 1..=n {
+            for _ in 0..end {
+                examined += 1;
+            }
+        }
+        examined
+    }
+
+    #[test]
+    #[should_panic(expected = "quadratic: bytes grew from 16 to 64")]
+    fn counted_work_rejects_quadratic_scan() {
+        assert_linear_work("quadratic", "bytes", 16, synthetic_quadratic_scan);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeding bound")]
+    fn constant_work_rejects_linear_scan() {
+        assert_constant_work("scan", "retained bytes", 16, |n| n as u64);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeding bound")]
+    fn constant_work_rejects_quadratic_scan() {
+        assert_constant_work("scan", "retained bytes", 16, synthetic_quadratic_scan);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeding bound 0")]
+    fn counted_work_rejects_growth_from_zero() {
+        assert_linear_work("copy", "bytes", 16, |n| u64::from(n > 16));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be positive")]
+    fn counted_work_rejects_zero_dimension() {
+        assert_linear_work("scan", "bytes", 0, |_| 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "work dimension overflow")]
+    fn counted_work_rejects_dimension_overflow() {
+        assert_constant_work("scan", "bytes", usize::MAX, |_| 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "work measurement saturated")]
+    fn counted_work_rejects_saturation() {
+        assert_linear_work("scan", "bytes", 16, |_| u64::MAX);
     }
 
     #[test]
