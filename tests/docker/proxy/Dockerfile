@@ -21,10 +21,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --features web-proxy --bin fictionet --example web_fixture \
     && cp target/release/fictionet target/release/examples/web_fixture /usr/local/bin/
 
-# A Go client built with the standard library only.
+# A Go client tested and built with the standard library only.
 FROM golang:1-bookworm AS go
 WORKDIR /src
 COPY tests/docker/proxy/goclient .
+RUN go vet ./... && go test ./...
 RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath -o /goclient .
 
 # The world and attach.
