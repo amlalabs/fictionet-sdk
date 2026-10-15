@@ -6,7 +6,6 @@ which the agent cannot reach.
 """
 from __future__ import annotations
 
-import json
 import runpy
 import re
 import tomllib
@@ -17,8 +16,7 @@ from typing import Any
 from inspect_ai.util import sandbox
 
 ROOT = Path(__file__).resolve().parents[2]
-finalize_world = runpy.run_path(str(ROOT.parent / "common" / "finalize.py"))["finalize_world"]
-read_log = runpy.run_path(str(ROOT.parent / "common" / "logs.py"))["read_log"]
+WorldFiles = runpy.run_path(str(ROOT.parent / "common" / "world_io.py"))["WorldFiles"]
 COMPOSE = str(ROOT / "compose.yaml")
 SEEDS = ROOT / "seeds"
 
@@ -37,11 +35,7 @@ def seed_front(name: str) -> dict[str, Any]:
 
 
 async def world_state() -> dict[str, Any]:
-    r = await sandbox(WORLD).exec(["cat", STATE])
-    if not r.success:
-        msg = f"cannot read world state: {r.stderr}"
-        raise RuntimeError(msg)
-    return json.loads(r.stdout)
+    return await WorldFiles(sandbox(WORLD), state=STATE, log=LOG).state()
 
 
 async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str, Any]]:
@@ -49,9 +43,8 @@ async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str,
     command output to its last 10 MiB without an error. Check completeness before
     applying the line offset. Set finalize=False only for a preflight read.
     """
-    if finalize:
-        await finalize_world(sandbox(WORLD), sandbox(), LOG)
-    return await read_log(sandbox(WORLD), LOG, offset)
+    files = WorldFiles(sandbox(WORLD), sandbox() if finalize else None, state=STATE, log=LOG)
+    return await files.log_lines(offset, finalize=finalize)
 
 
 def sorted_percentile(values: list[float], p: float) -> float | None:

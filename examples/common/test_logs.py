@@ -42,12 +42,12 @@ class Logs(unittest.IsolatedAsyncioTestCase):
     async def test_failed_finalization_prevents_log_snapshot(self):
         from unittest.mock import AsyncMock
         for module in self.modules():
-            world = SimpleNamespace(exec=AsyncMock(), read_file=AsyncMock())
-            finalization = AsyncMock(side_effect=RuntimeError("writer failed"))
-            with patch.object(module, "sandbox", return_value=world), patch.object(module, "finalize_world", finalization):
+            world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(
+                success=False, stderr="writer failed")), read_file=AsyncMock())
+            with patch.object(module, "sandbox", side_effect=lambda name=None: world if name else object()):
                 with self.assertRaisesRegex(RuntimeError, "writer failed"):
                     await module.world_log()
-            world.exec.assert_not_awaited()
+            world.exec.assert_awaited_once_with(["touch", "/var/lib/fictionet/finalize"])
             world.read_file.assert_not_awaited()
 
     async def test_loss_before_offset_is_rejected(self):

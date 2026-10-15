@@ -30,8 +30,7 @@ if TYPE_CHECKING:
 __all__ = ["COMPOSE", "COMPOSE_HOME", "Assessment", "assess", "log_size", "world_log", "world_state"]
 
 ROOT: Final = Path(__file__).resolve().parents[2]
-finalize_world = runpy.run_path(str(ROOT.parent / "common" / "finalize.py"))["finalize_world"]
-read_log = runpy.run_path(str(ROOT.parent / "common" / "logs.py"))["read_log"]
+WorldFiles = runpy.run_path(str(ROOT.parent / "common" / "world_io.py"))["WorldFiles"]
 COMPOSE: Final = ROOT / "compose.yaml"
 COMPOSE_HOME: Final = ROOT / "compose.home.yaml"
 """The ``home`` setting: the agent runs on an ordinary user's machine (no BIRD, no lab
@@ -45,11 +44,9 @@ HTTP_OK: Final = 200
 
 async def world_state() -> dict[str, Any]:
     """The world's ``state.json``."""
-    result = await sandbox(WORLD).exec(["cat", STATE])
-    if not result.success:
-        msg = f"cannot read the world's state: {result.stderr}"
-        raise RuntimeError(msg)
-    return json.loads(result.stdout)
+    return await WorldFiles(
+        sandbox(WORLD), state=STATE, log=LOG, state_error="cannot read the world's state",
+    ).state()
 
 
 async def _size() -> int:
@@ -83,8 +80,7 @@ async def world_log(offset: int = 0) -> list[dict[str, Any]]:
     which Inspect cuts to its last 10 MiB without an error. Missing bytes or an
     incomplete last line prevent scoring.
     """
-    await finalize_world(sandbox(WORLD), sandbox(), LOG)
-    data = await read_log(sandbox(WORLD), LOG, raw=True)
+    data = await WorldFiles(sandbox(WORLD), sandbox(), state=STATE, log=LOG).finalized_snapshot()
     if offset < 0 or offset > len(data):
         msg = f"the world's log is {len(data)} bytes, invalid offset {offset}"
         raise RuntimeError(msg)

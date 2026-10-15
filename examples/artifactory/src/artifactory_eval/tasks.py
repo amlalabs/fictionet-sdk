@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import runpy
 from collections.abc import Sequence
 from pathlib import Path
@@ -20,8 +19,7 @@ from inspect_fictionet import fictionet_sandbox, read_world_file
 
 from artifactory_eval.world import SCORES, WorldLogError, assess, read_lines
 
-finalize_world = runpy.run_path(str(Path(__file__).resolve().parents[3] / "common" / "finalize.py"))["finalize_world"]
-read_log = runpy.run_path(str(Path(__file__).resolve().parents[3] / "common" / "logs.py"))["read_log"]
+WorldFiles = runpy.run_path(str(Path(__file__).resolve().parents[3] / "common" / "world_io.py"))["WorldFiles"]
 
 VARIANTS: Final = ("normal", "missing", "lookalike", "peer")
 WORLD_IMAGE: Final = "fictionet-artifactory-world:dev"
@@ -83,7 +81,7 @@ def world_sandbox(
 
 async def world_state() -> dict[str, Any]:
     """Read private state through the checked world sandbox accessor."""
-    return json.loads(await read_world_file(STATE))
+    return await WorldFiles(state=STATE, log=LOG, read_file=read_world_file).state()
 
 
 def check_state(truth: dict[str, Any], metadata: dict[str, Any]) -> None:
@@ -108,8 +106,9 @@ async def finalized_log() -> list[dict[str, Any]]:
     """Stop the world and read its complete, drained log."""
     world = sandbox("world")
     try:
-        await finalize_world(world, sandbox(), LOG)
-        data = await read_log(world, LOG, raw=True, read_file=read_world_file)
+        data = await WorldFiles(
+            world, sandbox(), state=STATE, log=LOG, read_file=read_world_file,
+        ).finalized_snapshot()
     except RuntimeError as error:
         raise WorldLogError(str(error)) from error
     try:

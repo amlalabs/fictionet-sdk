@@ -97,19 +97,22 @@ def test_setup_accepts_exact_parameters(monkeypatch: pytest.MonkeyPatch) -> None
 
 @pytest.mark.parametrize("data,valid", [(b'{"type":"attached"}\n', True), (b'{"type":"attached"}', False), (b'{"type":"lost","count":1}\n', False)])
 def test_finalized_and_checked_log_read(data: bytes, valid: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-    world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=True, stdout=str(len(data)))))
+    world = SimpleNamespace(exec=AsyncMock(side_effect=lambda command: SimpleNamespace(
+        success=True, stdout=str(len(data)) if command[0] == "sh" else "ok\n")))
     agent = object()
     monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else agent)
     reader = AsyncMock(return_value=data)
     monkeypatch.setattr(tasks, "read_world_file", reader)
-    monkeypatch.setattr(tasks, "finalize_world", AsyncMock())
     if valid:
         assert asyncio.run(tasks.finalized_log()) == [{"type": "attached"}]
     else:
         with pytest.raises(WorldLogError):
             asyncio.run(tasks.finalized_log())
-    tasks.finalize_world.assert_awaited_once_with(world, agent, tasks.LOG)
-    assert world.exec.await_count == 1
+    assert [call.args[0] for call in world.exec.await_args_list] == [
+        ["touch", "/var/lib/fictionet/finalize"],
+        ["cat", "/var/lib/fictionet/finalized"],
+        ["sh", "-c", 'cp "$1" "$2" && wc -c < "$2"', "sh", tasks.LOG, tasks.LOG + ".snapshot"],
+    ]
     reader.assert_awaited_once_with(tasks.LOG + ".snapshot", text=False)
 
 
@@ -121,20 +124,44 @@ def test_world_alias_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_snapshot_failure_is_not_silent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tasks, "finalize_world", AsyncMock())
-    world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=False, stderr="denied")))
+    world = SimpleNamespace(exec=AsyncMock(side_effect=lambda command: SimpleNamespace(
+        success=command[0] != "sh", stdout="ok\n", stderr="denied")))
     monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else object())
     with pytest.raises(WorldLogError, match="denied"):
         asyncio.run(tasks.finalized_log())
 
 
 def test_growth_during_read_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=True, stdout="0")))
+    world = SimpleNamespace(exec=AsyncMock(side_effect=lambda command: SimpleNamespace(
+        success=True, stdout="0" if command[0] == "sh" else "ok\n")))
     monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else object())
-    monkeypatch.setattr(tasks, "finalize_world", AsyncMock())
     monkeypatch.setattr(tasks, "read_world_file", AsyncMock(return_value=b'{"type":"dns"}\n'))
     with pytest.raises(WorldLogError, match="changed"):
         asyncio.run(tasks.finalized_log())
+
+
+def test_checked_reader_failure_keeps_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    error = RuntimeError("untrusted sandbox")
+    world = SimpleNamespace(exec=AsyncMock(side_effect=lambda command: SimpleNamespace(
+        success=True, stdout="3" if command[0] == "sh" else "ok\n")))
+    monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else object())
+    monkeypatch.setattr(tasks, "read_world_file", AsyncMock(side_effect=error))
+    with pytest.raises(RuntimeError) as state_error:
+        asyncio.run(tasks.world_state())
+    assert state_error.value is error
+    with pytest.raises(WorldLogError, match="untrusted sandbox") as log_error:
+        asyncio.run(tasks.finalized_log())
+    assert log_error.value.__cause__ is error
+
+
+def test_non_utf8_snapshot_keeps_domain_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    world = SimpleNamespace(exec=AsyncMock(side_effect=lambda command: SimpleNamespace(
+        success=True, stdout="2" if command[0] == "sh" else "ok\n")))
+    monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else object())
+    monkeypatch.setattr(tasks, "read_world_file", AsyncMock(return_value=b'\xff\n'))
+    with pytest.raises(WorldLogError, match="world log is not UTF-8") as raised:
+        asyncio.run(tasks.finalized_log())
+    assert isinstance(raised.value.__cause__, UnicodeDecodeError)
 
 
 @pytest.mark.parametrize("valid", [True, False])

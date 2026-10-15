@@ -15,10 +15,10 @@ def test_finalized_byte_offsets(offset_kind, monkeypatch):
     episode = b'{"type":"dns"}\n'
     data = preflight + episode
     offset = {"start": 0, "episode": len(preflight), "end": len(data), "past_end": len(data) + 1}[offset_kind]
-    private = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=True, stdout=str(len(data)))),
+    private = SimpleNamespace(exec=AsyncMock(side_effect=lambda command: SimpleNamespace(
+        success=True, stdout=str(len(data)) if command[0] == "sh" else "ok\n")),
                               read_file=AsyncMock(return_value=data))
     monkeypatch.setattr(world, "sandbox", lambda name=None: private if name else object())
-    monkeypatch.setattr(world, "finalize_world", AsyncMock())
     if offset_kind == "past_end":
         with pytest.raises(RuntimeError, match="offset"):
             asyncio.run(world.world_log(offset))
