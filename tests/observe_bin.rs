@@ -951,6 +951,113 @@ fn the_dashboard_merges_the_packets_of_several_links() {
     drop(child);
 }
 
+fn two_dashboard_links(port: u16) -> Vec<String> {
+    let mut graph = String::new();
+    poll::until(Duration::from_secs(10), || {
+        graph = get(port, "/api/graph").1;
+        graph.matches(r#"{"id":"e"#).count() == 2
+    });
+    let links: Vec<String> = graph
+        .split(r#"{"id":"e"#)
+        .skip(1)
+        .map(|r| format!("e{}", r.split('"').next().unwrap()))
+        .collect();
+    assert_eq!(links.len(), 2, "{graph}");
+    links
+}
+
+/// Checks that a failed download carries JSON, with no partial capture.
+fn capture_failure(port: u16, links: &str) -> String {
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        conn,
+        "GET /api/pcap?link={links} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer dashboard-test-token\r\n\r\n"
+    )
+    .unwrap();
+    let mut all = Vec::new();
+    conn.read_to_end(&mut all).unwrap();
+    let head_end = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = std::str::from_utf8(&all[..head_end]).unwrap();
+    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    assert!(head.lines().any(|l| l == "Content-Type: application/json"));
+    let body = &all[head_end..];
+    assert!(!body.windows(4).any(|w| w == [0x0a, 0x0d, 0x0d, 0x0a]));
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+#[test]
+fn the_dashboard_fails_a_capture_when_the_second_link_is_not_watched() {
+    let path = temp_socket();
+    let _listening = start_two_links(&path);
+    with_dashboard(&path, |port| {
+        let links = two_dashboard_links(port);
+        let mut events = sse_connection(port, &format!("/api/packets?link={}", links[0]));
+        while !sse_frame(&mut events).starts_with("event: packet\n") {}
+
+        let body = capture_failure(port, &links.join(","));
+        assert_eq!(
+            body,
+            format!(
+                r#"{{"error":"no capture for {0}","links":[{{"link":"{0}","error":"nothing is watching that link"}}]}}"#,
+                links[1]
+            )
+        );
+        drop(events);
+    });
+}
+
+#[test]
+fn the_dashboard_fails_a_capture_when_a_requested_link_does_not_exist() {
+    let path = temp_socket();
+    let _listening = start_two_links(&path);
+    with_dashboard(&path, |port| {
+        let links = two_dashboard_links(port);
+        let streams: Vec<_> = links
+            .iter()
+            .map(|link| {
+                let mut events = sse_connection(port, &format!("/api/packets?link={link}"));
+                while !sse_frame(&mut events).starts_with("event: packet\n") {}
+                events
+            })
+            .collect();
+
+        let body = capture_failure(port, &format!("{},e999", links.join(",")));
+        assert_eq!(
+            body,
+            r#"{"error":"no capture for e999","links":[{"link":"e999","error":"nothing is watching that link"}]}"#
+        );
+        drop(streams);
+    });
+}
+
+#[test]
+fn the_dashboard_names_every_failed_capture_and_preserves_unexpected_replies() {
+    use fictionet::relay::END;
+
+    for (reply, error) in [
+        (
+            r#" { "error": "missing \"capture\"\n" } "#,
+            r#""missing \"capture\"\u000a""#,
+        ),
+        (r#"{"error":false}"#, r#""{\"error\":false}""#),
+        (r#"{"error":"truncated""#, r#""{\"error\":\"truncated\"""#),
+    ] {
+        with_observer(&[(END, reply.as_bytes())], 2, |path| {
+            with_dashboard(path, |port| {
+                let body = capture_failure(port, "e3,e7");
+                assert_eq!(
+                    body,
+                    format!(
+                        r#"{{"error":"no capture for e3, e7","links":[{{"link":"e3","error":{error}}},{{"link":"e7","error":{error}}}]}}"#
+                    )
+                );
+            });
+        });
+    }
+}
+
 /// A watch on a world that ends normally exits 0, after printing `ended`
 /// and the stream's end.
 #[test]

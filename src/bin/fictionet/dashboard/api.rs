@@ -164,25 +164,54 @@ pub(super) fn with_link(query: &[(String, String)], link: &str) -> Vec<(String, 
         .collect()
 }
 
+/// One link's capture, or the reason it could not be captured.
+fn capture(client: &mut Client, link: &str) -> io::Result<Result<Vec<u8>, String>> {
+    let value = client.call(&observe_request(
+        "pcap",
+        &[("link".to_owned(), link.to_owned())],
+    ))?;
+    if value.binary {
+        return Ok(Ok(value.bytes));
+    }
+    let error = match value.envelope() {
+        Some(Envelope::Error(message)) => message,
+        _ => String::from_utf8_lossy(&value.bytes).into_owned(),
+    };
+    Ok(Err(error))
+}
+
 /// The captures of several links, one pcapng section after another.
+/// A link without a capture fails the whole download, naming every failed link.
 fn pcap_merged(mut client: Client, mut conn: TcpStream, links: &[String]) -> io::Result<()> {
     client.set_timeout(Some(Duration::from_secs(30)))?;
     let mut file = Vec::new();
+    let mut failed = Vec::new();
     for link in links {
-        let value = client.call(&observe_request(
-            "pcap",
-            &[("link".to_owned(), link.clone())],
-        ))?;
-        if value.binary {
-            file.extend_from_slice(&value.bytes);
+        match capture(&mut client, link)? {
+            Ok(bytes) => file.extend_from_slice(&bytes),
+            Err(error) => failed.push((link, error)),
         }
     }
-    if file.is_empty() {
+    if !failed.is_empty() {
+        let names = failed
+            .iter()
+            .map(|(link, _)| link.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let errors = failed
+            .iter()
+            .map(|(link, error)| format!("{{\"link\":{},\"error\":{}}}", quote(link), quote(error)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(
+            "{{\"error\":{},\"links\":[{errors}]}}",
+            quote(&format!("no capture for {names}"))
+        );
         return respond(
             &mut conn,
             "404 Not Found",
             "application/json",
-            br#"{"error":"nothing is watching those links"}"#,
+            body.as_bytes(),
             "",
         );
     }

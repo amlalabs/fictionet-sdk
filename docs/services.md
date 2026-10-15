@@ -852,6 +852,11 @@ sampling totals and the selected detail before replay. A paused view stays
 paused until resumed. This also applies to merged links and captures whose
 packet numbering restarts.
 
+A capture download for several links includes a pcapng section for each link.
+If any link has no capture, the whole download fails with HTTP 404 and JSON.
+The `error` message names every failed link. The `links` array gives each
+failed `link` and its `error` reason. No partial capture is returned.
+
 The dashboard serves one HTTP/1.0 or HTTP/1.1 GET request per connection.
 The target must be a path starting with `/`. The head may be at most 16 KiB,
 including the first `\r\n\r\n`. Bytes after it cannot supply headers or another

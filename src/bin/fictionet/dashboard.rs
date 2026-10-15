@@ -14,6 +14,8 @@
 //! one session, and merges the streams into one, with each packet's
 //! `link` added. `pcap` asks for each link's capture and joins them: a
 //! pcapng file may hold several sections, and Wireshark reads them all.
+//! A link without a capture fails the whole download. The JSON error names
+//! every failed link and gives its reason.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
