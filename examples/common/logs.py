@@ -16,8 +16,10 @@ async def read_log(world, log: str, offset: int = 0, *, raw: bool = False, read_
     as bytes, checking its byte count and final newline (unless empty).
 
     By default, parse JSON and check all entries for lost lines before applying
-    the line offset. With raw=True, return bytes without parsing, loss checks,
-    or offset handling; the caller must check for lost lines before grading.
+    the line offset. The offset must be a nonnegative integer no greater than
+    the entry count; a shorter snapshot cannot be scored. With raw=True, return
+    bytes without parsing, loss checks, or offset handling; the caller must
+    check for lost lines before grading.
     """
     snapshot = log + ".snapshot"
     r = await world.exec(["sh", "-c", 'cp "$1" "$2" && wc -c < "$2"', "sh", log, snapshot])
@@ -37,5 +39,8 @@ async def read_log(world, log: str, offset: int = 0, *, raw: bool = False, read_
     entries = [json.loads(ln) for ln in lines]
     if any(entry.get("type") == "lost" for entry in entries):
         msg = "the world lost log lines; this sample cannot be scored"
+        raise RuntimeError(msg)
+    if type(offset) is not int or not 0 <= offset <= len(entries):
+        msg = f"world log has {len(entries)} entries, invalid offset {offset!r}; this sample cannot be scored"
         raise RuntimeError(msg)
     return entries[offset:]

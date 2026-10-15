@@ -84,6 +84,21 @@ class Logs(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(module=module.__name__, data=data), self.assertRaisesRegex(RuntimeError, "cannot be scored"):
                     await self.read(module, data, returned=returned)
 
+    async def test_incomplete_snapshot_cannot_pass(self):
+        for module in self.modules():
+            for data, offset in [(b'', 1), (b'{}\n', 2)]:
+                with self.subTest(module=module.__name__, data=data, offset=offset):
+                    with self.assertRaisesRegex(RuntimeError, "invalid offset.*cannot be scored"):
+                        await self.read(module, data, offset=offset)
+
+    async def test_line_offset_must_be_a_nonnegative_integer(self):
+        for module in self.modules():
+            for offset in [-1, True, 1.0, "1", None]:
+                with self.subTest(module=module.__name__, offset=offset):
+                    with self.assertRaisesRegex(RuntimeError, "invalid offset"):
+                        await self.read(module, b'{}\n', offset=offset)
+            self.assertEqual(await self.read(module, b'{}\n', offset=1), [])
+
     async def test_empty_log_and_read_failure(self):
         for module in self.modules():
             with self.subTest(module=module.__name__):
