@@ -6,6 +6,118 @@ use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
 use fictionet_copy_modules::*;
 
 #[test]
+fn copied_printable_fields_preserve_padding_and_rejections() {
+    macro_rules! right_padded {
+        ($module:ident) => {{
+            for (text, bytes) in [
+                ("", *b"    "),
+                ("AB", *b"AB  "),
+                (" A ", *b" A  "),
+                (" ~! ", *b" ~! "),
+            ] {
+                assert_eq!(
+                    $module::Alpha::<4>::right_padded(text).unwrap().as_bytes(),
+                    &bytes
+                );
+            }
+            for text in ["ABCDE", "\0", "\t", "\n", "\u{1f}", "\u{7f}", "é", "🦀"] {
+                assert_eq!(
+                    $module::Alpha::<4>::right_padded(text),
+                    Err($module::Error::Field)
+                );
+            }
+            assert_eq!(
+                $module::Alpha::<0>::right_padded("").unwrap().as_bytes(),
+                &[]
+            );
+            assert_eq!(
+                $module::Alpha::<0>::right_padded("A"),
+                Err($module::Error::Field)
+            );
+        }};
+    }
+    right_padded!(itch);
+    right_padded!(ouch);
+    right_padded!(soupbintcp);
+    right_padded!(cboe_pitch);
+
+    for (text, bytes) in [
+        ("", *b"          "),
+        ("AB", *b"        AB"),
+        (" A ", *b"        A "),
+        ("0123456789", *b"0123456789"),
+    ] {
+        assert_eq!(
+            moldudp64::Session::left_padded(text).unwrap().as_bytes(),
+            &bytes
+        );
+        assert_eq!(
+            soupbintcp::Alpha::<10>::left_padded(text)
+                .unwrap()
+                .as_bytes(),
+            &bytes
+        );
+    }
+    for text in [
+        "01234567890",
+        "\0",
+        "\t",
+        "\n",
+        "\u{1f}",
+        "\u{7f}",
+        "é",
+        "🦀",
+    ] {
+        assert_eq!(
+            moldudp64::Session::left_padded(text),
+            Err(moldudp64::Error::Field)
+        );
+        assert_eq!(
+            soupbintcp::Alpha::<10>::left_padded(text),
+            Err(soupbintcp::Error::Field)
+        );
+    }
+    assert_eq!(
+        soupbintcp::Alpha::<0>::left_padded("").unwrap().as_bytes(),
+        &[]
+    );
+    assert_eq!(
+        soupbintcp::Alpha::<0>::left_padded("A"),
+        Err(soupbintcp::Error::Field)
+    );
+}
+
+#[test]
+fn copied_exact_fields_keep_protocol_validation_and_trimming() {
+    for byte in 0..=u8::MAX {
+        let mut bytes = *b" A        ";
+        bytes[2] = byte;
+        macro_rules! printable {
+            ($constructor:path, $error:path) => {
+                if (b' '..=b'~').contains(&byte) {
+                    assert_eq!($constructor(bytes).unwrap().as_bytes(), &bytes);
+                } else {
+                    assert_eq!($constructor(bytes), Err($error));
+                }
+            };
+        }
+        printable!(itch::Alpha::new, itch::Error::Field);
+        printable!(ouch::Alpha::new, ouch::Error::Field);
+        printable!(soupbintcp::Alpha::new, soupbintcp::Error::Field);
+        printable!(moldudp64::Session::new, moldudp64::Error::Field);
+        assert_eq!(cboe_pitch::Alpha::new(bytes).as_bytes(), &bytes);
+    }
+    assert_eq!(itch::Alpha::new(*b" A ").unwrap().trimmed(), " A");
+    assert_eq!(ouch::Alpha::new(*b" A ").unwrap().trimmed(), " A");
+    assert_eq!(soupbintcp::Alpha::new(*b" A ").unwrap().trimmed(), "A");
+    assert_eq!(
+        moldudp64::Session::new(*b" A        ").unwrap().trimmed(),
+        "A"
+    );
+    assert_eq!(cboe_pitch::Alpha::new(*b" A \0Z").trimmed(), " A");
+}
+
+#[test]
 fn copied_framers_expose_terminal_errors_and_stop_before_the_next_frame() {
     use fictionet::stdlib::codec::Fail;
     use std::fmt::Debug;

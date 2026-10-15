@@ -74,7 +74,7 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Wire, field};
 use fictionet::stdlib::session::Action;
 use std::fmt;
 
@@ -164,34 +164,20 @@ impl<const N: usize> Alpha<N> {
     }
     /// The field's exact bytes. Refuses a byte outside 0x20..=0x7e.
     pub fn new(bytes: [u8; N]) -> Result<Self, Error> {
-        if bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
-            Ok(Self(bytes))
-        } else {
-            Err(Error::Field)
-        }
+        field::validate_printable(bytes)
+            .map(Self)
+            .map_err(|_| Error::Field)
     }
     /// `text` padded on the left with spaces, as a session ID is (2.2.1).
     pub fn left_padded(text: &str) -> Result<Self, Error> {
-        let pad = N.checked_sub(text.len()).ok_or(Error::Field)?;
-        let mut bytes = [b' '; N];
-        bytes
-            .get_mut(pad..)
-            .ok_or(Error::Field)?
-            .copy_from_slice(text.as_bytes());
-        Self::new(bytes)
+        field::left_padded(text).map(Self).map_err(|_| Error::Field)
     }
     /// `text` padded on the right with spaces, as a username and password
     /// are (2.3.1).
     pub fn right_padded(text: &str) -> Result<Self, Error> {
-        if text.len() > N {
-            return Err(Error::Field);
-        }
-        let mut bytes = [b' '; N];
-        bytes
-            .get_mut(..text.len())
-            .ok_or(Error::Field)?
-            .copy_from_slice(text.as_bytes());
-        Self::new(bytes)
+        field::right_padded(text)
+            .map(Self)
+            .map_err(|_| Error::Field)
     }
     /// The field's bytes, padding included.
     pub fn as_bytes(&self) -> &[u8; N] {

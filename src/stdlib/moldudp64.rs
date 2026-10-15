@@ -57,7 +57,7 @@
 //! # Ok::<(), fictionet::stdlib::moldudp64::Error>(())
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, field};
 use fictionet::stdlib::session::Action;
 use std::collections::VecDeque;
 use std::fmt;
@@ -142,21 +142,13 @@ pub struct Session([u8; SESSION_LENGTH]);
 impl Session {
     /// The field's exact bytes. Refuses a byte outside 0x20..=0x7e.
     pub fn new(bytes: [u8; SESSION_LENGTH]) -> Result<Self, Error> {
-        if bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
-            Ok(Self(bytes))
-        } else {
-            Err(Error::Field)
-        }
+        field::validate_printable(bytes)
+            .map(Self)
+            .map_err(|_| Error::Field)
     }
     /// `text` padded on the left with spaces.
     pub fn left_padded(text: &str) -> Result<Self, Error> {
-        let pad = SESSION_LENGTH.checked_sub(text.len()).ok_or(Error::Field)?;
-        let mut bytes = [b' '; SESSION_LENGTH];
-        bytes
-            .get_mut(pad..)
-            .ok_or(Error::Field)?
-            .copy_from_slice(text.as_bytes());
-        Self::new(bytes)
+        field::left_padded(text).map(Self).map_err(|_| Error::Field)
     }
     /// The field's bytes, padding included.
     pub fn as_bytes(&self) -> &[u8; SESSION_LENGTH] {

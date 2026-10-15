@@ -279,15 +279,9 @@ impl<const N: usize> Alpha<N> {
     /// `text` padded on the right with spaces. Refuses text longer than
     /// the field or with a byte outside printable ASCII (0x20..=0x7e).
     pub fn right_padded(text: &str) -> Result<Self, Error> {
-        if text.len() > N || !text.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
-            return Err(Error::Field);
-        }
-        let mut bytes = [b' '; N];
-        bytes
-            .get_mut(..text.len())
-            .ok_or(Error::Field)?
-            .copy_from_slice(text.as_bytes());
-        Ok(Self(bytes))
+        field::right_padded(text)
+            .map(Self)
+            .map_err(|_| Error::Field)
     }
     /// The field's bytes, padding included.
     pub fn as_bytes(&self) -> &[u8; N] {

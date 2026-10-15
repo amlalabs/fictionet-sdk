@@ -201,23 +201,15 @@ impl<const N: usize> Alpha<N> {
     }
     /// The field's exact bytes. Refuses a byte outside 0x20..=0x7e.
     pub fn new(bytes: [u8; N]) -> Result<Self, Error> {
-        if bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
-            Ok(Self(bytes))
-        } else {
-            Err(Error::Field)
-        }
+        field::validate_printable(bytes)
+            .map(Self)
+            .map_err(|_| Error::Field)
     }
     /// `text` padded on the right with spaces.
     pub fn right_padded(text: &str) -> Result<Self, Error> {
-        if text.len() > N {
-            return Err(Error::Field);
-        }
-        let mut bytes = [b' '; N];
-        bytes
-            .get_mut(..text.len())
-            .ok_or(Error::Field)?
-            .copy_from_slice(text.as_bytes());
-        Self::new(bytes)
+        field::right_padded(text)
+            .map(Self)
+            .map_err(|_| Error::Field)
     }
     /// The field's bytes, padding included.
     pub fn as_bytes(&self) -> &[u8; N] {
