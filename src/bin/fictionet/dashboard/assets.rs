@@ -1,9 +1,12 @@
 const INDEX_HTML: &str = include_str!("../../../../dashboard/index.html");
 const APP_JS: &str = include_str!("../../../../dashboard/app.mjs");
+const GRAPH_JS: &str = include_str!("../../../../dashboard/graph.mjs");
 const GROUPS_JS: &str = include_str!("../../../../dashboard/groups.mjs");
+const INTERACTION_JS: &str = include_str!("../../../../dashboard/interaction.mjs");
 const LAYOUT_JS: &str = include_str!("../../../../dashboard/layout.mjs");
 const PACKETS_JS: &str = include_str!("../../../../dashboard/packets.mjs");
 const STATE_JS: &str = include_str!("../../../../dashboard/state.mjs");
+const TABLES_JS: &str = include_str!("../../../../dashboard/tables.mjs");
 const TRANSPORT_JS: &str = include_str!("../../../../dashboard/transport.mjs");
 const DOM_JS: &str = include_str!("../../../../dashboard/dom.mjs");
 const APP_CSS: &str = include_str!("../../../../dashboard/app.css");
@@ -14,10 +17,13 @@ pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static str)> {
     match path {
         "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX_HTML)),
         "/app.mjs" => Some(("text/javascript; charset=utf-8", APP_JS)),
+        "/graph.mjs" => Some(("text/javascript; charset=utf-8", GRAPH_JS)),
         "/groups.mjs" => Some(("text/javascript; charset=utf-8", GROUPS_JS)),
+        "/interaction.mjs" => Some(("text/javascript; charset=utf-8", INTERACTION_JS)),
         "/layout.mjs" => Some(("text/javascript; charset=utf-8", LAYOUT_JS)),
         "/packets.mjs" => Some(("text/javascript; charset=utf-8", PACKETS_JS)),
         "/state.mjs" => Some(("text/javascript; charset=utf-8", STATE_JS)),
+        "/tables.mjs" => Some(("text/javascript; charset=utf-8", TABLES_JS)),
         "/transport.mjs" => Some(("text/javascript; charset=utf-8", TRANSPORT_JS)),
         "/dom.mjs" => Some(("text/javascript; charset=utf-8", DOM_JS)),
         "/app.css" => Some(("text/css; charset=utf-8", APP_CSS)),
