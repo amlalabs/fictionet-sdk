@@ -2136,28 +2136,24 @@ impl Decode for Responses {
 }
 
 /// Reads one text unit under its size limit and refuses trailing bytes.
-fn exact_text<D, T>(mut decoder: D, mut bytes: &[u8]) -> Result<T, Error>
+fn exact_text<D, T>(decoder: D, bytes: &[u8]) -> Result<T, Error>
 where
     D: Decode<Item = Result<T, Error>, Error = FrameError>,
 {
     if bytes.len() > MAX_TEXT_UNIT {
         return Err(Error::LineTooLong);
     }
-    loop {
-        match decoder.decode(bytes, true).map_err(|e| match e {
+    codec::decode_exact(
+        decoder,
+        bytes,
+        |e| e,
+        |e| match e {
             FrameError::LineTooLong => Error::LineTooLong,
             FrameError::Incomplete => Error::Incomplete,
-        })? {
-            Step::Item(Err(e), _) => return Err(e),
-            Step::Item(Ok(item), used) if used == bytes.len() => return Ok(item),
-            Step::Item(_, _) => return Err(Error::Trailing),
-            Step::Skip(used) => match bytes.get(used..) {
-                Some(rest) => bytes = rest,
-                None => return Err(Error::Incomplete),
-            },
-            Step::Need | Step::End => return Err(Error::Incomplete),
-        }
-    }
+        },
+        Error::Incomplete,
+        Error::Trailing,
+    )
 }
 
 fn exact_command(bytes: &[u8]) -> Result<Command, Error> {

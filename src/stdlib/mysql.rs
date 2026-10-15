@@ -80,7 +80,9 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire, reserve_bytes};
+use fictionet::stdlib::codec::{
+    Decode, Map, Reader, Step, Truncated, Wire, decode_exact, reserve_bytes,
+};
 
 /// The TCP port MySQL servers listen on.
 pub const PORT: u16 = 3306;
@@ -615,16 +617,14 @@ impl Wire for Message {
     /// Reads exactly one assembled message. Refuses sequence gaps, excess
     /// payload, missing final packets, incomplete packets, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut decoder = Messages::new();
-        let mut rest = bytes;
-        loop {
-            match decoder.decode(rest, true)? {
-                Step::Skip(used) => rest = &rest[used..],
-                Step::Item(value, used) if used == rest.len() => return Ok(value),
-                Step::Item(_, _) => return Err(Error::Trailing),
-                Step::Need | Step::End => return Err(Error::Truncated),
-            }
-        }
+        decode_exact(
+            Map::new(Messages::new(), Ok::<_, core::convert::Infallible>),
+            bytes,
+            |e| match e {},
+            |e| e,
+            Error::Truncated,
+            Error::Trailing,
+        )
     }
 
     /// Appends packets with consecutive sequence IDs and the required

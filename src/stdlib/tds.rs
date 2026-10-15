@@ -88,7 +88,8 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
-    Decode, Reader, Step, Trailing, Truncated, Wire, Work, be16, le16, le32, le64, reserve_bytes,
+    Decode, Map, Reader, Step, Trailing, Truncated, Wire, Work, be16, decode_exact, le16, le32,
+    le64, reserve_bytes,
 };
 
 /// The TCP port SQL Server listens on.
@@ -615,16 +616,14 @@ impl Wire for Message {
     /// Reads one complete message. Refuses invalid packet lengths, a type
     /// change, oversized data, missing EOM, incomplete or trailing packets.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut decoder = Messages::new();
-        let mut rest = bytes;
-        loop {
-            match decoder.decode(rest, true)? {
-                Step::Skip(used) => rest = &rest[used..],
-                Step::Item(value, used) if used == rest.len() => return Ok(value),
-                Step::Item(_, _) => return Err(Error::Trailing),
-                Step::Need | Step::End => return Err(Error::Truncated),
-            }
-        }
+        decode_exact(
+            Map::new(Messages::new(), Ok::<_, core::convert::Infallible>),
+            bytes,
+            |e| match e {},
+            |e| e,
+            Error::Truncated,
+            Error::Trailing,
+        )
     }
 
     /// Appends packets of at most 4096 bytes. Refuses data above
