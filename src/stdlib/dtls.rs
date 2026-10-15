@@ -1543,6 +1543,121 @@ impl Wire for Fragments {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{
+        ClientHello, Datagram, Error, Fragment, Fragments, Handshake, HelloVerifyRequest,
+        MAX_MESSAGE_LEN, MAX_REASSEMBLY_BYTES, Reassembler, Record, ServerHello,
+    };
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks the wire contracts for records, fragments, messages and hellos.
+    pub fn wire(data: &[u8]) {
+        contract::check_wire::<Datagram>(data);
+        contract::check_wire::<Fragment>(data);
+        contract::check_wire::<Fragments>(data);
+        contract::check_wire::<Handshake>(data);
+        contract::check_wire::<ClientHello>(data);
+        contract::check_wire::<ServerHello>(data);
+        contract::check_wire::<HelloVerifyRequest>(data);
+    }
+
+    /// Checks records read with a runtime CID length.
+    pub fn records(data: &[u8], cid_len: u8) {
+        if let Ok(record) = Record::read(data, cid_len) {
+            let datagram = record.datagram(cid_len).unwrap();
+            contract::check_wire_value(&datagram);
+            assert_eq!(datagram.to_bytes().unwrap(), data);
+        }
+        if let Ok(records) = Datagram::read(data, cid_len) {
+            let datagram = Datagram::new(&records, cid_len).unwrap();
+            contract::check_wire_value(&datagram);
+            assert_eq!(datagram.to_bytes().unwrap(), data);
+        }
+    }
+
+    /// Checks records built with a runtime CID length and strict datagrams.
+    pub fn record_values(built: &[Record], cid_len: u8) {
+        for record in built {
+            if let Ok(datagram) = record.datagram(cid_len) {
+                contract::check_wire_value(&datagram);
+                assert_eq!(
+                    Record::read(&datagram.to_bytes().unwrap(), cid_len).as_ref(),
+                    Ok(record)
+                );
+            }
+        }
+        if let Ok(datagram) = Datagram::new(built, cid_len) {
+            contract::check_wire_value(&datagram);
+            assert_eq!(
+                Datagram::read(&datagram.to_bytes().unwrap(), cid_len).as_deref(),
+                Ok(built)
+            );
+        }
+    }
+
+    /// Checks fragment identity, reassembly limits and next-message progress.
+    pub fn fragments(data: &[u8], msg_type: u8) {
+        if let Ok(Fragments(fragments)) = Fragments::parse(data) {
+            let bytes: Vec<u8> = fragments
+                .iter()
+                .flat_map(|f| f.to_bytes().unwrap())
+                .collect();
+            assert_eq!(bytes, data);
+            let mut r = Reassembler::new();
+            for f in &fragments {
+                let _ = r.add(f);
+                assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
+                while let Some(m) = r.next_message() {
+                    let _ = m.parse_body();
+                    contract::check_wire_value(&m);
+                }
+            }
+            let next = Handshake {
+                msg_type,
+                message_seq: r.next_seq(),
+                body: data[..data.len().min(MAX_MESSAGE_LEN)].to_vec(),
+            };
+            match r.add(&next.to_fragment().unwrap()) {
+                Ok(_) => assert!(r.next_message().is_some()),
+                Err(e) => assert_eq!(e, Error::FragmentConflict),
+            }
+            assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
+        }
+    }
+
+    /// Checks a complete message sent in the supplied fragment order.
+    pub fn reassemble(message: &Handshake, fragments: &[Fragment]) {
+        let mut r = Reassembler::new();
+        for f in fragments {
+            contract::check_wire_value(f);
+            let f = Fragment::parse(&f.to_bytes().unwrap()).unwrap();
+            r.add(&f).unwrap();
+        }
+        assert_eq!(r.next_message().as_ref(), Some(message));
+        assert_eq!(r.buffered(), 0);
+    }
+
+    /// Checks hello body identity and public accessors.
+    pub fn hellos(data: &[u8]) {
+        if let Ok(h) = ClientHello::parse(data) {
+            assert_eq!(h.to_bytes().unwrap(), data);
+            assert!(!h.cipher_suites.is_empty() && !h.compression_methods.is_empty());
+            let _ = h.supported_versions();
+        }
+        if let Ok(h) = ServerHello::parse(data) {
+            assert_eq!(h.to_bytes().unwrap(), data);
+            let _ = (h.selected_version(), h.is_hello_retry_request());
+        }
+        if let Ok(h) = HelloVerifyRequest::parse(data) {
+            assert_eq!(h.to_bytes().unwrap(), data);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn fixture_handshake(msg_type: u8, message_seq: u16, body: Vec<u8>) -> Handshake {
@@ -2533,6 +2648,7 @@ mod tests {
                 cid_record(vec![0xa5; usize::from(cid_len)]),
                 unified(Some(vec![0x5a; usize::from(cid_len)]), true, vec![7; 16]),
             ];
+            harness::record_values(&records, cid_len);
             let datagram = Datagram::new(&records, cid_len).unwrap();
             let bytes = datagram.to_bytes().unwrap();
             assert_eq!(Datagram::read(&bytes, cid_len).unwrap(), records);
@@ -2685,57 +2801,6 @@ mod tests {
         assert_eq!(sh.to_bytes(), Err(Error::Unwritable));
     }
 
-    /// Checks every reader on `b`, and that what they read writes back to
-    /// bytes that read the same.
-    fn check(b: &[u8], cid_len: u8) {
-        contract::check_wire::<Datagram>(b);
-        if let Ok(record) = Record::read(b, cid_len) {
-            let datagram = record.datagram(cid_len).unwrap();
-            contract::check_wire_value(&datagram);
-            assert_eq!(datagram.to_bytes().unwrap(), b);
-        }
-        if let Ok(records) = Datagram::read(b, cid_len) {
-            let datagram = Datagram::new(&records, cid_len).unwrap();
-            contract::check_wire_value(&datagram);
-            assert_eq!(datagram.to_bytes().unwrap(), b);
-        }
-        contract::check_wire::<Fragment>(b);
-        contract::check_wire::<Handshake>(b);
-        contract::check_wire::<ClientHello>(b);
-        contract::check_wire::<ServerHello>(b);
-        contract::check_wire::<HelloVerifyRequest>(b);
-        if let Ok(frags) = Fragments::parse(b).map(|fragments| fragments.0) {
-            let bytes: Vec<u8> = frags.iter().flat_map(|f| f.to_bytes().unwrap()).collect();
-            assert_eq!(bytes, b);
-            let mut r = Reassembler::new();
-            for f in &frags {
-                let _ = r.add(f);
-                assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
-                while let Some(m) = r.next_message() {
-                    let _ = m.parse_body();
-                }
-            }
-            // The next message expected still goes in.
-            let next = fixture_handshake(1, r.next_seq(), b.to_vec());
-            match r.add(&next.to_fragment().unwrap()) {
-                Ok(_) => assert!(r.next_message().is_some()),
-                Err(e) => assert_eq!(e, Error::FragmentConflict),
-            }
-        }
-        if let Ok(ch) = ClientHello::parse(b) {
-            assert_eq!(ch.to_bytes().unwrap(), b);
-            assert!(!ch.cipher_suites.is_empty() && !ch.compression_methods.is_empty());
-            let _ = ch.supported_versions();
-        }
-        if let Ok(sh) = ServerHello::parse(b) {
-            assert_eq!(sh.to_bytes().unwrap(), b);
-            let _ = (sh.selected_version(), sh.is_hello_retry_request());
-        }
-        if let Ok(h) = HelloVerifyRequest::parse(b) {
-            assert_eq!(h.to_bytes().unwrap(), b);
-        }
-    }
-
     #[test]
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x4454_4c53);
@@ -2783,10 +2848,13 @@ mod tests {
             if Record::read(&b, 0).is_ok() || Fragment::parse(&b).is_ok() {
                 parsed += 1;
             }
-            check(&b, 0);
-            check(&b, 1);
-            check(&b, 8);
-            check(&b, rng.next() as u8);
+            harness::wire(&b);
+            harness::records(&b, 0);
+            harness::records(&b, 1);
+            harness::records(&b, 8);
+            harness::records(&b, rng.next() as u8);
+            harness::fragments(&b, 1);
+            harness::hellos(&b);
 
             // Random messages, split into random fragments, passed in a random
             // order with repeats, and one byte at a time, come back whole.
@@ -2801,18 +2869,8 @@ mod tests {
                 let again = parts[rng.index(parts.len())].clone();
                 parts.push(again);
             }
-            let mut r = Reassembler::new();
-            for f in &parts {
-                let f = Fragment::parse(&f.to_bytes().unwrap()).unwrap();
-                r.add(&f).unwrap();
-            }
-            assert_eq!(r.next_message().as_ref(), Some(&m));
-            let mut r = Reassembler::new();
-            for f in m.fragments(1).unwrap() {
-                r.add(&f).unwrap();
-            }
-            assert_eq!(r.next_message(), Some(m));
-            assert_eq!(r.buffered(), 0);
+            harness::reassemble(&m, &parts);
+            harness::reassemble(&m, &m.fragments(1).unwrap());
         }
         assert!(parsed > 500, "only {parsed} buffers read");
     }

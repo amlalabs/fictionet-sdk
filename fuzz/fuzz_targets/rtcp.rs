@@ -14,24 +14,11 @@ use fictionet::stdlib::rtcp::{
     App, Body, Bye, Compound, Datagram, DlrrItem, ExtendedReport, Fir, MAX_DATAGRAM, MAX_PACKET,
     Nack, Packet, PayloadFeedback, PayloadMessage, ReceiverReport, Remb, ReportBlock, Rpsi,
     SdesChunk, SdesItem, SenderReport, Sli, Tmmb, TransportFeedback, TransportMessage, XrBlock,
-    check_compound, classify,
+    harness::datagram,
 };
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
-fn datagram(data: &[u8]) {
-    let _ = classify(data);
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<Datagram>(data);
-    contract::check_wire::<Compound>(data);
-    if let Ok(packets) = Datagram::parse(data) {
-        assert_eq!(packets.to_bytes().unwrap().len(), data.len());
-        assert_eq!(
-            Compound::parse(data).is_ok(),
-            check_compound(&packets.0).is_ok()
-        );
-    }
-}
 
 /// Payload bytes: usually up to 40 fuzz bytes, sometimes one byte repeated
 /// up to past the longest packet, to test the writers' size limits.

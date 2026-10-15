@@ -1872,6 +1872,33 @@ fn check_size(n: usize) -> Result<(), Error> {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Compound, Datagram, Packet, check_compound, classify};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Reads `data` every way there is, and checks what reads writes back
+    /// and reads the same.
+    pub fn datagram(data: &[u8]) {
+        let _ = classify(data);
+        if let Ok(packets) = Datagram::parse(data).map(|p| p.0) {
+            let bytes = Datagram(packets.to_vec()).to_bytes().unwrap();
+            assert_eq!(bytes.len(), data.len());
+            assert_eq!(Datagram::parse(&bytes).map(|p| p.0), Ok(packets.clone()));
+            assert_eq!(
+                Compound::parse(data).map(|p| p.0).is_ok(),
+                check_compound(&packets).is_ok()
+            );
+        }
+        contract::check_wire::<Packet>(data);
+        contract::check_wire::<Datagram>(data);
+        contract::check_wire::<Compound>(data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3179,24 +3206,6 @@ mod tests {
         });
     }
 
-    /// Reads `data` every way there is, and checks what reads writes back
-    /// and reads the same.
-    fn check(data: &[u8]) {
-        let _ = classify(data);
-        if let Ok(packets) = Datagram::parse(data).map(|p| p.0) {
-            let bytes = Datagram(packets.to_vec()).to_bytes().unwrap();
-            assert_eq!(bytes.len(), data.len());
-            assert_eq!(Datagram::parse(&bytes).map(|p| p.0), Ok(packets.clone()));
-            assert_eq!(
-                Compound::parse(data).map(|p| p.0).is_ok(),
-                check_compound(&packets).is_ok()
-            );
-        }
-        contract::check_wire::<Packet>(data);
-        contract::check_wire::<Datagram>(data);
-        contract::check_wire::<Compound>(data);
-    }
-
     /// A packet built from random numbers, often out of range.
     fn random_packet(r: &mut Lcg) -> Packet {
         let n = |r: &mut Lcg, max: usize| r.index(max + 1);
@@ -3409,7 +3418,7 @@ mod tests {
                 d.truncate(d.len().saturating_sub(r.index(3)));
                 d
             };
-            check(&data);
+            harness::datagram(&data);
             let mut bytes = Frame(data.clone()).to_bytes().unwrap();
             bytes.extend_from_slice(&data);
             contract::check_decode_with_alloc_limit(
