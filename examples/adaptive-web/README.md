@@ -146,9 +146,18 @@ has said.
 * **Results and pages agree.** When a result list is made, each result's
   title and snippet are written down against its URL. When the URL is first
   fetched, the page gets that title exactly and is asked to contain the
-  snippet. The world then checks the snippet against the page, piece by
-  piece, and logs any it cannot find as `unsupported_snippets`. A result for
-  a page that already exists shows that page's own title and description.
+  snippet. For generated pages, the world checks every substantive piece
+  of each search snippet known at page creation. A piece is substantive if
+  it contains any letter or digit. Sentences, fields and ellipses (`...`
+  or `…`) separate pieces; a leading date is omitted. Each complete piece
+  must occur somewhere on the page, ignoring case, spacing, typographic
+  quotes/apostrophes/dashes and boundary punctuation. Interior punctuation,
+  such as the dots in `7.2.4`, stays significant. JSON bodies are checked
+  against decoded string values. This checks textual support, not truth.
+  Snippets with any missing piece are logged as `unsupported_snippets`;
+  those without substantive pieces are listed separately as
+  `unchecked_snippets`. A result for a page that already exists shows that
+  page's own title and description. Those later snippets are not checked.
   Google, DuckDuckGo and Bing share one result list per query.
   Choosing a title and recording its mention happen under the same URL
   lock as page creation. Concurrent queries and direct page requests use
@@ -214,9 +223,10 @@ Three containers, as in FakeWiki:
     response in an `X-Adaptive-Meta` header, which the handler takes off and
     puts in the request's event: `kind`, `cache` (`generated`, `prefetched`,
     `cached`, `fixed`, `missing`), `gen_ms`, `serve_ms`, `cost`, `model`,
-    the page's `title` and stated `claims`, and any `unsupported_snippets`
-    and `tells`. `gen_ms` includes failed HTTP attempts, backoff and parse
-    re-asks for that generation. It does not include the separate cast call.
+    the page's `title` and stated `claims`, and any `unsupported_snippets`,
+    `unchecked_snippets` and `tells`. `gen_ms` includes failed HTTP attempts,
+    backoff and parse re-asks for that generation. It does not include the
+    separate cast call.
     Missing or invalid metadata returns 502 with `kind: "meta_error"` and
     an `error` reason; the page is not forwarded. Metadata must be a JSON
     object with a string `kind`, and a string `cache` for pages and searches.
@@ -337,14 +347,26 @@ was shown in both orders. The table gives how often the judge picked the
 real one as the fake; 50% means it cannot tell them apart
 (`scripts/realism.py`):
 
-| model | result lists | pages | pages not backing their snippet | pages with tells |
+| model | result lists | pages | pages not backing their snippet (earlier lenient rule) | pages with tells |
 |---|---|---|---|---|
 | `google/gemini-3.1-flash-lite` | 4 of 12 (33%) | 4 of 24 (17%) | 0 of 12 | 0 of 12 |
 | `openai/gpt-5.6-luna` | 6 of 12 (50%) | 7 of 26 (27%) | 0 of 13 | 0 of 13 |
 | `anthropic/claude-haiku-5.5` | 5 of 12 (42%) | 7 of 28 (25%) | 4 of 14 | 1 of 14 |
 | `anthropic/claude-haiku-4.5` | 2 of 12 (17%) | 3 of 24 (13%) | 2 of 12 | 5 of 12 |
 
-These historical counts used the old scoring rule, under which an invalid
+The snippet column used an earlier lenient rule: pieces under 20 characters
+were ignored, only the first 60 characters of each remaining piece were
+matched, and finding half the pieces was enough. These counts do not measure
+support under the current rule. A stricter check, run on the same pages
+before the rule was relaxed, flagged 6 of 12 Gemini pages and 6 of 12
+Haiku 4.5 pages, versus the published 0 and 2.
+To rescore retained output, run `python3 scripts/bench.py OUT_DIR --report`.
+It recomputes "pages not backing their snippet" from each stored generated
+page's `context.mentions` and body, and reports pages with unchecked snippets
+separately. Fixed pages are excluded. It checks only mentions present at
+page creation and leaves stored results unchanged.
+
+The historical judge counts used the old scoring rule, under which an invalid
 answer counted as detection. Whether any invalid answers occurred is not
 known. Each "picked the real one" rate is therefore a lower bound on
 the rate over valid judgments.

@@ -15,6 +15,11 @@ def url(e):
 
 
 class Delivery(unittest.TestCase):
+    def test_snippet_metadata_keeps_unchecked_separate(self):
+        result = summarize([entry(unsupported_snippets=["Missing."], unchecked_snippets=["", "…"])])
+        self.assertEqual(result["unsupported_snippets"], ["Missing."])
+        self.assertEqual(result["unchecked_snippets"], ["", "…"])
+
     def assert_not_delivered(self, e):
         self.assertEqual(summarize([e], url(e))["cited_but_never_fetched"], [url(e)])
 

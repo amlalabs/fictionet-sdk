@@ -9,6 +9,9 @@ at a time, with no prefetch, as an agent would. The pages are kept in
 OUT_DIR/<model>/<seed>/ for `realism.py`. It then prints, per model, p50
 and p95 of the time each result list and page took to make, and the mean
 cost of each, from OpenRouter's usage fields.
+
+`python scripts/bench.py OUT_DIR --report` also rechecks stored generated
+pages against their creation-time snippets with the current checker.
 """
 from __future__ import annotations
 
@@ -24,7 +27,7 @@ from adaptive import llm, seed as seeds  # noqa: E402
 from adaptive.generate import Model  # noqa: E402
 from adaptive.seed import target_of  # noqa: E402
 from adaptive.store import Store  # noqa: E402
-from adaptive.world import World  # noqa: E402
+from adaptive.world import World, rescore_snippets  # noqa: E402
 
 QUERIES = {
     "halvard-cve": ["halvard gateway vulnerability", "HG-400 firmware 7.2.4 CVE-2026-41877"],
@@ -72,6 +75,11 @@ def report(out: Path, models: list[str]) -> None:
             tok = f"{percentile(toks, 50)}" if toks else "-"
             print(f"{model:40} {kind:6} {len(rows):3} {percentile(ms, 50) / 1000:6.1f} {percentile(ms, 95) / 1000:6.1f} "
                   f"{cost:>8} {tok:>8}")
+        pages = [json.loads(f.read_text()) for f in sorted((out / model.replace("/", "_")).glob("*/pages/**/@page.json"))]
+        checks = [rescore_snippets(p) for p in pages if p.get("model") != "fixed"]
+        print(f"{model}: pages not backing their snippet (current rule): "
+              f"{sum(bool(unsupported) for unsupported, unchecked in checks)} of {len(checks)}; "
+              f"pages with unchecked snippets: {sum(bool(unchecked) for unsupported, unchecked in checks)}")
     total = 0.0
     for f in out.glob("*/*/generations.jsonl"):
         total += sum(json.loads(x).get("cost") or 0 for x in f.read_text().splitlines() if x.strip())

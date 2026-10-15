@@ -15,7 +15,8 @@ Every request is one of:
 
 The consistency rules live here: a page takes the title its first mention
 showed, a result for a URL the world already knows shows what the world
-said about it, and every snippet is checked against the page behind it.
+said about it, and search snippets known when a generated page is created
+are checked for textual support in that page.
 Searches reserve that title under the same URL lock as page creation, so
 concurrent searches and direct page requests publish one title.
 
@@ -26,9 +27,11 @@ from __future__ import annotations
 
 import base64
 import html
+import json
 import re
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urljoin
@@ -63,32 +66,88 @@ def text_of(markup: str) -> str:
     return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", markup)).split())
 
 
-def snippet_core(snippet: str) -> str:
-    """A snippet without its ellipses and a leading date, the part that must
-    appear on the page word for word."""
-    s = snippet.replace("...", " ").replace("…", " ")
-    s = re.sub(r"^\s*(\w{3} \d{1,2}, \d{4}|\d+ (days?|hours?) ago)\s*[—–-]\s*", "", s)
-    return " ".join(s.split())
+def normalize_snippet(text: str) -> str:
+    """Ignore case, spacing and typographic quotes, apostrophes and dashes."""
+    text = text.translate(str.maketrans({**dict.fromkeys("‘’‚‛", "'"),
+                                       **dict.fromkeys('“”„‟', '"'),
+                                       **dict.fromkeys("‐‑‒–—―", "-")}))
+    return " ".join(text.lower().split())
 
 
-def unsupported_snippets(mentions: list[dict], page_text: str) -> list[str]:
-    """The search snippets for a page that the page does not back up.
+def snippet_pieces(snippet: str) -> list[str]:
+    """Complete substantive pieces, separated by sentences, fields or ellipses.
 
-    A snippet is often stitched together from several places on the page
-    ("12 replies. Kwame Osei: Just finished ..."), so it is split into
-    sentences and fields, and each piece of 20 characters or more is looked
-    for on the page by its first 60 characters, ignoring case and spacing.
-    A snippet is backed up when at least half of its pieces are found."""
-    text = " ".join(page_text.split()).lower()
-    out = []
+    A leading date is a boundary. Strip boundary punctuation from each piece;
+    keep interior punctuation, including version numbers. Any letter or digit
+    makes a piece substantive, with no minimum length."""
+    text = normalize_snippet(snippet)
+    text = re.sub(r"^((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec) \d{1,2}, \d{4}|"
+                  r"\d+ (days?|hours?) ago)\s*-\s*", "", text)
+    pieces = []
+    for piece in re.split(r"\.{3,}|…+|(?<=[.!?:])\s+|(?<=\s)[|·](?=\s)", text):
+        while piece and (piece[0].isspace() or unicodedata.category(piece[0]).startswith("P")):
+            piece = piece[1:]
+        while piece and (piece[-1].isspace() or unicodedata.category(piece[-1]).startswith("P")):
+            piece = piece[:-1]
+        if any(c.isalnum() for c in piece):
+            pieces.append(piece)
+    return pieces
+
+
+def check_snippets(mentions: list[dict], page_text: str | list[str]) -> tuple[list[str], list[str]]:
+    """Return unsupported and unchecked search snippets separately.
+
+    Every complete substantive piece must occur somewhere in the page text.
+    JSON string values are checked separately. This is textual matching, not
+    fact checking. Snippets without substantive pieces are unchecked."""
+    texts = [normalize_snippet(t) for t in ([page_text] if isinstance(page_text, str) else page_text)]
+    if not isinstance(mentions, list) or any(not isinstance(m, dict) for m in mentions):
+        raise ValueError("snippet mentions must be a list of objects")
+    unsupported, unchecked = [], []
     for m in mentions:
-        if m.get("via") != "search" or not m.get("snippet"):
+        if m["via"] == "link":
             continue
-        pieces = [p for p in re.split(r"(?<=[.!?:])\s+|\s+[|·]\s+", snippet_core(m["snippet"])) if len(p) >= 20]
-        found = sum(" ".join(p.split())[:60].lower() in text for p in pieces)
-        if pieces and found * 2 < len(pieces):
-            out.append(m["snippet"])
-    return out
+        if m["via"] != "search":
+            raise ValueError("snippet mention must come via search or link")
+        snippet = m.get("snippet", "")
+        if not isinstance(snippet, str):
+            raise ValueError("search snippet must be a string")
+        pieces = snippet_pieces(snippet)
+        if not pieces:
+            unchecked.append(snippet)
+        elif not all(any(piece in text for text in texts) for piece in pieces):
+            unsupported.append(snippet)
+    return unsupported, unchecked
+
+
+def json_strings(value) -> list[str]:
+    """The decoded string values in a JSON body, excluding object keys."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in json_strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in json_strings(v)]
+    return []
+
+
+def rescore_snippets(record: dict) -> tuple[list[str], list[str]]:
+    """Check a generated page's creation-time mentions against its stored body.
+
+    Ignore previously recorded check results. Missing fields and invalid JSON
+    are errors, so incomplete records cannot be reported as supported."""
+    body = record["body"]
+    content_type = record["content_type"]
+    if not isinstance(body, str) or not isinstance(content_type, str) or not content_type.strip():
+        raise ValueError("snippet check requires a text body and content type")
+    ctype = content_type.split(";", 1)[0].strip().lower()
+    if ctype == "text/html":
+        text = text_of(body)
+    elif ctype == "application/json" or ctype.endswith("+json"):
+        text = json_strings(json.loads(body))
+    else:
+        text = body
+    return check_snippets(record["context"]["mentions"], text)
 
 
 LINK = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"'#]+)[^"']*["'][^>]*>(.*?)</a>""", re.I | re.S)
@@ -266,7 +325,8 @@ class World:
         meta = {"kind": "page", "cache": cache, "title": record.get("title"), "model": record.get("model"),
                 "prefetched": bool(record.get("prefetched")), "claims": record.get("claims", []),
                 "mentions": len(record.get("context", {}).get("mentions", [])),
-                "unsupported_snippets": record.get("unsupported_snippets", []), "tells": record.get("tells", [])}
+                "unsupported_snippets": record.get("unsupported_snippets", []),
+                "unchecked_snippets": record.get("unchecked_snippets", []), "tells": record.get("tells", [])}
         if cache != "cached":
             meta |= {"gen_ms": record.get("gen_ms"), "cost": record.get("cost")}
         profile = self.store.site(host)
@@ -321,12 +381,13 @@ class World:
         if prefetch:
             with self.unserved_lock:
                 self.unserved.add((host, target))
-        return {"url": url, "status": page["status"], "content_type": page["content_type"], "title": page["title"],
-                "description": page.get("description", ""), "date": page.get("date", ""), "claims": page["claims"],
-                "body": body, **made.usage(), "prefetched": prefetch, "created": time.time(),
-                "context": {"mentions": mentions},
-                "unsupported_snippets": unsupported_snippets(mentions, text_of(page["body"]) if is_html else body),
-                "tells": tells.find(text_of(page["body"]) if is_html else body)}
+        record = {"url": url, "status": page["status"], "content_type": page["content_type"], "title": page["title"],
+                  "description": page.get("description", ""), "date": page.get("date", ""), "claims": page["claims"],
+                  "body": body, **made.usage(), "prefetched": prefetch, "created": time.time(),
+                  "context": {"mentions": mentions},
+                  "tells": tells.find(text_of(page["body"]) if is_html else body)}
+        record["unsupported_snippets"], record["unchecked_snippets"] = rescore_snippets(record)
+        return record
 
     def _note_links(self, url: str, markup: str) -> None:
         """Writes down every link of a page as a mention of its target, so a

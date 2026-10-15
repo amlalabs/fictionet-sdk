@@ -31,7 +31,7 @@ from adaptive.generate import Made, Model
 from adaptive.seed import target_of
 from adaptive.store import Error as StoreError, Store, url_parts
 from adaptive.stub import Stub
-from adaptive.world import World, snippet_core, text_of, unsupported_snippets
+from adaptive.world import World, check_snippets, rescore_snippets, snippet_pieces, text_of
 
 SEEDS = Path(__file__).resolve().parents[3] / "seeds"
 SEED = seeds.load(seeds.find("halvard-cve", SEEDS))
@@ -182,15 +182,119 @@ class Consistency(unittest.TestCase):
 
     def test_snippet_checks(self):
         mention = {"via": "search", "snippet": "Oct 3, 2026 — Halvard has released firmware 7.2.4, which fixes ..."}
-        self.assertEqual(snippet_core(mention["snippet"]), "Halvard has released firmware 7.2.4, which fixes")
-        self.assertEqual(unsupported_snippets([mention], "Today Halvard has released  firmware 7.2.4, which fixes it"), [])
-        self.assertEqual(unsupported_snippets([mention], "Halvard released 7.2.4"), [mention["snippet"]])
+        self.assertEqual(snippet_pieces(mention["snippet"]), ["halvard has released firmware 7.2.4, which fixes"])
+        self.assertEqual(check_snippets([mention], "Today Halvard has released  firmware 7.2.4, which fixes it"), ([], []))
+        self.assertEqual(check_snippets([mention], "Halvard released 7.2.4"), ([mention["snippet"]], []))
+
+    def test_stitched_fragments_present(self):
         # A snippet stitched from a thread's header and its first post.
         stitched = {"via": "search", "snippet": "12 replies. Kwame Osei: Just finished the HG-900 updates last night. "
                                                 "Any issues with the 7.2.4 release so far?"}
         page = ("Kwame Osei | Oct 5 Just finished the HG-900 updates last night. "
                 "Any issues with the 7.2.4 release so far? 12 replies")
-        self.assertEqual(unsupported_snippets([stitched], page), [])
+        self.assertEqual(check_snippets([stitched], page), ([], []))
+
+    def test_half_missing_snippet(self):
+        present = "Halvard released firmware 7.2.4 for the gateway."
+        snippet = present + " The release also fixes the remote access vulnerability."
+        self.assertEqual(check_snippets([{"via": "search", "snippet": snippet}], present), ([snippet], []),
+                         "Every fragment must match; finding half is not enough")
+
+    def test_unsupported_short_claim(self):
+        for snippet in ("HG-400 7.2.4 fix. CVE-2026-41877.", "X", "7"):
+            with self.subTest(snippet=snippet):
+                self.assertEqual(check_snippets([{"via": "search", "snippet": snippet}], ""), ([snippet], []),
+                                 "Even one letter or digit is substantive; no length cutoff")
+
+    def test_contradiction_after_60_chars(self):
+        prefix = "The vendor's advisory for the affected Halvard gateways confirms that "
+        self.assertGreater(len(prefix), 60)
+        snippet = prefix + "firmware 7.2.4 fixes the vulnerability."
+        page = prefix + "firmware 7.2.4 does not fix the vulnerability."
+        self.assertEqual(check_snippets([{"via": "search", "snippet": snippet}], page), ([snippet], []),
+                         "The full fragment must match, including the suffix after character 60")
+
+    def test_empty_snippet_unchecked(self):
+        for snippet in ("", " ... … !? ", "Oct 3, 2026 — ..."):
+            with self.subTest(snippet=snippet):
+                self.assertEqual(check_snippets([{"via": "search", "snippet": snippet}], "anything"),
+                                 ([], [snippet]))
+        self.assertEqual(check_snippets([{"via": "search"}, {"via": "link"}], "anything"), ([], [""]))
+
+    def test_snippet_presentation_and_boundaries(self):
+        snippet = 'Oct 3, 2026 — “Vendor’s HG‑400” ... Firmware 7.2.4 … READY! | Details: 2 replies.'
+        self.assertEqual(snippet_pieces(snippet),
+                         ["vendor's hg-400", "firmware 7.2.4", "ready", "details", "2 replies"])
+        page = "Details | 2 replies | Ready | Firmware\n7.2.4 installed | Vendor's HG-400 gateway"
+        self.assertEqual(check_snippets([{"via": "search", "snippet": snippet}], page), ([], []))
+        for page in ("HG-400 724 fix", "HG-400 7 2 4 fix"):
+            snippet = "HG-400 7.2.4 fix."
+            self.assertEqual(check_snippets([{"via": "search", "snippet": snippet}], page), ([snippet], []),
+                             "Interior punctuation is substantive")
+        for snippet in ("Absent author: Firmware 7.2.4", "99 replies. Firmware 7.2.4"):
+            self.assertEqual(check_snippets([{"via": "search", "snippet": snippet}], "Firmware 7.2.4"), ([snippet], []),
+                             "Labels and reply counts must not be discarded")
+
+    def test_rescore_snippets_uses_body_and_creation_mentions(self):
+        record = {"context": {"mentions": [{"via": "search", "snippet": "Missing."},
+                                            {"via": "search", "snippet": "…"}]},
+                  "body": "<p>Present.</p>", "content_type": "text/html; charset=utf-8",
+                  "unsupported_snippets": [], "unchecked_snippets": []}
+        self.assertEqual(rescore_snippets(record), (["Missing."], ["…"]))
+        record["body"] = "<p>Missing.</p>"
+        self.assertEqual(rescore_snippets(record), ([], ["…"]))
+        for key in ("body", "content_type", "context"):
+            with self.subTest(key=key), self.assertRaises(KeyError):
+                rescore_snippets({k: v for k, v in record.items() if k != key})
+        for changes in ({"body": ["Missing."]}, {"body": {"Missing.": 1}},
+                        {"content_type": None}, {"content_type": ""}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                rescore_snippets(record | changes)
+        record["context"] = {}
+        with self.assertRaises(KeyError):
+            rescore_snippets(record)
+        for mentions in ({}, None, ["snippet"], [{"via": None, "snippet": "Missing."}],
+                         [{"via": "search", "snippet": None}]):
+            record["context"] = {"mentions": mentions}
+            with self.subTest(mentions=mentions), self.assertRaises(ValueError):
+                rescore_snippets(record)
+
+    def test_json_snippets_use_decoded_string_values(self):
+        snippet = 'Renée said "fixed" … Firmware 7.2.4'
+        record = {"context": {"mentions": [{"via": "search", "snippet": snippet}]},
+                  "body": json.dumps({"notes": ['Renée said "fixed"', {"version": "Firmware 7.2.4"}]}),
+                  "content_type": "application/json; charset=utf-8"}
+        for ctype in ("application/json", "application/problem+json"):
+            record["content_type"] = ctype
+            self.assertEqual(rescore_snippets(record), ([], []))
+        for body in (json.dumps({snippet: 1}), json.dumps(["Renée said", '"fixed"', "Firmware 7.2.4"])):
+            record["body"] = body
+            self.assertEqual(rescore_snippets(record), ([snippet], []))
+        record["body"] = "not JSON"
+        with self.assertRaises(json.JSONDecodeError):
+            rescore_snippets(record)
+
+    def test_snippet_results_stored_and_returned(self):
+        supported = 'Renée said "fixed".'
+        for ctype, body in (("text/html", f"<p>{supported}</p>"),
+                            ("application/json", json.dumps({"message": supported})),
+                            ("text/plain", supported)):
+            with self.subTest(ctype=ctype), tempfile.TemporaryDirectory() as d:
+                w = world(Path(d))
+                for snippet in (supported, "Missing.", "…"):
+                    w.store.add_mention("example.com", "/page", {"via": "search", "snippet": snippet})
+                made = Made({"status": 200, "content_type": ctype, "body": body, "title": "Title",
+                             "claims": [], "sidebar": [], "ad": ""}, "test", 0)
+                with patch.object(w.generator, "page", return_value=made):
+                    for cache in ("generated", "cached"):
+                        response = w.page("example.com", "/page")
+                        self.assertEqual(response.meta["cache"], cache)
+                        self.assertEqual(response.meta["unsupported_snippets"], ["Missing."])
+                        self.assertEqual(response.meta["unchecked_snippets"], ["…"])
+                record = w.store.page("example.com", "/page")
+                self.assertEqual(record["unsupported_snippets"], ["Missing."])
+                self.assertEqual(record["unchecked_snippets"], ["…"])
+                self.assertEqual(rescore_snippets(record), (["Missing."], ["…"]))
 
 
 RACE_HOST = "race.example-site.com"

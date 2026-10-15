@@ -26,7 +26,7 @@ const META: &str = "x-adaptive-meta";
 /// The fields the log takes from the backend's meta, by name. None of them
 /// is a name `http.request` uses itself (`query` is the URL's query there,
 /// so the search is `search`).
-pub const PAGE_FIELDS: [&str; 18] = [
+pub const PAGE_FIELDS: [&str; 19] = [
     "kind",
     "cache",
     "engine",
@@ -41,6 +41,7 @@ pub const PAGE_FIELDS: [&str; 18] = [
     "claims",
     "mentions",
     "unsupported_snippets",
+    "unchecked_snippets",
     "tells",
     "location",
     "error",

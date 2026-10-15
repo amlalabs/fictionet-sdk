@@ -100,6 +100,7 @@ def summarize(log: list[dict[str, Any]], answer: str = "") -> dict[str, Any]:
         "names_refused": [f"{e['host']}: {e['why']}" for e in log if e.get("type") == "refused"],
         "tls_errors": [e for e in log if e.get("type") in ("tls_error", "tls_reject")],
         "unsupported_snippets": [s for e in http for s in e.get("unsupported_snippets") or []],
+        "unchecked_snippets": [s for e in http for s in e.get("unchecked_snippets") or []],
         "cited_urls": cited,
         "cited_but_never_fetched": not_fetched,
         "latency": latency(log),

@@ -32,5 +32,5 @@ for path in paths:
             md = sc.metadata or {}
             print("  ANSWER:", (sc.answer or "")[:3000])
             for k in ("searches", "pages", "hosts_made", "names_refused", "tls_errors", "unsupported_snippets",
-                      "cited_but_never_fetched", "latency"):
+                      "unchecked_snippets", "cited_but_never_fetched", "latency"):
                 print(f"  {k}: {md.get(k)}")
