@@ -57,7 +57,7 @@ if [ ! -f "$assets_iso" ]; then
 fi
 genisoimage -quiet -output "$run/run.iso" -volid FNRUN -rock -graft-points \
     "fictionet=$target/release/fictionet" "web_fixture=$target/release/examples/web_fixture" \
-    "nested-l1.sh=$here/nested-l1.sh" "l2-check.sh=$here/l2-check.sh"
+    "nested-l1.sh=$here/nested-l1.sh" "l2-check.sh=$here/l2-check.sh" "results.sh=$here/results.sh"
 
 cat > "$run/user-data" <<'EOF'
 #cloud-config
@@ -70,15 +70,26 @@ qemu-img create -q -f qcow2 -b "$prepared_l1" -F qcow2 "$run/l1.qcow2"
 
 echo "booting L1"
 t0=$(date +%s)
+status=0
 timeout 1200 "${qemu_base[@]}" -m 5G -smp 4 \
     -serial "file:$run/l1-console.log" -serial "file:$run/l1-out.txt" \
     -drive "file=$run/l1.qcow2,if=virtio" \
     -drive "file=$run/seed.iso,if=virtio,media=cdrom,readonly=on" \
     -drive "file=$assets_iso,if=virtio,media=cdrom,readonly=on" \
     -drive "file=$run/run.iso,if=virtio,media=cdrom,readonly=on" \
-    -nic none || true
+    -nic none || status=$?
 echo "L1 ran for $(($(date +%s) - t0)) s"
-tr -d '\r' < "$run/l1-out.txt"
+if [ -f "$run/l1-out.txt" ]; then
+    tr -d '\r' < "$run/l1-out.txt"
+else
+    echo "(no output from L1)"
+fi
+if [ "$status" != 0 ]; then
+    echo "FAIL: L1: QEMU exited with status $status; the logs are in $run"
+    trap - EXIT
+    if [ -f "$run/l1-console.log" ]; then tail -40 "$run/l1-console.log"; fi
+    exit 1
+fi
 
 passed=$(grep -c '^PASS: ' "$run/l1-out.txt" || true)
 failed=$(grep -c '^FAIL: ' "$run/l1-out.txt" || true)

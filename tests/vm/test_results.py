@@ -1,4 +1,4 @@
-"""Offline fixtures for the VM result protocol, using the guest transcript format."""
+"""Offline fixtures for the VM result protocol and emulator completion checks."""
 
 from pathlib import Path
 import runpy
@@ -185,6 +185,66 @@ results_end
                                  cwd=directory, capture_output=True, text=True)
             self.assertEqual(run.returncode, 1)
             self.assertIn("No such file", run.stderr)
+
+
+class EmulatorEnded(unittest.TestCase):
+    def check(self, transcript, status):
+        script = r'''
+source "$1"
+failures=0
+fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
+results_emulator_ended fixture "$2" "$3" "$4" "$5"
+echo "checks continued"
+if [ "$failures" -gt 0 ]; then exit 1; fi
+'''
+        with TemporaryDirectory() as directory:
+            out = Path(directory) / "guest.txt"
+            out.write_bytes(transcript.encode("utf-8"))
+            vmm_log = Path(directory) / "vmm.log"
+            vmm_log.write_text("emulator diagnostic\n", encoding="utf-8")
+            console = Path(directory) / "console.log"
+            console.write_text("console diagnostic\n", encoding="utf-8")
+            run = subprocess.run(["bash", "-euo", "pipefail", "-c", script, "host",
+                                  str(HERE / "results.sh"), str(status), str(out),
+                                  str(vmm_log), str(console)], capture_output=True, text=True)
+        self.assertEqual(run.stderr, "")
+        self.assertIn("checks continued\n", run.stdout)
+        return run
+
+    def test_complete(self):
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=newline):
+                run = self.check(newline.join(("=== guest begin", "[exit 0]",
+                                               "=== guest end", "")), 0)
+                self.assertEqual(run.returncode, 0)
+                self.assertEqual(run.stdout, "checks continued\n")
+
+    def test_failed_emulator_with_complete_output(self):
+        for status in (1, 124):
+            with self.subTest(status=status):
+                run = self.check("=== guest begin\n[exit 0]\n=== guest end\n", status)
+                self.assertEqual(run.returncode, 1)
+                self.assertIn(f"FAIL: fixture: emulator exited with status {status}\n", run.stdout)
+                self.assertNotIn("missing === guest end", run.stdout)
+                self.assertIn("emulator diagnostic\n", run.stdout)
+                self.assertIn("console diagnostic\n", run.stdout)
+
+    def test_missing_end(self):
+        for end in ("", "prefix === guest end\n", "=== guest end extra\n"):
+            with self.subTest(end=end):
+                run = self.check("=== guest begin\n[exit 0]\n" + end, 0)
+                self.assertEqual(run.returncode, 1)
+                self.assertIn("FAIL: fixture: missing === guest end\n", run.stdout)
+                self.assertIn("emulator diagnostic\n", run.stdout)
+                self.assertIn("console diagnostic\n", run.stdout)
+
+    def test_failed_emulator_and_missing_end(self):
+        run = self.check("", 124)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("FAIL: fixture: emulator exited with status 124\n", run.stdout)
+        self.assertIn("FAIL: fixture: missing === guest end\n", run.stdout)
+        self.assertEqual(run.stdout.count("emulator diagnostic\n"), 1)
+        self.assertEqual(run.stdout.count("console diagnostic\n"), 1)
 
 
 if __name__ == "__main__":

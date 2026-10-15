@@ -6,7 +6,8 @@
 #   2. starts `fictionet attach --type tap --vm tap:tap0` there, which makes
 #      its own TAP device and redirects frames between the two;
 #   3. boots a nested guest (L2) on tap0, which runs l2-check.sh;
-#   4. prints the guest's output, and checks it;
+#   4. prints and checks the guest's output; the emulator must exit 0 and
+#      the guest must reach === guest end;
 #   5. removes tap0, and checks that attach exits and removes its redirect.
 #
 # It prints PASS and FAIL lines, which nested.sh counts.
@@ -14,6 +15,7 @@
 set -u
 assets=/mnt/assets
 run=/mnt/run
+source "$run/results.sh" || exit 1
 work=/var/lib/fictionet-test
 # The world and attach use the paths of the docs (attaching.rs).
 mkdir -p "$work" /run/fictionet
@@ -156,6 +158,7 @@ for vmm in qemu firecracker cloud-hypervisor; do
     echo "--- $vmm: in the guest"
     cat "$work/$vmm-out.txt"
     out="$work/$vmm-out.txt"
+    results_emulator_ended "$vmm" "$status" "$out" "$work/$vmm-vmm.log" "$work/$vmm-console.log"
     says() { grep -Eq -- "$1" "$out"; }
     took() { grep -A20 -F -- "$1" "$out" | grep -m1 -o 'took [0-9]*' | grep -o '[0-9]*'; }
     says "UP +$addr/24" && pass "$vmm: the guest got $addr/24 by DHCP" || fail "$vmm: the guest has no $addr/24"
@@ -170,11 +173,6 @@ for vmm in qemu firecracker cloud-hypervisor; do
     t=$(took 'http://192.0.2.1/' || echo 99999)
     says 'Failed to connect to 192\.0\.2\.1' && [ "$t" -lt 2000 ] \
         && pass "$vmm: an unknown address failed in $t ms" || fail "$vmm: an unknown address did not fail fast ($t ms)"
-    if ! grep -q "=== guest end" "$out"; then
-        echo "--- $vmm: its output"
-        tail -20 "$work/$vmm-vmm.log"
-        tail -40 "$work/$vmm-console.log" 2>/dev/null
-    fi
 
     # The VM is gone, but tap0 stays until it is removed. Then attach exits.
     ip -n vm1 link del tap0

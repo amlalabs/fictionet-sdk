@@ -21,13 +21,15 @@
 #      and router advertisements plus DHCPv6), and the guest pings the
 #      gateway over each.
 #
-# After each boot it checks that attach exited 0 when QEMU closed the
-# socket. It prints the guest's commands and outputs, then PASS or FAIL
-# lines, and exits 1 if anything failed.
+# After each boot QEMU must exit 0 and the guest must reach === guest end.
+# It also checks that attach exited 0 when QEMU closed the socket. It prints
+# the guest's commands and outputs, then PASS or FAIL lines, and exits 1 if
+# anything failed.
 
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 source "$here/common.sh"
+source "$here/results.sh"
 
 if [ "${1:-}" = --fetch ]; then
     command -v genisoimage >/dev/null || { echo "genisoimage is missing"; exit 1; }
@@ -81,7 +83,7 @@ EOF
 # Boots the image once. $1: a name for this boot. The guest commands come on
 # stdin. A network-config may be given as $2.
 boot() {
-    local name="$1" seed="$run/$1-seed"
+    local name="$1" seed="$run/$1-seed" status=0
     mkdir -p "$seed"
     guest_script > "$seed/check.sh"
     {
@@ -109,11 +111,16 @@ boot() {
         -drive "file=$seed/disk.qcow2,if=virtio" \
         -drive "file=$seed/seed.iso,if=virtio,media=cdrom,readonly=on" \
         -netdev "stream,id=n0,server=off,addr.type=unix,addr.path=$run/vm.sock" \
-        -device virtio-net-pci,netdev=n0 || true
-    tr -d '\r' < "$run/$name-out.txt" > "$run/$name-guest.txt"
+        -device virtio-net-pci,netdev=n0 || status=$?
+    if [ -f "$run/$name-out.txt" ]; then
+        tr -d '\r' < "$run/$name-out.txt" > "$run/$name-guest.txt"
+    else
+        echo "(no output from the guest)" > "$run/$name-guest.txt"
+    fi
     echo "--- $name: in the guest"
     cat "$run/$name-guest.txt"
     echo "---"
+    results_emulator_ended "$name: QEMU" "$status" "$run/$name-guest.txt" "$run/$name-console.log"
 }
 
 # Starts attach for one boot and waits until it is ready. Flags in "$@".

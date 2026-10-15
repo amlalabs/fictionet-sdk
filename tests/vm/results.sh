@@ -28,3 +28,29 @@ results_run() {
     printf '\n[exit %d]\n[took %d ms]\n=== guest result %s %d %d\n' \
         "$status" "$ms" "$id" "$status" "$ms"
 }
+
+# Host check for the legacy transcripts in run.sh and nested-l1.sh. The caller's
+# fail() records failures without exiting, so the remaining checks still run.
+# Arguments: boot name, emulator status, transcript, diagnostic log paths.
+results_emulator_ended() {
+    local name="$1" status="$2" out="$3" failed=0 log
+    shift 3
+    if [ "$status" != 0 ]; then
+        fail "$name: emulator exited with status $status"
+        failed=1
+    fi
+    if ! grep -Eq $'^=== guest end\r?$' "$out"; then
+        fail "$name: missing === guest end"
+        failed=1
+    fi
+    if [ "$failed" = 1 ]; then
+        for log in "$@"; do
+            echo "--- $name: $log"
+            if [ -f "$log" ]; then
+                tail -40 "$log"
+            else
+                echo "(no log at $log)"
+            fi
+        done
+    fi
+}
