@@ -852,6 +852,14 @@ synchronously in the subscription's drainer, in sequence order. Browser runs
 can use an in-memory sink with `EventLog::to_writer`. Native writer queues
 have their own limit of 100,000 events or 16 MiB of event data; oversized
 events are lost there too.
+After a native writer fails to write or flush, or panics, it writes nothing
+more, including an `events.lost` line. Lines written since its last successful
+flush count as lost too. A panic's remaining batch is counted during unwind;
+events still in its channel are counted when the thread is joined. Shutdown
+and replay after shutdown do not rethrow that panic. A send racing with
+finalization can be counted twice, at most one per writer. Native writer
+failures are latched: `EventLog::lost()` stays at least one even if no lines
+were pending. Synchronous sink panics still propagate to the drainer's caller.
 Discard a sample if
 [`EventLog::lost`](../src/events.rs) is nonzero.
 

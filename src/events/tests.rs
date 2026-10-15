@@ -38,12 +38,25 @@ fn json_names_tls_and_alpn() {
 pub(super) struct Sink {
     pub(super) bytes: Arc<Mutex<Vec<u8>>>,
     fail_after: Option<usize>,
+    panic_after: Option<usize>,
+    panic_on_flush: bool,
+    write_barrier: Option<Arc<std::sync::Barrier>>,
     slow: bool,
 }
 
 impl Write for Sink {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if let Some(barrier) = self.write_barrier.take() {
+            barrier.wait();
+            barrier.wait();
+        }
         let mut bytes = self.bytes.lock();
+        if self
+            .panic_after
+            .is_some_and(|n| bytes.iter().filter(|b| **b == b'\n').count() >= n)
+        {
+            panic!("the sink panicked while writing");
+        }
         if self
             .fail_after
             .is_some_and(|n| bytes.iter().filter(|b| **b == b'\n').count() >= n)
@@ -58,6 +71,7 @@ impl Write for Sink {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        assert!(!self.panic_on_flush, "the sink panicked while flushing");
         Ok(())
     }
 }
@@ -135,6 +149,164 @@ fn a_failed_write_is_counted_as_lost() {
         "{}",
         log.lost()
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_with_panicking_sink(panic_after: usize) -> (Sink, EventLog) {
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let sink = Sink {
+        panic_after: Some(panic_after),
+        write_barrier: Some(barrier.clone()),
+        ..Sink::default()
+    };
+    let out = sink.clone();
+    let kept = Arc::new(Mutex::new(None));
+    let keep = kept.clone();
+    crate::block_on(crate::run(
+        fictionet::Seed::from_u64(55),
+        |fcx| async move {
+            fcx.events().to_writer(Box::new(out));
+            fcx.record(Event::new("test", "tick").field("i", 0u32));
+            // Hold the first write until the rest are queued. The next batch
+            // has every remaining event, regardless of thread scheduling.
+            barrier.wait();
+            for i in 1..300u32 {
+                fcx.record(Event::new("test", "tick").field("i", i));
+            }
+            barrier.wait();
+            *keep.lock() = Some(fcx.events());
+            Ok(())
+        },
+    ))
+    .unwrap();
+    let log = kept.lock().take().unwrap();
+    (sink, log)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn sink_panics_before_write() {
+    let (sink, log) = run_with_panicking_sink(0);
+    assert!(sink.bytes.lock().is_empty());
+    assert_eq!(log.recorded(), 300);
+    assert_eq!(log.lost(), log.recorded());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn sink_panics_mid_batch() {
+    let (sink, log) = run_with_panicking_sink(100);
+    let bytes = sink.bytes.lock();
+    let lines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+    assert_eq!(lines, 100);
+    assert!(log.lost() >= log.recorded() - lines);
+    // Only the first batch's single line was flushed. The 99 written
+    // lines in the second batch are lost along with its 200 unwritten ones.
+    assert_eq!(log.lost(), 299);
+    assert!(
+        !std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("\"kind\":\"lost\"")
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn join_failure_visible() {
+    let store = Store::new(crate::RunMode::Real);
+    let log = EventLog::new(store.clone());
+    for i in 0..300u32 {
+        store.push(Event::new("test", "tick").field("i", i));
+    }
+    store.close();
+    let sink = Sink {
+        panic_after: Some(0),
+        ..Sink::default()
+    };
+    log.to_writer(Box::new(sink.clone()));
+    assert!(sink.bytes.lock().is_empty());
+    assert_eq!(log.lost(), log.all().len() as u64);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn sink_panics_while_flushing() {
+    for n in [0, 1] {
+        let store = Store::new(crate::RunMode::Real);
+        let log = EventLog::new(store.clone());
+        for _ in 0..n {
+            store.push(Event::new("test", "tick"));
+        }
+        store.close();
+        let sink = Sink {
+            panic_on_flush: true,
+            ..Sink::default()
+        };
+        log.to_writer(Box::new(sink.clone()));
+        assert_eq!(sink.bytes.lock().iter().filter(|b| **b == b'\n').count(), n);
+        assert_eq!(log.lost(), 1);
+    }
+}
+
+/// A panic when the sink is dropped happens after the write guard is gone.
+/// Both join paths must latch it, even with no pending lines.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn sink_drop_panic_is_latched() {
+    struct PanicOnDrop(Sink);
+
+    impl Write for PanicOnDrop {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.write(data)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("the sink panicked when dropped");
+        }
+    }
+
+    for closed in [false, true] {
+        let store = Store::new(crate::RunMode::Real);
+        let log = EventLog::new(store.clone());
+        if closed {
+            store.close();
+        }
+        log.to_writer(Box::new(PanicOnDrop(Sink::default())));
+        store.close();
+        assert_eq!(log.lost(), 1);
+        log.to_writer(Box::new(Sink::default()));
+        assert_eq!(log.lost(), 1, "a later writer cannot clear the failure");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn sink_panic_during_shutdown_preserves_world_panic() {
+    let kept = Arc::new(Mutex::new(None));
+    let keep = kept.clone();
+    let failure = std::panic::catch_unwind(|| {
+        crate::block_on(crate::run(
+            fictionet::Seed::from_u64(55),
+            |fcx| async move {
+                *keep.lock() = Some(fcx.events());
+                fcx.events().to_writer(Box::new(Sink {
+                    panic_after: Some(0),
+                    ..Sink::default()
+                }));
+                fcx.record(Event::new("test", "tick"));
+                panic!("the world panicked");
+            },
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(failure.downcast_ref::<&str>(), Some(&"the world panicked"));
+    assert_eq!(kept.lock().take().unwrap().lost(), 1);
 }
 
 /// Events are recorded with no reader at all, numbered and dated on

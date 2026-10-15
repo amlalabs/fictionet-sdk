@@ -1,3 +1,5 @@
+#![deny(clippy::let_underscore_must_use)]
+
 use fictionet::sync::Mutex;
 use std::io::Write;
 #[cfg(feature = "std")]
@@ -5,15 +7,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::sync::mpsc::{Receiver, sync_channel};
 
 use crate::stdlib::codec::Wire;
 
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-use super::MAX_EVENT_BYTES;
 use super::{Event, EventLog};
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+use super::{MAX_EVENT_BYTES, Store};
 
 /// How many events may wait for a file's writer thread.
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -21,6 +23,28 @@ const FILE_QUEUE: usize = 100_000;
 /// How many retained event bytes may wait for a file's writer thread.
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub(super) const FILE_QUEUE_BYTES: usize = MAX_EVENT_BYTES;
+
+/// A native writer and the events it has not taken from its channel.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub(super) struct Writer {
+    thread: std::thread::JoinHandle<()>,
+    pending: Arc<AtomicU64>,
+}
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+impl Writer {
+    pub(super) fn join(self, store: &Store) {
+        if self.thread.join().is_err() {
+            store.writer_failed.store(true, Ordering::Relaxed);
+            // The unwind guard counts the batch; the channel's remainder
+            // is still pending. An active drainer may have one send in
+            // flight, which can also count itself lost when it fails.
+            store
+                .lost
+                .fetch_add(self.pending.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+}
 
 impl EventLog {
     /// Calls `f` with every event the log holds now, oldest first (with
@@ -71,7 +95,15 @@ impl EventLog {
     /// an `events.lost` line with the count so far. After a failed write or
     /// flush the thread writes nothing more, and counts every line after
     /// it, and each line written since the last flush that worked, as
-    /// lost. A grader throws away a sample with any line lost.
+    /// lost. A panic in the native writer is counted the same way and
+    /// latched; it is not rethrown at shutdown or after replay. That writer
+    /// writes nothing more, including an `events.lost` line. Its queued
+    /// events are counted when the thread is joined. A send racing with
+    /// finalization can be counted twice, at most one per writer. A native
+    /// writer failure makes `lost()` at least one, even if no lines were
+    /// pending. Synchronous sink panics still propagate to the drainer's
+    /// caller, as in [`EventLog::subscribe`]. A grader throws away a sample
+    /// with any line lost.
     pub fn to_writer(&self, out: Box<dyn Write + Send>) {
         if cfg!(target_arch = "wasm32")
             || !cfg!(feature = "std")
@@ -101,19 +133,27 @@ impl EventLog {
         {
             let (tx, rx) = sync_channel::<Arc<Event>>(FILE_QUEUE);
             let queued = Arc::new(AtomicUsize::new(0));
+            let pending = Arc::new(AtomicU64::new(0));
             let lost = self.store.lost.clone();
-            let writer = {
-                let (lost, queued) = (lost.clone(), queued.clone());
+            let thread = {
+                let (lost, queued, pending) = (lost.clone(), queued.clone(), pending.clone());
+                let failure = self.store.writer_failed.clone();
                 std::thread::Builder::new()
                     .name("fictionet-events".into())
-                    .spawn(move || write_lines(rx, out, &lost, &queued))
+                    .spawn(move || write_lines(rx, out, &lost, &queued, &pending, &failure))
                     .expect("the event writer's thread starts")
+            };
+            let writer = Writer {
+                thread,
+                pending: pending.clone(),
             };
             self.subscribe_arc(Arc::new(move |event| {
                 let len = event.size();
+                pending.fetch_add(1, Ordering::Relaxed);
                 if queued.fetch_add(len, Ordering::Relaxed) + len > FILE_QUEUE_BYTES
                     || tx.try_send(event.clone()).is_err()
                 {
+                    pending.fetch_sub(1, Ordering::Relaxed);
                     queued.fetch_sub(len, Ordering::Relaxed);
                     lost.fetch_add(1, Ordering::Relaxed);
                 }
@@ -122,7 +162,7 @@ impl EventLog {
             if s.closed {
                 // The run is over: the thread has all it will get.
                 drop(s);
-                let _ = writer.join();
+                writer.join(&self.store);
             } else {
                 s.writers.push(writer);
             }
@@ -130,9 +170,37 @@ impl EventLog {
     }
 
     /// How many lines file writers lost: lines that did not fit in a
-    /// writer's queue, or that a writer could not write.
+    /// writer's queue, or that a writer could not write or flush. Native
+    /// writer failures are latched: this is at least one after a failure,
+    /// even with no pending lines. See [`EventLog::to_writer`] for panic
+    /// accounting and concurrent finalization.
     pub fn lost(&self) -> u64 {
-        self.store.lost.load(Ordering::Relaxed)
+        let lost = self.store.lost.load(Ordering::Relaxed);
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        if self.store.writer_failed.load(Ordering::Relaxed) {
+            return lost.max(1);
+        }
+        lost
+    }
+}
+
+/// Owns loss accounting for the current batch, including the line in hand.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+struct WriteGuard<'a> {
+    lost: &'a AtomicU64,
+    failure: &'a AtomicBool,
+    remaining: u64,
+    unflushed: u64,
+}
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.lost
+                .fetch_add(self.remaining + self.unflushed, Ordering::Relaxed);
+            self.failure.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -144,39 +212,56 @@ fn write_lines(
     mut out: Box<dyn Write + Send>,
     lost: &AtomicU64,
     queued: &AtomicUsize,
+    pending: &AtomicU64,
+    failure: &AtomicBool,
 ) {
     let mut reported = 0;
-    // Lines written since the last flush that worked.
-    let mut unflushed = 0u64;
+    let mut guard = WriteGuard {
+        lost,
+        failure,
+        remaining: 0,
+        unflushed: 0,
+    };
     let mut failed = false;
     let mut batch = Vec::new();
     while let Ok(event) = rx.recv() {
+        guard.remaining += 1;
+        pending.fetch_sub(1, Ordering::Relaxed);
         batch.push(event);
-        batch.extend(rx.try_iter());
+        for event in rx.try_iter() {
+            guard.remaining += 1;
+            pending.fetch_sub(1, Ordering::Relaxed);
+            batch.push(event);
+        }
         for event in batch.drain(..) {
             queued.fetch_sub(event.size(), Ordering::Relaxed);
             if failed {
                 lost.fetch_add(1, Ordering::Relaxed);
+                guard.remaining -= 1;
                 continue;
             }
             let Ok(mut line) = event.to_json().to_bytes() else {
                 lost.fetch_add(1, Ordering::Relaxed);
+                guard.remaining -= 1;
                 continue;
             };
             line.push(b'\n');
             if out.write_all(&line).is_ok() {
-                unflushed += 1;
+                guard.unflushed += 1;
             } else {
-                lost.fetch_add(unflushed + 1, Ordering::Relaxed);
+                lost.fetch_add(guard.unflushed + 1, Ordering::Relaxed);
+                guard.unflushed = 0;
+                failure.store(true, Ordering::Relaxed);
                 failed = true;
             }
+            guard.remaining -= 1;
         }
         if !failed {
-            failed = finish_batch(&mut out, lost, &mut reported, &mut unflushed);
+            failed = finish_batch(&mut out, lost, &mut reported, &mut guard.unflushed, failure);
         }
     }
     if !failed {
-        finish_batch(&mut out, lost, &mut reported, &mut unflushed);
+        finish_batch(&mut out, lost, &mut reported, &mut guard.unflushed, failure);
     }
 }
 
@@ -189,6 +274,7 @@ fn finish_batch(
     lost: &AtomicU64,
     reported: &mut u64,
     unflushed: &mut u64,
+    failure: &AtomicBool,
 ) -> bool {
     let n = lost.load(Ordering::Relaxed);
     let report =
@@ -198,7 +284,8 @@ fn finish_batch(
     if ok {
         *unflushed = 0;
     } else {
-        lost.fetch_add(*unflushed, Ordering::Relaxed);
+        lost.fetch_add(std::mem::take(unflushed), Ordering::Relaxed);
+        failure.store(true, Ordering::Relaxed);
     }
     !ok
 }

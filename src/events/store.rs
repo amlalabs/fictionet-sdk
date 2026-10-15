@@ -1,6 +1,10 @@
+#![deny(clippy::let_underscore_must_use)]
+
 use fictionet::sync::{Mutex, MutexGuard};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 
 use crate::time::Instant;
@@ -82,6 +86,9 @@ pub(crate) struct Store {
     pub(super) state: Mutex<State>,
     /// Lines file sinks could not keep up with, or could not write.
     pub(super) lost: Arc<AtomicU64>,
+    /// A native writer failed, even if it had no lines left to count.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    pub(super) writer_failed: Arc<AtomicBool>,
 }
 
 /// One bounded part of the log: its events, oldest first.
@@ -146,7 +153,7 @@ pub(super) struct State {
     pub(super) closed: bool,
     /// The file writers' threads, joined when the run is over.
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-    pub(super) writers: Vec<std::thread::JoinHandle<()>>,
+    pub(super) writers: Vec<super::sink::Writer>,
 }
 
 impl State {
@@ -209,6 +216,8 @@ impl Store {
                 writers: Vec::new(),
             }),
             lost: Arc::new(AtomicU64::new(0)),
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+            writer_failed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -330,7 +339,7 @@ impl Store {
         drop(subscribers);
         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         for writer in writers {
-            let _ = writer.join();
+            writer.join(self);
         }
     }
 
