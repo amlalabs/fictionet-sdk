@@ -23,7 +23,7 @@
 //!   the `421 Misdirected Request` of [`web::Sites`](fictionet::stdlib::web::Sites).
 //!
 //! On a [`Net`](fictionet::stdlib::net::Net), a [`Server`] is the
-//! [`PortServer`] that serves HTTP on a host's
+//! [`PortServer`](fictionet::stdlib::net::PortServer) that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
 //! hosts. [`Server::served_by`] puts a site on ports 80 and 443 the way
 //! websites are served. `Net` knows nothing of HTTP, so a copy of this
@@ -122,34 +122,25 @@
 //! A connection that ends in an error is one `http.error` event, with
 //! `local`, `cause` (`protocol`, `timeout` or `transport`) and `detail`.
 
-use std::any::Any;
-use std::collections::HashMap;
 use std::convert::Infallible;
-use std::fmt::Write as _;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use http::header::{CONTENT_LENGTH, DATE, HOST, LOCATION};
-use http::uri::{Authority, Scheme};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame};
 
 use fictionet::RaceError;
-use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
+use fictionet::events::{ConnInfo, Fields};
 use fictionet::stdlib::ConnectionExt;
 use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
-use fictionet::stdlib::json::Value;
-use fictionet::stdlib::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
 use fictionet::stdlib::serve::Prefixed;
 use fictionet::stdlib::serve::{
     self, Budget, Driver, Ended, Flow, Pending, PendingDriver, ServeOptions, Timer,
 };
-use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection};
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, Error};
@@ -158,359 +149,22 @@ use fictionet::{Cancelled, Cx, Error};
 mod body;
 #[path = "httpd/handlers.rs"]
 mod handlers;
+#[path = "httpd/response.rs"]
+mod response;
+#[path = "httpd/sites.rs"]
+mod sites;
 
 pub use body::Body;
 pub use handlers::{
-    BadGateway, Exchange, Handler, Later, Reply, Router, Routing, Target, Tower, UpgradeHandler, text,
-    tower,
+    BadGateway, Exchange, Handler, Later, Reply, Router, Tower, UpgradeHandler, text, tower,
 };
+
+pub use response::{date_header, http_date};
+pub use sites::{Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
 
 use body::Inner;
 use handlers::status_only;
-
-// ---------------------------------------------------------------------------
-// Virtual hosts
-
-/// One site of [`VirtualHosts`].
-#[derive(Clone)]
-pub struct VHost {
-    /// Its handler.
-    pub handler: Arc<dyn Handler>,
-    /// It is served over HTTPS. Plain HTTP requests for it get a `301`
-    /// redirect to https, unless `plain_http`.
-    pub https: bool,
-    /// Its handler answers plain HTTP too, even with `https`.
-    pub plain_http: bool,
-}
-
-impl VHost {
-    /// A site with `handler`, plain HTTP only.
-    pub fn new(handler: impl Handler) -> VHost {
-        VHost {
-            handler: Arc::new(handler),
-            https: false,
-            plain_http: false,
-        }
-    }
-}
-
-/// Picks a site by the request's host, as a web server with several sites
-/// at one address does.
-///
-/// - A request with no host gets `400 Bad Request`.
-/// - A host with no site, and no default site, gets `421 Misdirected
-///   Request`. So does a site without `https`, asked for over TLS.
-/// - A site with `https` asked for over plain HTTP gets a `301` to the same
-///   path at `https://host`, unless it has `plain_http`.
-/// - Every other request goes to the site's handler, with a [`Target`] in
-///   its extensions. Its [`Target::routing`] distinguishes a registered
-///   host from a default-site fallback.
-///
-/// Its own answers put `answer` in the request's event: `no_host`,
-/// `misdirected` or `redirect`.
-#[derive(Clone, Default)]
-pub struct VirtualHosts {
-    inner: Arc<VInner>,
-}
-
-#[derive(Default)]
-struct VInner {
-    hosts: RwLock<HashMap<String, VHost>>,
-    default: RwLock<Option<VHost>>,
-}
-
-impl VirtualHosts {
-    /// No sites.
-    pub fn new() -> VirtualHosts {
-        VirtualHosts::default()
-    }
-
-    /// Adds `site` under `name` (lowercase, without a trailing dot),
-    /// replacing one there.
-    pub fn insert(&self, name: &str, site: VHost) {
-        self.inner
-            .hosts
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(normalize(name), site);
-    }
-
-    /// Makes `site` the default, for hosts no site has. The first default
-    /// set keeps the role.
-    /// Requests routed this way keep their requested host and carry
-    /// [`Routing::Fallback`] in their [`Target`].
-    pub fn set_default(&self, site: VHost) {
-        self.inner
-            .default
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert(site);
-    }
-
-    /// The site named `name`.
-    pub fn get(&self, name: &str) -> Option<VHost> {
-        self.inner
-            .hosts
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .cloned()
-    }
-
-    /// Whether a site named `name` is served over HTTPS here.
-    pub fn has_https(&self, name: &str) -> bool {
-        self.get(name).is_some_and(|s| s.https)
-    }
-
-    fn site_or_default(&self, host: &str) -> Option<(VHost, Routing)> {
-        self.get(host).map(|site| (site, Routing::Exact)).or_else(|| {
-            self.inner
-                .default
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-                .map(|site| (site, Routing::Fallback))
-        })
-    }
-}
-
-fn answered(mut response: Response<Body>, answer: &'static str) -> Response<Body> {
-    response
-        .extensions_mut()
-        .insert(Fields::new().with("answer", answer));
-    response
-}
-
-impl Handler for VirtualHosts {
-    fn call(&self, mut request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
-        let Some(host) = request_host(&request) else {
-            return Reply::Now(answered(
-                text(StatusCode::BAD_REQUEST, "The request names no host.\n"),
-                "no_host",
-            ));
-        };
-        let misdirected = || {
-            Reply::Now(answered(
-                text(
-                    StatusCode::MISDIRECTED_REQUEST,
-                    "This server does not serve that host.\n",
-                ),
-                "misdirected",
-            ))
-        };
-        let Some((site, routing)) = self.site_or_default(&host) else {
-            return misdirected();
-        };
-        let tls = ex.conn().tls;
-        match (tls, site.https) {
-            (true, false) => misdirected(),
-            (false, true) if !site.plain_http => {
-                let path = request
-                    .uri()
-                    .path_and_query()
-                    .map(|p| p.as_str())
-                    .unwrap_or("/");
-                let location = format!("https://{host}{path}");
-                let mut response = text(
-                    StatusCode::MOVED_PERMANENTLY,
-                    &format!("Moved to {location}\n"),
-                );
-                if let Ok(value) = location.parse() {
-                    response.headers_mut().insert(LOCATION, value);
-                }
-                Reply::Now(answered(response, "redirect"))
-            }
-            _ => {
-                let conn = ex.conn();
-                let target = Target {
-                    scheme: if tls { Scheme::HTTPS } else { Scheme::HTTP },
-                    host,
-                    port: conn.local.map_or(0, |a| a.port()),
-                    sni: conn.sni.as_deref().map(str::to_owned),
-                    routing,
-                };
-                request.extensions_mut().insert(target);
-                site.handler.call(request, ex)
-            }
-        }
-    }
-}
-
-/// A name as hosts are kept: lowercase, without a trailing dot.
-pub fn normalize(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
-}
-
-/// The host a request is for: the authority of its URI (HTTP/2's
-/// `:authority`, or an absolute URI in HTTP/1.1), else its `Host` header.
-/// Lowercase, without the port or a trailing dot.
-pub fn request_host<B>(request: &Request<B>) -> Option<String> {
-    let host = match request.uri().authority() {
-        Some(a) => a.host().to_owned(),
-        None => {
-            let value = request.headers().get(HOST)?.to_str().ok()?;
-            value.parse::<Authority>().ok()?.host().to_owned()
-        }
-    };
-    let host = normalize(&host);
-    (!host.is_empty()).then_some(host)
-}
-
-// ---------------------------------------------------------------------------
-// The request event
-
-/// One request's event, filled in as it goes.
-struct Tracker {
-    event: Option<Event>,
-}
-
-/// Owned HTTP head storage. `http` hides allocation capacities, so charge
-/// string lengths and the header map's capacity, including shared values
-/// in full. Extensions and third-party allocation overhead are excluded.
-fn request_held<B>(request: &Request<B>) -> usize {
-    let uri = request.uri();
-    let headers = request.headers();
-    let slots = headers.capacity() + headers.len() - headers.keys_len();
-    std::mem::size_of::<http::request::Parts>()
-        + request.method().as_str().len()
-        + uri.scheme_str().map_or(0, str::len)
-        + uri.authority().map_or(0, |a| a.as_str().len())
-        + uri.path_and_query().map_or(0, |p| p.as_str().len())
-        + slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
-        + headers
-            .iter()
-            .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
-            .sum::<usize>()
-}
-
-fn head_held(head: &RequestHead) -> usize {
-    head.method.capacity()
-        + head.target.capacity()
-        + head.headers.capacity() * std::mem::size_of::<http1::Header>()
-        + head
-            .headers
-            .iter()
-            .map(|h| h.name.capacity() + h.value.capacity())
-            .sum::<usize>()
-}
-
-fn version_name(v: Version) -> &'static str {
-    match v {
-        Version::HTTP_09 => "HTTP/0.9",
-        Version::HTTP_10 => "HTTP/1.0",
-        Version::HTTP_2 => "HTTP/2.0",
-        Version::HTTP_3 => "HTTP/3.0",
-        _ => "HTTP/1.1",
-    }
-}
-
-impl Tracker {
-    fn held(&self) -> usize {
-        self.event.as_ref().map_or(0, Event::size)
-    }
-
-    fn new<B>(request: &Request<B>, conn: &ConnInfo, started: Instant) -> Tracker {
-        let host = request_host(request);
-        let headers: Vec<Value> = request
-            .headers()
-            .iter()
-            .map(|(n, v)| {
-                Value::Array(vec![
-                    n.as_str().into(),
-                    String::from_utf8_lossy(v.as_bytes()).into_owned().into(),
-                ])
-            })
-            .collect();
-        let uri = request.uri();
-        // Room for every field, and for the status the summary gets later.
-        let mut summary = String::with_capacity(
-            request.method().as_str().len()
-                + host.as_ref().map_or(1, String::len)
-                + uri.path().len()
-                + 5,
-        );
-        let _ = write!(
-            summary,
-            "{} {}{}",
-            request.method(),
-            host.as_deref().unwrap_or("-"),
-            uri.path()
-        );
-        let event = Event::new("http", "request")
-            .fields(Fields::with_capacity(16))
-            .field("scheme", if conn.tls { "https" } else { "http" })
-            .field("sni", opt(conn.sni.as_deref()))
-            .field("host", opt(host.clone()))
-            .field("method", request.method().as_str())
-            .field("uri", uri.to_string())
-            .field("path", uri.path())
-            .field("query", opt(uri.query()))
-            .field("version", version_name(request.version()))
-            .field("headers", Value::Array(headers))
-            .field("started", float(started.since_start().as_secs_f64()))
-            .summary(summary);
-        Tracker { event: Some(event) }
-    }
-
-    /// The finished event: `extra` from the handler first, then the facts.
-    fn finish(
-        &mut self,
-        extra: Option<Fields>,
-        status: Option<StatusCode>,
-        sent: u64,
-        complete: bool,
-    ) -> Option<Event> {
-        let mut event = self.event.take()?;
-        let mut fields = extra.unwrap_or_default();
-        let answer = fields.remove("answer").unwrap_or_else(|| {
-            if status.is_none() {
-                "cancelled".into()
-            } else {
-                "handler".into()
-            }
-        });
-        let mut own = std::mem::take(&mut event.fields);
-        own.set("answer", answer);
-        own.set("status", opt(status.map(|s| u32::from(s.as_u16()))));
-        own.set("sent", sent);
-        own.set("complete", complete);
-        fields.extend(own);
-        event.fields = fields;
-        if let Some(s) = status {
-            let _ = write!(event.summary, " {}", s.as_u16());
-            if s.is_server_error() {
-                event.level = Level::Notice;
-            }
-        }
-        Some(event)
-    }
-}
-
-/// The response for a handler error: `502` for [`BadGateway`], else `500`.
-fn error_response(e: &Error) -> Response<Body> {
-    let mut response = if e.is::<BadGateway>() {
-        text(StatusCode::BAD_GATEWAY, &format!("{e}\n"))
-    } else {
-        text(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "The site failed to answer.\n",
-        )
-    };
-    response
-        .extensions_mut()
-        .insert(Fields::new().with("answer", "error"));
-    response
-}
-
-/// Logs an `http.error` event.
-fn error_event(conn: &ConnInfo, cause: &'static str, detail: String) -> Event {
-    Event::new("http", "error")
-        .level(Level::Notice)
-        .summary(format!("HTTP {cause} error: {detail}"))
-        .field("local", opt(conn.local.map(|a| a.to_string())))
-        .field("cause", cause)
-        .field("detail", detail)
-}
+use response::{ResponsePolicy, Tracker, error_event, error_response, head_held, request_held};
 
 // ---------------------------------------------------------------------------
 // HTTP/1 as a service
@@ -784,43 +438,6 @@ fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Reques
     builder.body(body).ok()
 }
 
-/// Shared response decisions, before either backend chooses wire framing.
-struct ResponsePolicy {
-    bodiless: bool,
-    len: Option<u64>,
-    date: Option<HeaderValue>,
-}
-
-impl ResponsePolicy {
-    fn new(
-        parts: &http::response::Parts,
-        len: Option<u64>,
-        head_only: bool,
-        date: Option<HeaderValue>,
-    ) -> Self {
-        let no_body = parts.status.is_informational()
-            || parts.status == StatusCode::NO_CONTENT
-            || parts.status == StatusCode::NOT_MODIFIED;
-        let len = if no_body {
-            None
-        } else if head_only {
-            // A handler that drops the HEAD body can supply the GET length.
-            parts
-                .headers
-                .get(CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
-                .or(len)
-        } else {
-            len
-        };
-        Self {
-            bodiless: head_only || no_body,
-            len,
-            date: date.filter(|_| !parts.headers.contains_key(DATE)),
-        }
-    }
-}
-
 /// Writes a response head. Returns whether the connection must close
 /// after the body: a body of unknown length to an HTTP/1.0 client ends
 /// with the connection.
@@ -882,54 +499,6 @@ fn write_simple(
     let (parts, _) = status_only(status).into_parts();
     let policy = ResponsePolicy::new(&parts, Some(0), false, date);
     encode(out, version, &parts, &policy, true);
-}
-
-/// The `Date` header at `now` on the run's clock, in a world whose date at
-/// the start of the run was `start`. `None` without a world date.
-pub fn date_header(start: Option<SystemTime>, now: Instant) -> Option<HeaderValue> {
-    let secs = start?
-        .checked_add(now.since_start())?
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    HeaderValue::from_str(&http_date(secs)).ok()
-}
-
-/// An IMF-fixdate (RFC 9110 section 5.6.7), such as
-/// `Sun, 06 Nov 1994 08:49:37 GMT`, for `secs` since the Unix epoch.
-///
-/// ```
-/// use fictionet::stdlib::httpd::http_date;
-/// assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-/// assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
-/// assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
-/// assert_eq!(http_date(1_559_347_200), "Sat, 01 Jun 2019 00:00:00 GMT");
-/// ```
-pub fn http_date(secs: u64) -> String {
-    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let days = (secs / 86_400) as i64;
-    let rest = secs % 86_400;
-    // Days to a civil date (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
-        DAYS[(days % 7) as usize],
-        MONTHS[(month - 1) as usize],
-        rest / 3600,
-        rest / 60 % 60,
-        rest % 60
-    )
 }
 
 impl serve::Service for Http1 {
@@ -1360,7 +929,7 @@ pub struct HttpOptions {
     /// its event metadata, and each response frame until its last slice is
     /// dropped. Heads count method, URI and header bytes, plus header slots;
     /// hidden capacities, extensions and third-party overhead are excluded.
-    /// Events use [`Event::size`]. Transport and hyper buffers are excluded.
+    /// Events use [`Event::size`](fictionet::events::Event::size). Transport and hyper buffers are excluded.
     /// Response storage is charged by its original byte length; spare capacity
     /// and backing storage outside a supplied slice are not exposed by `Bytes`.
     pub budget: Option<Budget>,
@@ -1475,191 +1044,12 @@ pub async fn serve_connection<C: Connection + Unpin>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP on a network
-
-/// HTTP on one port of a [`Net`](fictionet::stdlib::net::Net) host: an
-/// [`PortServer`] that serves the host's site for each of its DNS names.
-///
-/// Every host at one address that serves HTTP on a port shares that port:
-/// the first host's `Server` takes in the others' sites as
-/// [`VirtualHosts`], and each request goes to the site its host names.
-/// Names and defaults belong to the local address and port where `Net`
-/// installed them. Sharing one address does not add sites at another.
-/// Over TLS, ALPN offers `h2` and `http/1.1` with `tokio`, or only
-/// `http/1.1` without it.
-///
-/// ```
-/// # use fictionet::stdlib::{httpd, net::Host};
-/// let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
-/// let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
-/// # drop(host);
-/// ```
-#[derive(Clone)]
-pub struct Server {
-    vhost: VHost,
-    default_host: bool,
-    limits: Limits,
-    date: Option<SystemTime>,
-    vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
-    tls: Option<ConfigFor>,
-}
-
-impl Server {
-    /// A site served by `handler`, over plain HTTP.
-    pub fn new(handler: impl Handler) -> Server {
-        Server::shared(Arc::new(handler))
-    }
-
-    /// The same, from a shared handler.
-    pub fn shared(handler: Arc<dyn Handler>) -> Server {
-        Server {
-            vhost: VHost {
-                handler,
-                https: false,
-                plain_http: false,
-            },
-            default_host: false,
-            limits: Limits::default(),
-            date: None,
-            vhosts: Arc::default(),
-            tls: None,
-        }
-    }
-
-    /// The site is served over HTTPS: on a TLS port it answers, and on a
-    /// plain port its requests get a `301` to https, unless
-    /// [`plain_http`](Self::plain_http).
-    /// This sets routing policy without installing TLS.
-    /// Use [`tls_with`](Self::tls_with) to select a config and
-    /// [`served_by`](Self::served_by) to install ports 80 and 443.
-    pub fn https(mut self) -> Server {
-        self.vhost.https = true;
-        self
-    }
-
-    /// With [`https`](Self::https), answers plain HTTP too, with no
-    /// redirect.
-    pub fn plain_http(mut self) -> Server {
-        self.vhost.plain_http = true;
-        self
-    }
-
-    /// Answers requests at its address whose host names no site there.
-    /// The first default site at each local address and port keeps the role.
-    /// These requests keep their requested host in [`Target`] and carry
-    /// [`Routing::Fallback`]. Handlers that forward dynamically should
-    /// check [`Target::routing`].
-    pub fn default_host(mut self) -> Server {
-        self.default_host = true;
-        self
-    }
-
-    /// Sets the limits and timers.
-    pub fn limits(mut self, limits: Limits) -> Server {
-        self.limits = limits;
-        self
-    }
-
-    /// Sends `Date` headers: `start` is the world's date and time at the
-    /// start of the run. See [Dates](self#dates). Sites that share a port
-    /// use the first one's.
-    pub fn date(mut self, start: SystemTime) -> Server {
-        self.date = Some(start);
-        self
-    }
-
-    /// Serves HTTPS on 443 with a config selected for each handshake.
-    /// Port 80 redirects to HTTPS unless [`plain_http`](Self::plain_http) was selected.
-    pub fn tls_with(
-        mut self,
-        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
-    ) -> Server {
-        self.vhost.https = true;
-        self.tls = Some(Arc::new(config_for));
-        self
-    }
-
-    /// Installs this site on ports 80 and, with TLS, 443.
-    /// TLS uses the host's names for SNI; without TLS only port 80 opens.
-    /// Each installed port has a fresh virtual-host table, including
-    /// when this builder was cloned.
-    pub fn served_by(mut self, host: Host) -> Host {
-        self.vhosts = Arc::default();
-        let secure = self.tls.take().map(|config| {
-            let mut server = self.clone();
-            server.vhosts = Arc::default();
-            server.vhost.plain_http = false;
-            (config, server)
-        });
-        let host = host.port_server(80, self);
-        match secure {
-            None => host,
-            Some((config, server)) => {
-                host.tls_accept(443, Sni::Names, move |fcx| config(fcx), server)
-            }
-        }
-    }
-}
-
-impl PortServer for Server {
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let vhosts = arrival.info.local.and_then(|local| {
-            self.vhosts
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&local)
-                .cloned()
-        });
-        let handler: Arc<dyn Handler> = Arc::new(vhosts.unwrap_or_default());
-        let opts = HttpOptions {
-            limits: self.limits,
-            first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
-            budget: arrival.budget,
-            date: self.date,
-        };
-        let (conn, info) = (arrival.conn, arrival.info);
-        Box::pin(async move {
-            let _ = serve_connection(&fcx, conn, info, handler, &opts).await;
-        })
-    }
-
-    fn alpn(&self) -> Vec<Vec<u8>> {
-        fictionet::cfg_tokio!({
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        } else {
-            vec![b"http/1.1".to_vec()]
-        })
-    }
-
-    fn prepare_share(
-        &self,
-        local: SocketAddr,
-        names: &[String],
-        other: &Arc<dyn PortServer>,
-    ) -> Option<PreparedShare> {
-        let other: &dyn Any = &**other;
-        let site = other.downcast_ref::<Server>()?;
-        let (vhost, default_host) = (site.vhost.clone(), site.default_host);
-        let names = names.to_vec();
-        let endpoints = self.vhosts.clone();
-        Some(PreparedShare::new(move || {
-            let mut endpoints = endpoints.write().unwrap_or_else(|e| e.into_inner());
-            let vhosts = endpoints.entry(local).or_default();
-            for name in names {
-                vhosts.insert(&name, vhost.clone());
-            }
-            if default_host {
-                vhosts.set_default(vhost);
-            }
-        }))
-    }
-}
-
 fictionet::cfg_tokio! {
 /// Live HTTP/2 and HTTP/1 Upgrade serving on hyper.
 mod h2 {
     use super::*;
+    use super::response::{Track, answered};
+    use http::header::{CONTENT_LENGTH, DATE};
     use fictionet::stdlib::codec::{Buffer, Decode, Step};
     use fictionet::stdlib::serve::{Charge, PanicNote};
     use http_body::SizeHint;
@@ -2051,31 +1441,6 @@ mod h2 {
                     },
                 ))
             })
-        }
-    }
-
-    /// One request's event, sent when it is dropped.
-    struct Track {
-        tracker: Tracker,
-        _charge: Option<Charge>,
-        fcx: Cx,
-        info: Arc<ConnInfo>,
-        extra: Option<Fields>,
-        status: Option<StatusCode>,
-        sent: u64,
-        complete: bool,
-        /// Names the connection if the handler or its body panics.
-        _note: PanicNote,
-    }
-
-    impl Drop for Track {
-        fn drop(&mut self) {
-            if let Some(e) =
-                self.tracker
-                    .finish(self.extra.take(), self.status, self.sent, self.complete)
-            {
-                self.fcx.record(e.conn(&self.info));
-            }
         }
     }
 
@@ -2512,6 +1877,7 @@ mod h2 {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use fictionet::stdlib::json::Value;
         use fictionet::sync::Mutex;
         use hyper::rt::Timer;
 

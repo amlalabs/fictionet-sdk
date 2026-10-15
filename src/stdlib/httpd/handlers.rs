@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::uri::Scheme;
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 
 use fictionet::events::ConnInfo;
@@ -16,40 +15,6 @@ use super::Body;
 
 // ---------------------------------------------------------------------------
 // Handlers
-
-/// Where a request arrived: the scheme and port from the connection, the
-/// host from the request. [`VirtualHosts`](super::VirtualHosts) puts one in the extensions of
-/// every request it hands on; handlers read it with
-/// `request.extensions().get::<Target>()`, or axum's `Extension`.
-///
-/// The scheme, port and SNI come from the connection, not from headers the
-/// client wrote. The host is the one the request named, even when routing
-/// used the default site. [`routing`](Self::routing) says how it matched.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Target {
-    /// `http` or `https`.
-    pub scheme: Scheme,
-    /// The host the request was routed by, in lowercase, without a port or
-    /// a trailing dot.
-    pub host: String,
-    /// The port the connection arrived on.
-    pub port: u16,
-    /// The name the client sent in its TLS hello. `None` without TLS.
-    pub sni: Option<String>,
-    /// Whether the requested host matched a registered site or used the default.
-    pub routing: Routing,
-}
-
-/// How [`VirtualHosts`](super::VirtualHosts) selected a request's handler.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Routing {
-    /// The requested host matched a registered name after normalization.
-    Exact,
-    /// No registered name matched; the default site supplied the handler.
-    Fallback,
-}
 
 /// What a sync handler can use: the clock reading the service took,
 /// randomness, and the connection.

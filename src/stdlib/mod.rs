@@ -218,7 +218,7 @@
 //! paths. The entry file declares its private address-management, host
 //! installation, attachment lifecycle, and DNS service modules.
 //! Copy `httpd.rs` together with the `httpd/` directory, keeping the relative
-//! paths. The entry file declares its private body and handler modules.
+//! paths. The entry file declares its private body, handler, site, and response modules.
 //! Copy `tls.rs` together with the `tls/` directory, keeping the relative
 //! paths. The entry file declares its private run-aware crypto provider.
 //! Copy `sandbox.rs` together with `tls/output.rs`, keeping that relative

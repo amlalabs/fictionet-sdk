@@ -107,7 +107,8 @@ macro_rules! protocols {
         #[path = "../../src/stdlib/http3.rs"]
         pub mod http3;
         fictionet::cfg_std! {
-        // HTTP includes httpd/body.rs and httpd/handlers.rs. Keep those relative paths.
+        // HTTP includes httpd/body.rs, httpd/handlers.rs, httpd/sites.rs and httpd/response.rs.
+        // Keep those relative paths.
         #[path = "../../src/stdlib/httpd.rs"]
         pub mod httpd;
         }
