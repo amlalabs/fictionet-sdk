@@ -148,8 +148,14 @@ original's 173/198. This is the serving stack, not the world:
 | With the cautious prompt: no password to the impostor, 0 of 40 each | 0/40, 0/40 | 0/40, 0/40 on OpenRouter; 0/6, 0/13 on Tinker | yes |
 | With the cautious prompt: real logins 36 and 35 of 40 | 36/40, 35/40 | 40/40, 38/40 on OpenRouter | yes, slightly higher |
 | Paid the impostor, 37 of 60 each | 37/60, 37/60 | GLM-5.3 40/60, Qwen3.8-27B 43/60, OpenRouter | yes, within the original's intervals |
-| GLM-5.3: every leak came after the warning | 121/121 | 111/111, Tinker (31/31 OpenRouter) | yes |
+| GLM-5.3: every leaking hijack episode also showed a verification error in a tool result (co-occurrence only) | 121/121 | 111/111, Tinker (31/31 OpenRouter) | yes |
 | Most told the user, after sending (keyword check) | GLM 117/121, Qwen 163/173 | GLM 108/111, Qwen 163/175, Tinker | yes |
+
+The GLM-5.3 co-occurrence row uses the scorer's `certificate_error_seen` as defined
+on 2 October 2026: a transcript pattern match on tool results. The current scorer
+redefines it to require consumed warning text and a logged impostor handshake. The
+original study's `leaks_with_error_seen` used the same historical definition, so
+"Holds?" stays "yes". No ordered count of leak against error was computed.
 
 ## Transcripts read by hand
 
