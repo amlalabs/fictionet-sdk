@@ -4088,6 +4088,15 @@ mod tests {
                     contract::check_wire::<BackendMessage>(&b);
                 }
             }
+            let make = || BackendEvents::with_limit(SMALL_MESSAGE);
+            contract::check_decode_with_alloc_limit(make, &data, 2 * make().capacity());
+            for item in decode_all(make, &data).0.into_iter().flatten() {
+                if let BackendEvent::Message(m) = item {
+                    let b = m.to_bytes().unwrap();
+                    assert_eq!(BackendMessage::parse(&b), Ok(m));
+                    contract::check_wire::<BackendMessage>(&b);
+                }
+            }
             contract::check_wire::<FrontendMessage>(&data);
             contract::check_wire::<BackendMessage>(&data);
             contract::check_wire::<Password>(&data);
@@ -4120,6 +4129,63 @@ mod tests {
         let make = || BackendEvents::with_limit(SMALL_MESSAGE);
         contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity());
         assert_eq!(decode_all(make, &input).0.len(), 3000);
+    }
+
+    #[test]
+    fn large_message_then_small_message() {
+        let tail = b"S\0\0\0\x03";
+        let row = BackendMessage::DataRow(vec![Some(vec![b'x'; 300])]);
+        let ready = BackendMessage::ReadyForQuery(TransactionStatus::Idle);
+        let mut input = row.to_bytes().unwrap();
+        let length = u32::try_from(input.len() - 1).unwrap();
+        assert_eq!(length, 310);
+        ready.write(&mut input).unwrap();
+        input.extend_from_slice(tail);
+        let make = || BackendEvents::with_limit(SMALL_MESSAGE);
+        assert_eq!(
+            contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity()),
+            (
+                vec![
+                    Ok(BackendEvent::Message(row)),
+                    Ok(BackendEvent::Message(ready)),
+                ],
+                Some(Fail::Protocol(FrameError::BadLength(3))),
+            )
+        );
+        let make = || BackendEvents::with_limit(64);
+        assert_eq!(
+            contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity()),
+            (
+                vec![],
+                Some(Fail::Protocol(FrameError::TooLong { length, max: 64 })),
+            )
+        );
+
+        let startup = FrontendMessage::Startup(Startup::new("alice", "shop"));
+        let query = FrontendMessage::Query("x".repeat(200));
+        let mut input = startup_bytes();
+        let start = input.len();
+        query.write(&mut input).unwrap();
+        let length = u32::try_from(input.len() - start - 1).unwrap();
+        assert_eq!(length, 205);
+        FrontendMessage::Sync.write(&mut input).unwrap();
+        input.extend_from_slice(tail);
+        let make = || FrontendMessages::with_limit(SMALL_MESSAGE);
+        assert_eq!(
+            contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity()),
+            (
+                vec![Ok(startup.clone()), Ok(query), Ok(FrontendMessage::Sync)],
+                Some(Fail::Protocol(FrameError::BadLength(3))),
+            )
+        );
+        let make = || FrontendMessages::with_limit(64);
+        assert_eq!(
+            contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity()),
+            (
+                vec![Ok(startup)],
+                Some(Fail::Protocol(FrameError::TooLong { length, max: 64 })),
+            )
+        );
     }
 
     /// One of every message, in a valid form.
