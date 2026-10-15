@@ -633,22 +633,22 @@
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::admission::a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address",
+      "source": "tests/web/admission.rs",
       "finding": "RH-104",
       "reason": "Only the matching echo reply counts as readiness, and every other packet is checked."
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::fragments_do_not_outlive_their_sandbox",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::ipv6::fragments_do_not_outlive_their_sandbox",
+      "source": "tests/web/ipv6.rs",
       "finding": "RH-104",
       "reason": "Only the matching echo reply counts as readiness, and every other packet is checked."
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::a_fragment_inside_a_fragment_is_dropped",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::ipv6::a_fragment_inside_a_fragment_is_dropped",
+      "source": "tests/web/ipv6.rs",
       "finding": "RH-104",
       "reason": "Only the matching echo reply counts as readiness, and every other packet is checked."
     },
@@ -661,43 +661,43 @@
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::a_client_that_half_closes_after_its_request_gets_the_response",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::http_serving::a_client_that_half_closes_after_its_request_gets_the_response",
+      "source": "tests/web/http_serving.rs",
       "finding": "RH-107",
       "reason": "Raw HTTP reads need a whole response and a clean EOF; resets stay errors."
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::half_close_truncated_body_rejected",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::http_serving::half_close_truncated_body_rejected",
+      "source": "tests/web/http_serving.rs",
       "finding": "RH-107",
       "reason": "Raw HTTP reads need a whole response and a clean EOF; resets stay errors."
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::events_for_bytes_that_are_not_http",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::events::events_for_bytes_that_are_not_http",
+      "source": "tests/web/events.rs",
       "finding": "RH-107",
       "reason": "Raw HTTP reads need a whole response and a clean EOF; resets stay errors."
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::a_known_length_is_sent_as_content_length",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::http_serving::a_known_length_is_sent_as_content_length",
+      "source": "tests/web/http_serving.rs",
       "finding": "RH-107",
       "reason": "Raw HTTP reads need a whole response and a clean EOF; resets stay errors."
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::the_default_host_answers_hosts_with_no_site_of_their_own",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::http_serving::the_default_host_answers_hosts_with_no_site_of_their_own",
+      "source": "tests/web/http_serving.rs",
       "finding": "RH-107",
       "reason": "Raw HTTP reads need a whole response and a clean EOF; resets stay errors."
     },
     {
       "suite": "rust",
-      "case": "fictionet::web::events_for_http_requests",
-      "source": "tests/web.rs",
+      "case": "fictionet::web::events::events_for_http_requests",
+      "source": "tests/web/events.rs",
       "finding": "RH-107",
       "reason": "Raw HTTP reads need a whole response and a clean EOF; resets stay errors."
     },

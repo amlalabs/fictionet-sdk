@@ -2511,35 +2511,35 @@
       "id": "POL-DEADLINE"
     },
     {
-      "path": "tests/web.rs",
+      "path": "tests/web/dns_dhcp.rs",
       "symbol": "dhcp_lease_renewal_and_restart",
       "pattern": "fcx.sleep(Duration::from_millis(20)).await?;",
       "reason": "Asks for the freed address at most 50 times, then asserts it was offered.",
       "id": "POL-DEADLINE"
     },
     {
-      "path": "tests/web.rs",
+      "path": "tests/web/admission.rs",
       "symbol": "connections_left_half_open_still_count",
       "pattern": "Err(ConnError::Reset) => fcx.sleep(Duration::from_millis(10)).await.unwrap(),",
       "reason": "Retries only resets while the closed connections free the count, under a 10 s timeout; any other error panics.",
       "id": "POL-DEADLINE"
     },
     {
-      "path": "tests/web.rs",
+      "path": "tests/web/events.rs",
       "symbol": "events_for_tls_handshakes",
       "pattern": "let _ = fcx.sleep(Duration::from_millis(30)).await;",
       "reason": "Sends the ClientHello in three pieces 30 ms apart, the case under test.",
       "id": "POL-PROTOCOL"
     },
     {
-      "path": "tests/web.rs",
+      "path": "tests/web/events.rs",
       "symbol": "events_for_a_client_that_resets_mid_request",
       "pattern": "let _ = fcx.sleep(Duration::from_millis(100)).await;",
       "reason": "In a lab world, all ready work runs before virtual time moves, so 100 ms shows that the reset recorded no error event.",
       "id": "POL-SETTLE"
     },
     {
-      "path": "tests/web.rs",
+      "path": "tests/web/events.rs",
       "symbol": "events_for_bytes_that_are_not_http",
       "pattern": "let _ = fcx.sleep(Duration::from_millis(200)).await;",
       "reason": "In a lab world, all ready work runs before virtual time moves, so 200 ms shows that no fourth error event follows.",
