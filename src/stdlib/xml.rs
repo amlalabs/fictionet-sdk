@@ -2302,7 +2302,7 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::{assert_linear, assert_linear_with_setup, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn built_text(builder: Builder) -> Result<String, ErrorKind> {
@@ -2406,26 +2406,38 @@ mod tests {
 
     #[test]
     fn codec_namespace_heavy_decode_cost() {
-        assert_linear("codec_namespace_heavy_decode_cost", 10_000, |size| {
-            let mut document = String::new();
-            for level in 0..250 {
-                document.push_str("<a");
-                for prefix in 0..4 {
-                    document.push_str(&format!(
-                        " xmlns:p{level}_{prefix}=\"urn:{level}:{prefix}\""
-                    ));
+        assert_linear_with_setup(
+            "codec_namespace_heavy_decode_cost",
+            2_500,
+            |size| {
+                // Grow retained state and children together: rescanning the
+                // stack, scope, or interned URIs per token must look quadratic.
+                let depth = size / 40;
+                assert!(depth < MAX_DEPTH);
+                assert!(4 * depth <= MAX_NAMESPACES);
+                let mut document = String::new();
+                for level in 0..depth {
+                    document.push_str("<a");
+                    for prefix in 0..4 {
+                        document.push_str(&format!(
+                            " xmlns:p{level}_{prefix}=\"urn:{level}:{prefix}\""
+                        ));
+                    }
+                    document.push('>');
                 }
-                document.push('>');
-            }
-            document.push_str(&"<b/>".repeat(size));
-            document.push_str(&"</a>".repeat(250));
-            let input = document.as_bytes();
-            let events = read_events(input).unwrap();
-            let expected = events.len();
-            let (events, error) = decode_all(Events::new, input);
-            assert_eq!(error, None);
-            assert_eq!(events.len(), expected);
-        });
+                document.push_str(&"<b/>".repeat(size));
+                document.push_str(&"</a>".repeat(depth));
+                let expected = read_events(document.as_bytes()).unwrap();
+                assert_eq!(expected.len(), 2 * (depth + size));
+                (document, expected)
+            },
+            |(document, _)| decode_all(Events::new, document.as_bytes()),
+            |(_, expected), (events, error)| {
+                assert_eq!(error, None);
+                assert_eq!(events.len(), expected.len());
+                assert_eq!(&events, expected);
+            },
+        );
     }
 
     fn kind(doc: &str) -> ErrorKind {

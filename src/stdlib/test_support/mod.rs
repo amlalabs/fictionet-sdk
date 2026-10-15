@@ -278,22 +278,59 @@ pub fn rounds(n: usize) -> usize {
 /// integration tests. Pick `n` so that `run(n)` takes at least a millisecond,
 /// or timer noise decides the ratio.
 ///
-/// `run` builds its input and decodes it; building with `repeat` or a loop
-/// is linear too, so it does not hide quadratic decoding.
+/// Every dimension multiplied by the guarded cost must grow with `size`.
+/// For a scan of retained state per token, grow both state and token count.
+/// Keeping either fixed makes the regression look linear. Keep both sizes
+/// within protocol limits. Use [`assert_linear_with_setup`] to exclude fixture
+/// construction and reference decoding from the measurement.
 ///
 /// # Panics
 ///
 /// If the ratio exceeds 10. `name` labels the message.
 pub fn assert_linear(name: &str, n: usize, mut run: impl FnMut(usize)) {
-    let time = |run: &mut dyn FnMut(usize), size| {
+    assert_linear_times(name, n, |size| {
         let started = thread_cpu_time();
         run(size);
         thread_cpu_time().saturating_sub(started)
-    };
+    });
+}
+
+/// Checks linear time like [`assert_linear`], measuring only `run(&fixture)`.
+/// Builds a fresh fixture with `setup(size)` before each measurement, then
+/// calls `check(&fixture, result)` after stopping the clock. Fixture and result
+/// destruction are outside the measurement too. Reference decoding belongs
+/// in `setup`, and correctness assertions belong in `check`.
+///
+/// Grow every dimension multiplied by the guarded cost together, as described
+/// in [`assert_linear`]. The sizes, clock, sample count, and ratio limit are
+/// the same as that helper's.
+///
+/// # Panics
+///
+/// If the time ratio exceeds 10 or any closure panics. `name` labels the ratio
+/// failure.
+pub fn assert_linear_with_setup<T, R>(
+    name: &str,
+    n: usize,
+    mut setup: impl FnMut(usize) -> T,
+    mut run: impl FnMut(&T) -> R,
+    mut check: impl FnMut(&T, R),
+) {
+    assert_linear_times(name, n, |size| {
+        let fixture = setup(size);
+        let started = thread_cpu_time();
+        let result = run(&fixture);
+        let elapsed = thread_cpu_time().saturating_sub(started);
+        check(&fixture, result);
+        elapsed
+    });
+}
+
+fn assert_linear_times(name: &str, n: usize, mut time: impl FnMut(usize) -> core::time::Duration) {
     let (mut small, mut large) = (core::time::Duration::MAX, core::time::Duration::MAX);
     for _ in 0..3 {
-        small = small.min(time(&mut run, n));
-        large = large.min(time(&mut run, n.saturating_mul(4)));
+        small = small.min(time(n));
+        large = large.min(time(n.saturating_mul(4)));
     }
     let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
     assert!(
