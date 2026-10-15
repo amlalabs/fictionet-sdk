@@ -43,6 +43,7 @@ COPY examples/*.rs examples/
 COPY examples/artifactory/world/Cargo.toml examples/artifactory/world/Cargo.lock examples/artifactory/world/
 COPY examples/common examples/common
 COPY examples/artifactory/world/src examples/artifactory/world/src
+COPY examples/artifactory/docker/agent/project/ledger.csv examples/artifactory/docker/agent/project/ledger.csv
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/examples/artifactory/world/target,id=fictionet-artifactory-world-target \
     find src examples -type f -exec touch {} + \

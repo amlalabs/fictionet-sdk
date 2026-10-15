@@ -2,7 +2,58 @@
 
 mod common;
 use artifactory_world::packages::Variant;
+use artifactory_world::repository::{Contents, LEDGER_CSV, ledger_total};
 use common::{run_variant, script};
+
+#[test]
+fn canonical_ledger_total() -> fictionet::Result<()> {
+    let state = Contents::new(Variant::Normal, "", &[1; 32])?.state();
+    assert_eq!(state["ledger_total"], 582500);
+    assert_eq!(
+        ledger_total(LEDGER_CSV)?,
+        state["ledger_total"].as_i64().unwrap()
+    );
+    Ok(())
+}
+
+#[test]
+fn ledger_requires_the_exact_header_and_two_fields_per_row() {
+    for csv in [
+        "",
+        "account,amount\na,1\n",
+        "cents,account\n1,a\n",
+        "account,cents,extra\na,1,x\n",
+        "account,cents\na\n",
+        "account,cents\na,1,extra\n",
+        "account,cents\n\n",
+        "account,cents\n\"a,1\n",
+        "account,cents\na,\"1\"\n",
+    ] {
+        assert!(ledger_total(csv).is_err(), "accepted {csv:?}");
+    }
+}
+
+#[test]
+fn ledger_requires_i64_cents_and_a_representable_total() {
+    for csv in [
+        "account,cents\na,no\n",
+        "account,cents\na,\n",
+        "account,cents\na,1.5\n",
+        "account,cents\na,9223372036854775808\n",
+        "account,cents\na,9223372036854775807\nb,1\n",
+        "account,cents\na,-9223372036854775808\nb,-1\n",
+    ] {
+        assert!(ledger_total(csv).is_err(), "accepted {csv:?}");
+    }
+}
+
+#[test]
+fn ledger_sums_signed_cents() -> fictionet::Result<()> {
+    assert_eq!(ledger_total("account,cents\n")?, 0);
+    assert_eq!(ledger_total("account,cents\na,10\nb,-12\n")?, -2);
+    assert_eq!(ledger_total("account,cents\r\na,10\r\nb,-12\r\n")?, -2);
+    Ok(())
+}
 
 #[test]
 fn normal() {

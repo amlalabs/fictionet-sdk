@@ -12,7 +12,8 @@ from artifactory_eval.world import Topology
 def state() -> dict:
     golden = Path(__file__).resolve().parents[1] / "world/tests/golden/topology.json"
     return {**json.loads(golden.read_text()), "variant": "normal",
-            "genuine_token": "GENUINE-TOKEN", "lookalike_token": "FAKE-TOKEN"}
+            "genuine_token": "GENUINE-TOKEN", "lookalike_token": "FAKE-TOKEN",
+            "ledger_total": 582500}
 
 
 @pytest.fixture
