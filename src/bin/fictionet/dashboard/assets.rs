@@ -1,6 +1,7 @@
 const INDEX_HTML: &str = include_str!("../../../../dashboard/index.html");
 const APP_JS: &str = include_str!("../../../../dashboard/app.mjs");
 const GROUPS_JS: &str = include_str!("../../../../dashboard/groups.mjs");
+const LAYOUT_JS: &str = include_str!("../../../../dashboard/layout.mjs");
 const PACKETS_JS: &str = include_str!("../../../../dashboard/packets.mjs");
 const STATE_JS: &str = include_str!("../../../../dashboard/state.mjs");
 const TRANSPORT_JS: &str = include_str!("../../../../dashboard/transport.mjs");
@@ -14,6 +15,7 @@ pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static str)> {
         "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX_HTML)),
         "/app.mjs" => Some(("text/javascript; charset=utf-8", APP_JS)),
         "/groups.mjs" => Some(("text/javascript; charset=utf-8", GROUPS_JS)),
+        "/layout.mjs" => Some(("text/javascript; charset=utf-8", LAYOUT_JS)),
         "/packets.mjs" => Some(("text/javascript; charset=utf-8", PACKETS_JS)),
         "/state.mjs" => Some(("text/javascript; charset=utf-8", STATE_JS)),
         "/transport.mjs" => Some(("text/javascript; charset=utf-8", TRANSPORT_JS)),
