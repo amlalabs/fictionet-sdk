@@ -97,7 +97,7 @@
 use fictionet::stdlib::asn1::{self, Reader, Rules, StringKind, Tag, Writer};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Prefixed, Wire};
+use fictionet::stdlib::codec::{Prefixed, Wire, write_checked};
 use std::fmt;
 
 /// The port KDCs listen on, over UDP and TCP.
@@ -1252,7 +1252,7 @@ impl Wire for Message {
     /// checks that the resulting encoding fits.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+        write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
     }
 }
 
@@ -1541,7 +1541,7 @@ impl Wire for EncryptedData {
     /// that the resulting encoding still fits.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+        write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
     }
 }
 
@@ -1564,7 +1564,7 @@ impl Wire for Ticket {
     /// may expand a signed kvno; the parser checks that the result fits.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+        write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
     }
 }
 
@@ -1593,7 +1593,7 @@ impl Wire for KdcReqBody {
     /// Refuses invalid fields or lists and output over [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+        write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
     }
 }
 

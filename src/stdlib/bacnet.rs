@@ -82,7 +82,7 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire, be16};
+use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire, be16, write_checked};
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -1710,11 +1710,7 @@ impl Wire for Npdu {
         if out.len() > MAX_MESSAGE {
             return Err(Error::Unwritable);
         }
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 
@@ -1905,11 +1901,7 @@ impl Wire for Apdu {
         if out.len() > MAX_MESSAGE {
             return Err(Error::Unwritable);
         }
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 
@@ -2002,11 +1994,7 @@ impl Wire for IAm {
         Value::Unsigned(u64::from(self.max_apdu)).write(&mut out)?;
         Value::Enumerated(self.segmentation.code()).write(&mut out)?;
         Value::Unsigned(u64::from(self.vendor)).write(&mut out)?;
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 

@@ -62,7 +62,7 @@
 //! assert_eq!(answer.answers[0].data, RData::Nb(vec![owner]));
 //! ```
 
-use fictionet::stdlib::codec::{Wire, be16};
+use fictionet::stdlib::codec::{Wire, be16, write_checked};
 use fictionet::stdlib::netbios;
 
 use std::net::Ipv4Addr;
@@ -1229,11 +1229,7 @@ impl Wire for RrName {
             RrName::NetBios(n) => n.write(&mut out)?,
             RrName::Domain(labels) => put_labels(&mut out, labels.iter().map(Vec::as_slice))?,
         }
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 
@@ -1320,12 +1316,7 @@ impl Wire for Packet {
     /// sections or packets, and values that would read as another variant.
     /// Preserves the TC flag. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        let out = self.encode()?;
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, Self::encode, Self::parse, Error::Unwritable, dst)
     }
 }
 

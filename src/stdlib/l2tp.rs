@@ -86,7 +86,7 @@
 //! assert_eq!(back.message(), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::{Wire, be16, be32};
+use fictionet::stdlib::codec::{Wire, be16, be32, write_checked};
 
 /// The UDP port L2TP peers listen on.
 pub const PORT: u16 = 1701;
@@ -821,11 +821,7 @@ impl Wire for ControlMessage {
                 return Err(Error::Unwritable);
             }
         }
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 

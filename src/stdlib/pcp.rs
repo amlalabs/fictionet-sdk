@@ -80,7 +80,7 @@
 //! assert_eq!(Response::parse(&error.to_bytes().unwrap()).unwrap().result, ResultCode::AddressMismatch);
 //! ```
 
-use fictionet::stdlib::codec::{Wire, be16, be32};
+use fictionet::stdlib::codec::{Wire, be16, be32, write_checked};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -1311,11 +1311,7 @@ impl Wire for Request {
         out.extend_from_slice(&self.client.octets());
         write_operation(&mut out, &self.operation)?;
         write_options(&mut out, &self.options, true)?;
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 
@@ -1373,11 +1369,7 @@ impl Wire for Response {
         out.extend_from_slice(&self.reserved);
         write_operation(&mut out, &self.operation)?;
         write_options(&mut out, &self.options, false)?;
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 
@@ -1466,11 +1458,7 @@ impl Wire for NatPmpRequest {
                 out
             }
         };
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 
@@ -1597,11 +1585,7 @@ impl Wire for NatPmpResponse {
                 out
             }
         };
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 

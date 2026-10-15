@@ -89,7 +89,7 @@
 
 use fictionet::stdlib::codec::{Reader, Truncated, be16};
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Wire, write_checked};
 use fictionet::stdlib::ipsec::Envelope;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -1476,11 +1476,7 @@ impl Wire for Message {
         let mut out = Vec::with_capacity(HEADER_LEN + chain.len());
         header.write(&mut out)?;
         out.extend_from_slice(&chain);
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 

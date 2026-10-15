@@ -81,7 +81,7 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
-    Decode, Map, Reader, Step, Truncated, Wire, decode_exact, reserve_bytes,
+    Decode, Map, Reader, Step, Truncated, Wire, decode_exact, reserve_bytes, write_checked,
 };
 
 /// The TCP port MySQL servers listen on.
@@ -2191,11 +2191,10 @@ macro_rules! payload_wire {
             /// Leaves the destination unchanged on error.
             fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
                 let bytes = self.encode().map_err(|_| Error::Unwritable)?;
-                if bytes.len() > MAX_MESSAGE || Self::parse(&bytes).as_ref() != Ok(self) {
+                if bytes.len() > MAX_MESSAGE {
                     return Err(Error::Unwritable);
                 }
-                out.extend_from_slice(&bytes);
-                Ok(())
+                write_checked(self, |_| Ok(bytes), Self::parse, Error::Unwritable, out)
             }
         }
     };

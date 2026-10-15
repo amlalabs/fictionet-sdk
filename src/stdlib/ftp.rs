@@ -1777,11 +1777,7 @@ impl Wire for Request {
             arg: arg.map(Cow::into_owned),
         };
         let bytes = command.to_bytes()?;
-        if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
+        codec::write_checked(self, |_| Ok(bytes), Self::parse, Error::Unwritable, out)
     }
 }
 

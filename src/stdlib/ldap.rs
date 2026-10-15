@@ -66,8 +66,8 @@
 use fictionet::stdlib::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::ascii::{hex_lower, hex_value as hex_digit};
+use fictionet::stdlib::codec::{Wire, write_checked};
 use std::fmt;
 
 /// The port LDAP servers listen on, over TCP, and CLDAP over UDP.
@@ -2439,7 +2439,7 @@ impl Wire for Message {
     /// referral is left out, as no referral.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(
+        write_checked(
             self,
             Self::encode,
             Self::decode,

@@ -83,7 +83,7 @@
 use fictionet::stdlib::codec::civil::days_in_month;
 use std::borrow::Cow;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, append_bounded};
+use fictionet::stdlib::codec::{Decode, Step, Wire, append_bounded, write_checked};
 
 /// The UDP port syslog collectors listen on (RFC 5426). Plain TCP syslog
 /// has no assigned port and most collectors use 514 for it too.
@@ -1090,11 +1090,7 @@ impl Wire for BsdMessage {
             }
         }
         append(&mut bytes, &self.content)?;
-        if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
+        write_checked(self, |_| Ok(bytes), Self::parse, Error::Unwritable, out)
     }
 }
 
@@ -1153,11 +1149,7 @@ impl Wire for Entry {
             Self::Rfc5424(message) => message.to_bytes()?,
             Self::Bsd(message) => message.to_bytes()?,
         };
-        if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
+        write_checked(self, |_| Ok(bytes), Self::parse, Error::Unwritable, out)
     }
 }
 

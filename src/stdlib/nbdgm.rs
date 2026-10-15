@@ -84,7 +84,7 @@
 //! assert_eq!(whole, Some(sent));
 //! ```
 
-use fictionet::stdlib::codec::{Wire, be16};
+use fictionet::stdlib::codec::{Wire, be16, write_checked};
 use fictionet::stdlib::netbios::{self, ENCODED_LEN, NAME_LEN};
 
 use std::net::Ipv4Addr;
@@ -890,11 +890,7 @@ impl Wire for Packet {
             | Body::PositiveQueryResponse(n)
             | Body::NegativeQueryResponse(n) => n.write(&mut out)?,
         }
-        if Self::parse(&out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_checked(self, |_| Ok(out), Self::parse, Error::Unwritable, dst)
     }
 }
 
