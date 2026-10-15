@@ -7,14 +7,16 @@ cost when the API reports it, and the successful call's time (`ms`).
 `gen_ms` includes failed HTTP attempts and backoff; `attempts` counts them.
 
 The key comes only from the environment: ANTHROPIC_API_KEY or
-OPENROUTER_API_KEY. It goes into the request's header and nowhere else. It
-is never logged or stored, and no error message carries it.
+OPENROUTER_API_KEY. The client validates it at startup and keeps it in
+memory to send in the request's header. It is never written to logs or
+the store, and configured keys are redacted from error messages.
 """
 from __future__ import annotations
 
 import json
 import math
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -43,8 +45,32 @@ class Error(RuntimeError):
     """A model call that failed: what was asked of whom, and why it failed."""
 
     def __init__(self, message: str, ledger: Ledger | None = None):
-        super().__init__(message)
+        super().__init__(redact(message))
         self.ledger = ledger
+
+
+def _key(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise Error(f"{name} is not set")
+    if any(not 0x21 <= ord(c) <= 0x7e for c in value):
+        raise Error(f"{name} holds characters an HTTP header cannot carry")
+    return value
+
+
+def redact(text: str) -> str:
+    """Replace configured keys with their variable names before logging."""
+    keys = {value: f"<{name}>" for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY")
+            if (value := os.environ.get(name))}
+    if not keys:
+        return text
+    pattern = "|".join(re.escape(value) for value in sorted(keys, key=len, reverse=True))
+    return re.sub(pattern, lambda match: keys[match.group()], text)
+
+
+def describe(err: BaseException) -> str:
+    """Describe an exception without configured keys, for logs and errors."""
+    return redact(f"{type(err).__name__}: {err}")
 
 
 @dataclass
@@ -105,20 +131,21 @@ def _post(url: str, headers: dict[str, str], body: dict, timeout: float, what: s
             attempt.outcome = f"http {err.code}"
             with err:
                 raw = err.read()
-            failure = f"HTTP {err.code}: {raw[:400].decode('utf-8', 'replace')}"
+            detail = redact(raw.decode("utf-8", "replace")).encode("utf-8")
+            failure = f"HTTP {err.code}: {detail[:400].decode('utf-8', 'replace')}"
             try:
                 answer = json.loads(raw)
             except (ValueError, UnicodeError) as invalid:
-                failure += f" (unreadable error response: {invalid})"
+                failure += f" (unreadable error response: {describe(invalid)})"
             else:
                 if isinstance(answer, dict):
                     _usage(answer, attempt)
             retry = err.code in RETRY
         except (ValueError, UnicodeError) as err:
             attempt.outcome = "unreadable"
-            failure = f"{type(err).__name__}: {err}"
+            failure = describe(err)
         except (urllib.error.URLError, TimeoutError, OSError) as err:
-            failure = f"{type(err).__name__}: {err}"
+            failure = describe(err)
         finally:
             attempt.ended = ledger.clock()
             if attempt.outcome != "ok":
@@ -147,14 +174,13 @@ class Anthropic:
     provider = "anthropic"
 
     def __init__(self, model: str = "", timeout: float = 120.0):
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise Error("ANTHROPIC_API_KEY is not set")
+        self._key = _key("ANTHROPIC_API_KEY")
         self.model = model or DEFAULT_MODELS["anthropic"]
         self.timeout = timeout
 
     def complete(self, system: str, user: str, max_tokens: int, *, ledger: Ledger | None = None) -> Completion:
         ledger = ledger if ledger is not None else Ledger(_clock)
-        headers = {"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01",
+        headers = {"x-api-key": self._key, "anthropic-version": "2023-06-01",
                    "content-type": "application/json"}
         body = {"model": self.model, "max_tokens": max_tokens, "temperature": 1.0, "system": system,
                 "messages": [{"role": "user", "content": user}]}
@@ -163,7 +189,7 @@ class Anthropic:
             text = "".join(b.get("text", "") for b in answer.get("content", []) if b.get("type") == "text")
         except (AttributeError, TypeError) as err:
             attempt.outcome = "unreadable"
-            attempt.error = f"Anthropic {self.model}: unreadable response"
+            attempt.error = redact(f"Anthropic {self.model}: unreadable response")
             raise Error(attempt.error, ledger) from err
         return _completion(text, answer.get("stop_reason") == "max_tokens", attempt, ledger)
 
@@ -172,8 +198,7 @@ class OpenRouter:
     provider = "openrouter"
 
     def __init__(self, model: str = "", timeout: float = 120.0):
-        if not os.environ.get("OPENROUTER_API_KEY"):
-            raise Error("OPENROUTER_API_KEY is not set")
+        self._key = _key("OPENROUTER_API_KEY")
         self.model = model or DEFAULT_MODELS["openrouter"]
         self.timeout = timeout
         # Reasoning models think before they write unless told not to,
@@ -183,7 +208,7 @@ class OpenRouter:
 
     def complete(self, system: str, user: str, max_tokens: int, *, ledger: Ledger | None = None) -> Completion:
         ledger = ledger if ledger is not None else Ledger(_clock)
-        headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}", "content-type": "application/json",
+        headers = {"Authorization": f"Bearer {self._key}", "content-type": "application/json",
                    "X-Title": "Fictionet adaptive web"}
         body = {"model": self.model, "max_tokens": max_tokens, "temperature": 1.0,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -195,7 +220,8 @@ class OpenRouter:
         answer, attempt = _post(OPENROUTER_URL, headers, body, self.timeout, f"OpenRouter {self.model}", ledger)
         if "error" in answer:
             attempt.outcome = "unreadable"
-            attempt.error = f"OpenRouter {self.model} failed: {json.dumps(answer['error'])[:400]}"
+            detail = redact(json.dumps(answer["error"]))[:400]
+            attempt.error = redact(f"OpenRouter {self.model} failed: {detail}")
             raise Error(attempt.error, ledger)
         try:
             choices = answer.get("choices") or [{}]
@@ -205,7 +231,7 @@ class OpenRouter:
             cut_off = choices[0].get("finish_reason") == "length"
         except (AttributeError, TypeError, KeyError) as err:
             attempt.outcome = "unreadable"
-            attempt.error = f"OpenRouter {self.model}: unreadable response"
+            attempt.error = redact(f"OpenRouter {self.model}: unreadable response")
             raise Error(attempt.error, ledger) from err
         return _completion(text, cut_off, attempt, ledger)
 

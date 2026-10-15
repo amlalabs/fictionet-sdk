@@ -75,8 +75,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             r = self.world.handle(method, host, self.path, form)
         except Exception as err:  # noqa: BLE001 - the agent sees a 503, the log sees why
-            traceback.print_exc()
-            meta = {"kind": "error", "error": f"{type(err).__name__}: {err}"[:400]}
+            print(llm.redact(traceback.format_exc()), file=sys.stderr)
+            meta = {"kind": "error", "error": llm.describe(err)[:400]}
             self._send(503, "text/html", UNAVAILABLE, {"Server": "nginx"}, meta, method)
             return
         r.meta["serve_ms"] = round((time.monotonic() - started) * 1000)
@@ -141,7 +141,7 @@ def main() -> int:
     try:
         generator = generator_for(seed, kind, os.environ.get("ADAPTIVE_WEB_MODEL", ""))
     except llm.Error as err:
-        print(f"cannot start the {kind} generator: {err}", file=sys.stderr)
+        print(llm.redact(f"cannot start the {kind} generator: {err}"), file=sys.stderr)
         return 2
     prefetch = int(os.environ.get("ADAPTIVE_WEB_PREFETCH") or (3 if isinstance(generator, Model) else 0))
     store = Store(Path(os.environ.get("ADAPTIVE_WEB_STORE", "/var/lib/adaptive-web")) / seed.name)

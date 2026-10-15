@@ -499,7 +499,9 @@ OpenRouter (`halvard-cve` and `fastjsonl-package`), every check passed:
   backend's tests: the consistency rules, the make-once store across
   threads and processes, replay, reading model answers, the tells, and the
   model generator against a fake OpenRouter on 127.0.0.1, including that
-  the key is never stored.
+  the key is never stored or included in an error. A key with characters
+  outside printable ASCII (0x21-0x7E) is rejected at startup, before any
+  request, with exit status 2.
 
 ## Layout
 

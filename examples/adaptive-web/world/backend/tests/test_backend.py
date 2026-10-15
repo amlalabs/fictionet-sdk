@@ -7,6 +7,7 @@ against a fake OpenRouter on 127.0.0.1.
 """
 from __future__ import annotations
 
+import io
 import json
 import multiprocessing
 import os
@@ -596,6 +597,7 @@ class FakeOpenRouter(BaseHTTPRequestHandler):
     bad_answers = 0  # how many unreadable answers to give first
     page_answers: list[str] = []
     page_prompts: list[str] = []
+    echo_errors: list[tuple[int, str]] = []  # statuses and prefixes for errors echoing the key
 
     def log_message(self, *args):
         pass
@@ -604,6 +606,15 @@ class FakeOpenRouter(BaseHTTPRequestHandler):
         FakeOpenRouter.keys.append(self.headers.get("Authorization", ""))
         ask = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         FakeOpenRouter.systems.append(ask["messages"][0]["content"])
+        if FakeOpenRouter.echo_errors:
+            status, prefix = FakeOpenRouter.echo_errors.pop(0)
+            reply = json.dumps({"error": f"{prefix}rejected Authorization: {self.headers['Authorization']}"}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+            return
         prompt = ask["messages"][1]["content"]
         if FakeOpenRouter.bad_answers:
             FakeOpenRouter.bad_answers -= 1
@@ -638,6 +649,7 @@ class ModelGenerator(unittest.TestCase):
     def setUp(self):
         FakeOpenRouter.keys, FakeOpenRouter.systems, FakeOpenRouter.bad_answers = [], [], 0
         FakeOpenRouter.page_answers, FakeOpenRouter.page_prompts = [], []
+        FakeOpenRouter.echo_errors = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenRouter)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.old = (llm.OPENROUTER_URL, os.environ.get("OPENROUTER_API_KEY"))
@@ -686,6 +698,113 @@ class ModelGenerator(unittest.TestCase):
         FakeOpenRouter.bad_answers = 2
         with self.assertRaises(prompts.Error):
             gen.search("halvard", [], [], [])
+
+    def test_invalid_header_key(self):
+        for provider in ("openrouter", "anthropic"):
+            name = f"{provider.upper()}_API_KEY"
+            for character in ("\n", "\r", "\t", " ", "\x1f", "\x7f", "é"):
+                with self.subTest(provider=provider, character=character), \
+                        patch.dict(os.environ, {name: self.KEY + character}):
+                    with self.assertRaises(llm.Error) as raised:
+                        llm.client(provider, "some/model")
+                    self.assertIn(name, str(raised.exception))
+                    self.assertIn("HTTP header cannot carry", str(raised.exception))
+                    self.assertNotIn(self.KEY, str(raised.exception))
+            # os.environ itself rejects NUL, but the validator also excludes it.
+            with patch.object(llm.os, "environ", {name: self.KEY + "\0"}):
+                with self.assertRaisesRegex(llm.Error, f"{name} holds characters"):
+                    llm.client(provider, "some/model")
+        self.assertEqual(FakeOpenRouter.keys, [])
+
+    def test_backend_rejects_invalid_header_key(self):
+        import backend
+        for provider in ("openrouter", "anthropic"):
+            name = f"{provider.upper()}_API_KEY"
+            with tempfile.TemporaryDirectory() as d, \
+                    patch.dict(os.environ, {name: self.KEY + "\n", "ADAPTIVE_WEB_SEED": str(SEED.path),
+                                            "ADAPTIVE_WEB_GENERATOR": provider, "ADAPTIVE_WEB_STORE": d}), \
+                    patch.object(backend.sys, "argv", ["backend.py", "0"]), \
+                    patch.object(backend, "Server") as server, \
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(backend.main(), 2)
+                server.assert_not_called()
+                self.assertIn(name, stderr.getvalue())
+                self.assertNotIn(self.KEY, stderr.getvalue())
+                self.assertEqual(list(Path(d).rglob("*")), [])
+        self.assertEqual(FakeOpenRouter.keys, [])
+
+    def test_only_the_validated_key_is_sent(self):
+        for provider, header in (("openrouter", "Authorization"), ("anthropic", "X-api-key")):
+            name = f"{provider.upper()}_API_KEY"
+            with self.subTest(provider=provider), patch.dict(os.environ, {name: self.KEY}):
+                client = llm.client(provider, "some/model")
+                os.environ[name] = self.KEY + "\n"
+                with patch.object(llm, "_open", return_value=io.BytesIO(b"{}")) as opened:
+                    client.complete("system", "user", 10)
+                request = opened.call_args.args[0]
+                expected = f"Bearer {self.KEY}" if provider == "openrouter" else self.KEY
+                self.assertEqual(request.get_header(header), expected)
+
+    def test_echoed_provider_error_never_stores_the_key(self):
+        for status, prefix in ((400, ""), (400, "x" * 330), (200, ""), (200, "x" * 330)):
+            with self.subTest(status=status, prefix=prefix), tempfile.TemporaryDirectory() as d:
+                w = World(SEED, Store(Path(d) / SEED.name), Model(SEED, llm.client("openrouter", "some/model")))
+                w.cast()
+                FakeOpenRouter.echo_errors = [(status, prefix)]
+                before = len(FakeOpenRouter.keys)
+                with self.assertRaises(llm.Error) as raised:
+                    w.handle("GET", "www.google.com", "/search?q=halvard+flaw")
+                self.assertEqual(len(FakeOpenRouter.keys), before + 1)
+                message = str(raised.exception)
+                self.assertIn("rejected Authorization: Bearer <OPENROUTER_API_KEY>", message)
+                self.assertNotIn(self.KEY, message)
+                self.assertNotIn(self.KEY[:12], message, "truncation must not expose part of the key")
+                rows = [json.loads(line) for line in (w.store.root / "generations.jsonl").read_text().splitlines()]
+                self.assertEqual(rows[-1]["generation"]["status"], "error")
+                self.assertIn("<OPENROUTER_API_KEY>", rows[-1]["error"])
+                for f in Path(d).rglob("*"):
+                    if f.is_file():
+                        self.assertNotIn(self.KEY, f.read_text(errors="replace"), f)
+                        self.assertNotIn(self.KEY[:12], f.read_text(errors="replace"), f)
+
+    def test_request_errors_redact_the_key(self):
+        import backend
+        with tempfile.TemporaryDirectory() as d:
+            w = world(Path(d))
+            handler = object.__new__(backend.Handler)
+            handler.world, handler.headers, handler.path = w, {"Host": "news.example"}, "/story"
+            failure = RuntimeError(f"generation failed with {self.KEY}")
+            with patch.object(w, "handle", side_effect=failure), \
+                    patch.object(handler, "_send") as send, \
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                handler._serve("GET")
+            self.assertEqual(send.call_args.args[0], 503)
+            self.assertEqual(send.call_args.args[4],
+                             {"kind": "error", "error": "RuntimeError: generation failed with <OPENROUTER_API_KEY>"})
+            self.assertIn("Traceback", stderr.getvalue())
+            self.assertIn("RuntimeError: generation failed with <OPENROUTER_API_KEY>", stderr.getvalue())
+            self.assertNotIn(self.KEY, stderr.getvalue())
+
+    def test_background_generation_errors_redact_the_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = world(Path(d))
+            failure = RuntimeError(f"generation failed with {self.KEY}")
+            with patch.object(w, "page", side_effect=failure):
+                w._prefetch("news.example", "/story")
+            rows = [json.loads(line) for line in (w.store.root / "generations.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[-1]["kind"], "prefetch_error")
+            self.assertEqual(rows[-1]["error"], "RuntimeError: generation failed with <OPENROUTER_API_KEY>")
+            for f in Path(d).rglob("*"):
+                if f.is_file():
+                    self.assertNotIn(self.KEY, f.read_text(errors="replace"), f)
+
+    def test_redact_configured_keys(self):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": self.KEY, "ANTHROPIC_API_KEY": self.KEY + "-long"}):
+            message = f"{self.KEY}-long and {self.KEY} and {self.KEY}-long"
+            self.assertEqual(llm.redact(message), "<ANTHROPIC_API_KEY> and <OPENROUTER_API_KEY> and <ANTHROPIC_API_KEY>")
+            self.assertEqual(llm.describe(ValueError(message)), "ValueError: " + llm.redact(message))
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "", "ANTHROPIC_API_KEY": ""}):
+            self.assertEqual(llm.redact("unchanged"), "unchanged")
 
     def test_referenced_404_not_relabelled(self):
         with tempfile.TemporaryDirectory() as d:

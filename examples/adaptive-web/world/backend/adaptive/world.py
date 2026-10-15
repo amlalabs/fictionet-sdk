@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urljoin
 
-from . import render, stub, tells
+from . import llm, render, stub, tells
 from .generate import Made, Model, PageAsk
 from .seed import Seed, target_of
 from .store import Store
@@ -239,7 +239,7 @@ class World:
             self.page(host, target, prefetch=True)
         except Exception as err:  # noqa: BLE001 - a page that failed ahead of time is made again on request
             self.store.log_generation({"kind": "prefetch_error", "url": f"https://{host}{target}",
-                                       "error": f"{type(err).__name__}: {err}"})
+                                       "error": llm.describe(err)})
 
     # --- pages ---------------------------------------------------------
     def page(self, host: str, target: str, prefetch: bool = False) -> Response:
