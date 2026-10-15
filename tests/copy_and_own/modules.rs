@@ -207,6 +207,7 @@ macro_rules! protocols {
         pub mod tcp;
         #[path = "../../src/stdlib/test_support/mod.rs"]
         pub mod test_support;
+        // tls.rs includes its private tls/provider.rs child; copy both.
         #[path = "../../src/stdlib/tls.rs"]
         pub mod tls;
         // Copy this private sibling with either TLS adapter.

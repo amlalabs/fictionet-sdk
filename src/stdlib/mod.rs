@@ -219,8 +219,10 @@
 //! installation, attachment lifecycle, and DNS service modules.
 //! Copy `httpd.rs` together with the `httpd/` directory, keeping the relative
 //! paths. The entry file declares its private body and handler modules.
-//! Copy `tls.rs` or `sandbox.rs` together with `tls/output.rs`, keeping
-//! that relative path. Declare `#[path = "tls/output.rs"] mod tls_output;`
+//! Copy `tls.rs` together with the `tls/` directory, keeping the relative
+//! paths. The entry file declares its private run-aware crypto provider.
+//! Copy `sandbox.rs` together with `tls/output.rs`, keeping that relative
+//! path. For either copy, declare `#[path = "tls/output.rs"] mod tls_output;`
 //! next to the copied module. Both adapters use this private output helper.
 //!
 //! For a Modbus gateway that accepts a nonzero protocol identifier, copy

@@ -525,6 +525,23 @@ reply. If that send fails, the read reports the underlying connection error.
 Plaintext already decrypted is kept for the next read. If the connection has
 no room for output, sending waits for the next read or write.
 
+TLS ownership and reproducibility are split across these files:
+
+- [`tls/provider.rs`](../src/stdlib/tls/provider.rs) owns config builders,
+  the run clock, context binding, key exchange and signing. Its public functions
+  remain under `tls`. Fixed certificates, a fixed world date, the same seed
+  and ordered inputs repeat TLS records in a closed lab. Its docs describe
+  the obligations of custom resolvers and signers and the effect of real peers.
+- [`tls.rs`](../src/stdlib/tls.rs) owns transport, handshakes, ALPN selection
+  and observation decoration. [`ca.rs`](../src/stdlib/ca.rs) issues certificates
+  using the run's randomness and world-supplied leaf validity.
+- [`tls/output.rs`](../src/stdlib/tls/output.rs) drains ciphertext for both
+  the server and the simulated client. Copy `tls.rs` with the `tls/` directory
+  and declare `#[path = "tls/output.rs"] mod tls_output;` beside the copy.
+
+The [repeatable-run contract](../src/running.rs) also describes external I/O
+and the HTTP/2 host-clock exception.
+
 Each peer address may hold 256 connections at once across all machines
 and gateway DNS listeners in the network. Bytes held by the service layer
 are charged to one budget per sandbox, 256 MiB by default. TCP socket
