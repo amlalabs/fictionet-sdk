@@ -17,12 +17,10 @@
 //! three rounds before the timeout, 1 if the deadline expires first, 2 on
 //! bad arguments.
 
-mod addresses;
 mod args;
 mod blocked;
 mod config;
 mod dashboard;
-mod ether;
 mod netlink;
 mod observe;
 #[cfg(feature = "tokio")]

@@ -6,6 +6,7 @@
 //! after a reboot or with a new client ID, gets the same answer.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::dhcp::{self, opt};
@@ -13,12 +14,17 @@ use fictionet::stdlib::dhcpv6::{
     self, DhcpOption, Duid, IaAddr, IaNa, Message, StatusCode, msg, status,
 };
 
+use super::ether;
 use crate::config::{Lease, mask4};
-use crate::ether;
 
 /// How long a lease lasts, in seconds, for both families. The VM renews
 /// it halfway through, and attach answers the renewal with the same lease.
 const LEASE_SECS: u32 = 86_400;
+
+/// How often attach sends a router advertisement without being asked,
+/// when it hands out IPv6 addresses. It is well inside the advertised
+/// router lifetime of 30 minutes.
+pub(super) const RA_EVERY: Duration = Duration::from_secs(600);
 
 // DHCP for IPv4
 
@@ -266,7 +272,7 @@ pub(crate) fn dhcp6_packet(request_packet: &[u8], answer: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::config::Cidr;
-    use crate::ether::tests::{VM, v6_checksum_ok};
+    use crate::tap::ether::tests::{VM, v6_checksum_ok};
 
     fn lease4() -> Lease<Ipv4Addr> {
         Lease {
