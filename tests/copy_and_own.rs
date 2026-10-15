@@ -275,6 +275,29 @@ fn copied_contract_checks_fixed_capacity_and_returns_decoded_items() {
     }
 }
 
+#[test]
+fn copied_contract_checks_both_limits_and_returns_items_and_failure() {
+    use fictionet::stdlib::codec::Fail;
+    let make = Frames::<tpkt::Packet>::new;
+    let alloc_limit = 2 * make().capacity();
+    assert_eq!(
+        test_support::contract::check_decode_limits(make, &[3, 0, 0, 7, 1, 2, 3], 0, alloc_limit),
+        (vec![tpkt::Packet::new(vec![1, 2, 3])], None)
+    );
+    assert_eq!(
+        test_support::contract::check_decode_limits(
+            make,
+            &[3, 0, 0, 7, 1, 2, 3, 3, 0, 0],
+            0,
+            alloc_limit,
+        ),
+        (
+            vec![tpkt::Packet::new(vec![1, 2, 3])],
+            Some(Fail::Truncated { unread: 3 })
+        )
+    );
+}
+
 #[cfg(feature = "observe")]
 #[test]
 fn copied_presenters_plug_into_observe_and_construct_display_items() {

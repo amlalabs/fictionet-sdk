@@ -24,8 +24,7 @@ fuzz_target!(|data: &[u8]| {
             decoder.expect_method("GET").unwrap();
             decoder
         };
-        contract::check_decode_with_held_limit(make, data, 3074);
-        contract::check_decode_with_alloc_limit(make, data, 8194);
+        contract::check_decode_limits(make, data, 3074, 8194);
     }
     let body = &data[..data.len().min(512)];
     let interim = b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\n";

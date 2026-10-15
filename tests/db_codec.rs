@@ -14,10 +14,9 @@ where
 {
     let bytes: Vec<u8> = values.iter().flat_map(contract::check_written).collect();
     assert_eq!(
-        contract::check_decode_with_alloc_limit(&make, &bytes, 2 * make().capacity()),
+        contract::check_decode_limits(&make, &bytes, 0, 2 * make().capacity()),
         (values.to_vec(), None)
     );
-    contract::check_decode_with_held_limit(make, &bytes, 0);
 }
 
 fn header_refusal<D>(make: impl Fn() -> D + Copy, header: &[u8], error: D::Error)

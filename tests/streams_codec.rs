@@ -11,8 +11,7 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode_with_held_limit(&make, bytes, 0);
-    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity())
+    contract::check_decode_limits(&make, bytes, 0, 2 * make().capacity())
 }
 
 fn refused_header<D>(make: impl Fn() -> D, header: &[u8], expected: D::Error)

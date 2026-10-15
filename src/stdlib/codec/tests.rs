@@ -1269,6 +1269,70 @@ fn contract_alloc_limit_rejects_large_buffer() {
     contract::check_decode_with_alloc_limit(|| Frames, &[7, 1, 2, 3, 4, 5, 6, 7], 4);
 }
 #[test]
+fn contract_combined_limits_preserve_outcomes_with_one_traversal() {
+    for data in [
+        vec![2, b'a', b'b', 0],
+        vec![0, 2, b'a'],
+        vec![0, 0x40],
+        vec![0, 0xff, 0x40],
+        vec![0; 300],
+        vec![],
+    ] {
+        let made = Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Frames
+        };
+        let held = contract::check_decode_with_held_limit(make, &data, 0);
+        let schedules = made.replace(0);
+        assert!(schedules > 0);
+        let allocated = contract::check_decode_with_alloc_limit(make, &data, 16);
+        assert_eq!(made.replace(0), schedules);
+        let combined = contract::check_decode_limits(make, &data, 0, 16);
+        assert_eq!(made.get(), schedules);
+        // Whole input, four fixed and three random chunkings, then prefixes.
+        assert_eq!(made.get(), 8 + data.len().min(256) + 1);
+        assert_eq!(combined, held);
+        assert_eq!(combined, allocated);
+        assert_eq!(combined, test_support::decode_all(|| Frames, &data));
+    }
+}
+#[test]
+#[should_panic(expected = "held exceeds named limit")]
+fn contract_combined_limits_reject_initial_held_state() {
+    contract::check_decode_limits(|| Fault::Drain(5, true), b"", 4, 8);
+}
+#[test]
+#[should_panic(expected = "held exceeds named limit")]
+fn contract_combined_limits_reject_held_growth() {
+    struct Retain(Vec<u8>);
+    impl Decode for Retain {
+        type Item = ();
+        type Error = Infallible;
+        const NAME: &'static str = "retain";
+        fn capacity(&self) -> usize {
+            1
+        }
+        fn held(&self) -> usize {
+            self.0.len()
+        }
+        fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<()>, Infallible> {
+            let Some(&byte) = input.first() else {
+                return Ok(Step::Need);
+            };
+            self.0.push(byte);
+            Ok(Step::Item((), 1))
+        }
+    }
+    contract::check_decode_limits(|| Retain(Vec::new()), b"a", 1, 2);
+    contract::check_decode_limits(|| Retain(Vec::new()), b"a", 0, 2);
+}
+#[test]
+#[should_panic(expected = "buffer allocation exceeds limit")]
+fn contract_combined_limits_reject_large_buffer() {
+    contract::check_decode_limits(|| Frames, &[7, 1, 2, 3, 4, 5, 6, 7], 0, 4);
+}
+#[test]
 fn wrappers_chain_to_their_source_and_display_only_their_own_context() {
     use alloc::string::ToString;
     use core::error::Error as _;

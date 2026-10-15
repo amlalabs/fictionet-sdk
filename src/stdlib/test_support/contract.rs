@@ -8,9 +8,10 @@
 //!
 //! It cannot inspect hidden memory, prove absence of panics on untested
 //! input, or infer a protocol's held-state limit or exact wire grammar.
-//! Use [`check_decode_with_held_limit`] for a named state limit and
-//! [`check_decode_with_alloc_limit`] for a bound on the input buffer's
-//! allocation. A decoder
+//! Use [`check_decode_limits`] to check a named state limit and the input
+//! buffer's allocation bound in one traversal. The separate
+//! [`check_decode_with_held_limit`] and [`check_decode_with_alloc_limit`]
+//! helpers check either bound alone. A decoder
 //! must report its state accurately. Mode timing is enforced by the
 //! one-item interface. [`check_wire_value`] tests constructed writer values,
 //! including values a parser cannot produce.
@@ -284,14 +285,7 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    check_limits(
-        make,
-        data,
-        Limits {
-            held: held_limit,
-            alloc: usize::MAX,
-        },
-    )
+    check_decode_limits(make, data, held_limit, usize::MAX)
 }
 /// Like [`check_decode`], also checking that the stream's input buffer
 /// never has more than `alloc_limit` bytes allocated, measured by
@@ -307,11 +301,40 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
+    check_decode_limits(make, data, usize::MAX, alloc_limit)
+}
+
+/// Like [`check_decode`], checking both memory bounds in one traversal of
+/// the input schedules and bounded prefixes. Returns the whole-input items
+/// and terminal failure. Panics on a contract violation.
+///
+/// Checks `held_limit` initially and after every decode call, as in
+/// [`check_decode_with_held_limit`]. Checks `alloc_limit` after every push
+/// and every item, as in [`check_decode_with_alloc_limit`].
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Ending, Lines}, test_support::contract};
+/// let (items, failure) = contract::check_decode_limits(
+///     || Lines::new(16, Ending::LfOrCrlf), b"one\ntwo\n", 0, 36,
+/// );
+/// assert_eq!(items, [Ok(b"one".to_vec()), Ok(b"two".to_vec())]);
+/// assert_eq!(failure, None);
+/// ```
+pub fn check_decode_limits<D: Decode>(
+    make: impl Fn() -> D,
+    data: &[u8],
+    held_limit: usize,
+    alloc_limit: usize,
+) -> (Vec<D::Item>, Option<Fail<D::Error>>)
+where
+    D::Item: PartialEq + Debug,
+    D::Error: Clone + PartialEq + Debug,
+{
     check_limits(
         make,
         data,
         Limits {
-            held: usize::MAX,
+            held: held_limit,
             alloc: alloc_limit,
         },
     )

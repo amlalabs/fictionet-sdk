@@ -18,8 +18,7 @@ fuzz_target!(|data: &[u8]| {
         message: 4096,
     };
     let make = || Requests::with_limits(limits);
-    contract::check_decode_with_held_limit(make, data, 3072);
-    contract::check_decode_with_alloc_limit(make, data, 8194);
+    contract::check_decode_limits(make, data, 3072, 8194);
     // Also exercise valid pipelined messages with arbitrary body bytes.
     let body = &data[..data.len().min(512)];
     let mut input = format!(

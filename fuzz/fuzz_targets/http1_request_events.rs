@@ -16,8 +16,7 @@ fuzz_target!(|data: &[u8]| {
         body_chunk: 31,
         ..Limits::default()
     };
-    contract::check_decode_with_held_limit(|| RequestEvents::with_limits(limits), data, 0);
-    contract::check_decode_with_alloc_limit(|| RequestEvents::with_limits(limits), data, 4096);
+    contract::check_decode_limits(|| RequestEvents::with_limits(limits), data, 0, 4096);
     contract::check_decode(|| Collect::<Request>::new(4096), data);
     contract::check_wire::<Request>(data);
     contract::check_wire::<RequestHead>(data);

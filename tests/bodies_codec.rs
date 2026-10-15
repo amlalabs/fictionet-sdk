@@ -12,8 +12,7 @@ where
     D::Item: PartialEq + core::fmt::Debug,
 {
     let capacity = make().capacity();
-    contract::check_decode_with_held_limit(&make, bytes, 0);
-    contract::check_decode_with_alloc_limit(make, bytes, 2 * capacity)
+    contract::check_decode_limits(make, bytes, 0, 2 * capacity)
 }
 
 fn failure<D: Decode>(decoder: D, bytes: &[u8], eof: bool, expected: Fail<D::Error>)

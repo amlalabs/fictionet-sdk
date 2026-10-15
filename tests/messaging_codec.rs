@@ -12,8 +12,7 @@ where
     D::Error: Clone + PartialEq + Debug,
 {
     let limit = 2 * make().capacity();
-    contract::check_decode_with_held_limit(&make, bytes, 0);
-    contract::check_decode_with_alloc_limit(make, bytes, limit)
+    contract::check_decode_limits(make, bytes, 0, limit)
 }
 
 #[test]
