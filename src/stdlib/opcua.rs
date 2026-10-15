@@ -4026,11 +4026,34 @@ mod tests {
         diag.push(0);
         assert_eq!(<DiagnosticInfo as Wire>::parse(&diag), Err(Error::Depth));
         assert!(<DiagnosticInfo as Wire>::parse(&diag[1..]).is_ok());
-        // A failed read leaves the reader's depth where it was.
+    }
+
+    #[test]
+    fn same_reader_recovers() {
+        let mut deep = Vec::new();
+        for _ in 0..MAX_DEPTH {
+            deep.extend_from_slice(&[0x98, 1, 0, 0, 0]);
+        }
+        deep.extend_from_slice(&[6, 1, 0, 0, 0]);
         let mut r = Reader::new(&deep);
-        assert!(r.read::<Variant>().is_err());
-        let mut r2 = Reader::new(&bytes);
-        assert!(r2.read::<Variant>().is_ok());
+        assert_eq!(r.read::<Variant>(), Err(Error::Depth));
+        assert_eq!(r.depth, 0);
+        assert_eq!(r.data_values, 0);
+        assert_eq!(r.read::<Variant>(), Ok(Variant::Scalar(Value::Int32(1))));
+        assert_eq!(r.depth, 0);
+        assert_eq!(r.finish(), Ok(()));
+
+        let mut r = Reader::new(&[1, 23, 23, 0]);
+        assert_eq!(r.read::<DataValue>(), Err(Error::VariantType(23)));
+        assert_eq!(r.data_values, 0);
+        assert_eq!(r.depth, 0);
+        assert_eq!(
+            r.read::<Variant>(),
+            Ok(Variant::Scalar(Value::DataValue(Box::default())))
+        );
+        assert_eq!(r.data_values, 0);
+        assert_eq!(r.depth, 0);
+        assert_eq!(r.finish(), Ok(()));
     }
 
     #[test]
@@ -4679,6 +4702,28 @@ mod tests {
         let mut w = Writer::new();
         assert_eq!(w.array_len(MAX_ARRAY_LEN + 1), Err(Error::TooLong));
         assert_eq!(w.string_max(Some("abc"), 2), Err(Error::TooLong));
+    }
+
+    #[test]
+    fn writer_refusal_preserves_prefix() {
+        let mut w = Writer::new();
+        w.u32(7);
+        assert_eq!(w.array_len(MAX_ARRAY_LEN + 1), Err(Error::TooLong));
+        assert_eq!(w.out, [7, 0, 0, 0]);
+        assert_eq!(w.values, 0);
+        assert_eq!(w.depth, 0);
+
+        assert_eq!(w.string_max(Some("abc"), 2), Err(Error::TooLong));
+        assert_eq!(w.out, [7, 0, 0, 0]);
+        assert_eq!(w.values, 0);
+        assert_eq!(w.depth, 0);
+
+        w.count(MAX_VALUES).unwrap();
+        assert_eq!(w.array_len(1), Err(Error::TooManyValues));
+        assert_eq!(w.out, [7, 0, 0, 0]);
+        assert_eq!(w.values, MAX_VALUES);
+        assert_eq!(w.depth, 0);
+        assert_eq!(w.into_bytes(), Ok(vec![7, 0, 0, 0]));
     }
 
     #[test]
