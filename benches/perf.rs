@@ -21,7 +21,7 @@
 #[path = "../tests/common/certs.rs"]
 mod certs;
 
-#[path = "../tests/common/hyper.rs"]
+#[path = "../examples/common/hyper.rs"]
 mod hyper_io;
 use hyper_io::{Exec, Io};
 

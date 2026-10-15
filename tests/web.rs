@@ -6,7 +6,7 @@
 #[path = "common/certs.rs"]
 mod certs;
 mod common;
-#[path = "common/hyper.rs"]
+#[path = "../examples/common/hyper.rs"]
 mod hyper_io;
 use hyper_io::{Exec, Io};
 

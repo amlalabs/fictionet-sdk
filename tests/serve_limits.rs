@@ -15,7 +15,7 @@ mod wait;
 #[path = "common/world.rs"]
 mod world;
 
-#[path = "common/hyper.rs"]
+#[path = "../examples/common/hyper.rs"]
 mod hyper_io;
 use hyper_io::{Exec, Io};
 
