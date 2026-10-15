@@ -1354,9 +1354,10 @@ pub struct MetadataRequestTopic {
 /// topics, and which broker leads each partition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetadataRequest {
-    /// The topics to describe, or `None` for every topic. Version 0 has no
-    /// null: there an empty list means every topic, and `None` is written
-    /// as one.
+    /// The topics to describe, or `None` for every topic from version 1.
+    /// Version 0 has no null array: use `Some(vec![])` for every topic.
+    /// At version 0, writing `None` returns [`Error::Unwritable`], and
+    /// parsing a null array returns [`Error::Null`].
     pub topics: Option<Vec<MetadataRequestTopic>>,
     /// Whether the broker may create topics that do not exist, from
     /// version 4. True by default.
@@ -1370,6 +1371,8 @@ pub struct MetadataRequest {
     pub tagged_fields: Vec<TaggedField>,
 }
 
+/// Defaults to `topics: None`, which cannot be encoded at version 0.
+/// Set `topics` to `Some(vec![])` to request every topic at version 0.
 impl Default for MetadataRequest {
     fn default() -> MetadataRequest {
         MetadataRequest {
