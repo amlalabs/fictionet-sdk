@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -26,6 +26,19 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
   t.after(() => rm(profile, { recursive: true, force: true }));
   const received = [], foreign = [];
   let streams = 0, bootstraps = 0;
+  let recordResult;
+  const reported = new Promise((resolve, reject) => {
+    recordResult = (req, res) => {
+      let report = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { report += chunk; });
+      req.on('end', () => {
+        res.writeHead(204).end();
+        resolve({ report });
+      });
+      req.on('error', reject);
+    };
+  });
   const serve = async (handler) => {
     const server = createServer(handler);
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -34,16 +47,19 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
   };
   const other = await serve((req, res) => {
     foreign.push({ url: req.url, ...req.headers });
+    if (req.url === '/result') { recordResult(req, res); return; }
     res.setHeader('Content-Type', 'text/html');
     res.end(`<body>Checking other origin<script>
       const isolated = sessionStorage.getItem('fictionet_token') === null && !document.cookie.includes('fictionet_token');
       document.body.textContent = isolated ? 'PASS: isolated' : 'FAIL: leaked storage';
-      ${req.url === '/probe' ? `if (isolated) location.replace(${JSON.stringify(origin + '/reload#token=browser-test-token')});` : ''}
+      ${req.url === '/probe' ? `if (isolated) location.replace(${JSON.stringify(origin + '/reload#token=browser-test-token')}); else` : ''}
+      fetch('/result', { method: 'POST', credentials: 'omit', body: document.body.textContent });
     </script>`);
   });
   const transport = await readFile(new URL('./transport.mjs', import.meta.url));
   const origin = await serve((req, res) => {
     received.push({ url: req.url, ...req.headers });
+    if (req.url === '/result') { recordResult(req, res); return; }
     if (req.url === '/legacy') {
       res.writeHead(302, {
         'Set-Cookie': 'fictionet_token=browser-test-token; Path=/; HttpOnly; SameSite=Strict',
@@ -129,21 +145,54 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
           check(!accepted, 'request after logout');
           location.replace(${JSON.stringify(other + '/done')});
         }
-      } catch (error) { document.body.textContent = 'FAIL: ' + error.message; }
+      } catch (error) {
+        document.body.textContent = 'FAIL: ' + error.message;
+        await fetch('/result', { method: 'POST', credentials: 'omit', body: document.body.textContent });
+      }
     </script>`);
   });
-  let stdout;
+  // Streaming fetch bodies can outlive Chromium's virtual-time budget. Wait for the page's report.
+  const browser = spawn(chromium, [
+    '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+    '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
+    // The throwaway profile must not wait on the desktop keyring, which can be locked.
+    '--password-store=basic', `${origin}/legacy`,
+  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = '';
+  browser.stderr.setEncoding('utf8');
+  browser.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-4096); });
+  const exited = new Promise((resolve) => browser.once('exit', (code, signal) => resolve({ code, signal })));
+  const failed = new Promise((resolve) => browser.once('error', (error) => resolve({ error })));
+  const closed = new Promise((resolve) => browser.once('close', resolve));
+  const stop = async () => {
+    if (browser.pid && browser.exitCode === null && browser.signalCode === null) browser.kill();
+    await closed;
+  };
+  t.after(stop);
+  let timer;
+  const deadline = new Promise((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), 30000); });
+  let outcome;
   try {
-    ({ stdout } = await exec(chromium, [
-      '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
-      '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
-      '--dump-dom', '--virtual-time-budget=10000', `${origin}/legacy`,
-    ], { timeout: 30000, maxBuffer: 2 << 20 }));
-  } catch (error) {
-    unavailable(error);
+    outcome = await Promise.race([reported, exited, failed, deadline]);
+  } finally {
+    clearTimeout(timer);
+    await stop();
+  }
+  const diagnostics = `Chromium stderr (tail):\n${stderr}\nOrigin requests: ${received.map((r) => r.url).join(', ')}\nOther origin requests: ${foreign.map((r) => r.url).join(', ')}`;
+  if (outcome.error) {
+    unavailable(outcome.error);
     return;
   }
-  assert.match(stdout, /<body>PASS: isolated/);
+  if ('code' in outcome) {
+    const message = `Chromium exited before reporting a result (code ${outcome.code}, signal ${outcome.signal})\n${diagnostics}`;
+    if (outcome.code !== 0 || outcome.signal) {
+      unavailable(new Error(message));
+      return;
+    }
+    assert.fail(message);
+  }
+  if (outcome.timeout) assert.fail(`Chromium did not report a result within 30 s\n${diagnostics}`);
+  assert.match(outcome.report, /^PASS: isolated$/);
   assert.equal(bootstraps, 3);
   assert.equal(streams, 2);
   assert.ok(received.some((r) => r.url.startsWith('/api/pcap?')));
