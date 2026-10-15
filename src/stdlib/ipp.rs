@@ -1432,49 +1432,65 @@ fn scan_head(bytes: &[u8], pos: &mut usize, limit: usize) -> Result<Option<usize
         return Ok(None);
     }
     *pos = (*pos).max(HEADER_LEN);
-    loop {
-        let p = *pos;
-        let Some(&tag) = bytes.get(p) else {
-            return Ok(None);
-        };
-        let next = p.checked_add(1).ok_or(FrameError::TooLong)?;
-        if next > limit {
-            return Err(FrameError::TooLong);
-        }
-        if tag == tag::END_OF_ATTRIBUTES {
-            return Ok(Some(next));
-        }
-        if tag < 0x10 {
-            if next >= limit {
-                return Err(FrameError::TooLong);
-            }
-            *pos = next;
-            continue;
-        }
-        let name_start = p.checked_add(3).ok_or(FrameError::TooLong)?;
-        if name_start >= limit {
-            return Err(FrameError::TooLong);
-        }
-        let Some(n) = len_at(bytes, next)? else {
-            return Ok(None);
-        };
-        let at = name_start.checked_add(n).ok_or(FrameError::TooLong)?;
-        let value_start = at.checked_add(2).ok_or(FrameError::TooLong)?;
-        if value_start >= limit {
-            return Err(FrameError::TooLong);
-        }
-        let Some(v) = len_at(bytes, at)? else {
-            return Ok(None);
-        };
-        let end = value_start.checked_add(v).ok_or(FrameError::TooLong)?;
-        if end >= limit {
-            return Err(FrameError::TooLong);
-        }
-        if bytes.len() < end {
-            return Ok(None);
+    while let Some((record, end)) = record_prefix(bytes, *pos, limit)? {
+        if matches!(record, Record::Delimiter(tag::END_OF_ATTRIBUTES)) {
+            return Ok(Some(end));
         }
         *pos = end;
     }
+    Ok(None)
+}
+
+// Borrow one complete record, reserving room for the final end tag.
+// Check each known boundary before waiting for the next length or payload.
+fn record_prefix(
+    bytes: &[u8],
+    p: usize,
+    limit: usize,
+) -> Result<Option<(Record<'_>, usize)>, FrameError> {
+    let Some(&tag) = bytes.get(p) else {
+        return Ok(None);
+    };
+    let next = p.checked_add(1).ok_or(FrameError::TooLong)?;
+    if next > limit {
+        return Err(FrameError::TooLong);
+    }
+    if tag < 0x10 {
+        if tag != tag::END_OF_ATTRIBUTES && next >= limit {
+            return Err(FrameError::TooLong);
+        }
+        return Ok(Some((Record::Delimiter(tag), next)));
+    }
+    let name_start = p.checked_add(3).ok_or(FrameError::TooLong)?;
+    if name_start >= limit {
+        return Err(FrameError::TooLong);
+    }
+    let Some(n) = len_at(bytes, next)? else {
+        return Ok(None);
+    };
+    let at = name_start.checked_add(n).ok_or(FrameError::TooLong)?;
+    let value_start = at.checked_add(2).ok_or(FrameError::TooLong)?;
+    if value_start >= limit {
+        return Err(FrameError::TooLong);
+    }
+    let Some(v) = len_at(bytes, at)? else {
+        return Ok(None);
+    };
+    let end = value_start.checked_add(v).ok_or(FrameError::TooLong)?;
+    if end >= limit {
+        return Err(FrameError::TooLong);
+    }
+    if bytes.len() < end {
+        return Ok(None);
+    }
+    Ok(Some((
+        Record::Value {
+            tag,
+            name: &bytes[name_start..at],
+            value: &bytes[value_start..end],
+        },
+        end,
+    )))
 }
 
 /// Reads a length field at `i`: `None` if its bytes have not come.
@@ -1508,28 +1524,13 @@ struct Records<'a> {
     pos: usize,
 }
 
-impl<'a> Iterator for Records<'a> {
-    type Item = Record<'a>;
-
-    fn next(&mut self) -> Option<Record<'a>> {
-        let b = self.b;
-        let p = self.pos;
-        let &t = b.get(p)?;
-        if t < 0x10 {
-            self.pos = p + 1;
-            return Some(Record::Delimiter(t));
-        }
-        let n = usize::from(u16::from_be_bytes([*b.get(p + 1)?, *b.get(p + 2)?]));
-        let name = b.get(p + 3..p + 3 + n)?;
-        let at = p + 3 + n;
-        let v = usize::from(u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?]));
-        let value = b.get(at + 2..at + 2 + v)?;
-        self.pos = at + 2 + v;
-        Some(Record::Value {
-            tag: t,
-            name,
-            value,
-        })
+impl<'a> Records<'a> {
+    fn next(&mut self) -> Result<Option<Record<'a>>, FrameError> {
+        let Some((record, end)) = record_prefix(self.b, self.pos, self.b.len())? else {
+            return Ok(None);
+        };
+        self.pos = end;
+        Ok(Some(record))
     }
 }
 
@@ -1541,7 +1542,7 @@ fn head(fixed: &[u8; HEADER_LEN], body: &[u8]) -> Result<Header, Error> {
     // The names in the current group, to find one used twice. A BTreeSet
     // keeps the check free of the random keys a HashSet would draw.
     let mut names: BTreeSet<&[u8]> = BTreeSet::new();
-    while let Some(r) = records.next() {
+    while let Some(r) = records.next()? {
         match r {
             Record::Delimiter(tag::END_OF_ATTRIBUTES) => break,
             Record::Delimiter(0) => return Err(Error::ReservedGroup),
@@ -1771,7 +1772,7 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
             tag: t,
             name,
             value,
-        }) = records.next()
+        }) = records.next()?
         else {
             return Err(Error::Collection);
         };
@@ -1965,6 +1966,34 @@ mod tests {
         out.extend_from_slice(&(value.len() as u16).to_be_bytes());
         out.extend_from_slice(value);
         out
+    }
+
+    #[test]
+    fn head_scan_keeps_complete_record_progress() {
+        let mut bytes = vec![1, 1, 0, 2, 0, 0, 0, 7, tag::OPERATION_ATTRIBUTES];
+        let mut pos = 0;
+        assert_eq!(scan_head(&bytes, &mut pos, MAX_HEAD), Ok(None));
+        assert_eq!(pos, bytes.len());
+        for record in [
+            rec(tag::OCTET_STRING, "n", b"a\x03b"),
+            rec(tag::NO_VALUE, "", b""),
+        ] {
+            let start = bytes.len();
+            for (i, byte) in record.iter().enumerate() {
+                bytes.push(*byte);
+                assert_eq!(scan_head(&bytes, &mut pos, MAX_HEAD), Ok(None));
+                assert_eq!(
+                    pos,
+                    if i + 1 == record.len() {
+                        bytes.len()
+                    } else {
+                        start
+                    }
+                );
+            }
+        }
+        bytes.push(tag::END_OF_ATTRIBUTES);
+        assert_eq!(scan_head(&bytes, &mut pos, MAX_HEAD), Ok(Some(bytes.len())));
     }
 
     /// The Print-Job request of RFC 8010 appendix A.1.

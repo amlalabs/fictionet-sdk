@@ -600,6 +600,128 @@ fn ipp_overlong_names_are_bad_request_items() {
 }
 
 #[test]
+fn ipp_record_prefixes_wait_at_every_split_and_leave_the_document_unread() {
+    let bytes = b"\x01\x01\0\x02\0\0\0\x07\x01\x30\0\x01n\0\x03a\x03b\x30\0\0\0\0\x03";
+    let head = ipp::Header {
+        version: (1, 1),
+        code: ipp::operation::PRINT_JOB,
+        request_id: 7,
+        groups: vec![ipp::Group {
+            tag: ipp::tag::OPERATION_ATTRIBUTES,
+            attributes: vec![ipp::Attribute {
+                name: "n".into(),
+                values: vec![
+                    ipp::Value::OctetString(b"a\x03b".to_vec()),
+                    ipp::Value::OctetString(vec![]),
+                ],
+            }],
+        }],
+    };
+    assert_eq!(ipp::Header::parse(bytes), Ok(head.clone()));
+    let mut decoder = ipp::Head::new();
+    for end in 1..bytes.len() {
+        let prefix = &bytes[..end];
+        assert_eq!(decoder.decode(prefix, false), Ok(Step::Need));
+        assert_eq!(ipp::Header::parse(prefix), Err(ipp::Error::Truncated));
+        failure(
+            ipp::Head::new(),
+            prefix,
+            true,
+            Fail::Truncated { unread: end },
+        );
+
+        let mut stream = Stream::new(ipp::Head::new());
+        assert_eq!(stream.push(prefix), end);
+        assert_eq!(stream.next(), None);
+        assert!(!stream.is_done());
+        assert_eq!(stream.push(&bytes[end..]), bytes.len() - end);
+        assert_eq!(stream.push(b"document"), 8);
+        assert_eq!(stream.next(), Some(Ok(Ok(head.clone()))));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.unread(), b"document");
+        assert_eq!(stream.offset(), bytes.len() as u64);
+    }
+    assert_eq!(
+        decoder.decode(bytes, false),
+        Ok(Step::Item(Ok(head.clone()), bytes.len()))
+    );
+    assert_eq!(
+        check(|| ipp::Head::with_limit(bytes.len()), bytes),
+        (vec![Ok(head)], None)
+    );
+    failure(
+        ipp::Head::with_limit(bytes.len() - 1),
+        &bytes[..bytes.len() - 1],
+        false,
+        Fail::Protocol(ipp::FrameError::TooLong),
+    );
+}
+
+#[test]
+fn ipp_signed_record_lengths_precede_attribute_errors() {
+    for prefix in [&b"\x41"[..], &b"\x41\0\x01n"[..]] {
+        for length in [0x8000u16, 0xffff] {
+            // A reserved group is an item error only after framing succeeds.
+            let mut bytes = b"\x01\x01\0\x02\0\0\0\x07\0".to_vec();
+            bytes.extend_from_slice(prefix);
+            bytes.extend_from_slice(&length.to_be_bytes());
+            let mut decoder = ipp::Head::new();
+            for end in 1..bytes.len() {
+                assert_eq!(decoder.decode(&bytes[..end], false), Ok(Step::Need));
+            }
+            assert_eq!(
+                decoder.decode(&bytes, false),
+                Err(ipp::FrameError::Length(length))
+            );
+            assert_eq!(ipp::Header::parse(&bytes), Err(ipp::Error::Length(length)));
+            assert_eq!(ipp::Message::parse(&bytes), Err(ipp::Error::Length(length)));
+            assert_eq!(
+                check(ipp::Head::new, &bytes),
+                (
+                    vec![],
+                    Some(Fail::Protocol(ipp::FrameError::Length(length)))
+                )
+            );
+            failure(
+                ipp::Head::new(),
+                &bytes,
+                false,
+                Fail::Protocol(ipp::FrameError::Length(length)),
+            );
+        }
+    }
+}
+
+#[test]
+fn ipp_record_limits_precede_unread_lengths_and_reserve_the_end_tag() {
+    for (record, limit, expected) in [
+        (&b"\x41"[..], 12, Err(ipp::FrameError::TooLong)),
+        (&b"\x41\x80\0"[..], 12, Err(ipp::FrameError::TooLong)),
+        (&b"\x41\x80\0"[..], 13, Err(ipp::FrameError::Length(0x8000))),
+        (&b"\x41\0\x01"[..], 15, Err(ipp::FrameError::TooLong)),
+        (&b"\x41\0\x01n\x80\0"[..], 15, Err(ipp::FrameError::TooLong)),
+        (
+            &b"\x41\0\x01n\x80\0"[..],
+            16,
+            Err(ipp::FrameError::Length(0x8000)),
+        ),
+        (&b"\x41\0\x01n\0\x01"[..], 16, Err(ipp::FrameError::TooLong)),
+        (&b"\x41\0\x01n\0\x01"[..], 17, Ok(Step::Need)),
+        (&b"\x41\0\x01n\0\x01x"[..], 17, Ok(Step::Need)),
+    ] {
+        let mut bytes = b"\x01\x01\0\x02\0\0\0\x07\x01".to_vec();
+        bytes.extend_from_slice(record);
+        for eof in [false, true] {
+            assert_eq!(
+                ipp::Head::with_limit(limit).decode(&bytes, eof),
+                expected,
+                "record {record:?}, limit {limit}, eof {eof}"
+            );
+        }
+    }
+}
+
+#[test]
 fn ipp_limits_are_refused_from_attribute_headers_and_partial_heads_truncate() {
     let name = b"\x01\x01\0\x02\0\0\0\x07\x01\x41\x01\0";
     failure(
