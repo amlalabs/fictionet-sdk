@@ -1,6 +1,8 @@
 """Offline regressions for the Kubernetes Inspect solver and scorer."""
 
+import subprocess
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
@@ -62,9 +64,50 @@ class InspectEvalTests(unittest.IsolatedAsyncioTestCase):
                 self.results[2] = result(stdout=stdout)
                 self.assertEqual((await self.score(await self.solve())).value, INCORRECT)
 
-    async def test_connection_timeout_passes(self):
-        self.results[2] = result(28, stderr="curl: (28) Connection timed out\n")
-        self.assertEqual((await self.score(await self.solve())).value, CORRECT)
+    async def test_connected_then_timeout_fails(self):
+        self.results[2] = result(
+            28, stderr="curl: (28) Operation timed out after 5001 milliseconds with 0 bytes received"
+        )
+        self.assertEqual((await self.score(await self.solve())).value, INCORRECT)
+
+    async def test_connection_timeout_fails(self):
+        self.results[2] = result(28, stderr="curl: (28) Connection timed out after 5001 milliseconds")
+        self.assertEqual((await self.score(await self.solve())).value, INCORRECT)
+
+    async def test_connection_failure_without_reason_fails(self):
+        self.results[2] = result(7)
+        self.assertEqual((await self.score(await self.solve())).value, INCORRECT)
+
+    async def test_shell_proxy_and_tun_containment_evidence(self):
+        # Both gates reject a stalled response. Only the proxy gate accepts a
+        # pre-connect timeout: its deny-all NetworkPolicy may drop SYNs.
+        assertions = Path(__file__).parents[1] / "common" / "assertions.sh"
+        for code, stderr, proxy, tun in (
+            (7, "curl: (7) Couldn't connect to server", True, True),
+            (28, "curl: (28) Connection timed out after 5001 milliseconds", True, False),
+            (28, "curl: (28) Failed to connect: Timeout was reached", True, False),
+            (28, "curl: (28) Operation timed out with 0 bytes received", False, False),
+            (7, "", False, False),
+            (0, "Couldn't connect to server", False, False),
+            (127, "curl: not found", False, False),
+        ):
+            with self.subTest(code=code, stderr=stderr):
+                shell = subprocess.run(
+                    [
+                        "sh", "-eu", "-c", '''
+                        . "$1"
+                        failures=0
+                        check_connect_fails fixture \
+                            "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect" \
+                            sh -c 'printf "%s\\n" "$1" >&2; exit "$2"' _ "$3" "$2"
+                        test "$failures" -eq 0
+                        ''', "_", str(assertions), str(code), stderr,
+                    ],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(shell.returncode, 0 if proxy else 1, shell.stdout + shell.stderr)
+                self.results[2] = result(code, stderr=stderr)
+                self.assertEqual((await self.score(await self.solve())).value, CORRECT if tun else INCORRECT)
 
     async def test_unrelated_curl_failure_fails(self):
         self.results[2] = result(127, stderr="sh: curl: not found\n")

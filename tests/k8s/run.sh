@@ -54,7 +54,7 @@ test_ordering_fixtures() {
     test_ordering() {
         local name="$1" want="$2" attach_started="$3" agent_started="$4" ordered=false
         if starts_in_order "$attach_started" "$agent_started"; then ordered=true; fi
-        check "$name" "^$want $" echo "$ordered"
+        check_ok "$name" "^$want $" echo "$ordered"
     }
     test_ordering "equal start timestamps are accepted" true \
         2026-10-14T12:00:00Z 2026-10-14T12:00:00Z
@@ -91,41 +91,41 @@ helm uninstall "$release" --wait >/dev/null 2>&1 || true
 helm install "$release" "$root/charts/fictionet-sandbox" -f "$root/examples/attach/k8s-tun.yaml" --wait --timeout 180s >/dev/null
 
 # 1. Who the agent is, and what it sees.
-check "the agent is uid 1000" '^uid=1000' agent id
-check "the agent's process 1 is its own command" '^sleep infinity +$' agent sh -c 'tr "\0" " " < /proc/1/cmdline'
-check "the agent sees no process of attach or the world" '^0 $' \
-    agent sh -c 'cat /proc/[0-9]*/cmdline 2>/dev/null | tr "\0" " " | grep -c -E "fictione[t]|web_worl[d]"; true'
-check "the agent's memory is limited to 2 GiB" '^2147483648 $' agent cat /sys/fs/cgroup/memory.max
-check "the agent's CPU is limited to 1" '^100000 100000 $' agent cat /sys/fs/cgroup/cpu.max
-check "with tun, there is no wait-blocked" '^world attach ?$' \
+check_ok "the agent is uid 1000" '^uid=1000' agent id
+check_ok "the agent's process 1 is its own command" '^sleep infinity +$' agent sh -c 'tr "\0" " " < /proc/1/cmdline'
+check_ok "the agent sees no process of attach or the world" '^0 $' \
+    agent bash -e -o pipefail -c 'cmdlines=$(cat /proc/[0-9]*/cmdline | tr "\0" " "); printf "%s\n" "$cmdlines" | awk "/fictione[t]|web_worl[d]/ { n++ } END { print n+0 }"'
+check_ok "the agent's memory is limited to 2 GiB" '^2147483648 $' agent cat /sys/fs/cgroup/memory.max
+check_ok "the agent's CPU is limited to 1" '^100000 100000 $' agent cat /sys/fs/cgroup/cpu.max
+check_ok "with tun, there is no wait-blocked" '^world attach ?$' \
     kubectl get pod "$pod" -o jsonpath='{.spec.initContainers[*].name}'
 
 # 2. Links and routes.
-check "eth0 is down" 'eth0@[^ ]+ +DOWN' agent ip -br link show eth0
-check "eth0 has no address" '^eth0@[^ ]+ +DOWN +$' agent ip -br addr show eth0
-check "the only default route is tun0's" '^default via 10\.0\.0\.1 dev tun0 proto static onlink +$' \
-    agent sh -c 'ip route show table all | grep -E "^default|dev eth0"; ip -6 route show table all | grep -E "^default|dev eth0"; true'
+check_ok "eth0 is down" 'eth0@[^ ]+ +DOWN' agent ip -br link show eth0
+check_ok "eth0 has no address" '^eth0@[^ ]+ +DOWN +$' agent ip -br addr show eth0
+check_ok "the only default route is tun0's" '^default via 10\.0\.0\.1 dev tun0 proto static onlink +$' \
+    agent sh -ec 'v4=$(ip route show table all); v6=$(ip -6 route show table all); printf "%s\n" "$v4" "$v6" | awk "/^default|dev eth0/"'
 
 # 3. DNS.
-check "resolv.conf names only the world" '^nameserver 10\.0\.0\.1 options ndots:1 $' agent cat /etc/resolv.conf
-check "the world answers DNS" '^203\.0\.113\.10 $' agent dig +short example.test
+check_ok "resolv.conf names only the world" '^nameserver 10\.0\.0\.1 options ndots:1 $' agent cat /etc/resolv.conf
+check_ok "the world answers DNS" '^203\.0\.113\.10 $' agent dig +short example.test
 
 # 4. HTTPS.
-check "https to the world's site" '^hello from https example.test 443 over HTTP/2.0 $' \
+check_ok "https to the world's site" '^hello from https example.test 443 over HTTP/2.0 $' \
     agent curl -sS "${ca[@]}" https://example.test/
 
 # 5. Nothing else.
-check "1.1.1.1 is unreachable" "Couldn't connect to server" agent curl -sS -m 5 http://1.1.1.1/
+check_fails "1.1.1.1 is unreachable" "Couldn't connect to server" agent curl -sS -m 5 http://1.1.1.1/
 kube_dns="$(kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}')"
-check "the cluster's DNS ($kube_dns) is unreachable" 'no servers could be reached' \
+check_fails "the cluster's DNS ($kube_dns) is unreachable" 'no servers could be reached' \
     agent dig +time=2 +tries=1 "@$kube_dns" kubernetes.default.svc.cluster.local
 api="$(kubectl get service kubernetes -o jsonpath='{.spec.clusterIP}')"
-check "the API server ($api) is unreachable" "Couldn't connect to server" agent curl -sS -m 5 -k "https://$api/version"
+check_fails "the API server ($api) is unreachable" "Couldn't connect to server" agent curl -sS -m 5 -k "https://$api/version"
 
 # 6. No way back.
-check "ip link set eth0 up is refused" 'Operation not permitted' agent ip link set eth0 up
-check "ip route add is refused" 'Operation not permitted' agent ip route add 1.1.1.1 dev eth0
-check "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/relay
+check_fails "ip link set eth0 up is refused" 'Operation not permitted' agent ip link set eth0 up
+check_fails "ip route add is refused" 'Operation not permitted' agent ip route add 1.1.1.1 dev eth0
+check_fails "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/relay
 
 # 7. Coarse start ordering and current readiness are separate checks.
 attach_started="$(kubectl get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].state.running.startedAt}')"
@@ -135,30 +135,31 @@ if starts_in_order "$attach_started" "$agent_started"; then
 else
     fail "start ordering: attach $attach_started, agent $agent_started"
 fi
-check "attach is ready" '^true ?$' \
+check_ok "attach is ready" '^true ?$' \
     kubectl get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].ready}'
-check "attach made /dev/net/tun and took eth0 down" 'eth0 is down.*made /dev/net/tun.*attached as tun0' \
+check_ok "attach made /dev/net/tun and took eth0 down" 'eth0 is down.*made /dev/net/tun.*attached as tun0' \
     kubectl logs "$pod" -c attach
 
 # 8. Attach stopped: no network. Restarted: the network is back.
 node="$cluster-control-plane"
 attach_id="$(docker exec "$node" crictl ps --name attach -q)"
 docker exec "$node" crictl --timeout 30s stop -t 0 "$attach_id" >/dev/null
-check "with attach stopped, tun0 is gone" '^0 $' agent sh -c 'ip -br link | grep -c tun0; true'
-check "with attach stopped, nothing answers" 'Could not resolve host' agent curl -sS -m 3 "${ca[@]}" https://example.test/
+check_ok "with attach stopped, tun0 is gone" '^0 $' \
+    agent sh -ec 'links=$(ip -br link); printf "%s\n" "$links" | awk "/tun0/ { n++ } END { print n+0 }"'
+check_fails "with attach stopped, nothing answers" 'Could not resolve host' agent curl -sS -m 3 "${ca[@]}" https://example.test/
 for _ in $(seq 1 60); do
     restarts="$(kubectl get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].restartCount}')"
     ready="$(kubectl get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].ready}')"
     if [ "$restarts" -ge 1 ] && [ "$ready" = true ]; then break; fi
     sleep 1
 done
-check "attach restarted and is ready" '^1 true $' echo "$restarts $ready"
-check "after the restart, https works again" '^hello from https example.test 443' \
+check_ok "attach restarted and is ready" '^1 true $' echo "$restarts $ready"
+check_ok "after the restart, https works again" '^hello from https example.test 443' \
     agent curl -sS "${ca[@]}" https://example.test/
 
 # 9. Inspect.
 if [ "${INSPECT:-0}" = 1 ]; then
-    check "the Inspect eval passes" 'accuracy +1\.0' \
+    check_ok "the Inspect eval passes" 'accuracy +1\.0' \
         sh -c "cd '$root' && inspect eval tests/k8s/inspect_eval.py --model mockllm/model --display plain \
             --log-dir target/inspect-logs"
 fi

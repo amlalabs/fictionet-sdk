@@ -71,25 +71,42 @@ check_fails_with() {
     fi
 }
 
+_capture_stderr() { "$@" 2>"$_assert_stderr_file"; }
+
+# NAME, PATTERN, CMD...: require a failed connection and its reason on stderr.
+# A NetworkPolicy may drop SYNs. A timeout is evidence only before connecting;
+# a stalled response (even with no bytes received) is not isolation evidence.
+check_connect_fails() {
+    _assert_name=$1 _assert_want=$2
+    shift 2
+    if ! _assert_stderr_file=$(mktemp); then
+        fail "$_assert_name: could not create stderr capture"
+        return
+    fi
+    run_captured _capture_stderr "$@"
+    if ! _assert_stderr=$(cat "$_assert_stderr_file"); then
+        fail "$_assert_name: could not read stderr capture"
+        if ! rm -f "$_assert_stderr_file"; then fail "$_assert_name: could not remove stderr capture"; fi
+        return
+    fi
+    if ! rm -f "$_assert_stderr_file"; then
+        fail "$_assert_name: could not remove stderr capture"
+        return
+    fi
+    if ! _refusal_status "$status"; then
+        fail "$_assert_name: wanted a failed connection, got status $status: $out $_assert_stderr"
+    elif printf '%s\n' "$_assert_stderr" | grep -E 'Operation timed out|bytes received' >/dev/null; then
+        fail "$_assert_name: timeout after connecting: $_assert_stderr"
+    elif printf '%s\n' "$_assert_stderr" | grep -E -- "$_assert_want" >/dev/null; then
+        pass "$_assert_name"
+    else
+        fail "$_assert_name: wanted /$_assert_want/ on stderr, got status $status: $out $_assert_stderr"
+    fi
+}
+
 # Require exactly N recorded checks. This does not count itself as a pass.
 expect_checks() {
     if [ "$((${passes:-0} + failures))" != "$1" ]; then
         fail "wanted $1 checks, got $((${passes:-0} + failures))"
-    fi
-}
-
-# T11-32 replaces this legacy output-only check at its callers.
-# Runs a check: name, then the expected text (a grep -E pattern), then the
-# command. The command's stdout and stderr are matched, as one line.
-check() {
-    _legacy_name=$1 _legacy_want=$2
-    shift 2
-    # Lines are joined with spaces, so a pattern can span them.
-    # Only the output is checked; the command's exit status is ignored.
-    _legacy_out="$("$@" 2>&1 | tr '\n' ' ')" || true
-    if printf '%s\n' "$_legacy_out" | grep -E -- "$_legacy_want" >/dev/null; then
-        pass "$_legacy_name"
-    else
-        fail "$_legacy_name: wanted /$_legacy_want/, got: $_legacy_out"
     fi
 }

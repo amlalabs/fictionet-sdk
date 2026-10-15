@@ -2,7 +2,8 @@
 fictionet-sandbox chart. No model is called: the solver runs fixed
 commands in the sandbox, so `--model mockllm/model` works with no API key.
 Each check scores only its own exit status and output. Direct internet access
-must fail to connect or time out. The transcript is only for diagnostics.
+must fail with curl exit 7 and "Couldn't connect to server". A timeout does not
+prove tun isolation. The transcript is only for diagnostics.
 
     inspect eval tests/k8s/inspect_eval.py --model mockllm/model
 
@@ -28,7 +29,7 @@ VALUES = HERE.parent.parent / "examples" / "attach" / "k8s-tun.yaml"
 CHECKS = [
     ("curl -sS --cacert /run/ca/ca.pem https://example.test/", (0,), "hello from https example.test 443"),
     ("dig +short example.test", (0,), "203.0.113.10"),
-    ("curl -sS -m 5 http://1.1.1.1/", (7, 28), ""),
+    ("curl -sS -m 5 http://1.1.1.1/", (7,), "Couldn't connect to server"),
     ("ip link set eth0 up", (2,), "Operation not permitted"),
     ("ls /run/relay", (2,), "No such file or directory"),
 ]

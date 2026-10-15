@@ -70,24 +70,24 @@ out="$(helm install "$release" "$root/charts/fictionet-sandbox" -n "$ns" -f "$ro
     --set serviceDefaults.world.image=fictionet-web-fixture:dev \
     --wait --timeout 180s 2>&1)" || fail "helm install: $out"
 if grep -qi 'PodSecurity' <<<"$out"; then fail "Pod Security warnings: $out"; else pass "the proxy release is admitted under restricted, with no warning"; fi
-check "both sandboxes run" '^Running Running ?$' \
+check_ok "both sandboxes run" '^Running Running ?$' \
     kubectl -n "$ns" get pod "$pod" "$socks_pod" -o jsonpath='{.items[*].status.phase}'
-check "no container adds a capability or runs as root" '^$' \
-    sh -c "kubectl -n $ns get pod $pod -o json | grep -E '\"add\"|\"runAsUser\": 0|\"privileged\": true' || true"
-check "attach runs as the world's user, with no capabilities" '^uid=65532' \
-    sh -c "kubectl -n $ns get pod $pod -o jsonpath='{.spec.initContainers[?(@.name==\"attach\")].securityContext.runAsUser}' | sed 's/^/uid=/'"
-helm install fntun "$root/charts/fictionet-sandbox" -n "$ns" -f "$root/examples/attach/k8s-tun.yaml" >/dev/null 2>&1 || true
+check_ok "no container adds a capability or runs as root" '^$' \
+    sh -ec 'pod=$(kubectl -n "$1" get pod "$2" -o json); printf "%s\n" "$pod" | awk "/\"add\"|\"runAsUser\": 0|\"privileged\": true/"' _ "$ns" "$pod"
+check_ok "attach runs as the world's user, with no capabilities" '^uid=65532' \
+    bash -o pipefail -c "kubectl -n $ns get pod $pod -o jsonpath='{.spec.initContainers[?(@.name==\"attach\")].securityContext.runAsUser}' | sed 's/^/uid=/'"
+helm install fntun "$root/charts/fictionet-sandbox" -n "$ns" -f "$root/examples/attach/k8s-tun.yaml" >/dev/null
 sleep 3
-check "a tun release in the same namespace is refused" 'violates PodSecurity "restricted:latest".*NET_ADMIN' \
+check_ok "a tun release in the same namespace is refused" 'violates PodSecurity "restricted:latest".*NET_ADMIN' \
     kubectl -n "$ns" get events --field-selector reason=FailedCreate -o jsonpath='{.items[*].message}'
 helm uninstall fntun -n "$ns" >/dev/null 2>&1 || true
 
 # 1a. The agent waits for the NetworkPolicy.
-check "wait-blocked exited 0 once the API server stopped answering" \
+check_ok "wait-blocked exited 0 once the API server stopped answering" \
     'unreachable 3 times in a row' kubectl -n "$ns" logs "$pod" -c wait-blocked
 blocked_at="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="wait-blocked")].state.terminated.finishedAt}')"
 agent_started="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.containerStatuses[?(@.name=="default")].state.running.startedAt}')"
-check "the agent started after wait-blocked exited" 'after' \
+check_ok "the agent started after wait-blocked exited" '^after $' \
     sh -c "[ -n \"$blocked_at\" ] && [ ! \"$agent_started\" \< \"$blocked_at\" ] && echo after || echo 'wait-blocked $blocked_at, agent $agent_started'"
 # A release with no NetworkPolicy: whatever the CNI does, the agent must
 # not start. Then a deny-all policy is applied by hand, and it starts.
@@ -96,9 +96,9 @@ helm install fnnopolicy "$root/charts/fictionet-sandbox" -n "$ns" -f "$root/exam
     --set serviceDefaults.world.image=fictionet-web-fixture:dev \
     --set networkPolicy.enabled=false >/dev/null
 sleep 20
-check "with no NetworkPolicy, wait-blocked is still waiting" 'still reachable; waiting' \
+check_ok "with no NetworkPolicy, wait-blocked is still waiting" 'still reachable; waiting' \
     kubectl -n "$ns" logs "$nopolicy_pod" -c wait-blocked
-check "with no NetworkPolicy, the agent has not started" '^PodInitializing ?$' \
+check_ok "with no NetworkPolicy, the agent has not started" '^PodInitializing ?$' \
     kubectl -n "$ns" get pod "$nopolicy_pod" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}'
 kubectl -n "$ns" apply -f - >/dev/null <<EOF_POLICY
 apiVersion: networking.k8s.io/v1
@@ -111,53 +111,53 @@ spec:
       app.kubernetes.io/instance: fnnopolicy
   policyTypes: [Ingress, Egress]
 EOF_POLICY
-kubectl -n "$ns" wait --for=condition=Ready "pod/$nopolicy_pod" --timeout 90s >/dev/null 2>&1 || true
-check "once a deny-all policy is applied, the agent starts" '^true ?$' \
+kubectl -n "$ns" wait --for=condition=Ready "pod/$nopolicy_pod" --timeout 90s >/dev/null
+check_ok "once a deny-all policy is applied, the agent starts" '^true ?$' \
     kubectl -n "$ns" get pod "$nopolicy_pod" -o jsonpath='{.status.containerStatuses[0].ready}'
-check "and its first try at the API server is blocked" "Couldn't connect|timed out|Failed to connect" \
-    kubectl -n "$ns" exec "$nopolicy_pod" -c default -- curl -sS --noproxy '*' -m 5 -k "https://$(kubectl get service kubernetes -o jsonpath='{.spec.clusterIP}')/version"
+api="$(kubectl get service kubernetes -o jsonpath='{.spec.clusterIP}')"
+check_connect_fails "and its first try at the API server is blocked" "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect" \
+    kubectl -n "$ns" exec "$nopolicy_pod" -c default -- curl -sS --noproxy '*' -m 5 -k "https://$api/version"
 helm uninstall fnnopolicy -n "$ns" >/dev/null 2>&1 || true
 kubectl -n "$ns" delete networkpolicy fnnopolicy-deny-all >/dev/null 2>&1 || true
 
 # 1b. Resource limits.
-check "the agent's memory is limited to 2 GiB" '^2147483648 $' agent cat /sys/fs/cgroup/memory.max
-check "the agent's CPU is limited to 1" '^100000 100000 $' agent cat /sys/fs/cgroup/cpu.max
+check_ok "the agent's memory is limited to 2 GiB" '^2147483648 $' agent cat /sys/fs/cgroup/memory.max
+check_ok "the agent's CPU is limited to 1" '^100000 100000 $' agent cat /sys/fs/cgroup/cpu.max
 
 # 2. Through the proxies.
-check "the agent is uid 1000 with no capabilities" '^uid=1000.* CapEff:\s+0+ $' \
+check_ok "the agent is uid 1000 with no capabilities" '^uid=1000.* CapEff:\s+0+ $' \
     agent sh -c 'id; grep CapEff /proc/self/status'
-check "the chart set the proxy variables" '^https_proxy=http://relay:\*\*\*@127\.0\.0\.1:8080 $' \
+check_ok "the chart set the proxy variables" '^https_proxy=http://relay:\*\*\*@127\.0\.0\.1:8080 $' \
     agent sh -c 'echo "https_proxy=$https_proxy" | sed "s/:[^:@]*@/:***@/"'
-check "https to the world's site through the HTTP door" '^hello from https example.test 443 over HTTP/2.0 $' \
+check_ok "https to the world's site through the HTTP door" '^hello from https example.test 443 over HTTP/2.0 $' \
     agent curl -sS https://example.test/
-check "plain http through the HTTP door" '^plain site http plain.test 80 $' agent curl -sS http://plain.test/k
-check "https through the SOCKS5 door (ALL_PROXY)" '^hello from https example.test 443 over HTTP/2.0 $' \
+check_ok "plain http through the HTTP door" '^plain site http plain.test 80 $' agent curl -sS http://plain.test/k
+check_ok "https through the SOCKS5 door (ALL_PROXY)" '^hello from https example.test 443 over HTTP/2.0 $' \
     socks_agent curl -sS https://example.test/
 
 # 3. eth0 is up, and nothing else answers.
-check "the agent's eth0 is up, with the pod's address" '^eth0@[^ ]+ +UP +[0-9.]+/' agent ip -br addr show eth0
-check "names do not resolve in the pod" 'Could not resolve host' agent curl -sS --noproxy '*' -m 5 https://example.test/
-check "1.1.1.1 is unreachable around the proxy" "Couldn't connect|timed out|Connection refused|Failed to connect" \
+check_ok "the agent's eth0 is up, with the pod's address" '^eth0@[^ ]+ +UP +[0-9.]+/' agent ip -br addr show eth0
+check_fails "names do not resolve in the pod" 'Could not resolve host' agent curl -sS --noproxy '*' -m 5 https://example.test/
+check_connect_fails "1.1.1.1 is unreachable around the proxy" "Couldn't connect|Connection timed out|Timeout was reached|Connection refused|Failed to connect" \
     agent curl -sS --noproxy '*' -m 5 http://1.1.1.1/
 kube_dns="$(kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}')"
-check "the cluster's DNS ($kube_dns) is unreachable" 'no servers could be reached|timed out' \
+check_fails "the cluster's DNS ($kube_dns) is unreachable" 'no servers could be reached|timed out' \
     agent dig +time=2 +tries=1 "@$kube_dns" kubernetes.default.svc.cluster.local
-api="$(kubectl get service kubernetes -o jsonpath='{.spec.clusterIP}')"
-check "the API server ($api) is unreachable around the proxy" "Couldn't connect|timed out|Failed to connect" \
+check_connect_fails "the API server ($api) is unreachable around the proxy" "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect" \
     agent curl -sS --noproxy '*' -m 5 -k "https://$api/version"
 node_ip="$(kubectl get node "$cluster-control-plane" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')"
-check "the kubelet on the pod's node ($node_ip) is unreachable" "Couldn't connect|timed out|Failed to connect" \
+check_connect_fails "the kubelet on the pod's node ($node_ip) is unreachable" "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect" \
     agent curl -sS --noproxy '*' -m 5 -k "https://$node_ip:10250/healthz"
 gateway="$(agent ip -4 route show default | awk '{print $3}')"
-check "the kubelet at the pod's gateway ($gateway) is unreachable" "Couldn't connect|timed out|Failed to connect" \
+check_connect_fails "the kubelet at the pod's gateway ($gateway) is unreachable" "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect" \
     agent curl -sS --noproxy '*' -m 5 -k "https://$gateway:10250/healthz"
-check "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/relay
+check_fails "the world's socket is not in the agent's container" 'No such file or directory' agent ls /run/relay
 
 # 4. Tokens, and the world's edge.
-check "a wrong token gets 407" 'response 407' agent curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/
-check "the API server's address through the proxy is a world address with no machine: 502" 'response 502' \
+check_fails "a wrong token gets 407" 'response 407' agent curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/
+check_fails "the API server's address through the proxy is a world address with no machine: 502" 'response 502' \
     agent curl -sS -m 10 -k "https://$api/version"
-check "a real name through the proxy does not exist in the world: 502" 'response 502' agent curl -sS -m 10 https://example.com/
+check_fails "a real name through the proxy does not exist in the world: 502" 'response 502' agent curl -sS -m 10 https://example.com/
 
 # 5. Complete downloads, with timing thresholds in performance mode.
 check_downloads "10 downloads of 16 MiB at once" 10 2 0 \
@@ -167,24 +167,24 @@ if speed="$(check_transfer 16777216 agent curl -fsS --max-time 30 -o /dev/null -
 else
     fail "16 MiB: $speed"
 fi
-check "attach logged the requests" 'CONNECT example.test:443 \(203\.0\.113\.10\) 200' kubectl -n "$ns" logs "$pod" -c attach
+check_ok "attach logged the requests" 'CONNECT example.test:443 \(203\.0\.113\.10\) 200' kubectl -n "$ns" logs "$pod" -c attach
 
-check "attach has not restarted under load" '^0 ?$' \
+check_ok "attach has not restarted under load" '^0 ?$' \
     kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].restartCount}'
 
 # 6. Attach stopped: no way out. Restarted: the proxy is back.
 node="$cluster-control-plane"
 attach_id="$(docker exec "$node" crictl ps --name attach --label "io.kubernetes.pod.name=$pod" -q)"
 docker exec "$node" crictl --timeout 30s stop -t 0 "$attach_id" >/dev/null
-check "with attach stopped, nothing answers" 'Failed to connect|Connection refused' agent curl -sS -m 3 https://example.test/
+check_fails "with attach stopped, nothing answers" 'Failed to connect|Connection refused' agent curl -sS -m 3 https://example.test/
 for _ in $(seq 1 60); do
     restarts="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].restartCount}')"
     ready="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.initContainerStatuses[?(@.name=="attach")].ready}')"
     if [ "$restarts" -ge 1 ] && [ "$ready" = true ]; then break; fi
     sleep 1
 done
-check "attach restarted and is ready" '^1 true $' echo "$restarts $ready"
-check "after the restart, https works again" '^hello from https example.test 443' agent curl -sS https://example.test/
+check_ok "attach restarted and is ready" '^1 true $' echo "$restarts $ready"
+check_ok "after the restart, https works again" '^hello from https example.test 443' agent curl -sS https://example.test/
 
 helm uninstall "$release" -n "$ns" --wait >/dev/null 2>&1 || true
 if [ "$failures" -gt 0 ]; then
