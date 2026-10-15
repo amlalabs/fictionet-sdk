@@ -1,7 +1,46 @@
 use super::*;
+use fictionet::observe::Layer;
 
 // ---------------------------------------------------------------------------
 // Events
+
+#[test]
+fn event_layers_keep_field_order_and_render_json_values() {
+    let event = Event::new("test", "values")
+        .summary("all field types")
+        .field("text", "hello\n\"world\"")
+        .field("number", 42u32)
+        .field("flag", true)
+        .field("none", json::Value::Null)
+        .field("array", json::Value::parse(br#"[1,"two",null]"#).unwrap())
+        .field("object", json::Value::parse(br#"{"a":false}"#).unwrap());
+    let original = event.clone();
+    let layer = Layer::from_event(&event);
+    assert_eq!(layer.name, "test.values");
+    assert_eq!(layer.summary, "all field types");
+    assert_eq!(layer.buf, 0);
+    assert_eq!(layer.range, (0, 0));
+    assert_eq!(
+        layer
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.value.as_str(), field.range))
+            .collect::<Vec<_>>(),
+        [
+            ("text", "hello\n\"world\"", None),
+            ("number", "42", None),
+            ("flag", "true", None),
+            ("none", "null", None),
+            ("array", r#"[1,"two",null]"#, None),
+            ("object", r#"{"a":false}"#, None),
+        ]
+    );
+    assert_eq!(event, original);
+    assert_eq!(
+        Layer::from_event(&Event::new("test", "empty")),
+        Layer::new("test.empty", 0, (0, 0))
+    );
+}
 
 #[test]
 fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
@@ -30,7 +69,7 @@ fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
             [1, 2, 3]
         );
         assert_eq!(events.dropped(), 0);
-        let layer = events.all()[1].layer();
+        let layer = Layer::from_event(&events.all()[1]);
         assert_eq!(layer.name, "test.n");
         assert_eq!(layer.summary, "n=1");
         wait::until(&fcx, Duration::from_secs(10), || {

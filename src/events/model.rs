@@ -409,25 +409,6 @@ impl Event {
         String::from_utf8(bytes).unwrap_or_default()
     }
 
-    /// The event as an observe layer: its summary, and each field as a
-    /// note. The dashboard shows it as it shows a decoded packet.
-    pub fn layer(&self) -> crate::observe::Layer {
-        let name = format!("{}.{}", self.source, self.kind);
-        let mut layer = crate::observe::Layer::new(&name, 0, (0, 0));
-        layer.summary = self.summary.clone();
-        for (n, v) in self.fields.iter() {
-            let text = match v {
-                Value::String(s) => s.clone(),
-                other => other
-                    .to_bytes()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default(),
-            };
-            layer.note(n, text);
-        }
-        layer
-    }
-
     /// The `events.dropped` event that stands for `count` events a reader
     /// missed, the last of which was number `seq`.
     pub(super) fn dropped(seq: u64, at: Instant, count: u64) -> Event {

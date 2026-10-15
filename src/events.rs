@@ -150,8 +150,6 @@
 //! [`Cx::record_repeat`]: crate::Cx::record_repeat
 //! [`Layer::note`]: crate::observe::Layer::note
 
-use crate::Cx;
-
 mod log;
 mod model;
 mod repeat;
@@ -162,41 +160,6 @@ pub use log::EventLog;
 pub(crate) use model::Origin;
 pub use model::{ConnInfo, Event, Fields, Level, Sandbox, Transport, float, opt};
 pub(crate) use store::Store;
-
-/// Records that `source` dropped `packet`, and `why`, as a `drop` event
-/// with the packet's addresses and protocol (a
-/// [repeat](crate::events#repeats)). Its length, its destination port and
-/// `detail` change with each packet, so they are its detail.
-/// `enrich` adds context to the owned event before it is recorded.
-pub fn record_drop<F>(
-    fcx: &Cx,
-    source: &'static str,
-    packet: &crate::Packet,
-    why: &'static str,
-    detail: Fields,
-    enrich: F,
-) where
-    F: FnOnce(Event) -> Event,
-{
-    let h = crate::stdlib::ip::Header::parse_truncated(&packet.0);
-    let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
-    let (src, dst) = match &h {
-        Some(h) => (h.src.to_string(), h.dst.to_string()),
-        None => ("?".to_owned(), "?".to_owned()),
-    };
-    let event = Event::new(source, "drop")
-        .level(Level::Notice)
-        .summary(format!("{src} → {dst}: {why}"))
-        .field("src", opt(h.as_ref().map(|_| src)))
-        .field("dst", opt(h.as_ref().map(|_| dst)))
-        .field("protocol", opt(h.as_ref().map(|h| u32::from(h.protocol))))
-        .field("why", why);
-    let mut all = Fields::new()
-        .with("len", packet.0.len() as u64)
-        .with("dst_port", opt(port.map(u32::from)));
-    all.extend(detail);
-    fcx.record_repeat(enrich(event), all);
-}
 
 /// How many events a run's log holds. Past this, the oldest are dropped.
 pub const MAX_EVENTS: usize = 50_000;

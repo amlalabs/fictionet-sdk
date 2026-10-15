@@ -21,6 +21,111 @@ use fictionet::stdlib::{bottleneck, delay, icmp, ip, udp};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, pair, run};
 
+#[test]
+fn packet_drop_events_keep_packet_fields_and_repeat_details() {
+    use fictionet::events::{ConnInfo, Fields, Level};
+    use fictionet::stdlib::codec::Wire;
+
+    let kept = Arc::new(Mutex::new(None));
+    let saved = kept.clone();
+    block_on(fictionet::lab(
+        fictionet::Seed::from_u64(1),
+        |fcx| async move {
+            let conn = ConnInfo::new(9, "10.0.0.1:53".parse()?, "10.0.0.2:4000".parse()?);
+            let udp = |port: u16, len| {
+                let mut payload = vec![0; len];
+                payload[..4].copy_from_slice(&[0x0f, 0xa0, (port >> 8) as u8, port as u8]);
+                ip::packet(
+                    "10.0.0.2".parse().unwrap(),
+                    "10.0.0.1".parse().unwrap(),
+                    ip::protocol::UDP,
+                    &payload,
+                )
+            };
+            let mut truncated = udp(53, 8);
+            truncated.0.truncate(24);
+            let packets = [
+                truncated,
+                ip::packet(
+                    "2001:db8::2".parse()?,
+                    "2001:db8::1".parse()?,
+                    ip::protocol::TCP,
+                    &[0x0f, 0xa0, 0x01, 0xbb],
+                ),
+                ip::packet(
+                    "10.0.0.2".parse()?,
+                    "10.0.0.1".parse()?,
+                    ip::protocol::ICMP,
+                    &[8, 0, 0, 0],
+                ),
+                Packet(vec![0xff]),
+                udp(80, 10),
+                udp(443, 12),
+            ];
+            for (i, packet) in packets.iter().enumerate() {
+                ip::record_drop(
+                    &fcx,
+                    "test",
+                    packet,
+                    "blocked",
+                    Fields::new().with("waiting", i as u64),
+                    |event| event.conn(&conn).field("owner", "edge"),
+                );
+            }
+            assert_eq!(fcx.events().of("test", "drop").len(), 4);
+            *saved.lock().unwrap() = Some(fcx.events());
+            Ok(())
+        },
+    ))
+    .unwrap();
+
+    let log = kept.lock().unwrap().take().unwrap();
+    let events = log.all();
+    assert_eq!(events.len(), 5);
+    let expected = [
+        (
+            "10.0.0.2 → 10.0.0.1: blocked",
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":24,"dst_port":53,"waiting":0,"count":1}"#,
+        ),
+        (
+            "2001:db8::2 → 2001:db8::1: blocked",
+            r#"{"src":"2001:db8::2","dst":"2001:db8::1","protocol":6,"why":"blocked","owner":"edge","len":44,"dst_port":443,"waiting":1,"count":1}"#,
+        ),
+        (
+            "10.0.0.2 → 10.0.0.1: blocked",
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":1,"why":"blocked","owner":"edge","len":24,"dst_port":null,"waiting":2,"count":1}"#,
+        ),
+        (
+            "? → ?: blocked",
+            r#"{"src":null,"dst":null,"protocol":null,"why":"blocked","owner":"edge","len":1,"dst_port":null,"waiting":3,"count":1}"#,
+        ),
+        (
+            "2 more: 10.0.0.2 → 10.0.0.1: blocked",
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","count":2,"len":[30,32],"dst_port":[80,443],"waiting":[4,5]}"#,
+        ),
+    ];
+    for (i, (event, (summary, fields))) in events.iter().zip(expected).enumerate() {
+        assert!(event.is("test", "drop"));
+        assert_eq!(event.seq, i as u64 + 1);
+        assert_eq!(event.at, fictionet::time::Instant::ZERO);
+        assert_eq!(event.level, Level::Notice);
+        assert_eq!(event.summary, summary);
+        assert_eq!(
+            event.conn,
+            ConnInfo::new(
+                9,
+                "10.0.0.1:53".parse().unwrap(),
+                "10.0.0.2:4000".parse().unwrap()
+            )
+        );
+        assert_eq!(
+            event.fields.to_json().to_bytes().unwrap(),
+            fields.as_bytes()
+        );
+        assert!(event.to_json().get("node").unwrap().as_str().is_some());
+    }
+}
+
 /// Runs a world to the end, within 10 seconds.
 fn world<F, Fut>(f: F)
 where

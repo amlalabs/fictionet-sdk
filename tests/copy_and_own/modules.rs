@@ -441,6 +441,17 @@ fn copied_router<I: fictionet::Interface>(fcx: &fictionet::Cx, interface: I) {
     let _ = route::router(fcx, vec![("10.0.0.0/24".parse().unwrap(), interface)]);
 }
 
+fn copied_packet_drop(fcx: &fictionet::Cx, packet: &fictionet::Packet) {
+    ip::record_drop(
+        fcx,
+        "copied",
+        packet,
+        "blocked",
+        fictionet::events::Fields::new(),
+        |event| event.field("owner", "edge"),
+    );
+}
+
 // Copied faults accept either the run capability or a public standalone source.
 fn copied_entropy(fcx: &fictionet::Cx) {
     let seed = fictionet::Seed::from_u64(7);

@@ -338,7 +338,7 @@ fn expired<I: Interface>(
     } else {
         "its hop limit ran out"
     };
-    fictionet::events::record_drop(
+    ip::record_drop(
         fcx,
         "router",
         &packet,
@@ -702,7 +702,7 @@ fn dropped<F>(
 ) where
     F: Fn(events::Event) -> events::Event,
 {
-    events::record_drop(
+    ip::record_drop(
         fcx,
         "lan",
         packet,

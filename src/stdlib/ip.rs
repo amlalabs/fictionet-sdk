@@ -64,6 +64,8 @@
 //!   a protocol chooses its own checksum coverage.
 //! - [`packet`] and [`packet_with`] put an IP header in front of a payload.
 //!   [`hop`] lowers the TTL as a router does.
+//! - [`record_drop`] records a dropped packet in the run's event log, with
+//!   its addresses, protocol and reason.
 //!
 //! ```
 //! use fictionet::stdlib::ip::{self, Header, protocol};
@@ -85,6 +87,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::task::Poll;
 
+use fictionet::events::{self, Level, opt};
 use fictionet::stdlib::{
     icmp,
     ports::{Event, Ports},
@@ -801,6 +804,41 @@ pub mod protocol {
     pub const NONE: u8 = 59;
     /// IPv6 Destination Options.
     pub const DEST_OPTIONS: u8 = 60;
+}
+
+/// Records that `source` dropped `packet`, and `why`, as a `drop` event
+/// with the packet's addresses and protocol (a
+/// [repeat](fictionet::events#repeats)). Its length, its destination port and
+/// `detail` change with each packet, so they are its detail.
+/// `enrich` adds context to the owned event before it is recorded.
+pub fn record_drop<F>(
+    fcx: &Cx,
+    source: &'static str,
+    packet: &Packet,
+    why: &'static str,
+    detail: events::Fields,
+    enrich: F,
+) where
+    F: FnOnce(events::Event) -> events::Event,
+{
+    let h = Header::parse_truncated(&packet.0);
+    let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
+    let (src, dst) = match &h {
+        Some(h) => (h.src.to_string(), h.dst.to_string()),
+        None => ("?".to_owned(), "?".to_owned()),
+    };
+    let event = events::Event::new(source, "drop")
+        .level(Level::Notice)
+        .summary(format!("{src} → {dst}: {why}"))
+        .field("src", opt(h.as_ref().map(|_| src)))
+        .field("dst", opt(h.as_ref().map(|_| dst)))
+        .field("protocol", opt(h.as_ref().map(|h| u32::from(h.protocol))))
+        .field("why", why);
+    let mut all = events::Fields::new()
+        .with("len", packet.0.len() as u64)
+        .with("dst_port", opt(port.map(u32::from)));
+    all.extend(detail);
+    fcx.record_repeat(enrich(event), all);
 }
 
 /// The IP version of a packet, from the top four bits of its first byte:

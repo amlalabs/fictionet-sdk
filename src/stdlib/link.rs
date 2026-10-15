@@ -284,7 +284,7 @@ where
                             queues[i].packets.push_back((leaves, packet));
                         } else {
                             let waiting = queues[i].packets.len();
-                            fictionet::events::record_drop(
+                            fictionet::stdlib::ip::record_drop(
                                 &fcx,
                                 name,
                                 &packet,

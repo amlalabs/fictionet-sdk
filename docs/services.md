@@ -800,6 +800,20 @@ events are lost there too.
 Discard a sample if
 [`EventLog::lost`](../src/events.rs) is nonzero.
 
+### Packet drops and event layers
+
+Packet-drop construction lives in [`fictionet::stdlib::ip::record_drop`](../src/stdlib/ip.rs).
+It reads the packet's addresses and protocol and records a `drop` repeat.
+[`fictionet::observe::Layer::from_event(&event)`](../src/observe/decode.rs)
+turns an event into a display layer, with its summary and fields as notes.
+
+Migration: replace `fictionet::events::record_drop` with
+`fictionet::stdlib::ip::record_drop`, using the same arguments. Replace
+`event.layer()` with `fictionet::observe::Layer::from_event(&event)`.
+The old entry points are removed so generic events no longer depend on
+packet parsing or display-layer construction. These are source-breaking
+path changes. Event data, repeat aggregation and display output are unchanged.
+
 ## 6. The dashboard
 
 Open `/#token=<URL-encoded-token>` on the dashboard's origin to sign in.

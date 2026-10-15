@@ -11,8 +11,10 @@ use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::json;
+use crate::events::Event;
 use crate::watch::KeyLine;
-use fictionet::stdlib::codec::{be16, be32};
+use fictionet::stdlib::codec::{Wire, be16, be32};
+use fictionet::stdlib::json::Value;
 use fictionet::stdlib::tcp_reassembly::{Chunk, FlowKey, Reassembler, Segment, conversation_key};
 
 /// A field of a layer, and where its bytes are.
@@ -26,7 +28,7 @@ pub struct Field {
     pub range: Option<(usize, usize)>,
 }
 
-/// One protocol layer of a packet.
+/// One protocol layer of a packet, or an event shown as one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layer {
     /// Display name.
@@ -51,6 +53,43 @@ impl Layer {
             range,
             fields: Vec::new(),
         }
+    }
+
+    /// The event as an observe layer: its summary, and each field as a
+    /// note. The dashboard shows it as it shows a decoded packet.
+    ///
+    /// The name is `source.kind`. Strings appear as text; other values
+    /// appear as JSON. The layer uses buffer 0 and range `(0, 0)`, and
+    /// its notes have no byte ranges.
+    ///
+    /// ```
+    /// use fictionet::events::Event;
+    /// use fictionet::observe::Layer;
+    ///
+    /// let event = Event::new("http", "request")
+    ///     .summary("GET /")
+    ///     .field("status", 200u32);
+    /// let layer = Layer::from_event(&event);
+    /// assert_eq!(layer.name, "http.request");
+    /// assert_eq!(layer.summary, "GET /");
+    /// assert_eq!(layer.fields[0].value, "200");
+    /// assert_eq!(layer.fields[0].range, None);
+    /// ```
+    pub fn from_event(event: &Event) -> Layer {
+        let name = format!("{}.{}", event.source, event.kind);
+        let mut layer = Layer::new(&name, 0, (0, 0));
+        layer.summary = event.summary.clone();
+        for (n, v) in event.fields.iter() {
+            let text = match v {
+                Value::String(s) => s.clone(),
+                other => other
+                    .to_bytes()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default(),
+            };
+            layer.note(n, text);
+        }
+        layer
     }
 
     /// Adds a field with a byte range in this layer's buffer.
