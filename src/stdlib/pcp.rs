@@ -2369,6 +2369,22 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_version_reply_no_loop() {
+        let reply = NatPmpResponse::UnsupportedVersion { epoch: 7 }
+            .to_bytes()
+            .unwrap();
+        fictionet::assert_cases! {
+            receive;
+            (&reply, Speaks::NatPmp, laptop(), 11) => Incoming::Ignore,
+            (&reply, Speaks::Both, laptop(), 11) => Incoming::Ignore,
+            (&[0, 0x89, 0, 5, 1, 2], Speaks::NatPmp, laptop(), 11) => Incoming::Ignore,
+            (&[0, 0x89, 0, 5, 1, 2], Speaks::Both, laptop(), 11) => Incoming::Ignore,
+            (&[0, 0x89, 0, 5], Speaks::NatPmp, laptop(), 11) => Incoming::Ignore,
+            (&[0, 0x89, 0, 5], Speaks::Both, laptop(), 11) => Incoming::Ignore,
+        }
+    }
+
+    #[test]
     fn nat_pmp_errors() {
         fictionet::assert_cases! {
             NatPmpRequest::parse;
@@ -2668,8 +2684,8 @@ mod tests {
                     assert!(NatPmpResponse::parse(&reply).is_ok());
                 } else {
                     assert!(Response::parse(&reply).is_ok());
-                    assert!(receive(&reply, speaks, laptop(), 11) == Incoming::Ignore);
                 }
+                assert!(receive(&reply, speaks, laptop(), 11) == Incoming::Ignore);
             }
         }
         if let Some(u) = unsupported_version(b) {
