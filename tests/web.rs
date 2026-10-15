@@ -1628,6 +1628,72 @@ fn the_target_is_from_the_connection_not_the_headers() {
 // The proxy (feature tokio)
 
 #[cfg(feature = "web-proxy")]
+#[tokio::test]
+async fn the_proxy_uses_its_target_and_removes_connection_headers() {
+    use fictionet::stdlib::httpd::{self, Handler, VHost, VirtualHosts};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0; 4096];
+        while !received.ends_with(b"\r\n\r\nhello") {
+            let n = conn.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0);
+            received.extend_from_slice(&buf[..n]);
+        }
+        conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close, x-private\r\nConnection: x-other\r\nX-Private: secret\r\nX-Other: secret\r\nUpgrade: websocket\r\nX-Public: kept\r\n\r\nworld").await.unwrap();
+        String::from_utf8(received).unwrap()
+    });
+    run(fictionet::Seed::from_u64(1), move |fcx| async move {
+        let vhosts = VirtualHosts::new();
+        vhosts.insert("127.0.0.1", VHost::new(httpd::tower(web::proxy(&fcx)?)));
+        let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+        let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
+        let reply = vhosts.call(
+            Request::builder()
+                .method("POST")
+                .uri("https://127.0.0.1:443/path?q=1")
+                .version(http::Version::HTTP_2)
+                .header("host", "different.test")
+                .header("connection", "x-private")
+                .header("connection", "x-other, upgrade")
+                .header("x-private", "secret")
+                .header("x-other", "secret")
+                .header("upgrade", "websocket")
+                .header("proxy-authorization", "Basic secret")
+                .header("x-public", "kept")
+                .body(web::Body::from("hello"))
+                .unwrap(),
+            &mut ex,
+        );
+        let httpd::Reply::Later(work) = reply else {
+            panic!("the proxy dispatches upstream");
+        };
+        let response = work(fcx.clone()).await?;
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.headers()["x-public"], "kept");
+        for name in ["connection", "x-private", "x-other", "upgrade"] {
+            assert!(!response.headers().contains_key(name));
+        }
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "world");
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
+        assert!(request.contains(&format!("host: {address}\r\n")));
+        assert!(request.contains("x-public: kept\r\n"));
+        for name in ["x-private", "x-other", "upgrade", "proxy-authorization"] {
+            assert!(!request.contains(name));
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "web-proxy")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
     let result = tokio::time::timeout(

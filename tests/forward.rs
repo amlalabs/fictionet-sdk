@@ -18,7 +18,7 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
             assert_ne!(n, 0);
             received.extend_from_slice(&buf[..n]);
         }
-        conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close, x-private\r\nX-Private: secret\r\nX-Public: kept\r\n\r\nworld").await.unwrap();
+        conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close, x-private\r\nConnection: x-other\r\nX-Private: secret\r\nX-Other: secret\r\nUpgrade: websocket\r\nX-Public: kept\r\n\r\nworld").await.unwrap();
         String::from_utf8(received).unwrap()
     });
     fictionet::run(fictionet::Seed::from_u64(1), move |fcx| async move {
@@ -27,10 +27,15 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
             .call(
                 http::Request::builder()
                     .method("POST")
-                    .uri("/path?q=1")
+                    .uri("http://different.test/path?q=1")
+                    .version(http::Version::HTTP_2)
                     .header("host", "site.test")
                     .header("connection", "x-private")
+                    .header("connection", "x-other, upgrade")
                     .header("x-private", "secret")
+                    .header("x-other", "secret")
+                    .header("upgrade", "websocket")
+                    .header("proxy-authorization", "Basic secret")
                     .header("x-public", "kept")
                     .body(Body::from("hello"))
                     .unwrap(),
@@ -41,6 +46,8 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
         assert_eq!(response.headers()["x-public"], "kept");
         assert!(!response.headers().contains_key("connection"));
         assert!(!response.headers().contains_key("x-private"));
+        assert!(!response.headers().contains_key("x-other"));
+        assert!(!response.headers().contains_key("upgrade"));
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
             "world"
@@ -50,6 +57,9 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
         assert!(request.contains("host: site.test\r\n"));
         assert!(request.contains("x-public: kept\r\n"));
         assert!(!request.contains("x-private"));
+        assert!(!request.contains("x-other"));
+        assert!(!request.contains("upgrade"));
+        assert!(!request.contains("proxy-authorization"));
         Ok(())
     })
     .await

@@ -142,7 +142,6 @@ async fn send_upstream(
             .insert(fictionet::events::Fields::new().with("answer", "misdirected"));
         return Ok(response);
     }
-    let (mut parts, body) = request.into_parts();
     let default_port = (target.scheme == Scheme::HTTP && target.port == 80)
         || (target.scheme == Scheme::HTTPS && target.port == 443);
     let authority = if default_port {
@@ -150,22 +149,60 @@ async fn send_upstream(
     } else {
         format!("{}:{}", target.host, target.port)
     };
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
-    parts.uri = format!("{}://{}{}", target.scheme, authority, path).parse()?;
+    dispatch(
+        client,
+        request,
+        |path| Ok(format!("{}://{}{}", target.scheme, authority, path).parse()?),
+        Host::Replace(&authority),
+        Some(&target.host),
+    )
+    .await
+    .map(|response| response.map(Body::new))
+}
+
+/// What [`dispatch`] does with the request's `Host` header.
+enum Host<'a> {
+    /// Keeps the agent's `Host` header.
+    Preserve,
+    /// Replaces it with this authority.
+    Replace(&'a str),
+}
+
+/// Sends one request upstream. `destination` makes the upstream URI from
+/// the request's path and query. A failed request becomes a
+/// [`httpd::BadGateway`], prefixed with `error_context` when there is one.
+async fn dispatch(
+    client: Arc<ProxyClient>,
+    request: Request<Body>,
+    destination: impl FnOnce(&str) -> Result<http::Uri, Error>,
+    host: Host<'_>,
+    error_context: Option<&str>,
+) -> Result<Response<hyper::body::Incoming>, Error> {
+    let (mut parts, body) = request.into_parts();
+    parts.uri = destination(
+        parts
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/"),
+    )?;
     parts.version = http::Version::HTTP_11;
     parts.extensions = http::Extensions::new();
     strip_hop_by_hop(&mut parts.headers);
-    parts.headers.insert(http::header::HOST, authority.parse()?);
+    if let Host::Replace(authority) = host {
+        parts.headers.insert(http::header::HOST, authority.parse()?);
+    }
     let mut response = client
         .request(Request::from_parts(parts, body))
         .await
-        .map_err(|e| httpd::BadGateway(format!("{}: {e}", target.host)))?;
+        .map_err(|e| {
+            httpd::BadGateway(match error_context {
+                Some(context) => format!("{context}: {e}"),
+                None => e.to_string(),
+            })
+        })?;
     strip_hop_by_hop(response.headers_mut());
-    Ok(response.map(Body::new))
+    Ok(response)
 }
 
 /// Forwards requests to a fixed HTTP or HTTPS origin through the world's
@@ -212,38 +249,28 @@ impl tower_service::Service<Request<Body>> for Forward {
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let client = self.client.clone();
         let upstream = self.upstream.clone();
-        Box::pin(async move {
-            let (mut parts, body) = request.into_parts();
-            parts.uri = http::Uri::builder()
-                .scheme(
-                    upstream
-                        .scheme()
-                        .cloned()
-                        .ok_or_else(|| Error::msg("upstream has no scheme"))?,
-                )
-                .authority(
-                    upstream
-                        .authority()
-                        .cloned()
-                        .ok_or_else(|| Error::msg("upstream has no authority"))?,
-                )
-                .path_and_query(
-                    parts
-                        .uri
-                        .path_and_query()
-                        .map(|p| p.as_str())
-                        .unwrap_or("/"),
-                )
-                .build()?;
-            parts.version = http::Version::HTTP_11;
-            parts.extensions = http::Extensions::new();
-            strip_hop_by_hop(&mut parts.headers);
-            let mut response = client
-                .request(Request::from_parts(parts, body))
-                .await
-                .map_err(|e| httpd::BadGateway(e.to_string()))?;
-            strip_hop_by_hop(response.headers_mut());
-            Ok(response)
-        })
+        Box::pin(dispatch(
+            client,
+            request,
+            move |path| {
+                Ok(http::Uri::builder()
+                    .scheme(
+                        upstream
+                            .scheme()
+                            .cloned()
+                            .ok_or_else(|| Error::msg("upstream has no scheme"))?,
+                    )
+                    .authority(
+                        upstream
+                            .authority()
+                            .cloned()
+                            .ok_or_else(|| Error::msg("upstream has no authority"))?,
+                    )
+                    .path_and_query(path)
+                    .build()?)
+            },
+            Host::Preserve,
+            None,
+        ))
     }
 }
