@@ -10,8 +10,9 @@
 // them: httpd.rs includes httpd/body.rs, httpd/handlers.rs, httpd/http1.rs,
 // httpd/hyper.rs, httpd/sites.rs and httpd/response.rs; tls.rs its private
 // tls/provider.rs; net.rs net/addresses.rs, net/hosts.rs, net/attachments.rs,
-// net/dns.rs and world/names.rs; cme_mdp3/mod.rs its framing.rs; smb2/mod.rs
-// its contexts.rs; and observe/protocols.rs protocols/{modbus,dns,dhcp,http1}.rs.
+// net/dns.rs and world/names.rs; cme_mdp3/mod.rs its framing.rs;
+// json_schema/mod.rs its formats.rs; smb2/mod.rs its contexts.rs; and
+// observe/protocols.rs protocols/{modbus,dns,dhcp,http1}.rs.
 // tls.rs and sandbox.rs share the private tls_output sibling, copied with
 // either. NBNS, NBDGM and NBSS use the public NetBIOS name encoding helpers,
 // and SNMP the public ASN.1 integer and length helpers.
@@ -150,7 +151,7 @@ macro_rules! protocols {
         pub mod itch;
         #[path = "../../src/stdlib/json.rs"]
         pub mod json;
-        #[path = "../../src/stdlib/json_schema.rs"]
+        #[path = "../../src/stdlib/json_schema/mod.rs"]
         pub mod json_schema;
         #[path = "../../src/stdlib/codec/json_syntax.rs"]
         pub mod json_syntax;

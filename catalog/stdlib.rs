@@ -181,7 +181,7 @@ catalog! {
     json: "JSON text to a tree of values and back, under limits.";
         wire: true, decode: true, fuzz: true, copy: true;
     json_schema: "Checked JSON schemas: compile one, validate values against it, and generate values from it.";
-        fuzz: true, copy: true;
+        fuzz: true, copy: true, file: Some("json_schema/mod.rs");
     jsonrpc: "JSON-RPC 2.0 requests, notifications, responses and batches, over lines or HTTP bodies.";
         wire: true, decode: true, fuzz: true, copy: true;
     kafka: "Apache Kafka frames, headers, and the ApiVersions and Metadata messages.";

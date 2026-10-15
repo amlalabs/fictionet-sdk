@@ -236,6 +236,8 @@
 //! file, `mod.rs`, declares the private packet framing module.
 //! Copy the `smb2/` directory the same way. Its `mod.rs` declares the
 //! private module of negotiate, create and error contexts.
+//! Copy the `json_schema/` directory the same way. Its `mod.rs` declares
+//! the private module of string format checks and examples.
 //!
 //! For a Modbus gateway that accepts a nonzero protocol identifier, copy
 //! `src/stdlib/modbus.rs` into your crate and remove the two protocol-identifier
