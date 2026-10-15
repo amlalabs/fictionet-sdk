@@ -28,10 +28,10 @@
 //! HMAC, a packet ID and a time after the session ID; one set up with
 //! tls-crypt puts a packet ID, a time and a tag there, and encrypts the
 //! rest. Nothing in the bytes says which is in use, so the caller says
-//! with a [`Wrapping`] for [`Packet::parse_with`]. Writers use [`Packet`]
-//! for plain control, [`Authenticated`] for tls-auth, and [`Encrypted`]
-//! for tls-crypt. The module reads the wrapping's fields as they are. It
-//! neither checks the HMAC nor decrypts.
+//! with a [`Wrapping`] for [`Packet::parse_with`] and [`Packet::write_with`].
+//! The [`Wire`] writers use [`Packet`] for plain control, [`Authenticated`]
+//! for tls-auth, and [`Encrypted`] for tls-crypt. The module reads the
+//! wrapping's fields as they are. It neither checks the HMAC nor decrypts.
 //!
 //! Nothing here reads a socket. A world that plays an OpenVPN server pushes
 //! TCP bytes through [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream), or takes each
@@ -80,9 +80,13 @@
 //!         payload: Vec::new(),
 //!     }),
 //! };
-//! let wire = Frame::from_packet(&reply).unwrap().to_bytes().unwrap();
+//! // Use the connection's runtime wrapping for both reading and writing.
+//! let wrapping = Wrapping::None;
+//! let mut payload = Vec::new();
+//! reply.write_with(wrapping, &mut payload).unwrap();
+//! let wire = Frame(payload).to_bytes().unwrap();
 //! assert_eq!(wire[..3], [0, 26, 0x40]);
-//! assert_eq!(Packet::parse_with(&wire[2..], Wrapping::None), Ok(reply));
+//! assert_eq!(Packet::parse_with(&wire[2..], wrapping), Ok(reply));
 //! ```
 
 use fictionet::stdlib::codec::Frames;
@@ -377,7 +381,7 @@ impl ControlBody {
 
 /// One OpenVPN packet. The wire implementation uses unwrapped control fields.
 /// Use [`Authenticated`] or [`Encrypted`] for protected control packets,
-/// or [`Packet::parse_with`] to read with a runtime wrapping.
+/// or [`Packet::parse_with`] and [`Packet::write_with`] for runtime wrapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Packet {
     /// A control channel packet.
@@ -585,6 +589,23 @@ impl Packet {
         })
     }
 
+    /// Appends one datagram or frame payload with explicit control wrapping.
+    /// Control packets must match `wrapping`, including the HMAC length.
+    /// Data packets ignore it, even if its HMAC length is out of range.
+    /// Returns [`Error::Unwritable`] for incompatible wrapping, invalid fields,
+    /// or a packet over [`MAX_PACKET`]. On error, `out` is unchanged.
+    /// For TCP, place the written bytes in a [`Frame`] to add the length prefix.
+    pub fn write_with(&self, wrapping: Wrapping, out: &mut Vec<u8>) -> Result<(), Error> {
+        if matches!(self, Packet::Control { .. }) && self.wrapping() != wrapping {
+            return Err(Error::Unwritable);
+        }
+        let bytes = self.encode()?;
+        out.try_reserve_exact(bytes.len())
+            .map_err(|_| Error::Unwritable)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+
     /// The packet's opcode.
     pub fn opcode(&self) -> u8 {
         match self {
@@ -780,6 +801,8 @@ impl Wire for Frame {
 /// The HMAC is carried as bytes and is not verified.
 /// Control packets require a matching HMAC length from 0 through [`MAX_HMAC_LEN`].
 /// Select the wire type for the connection's configured length.
+/// For a runtime length, use [`Packet::write_with`] and [`Packet::parse_with`]
+/// with [`Wrapping::TlsAuth`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authenticated<const HMAC_LEN: usize>(
     /// The packet whose control fields use this HMAC length.
@@ -792,17 +815,6 @@ pub struct Encrypted(
     /// The packet whose control fields use tls-crypt.
     pub Packet,
 );
-
-fn write_packet(packet: &Packet, wrapping: Wrapping, out: &mut Vec<u8>) -> Result<(), Error> {
-    if matches!(packet, Packet::Control { .. }) && packet.wrapping() != wrapping {
-        return Err(Error::Unwritable);
-    }
-    let bytes = packet.encode()?;
-    out.try_reserve_exact(bytes.len())
-        .map_err(|_| Error::Unwritable)?;
-    out.extend_from_slice(&bytes);
-    Ok(())
-}
 
 macro_rules! packet_wire {
     ($ty:ty, $wrapping:expr, $wrap:expr, |$packet:ident| $get:expr $(, $n:ident)?) => {
@@ -820,7 +832,7 @@ macro_rules! packet_wire {
             /// acknowledgements, ciphertext layout, or a length over [`MAX_PACKET`].
             fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
                 let $packet = self;
-                write_packet($get, $wrapping, out)
+                ($get).write_with($wrapping, out)
             }
         }
     };
@@ -912,26 +924,9 @@ mod tests {
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn wire(packet: &Packet) -> Result<Vec<u8>, Error> {
-        match packet.wrapping() {
-            Wrapping::None => packet.to_bytes(),
-            Wrapping::TlsCrypt => Encrypted(packet.clone()).to_bytes(),
-            Wrapping::TlsAuth { hmac_len } => {
-                macro_rules! authenticated {
-                    ($($n:literal),*) => {
-                        match hmac_len {
-                            $($n => Authenticated::<$n>(packet.clone()).to_bytes(),)*
-                            _ => Err(Error::Unwritable),
-                        }
-                    };
-                }
-                authenticated!(
-                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-                    22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
-                    42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                    62, 63, 64
-                )
-            }
-        }
+        let mut out = Vec::new();
+        packet.write_with(packet.wrapping(), &mut out)?;
+        Ok(out)
     }
 
     fn envelope(packet: &Packet) -> Result<Vec<u8>, Error> {
@@ -1421,6 +1416,169 @@ mod tests {
             });
         }
         out
+    }
+
+    #[test]
+    fn runtime_writing_checks_every_hmac_length() {
+        for hmac_len in 0..=MAX_HMAC_LEN + 1 {
+            let packet = plain(
+                ControlKind::ControlV1,
+                Control {
+                    session_id: CLIENT_SID,
+                    tls_auth: Some(fixture_tls_auth(vec![0xee; hmac_len], 1, 2)),
+                    ack: None,
+                    message_id: 3,
+                    payload: vec![4, 5],
+                },
+            );
+            let wrapping = Wrapping::TlsAuth { hmac_len };
+            let prefix = [0xa5, 0x5a];
+            let mut out = prefix.to_vec();
+            if hmac_len > MAX_HMAC_LEN {
+                assert_eq!(
+                    packet.write_with(wrapping, &mut out),
+                    Err(Error::Unwritable)
+                );
+                assert_eq!(out, prefix);
+                continue;
+            }
+            packet.write_with(wrapping, &mut out).unwrap();
+            let mut expected = vec![0x20];
+            expected.extend_from_slice(&CLIENT_SID);
+            expected.extend_from_slice(&vec![0xee; hmac_len]);
+            expected.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 3, 4, 5]);
+            assert_eq!(&out[..prefix.len()], &prefix);
+            assert_eq!(&out[prefix.len()..], expected);
+            assert_eq!(Packet::parse_with(&expected, wrapping), Ok(packet.clone()));
+            for wrong in [
+                Wrapping::None,
+                Wrapping::TlsCrypt,
+                Wrapping::TlsAuth {
+                    hmac_len: hmac_len + 1,
+                },
+            ] {
+                let before = out.clone();
+                assert_eq!(packet.write_with(wrong, &mut out), Err(Error::Unwritable));
+                assert_eq!(out, before);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_and_typed_writers_agree() {
+        fn check<P: Wire<WriteError = Error> + PartialEq + core::fmt::Debug>(
+            packet: &Packet,
+            wrapping: Wrapping,
+            typed: P,
+        ) {
+            let prefix = [0xa5, 0x5a];
+            let mut runtime_out = prefix.to_vec();
+            let mut typed_out = prefix.to_vec();
+            let result = packet.write_with(wrapping, &mut runtime_out);
+            assert_eq!(result, typed.write(&mut typed_out));
+            assert_eq!(runtime_out, typed_out);
+            let compatible =
+                !matches!(packet, Packet::Control { .. }) || packet.wrapping() == wrapping;
+            assert_eq!(result.is_ok(), compatible);
+            if compatible {
+                assert_eq!(&runtime_out[..prefix.len()], &prefix);
+                assert_eq!(
+                    Packet::parse_with(&runtime_out[prefix.len()..], wrapping),
+                    Ok(packet.clone())
+                );
+            } else {
+                assert_eq!(result, Err(Error::Unwritable));
+                assert_eq!(runtime_out, prefix);
+            }
+            contract::check_wire_value(&typed);
+        }
+        let mut packets = samples();
+        for hmac_len in [0, 32, 64] {
+            packets.push(plain(
+                ControlKind::ControlV1,
+                Control {
+                    session_id: CLIENT_SID,
+                    tls_auth: Some(fixture_tls_auth(vec![0x5a; hmac_len], 1, 2)),
+                    ack: None,
+                    message_id: 3,
+                    payload: vec![4],
+                },
+            ));
+        }
+        for packet in packets {
+            check(&packet, Wrapping::None, packet.clone());
+            check(&packet, Wrapping::TlsCrypt, Encrypted(packet.clone()));
+            check(
+                &packet,
+                Wrapping::TlsAuth { hmac_len: 0 },
+                Authenticated::<0>(packet.clone()),
+            );
+            check(
+                &packet,
+                Wrapping::TlsAuth { hmac_len: 20 },
+                Authenticated::<20>(packet.clone()),
+            );
+            check(
+                &packet,
+                Wrapping::TlsAuth { hmac_len: 32 },
+                Authenticated::<32>(packet.clone()),
+            );
+            check(
+                &packet,
+                Wrapping::TlsAuth { hmac_len: 64 },
+                Authenticated::<64>(packet.clone()),
+            );
+            check(
+                &packet,
+                Wrapping::TlsAuth { hmac_len: 65 },
+                Authenticated::<65>(packet.clone()),
+            );
+            check(
+                &packet,
+                Wrapping::TlsAuth {
+                    hmac_len: usize::MAX,
+                },
+                Authenticated::<{ usize::MAX }>(packet.clone()),
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_writing_rolls_back_invalid_fields() {
+        for packet in [
+            fixture_packet_data_v1(MAX_KEY_ID + 1, vec![]),
+            fixture_packet_data_v2(0, MAX_PEER_ID + 1, vec![]),
+            fixture_packet_data_v1(0, vec![0; MAX_PACKET]),
+            plain(
+                ControlKind::AckV1,
+                Control {
+                    session_id: CLIENT_SID,
+                    tls_auth: None,
+                    ack: None,
+                    message_id: 1,
+                    payload: vec![],
+                },
+            ),
+            Packet::Control {
+                kind: ControlKind::ControlV1,
+                key_id: 0,
+                body: ControlBody::TlsCrypt(TlsCrypt {
+                    session_id: CLIENT_SID,
+                    packet_id: 1,
+                    net_time: 2,
+                    tag: [0; TLS_CRYPT_TAG_LEN],
+                    ciphertext: vec![0; 4],
+                }),
+            },
+        ] {
+            let prefix = [0xa5, 0x5a];
+            let mut out = prefix.to_vec();
+            assert_eq!(
+                packet.write_with(packet.wrapping(), &mut out),
+                Err(Error::Unwritable)
+            );
+            assert_eq!(out, prefix);
+        }
     }
 
     #[test]

@@ -146,17 +146,18 @@ fn openvpn_wrapping_stays_explicit() {
     let bytes = contract::check_written(
         &openvpn::Frame::from_packet(&openvpn::Authenticated::<20>(packet.clone())).unwrap(),
     );
+    let wrapping = openvpn::Wrapping::TlsAuth { hmac_len: 20 };
+    let mut payload = Vec::new();
+    packet.write_with(wrapping, &mut payload).unwrap();
+    let runtime_bytes = contract::check_written(&openvpn::Frame(payload));
+    assert_eq!(runtime_bytes, bytes);
     assert_eq!(
         check(
             || {
-                Frames::<openvpn::Frame>::new().map(|frame| {
-                    openvpn::Packet::parse_with(
-                        &frame.0,
-                        openvpn::Wrapping::TlsAuth { hmac_len: 20 },
-                    )
-                })
+                Frames::<openvpn::Frame>::new()
+                    .map(|frame| openvpn::Packet::parse_with(&frame.0, wrapping))
             },
-            &bytes,
+            &runtime_bytes,
         ),
         (vec![Ok(packet)], None)
     );

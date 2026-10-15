@@ -142,25 +142,21 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Encrypted>(data);
     contract::check_wire_value(&Frame(data[..data.len().min(MAX_PACKET + 1)].to_vec()));
     for wrapping in WRAPPINGS {
-        if let Ok(packet) = Packet::parse_with(data, wrapping) {
-            let bytes = match wrapping {
-                Wrapping::None => packet.to_bytes(),
-                Wrapping::TlsAuth { hmac_len: 0 } => Authenticated::<0>(packet).to_bytes(),
-                Wrapping::TlsAuth { hmac_len: 20 } => Authenticated::<20>(packet).to_bytes(),
-                Wrapping::TlsAuth { hmac_len: 32 } => Authenticated::<32>(packet).to_bytes(),
-                Wrapping::TlsAuth { hmac_len } => {
-                    assert_eq!(hmac_len, MAX_HMAC_LEN);
-                    Authenticated::<MAX_HMAC_LEN>(packet).to_bytes()
-                }
-                Wrapping::TlsCrypt => Encrypted(packet).to_bytes(),
-            };
-            assert_eq!(bytes.unwrap(), data);
-        }
         contract::check_decode_with_alloc_limit(
             || Frames::<Frame>::new().map(|frame| Packet::parse_with(&frame.0, wrapping)),
             data,
             2 * MAX_TCP_FRAME,
         );
+    }
+    for wrapping in [Wrapping::None, Wrapping::TlsCrypt]
+        .into_iter()
+        .chain((0..=MAX_HMAC_LEN).map(|hmac_len| Wrapping::TlsAuth { hmac_len }))
+    {
+        if let Ok(packet) = Packet::parse_with(data, wrapping) {
+            let mut bytes = Vec::new();
+            packet.write_with(wrapping, &mut bytes).unwrap();
+            assert_eq!(bytes, data);
+        }
     }
     let too_long = Wrapping::TlsAuth {
         hmac_len: MAX_HMAC_LEN + 1,
@@ -184,23 +180,25 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire_value(&Authenticated::<20>(packet.clone()));
     contract::check_wire_value(&Authenticated::<32>(packet.clone()));
     contract::check_wire_value(&Authenticated::<64>(packet.clone()));
-    if let Wrapping::TlsAuth { hmac_len } = packet.wrapping() {
-        macro_rules! authenticated {
-            ($($n:literal),*) => {
-                match hmac_len {
-                    $($n => {
-                        contract::check_wire::<Authenticated<$n>>(data);
-                        contract::check_wire_value(&Authenticated::<$n>(packet.clone()));
-                    },)*
-                    _ => assert!(hmac_len > MAX_HMAC_LEN),
-                }
-            };
+    contract::check_wire::<Authenticated<65>>(data);
+    contract::check_wire_value(&Authenticated::<65>(packet.clone()));
+    for wrapping in WRAPPINGS.into_iter().chain([packet.wrapping(), too_long]) {
+        let mut bytes = Vec::new();
+        let result = packet.write_with(wrapping, &mut bytes);
+        let mut appended = vec![0xa5, 0x5a];
+        assert_eq!(packet.write_with(wrapping, &mut appended), result);
+        assert_eq!(&appended[..2], &[0xa5, 0x5a]);
+        match result {
+            Ok(()) => {
+                assert_eq!(&appended[2..], bytes);
+                assert_eq!(Packet::parse_with(&bytes, wrapping), Ok(packet.clone()));
+            }
+            Err(error) => {
+                assert_eq!(error, Error::Unwritable);
+                assert!(bytes.is_empty());
+                assert_eq!(appended.len(), 2);
+            }
         }
-        authenticated!(
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
-        );
     }
     contract::check_wire_value(&Encrypted(packet));
 });
