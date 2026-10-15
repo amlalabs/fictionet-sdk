@@ -700,12 +700,6 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-impl From<Cancelled> for crate::RecvError {
-    fn from(_: Cancelled) -> Self {
-        crate::RecvError::Cancelled
-    }
-}
-
 /// Why [`Task::join`] has no `Ok` for its task.
 #[derive(Clone, Debug)]
 pub enum JoinError {
