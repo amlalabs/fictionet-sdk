@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 
 use crate::log::Log;
 
+#[path = "../../../common/headers.rs"]
+mod headers;
+
 /// What the handler tells the log about one response.
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -135,15 +138,7 @@ fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
         Some(q) => format!("{}?{q}", e.str("path").unwrap_or("/")),
         None => e.str("path").unwrap_or("/").to_owned(),
     };
-    let ua = e
-        .get("headers")
-        .and_then(J::as_array)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(J::as_array)
-        .find(|p| p.first().and_then(J::as_str) == Some("user-agent"))
-        .and_then(|p| p.get(1).and_then(J::as_str))
-        .map(str::to_owned);
+    let ua = headers::header(e, "user-agent");
     let mut entry = json!({
         "type": "http",
         "scheme": e.str("scheme").unwrap_or_default(),

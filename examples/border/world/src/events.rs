@@ -57,58 +57,12 @@ fn tls(scenario: &Scenario, e: &Entry) -> Value {
         "identity": identity,
     });
     let fields = line.as_object_mut().expect("an object");
-    let outcome = e.str("outcome").unwrap_or("other");
-    match outcome {
-        "accepted" => {
-            fields.insert("alpn".into(), js(e.get("alpn")));
-        }
-        "alert" => {
-            fields.insert("alert".into(), js(e.get("alert")));
-            fields.insert("alert_code".into(), js(e.get("alert_code")));
-        }
-        "failed" => {
-            fields.insert(
-                "detail".into(),
-                json!(
-                    e.str("detail")
-                        .unwrap_or_default()
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                ),
-            );
-        }
-        _ => {}
-    }
-    let outcome = match outcome {
-        "accepted" | "rejected" | "alert" | "failed" | "closed" | "timed_out" | "detached"
-        | "cancelled" => outcome,
-        _ => "other",
-    };
-    fields.insert("outcome".into(), json!(outcome));
+    shared::tls_outcome(e, fields);
     line
 }
 
 fn http(e: &Entry) -> Value {
-    let mut names: Vec<String> = Vec::new();
-    let mut ua = None;
-    for pair in e.get("headers").and_then(J::as_array).unwrap_or_default() {
-        let Some(pair) = pair.as_array() else {
-            continue;
-        };
-        let (Some(name), Some(value)) = (
-            pair.first().and_then(J::as_str),
-            pair.get(1).and_then(J::as_str),
-        ) else {
-            continue;
-        };
-        if !names.iter().any(|n| n == name) {
-            names.push(name.to_owned());
-        }
-        if name == "user-agent" && ua.is_none() {
-            ua = Some(value.to_owned());
-        }
-    }
+    let (names, ua) = shared::request_headers(e);
     let answer = e
         .str("answer")
         .filter(|a| {

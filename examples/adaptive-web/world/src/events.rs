@@ -18,6 +18,9 @@ use serde_json::{Map, Value, json};
 use crate::backend::PAGE_FIELDS;
 use crate::log::Log;
 
+#[path = "../../../common/headers.rs"]
+mod headers;
+
 /// Writes the request log from `fcx`'s run's events.
 pub fn log_to(fcx: &Cx, log: Arc<Log>) {
     log.attach(fcx);
@@ -105,17 +108,6 @@ fn tls(e: &Entry) -> Option<Value> {
     Some(json!({"type": "tls_error", "sni": sni, "error": error}))
 }
 
-fn header(e: &Entry, name: &str) -> Value {
-    e.get("headers")
-        .and_then(J::as_array)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(J::as_array)
-        .find(|p| p.first().and_then(J::as_str) == Some(name))
-        .and_then(|p| p.get(1).and_then(J::as_str))
-        .map_or(Value::Null, |s| Value::String(s.to_owned()))
-}
-
 /// An HTTP request: what the agent asked for, then what the world made of
 /// it.
 fn http(e: &Entry) -> Value {
@@ -129,8 +121,8 @@ fn http(e: &Entry) -> Value {
     line.insert("method".into(), get(e, "method"));
     line.insert("host".into(), get(e, "host"));
     line.insert("path".into(), json!(path));
-    line.insert("ua".into(), header(e, "user-agent"));
-    line.insert("referer".into(), header(e, "referer"));
+    line.insert("ua".into(), json!(headers::header(e, "user-agent")));
+    line.insert("referer".into(), json!(headers::header(e, "referer")));
     line.insert("answer".into(), get(e, "answer"));
     line.insert("status".into(), get(e, "status"));
     for name in PAGE_FIELDS {
