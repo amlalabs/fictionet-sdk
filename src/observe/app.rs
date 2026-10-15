@@ -17,7 +17,6 @@ use super::protocols;
 use super::tls::TlsSession;
 use super::{Match, Registry};
 use crate::events::Transport;
-const MAX_BUFFER: usize = 32 << 10;
 
 // ---------------------------------------------------------------------------
 // TCP conversations
@@ -50,7 +49,7 @@ fn register_http(registry: &mut Registry) {
                 Match::No
             }
         },
-        MAX_BUFFER + 1 + 65_535,
+        protocols::HTTP1_READ_AHEAD,
         |_| protocols::Http1::pair(),
     );
     let budget = capture::CaptureBudget::default();
