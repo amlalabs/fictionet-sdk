@@ -234,6 +234,12 @@ panic instead of producing a timing. The 30-second read timeout bounds stalled r
 The suite is not a test, and CI does not run it. A full run takes a few minutes and
 uses one core per world, plus one for the observer in `observe` and `graph`.
 
+The `observe` and `graph` groups report an observed row only when the observer
+outlived the measurement. Each subscription must first acknowledge its own request id.
+Early EOF, ended streams, error replies and invalid events fail the run. After
+measurement, the suite signals the observer to stop before cancelling the world, then
+joins it before reporting the row.
+
 ## Docs
 
 The crate docs are the guide, and they are written as a spec: they say what the code

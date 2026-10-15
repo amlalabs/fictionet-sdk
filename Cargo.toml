@@ -135,6 +135,10 @@ name = "attach_bin"
 required-features = ["std"]
 
 [[test]]
+name = "benchmark_contract"
+required-features = ["std"]
+
+[[test]]
 name = "compose"
 required-features = ["std"]
 

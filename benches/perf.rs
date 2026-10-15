@@ -19,9 +19,11 @@
 //!
 //! The proxy group requires the expected status and a complete Content-Length
 //! body before recording a timing. Read errors and invalid responses panic.
+//! An observed row is reported only when the observer outlived the measurement.
 
 #[path = "../tests/common/benchmark.rs"]
 mod benchmark;
+use benchmark::ObserverStatus;
 
 #[allow(dead_code)]
 #[path = "../tests/common/certs.rs"]
@@ -35,7 +37,6 @@ use fictionet::stdlib::codec::Frames;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::convert::Infallible;
 use std::future::poll_fn;
-use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -1360,22 +1361,18 @@ fn http_run(case: HttpCase) -> HttpRun {
     let listening = (case.watch != Watch::None)
         .then(|| listen(WorldSocket::UnixSocket(path.clone()), attacher.clone()).unwrap());
     let stop = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(Mutex::new(ObserverStatus::Waiting));
     let measuring = Arc::new(AtomicBool::new(false));
-    let observer = (case.watch != Watch::None).then(|| {
-        let (stop, ready, measuring, path) =
-            (stop.clone(), ready.clone(), measuring.clone(), path.clone());
-        std::thread::spawn(move || {
-            watch_world(&path, case.watch, case.sandboxes, &stop, &ready, &measuring)
-        })
-    });
+    let observer = Arc::new(Mutex::new(None));
+    let watching = observer.clone();
+    let watch_path = path.clone();
     let timing = measuring.clone();
+    let stop_after = stop.clone();
     let out = Arc::new(Mutex::new(None));
     let result = out.clone();
     let wait_for = ready.clone();
-    finish(block_on(run(
-        fictionet::Seed::random(),
-        move |fcx| async move {
+    let run_result: fictionet::Result =
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let (roots, chain, key) = certs(&fcx);
             let roots = Arc::new(roots);
             let config = Arc::new(
@@ -1408,6 +1405,29 @@ fn http_run(case: HttpCase) -> HttpRun {
             for i in 1..case.sites {
                 lookup(&fcx, &machines[0], &format!("site{i}.test")).await;
             }
+            // The DNS lookup has run the world and attached its graph.
+            if case.watch != Watch::None {
+                *watching.lock().unwrap() = Some(std::thread::spawn(move || {
+                    let result = (|| {
+                        let mut client =
+                            relay::observer::Client::connect(watch_path.to_str().unwrap(), "bench")
+                                .map_err(std::io::Error::other)?;
+                        client.set_timeout(Some(Duration::from_millis(100)))?;
+                        benchmark::watch_world(
+                            &mut client,
+                            case.watch == Watch::Packets,
+                            case.sandboxes,
+                            &stop,
+                            &ready,
+                            &measuring,
+                        )
+                    })();
+                    if let Err(error) = &result {
+                        *ready.lock().unwrap() = ObserverStatus::Failed(error.to_string());
+                    }
+                    result
+                }));
+            }
             let mut clients = Vec::new();
             for m in &machines {
                 let conn = m
@@ -1435,7 +1455,7 @@ fn http_run(case: HttpCase) -> HttpRun {
             }
             // Wait until the observer is watching, while the world runs.
             if case.watch != Watch::None {
-                while !wait_for.load(Ordering::Acquire) {
+                while !wait_for.lock().unwrap().ready()? {
                     fcx.sleep(fictionet::time::ms(5)).await?;
                 }
             }
@@ -1476,6 +1496,7 @@ fn http_run(case: HttpCase) -> HttpRun {
             // Rows still on their way belong to the timed requests.
             fcx.sleep(fictionet::time::ms(150)).await?;
             timing.store(false, Ordering::Release);
+            stop_after.store(true, Ordering::Release);
             assert_eq!(fcx.events().lost(), 0, "the writer lost events");
             let mut l = lat.lock().unwrap();
             l.sort_unstable();
@@ -1491,107 +1512,16 @@ fn http_run(case: HttpCase) -> HttpRun {
             });
             fcx.cancel();
             Ok(())
-        },
-    )));
-    stop.store(true, Ordering::Release);
-    let rows = observer.map_or(0, |o| o.join().unwrap());
+        }));
+    let observer = observer.lock().unwrap().take();
+    let rows = observer.map_or(Ok(0), |o| o.join().expect("observer thread"));
     drop(listening);
     let _ = std::fs::remove_file(&path);
+    finish(run_result);
+    let rows = rows.expect("observer outlived the measurement");
     let mut r = out.lock().unwrap().take().expect("the run reported");
     r.rows = rows;
     r
-}
-
-/// An observer session: watches the graph and, for `Watch::Packets`, the
-/// packets of every sandbox link, reading every value until `stop`.
-/// Returns how many packet rows arrived while `measuring` was set. Rows
-/// lag the packets by up to one 100 ms tick, so the count is close, not
-/// exact.
-fn watch_world(
-    path: &std::path::Path,
-    watch: Watch,
-    sandboxes: usize,
-    stop: &AtomicBool,
-    ready: &AtomicBool,
-    measuring: &AtomicBool,
-) -> u64 {
-    let path = path.to_str().unwrap();
-    let mut client = relay::observer::Client::connect(path, "bench").expect("an observer session");
-    client
-        .set_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    // Wait until every sandbox has a link in the graph.
-    let links = loop {
-        let graph = client.call(r#"{"op":"graph"}"#).expect("a graph");
-        let links = sandbox_links(&String::from_utf8_lossy(&graph.bytes));
-        if links.len() >= sandboxes {
-            break links;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    // Ready once the world has answered every subscription: the graph's
-    // snapshot, and the `link` event that starts each packet stream.
-    let mut waiting = 1;
-    client.request(r#"{"op":"watch"}"#).unwrap();
-    if watch == Watch::Packets {
-        for link in &links {
-            client
-                .request(&format!(r#"{{"op":"packets","link":"{link}","after":0}}"#))
-                .unwrap();
-        }
-        waiting += links.len();
-    }
-    let mut rows = 0;
-    while !stop.load(Ordering::Acquire) {
-        match client.next_value() {
-            Ok(Some(v)) => {
-                if v.bytes.starts_with(br#"{"event":"snapshot""#)
-                    || v.bytes.starts_with(br#"{"event":"link""#)
-                {
-                    waiting -= 1;
-                    if waiting == 0 {
-                        ready.store(true, Ordering::Release);
-                    }
-                }
-                // Rows of packets sent while the requests were timed.
-                if v.bytes.starts_with(br#"{"event":"packet""#) && measuring.load(Ordering::Acquire)
-                {
-                    rows += 1;
-                }
-            }
-            Ok(None) => break,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(e) => panic!("observer: {e}"),
-        }
-    }
-    rows
-}
-
-/// The ids of the links that end at a sandbox, read from a graph's JSON.
-fn sandbox_links(graph: &str) -> Vec<String> {
-    // Nodes look like {"id":"s7","kind":"sandbox",...}, edges like
-    // {"id":"e7","a":"t11","b":"s7",...}.
-    let field = |obj: &str, key: &str| -> Option<String> {
-        let at = obj.find(&format!("\"{key}\":\""))? + key.len() + 4;
-        Some(obj[at..].split('"').next()?.to_string())
-    };
-    let objects: Vec<&str> = graph.split('{').collect();
-    let sandboxes: Vec<String> = objects
-        .iter()
-        .filter(|o| o.contains(r#""kind":"sandbox""#))
-        .filter_map(|o| field(o, "id"))
-        .collect();
-    objects
-        .iter()
-        .filter(|o| o.starts_with(r#""id":"e"#))
-        .filter(|o| {
-            [field(o, "a"), field(o, "b")]
-                .iter()
-                .flatten()
-                .any(|end| sandboxes.contains(end))
-        })
-        .filter_map(|o| field(o, "id"))
-        .collect()
 }
 
 // A hyper client over a `Connection`.
