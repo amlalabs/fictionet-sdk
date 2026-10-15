@@ -30,6 +30,8 @@
 //! two-byte length in front ([`codec::Frames<Message>`](fictionet::stdlib::codec::Frames)). Parse each block or payload
 //! with [`Message::parse`]. [`Book`] applies the order messages to
 //! per-stock bid and ask price levels, within named limits.
+//! Stream items keep [`Error`] for refused messages. A length prefix over
+//! the configured limit ends the stream with [`FrameError::TooLong`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -114,7 +116,10 @@ pub enum Error {
     Timestamp,
     /// A decimal price with more places than the field, or too large.
     Price,
-    /// A frame length prefix over the [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) limit.
+    /// Retained for source compatibility. Nothing in this module returns it.
+    /// [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) reports
+    /// [`FrameError::TooLong`] when a length prefix exceeds its limit.
+    #[deprecated(note = "Nothing in this module returns this variant; use FrameError::TooLong")]
     TooLong,
     /// A configuration value outside its named limits.
     Config,
@@ -142,6 +147,7 @@ fictionet::error_display!(Error, f, {
     Error::Side(s) => write!(f, "invalid ITCH buy/sell indicator {s:#04x}"),
     Error::Timestamp => f.write_str("ITCH timestamp does not fit six bytes"),
     Error::Price => f.write_str("ITCH price is invalid"),
+    #[allow(deprecated)]
     Error::TooLong => f.write_str("ITCH frame is too long"),
     Error::Config => f.write_str("ITCH book configuration is out of range"),
     Error::UnknownOrder(r) => write!(f, "ITCH order {r} is not on the book"),
@@ -151,6 +157,16 @@ fictionet::error_display!(Error, f, {
     Error::TooManyOrders => f.write_str("ITCH book order limit reached"),
     Error::TooManyLevels => f.write_str("ITCH book price level limit reached"),
     Error::TooManyStocks => f.write_str("ITCH book stock limit reached"),
+});
+
+/// A fault that ends a length-prefixed ITCH stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// A frame length prefix over the configured limit.
+    TooLong,
+}
+fictionet::error_display!(FrameError, f, {
+    FrameError::TooLong => f.write_str("ITCH frame is too long"),
 });
 
 fictionet::fixed_fields!(Field, take, array; Error, Error::Length;
@@ -769,7 +785,7 @@ fictionet::prefixed! {
     /// Each item is one message, parsed: `Err` for a frame that does not
     /// parse (an unknown type, a length that does not match the type), so
     /// the caller decides whether to skip it. A length prefix over the limit
-    /// ends the stream with [`Error::TooLong`], read from the prefix alone.
+    /// ends the stream with [`FrameError::TooLong`], read from the prefix alone.
     ///
     /// ```
     /// use fictionet::stdlib::codec::Frames;
@@ -787,7 +803,7 @@ fictionet::prefixed! {
     /// assert_eq!(messages, [Ok(Message::MwcbStatus(status))]);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    Message => (Result<Message, Error>, Error, usize);
+    Message => (Result<Message, Error>, FrameError, usize);
     name = "ITCH";
     default { MAX_FRAME }
     normalize(limit) { limit.min(MAX_FRAME) }
@@ -805,7 +821,7 @@ fictionet::prefixed! {
         };
         let length = usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
         if length > limit {
-            return Err(Error::TooLong);
+            return Err(FrameError::TooLong);
         }
         let Some(body) = rest.get(..length) else {
             return Ok(None);
@@ -1697,19 +1713,22 @@ mod tests {
         let mut bytes = framed(&samples);
         // An unknown type frames as an Err item; the stream goes on.
         bytes.extend_from_slice(&[0, 3, b'z', 1, 2]);
+        bytes.extend_from_slice(&[0, 0]);
         bytes.extend_from_slice(&framed(&samples[..1]));
         check_decode(Frames::<Message>::default, &bytes);
         check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH), &bytes);
         check_decode_with_alloc_limit(Frames::<Message>::default, &bytes, 2 * (MAX_FRAME + 2));
         let (items, failure) = decode_all(Frames::<Message>::default, &bytes);
         assert!(failure.is_none());
-        assert_eq!(items.len(), samples.len() + 2);
+        assert_eq!(items.len(), samples.len() + 3);
         assert_eq!(items[samples.len()], Err(Error::Type(b'z')));
+        assert_eq!(items[samples.len() + 1], Err(Error::Length));
+        assert_eq!(items.last(), Some(&Ok(samples[0])));
         for (item, m) in items.iter().zip(&samples) {
             assert_eq!(item, &Ok(*m));
         }
         let (_, failure) = decode_all(|| Frames::<Message>::with_limit(10), &bytes);
-        assert_eq!(failure, Some(Fail::Protocol(Error::TooLong)));
+        assert_eq!(failure, Some(Fail::Protocol(FrameError::TooLong)));
         let (_, failure) = decode_all(Frames::<Message>::default, &[0, 12, b'S']);
         assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
     }

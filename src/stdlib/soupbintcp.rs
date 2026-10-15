@@ -15,9 +15,9 @@
 //! [`Wire`]. [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) reads packets from a byte stream for a
 //! [`Stream`](fictionet::stdlib::codec::Stream). A packet that frames but
 //! does not parse is an item (`Err`), so a session can close the
-//! connection as it chooses. The one fault that ends the stream,
-//! [`Error::TooLong`], is also what writers and sessions report, so the
-//! module has one [`Error`] and no `FrameError`.
+//! connection as it chooses. A length prefix over the configured limit
+//! ends the stream with [`FrameError::TooLong`]. Writers, sessions and
+//! refused packet items use [`Error`].
 //!
 //! [`Client`] and [`Server`] are the session rules: login (1.2, 2.2.1,
 //! 2.3.1), heartbeats once a side has sent nothing for one second and an
@@ -108,7 +108,7 @@ pub enum Error {
     /// The length prefix disagrees with the bytes, or with the fixed size
     /// of the packet's type.
     Length,
-    /// A payload is longer than [`MAX_PAYLOAD`] or a [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) limit.
+    /// A payload is longer than [`MAX_PAYLOAD`].
     TooLong,
     /// An unknown packet type byte.
     Type(u8),
@@ -140,6 +140,16 @@ fictionet::error_display!(Error, f, {
     Error::Time => f.write_str("time went backwards"),
     Error::Sequence => f.write_str("SoupBinTCP sequence number is exhausted"),
     Error::Config => f.write_str("SoupBinTCP timer is out of range"),
+});
+
+/// A fault that ends a SoupBinTCP packet stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The length prefix describes a payload over the configured limit.
+    TooLong,
+}
+fictionet::error_display!(FrameError, f, {
+    FrameError::TooLong => f.write_str("SoupBinTCP payload is too long"),
 });
 
 /// A fixed-width alphanumeric field: `N` bytes of printable ASCII,
@@ -440,7 +450,7 @@ fictionet::prefixed! {
     /// Each item is one length-prefixed packet, parsed: `Err` for a packet
     /// that frames but does not parse (an unknown type, a wrong fixed length,
     /// a bad field), so the session can decide what to do. A length prefix
-    /// over the limit ends the stream with [`Error::TooLong`], read from the
+    /// over the limit ends the stream with [`FrameError::TooLong`], read from the
     /// prefix alone. A zero length prefix is an item, `Err(Error::Length)`.
     ///
     /// ```
@@ -455,9 +465,9 @@ fictionet::prefixed! {
     /// pump(&mut stream, &[b'S', b'h', b'i'], |p| packets.push(p))?;
     /// finish(&mut stream, |p| packets.push(p))?;
     /// assert_eq!(packets, [Ok(Packet::ServerHeartbeat), Ok(Packet::SequencedData(b"hi".to_vec()))]);
-    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::soupbintcp::Error>>(())
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::soupbintcp::FrameError>>(())
     /// ```
-    Packet => (Result<Packet, Error>, Error, usize);
+    Packet => (Result<Packet, Error>, FrameError, usize);
     name = "SoupBinTCP";
     default { MAX_PAYLOAD }
     normalize(limit) { limit.min(MAX_PAYLOAD) }
@@ -475,7 +485,7 @@ fictionet::prefixed! {
         };
         let length = usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
         if length > limit + 1 {
-            return Err(Error::TooLong);
+            return Err(FrameError::TooLong);
         }
         let Some(body) = rest.get(..length) else {
             return Ok(None);
@@ -1252,7 +1262,7 @@ mod tests {
     fn frames_refuse_over_limit_from_the_prefix() {
         let mut s = Stream::new(Frames::<Packet>::with_limit(4));
         assert_eq!(s.push(&[0, 6]), 2);
-        assert_eq!(s.next(), Some(Err(Fail::Protocol(Error::TooLong))));
+        assert_eq!(s.next(), Some(Err(Fail::Protocol(FrameError::TooLong))));
         let mut s = Stream::new(Frames::<Packet>::with_limit(4));
         assert_eq!(s.push(&[0, 5, b'S', 1, 2, 3, 4]), 7);
         assert_eq!(

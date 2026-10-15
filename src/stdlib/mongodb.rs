@@ -30,9 +30,10 @@
 //! written. Compressed messages (OP_COMPRESSED) are reported with their
 //! compressor and bytes, not decompressed. Every writer checks the same
 //! limits, so what it writes always reads back. The faults that end a
-//! [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) stream, [`Error::Length`] and [`Error::SectionKind`], are the
-//! ones [`Message`]'s `parse` reports too, so the module has one [`Error`]
-//! and no `FrameError`.
+//! [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) stream are
+//! [`FrameError::Length`] and [`FrameError::SectionKind`]. Other body
+//! faults are [`Error`] items and leave the next frame readable.
+//! Standalone [`Wire`] operations use [`Error`] for every fault.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
@@ -500,7 +501,8 @@ pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
     /// The message length field is under [`HEADER_LEN`] or over the
-    /// largest message allowed. The stream cannot be split any further.
+    /// largest message allowed. The stream reports [`FrameError::Length`]
+    /// for this fault.
     Length(i32),
     /// A field runs past the end of the message.
     Truncated,
@@ -512,7 +514,8 @@ pub enum Error {
     /// which only servers use among themselves, and kind 3, telemetry a
     /// client sends only to a server that says it takes it. The OP_MSG
     /// specification says the connection must then be closed, so
-    /// [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) stops here for good.
+    /// [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) stops here
+    /// with [`FrameError::SectionKind`].
     SectionKind(u8),
     /// An OP_MSG has this many body sections, not exactly one.
     BodyCount(usize),
@@ -589,6 +592,21 @@ fictionet::error_display!(Error, f, {
     Error::UncompressedSize(n) => {
         write!(f, "OP_COMPRESSED uncompressed size {n} out of range")
     }
+});
+
+/// A fault that ends a MongoDB message stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The message length field is under [`HEADER_LEN`] or over the
+    /// configured limit.
+    Length(i32),
+    /// An OP_MSG section kind other than 0 or 1. The specification
+    /// requires closing the connection for an unsupported section kind.
+    SectionKind(u8),
+}
+fictionet::error_display!(FrameError, f, {
+    FrameError::Length(n) => write!(f, "message length {n} out of range"),
+    FrameError::SectionKind(k) => write!(f, "unknown OP_MSG section kind {k}"),
 });
 
 impl Document {
@@ -1260,14 +1278,14 @@ pub struct Compressed {
 }
 
 /// The length of the message at the start of `b`, once all of it is there.
-/// A bad length is known from the first four bytes.
-fn frame_len(b: &[u8], max: usize) -> Result<Option<usize>, Error> {
+/// Returns the invalid length field, known from the first four bytes.
+fn frame_len(b: &[u8], max: usize) -> Result<Option<usize>, i32> {
     let Some(head) = b.get(..4) else {
         return Ok(None);
     };
     let len = i32::from_le_bytes([head[0], head[1], head[2], head[3]]);
     if len < HEADER_LEN as i32 || len as usize > max {
-        return Err(Error::Length(len));
+        return Err(len);
     }
     let len = len as usize;
     Ok(if b.len() < len { None } else { Some(len) })
@@ -1396,7 +1414,7 @@ impl Message {
 
 // Only complete, bounded messages reach the body parser.
 fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Error> {
-    let Some(len) = frame_len(b, limit)? else {
+    let Some(len) = frame_len(b, limit).map_err(Error::Length)? else {
         return Ok(None);
     };
     let frame = b.get(..len).ok_or(Error::Truncated)?;
@@ -1438,9 +1456,9 @@ fictionet::prefixed! {
     ///
     /// Items are `Result<Message, Error>`. A body error consumes its
     /// frame and is returned as an error item, so the next message can still
-    /// be read. Only [`Error::Length`] from the length field and
-    /// [`Error::SectionKind`] end the stream.
-    Message => (Result<Message, Error>, Error, usize);
+    /// be read. Only [`FrameError::Length`] from the length field and
+    /// [`FrameError::SectionKind`] end the stream.
+    Message => (Result<Message, Error>, FrameError, usize);
     name = "MongoDB";
     default { MAX_MESSAGE_SIZE }
     normalize(limit) { limit.clamp(HEADER_LEN, MAX_MESSAGE_SIZE) }
@@ -1452,12 +1470,12 @@ fictionet::prefixed! {
         limit: &Self::Limit,
     ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
-        let Some(len) = frame_len(input, limit)? else {
+        let Some(len) = frame_len(input, limit).map_err(FrameError::Length)? else {
             return Ok(None);
         };
         let message = Message::from_frame(&input[..len]);
-        if let Err(e @ Error::SectionKind(_)) = message {
-            return Err(e);
+        if let Err(Error::SectionKind(kind)) = message {
+            return Err(FrameError::SectionKind(kind));
         }
         Ok(Some((message, len)))
     }
@@ -2643,7 +2661,7 @@ mod tests {
             let ids: Vec<_> = items.into_iter().map(|m| m.map(|m| m.request_id)).collect();
             if terminal {
                 assert_eq!(ids, [Ok(1)]);
-                assert_eq!(failure, Some(Fail::Protocol(Error::SectionKind(9))));
+                assert_eq!(failure, Some(Fail::Protocol(FrameError::SectionKind(9))));
             } else {
                 assert_eq!(ids, [Ok(1), Err(Error::BodyCount(0)), Ok(2)]);
                 assert_eq!(failure, None);
@@ -2651,9 +2669,15 @@ mod tests {
         }
         let mut stream = Stream::new(Frames::<Message>::new());
         assert_eq!(stream.push(&[3, 0, 0, 0]), 4);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Length(3)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(FrameError::Length(3))))
+        );
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Length(3))));
+        assert_eq!(
+            stream.failed(),
+            Some(&Fail::Protocol(FrameError::Length(3)))
+        );
     }
 
     #[test]
@@ -2669,7 +2693,7 @@ mod tests {
         );
         assert_eq!(
             decode_all(|| Frames::<Message>::with_limit(a.len() - 1), &a).1,
-            Some(Fail::Protocol(Error::Length(a.len() as i32)))
+            Some(Fail::Protocol(FrameError::Length(a.len() as i32)))
         );
         assert_eq!(Frames::<Message>::with_limit(0).limit(), HEADER_LEN);
         assert_eq!(

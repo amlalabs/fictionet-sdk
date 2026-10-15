@@ -232,6 +232,28 @@ writing a frame preserves the original attributes and nonzero padding.
 Use `stun::Message::parse(&frame.0)` to interpret attributes. Writing that
 message uses zero padding and recomputes FINGERPRINT.
 
+### Terminal framing errors
+
+The ITCH, SoupBinTCP, Cboe PITCH, Cboe BOE, and MongoDB framers now use
+protocol-local `FrameError` types for terminal failures. This is a
+source-breaking change to `Prefixed::Error` and `Decode::Error` on
+`codec::Frames<T>`. Update decoder bounds, terminal error matches, and
+return types such as `codec::Fail<itch::Error>` to use `itch::FrameError`.
+
+`itch::FrameError` and `soupbintcp::FrameError` contain only `TooLong`.
+`cboe_pitch::FrameError` has `Length` and `TooLong`.
+`cboe_boe::FrameError` has `Start`, `Length`, and `TooLong`.
+`mongodb::FrameError` has `Length(i32)` and `SectionKind(u8)`.
+
+Items keep `Result<T, Error>`. Standalone `Wire` parsing and writing,
+books, and sessions keep `Error`. Wire acceptance, limits, error text,
+and recovery are unchanged. A refused item leaves the next frame readable;
+a terminal failure ends the stream.
+
+ITCH's `Error::TooLong` remains for source compatibility but is deprecated.
+Nothing in the module returns it. `codec::Frames<itch::Message>` reports
+`itch::FrameError::TooLong` instead.
+
 ### Bounded writer appends
 
 Kafka body writers, Thrift value writers, DHCPv6 option body writers, and

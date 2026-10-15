@@ -331,7 +331,8 @@ fn decoders(o: &Options) {
     fn requests() -> impl Decode<Item = http1::Request, Error = http1::Error> {
         http1::Requests::new()
     }
-    fn messages() -> impl Decode<Item = Result<itch::Message, itch::Error>, Error = itch::Error> {
+    fn messages() -> impl Decode<Item = Result<itch::Message, itch::Error>, Error = itch::FrameError>
+    {
         Frames::<itch::Message>::default()
     }
 

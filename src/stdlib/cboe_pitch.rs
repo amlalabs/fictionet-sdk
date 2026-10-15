@@ -39,6 +39,8 @@
 //! rollover from 4,294,967,295 to 1 ("Symbol Ranges, Units, and Sequence
 //! Numbers") and names the [`Gap`] to request from the GRP. [`Book`]
 //! applies the order messages to per-symbol bid and ask levels.
+//! Stream items keep [`Error`] for refused units. A Hdr Length below the
+//! header size or over the configured limit ends the stream with [`FrameError`].
 //!
 //! ```
 //! use fictionet::stdlib::cboe_pitch::{
@@ -140,7 +142,7 @@ pub enum Error {
     Count,
     /// A decimal price with more places than the field, or too large.
     Price,
-    /// A unit longer than the framer's limit, or than [`MAX_UNIT_LENGTH`].
+    /// A unit longer than [`MAX_UNIT_LENGTH`].
     TooLong,
     /// A configuration value outside its named limits.
     Config,
@@ -176,6 +178,19 @@ fictionet::error_display!(Error, f, {
     Error::TooManyOrders => f.write_str("PITCH book order limit reached"),
     Error::TooManyLevels => f.write_str("PITCH book price level limit reached"),
     Error::TooManySymbols => f.write_str("PITCH book symbol limit reached"),
+});
+
+/// A fault that ends a PITCH unit stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// Hdr Length is less than [`HEADER_LENGTH`].
+    Length,
+    /// Hdr Length is over the configured limit.
+    TooLong,
+}
+fictionet::error_display!(FrameError, f, {
+    FrameError::Length => f.write_str("PITCH length is wrong"),
+    FrameError::TooLong => f.write_str("PITCH unit is too long"),
 });
 
 fictionet::fixed_fields!(Field, take, array; Error, Error::Length;
@@ -1208,8 +1223,9 @@ fictionet::prefixed! {
     /// Reads units from a GRP or Spin Server TCP connection, where blocks may
     /// cross segments ("Message Format"). Each item is one unit, parsed: `Err`
     /// for a block that frames by its Hdr Length but does not parse. A Hdr
-    /// Length below the header or over the limit ends the stream, read from
-    /// the header alone.
+    /// Length below the header ends the stream with [`FrameError::Length`];
+    /// one over the limit ends it with [`FrameError::TooLong`]. Both are
+    /// read from the header alone.
     ///
     /// ```
     /// use fictionet::stdlib::codec::Frames;
@@ -1227,7 +1243,7 @@ fictionet::prefixed! {
     /// assert_eq!(Control::parse(&unit.messages[0])?, response);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    Unit => (Result<Unit, Error>, Error, usize);
+    Unit => (Result<Unit, Error>, FrameError, usize);
     name = "PITCH";
     default { MAX_UNIT_LENGTH }
     normalize(limit) { limit.clamp(HEADER_LENGTH, MAX_UNIT_LENGTH) }
@@ -1244,10 +1260,10 @@ fictionet::prefixed! {
         };
         let length = usize::from(u16::from_le_bytes([prefix[0], prefix[1]]));
         if length < HEADER_LENGTH {
-            return Err(Error::Length);
+            return Err(FrameError::Length);
         }
         if length > limit {
-            return Err(Error::TooLong);
+            return Err(FrameError::TooLong);
         }
         let Some(unit) = input.get(..length) else {
             return Ok(None);
@@ -2727,10 +2743,11 @@ mod tests {
         assert!(failure.is_none());
         assert_eq!(items.len(), 5);
         assert_eq!(items[3], Err(Error::Length));
+        assert_eq!(items[4], Ok(Unit::heartbeat(0, 0)));
         let (_, failure) = decode_all(|| Frames::<Unit>::with_limit(10), &bytes);
-        assert_eq!(failure, Some(Fail::Protocol(Error::TooLong)));
+        assert_eq!(failure, Some(Fail::Protocol(FrameError::TooLong)));
         let (_, failure) = decode_all(Frames::<Unit>::default, &[3, 0, 0]);
-        assert_eq!(failure, Some(Fail::Protocol(Error::Length)));
+        assert_eq!(failure, Some(Fail::Protocol(FrameError::Length)));
         let (_, failure) = decode_all(Frames::<Unit>::default, &[9, 0, 0]);
         assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
     }

@@ -137,16 +137,20 @@ fn mongodb_chunked_round_trip() {
 
 #[test]
 fn mongodb_refuses_length_from_header() {
+    assert_eq!(
+        mongodb::Message::parse(&0i32.to_le_bytes()),
+        Err(mongodb::Error::Length(0))
+    );
     header_refusal(
         || Frames::<mongodb::Message>::with_limit(32),
         &33i32.to_le_bytes(),
-        mongodb::Error::Length(33),
+        mongodb::FrameError::Length(33),
     );
     let length = mongodb::MAX_MESSAGE_SIZE as i32 + 1;
     header_refusal(
         Frames::<mongodb::Message>::new,
         &length.to_le_bytes(),
-        mongodb::Error::Length(length),
+        mongodb::FrameError::Length(length),
     );
 }
 
@@ -222,7 +226,7 @@ fn mongodb_body_recovery_and_terminal_failure() {
     assert_eq!(stream.offset(), input.len() as u64);
 
     assert_eq!(stream.push(&0i32.to_le_bytes()), 4);
-    let failure = Fail::Protocol(mongodb::Error::Length(0));
+    let failure = Fail::Protocol(mongodb::FrameError::Length(0));
     assert_eq!(stream.next(), Some(Err(failure.clone())));
     assert_eq!(stream.next(), None);
     assert_eq!(stream.failed(), Some(&failure));
@@ -237,10 +241,14 @@ fn mongodb_unknown_section_kind_ends_stream() {
     bad.extend_from_slice(&mongodb::op_code::MSG.to_le_bytes());
     bad.extend_from_slice(&[0; 4]);
     bad.push(2);
+    assert_eq!(
+        mongodb::Message::parse(&bad),
+        Err(mongodb::Error::SectionKind(2))
+    );
     header_refusal(
         Frames::<mongodb::Message>::new,
         &bad,
-        mongodb::Error::SectionKind(2),
+        mongodb::FrameError::SectionKind(2),
     );
 }
 

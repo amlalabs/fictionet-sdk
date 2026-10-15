@@ -102,8 +102,9 @@
 //! Reads whole messages of one direction from a byte stream. Each item
 //! is one message, parsed: `Err` for one that frames but does not parse.
 //! A stream that does not start with `BA BA` at a message boundary, or a
-//! MessageLength below the header or over the limit, ends the stream,
-//! read from the first four bytes.
+//! MessageLength below the header or over the limit, ends the stream with
+//! [`FrameError`], read from the first four bytes. Refused message items
+//! and standalone [`Wire`] operations keep [`Error`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
@@ -194,7 +195,7 @@ pub enum Error {
     Count,
     /// A decimal price with more than four places, or too large.
     Price,
-    /// A message longer than [`MAX_MESSAGE`] or the framer's limit.
+    /// A message longer than [`MAX_MESSAGE`].
     TooLong,
     /// A timer or limit outside its named range.
     Config,
@@ -242,6 +243,23 @@ fictionet::error_display!(Error, f, {
     Error::UnknownExecution(e) => write!(f, "no BOE execution {e}"),
     Error::Exhausted => f.write_str("BOE numbering is exhausted"),
     Error::Text => f.write_str("BOE text is invalid"),
+});
+
+/// A fault that ends a BOE message stream in either direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The message does not start with `BA BA`.
+    Start,
+    /// MessageLength describes fewer than [`HEADER_LENGTH`] bytes,
+    /// including StartOfMessage.
+    Length,
+    /// MessageLength describes a message over the configured limit.
+    TooLong,
+}
+fictionet::error_display!(FrameError, f, {
+    FrameError::Start => f.write_str("BOE message does not start with BA BA"),
+    FrameError::Length => f.write_str("BOE message length is wrong"),
+    FrameError::TooLong => f.write_str("BOE message is too long"),
 });
 
 fictionet::fixed_fields!(Field, take, array; Error, Error::Length;
@@ -1230,7 +1248,7 @@ macro_rules! prefixed {
     ($item:ty) => {
         impl Prefixed for $item {
             type Item = Result<Self, Error>;
-            type Error = Error;
+            type Error = FrameError;
             type Limit = usize;
             const NAME: &'static str = "BOE";
             #[inline]
@@ -1248,23 +1266,23 @@ macro_rules! prefixed {
             fn parse_prefix(
                 input: &[u8],
                 limit: &usize,
-            ) -> Result<Option<(Self::Item, usize)>, Error> {
+            ) -> Result<Option<(Self::Item, usize)>, FrameError> {
                 let Some(head) = input.get(..4) else {
                     if input.first().is_some_and(|b| *b != 0xBA) {
-                        return Err(Error::Start);
+                        return Err(FrameError::Start);
                     }
                     return Ok(None);
                 };
                 if head[..2] != START_OF_MESSAGE {
-                    return Err(Error::Start);
+                    return Err(FrameError::Start);
                 }
                 let length = usize::from(u16::from_le_bytes([head[2], head[3]]));
                 if length + 2 < HEADER_LENGTH {
-                    return Err(Error::Length);
+                    return Err(FrameError::Length);
                 }
                 let total = length + 2;
                 if total > *limit {
-                    return Err(Error::TooLong);
+                    return Err(FrameError::TooLong);
                 }
                 let Some(message) = input.get(..total) else {
                     return Ok(None);
@@ -4119,14 +4137,30 @@ mod tests {
         assert!(failure.is_none());
         assert_eq!(items.len(), 5);
         assert_eq!(items[2], Err(Error::Type(0x99)));
+        assert_eq!(items[3], Ok(ServerHeartbeat::default().into()));
+        assert_eq!(items[4], Ok(MassCancelAcknowledgment::default().into()));
         let (_, failure) = decode_all(Frames::<Outbound>::default, &[0xBA, 0xBB, 8, 0]);
-        assert_eq!(failure, Some(Fail::Protocol(Error::Start)));
+        assert_eq!(failure, Some(Fail::Protocol(FrameError::Start)));
         let (_, failure) = decode_all(Frames::<Outbound>::default, &[0x00]);
-        assert_eq!(failure, Some(Fail::Protocol(Error::Start)));
+        assert_eq!(failure, Some(Fail::Protocol(FrameError::Start)));
         let (_, failure) = decode_all(Frames::<Outbound>::default, &[0xBA, 0xBA, 7, 0]);
-        assert_eq!(failure, Some(Fail::Protocol(Error::Length)));
+        assert_eq!(failure, Some(Fail::Protocol(FrameError::Length)));
         let (_, failure) = decode_all(|| Frames::<Outbound>::with_limit(11), &bytes);
-        assert_eq!(failure, Some(Fail::Protocol(Error::TooLong)));
+        assert_eq!(failure, Some(Fail::Protocol(FrameError::TooLong)));
+    }
+
+    #[test]
+    fn inbound_frames_keep_body_errors_and_continue() {
+        let good = Inbound::from(ClientHeartbeat::default());
+        let mut bytes = good.to_bytes().unwrap();
+        bytes[4] = 0x99;
+        assert_eq!(Inbound::parse(&bytes), Err(Error::Type(0x99)));
+        good.write(&mut bytes).unwrap();
+        check_decode(Frames::<Inbound>::default, &bytes);
+        assert_eq!(
+            decode_all(Frames::<Inbound>::default, &bytes),
+            (vec![Err(Error::Type(0x99)), Ok(good)], None)
+        );
     }
 
     fn config() -> ClientConfig {

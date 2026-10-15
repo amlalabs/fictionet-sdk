@@ -6,6 +6,105 @@ use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
 use fictionet_copy_modules::*;
 
 #[test]
+fn copied_framers_expose_terminal_errors_and_stop_before_the_next_frame() {
+    use fictionet::stdlib::codec::Fail;
+    use std::fmt::Debug;
+
+    fn check<D>(decoder: D, prefix: &[u8], good: &[u8], error: D::Error)
+    where
+        D: Decode,
+        D::Item: Debug + PartialEq,
+        D::Error: Clone + Debug + PartialEq,
+    {
+        let bytes = [prefix, good].concat();
+        let mut stream = Stream::new(decoder);
+        assert_eq!(stream.push(&bytes), bytes.len());
+        let failure = Fail::Protocol(error);
+        assert_eq!(stream.next(), Some(Err(failure.clone())));
+        assert_eq!(stream.offset(), 0);
+        assert_eq!(stream.unread(), bytes);
+        assert_eq!(stream.failed(), Some(&failure));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(good), good.len());
+        assert_eq!(stream.unread(), bytes);
+        stream.end();
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&failure));
+    }
+
+    let status = itch::MwcbStatus {
+        header: itch::Header::default(),
+        breached_level: b'1',
+    };
+    let mut good = vec![0, 12];
+    status.write(&mut good).unwrap();
+    check(
+        Frames::<itch::Message>::with_limit(64),
+        &[0, 65],
+        &good,
+        itch::FrameError::TooLong,
+    );
+    check(
+        Frames::<soupbintcp::Packet>::with_limit(64),
+        &[0, 66],
+        &soupbintcp::Packet::ServerHeartbeat.to_bytes().unwrap(),
+        soupbintcp::FrameError::TooLong,
+    );
+    for (prefix, error) in [
+        ([7, 0], cboe_pitch::FrameError::Length),
+        ([65, 0], cboe_pitch::FrameError::TooLong),
+    ] {
+        check(
+            Frames::<cboe_pitch::Unit>::with_limit(64),
+            &prefix,
+            &cboe_pitch::Unit::heartbeat(0, 0).to_bytes().unwrap(),
+            error,
+        );
+    }
+    for (prefix, error) in [
+        ([0xBA, 0xBB, 8, 0], cboe_boe::FrameError::Start),
+        ([0xBA, 0xBA, 7, 0], cboe_boe::FrameError::Length),
+        ([0xBA, 0xBA, 63, 0], cboe_boe::FrameError::TooLong),
+    ] {
+        check(
+            Frames::<cboe_boe::Inbound>::with_limit(64),
+            &prefix,
+            &cboe_boe::ClientHeartbeat::default().to_bytes().unwrap(),
+            error,
+        );
+        check(
+            Frames::<cboe_boe::Outbound>::with_limit(64),
+            &prefix,
+            &cboe_boe::ServerHeartbeat::default().to_bytes().unwrap(),
+            error,
+        );
+    }
+    let good = mongodb::Message {
+        request_id: 1,
+        response_to: 0,
+        body: mongodb::Body::Msg(mongodb::Msg::new(mongodb::Document::new())),
+    }
+    .to_bytes()
+    .unwrap();
+    check(
+        Frames::<mongodb::Message>::with_limit(64),
+        &0i32.to_le_bytes(),
+        &good,
+        mongodb::FrameError::Length(0),
+    );
+    let mut bad = 21i32.to_le_bytes().to_vec();
+    bad.extend_from_slice(&[0; 8]);
+    bad.extend_from_slice(&mongodb::op_code::MSG.to_le_bytes());
+    bad.extend_from_slice(&[0, 0, 0, 0, 2]);
+    check(
+        Frames::<mongodb::Message>::with_limit(64),
+        &bad,
+        &good,
+        mongodb::FrameError::SectionKind(2),
+    );
+}
+
+#[test]
 fn copied_mail_modules_write_through_wire() {
     assert_eq!(
         smtp::Reply::new(250, "Queued").to_bytes().unwrap(),
