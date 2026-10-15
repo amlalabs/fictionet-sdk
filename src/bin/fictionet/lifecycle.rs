@@ -6,6 +6,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::netlink::Request;
 use crate::world::{Failure, err};
 
 static READY_FILE: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
@@ -40,14 +41,48 @@ pub(crate) fn remove_ready_on_signal(path: &std::path::Path) {
     }
 }
 
-/// A netlink request the signal handler sends before exiting: `--type
-/// tap --vm tap:<name>` removes its redirect from the VM's device with it.
-static NETLINK_ON_SIGNAL: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+/// Ordered netlink requests, serialized before setup changes any device.
+/// Normal cleanup sends each request and waits for its ack. Signal cleanup
+/// sends the same bytes in one datagram, without waiting for replies.
+pub(crate) struct NetlinkCleanup {
+    message: Vec<u8>,
+    requests: Vec<std::ops::Range<usize>>,
+}
 
-/// Has the signal handler send `msg` to the kernel's route netlink. Only
-/// one message is ever set.
-pub(crate) fn netlink_on_signal(msg: Vec<u8>) {
-    let _ = NETLINK_ON_SIGNAL.set(msg);
+impl NetlinkCleanup {
+    pub(crate) fn new(requests: impl IntoIterator<Item = Request>) -> Self {
+        let mut message = Vec::new();
+        let mut ranges = Vec::new();
+        for request in requests {
+            let start = message.len();
+            message.extend_from_slice(&request.finish());
+            ranges.push(start..message.len());
+        }
+        Self {
+            message,
+            requests: ranges,
+        }
+    }
+
+    pub(crate) fn requests(&self) -> impl Iterator<Item = &[u8]> {
+        self.requests.iter().map(|r| &self.message[r.clone()])
+    }
+}
+
+/// The cleanup the signal handler sends before exiting: `--type tap
+/// --vm tap:<name>` sets the VM's device down and removes its redirect.
+static NETLINK_ON_SIGNAL: std::sync::OnceLock<NetlinkCleanup> = std::sync::OnceLock::new();
+
+/// Registers the cleanup once, before setup, and returns the same plan
+/// for normal teardown. The caller keeps its device lock until process
+/// exit, so a later signal cannot undo another attach's setup.
+pub(crate) fn netlink_on_signal(cleanup: NetlinkCleanup) -> &'static NetlinkCleanup {
+    NETLINK_ON_SIGNAL.get_or_init(|| cleanup)
+}
+
+#[cfg(test)]
+pub(crate) fn registered_netlink_cleanup() -> Option<&'static NetlinkCleanup> {
+    NETLINK_ON_SIGNAL.get()
 }
 
 /// Stops the signal handler removing the path given to
@@ -87,7 +122,8 @@ pub(crate) fn exit_on_signals(ready_file: Option<&std::path::Path>) {
                 }
             }
         }
-        if let Some(msg) = NETLINK_ON_SIGNAL.get() {
+        if let Some(cleanup) = NETLINK_ON_SIGNAL.get() {
+            let msg = &cleanup.message;
             // SAFETY: socket, sendto and close are async-signal-safe; the
             // message was built before it was set. The kernel handles a
             // route netlink request inside sendto, so no answer is awaited.
@@ -207,6 +243,35 @@ pub(crate) fn open_own_file(path: &Path, new: bool) -> io::Result<fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_and_signal_cleanup_use_the_same_requests_in_order() {
+        use crate::netlink;
+
+        let cleanup = NetlinkCleanup::new([
+            netlink::link_down(7),
+            netlink::del_ingress(7),
+            netlink::link_down(8),
+        ]);
+        let requests: Vec<_> = cleanup.requests().collect();
+        assert_eq!(
+            requests,
+            [
+                netlink::link_down(7).finish(),
+                netlink::del_ingress(7).finish(),
+                netlink::link_down(8).finish(),
+            ]
+        );
+        // Decode the datagram's boundaries as the kernel does. Each
+        // acknowledged request must also be a complete signal request.
+        let mut signal = cleanup.message.as_slice();
+        for request in requests {
+            let len = u32::from_ne_bytes(signal[..4].try_into().unwrap()) as usize;
+            assert_eq!(&signal[..len], request);
+            signal = &signal[(len + 3) & !3..];
+        }
+        assert!(signal.is_empty());
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let n = std::time::SystemTime::now()

@@ -486,8 +486,7 @@ impl Netlink {
         Ok(Netlink { fd })
     }
 
-    fn send(&self, req: Request) -> io::Result<()> {
-        let msg = req.finish();
+    fn send(&self, msg: &[u8]) -> io::Result<()> {
         // SAFETY: an all-zero sockaddr_nl with the family set addresses the kernel.
         let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
@@ -527,7 +526,7 @@ impl Netlink {
     /// each with its header. An interrupted dump or a failed or malformed
     /// completion returns an error and discards the collected messages.
     pub(crate) fn dump(&self, req: Request) -> io::Result<Vec<Vec<u8>>> {
-        self.send(req)?;
+        self.send(&req.finish())?;
         let mut buf = vec![0u8; 32768];
         let mut out = Vec::new();
         loop {
@@ -546,7 +545,12 @@ impl Netlink {
 
     /// Sends one request and waits for its ack.
     pub(crate) fn call(&self, req: Request) -> io::Result<()> {
-        self.send(req)?;
+        self.call_message(&req.finish())
+    }
+
+    /// Sends one already serialized request and waits for its ack.
+    pub(crate) fn call_message(&self, msg: &[u8]) -> io::Result<()> {
+        self.send(msg)?;
         let mut buf = vec![0u8; 8192];
         loop {
             if let Some(result) = parse_ack(self.recv(&mut buf)?) {
@@ -652,6 +656,23 @@ pub(crate) fn parse_ack(mut reply: &[u8]) -> Option<io::Result<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_requests_report_kernel_errors() {
+        let nl = Netlink::open().unwrap();
+        // Index zero and no name cannot identify a device to set down.
+        // sendto succeeds; the error comes back in the acknowledgement.
+        let message = link_down(0).finish();
+        nl.send(&message).unwrap();
+        let mut reply = [0u8; 8192];
+        let expected = parse_ack(nl.recv(&mut reply).unwrap())
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            nl.call_message(&message).unwrap_err().raw_os_error(),
+            expected.raw_os_error()
+        );
+    }
 
     #[test]
     fn address_request_layout() {

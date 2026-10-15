@@ -86,7 +86,7 @@ const IFF_TAP: libc::c_short = 0x0002;
 /// instead of handing them to the namespace's IP stack, then removes its
 /// qdisc. Attach's device goes with its fd.
 struct Mirror {
-    vm: u32,
+    cleanup: &'static lifecycle::NetlinkCleanup,
 }
 
 /// One step of [`Mirror::set_up`].
@@ -136,14 +136,12 @@ impl Mirror {
         // The cleanup is in place before anything changes: dropping the
         // guard, or SIGTERM, SIGINT and SIGHUP (whose handler does the same
         // as dropping it), set the VM's device down and remove its qdisc.
-        lifecycle::netlink_on_signal(
-            [
-                netlink::link_down(vm).finish(),
-                netlink::del_ingress(vm).finish(),
-            ]
-            .concat(),
-        );
-        let mirror = Mirror { vm };
+        let mirror = Mirror {
+            cleanup: lifecycle::netlink_on_signal(lifecycle::NetlinkCleanup::new([
+                netlink::link_down(vm),
+                netlink::del_ingress(vm),
+            ])),
+        };
         for step in mirror_steps(vm, own) {
             match step {
                 Step::VmDown => {
@@ -185,8 +183,11 @@ impl Mirror {
 impl Drop for Mirror {
     fn drop(&mut self) {
         if let Ok(nl) = Netlink::open() {
-            let _ = nl.call(netlink::link_down(self.vm));
-            let _ = nl.call(netlink::del_ingress(self.vm));
+            for request in self.cleanup.requests() {
+                // Teardown remains best effort, including after partial setup:
+                // a missing device or qdisc does not stop the remaining requests.
+                let _ = nl.call_message(request);
+            }
         }
     }
 }
@@ -226,6 +227,31 @@ fn lock_device(name: &str, index: u32) -> Result<OwnedFd, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_startup_keeps_vm_down_before_qdisc_removal_in_the_cleanup_plan() {
+        // Index zero cannot name a device for RTM_NEWLINK. This fails the
+        // first setup step without needing TAP devices or CAP_NET_ADMIN.
+        let error = match Mirror::set_up(0, "", 0, "", 1500) {
+            Ok(_) => panic!("setup must reject an absent VM device"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .starts_with("setting the VM's device down:")
+        );
+        // The guard has already dropped. The plan must have been published
+        // before the failed step and must remain available until exit.
+        let cleanup = lifecycle::registered_netlink_cleanup().expect("cleanup before setup");
+        assert_eq!(
+            cleanup.requests().collect::<Vec<_>>(),
+            [
+                netlink::link_down(0).finish(),
+                netlink::del_ingress(0).finish()
+            ]
+        );
+    }
 
     #[test]
     fn the_vm_device_stays_down_until_both_redirects_are_in_place() {
