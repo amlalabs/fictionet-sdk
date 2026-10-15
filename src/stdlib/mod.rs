@@ -217,6 +217,8 @@
 //! Copy `net.rs` together with the `net/` directory, keeping the relative
 //! paths. The entry file declares its private address-management, host
 //! installation, attachment lifecycle, and DNS service modules.
+//! Copy `httpd.rs` together with the `httpd/` directory, keeping the relative
+//! paths. The entry file declares its private body and handler modules.
 //! Copy `tls.rs` or `sandbox.rs` together with `tls/output.rs`, keeping
 //! that relative path. Declare `#[path = "tls/output.rs"] mod tls_output;`
 //! next to the copied module. Both adapters use this private output helper.
