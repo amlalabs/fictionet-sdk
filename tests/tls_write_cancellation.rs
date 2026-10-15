@@ -189,30 +189,40 @@ fn control_no_dropped_write() {
     scenario_mode(2);
 }
 
-mod sandbox_client {
+mod contract {
     use super::*;
     use fictionet::stdlib::{ConnError, sandbox::TlsClient};
+    use std::io::Write;
+    use std::sync::Mutex;
     use std::task::{Context, Waker};
     use std::time::{Duration, UNIX_EPOCH};
 
     struct Peer {
-        tls: rustls::ServerConnection,
+        tls: rustls::Connection,
         budget: usize,
         terminal: Option<Result<usize, ConnError>>,
         received: Vec<u8>,
+        corrupt: bool,
     }
 
-    impl Connection for Peer {
+    struct Transport(Arc<Mutex<Peer>>);
+
+    impl Connection for Transport {
         fn poll_read(
             &mut self,
             _: &Cx,
             _: &mut Context<'_>,
-            mut buf: &mut [u8],
+            buf: &mut [u8],
         ) -> Poll<Result<usize, ConnError>> {
-            if !self.tls.wants_write() {
+            let mut peer = self.0.lock().unwrap();
+            if !peer.tls.wants_write() {
                 return Poll::Pending;
             }
-            Poll::Ready(Ok(self.tls.write_tls(&mut buf).unwrap()))
+            let n = peer.tls.write_tls(&mut &mut *buf).unwrap();
+            if peer.corrupt {
+                buf[n - 1] ^= 1;
+            }
+            Poll::Ready(Ok(n))
         }
 
         fn poll_write(
@@ -221,19 +231,19 @@ mod sandbox_client {
             _: &mut Context<'_>,
             data: &[u8],
         ) -> Poll<Result<usize, ConnError>> {
-            if let Some(result) = self.terminal.take() {
+            let mut peer = self.0.lock().unwrap();
+            if let Some(result) = peer.terminal.take() {
                 return Poll::Ready(result);
             }
-            if self.budget == 0 {
+            if peer.budget == 0 {
                 return Poll::Pending;
             }
-            let n = self
-                .tls
-                .read_tls(&mut &data[..data.len().min(self.budget)])
-                .unwrap();
-            self.budget -= n;
-            tls::with_context(fcx, || self.tls.process_new_packets()).unwrap();
-            let result = self.tls.reader().read_to_end(&mut self.received);
+            let limit = data.len().min(peer.budget);
+            let n = peer.tls.read_tls(&mut &data[..limit]).unwrap();
+            peer.budget -= n;
+            tls::with_context(fcx, || peer.tls.process_new_packets()).unwrap();
+            let Peer { tls, received, .. } = &mut *peer;
+            let result = tls.reader().read_to_end(received);
             assert_eq!(result.unwrap_err().kind(), ErrorKind::WouldBlock);
             Poll::Ready(Ok(n))
         }
@@ -243,7 +253,7 @@ mod sandbox_client {
         }
     }
 
-    async fn connected(fcx: &Cx) -> TlsClient<Peer> {
+    async fn connected(fcx: &Cx, server: bool) -> (Box<dyn Connection>, Arc<Mutex<Peer>>) {
         let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
         let leaf = ca
@@ -257,44 +267,77 @@ mod sandbox_client {
             )
             .unwrap();
         let config = leaf.server_config(fcx, start).unwrap();
-        let peer = Peer {
-            tls: tls::with_context(fcx, || rustls::ServerConnection::new(config)).unwrap(),
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.cert_der()).unwrap();
+        let client_config =
+            fictionet::stdlib::sandbox::client_config(fcx, start, Some(&Arc::new(roots)), &[])
+                .unwrap();
+        let session = if server {
+            let client = tls::with_context(fcx, || {
+                ClientConnection::new(
+                    client_config.clone(),
+                    ServerName::try_from("secret.test").unwrap(),
+                )
+            })
+            .unwrap();
+            rustls::Connection::Client(client)
+        } else {
+            rustls::Connection::Server(
+                tls::with_context(fcx, || rustls::ServerConnection::new(config.clone())).unwrap(),
+            )
+        };
+        let peer = Arc::new(Mutex::new(Peer {
+            tls: session,
             budget: usize::MAX,
             terminal: None,
             received: Vec::new(),
+            corrupt: false,
+        }));
+        let transport = Transport(peer.clone());
+        let conn: Box<dyn Connection> = if server {
+            let conn = tls::server(fcx, transport)
+                .await
+                .unwrap()
+                .finish(fcx, config)
+                .await
+                .unwrap();
+            assert!(!conn.inner().0.lock().unwrap().tls.is_handshaking());
+            Box::new(conn)
+        } else {
+            let session = tls::with_context(fcx, || {
+                ClientConnection::new(client_config, ServerName::try_from("secret.test").unwrap())
+            })
+            .unwrap();
+            let mut conn = TlsClient::with(transport, session);
+            conn.handshake(fcx).await.unwrap();
+            assert!(!conn.tls.is_handshaking());
+            assert!(!conn.conn.0.lock().unwrap().tls.is_handshaking());
+            Box::new(conn)
         };
-        let mut roots = RootCertStore::empty();
-        roots.add(ca.cert_der()).unwrap();
-        let mut client =
-            TlsClient::new(fcx, peer, &Arc::new(roots), "secret.test", &[], start).unwrap();
-        client.handshake(fcx).await.unwrap();
-        assert!(!client.tls.is_handshaking());
-        assert!(!client.conn.tls.is_handshaking());
-        client
+        (conn, peer)
     }
 
-    #[test]
-    fn write_waits_for_complete_ciphertext() {
+    fn write_waits_for_complete_ciphertext(server: bool) {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(4),
-            |fcx| async move {
-                let mut client = connected(&fcx).await;
+            move |fcx| async move {
+                let (mut client, peer) = connected(&fcx, server).await;
                 let data = b"hello";
                 {
                     let mut cx = Context::from_waker(Waker::noop());
-                    client.conn.budget = 0;
+                    peer.lock().unwrap().budget = 0;
                     assert!(client.poll_write(&fcx, &mut cx, data).is_pending());
                     let mut complete = false;
                     for _ in 0..128 {
-                        assert!(client.conn.received.is_empty());
-                        client.conn.budget = 1;
+                        assert!(peer.lock().unwrap().received.is_empty());
+                        peer.lock().unwrap().budget = 1;
                         match client.poll_write(&fcx, &mut cx, data) {
                             Poll::Pending => {
                                 assert!(client.poll_write(&fcx, &mut cx, data).is_pending());
                             }
                             Poll::Ready(result) => {
                                 assert_eq!(result, Ok(data.len()));
-                                assert_eq!(client.conn.received, data);
+                                assert_eq!(peer.lock().unwrap().received, data);
                                 complete = true;
                                 break;
                             }
@@ -302,38 +345,37 @@ mod sandbox_client {
                     }
                     assert!(complete, "ciphertext did not drain");
                 }
-                client.conn.budget = usize::MAX;
+                peer.lock().unwrap().budget = usize::MAX;
                 client.write_all(&fcx, b"!").await?;
-                assert_eq!(client.conn.received, b"hello!");
+                assert_eq!(peer.lock().unwrap().received, b"hello!");
                 Ok(())
             },
         ))
         .unwrap();
     }
 
-    #[test]
-    fn dropped_write_credits_only_matching_retries() {
+    fn dropped_write_credits_only_matching_retries(server: bool) {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(5),
-            |fcx| async move {
+            move |fcx| async move {
                 let original = b"original";
                 let retries: &[&[u8]] = &[original, b"original plus", b"orig", b"other", b""];
                 for flush_by_read in [false, true] {
                     for &retry in retries {
-                        let mut client = connected(&fcx).await;
+                        let (mut client, peer) = connected(&fcx, server).await;
                         {
                             let mut cx = Context::from_waker(Waker::noop());
-                            client.conn.budget = 1;
+                            peer.lock().unwrap().budget = 1;
                             {
                                 let mut write = std::pin::pin!(client.write_all(&fcx, original));
                                 assert!(write.as_mut().poll(&mut cx).is_pending());
                             }
-                            assert!(client.conn.received.is_empty());
+                            assert!(peer.lock().unwrap().received.is_empty());
                             assert!(client.poll_write(&fcx, &mut cx, retry).is_pending());
-                            client.conn.budget = usize::MAX;
+                            peer.lock().unwrap().budget = usize::MAX;
                             if flush_by_read {
                                 assert!(client.poll_read(&fcx, &mut cx, &mut [0]).is_pending());
-                                assert_eq!(client.conn.received, original);
+                                assert_eq!(peer.lock().unwrap().received, original);
                             }
                         }
                         let n = client.write(&fcx, retry).await?;
@@ -348,7 +390,7 @@ mod sandbox_client {
                             retry
                         });
                         expected.push(b'!');
-                        assert_eq!(client.conn.received, expected);
+                        assert_eq!(peer.lock().unwrap().received, expected);
                     }
                 }
                 Ok(())
@@ -357,29 +399,28 @@ mod sandbox_client {
         .unwrap();
     }
 
-    #[test]
-    fn write_propagates_downstream_failures() {
+    fn write_propagates_downstream_failures(server: bool) {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(6),
-            |fcx| async move {
+            move |fcx| async move {
                 for partial in [false, true] {
                     for (result, error) in [
                         (Ok(0), ConnError::Closed),
                         (Err(ConnError::Reset), ConnError::Reset),
                         (Err(ConnError::Broken), ConnError::Broken),
                     ] {
-                        let mut client = connected(&fcx).await;
+                        let (mut client, peer) = connected(&fcx, server).await;
                         let mut cx = Context::from_waker(Waker::noop());
                         if partial {
-                            client.conn.budget = 1;
+                            peer.lock().unwrap().budget = 1;
                             assert!(client.poll_write(&fcx, &mut cx, b"hello").is_pending());
                         }
-                        client.conn.terminal = Some(result);
+                        peer.lock().unwrap().terminal = Some(result);
                         assert_eq!(
                             client.poll_write(&fcx, &mut cx, b"hello"),
                             Poll::Ready(Err(error))
                         );
-                        assert!(client.conn.received.is_empty());
+                        assert!(peer.lock().unwrap().received.is_empty());
                     }
                 }
                 Ok(())
@@ -387,4 +428,139 @@ mod sandbox_client {
         ))
         .unwrap();
     }
+
+    fn read_propagates_output_failure(
+        server: bool,
+        incoming: bool,
+        result: Result<usize, ConnError>,
+        error: ConnError,
+    ) {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(7),
+            move |fcx| async move {
+                let (mut conn, peer) = connected(&fcx, server).await;
+                let mut cx = Context::from_waker(Waker::noop());
+                // Leave ciphertext queued, as when a write future is dropped.
+                peer.lock().unwrap().budget = 0;
+                assert!(conn.poll_write(&fcx, &mut cx, b"queued").is_pending());
+                if incoming {
+                    let mut peer = peer.lock().unwrap();
+                    tls::with_context(&fcx, || peer.tls.refresh_traffic_keys()).unwrap();
+                    peer.tls.writer().write_all(b"hello").unwrap();
+                }
+                peer.lock().unwrap().terminal = Some(result);
+                let mut buf = [0; 16];
+                assert_eq!(
+                    conn.poll_read(&fcx, &mut cx, &mut buf),
+                    Poll::Ready(Err(error))
+                );
+                assert!(peer.lock().unwrap().received.is_empty());
+                if incoming && server {
+                    assert!(!peer.lock().unwrap().tls.wants_write());
+                }
+                // The output error must not consume decrypted application bytes.
+                peer.lock().unwrap().budget = usize::MAX;
+                if incoming {
+                    assert_eq!(conn.poll_read(&fcx, &mut cx, &mut buf), Poll::Ready(Ok(5)));
+                    assert_eq!(&buf[..5], b"hello");
+                } else {
+                    assert!(conn.poll_read(&fcx, &mut cx, &mut buf).is_pending());
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn server_tls_error_wins_over_output_failure() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(8),
+            |fcx| async move {
+                let (mut conn, peer) = connected(&fcx, true).await;
+                {
+                    let mut peer = peer.lock().unwrap();
+                    peer.tls.writer().write_all(b"hello").unwrap();
+                    peer.corrupt = true;
+                    peer.terminal = Some(Err(ConnError::Reset));
+                }
+                let mut cx = Context::from_waker(Waker::noop());
+                assert_eq!(
+                    conn.poll_read(&fcx, &mut cx, &mut [0; 16]),
+                    Poll::Ready(Err(ConnError::Broken))
+                );
+                assert!(peer.lock().unwrap().terminal.is_none());
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    macro_rules! contracts {
+        ($name:ident, $server:expr) => {
+            mod $name {
+                use super::*;
+
+                #[test]
+                fn write_waits_for_complete_ciphertext() {
+                    super::write_waits_for_complete_ciphertext($server);
+                }
+                #[test]
+                fn dropped_write_credits_only_matching_retries() {
+                    super::dropped_write_credits_only_matching_retries($server);
+                }
+                #[test]
+                fn write_propagates_downstream_failures() {
+                    super::write_propagates_downstream_failures($server);
+                }
+                #[test]
+                fn read_with_input_reports_closed_output() {
+                    read_propagates_output_failure($server, true, Ok(0), ConnError::Closed);
+                }
+                #[test]
+                fn read_with_input_reports_reset_output() {
+                    read_propagates_output_failure(
+                        $server,
+                        true,
+                        Err(ConnError::Reset),
+                        ConnError::Reset,
+                    );
+                }
+                #[test]
+                fn read_with_input_reports_broken_output() {
+                    read_propagates_output_failure(
+                        $server,
+                        true,
+                        Err(ConnError::Broken),
+                        ConnError::Broken,
+                    );
+                }
+                #[test]
+                fn read_without_input_reports_closed_output() {
+                    read_propagates_output_failure($server, false, Ok(0), ConnError::Closed);
+                }
+                #[test]
+                fn read_without_input_reports_reset_output() {
+                    read_propagates_output_failure(
+                        $server,
+                        false,
+                        Err(ConnError::Reset),
+                        ConnError::Reset,
+                    );
+                }
+                #[test]
+                fn read_without_input_reports_broken_output() {
+                    read_propagates_output_failure(
+                        $server,
+                        false,
+                        Err(ConnError::Broken),
+                        ConnError::Broken,
+                    );
+                }
+            }
+        };
+    }
+
+    contracts!(server, true);
+    contracts!(sandbox_client, false);
 }

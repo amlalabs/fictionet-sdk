@@ -212,6 +212,9 @@
 //! `tests/copy_and_own` compiles the files in a separate crate. Optional
 //! code uses the SDK's feature-selection macros, so a copied file needs
 //! no matching Cargo features in the consuming crate.
+//! Copy `tls.rs` or `sandbox.rs` together with `tls/output.rs`, keeping
+//! that relative path. Declare `#[path = "tls/output.rs"] mod tls_output;`
+//! next to the copied module. Both adapters use this private output helper.
 //!
 //! For a Modbus gateway that accepts a nonzero protocol identifier, copy
 //! `src/stdlib/modbus.rs` into your crate and remove the two protocol-identifier
@@ -539,6 +542,8 @@ pub mod test_support;
 pub mod tftp;
 pub mod thrift;
 pub mod tls;
+#[path = "tls/output.rs"]
+mod tls_output;
 pub mod tpkt;
 pub mod udp;
 pub mod urlencoded_form;

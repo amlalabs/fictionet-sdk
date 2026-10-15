@@ -379,6 +379,11 @@ Other kinds of port:
 - `port_server(port, server)` and `tls_accept(port, sni, config, server)`: a
   `PortServer` of the world's own. HTTP is one: `httpd::Server`, below.
 
+Reading a `tls::TlsConnection` can also send TLS output, such as a KeyUpdate
+reply. If that send fails, the read reports the underlying connection error.
+Plaintext already decrypted is kept for the next read. If the connection has
+no room for output, sending waits for the next read or write.
+
 Each peer address may hold 256 connections at once across all machines
 and gateway DNS listeners in the network. Bytes held by the service layer
 are charged to one budget per sandbox, 256 MiB by default. TCP socket

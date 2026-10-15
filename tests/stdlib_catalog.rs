@@ -129,15 +129,15 @@ fn catalog() -> Vec<Row> {
     rows
 }
 
-/// The modules of `src/stdlib/`: every file and every directory with a
-/// `mod.rs`, less the private ones (`mod x;` without `pub`).
+/// The modules of `src/stdlib/`, including component files beside their
+/// directories, less the private ones (`mod x;` without `pub`).
 fn modules_on_disk() -> BTreeMap<String, Vec<PathBuf>> {
     let private: BTreeSet<&str> = MOD_RS
         .lines()
         .filter_map(|l| l.strip_prefix("mod ").and_then(|l| l.strip_suffix(';')))
         .collect();
     let dir = Path::new(ROOT).join("src/stdlib");
-    let mut modules = BTreeMap::new();
+    let mut modules: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for entry in fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
@@ -148,15 +148,27 @@ fn modules_on_disk() -> BTreeMap<String, Vec<PathBuf>> {
                 .filter(|p| p.extension().is_some_and(|e| e == "rs"))
                 .collect();
             files.sort();
-            modules.insert(name, files);
+            modules.entry(name).or_default().extend(files);
         } else if let Some(stem) = name.strip_suffix(".rs")
             && stem != "mod"
             && !private.contains(stem)
         {
-            modules.insert(stem.to_owned(), vec![path]);
+            modules.entry(stem.to_owned()).or_default().push(path);
         }
     }
+    for files in modules.values_mut() {
+        files.sort();
+    }
     modules
+}
+
+#[test]
+fn component_sources_keep_the_entry_file_and_children() {
+    let modules = modules_on_disk();
+    let tls = &modules["tls"];
+    let root = Path::new(ROOT);
+    assert!(tls.contains(&root.join("src/stdlib/tls.rs")));
+    assert!(tls.contains(&root.join("src/stdlib/tls/output.rs")));
 }
 
 /// A module's source with every comment line taken out, so that doc

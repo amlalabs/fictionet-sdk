@@ -3,6 +3,8 @@
 //! [`machine`] splits a cable into TCP, UDP, and ICMP. DNS queries and
 //! TLS handshakes use the run's clock and randomness.
 
+use super::tls_output::Output;
+
 use fictionet::stdlib::codec::{Stream, Wire};
 use fictionet::stdlib::dns::op::{Message, Query};
 use fictionet::stdlib::dns::rr::{Name, RecordType};
@@ -116,10 +118,7 @@ pub struct TlsClient<C> {
     pub conn: C,
     /// The TLS session.
     pub tls: ClientConnection,
-    out: Vec<u8>,
-    out_pos: usize,
-    /// Plaintext encrypted for a pending write, credited once its output is sent.
-    taken: Option<Vec<u8>>,
+    output: Output,
     inbuf: Box<[u8]>,
     /// Bytes read from `conn` that rustls could not take yet, because its
     /// plaintext buffer was full.
@@ -147,35 +146,15 @@ impl<C: Connection + Unpin> TlsClient<C> {
         TlsClient {
             conn,
             tls,
-            out: Vec::new(),
-            out_pos: 0,
-            taken: None,
+            output: Output::default(),
             inbuf: vec![0; 4096].into_boxed_slice(),
             pending: Vec::new(),
         }
     }
 
     fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        loop {
-            if self.out_pos == self.out.len() {
-                self.out.clear();
-                self.out_pos = 0;
-                if !self.tls.wants_write() {
-                    return Poll::Ready(Ok(()));
-                }
-                self.tls
-                    .write_tls(&mut self.out)
-                    .map_err(|_| ConnError::Broken)?;
-            }
-            match self.conn.poll_write(fcx, cx, &self.out[self.out_pos..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(ConnError::Closed)),
-                Poll::Ready(Ok(n)) => {
-                    self.out_pos += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        self.output.take_output(&mut self.tls)?;
+        self.output.poll_flush(&mut self.conn, fcx, cx)
     }
 
     /// Reads from the connection into rustls once. `Ok(false)` at the end
@@ -256,9 +235,8 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Poll::Ready(Ok(0)),
                 Err(_) => return Poll::Ready(Err(ConnError::Broken)),
             }
-            if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
-                return Poll::Ready(Err(e));
-            }
+            self.output.take_output(&mut self.tls)?;
+            self.output.flush_for_read(&mut self.conn, fcx, cx)?;
             match self.poll_fill(fcx, cx) {
                 Poll::Ready(Ok(true)) => {}
                 Poll::Ready(Ok(false)) => {
@@ -279,19 +257,12 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>> {
-        if let Some(previous) = self.taken.as_ref() {
-            let same = data.starts_with(previous);
-            let n = previous.len();
-            // Credit an earlier write only when these are its bytes.
-            match self.poll_flush(fcx, cx) {
-                Poll::Ready(Ok(())) => {
-                    self.taken = None;
-                    if same {
-                        return Poll::Ready(Ok(n));
-                    }
-                }
-                other => return other.map(|r| r.map(|()| 0)),
-            }
+        self.output.take_output(&mut self.tls)?;
+        match self.output.poll_credit(&mut self.conn, fcx, cx, data) {
+            Poll::Ready(Ok(Some(n))) => return Poll::Ready(Ok(n)),
+            Poll::Ready(Ok(None)) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
         }
         match self.poll_flush(fcx, cx) {
             Poll::Ready(Ok(())) => {}
@@ -303,14 +274,9 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
             .writer()
             .write(data)
             .map_err(|_| ConnError::Broken)?;
-        match self.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => {
-                self.taken = Some(data[..n].to_vec());
-                Poll::Pending
-            }
-        }
+        self.output.take_output(&mut self.tls)?;
+        self.output
+            .poll_written(&mut self.conn, fcx, cx, &data[..n])
     }
 
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
@@ -496,7 +462,7 @@ mod tests {
                 poll_fn(|cx| client.poll_flush(&fcx, cx)).await?;
                 {
                     let mut cx = Context::from_waker(std::task::Waker::noop());
-                    client.out.extend_from_slice(b"next flight");
+                    client.output.bytes.extend_from_slice(b"next flight");
                     client.conn.terminal = Some(Ok(0));
                     assert_eq!(
                         client.poll_flush(&fcx, &mut cx),
@@ -509,7 +475,7 @@ mod tests {
                     );
                 }
                 poll_fn(|cx| client.poll_flush(&fcx, cx)).await?;
-                assert!(client.out.is_empty());
+                assert!(client.output.bytes.is_empty());
                 *out.lock() = client.conn.bytes;
                 Ok(())
             },

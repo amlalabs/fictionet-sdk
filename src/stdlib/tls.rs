@@ -51,6 +51,7 @@
 //! can run rustls, OpenSSL, or anything else over a connection itself,
 //! since [`Connection`] is an open trait.
 
+use super::tls_output::Output;
 use std::cell::RefCell;
 use std::future::poll_fn;
 use std::io::{ErrorKind, Read, Write};
@@ -649,9 +650,7 @@ struct Io<C> {
     conn: C,
     /// Bytes read from `conn` that rustls has not taken yet.
     inbuf: fictionet::stdlib::codec::Buffer,
-    /// Encrypted bytes for `conn` that it has not taken yet, from `out_pos`.
-    out: Vec<u8>,
-    out_pos: usize,
+    output: Output,
     /// `conn` said it will send nothing more.
     eof: bool,
 }
@@ -661,25 +660,14 @@ impl<C: Connection> Io<C> {
         Io {
             conn,
             inbuf: fictionet::stdlib::codec::Buffer::new(READ_CHUNK),
-            out: Vec::new(),
-            out_pos: 0,
+            output: Output::default(),
             eof: false,
         }
     }
 
-    /// Hands all of `out` to `conn`.
+    /// Hands all queued output to `conn`.
     fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        while self.out_pos < self.out.len() {
-            match self.conn.poll_write(fcx, cx, &self.out[self.out_pos..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(ConnError::Closed)),
-                Poll::Ready(Ok(n)) => self.out_pos += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        self.out.clear();
-        self.out_pos = 0;
-        Poll::Ready(Ok(()))
+        self.output.poll_flush(&mut self.conn, fcx, cx)
     }
 
     /// Reads more bytes from `conn` into `inbuf`, or sets `eof`.
@@ -705,15 +693,6 @@ impl<C: Connection> Io<C> {
         }
     }
 
-    /// Moves what rustls wants to send into `out`.
-    fn take_output(&mut self, tls: &mut ServerConnection) {
-        while tls.wants_write() {
-            if tls.write_tls(&mut self.out).is_err() {
-                break;
-            }
-        }
-    }
-
     /// Feeds `inbuf` (or the end of input) to rustls and processes it. On a
     /// TLS error, queues the alert rustls made and fails with what went
     /// wrong.
@@ -734,7 +713,7 @@ impl<C: Connection> Io<C> {
         }
         let result = with_context(fcx, || tls.process_new_packets().map(|_| ()));
         if let Err(e) = result {
-            self.take_output(tls);
+            self.output.take_output(tls)?;
             return Err(match e {
                 rustls::Error::AlertReceived(alert) => HandshakeError::Alert(u8::from(alert)),
                 e => HandshakeError::Failed(e.to_string()),
@@ -964,8 +943,7 @@ impl<C: Connection> ClientHello<C> {
         let mut io = Io {
             conn: self.conn,
             inbuf: self.inbuf,
-            out: Vec::new(),
-            out_pos: 0,
+            output: Output::default(),
             eof: false,
         };
         let config = fictionet::observe::observed_config(fcx, config);
@@ -973,14 +951,14 @@ impl<C: Connection> ClientHello<C> {
             Ok(tls) => tls,
             Err((e, mut alert)) => {
                 // Best effort: tell the client why, then close.
-                let _ = alert.write_all(&mut io.out);
+                let _ = alert.write_all(&mut io.output.bytes);
                 let _ = poll_fn(|cx| io.poll_flush(fcx, cx)).await;
                 return Err(HandshakeError::Failed(e.to_string()));
             }
         };
         let result = poll_fn(|cx| {
             loop {
-                io.take_output(&mut tls);
+                io.output.take_output(&mut tls)?;
                 match io.poll_flush(fcx, cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
@@ -1008,12 +986,11 @@ impl<C: Connection> ClientHello<C> {
             Ok(()) => Ok(TlsConnection {
                 io,
                 tls,
-                taken: None,
                 closing: false,
             }),
             Err(e) => {
                 // Send the alert rustls made, if there is one.
-                if !io.out.is_empty() {
+                if !io.output.bytes.is_empty() {
                     let _ = poll_fn(|cx| io.poll_flush(fcx, cx)).await;
                 }
                 Err(e)
@@ -1023,12 +1000,14 @@ impl<C: Connection> ClientHello<C> {
 }
 
 /// A finished TLS connection. Reads and writes carry the decrypted bytes.
+///
+/// A read reports a failure of the connection underneath even when it happened
+/// while sending TLS output, such as a KeyUpdate reply. Plaintext already
+/// decrypted is kept for the next read. Output waits for the next read or write
+/// only when the connection has no room for it.
 pub struct TlsConnection<C> {
     io: Io<C>,
     tls: ServerConnection,
-    /// Plaintext rustls has encrypted for an earlier `poll_write` whose
-    /// output `conn` has not taken yet. Reported as taken once it has.
-    taken: Option<Vec<u8>>,
     /// `close_notify` is queued.
     closing: bool,
 }
@@ -1073,13 +1052,17 @@ impl<C: Connection> Connection for TlsConnection<C> {
                 let eof_seen = self.io.inbuf.is_empty();
                 let fed = self.io.feed(fcx, &mut self.tls);
                 // rustls may have something to send: a key update, a ticket
-                // or an alert. Hand it on if `conn` has room now; otherwise
-                // the next write or read sends it.
-                self.io.take_output(&mut self.tls);
-                let _ = self.io.poll_flush(fcx, cx);
+                // or an alert. Only a lack of room defers it to the next read
+                // or write; a transport failure must reach this reader.
+                let flushed = self
+                    .io
+                    .output
+                    .take_output(&mut self.tls)
+                    .and_then(|()| self.io.output.flush_for_read(&mut self.io.conn, fcx, cx));
                 if fed.is_err() {
                     return Poll::Ready(Err(ConnError::Broken));
                 }
+                flushed?;
                 if eof_seen {
                     // The end of input was fed; the reader now says how it
                     // ended. Never loop on it twice.
@@ -1101,7 +1084,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
                     // Output queued by an earlier read still goes out.
-                    let _ = self.io.poll_flush(fcx, cx);
+                    self.io.output.flush_for_read(&mut self.io.conn, fcx, cx)?;
                     return Poll::Pending;
                 }
             }
@@ -1114,19 +1097,11 @@ impl<C: Connection> Connection for TlsConnection<C> {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>> {
-        if let Some(previous) = self.taken.as_ref() {
-            let same = data.starts_with(previous);
-            let n = previous.len();
-            // Credit an earlier write only when these are its bytes.
-            match self.io.poll_flush(fcx, cx) {
-                Poll::Ready(Ok(())) => {
-                    self.taken = None;
-                    if same {
-                        return Poll::Ready(Ok(n));
-                    }
-                }
-                other => return other.map(|r| r.map(|()| 0)),
-            }
+        match self.io.output.poll_credit(&mut self.io.conn, fcx, cx, data) {
+            Poll::Ready(Ok(Some(n))) => return Poll::Ready(Ok(n)),
+            Poll::Ready(Ok(None)) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
         }
         if self.closing {
             return Poll::Ready(Err(ConnError::Closed));
@@ -1143,15 +1118,10 @@ impl<C: Connection> Connection for TlsConnection<C> {
             Ok(0) | Err(_) => return Poll::Ready(Err(ConnError::Closed)),
             Ok(n) => n,
         };
-        self.io.take_output(&mut self.tls);
-        match self.io.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => {
-                self.taken = Some(chunk[..n].to_vec());
-                Poll::Pending
-            }
-        }
+        self.io.output.take_output(&mut self.tls)?;
+        self.io
+            .output
+            .poll_written(&mut self.io.conn, fcx, cx, &chunk[..n])
     }
 
     /// Sends `close_notify`, then shuts down the connection underneath.
@@ -1159,7 +1129,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
         if !self.closing {
             self.closing = true;
             with_context(fcx, || self.tls.send_close_notify());
-            self.io.take_output(&mut self.tls);
+            self.io.output.take_output(&mut self.tls)?;
         }
         match self.io.poll_flush(fcx, cx) {
             Poll::Ready(Ok(())) => self.io.conn.poll_shutdown(fcx, cx),

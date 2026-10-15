@@ -198,6 +198,9 @@ macro_rules! protocols {
         pub mod test_support;
         #[path = "../../src/stdlib/tls.rs"]
         pub mod tls;
+        // Copy this private sibling with either TLS adapter.
+        #[path = "../../src/stdlib/tls/output.rs"]
+        mod tls_output;
         #[path = "../../src/stdlib/udp.rs"]
         pub mod udp;
         #[path = "../../src/stdlib/codec/work.rs"]
@@ -265,6 +268,7 @@ macro_rules! protocols {
         pub mod rtp;
         #[path = "../../src/stdlib/rtsp.rs"]
         pub mod rtsp;
+        // The sandbox client shares the private tls_output sibling above.
         #[path = "../../src/stdlib/sandbox.rs"]
         pub mod sandbox;
         #[path = "../../src/stdlib/sbe.rs"]
