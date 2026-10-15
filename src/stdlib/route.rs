@@ -223,17 +223,24 @@ impl Prefix {
 /// interface it came in on goes back out on that interface, as on a real
 /// router.
 ///
-/// Like a real router, it lowers each packet's TTL or hop limit by one,
-/// and changes nothing else (the IPv4 header checksum follows the TTL). A
+/// Except for the exemptions below, it lowers each packet's TTL or hop limit
+/// by one and changes nothing else (the IPv4 header checksum follows the TTL). A
 /// packet that arrives with a TTL or hop limit of 0 or 1 is dropped, so a
 /// loop of routes, such as two routers whose default routes point at each
-/// other, cannot carry a packet forever. The drop is recorded as a
+/// other, cannot carry such a packet forever. The drop is recorded as a
 /// `router.drop` [event](fictionet::events), a [repeat](fictionet::events#repeats). Once the router has an [address](Router::address) of the
 /// packet's family, it also answers the sender with an ICMP "time
 /// exceeded" ([`icmp::time_exceeded`](fictionet::stdlib::icmp::time_exceeded)),
-/// which is what `traceroute` reads. Packets to or from the router's own
-/// addresses are its own, not forwarded, and keep their TTL. A router
-/// told to [`keep_ttl`](Router::keep_ttl) changes no packet.
+/// which is what `traceroute` reads.
+///
+/// Packets to or from the router's own addresses still go through route
+/// lookup and out on the best matching route, like any other packet. The
+/// router has no local stack; add a `/32` or `/128` route to the machine that
+/// should receive packets for its address. These packets keep their TTL or
+/// hop limit and are never dropped for running out. The source exemption
+/// also applies to packets that spoof the router's address, so a routing
+/// loop could carry them forever. A router told to
+/// [`keep_ttl`](Router::keep_ttl) changes no packet.
 #[track_caller]
 pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
     let (sender, changes) =
@@ -549,6 +556,11 @@ impl<I: Interface> Router<I> {
     /// Gives the router an address of `addr`'s family, replacing the one it
     /// had. Its ICMP "time exceeded" answers come from it. A router has no
     /// address at first, and then drops expired packets without an answer.
+    ///
+    /// The address only sets the ICMP source and exempts packets to or from
+    /// it from TTL or hop limit handling. It does not change delivery: those
+    /// packets still use the route table. The router has no local stack;
+    /// add a `/32` or `/128` route to the machine that should receive them.
     pub fn address(&self, addr: IpAddr) {
         drop(self.handle.send(Edit::Address(addr)));
     }
