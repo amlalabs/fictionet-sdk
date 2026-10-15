@@ -1804,8 +1804,136 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{
+        Attribute, Error, FrameError, Head, Header, MAX_DOCUMENT, MAX_FIELD, MAX_HEAD, Message,
+        Value, tag,
+    };
+    use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire};
+    use fictionet::stdlib::test_support::{contract, decode_all};
+
+    /// Semantic branches reached by one input.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct Reach {
+        /// Heads refused by the 64-byte limit.
+        pub head_too_long: usize,
+        /// Documents refused after a complete head.
+        pub document_too_long: usize,
+        /// Attribute errors that preserve the request ID.
+        pub bad_requests: usize,
+    }
+
+    /// Checks everything the fuzz target checks, for one buffer.
+    /// The fuzz target is exactly this call.
+    pub fn check(data: &[u8]) -> Reach {
+        let mut reach = Reach::default();
+        contract::check_decode_with_alloc_limit(Head::new, data, 2 * MAX_HEAD);
+        let (_, limited_failure) =
+            contract::check_decode_with_alloc_limit(|| Head::with_limit(64), data, 128);
+        if limited_failure == Some(Fail::Protocol(FrameError::TooLong)) {
+            reach.head_too_long += 1;
+        }
+        contract::check_wire::<Header>(data);
+        contract::check_wire::<Message>(data);
+        let (items, failure) = decode_all(Head::new, data);
+        match Message::parse(data) {
+            Ok(message) => {
+                assert_eq!((items, failure), (vec![Ok(Header::from(message))], None));
+            }
+            Err(Error::DocumentTooLong) => {
+                let Ok(Step::Item(Ok(header), used)) = Head::new().decode(data, false) else {
+                    panic!("document limit without a complete head");
+                };
+                assert!(data.len() - used > MAX_DOCUMENT);
+                let end = super::scan_head(data, &mut 0, MAX_HEAD).unwrap().unwrap();
+                assert_eq!(header, Header::parse(&data[..end]).unwrap());
+                reach.document_too_long += 1;
+                assert_eq!((items, failure), (vec![Ok(header)], None));
+            }
+            Err(Error::Truncated) => {
+                assert!(items.is_empty());
+                assert_eq!(
+                    failure,
+                    (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })
+                );
+            }
+            Err(Error::Trailing) => panic!("a message includes its document"),
+            Err(Error::Length(n)) => {
+                assert!(items.is_empty());
+                assert_eq!(failure, Some(Fail::Protocol(FrameError::Length(n))));
+            }
+            Err(Error::TooLong) => {
+                assert!(items.is_empty());
+                assert_eq!(failure, Some(Fail::Protocol(FrameError::TooLong)));
+            }
+            Err(error) => {
+                reach.bad_requests += 1;
+                let fixed = data.first_chunk::<8>().unwrap();
+                let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+                assert_eq!(
+                    (items, failure),
+                    (
+                        vec![Err(Error::BadRequest {
+                            request_id,
+                            error: Box::new(error)
+                        })],
+                        None
+                    )
+                );
+            }
+        }
+        let mut stream = Stream::new(Head::new());
+        assert_eq!(stream.push(data), data.len().min(MAX_HEAD));
+        stream.end();
+        let item = stream.next();
+        if let Some(fixed) = data.first_chunk::<8>() {
+            let expected = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+            let request_id = match item {
+                Some(Ok(Ok(header))) => {
+                    let b = header.to_bytes().unwrap();
+                    assert_eq!(Header::parse(&b), Ok(header.clone()));
+                    contract::check_wire::<Header>(&b);
+                    header.request_id
+                }
+                Some(Ok(Err(Error::BadRequest { request_id, .. }))) => request_id,
+                _ => {
+                    let fixed = stream.unread().first_chunk::<8>().unwrap();
+                    u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]])
+                }
+            };
+            assert_eq!(request_id, expected);
+        }
+        let mut message = Message::request(2, 7);
+        message.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new(
+                "document",
+                Value::OctetString(data.get(..MAX_FIELD + 1).unwrap_or(data).to_vec()),
+            ),
+        );
+        contract::check_wire_value(&message);
+        let built = Header::from(message);
+        contract::check_wire_value(&built);
+        let mut body = Header {
+            version: (1, 1),
+            code: 2,
+            request_id: 7,
+            groups: vec![],
+        }
+        .to_bytes()
+        .unwrap();
+        body.extend_from_slice(data.get(..4096).unwrap_or(data));
+        contract::check_decode_with_alloc_limit(|| Head::with_limit(64), &body, 128);
+        reach
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check;
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
@@ -3042,69 +3170,40 @@ mod tests {
         check(bytes);
     }
 
-    /// Checks everything the fuzz target checks, for one buffer.
-    fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Head::new, data, 2 * MAX_HEAD);
-        contract::check_wire::<Header>(data);
-        contract::check_wire::<Message>(data);
-        let (items, failure) = decode_all(Head::new, data);
-        match Message::parse(data) {
-            Ok(message) => {
-                assert_eq!((items, failure), (vec![Ok(Header::from(message))], None));
-            }
-            Err(Error::DocumentTooLong) => {
-                let end = scan_head(data, &mut 0, MAX_HEAD).unwrap().unwrap();
-                assert_eq!(
-                    (items, failure),
-                    (vec![Ok(Header::parse(&data[..end]).unwrap())], None)
-                );
-            }
-            Err(Error::Truncated) => {
-                assert!(items.is_empty());
-                assert_eq!(
-                    failure,
-                    (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })
-                );
-            }
-            Err(Error::Trailing) => panic!("a message includes its document"),
-            Err(Error::Length(n)) => {
-                assert!(items.is_empty());
-                assert_eq!(failure, Some(Fail::Protocol(FrameError::Length(n))));
-            }
-            Err(Error::TooLong) => {
-                assert!(items.is_empty());
-                assert_eq!(failure, Some(Fail::Protocol(FrameError::TooLong)));
-            }
-            Err(error) => {
-                let fixed = data.first_chunk::<8>().unwrap();
-                let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
-                assert_eq!(
-                    (items, failure),
-                    (
-                        vec![Err(Error::BadRequest {
-                            request_id,
-                            error: Box::new(error)
-                        })],
-                        None
-                    )
-                );
-            }
-        }
-        let mut stream = Stream::new(Head::new());
-        let _ = stream.push(data);
-        stream.end();
-        let item = stream.next();
-        if let Some(fixed) = data.first_chunk::<8>() {
-            let expected = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
-            let request_id = match item {
-                Some(Ok(Ok(header))) => header.request_id,
-                Some(Ok(Err(Error::BadRequest { request_id, .. }))) => request_id,
-                _ => {
-                    let fixed = stream.unread().first_chunk::<8>().unwrap();
-                    u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]])
-                }
-            };
-            assert_eq!(request_id, expected);
+    #[test]
+    fn harness_reaches_small_head_limit() {
+        let mut message = Message::request(operation::PRINT_JOB, 42);
+        message.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new("document", Value::OctetString(vec![0; 64])),
+        );
+        let bytes = message.to_bytes().unwrap();
+        assert!(bytes.len() > 64);
+        assert_eq!(check(&bytes).head_too_long, 1);
+    }
+
+    #[test]
+    fn harness_reaches_document_limit() {
+        let mut bytes = Message::request(operation::PRINT_JOB, 42)
+            .to_bytes()
+            .unwrap();
+        bytes.resize(bytes.len() + MAX_DOCUMENT + 1, 0);
+        assert_eq!(check(&bytes).document_too_long, 1);
+    }
+
+    #[test]
+    fn harness_reaches_bad_request() {
+        let mut bytes = vec![1, 1, 0, 2, 0, 0, 0, 42, tag::OPERATION_ATTRIBUTES];
+        // A Boolean may only be 0 or 1.
+        bytes.extend(rec(0x22, "a", &[2]));
+        bytes.push(tag::END_OF_ATTRIBUTES);
+        assert_eq!(check(&bytes).bad_requests, 1);
+    }
+
+    #[test]
+    fn harness_checks_constructed_value_limits() {
+        for size in [MAX_FIELD, MAX_FIELD + 1] {
+            check(&vec![0; size]);
         }
     }
 

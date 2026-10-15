@@ -1480,8 +1480,172 @@ impl Client {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{
+        BeginRequest, Client, ClientEvent, EndRequest, Error, MAX_CONTENT, MAX_HELD, MAX_RECORD,
+        MAX_REQUESTS, Pairs, Record, RecordStream, Request, Response, Server, ServerEvent,
+        UnknownType, kind,
+    };
+    use fictionet::stdlib::codec::{Decode, Frames, Wire};
+    use fictionet::stdlib::test_support::{contract, decode_all};
+
+    /// Semantic branches reached by one input.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct Reach {
+        /// Complete even-ID requests ended by the server.
+        pub requests_ended: usize,
+        /// Aborted requests ended by the server.
+        pub aborts_ended: usize,
+        /// STDOUT or STDERR records suppressed after a client failure.
+        pub suppressed_records: usize,
+        /// Successful responses delivered by the client.
+        pub responses: usize,
+    }
+
+    /// Everything the fuzz target checks, on one input.
+    /// The fuzz target is exactly this call.
+    pub fn check(data: &[u8]) -> Reach {
+        let mut reach = Reach::default();
+        contract::check_decode_capacity(Frames::<Record>::new, data);
+        contract::check_decode_with_alloc_limit(Frames::<Record>::new, data, 2 * MAX_RECORD);
+        contract::check_wire::<Record>(data);
+        let limit = usize::from(data.first().copied().unwrap_or(0));
+        contract::check_decode_capacity(|| Frames::<Record>::with_limit(limit), data);
+        contract::check_decode_with_alloc_limit(
+            || Frames::<Record>::new().map(|record| BeginRequest::parse(&record.content)),
+            data,
+            2 * Frames::<Record>::new().capacity(),
+        );
+        let built = Record {
+            kind: data.first().copied().unwrap_or(0),
+            request_id: 1,
+            content: data.iter().take(MAX_CONTENT + 1).copied().collect(),
+            padding: data.last().copied().unwrap_or(0),
+        };
+        contract::check_wire_value(&built);
+
+        let whole = decode_all(Frames::<Record>::new, data).0;
+
+        let mut server = Server::new();
+        let mut client = Client::new();
+        let mut client_failed = std::collections::BTreeSet::new();
+        for r in &whole {
+            // A record read can be written, and reads back the same.
+            let bytes = r.to_bytes().unwrap();
+            let back = Record::parse(&bytes).unwrap();
+            assert_eq!(&back, r);
+
+            // A request put together can be written, and is put together the
+            // same again. Some requests are answered and ended, so their IDs
+            // can be used again.
+            let event = server.receive(r);
+            match &event {
+                Ok(Some(ServerEvent::Request(req))) if req.id % 2 == 0 => {
+                    assert!(server.end(req.id));
+                    reach.requests_ended += 1;
+                }
+                Ok(Some(ServerEvent::Abort(id))) => {
+                    assert!(server.end(*id));
+                    reach.aborts_ended += 1;
+                }
+                _ => {}
+            }
+            if let Ok(Some(ServerEvent::Request(req))) = event {
+                let mut s = Server::new();
+                let mut got = None;
+                let (records, failure) =
+                    decode_all(Frames::<Record>::new, &req.to_bytes().unwrap());
+                assert_eq!(failure, None);
+                for r in records {
+                    got = s.receive(&r).unwrap();
+                }
+                assert_eq!(got, Some(ServerEvent::Request(req)));
+            }
+            // So can a response. One with an error reported is never given.
+            let failed_before = matches!(r.kind, kind::STDOUT | kind::STDERR)
+                && client_failed.contains(&r.request_id);
+            let got = client.receive(r);
+            match &got {
+                Err(Error::AfterEnd { id, .. } | Error::TooLarge { id, .. }) => {
+                    client_failed.insert(*id);
+                }
+                Ok(Some(ClientEvent::Response(resp))) => assert!(!client_failed.contains(&resp.id)),
+                _ => {}
+            }
+            if r.kind == kind::END_REQUEST {
+                client_failed.remove(&r.request_id);
+            }
+            if failed_before {
+                assert_eq!(got, Ok(None));
+                reach.suppressed_records += 1;
+            }
+            if let Ok(Some(ClientEvent::Response(resp))) = got {
+                reach.responses += 1;
+                let mut c = Client::new();
+                let mut got = None;
+                let (records, failure) =
+                    decode_all(Frames::<Record>::new, &resp.to_bytes().unwrap());
+                assert_eq!(failure, None);
+                for r in records {
+                    got = c.receive(&r).unwrap();
+                }
+                assert_eq!(got, Some(ClientEvent::Response(resp)));
+            }
+            assert!(server.open() <= MAX_REQUESTS);
+            assert!(client.open() <= MAX_REQUESTS);
+            assert!(server.held() <= MAX_HELD);
+            assert!(client.held() <= MAX_HELD);
+        }
+
+        contract::check_wire::<Pairs>(data);
+        contract::check_wire::<BeginRequest>(data);
+        contract::check_wire::<EndRequest>(data);
+        contract::check_wire::<UnknownType>(data);
+        contract::check_wire::<RecordStream>(data);
+        contract::check_wire::<Request>(data);
+        contract::check_wire::<Response>(data);
+
+        let stream = RecordStream {
+            kind: kind::STDOUT,
+            request_id: 1,
+            data: data.to_vec(),
+        };
+        contract::check_wire_value(&stream);
+        if let Ok(bytes) = stream.to_bytes() {
+            let mut client = Client::new();
+            let mut got = Vec::new();
+            for r in decode_all(Frames::<Record>::new, &bytes).0 {
+                assert!(r.content.len() <= MAX_CONTENT);
+                assert_eq!(client.receive(&r), Ok(None));
+                got = r.content;
+            }
+            assert!(got.is_empty());
+        }
+        let names: Vec<&[u8]> = data.split(|&b| b == b',').collect();
+        if let Ok(ask) = Record::get_values(&names) {
+            assert!(ask.content.len() <= MAX_CONTENT);
+            match Server::new().receive(&ask) {
+                Ok(Some(ServerEvent::GetValues(back))) => assert_eq!(back, names),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        if let Ok(pairs) = Pairs::parse(data).map(|pairs| pairs.0) {
+            assert_eq!(
+                Pairs::parse(&Pairs(pairs.clone()).to_bytes().unwrap()).map(|pairs| pairs.0),
+                Ok(pairs)
+            );
+        }
+        reach
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check;
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Decode, Step};
@@ -2359,49 +2523,70 @@ mod tests {
         assert!(c.held() < before);
     }
 
-    /// Everything the fuzz target checks, on one input.
-    fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::<Record>::new, data, 2 * MAX_RECORD);
-        contract::check_wire::<Record>(data);
-        contract::check_wire::<Pairs>(data);
-        contract::check_wire::<BeginRequest>(data);
-        contract::check_wire::<EndRequest>(data);
-        contract::check_wire::<UnknownType>(data);
-        contract::check_wire::<RecordStream>(data);
-        contract::check_wire::<Request>(data);
-        contract::check_wire::<Response>(data);
-        let recs = decode_all(Frames::<Record>::new, data).0;
-        let mut server = Server::new();
-        let mut client = Client::new();
-        for r in &recs {
-            let bytes = r.to_bytes().unwrap();
-            assert_eq!(Record::parse(&bytes), Ok(r.clone()));
-            if let Ok(Some(ServerEvent::Request(req))) = server.receive(r) {
-                let Some(Ok(Some(ServerEvent::Request(back)))) =
-                    serve(&req.to_bytes().unwrap()).pop()
-                else {
-                    panic!()
-                };
-                assert_eq!(back, req);
-            }
-            if let Ok(Some(ClientEvent::Response(resp))) = client.receive(r) {
-                let mut c = Client::new();
-                let mut last = None;
-                for r in records(&resp.to_bytes().unwrap()) {
-                    last = c.receive(&r).unwrap();
-                }
-                assert_eq!(last, Some(ClientEvent::Response(resp)));
-            }
-            assert!(server.open() <= MAX_REQUESTS && client.open() <= MAX_REQUESTS);
+    #[test]
+    fn harness_ends_requests_and_reuses_ids() {
+        let request = Request {
+            id: 2,
+            role: Role::Responder,
+            keep_conn: true,
+            params: Pairs(vec![pair("A", "1")]),
+            stdin: b"body".to_vec(),
+            data: Vec::new(),
+        };
+        let mut bytes = request.to_bytes().unwrap();
+        request.write(&mut bytes).unwrap();
+        // The second request can finish only if the first one's ID was freed.
+        assert_eq!(check(&bytes).requests_ended, 2);
+
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            Record::begin_request(3, begin_request(Role::Responder, 0))
+                .write(&mut bytes)
+                .unwrap();
+            Record::abort_request(3).write(&mut bytes).unwrap();
         }
-        if let Ok(pairs) = Pairs::parse(data).map(|pairs| pairs.0) {
-            assert_eq!(
-                Pairs::parse(&Pairs(pairs.clone()).to_bytes().unwrap()).map(|pairs| pairs.0),
-                Ok(pairs)
-            );
+        assert_eq!(check(&bytes).aborts_ended, 2);
+    }
+
+    #[test]
+    fn harness_suppresses_failed_responses_until_id_reuse() {
+        for stream in [kind::STDOUT, kind::STDERR] {
+            let mut bytes = Vec::new();
+            for record in [
+                Record::new(stream, 1, &[]),
+                Record::new(stream, 1, b"after end"),
+                Record::new(kind::STDOUT, 1, b"suppressed"),
+                Record::new(kind::STDERR, 1, b"suppressed"),
+            ] {
+                record.write(&mut bytes).unwrap();
+            }
+            let reach = check(&bytes);
+            assert_eq!(reach.suppressed_records, 2);
+            assert_eq!(reach.responses, 0);
+
+            Record::end_request(1, end_request(0, ProtocolStatus::RequestComplete))
+                .write(&mut bytes)
+                .unwrap();
+            assert_eq!(check(&bytes).responses, 0);
+            let response = Response {
+                id: 1,
+                stdout: b"reused".to_vec(),
+                stderr: Vec::new(),
+                app_status: 0,
+                protocol_status: ProtocolStatus::RequestComplete,
+            };
+            response.write(&mut bytes).unwrap();
+            let reach = check(&bytes);
+            assert_eq!(reach.suppressed_records, 2);
+            assert_eq!(reach.responses, 1);
         }
-        let _ = BeginRequest::parse(data);
-        let _ = EndRequest::parse(data);
+    }
+
+    #[test]
+    fn harness_checks_constructed_record_limits() {
+        for size in [MAX_CONTENT, MAX_CONTENT + 1] {
+            check(&vec![0; size]);
+        }
     }
 
     #[test]
