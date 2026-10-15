@@ -449,8 +449,10 @@ every generator error category, CLI errors,
 JSON limits, deterministic output, and exact golden source bytes.
 Formatting checks run `rustfmt --edition 2024 --check` over the goldens,
 every name length from 1 through `MAX_NAME`, and deterministic random
-schemas when rustfmt is on PATH. Random modules also compile with warnings
-denied and run their generated tests. They use clippy when it is installed.
+schemas. If rustfmt is not on PATH, these checks skip with a `skipped:`
+note locally and fail when `CI` is set, even to an empty value. A nonzero
+rustfmt exit always fails. Random modules also compile with warnings denied
+and run their generated tests. They use clippy when it is installed.
 
 `tests/sbe_codegen.rs` compares generated SBE code with the runtime
 decoder `stdlib::sbe`, loaded with the same XML, for every template of

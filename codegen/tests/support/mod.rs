@@ -2,7 +2,6 @@ pub mod schemas;
 
 use std::{
     path::PathBuf,
-    process::Command,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -22,24 +21,5 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-pub fn rustfmt_available() -> bool {
-    Command::new("rustfmt").arg("--version").output().is_ok()
-}
-pub fn check_rustfmt(files: &[PathBuf]) {
-    for chunk in files.chunks(32) {
-        let result = Command::new("rustfmt")
-            .args(["--edition", "2024", "--check"])
-            .args(chunk)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
     }
 }

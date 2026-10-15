@@ -1,6 +1,13 @@
 //! Code generator integration checks.
+//! Missing rustfmt skips formatting checks with a note locally and fails
+//! when `CI` is set, even to an empty value. A nonzero rustfmt exit always fails.
 use fictionet_codegen::{FrontEnd, Input, IrFrontEnd, Limits, emit, emit_fuzz, generate, validate};
-use std::{path::Path, process::Command};
+use std::path::Path;
+#[path = "../../tests/common/requirements.rs"]
+mod requirements;
+#[path = "support/rustfmt.rs"]
+mod rustfmt;
+use rustfmt::check_rustfmt;
 
 const EXAMPLES: &[&str] = &[
     "primitives",
@@ -83,23 +90,17 @@ fn goldens_and_determinism() {
     }
 }
 #[test]
-fn goldens_are_rustfmt_clean_when_available() {
-    if Command::new("rustfmt").arg("--version").output().is_err() {
-        eprintln!("rustfmt is not on PATH; skipping golden formatting check");
-        return;
-    }
-    let mut command = Command::new("rustfmt");
-    command.args(["--edition", "2024", "--check"]);
-    for (name, _, _) in examples() {
-        command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/{name}.rs")));
-    }
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn goldens_are_rustfmt_clean() {
+    let files: Vec<_> = examples()
+        .map(|(name, _, _)| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/{name}.rs"))
+        })
+        .collect();
+    check_rustfmt(&files);
+}
+#[test]
+fn missing_rustfmt_for_goldens_fails_in_ci() {
+    requirements::fails_in_ci("goldens_are_rustfmt_clean", "rustfmt is not on PATH");
 }
 #[test]
 fn header_quotes_untrusted_filenames() {
