@@ -232,7 +232,24 @@ fn pop3_chunked_expectations_and_dot_stuffing() {
         (pop3::Inputs::new)().capacity().saturating_mul(2),
     );
     let got = read(pop3::Inputs::new, commands);
-    assert_eq!(got.get(1), Some(&Ok(Err(pop3::Error::BadKeyword))));
+    assert_eq!(
+        got,
+        vec![
+            Ok(Ok(pop3::Input::Command(pop3::Command {
+                keyword: "USER".into(),
+                argument: Some("alice".into()),
+            }))),
+            Ok(Err(pop3::Error::BadKeyword)),
+            Ok(Ok(pop3::Input::Command(pop3::Command {
+                keyword: "RETR".into(),
+                argument: Some("1".into()),
+            }))),
+            Ok(Ok(pop3::Input::Command(pop3::Command {
+                keyword: "QUIT".into(),
+                argument: None,
+            }))),
+        ]
+    );
     for item in got.into_iter().filter_map(|r| r.ok()?.ok()) {
         let pop3::Input::Command(command) = item else {
             panic!()
@@ -295,30 +312,42 @@ fn imap_chunked_literals_commands_and_responses() {
         imap::Inputs::new().capacity().saturating_mul(2),
     );
     contract::check_decode_with_held_limit(imap::Inputs::new, bytes, imap::MAX_HELD);
-    let expected = read(imap::Inputs::new, bytes);
+    let expected = vec![
+        Ok(Ok(imap::Input::Continue {
+            tag: Some("a".into()),
+            size: 5,
+        })),
+        Ok(Ok(imap::Input::Command(imap::Command::new(
+            "a",
+            "APPEND",
+            vec![
+                imap::Value::atom("INBOX"),
+                imap::Value::Literal {
+                    data: b"x\r\nyz".to_vec(),
+                    non_sync: false,
+                },
+                imap::Value::Literal {
+                    data: b"abc".to_vec(),
+                    non_sync: true,
+                },
+            ],
+        )))),
+        Ok(Ok(imap::Input::Command(imap::Command::new(
+            "b",
+            "NOOP",
+            vec![],
+        )))),
+        Ok(Err(imap::Error::Syntax {
+            tag: None,
+            reason: "a space must follow the tag",
+        })),
+        Ok(Ok(imap::Input::Command(imap::Command::new(
+            "c",
+            "LOGOUT",
+            vec![],
+        )))),
+    ];
     assert_eq!(read(imap::Inputs::new, bytes), expected);
-    assert!(matches!(
-        expected.first(),
-        Some(Ok(Ok(imap::Input::Continue { size: 5, .. })))
-    ));
-    assert!(matches!(
-        expected.get(3),
-        Some(Ok(Err(imap::Error::Syntax { .. })))
-    ));
-    let Some(Ok(Ok(imap::Input::Command(command)))) = expected.get(1) else {
-        panic!()
-    };
-    assert_eq!(
-        command.args.get(1).and_then(imap::Value::as_bytes),
-        Some(&b"x\r\nyz"[..])
-    );
-    assert_eq!(
-        command.args.get(2),
-        Some(&imap::Value::Literal {
-            data: b"abc".to_vec(),
-            non_sync: true
-        })
-    );
     for command in expected.iter().filter_map(|item| match item {
         Ok(Ok(imap::Input::Command(command))) => Some(command),
         _ => None,
