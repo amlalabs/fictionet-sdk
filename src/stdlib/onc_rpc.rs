@@ -2589,7 +2589,15 @@ mod tests {
                 rng.below(200) as u32,
                 (0..rng.below(4)).map(|_| rng.below(100) as u32).collect(),
             )),
-            _ => other_auth(rng.below(8) as u32, rng.bytes(11)),
+            _ => {
+                let flavor = rng.below(8) as u32;
+                let body = rng.bytes(11);
+                if flavor == flavor::NONE && body.is_empty() {
+                    Auth::None
+                } else {
+                    other_auth(flavor, body)
+                }
+            }
         }
     }
 
@@ -2675,12 +2683,58 @@ mod tests {
     /// short, or with bytes added.
     fn random_bytes(rng: &mut Lcg) -> Vec<u8> {
         let message = random_message(rng);
-        contract::check_wire_value(&message);
-        let mut b = message.to_bytes().unwrap_or_default();
+        let mut b = contract::check_written(&message);
         for _ in 0..rng.below(3) {
             test_support::mutate(rng, &mut b);
         }
         b
+    }
+
+    #[test]
+    fn every_constructed_seed_writes() {
+        let mut rng = Lcg::new(0x5531_4506);
+        let mut seen_none = false;
+        let mut seen_sys = false;
+        let mut seen_other_none = false;
+        let mut seen_other_sys = false;
+        let mut record_auth = |auth: &Auth| match auth {
+            Auth::None => seen_none = true,
+            Auth::Sys(_) => seen_sys = true,
+            Auth::Other {
+                flavor: flavor::NONE,
+                body,
+            } => {
+                assert!(!body.is_empty());
+                seen_other_none = true;
+            }
+            Auth::Other {
+                flavor: flavor::SYS,
+                ..
+            } => seen_other_sys = true,
+            Auth::Other { .. } => {}
+        };
+        for _ in 0..rounds(20_000) {
+            let message = random_message(&mut rng);
+            contract::check_written(&message);
+            match &message.body {
+                Body::Call(call) => {
+                    record_auth(&call.cred);
+                    record_auth(&call.verf);
+                }
+                Body::Reply(Reply::Accepted { verf, .. }) => record_auth(verf),
+                Body::Reply(Reply::Denied(_)) => {}
+            }
+        }
+        assert!(seen_none, "no AUTH_NONE generated");
+        assert!(seen_sys, "no AUTH_SYS generated");
+        assert!(
+            seen_other_none,
+            "no AUTH_NONE with a nonempty body generated"
+        );
+        assert!(
+            seen_other_sys,
+            "no AUTH_SYS with an unparseable body generated"
+        );
     }
 
     #[test]
