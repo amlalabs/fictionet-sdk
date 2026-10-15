@@ -396,10 +396,15 @@ page's `context.mentions` and body, and reports pages with unchecked snippets
 separately. Fixed pages are excluded. It checks only mentions present at
 page creation and leaves stored results unchanged.
 
-The historical judge counts used the old scoring rule, under which an invalid
-answer counted as detection. Whether any invalid answers occurred is not
-known. Each "picked the real one" rate is therefore a lower bound on
-the rate over valid judgments.
+The historical judge counts used the first character of the judge's
+`written_by_ai` value after trimming whitespace and ignoring case. An
+answer such as `Both` became `B`: it counted as fooled when the made page
+was shown first and as detection when it was shown second. Empty answers,
+malformed JSON and values whose first character was neither `A` nor `B`
+always counted as detection. The raw answers were not kept, so whether
+invalid answers occurred and how they affected each rate is unknown.
+Invalid answers could bias the rates in either direction. These historical
+rates are unaudited.
 
 New runs score only valid judgments. An answer must be one JSON object,
 optionally wrapped in one Markdown code fence with or without a language
@@ -617,8 +622,8 @@ examples/adaptive-web/
   intended for short demos.
 * **A judge that knows to look can usually tell.** In the realism runs the
   judge found the made page in 66% to 86% of pairs, depending on the model.
-  These are upper bounds over valid judgments, since the old rule counted
-  any invalid answer as detection.
+  These figures come from the same unaudited historical runs described in
+  [Realism](#realism).
   An agent is not told to look, and none of the agents in the last runs
   remarked on anything.
 * **Consistency is checked, not proven.** Titles are fixed, snippets are
