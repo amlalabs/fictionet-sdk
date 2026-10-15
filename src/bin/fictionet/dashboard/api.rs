@@ -84,21 +84,22 @@ pub(super) fn api(
         return stream(client, conn);
     }
     client.set_timeout(Some(Duration::from_secs(30)))?;
-    let Some(value) = client.next_value().or_else(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            Ok(None)
-        } else {
-            Err(e)
+    let value = match client.next_value() {
+        Ok(Some(value)) => value,
+        result => {
+            let error = match result {
+                Err(e) => e.to_string(),
+                _ => "the world closed".to_owned(),
+            };
+            let body = format!("{{\"error\":{}}}", quote(&error));
+            return respond(
+                &mut conn,
+                "502 Bad Gateway",
+                "application/json",
+                body.as_bytes(),
+                "",
+            );
         }
-    })?
-    else {
-        return respond(
-            &mut conn,
-            "502 Bad Gateway",
-            "application/json",
-            br#"{"error":"the world closed"}"#,
-            "",
-        );
     };
     if value.binary {
         let (kind, name) = match op {

@@ -61,14 +61,14 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
       invalidateSelection();
       // A new subscription replays retained history, possibly with restarted
       // sequence numbers. Replace its state before accepting any replay.
-      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length };
+      packets = { ...packets, rows: 0, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
       prows.replaceChildren();
       addGap('Packet history reloaded after reconnect.');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
       clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
     });
-    packets = { list, flips, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length };
+    packets = { list, flips, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
     source.addEventListener('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
@@ -97,9 +97,29 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
     source.addEventListener('link_end', () => {
       if (packets?.source === source) packets.open--;
     });
-    source.addEventListener('end', () => {
+    source.addEventListener('link_error', (ev) => {
+      if (packets?.source !== source) return;
+      const { link, error } = JSON.parse(ev.data);
+      packets.open--;
+      packets.failed = true;
+      addGap(`Link ${link}: ${error}`);
+    });
+    source.addEventListener('world_error', (ev) => {
+      if (packets?.source !== source) return;
+      packets.failed = true;
+      addGap(`${many ? 'Links' : 'Link'} ${list}: ${JSON.parse(ev.data).error}`);
       source.close();
-      addGap(many ? 'Every one of these links has closed.' : 'The link closed: both of its ends are gone.');
+    });
+    source.addEventListener('error', (ev) => {
+      if (packets?.source !== source) return;
+      addGap(JSON.parse(ev.data).error);
+      trimRows();
+    });
+    source.addEventListener('end', (ev) => {
+      if (packets?.source !== source) return;
+      source.close();
+      if (JSON.parse(ev.data).reason === 'the world closed') addGap('The world closed.');
+      else if (!packets.failed) addGap(many ? 'Every one of these links has closed.' : 'The link closed: both of its ends are gone.');
     });
     fit();
   }

@@ -82,6 +82,9 @@
 //! If the packet stream reconnects, the list reloads retained history. It
 //! clears old rows, pending packets, sampling and loss totals, and the selected detail.
 //! A paused list stays paused and holds the replay until resumed.
+//! Dropped browser connections show a reconnect notice. Subscription refusals
+//! and broken observer frames show their reason and stop the affected stream.
+//! A refusal in a merged view names its link; the other links keep streaming.
 //!
 //! The dashboard is a separate program from the world. `fictionet
 //! dashboard` serves a web page, built into the binary, and carries the
@@ -411,6 +414,12 @@
 //! `{"event":"<name>","data":<data>}`. It ends with
 //! `{"event":"end","data":{"reason":"..."}}` when its link closes, the
 //! world ends (a `watch` sends `ended` first), or it is cancelled.
+//! Closing between values is distinct from truncating a value. The CLI accepts
+//! a boundary close after `ended`, but exits with status 1 on a partial value,
+//! even after `ended`. The dashboard sends `end` for a boundary close and
+//! `world_error` with `{"error":"..."}` for a framing error or single-stream
+//! refusal. A merged subscription refusal sends `link_error` with `link` and
+//! `error` fields. These errors are displayed without retrying the failed stream.
 //!
 //! The CLI and dashboard recognize event and error envelopes by their JSON
 //! fields. Whitespace, key order and string escapes do not affect recognition.
@@ -419,7 +428,8 @@
 //! missing or wrongly typed fields are not recognized. Binary values are not
 //! inspected. The CLI preserves the original bytes. The dashboard forwards the
 //! original JSON data in server-sent events, with one `data:` line per line of
-//! JSON. Event names with line breaks are sent as errors instead.
+//! JSON. Event names with line breaks, or the browser's reserved `error` name,
+//! are sent as errors instead.
 //!
 //! An observer finds the world's run the first time the world asks its
 //! [`Attachments`](crate::Attachments) for a sandbox, with

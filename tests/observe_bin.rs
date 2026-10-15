@@ -292,14 +292,21 @@ fn dashboard_inspects_envelopes_for_json_and_streams() {
             1,
             "{\"event\":\"node\",\"data\":}",
             "200 OK",
-            "event: error\ndata: {\"event\":\"node\",\"data\":}\n\n",
+            "event: world_error\ndata: {\"error\":\"the world sent an invalid stream event\"}\n\n",
         ),
         (
             "/api/watch",
             1,
             "{\n\"error\": \"missing\"\n}",
             "200 OK",
-            "event: error\ndata: {\ndata: \"error\": \"missing\"\ndata: }\n\n",
+            "event: world_error\ndata: {\"error\":\"missing\"}\n\n",
+        ),
+        (
+            "/api/watch",
+            1,
+            "{\"event\":\"error\",\"data\":{}}",
+            "200 OK",
+            "event: world_error\ndata: {\"error\":\"the world sent an invalid stream event\"}\n\n",
         ),
         (
             "/api/packets?link=e3,e7",
@@ -512,13 +519,10 @@ fn dashboard_sse_keeps_partial_replies_across_heartbeats() {
 }
 
 #[test]
-fn dashboard_sse_ends_on_world_close_even_during_a_reply() {
+fn dashboard_sse_distinguishes_boundary_close_from_truncation() {
     use fictionet::relay::{MORE, Message, unix};
 
-    for (route, requests, reason) in [
-        ("/api/watch", 1, "the world closed"),
-        ("/api/packets?link=e3,e7", 2, "every link closed"),
-    ] {
+    for (route, requests) in [("/api/watch", 1), ("/api/packets?link=e3,e7", 2)] {
         for partial in [false, true] {
             let mut remaining = requests;
             with_observer_action(
@@ -546,13 +550,147 @@ fn dashboard_sse_ends_on_world_close_even_during_a_reply() {
                         reader.read_to_string(&mut body).unwrap();
                         assert_eq!(
                             body,
-                            format!("event: end\ndata: {{\"reason\":\"{reason}\"}}\n\n")
+                            if partial {
+                                "event: world_error\ndata: {\"error\":\"the world closed during a reply value\"}\n\n"
+                            } else {
+                                "event: end\ndata: {\"reason\":\"the world closed\"}\n\n"
+                            }
                         );
                     });
                 },
             );
         }
     }
+}
+
+#[test]
+fn dashboard_partial_frame_after_ended() {
+    use fictionet::relay::{END, MORE, Message, unix};
+
+    for (route, requests, prefix) in [
+        ("/api/watch", 1, "event: ended\ndata: {}\n\n"),
+        (
+            "/api/packets?link=e3,e7",
+            2,
+            "event: ended\ndata: {\"link\":\"e7\"}\n\n",
+        ),
+    ] {
+        for (flags, reason) in [
+            (MORE, "the world closed during a reply value"),
+            (MORE | END, "invalid reply flags or continuation"),
+        ] {
+            let mut remaining = requests;
+            with_observer_action(
+                requests,
+                |peer, id| {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        for (flags, body) in [
+                            (0, br#"{"event":"ended","data":{}}"#.as_slice()),
+                            (flags, br#"{"event":"end","data":"#),
+                        ] {
+                            unix::send(peer, &Message::Reply { id, flags, body }.encode(), false)
+                                .unwrap();
+                        }
+                    }
+                },
+                |path| {
+                    with_dashboard(path, |port| {
+                        let (status, body) = get(port, route);
+                        assert_eq!(status, "HTTP/1.1 200 OK");
+                        assert_eq!(
+                            body,
+                            format!(
+                                "{prefix}event: world_error\ndata: {{\"error\":\"{reason}\"}}\n\n"
+                            )
+                        );
+                    });
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn dashboard_refused_subscription_reason() {
+    use fictionet::relay::END;
+
+    for (route, requests, expected) in [
+        (
+            "/api/packets?link=e3",
+            1,
+            "event: world_error\ndata: {\"error\":\"no such link\"}\n\n",
+        ),
+        (
+            "/api/packets?link=e3,e7",
+            2,
+            "event: link_error\ndata: {\"link\":\"e3\",\"error\":\"no such link\"}\n\nevent: link_error\ndata: {\"link\":\"e7\",\"error\":\"no such link\"}\n\nevent: end\ndata: {\"reason\":\"every link finished\"}\n\n",
+        ),
+    ] {
+        with_observer(
+            &[(END, br#"{ "error": "no such link" }"#)],
+            requests,
+            |path| {
+                with_dashboard(path, |port| {
+                    let (status, body) = get(port, route);
+                    assert_eq!(status, "HTTP/1.1 200 OK");
+                    assert_eq!(body, expected);
+                });
+            },
+        );
+    }
+}
+
+#[test]
+fn dashboard_json_truncation_preserves_the_reason() {
+    use fictionet::relay::MORE;
+
+    with_observer(&[(MORE, br#"{"nodes":"#)], 1, |path| {
+        with_dashboard(path, |port| {
+            let (status, body) = get(port, "/api/graph");
+            assert_eq!(status, "HTTP/1.1 502 Bad Gateway");
+            assert_eq!(body, r#"{"error":"the world closed during a reply value"}"#);
+        });
+    });
+}
+
+#[test]
+fn dashboard_merged_refusal_keeps_other_links_streaming() {
+    use fictionet::relay::{END, Message, unix};
+
+    let mut first = true;
+    with_observer_action(
+        2,
+        |peer, id| {
+            let replies: &[(u8, &[u8])] = if first {
+                &[(END, br#"{"error":"no such link"}"#)]
+            } else {
+                &[
+                    (0, br#"{"event":"packet","data":{"seq":1}}"#),
+                    (END, br#"{"event":"end","data":{"reason":"closed"}}"#),
+                ]
+            };
+            first = false;
+            for &(flags, body) in replies {
+                unix::send(peer, &Message::Reply { id, flags, body }.encode(), false).unwrap();
+            }
+        },
+        |path| {
+            with_dashboard(path, |port| {
+                let (status, body) = get(port, "/api/packets?link=e3,e7");
+                assert_eq!(status, "HTTP/1.1 200 OK");
+                assert_eq!(
+                    body,
+                    concat!(
+                        "event: link_error\ndata: {\"link\":\"e3\",\"error\":\"no such link\"}\n\n",
+                        "event: packet\ndata: {\"link\":\"e7\",\"seq\":1}\n\n",
+                        "event: link_end\ndata: {\"link\":\"e7\",\"reason\":\"closed\"}\n\n",
+                        "event: end\ndata: {\"reason\":\"every link finished\"}\n\n",
+                    )
+                );
+            });
+        },
+    );
 }
 
 #[test]
@@ -1122,86 +1260,43 @@ fn a_watch_exits_0_when_the_world_ends() {
 }
 
 #[test]
-fn a_truncated_watch_exits_0_only_after_the_world_ended() {
-    use fictionet::relay::{self, Message, unix};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+fn observe_partial_frame_after_ended_is_an_error() {
+    use fictionet::relay::MORE;
 
-    for ended in [false, true] {
-        let path = temp_socket();
-        let (addr, len) = unix::address(std::path::Path::new(&path)).unwrap();
-        // SAFETY: the socket is owned here; addr is valid for len bytes.
-        let listener = unsafe {
-            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
-            assert!(fd >= 0);
-            let listener = OwnedFd::from_raw_fd(fd);
-            assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
-            assert_eq!(libc::listen(fd, 1), 0);
-            listener
-        };
-        let world = format!("unix:{path}");
-        let child = std::thread::spawn(move || {
-            Command::new(BIN)
-                .args(["observe", "--world", &world, "watch"])
-                .output()
-                .unwrap()
-        });
-        // SAFETY: accept needs no address output; the returned fd is owned here.
-        let peer = unsafe {
-            let fd = libc::accept(
-                listener.as_raw_fd(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            assert!(fd >= 0);
-            OwnedFd::from_raw_fd(fd)
-        };
-        unix::set_timeout(
-            peer.as_raw_fd(),
-            libc::SO_RCVTIMEO,
-            Some(Duration::from_secs(5)),
-        )
-        .unwrap();
-        let mut buf = vec![0; relay::MAX_MESSAGE];
-        let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
-        assert!(matches!(relay::decode(&buf[..n]), Ok(Message::Hello(_))));
-        unix::send(peer.as_raw_fd(), &Message::Accept.encode(), false).unwrap();
-        let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
-        let Message::Request { id, .. } = relay::decode(&buf[..n]).unwrap() else {
-            panic!("expected a watch request");
-        };
-        let ended_value = br#"{"event":"ended","data":{}}"#;
+    let ended_value = br#"{"event":"ended","data":{}}"#;
+    for (ended, partial) in [(true, false), (true, true), (false, true)] {
+        let mut replies = Vec::new();
         if ended {
-            let frame = Message::Reply {
-                id,
-                flags: 0,
-                body: ended_value,
+            replies.push((0, ended_value.as_slice()));
+        }
+        if partial {
+            replies.push((MORE, br#"{"event":"end","data":"#.as_slice()));
+        }
+        with_observer(&replies, 1, |path| {
+            let out = Command::new(BIN)
+                .args(["observe", "--world", &format!("unix:{path}"), "watch"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(if partial { 1 } else { 0 }),
+                "{out:?}"
+            );
+            if partial {
+                assert!(
+                    String::from_utf8_lossy(&out.stderr).contains("during a reply value"),
+                    "{out:?}"
+                );
+            } else {
+                assert!(out.stderr.is_empty(), "{out:?}");
             }
-            .encode();
-            unix::send(peer.as_raw_fd(), &frame, false).unwrap();
-        }
-        let frame = Message::Reply {
-            id,
-            flags: relay::MORE,
-            body: br#"{"event":"end","data":"#,
-        }
-        .encode();
-        unix::send(peer.as_raw_fd(), &frame, false).unwrap();
-        drop(peer);
-        let out = child.join().unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(if ended { 0 } else { 1 }),
-            "{out:?}"
-        );
-        let expected = if ended {
-            [ended_value.as_slice(), b"\n"].concat()
-        } else {
-            Vec::new()
-        };
-        assert_eq!(out.stdout, expected, "only whole values reach stdout");
-        drop(listener);
-        std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).unwrap();
+            let expected = if ended {
+                [ended_value.as_slice(), b"\n"].concat()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(out.stdout, expected, "only whole values reach stdout");
+        });
     }
 }
 

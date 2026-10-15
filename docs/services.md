@@ -864,6 +864,11 @@ sampling totals and the selected detail before replay. A paused view stays
 paused until resumed. This also applies to merged links and captures whose
 packet numbering restarts.
 
+Dropped browser connections show a reconnect notice. A subscription refusal
+shows its reason and stops that subscription. In a merged view it names the
+failed link, and the other links keep streaming. A refusal never appears as
+a normal link close.
+
 A capture download for several links includes a pcapng section for each link.
 If any link has no capture, the whole download fails with HTTP 404 and JSON.
 The `error` message names every failed link. The `links` array gives each
@@ -890,7 +895,19 @@ Invalid JSON, missing or wrongly typed fields, duplicate envelope fields,
 and mixed event/error objects are not recognized. Binary values are never
 inspected. Raw reply bytes and flags stay intact. The CLI writes the original
 bytes; the dashboard forwards the original JSON data in SSE, with one `data:`
-line per line of JSON. Event names with line breaks are sent as errors instead.
+line per line of JSON. Event names with line breaks, or the browser's reserved
+`error` name, are sent as errors instead.
+
+A close between reply values is distinct from a truncated value. The CLI
+exits with status 0 for a boundary close after `ended`. A partial value exits
+with status 1 and its framing error, even after `ended`.
+The dashboard sends `end` with `the world closed` for a boundary close.
+Framing errors and single-stream refusals send `world_error` with an `error`
+string. Merged refusals send `link_error` with `link` and `error` strings;
+other links continue. Once all links finish, the merged stream sends `end`.
+The browser displays terminal reasons without retrying. Its local `error`
+event is reserved for transient connection drops, which still reconnect.
+Non-stream API replies use HTTP 502 with the framing error in the JSON body.
 
 Each world listener admits 64 observer sessions by default, including idle
 clients and direct API users. A full listener refuses the greeting with

@@ -115,6 +115,52 @@ function setup(t, links = ['a'], maxRows = 3000) {
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const detail = (seq) => ({ seq, len: 40, t: seq, layers: [], buffers: [{ name: 'packet', hex: '4142' }, { name: 'payload', hex: '43' }] });
 
+test('refused_subscription_reason: a single link shows its terminal reason', (t) => {
+  const h = setup(t, ['e3']);
+  h.source.emit('world_error', { error: 'no such link' });
+  assert.equal($('prows').textContent, 'Link e3: no such link');
+  assert.equal(h.source.closed, true);
+});
+
+test('a merged refusal names its link and does not claim every link closed', (t) => {
+  const h = setup(t, ['e3', 'e7']);
+  h.source.emit('link_error', { link: 'e3', error: 'this world has too many watched links' });
+  assert.equal($('prows').textContent, 'Link e3: this world has too many watched links');
+  assert.notEqual(h.source.closed, true);
+  h.send(1, { link: 'e7', skipped: 0 });
+  h.flush();
+  h.source.emit('link_end', { link: 'e7' });
+  h.source.emit('end', { reason: 'every link finished' });
+  assert.equal(h.rows().length, 1);
+  assert.doesNotMatch($('prows').textContent, /Every one of these links has closed/);
+  assert.equal(h.source.closed, true);
+});
+
+test('clean end keeps the link-close message', (t) => {
+  const h = setup(t);
+  h.source.emit('end', { reason: 'closed' });
+  assert.equal($('prows').textContent, 'The link closed: both of its ends are gone.');
+  assert.equal(h.source.closed, true);
+});
+
+test('a world boundary close does not claim both ends of the link are gone', (t) => {
+  const h = setup(t);
+  h.source.emit('end', { reason: 'the world closed' });
+  assert.equal($('prows').textContent, 'The world closed.');
+  assert.equal(h.source.closed, true);
+});
+
+test('transient packet retries are visible', (t) => {
+  const h = setup(t, ['a'], 2);
+  h.source.emit('error', { error: 'Connection dropped. Reconnecting.' });
+  assert.equal($('prows').textContent, 'Connection dropped. Reconnecting.');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    h.source.emit('error', { error: 'Connection dropped. Reconnecting.' });
+  }
+  assert.equal($('prows').children.length, 2);
+  assert.notEqual(h.source.closed, true);
+});
+
 test('capture eviction and subscriber overruns stay distinct from sampling and row identity', async (t) => {
   const h = setup(t);
   h.source.emit('packet_gap', { after: 1, next: 5, missed: 3 });
@@ -334,7 +380,7 @@ test('repeated reconnects replace single-link rows and sampling totals before re
     assert.deepEqual(h.rows().map((r) => r.dataset.seq), ['1', '2']);
     assert.equal($('sampled').textContent, 'Sampled: 4 packets not copied');
     h.send(3); // A packet waiting for the next animation frame.
-    h.source.emit('error');
+    h.source.emit('error', { error: 'Connection dropped. Reconnecting.' });
     assert.equal(h.rows().length, 2);
     h.source.emit('open');
     assert.equal(h.rows().length, 0);

@@ -31,9 +31,9 @@ Requests:
   keylog                  the world's TLS keys, as an SSLKEYLOGFILE
   '{\"op\":...}'            any request, as JSON
 
-Exit status: 0 when the reply ended, including a watch whose world ended,
-1 if the world sent an error, could not be reached or went away while
-running, 2 on bad arguments.";
+Exit status: 0 when the reply ended, including a watch closed between values
+after its world ended, 1 if the world sent an error, could not be reached,
+went away while running or truncated a reply value, 2 on bad arguments.";
 
 /// The request for the words after the flags.
 pub(crate) fn request(words: &[String]) -> Result<String, String> {
@@ -91,16 +91,10 @@ pub(crate) fn main(args: &[String]) -> i32 {
     }
     let stdout = std::io::stdout();
     // A world that exits right after its run ends may close the socket
-    // before its stream's end: that is still a normal end.
+    // before its stream's end: only a close between values is a normal end.
     let mut saw_ended = false;
     loop {
-        let value = match client.next_value().or_else(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }) {
+        let value = match client.next_value() {
             Ok(Some(v)) => v,
             Ok(None) if saw_ended => return 0,
             Ok(None) => {

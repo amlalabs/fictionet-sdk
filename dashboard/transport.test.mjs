@@ -193,15 +193,85 @@ test('end closes the watch without retrying', async (t) => {
   assert.equal(h.timers.size, 0);
 });
 
+test('terminal_refusal_no_retry: the watch shows the reason even after ended', async (t) => {
+  for (const ended of [false, true]) {
+    const h = transport(t);
+    h.connect();
+    await settle();
+    if (ended) h.sources[0].emit('ended', { t: 3 });
+    h.sources[0].emit('world_error', { error: 'the world closed during a reply value' });
+    h.sources[0].end();
+    await settle();
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.state.ended, true);
+    assert.deepEqual(h.calls.at(-1), ['setStatus', 'ended', 'the world closed during a reply value']);
+  }
+});
+
+test('packet refusal is terminal and preserves the reason', async (t) => {
+  const h = transport(t), seen = [];
+  const source = h.packetStream('e1');
+  source.addEventListener('world_error', (e) => seen.push(JSON.parse(e.data)));
+  await settle();
+  h.sources[0].emit('world_error', { error: 'no such link' });
+  h.sources[0].end();
+  await settle();
+  assert.deepEqual(seen, [{ error: 'no such link' }]);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.requests[0].signal.aborted, true);
+});
+
+test('a merged refusal leaves other links readable until the terminal end', async (t) => {
+  const h = transport(t), seen = [];
+  const source = h.packetStream('e1,e2');
+  for (const name of ['link_error', 'packet', 'end']) {
+    source.addEventListener(name, (e) => seen.push([name, JSON.parse(e.data)]));
+  }
+  await settle();
+  h.sources[0].emit('link_error', { link: 'e1', error: 'no such link' });
+  await settle();
+  assert.equal(h.sources[0].cancelled, false);
+  h.sources[0].emit('packet', { link: 'e2', seq: 1 });
+  h.sources[0].emit('end', { reason: 'every link finished' });
+  h.sources[0].end();
+  await settle();
+  assert.deepEqual(seen, [
+    ['link_error', { link: 'e1', error: 'no such link' }],
+    ['packet', { link: 'e2', seq: 1 }],
+    ['end', { reason: 'every link finished' }],
+  ]);
+  assert.equal(h.timers.size, 0);
+});
+
+test('HTTP refusal reasons reach the watch and packet stream without retry', async (t) => {
+  for (const status of [400, 502]) {
+    const h = transport(t);
+    h.respond(Response.json({ error: 'this world has too many watched links' }, { status }));
+    h.connect();
+    await settle();
+    assert.deepEqual(h.calls.at(-1), ['setStatus', 'ended', 'this world has too many watched links']);
+    assert.equal(h.state.ended, true);
+    const seen = [];
+    h.respond(Response.json({ error: 'no such link' }, { status }));
+    h.packetStream('e1').addEventListener('world_error', (e) => seen.push(JSON.parse(e.data)));
+    await settle();
+    assert.deepEqual(seen, [{ error: 'no such link' }]);
+    assert.equal(h.timers.size, 0);
+  }
+});
+
 test('packet reconnect sends authorization and resets history before replay', async (t) => {
   const h = transport(t);
   const seen = [];
   const source = h.packetStream('e1,e2', () => seen.push('reset'));
+  const errors = [];
+  source.addEventListener('error', (e) => errors.push(JSON.parse(e.data)));
   source.addEventListener('packet', (e) => seen.push(JSON.parse(e.data).seq));
   await settle();
   h.sources[0].emit('packet', { seq: 1 });
   h.sources[0].end();
   await settle();
+  assert.deepEqual(errors, [{ error: 'Connection dropped. Reconnecting.' }]);
   h.retry();
   await settle();
   h.sources[1].emit('packet', { seq: 1 });

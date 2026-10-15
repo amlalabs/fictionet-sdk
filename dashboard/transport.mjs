@@ -115,14 +115,21 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
       const event = new Event(name);
       event.data = data;
       source.dispatchEvent(event);
+      if (name === 'world_error' || name === 'end') source.close();
     };
     async function run() {
       try {
         const response = await request(op, params, controller.signal);
         if (!response.ok || response.headers.get('Content-Type')?.split(';')[0] !== 'text/event-stream') {
-          emit('error');
-          source.close();
-          await response.body?.cancel();
+          let error = `Stream request failed: HTTP ${response.status}`;
+          try {
+            const body = await response.json();
+            if (typeof body.error === 'string') error = body.error;
+            else error += ' (missing error reason)';
+          } catch (e) {
+            error += ` (could not read error response: ${e.message})`;
+          }
+          emit('world_error', JSON.stringify({ error }));
           return;
         }
         if (stopped()) {
@@ -163,7 +170,7 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
         await reader?.cancel().catch(() => {});
         reader = undefined;
         if (!stopped()) {
-          emit('error');
+          emit('error', JSON.stringify({ error: 'Connection dropped. Reconnecting.' }));
           if (!stopped()) timer = setTimeout(run, 1000);
         }
       }
@@ -199,6 +206,10 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
       events.close();
       if (!state.ended) setStatus('ended', 'The world closed');
       state.ended = true;
+    });
+    events.addEventListener('world_error', (e) => {
+      state.ended = true;
+      setStatus('ended', JSON.parse(e.data).error);
     });
     events.addEventListener('error', () => {
       if (!state.ended) setStatus('connecting', 'Reconnecting');
