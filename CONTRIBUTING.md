@@ -162,26 +162,28 @@ tag does.
 
 ## Adding a protocol module
 
-A protocol is one file in `src/stdlib/`, declared with `pub mod` in
-`src/stdlib/mod.rs`. It is written with no I/O, on the tools in
-`stdlib::codec`: its message types implement `Wire`, and its framer implements
-`Decode`. It uses only public `fictionet::` items; see
+A protocol is one file in `src/stdlib/protocols/`, declared with `pub mod` in
+`src/stdlib/mod.rs`. A `#[path]` attribute on the declaration loads the file,
+so the public path stays `stdlib::<name>`. It is written with no I/O, on the
+tools in `stdlib::codec`: its message types implement `Wire`, and its framer
+implements `Decode`. It uses only public `fictionet::` items; see
 [the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
 The module's own docs explain the protocol and show how to use it, with examples
 that run as doctests.
 
-A large protocol may be a directory instead, as `cme_mdp3/`, `json_schema/` and
-`smb2/` are. Its entry file is `mod.rs`, which its catalog record names in
-`file`, and it declares private child modules next to it. A copy takes the
-whole directory. The module's public paths stay flat: re-export child items
-from `mod.rs`.
+A large protocol may be a directory instead, as `protocols/cme_mdp3/`,
+`protocols/json_schema/` and `protocols/smb2/` are. Its entry file is `mod.rs`,
+which its catalog record names in `file`, and it declares private child modules
+next to it. A copy takes the whole directory. The module's public paths stay
+flat: re-export child items from `mod.rs`.
 
 For modules generated from schemas, see [code generation](docs/codegen.md).
 
 A new module is registered in two places, and a test holds each to the code:
 
 - a record in `catalog/stdlib.rs`, which says what the module can do
-  (`tests/stdlib_catalog.rs` checks every column). Regenerate the table in
+  (`tests/stdlib_catalog.rs` checks every column) and names its entry file,
+  such as `protocols/<name>.rs`, in `file`. Regenerate the table in
   `src/stdlib/catalog.md` with
   `BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`.
   The same command writes the module's `pub mod` declaration in

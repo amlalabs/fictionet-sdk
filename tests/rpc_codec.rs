@@ -25,12 +25,18 @@ where
 #[test]
 fn migrated_public_docs_do_not_reference_internal_design_sections() {
     for (module, source) in [
-        ("dcerpc", include_str!("../src/stdlib/dcerpc.rs")),
-        ("smb2", include_str!("../src/stdlib/smb2/mod.rs")),
-        ("smb2", include_str!("../src/stdlib/smb2/contexts.rs")),
-        ("nbss", include_str!("../src/stdlib/nbss.rs")),
-        ("radius", include_str!("../src/stdlib/radius.rs")),
-        ("diameter", include_str!("../src/stdlib/diameter.rs")),
+        ("dcerpc", include_str!("../src/stdlib/protocols/dcerpc.rs")),
+        ("smb2", include_str!("../src/stdlib/protocols/smb2/mod.rs")),
+        (
+            "smb2",
+            include_str!("../src/stdlib/protocols/smb2/contexts.rs"),
+        ),
+        ("nbss", include_str!("../src/stdlib/protocols/nbss.rs")),
+        ("radius", include_str!("../src/stdlib/protocols/radius.rs")),
+        (
+            "diameter",
+            include_str!("../src/stdlib/protocols/diameter.rs"),
+        ),
     ] {
         let docs = source
             .lines()

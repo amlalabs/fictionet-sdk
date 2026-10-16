@@ -1,8 +1,8 @@
 # Add an observe protocol
 
 Implement `fictionet::stdlib::codec::Decode` and `fictionet::observe::Present`
-on your decoder. You can copy a protocol file from `src/stdlib/` into your
-crate and edit it, or write a decoder from scratch. `Present::summary`
+on your decoder. You can copy a protocol file from `src/stdlib/protocols/`
+into your crate and edit it, or write a decoder from scratch. `Present::summary`
 describes one item. `Present::fields` adds fields to a `Layer`, with ranges
 relative to the item's raw bytes. `Layer::note` adds text without a range.
 The `Present` rustdoc includes a complete decoder and registration example.
@@ -188,5 +188,5 @@ DATA budget shared by every connection from the built-in registry and its
 clones, including nested TLS streams, through `Capture::pair_in`.
 Message layers point at payload bytes when one
 contiguous range is available; otherwise they use a reassembly buffer.
-To show a copied `src/stdlib/grpc.rs` in HTTP/2 display, also copy
+To show a copied `src/stdlib/protocols/grpc.rs` in HTTP/2 display, also copy
 `src/observe/http2.rs` and change its `grpc` import to the copied module.

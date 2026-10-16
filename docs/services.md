@@ -38,7 +38,7 @@ passes. World code decides whether these valid requests can be fulfilled.
 
 TDS response decoding has two separate ceilings: 4 MiB of wire bytes and
 1,048,576 decoded units per reader or written token stream. These are codec
-limits, not a process-memory bound; see the [`tds` module docs](../src/stdlib/tds.rs)
+limits, not a process-memory bound; see the [`tds` module docs](../src/stdlib/protocols/tds.rs)
 for the accounting rules and exclusions.
 
 `codec::reserve_bytes` reserves space for additional bytes under a caller's

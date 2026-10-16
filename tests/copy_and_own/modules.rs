@@ -19,21 +19,21 @@
 macro_rules! protocols {
     () => {
         // Generated from catalog/stdlib.rs. Update with BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog.
-        #[path = "../../src/stdlib/amqp.rs"]
+        #[path = "../../src/stdlib/protocols/amqp.rs"]
         pub mod amqp;
         #[path = "../../src/stdlib/codec/ascii.rs"]
         pub mod ascii;
-        #[path = "../../src/stdlib/asn1.rs"]
+        #[path = "../../src/stdlib/protocols/asn1.rs"]
         pub mod asn1;
-        #[path = "../../src/stdlib/bacnet.rs"]
+        #[path = "../../src/stdlib/protocols/bacnet.rs"]
         pub mod bacnet;
         #[path = "../../src/stdlib/codec/base64.rs"]
         pub mod base64;
         #[path = "../../src/stdlib/codec/ber.rs"]
         pub mod ber;
-        #[path = "../../src/stdlib/bgp.rs"]
+        #[path = "../../src/stdlib/protocols/bgp.rs"]
         pub mod bgp;
-        #[path = "../../src/stdlib/book_levels.rs"]
+        #[path = "../../src/stdlib/protocols/book_levels.rs"]
         pub mod book_levels;
         #[path = "../../src/stdlib/codec/bounded.rs"]
         pub mod bounded;
@@ -41,167 +41,167 @@ macro_rules! protocols {
         pub mod buffer;
         #[path = "../../src/stdlib/ca.rs"]
         pub mod ca;
-        #[path = "../../src/stdlib/cboe_boe.rs"]
+        #[path = "../../src/stdlib/protocols/cboe_boe.rs"]
         pub mod cboe_boe;
-        #[path = "../../src/stdlib/cboe_pitch.rs"]
+        #[path = "../../src/stdlib/protocols/cboe_pitch.rs"]
         pub mod cboe_pitch;
         #[path = "../../src/stdlib/codec/checked.rs"]
         pub mod checked;
         #[path = "../../src/stdlib/codec/civil.rs"]
         pub mod civil;
-        #[path = "../../src/stdlib/cme_mdp3/mod.rs"]
+        #[path = "../../src/stdlib/protocols/cme_mdp3/mod.rs"]
         pub mod cme_mdp3;
-        #[path = "../../src/stdlib/coap.rs"]
+        #[path = "../../src/stdlib/protocols/coap.rs"]
         pub mod coap;
         #[path = "../../src/stdlib/codec/combinators.rs"]
         pub mod combinators;
         #[path = "../../src/stdlib/connection.rs"]
         pub mod connection;
-        #[path = "../../src/stdlib/cotp.rs"]
+        #[path = "../../src/stdlib/protocols/cotp.rs"]
         pub mod cotp;
         #[path = "../../src/stdlib/codec/crc32.rs"]
         pub mod crc32;
         #[path = "../../src/stdlib/codec/crc32c.rs"]
         pub mod crc32c;
-        #[path = "../../src/stdlib/dcerpc.rs"]
+        #[path = "../../src/stdlib/protocols/dcerpc.rs"]
         pub mod dcerpc;
         #[path = "../../src/stdlib/codec/declarations.rs"]
         pub mod declarations;
         #[path = "../../src/stdlib/codec/demux.rs"]
         pub mod demux;
-        #[path = "../../src/stdlib/dhcp.rs"]
+        #[path = "../../src/stdlib/protocols/dhcp.rs"]
         pub mod dhcp;
-        #[path = "../../src/stdlib/dhcpv6.rs"]
+        #[path = "../../src/stdlib/protocols/dhcpv6.rs"]
         pub mod dhcpv6;
-        #[path = "../../src/stdlib/diameter.rs"]
+        #[path = "../../src/stdlib/protocols/diameter.rs"]
         pub mod diameter;
-        #[path = "../../src/stdlib/dnp3.rs"]
+        #[path = "../../src/stdlib/protocols/dnp3.rs"]
         pub mod dnp3;
-        #[path = "../../src/stdlib/dns.rs"]
+        #[path = "../../src/stdlib/protocols/dns.rs"]
         pub mod dns;
         #[path = "../../src/stdlib/codec/dot_body.rs"]
         pub mod dot_body;
-        #[path = "../../src/stdlib/dtls.rs"]
+        #[path = "../../src/stdlib/protocols/dtls.rs"]
         pub mod dtls;
-        #[path = "../../src/stdlib/enip.rs"]
+        #[path = "../../src/stdlib/protocols/enip.rs"]
         pub mod enip;
-        #[path = "../../src/stdlib/fast.rs"]
+        #[path = "../../src/stdlib/protocols/fast.rs"]
         pub mod fast;
-        #[path = "../../src/stdlib/fastcgi.rs"]
+        #[path = "../../src/stdlib/protocols/fastcgi.rs"]
         pub mod fastcgi;
         #[path = "../../src/stdlib/codec/faults.rs"]
         pub mod faults;
         #[path = "../../src/stdlib/codec/field.rs"]
         pub mod field;
-        #[path = "../../src/stdlib/fix.rs"]
+        #[path = "../../src/stdlib/protocols/fix.rs"]
         pub mod fix;
         #[path = "../../src/stdlib/codec/frames.rs"]
         pub mod frames;
-        #[path = "../../src/stdlib/ftp.rs"]
+        #[path = "../../src/stdlib/protocols/ftp.rs"]
         pub mod ftp;
         #[path = "../../src/stdlib/codec/generated.rs"]
         pub mod generated;
         #[path = "../../codegen/tests/golden/recursive.rs"]
         pub mod generated_recursive;
-        #[path = "../../src/stdlib/geneve.rs"]
+        #[path = "../../src/stdlib/protocols/geneve.rs"]
         pub mod geneve;
-        #[path = "../../src/stdlib/git_protocol.rs"]
+        #[path = "../../src/stdlib/protocols/git_protocol.rs"]
         pub mod git_protocol;
-        #[path = "../../src/stdlib/gre.rs"]
+        #[path = "../../src/stdlib/protocols/gre.rs"]
         pub mod gre;
-        #[path = "../../src/stdlib/grpc.rs"]
+        #[path = "../../src/stdlib/protocols/grpc.rs"]
         pub mod grpc;
         #[path = "../../src/stdlib/codec/head_body.rs"]
         pub mod head_body;
-        #[path = "../../src/stdlib/hpack.rs"]
+        #[path = "../../src/stdlib/protocols/hpack.rs"]
         pub mod hpack;
-        #[path = "../../src/stdlib/http1.rs"]
+        #[path = "../../src/stdlib/protocols/http1.rs"]
         pub mod http1;
-        #[path = "../../src/stdlib/http2.rs"]
+        #[path = "../../src/stdlib/protocols/http2.rs"]
         pub mod http2;
-        #[path = "../../src/stdlib/http3.rs"]
+        #[path = "../../src/stdlib/protocols/http3.rs"]
         pub mod http3;
         fictionet::cfg_std! {
         #[path = "../../src/stdlib/httpd.rs"]
         pub mod httpd;
         }
-        #[path = "../../src/stdlib/huffman.rs"]
+        #[path = "../../src/stdlib/protocols/huffman.rs"]
         pub mod huffman;
         #[path = "../../src/stdlib/icmp.rs"]
         pub mod icmp;
-        #[path = "../../src/stdlib/iec104.rs"]
+        #[path = "../../src/stdlib/protocols/iec104.rs"]
         pub mod iec104;
-        #[path = "../../src/stdlib/igmp.rs"]
+        #[path = "../../src/stdlib/protocols/igmp.rs"]
         pub mod igmp;
-        #[path = "../../src/stdlib/ike.rs"]
+        #[path = "../../src/stdlib/protocols/ike.rs"]
         pub mod ike;
-        #[path = "../../src/stdlib/imap.rs"]
+        #[path = "../../src/stdlib/protocols/imap.rs"]
         pub mod imap;
-        #[path = "../../src/stdlib/imf.rs"]
+        #[path = "../../src/stdlib/protocols/imf.rs"]
         pub mod imf;
         #[path = "../../src/stdlib/codec/interceptor.rs"]
         pub mod interceptor;
         #[path = "../../src/stdlib/ip.rs"]
         pub mod ip;
-        #[path = "../../src/stdlib/ipp.rs"]
+        #[path = "../../src/stdlib/protocols/ipp.rs"]
         pub mod ipp;
-        #[path = "../../src/stdlib/ipsec.rs"]
+        #[path = "../../src/stdlib/protocols/ipsec.rs"]
         pub mod ipsec;
-        #[path = "../../src/stdlib/itch.rs"]
+        #[path = "../../src/stdlib/protocols/itch.rs"]
         pub mod itch;
-        #[path = "../../src/stdlib/json.rs"]
+        #[path = "../../src/stdlib/protocols/json.rs"]
         pub mod json;
-        #[path = "../../src/stdlib/json_schema/mod.rs"]
+        #[path = "../../src/stdlib/protocols/json_schema/mod.rs"]
         pub mod json_schema;
         #[path = "../../src/stdlib/codec/json_syntax.rs"]
         pub mod json_syntax;
-        #[path = "../../src/stdlib/jsonrpc.rs"]
+        #[path = "../../src/stdlib/protocols/jsonrpc.rs"]
         pub mod jsonrpc;
-        #[path = "../../src/stdlib/kafka.rs"]
+        #[path = "../../src/stdlib/protocols/kafka.rs"]
         pub mod kafka;
-        #[path = "../../src/stdlib/kerberos.rs"]
+        #[path = "../../src/stdlib/protocols/kerberos.rs"]
         pub mod kerberos;
-        #[path = "../../src/stdlib/l2tp.rs"]
+        #[path = "../../src/stdlib/protocols/l2tp.rs"]
         pub mod l2tp;
         #[path = "../../src/stdlib/codec/layout.rs"]
         pub mod layout;
         #[path = "../../src/stdlib/codec/lcg.rs"]
         pub mod lcg;
-        #[path = "../../src/stdlib/ldap.rs"]
+        #[path = "../../src/stdlib/protocols/ldap.rs"]
         pub mod ldap;
         #[path = "../../src/stdlib/codec/leb128.rs"]
         pub mod leb128;
         #[path = "../../src/stdlib/link.rs"]
         pub mod link;
-        #[path = "../../src/stdlib/memcache.rs"]
+        #[path = "../../src/stdlib/protocols/memcache.rs"]
         pub mod memcache;
-        #[path = "../../src/stdlib/mime_multipart.rs"]
+        #[path = "../../src/stdlib/protocols/mime_multipart.rs"]
         pub mod mime_multipart;
-        #[path = "../../src/stdlib/modbus.rs"]
+        #[path = "../../src/stdlib/protocols/modbus.rs"]
         pub mod modbus;
-        #[path = "../../src/stdlib/moldudp64.rs"]
+        #[path = "../../src/stdlib/protocols/moldudp64.rs"]
         pub mod moldudp64;
-        #[path = "../../src/stdlib/mongodb.rs"]
+        #[path = "../../src/stdlib/protocols/mongodb.rs"]
         pub mod mongodb;
-        #[path = "../../src/stdlib/mqtt.rs"]
+        #[path = "../../src/stdlib/protocols/mqtt.rs"]
         pub mod mqtt;
-        #[path = "../../src/stdlib/mysql.rs"]
+        #[path = "../../src/stdlib/protocols/mysql.rs"]
         pub mod mysql;
-        #[path = "../../src/stdlib/nbdgm.rs"]
+        #[path = "../../src/stdlib/protocols/nbdgm.rs"]
         pub mod nbdgm;
-        #[path = "../../src/stdlib/nbns.rs"]
+        #[path = "../../src/stdlib/protocols/nbns.rs"]
         pub mod nbns;
-        #[path = "../../src/stdlib/nbss.rs"]
+        #[path = "../../src/stdlib/protocols/nbss.rs"]
         pub mod nbss;
         #[path = "../../src/stdlib/net.rs"]
         pub mod net;
-        #[path = "../../src/stdlib/netbios.rs"]
+        #[path = "../../src/stdlib/protocols/netbios.rs"]
         pub mod netbios;
-        #[path = "../../src/stdlib/nfs.rs"]
+        #[path = "../../src/stdlib/protocols/nfs.rs"]
         pub mod nfs;
-        #[path = "../../src/stdlib/ntlmssp.rs"]
+        #[path = "../../src/stdlib/protocols/ntlmssp.rs"]
         pub mod ntlmssp;
-        #[path = "../../src/stdlib/ntp.rs"]
+        #[path = "../../src/stdlib/protocols/ntp.rs"]
         pub mod ntp;
         fictionet::cfg_observe! {
         #[path = "../../src/observe/conversation.rs"]
@@ -219,147 +219,147 @@ macro_rules! protocols {
         #[path = "../../src/observe/tls.rs"]
         pub mod observe_tls;
         }
-        #[path = "../../src/stdlib/ocsp.rs"]
+        #[path = "../../src/stdlib/protocols/ocsp.rs"]
         pub mod ocsp;
-        #[path = "../../src/stdlib/onc_rpc.rs"]
+        #[path = "../../src/stdlib/protocols/onc_rpc.rs"]
         pub mod onc_rpc;
-        #[path = "../../src/stdlib/opcua.rs"]
+        #[path = "../../src/stdlib/protocols/opcua.rs"]
         pub mod opcua;
-        #[path = "../../src/stdlib/openvpn.rs"]
+        #[path = "../../src/stdlib/protocols/openvpn.rs"]
         pub mod openvpn;
-        #[path = "../../src/stdlib/ospf.rs"]
+        #[path = "../../src/stdlib/protocols/ospf.rs"]
         pub mod ospf;
-        #[path = "../../src/stdlib/ouch.rs"]
+        #[path = "../../src/stdlib/protocols/ouch.rs"]
         pub mod ouch;
-        #[path = "../../src/stdlib/pcp.rs"]
+        #[path = "../../src/stdlib/protocols/pcp.rs"]
         pub mod pcp;
-        #[path = "../../src/stdlib/pim.rs"]
+        #[path = "../../src/stdlib/protocols/pim.rs"]
         pub mod pim;
         #[path = "../../src/stdlib/codec/pipe.rs"]
         pub mod pipe;
-        #[path = "../../src/stdlib/pop3.rs"]
+        #[path = "../../src/stdlib/protocols/pop3.rs"]
         pub mod pop3;
-        #[path = "../../src/stdlib/portmap.rs"]
+        #[path = "../../src/stdlib/protocols/portmap.rs"]
         pub mod portmap;
         #[path = "../../src/stdlib/ports.rs"]
         pub mod ports;
-        #[path = "../../src/stdlib/postgres.rs"]
+        #[path = "../../src/stdlib/protocols/postgres.rs"]
         pub mod postgres;
-        #[path = "../../src/stdlib/prefix_int.rs"]
+        #[path = "../../src/stdlib/protocols/prefix_int.rs"]
         pub mod prefix_int;
-        #[path = "../../src/stdlib/protobuf.rs"]
+        #[path = "../../src/stdlib/protocols/protobuf.rs"]
         pub mod protobuf;
-        #[path = "../../src/stdlib/proxy_protocol.rs"]
+        #[path = "../../src/stdlib/protocols/proxy_protocol.rs"]
         pub mod proxy_protocol;
-        #[path = "../../src/stdlib/qpack.rs"]
+        #[path = "../../src/stdlib/protocols/qpack.rs"]
         pub mod qpack;
-        #[path = "../../src/stdlib/quic.rs"]
+        #[path = "../../src/stdlib/protocols/quic.rs"]
         pub mod quic;
-        #[path = "../../src/stdlib/radius.rs"]
+        #[path = "../../src/stdlib/protocols/radius.rs"]
         pub mod radius;
-        #[path = "../../src/stdlib/rdp.rs"]
+        #[path = "../../src/stdlib/protocols/rdp.rs"]
         pub mod rdp;
         #[path = "../../src/stdlib/codec/reader.rs"]
         pub mod reader;
         #[path = "../../src/stdlib/codec/recorder.rs"]
         pub mod recorder;
-        #[path = "../../src/stdlib/resp.rs"]
+        #[path = "../../src/stdlib/protocols/resp.rs"]
         pub mod resp;
-        #[path = "../../src/stdlib/rfb.rs"]
+        #[path = "../../src/stdlib/protocols/rfb.rs"]
         pub mod rfb;
-        #[path = "../../src/stdlib/rip.rs"]
+        #[path = "../../src/stdlib/protocols/rip.rs"]
         pub mod rip;
         #[path = "../../src/stdlib/route.rs"]
         pub mod route;
-        #[path = "../../src/stdlib/rtcp.rs"]
+        #[path = "../../src/stdlib/protocols/rtcp.rs"]
         pub mod rtcp;
-        #[path = "../../src/stdlib/rtp.rs"]
+        #[path = "../../src/stdlib/protocols/rtp.rs"]
         pub mod rtp;
-        #[path = "../../src/stdlib/rtsp.rs"]
+        #[path = "../../src/stdlib/protocols/rtsp.rs"]
         pub mod rtsp;
         #[path = "../../src/stdlib/sandbox.rs"]
         pub mod sandbox;
-        #[path = "../../src/stdlib/sbe.rs"]
+        #[path = "../../src/stdlib/protocols/sbe.rs"]
         pub mod sbe;
-        #[path = "../../src/stdlib/sdp.rs"]
+        #[path = "../../src/stdlib/protocols/sdp.rs"]
         pub mod sdp;
         #[path = "../../src/stdlib/serve.rs"]
         pub mod serve;
-        #[path = "../../src/stdlib/session.rs"]
+        #[path = "../../src/stdlib/protocols/session.rs"]
         pub mod session;
-        #[path = "../../src/stdlib/sftp.rs"]
+        #[path = "../../src/stdlib/protocols/sftp.rs"]
         pub mod sftp;
-        #[path = "../../src/stdlib/sip.rs"]
+        #[path = "../../src/stdlib/protocols/sip.rs"]
         pub mod sip;
-        #[path = "../../src/stdlib/smb2/mod.rs"]
+        #[path = "../../src/stdlib/protocols/smb2/mod.rs"]
         pub mod smb2;
-        #[path = "../../src/stdlib/smtp.rs"]
+        #[path = "../../src/stdlib/protocols/smtp.rs"]
         pub mod smtp;
-        #[path = "../../src/stdlib/snmp.rs"]
+        #[path = "../../src/stdlib/protocols/snmp.rs"]
         pub mod snmp;
-        #[path = "../../src/stdlib/socks.rs"]
+        #[path = "../../src/stdlib/protocols/socks.rs"]
         pub mod socks;
-        #[path = "../../src/stdlib/soupbintcp.rs"]
+        #[path = "../../src/stdlib/protocols/soupbintcp.rs"]
         pub mod soupbintcp;
-        #[path = "../../src/stdlib/spnego.rs"]
+        #[path = "../../src/stdlib/protocols/spnego.rs"]
         pub mod spnego;
-        #[path = "../../src/stdlib/sse.rs"]
+        #[path = "../../src/stdlib/protocols/sse.rs"]
         pub mod sse;
-        #[path = "../../src/stdlib/ssh.rs"]
+        #[path = "../../src/stdlib/protocols/ssh.rs"]
         pub mod ssh;
         #[path = "../../src/stdlib/codec/stream.rs"]
         pub mod stream;
-        #[path = "../../src/stdlib/stun.rs"]
+        #[path = "../../src/stdlib/protocols/stun.rs"]
         pub mod stun;
-        #[path = "../../src/stdlib/syslog.rs"]
+        #[path = "../../src/stdlib/protocols/syslog.rs"]
         pub mod syslog;
         #[path = "../../src/stdlib/tcp.rs"]
         pub mod tcp;
-        #[path = "../../src/stdlib/tcp_reassembly.rs"]
+        #[path = "../../src/stdlib/protocols/tcp_reassembly.rs"]
         pub mod tcp_reassembly;
-        #[path = "../../src/stdlib/tds.rs"]
+        #[path = "../../src/stdlib/protocols/tds.rs"]
         pub mod tds;
-        #[path = "../../src/stdlib/telnet.rs"]
+        #[path = "../../src/stdlib/protocols/telnet.rs"]
         pub mod telnet;
         #[path = "../../src/stdlib/test_support/mod.rs"]
         pub mod test_support;
-        #[path = "../../src/stdlib/tftp.rs"]
+        #[path = "../../src/stdlib/protocols/tftp.rs"]
         pub mod tftp;
-        #[path = "../../src/stdlib/thrift.rs"]
+        #[path = "../../src/stdlib/protocols/thrift.rs"]
         pub mod thrift;
         #[path = "../../src/stdlib/tls.rs"]
         pub mod tls;
         #[path = "../../src/stdlib/tls/output.rs"]
         mod tls_output;
-        #[path = "../../src/stdlib/tpkt.rs"]
+        #[path = "../../src/stdlib/protocols/tpkt.rs"]
         pub mod tpkt;
         #[path = "../../src/stdlib/udp.rs"]
         pub mod udp;
-        #[path = "../../src/stdlib/urlencoded_form.rs"]
+        #[path = "../../src/stdlib/protocols/urlencoded_form.rs"]
         pub mod urlencoded_form;
-        #[path = "../../src/stdlib/vrrp.rs"]
+        #[path = "../../src/stdlib/protocols/vrrp.rs"]
         pub mod vrrp;
-        #[path = "../../src/stdlib/vxlan.rs"]
+        #[path = "../../src/stdlib/protocols/vxlan.rs"]
         pub mod vxlan;
-        #[path = "../../src/stdlib/wake_on_lan.rs"]
+        #[path = "../../src/stdlib/protocols/wake_on_lan.rs"]
         pub mod wake_on_lan;
         fictionet::cfg_std! {
         #[path = "../../src/stdlib/web.rs"]
         pub mod web;
         }
-        #[path = "../../src/stdlib/websocket.rs"]
+        #[path = "../../src/stdlib/protocols/websocket.rs"]
         pub mod websocket;
-        #[path = "../../src/stdlib/whois.rs"]
+        #[path = "../../src/stdlib/protocols/whois.rs"]
         pub mod whois;
-        #[path = "../../src/stdlib/wireguard.rs"]
+        #[path = "../../src/stdlib/protocols/wireguard.rs"]
         pub mod wireguard;
         #[path = "../../src/stdlib/codec/work.rs"]
         pub mod work;
-        #[path = "../../src/stdlib/x509.rs"]
+        #[path = "../../src/stdlib/protocols/x509.rs"]
         pub mod x509;
-        #[path = "../../src/stdlib/xml.rs"]
+        #[path = "../../src/stdlib/protocols/xml.rs"]
         pub mod xml;
-        #[path = "../../src/stdlib/zabbix.rs"]
+        #[path = "../../src/stdlib/protocols/zabbix.rs"]
         pub mod zabbix;
         // End of the generated copy declarations.
     };

@@ -371,10 +371,10 @@ and the element path in the location.
 
 `stdlib::cme_mdp3` is generated this way from CME's public MDP 3.0
 schema, kept at `data/cme/templates_FixBinary.xml`. The generated code is
-in `src/stdlib/cme_mdp3/mod.rs`. It is followed by a short hand-written
+in `src/stdlib/protocols/cme_mdp3/mod.rs`. It is followed by a short hand-written
 tail that declares the hand-written packet framing in
-`src/stdlib/cme_mdp3/framing.rs`: the binary packet header and the
-two-byte message size. The module docs are in `src/stdlib/cme_mdp3/docs.md`.
+`src/stdlib/protocols/cme_mdp3/framing.rs`: the binary packet header and the
+two-byte message size. The module docs are in `src/stdlib/protocols/cme_mdp3/docs.md`.
 A test checks that `mod.rs` still starts with the generator's output. To
 regenerate the generated part and keep the hand-written tail:
 
@@ -477,7 +477,7 @@ or refused by both, with two intentional exceptions:
   checks that writing and reading it preserves the generated value.
 
 The [SBE front end](../codegen/src/sbe.rs) owns the generated schema
-mapping. The [runtime SBE module](../src/stdlib/sbe.rs) owns runtime
+mapping. The [runtime SBE module](../src/stdlib/protocols/sbe.rs) owns runtime
 acceptance. Their module docs describe each implementation's rules;
 these exceptions are checked in [the differential tests](../tests/sbe_codegen.rs).
 

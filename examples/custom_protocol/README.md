@@ -18,7 +18,7 @@ The source comparison also includes differences in macro usage for error
 formatting, framing and test assertions. It shows more than the parser change:
 
 ```sh
-diff -u src/stdlib/modbus.rs examples/custom_protocol/modbus.rs
+diff -u src/stdlib/protocols/modbus.rs examples/custom_protocol/modbus.rs
 ```
 
 See [Changing a protocol by copying it](../../src/stdlib/mod.rs).

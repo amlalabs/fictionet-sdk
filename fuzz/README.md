@@ -141,7 +141,7 @@ through `codec::Stream` and `test_support::contract`. OPC UA also checks `Messag
 with its assembly limit. Typed values use `Wire` writer contracts.
 RDP uses `DataBlocks` for bounded GCC block sequences.
 The module docs describe the APIs:
-[DNP3](../src/stdlib/dnp3.rs), [IEC 104](../src/stdlib/iec104.rs),
-[EtherNet/IP](../src/stdlib/enip.rs), [OPC UA](../src/stdlib/opcua.rs), and
-[RDP](../src/stdlib/rdp.rs). The shared [codec docs](../src/stdlib/codec/mod.rs)
+[DNP3](../src/stdlib/protocols/dnp3.rs), [IEC 104](../src/stdlib/protocols/iec104.rs),
+[EtherNet/IP](../src/stdlib/protocols/enip.rs), [OPC UA](../src/stdlib/protocols/opcua.rs), and
+[RDP](../src/stdlib/protocols/rdp.rs). The shared [codec docs](../src/stdlib/codec/mod.rs)
 cover `pump`, `finish`, stream errors, and unread bytes.

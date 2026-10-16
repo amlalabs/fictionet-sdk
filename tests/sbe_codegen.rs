@@ -25,7 +25,7 @@ use std::fmt::Debug;
 
 const XML: &str = include_str!("../data/cme/templates_FixBinary.xml");
 const SAMPLE: &str = include_str!("../codegen/tests/schemas/sbe_sample.xml");
-const MODULE: &str = include_str!("../src/stdlib/cme_mdp3/mod.rs");
+const MODULE: &str = include_str!("../src/stdlib/protocols/cme_mdp3/mod.rs");
 
 fn input() -> Input {
     Input {
@@ -63,7 +63,10 @@ fn module_is_generator_output_plus_hand_written_framing() {
     let generated = body(&generated);
     let tail = &MODULE[MODULE.find(MARKER).expect("marker")..];
     if std::env::var_os("BLESS_CODEGEN").is_some() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/stdlib/cme_mdp3/mod.rs");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/stdlib/protocols/cme_mdp3/mod.rs"
+        );
         std::fs::write(
             path,
             format!(
@@ -77,7 +80,7 @@ fn module_is_generator_output_plus_hand_written_framing() {
     assert_eq!(
         body(&MODULE[..MODULE.len() - tail.len()]),
         generated,
-        "src/stdlib/cme_mdp3/mod.rs differs from the generator; set BLESS_CODEGEN=1 to update"
+        "src/stdlib/protocols/cme_mdp3/mod.rs differs from the generator; set BLESS_CODEGEN=1 to update"
     );
 }
 
