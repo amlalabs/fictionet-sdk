@@ -154,7 +154,7 @@
 //! ends, or the script is stopped, it stops attach and removes the
 //! namespace. This is the whole file:
 //!
-#![cfg_attr(doc, doc = concat!("```sh\n", include_str!("../examples/attach/netns.sh"), "```"))]
+#![cfg_attr(doc, doc = concat!("```sh\n", include_str!("../../examples/attach/netns.sh"), "```"))]
 //!
 //! The loop in the middle waits for attach's ready file, so the agent never
 //! starts without a network. `--world-wait 5` lets attach wait up to 5
@@ -244,7 +244,7 @@
 //!
 //! ## What the script relies on
 //!
-#![doc = include_str!("../docs/diagrams/attach-tun-netns.svg")]
+#![doc = include_str!("../diagrams/attach-tun-netns.svg")]
 //!
 //! **Attach sets the address.** It enters `/run/netns/agent` before it
 //! makes `tun0`, so the device and its addresses are in that namespace.
@@ -299,7 +299,7 @@
 //! (`depends_on` with `service_healthy`), so it never runs without a
 //! network.
 //!
-#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../examples/attach/compose-tun.yaml"), "```"))]
+#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../examples/attach/compose-tun.yaml"), "```"))]
 //!
 //! ## The images
 //!
@@ -340,7 +340,7 @@
 //! $ docker compose -f examples/attach/compose-tun.yaml down -v
 //! ```
 //!
-#![doc = include_str!("../docs/diagrams/attach-tun-compose.svg")]
+#![doc = include_str!("../diagrams/attach-tun-compose.svg")]
 //!
 //! From inside the agent's container
 //! (`docker compose -f examples/attach/compose-tun.yaml exec agent ...`),
@@ -428,7 +428,7 @@
 //! `socks5` instead: no container then needs a privilege. See
 //! [The proxy on Kubernetes](#the-proxy-on-kubernetes).
 //!
-#![doc = include_str!("../docs/diagrams/attach-tun-pod.svg")]
+#![doc = include_str!("../diagrams/attach-tun-pod.svg")]
 //!
 //! A pod is not an empty namespace, and Kubernetes gives a container no
 //! tun device node, so attach needs more there than in Docker Compose.
@@ -488,7 +488,7 @@
 //! installs, shown here whole. The world is `web_world`, and the agent is
 //! the Debian image from [The images](#the-images), run as uid 1000:
 //!
-#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../examples/attach/k8s-tun.yaml"), "```"))]
+#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../examples/attach/k8s-tun.yaml"), "```"))]
 //!
 //! The [chart's values reference](https://github.com/amlalabs/fictionet-sdk/blob/main/charts/fictionet-sandbox/values.yaml)
 //! describes every setting and its default. Use `attach` for settings shared
@@ -806,7 +806,7 @@
 //! there is no IPv6. [`lowering`](crate::lowering) compares the types
 //! packet by packet.
 //!
-#![doc = include_str!("../docs/diagrams/attach-proxy.svg")]
+#![doc = include_str!("../diagrams/attach-proxy.svg")]
 //!
 //! When it starts, attach does these steps in order:
 //!
@@ -1086,7 +1086,7 @@
 //! environment variable `RELAY_TOKEN`. Compose gives it to attach as a
 //! file, `/run/secrets/token`, and puts it in the agent's proxy URLs.
 //!
-#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../examples/attach/compose-proxy.yaml"), "```"))]
+#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../examples/attach/compose-proxy.yaml"), "```"))]
 //!
 //! For `socks5`, change attach's `--type` and port, and give the agent
 //! `ALL_PROXY=socks5h://relay:${RELAY_TOKEN}@attach:1080` instead
@@ -1174,7 +1174,7 @@
 //! `examples/attach/k8s-proxy.yaml` has two sandboxes, one with each proxy
 //! type. The crate's test installs it, and it is shown here whole:
 //!
-#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../examples/attach/k8s-proxy.yaml"), "```"))]
+#![cfg_attr(doc, doc = concat!("```yaml\n", include_str!("../../examples/attach/k8s-proxy.yaml"), "```"))]
 //!
 //! ### Run it on kind
 //!
@@ -1391,7 +1391,7 @@
 //!   every frame between the two. This needs `CAP_NET_ADMIN` in the TAP
 //!   device's network namespace.
 //!
-#![doc = include_str!("../docs/diagrams/attach-tap.svg")]
+#![doc = include_str!("../diagrams/attach-tap.svg")]
 //!
 //! ## With QEMU, over a socket
 //!

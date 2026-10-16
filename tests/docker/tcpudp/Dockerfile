@@ -18,7 +18,7 @@ COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY tests/common tests/common
 COPY tests/tun_linux.rs tests/tun_linux.rs
-# Cargo.toml names web_world, and src/recipes.rs includes other examples.
+# Cargo.toml names web_world, and docs/guide/recipes.rs includes other examples.
 COPY examples examples
 ARG PROFILE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

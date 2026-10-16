@@ -71,7 +71,7 @@
 //! This world puts a 200 ms delay in front of every sandbox, each way, so
 //! every round trip takes 400 ms longer:
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/delayed_sites.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/delayed_sites.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -118,7 +118,7 @@
 //! side and never came out of the other was dropped by the queue. Once the
 //! packets have stopped for a second, the world prints the counts:
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/bottleneck_sites.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/bottleneck_sites.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -161,7 +161,7 @@
 //! [`filter`](crate::stdlib::filter) decides for each packet with
 //! [`Cx::random_f64`](crate::Cx::random_f64):
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/lossy_sites.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/lossy_sites.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -216,7 +216,7 @@
 //! does not always print the final loss count before it exits. A quiet world
 //! log therefore does not prove the file is complete.
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/capture_sites.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/capture_sites.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it, and make a request:
 //!
@@ -283,7 +283,7 @@
 //! [`ServeOptions::idle`](crate::stdlib::serve::ServeOptions::idle) closes
 //! connections after 10 seconds without input while the service waits:
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/route_change.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/route_change.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! The world has IPv4 only, so attach the sandbox with `--no-ip-addr-v6
 //! --no-gateway-v6 --no-dns-v6` in place of the three IPv6 flags (see

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The `ip netns` test: the getting-started tutorial (src/getting_started.rs),
+# The `ip netns` test: the getting-started tutorial (docs/guide/getting_started.rs),
 # checked. Runs inside the VM as root (`vm/run test netns`), with the binaries
 # from vm/guest/build.sh.
 #

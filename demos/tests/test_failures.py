@@ -474,7 +474,7 @@ cmp fictionet/ca.pem complete.pem
         self.assertIn(' down ', commands[-1])
 
     def test_local_hosted_recipe_keeps_directory_and_check_status(self):
-        guide = (ROOT / 'src/attaching.rs').read_text()
+        guide = (ROOT / 'docs/guide/attaching.rs').read_text()
         section = guide.split('//! ## Run it locally first\n', 1)[1].split('//! ## ', 1)[0]
         block = section.split('//! ```sh\n', 1)[1].split('//! ```', 1)[0]
         lines = [line.removeprefix('//! ') for line in block.splitlines()]

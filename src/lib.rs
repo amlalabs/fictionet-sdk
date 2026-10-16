@@ -334,6 +334,7 @@ mod attach;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub mod attach_proxy;
+#[path = "../docs/guide/attaching.rs"]
 pub mod attaching;
 mod block_on;
 mod cable;
@@ -345,22 +346,28 @@ pub mod events;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
+#[path = "../docs/guide/getting_started.rs"]
 pub mod getting_started;
 mod interface;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 mod listen;
+#[path = "../docs/guide/lowering.rs"]
 pub mod lowering;
 pub mod observe;
 #[path = "relay/queue.rs"]
 mod packet_queue;
+#[path = "../docs/guide/proto.rs"]
 pub mod proto;
+#[path = "../docs/guide/recipes.rs"]
 pub mod recipes;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub mod relay;
+#[path = "../docs/guide/roadmap.rs"]
 pub mod roadmap;
 pub use entropy::{Entropy, Seed, SeededEntropy};
 mod run;
+#[path = "../docs/guide/running.rs"]
 pub mod running;
 pub mod stdlib;
 pub mod sync;

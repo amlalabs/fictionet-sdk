@@ -17,7 +17,7 @@
 //! set each type up. The [relay protocol](crate::proto) describes the
 //! messages on the world socket. This page sits between the two.
 //!
-#![doc = include_str!("../docs/diagrams/lowering.svg")]
+#![doc = include_str!("../diagrams/lowering.svg")]
 //!
 //! The function names on this page are those in the `fictionet` binary's
 //! source, under `src/bin/fictionet/`, so you can follow each step in the

@@ -50,7 +50,7 @@
 //! writes `resolv.conf`, so a sandbox image without `resolvconf` needs it
 //! installed.
 //!
-#![doc = include_str!("../docs/diagrams/attach-wireguard.svg")]
+#![doc = include_str!("../diagrams/attach-wireguard.svg")]
 //!
 //! ## `tailscale`: a sandbox on a tailnet
 //!
@@ -170,7 +170,7 @@
 //! bytes from the middle of a packet as a length. Every message after that
 //! would be misread.
 //!
-#![doc = include_str!("../docs/diagrams/stream-writer.svg")]
+#![doc = include_str!("../diagrams/stream-writer.svg")]
 //!
 //! So each side keeps one writer per remote connection, with three rules:
 //!

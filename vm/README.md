@@ -7,7 +7,7 @@ root, and Docker is not used at all.
 
 This directory owns the development appliance and its host commands. To
 attach an agent VM's network to a world, follow
-[the attachment guide](../src/attaching.rs), section "A virtual machine, with `tap`".
+[the attachment guide](../docs/guide/attaching.rs), section "A virtual machine, with `tap`".
 The scripts in [`tests/vm`](../tests/vm) exercise that attachment path.
 
 You need Linux on x86-64 with:
@@ -73,7 +73,7 @@ in `.vm/test-<name>.log`.
 
 | Name | What runs |
 |---|---|
-| `netns` | `vm/guest/tests/netns.sh`: [the getting-started tutorial](../src/getting_started.rs), checked. A network namespace named `agent`, attached with `--type tun --netns`. |
+| `netns` | `vm/guest/tests/netns.sh`: [the getting-started tutorial](../docs/guide/getting_started.rs), checked. A network namespace named `agent`, attached with `--type tun --netns`. |
 | `docker-web` | `tests/docker/web/run.sh`: `web::Sites` under Docker Compose, attached with `--type tun`. |
 | `docker-proxy` | `tests/docker/proxy/run.sh`: `--type http_proxy` and `--type socks5` under Docker Compose. |
 | `docker-ping`, `docker-tcpudp` | `tests/docker/ping/run.sh` and `tests/docker/tcpudp/run.sh`. |

@@ -43,7 +43,7 @@
 //! # fn main() {}
 //! ```
 //!
-#![doc = include_str!("../docs/diagrams/running.svg")]
+#![doc = include_str!("../diagrams/running.svg")]
 //!
 //! Here is what each call does:
 //!

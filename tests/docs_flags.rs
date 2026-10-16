@@ -24,15 +24,30 @@ const PAGES: &[(&str, &str)] = &[
     ("README.md", include_str!("../README.md")),
     ("src/lib.rs", include_str!("../src/lib.rs")),
     (
-        "src/getting_started.rs",
-        include_str!("../src/getting_started.rs"),
+        "docs/guide/getting_started.rs",
+        include_str!("../docs/guide/getting_started.rs"),
     ),
-    ("src/running.rs", include_str!("../src/running.rs")),
-    ("src/attaching.rs", include_str!("../src/attaching.rs")),
-    ("src/lowering.rs", include_str!("../src/lowering.rs")),
-    ("src/recipes.rs", include_str!("../src/recipes.rs")),
+    (
+        "docs/guide/running.rs",
+        include_str!("../docs/guide/running.rs"),
+    ),
+    (
+        "docs/guide/attaching.rs",
+        include_str!("../docs/guide/attaching.rs"),
+    ),
+    (
+        "docs/guide/lowering.rs",
+        include_str!("../docs/guide/lowering.rs"),
+    ),
+    (
+        "docs/guide/recipes.rs",
+        include_str!("../docs/guide/recipes.rs"),
+    ),
     ("src/observe.rs", include_str!("../src/observe.rs")),
-    ("src/proto.rs", include_str!("../src/proto.rs")),
+    (
+        "docs/guide/proto.rs",
+        include_str!("../docs/guide/proto.rs"),
+    ),
     ("src/stdlib/mod.rs", include_str!("../src/stdlib/mod.rs")),
     (
         "src/stdlib/web/sites.rs",
@@ -174,7 +189,10 @@ fn every_attach_command_in_the_docs_uses_real_flags() {
 
 #[test]
 fn attaching_lists_every_flag() {
-    let attaching = doc_text("src/attaching.rs", include_str!("../src/attaching.rs"));
+    let attaching = doc_text(
+        "docs/guide/attaching.rs",
+        include_str!("../docs/guide/attaching.rs"),
+    );
     let start = attaching
         .find("\n# Every flag\n")
         .expect("attaching has an 'Every flag' section");
@@ -212,7 +230,7 @@ fn a_page_that_names_an_attach_flag_links_to_attaching() {
     let known = flags(usage());
     let mut bad = Vec::new();
     for (path, text) in PAGES {
-        if *path == "src/attaching.rs" || path.ends_with(".sh") {
+        if *path == "docs/guide/attaching.rs" || path.ends_with(".sh") {
             continue;
         }
         let text = doc_text(path, text);
@@ -224,7 +242,7 @@ fn a_page_that_names_an_attach_flag_links_to_attaching() {
             || text.contains("fictionet::attaching")
             || text.contains("(attaching")
             || text.contains("[`attaching`]")
-            || text.contains("src/attaching.rs");
+            || text.contains("docs/guide/attaching.rs");
         if !named.is_empty() && !links {
             bad.push(format!(
                 "{path} names {named:?} but never links to attaching"

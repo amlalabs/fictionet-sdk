@@ -577,7 +577,7 @@ TLS ownership and reproducibility are split across these files:
   the server and the simulated client. Copy `tls.rs` with the `tls/` directory
   and declare `#[path = "tls/output.rs"] mod tls_output;` beside the copy.
 
-The [repeatable-run contract](../src/running.rs) also describes external I/O
+The [repeatable-run contract](guide/running.rs) also describes external I/O
 and the HTTP/2 host-clock exception.
 
 Each peer address may hold 256 connections at once across all machines

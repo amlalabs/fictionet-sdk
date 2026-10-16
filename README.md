@@ -61,7 +61,7 @@ A world's time and randomness come from one place, and its randomness from a
 seed. With real sandboxes it runs on real time. In a test it can run on
 simulated time instead, where the same seed and the same inputs give the same
 event log and the same packets, byte for byte
-([running a world](src/running.rs)).
+([running a world](docs/guide/running.rs)).
 
 ## Try it
 
@@ -89,7 +89,7 @@ for the feature relationships. The crate still links Rust's standard library.
 
 ## Quick start
 
-Follow [Getting started](src/getting_started.rs) for the full Linux namespace
+Follow [Getting started](docs/guide/getting_started.rs) for the full Linux namespace
 walkthrough: build `web_world`, attach a namespace, make HTTPS requests, watch
 the world's events, and clean up. It includes expected output and troubleshooting.
 You need Linux, Rust 1.91 or later, `sudo`, iproute2 and `curl`.
@@ -97,7 +97,7 @@ You need Linux, Rust 1.91 or later, `sudo`, iproute2 and `curl`.
 This is a **trusted connectivity demonstration**. A network namespace isolates
 networking only. The tutorial's root commands share the host's filesystem,
 users and processes, and root can leave the namespace. Do not use it as a
-sandbox for an untrusted agent. The [attachment guide](src/attaching.rs) owns
+sandbox for an untrusted agent. The [attachment guide](docs/guide/attaching.rs) owns
 the deployment instructions for containers, Kubernetes, hosted sandboxes,
 proxies and VMs, including the harness's isolation responsibilities.
 
@@ -159,7 +159,7 @@ protocol of your own in the dashboard, see
 
 | Where the sandbox runs | How it attaches | Tested by |
 |---|---|---|
-| A network namespace on the host (`ip netns`) | `tun` | [Getting started](src/getting_started.rs) |
+| A network namespace on the host (`ip netns`) | `tun` | [Getting started](docs/guide/getting_started.rs) |
 | Docker Compose: the agent shares the network namespace of an `attach` container | `tun` | `tests/docker/web`, and the examples below |
 | Kubernetes: `world` and `attach` as native sidecars, from the Helm chart in [`charts/fictionet-sandbox`](charts/fictionet-sandbox), which the k8s sandbox of [Inspect](https://inspect.aisi.org.uk/), a framework for running AI evals, accepts | `tun`, under runc and gVisor | `tests/k8s/run.sh` on kind |
 | Daytona and E2B: the Compose setup inside one hosted sandbox | `tun` | [`examples/hosted`](examples/hosted) |
@@ -168,7 +168,7 @@ protocol of your own in the dashboard, see
 
 Attach takes each sandbox's addresses as flags, and hands a VM its addresses by DHCP.
 Remote sandboxes, DHCP in attach for `tun`, Python worlds and more are on the
-[roadmap](src/roadmap.rs).
+[roadmap](docs/guide/roadmap.rs).
 
 ## From an Inspect eval
 
@@ -212,27 +212,27 @@ $ cargo doc --no-deps --open
 
 Start at the crate root, which explains the main ideas, then read in this order:
 
-1. [`getting_started`](src/getting_started.rs): from `cargo build` to an HTTPS
+1. [`getting_started`](docs/guide/getting_started.rs): from `cargo build` to an HTTPS
    request from a sandbox.
-2. [`running`](src/running.rs): the program around a world, how it starts and
+2. [`running`](docs/guide/running.rs): the program around a world, how it starts and
    stops, and worlds in tests.
-3. [`attaching`](src/attaching.rs): every way to attach a sandbox (a host
+3. [`attaching`](docs/guide/attaching.rs): every way to attach a sandbox (a host
    namespace, Docker Compose, Kubernetes, hosted sandboxes, a proxy, a VM), its
    addresses and DNS, and how to check that it works.
-4. [`lowering`](src/lowering.rs): how each attach type turns what its sandbox
+4. [`lowering`](docs/guide/lowering.rs): how each attach type turns what its sandbox
    sends into IP packets.
 5. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
    protocol catalog. Then [`stdlib::net`](src/stdlib/world/net.rs) and
    [`stdlib::serve`](src/stdlib/services/serve.rs) for a network of hosts and
    services, and [`stdlib::web`](src/stdlib/web/sites.rs) for a network of
    websites.
-6. [`recipes`](src/recipes.rs): a delayed website, a slow or lossy link, a packet
+6. [`recipes`](docs/guide/recipes.rs): a delayed website, a slow or lossy link, a packet
    capture, and a route that changes mid-run.
 7. [`observe`](src/observe.rs): watching a running world, in the dashboard or
    from a shell.
-8. [`proto`](src/proto.rs): the relay protocol between attach and a world, for
+8. [`proto`](docs/guide/proto.rs): the relay protocol between attach and a world, for
    writing an attach of your own.
-9. [`roadmap`](src/roadmap.rs): what is planned.
+9. [`roadmap`](docs/guide/roadmap.rs): what is planned.
 
 ## Building and testing
 

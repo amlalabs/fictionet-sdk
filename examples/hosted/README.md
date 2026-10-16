@@ -1,13 +1,13 @@
 # Fictionet on hosted sandboxes
 
 This directory runs the Docker Compose setup inside a hosted sandbox with
-its own Docker daemon. The [attachment guide](../../src/attaching.rs)
+its own Docker daemon. The [attachment guide](../../docs/guide/attaching.rs)
 owns the setup and run instructions. This README owns the dated provider
 measurements and limitations below.
 
 The world, attach and agent run in separate containers. The agent shares
 attach's network namespace, where `tun0` is its only interface besides
-loopback. See [Docker Compose](../../src/attaching.rs)
+loopback. See [Docker Compose](../../docs/guide/attaching.rs)
 for the isolation rules.
 
 On local Docker or Kubernetes, [`python/inspect_fictionet`](../../python/inspect_fictionet)
@@ -84,12 +84,12 @@ Compose CLI, but no Docker daemon or network. Run the offline contract tests wit
 Run the commands from the repository root.
 Follow these sections of the attachment guide:
 
-- [Run it locally first](../../src/attaching.rs): build the binaries and
+- [Run it locally first](../../docs/guide/attaching.rs): build the binaries and
   check the Compose setup.
-- [Directly, with each provider's SDK](../../src/attaching.rs): run on
+- [Directly, with each provider's SDK](../../docs/guide/attaching.rs): run on
   Daytona or E2B.
-- [Through Inspect](../../src/attaching.rs): run the scripted eval.
-- [Through Harbor](../../src/attaching.rs): run the oracle task.
+- [Through Inspect](../../docs/guide/attaching.rs): run the scripted eval.
+- [Through Harbor](../../docs/guide/attaching.rs): run the oracle task.
 
 ## What was run, 2 October 2026
 
