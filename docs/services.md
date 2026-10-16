@@ -897,7 +897,7 @@ past an original event.
 
 ### Packet drops and event layers
 
-Packet-drop construction lives in [`fictionet::stdlib::ip::record_drop`](../src/stdlib/ip.rs).
+Packet-drop construction lives in [`fictionet::stdlib::ip::record_drop`](../src/stdlib/network/ip.rs).
 It reads the packet's addresses and protocol and records a `drop` repeat.
 [`fictionet::observe::Layer::from_event(&event)`](../src/observe/decode.rs)
 turns an event into a display layer, with its summary and fields as notes.

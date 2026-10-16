@@ -223,6 +223,12 @@
 //! no matching Cargo features in the consuming crate.
 //! Protocol and format modules live in `src/stdlib/protocols/`, and their
 //! public paths stay `stdlib::<name>`.
+//! The packet-to-connection stack lives in `src/stdlib/network/`: the `ip`,
+//! `icmp`, `tcp`, `udp`, `ports` and `route` modules, and the private
+//! `connection` and `link` modules behind the root re-exports such as
+//! [`Connection`] and [`delay`]. Their public paths stay the same.
+//! Copy `network/udp.rs` together with the `network/udp/` directory, keeping
+//! the relative paths. The entry file declares its private wire module.
 //! Copy `net.rs` together with the `net/` directory, keeping the relative
 //! paths. The entry file declares its private address-management, host
 //! installation, attachment lifecycle, and DNS service modules.
@@ -359,6 +365,7 @@ pub mod http3;
 fictionet::cfg_std! { pub mod httpd; }
 #[path = "protocols/huffman.rs"]
 pub mod huffman;
+#[path = "network/icmp.rs"]
 pub mod icmp;
 #[path = "protocols/iec104.rs"]
 pub mod iec104;
@@ -370,6 +377,7 @@ pub mod ike;
 pub mod imap;
 #[path = "protocols/imf.rs"]
 pub mod imf;
+#[path = "network/ip.rs"]
 pub mod ip;
 #[path = "protocols/ipp.rs"]
 pub mod ipp;
@@ -440,6 +448,7 @@ pub mod pim;
 pub mod pop3;
 #[path = "protocols/portmap.rs"]
 pub mod portmap;
+#[path = "network/ports.rs"]
 pub mod ports;
 #[path = "protocols/postgres.rs"]
 pub mod postgres;
@@ -463,6 +472,7 @@ pub mod resp;
 pub mod rfb;
 #[path = "protocols/rip.rs"]
 pub mod rip;
+#[path = "network/route.rs"]
 pub mod route;
 #[path = "protocols/rtcp.rs"]
 pub mod rtcp;
@@ -502,6 +512,7 @@ pub mod ssh;
 pub mod stun;
 #[path = "protocols/syslog.rs"]
 pub mod syslog;
+#[path = "network/tcp.rs"]
 pub mod tcp;
 #[path = "protocols/tcp_reassembly.rs"]
 pub mod tcp_reassembly;
@@ -517,6 +528,7 @@ pub mod thrift;
 pub mod tls;
 #[path = "protocols/tpkt.rs"]
 pub mod tpkt;
+#[path = "network/udp.rs"]
 pub mod udp;
 #[path = "protocols/urlencoded_form.rs"]
 pub mod urlencoded_form;
@@ -541,11 +553,13 @@ pub mod xml;
 pub mod zabbix;
 // End of the generated module declarations.
 
+#[path = "network/connection.rs"]
 mod connection;
 pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, DatagramSocket};
 
 #[path = "tls/output.rs"]
 mod tls_output;
 
+#[path = "network/link.rs"]
 mod link;
 pub use link::{Direction, bottleneck, delay, filter};

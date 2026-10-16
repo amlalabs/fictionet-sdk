@@ -55,7 +55,7 @@ macro_rules! protocols {
         pub mod coap;
         #[path = "../../src/stdlib/codec/combinators.rs"]
         pub mod combinators;
-        #[path = "../../src/stdlib/connection.rs"]
+        #[path = "../../src/stdlib/network/connection.rs"]
         pub mod connection;
         #[path = "../../src/stdlib/protocols/cotp.rs"]
         pub mod cotp;
@@ -127,7 +127,7 @@ macro_rules! protocols {
         }
         #[path = "../../src/stdlib/protocols/huffman.rs"]
         pub mod huffman;
-        #[path = "../../src/stdlib/icmp.rs"]
+        #[path = "../../src/stdlib/network/icmp.rs"]
         pub mod icmp;
         #[path = "../../src/stdlib/protocols/iec104.rs"]
         pub mod iec104;
@@ -141,7 +141,7 @@ macro_rules! protocols {
         pub mod imf;
         #[path = "../../src/stdlib/codec/interceptor.rs"]
         pub mod interceptor;
-        #[path = "../../src/stdlib/ip.rs"]
+        #[path = "../../src/stdlib/network/ip.rs"]
         pub mod ip;
         #[path = "../../src/stdlib/protocols/ipp.rs"]
         pub mod ipp;
@@ -171,7 +171,7 @@ macro_rules! protocols {
         pub mod ldap;
         #[path = "../../src/stdlib/codec/leb128.rs"]
         pub mod leb128;
-        #[path = "../../src/stdlib/link.rs"]
+        #[path = "../../src/stdlib/network/link.rs"]
         pub mod link;
         #[path = "../../src/stdlib/protocols/memcache.rs"]
         pub mod memcache;
@@ -241,7 +241,7 @@ macro_rules! protocols {
         pub mod pop3;
         #[path = "../../src/stdlib/protocols/portmap.rs"]
         pub mod portmap;
-        #[path = "../../src/stdlib/ports.rs"]
+        #[path = "../../src/stdlib/network/ports.rs"]
         pub mod ports;
         #[path = "../../src/stdlib/protocols/postgres.rs"]
         pub mod postgres;
@@ -269,7 +269,7 @@ macro_rules! protocols {
         pub mod rfb;
         #[path = "../../src/stdlib/protocols/rip.rs"]
         pub mod rip;
-        #[path = "../../src/stdlib/route.rs"]
+        #[path = "../../src/stdlib/network/route.rs"]
         pub mod route;
         #[path = "../../src/stdlib/protocols/rtcp.rs"]
         pub mod rtcp;
@@ -313,7 +313,7 @@ macro_rules! protocols {
         pub mod stun;
         #[path = "../../src/stdlib/protocols/syslog.rs"]
         pub mod syslog;
-        #[path = "../../src/stdlib/tcp.rs"]
+        #[path = "../../src/stdlib/network/tcp.rs"]
         pub mod tcp;
         #[path = "../../src/stdlib/protocols/tcp_reassembly.rs"]
         pub mod tcp_reassembly;
@@ -333,7 +333,7 @@ macro_rules! protocols {
         mod tls_output;
         #[path = "../../src/stdlib/protocols/tpkt.rs"]
         pub mod tpkt;
-        #[path = "../../src/stdlib/udp.rs"]
+        #[path = "../../src/stdlib/network/udp.rs"]
         pub mod udp;
         #[path = "../../src/stdlib/protocols/urlencoded_form.rs"]
         pub mod urlencoded_form;

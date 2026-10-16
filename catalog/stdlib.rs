@@ -166,7 +166,7 @@ catalog! {
     huffman: "The RFC 7541 Huffman code that HPACK and QPACK share.";
         wire: true, fuzz: true, copy: true, file: Some("protocols/huffman.rs");
     icmp: "ICMP echo replies and error messages, for machines built by hand.";
-        copy: true;
+        copy: true, file: Some("network/icmp.rs");
     iec104: "IEC 60870-5-104 APDUs and ASDU headers.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/iec104.rs");
     igmp: "IGMP membership queries and reports, versions 1 to 3.";
@@ -178,7 +178,7 @@ catalog! {
     imf: "Internet Message Format mail headers: fields, addresses, dates, message IDs and encoded words.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/imf.rs");
     ip: "IP headers read, checked and built, checksums, fragment reassembly, and sorting packets by version and protocol.";
-        fuzz: true, copy: true;
+        fuzz: true, copy: true, file: Some("network/ip.rs");
     ipp: "IPP, the Internet Printing Protocol: requests, responses and their attribute groups.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/ipp.rs");
     ipsec: "IPsec ESP and AH wire headers, with no cryptography or security association state.";
@@ -254,7 +254,7 @@ catalog! {
     portmap: "Portmapper version 2 and rpcbind versions 3 and 4 requests and results, and universal addresses.";
         fuzz: true, copy: true, file: Some("protocols/portmap.rs");
     ports: "Ready-slot polling for packet interfaces.";
-        copy: true;
+        copy: true, file: Some("network/ports.rs");
     postgres: "The PostgreSQL protocol, version 3: frontend and backend messages, from startup to query results.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/postgres.rs");
     prefix_int: "RFC 7541 prefix integers, shared by HPACK and QPACK.";
@@ -279,7 +279,7 @@ catalog! {
     rip: "RIP and RIPng routing messages.";
         wire: true, fuzz: true, copy: true, file: Some("protocols/rip.rs");
     route: "Forwarding packets between interfaces by destination: the router and the LAN.";
-        copy: true;
+        copy: true, file: Some("network/route.rs");
     rtcp: "RTCP control packets, compound packets and feedback messages.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/rtcp.rs");
     rtp: "RTP media packets and their header extensions, told apart from RTCP.";
@@ -323,7 +323,7 @@ catalog! {
     syslog: "Syslog messages in the RFC 5424 and RFC 3164 formats, and RFC 6587 stream framing.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/syslog.rs");
     tcp: "TCP listeners and connections for a machine on the simulated network, on smoltcp.";
-        fuzz: true, copy: true;
+        fuzz: true, copy: true, file: Some("network/tcp.rs");
     tcp_reassembly: "TCP capture reassembly for observers: ordered bytes, gaps and end signals.";
         fuzz: true, copy: true, file: Some("protocols/tcp_reassembly.rs");
     tds: "TDS, the SQL Server protocol: packets, logins, SQL batches and response tokens.";
@@ -344,7 +344,7 @@ catalog! {
     tpkt: "TPKT packets, the carrier of ISO transport on TCP.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/tpkt.rs");
     udp: "UDP sockets, borrowed datagram parsing and checked encoding.";
-        copy: true;
+        copy: true, file: Some("network/udp.rs");
     urlencoded_form: "application/x-www-form-urlencoded form bodies and query strings.";
         wire: true, decode: true, fuzz: true, copy: true,
         file: Some("protocols/urlencoded_form.rs");
@@ -419,7 +419,7 @@ copy_parts! {
     checked: "src/stdlib/codec/checked.rs";
     civil: "src/stdlib/codec/civil.rs";
     combinators: "src/stdlib/codec/combinators.rs";
-    connection: "src/stdlib/connection.rs";
+    connection: "src/stdlib/network/connection.rs";
     crc32: "src/stdlib/codec/crc32.rs";
     crc32c: "src/stdlib/codec/crc32c.rs";
     declarations: "src/stdlib/codec/declarations.rs";
@@ -436,7 +436,7 @@ copy_parts! {
     layout: "src/stdlib/codec/layout.rs";
     lcg: "src/stdlib/codec/lcg.rs";
     leb128: "src/stdlib/codec/leb128.rs";
-    link: "src/stdlib/link.rs";
+    link: "src/stdlib/network/link.rs";
     observe_conversation: "src/observe/conversation.rs", gate: Gate::Observe;
     observe_http2: "src/observe/http2.rs", gate: Gate::Observe;
     observe_protocols: "src/observe/protocols.rs", gate: Gate::Observe;
