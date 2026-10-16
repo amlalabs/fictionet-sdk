@@ -150,7 +150,7 @@ mod dns;
 #[path = "net/hosts.rs"]
 mod hosts;
 
-#[path = "world/names.rs"]
+#[path = "names.rs"]
 mod names;
 
 use addresses::{AUTO, AUTO6, Leases, Subnet, Subnet6};

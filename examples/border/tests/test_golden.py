@@ -89,11 +89,11 @@ def test_httpd_answer_inventory_matches_border_projection() -> None:
     root = GOLDEN.parents[4]
     kinds: set[str] = set()
     for path in (
-        "httpd.rs",
-        "httpd/http1.rs",
-        "httpd/hyper.rs",
-        "httpd/sites.rs",
-        "httpd/response.rs",
+        "web/httpd.rs",
+        "web/httpd/http1.rs",
+        "web/httpd/hyper.rs",
+        "web/httpd/sites.rs",
+        "web/httpd/response.rs",
     ):
         source = (root / "src" / "stdlib" / path).read_text().split("#[cfg(test)]", 1)[0]
         kinds.update(re.findall(r'with\("answer", "([a-z_]+)"\)', source))
@@ -114,11 +114,11 @@ def test_httpd_answer_inventory_matches_border_projection() -> None:
                     if tokens[j + 1].startswith('"'):
                         kinds.add(json.loads(tokens[j + 1]))
                     break
-        if path == "httpd.rs":
+        if path == "web/httpd.rs":
             receipt = source.split("impl Received {", 1)[1].split("///", 1)[0]
             kinds.update(re.findall(r'=> "([a-z_]+)"', receipt))
             kinds.remove("complete")  # receipt only, never an answer
-        elif path == "httpd/response.rs":
+        elif path == "web/httpd/response.rs":
             fallback = source.split('let answer = extra.remove("answer")', 1)[1].split("fields.extend(extra)", 1)[0]
             kinds.update(re.findall(r'"([a-z_]+)"\.into\(\)', fallback))
     assert kinds == {"handler", "error", "cancelled", "no_host", "misdirected", "redirect", "cut_off", "too_large", "timeout", "budget"}

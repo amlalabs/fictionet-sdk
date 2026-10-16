@@ -442,8 +442,8 @@ fn modules_on_disk() -> BTreeMap<String, Vec<PathBuf>> {
 fn component_sources_keep_the_entry_file_and_children() {
     let modules = modules_on_disk();
     let root = Path::new(ROOT);
-    assert!(modules["net"].contains(&root.join("src/stdlib/net.rs")));
-    assert!(modules["net"].contains(&root.join("src/stdlib/net/hosts.rs")));
+    assert!(modules["net"].contains(&root.join("src/stdlib/world/net.rs")));
+    assert!(modules["net"].contains(&root.join("src/stdlib/world/net/hosts.rs")));
     assert!(modules["codec"].contains(&root.join("src/stdlib/codec/combinators.rs")));
     assert!(!modules["codec"].contains(&root.join("src/stdlib/codec/tests.rs")));
 }

@@ -100,7 +100,7 @@ catalog! {
     book_levels: "Ordered quantity and order-count aggregates for one side of an order book.";
         copy: true, file: Some("protocols/book_levels.rs");
     ca: "Seeded certificate authorities and server leaves for simulated TLS sites.";
-        copy: true;
+        copy: true, file: Some("services/ca.rs");
     cboe_boe: "Cboe Binary Order Entry: every session and order message, a member's and an exchange's session, and an order tracker.";
         wire: true, decode: true, state: &["Client", "Server", "Exchange"], fuzz: true, copy: true,
         file: Some("protocols/cboe_boe.rs");
@@ -162,7 +162,7 @@ catalog! {
         wire: true, decode: true, state: &["Session"], fuzz: true, copy: true,
         file: Some("protocols/http3.rs");
     httpd: "HTTP serving: `Http1`, upgrade continuations, hyper for HTTP/2 and axum upgrades, handlers, tower integration, and virtual hosts.";
-        service: &["Http1"], copy: true, gate: Gate::Std;
+        service: &["Http1"], copy: true, file: Some("web/httpd.rs"), gate: Gate::Std;
     huffman: "The RFC 7541 Huffman code that HPACK and QPACK share.";
         wire: true, fuzz: true, copy: true, file: Some("protocols/huffman.rs");
     icmp: "ICMP echo replies and error messages, for machines built by hand.";
@@ -224,7 +224,7 @@ catalog! {
     nbss: "NetBIOS Session Service packets, using `netbios` name encoding.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/nbss.rs");
     net: "A network of hosts and services in a few lines: the sandboxes' subnet, DHCP, DNS, a router, machines, LANs and each host's services.";
-        copy: true;
+        copy: true, file: Some("world/net.rs");
     netbios: "NetBIOS name construction, display, and uncompressed reading and writing shared by NBNS, NBDGM and NBSS.";
         fuzz: true, copy: true, file: Some("protocols/netbios.rs");
     nfs: "NFS version 3 and MOUNT version 3: the arguments and results of every procedure, over `onc_rpc`.";
@@ -287,13 +287,13 @@ catalog! {
     rtsp: "RTSP messages and interleaved data, with transport and range headers.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/rtsp.rs");
     sandbox: "Client machines with DNS, TLS, and HTTP requests for lab tests.";
-        copy: true;
+        copy: true, file: Some("world/sandbox.rs");
     sbe: "FIX Simple Binary Encoding 1.0 at run time: load a schema's XML, then read and write its messages.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/sbe.rs");
     sdp: "SDP session descriptions, with ICE candidates and RTP maps.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/sdp.rs");
     serve: "Services: the `Service` trait, the driver that runs one over a connection or a UDP socket, `listen`, a test harness, transcripts and fault plans.";
-        fuzz: true, copy: true;
+        fuzz: true, copy: true, file: Some("services/serve.rs");
     session: "Passive mechanics shared by caller-driven protocol sessions.";
         copy: true, file: Some("protocols/session.rs");
     sftp: "SFTP version 3 packets, requests and responses.";
@@ -340,7 +340,7 @@ catalog! {
     thrift: "Apache Thrift messages and values in the binary and compact protocols, and the framed transport.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/thrift.rs");
     tls: "The server side of a TLS connection, played by the world with rustls. The world picks the certificate after the client hello.";
-        observe: true, fuzz: true, copy: true;
+        observe: true, fuzz: true, copy: true, file: Some("services/tls.rs");
     tpkt: "TPKT packets, the carrier of ISO transport on TCP.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/tpkt.rs");
     udp: "UDP sockets, borrowed datagram parsing and checked encoding.";
@@ -355,7 +355,7 @@ catalog! {
     wake_on_lan: "Wake-on-LAN magic packets.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/wake_on_lan.rs");
     web: "Websites by hostname: `Sites`, a preset on `Net` that builds DNS, addresses, TLS and HTTP around one callback.";
-        fuzz: true, copy: true, gate: Gate::Std;
+        fuzz: true, copy: true, file: Some("web/sites.rs"), gate: Gate::Std;
     websocket: "WebSocket: the opening handshake, frames and messages.";
         wire: true, decode: true, fuzz: true, copy: true, file: Some("protocols/websocket.rs");
     whois: "WHOIS queries and responses, with referrals.";
@@ -445,7 +445,7 @@ copy_parts! {
     reader: "src/stdlib/codec/reader.rs";
     recorder: "src/stdlib/codec/recorder.rs";
     stream: "src/stdlib/codec/stream.rs";
-    tls_output: "src/stdlib/tls/output.rs", public: false;
+    tls_output: "src/stdlib/services/tls/output.rs", public: false;
     work: "src/stdlib/codec/work.rs";
 }
 

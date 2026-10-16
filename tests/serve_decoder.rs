@@ -371,7 +371,7 @@ fn fault_decoder_failure_preserves_partial_bytes() {
 
 #[test]
 fn fault_operations_do_not_discard_errors() {
-    let source = include_str!("../src/stdlib/serve.rs");
+    let source = include_str!("../src/stdlib/services/serve.rs");
     let faults = source
         .split_once("impl<D: Decode> ConnFaults<D>")
         .expect("connection fault implementation")

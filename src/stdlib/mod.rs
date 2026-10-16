@@ -229,19 +229,25 @@
 //! [`Connection`] and [`delay`]. Their public paths stay the same.
 //! Copy `network/udp.rs` together with the `network/udp/` directory, keeping
 //! the relative paths. The entry file declares its private wire module.
-//! Copy `net.rs` together with the `net/` directory, keeping the relative
+//! The service drivers live in `src/stdlib/services/`: the `serve`, `tls`
+//! and `ca` modules. World composition lives in `src/stdlib/world/`: the
+//! `net` and `sandbox` modules. Web serving lives in `src/stdlib/web/`: the
+//! `httpd` module, and the `web` module in `web/sites.rs` with its private
+//! outbound proxy in `web/proxy.rs`. Their public paths stay the same.
+//! Copy `world/net.rs` together with the `world/net/` directory, keeping the relative
 //! paths. The entry file declares its private address-management, host
 //! installation, attachment lifecycle, and DNS service modules.
-//! It also needs `world/names.rs`, keeping that relative path.
-//! Copy `httpd.rs` together with the `httpd/` directory, keeping the relative
+//! It also needs its sibling `world/names.rs`, keeping that relative path.
+//! Copy `web/httpd.rs` together with the `web/httpd/` directory, keeping the relative
 //! paths. The entry file declares its private body, handler, site, and response modules,
 //! and one module per serving engine: native HTTP/1 in `httpd/http1.rs`, and
 //! hyper's HTTP/2 and upgrades in `httpd/hyper.rs` with the `tokio` feature.
-//! Copy `tls.rs` together with the `tls/` directory, keeping the relative
+//! Copy `services/tls.rs` together with the `services/tls/` directory, keeping the relative
 //! paths. The entry file declares its private run-aware crypto provider.
-//! Copy `sandbox.rs` together with `tls/output.rs`, keeping that relative
-//! path. For either copy, declare `#[path = "tls/output.rs"] mod tls_output;`
-//! next to the copied module. Both adapters use this private output helper.
+//! Copy `world/sandbox.rs` together with `services/tls/output.rs`, and put the
+//! helper at `tls/output.rs` beside the copied module. For either copy, declare
+//! `#[path = "tls/output.rs"] mod tls_output;` next to the copied module. Both
+//! adapters use this private output helper.
 //! Copy the `protocols/cme_mdp3/` directory, keeping the relative paths. Its entry
 //! file, `mod.rs`, declares the private packet framing module.
 //! Copy the `protocols/smb2/` directory the same way. Its `mod.rs` declares the
@@ -309,6 +315,7 @@ pub mod bacnet;
 pub mod bgp;
 #[path = "protocols/book_levels.rs"]
 pub mod book_levels;
+#[path = "services/ca.rs"]
 pub mod ca;
 #[path = "protocols/cboe_boe.rs"]
 pub mod cboe_boe;
@@ -362,7 +369,7 @@ pub mod http1;
 pub mod http2;
 #[path = "protocols/http3.rs"]
 pub mod http3;
-fictionet::cfg_std! { pub mod httpd; }
+fictionet::cfg_std! { #[path = "web/httpd.rs"] pub mod httpd; }
 #[path = "protocols/huffman.rs"]
 pub mod huffman;
 #[path = "network/icmp.rs"]
@@ -419,6 +426,7 @@ pub mod nbdgm;
 pub mod nbns;
 #[path = "protocols/nbss.rs"]
 pub mod nbss;
+#[path = "world/net.rs"]
 pub mod net;
 #[path = "protocols/netbios.rs"]
 pub mod netbios;
@@ -480,11 +488,13 @@ pub mod rtcp;
 pub mod rtp;
 #[path = "protocols/rtsp.rs"]
 pub mod rtsp;
+#[path = "world/sandbox.rs"]
 pub mod sandbox;
 #[path = "protocols/sbe.rs"]
 pub mod sbe;
 #[path = "protocols/sdp.rs"]
 pub mod sdp;
+#[path = "services/serve.rs"]
 pub mod serve;
 #[path = "protocols/session.rs"]
 pub mod session;
@@ -525,6 +535,7 @@ pub mod test_support;
 pub mod tftp;
 #[path = "protocols/thrift.rs"]
 pub mod thrift;
+#[path = "services/tls.rs"]
 pub mod tls;
 #[path = "protocols/tpkt.rs"]
 pub mod tpkt;
@@ -538,7 +549,7 @@ pub mod vrrp;
 pub mod vxlan;
 #[path = "protocols/wake_on_lan.rs"]
 pub mod wake_on_lan;
-fictionet::cfg_std! { pub mod web; }
+fictionet::cfg_std! { #[path = "web/sites.rs"] pub mod web; }
 #[path = "protocols/websocket.rs"]
 pub mod websocket;
 #[path = "protocols/whois.rs"]
@@ -557,7 +568,7 @@ pub mod zabbix;
 mod connection;
 pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, DatagramSocket};
 
-#[path = "tls/output.rs"]
+#[path = "services/tls/output.rs"]
 mod tls_output;
 
 #[path = "network/link.rs"]

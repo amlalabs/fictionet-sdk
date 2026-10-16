@@ -561,19 +561,19 @@ no room for output, sending waits for the next read or write.
 
 TLS ownership and reproducibility are split across these files:
 
-- [`tls/provider.rs`](../src/stdlib/tls/provider.rs) owns config builders,
+- [`tls/provider.rs`](../src/stdlib/services/tls/provider.rs) owns config builders,
   the run clock, context binding, key exchange and signing. Its public functions
   remain under `tls`. Fixed certificates, a fixed world date, the same seed
   and ordered inputs repeat TLS records in a closed lab. Its docs describe
   the obligations of custom resolvers and signers and the effect of real peers.
-- [`tls.rs`](../src/stdlib/tls.rs) owns transport, handshakes, ALPN selection
-  and installs the run's key recorder. [`ca.rs`](../src/stdlib/ca.rs) issues certificates
+- [`tls.rs`](../src/stdlib/services/tls.rs) owns transport, handshakes, ALPN selection
+  and installs the run's key recorder. [`ca.rs`](../src/stdlib/services/ca.rs) issues certificates
   using the run's randomness and world-supplied leaf validity.
 - [`telemetry.rs`](../src/telemetry.rs) owns the bounded TLS key log, created
   by the run. TLS acquires a recorder only while an observer is connected.
   The recorder holds only that log. Capture, key export and decryption stay
   in `observe`, including the public `observe::observed_config` helper.
-- [`tls/output.rs`](../src/stdlib/tls/output.rs) drains ciphertext for both
+- [`tls/output.rs`](../src/stdlib/services/tls/output.rs) drains ciphertext for both
   the server and the simulated client. Copy `tls.rs` with the `tls/` directory
   and declare `#[path = "tls/output.rs"] mod tls_output;` beside the copy.
 
@@ -687,7 +687,7 @@ Net::new()
 
 Sites of several hosts at one address share the port as virtual hosts:
 the first host's `Server` takes in the others through
-[`PortServer::prepare_share`](../src/stdlib/net.rs). It receives the local
+[`PortServer::prepare_share`](../src/stdlib/world/net.rs). It receives the local
 `SocketAddr`, the host's DNS names and the other server. It returns `None`
 to decline sharing, or a `PreparedShare` token. Preparation must not change
 either server. The token captures an infallible commit; dropping it leaves
@@ -702,7 +702,7 @@ IPv4 address does not add a site's names or default to another IPv6 address,
 or the reverse. The first default at each endpoint keeps the role. Names
 are matched without case or a trailing dot. `Net` itself knows nothing of
 HTTP, so a copy of `httpd` with its own handlers plugs in the same way.
-Copy `src/stdlib/httpd.rs` together with `src/stdlib/httpd/`, keeping the
+Copy `src/stdlib/web/httpd.rs` together with `src/stdlib/web/httpd/`, keeping the
 relative paths. Each serving engine has its own file there: `http1.rs` for
 native HTTP/1, and `hyper.rs` for HTTP/2 and upgrades on hyper.
 
@@ -790,7 +790,7 @@ allowance in place. ACKs apply in announcement order. Later pending
 increases stay allowed, but do not cancel required minimum-size updates
 at the next header block.
 
-See [`httpd`'s event contract](../src/stdlib/httpd.rs) for `sent` and
+See [`httpd`'s event contract](../src/stdlib/web/httpd.rs) for `sent` and
 `complete`, including when HTTP/1 and HTTP/2 count bytes.
 
 ## 5. Events

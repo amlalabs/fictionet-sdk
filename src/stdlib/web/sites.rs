@@ -164,7 +164,7 @@
 //!
 //! # What `start` builds
 //!
-#![doc = include_str!("../../docs/diagrams/sites-network.svg")]
+#![doc = include_str!("../../../docs/diagrams/sites-network.svg")]
 //!
 //! - **The sandboxes' side.** Every sandbox that attaches, now or later,
 //!   joins the same two subnets: `10.0.0.0/24` for IPv4, with the gateway
@@ -273,7 +273,7 @@
 //!
 //! How one sandbox's IPv4 address is bound, as its filter sees it:
 //!
-#![doc = include_str!("../../docs/diagrams/sites-binding.svg")]
+#![doc = include_str!("../../../docs/diagrams/sites-binding.svg")]
 //!
 //! # IPv6
 //!
@@ -394,7 +394,7 @@
 //! One HTTPS request to a site with [`tls`](Site::tls), from its lookup to
 //! its events:
 //!
-#![doc = include_str!("../../docs/diagrams/sites-request.svg")]
+#![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
 //!
 //! [`EventLog::subscribe`](fictionet::events::EventLog::subscribe) documents callback delivery.
 //! Callbacks must not block the world's thread. For file output, use
@@ -823,7 +823,7 @@ impl Site {
 }
 
 fictionet::cfg_web_proxy! {
-#[path = "web/proxy.rs"]
+#[path = "proxy.rs"]
 mod proxy;
 pub use proxy::{Forward, Proxy, forward, proxy};
 }

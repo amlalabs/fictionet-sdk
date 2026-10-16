@@ -449,7 +449,7 @@
 //!
 //! ```text
 //! {"t":12.5,"started":1790989827708,"ended":false,
-//!  "nodes":[{"id":"t11","kind":"task","name":"net::filter","file":"src/stdlib/net.rs",
+//!  "nodes":[{"id":"t11","kind":"task","name":"net::filter","file":"src/stdlib/world/net.rs",
 //!            "line":243,"parent":"t10","started":0.113998},
 //!           {"id":"s7","kind":"sandbox","name":"agent"}],
 //!  "edges":[{"id":"e7","a":"t11","b":"s7","label":null}],
@@ -515,7 +515,7 @@
 //!  "addr":"10.0.0.2","addr_v6":null},"conn":null,"local":null,"peer":"10.0.0.2:47583",
 //!  "transport":"tcp","tls":false,"sni":null,"alpn":null,
 //!  "fields":{"name":"example.test","qtype":1,...},
-//!  "node":"t7","task":"net::serve_dns","file":"src/stdlib/net.rs","line":1750,"parent":"t1"}
+//!  "node":"t7","task":"net::serve_dns","file":"src/stdlib/world/net.rs","line":1750,"parent":"t1"}
 //! ```
 //!
 //! `seq` numbers the run's events from 1, with no gaps, and `at` is when it

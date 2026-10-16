@@ -125,7 +125,7 @@ web::Sites::new(move |host: &str| match host {
 ```
 
 A longer version, which the docs compile as a test, is at the top of
-[`stdlib::web`](src/stdlib/web.rs), and [`examples/web_world.rs`](examples/web_world.rs)
+[`stdlib::web`](src/stdlib/web/sites.rs), and [`examples/web_world.rs`](examples/web_world.rs)
 is a complete world.
 
 Underneath, a world is a set of tasks joined by packet interfaces: a delay, a
@@ -222,9 +222,9 @@ Start at the crate root, which explains the main ideas, then read in this order:
 4. [`lowering`](src/lowering.rs): how each attach type turns what its sandbox
    sends into IP packets.
 5. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
-   protocol catalog. Then [`stdlib::net`](src/stdlib/net.rs) and
-   [`stdlib::serve`](src/stdlib/serve.rs) for a network of hosts and
-   services, and [`stdlib::web`](src/stdlib/web.rs) for a network of
+   protocol catalog. Then [`stdlib::net`](src/stdlib/world/net.rs) and
+   [`stdlib::serve`](src/stdlib/services/serve.rs) for a network of hosts and
+   services, and [`stdlib::web`](src/stdlib/web/sites.rs) for a network of
    websites.
 6. [`recipes`](src/recipes.rs): a delayed website, a slow or lossy link, a packet
    capture, and a route that changes mid-run.

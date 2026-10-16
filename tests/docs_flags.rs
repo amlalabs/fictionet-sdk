@@ -34,7 +34,10 @@ const PAGES: &[(&str, &str)] = &[
     ("src/observe.rs", include_str!("../src/observe.rs")),
     ("src/proto.rs", include_str!("../src/proto.rs")),
     ("src/stdlib/mod.rs", include_str!("../src/stdlib/mod.rs")),
-    ("src/stdlib/web.rs", include_str!("../src/stdlib/web.rs")),
+    (
+        "src/stdlib/web/sites.rs",
+        include_str!("../src/stdlib/web/sites.rs"),
+    ),
     (
         "examples/attach/netns.sh",
         include_str!("../examples/attach/netns.sh"),

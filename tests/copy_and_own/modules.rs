@@ -10,7 +10,7 @@
 // them: httpd.rs includes httpd/body.rs, httpd/handlers.rs, httpd/http1.rs,
 // httpd/hyper.rs, httpd/sites.rs and httpd/response.rs; tls.rs its private
 // tls/provider.rs; net.rs net/addresses.rs, net/hosts.rs, net/attachments.rs,
-// net/dns.rs and world/names.rs; cme_mdp3/mod.rs its framing.rs;
+// net/dns.rs and names.rs; cme_mdp3/mod.rs its framing.rs;
 // json_schema/mod.rs its formats.rs and decimal.rs; smb2/mod.rs its
 // contexts.rs; and observe/protocols.rs protocols/{modbus,dns,dhcp,http1}.rs.
 // tls.rs and sandbox.rs share the private tls_output sibling, copied with
@@ -39,7 +39,7 @@ macro_rules! protocols {
         pub mod bounded;
         #[path = "../../src/stdlib/codec/buffer.rs"]
         pub mod buffer;
-        #[path = "../../src/stdlib/ca.rs"]
+        #[path = "../../src/stdlib/services/ca.rs"]
         pub mod ca;
         #[path = "../../src/stdlib/protocols/cboe_boe.rs"]
         pub mod cboe_boe;
@@ -122,7 +122,7 @@ macro_rules! protocols {
         #[path = "../../src/stdlib/protocols/http3.rs"]
         pub mod http3;
         fictionet::cfg_std! {
-        #[path = "../../src/stdlib/httpd.rs"]
+        #[path = "../../src/stdlib/web/httpd.rs"]
         pub mod httpd;
         }
         #[path = "../../src/stdlib/protocols/huffman.rs"]
@@ -193,7 +193,7 @@ macro_rules! protocols {
         pub mod nbns;
         #[path = "../../src/stdlib/protocols/nbss.rs"]
         pub mod nbss;
-        #[path = "../../src/stdlib/net.rs"]
+        #[path = "../../src/stdlib/world/net.rs"]
         pub mod net;
         #[path = "../../src/stdlib/protocols/netbios.rs"]
         pub mod netbios;
@@ -277,13 +277,13 @@ macro_rules! protocols {
         pub mod rtp;
         #[path = "../../src/stdlib/protocols/rtsp.rs"]
         pub mod rtsp;
-        #[path = "../../src/stdlib/sandbox.rs"]
+        #[path = "../../src/stdlib/world/sandbox.rs"]
         pub mod sandbox;
         #[path = "../../src/stdlib/protocols/sbe.rs"]
         pub mod sbe;
         #[path = "../../src/stdlib/protocols/sdp.rs"]
         pub mod sdp;
-        #[path = "../../src/stdlib/serve.rs"]
+        #[path = "../../src/stdlib/services/serve.rs"]
         pub mod serve;
         #[path = "../../src/stdlib/protocols/session.rs"]
         pub mod session;
@@ -327,9 +327,9 @@ macro_rules! protocols {
         pub mod tftp;
         #[path = "../../src/stdlib/protocols/thrift.rs"]
         pub mod thrift;
-        #[path = "../../src/stdlib/tls.rs"]
+        #[path = "../../src/stdlib/services/tls.rs"]
         pub mod tls;
-        #[path = "../../src/stdlib/tls/output.rs"]
+        #[path = "../../src/stdlib/services/tls/output.rs"]
         mod tls_output;
         #[path = "../../src/stdlib/protocols/tpkt.rs"]
         pub mod tpkt;
@@ -344,7 +344,7 @@ macro_rules! protocols {
         #[path = "../../src/stdlib/protocols/wake_on_lan.rs"]
         pub mod wake_on_lan;
         fictionet::cfg_std! {
-        #[path = "../../src/stdlib/web.rs"]
+        #[path = "../../src/stdlib/web/sites.rs"]
         pub mod web;
         }
         #[path = "../../src/stdlib/protocols/websocket.rs"]
