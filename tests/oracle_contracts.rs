@@ -412,7 +412,13 @@ fn shared_harnesses_have_both_callers() {
         .collect();
     let mut gaps = Vec::new();
     for (path, source) in sources(&Path::new(ROOT).join("src/stdlib")) {
-        let module = path.file_stem().unwrap().to_str().unwrap();
+        // A directory module such as `smb2/mod.rs` is named by its directory.
+        let named = if path.file_name().unwrap() == "mod.rs" {
+            path.parent().unwrap().file_name()
+        } else {
+            path.file_stem()
+        };
+        let module = named.unwrap().to_str().unwrap();
         gaps.extend(harness_gaps(module, &source, &targets, &tests));
     }
     assert!(gaps.is_empty(), "{}", gaps.join("\n"));
