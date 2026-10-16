@@ -1844,6 +1844,12 @@
 //! path. If writing it fails, attach exits with status 1 and tries to remove
 //! the file it created. It leaves a replacement at that path alone.
 //!
+//! On a host with systemd-resolved, such as Ubuntu, `/etc/resolv.conf` is a
+//! symlink to the resolver's stub file. So attach that sees the host's
+//! `/etc`, and has no named `--netns`, needs `--resolv-conf` or
+//! `--no-resolv-conf`. A bind mount over the symlink does not help because
+//! it lands on the symlink's target.
+//!
 //! For example, a harness might start the agent with runc, in the namespace
 //! `/run/netns/agent`, and give it the host directory `/srv/agent/etc` as
 //! its `/etc`. Then attach should write the file there:

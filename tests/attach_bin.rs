@@ -103,8 +103,10 @@ fn userns_works() -> bool {
         .unwrap_or(false)
 }
 
-/// Starts attach in new namespaces, with a private resolv.conf bound over
-/// /etc/resolv.conf.
+/// Starts attach in new namespaces, with `--resolv-conf` naming a private
+/// resolv.conf. A bind mount over /etc/resolv.conf would not do: where the
+/// host's /etc/resolv.conf is a symlink, as with systemd-resolved, the mount
+/// lands on its target, and attach does not write through the symlink.
 fn spawn_attach(
     dir: &std::path::Path,
     sock: &str,
@@ -114,7 +116,7 @@ fn spawn_attach(
     let resolv = dir.join(resolv);
     std::fs::write(&resolv, "nameserver 192.0.2.1\n").unwrap();
     let script = format!(
-        "mount --bind {resolv} /etc/resolv.conf && exec {BIN} attach --world unix:{sock} --name {name} --type tun \
+        "exec {BIN} attach --world unix:{sock} --name {name} --type tun --resolv-conf {resolv} \
          --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
          --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6 --mtu 1400",
         resolv = resolv.display()
@@ -198,10 +200,19 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
     let dir2 = dir.clone();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let out = slot.clone();
-    fictionet::block_on(fictionet::run(
+    let result = fictionet::block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
-            let mut abc = attachments.get(&fcx, "abc").await?;
+            let mut abc = fcx
+                .race(
+                    Some(fcx.now() + Duration::from_secs(10)),
+                    attachments.get(&fcx, "abc"),
+                )
+                .await
+                .map_err(|err| match err {
+                    fictionet::RaceError::Deadline => fictionet::Error::msg("abc never attached"),
+                    fictionet::RaceError::Cancelled => err.into(),
+                })??;
             let mtu = abc.mtu();
             // Send echo requests until one is answered: the device may come up
             // a moment after accept is sent.
@@ -242,8 +253,19 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
             *out.lock().unwrap() = Some((mtu, reply, second));
             Ok(())
         },
-    ))
-    .unwrap();
+    ));
+    if let Err(err) = result {
+        first
+            .kill()
+            .unwrap_or_else(|kill_err| panic!("world failed: {err}; killing attach: {kill_err}"));
+        let out = first.wait_with_output().unwrap_or_else(|output_err| {
+            panic!("world failed: {err}; collecting attach output: {output_err}")
+        });
+        panic!(
+            "world failed: {err}\nattach stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     let (mtu, reply, second) = slot.lock().unwrap().take().unwrap();
     drop(listening);
 
