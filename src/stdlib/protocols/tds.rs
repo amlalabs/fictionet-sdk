@@ -4472,8 +4472,6 @@ mod tests {
         }
     }
 
-    // Problems found in review against MS-TDS, one test each.
-
     /// 2.2.6.4: the offset table has ibAtchDBFile at byte 82 and
     /// ibChangePassword at byte 86, in that order.
     #[test]

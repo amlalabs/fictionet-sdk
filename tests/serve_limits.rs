@@ -1502,12 +1502,12 @@ fn upgrade_keep_alive_preserves_line_limits() {
 }
 
 #[test]
-#[ignore = "RH-110: hyper treats HeadCheck's rejection on an idle keep-alive connection as a clean EOF, so no http.error event is recorded"]
+#[ignore = "hyper treats HeadCheck's rejection on an idle keep-alive connection as a clean EOF, so no http.error event is recorded"]
 fn upgrade_keep_alive_line_limit_rejection_records_protocol_error() {
     world(Duration::from_secs(10), |fcx| async move {
         upgrade_keep_alive_line_limit(&fcx).await?;
         let errors = fcx.events().of("http", "error");
-        assert_eq!(errors.len(), 1, "RH-110: missing limit rejection event");
+        assert_eq!(errors.len(), 1, "missing limit rejection event");
         assert_eq!(errors[0].str("cause"), Some("protocol"));
         Ok(())
     });

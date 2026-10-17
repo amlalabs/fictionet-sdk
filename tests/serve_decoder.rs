@@ -380,11 +380,8 @@ fn fault_operations_do_not_discard_errors() {
         .expect("end of connection fault implementation")
         .0;
     let compact: String = faults.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(
-        !compact.contains("Err(_)=>"),
-        "RH-030: discarded fault error"
-    );
-    assert!(!compact.contains("let_="), "RH-030: unchecked fault result");
+    assert!(!compact.contains("Err(_)=>"), "discarded fault error");
+    assert!(!compact.contains("let_="), "unchecked fault result");
 }
 
 #[derive(Default)]

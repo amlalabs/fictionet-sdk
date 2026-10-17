@@ -1869,7 +1869,7 @@ mod tests {
     }
 
     #[test]
-    fn review_value_checks_have_distinct_roles() {
+    fn value_checks_have_distinct_roles() {
         let empty = Value::Tlv(vec![]);
         assert_eq!(empty.raw_bytes(), Some(vec![]));
         assert_eq!(empty.encode(), None);

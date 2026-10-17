@@ -2526,7 +2526,7 @@ mod tests {
     }
 
     #[test]
-    fn review_pixel_format_waits_after_bell() {
+    fn pixel_format_waits_after_bell() {
         let (_, mut c) = normal_pair();
         assert_eq!(
             c.push(&[server_type::BELL, server_type::FRAMEBUFFER_UPDATE, 0]),

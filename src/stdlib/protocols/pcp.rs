@@ -1691,7 +1691,7 @@ mod tests {
 
     // RFC 6887 figures 2, 9 and 13: a MAP request, byte by byte.
     #[test]
-    fn review_nat_pmp_request_trailing() {
+    fn nat_pmp_request_trailing() {
         for mut bytes in [
             vec![0, 0],
             vec![0, 1, 0, 0, 0, 1, 0, 2, 0, 0, 0, 3],

@@ -3167,8 +3167,6 @@ mod tests {
         assert!(!Error::Attribute.to_string().is_empty());
     }
 
-    // Regressions from review.
-
     #[test]
     fn typed_helpers_read_and_write_at_most_a_line() {
         // A trickled candidate with many extensions is refused before it

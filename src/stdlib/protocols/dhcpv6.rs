@@ -1950,7 +1950,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_review_cases() {
+    fn user_class_and_status_code_validation() {
         // RFC 8415, section 21.15: a User Class option holds one or more
         // instances, so readers and writers refuse a list with no items.
         assert_eq!(
@@ -2470,7 +2470,7 @@ mod tests {
     }
 
     #[test]
-    fn review_tcp_frames_up_to_65535_bytes_read() {
+    fn tcp_frames_up_to_65535_bytes_read() {
         // RFC 5460, section 5.1: the 2-byte length allows 65,535 bytes.
         let mut body = vec![0u8; 65_535 - 8];
         body[0] = 1;
@@ -2484,7 +2484,7 @@ mod tests {
     }
 
     #[test]
-    fn review_odd_label_bytes_keep_the_message() {
+    fn odd_label_bytes_keep_the_message() {
         // RFC 1035, section 3.1 allows any byte in a label. The message
         // still reads, with the list kept as its bytes.
         let bytes = with_option(opt::DOMAIN_LIST, &[1, b'.', 0]);
@@ -2500,7 +2500,7 @@ mod tests {
     }
 
     #[test]
-    fn review_vendor_and_dns_bodies() {
+    fn vendor_and_dns_bodies() {
         let bad = |code: u16, body: &[u8]| {
             assert_eq!(
                 Message::parse(&with_option(code, body)),
@@ -2539,7 +2539,7 @@ mod tests {
     }
 
     #[test]
-    fn review_relayed_reads_only_relay_messages() {
+    fn relayed_reads_only_relay_messages() {
         // RFC 8415, section 21.10: the Relay Message option is carried by
         // Relay-forward and Relay-reply messages only.
         let mut m = Message::new(msg::SOLICIT, 1);
@@ -2548,7 +2548,7 @@ mod tests {
     }
 
     #[test]
-    fn review_stream_holds_a_bounded_number_of_bytes() {
+    fn stream_holds_a_bounded_number_of_bytes() {
         let mut stream = Stream::new(Frames::<Message>::new());
         assert_eq!(stream.push(&vec![0; 2 * MAX_BUFFERED]), MAX_BUFFERED);
         assert_eq!(stream.buffered(), MAX_BUFFERED);

@@ -1872,7 +1872,7 @@ mod tests {
 
     // Examples from gitprotocol-common, "pkt-line Format".
     #[test]
-    fn review_writer_validation() {
+    fn writer_validation() {
         let request = V2Request::Command(command_fixture(
             "fetch".into(),
             vec![],

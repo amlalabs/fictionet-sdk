@@ -3130,7 +3130,7 @@ mod tests {
     }
 
     #[test]
-    fn review_a_fixt_headers_accept_tag_order() {
+    fn fixt_headers_accept_tag_order() {
         // Session Layer 8.5: only 8, 9, 35 have fixed header positions.
         let mut session = Session::new(
             SessionConfig::new(Version::Fixt11, Role::Acceptor, "LOCAL", "PEER").unwrap(),
@@ -3146,7 +3146,7 @@ mod tests {
     }
 
     #[test]
-    fn review_b_acceptor_first_message_closes_without_sending() {
+    fn acceptor_first_message_closes_without_sending() {
         // Session Layer 4.3.1; FIX 4.4 Vol 2 cases 1S.b and 1S.c.
         for bytes in [b"8=FIX.4.4\x019=52\x0135=0\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=079\x01".as_slice(), b"8=FIX.4.4\x019=64\x0135=A\x0134=1\x0149=EVIL\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x0110=128\x01"] {
             let mut session = Session::new(
@@ -3160,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn review_c_invalid_logon_timestamps_never_send_reject_first() {
+    fn invalid_logon_timestamps_never_send_reject_first() {
         // Session Layer 4.3.11 and 4.6.4; FIX 4.4 Vol 2 cases 1S.d and 1B.e.
         for role in [Role::Acceptor, Role::Initiator] {
             for bytes in [b"8=FIX.4.4\x019=52\x0135=A\x0134=1\x0149=PEER\x0152=bad\x0156=LOCAL\x0198=0\x01108=30\x01141=Y\x0110=185\x01".as_slice(), b"8=FIX.4.4\x019=83\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=bad\x0198=0\x01108=30\x01141=Y\x0110=162\x01", b"8=FIX.4.4\x019=97\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:02\x0198=0\x01108=30\x01141=Y\x0110=215\x01"] {
@@ -3181,7 +3181,7 @@ mod tests {
     }
 
     #[test]
-    fn review_d_reset_equal_is_noop() {
+    fn reset_equal_is_noop() {
         // FIX 4.4 Vol 2 case 11.b: equal NewSeqNo is accepted.
         let mut session = established(Version::Fix44);
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=57\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0136=2\x0110=050\x01", 1);
@@ -3191,7 +3191,7 @@ mod tests {
     }
 
     #[test]
-    fn review_d_invalid_reset_and_gap_fill_only_reject() {
+    fn invalid_reset_and_gap_fill_only_reject() {
         // FIX 4.4 Vol 2 cases 11.c and 10.e: no disconnect or inbound change.
         for bytes in [b"8=FIX.4.4\x019=57\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0136=1\x0110=049\x01".as_slice(), b"8=FIX.4.4\x019=63\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01123=Y\x0136=2\x0110=092\x01", b"8=FIX.4.4\x019=63\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01123=Y\x0136=1\x0110=091\x01"] {
             let mut session = established(Version::Fix44);
@@ -3206,7 +3206,7 @@ mod tests {
     }
 
     #[test]
-    fn review_d_large_gap_fill_moves_only_counters() {
+    fn large_gap_fill_moves_only_counters() {
         // FIX 4.4 Vol 2 case 10.b: no bound on an inbound gap's size.
         let mut session = established(Version::Fix44);
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=67\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01123=Y\x0136=10003\x0110=034\x01", 1);
@@ -3216,7 +3216,7 @@ mod tests {
     }
 
     #[test]
-    fn review_e_logout_response_waits_and_serves_resends() {
+    fn logout_response_waits_and_serves_resends() {
         // FIX 4.4 Vol 2 state matrix row 15 and case 13b.
         let mut session = established(Version::Fix44);
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=52\x0135=5\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=085\x01", 1);
@@ -3237,7 +3237,7 @@ mod tests {
     }
 
     #[test]
-    fn review_f_application_traffic_satisfies_probe() {
+    fn application_traffic_satisfies_probe() {
         // FIX 4.4 Vol 2 state matrix row 14: any non-garbled inbound message.
         let mut session = established(Version::Fix44);
         session.test_request(b"probe", 0, TIME).unwrap();
@@ -3252,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn review_g_garbled_frames_do_not_end_stream() {
+    fn garbled_frames_do_not_end_stream() {
         // FIX 4.4 Vol 2 cases 2.d, 2.m, 2.t, 3.b: discard then continue.
         let mut bad_checksum = HEARTBEAT.to_vec();
         let digit = bad_checksum.len() - 2;
@@ -3268,7 +3268,7 @@ mod tests {
     }
 
     #[test]
-    fn review_h_application_delivered_while_logout_sent() {
+    fn application_delivered_while_logout_sent() {
         // Session Layer state 16 and section 4.6.3: deliver during recovery.
         let mut session = established(Version::Fix44);
         session.logout(b"bye", 0, TIME).unwrap();
@@ -3514,7 +3514,7 @@ mod tests {
 
     #[test]
     fn periodic_overlapping_candidates_take_linear_work() {
-        // The reviewed input: every 26 bytes a candidate whose BodyLength, a
+        // Every 26 bytes starts a candidate whose BodyLength, a
         // multiple of 26, lands its trailer on a later `10=000`. Its first
         // body field is not MsgType, so the cheap checks refuse it unread.
         let period = b"8=FIX.4.4\x019=988000\x0110=000\x01";

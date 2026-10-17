@@ -224,7 +224,7 @@ fn request_field_limit_rejects_oversized_fields() {
     let mut fields = received_request(&[]);
     fields[0] = Field::new(":method", "GET");
     fields.push(Field::new("x-big", vec![b'a'; 2000]));
-    // Keep literal strings uncompressed to exercise the review's 2.1 KB section.
+    // Keep literal strings uncompressed so the section exceeds the field limit.
     let mut section = vec![0, 0];
     for field in fields {
         fictionet::stdlib::prefix_int::Integer::<3> {

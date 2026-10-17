@@ -2738,7 +2738,7 @@ mod tests {
     }
 
     #[test]
-    fn review_push_is_bounded() {
+    fn push_is_bounded() {
         // One large push with a tiny limit holds at most one control frame.
         let mut d = Stream::new(Messages::for_receiver(Side::Client).with_limit(1));
         #[expect(
@@ -2769,7 +2769,7 @@ mod tests {
     }
 
     #[test]
-    fn review_field_values_are_bounded() {
+    fn field_values_are_bounded() {
         let commas = format!("Upgrade{}", ",".repeat(1 << 20));
         let key = "A".repeat(1 << 20);
         let origin = "o".repeat(MAX_FIELD_LEN + 1);
@@ -2820,7 +2820,7 @@ mod tests {
     }
 
     #[test]
-    fn review_extension_grammar() {
+    fn extension_grammar() {
         for bad in [
             "permessage-deflate; =bad",
             "permessage-deflate;",
@@ -2894,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn review_host_is_an_authority() {
+    fn host_is_an_authority() {
         for bad in [
             "example.com/path",
             "example.com:abc",
@@ -2945,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn review_origin_appears_once() {
+    fn origin_appears_once() {
         let mut h = rfc_request();
         h.push(("Origin", "https://other.example"));
         assert_eq!(check_request(&h), Err(Error::Origin));
@@ -2953,7 +2953,7 @@ mod tests {
     }
 
     #[test]
-    fn review_split_messages_get_a_key_per_frame() {
+    fn split_messages_get_a_key_per_frame() {
         let m = Message::Text("abcdé".into());
         let mut n = 0u8;
         let frames = m
@@ -2983,7 +2983,7 @@ mod tests {
     }
 
     #[test]
-    fn review_push_takes_what_fits_and_loops_end() {
+    fn push_takes_what_fits_and_loops_end() {
         let mut d = Stream::new(Messages::for_receiver(Side::Client).with_limit(3));
         assert_eq!(d.decoder().capacity(), MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD);
         let stream = [0x8a, 0x00].repeat(200);

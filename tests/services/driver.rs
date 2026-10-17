@@ -396,10 +396,6 @@ fn a_tower_service_runs_as_a_handler() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Fixes from the service-layer review: each test below failed, or could
-// not be written, before its fix.
-
 /// A decoder that skips a long run of bytes is making progress: the
 /// connection stays open, as in the harness. Before, the driver took a
 /// pass with no item for a stuck decoder and closed the connection as

@@ -3547,7 +3547,7 @@ mod tests {
     }
 
     #[test]
-    fn review_to_frame_checks_the_whole_body() {
+    fn to_frame_checks_the_whole_body() {
         // 4074 withdrawn /0 routes: 4076 bytes of withdrawn routes, then
         // the attribute length makes the body 4078, too long.
         let u = Update {
@@ -3565,7 +3565,7 @@ mod tests {
     }
 
     #[test]
-    fn review_open_new_carries_one_four_octet_as() {
+    fn open_new_carries_one_four_octet_as() {
         let o = Open::new(
             65001,
             90,
@@ -3582,7 +3582,7 @@ mod tests {
     }
 
     #[test]
-    fn review_empty_communities_are_malformed() {
+    fn empty_communities_are_malformed() {
         assert_eq!(
             update_body(&[0, 0, 0, 3, 0xc0, 8, 0], &TWO),
             Err(Error::AttributeLength(vec![0xc0, 8, 0]))
@@ -3590,7 +3590,7 @@ mod tests {
     }
 
     #[test]
-    fn review_unknown_non_transitive_attributes_drop_partial() {
+    fn unknown_non_transitive_attributes_drop_partial() {
         let Ok(Message::Update(u)) = update_body(&[0, 0, 0, 3, 0xa0, 99, 0], &TWO) else {
             panic!()
         };
@@ -3617,7 +3617,7 @@ mod tests {
     }
 
     #[test]
-    fn review_prefixes_are_canonical() {
+    fn prefixes_are_canonical() {
         // 10.128.0.0/9 with the padding bit clear and set reads the same.
         let a = update_body(&[0, 3, 9, 10, 0x80, 0, 0], &TWO).unwrap();
         let b = update_body(&[0, 3, 9, 10, 0xff, 0, 0], &TWO).unwrap();
@@ -3636,7 +3636,7 @@ mod tests {
     }
 
     #[test]
-    fn review_mp_reach_next_hop_lengths() {
+    fn mp_reach_next_hop_lengths() {
         let reach = |afi: u16, next_hop: Vec<u8>| {
             let mut v = afi.to_be_bytes().to_vec();
             v.push(1);
@@ -3683,7 +3683,7 @@ mod tests {
     }
 
     #[test]
-    fn review_as_zero_is_refused() {
+    fn as_zero_is_refused() {
         // RFC 7607: an OPEN from AS 0 is Bad Peer AS.
         let mut b = open_bytes();
         b[20..22].copy_from_slice(&[0, 0]);
@@ -3711,7 +3711,7 @@ mod tests {
     }
 
     #[test]
-    fn review_extended_open_parameters() {
+    fn extended_open_parameters() {
         // RFC 9072: an OPEN in the extended format, with no parameters.
         let body = [4, 0xfd, 0xe9, 0, 0x5a, 0xc0, 0, 2, 1, 0xff, 0xff, 0, 0];
         let Message::Open(o) = Message::decode(
@@ -3743,7 +3743,7 @@ mod tests {
     }
 
     #[test]
-    fn review_update_writer_follows_rfc_7606_layout() {
+    fn update_writer_follows_rfc_7606_layout() {
         let path = Attribute::AsPath(vec![Segment {
             kind: SegmentKind::Sequence,
             asns: vec![1],
@@ -3822,7 +3822,7 @@ mod tests {
     }
 
     #[test]
-    fn review_receive_follows_rfc_7606() {
+    fn receive_follows_rfc_7606() {
         // A good UPDATE reads the same both ways.
         let good = route_with(&[]);
         let r = Update::receive(&good, &TWO).unwrap();
@@ -3908,7 +3908,7 @@ mod tests {
     }
 
     #[test]
-    fn review_partial_is_kept_on_known_attributes() {
+    fn partial_is_kept_on_known_attributes() {
         let b = [0, 0, 0, 7, 0xe0, 8, 4, 0xfd, 0xe9, 0, 1];
         let Message::Update(u) = update_body(&b, &TWO).unwrap() else {
             panic!()
@@ -3929,7 +3929,7 @@ mod tests {
     }
 
     #[test]
-    fn review_as4_attributes_are_checked() {
+    fn as4_attributes_are_checked() {
         let with = |raw: &[u8], negotiated: &Context| {
             let Ok(Message::Update(u)) = update_body(&route_with(raw), negotiated) else {
                 panic!("{raw:?}")
@@ -4012,7 +4012,7 @@ mod tests {
     }
 
     #[test]
-    fn review_enhanced_route_refresh_length() {
+    fn enhanced_route_refresh_length() {
         let negotiated = Context {
             enhanced_route_refresh: true,
             ..TWO

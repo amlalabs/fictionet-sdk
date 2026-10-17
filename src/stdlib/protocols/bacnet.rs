@@ -2162,7 +2162,7 @@ mod tests {
     // Encoding examples from ASHRAE 135, Clause 20.2.
 
     #[test]
-    fn review_writer_checks_preserve_variants_and_fields() {
+    fn writer_checks_preserve_variants_and_fields() {
         let npdu = Npdu {
             destination: None,
             source: None,
@@ -3248,8 +3248,6 @@ mod tests {
             hex("810B0015 0100 1000 C4020004D2 2205C4 9103 220104")
         );
     }
-
-    // Each case below once failed.
 
     #[test]
     fn value_lists_are_bounded() {

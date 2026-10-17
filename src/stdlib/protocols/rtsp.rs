@@ -2759,7 +2759,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_review() {
+    fn session_transport_and_range_syntax() {
         use TransportParam as P;
         let bad = Error::HeaderSyntax("Transport");
         // RFC 2326 section 3.4 and RFC 7826 section 20.2.3: safe is `$ - _ . +`.
@@ -2872,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_review_fixes() {
+    fn transport_parameter_validation() {
         use TransportParam as P;
         let bad = Error::HeaderSyntax("Transport");
         // RFC 2326 section 12.39, RFC 7826 section 18.54: mutually exclusive.
@@ -2948,7 +2948,7 @@ mod tests {
     }
 
     #[test]
-    fn value_review_fixes() {
+    fn range_and_session_value_limits() {
         let bad = Error::HeaderSyntax("Range");
         let mut m = Message::request(Version::Rtsp20, "PLAY", "rtsp://h/a");
         // RFC 7826 section 4.4.1: frames below the rate, minutes and
@@ -3037,7 +3037,7 @@ mod tests {
     }
 
     #[test]
-    fn message_review_fixes() {
+    fn message_version_rules() {
         // RFC 2326 section 12.17: any number of digits in RTSP 1.0.
         let mut m = Message::request(Version::Rtsp10, "OPTIONS", "*");
         m.push_header("CSeq", "1000000000");

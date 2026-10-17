@@ -2474,7 +2474,7 @@ fn demux_shrink_reclaims_partial_and_terminal_streams() {
 }
 
 #[test]
-fn review_write_checked_rejects_lossy_encoding() {
+fn write_checked_rejects_lossy_encoding() {
     use fictionet::stdlib::asn1::Error;
 
     let mut out = vec![42];

@@ -3759,7 +3759,7 @@ mod tests {
         assert_eq!(e.kind, CompileKind::Limit("work"));
     }
     #[test]
-    fn review_unique_items_scales_and_normalizes() {
+    fn unique_items_scales_and_normalizes() {
         let s = schema(r#"{"uniqueItems":true}"#);
         for values in [
             (0..1000)
@@ -3779,7 +3779,7 @@ mod tests {
     }
 
     #[test]
-    fn review_dependent_schemas_and_unsupported_keywords() {
+    fn dependent_schemas_and_unsupported_keywords() {
         cases(
             r#"{"dependentSchemas":{"a":{"required":["b"]}}}"#,
             &["{}", r#"{"a":1,"b":2}"#],
@@ -3802,7 +3802,7 @@ mod tests {
     }
 
     #[test]
-    fn review_format_generation() {
+    fn format_generation() {
         for (format, expected) in [
             ("date-time", "2000-01-01T00:00:00Z"),
             ("date", "2000-01-01"),
@@ -3821,7 +3821,7 @@ mod tests {
     }
 
     #[test]
-    fn review_path_storage_is_proportional_to_source() {
+    fn path_storage_is_proportional_to_source() {
         let mut source = Value::Object(vec![(
             "properties".into(),
             Value::Object(
@@ -3842,7 +3842,7 @@ mod tests {
     }
 
     #[test]
-    fn review_recursive_list_reaches_json_depth() {
+    fn recursive_list_reaches_json_depth() {
         let s = schema(
             r##"{"$defs":{"n":{"anyOf":[{"type":"null"},{"type":"object","required":["next"],"properties":{"next":{"$ref":"#/$defs/n"}}}]}},"$ref":"#/$defs/n"}"##,
         );
@@ -3856,7 +3856,7 @@ mod tests {
     }
 
     #[test]
-    fn review_property_names_path_and_oas_examples() {
+    fn property_names_path_and_oas_examples() {
         let s = schema(r#"{"propertyNames":{"maxLength":2}}"#);
         assert_eq!(
             s.validate(&value(r#"{"abc":1}"#)).errors[0].instance_path,
@@ -3875,7 +3875,7 @@ mod tests {
     }
 
     #[test]
-    fn review_raised_schema_limits_take_effect() {
+    fn raised_schema_limits_take_effect() {
         let source = Value::Object(vec![(
             "enum".into(),
             Value::Array(vec![Value::Null; 17_000]),
@@ -3903,7 +3903,7 @@ mod tests {
         assert!(Schema::compile_with(&source, options).is_ok());
     }
     #[test]
-    fn review_format_assertions_share_generation_checks() {
+    fn format_assertions_share_generation_checks() {
         for (name, good, bad) in [
             (
                 "date-time",
@@ -3977,7 +3977,7 @@ mod tests {
     }
 
     #[test]
-    fn review_missing_names_and_generation_work_errors() {
+    fn missing_names_and_generation_work_errors() {
         let s = schema(r#"{"required":["a","b"],"dependentRequired":{"x":["c"]}}"#);
         let errors = s.validate_with(&value(r#"{"x":1}"#), ErrorMode::All).errors;
         assert_eq!(
@@ -4007,7 +4007,7 @@ mod tests {
         }
     }
     #[test]
-    fn review_compile_at_limits_exclude_document_ancestors_and_unused_defs() {
+    fn compile_at_limits_exclude_document_ancestors_and_unused_defs() {
         let unused = value(r#"{"$defs":{"bad":{"unevaluatedProperties":false}}}"#);
         assert!(
             Schema::compile_with(
@@ -4063,7 +4063,7 @@ mod tests {
     }
 
     #[test]
-    fn review_raised_evaluation_ceiling_stays_bounded() {
+    fn raised_evaluation_ceiling_stays_bounded() {
         let defs = (0..1030)
             .map(|i| {
                 (
@@ -4100,7 +4100,7 @@ mod tests {
     }
 
     #[test]
-    fn review_generation_applies_triggered_dependent_schemas() {
+    fn generation_applies_triggered_dependent_schemas() {
         let s = schema(
             r#"{"type":"object","required":["a"],"properties":{"a":{"const":true}},"dependentSchemas":{"a":{"required":["b"],"properties":{"b":{"const":7}},"dependentSchemas":{"b":{"required":["c"],"properties":{"c":{"const":"yes"}}}}}}}"#,
         );
@@ -4113,7 +4113,7 @@ mod tests {
     }
 
     #[test]
-    fn review_multiple_of_large_exponents_is_exact() {
+    fn multiple_of_large_exponents_is_exact() {
         let kind = |source: &str, instance: &str| {
             schema(source)
                 .validate(&value(instance))
@@ -4168,7 +4168,7 @@ mod tests {
     }
 
     #[test]
-    fn review_anchors_are_found_only_in_schema_positions() {
+    fn anchors_are_found_only_in_schema_positions() {
         for source in [
             r##"{"examples":[{"$anchor":"foo","type":"integer"}],"$ref":"#foo"}"##,
             r##"{"default":{"$anchor":"foo"},"$ref":"#foo"}"##,
@@ -4216,7 +4216,7 @@ mod tests {
     }
 
     #[test]
-    fn review_nested_ids_fail_closed() {
+    fn nested_ids_fail_closed() {
         // In 2020-12 the inner reference resolves to /$defs/a/$defs/b, a string.
         let nested = r##"{"$defs":{"a":{"$id":"https://example.test/a","$defs":{"b":{"type":"string"}},"$ref":"#/$defs/b"},"b":{"type":"integer"}},"$ref":"#/$defs/a"}"##;
         assert_eq!(

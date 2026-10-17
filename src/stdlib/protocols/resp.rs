@@ -2033,7 +2033,7 @@ mod tests {
     }
 
     #[test]
-    fn review_scalar_and_inline_writability() {
+    fn scalar_and_inline_writability() {
         assert!(!parsed_may_expand(&Value::Array(vec![
             Value::bulk("ordinary"),
             Value::Integer(1)

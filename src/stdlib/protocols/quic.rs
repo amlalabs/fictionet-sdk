@@ -2973,9 +2973,8 @@ mod tests {
         );
     }
 
-    // Fixes from a review against RFC 9000.
     #[test]
-    fn spec_review() {
+    fn frame_errors_and_datagram_connection_ids() {
         use frame_type as t;
         // Section 12.4: a frame type in a longer encoding than needed is a
         // PROTOCOL_VIOLATION, not a FRAME_ENCODING_ERROR.
@@ -3022,7 +3021,7 @@ mod tests {
     }
 
     #[test]
-    fn second_review() {
+    fn frame_and_packet_validation() {
         use frame_type as t;
         // Frame::parse holds to MAX_PAYLOAD as Payload does, so
         // whatever it reads can be written.
@@ -3366,11 +3365,8 @@ mod tests {
         assert!(!payload.is_empty());
     }
 
-    // Found in the hardening review: accessors a world needs to answer a
-    // packet, a frame writer that made bytes Payload refused, and a
-    // reassembler that moved everything it held on each small read.
     #[test]
-    fn hardening_review() {
+    fn packet_accessors_frame_limits_and_reassembly() {
         // Accessors.
         for (p, _) in sample_packets() {
             assert_eq!(p.scid().is_none(), matches!(p, Packet::Short { .. }));

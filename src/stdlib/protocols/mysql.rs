@@ -3316,8 +3316,6 @@ mod tests {
         );
     }
 
-    // Regressions for an outside review of this module.
-
     #[test]
     fn stream_holds_at_most_its_capacity() {
         let mut stream = Stream::new(Messages::with_limit(16));

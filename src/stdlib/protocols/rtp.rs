@@ -696,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn review_one_byte_id_0_with_a_length_ends_the_extension() {
+    fn one_byte_id_0_with_a_length_ends_the_extension() {
         // RFC 8285 section 4.2: an element with ID 0 and a nonzero length
         // ends processing of the extension; the elements before it stay.
         let mut b = vec![0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
@@ -744,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn review_marked_payload_types_64_to_95_read_as_rtcp() {
+    fn marked_payload_types_64_to_95_read_as_rtcp() {
         // RFC 5761 section 4: these payload types clash with RTCP types
         // when the marker is set, so Demux::parse reads them as RTCP.
         // Packet::parse still reads them as RTP.

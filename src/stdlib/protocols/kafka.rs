@@ -3336,8 +3336,6 @@ mod tests {
         }
     }
 
-    // Regressions from review.
-
     #[test]
     fn stream_refuses_bad_sizes_with_bounded_input() {
         let mut stream = Stream::new(Frames::<Frame>::with_limit(16));

@@ -1518,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn review_version_line_endings_at_limit() {
+    fn version_line_endings_at_limit() {
         for ending in ["\n", "\r\n"] {
             let text = format!(
                 "SSH-2.0-{}",

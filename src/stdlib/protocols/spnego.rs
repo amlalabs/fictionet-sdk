@@ -1056,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn review_encoders_validate_before_writing() {
+    fn encoders_validate_before_writing() {
         assert_eq!(
             NegotiationToken::Init(NegTokenInit::default()).to_bytes(),
             Err(Error::MissingMechTypes)

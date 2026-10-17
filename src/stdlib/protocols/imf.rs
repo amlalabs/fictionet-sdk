@@ -2894,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn review_obsolete_space_before_colon() {
+    fn obsolete_space_before_colon() {
         // RFC 5322 section 4.5: obsolete fields allow white space between
         // the name and the colon.
         let (h, _) = split_message(b"Subject : hi\r\nTo\t: a@b\r\n\r\n").unwrap();
@@ -2913,7 +2913,7 @@ mod tests {
     }
 
     #[test]
-    fn review_no_white_space_only_lines() {
+    fn no_white_space_only_lines() {
         // RFC 5322 section 3.2.2: a folded line may not be white space alone.
         let mut h = Header::default();
         h.push("A", &format!("{}{}", "a".repeat(76), " ".repeat(10)));
@@ -2927,7 +2927,7 @@ mod tests {
     }
 
     #[test]
-    fn review_line_limit() {
+    fn line_limit() {
         // RFC 5322 section 2.1.1: lines are at most 998 characters.
         let field = |v: String| Header {
             fields: vec![Field {
@@ -2945,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn review_folding_inside_quotes_and_comments() {
+    fn folding_inside_quotes_and_comments() {
         // FWS may fold a quoted string: the CRLF goes, the space stays.
         assert_eq!(
             one("\"Joe\r\n Doe\" <j@x>").name.as_deref(),
@@ -2965,7 +2965,7 @@ mod tests {
     }
 
     #[test]
-    fn review_writers_refuse_obsolete_text() {
+    fn writers_refuse_obsolete_text() {
         // Control characters are only obsolete text: readers take them,
         // writers do not write them.
         assert!(parse_address_list("\"a\u{1}\" <x@y>").is_ok());
@@ -3026,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn review_obsolete_phrases_in_reply_lists() {
+    fn obsolete_phrases_in_reply_lists() {
         // RFC 5322 section 4.5.4: In-Reply-To and References may hold
         // phrases, which readers ignore.
         let ids = parse_message_ids("Your message of \"Mon, 1 Jan\" <a@x> and. <b@y>").unwrap();
@@ -3041,7 +3041,7 @@ mod tests {
     }
 
     #[test]
-    fn review_weekday_matches_date() {
+    fn weekday_matches_date() {
         // RFC 5322 section 3.3: the weekday must be the date's own.
         assert_eq!(
             DateTime::parse("Mon, 21 Nov 1997 09:55:06 -0600".as_bytes()),
@@ -3078,7 +3078,7 @@ mod tests {
     }
 
     #[test]
-    fn review_empty_encoded_text() {
+    fn empty_encoded_text() {
         // RFC 2047 section 2: encoded-text is at least one character.
         assert_eq!(decode_word("=?utf-8?q??="), None);
         assert_eq!(decode_word("=?utf-8?b??="), None);
@@ -3086,7 +3086,7 @@ mod tests {
     }
 
     #[test]
-    fn review_encoded_name_with_control_round_trips() {
+    fn encoded_name_with_control_round_trips() {
         // An encoded word may decode to a control character. The reader
         // takes it, so the writer writes it back as an encoded word.
         for s in [

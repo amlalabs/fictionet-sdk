@@ -2030,8 +2030,6 @@ mod tests {
         assert_eq!(Frame::new(Code::PING).max_message_size(), None);
     }
 
-    // Problems found in review, one test each.
-
     #[test]
     fn q_block2_may_repeat() {
         // RFC 9177 section 4.1: Q-Block2 repeats when asking for missing

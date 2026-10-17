@@ -1474,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn review_parsers_refuse_pdus_past_max_pdu() {
+    fn parsers_refuse_pdus_past_max_pdu() {
         let mut long = vec![0x41];
         long.resize(MAX_PDU + 1, 0);
         assert_eq!(Request::parse(&long), Err(Exception::IllegalDataValue));
@@ -1485,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn review_writers_refuse_rather_than_truncate() {
+    fn writers_refuse_rather_than_truncate() {
         let req = Request::WriteMultipleRegisters {
             address: 0,
             values: vec![1; 124],
@@ -1542,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn review_request_writers_check_quantity_and_range() {
+    fn request_writers_check_quantity_and_range() {
         fictionet::assert_cases!(|input: Request| input.to_pdu();
             (Request::ReadHoldingRegisters { address: 0, quantity: 0 }) => Err(Error::Quantity),
             (Request::ReadInputRegisters { address: 0, quantity: 126 }) => Err(Error::Quantity),
@@ -1562,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn review_empty_frame_is_refused() {
+    fn empty_frame_is_refused() {
         let frame = Frame {
             transaction: 0,
             unit: 1,
@@ -1582,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn review_response_writers_check_the_function() {
+    fn response_writers_check_the_function() {
         assert_eq!(
             Response::Bits(vec![true]).to_pdu(3),
             Err(Error::Function(3))
@@ -1627,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn review_responses_check_counts_ranges_and_function() {
+    fn responses_check_counts_ranges_and_function() {
         // Empty reads.
         assert_eq!(Response::parse(&[0x01, 0x00]), Err(Error::BadResponse));
         assert_eq!(Response::parse(&[0x03, 0x00]), Err(Error::BadResponse));
@@ -1689,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn review_other_variants_do_not_alias_typed_ones() {
+    fn other_variants_do_not_alias_typed_ones() {
         let req = Request::Other {
             function: 3,
             data: vec![0, 0, 0, 1],
@@ -1744,7 +1744,7 @@ mod tests {
     /// Every value a writer accepts reads back the same, over a spread of
     /// constructed values.
     #[test]
-    fn review_what_writers_accept_reads_back_the_same() {
+    fn what_writers_accept_reads_back_the_same() {
         let addresses = [0u16, 1, 100, 65400, 65534, 65535];
         let counts = [
             0usize, 1, 7, 8, 9, 123, 124, 125, 126, 1968, 1969, 2000, 2001,
