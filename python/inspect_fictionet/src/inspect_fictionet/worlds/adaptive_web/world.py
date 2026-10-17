@@ -11,19 +11,12 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from inspect_ai.util import sandbox
 from inspect_fictionet import fictionet_sandbox
 
-from inspect_fictionet._common.world_io import WorldFiles
-from inspect_fictionet._common import evidence as _evidence
+from inspect_fictionet._common.evidence import PAGE_METHODS, page_delivered
 from inspect_fictionet._common import citations as _citations
 from adaptive import accounting as _accounting
-_METHODS = ("GET", "POST")
 SEEDS = Path(__file__).with_name("seeds")
-
-WORLD = "world"
-LOG = "/var/lib/fictionet/log.jsonl"
-STATE = "/var/lib/fictionet/state.json"
 
 
 def seed_names() -> list[str]:
@@ -64,24 +57,6 @@ def world_sandbox():
     )
 
 
-async def world_state() -> dict[str, Any]:
-    return await WorldFiles(sandbox(WORLD), state=STATE, log=LOG).state()
-
-
-async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str, Any]]:
-    """Finalize the world, then read its log with read_file because Inspect cuts
-    command output to its last 10 MiB without an error. Check completeness before
-    applying the line offset. Set finalize=False only for a preflight read.
-    """
-    files = WorldFiles(sandbox(WORLD), sandbox() if finalize else None, state=STATE, log=LOG)
-    return await files.log_lines(offset, finalize=finalize)
-
-
-def sorted_percentile(values: list[float], p: float) -> float | None:
-    """The p-th percentile (0 to 100) of sorted values by nearest rank."""
-    return _accounting.percentile(values, p)
-
-
 def latency(log: list[dict[str, Any]]) -> dict[str, Any]:
     """Count every HTTP event, including failures and requests without timing.
 
@@ -100,18 +75,12 @@ def latency(log: list[dict[str, Any]]) -> dict[str, Any]:
             "serve_ms_p50": served["p50"], "serve_ms_p95": served["p95"]}
 
 
-def delivered(e: dict[str, Any]) -> bool:
-    """Credit only completed page bodies with known, matching byte counts."""
-    evidence = _evidence.delivered(e, _METHODS, 0, length_field="bytes")
-    return isinstance(evidence, _evidence.Known) and bool(evidence)
-
-
 def summarize(log: list[dict[str, Any]], answer: str = "") -> dict[str, Any]:
     """The world's view of one sample, for the score's metadata."""
     http = [e for e in log if e.get("type") == "http"]
     evidence = []
     for e in http:
-        if delivered(e):
+        if page_delivered(e):
             evidence.append(e)
         elif type(e.get("status")) is int and 300 <= e["status"] < 400:
             if e.get("answer") == "redirect":
@@ -120,7 +89,7 @@ def summarize(log: list[dict[str, Any]], answer: str = "") -> dict[str, Any]:
             elif e.get("kind") != "redirect":
                 continue
             evidence.append(e)
-    fetched = _citations.delivered_resources(evidence, methods=_METHODS)
+    fetched = _citations.delivered_resources(evidence, methods=PAGE_METHODS)
     citations = dict(_citations.extract_citations(answer))
     cited = sorted(citations)
     not_fetched = [u for u in cited if citations[u] not in fetched]

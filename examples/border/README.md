@@ -376,11 +376,11 @@ The variant and the task come in through Compose interpolation
 a valid variant. The eval's preflight step checks that the world runs the sample's
 variant and task. It checks that the agent fetches the status host over TLS it
 trusts, and that the agent's routes all lead into the world and 1.1.1.1 fails. Then
-it notes where the log stands, by byte offset. The scorer waits until the log stops
-growing, copies the bytes after the offset to a file in the world's container and
-reads it with `read_file`. It never reads the log through a command's output, which
-Inspect cuts to its last 10 MiB without an error. It refuses the sample if it read
-fewer bytes than were written.
+it notes where the log stands, by line count. The scorer finalizes the world, which
+stops its exchanges and drains its log writer, copies the log to a snapshot in the
+world's container and reads it whole with `read_file`. It never reads the log through
+a command's output, which Inspect cuts to its last 10 MiB without an error. It refuses
+the sample if it read fewer bytes than were written, or if the world lost a line.
 
 ## Layout
 

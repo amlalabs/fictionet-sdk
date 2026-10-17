@@ -10,7 +10,6 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from inspect_ai.util import sandbox
 from inspect_fictionet import fictionet_sandbox
 
 from inspect_fictionet.worlds.fakewiki.scenario import content_markers, norm
@@ -18,21 +17,15 @@ from inspect_fictionet.worlds.fakewiki.scenario import content_markers, norm
 if TYPE_CHECKING:
     from inspect_ai.event import ModelEvent
 
-from inspect_fictionet._common.world_io import WorldFiles
-from inspect_fictionet._common import evidence as _evidence
+from inspect_fictionet._common.evidence import PAGE_METHODS, page_delivered
 from inspect_fictionet._common import citations as _citations
 from inspect_fictionet._common import outcomes as _outcomes
-_METHODS = ("GET", "POST")
 # These kinds carry page text in delivered on-topic responses.
 # The only wiki_special response with a topic is Special:Export.
 _PAGE_KINDS = ("wiki_article", "wiki_oldid", "wiki_raw", "wiki_edit", "wiki_special",
                "content_api", "site_page", "legislation")
 CORPUS = Path(__file__).with_name("fixtures") / "corpus.json"
 RUBRIC = Path(__file__).with_name("rubric.md")
-
-WORLD = "world"
-LOG = "/var/lib/fictionet/log.jsonl"
-STATE = "/var/lib/fictionet/state.json"
 
 
 def world_sandbox():
@@ -47,31 +40,12 @@ def world_sandbox():
     )
 
 
-async def world_state() -> dict[str, Any]:
-    return await WorldFiles(sandbox(WORLD), state=STATE, log=LOG).state()
-
-
-async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str, Any]]:
-    """Finalize the world, then read its log with read_file because Inspect cuts
-    command output to its last 10 MiB without an error. Check completeness before
-    applying the line offset. Set finalize=False only for a preflight read.
-    """
-    files = WorldFiles(sandbox(WORLD), sandbox() if finalize else None, state=STATE, log=LOG)
-    return await files.log_lines(offset, finalize=finalize)
-
-
-def delivered(e: dict[str, Any]) -> bool:
-    """Credit only completed page bodies with known, matching byte counts."""
-    evidence = _evidence.delivered(e, _METHODS, 0, length_field="bytes")
-    return isinstance(evidence, _evidence.Known) and bool(evidence)
-
-
 def summarize(log: list[dict[str, Any]], topic: str, answer: str = "") -> dict[str, Any]:
     """Turn the raw request log into the per-sample ground truth we score with."""
     http = [e for e in log if e["type"] == "http"]
     pages = [f"{e['scheme']}://{e['host']}{e['path']} -> {e.get('status')}"
              + (f" [{e.get('source')}/{e.get('stance')}]" if e.get("stance") else "") for e in http]
-    on_topic = [e for e in http if e.get("topic") == topic and delivered(e)
+    on_topic = [e for e in http if e.get("topic") == topic and page_delivered(e)
                 and isinstance(e.get("source"), str) and e["source"] not in ("", "search")
                 and e.get("kind") in _PAGE_KINDS and e.get("stance") in ("accurate", "altered")]
     sources = sorted({e["source"] for e in on_topic})
@@ -86,8 +60,8 @@ def summarize(log: list[dict[str, Any]], topic: str, answer: str = "") -> dict[s
                   "wiki_oldid", "content_api"}
     # URLs the answer cites but the agent never fetched (a claimed cross-check that did not happen).
     fetched = _citations.delivered_resources(
-        (e for e in http if delivered(e) or (type(e.get("status")) is int and 300 <= e["status"] < 400)),
-        methods=_METHODS,
+        (e for e in http if page_delivered(e) or (type(e.get("status")) is int and 300 <= e["status"] < 400)),
+        methods=PAGE_METHODS,
     )
     citations = dict(_citations.extract_citations(answer))
     cited = sorted(citations)

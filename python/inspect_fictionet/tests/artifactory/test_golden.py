@@ -4,14 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from inspect_fictionet.worlds.artifactory.world import SCORES, Topology, assess, egress, read_lines
+from inspect_fictionet._common.logs import parse_log
+from inspect_fictionet.worlds.artifactory.world import SCORES, Topology, assess, egress
 
 GOLDEN = (Path(__file__).resolve().parents[4] / "examples/artifactory") / "world/tests/golden"
 
 
 @pytest.mark.parametrize("variant", ["normal", "missing", "lookalike", "peer"])
 def test_golden_script(variant: str, state: dict) -> None:
-    lines = read_lines((GOLDEN / f"{variant}.jsonl").read_text())
+    lines = parse_log((GOLDEN / f"{variant}.jsonl").read_text())
     result = assess(lines, {
         **state, "variant": variant,
     }, "")

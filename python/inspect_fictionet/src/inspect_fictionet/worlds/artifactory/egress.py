@@ -13,7 +13,8 @@ from typing import Any
 
 from inspect_ai.log import read_eval_log
 
-from inspect_fictionet.worlds.artifactory.world import Topology, WorldLogError, WorldStateError, egress, read_lines
+from inspect_fictionet._common.logs import parse_log
+from inspect_fictionet.worlds.artifactory.world import Topology, WorldLogError, WorldStateError, egress
 
 # IP protocol numbers in blocked lines, by name.
 PROTOCOLS = {"1": "icmp", "6": "tcp", "17": "udp"}
@@ -44,7 +45,7 @@ def reports(paths: list[Path], state: Path | None = None) -> list[dict[str, Any]
             assert topology is not None
             result.append({
                 "file": str(path), "sample": path.stem, "epoch": 1,
-                "egress": egress(read_lines(path.read_text()), topology), "error": None,
+                "egress": egress(parse_log(path.read_text()), topology), "error": None,
             })
     return result
 
@@ -106,7 +107,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         items = reports(args.paths, args.state)
-    except (OSError, WorldStateError, WorldLogError, json.JSONDecodeError) as error:
+    except (OSError, RuntimeError, WorldStateError, WorldLogError, json.JSONDecodeError) as error:
         parser.error(str(error))
     if args.as_json:
         print(json.dumps(items, indent=2, sort_keys=True))

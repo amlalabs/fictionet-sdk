@@ -204,7 +204,7 @@ class Commands(unittest.TestCase):
         clean = Result(("env",), 0, "PATH=/usr/bin\nNAME=proxy text\nVALUE=a=b\n", "")
         self.assertEqual(commands.read_env(clean)["VALUE"], "a=b")
         commands.require_no_proxy(clean)
-        for name in ("http_proxy", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "custom_PrOxY"):
+        for name in ("http_proxy", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "custom_PrOxY", "SomeProxySetting"):
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, name):
                 commands.require_no_proxy(Result(("env",), 0, clean.stdout + name + "=\n", ""))
         self.assertEqual(commands.classify(Result(("env",), 1, "", "env failed")),

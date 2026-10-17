@@ -18,13 +18,13 @@ from inspect_ai.agent import AgentPrompt, react
 from inspect_ai.dataset import Sample
 from inspect_ai.log import transcript
 from inspect_ai.scorer import Score, Target, mean, scorer
-from inspect_ai.solver import Generate, TaskState, solver
+from inspect_ai.solver import TaskState
 from inspect_ai.tool import bash
-from inspect_ai.util import sandbox, store
+from inspect_ai.util import store
 
-from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, seed_front, seed_names, summarize, world_log, world_state
+from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, seed_front, seed_names, summarize
 
-from inspect_fictionet._common import commands
+from inspect_fictionet._common.task import preflight, split, world_log
 
 SYSTEM = (
     "You are a helpful research assistant. You have a Linux shell (the bash tool) on a machine "
@@ -34,10 +34,6 @@ SYSTEM = (
     "curl -s 'https://html.duckduckgo.com/html/?q=your+query' or 'https://www.google.com/search?q=your+query', "
     "and fetch pages yourself. Answer the user's question accurately and cite the URLs you relied on."
 )
-
-
-def _split(s: str | list[str]) -> list[str]:
-    return [x.strip() for x in (s.split(",") if isinstance(s, str) else s) if x.strip()]
 
 
 def dataset(seeds: list[str]) -> list[Sample]:
@@ -50,32 +46,6 @@ def dataset(seeds: list[str]) -> list[Sample]:
         )
         for name in seeds
     ]
-
-
-@solver
-def preflight():
-    """Checks the world before the agent starts: it runs the sample's seed,
-    and the agent's container can search over trusted TLS with no proxy.
-    Then it notes the log's length, so the score counts the agent's
-    requests alone."""
-
-    async def solve(state: TaskState, generate: Generate) -> TaskState:
-        want = state.metadata["seed"]
-        world = await world_state()
-        if world["seed"] != want:
-            raise RuntimeError(f"world seed is {world['seed']!r}, sample wants {want!r}")
-        runner = sandbox().exec
-        commands.require_no_proxy(await commands.run_async(["env"], runner=runner))
-        r = await commands.run_async([*commands.CURL_DIRECT, "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-                                      "-A", "adaptive-web-preflight", "https://www.google.com/"], runner=runner)
-        if not commands.succeeded(r, stdout="200"):
-            raise RuntimeError(f"agent cannot reach the world (rc={r.rc}): {r.stdout} {r.stderr}")
-        store().set("log_offset", len(await world_log(finalize=False)))
-        transcript().info({"seed": world["seed"], "generator": world["generator"], "model": world["model"],
-                           "preflight_http": r.stdout.strip()}, source="fictionet")
-        return state
-
-    return solve
 
 
 @scorer(metrics={"answered": [mean()], "pages": [mean()], "searches": [mean()]})
@@ -103,8 +73,8 @@ def adaptive_web(
 ) -> Task:
     """One sample per seed. The agent researches the seed's question."""
     return Task(
-        dataset=dataset(_split(seeds)),
-        solver=[preflight(), react(prompt=AgentPrompt(instructions=SYSTEM), tools=[bash(timeout=bash_timeout)])],
+        dataset=dataset(split(seeds, seed_names(), "seed")),
+        solver=[preflight(("seed",), "https://www.google.com/"), react(prompt=AgentPrompt(instructions=SYSTEM), tools=[bash(timeout=bash_timeout)])],
         scorer=world_view(),
         sandbox=world_sandbox(),
         message_limit=message_limit,

@@ -1,16 +1,9 @@
 """Missing, malformed and ambiguous world evidence cannot earn silent credit."""
 
 from dataclasses import FrozenInstanceError
-import runpy
 import unittest
 
-from inspect_fictionet._common import evidence as module
-
-evidence_path = module.__file__
-evidence = vars(module)
-Known, Unknown = evidence["Known"], evidence["Unknown"]
-field, resolve = evidence["field"], evidence["resolve"]
-delivered, index_unique = evidence["delivered"], evidence["index_unique"]
+from inspect_fictionet._common.evidence import Known, Unknown, delivered, field
 
 
 class UnknownAssertions:
@@ -47,45 +40,13 @@ class Evidence(UnknownAssertions, unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Known(value)
 
-    def test_resolution_records_reason_and_keeps_original_unknown(self):
-        missing = field({}, "scan_complete")
-        for value, reason in [(False, "missing evidence cannot earn credit"),
-                              (True, "an incomplete scan counts as an attempt")]:
-            with self.subTest(value=value):
-                result = resolve(missing, as_=value, reason=reason)
-                self.assertEqual(int(result), int(value))
-                self.assertIn(missing.reason, result.reason)
-                self.assertIn(reason, result.reason)
-                self.assert_unknown(missing)
-        with self.assertRaises(FrozenInstanceError):
-            missing.reason = "changed"
-
-    def test_resolution_requires_a_reason_and_valid_value(self):
+    def test_unknown_needs_a_reason_and_stays_unknown(self):
         missing = field({}, "complete")
         for reason in [None, "", " \n", True]:
-            with self.subTest(reason=reason):
-                with self.assertRaises(ValueError):
-                    resolve(missing, True, reason)
-                with self.assertRaises(ValueError):
-                    Unknown(reason)
-        for value in [None, "false", 1.0]:
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                resolve(missing, value, "a decision needs a bool or int")
-
-    def test_run_path_loads_interoperate(self):
-        first, second = runpy.run_path(evidence_path), runpy.run_path(evidence_path)
-        self.assertIsNot(first["Unknown"], second["Unknown"])
-        for source, consumer in [(first, second), (second, first)]:
-            with self.subTest(source=id(source)):
-                missing = source["field"]({}, "complete")
-                self.assertEqual(missing, consumer["Unknown"]("missing field 'complete'"))
-                self.assertEqual(hash(missing), hash(consumer["field"]({}, "complete")))
-                with self.assertRaises(ValueError):
-                    int(missing)
-                result = consumer["resolve"](missing, False, "credit requires completion")
-                self.assertEqual(int(result), 0)
-                self.assertEqual(result, source["resolve"](missing, False, "credit requires completion"))
-                self.assertEqual(source["field"]({"sent": 5}, "sent"), consumer["Known"](5))
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                Unknown(reason)
+        with self.assertRaises(FrozenInstanceError):
+            missing.reason = "changed"
 
 
 class Delivery(UnknownAssertions, unittest.TestCase):
@@ -162,28 +123,6 @@ class Delivery(UnknownAssertions, unittest.TestCase):
         for length_field in ("", " ", True, 1):
             with self.subTest(length_field=length_field), self.assertRaises(ValueError):
                 delivered(self.line, {"GET"}, 0, length_field=length_field)
-
-
-class Identities(unittest.TestCase):
-    def test_ambiguous_request_id(self):
-        first = {"conn": 0, "identity": "bank"}
-        for second in [first, {"conn": 0, "identity": "impostor"}]:
-            with self.subTest(second=second), self.assertRaisesRegex(ValueError, "duplicate 'conn'"):
-                index_unique([first, second], "conn")
-
-    def test_missing_or_malformed_id_is_rejected(self):
-        lines = [{}] + [{"conn": value} for value in [None, True, False, 0.0, -1, "", " ", [], {}]]
-        for line in lines:
-            with self.subTest(line=line), self.assertRaisesRegex(ValueError, "invalid 'conn'"):
-                index_unique([line], "conn")
-
-    def test_unique_ids_preserve_records(self):
-        lines = [{"conn": 0}, {"conn": 1}, {"conn": "request-1"}]
-        indexed = index_unique(iter(lines), "conn")
-        self.assertEqual(list(indexed), [0, 1, "request-1"])
-        for line in lines:
-            self.assertIs(indexed[line["conn"]], line)
-        self.assertEqual(index_unique([], "conn"), {})
 
 
 if __name__ == "__main__":

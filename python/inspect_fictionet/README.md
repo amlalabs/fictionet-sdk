@@ -26,8 +26,8 @@ FakeWiki's negative control runs as
 `python -m inspect_fictionet.worlds.fakewiki.negative_control`. Run them through
 `uv run --project python/inspect_fictionet --locked` from the repository root.
 The backends remain in `examples/*/world/backend`; the package includes them and
-the seeds, corpus and rubric when built. All scorers share the log snapshot and
-finalization reader in `inspect_fictionet._common.world_io`.
+the seeds, corpus and rubric when built. All scorers read the world's state and
+log through `inspect_fictionet._common.task`.
 
 ## Install
 
@@ -447,9 +447,8 @@ published ones, and on files in the world's volumes. `examples/web_eval.py`
 reads the CA certificate this way, and checks that the agent sees the same
 file.
 
-For log scoring, follow the existing composition in Artifactory's
-[`finalized_log`](src/inspect_fictionet/worlds/artifactory/tasks.py)
-and its [log parser](src/inspect_fictionet/worlds/artifactory/world.py):
+For log scoring, every world's task uses
+[`world_log`](src/inspect_fictionet/_common/task.py), which composes two helpers:
 
 1. Await [`finalize_world(world, agent, log)`](src/inspect_fictionet/_common/finalize.py).
    It creates `finalize` beside the log and waits for `finalized` containing
@@ -462,12 +461,9 @@ and its [log parser](src/inspect_fictionet/worlds/artifactory/world.py):
    It copies the log to `<log>.snapshot`, counts that file's bytes, and reads
    it as bytes through the trusted accessor. It rejects a byte-count mismatch
    or a nonempty snapshot without a final newline. A snapshot alone does not
-   prove that the live log was drained.
-3. Reject lost log lines before grading. By default, `read_log` parses JSON
-   and rejects any `{"type": "lost"}` entry before applying a line offset.
-   With `raw=True`, it checks the transfer but returns bytes without parsing
-   or loss checks. Artifactory uses this mode and performs those checks in
-   its own parser. Collection failures must not become an empty log or a score.
+   prove that the live log was drained. It then parses the JSON Lines and
+   rejects a malformed line or a `{"type": "lost"}` entry before applying a
+   line offset. Collection failures must not become an empty log or a score.
 
 These are repository example helpers, not an `inspect_fictionet` package API.
 They require a separate world sandbox with `exec`, `touch`, `cat`, and a

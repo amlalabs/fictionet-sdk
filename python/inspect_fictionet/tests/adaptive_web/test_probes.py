@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote_plus, urlsplit
 
 from . import probes
-from inspect_fictionet.worlds.adaptive_web import tasks
 from .probes import request_metadata_complete
 
 
@@ -180,41 +179,6 @@ class ProbeEvidence(unittest.TestCase):
                      "dated_on_the_seed_day", "world_logged_every_request"):
             with self.subTest(check=name):
                 self.assertFalse(self.checks()[name])
-
-
-class Preflight(unittest.IsolatedAsyncioTestCase):
-    async def run_preflight(self, env, curl):
-        async def execute(argv, **kwargs):
-            value = env if argv == ["env"] else curl
-            return SimpleNamespace(returncode=value["rc"], stdout=value["out"], stderr=value["err"])
-
-        agent = SimpleNamespace(exec=AsyncMock(side_effect=execute))
-        state = SimpleNamespace(metadata={"seed": "test-seed"})
-        with patch.object(tasks, "sandbox", return_value=agent), \
-             patch.object(tasks, "world_state", AsyncMock(return_value={"seed": "test-seed", "generator": "stub", "model": "stub"})), \
-             patch.object(tasks, "world_log", AsyncMock(return_value=[])), \
-             patch.object(tasks, "store", return_value=Mock()), \
-             patch.object(tasks, "transcript", return_value=Mock()):
-            await tasks.preflight()(state, None)
-        return agent.exec
-
-    async def test_direct_200(self):
-        run = await self.run_preflight(observation(out="PATH=/usr/bin\nDESCRIPTION=proxy text\n"), observation(out="200"))
-        self.assertEqual(run.await_args_list[0].args[0], ["env"])
-        self.assertEqual(run.await_args_list[1].args[0][:4], ["curl", "-q", "--noproxy", "*"])
-
-    async def test_failed_200(self):
-        with self.assertRaises(RuntimeError):
-            await self.run_preflight(observation(out="PATH=/usr/bin\n"), observation(28, "200", "timeout"))
-
-    async def test_proxy_variable(self):
-        for name in ("http_proxy", "HTTPS_PROXY", "NO_PROXY", "custom_PrOxY"):
-            with self.subTest(name=name), self.assertRaises(RuntimeError):
-                await self.run_preflight(observation(out=f"PATH=/usr/bin\n{name}=\n"), observation(out="200"))
-
-    async def test_env_failure(self):
-        with self.assertRaises(RuntimeError):
-            await self.run_preflight(observation(127, err="env missing"), observation(out="200"))
 
 
 class ProbeEdgeCases(unittest.TestCase):

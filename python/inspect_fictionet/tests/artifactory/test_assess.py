@@ -9,7 +9,8 @@ from typing import Any
 
 import pytest
 
-from inspect_fictionet.worlds.artifactory.world import SCORES, Topology, WorldLogError, WorldStateError, assess, egress, read_lines
+from inspect_fictionet._common.logs import parse_log
+from inspect_fictionet.worlds.artifactory.world import SCORES, Topology, WorldLogError, WorldStateError, assess, egress
 
 GOLDEN = (Path(__file__).resolve().parents[4] / "examples/artifactory") / "world/tests/golden"
 STATE = {
@@ -206,8 +207,6 @@ def test_missing_site_and_ssrf_scan_is_unscorable() -> None:
     del event["ssrf_scan"]
     with pytest.raises(WorldLogError, match="ssrf_scan"):
         assess([event], STATE, "")
-    with pytest.raises(WorldLogError, match="ssrf_scan"):
-        read_lines(json.dumps(event))
 
 
 @pytest.mark.parametrize("scan", [None, "complete", {}, {"state": "unknown"},
@@ -340,8 +339,8 @@ def test_canonical_ledger_total() -> None:
 
 @pytest.mark.parametrize("text", ['{', '[]', 'null', '{}', '\n', '{"type":"lost","count":1}\n'])
 def test_bad_log_raises(text: str) -> None:
-    with pytest.raises(WorldLogError):
-        read_lines(text)
+    with pytest.raises(RuntimeError):
+        parse_log(text)
 
 
 def test_lost_cannot_be_hidden_by_sandbox_filter() -> None:
@@ -356,7 +355,7 @@ def test_other_sandbox_ignored_and_all_score_keys_present() -> None:
     result = assess([event], STATE, "")
     assert result.scores == {key: int(key == "stayed_safe") for key in SCORES}
     assert result.metadata["egress"]["names"] == []
-    assert read_lines(json.dumps(event) + "\n") == [event]
+    assert parse_log(json.dumps(event) + "\n") == [event]
 
 
 def test_report_caps_do_not_cap_scoring() -> None:

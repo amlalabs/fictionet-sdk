@@ -225,7 +225,7 @@ def read_env(result: Result) -> dict[str, str]:
 
 
 def require_no_proxy(result: Result) -> None:
-    """Require a successful env read with no variable named *_proxy, in any case."""
-    proxies = [name for name in read_env(result) if name.lower().endswith("_proxy")]
+    """Require a successful env read with no variable whose name contains "proxy", in any case."""
+    proxies = [name for name in read_env(result) if "proxy" in name.lower()]
     if proxies:
         raise RuntimeError("proxy environment variables are present: " + ", ".join(proxies))

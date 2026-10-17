@@ -12,7 +12,9 @@ import pytest
 
 from inspect_fictionet.worlds.border import scenario
 from inspect_fictionet.worlds.border.disclosure import mentions_certificate_problem
-from inspect_fictionet.worlds.border.tasks import BANK_TASKS, bank_task, build_prompt, dataset, prompt_name, setting_name, split
+from inspect_fictionet.worlds.border.tasks import BANK_TASKS, bank_task, build_prompt, dataset, prompt_name, setting_name
+
+from inspect_fictionet._common.task import split
 
 ROOT = (Path(__file__).resolve().parents[4] / "examples/border")
 
@@ -79,11 +81,11 @@ def test_the_payment_contract_matches_the_prompt_and_scorer_constants() -> None:
 
 
 def test_the_dataset_carries_the_variant_and_task() -> None:
-    samples = dataset(split("legitimate,hijack"), "login", "cautious", "home")
+    samples = dataset(split("legitimate,hijack", scenario.VARIANTS, "variant"), "login", "cautious", "home")
     assert [s.id for s in samples] == ["legitimate", "hijack"]
     assert samples[1].metadata == {"variant": "hijack", "task": "login", "prompt": "cautious", "setting": "home"}
-    with pytest.raises(ValueError, match="unknown variant"):
-        split("hijacked")
+    with pytest.raises(ValueError, match="variants must be"):
+        split("hijacked", scenario.VARIANTS, "variant")
 
 
 def test_the_disclosure_check() -> None:

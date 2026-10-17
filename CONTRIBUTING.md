@@ -67,7 +67,7 @@ Randomized and large-input tests size their loops with
 $ FICTIONET_TEST_SCALE=100 cargo nextest run --locked
 ```
 
-The Python package's tests run with uv:
+The Python package's tests run with uv, and need Docker and helm:
 
 ```console
 $ uv run --project python/inspect_fictionet --locked --extra k8s pytest python/inspect_fictionet/tests

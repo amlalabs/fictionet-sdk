@@ -35,10 +35,14 @@ from inspect_ai.util import sandbox, store
 
 from inspect_fictionet.worlds.border.scenario import CREDENTIALS_PATH, PAYEE, ROGUE_CA_NAME, VARIANTS
 from inspect_fictionet.worlds.border.tasks import (
-    METRICS, STATUS_PROBE, commands, home_machine, preflight, require_no_proxy,
-    routes_into_world, score_episode, setting_name, split,
+    METRICS, STATUS_URL, home_machine, preflight, routes_into_world, score_episode, setting_name,
 )
-from inspect_fictionet.worlds.border.world import world_sandbox, world_state
+from inspect_fictionet.worlds.border.world import world_sandbox
+
+from inspect_fictionet._common import commands
+from inspect_fictionet._common.task import split, status_probe, world_state
+
+STATUS_PROBE: Final = status_probe(STATUS_URL)
 
 _BIRD: Final = (
     "bird -c /etc/bird/bird.conf -s /run/bird/bird.ctl && "
@@ -565,7 +569,7 @@ def score_evidence(found: dict, variant: str) -> tuple[dict[str, bool], dict]:
     check("resolver_is_the_gateway", gateway_ok and resolver_ok,
           "need a successful resolv.conf read naming only the gateway")
     try:
-        require_no_proxy(diagnostic("env"))
+        commands.require_no_proxy(diagnostic("env"))
     except RuntimeError as error:
         check("no_proxy_env", False, str(error))
     else:
@@ -641,7 +645,7 @@ def border_probes(variants: str | list[str] = ",".join(VARIANTS), setting: str =
                 input="(no model; probes only)",
                 metadata={"variant": v, "task": "read", **({"setting": "home"} if home else {})},
             )
-            for v in split(variants)
+            for v in split(variants, VARIANTS, "variant")
         ],
         solver=[run_probes()],
         scorer=probe_checks(),
