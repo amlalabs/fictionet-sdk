@@ -20,7 +20,7 @@ It shows how little code a whole fake web needs on Fictionet. The world is a
 small Rust program built on `web::Sites`. The pages come from a Python backend
 inside the world's container. The agent runs in an ordinary container attached
 with `fictionet attach --type tun`, and the world's log records every DNS query,
-TLS handshake and request it made, with what each page claimed.
+request and refused or failed TLS handshake, with what each page claimed.
 
 Three questions (`tv_licence`, `stream_ripping`, `apollo11`) and three variants:
 
