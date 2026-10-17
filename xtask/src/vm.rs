@@ -19,20 +19,6 @@ const KIND_VERSION: &str = "v0.33.0";
 const KUBECTL_VERSION: &str = "v1.37.1";
 const HELM_VERSION: &str = "v4.3.0";
 const UV_VERSION: &str = "0.12.22";
-const SUITES: &[&str] = &[
-    "netns",
-    "docker-web",
-    "docker-proxy",
-    "docker-ping",
-    "docker-tcpudp",
-    "k8s",
-    "k8s-proxy",
-    "border-world",
-    "border-scripted",
-    "border-probes",
-    "fakewiki-probes",
-    "cargo",
-];
 
 pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -98,26 +84,12 @@ fn download(url: &str, path: &Path, algorithm: &str, hash: &str) -> Result {
 }
 
 fn iso(output: &Path, label: &str, files: &[PathBuf]) -> Result {
-    let mut iso = if available("genisoimage") {
-        cmd("genisoimage", &[])
-    } else if available("mkisofs") {
-        cmd("mkisofs", &[])
-    } else if available("xorriso") {
-        cmd("xorriso", &["-as", "mkisofs"])
-    } else {
-        return Err("need genisoimage, mkisofs or xorriso".into());
-    };
     execute(
-        iso.args(["-quiet", "-output"])
+        cmd("genisoimage", &["-quiet", "-output"])
             .arg(output)
             .args(["-volid", label, "-joliet", "-rock"])
             .args(files),
     )
-}
-
-fn available(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(program).is_file()))
 }
 
 fn overlay(base: &Path, out: &Path, size: Option<&str>) -> Result {
@@ -450,18 +422,7 @@ impl Vm {
         let start = Instant::now();
         eprintln!("Preparing the VM image (packages, Docker, kind and Rust)");
         let part = prepared.with_extension("part");
-        for entry in fs::read_dir(self.path("images"))? {
-            let path = entry?.path();
-            if path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .starts_with("prepared-")
-                && path.extension().is_some_and(|e| e == "part")
-            {
-                remove(&path)?;
-            }
-        }
+        self.remove_prepared("part")?;
         overlay(
             Path::new(base.file_name().ok_or("missing image name")?),
             &part,
@@ -515,18 +476,7 @@ impl Vm {
         let stopped = self.stop();
         result.and(stopped)?;
         remove(&self.path("run"))?;
-        for entry in fs::read_dir(self.path("images"))? {
-            let path = entry?.path();
-            if path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .starts_with("prepared-")
-                && path.extension().is_some_and(|e| e == "qcow2")
-            {
-                remove(&path)?;
-            }
-        }
+        self.remove_prepared("qcow2")?;
         fs::rename(part, &prepared)?;
         remove(&self.path("ssh/known_hosts"))?;
         eprintln!(
@@ -534,6 +484,21 @@ impl Vm {
             start.elapsed().as_secs_f64()
         );
         Ok(prepared)
+    }
+    fn remove_prepared(&self, extension: &str) -> Result {
+        for entry in fs::read_dir(self.path("images"))? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("prepared-")
+                && path.extension().is_some_and(|e| e == extension)
+            {
+                remove(&path)?;
+            }
+        }
+        Ok(())
     }
     fn up(&self) -> Result {
         if self.pid().is_some() {
@@ -658,18 +623,7 @@ pub fn run(args: &[String]) -> Result {
         [nested] if nested == "nested" => return nested::run(false),
         [nested, fetch] if nested == "nested" && fetch == "--fetch" => return nested::run(true),
         [guest] if guest == "nested-guest" => return nested::guest(),
-        [test] if test == "test" => {
-            println!("{}", SUITES.join("\n"));
-            return Ok(());
-        }
         [test, name] if test == "test" => {
-            if name == "list" {
-                println!("{}", SUITES.join("\n"));
-                return Ok(());
-            }
-            if !SUITES.contains(&name.as_str()) {
-                return Err(format!("unknown VM suite: {name}").into());
-            }
             return with_vm(|vm| {
                 vm.sync()?;
                 logged(
@@ -684,7 +638,7 @@ pub fn run(args: &[String]) -> Result {
         }
         [help] if matches!(help.as_str(), "--help" | "-h") => {
             println!(
-                "cargo xtask vm [--fetch | nested [--fetch] | prepare | up | down | clean | status | sync | build [sdk|border|fakewiki] | test [list|name] | ssh [command]]"
+                "cargo xtask vm [--fetch | nested [--fetch] | prepare | up | down | clean | status | sync | build [sdk|border|fakewiki] | test <name> | ssh [command]]"
             );
             return Ok(());
         }
