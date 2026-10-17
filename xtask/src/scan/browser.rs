@@ -316,7 +316,7 @@ impl Browser {
         Ok(())
     }
 
-    pub fn finish_scan(&mut self, services: bool) -> Result {
+    pub fn finish_scan(&mut self) -> Result {
         while self
             .scan
             .as_ref()
@@ -326,8 +326,7 @@ impl Browser {
         {
             self.pump()?;
         }
-        let output = self.scan.take().unwrap().finish()?;
-        super::validate_scan(&output, services)
+        self.scan.take().unwrap().finish()
     }
 
     pub fn finish(mut self) -> Result {
