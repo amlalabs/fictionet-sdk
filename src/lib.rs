@@ -413,28 +413,10 @@ pub use sys::random_bytes;
 /// `Sync` converts into [`Error`] with `?`.
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
-/// The README's example, `docs/readme/sites.rs`, compiled as a doctest.
-/// `tests/readme.rs` checks that the README shows exactly that file.
-#[cfg(doctest)]
-#[doc = concat!(
-    "```\n",
-    "# use std::net::Ipv4Addr;\n",
-    "# use std::sync::Arc;\n",
-    "# use fictionet::{Attachments, Cx, Result, stdlib::web};\n",
-    "# use rustls::ServerConfig;\n",
-    "# struct Certs { wikipedia: Arc<ServerConfig>, stripe: Arc<ServerConfig> }\n",
-    "# async fn world(fcx: Cx, attachments: Attachments) -> Result {\n",
-    "# let wiki = axum::Router::new();\n",
-    "# let fake_stripe = axum::Router::new();\n",
-    "# fn certificates() -> Certs { unimplemented!() }\n",
-    "# let certs = certificates();\n",
-    include_str!("../docs/readme/sites.rs"),
-    "# Ok(())\n",
-    "# }\n",
-    "```\n",
-)]
-#[cfg(feature = "std")]
-pub struct ReadmeExample;
+#[cfg(all(doctest, feature = "std"))]
+#[doc(hidden)]
+#[doc = include_str!("../README.md")]
+mod readme {}
 
 /// Includes tokens when the SDK's `tokio` feature is enabled.
 ///

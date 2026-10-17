@@ -108,20 +108,32 @@ addresses, a router, one machine per address, TLS and HTTP. Each site is a
 [tower](https://docs.rs/tower) service, such as an axum `Router`.
 
 ```rust
-// wiki and fake_stripe are axum Routers; certs holds rustls ServerConfigs.
-web::Sites::new(move |host: &str| match host {
-    "en.wikipedia.org" => Some(
-        web::Site::new(wiki.clone())
-            .at(Ipv4Addr::new(185, 15, 59, 224))
-            .tls(certs.wikipedia.clone()),
-    ),
-    "api.stripe.com" => Some(
-        web::Site::new(fake_stripe.clone())
-            .tls(certs.stripe.clone()),
-    ),
-    _ => None, // NXDOMAIN: the world stays closed
-})
-.start(&fcx, attachments)?;
+use std::{net::Ipv4Addr, sync::Arc};
+use fictionet::{Attachments, Cx, Result, stdlib::web};
+use rustls::ServerConfig;
+
+fn world(
+    fcx: Cx,
+    attachments: Attachments,
+    wiki: axum::Router,
+    fake_stripe: axum::Router,
+    wikipedia_tls: Arc<ServerConfig>,
+    stripe_tls: Arc<ServerConfig>,
+) -> Result {
+    web::Sites::new(move |host: &str| match host {
+        "en.wikipedia.org" => Some(
+            web::Site::new(wiki.clone())
+                .at(Ipv4Addr::new(185, 15, 59, 224))
+                .tls(wikipedia_tls.clone()),
+        ),
+        "api.stripe.com" => Some(
+            web::Site::new(fake_stripe.clone())
+                .tls(stripe_tls.clone()),
+        ),
+        _ => None, // NXDOMAIN: the world stays closed
+    })
+    .start(&fcx, attachments)
+}
 ```
 
 A longer version, which the docs compile as a test, is at the top of

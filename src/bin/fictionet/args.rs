@@ -785,6 +785,42 @@ mod tests {
     }
 
     #[test]
+    fn tun_in_a_namespace_with_both_address_families() {
+        let a = parse_attach(&args(
+            "--world unix:/run/fictionet/world.sock --name agent --type tun \
+             --netns /run/netns/agent \
+             --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
+             --ip-addr-v6 2001:db8::2/64 --gateway-v6 2001:db8::1 --dns-v6 2001:db8::1",
+        ))
+        .unwrap();
+        assert_eq!(
+            a,
+            AttachArgs {
+                world: "/run/fictionet/world.sock".into(),
+                name: "agent".into(),
+                netns: Some("/run/netns/agent".into()),
+                ip_addr: Setting::Value(Cidr {
+                    addr: Ipv4Addr::new(10, 0, 0, 2),
+                    prefix: 24,
+                }),
+                gateway: Setting::Value(Ipv4Addr::new(10, 0, 0, 1)),
+                dns: Setting::Value(Ipv4Addr::new(10, 0, 0, 1)),
+                ip_addr_v6: Setting::Value(Cidr {
+                    addr: "2001:db8::2".parse().unwrap(),
+                    prefix: 64,
+                }),
+                gateway_v6: Setting::Value("2001:db8::1".parse().unwrap()),
+                dns_v6: Setting::Value("2001:db8::1".parse().unwrap()),
+                mtu: 1500,
+                ready_file: None,
+                resolv_conf: ResolvConf::Default,
+                down_links: Vec::new(),
+                world_wait: std::time::Duration::ZERO,
+            }
+        );
+    }
+
+    #[test]
     fn every_setting_off() {
         let a = parse_attach(&args(ALL_OFF)).unwrap();
         for off in [
@@ -1038,6 +1074,34 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[test]
+    fn proxies_with_a_readiness_file() {
+        for kind in [ProxyKind::Http, ProxyKind::Socks5] {
+            let p = parse_proxy(&format!(
+                "--world unix:/run/fictionet/world.sock --name agent \
+                 --type {} --listen 0.0.0.0:8080 --token-file /run/fictionet/token \
+                 --ip-addr 10.0.0.2 --dns 10.0.0.1 --ready-file /run/fictionet/attach.ready",
+                kind.name(),
+            ))
+            .unwrap();
+            assert_eq!(
+                p,
+                ProxyArgs {
+                    kind,
+                    world: "/run/fictionet/world.sock".into(),
+                    name: "agent".into(),
+                    listen: "0.0.0.0:8080".parse().unwrap(),
+                    token_file: "/run/fictionet/token".into(),
+                    ip_addr: Ipv4Addr::new(10, 0, 0, 2),
+                    dns: Ipv4Addr::new(10, 0, 0, 1),
+                    ready_file: Some("/run/fictionet/attach.ready".into()),
+                    world_wait: std::time::Duration::ZERO,
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
     fn proxy_types_refuse_tun_flags() {
         let bad = |extra: &str| parse_proxy(&format!("{PROXY} {extra}")).unwrap_err();
         let e = bad("--gateway 10.0.0.1");
@@ -1141,6 +1205,51 @@ mod tests {
         ))
         .unwrap();
         assert_eq!((t.v4, t.v6), (Family::Off, Family::Off));
+    }
+
+    #[test]
+    fn tap_with_an_ipv4_lease_and_readiness_file() {
+        for (link, vm, netns) in [
+            (
+                "qemu:/run/fictionet/agent.sock",
+                VmLink::Qemu("/run/fictionet/agent.sock".into()),
+                None,
+            ),
+            (
+                "tap:tap0 --netns /run/netns/vm1",
+                VmLink::Tap("tap0".into()),
+                Some("/run/netns/vm1".into()),
+            ),
+        ] {
+            let t = parse_tap(&format!(
+                "--world unix:/run/fictionet/world.sock --name agent \
+                 --type tap --vm {link} \
+                 --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 --no-ip-addr-v6 \
+                 --ready-file /run/fictionet/agent.ready"
+            ))
+            .unwrap();
+            assert_eq!(
+                t,
+                TapArgs {
+                    world: "/run/fictionet/world.sock".into(),
+                    name: "agent".into(),
+                    vm,
+                    netns,
+                    v4: Family::Serve(Lease {
+                        addr: Cidr {
+                            addr: Ipv4Addr::new(10, 0, 0, 2),
+                            prefix: 24,
+                        },
+                        gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                        dns: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                    }),
+                    v6: Family::Off,
+                    mtu: 1500,
+                    ready_file: Some("/run/fictionet/agent.ready".into()),
+                    world_wait: std::time::Duration::ZERO,
+                }
+            );
+        }
     }
 
     #[test]
