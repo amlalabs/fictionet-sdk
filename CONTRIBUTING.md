@@ -102,7 +102,7 @@ commands. `cargo xtask --help` lists them.
 | `cargo xtask docker <ping\|tcpudp\|proxy\|web>` | Runs a Docker Compose test of `fictionet attach`. |
 | `cargo xtask k8s [tun\|proxy]` | Runs the Helm chart on kind. |
 | `cargo xtask vm ...` | Boots the development VM and runs test suites in it ([vm/README.md](vm/README.md)). |
-| `cargo xtask demo <border\|dashboard\|k8s\|proxy\|web>` | Runs a demo in the VM ([demos/README.md](demos/README.md)). |
+| `cargo xtask demo <name>` | Runs a demo in the VM. [demos/README.md](demos/README.md) lists them. |
 | `cargo xtask eval <border\|fakewiki\|adaptive-web\|artifactory>` | Builds a world's images and runs its Inspect eval. |
 | `cargo xtask fuzz [--check \| <target> \| <seconds>]` | Runs the fuzz targets ([fuzz/README.md](fuzz/README.md)). |
 | `cargo xtask scan [output directory]` | Records the scan example's dashboard. |

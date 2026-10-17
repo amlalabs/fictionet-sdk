@@ -69,14 +69,11 @@ event log and the same packets, byte for byte
 $ cargo xtask demo web
 ```
 
-The demo needs no root or Docker on your machine. It needs QEMU, KVM and
-[the host tools listed in vm/README.md](vm/README.md#the-fictionet-vm).
-It boots a small Debian VM, builds Fictionet inside it, and shows a sandbox
-using a world of websites with `dig`, `curl` and `ping`. The first run downloads
-and prepares the VM image, which takes a few minutes. [demos/](demos/README.md)
-has more: the proxy types, Kubernetes, and the BGP hijack from the Border eval
-(`examples/border`). `cargo xtask vm test <name>` runs the test suites in the same VM
-([vm/README.md](vm/README.md)).
+It boots a small Debian VM under QEMU and KVM, builds Fictionet inside it, and
+shows a sandbox using a world of websites with `dig`, `curl` and `ping`. Nothing
+needs root or Docker on your machine. The first run takes a few minutes; after
+that a demo starts in seconds. [demos/README.md](demos/README.md) lists every
+demo, what each one needs and shows, and how to make a demo of your own.
 
 ## Install
 
