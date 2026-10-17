@@ -194,9 +194,9 @@ jobs:
         with:
           tool: wasm-pack
       - name: Check
-        run: cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
+        run: cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown -p fictionet
       - name: Clippy
-        run: cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+        run: cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -p fictionet -- -D warnings
       - name: Check the browser example
         run: cargo check --locked --all-targets -p wasm-world --target wasm32-unknown-unknown
       - name: The browser example, in Node.js
