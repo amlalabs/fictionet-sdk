@@ -1,7 +1,4 @@
-#[path = "common/benchmark.rs"]
-mod benchmark;
-
-use benchmark::{Observer, ObserverStatus};
+use super::benchmark::{self, Observer, ObserverStatus};
 use fictionet::relay::observer::Value;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::TcpListener;
@@ -50,68 +47,68 @@ macro_rules! rejected_response {
 }
 
 rejected_response!(
-    benchmark_rejects_header_only,
+    fetch_rejects_header_only,
     b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\n",
     "HTTP body length"
 );
 rejected_response!(
-    benchmark_rejects_partial_body,
+    fetch_rejects_partial_body,
     b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nplain",
     "HTTP body length"
 );
 rejected_response!(
-    benchmark_rejects_extra_body,
+    fetch_rejects_extra_body,
     b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nplain site\n!",
     "HTTP body length"
 );
 rejected_response!(
-    benchmark_rejects_incomplete_head,
+    fetch_rejects_incomplete_head,
     b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\n",
     "complete HTTP response head"
 );
 rejected_response!(
-    benchmark_rejects_missing_length,
+    fetch_rejects_missing_length,
     b"HTTP/1.1 200 OK\r\n\r\nplain site\n",
     "missing Content-Length"
 );
 rejected_response!(
-    benchmark_rejects_invalid_length,
+    fetch_rejects_invalid_length,
     b"HTTP/1.1 200 OK\r\nContent-Length: +11\r\n\r\nplain site\n",
     "invalid Content-Length"
 );
 rejected_response!(
-    benchmark_rejects_duplicate_length,
+    fetch_rejects_duplicate_length,
     b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\ncontent-length: 11\r\n\r\nplain site\n",
     "duplicate Content-Length"
 );
 rejected_response!(
-    benchmark_rejects_conflicting_length,
+    fetch_rejects_conflicting_length,
     b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\ncontent-length: 5\r\n\r\nplain site\n",
     "duplicate Content-Length"
 );
 rejected_response!(
-    benchmark_rejects_transfer_encoding,
+    fetch_rejects_transfer_encoding,
     b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\ntRaNsFeR-EnCoDiNg: chunked\r\n\r\nplain site\n",
     "requires Content-Length framing"
 );
 rejected_response!(
-    benchmark_rejects_wrong_status,
+    fetch_rejects_wrong_status,
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nplain site\n",
     "HTTP status"
 );
 rejected_response!(
-    benchmark_rejects_status_prefix,
+    fetch_rejects_status_prefix,
     b"HTTP/1.1 2000 OK\r\nContent-Length: 11\r\n\r\nplain site\n",
     "HTTP status"
 );
 rejected_response!(
-    benchmark_rejects_invalid_header,
+    fetch_rejects_invalid_header,
     b"HTTP/1.1 200 OK\r\nContent-Length : 11\r\n\r\nplain site\n",
     "HTTP header name"
 );
 
 #[test]
-fn benchmark_accepts_complete_body() {
+fn fetch_accepts_complete_body() {
     assert_eq!(
         fetch(
             b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nplain site\n",
@@ -122,7 +119,7 @@ fn benchmark_accepts_complete_body() {
 }
 
 #[test]
-fn benchmark_accepts_complete_502() {
+fn fetch_accepts_complete_502() {
     assert_eq!(
         fetch(
             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 26\r\n\r\nno such name in the world\n",
@@ -134,7 +131,7 @@ fn benchmark_accepts_complete_502() {
 
 #[test]
 #[should_panic(expected = "HTTP body length")]
-fn benchmark_rejects_partial_502() {
+fn fetch_rejects_partial_502() {
     fetch(
         b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 26\r\n\r\nno such name",
         502,
