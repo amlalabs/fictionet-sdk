@@ -64,7 +64,11 @@ fn cancelling_deferred_end_work_keeps_the_world_running() {
                 );
                 let mut conn = client.connect(&fcx, "10.0.0.1:7".parse()?).await?;
                 conn.write_all(&fcx, b"bye\n").await?;
-                fcx.sleep(ms(100)).await?;
+                fcx.events()
+                    .wait(&fcx, 1, ms(100), |e| {
+                        e.is("conn", "close") && e.str("end") == Some("cancelled")
+                    })
+                    .await?;
                 assert!(
                     fcx.events()
                         .all()

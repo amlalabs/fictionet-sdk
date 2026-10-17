@@ -1,10 +1,10 @@
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Waker};
 
 use fictionet::stdlib::{ConnectionExt, filter, tcp};
-use fictionet::{Entropy, Seed, SeededEntropy, block_on, pair, run};
+use fictionet::{Entropy, Seed, SeededEntropy, block_on, lab, pair};
 
 #[test]
 fn interleaved_runs_have_independent_contiguous_streams() {
@@ -12,9 +12,10 @@ fn interleaved_runs_have_independent_contiguous_streams() {
     let contexts = Arc::new(Mutex::new(Vec::new()));
     let make = |seed| {
         let contexts = contexts.clone();
-        Box::pin(run(seed, move |fcx| async move {
-            contexts.lock().unwrap().push(fcx);
-            poll_fn(|_| Poll::<fictionet::Result>::Pending).await
+        Box::pin(lab(seed, move |fcx| async move {
+            contexts.lock().unwrap().push(fcx.clone());
+            fcx.yield_now().await?;
+            std::future::pending::<fictionet::Result>().await
         }))
     };
     let seed = Seed::from_u64(42);
@@ -52,7 +53,7 @@ struct Trace {
 fn connection_trace(seed: Seed) -> Trace {
     let trace = Arc::new(Mutex::new(Trace::default()));
     let output = trace.clone();
-    block_on(run(seed, move |fcx| async move {
+    block_on(lab(seed, move |fcx| async move {
         let a: IpAddr = "10.0.0.1".parse()?;
         let b: IpAddr = "10.0.0.2".parse()?;
         let (left, right) = pair();

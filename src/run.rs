@@ -212,6 +212,8 @@ struct Queue {
     /// The run was dropped.
     closed: bool,
     next_id: u64,
+    idle: BTreeMap<u64, Waker>,
+    next_idle: u64,
 }
 
 struct NewTask {
@@ -222,6 +224,47 @@ struct NewTask {
 }
 
 impl RunShared {
+    pub(crate) async fn idle(&self) {
+        struct Wait<'a> {
+            run: &'a RunShared,
+            key: Option<u64>,
+        }
+        impl Drop for Wait<'_> {
+            fn drop(&mut self) {
+                if let Some(key) = self.key {
+                    let removed = self.run.queue.lock().idle.remove(&key);
+                    drop(removed);
+                }
+            }
+        }
+        let mut wait = Wait {
+            run: self,
+            key: None,
+        };
+        std::future::poll_fn(|cx| {
+            let mut q = self.queue.lock();
+            let (key, outer) = if let Some(key) = wait.key {
+                if !q.idle.contains_key(&key) {
+                    return Poll::Ready(());
+                }
+                (key, None)
+            } else {
+                let key = q.next_idle;
+                q.next_idle += 1;
+                wait.key = Some(key);
+                (key, if q.polling { None } else { q.outer.clone() })
+            };
+            let old = q.idle.insert(key, cx.waker().clone());
+            drop(q);
+            drop(old);
+            if let Some(outer) = outer {
+                outer.wake();
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
     pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Self> {
         let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
@@ -549,7 +592,13 @@ impl RunState {
             });
         }
         let more = !q.ready.is_empty() || !q.incoming.is_empty() || q.wake_all;
-        if !more && self.shared.environment.clock.mode() == crate::RunMode::Lab {
+        if !more && !q.idle.is_empty() {
+            let idle = std::mem::take(&mut q.idle);
+            drop(q);
+            for waker in idle.into_values() {
+                waker.wake();
+            }
+        } else if !more && self.shared.environment.clock.mode() == crate::RunMode::Lab {
             // Admission and the time jump share this boundary. A spawn or
             // wake cannot slip between checking the queue and advancing.
             let due = match self.shared.environment.clock.advance() {

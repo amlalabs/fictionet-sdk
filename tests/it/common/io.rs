@@ -5,7 +5,6 @@ use fictionet::stdlib::{ConnError, Connection, codec, http1};
 use fictionet::{Cx, RaceError, time::Instant};
 
 /// Requires EOF. The caller must bound blocking reads with a socket timeout.
-#[allow(dead_code)]
 pub fn read_all(reader: &mut impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).expect("read until EOF");
@@ -13,7 +12,6 @@ pub fn read_all(reader: &mut impl Read) -> Vec<u8> {
 }
 
 /// Includes the delimiter, without consuming the next byte. Requires a read timeout.
-#[allow(dead_code)]
 pub fn read_until(reader: &mut impl Read, delimiter: &[u8]) -> Vec<u8> {
     assert!(!delimiter.is_empty(), "empty delimiter");
     let mut bytes = Vec::new();
@@ -26,7 +24,6 @@ pub fn read_until(reader: &mut impl Read, delimiter: &[u8]) -> Vec<u8> {
 }
 
 /// Requires EOF by the deadline. Race failures stay separate from transport errors.
-#[allow(dead_code)]
 pub async fn read_to_end(
     fcx: &Cx,
     conn: &mut impl Connection,
@@ -47,7 +44,6 @@ pub async fn read_to_end(
 }
 
 /// Includes the delimiter without read-ahead. EOF and transport errors panic.
-#[allow(dead_code)]
 pub async fn read_until_async(
     fcx: &Cx,
     conn: &mut impl Connection,
@@ -72,7 +68,6 @@ pub async fn read_until_async(
 }
 
 /// Validates one whole response. Close-delimited bodies need explicit opt-in and EOF.
-#[allow(dead_code)]
 pub fn response(bytes: &[u8], method: &str, allow_close_delimited: bool) -> http1::Response {
     let response = http1::Response::parse_for(bytes, method).expect("complete HTTP response");
     if !allow_close_delimited {

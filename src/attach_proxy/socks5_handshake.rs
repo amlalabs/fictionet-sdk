@@ -100,7 +100,7 @@ where
                 if !g.methods.contains(&Method::UsernamePassword) {
                     #[expect(
                         clippy::let_underscore_must_use,
-                        reason = "POL-TEARDOWN: the refusal is returned either way; this reply only informs a client that may be gone"
+                        reason = "the refusal is returned either way; this reply only informs a client that may be gone"
                     )]
                     let _ = s
                         .write_all(&write(&Selection {
@@ -122,7 +122,7 @@ where
                 if !ok {
                     #[expect(
                         clippy::let_underscore_must_use,
-                        reason = "POL-TEARDOWN: the refusal is returned either way; this reply only informs a client that may be gone"
+                        reason = "the refusal is returned either way; this reply only informs a client that may be gone"
                     )]
                     let _ = s.write_all(&write(&AuthReply { status: 1 })).await;
                     return Err(Refusal::BadToken);
@@ -197,7 +197,7 @@ where
 async fn refuse<W: AsyncWrite + Unpin>(w: &mut W, code: ReplyCode, why: &'static str) -> Refusal {
     #[expect(
         clippy::let_underscore_must_use,
-        reason = "POL-TEARDOWN: the caller returns this Refusal either way; the reply only informs a client that may be gone"
+        reason = "the caller returns this Refusal either way; the reply only informs a client that may be gone"
     )]
     let _ = w.write_all(&reply(code, None)).await;
     Refusal::Reply(code, why)
@@ -463,7 +463,7 @@ mod tests {
             }
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-PROBE: random bytes may be refused; this test checks that the handshake never panics"
+                reason = "random bytes may be refused; this test checks that the handshake never panics"
             )]
             let _ = run(v);
         }

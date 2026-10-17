@@ -3,8 +3,6 @@
 //! changes and custom events, and watching a link's packets.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fictionet::Interface;
@@ -302,41 +300,51 @@ fn start_world(path: &str) -> fictionet::Listening {
     let (attacher, mut attachments) = fictionet::attachments();
     let listening =
         fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
             fictionet::Seed::random(),
             move |fcx| async move {
-                while let Ok(mut sandbox) = attachments.next(&fcx).await {
-                    fcx.spawn(move |fcx| async move {
-                        let (mut mine, mut theirs) = fictionet::pair();
+                fcx.spawn(move |fcx| async move {
+                    while let Ok(mut sandbox) = attachments.next(&fcx).await {
                         fcx.spawn(move |fcx| async move {
-                            while let Ok(p) = theirs.recv(&fcx).await {
-                                fcx.record(
-                                    fictionet::events::Event::new("test", "echo")
-                                        .field("len", p.0.len() as u64),
-                                );
-                                theirs.send(p);
+                            let (mut mine, mut theirs) = fictionet::pair();
+                            fcx.spawn(move |fcx| async move {
+                                while let Ok(p) = theirs.recv(&fcx).await {
+                                    fcx.record(
+                                        fictionet::events::Event::new("test", "echo")
+                                            .field("len", p.0.len() as u64),
+                                    );
+                                    theirs.send(p);
+                                }
+                                Ok(())
+                            });
+                            while let Ok(p) = sandbox.recv(&fcx).await {
+                                mine.send(p);
+                                let back = mine.recv(&fcx).await?;
+                                sandbox.send(back);
                             }
                             Ok(())
                         });
-                        while let Ok(p) = sandbox.recv(&fcx).await {
-                            mine.send(p);
-                            let back = mine.recv(&fcx).await?;
-                            sandbox.send(back);
-                        }
-                        Ok(())
-                    });
-                }
+                    }
+                    Ok(())
+                });
+                fcx.idle().await?;
+                ready_tx.send(()).unwrap();
                 Ok(())
             },
         ));
     });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     listening
 }
 
 /// Attaches a sandbox called `name` by speaking the relay protocol, and
-/// sends it a ping every 20 ms until `stop` is set.
-fn start_sandbox(path: &str, name: &str, stop: Arc<AtomicBool>) {
+/// sends one ping per command. Dropping the sender detaches it.
+fn start_sandbox(
+    path: &str,
+    name: &str,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
     let fd = unix::connect(path).unwrap();
     let hello = Hello {
         version: relay::VERSION,
@@ -348,23 +356,22 @@ fn start_sandbox(path: &str, name: &str, stop: Arc<AtomicBool>) {
     let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
     let n = unix::recv(fd.as_raw_fd(), &mut buf, false).unwrap();
     assert_eq!(relay::decode(&buf[..n]), Ok(Message::Accept));
-    std::thread::spawn(move || {
+    let (send, receive) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
         let fd: OwnedFd = fd;
         let mut seq = 0u16;
-        while !stop.load(Ordering::SeqCst) {
+        while receive.recv().is_ok() {
             let mut ping = vec![
                 0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1, 8, 0, 0, 0,
                 0x12, 0x34,
             ];
             ping.extend_from_slice(&seq.to_be_bytes());
-            if unix::send(fd.as_raw_fd(), &Message::Packet(&ping).encode(), false).is_err() {
-                return;
-            }
-            let _ = unix::recv(fd.as_raw_fd(), &mut buf, false);
+            unix::send(fd.as_raw_fd(), &Message::Packet(&ping).encode(), false).unwrap();
+            assert!(unix::recv(fd.as_raw_fd(), &mut buf, false).unwrap() > 0);
             seq = seq.wrapping_add(1);
-            std::thread::sleep(Duration::from_millis(20));
         }
     });
+    (send, thread)
 }
 
 fn text(v: &Value) -> String {
@@ -438,23 +445,12 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
         "{}",
         text(&world)
     );
-    // The observer finds the run once the world first asks for a sandbox;
-    // before that, a watch starts with "waiting". Wait for it, so the watch
-    // below starts with the snapshot even on a busy machine.
-    let start = Instant::now();
-    while !text(&client.call(r#"{"op":"world"}"#).unwrap()).contains(r#""running":true"#) {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "the world never started running"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(text(&client.call(r#"{"op":"world"}"#).unwrap()).contains(r#""running":true"#));
 
     // Follow the graph, then attach a sandbox: it shows up as a node with
     // an edge, its counters rise, and the echo task's events arrive.
     let watch = client.request(r#"{"op":"watch"}"#).unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    start_sandbox(&path, "agent", stop.clone());
+    let (ping, sandbox) = start_sandbox(&path, "agent");
     let mut sandbox_edge = None;
     let (mut counters, mut echoes) = (0, 0);
     let seen = until(&mut client, |v| {
@@ -466,7 +462,14 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
         if t.starts_with(r#"{"event":"edge""#) || t.starts_with(r#"{"event":"snapshot""#) {
             sandbox_edge = sandbox_edge.or_else(|| sandbox_edge_in(&t));
         }
-        counters += t.starts_with(r#"{"event":"counters""#) as u32;
+        if t.starts_with(r#"{"event":"snapshot""#) {
+            ping.send(()).unwrap();
+        } else if t.starts_with(r#"{"event":"counters""#) {
+            counters += 1;
+            if counters < 2 {
+                ping.send(()).unwrap();
+            }
+        }
         if t.starts_with(r#"{"event":"event""#)
             && t.contains(r#""source":"test","kind":"echo","#)
             && t.contains(r#""fields":{"len":28}"#)
@@ -544,6 +547,9 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
         .request(&format!(r#"{{"op":"packets","link":"e{edge}"}}"#))
         .unwrap();
     let seen = until(&mut client, |v| {
+        if v.id == packets && text(v).starts_with(r#"{"event":"link""#) {
+            ping.send(()).unwrap();
+        }
         v.id == packets && text(v).starts_with(r#"{"event":"packet""#)
     });
     let link = seen.iter().find(|v| v.id == packets).unwrap();
@@ -588,7 +594,8 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
     assert_eq!(text(&err), r#"{"error":"unknown op fly"}"#);
 
     // When the sandbox leaves, its link closes and the packet stream ends.
-    stop.store(true, Ordering::SeqCst);
+    drop(ping);
+    sandbox.join().unwrap();
     let last = until(&mut client, |v| v.id == packets && v.end)
         .pop()
         .unwrap();
@@ -618,23 +625,25 @@ fn observer_session_capacity_counts_idle_clients_and_reuses_slots() {
             Some(refusal)
         );
     }
-    start_sandbox(&path, "agent", Arc::new(AtomicBool::new(true)));
+    drop(start_sandbox(&path, "agent"));
     assert!(text(&first.call(r#"{"op":"world"}"#).unwrap()).contains(r#""running":false"#));
     drop(second);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut reused = loop {
-        match Client::connect(&path, "reused") {
-            Ok(client) => break client,
+    let mut reused = None;
+    crate::common::poll::until(
+        Duration::from_secs(5),
+        "disconnected observer slot to be released",
+        || match Client::connect(&path, "reused") {
+            Ok(client) => {
+                reused = Some(client);
+                true
+            }
             Err(reason) => {
                 assert_eq!(reason, refusal);
-                assert!(
-                    Instant::now() < deadline,
-                    "the disconnected slot was not released"
-                );
-                std::thread::yield_now();
+                false
             }
-        }
-    };
+        },
+    );
+    let mut reused = reused.unwrap();
     reused.set_timeout(Some(Duration::from_secs(5))).unwrap();
     listening.set_observer_limit(0);
     assert_eq!(
@@ -732,7 +741,7 @@ fn an_observer_takes_no_name() {
     // An observer called "agent" does not stop a sandbox called "agent".
     let _a = Client::connect(&path, "agent").unwrap();
     let _b = Client::connect(&path, "agent").unwrap();
-    start_sandbox(&path, "agent", Arc::new(AtomicBool::new(true)));
+    drop(start_sandbox(&path, "agent"));
 }
 
 #[test]
@@ -779,5 +788,5 @@ fn a_later_observer_type_is_refused() {
         other => panic!("expected a refusal, got {other:?}"),
     }
     // The name was not taken.
-    start_sandbox(&path, "agent", Arc::new(AtomicBool::new(true)));
+    drop(start_sandbox(&path, "agent"));
 }

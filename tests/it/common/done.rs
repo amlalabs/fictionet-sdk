@@ -9,7 +9,6 @@ impl std::fmt::Display for Done {
 impl std::error::Error for Done {}
 
 /// Requires a region to end with Done and preserves every other error.
-#[allow(dead_code)]
 pub fn ended_with_done(result: fictionet::Result) -> fictionet::Result {
     match result {
         Err(e) if e.downcast_ref::<Done>().is_some() => Ok(()),

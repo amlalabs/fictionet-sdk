@@ -43,19 +43,6 @@ where
     });
 }
 
-pub(super) fn real_world<F, Fut>(f: F)
-where
-    F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
-    Fut: Future<Output = fictionet::Result> + Send + 'static,
-{
-    run_world::real_world(Duration::from_secs(60), move |fcx| async move {
-        let (attacher, attachments) = fictionet::attachments();
-        let env = sites(&fcx).serve_with(&fcx, attachments)?;
-        f(fcx, attacher, env).await?;
-        Ok(())
-    });
-}
-
 // ---------------------------------------------------------------------------
 // The sites
 

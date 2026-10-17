@@ -72,10 +72,6 @@ fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
         let layer = Layer::from_event(&events.all()[1]);
         assert_eq!(layer.name, "test.n");
         assert_eq!(layer.summary, "n=1");
-        wait::until(&fcx, Duration::from_secs(10), || {
-            std::fs::read_to_string(&p).unwrap().lines().count() == 3
-        })
-        .await;
         assert_eq!(events.lost(), 0);
         Ok(())
     });

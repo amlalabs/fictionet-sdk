@@ -2279,7 +2279,7 @@ pub mod harness {
         for (index, chunk) in bytes.chunks(17).enumerate() {
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-SCAFFOLD: arbitrary chunks may exceed the budget; the harness checks the buffered and budget bounds, not how much each push took"
+                reason = "arbitrary chunks may exceed the budget; the harness checks the buffered and budget bounds, not how much each push took"
             )]
             let _ = session.push([0, 2, 4, 6, 10][index % 5], chunk);
             while session.next().is_some() {}

@@ -21,7 +21,7 @@ def helm():
     executable = shutil.which("helm")
     if executable is None:
         assert "CI" not in os.environ, "helm is required in CI"
-        pytest.skip("POL-PREREQUISITE: needs helm")
+        pytest.skip("needs helm")
     return executable
 
 

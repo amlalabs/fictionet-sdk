@@ -141,7 +141,7 @@ impl WatchSet {
             }
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-FALLBACK: reap_later refuses only in a lab, which has no reaper thread; there evict_idle runs when the next watch starts"
+                reason = "reap_later refuses only in a lab, which has no reaper thread; there evict_idle runs when the next watch starts"
             )]
             let _ = Self::reap_later(&graph);
         }

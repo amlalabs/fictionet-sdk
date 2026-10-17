@@ -113,7 +113,7 @@ impl Meter {
     pub(crate) fn set_sandbox(&self, name: &str) {
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: callers set the sandbox once, on a meter just made by Meter::new or pair_with_guard"
+            reason = "callers set the sandbox once, on a meter just made by Meter::new or pair_with_guard"
         )]
         let _ = self.sandbox.set(Arc::from(name));
     }
@@ -122,7 +122,7 @@ impl Meter {
     pub(crate) fn count_in(&self, counted: Weak<dyn Counted>) {
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: the only caller, cable::make, sets it once, right after Meter::new"
+            reason = "the only caller, cable::make, sets it once, right after Meter::new"
         )]
         let _ = self.counted.set(counted);
     }

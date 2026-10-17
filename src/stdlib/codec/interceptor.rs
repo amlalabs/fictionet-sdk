@@ -233,7 +233,6 @@ impl Interceptor {
     /// Rewrite errors roll back this call. Decode errors keep consumed skips.
     /// Consumed input is not restored. Skip-only calls may append bytes and
     /// return `None`. The writer follows [`apply_with`](Self::apply_with).
-    #[allow(clippy::type_complexity)]
     pub fn next_with<D: Decode, T, E>(
         &self,
         stream: &mut Stream<D>,
@@ -249,7 +248,6 @@ impl Interceptor {
 
     /// Rewrites with caller-owned framing and observes the same pass.
     /// Uses the skip and transaction rules of [`next_with`](Self::next_with).
-    #[allow(clippy::type_complexity)]
     pub fn next_with_observed<D: Decode, T, E>(
         &self,
         stream: &mut Stream<D>,

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::task::Poll;
 
 use crate::Cx;
 use crate::stdlib::json::Value;
@@ -106,14 +107,15 @@ impl EventLog {
         fcx.record_at(Instant::ZERO, event);
     }
 
-    /// Waits until `n` held events match `pick`, checking every 10 ms on
-    /// the run's clock, for at most `limit`. Returns those events, or every
-    /// match so far if the time ran out. Each check first records the
-    /// counts of [repeats](crate::events#repeats) that are due. Returns early with
+    /// Waits until `n` held events match `pick`, waking when events are
+    /// recorded or a count of [repeats](crate::events#repeats) becomes due.
+    /// Waits for at most `limit` on the run's clock: simulated time in a lab.
+    /// Returns those events, or every match so far if the time ran out.
+    /// Each check first records the repeat counts that are due. Returns early with
     /// [`Cancelled`](crate::Cancelled) if `fcx`'s [region](Cx#regions) is
     /// cancelled. Cancellation is checked before inspecting events and
     /// before returning matches, even if `n` is zero or the deadline has
-    /// arrived. The last sleep is shortened to the remaining time. A limit
+    /// arrived. A limit
     /// that overflows the clock's range has no deadline.
     ///
     /// Each check takes a snapshot of the held events, oldest first, then
@@ -127,32 +129,61 @@ impl EventLog {
         limit: std::time::Duration,
         mut pick: impl FnMut(&Event) -> bool,
     ) -> Result<Vec<Event>, crate::Cancelled> {
-        let deadline = fcx.now().since_start().saturating_add(limit);
-        loop {
+        struct Wait<'a> {
+            store: &'a Store,
+            key: u64,
+        }
+        impl Drop for Wait<'_> {
+            fn drop(&mut self) {
+                let removed = self.store.state.lock().waiters.remove(&self.key);
+                drop(removed);
+            }
+        }
+        let key = {
+            let mut s = self.store.state.lock();
+            let key = s.next_waiter;
+            s.next_waiter += 1;
+            key
+        };
+        let wait = Wait {
+            store: &self.store,
+            key,
+        };
+        let deadline = Instant::from_since_start(fcx.now().since_start().saturating_add(limit));
+        let mut timer = crate::Timer::new(fcx);
+        std::future::poll_fn(|cx| {
             if fcx.is_cancelled() {
-                return Err(crate::Cancelled);
+                return Poll::Ready(Err(crate::Cancelled));
             }
             self.store.advance(fcx.now());
-            let events: Vec<Arc<Event>> = {
-                let s = self.store.state.lock();
-                held(&s, 0).cloned().collect()
+            let (events, next, old): (Vec<Arc<Event>>, _, _) = {
+                let mut s = self.store.state.lock();
+                let old = s.waiters.insert(wait.key, cx.waker().clone());
+                (
+                    held(&s, 0).cloned().collect(),
+                    s.next_repeat().unwrap_or(deadline).min(deadline),
+                    old,
+                )
             };
+            drop(old);
             let got: Vec<Event> = events
                 .into_iter()
                 .filter(|e| pick(e))
                 .map(|e| (*e).clone())
                 .collect();
             if fcx.is_cancelled() {
-                return Err(crate::Cancelled);
+                return Poll::Ready(Err(crate::Cancelled));
             }
-            let now = fcx.now().since_start();
-            if got.len() >= n || now >= deadline {
-                return Ok(got);
+            if got.len() >= n || fcx.now() >= deadline {
+                return Poll::Ready(Ok(got));
             }
-            let next = now
-                .saturating_add(std::time::Duration::from_millis(10))
-                .min(deadline);
-            fcx.sleep_until(Instant::from_since_start(next)).await?;
-        }
+            match timer.poll_until(cx, next) {
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => cx.waker().wake_by_ref(),
+                Poll::Pending => {}
+            }
+            Poll::Pending
+        })
+        .await
     }
 }

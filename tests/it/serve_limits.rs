@@ -5,7 +5,6 @@
 
 use crate::common::http_observer;
 use crate::common::io;
-use crate::common::wait;
 use crate::common::world;
 
 use crate::common::hyper_io;
@@ -1221,10 +1220,13 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             // Event timestamps can differ in size between requests.
             let other = budget.charge(budget.limit() - 2 * one - 1024).unwrap();
             let second = send.send_request(metadata_request());
-            wait::until(&fcx, Duration::from_secs(1), || {
-                fcx.events().of("test", "waiting").len() == 2
-            })
-            .await;
+            assert_eq!(
+                fcx.events()
+                    .wait(&fcx, 2, Duration::from_secs(1), |e| e.is("test", "waiting"))
+                    .await?
+                    .len(),
+                2
+            );
             let two = budget.used();
             assert!(two >= other.bytes() + 2 * 8192);
             assert!(send.send_request(metadata_request()).await.is_err());
@@ -1232,12 +1234,16 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             assert_eq!(budget.used(), two);
 
             drop(first);
-            wait::until(&fcx, Duration::from_secs(1), || budget.used() == two - one).await;
+            fcx.idle().await?;
+            assert_eq!(budget.used(), two - one);
             let third = send.send_request(metadata_request());
-            wait::until(&fcx, Duration::from_secs(1), || {
-                fcx.events().of("test", "waiting").len() == 3
-            })
-            .await;
+            assert_eq!(
+                fcx.events()
+                    .wait(&fcx, 3, Duration::from_secs(1), |e| e.is("test", "waiting"))
+                    .await?
+                    .len(),
+                3
+            );
             assert!(budget.used() >= other.bytes() + 2 * 8192);
             drop(other);
             fcx.cancel();
@@ -1280,7 +1286,8 @@ fn http1_pending_metadata_releases_on_reset() {
             .await?;
         assert!(budget.used() >= 8192);
         conn.reset();
-        wait::until(&fcx, Duration::from_secs(1), || budget.used() == 0).await;
+        fcx.idle().await?;
+        assert_eq!(budget.used(), 0);
         assert_eq!(
             fcx.events().of("http", "request")[0].str("answer"),
             Some("cancelled")
@@ -1369,7 +1376,8 @@ fn request_events_stay_charged_while_responses_stream() {
         assert!(budget.used() >= 4096);
         assert!(fcx.events().of("http", "request").is_empty());
         drop(response);
-        wait::until(&fcx, Duration::from_secs(1), || budget.used() == 0).await;
+        fcx.idle().await?;
+        assert_eq!(budget.used(), 0);
         Ok(())
     });
 }

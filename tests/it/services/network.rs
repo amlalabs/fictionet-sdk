@@ -980,14 +980,12 @@ impl PortServer for Spy {
 
 /// What `spy` has kept, once it has kept `n`.
 async fn spied(fcx: &Cx, spy: &Mutex<Vec<Option<Budget>>>, n: usize) -> Vec<Option<Budget>> {
-    for _ in 0..200 {
-        let kept = spy.lock().unwrap().clone();
-        if kept.len() >= n {
-            return kept;
-        }
-        let _ = fcx.sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the spy kept fewer than {n} budgets");
+    fcx.idle()
+        .await
+        .expect("the world stopped before the spy ran");
+    let kept = spy.lock().unwrap().clone();
+    assert!(kept.len() >= n, "the spy kept fewer than {n} budgets");
+    kept
 }
 
 /// `ended_with_done` accepts only Done: any other error comes back
@@ -1083,12 +1081,7 @@ fn net_keeps_one_budget_per_attachment() {
         let got = spied(&fcx, &budgets, 3).await;
         let b_budget = got[2].clone().expect("a budget");
         assert!(b_budget.used() >= 40 << 10, "{b_budget:?}");
-        for _ in 0..200 {
-            if a.used() == 0 {
-                break;
-            }
-            fcx.sleep(Duration::from_millis(10)).await?;
-        }
+        fcx.idle().await?;
         assert_eq!(
             a.used(),
             0,

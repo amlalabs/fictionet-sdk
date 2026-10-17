@@ -9,7 +9,6 @@ use crate::common::done::Done;
 use crate::common::within;
 
 /// Runs a closed lab world within the host limit and requires Done.
-#[allow(dead_code)]
 pub fn world<F, Fut>(limit: Duration, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
@@ -19,7 +18,6 @@ where
 }
 
 /// Runs a seeded lab world within the host limit and requires Done.
-#[allow(dead_code)]
 pub fn seeded_world<F, Fut>(seed: fictionet::Seed, limit: Duration, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
@@ -40,7 +38,6 @@ where
 
 /// Runs a world on real time within the host limit and requires Done.
 #[cfg(feature = "std")]
-#[allow(dead_code)]
 pub fn real_world<F, Fut>(limit: Duration, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
@@ -51,7 +48,6 @@ where
 
 /// Runs a seeded real-time world within the host limit and requires Done.
 #[cfg(feature = "std")]
-#[allow(dead_code)]
 pub fn seeded_real_world<F, Fut>(seed: fictionet::Seed, limit: Duration, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,

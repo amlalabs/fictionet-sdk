@@ -139,10 +139,14 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     // A new thread sets its own name, so it may not have one yet.
     let mut stats = thread_stats(&["world", "fictionet-"]);
-    poll::until(Duration::from_secs(10), || {
-        stats = thread_stats(&["world", "fictionet-"]);
-        stats.len() >= 3
-    });
+    poll::until(
+        Duration::from_secs(10),
+        "listener and world thread CPU state",
+        || {
+            stats = thread_stats(&["world", "fictionet-"]);
+            stats.len() >= 3
+        },
+    );
     assert!(
         stats.len() >= 3,
         "{:?}",
@@ -190,12 +194,16 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
     // Everyone attached and idle, with a timer pending: no thread of
     // Fictionet may use the CPU.
     let mut settled = None;
-    poll::until(Duration::from_secs(10), || {
-        let now = ticks(&stats);
-        let ready = settled.as_ref() == Some(&now);
-        settled = Some(now);
-        ready
-    });
+    poll::until(
+        Duration::from_secs(10),
+        "listener and world thread CPU state",
+        || {
+            let now = ticks(&stats);
+            let ready = settled.as_ref() == Some(&now);
+            settled = Some(now);
+            ready
+        },
+    );
     let idle_start = ticks(&stats);
     std::thread::sleep(Duration::from_millis(1500));
     let idle_end = ticks(&stats);

@@ -109,12 +109,12 @@ where
 async fn answer<W: AsyncWrite + Unpin>(w: &mut W, status: u16, why: &str) {
     #[expect(
         clippy::let_underscore_must_use,
-        reason = "POL-TEARDOWN: every caller has logged the error status; this reply only informs a client that may be gone"
+        reason = "every caller has logged the error status; this reply only informs a client that may be gone"
     )]
     let _ = w.write_all(&error_response(status, why)).await;
     #[expect(
         clippy::let_underscore_must_use,
-        reason = "POL-TEARDOWN: every caller has logged the error status; closing a client that may be gone"
+        reason = "every caller has logged the error status; closing a client that may be gone"
     )]
     let _ = w.shutdown().await;
 }

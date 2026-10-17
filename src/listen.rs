@@ -415,7 +415,7 @@ fn helper(
                 accept_paused = None;
                 #[expect(
                     clippy::let_underscore_must_use,
-                    reason = "POL-TEARDOWN: tells Drop the listener is closed; Drop may have stopped waiting"
+                    reason = "tells Drop the listener is closed; Drop may have stopped waiting"
                 )]
                 let _ = closed.send(());
             }
@@ -567,7 +567,7 @@ fn handshake_step(
     let refuse = |reason: &str| {
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-TEARDOWN: the handshake is dropped either way; this reply only informs a client that may be gone"
+            reason = "the handshake is dropped either way; this reply only informs a client that may be gone"
         )]
         let _ = unix::send(fd, &Message::Refuse(reason.to_owned()).encode(), true);
     };
@@ -860,12 +860,12 @@ impl Drop for Listening {
         self.shared.wake_helper();
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-TEARDOWN: Drop waits a bounded time for the helper to close the listener, then removes the socket file either way"
+            reason = "Drop waits a bounded time for the helper to close the listener, then removes the socket file either way"
         )]
         let _ = self.closed.recv_timeout(std::time::Duration::from_secs(5));
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-TEARDOWN: removes the listener's socket file in Drop"
+            reason = "removes the listener's socket file in Drop"
         )]
         let _ = std::fs::remove_file(&self.path);
     }

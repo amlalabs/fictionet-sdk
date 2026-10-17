@@ -205,7 +205,7 @@ impl Decoded {
             json::string(out, &l.summary);
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                reason = "fmt::Write for String never returns Err"
             )]
             let _ = write!(
                 out,
@@ -223,7 +223,7 @@ impl Decoded {
                 if let Some((a, b)) = f.range {
                     #[expect(
                         clippy::let_underscore_must_use,
-                        reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                        reason = "fmt::Write for String never returns Err"
                     )]
                     let _ = write!(out, ",\"range\":[{a},{b}]");
                 }
@@ -678,19 +678,19 @@ impl Dissector {
         if flags & 0x10 != 0 {
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                reason = "fmt::Write for String never returns Err"
             )]
             let _ = write!(info, "Ack={} ", flow.rel_ack);
         }
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            reason = "fmt::Write for String never returns Err"
         )]
         let _ = write!(info, "Win={win} Len={}", payload.1 - payload.0);
         if !opts.is_empty() && flags & 0x02 != 0 {
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                reason = "fmt::Write for String never returns Err"
             )]
             let _ = write!(info, " {}", opts.join(" "));
         }
@@ -930,7 +930,7 @@ fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
         l.note("Data", format!("{} bytes", c.len() - 8));
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            reason = "fmt::Write for String never returns Err"
         )]
         let _ = write!(info, " id=0x{id:04x}, seq={seq}");
     }
@@ -945,7 +945,7 @@ fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
         l.field("Original packet", summary.clone(), (at + 8, end));
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            reason = "fmt::Write for String never returns Err"
         )]
         let _ = write!(info, " ({summary})");
     }

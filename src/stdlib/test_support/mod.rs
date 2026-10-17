@@ -64,7 +64,6 @@ macro_rules! assert_cases {
     };
     (|$input:pat_param| $evaluate:expr; $($name:ident: $value:expr => $expected:expr,)+) => {
         $({
-            #[allow(clippy::redundant_closure_call)]
             (|$input| assert_eq!($evaluate, $expected, "{}", stringify!($name)))($value);
         })+
     };

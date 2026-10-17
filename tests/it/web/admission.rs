@@ -28,7 +28,7 @@ fn fragment(
 /// different packet, must not stall the gateway for everyone else.
 #[test]
 fn a_flood_of_unfinished_fragments_does_not_stall_the_gateway() {
-    real_world(|fcx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         raw.send(ping(me, GATEWAY, 1));
@@ -37,7 +37,7 @@ fn a_flood_of_unfinished_fragments_does_not_stall_the_gateway() {
                 .await
                 .is_some()
         );
-        let started = std::time::Instant::now();
+        let started = fictionet::stdlib::test_support::thread_cpu_time();
         for i in 0..60_000u32 {
             let proto = [17u8, 6, 1][(i % 3) as usize];
             raw.send(fragment(
@@ -54,12 +54,16 @@ fn a_flood_of_unfinished_fragments_does_not_stall_the_gateway() {
         // through every fragment before it. That must be quick.
         raw.send(ping(me, GATEWAY, 2));
         let reply = recv_within(&fcx, &mut raw, Duration::from_secs(5)).await;
+        let elapsed = fictionet::stdlib::test_support::thread_cpu_time() - started;
         assert!(
             reply.is_some(),
-            "no ping reply {:?} after the flood started",
-            started.elapsed()
+            "no ping reply after {elapsed:?} of CPU time"
         );
-        eprintln!("60,000 fragments went through in {:?}", started.elapsed());
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "flood and ping reply used {elapsed:?} of CPU time"
+        );
+        eprintln!("60,000 fragments went through in {elapsed:?} of CPU time");
         Ok(())
     });
 }
@@ -168,8 +172,8 @@ async fn timed_get(fcx: &Cx, m: &Machine, env: &Env) -> Duration {
 /// within `d`, counting each port once.
 async fn closed_ports(fcx: &Cx, raw: &mut End, d: Duration) -> std::collections::BTreeSet<u16> {
     let mut closed = std::collections::BTreeSet::new();
-    let until = std::time::Instant::now() + d;
-    while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+    let until = fcx.now().since_start() + d;
+    while let Some(left) = until.checked_sub(fcx.now().since_start()) {
         let Some(p) = recv_within(fcx, raw, left).await else {
             break;
         };
@@ -185,7 +189,7 @@ async fn closed_ports(fcx: &Cx, raw: &mut End, d: Duration) -> std::collections:
 /// others share. Past that, the machine resets new ones at once.
 #[test]
 fn one_sandbox_cannot_hold_thousands_of_connections_open() {
-    real_world(|fcx, attacher, env| async move {
+    world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let b = machine(
@@ -244,7 +248,7 @@ async fn get_and_hold(
 /// it may connect again.
 #[test]
 fn connections_left_half_open_still_count() {
-    real_world(|fcx, attacher, _env| async move {
+    world(|fcx, attacher, _env| async move {
         let a = default_machine(&fcx, &attacher);
         let to = lookup(&fcx, &a, "plain.test").await;
         let mut held = Vec::new();
@@ -277,17 +281,10 @@ fn connections_left_half_open_still_count() {
         assert!(text.starts_with("HTTP/1.0 200"), "{text}");
         // Closing them frees the count.
         drop(held);
-        let (text, _conn) = timeout(&fcx, Duration::from_secs(10), async {
-            loop {
-                match get_and_hold(&fcx, &a, to).await {
-                    Ok(reply) => break reply,
-                    Err(ConnError::Reset) => fcx.sleep(Duration::from_millis(10)).await.unwrap(),
-                    Err(e) => panic!("the readiness request failed: {e}"),
-                }
-            }
-        })
-        .await
-        .expect("the connection count was not freed");
+        fcx.idle().await?;
+        let (text, _conn) = get_and_hold(&fcx, &a, to)
+            .await
+            .expect("the connection count was not freed");
         assert!(text.starts_with("HTTP/1.0 200"), "{text}");
         for _ in 0..20 {
             let (text, _conn) = get_and_hold(&fcx, &a, to)
@@ -304,7 +301,7 @@ fn connections_left_half_open_still_count() {
 /// second.
 #[test]
 fn connections_that_send_nothing_are_closed() {
-    run_world::real_world(Duration::from_secs(60), |fcx| async move {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         sites(&fcx)
             .sites
@@ -340,7 +337,7 @@ fn connections_that_send_nothing_are_closed() {
         {
             let n = n as u16;
             // Ports 10000, 11000 and 12000.
-            opened.insert(10_000 + n * 1000, std::time::Instant::now());
+            opened.insert(10_000 + n * 1000, fcx.now());
             raw.send(tcp_seg(
                 me,
                 10_000 + n * 1000,
@@ -385,7 +382,8 @@ fn connections_that_send_nothing_are_closed() {
             let (_, _, proto, t) = parse(&packet);
             if proto == 6 && t[13] & (FIN | RST) != 0 {
                 let port = u16::from_be_bytes([t[2], t[3]]);
-                let took = opened.get(&port).expect("an opened port").elapsed();
+                let took = fcx.now().since_start()
+                    - opened.get(&port).expect("an opened port").since_start();
                 assert!(
                     took >= Duration::from_secs(1),
                     "port {port} closed too early: {took:?}"
@@ -409,7 +407,7 @@ fn connections_that_send_nothing_are_closed() {
 /// lock the others out of a site they share.
 #[test]
 fn a_syn_flood_from_one_sandbox_does_not_lock_out_the_others() {
-    real_world(|fcx, attacher, env| async move {
+    world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let b = machine(
@@ -453,7 +451,7 @@ async fn median_get(fcx: &Cx, m: &Machine, env: &Env) -> Duration {
 /// down: lookups stay quick, and so does every other request.
 #[test]
 fn ten_thousand_sites_do_not_slow_the_network() {
-    real_world(|fcx, attacher, env| async move {
+    world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let b = machine(
@@ -550,7 +548,7 @@ fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
 /// cancels as soon as it opens them.
 #[test]
 fn http2_with_a_thousand_streams_and_cancelled_ones() {
-    real_world(|fcx, attacher, env| async move {
+    world(|fcx, attacher, env| async move {
         let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
         let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"h2"])

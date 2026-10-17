@@ -162,7 +162,7 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
     conn.set_write_timeout(Some(Duration::from_secs(10)))?;
     #[expect(
         clippy::let_underscore_must_use,
-        reason = "POL-HINT: TCP_NODELAY only lowers latency; reads and writes below report their own errors"
+        reason = "TCP_NODELAY only lowers latency; reads and writes below report their own errors"
     )]
     let _ = conn.set_nodelay(true);
     let Some(buf) = read_head(deadline, |remaining, chunk| {

@@ -139,7 +139,7 @@ fn ten_megabytes_both_ways() {
     const LEN: usize = 10 * 1024 * 1024;
     let elapsed = Arc::new(Mutex::new(Duration::ZERO));
     let e = elapsed.clone();
-    world::real_world(Duration::from_secs(120), move |fcx| async move {
+    world(Duration::from_secs(120), move |fcx| async move {
         let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(9000)?;
         let up = pattern(LEN, 1);
@@ -404,7 +404,7 @@ fn write_waits_for_room_and_never_takes_zero() {
                 Some(Err(e)) => return Err(e.into()),
                 None => {
                     // Let the endpoints move what they can, then try once more.
-                    fcx.sleep(Duration::from_millis(20)).await?;
+                    fcx.idle().await?;
                     let again = poll_fn(|cx| Poll::Ready(conn.poll_write(&fcx, cx, &data))).await;
                     if again.is_pending() {
                         break;
@@ -541,7 +541,7 @@ fn cancellation_ends_accept_read_write_and_connect() {
             r4.lock().unwrap().push(("connect", res));
             Ok(())
         });
-        fcx.sleep(Duration::from_millis(100)).await?;
+        fcx.idle().await?;
         assert!(
             r.lock().unwrap().is_empty(),
             "nothing should have ended yet: {:?}",
@@ -756,7 +756,7 @@ fn udp_closed_port_gets_port_unreachable() {
                 "fd00::99"
             };
             raw.send(udp_packet(ip(a), 4000, ip(other), 99, b"hi"));
-            fcx.sleep(Duration::from_millis(20)).await?;
+            fcx.idle().await?;
             let next = poll_fn(|cx| Poll::Ready(raw.poll_recv(&fcx, cx))).await;
             assert!(next.is_pending(), "no more answers");
             Ok(())
@@ -1046,7 +1046,7 @@ fn lost_final_ack(simultaneous: bool) {
         drop(client);
         assert_eq!(read_to_end(&fcx, &mut server).await?, b"");
         drop(server);
-        fcx.sleep(Duration::from_millis(20)).await?;
+        fcx.idle().await?;
         assert!(poll_fn(|cx| Poll::Ready(watch.poll_gone(cx).is_ready())).await);
         assert_eq!(Arc::strong_count(&held), 1);
         assert!(
@@ -1255,7 +1255,7 @@ fn idle_endpoints_stay_idle() {
             keep.push(s);
         }
         let _waiting = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
-        fcx.sleep(Duration::from_millis(100)).await?;
+        fcx.idle().await?;
         let before = thread_cpu_time();
         fcx.sleep(Duration::from_secs(1)).await?;
         let used = thread_cpu_time() - before;

@@ -1,11 +1,12 @@
 #![deny(clippy::let_underscore_must_use)]
 
 use fictionet::sync::{Mutex, MutexGuard};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::task::Waker;
 
 use crate::time::Instant;
 
@@ -147,6 +148,8 @@ pub(super) struct State {
     max_open_bytes: usize,
     /// The same, oldest first, each with when its count is due.
     due: VecDeque<(Instant, Arc<RepeatKey>)>,
+    pub(super) waiters: BTreeMap<u64, Waker>,
+    pub(super) next_waiter: u64,
     /// Shared, so recording takes a reference count, not a copy.
     subscribers: Arc<[Arc<Subscription>]>,
     /// Whether the run is over.
@@ -157,6 +160,12 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn next_repeat(&self) -> Option<Instant> {
+        self.due
+            .iter()
+            .find_map(|(at, key)| (self.open[key].count > 0).then_some(*at))
+    }
+
     /// Numbers and keeps `event`, adding it to `out` for subscribers.
     fn keep(&mut self, mut event: Event, repeat: bool, out: &mut Vec<Arc<Event>>) {
         self.last += 1;
@@ -210,6 +219,8 @@ impl Store {
                 open_bytes: 0,
                 max_open_bytes: MAX_OPEN_REPEAT_BYTES,
                 due: VecDeque::new(),
+                waiters: BTreeMap::new(),
+                next_waiter: 0,
                 subscribers: Arc::new([]),
                 closed: false,
                 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -227,7 +238,7 @@ impl Store {
         let mut s = self.state.lock();
         s.advance(event.at, &mut out);
         s.keep(event, false, &mut out);
-        Store::tell(s, &out);
+        Store::tell(s, &out, true);
     }
 
     /// Keeps `event` as a repeat, or counts it. See
@@ -251,7 +262,7 @@ impl Store {
             if window.add(event.at, &detail, available) {
                 let growth = window.ranges_size() - before;
                 s.open_bytes += growth;
-                Store::tell(s, &out);
+                Store::tell(s, &out, true);
                 return;
             }
             s.close_oldest(&mut out);
@@ -278,7 +289,7 @@ impl Store {
         event.fields.extend(detail);
         event.fields.set("count", 1u64);
         s.keep(event, true, &mut out);
-        Store::tell(s, &out);
+        Store::tell(s, &out, true);
     }
 
     /// Moves the log's clock to `at`, recording the counts of repeats due
@@ -286,20 +297,27 @@ impl Store {
     pub(crate) fn advance(&self, at: Instant) {
         let mut out = Vec::new();
         let mut s = self.state.lock();
+        let before = s.last;
         s.advance(at, &mut out);
-        Store::tell(s, &out);
+        let changed = s.last != before;
+        Store::tell(s, &out, changed);
     }
 
     /// Calls the subscribers with `events`, once `s` is unlocked.
-    fn tell(s: MutexGuard<'_, State>, events: &[Arc<Event>]) {
-        if s.subscribers.is_empty() || events.is_empty() {
-            return;
-        }
+    fn tell(mut s: MutexGuard<'_, State>, events: &[Arc<Event>], changed: bool) {
+        let waiters = if changed {
+            std::mem::take(&mut s.waiters)
+        } else {
+            BTreeMap::new()
+        };
         let subscribers = s.subscribers.clone();
         for subscription in subscribers.iter() {
             subscription.enqueue(events);
         }
         drop(s);
+        for waker in waiters.into_values() {
+            waker.wake();
+        }
         for subscription in subscribers.iter() {
             subscription.drain();
         }
@@ -317,7 +335,7 @@ impl Store {
         let mut out = Vec::new();
         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         let writers;
-        let subscribers = {
+        let (subscribers, waiters) = {
             let mut s = self.state.lock();
             while !s.due.is_empty() {
                 s.close_oldest(&mut out);
@@ -330,8 +348,14 @@ impl Store {
             for subscription in s.subscribers.iter() {
                 subscription.enqueue(&out);
             }
-            std::mem::replace(&mut s.subscribers, Arc::new([]))
+            (
+                std::mem::replace(&mut s.subscribers, Arc::new([])),
+                std::mem::take(&mut s.waiters),
+            )
         };
+        for waker in waiters.into_values() {
+            waker.wake();
+        }
         for subscription in subscribers.iter() {
             subscription.drain();
         }

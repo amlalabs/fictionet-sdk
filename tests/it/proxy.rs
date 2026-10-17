@@ -10,13 +10,13 @@ use crate::common::io;
 
 use io::read_all;
 
+use fictionet::InterfaceExt;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::DefaultBodyLimit;
@@ -48,11 +48,11 @@ fn temp_dir() -> PathBuf {
 struct World {
     dir: PathBuf,
     sock: String,
-    stop: Arc<AtomicBool>,
+    stop: Option<fictionet::End>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The source and destination IPv4 addresses of the packets a
     /// [`World::black_hole`] has taken in.
-    seen: Arc<Mutex<HashSet<[u8; 8]>>>,
+    seen: Arc<(Mutex<HashSet<[u8; 8]>>, Condvar)>,
     /// How many `A` queries for each name reached the world's DNS.
     queries: Arc<Mutex<std::collections::HashMap<String, usize>>>,
 }
@@ -66,8 +66,8 @@ impl World {
         let dir = temp_dir();
         let sock = dir.join("w.sock").to_str().unwrap().to_owned();
         let ca_path = dir.join("ca.pem");
-        let stop = Arc::new(AtomicBool::new(false));
-        let (stop2, sock2) = (stop.clone(), sock.clone());
+        let (stop, mut stopped) = fictionet::pair();
+        let sock2 = sock.clone();
         let queries: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
         let queries2 = queries.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -142,9 +142,7 @@ impl World {
                         });
                     }
                     net.start(&fcx, attachments)?;
-                    while !stop2.load(Ordering::SeqCst) {
-                        fcx.sleep(fictionet::time::ms(20)).await?;
-                    }
+                    assert_eq!(stopped.recv(&fcx).await, Err(fictionet::RecvError::Closed));
                     // Ends the run: every attachment closes.
                     Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
                 },
@@ -155,7 +153,7 @@ impl World {
         World {
             dir,
             sock,
-            stop,
+            stop: Some(stop),
             thread: Some(thread),
             seen: Arc::default(),
             queries,
@@ -177,9 +175,9 @@ impl World {
         let answer = Arc::new(answer);
         let dir = temp_dir();
         let sock = dir.join("w.sock").to_str().unwrap().to_owned();
-        let stop = Arc::new(AtomicBool::new(false));
-        let seen: Arc<Mutex<HashSet<[u8; 8]>>> = Arc::default();
-        let (stop2, sock2, seen2) = (stop.clone(), sock.clone(), seen.clone());
+        let (stop, mut stopped) = fictionet::pair();
+        let seen: Arc<(Mutex<HashSet<[u8; 8]>>, Condvar)> = Arc::default();
+        let (sock2, seen2) = (sock.clone(), seen.clone());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let (attacher, mut attachments) = fictionet::attachments();
@@ -199,7 +197,8 @@ impl World {
                             fcx.spawn(move |fcx| async move {
                                 while let Ok(p) = sandbox.recv(&fcx).await {
                                     if let Some(addrs) = p.0.get(12..20) {
-                                        seen.lock().unwrap().insert(addrs.try_into().unwrap());
+                                        seen.0.lock().unwrap().insert(addrs.try_into().unwrap());
+                                        seen.1.notify_all();
                                     }
                                     for reply in answer(&p.0) {
                                         sandbox.send(reply);
@@ -210,9 +209,7 @@ impl World {
                         }
                         Ok(())
                     });
-                    while !stop2.load(Ordering::SeqCst) {
-                        fcx.sleep(fictionet::time::ms(20)).await?;
-                    }
+                    assert_eq!(stopped.recv(&fcx).await, Err(fictionet::RecvError::Closed));
                     // Ends the run: every attachment closes.
                     Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
                 },
@@ -223,7 +220,7 @@ impl World {
         World {
             dir,
             sock,
-            stop,
+            stop: Some(stop),
             thread: Some(thread),
             seen,
             queries: Arc::default(),
@@ -236,7 +233,7 @@ impl World {
 
     /// Ends the world: attach reads its connection close.
     fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        drop(self.stop.take());
         if let Some(t) = self.thread.take() {
             t.join().unwrap();
         }
@@ -321,9 +318,10 @@ fn certs(
 
 /// A running attach.
 struct Attach {
-    child: Child,
+    child: Option<Child>,
     addr: SocketAddr,
-    log: Arc<Mutex<String>>,
+    log: Arc<(Mutex<String>, Condvar)>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Attach {
@@ -361,14 +359,20 @@ impl Attach {
             .and_then(|r| r.split(',').next())
             .unwrap_or_else(|| panic!("{first}"));
         let addr: SocketAddr = addr.parse().unwrap();
-        let log = Arc::new(Mutex::new(format!("{first}\n")));
+        let log = Arc::new((Mutex::new(format!("{first}\n")), Condvar::new()));
         let log2 = log.clone();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             for line in lines.map_while(Result::ok) {
-                log2.lock().unwrap().push_str(&(line + "\n"));
+                log2.0.lock().unwrap().push_str(&(line + "\n"));
+                log2.1.notify_all();
             }
         });
-        Attach { child, addr, log }
+        Attach {
+            child: Some(child),
+            addr,
+            log,
+            reader: Some(reader),
+        }
     }
 
     fn connect(&self) -> TcpStream {
@@ -378,7 +382,7 @@ impl Attach {
     }
 
     fn log(&self) -> String {
-        self.log.lock().unwrap().clone()
+        self.log.0.lock().unwrap().clone()
     }
 
     /// Waits up to 5 s for attach to log a line containing `text`. Lines
@@ -388,32 +392,40 @@ impl Attach {
     }
 
     fn logged_within(&self, text: &str, deadline: Instant) -> bool {
-        while Instant::now() < deadline {
-            if self.log().contains(text) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        false
+        let (log, _) = self
+            .log
+            .1
+            .wait_timeout_while(
+                self.log.0.lock().unwrap(),
+                deadline.saturating_duration_since(Instant::now()),
+                |log| !log.contains(text),
+            )
+            .unwrap();
+        log.contains(text)
     }
 
     /// Waits for attach to exit, at most 10 s.
     fn wait(&mut self) -> std::process::ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(s) = self.child.try_wait().unwrap() {
-                return s;
-            }
-            assert!(Instant::now() < deadline, "attach did not exit");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut child = self.child.take().unwrap();
+        let (child, status) = crate::common::within(Duration::from_secs(10), move || {
+            let status = child.wait().unwrap();
+            (child, status)
+        });
+        self.child = Some(child);
+        self.reader.take().unwrap().join().unwrap();
+        status
     }
 }
 
 impl Drop for Attach {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -1189,15 +1201,22 @@ fn clients_waiting_for_a_connection_hear_that_the_world_is_gone() {
         c.write_all(&[5, 1, 0, 1, 192, 0, 2, i, 1, 187]).unwrap();
         socks.push(c);
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while world.seen.lock().unwrap().len() < 2 * n as usize {
-        assert!(
-            Instant::now() < deadline,
-            "the world saw {} connections",
-            world.seen.lock().unwrap().len()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let (seen, _) = world
+        .seen
+        .1
+        .wait_timeout_while(
+            world.seen.0.lock().unwrap(),
+            Duration::from_secs(5),
+            |seen| seen.len() < 2 * n as usize,
+        )
+        .unwrap();
+    assert_eq!(
+        seen.len(),
+        2 * n as usize,
+        "the world saw {} connections",
+        seen.len()
+    );
+    drop(seen);
     world.stop();
     for mut c in https {
         let head = read_head(&mut c);

@@ -61,7 +61,7 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     // A new thread sets its own name, so it may not have one yet.
     let mut stats = thread_stats("fictionet-liste");
-    poll::until(Duration::from_secs(10), || {
+    poll::until(Duration::from_secs(10), "listener thread name", || {
         stats = thread_stats("fictionet-liste");
         !stats.is_empty()
     });

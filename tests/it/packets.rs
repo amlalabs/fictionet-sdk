@@ -1,9 +1,8 @@
 //! The packet stdlib: delay, bottleneck, the IP splits with reassembly, the
 //! router and echo replies. Every test wires cables made with `pair()` and
-//! runs under `run()` in real time, so timing checks leave room.
+//! runs under `lab()` on simulated time.
 
 use crate::common;
-use crate::common::wait;
 
 use common::within;
 
@@ -18,7 +17,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::route::{Prefix, lan, router};
 use fictionet::stdlib::{bottleneck, delay, icmp, ip, udp};
 use fictionet::time::ms;
-use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, pair, run};
+use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, lab, pair};
 
 #[test]
 fn packet_drop_events_keep_packet_fields_and_repeat_details() {
@@ -132,7 +131,7 @@ where
     Fut: std::future::Future<Output = fictionet::Result> + Send + 'static,
 {
     within(Duration::from_secs(10), move || {
-        block_on(run(fictionet::Seed::random(), f))
+        block_on(lab(fictionet::Seed::from_u64(1), f))
     })
     .unwrap();
 }
@@ -1046,18 +1045,14 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
 
         // A closed cable loses its route: the next best one takes over.
         drop(e);
-        wait::until(&fcx, Duration::from_secs(10), || {
-            e_removed.load(Ordering::SeqCst)
-        })
-        .await;
+        fcx.idle().await?;
+        assert!(e_removed.load(Ordering::SeqCst));
         c.send(to4([10, 1, 2, 3], 9));
         assert_eq!(recv_soon(&fcx, &mut f).await.0[28], 9);
         // And with no route left for an address, packets are dropped.
         drop(c);
-        wait::until(&fcx, Duration::from_secs(10), || {
-            c_removed.load(Ordering::SeqCst)
-        })
-        .await;
+        fcx.idle().await?;
+        assert!(c_removed.load(Ordering::SeqCst));
         a.send(to4([8, 8, 8, 8], 10));
         for end in [&mut a, &mut d, &mut f] {
             assert!(recv_within(&fcx, end, ms(30)).await.is_none());
@@ -1084,10 +1079,8 @@ fn router_keeps_running_while_the_handle_can_add_routes() {
             )],
         );
         drop(a);
-        wait::until(&fcx, Duration::from_secs(10), || {
-            a_removed.load(Ordering::SeqCst)
-        })
-        .await;
+        fcx.idle().await?;
+        assert!(a_removed.load(Ordering::SeqCst));
         // Every cable is closed, but the handle is alive: a new route works.
         let (b_router, mut b) = pair();
         let (c_router, mut c) = pair();
@@ -1205,10 +1198,8 @@ fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
 
         // When the gateway closes, the LAN is sealed again.
         drop(gw2);
-        wait::until(&fcx, Duration::from_secs(10), || {
-            gw2_removed.load(Ordering::SeqCst)
-        })
-        .await;
+        fcx.idle().await?;
+        assert!(gw2_removed.load(Ordering::SeqCst));
         a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[10])));
         for end in [&mut a, &mut b] {
             assert!(recv_within(&fcx, end, ms(20)).await.is_none());
@@ -1299,10 +1290,8 @@ fn lan_forgets_a_member_whose_interface_closed() {
         lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
         lan.add("192.168.56.22".parse()?, Box::new(c_lan), None)?;
         drop(b);
-        wait::until(&fcx, Duration::from_secs(10), || {
-            b_removed.load(Ordering::SeqCst)
-        })
-        .await;
+        fcx.idle().await?;
+        assert!(b_removed.load(Ordering::SeqCst));
 
         // Unicast for it goes nowhere. Broadcast still reaches the rest.
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
@@ -1407,6 +1396,8 @@ fn a_router_with_no_routes_and_no_handle_ends() {
 
 /// Wraps a cable end and logs `p` for every packet the task takes from it.
 struct Logged {
+    remaining: usize,
+    done: Arc<AtomicBool>,
     inner: End,
     log: Arc<Mutex<Vec<char>>>,
 }
@@ -1416,6 +1407,10 @@ impl Interface for Logged {
         let r = self.inner.poll_recv(fcx, cx);
         if let Poll::Ready(Ok(_)) = r {
             self.log.lock().unwrap().push('p');
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                self.done.store(true, Ordering::SeqCst);
+            }
         }
         r
     }
@@ -1459,6 +1454,8 @@ fn each_task_yields_after_64_packets_in_a_row() {
             }
             ticker(&fcx, l.clone(), done.clone());
             let inner = Logged {
+                remaining: 1000,
+                done: done.clone(),
                 inner: world_side,
                 log: l.clone(),
             };
@@ -1651,7 +1648,7 @@ fn every_task_stops_when_its_region_is_cancelled() {
     // The world fails while every kind of task is running with its cables
     // still open. The run then ends with the error instead of waiting.
     let result = within(Duration::from_secs(5), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
             let mut keep = Vec::new();
             let (a, b) = pair();
             keep.push(a);
@@ -1677,7 +1674,7 @@ fn every_task_stops_when_its_region_is_cancelled() {
             keep.push(a);
             let l = lan::<Box<dyn Interface>, _>(&fcx, "10.0.0.0/24".parse()?, |event| event);
             l.add("10.0.0.2".parse()?, Box::new(b), None)?;
-            fcx.sleep(ms(20)).await?;
+            fcx.idle().await?;
             let _keep = (keep, r, l);
             Err(fictionet::Error::msg("stop"))
         }))

@@ -441,7 +441,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fictionet-resolv-{}", std::process::id()));
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-CHECKED-NEXT: removes what an earlier run left; the assertions below check the files this test writes"
+            reason = "removes what an earlier run left; the assertions below check the files this test writes"
         )]
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("a/b/resolv.conf");

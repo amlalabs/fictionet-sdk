@@ -312,10 +312,8 @@ fn events_name_each_attachment_by_id() {
             b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n",
         )
         .await;
-        wait::until(&fcx, Duration::from_secs(10), || {
-            env.waiting.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        fcx.idle().await?;
+        assert!(env.waiting.load(Ordering::SeqCst) == 1);
         drop(a);
         wait_for(&fcx, &log, 1, seen("net", "detached")).await;
 
@@ -891,10 +889,8 @@ fn events_for_a_client_that_resets_mid_request() {
             b"GET /wait HTTP/1.1\r\nHost: slow.test\r\n\r\n",
         )
         .await;
-        wait::until(&fcx, Duration::from_secs(10), || {
-            env.waiting.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        fcx.idle().await?;
+        assert!(env.waiting.load(Ordering::SeqCst) == 1);
         assert!(picked(&log, http_seen).is_empty());
         raw.send(tcp_seg(me, 30_000, slow, 80, seq, ack, RST, &[]));
         let got = wait_for(&fcx, &log, 1, http_seen).await;
@@ -911,7 +907,7 @@ fn events_for_a_client_that_resets_mid_request() {
             (Some("HTTP/1.1"), Some("slow.test"))
         );
         // A reset is the client going away, not an HTTP error.
-        let _ = fcx.sleep(Duration::from_millis(100)).await;
+        fcx.idle().await?;
         assert!(picked(&log, error_seen).is_empty());
         assert_eq!(picked(&log, http_seen).len(), 1, "exactly one event");
         Ok(())
@@ -969,17 +965,11 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
                 b"GET /hang HTTP/1.1\r\nHost: hang.test\r\n\r\n",
             )
             .await;
-            wait::until(&fcx, Duration::from_secs(10), || {
-                started.load(Ordering::SeqCst)
-            })
-            .await;
+            fcx.idle().await?;
             assert!(started.load(Ordering::SeqCst), "the handler started");
             assert!(!flag.load(Ordering::SeqCst));
             raw.send(tcp_seg(me, 30_000, addrs[0], 80, seq, ack, RST, &[]));
-            wait::until(&fcx, Duration::from_secs(10), || {
-                flag.load(Ordering::SeqCst)
-            })
-            .await;
+            fcx.idle().await?;
             // Checked here: stopping the world would drop the handler too.
             assert!(
                 flag.load(Ordering::SeqCst),
@@ -1021,10 +1011,8 @@ fn the_world_stops_while_handlers_wait() {
         bytes.extend_from_slice(&[0, 0, block.len() as u8, 1, 0x05, 0, 0, 0, 1]);
         bytes.extend_from_slice(&block);
         h2.write_all(&fcx, &bytes).await.unwrap();
-        wait::until(&fcx, Duration::from_secs(10), || {
-            env.waiting.load(Ordering::SeqCst) == 2
-        })
-        .await;
+        fcx.idle().await?;
+        assert!(env.waiting.load(Ordering::SeqCst) == 2);
         assert!(
             picked(&log, http_seen).is_empty(),
             "both handlers still wait"
@@ -1127,7 +1115,7 @@ fn events_for_bytes_that_are_not_http() {
         client.conn.write_all(&fcx, &record).await.unwrap();
 
         let got = wait_for(&fcx, &log, 3, error_seen).await;
-        let _ = fcx.sleep(Duration::from_millis(200)).await;
+        fcx.idle().await?;
         assert_eq!(
             picked(&log, error_seen).len(),
             3,

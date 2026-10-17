@@ -15,7 +15,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -172,10 +172,8 @@ fn demux(fcx: &Cx, tun: Tun) -> [End; 4] {
 /// The last packets seen, printed when the traffic stalls.
 static RING: Mutex<std::collections::VecDeque<String>> =
     Mutex::new(std::collections::VecDeque::new());
-static LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
 fn trace_packet(fcx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool) {
-    *LAST.lock().unwrap() = Some(Instant::now());
     let (proto, hdr) = if p.0[0] >> 4 == 4 {
         (p.0[9], (p.0[0] & 15) as usize * 4)
     } else {
@@ -417,7 +415,7 @@ fn a_linux_client_through_tun() {
         "ip link set fn0 up mtu 1500 && ip addr add 10.9.0.1/24 dev fn0 && ip -6 addr add fd09::1/64 dev fn0 nodad",
     );
     let log = Arc::new(Mutex::new(Vec::new()));
-    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
     let l = log.clone();
     let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
         let [t4, u4, t6, u6] = demux(&fcx, tun);
@@ -433,42 +431,14 @@ fn a_linux_client_through_tun() {
             client(&l);
             let _ = done_tx.send(());
         });
-        // Wait for the client thread without blocking the run.
-        let mut dumped = false;
-        loop {
-            match done_rx.try_recv() {
-                Ok(()) => break,
-                Err(mpsc::TryRecvError::Empty) => {
-                    fcx.sleep(Duration::from_millis(50)).await?;
-                    let quiet = LAST
-                        .lock()
-                        .unwrap()
-                        .is_some_and(|t| t.elapsed() > Duration::from_secs(5));
-                    if quiet && !dumped {
-                        dumped = true;
-                        eprintln!("STALL: no packets for 5 s. The last ones:");
-                        for l in RING.lock().unwrap().iter() {
-                            eprintln!("{l}");
-                        }
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let e = checks.join().unwrap_err();
-                    let msg = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or(e.downcast_ref::<&str>().map(|s| s.to_string()));
-                    return Err(fictionet::Error::msg(format!(
-                        "the client checks failed: {msg:?}"
-                    )));
-                }
+        if done_rx.await.is_err() {
+            for line in RING.lock().unwrap().iter() {
+                eprintln!("{line}");
             }
+            std::panic::resume_unwind(checks.join().unwrap_err());
         }
+        checks.join().unwrap();
         Err(fictionet::Error::from(Done))
     }));
-    match result {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("{e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
+    done::ended_with_done(result).unwrap();
 }

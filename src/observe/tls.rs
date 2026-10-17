@@ -346,7 +346,6 @@ impl Tls {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         i: usize,

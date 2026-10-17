@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use fictionet::stdlib::tls::{self, ServerConfig};
 use fictionet::stdlib::{Connection, ConnectionExt, tcp};
 use fictionet::time::ms;
-use fictionet::{Cx, Result};
+use fictionet::{Cx, Interface, InterfaceExt, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
@@ -36,12 +36,12 @@ fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
 }
 
 /// A TLS client that finishes the handshake, then reads nothing until
-/// `drain` is set, then reads and discards everything.
+/// `drain` receives a message, then reads and discards everything.
 async fn client<C: Connection>(
     fcx: &Cx,
     mut conn: C,
     config: Arc<ClientConfig>,
-    drain: Arc<AtomicBool>,
+    mut drain: fictionet::End,
     received: Arc<AtomicBool>,
 ) -> Result {
     let mut tls = ClientConnection::new(config, ServerName::try_from("secret.test").unwrap())?;
@@ -59,9 +59,7 @@ async fn client<C: Connection>(
         tls.read_tls(&mut &buf[..n])?;
         tls.process_new_packets()?;
     }
-    while !drain.load(Ordering::SeqCst) {
-        fcx.sleep(ms(10)).await?;
-    }
+    drain.recv(fcx).await?;
     let mut sink = Vec::new();
     loop {
         let n = conn.read(fcx, &mut buf).await?;
@@ -98,11 +96,10 @@ fn scenario_mode(mode: u8) {
             let c_ep = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
             let s_ep = tcp::endpoint(&fcx, b, "10.0.0.1".parse()?);
             let mut listener = s_ep.listen(443)?;
-            let drain = Arc::new(AtomicBool::new(false));
+            let (mut drain, d) = fictionet::pair();
             let received = Arc::new(AtomicBool::new(false));
             let got = received.clone();
-            let d = drain.clone();
-            fcx.spawn(move |fcx| async move {
+            let peer = fcx.spawn(move |fcx| async move {
                 let conn = c_ep.connect(&fcx, "10.0.0.1:443".parse()?).await?;
                 client(&fcx, conn, client_cfg, d, got).await
             });
@@ -118,15 +115,16 @@ fn scenario_mode(mode: u8) {
                 // Control: retry the same bytes, never drop a pending write.
                 let big = vec![b'A'; 600 << 10];
                 let w = conn.write_all(&fcx, &big);
-                let d2 = drain.clone();
+                let mut d2 = drain;
                 fcx.spawn(move |fcx| async move {
                     fcx.sleep(ms(200)).await?;
-                    d2.store(true, Ordering::SeqCst);
+                    d2.send(fictionet::Packet(Vec::new()));
                     Ok(())
                 });
                 w.await?;
                 conn.write_all(&fcx, b"hi").await?;
-                fcx.sleep(ms(500)).await?;
+                fcx.race(Some(fcx.now() + ms(500)), peer.join(&fcx))
+                    .await??;
                 eprintln!("control: wrote 600 KiB + 2 without dropping a write");
                 assert!(received.load(Ordering::SeqCst));
                 fcx.cancel();
@@ -140,13 +138,13 @@ fn scenario_mode(mode: u8) {
                     Poll::Ready(r) => total += r?,
                     Poll::Pending => break, // dropped here
                 }
-                fcx.sleep(ms(1)).await?;
+                fcx.idle().await?;
             }
             eprintln!(
                 "wrote {total} bytes, then dropped a pending write of {}",
                 chunk.len()
             );
-            drain.store(true, Ordering::SeqCst);
+            drain.send(fictionet::Packet(Vec::new()));
             if mode == 1 {
                 conn.write_all(&fcx, b"hi").await?;
                 eprintln!("write_all of 2 bytes returned");
@@ -155,7 +153,8 @@ fn scenario_mode(mode: u8) {
                 eprintln!("write(b\"hi\") (2 bytes) returned Ok({n})");
                 assert_eq!(n, 2);
             }
-            fcx.sleep(ms(500)).await?;
+            fcx.race(Some(fcx.now() + ms(500)), peer.join(&fcx))
+                .await??;
             assert!(
                 received.load(Ordering::SeqCst),
                 "the peer received the new bytes"

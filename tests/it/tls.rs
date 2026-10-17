@@ -633,8 +633,8 @@ fn pattern(i: usize) -> u8 {
 fn five_megabytes_each_way() {
     const SIZE: usize = 5 * 1024 * 1024;
     within(Duration::from_secs(120), || {
-        block_on(fictionet::run(
-            fictionet::Seed::random(),
+        block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
             |fcx| async move {
                 let ca = Ca::new(&fcx, "Test CA").unwrap();
                 let config = server_config(&fcx, &ca, "example.test", &[]);

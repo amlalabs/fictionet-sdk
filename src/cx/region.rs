@@ -372,7 +372,7 @@ mod tests {
             }));
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-SCAFFOLD: the receiver is gone only once recv_timeout below has failed the test"
+                reason = "the receiver is gone only once recv_timeout below has failed the test"
             )]
             let _ = tx.send(out.map_err(|e| e.to_string()));
         });

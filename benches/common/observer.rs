@@ -2,7 +2,6 @@ use fictionet::relay::observer::{Client, Envelope, Value};
 use std::io::{self, ErrorKind};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 /// Whether all subscriptions were acknowledged, or the observer failed.
 #[derive(Debug, PartialEq, Eq)]
@@ -41,32 +40,60 @@ pub fn watch_world(
     measuring: &AtomicBool,
 ) -> io::Result<u64> {
     let result = (|| {
-        // Wait until every sandbox has a link in the graph.
+        let watch = client.request(r#"{"op":"watch"}"#)?;
+        let mut graph_request = None;
+        let mut graph_changed = false;
+        let mut snapshot = false;
         let links = loop {
-            let id = client.request(r#"{"op":"graph"}"#)?;
-            let graph = client.next_value()?.ok_or_else(|| {
+            let value = client.next_value()?.ok_or_else(|| {
                 io::Error::new(ErrorKind::UnexpectedEof, "observer closed before graph")
             })?;
-            if graph.id != id || graph.binary {
-                return Err(reply_error(&graph, "invalid graph reply"));
+            if let Some(Envelope::Error(reason)) = value.envelope() {
+                return Err(reply_error(&value, &reason));
             }
-            if let Some(Envelope::Error(reason)) = graph.envelope() {
-                return Err(reply_error(&graph, &reason));
-            }
-            let links = sandbox_links(&String::from_utf8_lossy(&graph.bytes));
-            if links.len() >= sandboxes {
+            let graph = if value.id == watch {
+                match value.envelope() {
+                    Some(Envelope::Event { name, data }) if name == "snapshot" => {
+                        snapshot = true;
+                        data
+                    }
+                    Some(Envelope::Event { name, .. }) if name == "node" || name == "edge" => {
+                        if graph_request.is_none() {
+                            graph_request = Some(client.request(r#"{"op":"graph"}"#)?);
+                        } else {
+                            graph_changed = true;
+                        }
+                        continue;
+                    }
+                    Some(Envelope::Event { name, .. }) if !value.end && name != "ended" => continue,
+                    _ => return Err(reply_error(&value, "watch ended before graph")),
+                }
+            } else if Some(value.id) == graph_request && !value.binary && value.end {
+                graph_request = None;
+                std::str::from_utf8(&value.bytes)
+                    .map_err(|_| reply_error(&value, "invalid graph text"))?
+            } else {
+                return Err(reply_error(&value, "invalid graph reply"));
+            };
+            let links = sandbox_links(graph);
+            if snapshot && links.len() >= sandboxes {
                 break links;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            if graph_request.is_none() && graph_changed {
+                graph_request = Some(client.request(r#"{"op":"graph"}"#)?);
+                graph_changed = false;
+            }
         };
-        let watch = client.request(r#"{"op":"watch"}"#)?;
-        let mut subscriptions = vec![(watch, "snapshot", false)];
+        let mut subscriptions = vec![(watch, "snapshot", true)];
         if packets {
             for link in &links {
                 let id =
                     client.request(&format!(r#"{{"op":"packets","link":"{link}","after":0}}"#))?;
                 subscriptions.push((id, "link", false));
             }
+        }
+        if subscriptions.iter().all(|s| s.2) {
+            *status.lock().unwrap() = ObserverStatus::Ready;
         }
         let mut rows = 0;
         while !stop.load(Ordering::Acquire) {

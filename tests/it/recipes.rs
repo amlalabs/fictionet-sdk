@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use fictionet::prelude::*;
 use fictionet::stdlib::{ConnError, tcp};
-use fictionet::{Cx, block_on, pair, run};
+use fictionet::{Cx, block_on, lab, pair};
 
 #[allow(dead_code)]
 mod route_change {
@@ -47,7 +47,7 @@ async fn ask(fcx: &Cx, client: &tcp::Endpoint, request: &[u8]) -> fictionet::Res
 #[test]
 fn route_change_answers_get_with_the_body_and_head_without() {
     within(Duration::from_secs(10), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
             let (client, server) = pair();
             route_change::bank(&fcx, server);
             let client = tcp::endpoint(&fcx, client, "10.0.0.2".parse()?);
@@ -87,7 +87,7 @@ fn route_change_answers_get_with_the_body_and_head_without() {
 #[test]
 fn route_change_limits_unfinished_requests() {
     within(Duration::from_secs(30), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
             let (client, server) = pair();
             route_change::bank(&fcx, server);
             let client = tcp::endpoint(&fcx, client, "10.0.0.2".parse()?);

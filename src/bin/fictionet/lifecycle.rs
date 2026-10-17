@@ -27,12 +27,12 @@ pub(crate) fn remove_on_signal(path: &std::path::Path, id: (u64, u64)) {
     if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: set once per process, by Unlink::new in run_qemu, the only caller"
+            reason = "set once per process, by Unlink::new in run_qemu, the only caller"
         )]
         let _ = SOCKET_FILE.set(c);
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: set once per process, by Unlink::new in run_qemu, the only caller"
+            reason = "set once per process, by Unlink::new in run_qemu, the only caller"
         )]
         let _ = SOCKET_FILE_ID.set(id);
         SOCKET_FILE_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -47,7 +47,7 @@ pub(crate) fn remove_ready_on_signal(path: &std::path::Path) {
     if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: set once per process: main passes the path for tun and proxy, and None for tap, whose take_ready_file runs once"
+            reason = "set once per process: main passes the path for tun and proxy, and None for tap, whose take_ready_file runs once"
         )]
         let _ = READY_FILE.set(c);
     }
@@ -195,7 +195,7 @@ fn write_ready_file_with(
     if let Some(path) = path {
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-CHECKED-NEXT: open_own_file below uses O_EXCL, so a file that was not removed fails it"
+            reason = "open_own_file below uses O_EXCL, so a file that was not removed fails it"
         )]
         let _ = fs::remove_file(path);
         let mut f = open_own_file(path, true).map_err(err("writing the ready file"))?;

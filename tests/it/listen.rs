@@ -89,20 +89,23 @@ fn attach_echo_and_detach() {
         fictionet::Listening::bind(WorldSocket::UnixSocket(path.clone().into())).unwrap();
 
     let (done_tx, done_rx) = mpsc::channel();
-    let echoed = std::sync::Arc::new(AtomicU32::new(0));
-    let count = echoed.clone();
+    let (echoed_tx, echoed_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let mut abc = attachments.get(&fcx, "abc").await?;
             assert_eq!(abc.name(), "abc");
             assert_eq!(abc.mtu(), 9000);
+            let mut count = 0;
             // Echo every packet back with its bytes reversed, until detach.
             loop {
                 match abc.recv(&fcx).await {
                     Ok(Packet(mut bytes)) => {
                         bytes.reverse();
                         abc.send(Packet(bytes));
-                        count.fetch_add(1, Ordering::SeqCst);
+                        count += 1;
+                        if count == 20_501 || count == 21_501 {
+                            echoed_tx.send(count).unwrap();
+                        }
                     }
                     Err(RecvError::Closed) => return Ok(()),
                     Err(e) => return Err(e.into()),
@@ -151,9 +154,10 @@ fn attach_echo_and_detach() {
     for i in 0..20_000u32 {
         client.send(&Message::Packet(&payload(i, 1400)));
     }
-    poll::until(Duration::from_secs(15), || {
-        echoed.load(Ordering::SeqCst) == 20_501
-    });
+    assert_eq!(
+        echoed_rx.recv_timeout(Duration::from_secs(15)).unwrap(),
+        20_501
+    );
     client.set_timeout(Duration::from_millis(500));
     let mut got = 0;
     while let Some(m) = client.try_recv() {
@@ -169,9 +173,10 @@ fn attach_echo_and_detach() {
     for i in 0..1_000u32 {
         client.send(&Message::Packet(&payload(i, 60_000)));
     }
-    poll::until(Duration::from_secs(15), || {
-        echoed.load(Ordering::SeqCst) == 21_501
-    });
+    assert_eq!(
+        echoed_rx.recv_timeout(Duration::from_secs(15)).unwrap(),
+        21_501
+    );
     let mut last = None;
     let mut got = 0;
     while let Some(m) = client.try_recv() {
@@ -266,16 +271,19 @@ fn refuses_taken_and_bad_names_and_frees_names_on_close() {
     // When attach closes, the name is free again, even though the world
     // never took the attachment.
     drop(first);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let again = Client::connect(&path);
-        again.hello("abc", 1500);
-        match relay::decode(&again.recv().unwrap()) {
-            Ok(Message::Accept) => break,
-            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            other => panic!("name was not freed: {other:?}"),
-        }
-    }
+    poll::until(
+        Duration::from_secs(5),
+        "detached sandbox name to be released",
+        || {
+            let again = Client::connect(&path);
+            again.hello("abc", 1500);
+            match relay::decode(&again.recv().unwrap()) {
+                Ok(Message::Accept) => true,
+                Ok(Message::Refuse(_)) => false,
+                other => panic!("name was not freed: {other:?}"),
+            }
+        },
+    );
 }
 
 #[test]
@@ -498,16 +506,22 @@ fn reattaching_before_the_world_asks_gives_the_new_connection() {
     let (attacher, mut attachments) = attachments();
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     drop(Client::attach(&path, "abc"));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let client = loop {
-        let c = Client::connect(&path);
-        c.hello("abc", 1500);
-        if c.recv() == Some(vec![relay::ACCEPT]) {
-            break c;
-        }
-        assert!(Instant::now() < deadline, "the name was never freed");
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    let mut client = None;
+    poll::until(
+        Duration::from_secs(5),
+        "detached sandbox name to be released",
+        || {
+            let c = Client::connect(&path);
+            c.hello("abc", 1500);
+            if c.recv() == Some(vec![relay::ACCEPT]) {
+                client = Some(c);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    let client = client.unwrap();
     client.send(&Message::Packet(&[5]));
     let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
         let mut a = attachments.get(&fcx, "abc").await?;
@@ -546,16 +560,20 @@ fn a_taken_attachment_drains_packets_after_detach_and_reconnect() {
     }
     drop(first);
     let mut next = None;
-    poll::until(Duration::from_secs(5), || {
-        let client = Client::connect(&path);
-        client.hello("agent", 1500);
-        if client.recv() == Some(vec![relay::ACCEPT]) {
-            next = Some(client);
-            true
-        } else {
-            false
-        }
-    });
+    poll::until(
+        Duration::from_secs(5),
+        "detached sandbox name to be released",
+        || {
+            let client = Client::connect(&path);
+            client.hello("agent", 1500);
+            if client.recv() == Some(vec![relay::ACCEPT]) {
+                next = Some(client);
+                true
+            } else {
+                false
+            }
+        },
+    );
     let next = next.unwrap();
     next.send(&Message::Packet(&[255]));
     drop(go);
@@ -617,7 +635,7 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
     let (attacher, attachments) = attachments();
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     let (wrapped_tx, wrapped_rx) = mpsc::channel();
-    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (mut go_tx, mut go_rx) = fictionet::pair();
     let (queued_tx, queued_rx) = mpsc::channel();
     let world = std::thread::spawn(move || {
         block_on(run(fictionet::Seed::random(), move |fcx| async move {
@@ -630,9 +648,7 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
             drop(barrier);
             // Wait for the test thread without blocking the run's thread,
             // so the map task can pass sandboxes on meanwhile.
-            while go_rx.try_recv().is_err() {
-                fcx.sleep(fictionet::time::ms(5)).await?;
-            }
+            go_rx.recv(&fcx).await?;
             let mut a = mapped.get(&fcx, "agent").await?;
             assert_eq!(a.mtu(), 1400);
             assert_eq!(a.recv(&fcx).await?, Packet(vec![6]));
@@ -648,18 +664,24 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
         .expect("the map did not pass the barrier");
     drop(barrier);
     drop(first);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let client = loop {
-        let c = Client::connect(&path);
-        c.hello("agent", 1400);
-        if c.recv() == Some(vec![relay::ACCEPT]) {
-            break c;
-        }
-        assert!(Instant::now() < deadline, "the name was never freed");
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    let mut client = None;
+    poll::until(
+        Duration::from_secs(5),
+        "detached sandbox name to be released",
+        || {
+            let c = Client::connect(&path);
+            c.hello("agent", 1400);
+            if c.recv() == Some(vec![relay::ACCEPT]) {
+                client = Some(c);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    let client = client.unwrap();
     client.send(&Message::Packet(&[6]));
-    go_tx.send(()).unwrap();
+    go_tx.send(Packet(Vec::new()));
     world.join().unwrap().map_err(|e| e.to_string()).unwrap();
     // Only the barrier and the sandbox the world took were wrapped.
     assert_eq!(wrapped_rx.try_iter().collect::<Vec<_>>(), [1500, 1400]);

@@ -8,8 +8,8 @@
 
 #[path = "../it/common/logged.rs"]
 mod logged;
-#[path = "../it/common/wait.rs"]
-mod wait;
+#[path = "../it/common/poll.rs"]
+mod poll;
 
 use logged::logged;
 
@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use fictionet::stdlib::ip::checksum;
-use fictionet::{Interface, Packet, RecvError};
+use fictionet::{Interface, InterfaceExt, Packet};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 
@@ -149,36 +149,18 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
                     fictionet::RaceError::Cancelled => err.into(),
                 })??;
             let mtu = abc.mtu();
-            // Send echo requests until one is answered: the device may come up
-            // a moment after accept is sent.
-            let mut reply = None;
-            for seq in 0..50u16 {
-                abc.send(Packet(echo_request(seq)));
-                fcx.sleep(fictionet::time::ms(100)).await?;
-                // Drain what came back.
-                loop {
-                    let next = futures_poll_once(&fcx, &mut abc);
-                    match next {
-                        Some(Ok(Packet(p))) if p.len() >= 28 && p[9] == 1 && p[20] == 0 => {
-                            reply = Some(p)
+            // Attach configures the device before its world handshake.
+            abc.send(Packet(echo_request(0)));
+            let reply = fcx
+                .race(Some(fcx.now() + Duration::from_secs(5)), async {
+                    loop {
+                        let Packet(p) = abc.recv(&fcx).await?;
+                        if p.len() >= 28 && p[9] == 1 && p[20] == 0 {
+                            break Ok::<_, fictionet::RecvError>(p);
                         }
-                        Some(Ok(_)) => continue,
-                        Some(Err(RecvError::Closed)) => {
-                            return Err(fictionet::Error::msg("attach closed"));
-                        }
-                        Some(Err(RecvError::Cancelled)) => {
-                            return Err(fictionet::Error::msg("cancelled"));
-                        }
-                        None => break,
                     }
-                }
-                if reply.is_some() {
-                    break;
-                }
-            }
-            let reply = reply.ok_or_else(|| {
-                fictionet::Error::msg("the sandbox never answered the echo request")
-            })?;
+                })
+                .await??;
 
             // A second attach under the same name is refused. Waiting for it
             // blocks this thread, which is fine: the listen helper thread
@@ -223,20 +205,14 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
     );
 
     // The world closed the attachment: attach exits 0.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(s) = first.try_wait().unwrap() {
-            break s;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "attach did not exit after the world closed"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let out = first.wait_with_output().unwrap();
+    let (exited, exit) = std::sync::mpsc::channel();
+    let child = std::thread::spawn(move || exited.send(first.wait_with_output().unwrap()).unwrap());
+    let out = exit
+        .recv_timeout(Duration::from_secs(10))
+        .expect("attach did not exit after the world closed");
+    child.join().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
     assert!(err.contains("the world closed the connection"), "{err}");
     assert_eq!(
         std::fs::read_to_string(dir.join("resolv-first")).unwrap(),
@@ -248,19 +224,6 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
         "nameserver 192.0.2.1\n"
     );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Polls `recv` once: `None` if nothing is waiting.
-fn futures_poll_once(
-    fcx: &fictionet::Cx,
-    i: &mut fictionet::Attachment,
-) -> Option<Result<Packet, RecvError>> {
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    match i.poll_recv(fcx, &mut cx) {
-        std::task::Poll::Ready(r) => Some(r),
-        std::task::Poll::Pending => None,
-    }
 }
 
 /// `--resolv-conf <path>` writes the DNS servers there, making the
@@ -300,12 +263,9 @@ fn resolv_conf_flag_picks_the_file_and_a_failed_write_names_it() {
         fictionet::Seed::random(),
         move |fcx| async move {
             let abc = attachments.get(&fcx, "good").await?;
-            for _ in 0..100 {
-                if written.exists() {
-                    break;
-                }
-                fcx.sleep(fictionet::time::ms(50)).await?;
-            }
+            poll::until(Duration::from_secs(5), "sandbox resolver file", || {
+                written.exists()
+            });
             drop(abc);
             Ok(())
         },
@@ -354,7 +314,9 @@ fn hold_until(attachments: fictionet::Attachments, name: &'static str, done: std
         fictionet::Seed::random(),
         move |fcx| async move {
             let held = attachments.get(&fcx, name).await?;
-            wait::until(&fcx, Duration::from_secs(10), || done.exists()).await;
+            poll::until(Duration::from_secs(10), "sandbox completion file", || {
+                done.exists()
+            });
             drop(held);
             Ok(())
         },

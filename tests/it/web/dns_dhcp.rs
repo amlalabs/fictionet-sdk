@@ -390,18 +390,11 @@ fn dhcp_lease_renewal_and_restart() {
         assert_eq!(ack.message_type(), Some(dhcp::ACK));
         drop(a);
         let mut c = attacher.attach("c").unwrap();
-        let mut got = None;
-        for xid in 100..150 {
-            let mut d = dhcp_msg(dhcp::DISCOVER, xid, 4);
-            d.push(dhcp::opt::REQUESTED_IP, addr.octets());
-            let (_, offer) = dhcp_ask(&fcx, &mut c, any, bc, &d).await.unwrap();
-            if offer.yiaddr == addr {
-                got = Some(offer.yiaddr);
-                break;
-            }
-            fcx.sleep(Duration::from_millis(20)).await?;
-        }
-        assert_eq!(got, Some(addr), "a's address is free once a detached");
+        fcx.idle().await?;
+        let mut d = dhcp_msg(dhcp::DISCOVER, 100, 4);
+        d.push(dhcp::opt::REQUESTED_IP, addr.octets());
+        let (_, offer) = dhcp_ask(&fcx, &mut c, any, bc, &d).await.unwrap();
+        assert_eq!(offer.yiaddr, addr, "a's address is free once a detached");
 
         // INFORM from a static address: an ACK with the settings and no lease.
         let mut d = attacher.attach("d").unwrap();

@@ -6,14 +6,12 @@ use crate::common::certs;
 
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use fictionet::relay::observer::{Client, Value};
 use fictionet::stdlib::tls::{self, ServerConfig};
 use fictionet::stdlib::{Connection, ConnectionExt, tcp};
-use fictionet::time::ms;
-use fictionet::{Cx, Result};
+use fictionet::{Cx, Interface, InterfaceExt, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
@@ -102,11 +100,10 @@ fn an_observer_sees_http_inside_tls() {
         attacher,
     )
     .unwrap();
-    let go = Arc::new(AtomicBool::new(false));
-    let fetched = Arc::new(std::sync::Mutex::new(None));
-    let (g, f) = (go.clone(), fetched.clone());
-    std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(
+    let (mut go, mut started) = fictionet::pair();
+    let (response_tx, fetched) = std::sync::mpsc::channel();
+    let world = std::thread::spawn(move || {
+        fictionet::block_on(fictionet::run(
             fictionet::Seed::random(),
             move |fcx| async move {
                 // Taking attachments is what lets the world socket find this run.
@@ -136,9 +133,7 @@ fn an_observer_sees_http_inside_tls() {
                     conn.shutdown(&fcx).await?;
                     Ok(())
                 });
-                while !g.load(Ordering::SeqCst) {
-                    fcx.sleep(ms(10)).await?;
-                }
+                started.recv(&fcx).await?;
                 let conn = client.connect(&fcx, "10.0.0.1:443".parse()?).await?;
                 let response = fetch(
                     &fcx,
@@ -147,11 +142,12 @@ fn an_observer_sees_http_inside_tls() {
                     b"GET /secret HTTP/1.1\r\nhost: secret.test\r\n\r\n",
                 )
                 .await?;
-                *f.lock().unwrap() = Some(response);
-                fcx.sleep(std::time::Duration::from_secs(60)).await?;
+                response_tx.send(response).unwrap();
+                started.recv(&fcx).await?;
+                fcx.cancel();
                 Ok(())
             },
-        ));
+        ))
     });
 
     let mut observer = Client::connect(&path, "test").unwrap();
@@ -184,7 +180,7 @@ fn an_observer_sees_http_inside_tls() {
         }
         let t = text(&v);
         if t.starts_with(r#"{"event":"link""#) {
-            go.store(true, Ordering::SeqCst);
+            go.send(fictionet::Packet(Vec::new()));
         }
         // The packet is shown as what TLS carries.
         request |= t.contains(r#""proto":"HTTP","info":"GET /secret HTTP/1.1""#)
@@ -195,10 +191,9 @@ fn an_observer_sees_http_inside_tls() {
     assert!(request && response, "the HTTP inside the TLS was not shown");
     assert!(
         fetched
-            .lock()
+            .recv_timeout(Duration::from_secs(10))
             .unwrap()
-            .as_ref()
-            .is_some_and(|r| r.ends_with(b"hello"))
+            .ends_with(b"hello")
     );
 
     // The keys, and the capture with the keys in it.
@@ -231,4 +226,6 @@ fn an_observer_sees_http_inside_tls() {
         u32::from_le_bytes(b[first + second..first + second + 4].try_into().unwrap()),
         0x0a
     );
+    go.send(fictionet::Packet(Vec::new()));
+    world.join().unwrap().unwrap();
 }

@@ -201,7 +201,7 @@ fn dns_display(msg: &[u8]) -> Display {
         if code != "No Error" {
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                reason = "fmt::Write for String never returns Err"
             )]
             let _ = write!(text, " {code}");
             d.tag("dns-error");
@@ -209,7 +209,7 @@ fn dns_display(msg: &[u8]) -> Display {
         if !a_text.is_empty() {
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                reason = "fmt::Write for String never returns Err"
             )]
             let _ = write!(text, " {}", a_text.join(" "));
         }

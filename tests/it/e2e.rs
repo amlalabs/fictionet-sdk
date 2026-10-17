@@ -8,7 +8,7 @@ use crate::common::certs;
 use crate::common::world;
 
 use certs::certs;
-use world::real_world as world;
+use world::world;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};

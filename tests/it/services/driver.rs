@@ -956,7 +956,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
     });
 
     let ran = std::thread::spawn(move || {
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             Net::new()
                 .ipv4_only()
@@ -965,7 +965,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
             let s = machine(&fcx, attacher.attach("agent")?, ME);
             let mut a = s.tcp.connect(&fcx, to).await?;
             a.write_all(&fcx, b"boom\n").await?;
-            fcx.sleep(Duration::from_secs(30)).await?;
+            fcx.idle().await?;
             Ok(())
         }))
     })
@@ -1000,7 +1000,7 @@ service_fixture! {
 fn a_seeded_run_repeats_its_randomness() {
     let draws = |seed: u64| {
         let (tx, rx) = mpsc::channel();
-        fictionet::block_on(fictionet::run(
+        fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(seed),
             move |fcx| async move {
                 let (server, _su, client, _cu) = two_machines(&fcx);

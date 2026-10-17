@@ -431,6 +431,36 @@ impl Cx {
         EventLog::new(self.run.events.clone())
     }
 
+    /// Waits until every task in this run is waiting, before a lab's clock
+    /// jumps to its next deadline. Work spawned or woken by other tasks is
+    /// drained first. This does not wait for future timers or host I/O.
+    ///
+    /// Useful for inspecting a closed world's state after it has processed
+    /// its current input. The instant stays unchanged in a lab. Returns
+    /// [`Cancelled`] if this context's region is cancelled.
+    ///
+    /// ```
+    /// # fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |cx| async move {
+    /// let start = cx.now();
+    /// cx.idle().await?;
+    /// assert_eq!(cx.now(), start);
+    /// # Ok(()) }))?;
+    /// # Ok::<(), fictionet::Error>(())
+    /// ```
+    pub async fn idle(&self) -> Result<(), Cancelled> {
+        if self.is_cancelled() {
+            return Err(Cancelled);
+        }
+        self.race(None, self.run.idle())
+            .await
+            .map_err(|_| Cancelled)?;
+        if self.is_cancelled() {
+            Err(Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Waits until this `Cx`'s [region](Cx#regions) is cancelled.
     ///
     /// Returns immediately if it already is.

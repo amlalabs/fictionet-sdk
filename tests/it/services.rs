@@ -8,7 +8,6 @@ use crate::common::certs;
 use crate::common::done;
 use crate::common::echo_service;
 use crate::common::timeout;
-use crate::common::wait;
 use crate::common::world;
 
 #[path = "services/driver.rs"]
@@ -57,7 +56,7 @@ use fictionet::stdlib::serve::{
     ServeOptions, Served, Timer, Transcript, Upgrade,
 };
 use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};
-use fictionet::{Cx, block_on, pair, run};
+use fictionet::{Cx, block_on, lab, pair};
 
 // ---------------------------------------------------------------------------
 // Running a world in a test

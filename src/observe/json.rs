@@ -17,7 +17,7 @@ pub(crate) fn string(out: &mut String, s: &str) {
             c if (c as u32) < 0x20 || c == '<' || c == '\u{2028}' || c == '\u{2029}' => {
                 #[expect(
                     clippy::let_underscore_must_use,
-                    reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+                    reason = "fmt::Write for String never returns Err"
                 )]
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
@@ -77,7 +77,7 @@ impl Object {
         self.key(k);
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-INFALLIBLE: fmt::Write for String never returns Err"
+            reason = "fmt::Write for String never returns Err"
         )]
         let _ = write!(self.out, "{v}");
         self

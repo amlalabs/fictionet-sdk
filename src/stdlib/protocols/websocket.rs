@@ -2743,7 +2743,7 @@ mod tests {
         let mut d = Stream::new(Messages::for_receiver(Side::Client).with_limit(1));
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "POL-SCAFFOLD: an oversized push; the test checks the buffered bound, not how much of it was taken"
+            reason = "an oversized push; the test checks the buffered bound, not how much of it was taken"
         )]
         let _ = d.push(&vec![0x82; 1 << 20]);
         assert!(
@@ -2757,7 +2757,7 @@ mod tests {
         for _ in 0..3 {
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "POL-SCAFFOLD: undrained pushes fill the stream; the test checks the buffered bound, not how much each push took"
+                reason = "undrained pushes fill the stream; the test checks the buffered bound, not how much each push took"
             )]
             let _ = d.push(&chunk);
         }

@@ -2,7 +2,6 @@
 //! a world in this process.
 
 use crate::common::logged;
-use crate::common::poll;
 
 use logged::logged;
 
@@ -929,6 +928,7 @@ fn start_two_links(path: &str) -> fictionet::Listening {
     let (attacher, mut attachments) = fictionet::attachments();
     let listening =
         fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
+    let (ready, started) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
             fictionet::Seed::random(),
@@ -961,10 +961,13 @@ fn start_two_links(path: &str) -> fictionet::Listening {
                         }
                     });
                 }
+                fcx.idle().await?;
+                ready.send(()).unwrap();
                 Ok(())
             },
         ));
     });
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
     listening
 }
 
@@ -1015,11 +1018,7 @@ fn the_dashboard_merges_the_packets_of_several_links() {
     assert_eq!(get(port, "/groups.mjs").0, "HTTP/1.1 200 OK");
 
     // The two links, and the group their echo tasks are in.
-    let mut graph = String::new();
-    poll::until(Duration::from_secs(10), || {
-        graph = get(port, "/api/graph").1;
-        graph.contains(r#""name":"lan","parent":null"#) && graph.matches(r#"{"id":"e"#).count() == 2
-    });
+    let graph = get(port, "/api/graph").1;
     assert!(graph.contains(r#""name":"lan","parent":null"#), "{graph}");
     let links: Vec<String> = graph
         .split(r#"{"id":"e"#)
@@ -1091,11 +1090,7 @@ fn the_dashboard_merges_the_packets_of_several_links() {
 }
 
 fn two_dashboard_links(port: u16) -> Vec<String> {
-    let mut graph = String::new();
-    poll::until(Duration::from_secs(10), || {
-        graph = get(port, "/api/graph").1;
-        graph.matches(r#"{"id":"e"#).count() == 2
-    });
+    let graph = get(port, "/api/graph").1;
     let links: Vec<String> = graph
         .split(r#"{"id":"e"#)
         .skip(1)
@@ -1236,21 +1231,9 @@ fn a_watch_exits_0_when_the_world_ends() {
     });
     let log = logged(child.stdout.take().unwrap(), r#""event":"snapshot""#);
     drop(stop);
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break Some(status);
-        }
-        if std::time::Instant::now() > deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = crate::common::within(Duration::from_secs(20), move || child.wait().unwrap());
     world_thread.join().unwrap();
     let out = log.join().unwrap();
-    let status = status.expect("the watch should exit when the world ends");
     assert_eq!(status.code(), Some(0), "{out}");
     assert!(out.contains(r#"{"event":"ended","#), "{out}");
     assert!(

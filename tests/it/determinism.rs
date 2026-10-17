@@ -323,7 +323,7 @@ async fn episode(
             assert!(response.starts_with(b"HTTP/1.1 101"));
         }
     }
-    cx.sleep(Duration::from_secs(2)).await?;
+    cx.idle().await?;
     assert_eq!(cx.events().lost(), 0);
     cx.cancel();
     Ok(())

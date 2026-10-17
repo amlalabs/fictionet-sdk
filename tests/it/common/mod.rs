@@ -6,7 +6,6 @@ mod service_fixture;
 
 pub mod alloc;
 #[cfg(feature = "std")]
-#[allow(dead_code)]
 pub mod certs;
 #[cfg(feature = "std")]
 pub mod done;
@@ -29,8 +28,6 @@ pub mod requirements;
 pub mod rustls_client;
 #[cfg(feature = "std")]
 pub mod timeout;
-#[cfg(feature = "std")]
-pub mod wait;
 #[cfg(feature = "std")]
 pub mod world;
 

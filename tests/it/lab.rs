@@ -9,7 +9,94 @@ use fictionet::time::{Instant, ms};
 use fictionet::{Cancelled, JoinError, RaceError, RunMode, Seed, Timer, block_on, lab};
 
 #[test]
-fn event_wait_stops_at_its_limit_between_sampling_ticks() {
+fn idle_drains_spawned_and_woken_work_before_advancing_time() {
+    block_on(lab(Seed::from_u64(1), |cx| async move {
+        let task = cx.spawn(|cx| async move {
+            for _ in 0..100 {
+                cx.yield_now().await?;
+            }
+            cx.spawn(|cx| async move {
+                cx.record(Event::new("test", "ready"));
+                cx.sleep(ms(1)).await?;
+                cx.record(Event::new("test", "later"));
+                Ok(())
+            });
+            Ok(())
+        });
+        cx.idle().await?;
+        assert_eq!(cx.now(), Instant::ZERO);
+        assert_eq!(cx.events().of("test", "ready").len(), 1);
+        assert!(cx.events().of("test", "later").is_empty());
+        task.join(&cx).await?;
+        cx.idle().await?;
+        assert_eq!(cx.now(), Instant::ZERO);
+        cx.sleep(ms(1)).await?;
+        cx.idle().await?;
+        assert_eq!(cx.events().of("test", "later").len(), 1);
+        assert_eq!(cx.now(), Instant::ZERO + ms(1));
+        cx.cancel();
+        assert_eq!(cx.idle().await, Err(Cancelled));
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn dropped_idle_waits_do_not_delay_the_clock() {
+    block_on(lab(Seed::from_u64(1), |cx| async move {
+        let mut idle = Box::pin(cx.idle());
+        poll_fn(|task| {
+            assert!(idle.as_mut().poll(task).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(idle);
+        cx.sleep(ms(1)).await?;
+        assert_eq!(cx.now(), Instant::ZERO + ms(1));
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn event_wait_wakes_at_the_event_and_repeat_deadlines() {
+    for _ in 0..3 {
+        block_on(lab(Seed::from_u64(1), |cx| async move {
+            cx.spawn(|cx| async move {
+                cx.sleep(Duration::from_nanos(7)).await?;
+                cx.record(Event::new("test", "ready"));
+                cx.record_repeat(Event::new("test", "repeat"), Default::default());
+                cx.sleep(ms(2)).await?;
+                cx.record_repeat(Event::new("test", "repeat"), Default::default());
+                Ok(())
+            });
+            let log = cx.events();
+            let got = log.wait(&cx, 1, ms(1), |e| e.is("test", "ready")).await?;
+            assert_eq!(got.len(), 1);
+            assert_eq!(cx.now().since_start(), Duration::from_nanos(7));
+            let mut checks = Vec::new();
+            let got = log
+                .wait(&cx, 2, Duration::from_secs(2), |e| {
+                    if e.is("test", "repeat") {
+                        checks.push(cx.now());
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .await?;
+            assert_eq!(got.len(), 2);
+            let first = Instant::ZERO + Duration::from_nanos(7);
+            assert_eq!(cx.now(), first + Duration::from_secs(1));
+            assert_eq!(checks, [first, first + ms(2), cx.now(), cx.now()]);
+            Ok(())
+        }))
+        .unwrap();
+    }
+}
+
+#[test]
+fn event_wait_stops_at_its_exact_limit() {
     for limit in [Duration::ZERO, Duration::from_nanos(1), ms(1), ms(15)] {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             fcx.sleep(ms(3)).await?;
@@ -41,7 +128,7 @@ fn event_wait_accepts_an_overflowing_limit() {
             .wait(&fcx, 1, Duration::MAX, |event| event.is("test", "tick"))
             .await?;
         assert_eq!(got.len(), 1);
-        assert_eq!(fcx.now().since_start(), ms(11));
+        assert_eq!(fcx.now().since_start(), ms(2));
         Ok(())
     }))
     .unwrap();

@@ -383,7 +383,7 @@ def test_invalid_dockerignore_is_an_error(pattern):
 
 @pytest.mark.skipif(
     os.environ.get("INSPECT_FICTIONET_DOCKER") != "1" and "CI" not in os.environ,
-    reason="POL-PREREQUISITE: builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
+    reason="builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
 )
 @pytest.mark.parametrize("specific", [False, True])
 def test_dockerignore_matches_docker(tmp_path, specific):
@@ -516,10 +516,10 @@ def test_the_wheel_holds_the_chart(tmp_path):
     file of charts/fictionet-sandbox, unchanged."""
     if not (REPO / "charts" / "fictionet-sandbox").is_dir():
         assert "CI" not in os.environ, "repository chart is required in CI"
-        pytest.skip("POL-PREREQUISITE: not in the repository")
+        pytest.skip("not in the repository")
     if shutil.which("uv") is None:
         assert "CI" not in os.environ, "uv is required in CI"
-        pytest.skip("POL-PREREQUISITE: needs uv")
+        pytest.skip("needs uv")
     package = Path(__file__).resolve().parents[1]
     subprocess.run(["uv", "build", "--quiet", "--out-dir", str(tmp_path), str(package)], check=True)
     [wheel] = tmp_path.glob("*.whl")
@@ -698,7 +698,7 @@ def test_k8s_tiny_cpu_limit(tmp_path):
 
 @pytest.mark.skipif(
     os.environ.get("INSPECT_FICTIONET_DOCKER") != "1" and "CI" not in os.environ,
-    reason="POL-PREREQUISITE: builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
+    reason="builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
 )
 def test_edited_source_is_rebuilt(tmp_path):
     """A same-size, same-mtime edit changes the snapshot and compose path.
@@ -747,7 +747,7 @@ def test_edited_source_is_rebuilt(tmp_path):
 
 @pytest.mark.skipif(
     os.environ.get("INSPECT_FICTIONET_DOCKER") != "1" and "CI" not in os.environ,
-    reason="POL-PREREQUISITE: builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
+    reason="builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
 )
 def test_cargo_example_image_is_rebuilt(tmp_path):
     """Run the generated scratch image before and after a source edit,

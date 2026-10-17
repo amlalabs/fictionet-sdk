@@ -23,7 +23,7 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
         let (config, _roots) = tls_pair(&fcx, &["a.test"]);
         let (server, _su, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(443)?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
         fcx.spawn(move |fcx| async move {
             let conn = listener.accept(&fcx).await?;
             let _ = fcx
@@ -54,19 +54,11 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
         let _conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 443))
             .await?;
-        let mut result = None;
-        let slot = &mut result;
-        wait::until(&fcx, Duration::from_secs(10), move || match rx.try_recv() {
-            Ok(value) => {
-                *slot = Some(value);
-                true
-            }
-            Err(mpsc::TryRecvError::Empty) => false,
-            Err(e) => panic!("the handshake task stopped: {e}"),
-        })
-        .await;
+        let result = fcx
+            .race(Some(fcx.now() + Duration::from_secs(10)), rx)
+            .await??;
         // Not a closed connection, nor a broken one: the one cancel.
-        assert_eq!(result.unwrap(), "Err(Cancelled)");
+        assert_eq!(result, "Err(Cancelled)");
         let tls = fcx
             .events()
             .wait(&fcx, 1, Duration::from_secs(2), |e| {
@@ -100,7 +92,7 @@ fn net_routes_tls_by_name_to_each_service() {
         .enable_all()
         .build()
         .unwrap();
-    let result = rt.block_on(run(fictionet::Seed::random(), move |fcx| async move {
+    let result = rt.block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
         let (config, roots) = tls_pair(&fcx, &["a.test", "b.test"]);
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
@@ -244,7 +236,7 @@ fn net_performs_starttls_for_a_service_that_asks() {
         .enable_all()
         .build()
         .unwrap();
-    let result = rt.block_on(run(fictionet::Seed::random(), move |fcx| async move {
+    let result = rt.block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
         let (config, roots) = tls_pair(&fcx, &["mail.test"]);
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();

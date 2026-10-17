@@ -11,7 +11,6 @@ use hyper_io::{Exec, Io};
 
 use crate::common::done;
 use crate::common::timeout;
-use crate::common::wait;
 use crate::common::world as run_world;
 use fictionet::stdlib::sandbox::{TlsClient, TlsError};
 
@@ -38,8 +37,7 @@ use fictionet::stdlib::sandbox::machine;
 use fixture::{
     BIG, BOTH_ADDR, Client, DEFAULT_ADDR, DUAL_ADDR, DUAL_ADDR6, EVENTS_ADDR, Env, GATEWAY, Plain,
     SECURE_ADDR, SHORT, TLS_DEFAULT_ADDR, V6ONLY_ADDR6, bind_by_ping, default_machine, dns, ipv4,
-    lookup, parse, parse_dns, ping, plain_client, real_world, recv_within, sites, tls_connect, udp,
-    world,
+    lookup, parse, parse_dns, ping, plain_client, recv_within, sites, tls_connect, udp, world,
 };
 use timeout::timeout;
 

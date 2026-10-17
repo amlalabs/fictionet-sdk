@@ -8,7 +8,6 @@
 //! process's memory.
 
 use crate::common::timeout;
-use crate::common::wait;
 
 use fictionet::stdlib::sandbox::Machine;
 use fictionet::stdlib::sandbox::machine;
@@ -24,7 +23,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::dns::op::{Message, Query};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::{ip, web};
-use fictionet::{Cx, End, Interface, Packet, block_on, run};
+use fictionet::{Cx, End, Interface, Packet, block_on, lab, run};
 use http::{Request, Response};
 use http_body_util::Full;
 
@@ -192,7 +191,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
+        let result = block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
             let sites = web::Sites::new(|host| match host {
                 "plain.test" => Some(web::Site::new(Hello)),
                 h if h.ends_with(".wild.test") => Some(web::Site::new(Hello)),
@@ -384,10 +383,8 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     )
     .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
-    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let world_sent = sent.clone();
-    let attached = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let world_attached = attached.clone();
+    let (sent, mut world_sent) = tokio::sync::watch::channel(0u64);
+    let (attached, mut world_attached) = tokio::sync::watch::channel(0u64);
     let (tx, rx) = std::sync::mpsc::channel();
     let (senders_tx, senders_rx) = std::sync::mpsc::channel();
     let world_stop = stop.clone();
@@ -410,9 +407,8 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
                 std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
             let senders: Vec<_> = (0..4u8)
                 .map(|i| {
-                    let (path, stop, sent) =
-                        (world_path.clone(), world_stop.clone(), world_sent.clone());
-                    let attached = world_attached.clone();
+                    let (path, stop, sent) = (world_path.clone(), world_stop.clone(), sent.clone());
+                    let attached = attached.clone();
                     let progress = progress[usize::from(i)].clone();
                     std::thread::spawn(move || -> io::Result<()> {
                         let fd = unix::connect(&path)?;
@@ -428,7 +424,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
                         if buf[..n] != [relay::ACCEPT] {
                             return Err(io::Error::other("sender was not accepted"));
                         }
-                        attached.fetch_add(1, Ordering::Relaxed);
+                        attached.send_modify(|n| *n += 1);
                         let p = udp(Ipv4Addr::new(10, 0, 0, 2 + i), 5000, GATEWAY, 9, &[0; 100]);
                         while !stop.load(Ordering::Relaxed) {
                             if let Err(e) =
@@ -440,7 +436,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
                                     Err(e)
                                 };
                             }
-                            sent.fetch_add(1, Ordering::Relaxed);
+                            sent.send_modify(|n| *n += 1);
                             progress.fetch_add(1, Ordering::Relaxed);
                             loop {
                                 let error = match unix::recv(fd.as_raw_fd(), &mut buf, true) {
@@ -467,20 +463,25 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             // The queues fill in the first moments. After that, the world
             // must not keep growing.
             let start = rss();
-            let sent_before = world_sent.load(Ordering::Relaxed);
+            let sent_before = *world_sent.borrow();
             let progress_before = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
-            wait::until(&fcx, Duration::from_secs(30), || {
-                world_attached.load(Ordering::Relaxed) == 4
-                    && world_sent.load(Ordering::Relaxed) - sent_before > 100_000
-            })
-            .await;
+            let deadline = fcx.now() + Duration::from_secs(30);
+            fcx.race(Some(deadline), world_attached.wait_for(|n| *n == 4))
+                .await??;
+            fcx.race(
+                Some(deadline),
+                world_sent.wait_for(|n| *n - sent_before > 100_000),
+            )
+            .await??;
+            assert_eq!(*world_attached.borrow(), 4);
             let middle = rss();
-            let sent_middle = world_sent.load(Ordering::Relaxed);
+            let sent_middle = *world_sent.borrow();
             let progress_middle = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
-            wait::until(&fcx, Duration::from_secs(30), || {
-                world_sent.load(Ordering::Relaxed) - sent_middle > 100_000
-            })
-            .await;
+            fcx.race(
+                Some(fcx.now() + Duration::from_secs(30)),
+                world_sent.wait_for(|n| *n - sent_middle > 100_000),
+            )
+            .await??;
             let end = rss();
             let progress_end = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
             let took = timeout(
@@ -491,7 +492,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             .await;
             world_stop.store(true, Ordering::Relaxed);
             // The flood ran: the senders kept sending while memory was read.
-            let flooded = world_sent.load(Ordering::Relaxed) - sent_before;
+            let flooded = *world_sent.borrow() - sent_before;
             assert!(flooded > 100_000, "only {flooded} packets were sent");
             // Each link reads up to 64 packets per turn, so four symmetric
             // senders should each contribute over 10,000 packets per window.
@@ -507,11 +508,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
                     "sender {i} sent only {second} packets in the second window"
                 );
             }
-            assert_eq!(
-                world_attached.load(Ordering::Relaxed),
-                4,
-                "a sender was not attached"
-            );
+            assert_eq!(*world_attached.borrow(), 4, "a sender was not attached");
             let (first, second) = (middle.saturating_sub(start), end.saturating_sub(middle));
             eprintln!(
                 "four sandboxes flooding: +{:.1} MiB, then +{:.1} MiB",

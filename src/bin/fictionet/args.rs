@@ -162,7 +162,6 @@ fn left_out(group: &[(&str, bool)]) -> Vec<String> {
 
 /// What the arguments after `attach` ask for.
 // Made once per run, so the size of `Run` does not matter.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Parsed {
     /// `--help` or `-h`: print [`ATTACH_USAGE`] and exit 0.
