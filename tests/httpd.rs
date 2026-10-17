@@ -370,6 +370,75 @@ fn http_text(h: &Harness<Http1>) -> String {
     String::from_utf8_lossy(h.output()).into_owned()
 }
 
+struct StreamPieces(std::vec::IntoIter<&'static [u8]>);
+
+impl http_body::Body for StreamPieces {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, std::convert::Infallible>>> {
+        Poll::Ready(
+            self.0
+                .next()
+                .map(|data| Ok(http_body::Frame::data(Bytes::from_static(data)))),
+        )
+    }
+}
+
+struct StreamHandler;
+
+impl httpd::Handler for StreamHandler {
+    fn call(
+        &self,
+        request: http::Request<httpd::Body>,
+        _ex: &mut httpd::Exchange<'_>,
+    ) -> httpd::Reply {
+        let pieces: Vec<&'static [u8]> = match request.uri().path() {
+            "/empty" => vec![],
+            "/empty-frame" => vec![b"hello", b"", b" world"],
+            _ => vec![b"hello", b" world"],
+        };
+        httpd::Reply::Now(http::Response::new(httpd::Body::new(StreamPieces(
+            pieces.into_iter(),
+        ))))
+    }
+}
+
+#[test]
+fn http1_streams_chunks_once_and_keeps_alive() {
+    let answer = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    for path in ["/", "/empty-frame", "/empty"] {
+        let expected = if path == "/empty" {
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n"
+        } else {
+            answer
+        };
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(StreamHandler), ());
+        let request = format!("GET {path} HTTP/1.1\r\nHost: a.test\r\n\r\n");
+        h.push(request.as_bytes()).unwrap();
+        assert_eq!(http_text(&h), expected);
+        assert!(!h.closed());
+        h.push(request.as_bytes()).unwrap();
+        assert_eq!(http_text(&h), expected.repeat(2));
+        assert!(!h.closed());
+        assert_eq!(h.events().len(), 2);
+        for event in h.events() {
+            assert!(event.is("http", "request"));
+            assert_eq!(
+                event.get("sent").and_then(json::Value::as_u64),
+                Some(if path == "/empty" { 0 } else { 11 })
+            );
+            assert_eq!(
+                event.get("complete").and_then(json::Value::as_bool),
+                Some(true)
+            );
+        }
+    }
+}
+
 #[test]
 fn http1_answers_routes_head_errors_and_keep_alive() {
     let router = Router::new()
