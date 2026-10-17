@@ -43,6 +43,14 @@ network access after setup.
 )
 ```
 
+The demo keeps its pages in `examples/adaptive-web/store/<seed>/`, owned by
+root because the world runs as root. A later demo run of the same seed
+serves those pages again instead of making new ones. It must use the same
+generator, model and reasoning setting, or `ADAPTIVE_WEB_GENERATOR=replay`;
+with any other generator the world rejects the store and does not start.
+To start over, set `ADAPTIVE_WEB_STORE_DIR` to another absolute directory,
+or remove that seed's directory with `sudo`.
+
 Run the probes to check the world's requests:
 
 ```bash
@@ -505,10 +513,11 @@ as 503.
 
 ## Keep a run and replay it
 
-By default each run gets a fresh store, a Compose volume that goes away with
-the run. Set `ADAPTIVE_WEB_STORE_DIR` to an absolute directory to keep the
-store on the host. A later run with the same seed and directory starts
-from everything the earlier one made: the same pages, results, cast and
+By default an Inspect run gets a fresh store, a Compose volume that goes
+away with the run, and `scripts/live_demo.sh` keeps its store in `./store`.
+Set `ADAPTIVE_WEB_STORE_DIR` to an absolute directory to keep the store
+there instead. A later run with the same seed and directory starts from
+everything the earlier one made: the same pages, results, cast and
 addresses. A run fails without `finalized` if `addresses.jsonl` is
 unreadable, corrupt or cannot be appended.
 With `ADAPTIVE_WEB_GENERATOR=replay` it makes nothing new: a URL

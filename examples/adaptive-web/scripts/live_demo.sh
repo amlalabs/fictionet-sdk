@@ -31,7 +31,8 @@ case $generator in openrouter|anthropic) network=bridge ;; *) network=none ;; es
 export ADAPTIVE_WEB_NETWORK=${ADAPTIVE_WEB_NETWORK:-$network}
 project=adaptive-web-demo
 trap 'docker compose -p "$project" down -v -t 1' EXIT
-docker compose -p "$project" up -d --wait --quiet-pull
+# Build images from this checkout every time so they stay current and are not pulled.
+docker compose -p "$project" up -d --wait --quiet-pull --build
 
 docker compose -p $project exec -T default python3 - "$@" <<'PY'
 import html, re, subprocess, sys, urllib.parse
