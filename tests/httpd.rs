@@ -11,9 +11,15 @@ use fictionet::stdlib::httpd::{self, Http1, Router};
 use fictionet::stdlib::json;
 use fictionet::stdlib::serve::{FaultPlan, Harness, HarnessError, Plan, ServeOptions};
 
+mod common;
+#[path = "common/done.rs"]
+mod done;
 #[path = "common/http_observer.rs"]
 mod http_observer;
+#[path = "common/world.rs"]
+mod world;
 use http_observer::{Exposure, SECRET, assert_redacted};
+use world::world;
 
 #[test]
 fn observer_sees_no_host_body() {
@@ -752,6 +758,82 @@ fn http1_closes_when_asked_and_on_http10() {
         .unwrap();
     assert!(!h.closed());
     assert!(http_text(&h).contains("connection: keep-alive\r\n"));
+}
+
+#[test]
+fn http1_handler_connection_close() {
+    for connection in ["close", "keep-alive, Close", "keep-alive, \tClose \t"] {
+        let router = Router::new().get("/", move |_, _| {
+            http::Response::builder()
+                .header("connection", connection)
+                .body(Bytes::from("first"))
+                .unwrap()
+        });
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+        h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+        assert!(
+            http_text(&h).contains("connection: close\r\n"),
+            "{connection}"
+        );
+        assert!(http_text(&h).ends_with("\r\n\r\nfirst"));
+        assert!(h.closed());
+    }
+}
+
+#[test]
+fn http1_handler_connection_close_stops_pipeline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let router = Router::new().get("/", move |_, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        http::Response::builder()
+            .header("connection", "close")
+            .body(Bytes::from("first"))
+            .unwrap()
+    });
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n")
+        .unwrap();
+    assert_eq!(http_text(&h).matches("HTTP/1.1 200 OK").count(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(http_text(&h).contains("connection: close\r\n"));
+    assert!(h.closed());
+}
+
+#[test]
+fn http1_handler_connection_keep_alive_is_stripped() {
+    let router = Router::new().get("/", |_, _| {
+        http::Response::builder()
+            .header("connection", "keep-alive")
+            .body(Bytes::from("ok"))
+            .unwrap()
+    });
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+    assert!(http_text(&h).starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(!http_text(&h).contains("connection:"));
+    assert!(!h.closed());
+}
+
+#[test]
+fn http1_handler_connection_close_async() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let router = Router::new().route_async(None, "/", |_, _| async {
+            http::Response::builder()
+                .header("connection", "close")
+                .body(Bytes::from("first"))
+                .unwrap()
+        });
+        let mut h =
+            Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ()).with_fcx(fcx);
+        h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n")
+            .unwrap();
+        assert!(http_text(&h).contains("connection: close\r\n"));
+        assert_eq!(http_text(&h).matches("HTTP/1.1 200 OK").count(), 1);
+        assert!(http_text(&h).ends_with("\r\n\r\nfirst"));
+        assert!(h.closed());
+        Ok(())
+    });
 }
 
 #[test]

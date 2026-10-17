@@ -328,8 +328,9 @@ fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Reques
 }
 
 /// Writes a response head. Returns whether the connection must close
-/// after the body: a body of unknown length to an HTTP/1.0 client ends
-/// with the connection.
+/// after the body. Closing follows the request's `close` flag, the
+/// response's `Connection: close` token (except for 101), or an HTTP/1.0
+/// body of unknown length.
 fn encode(
     out: &mut Vec<u8>,
     version: Version,
@@ -339,7 +340,14 @@ fn encode(
 ) -> bool {
     let status = parts.status;
     let v10 = version == Version::HTTP_10;
-    let mut close = close;
+    let mut close = close
+        || (status != StatusCode::SWITCHING_PROTOCOLS
+            && parts.headers.get_all("connection").iter().any(|value| {
+                value
+                    .as_bytes()
+                    .split(|b| *b == b',')
+                    .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"close"))
+            }));
     out.extend_from_slice(if v10 { b"HTTP/1.0 " } else { b"HTTP/1.1 " });
     out.extend_from_slice(status.as_str().as_bytes());
     out.push(b' ');
@@ -770,8 +778,8 @@ impl Pending for Streaming {
                 let mut head = Vec::new();
                 self.close = encode(&mut head, self.version, &parts, &policy, self.close);
                 if self.close {
-                    // An HTTP/1.0 body of unknown length ends with the
-                    // connection, whatever the request asked for.
+                    // The request, the handler's `Connection: close`, or a
+                    // body that ends with the connection closes it.
                     driver.close();
                 }
                 self.status = Some(parts.status);

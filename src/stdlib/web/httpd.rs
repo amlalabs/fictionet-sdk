@@ -44,6 +44,9 @@
 //! Native HTTP/1 omits lengths for bodyless statuses and otherwise writes
 //! the body's known length or chooses framing for an unknown length.
 //! The hyper adapter leaves supplied lengths to hyper's framing rules.
+//! Native HTTP/1 writes its own `Connection` header. It closes the
+//! connection after a response, other than `101`, whose handler's
+//! `Connection` header names `close`, and drops the handler's other tokens.
 //!
 //! With `tokio`, a request that asks to switch protocols (`Connection: upgrade` with an
 //! `Upgrade` field, as a WebSocket handshake does) makes [`Http1`] hand
