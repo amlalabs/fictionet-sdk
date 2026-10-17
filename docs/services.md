@@ -574,8 +574,7 @@ TLS ownership and reproducibility are split across these files:
   The recorder holds only that log. Capture, key export and decryption stay
   in `observe`, including the public `observe::observed_config` helper.
 - [`tls/output.rs`](../src/stdlib/services/tls/output.rs) drains ciphertext for both
-  the server and the simulated client. Copy `tls.rs` with the `tls/` directory
-  and declare `#[path = "tls/output.rs"] mod tls_output;` beside the copy.
+  the server and the simulated client.
 
 The [repeatable-run contract](guide/running.rs) also describes external I/O
 and the HTTP/2 host-clock exception.

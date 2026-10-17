@@ -52,7 +52,7 @@ proxy instead.
 
 The standard library covers IPv4 and IPv6, TCP, UDP, ICMP, routing, whole
 networks of websites with `stdlib::web`, and codecs (no I/O) for about a hundred
-protocols and data formats, listed in [the catalog](src/stdlib/catalog.md).
+protocols and data formats, listed in [the stdlib docs](src/stdlib/mod.rs).
 HTTP has a ready server, `Net` serves DNS and DHCP, and TLS is built in.
 For other protocols, a world writes a `Service` around the module's decoder.
 The crate is not on crates.io, so build it from this repository.
@@ -157,9 +157,8 @@ run, callbacks, or the dashboard.
 step.
 
 Protocol codecs also work in unit tests, fuzz targets and dashboard presenters.
-The [catalog](src/stdlib/catalog.md) lists every module and what each can do,
-including which presenters are built in, and a test checks the table against
-the code. To change a protocol, see
+The [stdlib docs](src/stdlib/mod.rs) list the modules and describe their uses.
+To change a protocol, see
 [the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
 [`custom_protocol`](examples/custom_protocol) serves a Modbus gateway that
 accepts nonzero protocol identifiers.
@@ -234,7 +233,7 @@ Start at the crate root, which explains the main ideas, then read in this order:
 4. [`lowering`](docs/guide/lowering.rs): how each attach type turns what its sandbox
    sends into IP packets.
 5. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
-   protocol catalog. Then [`stdlib::net`](src/stdlib/world/net.rs) and
+   protocol modules. Then [`stdlib::net`](src/stdlib/world/net.rs) and
    [`stdlib::serve`](src/stdlib/services/serve.rs) for a network of hosts and
    services, and [`stdlib::web`](src/stdlib/web/sites.rs) for a network of
    websites.

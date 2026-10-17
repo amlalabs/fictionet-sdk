@@ -15,9 +15,7 @@ Built-ins use the same registration methods.
 `Registry::names()` lists the registered names in registration order, oldest
 first. Each name appears once. Replacing a name moves it to the end.
 `Registry::default()` includes built-ins with the `observe` feature and is
-empty without it. The catalog tests compare this inventory with the Observe
-column in `catalog/stdlib.rs`. Matchers, factories and presenters remain
-handwritten in `src/observe/`.
+empty without it. Matchers, factories and presenters live in `src/observe/`.
 
 Each built-in adapter owns its matcher, factory, and input read-ahead.
 Use `Http1::register`, `Dns::register`, `Dhcp::register`, or
@@ -121,31 +119,10 @@ The decoder then skips bytes until close because framing has been lost.
 Framing for DNS, DHCP, Modbus, HTTP/1, HTTP/2, and TLS uses `Stream`
 and `Present`.
 
-These files can be copied into another crate and edited:
-
-- `src/observe/protocols.rs` and `src/observe/protocols/`: capture decoders
-  and presenters. Copy them together, keeping the relative paths.
-  `protocols/dns.rs`, `protocols/dhcp.rs`, and `protocols/http1.rs` own the
-  DNS, DHCP, and HTTP/1 adapters, including their `register` methods.
-  Their public items remain re-exported by `protocols.rs`.
-  `protocols/modbus.rs` owns `Modbus` and `ModbusSession`, re-exported by
-  `protocols.rs`. Use `ModbusSession::register` to stop both directions after
-  a framing error, as the built-in does. These files use public observe and
-  stdlib APIs, plus `hickory-proto`.
-- `src/observe/http2.rs`: the HTTP/2 and gRPC presenter, `Capture`, with
-  `CaptureBudget`. It uses public observe and stdlib APIs. Use
-  `Capture::register` with a shared budget, as above.
-- `src/observe/tls.rs`: `TlsSession`, its key schedule, handshake parsing,
-  and record presentation. It uses public observe APIs and `ring`.
-  `TlsSession::register` passes the active registry to each new session.
-- `src/observe/conversation.rs`: the public prefix selection driver.
-
-Call the copied type's `register` method to use its matcher and factory.
-No edits to `app.rs` are needed. The copy fixture compiles the component
-directory and both standalone presenters. Tests compare their registry
-inventory and matching precedence with the built-ins. To change selection
-without editing an adapter, use the lower-level `Registry::register`,
-`register_with_buffer`, or `register_protocol` methods directly.
+You can copy and edit an adapter, then call its `register` method to use its
+matcher and factory. Keep any helpers it depends on. To change selection
+without editing an adapter, use `Registry::register`, `register_with_buffer`,
+or `register_protocol` directly.
 
 `Display::from_packet` builds an item from a relative layer, summary, and
 tags. `Decoded::level` and `Decoded::cap_info` expose the summary

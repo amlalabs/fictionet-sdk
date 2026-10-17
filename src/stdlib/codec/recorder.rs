@@ -177,8 +177,6 @@ impl<T: Clone, E: Clone> Recorder<T, E> {
         }
         let keep = bytes.len().min(self.max_bytes);
         let mut owned = Vec::new();
-        // Keep deque growth local for copy-and-own. Faults uses a heap
-        // and a temporary vector with their own reservation bounds.
         let target = self
             .entries
             .capacity()

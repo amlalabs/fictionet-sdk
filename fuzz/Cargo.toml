@@ -29,8 +29,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 [profile.release]
 debug = 1
 
-# Generated from catalog/stdlib.rs. Update with BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog.
-
 [[bin]]
 name = "codec_tools"
 path = "fuzz_targets/codec_tools.rs"
@@ -975,5 +973,3 @@ path = "fuzz_targets/cboe_boe.rs"
 test = false
 doc = false
 bench = false
-
-# End of the generated fuzz targets.

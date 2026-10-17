@@ -233,14 +233,13 @@
 //! # Protocols
 //!
 //! The stdlib provides codecs (no I/O) for about a hundred protocols and
-//! data formats, listed in the [catalog](stdlib#the-catalog). Their message
+//! data formats, listed in the [module table](stdlib#modules). Their message
 //! types parse and write bytes ([`Wire`](stdlib::codec::Wire)), and their
 //! decoders cut items out of input ([`Decode`](stdlib::codec::Decode)).
 //! HTTP has a ready server, [`stdlib::net::Net`] serves DNS and DHCP, and
 //! TLS is built in. For other protocols, a world writes a
 //! [`Service`](stdlib::serve::Service) around the module's decoder.
-//! The codecs also work in unit tests, fuzz targets and dashboard presenters;
-//! the catalog shows which presenters are built in.
+//! The codecs also work in unit tests, fuzz targets and dashboard presenters.
 //! See [Changing a protocol by copying it](stdlib#changing-a-protocol-by-copying-it).
 //!
 //! # Watching a world

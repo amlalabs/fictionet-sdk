@@ -226,7 +226,7 @@
 //! The [observe extension guide](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/observe-protocols.md)
 //! owns the adapter and registration details; the
 //! [protocol onboarding checklist](super#adding-a-protocol) lists the source,
-//! catalog, copy and fuzz entries a new codec needs.
+//! module declaration, documentation and fuzz target a new codec needs.
 
 extern crate alloc;
 

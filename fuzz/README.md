@@ -16,13 +16,8 @@ cargo +nightly fuzz list
 
 ## The targets
 
-`cargo +nightly fuzz list` names every target. Each target has a record
-in `catalog/stdlib.rs` that names its stdlib module, or says what it
-checks when it has none. The **Fuzz** column in
-[the stdlib catalog](../src/stdlib/catalog.md) marks the modules that own
-a target. The targets with no stdlib module are:
-
-<!-- Generated from catalog/stdlib.rs. Update with BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog. -->
+`cargo +nightly fuzz list` names every target. Most targets exercise a
+stdlib module. Others cover generated code, packet handling and the relay:
 
 - [`codegen_ir`](fuzz_targets/codegen_ir.rs) checks generated recursive values and stream frames.
 - [`packets`](fuzz_targets/packets.rs) checks IP protocol sorting, ICMP echo replies and DHCP messages.
@@ -30,8 +25,6 @@ a target. The targets with no stdlib module are:
 - [`proxy_socks5`](fuzz_targets/proxy_socks5.rs) checks SOCKS5 greetings, authentication and requests across chunk boundaries.
 - [`relay`](fuzz_targets/relay.rs) checks relay message decoding and encoding.
 - [`stack`](fuzz_targets/stack.rs) feeds IPv4 and IPv6 packets to TCP, UDP and ICMP endpoints.
-
-<!-- End of the generated list. -->
 
 The proxy targets call the doors' protocol side in
 `fictionet::relay::proxy`, the same code the `fictionet` binary runs over
@@ -94,12 +87,10 @@ It goes on past a target that fails and lists the failures at the end.
 It fails without running any targets if `cargo fuzz list` fails or
 lists no targets.
 Every target needs a `[[bin]]` in `fuzz/Cargo.toml` and a directory in
-`fuzz/corpus/`, even an empty one. The `[[bin]]` records are generated
-from the target records in `catalog/stdlib.rs`: add the record, then run
-`BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`.
+`fuzz/corpus/`, even an empty one. Add the `[[bin]]` entry directly when
+adding a target.
 `fuzz/check-targets.sh` checks the sources, `[[bin]]` records and corpus
-directories against each other, independently of the catalog, and CI
-runs it.
+directories against each other, and CI runs it.
 
 The `tcp` target never sleeps by default, which keeps it fast. To reach
 the timers too (delayed ACKs, TIME-WAIT), let each input sleep up to some

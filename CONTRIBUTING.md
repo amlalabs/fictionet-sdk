@@ -63,8 +63,6 @@ toolchain. Run this command from the repository root:
 $ RUSTFLAGS="--cfg fuzzing" cargo test --locked --manifest-path fuzz/Cargo.toml --lib
 ```
 
-CI runs `cargo bench --locked -p fictionet-copy-modules --bench tcp` in release to compare copied TCP throughput and allocation counts with the built-in module.
-
 ## Running the tests
 
 The tests run under [cargo-nextest](https://nexte.st), installed with
@@ -149,38 +147,21 @@ A protocol is one file in `src/stdlib/protocols/`, declared with `pub mod` in
 `src/stdlib/mod.rs`. A `#[path]` attribute on the declaration loads the file,
 so the public path stays `stdlib::<name>`. It is written with no I/O, on the
 tools in `stdlib::codec`: its message types implement `Wire`, and its framer
-implements `Decode`. It uses only public `fictionet::` items; see
-[the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
+implements `Decode`. Crate-private helpers and shared types are fine.
 The module's own docs explain the protocol and show how to use it, with examples
 that run as doctests.
 
 A large protocol may be a directory instead, as `protocols/cme_mdp3/`,
 `protocols/json_schema/` and `protocols/smb2/` are. Its entry file is `mod.rs`,
-which its catalog record names in `file`, and it declares private child modules
-next to it. A copy takes the whole directory. The module's public paths stay
+which declares private child modules next to it. The module's public paths stay
 flat: re-export child items from `mod.rs`.
 
 For modules generated from schemas, see [code generation](docs/codegen.md).
 
-A new module is registered in two places, and a test holds each to the code:
-
-- a record in `catalog/stdlib.rs`, which says what the module can do
-  (`tests/stdlib_catalog.rs` checks every column) and names its entry file,
-  such as `protocols/<name>.rs`, in `file`. Regenerate the table in
-  `src/stdlib/catalog.md` with
-  `BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`.
-  The same command writes the module's `pub mod` declaration in
-  `src/stdlib/mod.rs` and its `#[path]` entry in
-  `tests/copy_and_own/modules.rs`, which compiles the file as a module of a
-  separate crate;
-- a fuzz target in `fuzz/fuzz_targets/`, with a record in `catalog/stdlib.rs`
-  that names the module as its owner. The same bless command writes its
-  `[[bin]]` entry in `fuzz/Cargo.toml`.
-
-The catalog record and the module docs are where a module is described. The front
-pages (`README.md`, the crate root in `src/lib.rs`, and the top of
-`src/stdlib/mod.rs`) tell one story about the core and do not gain a paragraph
-per protocol.
+Add the module declaration and a one-line description to the table in
+`src/stdlib/mod.rs`. Add a fuzz target in `fuzz/fuzz_targets/` and its `[[bin]]`
+entry in `fuzz/Cargo.toml`. The module's own docs describe its behavior and limits.
+`tests/copy_and_own/stdlib.rs` compiles the whole stdlib in a separate crate.
 
 ## Names
 

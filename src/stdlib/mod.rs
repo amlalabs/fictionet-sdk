@@ -5,8 +5,8 @@
 //! never reads them. This module adds everything that does: IP addresses,
 //! routing, TCP and UDP, TLS, DNS, services, and the protocols they
 //! speak. Read it once you have a world running and want to give the
-//! sandbox something to talk to. [The catalog](#the-catalog) at the end
-//! lists every protocol module and what each can do.
+//! sandbox something to talk to. [The module table](#modules) at the end
+//! lists the modules and their uses.
 //!
 //! # What you build with it
 //!
@@ -152,8 +152,8 @@
 //! observe [`Registry`](fictionet::observe::Registry). The guide
 //! [Add an observe protocol](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/observe-protocols.md)
 //! walks through it. Wire parsing, serving and capture presentation are
-//! separate responsibilities. A catalog entry in **Wire** or **Decode**
-//! does not promise a live server or a built-in capture presenter. See the
+//! separate responsibilities. A codec does not imply a live server or a
+//! built-in capture presenter. See the
 //! codec's [serving and capture boundaries](codec#serving-and-capture-boundaries)
 //! for runtime support and observation policies.
 //!
@@ -163,27 +163,15 @@
 //! and the codec's [errors and names](codec#errors-and-names-in-a-codec-module).
 //! A new protocol needs these entries:
 //!
-//! 1. Add `src/stdlib/protocols/<name>.rs`, using public `fictionet::` items. Document
+//! 1. Add `src/stdlib/protocols/<name>.rs`. Document
 //!    the supported wire format, limits and caller responsibilities, with
 //!    runnable doctests. Implement [`codec::Wire`] for complete values and
 //!    [`codec::Prefixed`] or [`codec::Decode`] where stream framing is needed.
 //!    Check decoder contracts with [`test_support::contract`].
-//! 2. Add a record to `catalog/stdlib.rs` for [the catalog](#the-catalog).
-//!    List only capabilities the module implements. Regenerate the table with
-//!    `BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog`.
-//!    The same command writes the module's `pub mod` declaration here and its
-//!    `#[path]` entry in `tests/copy_and_own/modules.rs`, which checks that
-//!    the source compiles in a consumer crate using public APIs. The record's
-//!    `file` field names the entry file, `protocols/<name>.rs`, which the
-//!    declaration loads with `#[path]` so the public path stays
-//!    `stdlib::<name>`. Its `gate` field gives a feature gate.
-//!    Keep protocol-specific descriptions in that record and the module docs,
-//!    without adding a front-page paragraph.
-//! 3. Add `fuzz/fuzz_targets/<name>.rs`, a fuzz target record naming the
-//!    module in `catalog/stdlib.rs`, and `fuzz/corpus/<name>/` with seed
-//!    inputs. The bless command above writes its `[[bin]]` entry in
-//!    `fuzz/Cargo.toml`. `fuzz/check-targets.sh` checks the source, bin and
-//!    corpus inventory.
+//! 2. Declare the module here with `#[path]` and `pub mod`, and add a one-line
+//!    description to the [module table](#modules).
+//! 3. Add `fuzz/fuzz_targets/<name>.rs`, a `[[bin]]` entry in `fuzz/Cargo.toml`,
+//!    and `fuzz/corpus/<name>/` with seed inputs.
 //!
 //! A service and a presenter are optional additions. A service owns replies,
 //! connection state and events; install it on a [`net::Host`] port. A capture
@@ -198,11 +186,6 @@
 //! [`Cx::observe_protocols`](fictionet::Cx::observe_protocols) before watches
 //! start, as the observe guide shows.
 //!
-//! `tests/stdlib_catalog.rs` derives inventories from the source files and
-//! declarations, the observe app registrations, the fuzz manifest and the
-//! copy fixture. It checks the catalog against those owners; editing a row
-//! alone does not register a codec, a server or a presenter.
-//!
 //! The [CI workflow](https://github.com/amlalabs/fictionet-sdk/blob/main/.github/workflows/ci.yml)
 //! is the authority for the five feature combinations: default,
 //! `--no-default-features`, `--all-features`,
@@ -215,46 +198,11 @@
 //!
 //! ## Changing a protocol by copying it
 //!
-//! Every file in `src/stdlib/` uses only public `fictionet::` items. The crate
-//! root's `extern crate self as fictionet` makes those imports work here and
-//! in your crate. Copy a file, edit it, and use it through the public traits.
-//! `tests/copy_and_own` compiles the files in a separate crate. Optional
-//! code uses the SDK's feature-selection macros, so a copied file needs
-//! no matching Cargo features in the consuming crate.
-//! Protocol and format modules live in `src/stdlib/protocols/`, and their
-//! public paths stay `stdlib::<name>`.
-//! The packet-to-connection stack lives in `src/stdlib/network/`: the `ip`,
-//! `icmp`, `tcp`, `udp`, `ports` and `route` modules, and the private
-//! `connection` and `link` modules behind the root re-exports such as
-//! [`Connection`] and [`delay`]. Their public paths stay the same.
-//! Copy `network/udp.rs` together with the `network/udp/` directory, keeping
-//! the relative paths. The entry file declares its private wire module.
-//! The service drivers live in `src/stdlib/services/`: the `serve`, `tls`
-//! and `ca` modules. World composition lives in `src/stdlib/world/`: the
-//! `net` and `sandbox` modules. Web serving lives in `src/stdlib/web/`: the
-//! `httpd` module, and the `web` module in `web/sites.rs` with its private
-//! outbound proxy in `web/proxy.rs`. Their public paths stay the same.
-//! Copy `world/net.rs` together with the `world/net/` directory, keeping the relative
-//! paths. The entry file declares its private address-management, host
-//! installation, attachment lifecycle, and DNS service modules.
-//! It also needs its sibling `world/names.rs`, keeping that relative path.
-//! Copy `web/httpd.rs` together with the `web/httpd/` directory, keeping the relative
-//! paths. The entry file declares its private body, handler, site, and response modules,
-//! and one module per serving engine: native HTTP/1 in `httpd/http1.rs`, and
-//! hyper's HTTP/2 and upgrades in `httpd/hyper.rs` with the `tokio` feature.
-//! Copy `services/tls.rs` together with the `services/tls/` directory, keeping the relative
-//! paths. The entry file declares its private run-aware crypto provider.
-//! Copy `world/sandbox.rs` together with `services/tls/output.rs`, and put the
-//! helper at `tls/output.rs` beside the copied module. For either copy, declare
-//! `#[path = "tls/output.rs"] mod tls_output;` next to the copied module. Both
-//! adapters use this private output helper.
-//! Copy the `protocols/cme_mdp3/` directory, keeping the relative paths. Its entry
-//! file, `mod.rs`, declares the private packet framing module.
-//! Copy the `protocols/smb2/` directory the same way. Its `mod.rs` declares the
-//! private module of negotiate, create and error contexts.
-//! Copy the `protocols/json_schema/` directory the same way. Its `mod.rs` declares
-//! the private modules of string format checks and examples, and of exact
-//! decimal arithmetic.
+//! Copy the code you want to change into your crate and use it through the
+//! SDK's public traits. Keep the helpers and shared types it depends on.
+//! Crate-private helpers and shared types are fine; individual files need
+//! not compile on their own. `tests/copy_and_own/stdlib.rs` compiles the whole
+//! stdlib module tree in a separate crate.
 //!
 //! For a Modbus gateway that accepts a nonzero protocol identifier, copy
 //! `src/stdlib/protocols/modbus.rs` into your crate and remove the two protocol-identifier
@@ -270,41 +218,141 @@
 //! A module can also be generated from a schema; see
 //! [code generation](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md).
 //!
-//! # The catalog
+//! # Modules
 //!
-//! One row per module. The columns:
-//!
-//! - **Wire**: message types that implement [`codec::Wire`].
-//! - **Decode**: [`codec::Frames<T>`] for a [`codec::Prefixed`] wire value,
-//!   or a protocol decoder such as `Messages` or `Commands` that implements
-//!   [`codec::Decode`] and keeps state or yields a different item.
-//! - **State**: a caller-driven state machine for one side of a
-//!   conversation, by name.
-//! - **Service**: a type that implements [`serve::Service`], ready for a
-//!   [`net::Host`] port.
-//! - **Observe**: how the dashboard and captures show the protocol.
-//!   `built in` means the default observe registry decodes it, with a
-//!   presenter in [`observe`](fictionet::observe). Presenters live there, not
-//!   in the protocol's module, so a copied module carries no observe code.
-//! - **Fuzz**: the module has a fuzz target in `fuzz/`. CI builds every
-//!   target on pushes and pull requests. Nightly and manual runs also run
-//!   each target for 60 seconds.
-//! - **Copy**: `tests/copy_and_own` compiles the file as a module of a
-//!   separate crate, as a user's copy would be.
-//!
-//! `tests/stdlib_catalog.rs` checks the table against source declarations and
-//! the copy, fuzz and observe inventories. A listed capability must have a
-//! matching declaration of a kind the test recognizes; see that test's docs.
-//! The check is textual and does not prove every Rust trait implementation.
-//! The metadata lives in `catalog/stdlib.rs`. This table is generated from it;
-//! the test rejects drift unless `BLESS_STDLIB_CATALOG` is set to update it.
-//! A new module gets a record there and its own module docs.
-//! Do not add other prose about the module to this page or the crate root.
-//! See [Adding a protocol](#adding-a-protocol) for the registration checklist.
-//!
-#![doc = include_str!("catalog.md")]
+//! | Module | Description |
+//! | --- | --- |
+//! | [`amqp`] | AMQP 0-9-1 frames, methods, field tables and content headers. |
+//! | [`asn1`] | ASN.1 BER and DER tags, lengths and values. |
+//! | [`bacnet`] | BACnet/IP messages and application values. |
+//! | [`bgp`] | BGP-4 messages, path attributes and prefixes. |
+//! | [`book_levels`] | Quantity and order-count aggregates for an order book. |
+//! | [`ca`] | Seeded certificate authorities and server certificates. |
+//! | [`cboe_boe`] | Cboe Binary Order Entry messages, sessions and order tracking. |
+//! | [`cboe_pitch`] | Cboe Multicast PITCH messages, gap detection and order books. |
+//! | [`cme_mdp3`] | CME MDP 3.0 market data messages and packet framing. |
+//! | [`coap`] | CoAP messages, stream framing and block reassembly. |
+//! | [`codec`] | Wire traits, streaming decoders, combinators, recording and faults. |
+//! | [`cotp`] | ISO transport packets and segment reassembly over TCP. |
+//! | [`dcerpc`] | DCE/RPC connection messages and fragment reassembly. |
+//! | [`dhcp`] | DHCP messages used by networks and VM attachment. |
+//! | [`dhcpv6`] | DHCPv6 client, server and relay messages. |
+//! | [`diameter`] | Diameter messages and attribute-value pairs. |
+//! | [`dnp3`] | DNP3 link frames, transport segments and application headers. |
+//! | [`dns`] | DNS messages from the re-exported `hickory-proto` crate. |
+//! | [`dtls`] | DTLS records and handshake reassembly without cryptography. |
+//! | [`enip`] | EtherNet/IP encapsulation and CIP messages. |
+//! | [`fast`] | FAST 1.1 templates, dictionaries, encoding and decoding. |
+//! | [`fastcgi`] | FastCGI records, requests, responses and session bookkeeping. |
+//! | [`fix`] | FIX messages, repeating groups and sessions. |
+//! | [`ftp`] | FTP control commands, replies and features. |
+//! | [`geneve`] | Geneve tunnel headers and options. |
+//! | [`git_protocol`] | Git wire messages, negotiation and side-band streams. |
+//! | [`gre`] | GRE and PPTP tunnel headers. |
+//! | [`grpc`] | gRPC message framing, status codes, timeouts and headers. |
+//! | [`hpack`] | HTTP/2 header compression. |
+//! | [`http1`] | HTTP/1.0 and HTTP/1.1 wire messages and stream framing. |
+//! | [`http2`] | HTTP/2 frames, directional state and capture decoding. |
+//! | [`http3`] | HTTP/3 frames, headers and stream state without QUIC transport. |
+//! | [`httpd`] | HTTP serving, upgrades, handlers and virtual hosts. |
+//! | [`huffman`] | The Huffman code shared by HPACK and QPACK. |
+//! | [`icmp`] | ICMP echo replies and error messages. |
+//! | [`iec104`] | IEC 60870-5-104 APDUs and ASDU headers. |
+//! | [`igmp`] | IGMP membership queries and reports. |
+//! | [`ike`] | IKEv2 messages and payloads without cryptography. |
+//! | [`imap`] | IMAP commands and responses. |
+//! | [`imf`] | Internet mail headers, addresses, dates and encoded words. |
+//! | [`ip`] | IP packets, checksums, fragment reassembly and protocol splitting. |
+//! | [`ipp`] | Internet Printing Protocol requests, responses and attributes. |
+//! | [`ipsec`] | IPsec ESP and AH headers without cryptography. |
+//! | [`itch`] | Nasdaq TotalView-ITCH messages, framing and order books. |
+//! | [`json`] | Bounded JSON parsing and writing. |
+//! | [`json_schema`] | JSON schema compilation, validation and value generation. |
+//! | [`jsonrpc`] | JSON-RPC requests, notifications, responses and batches. |
+//! | [`kafka`] | Kafka framing, headers, ApiVersions and Metadata messages. |
+//! | [`kerberos`] | Kerberos V5 wire messages without cryptography. |
+//! | [`l2tp`] | L2TP headers, control messages and attributes. |
+//! | [`ldap`] | LDAP messages, search filters and distinguished names. |
+//! | [`memcache`] | Memcached text and binary messages and UDP framing. |
+//! | [`mime_multipart`] | MIME multipart body parsing and writing. |
+//! | [`modbus`] | Modbus/TCP frames, requests and responses. |
+//! | [`moldudp64`] | MoldUDP64 packets, gap recovery and retransmission. |
+//! | [`mongodb`] | MongoDB BSON documents and wire messages. |
+//! | [`mqtt`] | MQTT 3.1.1 packets and topic matching. |
+//! | [`mysql`] | MySQL packets, handshakes, commands and result sets. |
+//! | [`nbdgm`] | NetBIOS datagrams and fragment reassembly. |
+//! | [`nbns`] | NetBIOS name queries, registration and node status. |
+//! | [`nbss`] | NetBIOS Session Service packets. |
+//! | [`net`] | Networks of hosts, DNS names, addresses, routes and services. |
+//! | [`netbios`] | Shared NetBIOS name encoding and display. |
+//! | [`nfs`] | NFS version 3 and MOUNT procedure arguments and results. |
+//! | [`ntlmssp`] | NTLM negotiation and authentication messages without cryptography. |
+//! | [`ntp`] | NTP time packets and reply helpers. |
+//! | [`ocsp`] | Certificate status requests and responses without signing. |
+//! | [`onc_rpc`] | ONC RPC calls, replies, XDR values and TCP record framing. |
+//! | [`opcua`] | OPC UA binary transport and types without cryptography. |
+//! | [`openvpn`] | OpenVPN wire packets without cryptography or tunnel sessions. |
+//! | [`ospf`] | OSPFv2 and OSPFv3 packets and link-state advertisements. |
+//! | [`ouch`] | Nasdaq OUCH order entry messages and exchange state. |
+//! | [`pcp`] | PCP and NAT-PMP port mapping and version negotiation. |
+//! | [`pim`] | PIM version 2 multicast routing messages. |
+//! | [`pop3`] | POP3 commands and replies. |
+//! | [`portmap`] | Portmapper and rpcbind messages and universal addresses. |
+//! | [`ports`] | Ready-slot polling for packet interfaces. |
+//! | [`postgres`] | PostgreSQL startup, query and result messages. |
+//! | [`prefix_int`] | Prefix integers shared by HPACK and QPACK. |
+//! | [`protobuf`] | Protocol Buffers wire values without a schema. |
+//! | [`proxy_protocol`] | PROXY protocol headers, versions 1 and 2. |
+//! | [`qpack`] | HTTP/3 header compression and encoder and decoder streams. |
+//! | [`quic`] | QUIC packets and frames without cryptography. |
+//! | [`radius`] | RADIUS packets and attributes without cryptography. |
+//! | [`rdp`] | RDP connection sequence messages. |
+//! | [`resp`] | Redis RESP values and commands, versions 2 and 3. |
+//! | [`rfb`] | VNC handshakes, messages and sessions. |
+//! | [`rip`] | RIP and RIPng routing messages. |
+//! | [`route`] | Packet routing and LAN forwarding. |
+//! | [`rtcp`] | RTCP control packets and feedback. |
+//! | [`rtp`] | RTP media packets and header extensions. |
+//! | [`rtsp`] | RTSP messages, interleaved data and headers. |
+//! | [`sandbox`] | Simulated clients with DNS, TLS and HTTP requests. |
+//! | [`sbe`] | Runtime encoding and decoding from FIX SBE schemas. |
+//! | [`sdp`] | SDP descriptions, ICE candidates and RTP maps. |
+//! | [`serve`] | Service drivers, listeners, transcripts and fault plans. |
+//! | [`session`] | Shared mechanics for caller-driven protocol sessions. |
+//! | [`sftp`] | SFTP version 3 packets, requests and responses. |
+//! | [`sip`] | SIP messages, URIs and proxy headers. |
+//! | [`smb2`] | SMB2 and SMB3 wire messages without sessions or cryptography. |
+//! | [`smtp`] | SMTP commands, replies and DATA decoding. |
+//! | [`snmp`] | SNMP v1 and v2c messages, PDUs and OIDs. |
+//! | [`socks`] | SOCKS handshakes and UDP request headers. |
+//! | [`soupbintcp`] | SoupBinTCP packets, framing and client and server sessions. |
+//! | [`spnego`] | SPNEGO negotiation tokens. |
+//! | [`sse`] | Server-sent event lines, events and encoding. |
+//! | [`ssh`] | SSH version exchange and transport packets before encryption. |
+//! | [`stun`] | STUN messages, attributes and binding replies. |
+//! | [`syslog`] | Syslog messages and stream framing. |
+//! | [`tcp`] | Simulated TCP listeners and connections using smoltcp. |
+//! | [`tcp_reassembly`] | TCP capture reassembly, gaps and end signals. |
+//! | [`tds`] | SQL Server packets, logins, batches and response tokens. |
+//! | [`telnet`] | Telnet data, commands and option negotiation. |
+//! | [`test_support`] | Test data, scripted decoders and behavior assertions. |
+//! | [`tftp`] | TFTP packets, options and read transfers. |
+//! | [`thrift`] | Thrift binary and compact messages and framed transport. |
+//! | [`tls`] | Simulated TLS servers using rustls. |
+//! | [`tpkt`] | TPKT framing for ISO transport over TCP. |
+//! | [`udp`] | UDP sockets, datagram parsing and encoding. |
+//! | [`urlencoded_form`] | URL-encoded form bodies and query strings. |
+//! | [`vrrp`] | VRRP virtual router advertisements. |
+//! | [`vxlan`] | VXLAN and VXLAN-GPE headers. |
+//! | [`wake_on_lan`] | Wake-on-LAN magic packets. |
+//! | [`web`] | Websites by hostname with DNS, TLS and HTTP. |
+//! | [`websocket`] | WebSocket handshakes, frames and messages. |
+//! | [`whois`] | WHOIS queries, responses and referrals. |
+//! | [`wireguard`] | WireGuard wire messages without cryptography. |
+//! | [`x509`] | X.509 certificates, CRLs and PEM encoding without verification. |
+//! | [`xml`] | XML parsing and writing without declared entity expansion. |
+//! | [`zabbix`] | Zabbix packets and agent, sender and server messages. |
 
-// Generated from catalog/stdlib.rs. Update with BLESS_STDLIB_CATALOG=1 cargo nextest run --locked --test stdlib_catalog.
 #[path = "protocols/amqp.rs"]
 pub mod amqp;
 #[path = "protocols/asn1.rs"]
@@ -562,7 +610,6 @@ pub mod x509;
 pub mod xml;
 #[path = "protocols/zabbix.rs"]
 pub mod zabbix;
-// End of the generated module declarations.
 
 #[path = "network/connection.rs"]
 mod connection;

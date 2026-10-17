@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Checks that every target in fuzz_targets/ has a [[bin]] in Cargo.toml and a
 # corpus directory, and that every [[bin]] has its source file. CI runs it;
-# so can you, from anywhere. The [[bin]] records are generated from
-# catalog/stdlib.rs; this check reads them as written, independently of the
-# catalog.
+# so can you, from anywhere.
 set -euo pipefail
 cd "$(dirname "$0")"
 
