@@ -2,19 +2,20 @@ use crate::process::{Result, run as execute};
 use crate::vm::{self, quote};
 use std::fs;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::time::Instant;
 
 pub fn run(args: &[String]) -> Result {
+    let dir = crate::root().join("demos/guest");
+    let demos = demos(&dir)?;
+    let usage = format!("usage: cargo xtask demo <{}>", demos.join("|"));
     let [name] = args else {
-        return Err("usage: cargo xtask demo <border|dashboard|k8s|proxy|web>".into());
+        return Err(usage.into());
     };
-    if !matches!(
-        name.as_str(),
-        "border" | "dashboard" | "k8s" | "proxy" | "web"
-    ) {
-        return Err(format!("unknown demo: {name}").into());
+    if !demos.contains(name) {
+        return Err(format!("unknown demo: {name}\n{usage}").into());
     }
-    let script = fs::read_to_string(crate::root().join(format!("demos/guest/{name}.sh")))?;
+    let script = fs::read_to_string(dir.join(format!("{name}.sh")))?;
     let targets: Vec<String> = script
         .lines()
         .filter_map(|line| line.strip_prefix("# needs: "))
@@ -47,4 +48,26 @@ pub fn run(args: &[String]) -> Result {
         );
         result
     })
+}
+
+/// The demos are the scripts in demos/guest with a `# needs:` line.
+fn demos(dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "sh")
+            && fs::read_to_string(&path)?
+                .lines()
+                .any(|line| line.starts_with("# needs: "))
+        {
+            names.push(
+                path.file_stem()
+                    .ok_or("a script without a name")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    names.sort();
+    Ok(names)
 }
