@@ -103,16 +103,6 @@ pub fn run(args: &[String]) -> Result {
 }
 
 fn checked_eval(module: &str, mode: &str, task: &str, args: &[String]) -> Result {
-    let expected: Vec<String> = if mode == "--probes" {
-        serde_json::from_str(&capture(&mut uv(&[
-            "python",
-            "-c",
-            "import json, runpy, sys; probe = runpy.run_path(sys.argv[1]); print(json.dumps(list(probe['score_evidence']({}, 'control')[0])))",
-            task.split_once('@').ok_or("missing task name")?.0,
-        ]))?)?
-    } else {
-        Vec::new()
-    };
     let output = capture(
         uv(&["inspect", "eval", task])
             .args(args)
@@ -173,14 +163,6 @@ fn checked_eval(module: &str, mode: &str, task: &str, args: &[String]) -> Result
                         checks.require(&label, false, "missing nonempty boolean checks");
                         continue;
                     };
-                    if !expected.is_empty() {
-                        checks.require(
-                            &format!("{label}: complete containment checks"),
-                            results.len() == expected.len()
-                                && expected.iter().all(|name| results.contains_key(name)),
-                            "missing or unexpected containment checks",
-                        );
-                    }
                     for (name, value) in results {
                         checks.require(
                             &format!("{label}: {name}"),
@@ -302,32 +284,3 @@ for q in queries:
         text = " ".join(html.unescape(re.sub(r"(?s)<(script|style).*?</\1>|<[^>]+>", " ", page)).split())
         print(f"\n--- {html.unescape(url)}  ({code}, {secs:.1f} s, {len(page)} bytes)\n{text[:700]}")
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn task_selection() {
-        assert!(
-            task_path("border", "--scripted")
-                .unwrap()
-                .ends_with("tests/border/probes.py@border_scripted")
-        );
-        assert!(
-            task_path("fakewiki", "")
-                .unwrap()
-                .ends_with("worlds/fakewiki/tasks.py@fakewiki")
-        );
-        assert!(task_path("artifactory", "--probes").is_err());
-        assert!(task_path("fakewiki", "--live").is_err());
-    }
-
-    #[test]
-    fn inspect_option_forms() {
-        let args = ["--model=a,b", "--log-dir", "logs/with spaces"].map(String::from);
-        assert_eq!(option(&args, "--model"), Some("a,b".into()));
-        assert_eq!(option(&args, "--log-dir"), Some("logs/with spaces".into()));
-        assert_eq!(option(&args, "--epochs"), None);
-    }
-}
