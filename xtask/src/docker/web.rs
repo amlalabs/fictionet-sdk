@@ -46,7 +46,6 @@ pub fn run(compose: &Compose) -> Result {
                 "%{size_download} %{speed_download}",
                 "https://example.test/big",
             ]),
-            false,
         )?;
     }
     checks.downloads("10 sequential downloads of 16 MiB", 10, 16777216, &mut compose.agent(&["bash", "-c", "seq 10 | xargs -P 1 -I{} curl -fsS --max-time 30 --cacert /run/ca/ca.pem -o /dev/null -w '%{size_download} %{time_total}\\n' https://example.test/big"]))?;
@@ -81,7 +80,6 @@ pub fn run(compose: &Compose) -> Result {
             "%{size_download} %{speed_download}",
             "https://example.test/big",
         ]),
-        false,
     )?;
     println!(
         "world log:\n{}\nupstream log:\n{}",
@@ -194,7 +192,6 @@ fn closing(compose: &Compose, checks: &mut Checks) -> Result {
         "16 MiB before holding closing connections",
         16777216,
         &mut plain_big(),
-        true,
     )?;
     let (holder, counts) =
         start_holder(&mut compose.agent(&["timeout", "120", "python3", "-c", CLOSING]))?;
@@ -225,7 +222,6 @@ fn closing(compose: &Compose, checks: &mut Checks) -> Result {
         "16 MiB after releasing closing connections",
         16777216,
         &mut plain_big(),
-        true,
     )?;
     checks.require(
         "2,000 connections left in CLOSE_WAIT: 256 served, 1744 reset",

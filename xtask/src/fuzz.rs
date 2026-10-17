@@ -13,13 +13,6 @@ pub fn run(args: &[String]) -> Result {
     };
     let seconds = selection.filter(|s| s.bytes().all(|b| b.is_ascii_digit()));
     let single = selection.filter(|_| seconds.is_none());
-    let index = shard("FUZZ_SHARD_INDEX", "0")?;
-    let count = shard("FUZZ_SHARD_COUNT", "1")?;
-    if count == 0 || index >= count {
-        return Err(
-            "FUZZ_SHARD_INDEX must be less than FUZZ_SHARD_COUNT, which must be positive".into(),
-        );
-    }
     let listed = capture(&mut cmd("cargo", &["+nightly", "fuzz", "list"]))?;
     let targets: BTreeSet<_> = listed.split_whitespace().map(str::to_string).collect();
     if targets.is_empty() {
@@ -31,8 +24,8 @@ pub fn run(args: &[String]) -> Result {
         return Err(format!("unknown fuzz target: {target}").into());
     }
     let mut failures = Vec::new();
-    for (position, target) in targets.iter().enumerate() {
-        if single.map_or(position % count != index, |name| name != target) {
+    for target in &targets {
+        if single.is_some_and(|name| name != target) {
             continue;
         }
         println!("Running {target}");
@@ -40,11 +33,6 @@ pub fn run(args: &[String]) -> Result {
         std::fs::create_dir_all(crate::root().join(&corpus))?;
         let mut command = cmd("cargo", &["+nightly", "fuzz", "run", "-O", "-a"]);
         command.env("CARGO_TARGET_DIR", crate::root().join("target/fuzz"));
-        if let Ok(triple) = std::env::var("FUZZ_TRIPLE")
-            && !triple.is_empty()
-        {
-            command.args(["--target", &triple]);
-        }
         command.args([target, &corpus, "--"]);
         if single.is_none() {
             command.arg(format!("-max_total_time={}", seconds.unwrap_or("60")));
@@ -64,18 +52,6 @@ pub fn run(args: &[String]) -> Result {
         .into());
     }
     Ok(())
-}
-
-fn shard(name: &str, default: &str) -> Result<usize> {
-    let value = std::env::var(name).unwrap_or_else(|_| default.into());
-    if value.is_empty()
-        || value.len() > 9
-        || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(format!("{name} must be a decimal integer in 0..999999999").into());
-    }
-    Ok(value.parse()?)
 }
 
 fn targets() -> Result<BTreeSet<String>> {

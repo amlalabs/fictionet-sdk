@@ -16,8 +16,7 @@ You need Linux on x86-64 with:
 - `qemu-system-x86_64` and `qemu-img`;
 - `/dev/kvm` that your user can read and write (on most distributions, membership
   in the `kvm` group);
-- `genisoimage`, `mkisofs` or `xorriso`, for the cloud-init seed, which is used
-  only the first time;
+- `genisoimage`, for the cloud-init seed, which is used only the first time;
 - `curl`, `ssh`, `ssh-keygen`, `tar`, `sha256sum`, `sha512sum` and `git`.
   `cargo xtask vm sync` copies tracked and unignored files from a git checkout.
   It excludes `fuzz/corpus`.
@@ -53,7 +52,7 @@ command at a time changes the VM: a second one waits for the first.
 | `cargo xtask vm ssh [command]` | Opens a root shell in the VM, or runs one command there. |
 | `cargo xtask vm sync` | Copies this working tree into the VM, at `/src`. |
 | `cargo xtask vm build [sdk] [border] [fakewiki]` | Syncs, then builds the static binaries in the VM (see below). |
-| `cargo xtask vm test <name>` | Runs one test suite in the VM. `cargo xtask vm test list` lists them. |
+| `cargo xtask vm test <name>` | Runs one test suite in the VM. The table below lists them. |
 | `cargo xtask demo <name>` | Runs a [demo](../demos/README.md). |
 | `cargo xtask vm status` | Says whether the VM is running, on which ports, and how much disk `.vm/` uses. |
 | `cargo xtask vm down` | Shuts the VM down and deletes its disk overlay. |

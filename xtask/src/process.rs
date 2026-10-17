@@ -233,25 +233,11 @@ impl Checks {
         self.output(name, pattern, &command.output()?, None)
     }
 
-    pub fn connect_fails(&mut self, name: &str, pattern: &str, command: &mut Command) -> Result {
-        let output = command.output()?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        self.require(
-            name,
-            matches!(output.status.code(), Some(1..=123 | 125 | 128))
-                && !Regex::new("Operation timed out|bytes received")?.is_match(&stderr)
-                && Regex::new(pattern)?.is_match(&stderr),
-            format!("{}: {}", output.status, combined(&output)),
-        );
-        Ok(())
-    }
-
     pub fn transfer(
         &mut self,
         name: &str,
         bytes: u64,
         command: &mut Command,
-        seconds: bool,
     ) -> Result<Option<f64>> {
         let output = command.output()?;
         let text = String::from_utf8_lossy(&output.stdout);
@@ -261,18 +247,7 @@ impl Checks {
             output.status.success() && measurement.is_some(),
             combined(&output),
         );
-        let measurement = measurement.filter(|_| output.status.success());
-        if let Some(value) = measurement {
-            if seconds {
-                println!(
-                    "    {value:.3} s, {:.1} Mbit/s",
-                    bytes as f64 * 8.0 / value / 1e6
-                );
-            } else {
-                println!("    {:.1} Mbit/s", value * 8.0 / 1e6);
-            }
-        }
-        Ok(measurement)
+        Ok(measurement.filter(|_| output.status.success()))
     }
 
     pub fn downloads(
@@ -287,17 +262,9 @@ impl Checks {
         let times: Option<Vec<f64>> = text.lines().map(|line| transfer(line, bytes)).collect();
         self.require(
             name,
-            output.status.success() && times.as_ref().is_some_and(|t| t.len() == count),
+            output.status.success() && times.is_some_and(|t| t.len() == count),
             combined(&output),
         );
-        if let Some(mut times) = times.filter(|t| !t.is_empty()) {
-            times.sort_by(f64::total_cmp);
-            println!(
-                "    {:.3} s to {:.3} s per download",
-                times[0],
-                times[times.len() - 1]
-            );
-        }
         Ok(())
     }
 

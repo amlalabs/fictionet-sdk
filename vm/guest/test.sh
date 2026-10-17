@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs one of the repository's test suites inside the VM, as root, from the
-# copy of the working tree at /src. `cargo xtask vm test <name>` runs it; `cargo xtask vm
-# test list` lists the names. The suites run unchanged: this script only
-# starts them the way their READMEs say, and decides pass or fail.
+# copy of the working tree at /src. `cargo xtask vm test <name>` runs it. The
+# suites run unchanged: this script only starts them the way their READMEs
+# say, and decides pass or fail.
 set -euo pipefail
 export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/cache/cargo
 export UV_CACHE_DIR=/cache/uv UV_PYTHON_INSTALL_DIR=/cache/uv/python UV_LINK_MODE=copy

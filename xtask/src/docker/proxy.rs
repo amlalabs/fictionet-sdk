@@ -36,9 +36,9 @@ pub fn run(compose: &Compose) -> Result {
     );
     sandbox(compose, &mut checks)?;
     for (door, proxy) in [("http", ""), ("socks", "-x \"$SOCKS\"")] {
-        checks.transfer(&format!("16 MiB through the {door} door"), 16777216, &mut compose.agent(&["sh", "-c", &format!("curl -fsS --max-time 30 {proxy} -o /dev/null -w '%{{size_download}} %{{speed_download}}' https://example.test/big")]), false)?;
+        checks.transfer(&format!("16 MiB through the {door} door"), 16777216, &mut compose.agent(&["sh", "-c", &format!("curl -fsS --max-time 30 {proxy} -o /dev/null -w '%{{size_download}} %{{speed_download}}' https://example.test/big")]))?;
         checks.downloads(&format!("10 downloads of 16 MiB at once through the {door} door"), 10, 16777216, &mut compose.agent(&["sh", "-c", &format!("seq 10 | xargs -P 10 -I{{}} curl -fsS --max-time 30 {proxy} -o /dev/null -w '%{{size_download}} %{{time_total}}\\n' https://example.test/big")]))?;
-        checks.transfer(&format!("64 MiB upload through the {door} door"), 67108864, &mut compose.agent(&["sh", "-c", &format!("head -c 67108864 /dev/zero | curl -fsS --max-time 30 {proxy} --data-binary @- -w '%{{time_total}}' https://example.test/upload")]), true)?;
+        checks.transfer(&format!("64 MiB upload through the {door} door"), 67108864, &mut compose.agent(&["sh", "-c", &format!("head -c 67108864 /dev/zero | curl -fsS --max-time 30 {proxy} --data-binary @- -w '%{{time_total}}' https://example.test/upload")]))?;
     }
     plain_upload(compose, &mut checks)?;
     let start = Instant::now();

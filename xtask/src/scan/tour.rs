@@ -112,7 +112,7 @@ pub fn record(browser: &mut Browser, compose: &Compose) -> Result {
     )?;
     type_command(browser, DISCOVERY)?;
     browser.scan(compose, DISCOVERY)?;
-    browser.finish_scan(false)?;
+    browser.finish_scan()?;
     browser.wait(1.5)?;
     caption(
         browser,
@@ -197,7 +197,7 @@ pub fn record(browser: &mut Browser, compose: &Compose) -> Result {
     pointer.drag(browser, x - 40.0, y, -10.0, -50.0)?;
     pointer.move_to(browser, x + 120.0, y + 260.0, 500)?;
     browser.wait(1.5)?;
-    browser.finish_scan(true)?;
+    browser.finish_scan()?;
     caption(
         browser,
         "<b>All five hosts found.</b> 10.0.0.50 is the <b>real container</b>: nmap names its real nginx and OpenSSH.",

@@ -48,27 +48,25 @@ pub fn run() -> Result {
         stopped(&kube, &mut checks)?;
         kube.restart(&mut checks)?;
         restored(&kube, &mut checks)?;
-        if std::env::var("INSPECT").is_ok_and(|v| v == "1") {
-            // Inspect's sandbox uses the current Kubernetes context.
-            execute(&mut cmd("kubectl", &["config", "use-context", CONTEXT]))?;
-            checks.ok(
-                "the Inspect eval passes",
-                r"accuracy +1\.0",
-                &mut cmd(
-                    "inspect",
-                    &[
-                        "eval",
-                        "tests/k8s/inspect_eval.py",
-                        "--model",
-                        "mockllm/model",
-                        "--display",
-                        "plain",
-                        "--log-dir",
-                        "target/inspect-logs",
-                    ],
-                ),
-            )?;
-        }
+        // Inspect's sandbox uses the current Kubernetes context.
+        execute(&mut cmd("kubectl", &["config", "use-context", CONTEXT]))?;
+        checks.ok(
+            "the Inspect eval passes",
+            r"accuracy +1\.0",
+            &mut crate::eval::uv(&[
+                "--extra",
+                "k8s",
+                "inspect",
+                "eval",
+                "tests/k8s/inspect_eval.py",
+                "--model",
+                "mockllm/model",
+                "--display",
+                "plain",
+                "--log-dir",
+                "target/inspect-logs",
+            ]),
+        )?;
         checks.finish()
     })();
     cleanup.finish(result)
@@ -143,29 +141,15 @@ fn initial(kube: &Kube, checks: &mut Checks) -> Result {
 }
 
 fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
-    let kube_dns = capture(&mut kubectl(&[
-        "-n",
-        "kube-system",
-        "get",
-        "service",
-        "kube-dns",
-        "-o",
-        "jsonpath={.spec.clusterIP}",
-    ]))?;
-    let api = capture(&mut kubectl(&[
-        "get",
-        "service",
-        "kubernetes",
-        "-o",
-        "jsonpath={.spec.clusterIP}",
-    ]))?;
+    let kube_dns = kube_dns()?;
+    let api = api()?;
     checks.fails(
         "1.1.1.1 is unreachable",
         "Couldn't connect to server",
         &mut kube.agent(&["curl", "-sS", "-m", "5", "http://1.1.1.1/"]),
     )?;
     checks.fails(
-        "the cluster's DNS ($kube_dns) is unreachable",
+        &format!("the cluster's DNS ({kube_dns}) is unreachable"),
         "no servers could be reached",
         &mut kube.agent(&[
             "dig",
@@ -176,7 +160,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
         ]),
     )?;
     checks.fails(
-        "the API server ($api) is unreachable",
+        &format!("the API server ({api}) is unreachable"),
         "Couldn't connect to server",
         &mut kube.agent(&[
             "curl",
