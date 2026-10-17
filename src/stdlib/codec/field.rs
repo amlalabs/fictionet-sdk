@@ -1,4 +1,5 @@
-//! Fixed-point decimal text and space-padded printable ASCII fields.
+//! Fixed-point decimal text, space-padded printable ASCII fields and
+//! [`Alpha`], the fixed-width field the market data protocols share.
 
 use core::fmt;
 
@@ -77,6 +78,86 @@ fn padded<const N: usize>(text: &str, left: bool) -> Result<[u8; N], Error> {
     let mut bytes = [b' '; N];
     bytes[start..start + text.len()].copy_from_slice(text.as_bytes());
     validate_printable(bytes)
+}
+
+/// A fixed-width text field: `N` bytes, spaces included. Padding is part
+/// of the value, so fields round-trip byte for byte. [`new`](Self::new)
+/// and the padded constructors accept only printable ASCII (0x20..=0x7e).
+/// `From<[u8; N]>` keeps any bytes, for a protocol whose fields may hold
+/// reserved or NUL-filled bytes; [`trimmed`](Self::trimmed) stops at the
+/// first such byte.
+///
+/// ```
+/// use fictionet::stdlib::codec::field::Alpha;
+/// let stock = Alpha::<8>::right_padded("ZVZZT")?;
+/// assert_eq!(stock.as_bytes(), b"ZVZZT   ");
+/// assert_eq!(stock.trimmed(), "ZVZZT");
+/// # Ok::<(), fictionet::stdlib::codec::field::Error>(())
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Alpha<const N: usize>([u8; N]);
+impl<const N: usize> Alpha<N> {
+    /// All spaces.
+    pub const fn blank() -> Self {
+        Self([b' '; N])
+    }
+    /// The field's exact bytes. Refuses a byte outside 0x20..=0x7e.
+    pub fn new(bytes: [u8; N]) -> Result<Self, Error> {
+        validate_printable(bytes).map(Self)
+    }
+    /// `text` padded on the left with spaces, as [`left_padded`] pads it.
+    pub fn left_padded(text: &str) -> Result<Self, Error> {
+        left_padded(text).map(Self)
+    }
+    /// `text` padded on the right with spaces, as [`right_padded`] pads it.
+    pub fn right_padded(text: &str) -> Result<Self, Error> {
+        right_padded(text).map(Self)
+    }
+    /// The field's bytes, padding included.
+    pub fn as_bytes(&self) -> &[u8; N] {
+        &self.0
+    }
+    /// The text: the bytes up to the first one outside printable ASCII,
+    /// without leading or trailing spaces.
+    pub fn trimmed(&self) -> &str {
+        let end = self
+            .0
+            .iter()
+            .position(|b| !(0x20..=0x7e).contains(b))
+            .unwrap_or(N);
+        // Every byte before `end` is printable ASCII, so this is UTF-8.
+        core::str::from_utf8(self.0.get(..end).unwrap_or_default())
+            .unwrap_or_default()
+            .trim_matches(' ')
+    }
+    /// Whether every byte is a space.
+    pub fn is_blank(&self) -> bool {
+        self.0.iter().all(|b| *b == b' ')
+    }
+    /// The same text in a field of `M` bytes, padded on the right. Refuses
+    /// text that does not fit.
+    pub fn resized<const M: usize>(&self) -> Result<Alpha<M>, Error> {
+        Alpha::right_padded(self.trimmed())
+    }
+    /// Whether two fields hold the same text, ignoring padding.
+    pub fn same_text(&self, other: &Self) -> bool {
+        self.trimmed() == other.trimmed()
+    }
+    /// Whether two fields hold the same text, ignoring padding and ASCII
+    /// case.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.trimmed().eq_ignore_ascii_case(other.trimmed())
+    }
+}
+impl<const N: usize> From<[u8; N]> for Alpha<N> {
+    fn from(bytes: [u8; N]) -> Self {
+        Self(bytes)
+    }
+}
+impl<const N: usize> fmt::Debug for Alpha<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{}\"", self.0.escape_ascii())
+    }
 }
 
 /// Writes `raw` with exactly `places` fractional digits. Zero places writes an integer.
@@ -180,6 +261,38 @@ mod tests {
             assert_eq!(left_padded::<4>(text), Err(Error::Printable));
             assert_eq!(right_padded::<4>(text), Err(Error::Printable));
         }
+    }
+
+    #[test]
+    fn alpha_fields() {
+        assert_eq!(Alpha::<4>::left_padded("ab").unwrap().as_bytes(), b"  ab");
+        assert_eq!(Alpha::<4>::right_padded("ab").unwrap().as_bytes(), b"ab  ");
+        assert_eq!(Alpha::<2>::left_padded("abc"), Err(Error::Length));
+        assert_eq!(Alpha::<2>::right_padded("\u{e9}"), Err(Error::Printable));
+        assert_eq!(Alpha::<0>::right_padded("").unwrap().as_bytes(), &[]);
+        for byte in 0..=u8::MAX {
+            let bytes = [b' ', byte, b'~'];
+            assert_eq!(Alpha::from(bytes).as_bytes(), &bytes);
+            assert_eq!(
+                Alpha::new(bytes).map(|a| *a.as_bytes()),
+                validate_printable(bytes)
+            );
+        }
+        let field = Alpha::new(*b" x  ").unwrap();
+        assert_eq!(field.trimmed(), "x");
+        assert_eq!(format!("{field:?}"), "\" x  \"");
+        assert!(!field.is_blank());
+        assert!(Alpha::<3>::blank().is_blank());
+        // Bytes outside printable ASCII end the text and show escaped.
+        let raw = Alpha::from(*b" A \0Z");
+        assert_eq!(raw.trimmed(), "A");
+        assert_eq!(format!("{raw:?}"), "\" A \\x00Z\"");
+        assert_eq!(raw.resized::<2>().unwrap().as_bytes(), b"A ");
+        assert_eq!(Alpha::from(*b"ABC").resized::<2>(), Err(Error::Length));
+        assert!(Alpha::from(*b"Ab  ").same_text(&Alpha::from(*b"  Ab")));
+        assert!(!Alpha::from(*b"Ab  ").same_text(&Alpha::from(*b"  aB")));
+        assert!(Alpha::from(*b"Ab  ").matches(&Alpha::from(*b"  aB")));
+        assert!(!Alpha::from(*b"Ab  ").matches(&Alpha::from(*b"  aC")));
     }
 
     #[test]

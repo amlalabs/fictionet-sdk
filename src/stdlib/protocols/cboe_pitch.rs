@@ -44,10 +44,11 @@
 //!
 //! ```
 //! use fictionet::stdlib::cboe_pitch::{
-//!     AddOrderShort, Alpha, Book, BookConfig, GapDetector, Message, ReduceSizeShort, ShortPrice,
-//!     Side, Unit,
+//!     AddOrderShort, Book, BookConfig, GapDetector, Message, ReduceSizeShort, ShortPrice, Side,
+//!     Unit,
 //! };
 //! use fictionet::stdlib::codec::Wire;
+//! use fictionet::stdlib::codec::field::Alpha;
 //!
 //! // "Sequenced Unit Header with 2 Messages": an Add Order and a Reduce
 //! // Size on unit 1, sequence 1.
@@ -90,7 +91,7 @@ use fictionet::stdlib::book_levels::{Aggregate, Levels};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::codec::field;
+use fictionet::stdlib::codec::field::{self, Alpha};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
@@ -133,9 +134,6 @@ pub enum Error {
     /// Bytes of another message type than the one asked for, or an
     /// [`Unknown`] message written with a type this module defines.
     Type(u8),
-    /// Text for an alphanumeric field is longer than the field or not
-    /// printable ASCII.
-    Field,
     /// A side indicator other than "B" or "S".
     Side(u8),
     /// A unit's Hdr Count disagrees with the messages that follow, or a
@@ -166,7 +164,6 @@ pub enum Error {
 fictionet::error_display!(Error, f, {
     Error::Length => f.write_str("PITCH length is wrong"),
     Error::Type(t) => write!(f, "unexpected PITCH message type {t:#04x}"),
-    Error::Field => f.write_str("PITCH alphanumeric field is invalid"),
     Error::Side(s) => write!(f, "invalid PITCH side indicator {s:#04x}"),
     Error::Count => f.write_str("PITCH message count is wrong"),
     Error::Price => f.write_str("PITCH price is invalid"),
@@ -259,66 +256,16 @@ impl Field for ShortPrice {
     }
 }
 
-/// A fixed-width alphanumeric field, left justified and padded on the
-/// right with spaces ("Data Types"). Bytes are kept exactly as read, so
-/// fields round-trip byte for byte. Parsing accepts any byte: Cboe's
-/// Reserved bytes can sit inside a field of this type (the options layout
-/// of [`TradingStatus`] keeps two in `symbol`), and a feed may fill them
-/// with NUL. [`right_padded`](Self::right_padded) builds only printable
-/// ASCII.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Alpha<const N: usize>([u8; N]);
-impl<const N: usize> Alpha<N> {
-    /// All spaces.
-    pub fn blank() -> Self {
-        Self([b' '; N])
-    }
-    /// The field's exact bytes.
-    pub fn new(bytes: [u8; N]) -> Self {
-        Self(bytes)
-    }
-    /// `text` padded on the right with spaces. Refuses text longer than
-    /// the field or with a byte outside printable ASCII (0x20..=0x7e).
-    pub fn right_padded(text: &str) -> Result<Self, Error> {
-        field::right_padded(text)
-            .map(Self)
-            .map_err(|_| Error::Field)
-    }
-    /// The field's bytes, padding included.
-    pub fn as_bytes(&self) -> &[u8; N] {
-        &self.0
-    }
-    /// The text: the bytes up to the first one outside printable ASCII
-    /// (NUL fill, reserved bytes), without trailing spaces.
-    pub fn trimmed(&self) -> &str {
-        let end = self
-            .0
-            .iter()
-            .position(|b| !(0x20..=0x7e).contains(b))
-            .unwrap_or(N);
-        // Every byte before `end` is printable ASCII, so this is UTF-8.
-        std::str::from_utf8(self.0.get(..end).unwrap_or_default())
-            .unwrap_or_default()
-            .trim_end_matches(' ')
-    }
-    /// The same text in a field of `M` bytes, padded with spaces. Refuses
-    /// text that does not fit.
-    pub fn resized<const M: usize>(&self) -> Result<Alpha<M>, Error> {
-        Alpha::right_padded(self.trimmed())
-    }
-}
-impl<const N: usize> fmt::Debug for Alpha<N> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"{}\"", self.0.escape_ascii())
-    }
-}
+// Alphanumeric fields are read as they are, any byte included: Cboe's
+// Reserved bytes can sit inside one (the options layout of TradingStatus
+// keeps two in `symbol`), and a feed may fill them with NUL.
 impl<const N: usize> Field for Alpha<N> {
     const LEN: usize = N;
     fn get(b: &[u8]) -> Result<Self, Error> {
-        array(b).map(Self)
+        array(b).map(Alpha::from)
     }
     fn put(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0);
+        out.extend_from_slice(self.as_bytes());
     }
 }
 
@@ -1588,7 +1535,7 @@ impl Book {
         let widen = |s: &Symbol6| -> Symbol {
             let mut b = [b' '; 8];
             b[..6].copy_from_slice(s.as_bytes());
-            Alpha(b)
+            Alpha::from(b)
         };
         match message {
             Message::AddOrderLong(m) => self.add(
@@ -1963,8 +1910,8 @@ mod tests {
         exact_control(
             &hex("16 01 30 30 30 31 46 49 52 4D 20 20 41 42 43 44 30 30 20 20 20 20"),
             Login {
-                session_sub_id: Alpha(*b"0001"),
-                username: Alpha(*b"FIRM"),
+                session_sub_id: Alpha::from(*b"0001"),
+                username: Alpha::from(*b"FIRM"),
                 filler: Alpha::blank(),
                 password: Alpha::right_padded("ABCD00").unwrap(),
                 extra: Vec::new(),
@@ -2162,7 +2109,7 @@ mod tests {
                 symbol: sym("ZVZZT"),
                 price: Price(9050),
                 flags: 1,
-                participant_id: Alpha(*b"MPID"),
+                participant_id: Alpha::from(*b"MPID"),
                 customer_indicator: b'N',
                 extra: Vec::new(),
             },
@@ -2425,9 +2372,9 @@ mod tests {
                 price: Price(1_025_000),
                 contracts: 100,
                 customer_indicator: b'C',
-                participant_id: Alpha(*b"EFID"),
+                participant_id: Alpha::from(*b"EFID"),
                 auction_end_offset: 947_000,
-                client_id: Alpha(*b"CLID"),
+                client_id: Alpha::from(*b"CLID"),
                 extra: Vec::new(),
             },
         );
@@ -2577,7 +2524,6 @@ mod tests {
         };
         assert_eq!(m.symbol.trimmed(), "");
         assert_eq!(Message::from(m).to_bytes().unwrap(), add);
-        assert_eq!(Symbol6::right_padded("A\u{7f}"), Err(Error::Field));
     }
 
     // "Trading Status (Options)": the two Reserved bytes after the six-byte
@@ -2607,8 +2553,6 @@ mod tests {
             assert_eq!(bad.parse::<ShortPrice>(), Err(Error::Price), "{bad}");
         }
         assert_eq!("1.00001".parse::<Price>(), Err(Error::Price));
-        assert_eq!(Symbol6::right_padded("SEVENXX"), Err(Error::Field));
-        assert_eq!(sym6("AB").resized::<8>(), Ok(sym("AB")));
     }
 
     #[test]
@@ -2699,8 +2643,8 @@ mod tests {
         let mut bytes = Vec::new();
         for c in [
             Control::from(Login {
-                session_sub_id: Alpha(*b"0001"),
-                username: Alpha(*b"FIRM"),
+                session_sub_id: Alpha::from(*b"0001"),
+                username: Alpha::from(*b"FIRM"),
                 filler: Alpha::blank(),
                 password: Alpha::blank(),
                 extra: Vec::new(),

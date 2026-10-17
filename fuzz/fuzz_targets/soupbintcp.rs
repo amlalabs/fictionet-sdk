@@ -6,7 +6,8 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::session::Action;
 use fictionet::stdlib::soupbintcp::harness::{check_actions, login};
-use fictionet::stdlib::soupbintcp::{Alpha, Client, MAX_PACKET, Packet, Server, Timers};
+use fictionet::stdlib::codec::field::Alpha;
+use fictionet::stdlib::soupbintcp::{Client, MAX_PACKET, Packet, Server, Timers};
 use fictionet::stdlib::test_support::contract::{
     check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
 };

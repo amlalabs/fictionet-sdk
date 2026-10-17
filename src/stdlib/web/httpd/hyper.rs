@@ -1,7 +1,7 @@
 use std::future::poll_fn;
 use std::pin::{Pin, pin};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
@@ -50,7 +50,7 @@ pub(super) async fn serve<C: Connection + Unpin>(
     // cannot inject Cx time; that third-party limitation remains in labs.
     // hyper reads all the time on HTTP/2, so a reset ends it on its own.
     let served = builder.serve_connection(io, route);
-    finish(fcx, &info, &broke, fcx.race(None, served).await)
+    finish(fcx, &info, &broke, None, fcx.race(None, served).await)
 }
 
 /// Runs hyper's HTTP/1 server on `conn`, with upgrades: where
@@ -74,7 +74,13 @@ pub(super) async fn serve_upgrade<C: Connection + Unpin + Send + 'static>(
         opts.limits.write_timeout,
     );
     let upgraded = Arc::new(AtomicBool::new(false));
-    io.heads = Some(HeadCheck::new(fcx, opts.limits, upgraded.clone()));
+    let refused = Arc::new(OnceLock::new());
+    io.heads = Some(HeadCheck::new(
+        fcx,
+        opts.limits,
+        upgraded.clone(),
+        refused.clone(),
+    ));
     let mut route = Route::new(fcx, handler, &info, opts);
     route.upgraded = Some(upgraded);
     let mut builder = hyper::server::conn::http1::Builder::new();
@@ -92,7 +98,8 @@ pub(super) async fn serve_upgrade<C: Connection + Unpin + Send + 'static>(
         builder.header_read_timeout(opts.limits.header_timeout);
     }
     let served = builder.serve_connection(io, route).with_upgrades();
-    finish(fcx, &info, &broke, fcx.race(None, served).await)
+    let raced = fcx.race(None, served).await;
+    finish(fcx, &info, &broke, refused.get(), raced)
 }
 
 /// How a connection hyper served ends: [`Cancelled`] if `fcx`'s region
@@ -102,6 +109,7 @@ fn finish(
     fcx: &Cx,
     info: &ConnInfo,
     broke: &std::sync::atomic::AtomicBool,
+    refused: Option<&http1::Error>,
     raced: Result<Result<(), hyper::Error>, RaceError>,
 ) -> Result<(), Cancelled> {
     let Ok(result) = raced else {
@@ -110,26 +118,33 @@ fn finish(
     if fcx.is_cancelled() {
         return Err(Cancelled);
     }
-    report(fcx, info, broke, result);
+    report(fcx, info, broke, refused, result);
     Ok(())
 }
 
-/// Records how a connection hyper served ended, if in an error.
+/// Records how a connection hyper served ended, if in an error. `refused`
+/// is the request head [`HeadCheck`] refused, if one: hyper's result
+/// cannot say, since a read error on an idle connection before any byte of
+/// the next head reaches hyper is, to hyper, the client closing.
 fn report(
     fcx: &Cx,
     info: &ConnInfo,
     broke: &std::sync::atomic::AtomicBool,
+    refused: Option<&http1::Error>,
     result: Result<(), hyper::Error>,
 ) {
     let broke = broke.load(std::sync::atomic::Ordering::Relaxed);
-    let cause = match &result {
-        Err(e) => match error_cause(e) {
+    let cause = match (&result, refused) {
+        (_, Some(e)) => Some(("protocol", e.to_string())),
+        (Err(e), None) => match error_cause(e) {
             Some(cause) => Some((cause, e.to_string())),
             None if broke => Some(("transport", e.to_string())),
             None => None,
         },
-        Ok(()) if broke => Some(("transport", "a TLS record did not decrypt".to_owned())),
-        Ok(()) => None,
+        (Ok(()), None) if broke => {
+            Some(("transport", "a TLS record did not decrypt".to_owned()))
+        }
+        (Ok(()), None) => None,
     };
     if let Some((cause, detail)) = cause {
         fcx.record(error_event(info, cause, detail).conn(info));
@@ -535,20 +550,27 @@ impl Drop for Counted {
 }
 
 /// Validates request framing before hyper receives it, including heads
-/// after an Upgrade request that received an ordinary response.
+/// after an Upgrade request that received an ordinary response. A head
+/// it refuses goes in `refused` for [`report`].
 struct HeadCheck {
     decoder: http1::RequestEvents,
     input: Buffer,
     ready: usize,
     eof: bool,
     upgraded: Arc<AtomicBool>,
+    refused: Arc<OnceLock<http1::Error>>,
     timer: fictionet::Timer,
     deadline: Option<Instant>,
     timeout: Duration,
 }
 
 impl HeadCheck {
-    fn new(fcx: &Cx, limits: Limits, upgraded: Arc<AtomicBool>) -> Self {
+    fn new(
+        fcx: &Cx,
+        limits: Limits,
+        upgraded: Arc<AtomicBool>,
+        refused: Arc<OnceLock<http1::Error>>,
+    ) -> Self {
         let decoder = http1::RequestEvents::with_limits(limits.head);
         let input = Buffer::new(decoder.capacity());
         Self {
@@ -557,6 +579,7 @@ impl HeadCheck {
             ready: 0,
             eof: false,
             upgraded,
+            refused,
             timer: fictionet::Timer::new(fcx),
             deadline: Some(fcx.now() + limits.header_timeout),
             timeout: limits.header_timeout,
@@ -610,6 +633,7 @@ impl HeadCheck {
                     Ok(Step::End) => return Poll::Ready(Ok(())),
                     Ok(Step::Need) => {}
                     Err(e) => {
+                        let _ = self.refused.set(e);
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             e,
