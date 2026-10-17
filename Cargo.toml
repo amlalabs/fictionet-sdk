@@ -130,126 +130,6 @@ opt-level = 2
 debug = "line-tables-only"
 opt-level = 1
 
-[[test]]
-name = "attach_bin"
-required-features = ["std"]
-
-[[test]]
-name = "compose"
-required-features = ["std"]
-
-[[test]]
-name = "core"
-required-features = ["std"]
-
-[[test]]
-name = "determinism"
-required-features = ["std", "tokio"]
-
-[[test]]
-name = "e2e"
-required-features = ["std", "tokio"]
-
-[[test]]
-name = "entropy"
-required-features = ["std"]
-
-[[test]]
-name = "fd_limit"
-required-features = ["std"]
-
-[[test]]
-name = "flood"
-required-features = ["std"]
-
-[[test]]
-name = "http2_grpc"
-required-features = ["tokio"]
-
-[[test]]
-name = "httpd"
-required-features = ["std"]
-
-[[test]]
-name = "listen"
-required-features = ["std"]
-
-[[test]]
-name = "observe"
-required-features = ["std", "tokio", "observe"]
-
-[[test]]
-name = "observe_bin"
-required-features = ["std", "tokio", "observe"]
-
-[[test]]
-name = "observe_http2"
-required-features = ["tokio", "observe"]
-
-[[test]]
-name = "observe_present"
-required-features = ["std", "observe"]
-
-[[test]]
-name = "observe_tls"
-required-features = ["std", "observe"]
-
-[[test]]
-name = "packets"
-required-features = ["std"]
-
-[[test]]
-name = "proxy"
-required-features = ["std", "tokio"]
-
-[[test]]
-name = "recipes"
-required-features = ["std"]
-
-[[test]]
-name = "serve_cancellation"
-required-features = ["std"]
-
-[[test]]
-name = "serve_limits"
-required-features = ["std", "tokio"]
-
-[[test]]
-name = "services"
-required-features = ["std", "tokio", "observe"]
-
-[[test]]
-name = "stress"
-required-features = ["std"]
-
-[[test]]
-name = "tap_bin"
-required-features = ["std"]
-
-[[test]]
-name = "tcpudp"
-required-features = ["std", "tokio"]
-
-[[test]]
-name = "tls"
-required-features = ["std", "tokio"]
-
-[[test]]
-name = "tls_determinism"
-required-features = ["std"]
-
-[[test]]
-name = "tls_write_cancellation"
-required-features = ["std"]
-
-[[test]]
-name = "tun_linux"
-required-features = ["std", "tokio"]
-
-[[test]]
-name = "web"
-required-features = ["std", "tokio"]
-
 [[example]]
 name = "bottleneck_sites"
 required-features = ["std"]
@@ -280,6 +160,8 @@ name = "goad"
 path = "examples/goad/main.rs"
 required-features = ["std"]
 
+# Tests that need user namespaces, root or a tun device. They run only when
+# named: `cargo nextest run --test host`.
 [[test]]
-name = "sandbox"
-required-features = ["std"]
+name = "host"
+test = false

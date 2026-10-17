@@ -4,7 +4,7 @@
 //! Missing rustfmt skips formatting checks with a note locally and fails
 //! when `CI` is set, even to an empty value. A nonzero rustfmt exit always fails.
 use fictionet_codegen::*;
-#[path = "../../tests/common/requirements.rs"]
+#[path = "../../tests/it/common/requirements.rs"]
 mod requirements;
 #[path = "support/rustfmt.rs"]
 mod rustfmt;

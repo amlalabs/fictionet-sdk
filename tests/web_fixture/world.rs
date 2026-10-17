@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 #[allow(dead_code)]
-#[path = "../common/certs.rs"]
+#[path = "../it/common/certs.rs"]
 mod certs;
 
 use std::io::{Read, Write};

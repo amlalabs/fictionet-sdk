@@ -3,7 +3,7 @@
 //! when `CI` is set, even to an empty value. A nonzero rustfmt exit always fails.
 use fictionet_codegen::{FrontEnd, Input, IrFrontEnd, Limits, emit, emit_fuzz, generate, validate};
 use std::path::Path;
-#[path = "../../tests/common/requirements.rs"]
+#[path = "../../tests/it/common/requirements.rs"]
 mod requirements;
 #[path = "support/rustfmt.rs"]
 mod rustfmt;

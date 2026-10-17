@@ -52,13 +52,18 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Build
-        run: cargo build --locked --workspace --all-targets ${{ matrix.features }}
+        run: cargo build --locked --workspace --all-targets --test host ${{ matrix.features }}
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Use the runner's Chrome for the dashboard regression
         run: echo "CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
       - name: Test
         run: cargo nextest run --locked --workspace ${{ matrix.features }}
+      # The attach tests that need user namespaces. The tun test needs root
+      # and runs in the tcpudp Docker test.
+      - name: Test attach in user namespaces
+        if: matrix.features != '--no-default-features'
+        run: cargo nextest run --locked --test host ${{ matrix.features }} attach_bin::
       - name: Doctests
         run: cargo test --locked --doc --workspace ${{ matrix.features }}
       - name: Docs
@@ -66,7 +71,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets ${{ matrix.features }} -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --test host ${{ matrix.features }} -- -D warnings
 
   # Every crate in the repository is formatted with the default rustfmt
   # style (rustfmt.toml). From the crate root, so rust-toolchain.toml there

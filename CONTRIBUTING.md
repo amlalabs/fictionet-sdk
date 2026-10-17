@@ -26,11 +26,11 @@ other rows, append the listed feature flags to each Cargo command, before
 `-- -D warnings` for clippy:
 
 ```console
-$ cargo build --locked --workspace --all-targets
+$ cargo build --locked --workspace --all-targets --test host
 $ cargo nextest run --locked --workspace
 $ cargo test --locked --doc --workspace
 $ RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
-$ cargo clippy --locked --workspace --all-targets -- -D warnings
+$ cargo clippy --locked --workspace --all-targets --test host -- -D warnings
 ```
 
 CI also checks that every crate in the repository is formatted with the
@@ -76,6 +76,16 @@ at a time.
 
 `cargo test` runs everything too, doctests included, one test binary after
 another. It takes about a minute longer.
+
+The integration tests are two binaries. `tests/it` runs on any machine.
+`tests/host` holds the tests that need user namespaces, root or a tun device,
+and fails where the machine lacks them, so neither command above runs it.
+`--all-targets` leaves it out too, so the build and clippy commands name it.
+Run it by name:
+
+```console
+$ cargo nextest run --locked --test host
+```
 
 The test profile builds the crate with `opt-level = 1` and its dependencies
 with `opt-level = 2` (see `Cargo.toml`). The randomized protocol tests run

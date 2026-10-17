@@ -23,9 +23,9 @@ ARG PROFILE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-tcpudp-target \
     flag=""; [ "$PROFILE" = release ] && flag="--release"; \
-    cargo test $flag --test tun_linux --no-run \
-    && cp "$(ls -t target/$PROFILE/deps/tun_linux-* | grep -v '\.d$' | head -1)" /tun_linux
+    cargo test $flag --test host --no-run \
+    && cp "$(ls -t target/$PROFILE/deps/host-* | grep -v '\.d$' | head -1)" /host
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
-COPY --from=build /tun_linux /test
+COPY --from=build /host /test

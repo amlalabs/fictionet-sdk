@@ -17,7 +17,7 @@ use http::{HeaderMap, StatusCode};
 use rustls::ClientConfig;
 use serde_json::Value;
 
-#[path = "../../tests/common/timeout.rs"]
+#[path = "../../tests/it/common/timeout.rs"]
 mod timing;
 pub use timing::timeout;
 

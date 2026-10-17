@@ -120,7 +120,7 @@ Each bug a target found has a regression test in the SDK's own tests, so
 ## Resource limits
 
 Memory and fairness under a flood are a test, not a fuzz target:
-`tests/flood.rs` floods `web::Sites` from one sandbox with made-up names,
+`tests/it/flood.rs` floods `web::Sites` from one sandbox with made-up names,
 fragments, SYNs and held connections, checks the limits, and checks that
 the process grows by less than 200 MiB and that another sandbox is still
 served.

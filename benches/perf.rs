@@ -26,7 +26,7 @@ mod benchmark;
 use benchmark::ObserverStatus;
 
 #[allow(dead_code)]
-#[path = "../tests/common/certs.rs"]
+#[path = "../tests/it/common/certs.rs"]
 mod certs;
 
 #[path = "../examples/common/hyper.rs"]

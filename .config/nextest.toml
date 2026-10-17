@@ -22,13 +22,13 @@ slow-timeout = { period = "15s", terminate-after = 8 }
 fail-fast = false
 
 [[profile.default.overrides]]
-filter = "binary(flood) | binary(stress) | binary(fd_limit)"
+filter = "binary(it) & test(/^(flood|stress|fd_limit)::/)"
 test-group = "heavy"
 
 [[profile.default.overrides]]
 filter = """
-binary(web) | binary(listen) | binary(recipes) | binary(tcpudp) | binary(core)
-| binary(e2e) | binary(attach_bin) | binary(tap_bin) | binary(proxy) | binary(tls)
-| binary(observe) | binary(observe_bin) | binary(observe_tls) | binary(tun_linux)
+binary(host) | (binary(it) & test(
+  /^(web|listen|recipes|tcpudp|core|e2e|attach_bin|tap_bin|proxy|tls|observe|observe_bin|observe_tls)::/
+))
 """
 test-group = "worlds"
