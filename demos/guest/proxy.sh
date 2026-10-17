@@ -77,7 +77,7 @@ note "A name the world does not have gets 502, and attach says why:"
 expect_output 'curl -sS -o /dev/null -D - http://nope.test/' '^HTTP/1\.1 502 ' '^X-Proxy-Error: no such name in the world[[:space:]]*$'
 expect_fail 97 'connection to nope\.test\. \(4\)' 'curl -sS -x "$SOCKS" https://nope.test/'
 note "Around the proxy there is no network, and the world's socket is out of reach:"
-expect_fail 7 "Network is unreachable|Couldn't connect" 'curl -sS -m 5 --noproxy "*" http://1.1.1.1/'
+expect_fail 7 "Network is unreachable|Could(n't| not) connect" 'curl -sS -m 5 --noproxy "*" http://1.1.1.1/'
 expect_fail 2 'Permission denied' 'ls /run/fictionet'
 
 step "Clean up"
