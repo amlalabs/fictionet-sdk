@@ -57,11 +57,6 @@ def world_sandbox():
     )
 
 
-def sorted_percentile(values: list[float], p: float) -> float | None:
-    """The p-th percentile (0 to 100) of sorted values by nearest rank."""
-    return _accounting.percentile(values, p)
-
-
 def latency(log: list[dict[str, Any]]) -> dict[str, Any]:
     """Count every HTTP event, including failures and requests without timing.
 
