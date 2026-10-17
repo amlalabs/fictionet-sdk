@@ -24,6 +24,7 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 from urllib.parse import unquote
 
 from adaptive import llm, prompts, seed as seeds, tells
@@ -1086,6 +1087,38 @@ class ModelGenerator(unittest.TestCase):
         with self.assertRaisesRegex(llm.Error, "OPENROUTER_API_KEY is not set"):
             llm.client("openrouter")
         os.environ["OPENROUTER_API_KEY"] = self.KEY
+
+
+class ModelErrors(unittest.TestCase):
+    KEY = "sk-test-key-must-not-be-in-errors"
+
+    def assert_redacted(self, raised, variable):
+        """Neither the error nor any attempt the generation log keeps holds the key."""
+        self.assertNotIn(self.KEY, str(raised.exception))
+        self.assertIn(f"<{variable}>", str(raised.exception))
+        self.assertTrue(raised.exception.ledger.attempts)
+        for attempt in raised.exception.ledger.attempts:
+            self.assertNotIn(self.KEY, attempt.error)
+            self.assertIn(f"<{variable}>", attempt.error)
+
+    def test_anthropic_http_errors_redact_the_key(self):
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": self.KEY}):
+            error = HTTPError(llm.ANTHROPIC_URL, 401, "Unauthorized", {},
+                              io.BytesIO(f"Invalid key {self.KEY}: {self.KEY}".encode()))
+            self.addCleanup(error.close)
+            with patch.object(llm, "_open", side_effect=error):
+                with self.assertRaises(llm.Error) as raised:
+                    llm.client("anthropic").complete("system", "user", 10)
+            self.assert_redacted(raised, "ANTHROPIC_API_KEY")
+
+    def test_transport_errors_redact_the_key(self):
+        for error in (URLError(self.KEY), OSError(self.KEY)):
+            with self.subTest(error=type(error).__name__), patch.dict(os.environ, {"OPENROUTER_API_KEY": self.KEY}):
+                with patch.object(llm, "_open", side_effect=error), patch.object(llm, "_sleep"):
+                    with self.assertRaises(llm.Error) as raised:
+                        llm.client("openrouter").complete("system", "user", 10)
+                self.assertEqual(len(raised.exception.ledger.attempts), 3)
+                self.assert_redacted(raised, "OPENROUTER_API_KEY")
 
 
 class Reading(unittest.TestCase):
