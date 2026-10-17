@@ -177,7 +177,6 @@ fn an_observer_sees_http_inside_tls() {
     let packets = observer
         .request(&format!(r#"{{"op":"packets","link":"e{edge}"}}"#))
         .unwrap();
-    go.store(true, Ordering::SeqCst);
 
     let (mut request, mut response) = (false, false);
     while !(request && response) && start.elapsed() < Duration::from_secs(20) {
@@ -186,6 +185,9 @@ fn an_observer_sees_http_inside_tls() {
             continue;
         }
         let t = text(&v);
+        if t.starts_with(r#"{"event":"link""#) {
+            go.store(true, Ordering::SeqCst);
+        }
         // The packet is shown as what TLS carries.
         request |= t.contains(r#""proto":"HTTP","info":"GET /secret HTTP/1.1""#)
             && t.contains("decrypted");
