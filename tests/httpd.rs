@@ -639,7 +639,7 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
 }
 
 #[test]
-fn an_http11_request_with_no_host_reaches_the_handler_as_one_that_names_no_host() {
+fn an_http11_request_with_no_host_gets_400_from_the_service() {
     let vhosts = httpd::VirtualHosts::new();
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ());
     let _ = h.push(b"GET /x HTTP/1.1\r\nAccept: */*\r\n\r\n");
@@ -649,6 +649,7 @@ fn an_http11_request_with_no_host_reaches_the_handler_as_one_that_names_no_host(
         http_text(&h)
     );
     assert!(h.closed());
+    assert_eq!(h.events().len(), 1);
     let e = &h.events()[0];
     assert!(e.is("http", "request"));
     assert_eq!(
@@ -665,6 +666,72 @@ fn an_http11_request_with_no_host_reaches_the_handler_as_one_that_names_no_host(
         .map(|p| p.as_array().unwrap()[0].as_str().unwrap())
         .collect();
     assert_eq!(names, ["accept"]);
+}
+
+#[test]
+fn an_http11_absolute_request_with_no_host_gets_400_from_the_service() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let vhosts = httpd::VirtualHosts::new();
+    vhosts.insert(
+        "a.test",
+        httpd::VHost::new(Router::new().get("/", move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            http::Response::new(Bytes::from("ok"))
+        })),
+    );
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ());
+    assert!(h.push(b"GET http://a.test/ HTTP/1.1\r\n\r\n").is_err());
+    assert!(
+        http_text(&h).starts_with("HTTP/1.1 400 Bad Request"),
+        "{}",
+        http_text(&h)
+    );
+    assert!(http_text(&h).ends_with("\r\n\r\nThe request names no host.\n"));
+    assert!(h.closed());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(h.events().len(), 1);
+    let e = &h.events()[0];
+    assert!(e.is("http", "request"));
+    assert_eq!(
+        e.get("answer").and_then(json::Value::as_str),
+        Some("no_host")
+    );
+    assert_eq!(e.get("status").and_then(json::Value::as_u64), Some(400));
+    // The event's host is what the request named: its URI's authority.
+    assert_eq!(e.get("host").and_then(json::Value::as_str), Some("a.test"));
+    assert_eq!(e.get("method").and_then(json::Value::as_str), Some("GET"));
+    assert_eq!(e.get("path").and_then(json::Value::as_str), Some("/"));
+    assert!(
+        e.get("headers")
+            .and_then(json::Value::as_array)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_router_receives_no_host_requests_only_for_http10() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let router = Router::new().get("/x", move |_, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        http::Response::new(Bytes::from("ok"))
+    });
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
+    assert!(h.push(b"GET /x HTTP/1.1\r\n\r\n").is_err());
+    assert!(
+        http_text(&h).starts_with("HTTP/1.1 400 Bad Request"),
+        "{}",
+        http_text(&h)
+    );
+    assert!(h.closed());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    h.push(b"GET /x HTTP/1.0\r\n\r\n").unwrap();
+    assert!(http_text(&h).starts_with("HTTP/1.0 200 OK"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

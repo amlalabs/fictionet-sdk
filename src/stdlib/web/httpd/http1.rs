@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use bytes::Bytes;
+use http::header::HOST;
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame};
 
@@ -22,6 +23,7 @@ use super::handlers::status_only;
 use super::response::{
     ResponsePolicy, Tracker, answered, error_event, error_response, head_held, request_held,
 };
+use super::sites::no_host;
 use super::{
     Body, Exchange, Handler, Later, Limits, Observer, PIECE, Received, Reply, UpgradeHandler,
     date_header,
@@ -153,8 +155,8 @@ impl Http1 {
         self.dispatch(driver, body, close, held)
     }
 
-    /// Calls the handler for the request whose head is pending, with
-    /// `body`. `close` closes the connection after the answer.
+    /// Answers the request whose head is pending, with `body`.
+    /// `close` closes the connection after the answer.
     fn dispatch(
         &mut self,
         driver: &mut Driver<'_, http1::RequestEvents>,
@@ -183,11 +185,17 @@ impl Http1 {
         let held = held + request_held(&request);
         let now = driver.now();
         let conn = driver.conn().clone();
+        // RFC 9112 section 3.2: an HTTP/1.1 request without Host gets 400
+        // from the service, unless its body is too large. The decoder
+        // refuses such a head, so only `on_fail` brings one here.
+        let lacks_host = version == Version::HTTP_11 && !request.headers().contains_key(HOST);
         let reply = if self.too_big {
             Reply::Now(answered(
                 status_only(StatusCode::PAYLOAD_TOO_LARGE),
                 "too_large",
             ))
+        } else if lacks_host {
+            Reply::Now(no_host())
         } else {
             self.handler
                 .call(request, &mut Exchange::new(now, driver.entropy(), &conn))
@@ -198,7 +206,7 @@ impl Http1 {
         {
             self.upgrade = Some(upgrade.clone());
         }
-        let close = !keep_alive && self.upgrade.is_none();
+        let close = (!keep_alive || lacks_host) && self.upgrade.is_none();
         // Every answer goes out as deferred work, so its event is made
         // once its bytes are written.
         let (work, response) = match reply {
@@ -266,7 +274,7 @@ fn without_host(unread: &[u8]) -> Option<(RequestHead, http1::RequestEvents, usi
     let Step::Item(H1::Head(mut head), _) = decoder.decode(&patched, false).ok()? else {
         return None;
     };
-    // The handler sees the request as it came, without the field added.
+    // The event records the request as it came, without the field added.
     if head
         .headers
         .first()
@@ -509,8 +517,8 @@ impl serve::Service for Http1 {
             fictionet::stdlib::codec::Fail::Protocol(http1::Error::Host)
         ) && let Some((head, mut decoder, head_end)) = without_host(driver.unread())
         {
-            // An HTTP/1.1 request with no Host field: the handler answers
-            // it, as a request that names no host (`400`, `no_host`).
+            // The service answers an HTTP/1.1 request with no Host field
+            // with `400` and `no_host`, then closes the connection.
             self.started = driver.now();
             self.track(&head, driver.conn());
             if let Some(tracker) = &mut self.tracker {

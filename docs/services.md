@@ -737,6 +737,11 @@ Hyper rejects a request whose metadata does not fit before calling its handler.
 It records `answer: budget` without a status and ends that stream. Both versions
 draw a handler's randomness from the run's stream.
 
+An HTTP/1.1 request without `Host` gets `400` with `answer: no_host`
+without calling the handler, and the connection closes (RFC 9112 section
+3.2). If its body is also too large, it gets `413` with `answer: too_large`
+instead. An HTTP/1.0 request without `Host` still reaches the handler.
+
 An oversized request body gets `413` without calling the handler. Native
 HTTP/1 drains the request before answering and closes the connection.
 Hyper's HTTP/1 upgrade path and HTTP/2 reject it during body collection.

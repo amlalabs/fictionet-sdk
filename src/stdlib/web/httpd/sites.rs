@@ -164,10 +164,7 @@ impl VirtualHosts {
 impl Handler for VirtualHosts {
     fn call(&self, mut request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
         let Some(host) = request_host(&request) else {
-            return Reply::Now(answered(
-                text(StatusCode::BAD_REQUEST, "The request names no host.\n"),
-                "no_host",
-            ));
+            return Reply::Now(no_host());
         };
         let misdirected = || {
             Reply::Now(answered(
@@ -214,6 +211,16 @@ impl Handler for VirtualHosts {
             }
         }
     }
+}
+
+/// The answer to a request that names no host: `400`, with `answer`
+/// `no_host` in its event. [`VirtualHosts`] gives it, and [`Http1`](super::Http1)
+/// gives it to an HTTP/1.1 request without `Host` before any handler.
+pub(super) fn no_host() -> http::Response<Body> {
+    answered(
+        text(StatusCode::BAD_REQUEST, "The request names no host.\n"),
+        "no_host",
+    )
 }
 
 /// The host a request is for: the authority of its URI (HTTP/2's

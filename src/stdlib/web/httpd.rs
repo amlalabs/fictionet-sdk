@@ -111,9 +111,11 @@
 //! `uri`, `path`, `query`, `version` (`HTTP/1.1`, `HTTP/2.0`), `headers`
 //! (`[name, value]` pairs in the order of `http::HeaderMap`), `started`
 //! (seconds on the run's clock), `answer` (`handler`, `error`, `cancelled`,
-//! what the handler set, such as `redirect`, or `too_large`,
-//! `timeout`, `cut_off` or `budget` for a request the service turned
-//! down), `received` (`complete`, `cut_off`, `too_large`, `timeout` or
+//! `no_host` for an HTTP/1.1 request without a `Host` field, which gets
+//! `400` without reaching the handler, what the handler set, such as
+//! `redirect`, or `too_large`, `timeout`, `cut_off` or `budget` for a
+//! request the service turned down; `too_large` wins over `no_host`),
+//! `received` (`complete`, `cut_off`, `too_large`, `timeout` or
 //! `budget` for request receipt), `status`, `sent` (response body bytes the
 //! connection took) and `complete`
 //! (whether it took the whole body). Over HTTP/1 a byte counts once it is
