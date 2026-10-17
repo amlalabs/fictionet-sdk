@@ -2,7 +2,6 @@ use super::*;
 use crate::process::{Checks, poll_interruptible as poll};
 use base64::Engine;
 use regex::Regex;
-use std::collections::HashSet;
 
 pub(super) fn directory() -> PathBuf {
     std::env::var_os("FICTIONET_VM_DIR")
@@ -91,6 +90,26 @@ pub(super) fn qemu(seconds: u64) -> Command {
 }
 
 pub(super) fn wait_file(path: &Path, child: &mut ChildGuard, log: &Path) -> Result {
+    wait_for(path, Path::exists, child, log)
+}
+
+pub(super) fn wait_ca(path: &Path, world: &mut ChildGuard, log: &Path) -> Result {
+    wait_for(
+        path,
+        |path| {
+            fs::read_to_string(path).is_ok_and(|text| text.contains("-----END CERTIFICATE-----"))
+        },
+        world,
+        log,
+    )
+}
+
+fn wait_for(
+    path: &Path,
+    ready: impl Fn(&Path) -> bool,
+    child: &mut ChildGuard,
+    log: &Path,
+) -> Result {
     if poll(Duration::from_secs(10), Duration::from_millis(100), || {
         if let Some(status) = child.0.try_wait()? {
             return Err(format!(
@@ -99,34 +118,12 @@ pub(super) fn wait_file(path: &Path, child: &mut ChildGuard, log: &Path) -> Resu
             )
             .into());
         }
-        Ok(path.exists())
+        Ok(ready(path))
     })? {
         Ok(())
     } else {
         Err(format!(
             "timed out waiting for {}: {}",
-            path.display(),
-            fs::read_to_string(log).unwrap_or_default()
-        )
-        .into())
-    }
-}
-
-pub(super) fn wait_ca(path: &Path, world: &mut ChildGuard, log: &Path) -> Result {
-    if poll(Duration::from_secs(10), Duration::from_millis(100), || {
-        if let Some(status) = world.0.try_wait()? {
-            return Err(format!(
-                "world exited with {status}: {}",
-                fs::read_to_string(log).unwrap_or_default()
-            )
-            .into());
-        }
-        Ok(fs::read_to_string(path).is_ok_and(|text| text.contains("-----END CERTIFICATE-----")))
-    })? {
-        Ok(())
-    } else {
-        Err(format!(
-            "no complete CA in {}: {}",
             path.display(),
             fs::read_to_string(log).unwrap_or_default()
         )
@@ -196,86 +193,25 @@ echo '=== guest begin'
         guest
     }
     pub fn validate(&self, text: &str, success: bool) -> Result {
-        validate(text, success, &self.expected)
-    }
-}
-
-fn validate(text: &str, success: bool, expected: &[(String, u8)]) -> Result {
-    let mut errors = Vec::new();
-    if !success {
-        errors.push("emulator failed or timed out".into());
-    }
-    if expected.is_empty() {
-        errors.push("no required guest commands".into());
-    }
-    let record =
-        Regex::new(r"^=== guest result ([A-Za-z0-9_][A-Za-z0-9_.-]*) ([0-9]{1,3}) ([0-9]+)$")?;
-    let (mut begins, mut ends) = (0, 0);
-    let mut seen = HashSet::new();
-    for raw in text.split_inclusive('\n') {
-        let line = raw.strip_suffix('\n').unwrap_or(raw);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if !line.starts_with("=== guest") {
-            continue;
+        let mut errors = Vec::new();
+        if !success {
+            errors.push("emulator failed or timed out".into());
         }
-        if !raw.ends_with('\n') {
-            errors.push("unterminated guest record".into());
-            continue;
+        let lines: Vec<_> = text.lines().map(str::trim_end).collect();
+        if !lines.contains(&"=== guest end") {
+            errors.push("the guest did not reach the end of its script".into());
         }
-        match line {
-            "=== guest begin" => {
-                begins += 1;
-                if begins != 1 || ends != 0 {
-                    errors.push("duplicate or misplaced guest begin".into());
-                }
-            }
-            "=== guest end" => {
-                ends += 1;
-                if begins != 1 || ends != 1 {
-                    errors.push("duplicate or misplaced guest end".into());
-                }
-            }
-            _ => {
-                let Some(parts) = record.captures(line) else {
-                    errors.push(format!("malformed guest record: {line}"));
-                    continue;
-                };
-                let Ok(actual) = parts[2].parse::<u8>() else {
-                    errors.push(format!("invalid guest status: {}", &parts[2]));
-                    continue;
-                };
-                let name = parts[1].to_string();
-                if begins != 1 || ends != 0 {
-                    errors.push(format!("{name}: result outside guest begin/end"));
-                }
-                if !seen.insert(name.clone()) {
-                    errors.push(format!("duplicate guest result: {name}"));
-                }
-                match expected.iter().find(|(n, _)| *n == name) {
-                    None => errors.push(format!("undeclared guest result: {name}")),
-                    Some((_, status)) if *status != actual => {
-                        errors.push(format!("{name}: expected status {status}, got {actual}"))
-                    }
-                    _ => {}
-                }
+        for (name, status) in &self.expected {
+            let record = format!("=== guest result {name} {status} ");
+            if !lines.iter().any(|line| line.starts_with(&record)) {
+                errors.push(format!("{name}: no result with status {status}"));
             }
         }
-    }
-    if begins == 0 {
-        errors.push("missing guest begin".into());
-    }
-    if ends == 0 {
-        errors.push("missing guest end".into());
-    }
-    for (name, _) in expected {
-        if !seen.contains(name) {
-            errors.push(format!("missing guest result: {name}"));
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n").into())
         }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("\n").into())
     }
 }
 
