@@ -407,6 +407,37 @@ fn a_dropped_hello_closes_with_no_alert() {
 }
 
 #[test]
+fn a_malformed_hello_gets_a_decode_error_alert() {
+    within(Duration::from_secs(20), || {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (server_side, mut client_side) = mem_pair();
+            let server = fcx.spawn(move |fcx| async move {
+                assert_eq!(
+                    tls::server(&fcx, server_side).await.err(),
+                    Some(ConnError::Broken)
+                );
+                Ok(())
+            });
+            // The record and handshake lengths match the 35-byte body, but
+            // the session ID claims 200 bytes with none left in the body.
+            let mut hello = vec![22, 3, 1, 0, 39, 1, 0, 0, 35, 3, 3];
+            hello.extend_from_slice(&[0; 32]);
+            hello.push(200);
+            client_side.write_all(&fcx, &hello).await?;
+            server.join(&fcx).await?;
+            let mut buf = [0; 16];
+            let n = client_side.read(&fcx, &mut buf).await?;
+            assert_eq!(n, 7, "expected a fatal TLS alert");
+            assert_eq!(&buf[..n], &[21, 3, 3, 0, 2, 2, 50]);
+            // Then the end of the stream.
+            assert_eq!(client_side.read(&fcx, &mut buf).await?, 0);
+            Ok(())
+        }))
+    })
+    .unwrap();
+}
+
+#[test]
 fn a_first_message_that_is_not_a_hello_is_broken() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {

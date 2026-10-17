@@ -286,7 +286,8 @@ impl HandshakeError {
 ///
 /// Fails with [`ConnError::Broken`] if the client's first message is not a
 /// TLS hello, or if the client closes the connection before it sent a whole
-/// hello. An error of the connection underneath, such as
+/// hello. A malformed hello gets rustls' fatal alert first. Input that is
+/// not TLS gets no answer. An error of the connection underneath, such as
 /// [`ConnError::Cancelled`] when `fcx`'s [region](fictionet::Cx#regions) is
 /// cancelled, comes out as it is.
 pub async fn server<C: Connection>(fcx: &Cx, conn: C) -> Result<ClientHello<C>, ConnError> {
@@ -295,16 +296,20 @@ pub async fn server<C: Connection>(fcx: &Cx, conn: C) -> Result<ClientHello<C>, 
         .map_err(HandshakeError::into_conn)
 }
 
-/// [`server`], failing with how the hello went wrong.
+/// [`server`], failing with how the hello went wrong. A malformed hello
+/// gets rustls' fatal alert first. Input that is not TLS gets no answer.
 pub async fn server_detailed<C: Connection>(
     fcx: &Cx,
     conn: C,
 ) -> Result<ClientHello<C>, HandshakeError> {
     let mut io = Io::new(conn);
     let mut acceptor = Acceptor::default();
+    let mut first_byte = None;
+    let mut alert = None;
     let accepted = poll_fn(|cx| {
         loop {
             if !io.inbuf.is_empty() {
+                first_byte.get_or_insert(io.inbuf.unread()[0]);
                 let n = acceptor
                     .read_tls(&mut io.inbuf.unread())
                     .map_err(|e| HandshakeError::Failed(e.to_string()))?;
@@ -317,8 +322,15 @@ pub async fn server_detailed<C: Connection>(
                         )));
                     }
                     Ok(None) => continue,
-                    // Not a TLS hello. Nothing is sent: the connection closes.
-                    Err((e, _)) => return Poll::Ready(Err(HandshakeError::Failed(e.to_string()))),
+                    // Send rustls' fatal alert for a malformed hello, but
+                    // send nothing for input that did not start as a TLS
+                    // handshake record (content type 22).
+                    Err((e, fatal)) => {
+                        if first_byte == Some(22) {
+                            alert = Some(fatal);
+                        }
+                        return Poll::Ready(Err(HandshakeError::Failed(e.to_string())));
+                    }
                 }
             }
             if io.eof {
@@ -331,7 +343,16 @@ pub async fn server_detailed<C: Connection>(
             }
         }
     })
-    .await?;
+    .await;
+    if let Some(mut alert) = alert {
+        use fictionet::stdlib::ConnectionExt;
+        // Best effort: tell the client why, then close. The hello already
+        // failed, and that is the error returned.
+        let _ = alert.write_all(&mut io.output.bytes);
+        let _ = poll_fn(|cx| io.poll_flush(fcx, cx)).await;
+        let _ = io.conn.shutdown(fcx).await;
+    }
+    let accepted = accepted?;
     let hello = accepted.client_hello();
     let server_name = hello.server_name().map(str::to_owned);
     let alpn = hello
