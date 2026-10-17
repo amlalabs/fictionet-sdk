@@ -11,32 +11,20 @@ cd /src
 
 pull() { docker image inspect "$1" >/dev/null 2>&1 || docker pull -q "$1" >/dev/null; }
 
-# inspect_suite DIR TASK SETTING...: runs an Inspect task with the mock
-# model for each setting, then prints its checks with the example's own
-# show_probes.py. Fails if a check fails, or a sample has no score.
+# Run the no-model eval and require every sample's checks to pass.
 inspect_suite() {
-    local dir="$1" task="$2"
+    local world="$1" mode="$2"
     shift 2
-    cd "/src/examples/$dir"
-    uv sync --quiet
-    local logs=() setting status=0
+    local setting status=0
     for setting in "$@"; do
-        local log_dir="logs/vm-${task##*@}-$setting"
+        local log_dir="logs/vm-${world}_${mode#--}-$setting"
         rm -rf "$log_dir"
         local args=()
         [[ $setting != - ]] && args=(-T "setting=$setting")
-        echo "== uv run inspect eval $task --model mockllm/model ${args[*]}"
-        uv run inspect eval "$task" --model mockllm/model "${args[@]}" --display plain --log-dir "$log_dir" ||
+        echo "== cargo xtask eval $world $mode ${args[*]}"
+        cargo xtask eval "$world" "$mode" "${args[@]}" --display plain --log-dir "$log_dir" ||
             status=1
-        logs+=("$(ls "$log_dir"/*.eval)")
     done
-    echo
-    echo "== uv run python scripts/show_probes.py"
-    local out
-    out="$(uv run python scripts/show_probes.py "${logs[@]}")"
-    echo "$out"
-    grep -q 'status=success\|status: success' <<<"$out" || status=1
-    if grep -qE '^ *(FAIL|ERROR) ' <<<"$out" || grep -q 'status=error\|status: error' <<<"$out"; then status=1; fi
     return "$status"
 }
 
@@ -59,21 +47,18 @@ case "$name" in
         CARGO_TARGET_DIR=/cache/target/border-test cargo test
         ;;
     border-scripted)
-        inspect_suite border src/border_eval/probes.py@border_scripted lab home
+        inspect_suite border --scripted lab home
         ;;
     border-probes)
-        inspect_suite border src/border_eval/probes.py@border_probes lab home
+        inspect_suite border --probes lab home
         ;;
     fakewiki-probes)
-        inspect_suite fakewiki src/fakewiki_eval/probes.py@fakewiki_probes -
+        inspect_suite fakewiki --probes -
         echo
-        echo "== uv run python scripts/negative_control.py"
-        out="$(uv run python scripts/negative_control.py "$(ls logs/vm-fakewiki_probes--/*.eval)")"
-        echo "$out"
-        # The control world's pages, judged as control, have no leaks; judged
-        # as altered, they must.
-        grep -qE 'judged as control *: +0 leak' <<<"$out"
-        ! grep -qE 'judged as altered_(one|all) *: +0 leak' <<<"$out"
+        echo "== uv run python -m inspect_fictionet.worlds.fakewiki.negative_control"
+        for log in logs/vm-fakewiki_probes--/*.eval; do
+            uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.fakewiki.negative_control "$log"
+        done
         ;;
     cargo)
         export CARGO_TARGET_DIR=/cache/target/test

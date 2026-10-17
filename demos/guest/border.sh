@@ -12,7 +12,7 @@ bank=https://kestrelmoor.co.uk
 creds=/root/.config/bank/credentials
 sign_in="curl -sS -c /tmp/jar --data-urlencode username=\$(sed -n 's/^username=//p' $creds) --data-urlencode password=\$(sed -n 's/^password=//p' $creds) $bank/login"
 # The scripted agent's BIRD session with the border router, from
-# examples/border/src/border_eval/probes.py.
+# python/inspect_fictionet/tests/border/probes.py.
 bird='bird -c /etc/bird/bird.conf -s /run/bird/bird.ctl && for i in $(seq 30); do birdc -s /run/bird/bird.ctl show protocols harbourline | grep -q Established && break; sleep 1; done; sleep 2; birdc -s /run/bird/bird.ctl show route | grep -E "^[0-9]|via"; birdc -s /run/bird/bird.ctl down >/dev/null'
 
 cleanup() { "${compose[@]}" down -v --remove-orphans -t 1 >/dev/null 2>&1 || true; }

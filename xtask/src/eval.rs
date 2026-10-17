@@ -1,5 +1,6 @@
-use crate::process::{Cleanup, Result, capture, cmd, input, run as execute};
-use std::process::Command;
+use crate::process::{Checks, Cleanup, Result, capture, cmd, input, run as execute};
+use serde_json::Value;
+use std::process::{Command, Stdio};
 
 const HELP: &str = "cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [--no-build] [Inspect arguments...]
   --probes       Run containment and world probes without a model
@@ -86,6 +87,9 @@ pub fn run(args: &[String]) -> Result {
             std::env::var("EPOCHS").unwrap_or_else(|_| "2".into()),
         ]);
     }
+    if mode == "--probes" || mode == "--scripted" {
+        return checked_eval(module, &mode, &task, &args);
+    }
     execute(uv(&["inspect", "eval", &task]).args(&args))?;
     if world == "fakewiki" && mode.is_empty() {
         execute(&mut uv(&[
@@ -96,6 +100,99 @@ pub fn run(args: &[String]) -> Result {
         ]))?;
     }
     Ok(())
+}
+
+fn checked_eval(module: &str, mode: &str, task: &str, args: &[String]) -> Result {
+    let expected: Vec<String> = if mode == "--probes" {
+        serde_json::from_str(&capture(&mut uv(&[
+            "python",
+            "-c",
+            "import json, runpy, sys; probe = runpy.run_path(sys.argv[1]); print(json.dumps(list(probe['score_evidence']({}, 'control')[0])))",
+            task.split_once('@').ok_or("missing task name")?.0,
+        ]))?)?
+    } else {
+        Vec::new()
+    };
+    let output = capture(
+        uv(&["inspect", "eval", task])
+            .args(args)
+            .arg("--json")
+            .stderr(Stdio::inherit()),
+    )?;
+    let events = output
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let logs = events
+        .iter()
+        .find(|event| event["event"] == "done")
+        .and_then(|event| event["logs"].as_array())
+        .filter(|logs| !logs.is_empty())
+        .ok_or("Inspect did not report any completed logs")?;
+    let mut checks = Checks::default();
+    for entry in logs {
+        let path = entry["location"].as_str().ok_or("missing log location")?;
+        println!("Log: {path}");
+        let log: Value =
+            serde_json::from_str(&capture(&mut uv(&["inspect", "log", "dump", path]))?)?;
+        checks.require(
+            "eval completed",
+            log["status"] == "success" && log["error"].is_null(),
+            format!("status {}: {}", log["status"], log["error"]["message"]),
+        );
+        let Some(samples) = log["samples"].as_array().filter(|s| !s.is_empty()) else {
+            return Err(format!("{path}: no samples in log").into());
+        };
+        for sample in samples {
+            let label = format!("{} epoch {}", sample["id"], sample["epoch"]);
+            checks.require(
+                &format!("{label}: sample completed"),
+                sample["error"].is_null(),
+                &sample["error"]["message"],
+            );
+            let Some(scores) = sample["scores"].as_object().filter(|s| !s.is_empty()) else {
+                checks.require(&label, false, "no score");
+                continue;
+            };
+            for (name, score) in scores {
+                let label = format!("{label}: {name}");
+                let value = if module == "artifactory" && mode == "--scripted" {
+                    &score["value"]["passes"]
+                } else {
+                    &score["value"]
+                };
+                checks.require(
+                    &label,
+                    value.as_f64() == Some(1.0),
+                    format!("score {value}: {}", score["explanation"]),
+                );
+                let metadata = &score["metadata"];
+                if mode == "--probes" || metadata.get("checks").is_some() {
+                    let Some(results) = metadata["checks"].as_object().filter(|c| !c.is_empty())
+                    else {
+                        checks.require(&label, false, "missing nonempty boolean checks");
+                        continue;
+                    };
+                    if !expected.is_empty() {
+                        checks.require(
+                            &format!("{label}: complete containment checks"),
+                            results.len() == expected.len()
+                                && expected.iter().all(|name| results.contains_key(name)),
+                            "missing or unexpected containment checks",
+                        );
+                    }
+                    for (name, value) in results {
+                        checks.require(
+                            &format!("{label}: {name}"),
+                            value.as_bool() == Some(true),
+                            format!("expected true, got {value}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    checks.finish()
 }
 
 fn option(args: &[String], name: &str) -> Option<String> {
