@@ -4,7 +4,7 @@ and deletes the sandbox.
     python run_hosted.py daytona   # needs DAYTONA_API_KEY and `pip install daytona`
     python run_hosted.py e2b       # needs E2B_API_KEY and `pip install e2b`
 
-Run ./build.sh first. The script uploads this directory's Dockerfiles,
+Run cargo xtask images hosted first. The script uploads this directory's Dockerfiles,
 compose file, check.sh and bin/, runs `docker compose up --build --wait`
 inside the sandbox, then check.sh. It prints how long each step took.
 

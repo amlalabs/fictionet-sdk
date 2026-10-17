@@ -19,7 +19,7 @@ jobs:
           install_only: true
       - uses: azure/setup-helm@v4.3.0
       - uses: azure/setup-kubectl@v4
-      - run: tests/k8s/run.sh
+      - run: cargo xtask k8s tun
 
   vm:
     runs-on: ubuntu-latest

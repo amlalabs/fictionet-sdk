@@ -3,7 +3,7 @@
 # the agent is a Debian image that runs as uid 1000 with no capabilities.
 # All three images are built from deploy/Dockerfile and loaded into the
 # cluster with `kind load`, so none is pulled (imagePullPolicy: Never).
-# tests/k8s/run.sh installs these values.
+# cargo xtask k8s tun installs these values.
 attach:
   image: fictionet-attach:dev
   imagePullPolicy: Never

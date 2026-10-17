@@ -8,7 +8,7 @@ prove tun isolation. The transcript is only for diagnostics.
     inspect eval tests/k8s/inspect_eval.py --model mockllm/model
 
 Needs kubectl access to a cluster (KUBECONFIG), helm on PATH, and the
-images in examples/attach/k8s-tun.yaml on the cluster's nodes. tests/k8s/run.sh
+images in examples/attach/k8s-tun.yaml on the cluster's nodes. cargo xtask k8s tun
 sets all of that up on kind.
 """
 

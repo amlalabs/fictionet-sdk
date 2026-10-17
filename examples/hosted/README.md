@@ -17,9 +17,9 @@ in place of this example's `compose.yaml`.
 
 ## Files
 
-| File | What it is |
+| Command or file | What it is |
 |---|---|
-| `build.sh` | Builds `fictionet` and `web_world` for Debian bookworm, into `bin/` and the Harbor task, and generates the Harbor environment. Run it first. |
+| `cargo xtask images hosted` | Builds `fictionet` and `web_world` for Debian bookworm, into `bin/` and the Harbor task, and generates the Harbor environment. Run it first. |
 | `package_harbor.py` | Generates Harbor's Dockerfiles and Compose manifest from the hosted sources. |
 | `Dockerfile` | The world and attach image: Debian with the two binaries. |
 | `agent.Dockerfile` | The agent image: Debian with curl, dig, ping, ip and python3. |
@@ -60,12 +60,12 @@ not provide a separate trusted verifier environment. The command fixtures
 test the checks, not resistance to tool tampering inside the container.
 
 The canonical deployment files are `Dockerfile`, `agent.Dockerfile` and
-`compose.yaml` here. `build.sh` runs `package_harbor.py` to copy the Dockerfiles
+`compose.yaml` here. `cargo xtask images hosted` runs `package_harbor.py` to copy the Dockerfiles
 and generate `harbor/fictionet-web/environment/docker-compose.yaml`. These three
 files are ignored build output, like `environment/bin/`. Do not edit them;
-edit the hosted sources and run `build.sh` instead.
+edit the hosted sources and run `cargo xtask images hosted` instead.
 The generated manifest uses JSON syntax, which Compose accepts as YAML,
-and has no reference back to this directory. `build.sh` also supplies its `bin/`.
+and has no reference back to this directory. `cargo xtask images hosted` also supplies its `bin/`.
 
 The generator keeps Harbor's differences explicit: `default` becomes `main`,
 attach uses `--name main`, and world and attach build from `world.Dockerfile`.
@@ -127,7 +127,7 @@ the earlier challenge run's build image; neither changed in this update.
 |---|---|---|
 | Harbor, `-a oracle -e docker`, strict failure classification | reward 1.0, one trial, no exceptions | 37 s |
 
-In the local Docker run, `build.sh` took 56 s, `up` took 40 to 100 s
+In the local Docker run, image building took 56 s, `up` took 40 to 100 s
 (most of it `apt-get` in the agent's image), `check.sh` 6 to 7 s, and
 `down` 0.7 s. The outer address was `172.17.0.5`, the gateway
 `172.17.0.1`, and the Docker bridge `172.18.0.1`.

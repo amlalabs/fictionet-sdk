@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Built from the crate root: see run.sh.
+# Built from the crate root: run cargo xtask docker tcpudp.
 #
 # The test binary is built in Docker, not on the host as a musl binary,
 # because ring (rustls's crypto) needs a C compiler for its target.
@@ -15,6 +15,7 @@ COPY benches benches
 # any build. Examples link dev-dependencies, and tests/copy_and_own reads
 # a file in codegen/tests.
 COPY codegen codegen
+COPY xtask xtask
 # Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
 # Cargo.toml names web_world, and docs/guide/recipes.rs includes other examples.

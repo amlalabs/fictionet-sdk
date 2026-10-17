@@ -105,21 +105,35 @@ input with the time for one 4 times larger, so it does not fail on a busy
 machine the way a fixed time limit would.
 
 A change to `fictionet attach` or to how a world is reached should also pass the
-Docker tests (`tests/docker/*/run.sh`), and for the Helm chart, the Kubernetes test
-(`tests/k8s/run.sh`). Each script builds what it needs, checks, and cleans up.
+Docker tests (`cargo xtask docker <ping|tcpudp|proxy|web>`), and for the Helm chart,
+the Kubernetes tests (`cargo xtask k8s`). Each command builds what it needs,
+checks, and cleans up.
 
-CI runs the TCP/UDP, web, ping and proxy Docker scripts and the restricted
-kind proxy test (`tests/k8s/proxy.sh`) on every push and pull request.
-The nightly integration workflow runs the tun kind test (`tests/k8s/run.sh`)
+CI runs the TCP/UDP, web, ping and proxy Docker commands and the restricted
+kind proxy test (`cargo xtask k8s proxy`) on every push and pull request.
+The nightly integration workflow runs the tun kind test (`cargo xtask k8s tun`)
 and the QEMU VM test, with its prepared image cached. Nested VM and gVisor
 tests remain manual. Missing host capabilities fail when `CI` is set.
 
-The Docker web and proxy tests and `tests/k8s/proxy.sh` check full transfer
+The Docker web and proxy tests and `cargo xtask k8s proxy` check full transfer
 sizes and counts, with a 30-second deadline per bulk transfer (60 seconds for
 the 32 parallel web downloads, which share one attach socket). They print
-throughput and timing measurements without imposing performance thresholds.
-Incomplete or failed transfers and transfers that exceed the completion
-deadline fail.
+throughput and timing measurements on every run:
+
+```console
+$ cargo xtask docker web
+$ cargo xtask docker proxy
+$ cargo xtask k8s proxy
+```
+
+Transfer completion, sizes and counts are checked. Rates and timing comparisons
+are reports, without performance thresholds. Incomplete or failed transfers and
+transfers that exceed the completion deadline fail.
+
+`cargo xtask images` builds the Artifactory images and hosted binaries. Select
+`images artifactory` or `images hosted` to build just one example.
+`cargo xtask scan [output directory]` records the scan dashboard with Chromium
+and ffmpeg. `cargo xtask --help` lists all commands.
 
 ## Releases
 

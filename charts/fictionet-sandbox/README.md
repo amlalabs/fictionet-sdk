@@ -14,6 +14,6 @@ files are [k8s-tun.yaml](../../examples/attach/k8s-tun.yaml) and
 [k8s-proxy.yaml](../../examples/attach/k8s-proxy.yaml). The guide includes both
 files and gives the build, install, check and cleanup commands.
 
-[tests/k8s/run.sh](../../tests/k8s/run.sh) and
-[tests/k8s/proxy.sh](../../tests/k8s/proxy.sh) check these deployments.
+`cargo xtask k8s tun` and
+`cargo xtask k8s proxy` check these deployments.
 For an Inspect eval, see [inspect_fictionet](../../python/inspect_fictionet).

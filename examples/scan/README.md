@@ -155,14 +155,18 @@ Stop it all and remove its volume with `docker compose down -v`.
 
 ## Recording the dashboard
 
-`record.sh` builds and starts the stack, records the dashboard while nmap
-runs, and removes the stack again. It needs Docker, `uv` and `ffmpeg`:
+`cargo xtask scan` builds and starts the stack, records the dashboard while nmap
+runs, and removes the stack again. It needs Docker, Chromium and `ffmpeg`:
 
 ```text
-$ CHROMIUM=/usr/bin/chromium examples/scan/record.sh /tmp/scan-recording
+$ CHROMIUM=/usr/bin/chromium cargo xtask scan /tmp/scan-recording
 ```
 
-`record.py` drives Chromium with Playwright and records its screen. It
+`CHROMIUM` defaults to `chromium`. `SCAN_PROJECT` selects the Compose project
+(default `fn-scan-demo`), and `SCAN_DASHBOARD_PORT` defaults to `7880`.
+Set `KEEP=1` to retain the stack; the command prints its private token file's path.
+
+The Rust command drives Chromium and records its screen. It
 puts a terminal panel beside the dashboard with nmap's real output, runs
 host discovery and then the port scan, and uses the dashboard while the
 scan runs: it opens a group, opens the scanner's link and a RST in it,

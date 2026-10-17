@@ -1,5 +1,5 @@
 //! TCP and UDP endpoints against a real Linux network stack, through a tun
-//! device. Needs root and /dev/net/tun. `tests/docker/tcpudp/run.sh` runs it
+//! device. Needs root and /dev/net/tun. `cargo xtask docker tcpudp` runs it
 //! in a container.
 //!
 //! The container's kernel is the client: it has 10.9.0.1/24 and fd09::1/64

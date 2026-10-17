@@ -70,8 +70,12 @@ musl's static libc.
 To build and run every target in turn for some seconds each:
 
 ```sh
-fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
+cargo xtask fuzz 60 -timeout=20 -rss_limit_mb=4096
 ```
+
+Run one target by hand with `cargo xtask fuzz tcp`, adding libFuzzer arguments
+after the target name. Set `FUZZ_TRIPLE=x86_64-unknown-linux-gnu` when the
+default target uses musl.
 
 `FUZZ_SHARD_INDEX` defaults to 0 and `FUZZ_SHARD_COUNT` defaults to 1:
 one shard runs every target. Targets are sorted in C locale and dealt
@@ -82,7 +86,7 @@ Invalid values fail before target discovery. To run the first of four
 shards:
 
 ```sh
-FUZZ_SHARD_INDEX=0 FUZZ_SHARD_COUNT=4 fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
+FUZZ_SHARD_INDEX=0 FUZZ_SHARD_COUNT=4 cargo xtask fuzz 60 -timeout=20 -rss_limit_mb=4096
 ```
 
 It goes on past a target that fails and lists the failures at the end.
@@ -90,7 +94,7 @@ It fails without running any targets if `cargo fuzz list` fails or
 lists no targets.
 Every target needs a `[[bin]]` in `fuzz/Cargo.toml`. Add the `[[bin]]`
 entry directly when adding a target.
-`fuzz/check-targets.sh` checks the sources and `[[bin]]` records against
+`cargo xtask fuzz --check` checks the sources and `[[bin]]` records against
 each other.
 
 The `tcp` target never sleeps by default, which keeps it fast. To reach

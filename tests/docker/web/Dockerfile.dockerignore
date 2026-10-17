@@ -6,5 +6,6 @@
 !dashboard
 !benches
 !codegen
+!xtask
 !tests
 !examples

@@ -564,7 +564,7 @@
 //!
 //! ## What the agent sees
 //!
-//! This is from `tests/k8s/run.sh`, on a kind cluster (Kubernetes 1.37,
+//! This is from `cargo xtask k8s tun`, on a kind cluster (Kubernetes 1.37,
 //! containerd 2.3, runc 1.4), run in the agent's container. `eth0` is down,
 //! the only route is through `tun0`, the world's site answers, and every way
 //! around the world fails:
@@ -672,7 +672,7 @@
 //! `examples/hosted` in the crate's repository has a tested copy: two small
 //! Dockerfiles, a compose file, a `check.sh`, a script that runs it on
 //! either provider, a tiny Inspect eval and a Harbor task. Run
-//! `examples/hosted/build.sh` first. It builds `fictionet` and `web_world`
+//! `cargo xtask images hosted` first. It builds `fictionet` and `web_world`
 //! for Debian, so nothing is compiled in the sandbox.
 //!
 //! The [hosted example README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/hosted/README.md)
@@ -686,13 +686,13 @@
 //! The same files run on any machine with Docker, which is the quickest way
 //! to check a change before you pay for a sandbox. You need Linux with
 //! `/dev/net/tun`, and Docker Engine with Compose v2. Run these from the
-//! repository's top directory. `build.sh` builds `fictionet` and `web_world` in Docker
+//! repository's top directory. `cargo xtask images hosted` builds `fictionet` and `web_world` in Docker
 //! and copies them into `examples/hosted/bin`. Then Compose starts the
 //! three containers, `check.sh` runs 19 checks from outside them, and
 //! Compose removes them:
 //!
 //! ```sh
-//! examples/hosted/build.sh
+//! cargo xtask images hosted
 //! (
 //!   cd examples/hosted || exit
 //!   trap 'docker compose down -v' EXIT
@@ -706,10 +706,10 @@
 //! ## Directly, with each provider's SDK
 //!
 //! You need Python 3, the providers' SDKs, an API key for the provider,
-//! and the binaries from `build.sh` above:
+//! and the binaries from `cargo xtask images hosted` above:
 //!
 //! ```sh
-//! examples/hosted/build.sh
+//! cargo xtask images hosted
 //! pip install daytona e2b
 //! DAYTONA_API_KEY=... python examples/hosted/run_hosted.py daytona
 //! E2B_API_KEY=... python examples/hosted/run_hosted.py e2b
@@ -748,7 +748,7 @@
 //! or inside one Daytona sandbox. The agent is the service `main`, built from
 //! `environment/Dockerfile`. The task's compose file adds the world and
 //! attach, and puts `main` in attach's network namespace.
-//! `examples/hosted/build.sh` generates the task's `environment/` from the hosted files.
+//! `cargo xtask images hosted` generates the task's `environment/` from the hosted files.
 //!
 //! ```sh
 //! pip install 'harbor[daytona]'
@@ -1122,7 +1122,7 @@
 //! With the images already built, starting took 2.8 s and removing it all
 //! took 0.6 s.
 //!
-//! The crate's larger proxy test, `tests/docker/proxy/run.sh`, runs both
+//! The crate's larger proxy test, `cargo xtask docker proxy`, runs both
 //! proxy types side by side with more clients, and makes a new token each
 //! time. Some of what it printed:
 //!
@@ -1207,7 +1207,7 @@
 //! `helm install` took 15 s, with the images loaded but not yet started,
 //! and deleting the namespace took 11 s.
 //!
-//! **The pod passes Pod Security "restricted".** `tests/k8s/proxy.sh`
+//! **The pod passes Pod Security "restricted".** `cargo xtask k8s proxy`
 //! installs these values in a Kubernetes namespace that enforces
 //! "restricted", on kind (Kubernetes 1.37, kindnet). Helm printed no Pod
 //! Security warning, both pods ran, and no container added a capability or

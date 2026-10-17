@@ -6,6 +6,7 @@
 !dashboard
 !benches
 !codegen
+!xtask
 !tests
 !examples/*.rs
 !examples/adaptive-web/world/Cargo.toml

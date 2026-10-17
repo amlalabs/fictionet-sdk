@@ -1,5 +1,5 @@
 # The ping test: a world, attach next to the sandbox, and the sandbox.
-# Run it with ./run.sh, which also checks the results and cleans up.
+# Run it with cargo xtask docker ping, which also checks the results and cleans up.
 name: fictionet-ping
 
 x-build: &build

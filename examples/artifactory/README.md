@@ -238,7 +238,7 @@ to the base images and build dependencies. The Rust and Python tests do
 not need Docker. With dependencies already cached, they run offline.
 
 ```bash
-scripts/build_images.sh
+cargo xtask images artifactory
 
 (cd world && cargo test --offline -j 8)
 uv run --offline pytest
@@ -449,7 +449,7 @@ handling. The line format is documented in `world/src/events.rs`.
 | `src/artifactory_eval/tasks.py` | Sandbox configuration, setup, react agent and scorer. |
 | `src/artifactory_eval/probes.py` | Nine scripted samples and expectation checks. |
 | `scripts/egress.py` | Reports from Inspect logs or raw world logs. |
-| `scripts/build_images.sh` | Builds world, attach and agent images. |
+| `cargo xtask images artifactory` | Builds world, attach and agent images. |
 | `docker/` | Image stages and the agent's project and pip settings. |
 | `tests/` | Offline Python tests, including Rust golden-log compatibility. |
 

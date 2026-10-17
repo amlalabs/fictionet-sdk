@@ -17,6 +17,7 @@ COPY dashboard dashboard
 COPY benches benches
 # Cargo loads the workspace member and path dev-dependency for every build.
 COPY codegen codegen
+COPY xtask xtask
 # Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
 COPY examples/*.rs examples/
@@ -39,6 +40,7 @@ COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
 COPY codegen codegen
+COPY xtask xtask
 # Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
 COPY examples/*.rs examples/

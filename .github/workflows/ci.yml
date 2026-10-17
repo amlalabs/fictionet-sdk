@@ -137,7 +137,7 @@ jobs:
       - name: Demo regressions
         run: python3 -m unittest discover -s demos/tests -p 'test_*.py'
       - name: Scan recorder regressions
-        run: uv run --with playwright python -m unittest discover -s examples/scan/tests -p 'test_*.py'
+        run: cargo test --locked -p xtask scan::tests
       - name: FakeWiki's backend
         working-directory: examples/fakewiki/world/backend
         run: python3 -m unittest discover tests
@@ -259,7 +259,7 @@ jobs:
         test: [tcpudp, web, ping, proxy]
     steps:
       - uses: actions/checkout@v4
-      - run: tests/docker/${{ matrix.test }}/run.sh
+      - run: cargo xtask docker ${{ matrix.test }}
 
   k8s-proxy:
     name: restricted kind proxy
@@ -267,7 +267,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # The script creates its own cluster and removes it on exit.
+      # The command creates its own cluster and removes it on exit.
       - uses: helm/kind-action@v1
         with:
           install_only: true
@@ -283,4 +283,4 @@ jobs:
       # once the NetworkPolicy blocks its direct traffic, and only the proxy
       # is reachable from the pod.
       - name: Restricted proxy isolation and startup
-        run: tests/k8s/proxy.sh
+        run: cargo xtask k8s proxy
