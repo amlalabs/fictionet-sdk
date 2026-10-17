@@ -1176,6 +1176,26 @@ mod tests {
     use fictionet::stdlib::test_support::{decode_all, mutate};
     use std::collections::BTreeMap;
 
+    #[test]
+    fn alpha_padding_and_wire_errors() {
+        let field = Alpha::<8>::right_padded("AAPL").unwrap();
+        assert_eq!(field.trimmed(), "AAPL");
+        assert_eq!(field.as_bytes(), b"AAPL    ");
+        assert_eq!(format!("{field:?}"), "\"AAPL    \"");
+        let message = Message::from(AddOrder {
+            header: header(1),
+            order_ref: 1,
+            side: Side::Buy,
+            shares: 100,
+            stock: field,
+            price: Price4(10_000),
+        });
+        let mut bytes = message.to_bytes().unwrap();
+        assert_eq!(Message::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        bytes[24] = 0x1f;
+        assert_eq!(Message::parse(&bytes), Err(Error::Field));
+    }
+
     fn replace_order(
         header: Header,
         original_ref: u64,

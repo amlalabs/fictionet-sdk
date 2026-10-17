@@ -1950,6 +1950,22 @@ mod tests {
     use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
     use fictionet::stdlib::test_support::mutate;
 
+    #[test]
+    fn alpha_padding_and_wire_errors() {
+        let field = Alpha::<8>::right_padded("AAPL").unwrap();
+        assert_eq!(field.trimmed(), "AAPL");
+        assert_eq!(field.as_bytes(), b"AAPL    ");
+        assert_eq!(format!("{field:?}"), "\"AAPL    \"");
+        assert!(!field.is_blank());
+        assert!(Alpha::<8>::blank().is_blank());
+        let mut order = enter(1, 100, Options::default());
+        order.symbol = field;
+        let mut bytes = order.to_bytes().unwrap();
+        assert_eq!(Inbound::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        bytes[10] = 0x7f;
+        assert_eq!(Inbound::parse(&bytes), Err(Error::Field));
+    }
+
     fn cancel_order(user_ref: u32, quantity: u32, options: Option<Options>) -> CancelOrder {
         CancelOrder {
             user_ref,
