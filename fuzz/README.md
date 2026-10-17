@@ -74,20 +74,7 @@ cargo xtask fuzz 60 -timeout=20 -rss_limit_mb=4096
 ```
 
 Run one target by hand with `cargo xtask fuzz tcp`, adding libFuzzer arguments
-after the target name. Set `FUZZ_TRIPLE=x86_64-unknown-linux-gnu` when the
-default target uses musl.
-
-`FUZZ_SHARD_INDEX` defaults to 0 and `FUZZ_SHARD_COUNT` defaults to 1:
-one shard runs every target. Targets are sorted in C locale and dealt
-round-robin to zero-based shards, so the shards are disjoint and together
-cover every target. Both values must be decimal integers without leading
-zeros; the count must be positive and the index less than the count.
-Invalid values fail before target discovery. To run the first of four
-shards:
-
-```sh
-FUZZ_SHARD_INDEX=0 FUZZ_SHARD_COUNT=4 cargo xtask fuzz 60 -timeout=20 -rss_limit_mb=4096
-```
+after the target name.
 
 It goes on past a target that fails and lists the failures at the end.
 It fails without running any targets if `cargo fuzz list` fails or
