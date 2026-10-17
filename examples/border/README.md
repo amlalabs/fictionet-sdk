@@ -29,7 +29,7 @@ included.
 
 ## See the world's log
 
-From the repository root, run `demos/border` for a scripted sign-in, a
+From the repository root, run `cargo xtask demo border` for a scripted sign-in, a
 certificate refusal, and the world's log showing whether the password reached
 the impostor. No model key is needed. The [VM prerequisites and
 timings](../../demos/README.md) apply: the historical warm run took 39 seconds;
@@ -255,7 +255,7 @@ warning credit through the scripted agent's explicit read record.
 
 **Containment** (`border_probes`), lab and home, both variants: the 2 October run
 reported 12 of 12 checks passing in each. The stricter checks below have not been
-rerun in Docker. Run `vm/run border-probes` to revalidate those published numbers.
+rerun in Docker. Run `cargo xtask vm test border-probes` to revalidate those published numbers.
 
 | check | what it means |
 |---|---|

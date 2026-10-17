@@ -1,7 +1,7 @@
 # Attach recipes
 
 These small recipes connect ordinary tools to the `web_world` example. Start
-with [`demos/dashboard`](../../demos/README.md) for a scripted run and the
+with [`cargo xtask demo dashboard`](../../demos/README.md) for a scripted run and the
 world's live request log, or choose a deployment recipe below.
 
 | Recipe | Requirements and use |

@@ -247,9 +247,9 @@ Start at the crate root, which explains the main ideas, then read in this order:
 
 ## Building and testing
 
-[CONTRIBUTING.md](CONTRIBUTING.md#the-checks) lists the complete CI feature
-matrix and the build, test, documentation and clippy commands to run for each
-configuration. It also covers the Docker and Kubernetes tests.
+[CONTRIBUTING.md](CONTRIBUTING.md) has the commands to build, test and
+benchmark in each feature set, and the `cargo xtask` commands for the Docker,
+Kubernetes and VM tests.
 
 ## License
 

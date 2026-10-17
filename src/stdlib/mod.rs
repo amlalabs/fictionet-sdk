@@ -159,15 +159,16 @@
 //!
 //! ## Adding a protocol
 //!
-//! Follow [CONTRIBUTING.md](https://github.com/amlalabs/fictionet-sdk/blob/main/CONTRIBUTING.md#adding-a-protocol-module)
-//! and the codec's [errors and names](codec#errors-and-names-in-a-codec-module).
+//! Follow the codec's [errors and names](codec#errors-and-names-in-a-codec-module).
 //! A new protocol needs these entries:
 //!
 //! 1. Add `src/stdlib/protocols/<name>.rs`. Document
 //!    the supported wire format, limits and caller responsibilities, with
 //!    runnable doctests. Implement [`codec::Wire`] for complete values and
 //!    [`codec::Prefixed`] or [`codec::Decode`] where stream framing is needed.
-//!    Check decoder contracts with [`test_support::contract`].
+//!    Check decoder contracts with [`test_support::contract`]. A large
+//!    protocol may be a directory whose `mod.rs` declares private child
+//!    modules and re-exports their items, as `protocols/smb2/` does.
 //! 2. Declare the module here with `#[path]` and `pub mod`, and add a one-line
 //!    description to the [module table](#modules).
 //! 3. Add `fuzz/fuzz_targets/<name>.rs` and a `[[bin]]` entry in `fuzz/Cargo.toml`.
@@ -184,15 +185,6 @@
 //! [`Registry`](fictionet::observe::Registry) with
 //! [`Cx::observe_protocols`](fictionet::Cx::observe_protocols) before watches
 //! start, as the observe guide shows.
-//!
-//! The [CI workflow](https://github.com/amlalabs/fictionet-sdk/blob/main/.github/workflows/ci.yml)
-//! is the authority for the five feature combinations: default,
-//! `--no-default-features`, `--all-features`,
-//! `--no-default-features --features std,observe`, and
-//! `--no-default-features --features tokio`. With `RUSTFLAGS="--cfg fuzzing"`,
-//! it checks the fuzz bins on the nightly toolchain in
-//! `fuzz/rust-toolchain.toml` and runs the fuzz helper tests on pinned stable.
-//! It does not run the fuzzers. See that workflow for the exact commands.
 //!
 //! ## Changing a protocol by copying it
 //!

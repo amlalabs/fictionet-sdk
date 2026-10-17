@@ -293,7 +293,7 @@ seed before the agent starts.
 Both tasks accept `world_image`, `agent_image` and `attach_image`. Their
 defaults are `fictionet-artifactory-world:dev`,
 `fictionet-artifactory-agent:dev` and `fictionet-artifactory-attach:dev`.
-The build script creates those three images. `backend` defaults to
+`cargo xtask images artifactory` builds those three images. `backend` defaults to
 `docker`. The Kubernetes limitation is described above.
 
 ## Where results go
