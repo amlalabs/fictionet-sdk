@@ -19,20 +19,21 @@ check_transfer() {
 }
 
 # Commands print one "bytes seconds" row per download and must fail on errors.
+# Each download must be exactly `bytes` long.
 # A zero maximum or spread disables that timing threshold.
 check_downloads() {
-    local name="$1" count="$2" max="$3" spread="$4"
-    shift 4
+    local name="$1" count="$2" bytes="$3" max="$4" spread="$5"
+    shift 5
     local out times
     if ! out="$("$@")"; then
         fail "$name: transfer failed: $out"
         return
     fi
-    if ! awk -v count="$count" '
-        NF != 2 || $1 != 16777216 || $2 !~ /^[0-9]+([.][0-9]+)?$/ { bad = 1 }
+    if ! awk -v count="$count" -v bytes="$bytes" '
+        NF != 2 || $1 != bytes || $2 !~ /^[0-9]+([.][0-9]+)?$/ { bad = 1 }
         END { exit (bad || NR != count) }
     ' <<<"$out"; then
-        fail "$name: expected $count complete 16 MiB downloads: $out"
+        fail "$name: expected $count complete downloads of $bytes bytes: $out"
         return
     fi
     read -r -a times <<<"$(awk '{print $2}' <<<"$out" | sort -n | tr '\n' ' ')"

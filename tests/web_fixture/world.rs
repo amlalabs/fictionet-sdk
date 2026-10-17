@@ -37,6 +37,7 @@ fn world(
 ) -> Result {
     let app = web_world::app()
         .route("/big", get(|| async { vec![b'x'; 16 << 20] }))
+        .route("/4mb", get(|| async { vec![b'x'; 4 << 20] }))
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
     let plain = web_world::plain()
         .route("/mb", get(|| async { vec![b'x'; 1 << 20] }))

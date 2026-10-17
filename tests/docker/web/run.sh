@@ -103,7 +103,7 @@ done
 
 # A packet lost on a full socket buffer costs a 1 s retransmit.
 # Check that threshold only on a controlled performance runner.
-check_downloads "10 sequential downloads of 16 MiB" 10 1 0 \
+check_downloads "10 sequential downloads of 16 MiB" 10 16777216 1 0 \
     agent bash -c "seq 10 | xargs -P 1 -I{} curl -fsS --max-time 30 ${ca[*]} -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/big"
 
 # 7. The proxy.
@@ -148,10 +148,13 @@ check_ok "300 open connections: 256 kept, the rest reset at once; idle ones clos
 # in all than the socket buffer to attach holds. Packets that do not fit
 # wait in the world; when they were dropped, most of these downloads
 # stalled a second or more (smoltcp's minimum retransmission timeout).
+# Each body is 4 MiB, so the 32 held at once (128 MiB) stay inside the
+# sandbox's 256 MiB service budget (net::Limits::sandbox_budget). Past the
+# budget the world ends a response early, by design.
 # Allow 60 s for completion: these transfers share one attach socket and
-# move 512 MiB in total. This deadline catches stalls on a busy runner.
-check_downloads "32 downloads of 16 MiB at once" 32 0 0.8 \
-    agent bash -c "seq 32 | xargs -P 32 -I{} curl -fsS --max-time 60 ${ca[*]} -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/big"
+# move 128 MiB in total. This deadline catches stalls on a busy runner.
+check_downloads "32 downloads of 4 MiB at once" 32 4194304 0 0.8 \
+    agent bash -c "seq 32 | xargs -P 32 -I{} curl -fsS --max-time 60 ${ca[*]} -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/4mb"
 
 # Memory: 250 connections that each downloaded 1 MiB and then sit idle.
 world_pid="$(docker inspect -f '{{.State.Pid}}' "$("${compose[@]}" ps -q world)")"

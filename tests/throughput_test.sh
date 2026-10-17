@@ -47,29 +47,31 @@ expect() {
 }
 
 unset FICTIONET_PERF_CHECK
-expect pass 'performance checks default off' 10 1 0 rows 10 16777216 1.2
+expect pass 'performance checks default off' 10 16777216 1 0 rows 10 16777216 1.2
 FICTIONET_PERF_CHECK=0
-expect pass 'slow complete downloads' 10 1 0 rows 10 16777216 1.2
-expect pass 'slow complete Kubernetes downloads' 10 2 0 rows 10 16777216 2.2
-expect pass 'uneven complete downloads' 32 0 0.8 spread_rows 3.0
-expect fail 'short body' 10 1 0 rows 10 16777215 0.1
-expect fail 'missing transfer' 10 1 0 rows 9 16777216 0.1
-expect fail 'extra transfer' 10 1 0 rows 11 16777216 0.1
-expect fail 'empty output' 10 1 0 true
-expect fail 'malformed timing' 10 1 0 rows 10 16777216 invalid
-expect fail 'curl deadline failure despite full byte counts' 10 1 0 failed_transfer
+expect pass 'slow complete downloads' 10 16777216 1 0 rows 10 16777216 1.2
+expect pass 'slow complete Kubernetes downloads' 10 16777216 2 0 rows 10 16777216 2.2
+expect pass 'uneven complete downloads' 32 16777216 0 0.8 spread_rows 3.0
+expect fail 'short body' 10 16777216 1 0 rows 10 16777215 0.1
+expect fail 'missing transfer' 10 16777216 1 0 rows 9 16777216 0.1
+expect fail 'extra transfer' 10 16777216 1 0 rows 11 16777216 0.1
+expect fail 'empty output' 10 16777216 1 0 true
+expect fail 'malformed timing' 10 16777216 1 0 rows 10 16777216 invalid
+expect fail 'curl deadline failure despite full byte counts' 10 16777216 1 0 failed_transfer
+expect pass 'complete downloads of another size' 32 4194304 0 0.8 rows 32 4194304 1.0
+expect fail 'downloads of the wrong size' 32 4194304 0 0.8 rows 32 16777216 1.0
 
 FICTIONET_PERF_CHECK=1
-expect pass 'fast performance run' 10 1 0 rows 10 16777216 0.9
-expect fail 'Docker performance threshold' 10 1 0 rows 10 16777216 1.0
-expect pass 'Kubernetes performance run' 10 2 0 rows 10 16777216 1.9
-expect fail 'Kubernetes performance threshold' 10 2 0 rows 10 16777216 2.0
-expect pass 'uniformly slow parallel web run' 32 0 0.8 spread_rows 2.0
-expect pass 'numeric spread threshold' 32 0 12 spread_rows 11.5
-expect fail 'parallel web spread threshold' 32 0 0.8 spread_rows 2.8
-expect fail 'performance mode still checks bytes' 10 1 0 rows 10 123 0.1
+expect pass 'fast performance run' 10 16777216 1 0 rows 10 16777216 0.9
+expect fail 'Docker performance threshold' 10 16777216 1 0 rows 10 16777216 1.0
+expect pass 'Kubernetes performance run' 10 16777216 2 0 rows 10 16777216 1.9
+expect fail 'Kubernetes performance threshold' 10 16777216 2 0 rows 10 16777216 2.0
+expect pass 'uniformly slow parallel web run' 32 16777216 0 0.8 spread_rows 2.0
+expect pass 'numeric spread threshold' 32 16777216 0 12 spread_rows 11.5
+expect fail 'parallel web spread threshold' 32 16777216 0 0.8 spread_rows 2.8
+expect fail 'performance mode still checks bytes' 10 16777216 1 0 rows 10 123 0.1
 
-expect fail 'timing diagnostic includes limits' 10 1 0 rows 10 16777216 1.2
+expect fail 'timing diagnostic includes limits' 10 16777216 1 0 rows 10 16777216 1.2
 [[ $message == *'max=1 s, spread=0 s'* ]]
 
 # Single transfers return a measurement only after a successful, complete body.
