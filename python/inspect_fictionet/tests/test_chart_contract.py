@@ -1,7 +1,6 @@
 """Compare Compose with Helm rendering of the chart shipped by the package."""
 
 import base64
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,14 +13,8 @@ from inspect_fictionet import Limits, chart_path, fictionet_sandbox
 
 @pytest.fixture(scope="module")
 def helm():
-    if "CI" in os.environ:
-        __import__("k8s_sandbox")
-    else:
-        pytest.importorskip("k8s_sandbox")
     executable = shutil.which("helm")
-    if executable is None:
-        assert "CI" not in os.environ, "helm is required in CI"
-        pytest.skip("needs helm")
+    assert executable is not None, "the chart tests render the chart with helm"
     return executable
 
 
