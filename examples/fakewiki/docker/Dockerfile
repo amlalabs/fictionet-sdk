@@ -24,7 +24,8 @@ COPY benches benches
 # any build. Examples link dev-dependencies, and tests/copy_and_own reads
 # a file in codegen/tests.
 COPY codegen codegen
-COPY tests/copy_and_own tests/copy_and_own
+# Copy all tests because Cargo reads every test target the manifest declares.
+COPY tests tests
 COPY examples/*.rs examples/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-fakewiki-attach-target \
@@ -42,7 +43,8 @@ COPY benches benches
 # any build. Examples link dev-dependencies, and tests/copy_and_own reads
 # a file in codegen/tests.
 COPY codegen codegen
-COPY tests/copy_and_own tests/copy_and_own
+# Copy all tests because Cargo reads every test target the manifest declares.
+COPY tests tests
 COPY examples/*.rs examples/
 COPY examples/fakewiki/world/Cargo.toml examples/fakewiki/world/Cargo.lock examples/fakewiki/world/
 COPY examples/common examples/common

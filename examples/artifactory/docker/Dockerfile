@@ -17,7 +17,8 @@ COPY dashboard dashboard
 COPY benches benches
 # Cargo loads the workspace member and path dev-dependency for every build.
 COPY codegen codegen
-COPY tests/copy_and_own tests/copy_and_own
+# Copy all tests because Cargo reads every test target the manifest declares.
+COPY tests tests
 COPY examples/*.rs examples/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-artifactory-attach-target \
@@ -38,7 +39,8 @@ COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
 COPY codegen codegen
-COPY tests/copy_and_own tests/copy_and_own
+# Copy all tests because Cargo reads every test target the manifest declares.
+COPY tests tests
 COPY examples/*.rs examples/
 COPY examples/artifactory/world/Cargo.toml examples/artifactory/world/Cargo.lock examples/artifactory/world/
 COPY examples/common examples/common

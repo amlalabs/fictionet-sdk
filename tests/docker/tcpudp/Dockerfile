@@ -15,9 +15,8 @@ COPY benches benches
 # any build. Examples link dev-dependencies, and tests/copy_and_own reads
 # a file in codegen/tests.
 COPY codegen codegen
-COPY tests/copy_and_own tests/copy_and_own
-COPY tests/common tests/common
-COPY tests/tun_linux.rs tests/tun_linux.rs
+# Copy all tests because Cargo reads every test target the manifest declares.
+COPY tests tests
 # Cargo.toml names web_world, and docs/guide/recipes.rs includes other examples.
 COPY examples examples
 ARG PROFILE=release

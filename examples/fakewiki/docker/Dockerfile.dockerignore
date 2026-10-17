@@ -6,7 +6,7 @@
 !dashboard
 !benches
 !codegen
-!tests/copy_and_own
+!tests
 !examples/*.rs
 !examples/fakewiki/world/Cargo.toml
 !examples/fakewiki/world/Cargo.lock

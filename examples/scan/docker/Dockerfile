@@ -17,7 +17,8 @@ COPY benches benches
 # any build. Examples link dev-dependencies, and tests/copy_and_own reads
 # a file in codegen/tests.
 COPY codegen codegen
-COPY tests/copy_and_own tests/copy_and_own
+# Copy all tests because Cargo reads every test target the manifest declares.
+COPY tests tests
 COPY examples/*.rs examples/
 COPY examples/scan/main.rs examples/scan/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

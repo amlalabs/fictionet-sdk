@@ -6,7 +6,7 @@
 !dashboard
 !benches
 !codegen
-!tests/copy_and_own
+!tests
 !examples/*.rs
 !examples/artifactory/world/Cargo.toml
 !examples/artifactory/world/Cargo.lock
