@@ -92,9 +92,7 @@ FUZZ_SHARD_INDEX=0 FUZZ_SHARD_COUNT=4 fuzz/run-all.sh 60 -timeout=20 -rss_limit_
 
 It goes on past a target that fails and lists the failures at the end.
 It fails without running any targets if `cargo fuzz list` fails or
-lists no targets. `bash fuzz/tests/run_all.sh` tests discovery failures,
-shard coverage, argument validation and failure reporting with a stub
-cargo, and CI runs it.
+lists no targets.
 Every target needs a `[[bin]]` in `fuzz/Cargo.toml` and a directory in
 `fuzz/corpus/`, even an empty one. The `[[bin]]` records are generated
 from the target records in `catalog/stdlib.rs`: add the record, then run

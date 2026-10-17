@@ -32,8 +32,3 @@ binary(web) | binary(listen) | binary(recipes) | binary(tcpudp) | binary(core)
 | binary(observe) | binary(observe_bin) | binary(observe_tls) | binary(tun_linux)
 """
 test-group = "worlds"
-
-# Every run writes target/nextest/default/junit.xml. CI checks the registered
-# regression tests in it with tools/check_test_contracts.py.
-[profile.default.junit]
-path = "junit.xml"

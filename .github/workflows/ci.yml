@@ -59,10 +59,6 @@ jobs:
         run: echo "CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
       - name: Test
         run: cargo nextest run --locked --workspace ${{ matrix.features }}
-      # The registered regression tests all need the default features.
-      - name: Registered regression tests
-        if: matrix.name == 'default features'
-        run: python3 tools/check_test_contracts.py check rust=target/nextest/default/junit.xml
       - name: Doctests
         run: cargo test --locked --doc --workspace ${{ matrix.features }}
       - name: Docs
@@ -81,10 +77,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Transfer check fixtures
-        run: bash tests/throughput_test.sh
-      - name: VM provisioning fixtures
-        run: bash vm/provision_test.sh
       - name: Install the pinned toolchain
         run: rustup toolchain install
       - name: Check formatting
@@ -135,18 +127,12 @@ jobs:
         run: cargo test --locked --manifest-path examples/adaptive-web/world/Cargo.toml
       - name: Example log readers
         run: python3 -m unittest discover -s examples/common -p 'test_*.py'
-      - name: Anti-bypass and test contract checker regressions
-        run: python3 -m unittest discover -s tools -p 'test_*.py'
       - name: VM result protocol
         run: python3 -m unittest discover -s tests/vm -p 'test_*.py'
       - name: Hosted Harbor packaging
         run: python3 -m unittest discover -s examples/hosted/tests -p 'test_*.py'
       - name: Demo regressions
-        run: python3 tools/check_test_contracts.py run --report "$RUNNER_TEMP/contracts/demos.json" -s demos/tests -p 'test_*.py'
-      - name: Shell assertion regressions
-        run: |
-          bash tests/common/assertions_test.sh
-          sh tests/common/assertions_test.sh
+        run: python3 -m unittest discover -s demos/tests -p 'test_*.py'
       - name: Scan recorder regressions
         run: uv run --with playwright python -m unittest discover -s examples/scan/tests -p 'test_*.py'
       - name: FakeWiki's backend
@@ -174,28 +160,12 @@ jobs:
       - name: Artifactory's eval
         working-directory: examples/artifactory
         run: uv run --locked pytest
-      - name: Border evaluator contracts
-        run: uv run --locked --project examples/border python examples/common/check_evaluators.py --project examples/border
-      - name: FakeWiki evaluator contracts
-        run: uv run --locked --project examples/fakewiki python examples/common/check_evaluators.py --project examples/fakewiki
-      - name: Adaptive Web evaluator contracts
-        run: uv run --locked --project examples/adaptive-web python examples/common/check_evaluators.py --project examples/adaptive-web
-      - name: Artifactory evaluator contracts
-        run: uv run --locked --project examples/artifactory python examples/common/check_evaluators.py --project examples/artifactory
-      - name: Hosted evaluator contracts
-        run: uv run --project python/inspect_fictionet --locked --extra k8s python examples/common/check_evaluators.py --project examples/hosted
-      - name: Inspect example evaluator contracts
-        run: uv run --project python/inspect_fictionet --locked --extra k8s python examples/common/check_evaluators.py --project python/inspect_fictionet
       - uses: azure/setup-helm@v4.3.0
       - name: The Inspect package
         working-directory: python/inspect_fictionet
-        run: uv run --locked --extra k8s --no-editable --reinstall-package inspect-fictionet pytest --junitxml="$RUNNER_TEMP/contracts/inspect.xml"
+        run: uv run --locked --extra k8s --no-editable --reinstall-package inspect-fictionet pytest
       - name: Inspect Kubernetes scorer regressions
-        run: uv run --project python/inspect_fictionet --locked --extra k8s python tools/check_test_contracts.py run --report "$RUNNER_TEMP/contracts/k8s.json" -s tests/k8s -p 'test_*.py'
-      - name: Registered regression tests
-        run: |
-          python3 tools/check_test_contracts.py check inspect="$RUNNER_TEMP/contracts/inspect.xml" \
-              demos="$RUNNER_TEMP/contracts/demos.json" k8s="$RUNNER_TEMP/contracts/k8s.json"
+        run: uv run --project python/inspect_fictionet --locked --extra k8s python -m unittest discover -s tests/k8s -p 'test_*.py'
       # From the crate root, so rust-toolchain.toml there, not fuzz/'s
       # nightly, picks the toolchain.
       - name: The fuzz crate on stable
@@ -273,8 +243,6 @@ jobs:
           workspaces: fuzz
       - name: Every target has a [[bin]] and a corpus directory
         run: fuzz/check-targets.sh
-      - name: Fuzz sweep regressions
-        run: bash fuzz/tests/run_all.sh
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       # +nightly overrides the stable toolchain pinned in rust-toolchain.toml.

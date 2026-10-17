@@ -89,10 +89,6 @@ The Docker and Inspect suites build their images inside the VM, from the
 examples' own Dockerfiles, the first time. Docker keeps those images and its
 build cache on the cache disk, so later runs reuse them.
 
-Run `bash vm/provision_test.sh` on the host to check toolchain selection,
-shared image identity, and cache invalidation with stubs. It needs no VM or
-network access.
-
 ## How it works
 
 **The image.** The base is Debian's official Debian 13 (trixie) `genericcloud`

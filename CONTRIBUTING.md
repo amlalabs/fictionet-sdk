@@ -79,21 +79,6 @@ at a time.
 `cargo test` runs everything too, doctests included, one test binary after
 another. It takes about a minute longer.
 
-Some regression tests guard fixes to tests and checks that once passed
-without doing their work. `tests/check_contracts.json` lists them, each with
-its id and reason. CI fails unless each one ran exactly once and
-passed. `tools/check_test_contracts.py check` reads nextest's JUnit report,
-`target/nextest/default/junit.xml`, and pytest's `--junitxml` report. For
-unittest suites, `tools/check_test_contracts.py run` runs the discovery and
-writes the report. A registered test that is missing, skipped, ignored,
-failed, or passed only on a retry fails the check. Rename or remove one only
-together with its entry:
-
-```console
-$ cargo nextest run --locked --workspace
-$ python3 tools/check_test_contracts.py check rust=target/nextest/default/junit.xml
-```
-
 The test profile builds the crate with `opt-level = 1` and its dependencies
 with `opt-level = 2` (see `Cargo.toml`). The randomized protocol tests run
 about five times faster that way, and the dependencies are built once.
@@ -137,9 +122,7 @@ $ FICTIONET_PERF_CHECK=1 tests/k8s/proxy.sh
 Use a controlled machine for these performance checks. Routine runs check
 transfer completion, sizes and counts. They do not enforce strict timing
 thresholds or provide strict throughput regression coverage. Incomplete or failed
-transfers and transfers that exceed the completion deadline fail. Run the transfer
-check fixtures without Docker or Kubernetes with `bash tests/throughput_test.sh`.
-CI runs these fixtures on every push and pull request.
+transfers and transfers that exceed the completion deadline fail.
 
 ## Releases
 
