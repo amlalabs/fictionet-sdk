@@ -9,7 +9,6 @@ on:
 permissions:
   contents: read
 
-# A newer run cancels an older run of the same kind on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -18,61 +17,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: test (${{ matrix.name }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        # Build host integration with observation; the simulated core alone;
-        # all features including outbound web proxying; tokio without observation;
-        # and HTTP/1 and WebSocket serving with observation, without tokio.
-        include:
-          - name: default features
-            features: ""
-          - name: no default features
-            features: "--no-default-features"
-          - name: all features
-            features: "--all-features"
-          - name: std and observation without tokio
-            features: "--no-default-features --features std,observe"
-          - name: tokio without observation
-            features: "--no-default-features --features tokio"
-    steps:
-      - uses: actions/checkout@v4
-      # The toolchain pinned in rust-toolchain.toml, with clippy.
-      - name: Install the pinned toolchain
-        run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-      - name: Build tests, examples and benchmarks
-        run: cargo build --locked --workspace --all-targets --test host ${{ matrix.features }}
-      - name: Allow unprivileged user namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - name: Use the runner's Chrome for the dashboard regression
-        run: echo "CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
-      - name: Test
-        run: cargo nextest run --locked --workspace ${{ matrix.features }}
-      # The attach tests that need user namespaces. The tun test needs root
-      # and runs in the tcpudp Docker test.
-      - name: Test attach in user namespaces
-        if: matrix.features != '--no-default-features'
-        run: cargo nextest run --locked --test host ${{ matrix.features }} attach_bin::
-      - name: Doctests
-        run: cargo test --locked --doc --workspace ${{ matrix.features }}
-      - name: Docs
-        run: cargo doc --locked --workspace --no-deps ${{ matrix.features }}
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets --test host ${{ matrix.features }} -- -D warnings
-
-  # Every crate in the repository is formatted with the default rustfmt
-  # style (rustfmt.toml). From the crate root, so rust-toolchain.toml there
-  # picks the toolchain for all of them.
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -82,75 +26,69 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install
       - name: Check formatting
-        run: |
-          for manifest in Cargo.toml fuzz/Cargo.toml tests/copy_and_own/Cargo.toml \
-              examples/wasm_world/Cargo.toml examples/border/world/Cargo.toml \
-              examples/fakewiki/world/Cargo.toml examples/adaptive-web/world/Cargo.toml \
-              examples/artifactory/world/Cargo.toml; do
-            cargo fmt --all --check --manifest-path "$manifest"
-          done
+        run: cargo fmt --all --check
+      - name: Check formatting in the fuzz workspace
+        run: cargo fmt --all --check --manifest-path fuzz/Cargo.toml
 
-  # Tests for worlds outside the workspace, including Border, FakeWiki,
-  # Artifactory and adaptive web, plus adaptive web's offline backend.
-  # Also test the browser example on the host and in Node.js, Border's,
-  # FakeWiki's and Artifactory's evals, the demos and the Inspect package.
-  # Check the fuzz crate on the nightly toolchain in fuzz/rust-toolchain.toml,
-  # and test its helpers on the pinned stable toolchain, both with the cfg
-  # that cargo fuzz sets.
-  examples:
-    name: examples, Python and the fuzz crate
+  test:
+    name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The worlds enable web-proxy, so build them in the all-features run.
+        include:
+          - name: default features
+            args: ""
+          - name: no default features
+            args: --no-default-features
+          - name: all features
+            args: --workspace --all-features
     steps:
       - uses: actions/checkout@v4
-      - name: Install the pinned toolchain, with the wasm32 target
-        run: |
-          rustup toolchain install
-          rustup target add wasm32-unknown-unknown
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            examples/border/world
-            examples/fakewiki/world
-            examples/adaptive-web/world
-            examples/artifactory/world
-            examples/wasm_world
-            fuzz
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack
-      - uses: astral-sh/setup-uv@v6
-      - name: Border's world
-        run: cargo test --locked --manifest-path examples/border/world/Cargo.toml
-      - name: FakeWiki's world
-        run: cargo test --locked --manifest-path examples/fakewiki/world/Cargo.toml
-      - name: Artifactory's world
-        run: cargo test --locked --manifest-path examples/artifactory/world/Cargo.toml
-      - name: The adaptive web's world
-        run: cargo test --locked --manifest-path examples/adaptive-web/world/Cargo.toml
-      - name: Hosted Harbor packaging
-        run: python3 -m unittest discover -s examples/hosted/tests -p 'test_*.py'
-      - name: Scan recorder regressions
-        run: cargo test --locked -p xtask scan::tests
-      - name: FakeWiki's backend
-        working-directory: examples/fakewiki/world/backend
-        run: python3 -m unittest discover tests
-      - name: The adaptive web's backend
-        working-directory: examples/adaptive-web/world/backend
-        run: python3 -m unittest discover tests
-      - name: The browser example, on the host
-        run: cargo test --locked --manifest-path examples/wasm_world/Cargo.toml
-      - name: The browser example, in Node.js
-        working-directory: examples/wasm_world
-        run: wasm-pack test --node -- --locked
-      - uses: azure/setup-helm@v4.3.0
-      - name: Inspect package and world scorers
-        working-directory: python/inspect_fictionet
-        run: uv run --locked --extra k8s --no-editable --reinstall-package inspect-fictionet pytest
-      - name: Inspect Kubernetes scorer regressions
-        run: uv run --project python/inspect_fictionet --locked --extra k8s python -m unittest discover -s tests/k8s -p 'test_*.py'
-      # From fuzz/, so its rust-toolchain.toml picks nightly.
+          tool: cargo-nextest
+      - name: Build tests, examples and benchmarks
+        run: cargo test --locked --all-targets --no-run ${{ matrix.args }}
+      - name: Use the runner's Chrome for the dashboard regression
+        run: echo "CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
+      - name: Test
+        run: cargo nextest run --locked ${{ matrix.args }}
+      - name: Doctests
+        run: cargo test --locked --doc ${{ matrix.args }}
+
+  clippy-docs:
+    name: clippy and docs (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            args: ""
+          - name: no default features
+            args: --no-default-features
+          - name: all features
+            args: --workspace --all-features
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --test host ${{ matrix.args }} -- -D warnings
+      - name: Docs
+        run: cargo doc --locked --no-deps ${{ matrix.args }}
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: The fuzz crate on nightly
+        if: matrix.args == '--workspace --all-features'
         working-directory: fuzz
         run: |
           rustup toolchain install
@@ -158,51 +96,24 @@ jobs:
         env:
           RUSTFLAGS: --cfg fuzzing
       - name: Fuzz helper regressions
+        if: matrix.args == '--workspace --all-features'
         run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib
         env:
           RUSTFLAGS: --cfg fuzzing
 
-  wasm:
-    name: wasm32 (browser)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install the pinned toolchain, with the wasm32 target
-        run: |
-          rustup toolchain install
-          rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      # ring's C code builds with clang, which on the runner has the wasm32 target.
-      - name: Check
-        run: cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
-      - name: Clippy
-        run: cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
-      - name: Check the browser example
-        run: cargo check --locked --all-targets --manifest-path examples/wasm_world/Cargo.toml --target wasm32-unknown-unknown
-
-  msrv:
-    name: MSRV (1.91)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.91
-      - uses: Swatinem/rust-cache@v2
-      # +1.91 overrides rust-toolchain.toml.
-      - name: Check
-        run: cargo +1.91 check --locked --workspace --all-targets
-
-  docker:
-    name: docker (${{ matrix.dockerfile }})
+  host:
+    name: host (${{ matrix.test || matrix.dockerfile }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        # Each Dockerfile and the stages to build from it, from the crate
-        # root, as its compose file or script does. "-" is the last stage.
         include:
+          - test: namespaces
+          - test: tcpudp
+          - test: web
+          - test: ping
+          - test: proxy
           - dockerfile: deploy/Dockerfile
             targets: attach web-world agent
           - dockerfile: tests/docker/proxy/Dockerfile
@@ -219,48 +130,86 @@ jobs:
             targets: world world-home attach agent home
     steps:
       - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
       - uses: docker/setup-buildx-action@v3
-      - name: Build
+      - uses: taiki-e/install-action@v2
+        if: matrix.test == 'namespaces'
+        with:
+          tool: cargo-nextest
+      - name: Allow unprivileged user namespaces
+        if: matrix.test == 'namespaces'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # The tun tests run as root in the tcpudp container.
+      - name: Test attach in user namespaces
+        if: matrix.test == 'namespaces'
         run: |
-          for t in ${{ matrix.targets }}; do
-            echo "::group::$t"
-            if [ "$t" = - ]; then target=(); else target=(--target "$t"); fi
-            docker buildx build -f "${{ matrix.dockerfile }}" "${target[@]}" .
-            echo "::endgroup::"
+          cargo nextest run --locked --test host attach_bin::
+          cargo nextest run --locked --test host --all-features attach_bin::
+      - name: Docker tests
+        if: matrix.test != '' && matrix.test != 'namespaces'
+        run: cargo xtask docker ${{ matrix.test }}
+      - name: Build images
+        if: matrix.dockerfile != ''
+        run: |
+          for target in ${{ matrix.targets }}; do
+            docker buildx build -f "${{ matrix.dockerfile }}" --target "$target" .
           done
 
-  docker-test:
-    name: docker test (${{ matrix.test }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        test: [tcpudp, web, ping, proxy]
-    steps:
-      - uses: actions/checkout@v4
-      - run: cargo xtask docker ${{ matrix.test }}
-
-  k8s-proxy:
-    name: restricted kind proxy
+  python:
+    name: Python packages and world backends
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # The command creates its own cluster and removes it on exit.
-      - uses: helm/kind-action@v1
-        with:
-          install_only: true
+      - uses: astral-sh/setup-uv@v6
       - uses: azure/setup-helm@v4.3.0
-      - uses: azure/setup-kubectl@v4
-      - name: Check prerequisites
+      - name: Inspect package, world scorers and hosted packaging
+        run: >-
+          uv run --project python/inspect_fictionet --locked --extra k8s
+          --no-editable --reinstall-package inspect-fictionet pytest
+          python/inspect_fictionet/tests
+          examples/hosted/tests
+          tests/k8s
+      - name: FakeWiki's backend
+        working-directory: examples/fakewiki/world/backend
+        run: uv run --project "${{ github.workspace }}/python/inspect_fictionet" --locked --extra k8s --no-editable python -m pytest tests
+      - name: The adaptive web's backend
+        working-directory: examples/adaptive-web/world/backend
+        run: uv run --project "${{ github.workspace }}/python/inspect_fictionet" --locked --extra k8s --no-editable python -m pytest tests
+
+  wasm:
+    name: wasm32 (browser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain, with the wasm32 target
         run: |
-          docker info
-          kind version
-          kubectl version --client
-          helm version
-      # Pod Security "restricted" admits the release, the agent starts only
-      # once the NetworkPolicy blocks its direct traffic, and only the proxy
-      # is reachable from the pod.
-      - name: Restricted proxy isolation and startup
-        run: cargo xtask k8s proxy
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - name: Check
+        run: cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
+      - name: Clippy
+        run: cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+      - name: Check the browser example
+        run: cargo check --locked --all-targets -p wasm-world --target wasm32-unknown-unknown
+      - name: The browser example, in Node.js
+        working-directory: examples/wasm_world
+        run: wasm-pack test --node -- --locked
+
+  msrv:
+    name: MSRV (1.91)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo +1.91 check --locked --workspace --all-targets

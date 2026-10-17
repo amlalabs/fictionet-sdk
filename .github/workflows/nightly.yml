@@ -14,12 +14,14 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
       - uses: helm/kind-action@v1
         with:
           install_only: true
       - uses: azure/setup-helm@v4.3.0
       - uses: azure/setup-kubectl@v4
-      - run: cargo xtask k8s tun
+      - run: cargo xtask k8s
 
   vm:
     runs-on: ubuntu-latest
