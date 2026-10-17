@@ -48,12 +48,14 @@ Some paths are reached only in part:
 ## Running a target
 
 ```sh
-cargo +nightly fuzz run -O -a tcp fuzz/corpus/tcp -- -max_total_time=600
+cargo +nightly fuzz run -O -a tcp -- -max_total_time=600
 ```
 
 `-O` builds with optimizations, and `-a` keeps debug assertions and
-overflow checks on, as in a debug build of a world. Runs read and add to
-`fuzz/corpus/<target>`. A crash is saved in `fuzz/artifacts/<target>/`.
+overflow checks on, as in a debug build of a world. No corpus is committed:
+a run starts from `fuzz/corpus/<target>`, empty the first time, and adds
+the inputs it finds there. Git ignores that directory. A crash is saved in
+`fuzz/artifacts/<target>/`.
 To run one input again, or to shrink it:
 
 ```sh
@@ -76,8 +78,8 @@ one shard runs every target. Targets are sorted in C locale and dealt
 round-robin to zero-based shards, so the shards are disjoint and together
 cover every target. Both values must be decimal integers without leading
 zeros; the count must be positive and the index less than the count.
-Invalid values fail before target discovery. To run one of the four
-shards used by nightly and manual CI:
+Invalid values fail before target discovery. To run the first of four
+shards:
 
 ```sh
 FUZZ_SHARD_INDEX=0 FUZZ_SHARD_COUNT=4 fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
@@ -86,33 +88,18 @@ FUZZ_SHARD_INDEX=0 FUZZ_SHARD_COUNT=4 fuzz/run-all.sh 60 -timeout=20 -rss_limit_
 It goes on past a target that fails and lists the failures at the end.
 It fails without running any targets if `cargo fuzz list` fails or
 lists no targets.
-Every target needs a `[[bin]]` in `fuzz/Cargo.toml` and a directory in
-`fuzz/corpus/`, even an empty one. Add the `[[bin]]` entry directly when
-adding a target.
-`fuzz/check-targets.sh` checks the sources, `[[bin]]` records and corpus
-directories against each other, and CI runs it.
+Every target needs a `[[bin]]` in `fuzz/Cargo.toml`. Add the `[[bin]]`
+entry directly when adding a target.
+`fuzz/check-targets.sh` checks the sources and `[[bin]]` records against
+each other.
 
 The `tcp` target never sleeps by default, which keeps it fast. To reach
 the timers too (delayed ACKs, TIME-WAIT), let each input sleep up to some
 milliseconds in all:
 
 ```sh
-FICTIONET_FUZZ_SLEEP_MS=30 cargo +nightly fuzz run -O -a tcp fuzz/corpus/tcp
+FICTIONET_FUZZ_SLEEP_MS=30 cargo +nightly fuzz run -O -a tcp
 ```
-
-The corpora here are seeds, cut down to the fewest inputs that reach every
-edge the larger corpus reached. Cut a corpus down the same way before you
-commit it: merge it into an empty directory with libFuzzer's set cover,
-counting edges only, and commit the result.
-
-```sh
-mkdir /tmp/tcp
-cargo +nightly fuzz run -O -a tcp /tmp/tcp fuzz/corpus/tcp -- -set_cover_merge=1 -use_counters=0
-```
-
-`stack`, `tcp`, `web`, `web_http` and `ip_reassembly` run timers and
-threads, so the edges an input reaches vary from run to run, and a cut
-loses some. Their corpora are kept whole.
 
 Each bug a target found has a regression test in the SDK's own tests, so
 `cargo test` keeps it fixed without a fuzzer.

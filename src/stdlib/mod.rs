@@ -170,8 +170,7 @@
 //!    Check decoder contracts with [`test_support::contract`].
 //! 2. Declare the module here with `#[path]` and `pub mod`, and add a one-line
 //!    description to the [module table](#modules).
-//! 3. Add `fuzz/fuzz_targets/<name>.rs`, a `[[bin]]` entry in `fuzz/Cargo.toml`,
-//!    and `fuzz/corpus/<name>/` with seed inputs.
+//! 3. Add `fuzz/fuzz_targets/<name>.rs` and a `[[bin]]` entry in `fuzz/Cargo.toml`.
 //!
 //! A service and a presenter are optional additions. A service owns replies,
 //! connection state and events; install it on a [`net::Host`] port. A capture
@@ -190,11 +189,10 @@
 //! is the authority for the five feature combinations: default,
 //! `--no-default-features`, `--all-features`,
 //! `--no-default-features --features std,observe`, and
-//! `--no-default-features --features tokio`. It checks the fuzz bins and
-//! helper tests on pinned stable with `RUSTFLAGS="--cfg fuzzing"`. The fuzz
-//! job checks the inventory and sweep script, then builds all targets with
-//! `cargo +nightly fuzz build -O -a`. Scheduled and manual runs also execute
-//! every target for 60 seconds. See that workflow for the exact commands.
+//! `--no-default-features --features tokio`. With `RUSTFLAGS="--cfg fuzzing"`,
+//! it checks the fuzz bins on the nightly toolchain in
+//! `fuzz/rust-toolchain.toml` and runs the fuzz helper tests on pinned stable.
+//! It does not run the fuzzers. See that workflow for the exact commands.
 //!
 //! ## Changing a protocol by copying it
 //!

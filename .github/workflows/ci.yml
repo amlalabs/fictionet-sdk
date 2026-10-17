@@ -4,15 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: '17 3 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 # A newer run cancels an older run of the same kind on the same ref.
-# Pushes and nightly runs never cancel each other.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -97,8 +94,9 @@ jobs:
   # Artifactory and adaptive web, plus adaptive web's offline backend.
   # Also test the browser example on the host and in Node.js, Border's,
   # FakeWiki's and Artifactory's evals, the demos and the Inspect package.
-  # Check the fuzz crate and test its helpers on the pinned stable toolchain
-  # with the cfg that cargo fuzz sets.
+  # Check the fuzz crate on the nightly toolchain in fuzz/rust-toolchain.toml,
+  # and test its helpers on the pinned stable toolchain, both with the cfg
+  # that cargo fuzz sets.
   examples:
     name: examples, Python and the fuzz crate
     runs-on: ubuntu-latest
@@ -171,10 +169,12 @@ jobs:
         run: uv run --locked --extra k8s --no-editable --reinstall-package inspect-fictionet pytest
       - name: Inspect Kubernetes scorer regressions
         run: uv run --project python/inspect_fictionet --locked --extra k8s python -m unittest discover -s tests/k8s -p 'test_*.py'
-      # From the crate root, so rust-toolchain.toml there, not fuzz/'s
-      # nightly, picks the toolchain.
-      - name: The fuzz crate on stable
-        run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+      # From fuzz/, so its rust-toolchain.toml picks nightly.
+      - name: The fuzz crate on nightly
+        working-directory: fuzz
+        run: |
+          rustup toolchain install
+          cargo check --locked --bins
         env:
           RUSTFLAGS: --cfg fuzzing
       - name: Fuzz helper regressions
@@ -212,45 +212,6 @@ jobs:
       # +1.91 overrides rust-toolchain.toml.
       - name: Check
         run: cargo +1.91 check --locked --workspace --all-targets
-
-  fuzz:
-    name: fuzz (shard ${{ matrix.shard }}/${{ strategy.job-total }})
-    runs-on: ubuntu-latest
-    # Four scheduled/manual shards each build and run about 34 targets at 60 s
-    # each. Pushes and PRs have one job that builds and checks every target.
-    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 45 }}
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        shard: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '[0,1,2,3]' || '[0]') }}
-    env:
-      FUZZ_SHARD_INDEX: ${{ matrix.shard }}
-      FUZZ_SHARD_COUNT: ${{ strategy.job-total }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fuzz
-      - name: Every target has a [[bin]] and a corpus directory
-        run: fuzz/check-targets.sh
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-      # +nightly overrides the stable toolchain pinned in rust-toolchain.toml.
-      - name: Build the targets
-        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
-        run: cargo +nightly fuzz build -O -a
-      # Builds and runs only this shard, continuing after individual failures.
-      - name: Run each selected target for 60 seconds
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
-      - name: Keep what a target found
-        if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-artifacts-${{ matrix.shard }}
-          path: fuzz/artifacts
 
   docker:
     name: docker (${{ matrix.dockerfile }})

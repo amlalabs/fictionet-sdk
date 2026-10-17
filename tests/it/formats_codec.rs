@@ -598,28 +598,27 @@ fn multipart_long_boundary_padding_limits() {
 fn multipart_long_boundary_corpus() {
     for (seed, len, expected_error) in [
         (
-            include_bytes!("../../fuzz/corpus/mime_multipart/boundary-8").as_slice(),
+            include_bytes!("fixtures/mime_multipart/boundary-8").as_slice(),
             8,
             None,
         ),
         (
-            include_bytes!("../../fuzz/corpus/mime_multipart/boundary-69").as_slice(),
+            include_bytes!("fixtures/mime_multipart/boundary-69").as_slice(),
             69,
             None,
         ),
         (
-            include_bytes!("../../fuzz/corpus/mime_multipart/long-boundary").as_slice(),
+            include_bytes!("fixtures/mime_multipart/long-boundary").as_slice(),
             70,
             None,
         ),
         (
-            include_bytes!("../../fuzz/corpus/mime_multipart/long-boundary-padding").as_slice(),
+            include_bytes!("fixtures/mime_multipart/long-boundary-padding").as_slice(),
             70,
             None,
         ),
         (
-            include_bytes!("../../fuzz/corpus/mime_multipart/long-boundary-padding-over-limit")
-                .as_slice(),
+            include_bytes!("fixtures/mime_multipart/long-boundary-padding-over-limit").as_slice(),
             70,
             Some(mime::Error::Padding),
         ),
