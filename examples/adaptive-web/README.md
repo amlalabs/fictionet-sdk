@@ -27,7 +27,7 @@ they do outside.
 
 ## Quick start
 
-Prerequisites: Linux, Docker with Compose v2, `/dev/net/tun`, Python 3.11 or
+Prerequisites: Linux, Docker with Compose v2, `/dev/net/tun`, Python 3.12 or
 later, and uv. Cold setup downloads base images and packages and builds the
 world; allow several minutes before the first result.
 
@@ -84,12 +84,12 @@ Settings, all from the environment:
 
 | variable | what it sets |
 |---|---|
-| `ADAPTIVE_WEB_GENERATOR` | `stub` (default), `openrouter`, `anthropic`, or `replay` |
+| `ADAPTIVE_WEB_GENERATOR` | `stub`, `openrouter`, `anthropic`, or `replay`; default: `stub` in Compose/Inspect, `openrouter` in `scripts/live_demo.sh` |
 | `ADAPTIVE_WEB_MODEL` | the model; by default `google/gemini-3.1-flash-lite` on OpenRouter and `claude-haiku-4-5-20251001` on Anthropic |
 | `ADAPTIVE_WEB_NETWORK` | the world container's network: `none` (default), or `bridge` to reach a model API |
 | `ADAPTIVE_WEB_PREFETCH` | how many pages behind each new result list to make ahead of time (default 3 with a model) |
 | `ADAPTIVE_WEB_REASONING` | reasoning effort sent to OpenRouter, for models that think before writing (`none`, `minimal`, ...) |
-| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; by default a volume per run |
+| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; default: a fresh volume per run under Inspect, the Compose project's named `store` volume under `docker compose` (kept until `docker compose down --volumes`), and `examples/adaptive-web/store` in `scripts/live_demo.sh` |
 | `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY` | the provider's key. It is sent in the API request's header and nowhere else: never logged, stored or put in an error message. |
 
 Only the world container gets a network, and only in live mode. The
@@ -511,7 +511,7 @@ relabelled generated HTML failures as 200, so their logs cannot establish
 that every followed link worked. New runs expose repeated invalid answers
 as 503.
 
-## Keep a run and replay it
+## Keep the generated pages and serve them again
 
 By default an Inspect run gets a fresh store, a Compose volume that goes
 away with the run, and `scripts/live_demo.sh` keeps its store in `./store`.
@@ -522,7 +522,8 @@ addresses. A run fails without `finalized` if `addresses.jsonl` is
 unreadable, corrupt or cannot be appended.
 With `ADAPTIVE_WEB_GENERATOR=replay` it makes nothing new: a URL
 the store does not hold gets a 404, logged as `missing`, and a query it does
-not hold gets an empty result list. A replay needs no network and no key.
+not hold gets an empty result list. `replay` does not replay a run: each run
+is a fresh world that serves the stored pages. It needs no network and no key.
 This includes fixed URLs: replay serves their retained bytes, without
 opening the source files. An unfetched fixed URL is still missing.
 
