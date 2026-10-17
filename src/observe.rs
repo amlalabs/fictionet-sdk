@@ -339,7 +339,7 @@
 //! Watching links is not free once traffic is heavy. Each watched packet
 //! takes two locks, and the packets kept are decoded and turned into JSON
 //! on the observer's thread. The `observe` group of the performance suite
-//! (`cargo bench --bench perf -- observe`, see `CONTRIBUTING.md`) measures
+//! (`cargo bench --bench runtime -- observe`, see `CONTRIBUTING.md`) measures
 //! this with ten sandboxes sending HTTPS requests, unwatched, with the graph
 //! watched, and with all ten sandbox links watched.
 //!

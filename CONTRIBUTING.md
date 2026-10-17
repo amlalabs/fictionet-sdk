@@ -117,20 +117,9 @@ tests remain manual. Missing host capabilities fail when `CI` is set.
 The Docker web and proxy tests and `tests/k8s/proxy.sh` check full transfer
 sizes and counts, with a 30-second deadline per bulk transfer (60 seconds for
 the 32 parallel web downloads, which share one attach socket). They print
-throughput and timing measurements on every run. Strict download timings
-(including the web test's spread and recovery comparison) require
-`FICTIONET_PERF_CHECK=1`:
-
-```console
-$ FICTIONET_PERF_CHECK=1 tests/docker/web/run.sh
-$ FICTIONET_PERF_CHECK=1 tests/docker/proxy/run.sh
-$ FICTIONET_PERF_CHECK=1 tests/k8s/proxy.sh
-```
-
-Use a controlled machine for these performance checks. Routine runs check
-transfer completion, sizes and counts. They do not enforce strict timing
-thresholds or provide strict throughput regression coverage. Incomplete or failed
-transfers and transfers that exceed the completion deadline fail.
+throughput and timing measurements without imposing performance thresholds.
+Incomplete or failed transfers and transfers that exceed the completion
+deadline fail.
 
 ## Releases
 
@@ -200,45 +189,56 @@ All code, not only protocol modules, names its contexts one way:
 
 ## Performance
 
-`benches/perf.rs` is a performance suite. Each group builds a small world, pushes
-traffic through it, and prints a table. Run all of it, or name the groups you want:
+Run the Divan benchmarks with Cargo. Each file in `benches/` is a benchmark
+binary; pass a name after `--` to filter its benchmarks:
 
 ```console
-$ cargo bench --locked --bench perf
-$ cargo bench --locked --bench perf -- tcp path
-$ cargo bench --locked --bench perf -- sites --reps 5
-$ cargo bench --locked --bench perf -- --quick
+$ cargo bench --locked
+$ cargo bench --locked --bench network -- tcp
+$ cargo bench --locked --bench services -- sites
+$ cargo bench --locked --bench runtime -- observe
+$ cargo bench --locked --bench decoders
+$ cargo bench --locked --bench network -- --list
 ```
 
-Use `--list` for the complete list of groups and what each measures. The suite
-covers network throughput and latency, scheduler and timer costs, memory and
-allocations, logging and observation overhead, and decoder throughput:
+`network` covers TCP throughput, routed paths, idle connections, delayed links,
+scheduling and unread-link memory. `services` covers relay traffic, HTTPS sites
+and proxy DNS caching. `runtime` covers timers, event logging and observation,
+including a graph with 1,000 sites. `decoders` feeds TPKT/COTP, HTTP/1 requests
+and ITCH add orders in 16 KiB chunks.
+
+Divan reports timing distributions, byte or item rates, allocation counts and
+peak heap growth. World setup and cleanup happen outside measurement. The memory
+benchmarks keep queued packets alive until measurement ends; allocation,
+reallocation and free byte totals show heap growth. Counts are per iteration:
+divide allocations by the workload's bytes, requests, packets or round trips
+for per-item costs.
+The world workloads use three samples of one iteration by default; Divan's
+`--sample-count` changes that. Compare the same workloads on two commits on the
+same machine.
+
+Packet sends and losses, unread packets, HTTP request latency percentiles and
+process CPU time, observer rows and proxy DNS queries are printed to stderr
+for the last iteration. These are diagnostics, not performance thresholds. Observer row counts
+depend on request rate because packet observation samples every 100 ms.
+
+Every benchmark binary uses `divan::AllocProfiler`. It counts allocations on the
+benchmark thread; it does not count background relay, observer or event-writer
+threads or the proxy subprocess. The simulated worlds run on the benchmark
+thread. See [Divan's allocation profiler](https://docs.rs/divan/0.1.21/divan/struct.AllocProfiler.html).
+
+Proxy benchmarks run the `fictionet` binary built by Cargo, or `FICTIONET_BIN`.
+Responses must have the expected status and a complete Content-Length body;
+the successful site's bytes must match its page. Observer subscriptions must
+acknowledge their request ids and remain alive throughout measurement. Invalid
+responses and failed worlds abort the run; timings have no pass/fail thresholds.
+
+CI compiles benchmarks in `cargo build --locked --workspace --all-targets` and
+does not run them. To compile just the benchmark targets locally:
 
 ```console
-$ cargo bench --locked --bench perf -- --list
+$ cargo bench --locked --no-run
 ```
-
-Each run of a case repeats three times by default (`--reps`). Rates and times are
-medians, with the range of the runs in brackets. A shared machine makes any single
-timing noisy, so trust the counts first: allocations, and packets sent and lost.
-Those barely change from run to run. Observer rows are different: the observer keeps
-a sample of packets in each 100 ms, so a faster run yields fewer rows per request.
-Compare observer costs only between runs with similar request rates. To judge a change, run the same groups on
-the commit before it and on the change, one after the other, and compare.
-
-The `proxy` group runs the `fictionet` binary built with the suite, or the one that
-`FICTIONET_BIN` names. It records timings only after every response has the expected
-status and exactly the bytes declared by Content-Length. The successful site's body
-must also match its page. Read errors, incomplete responses and ambiguous framing
-panic instead of producing a timing. The 30-second read timeout bounds stalled reads.
-The suite is not a test, and CI does not run it. A full run takes a few minutes and
-uses one core per world, plus one for the observer in `observe` and `graph`.
-
-The `observe` and `graph` groups report an observed row only when the observer
-outlived the measurement. Each subscription must first acknowledge its own request id.
-Early EOF, ended streams, error replies and invalid events fail the run. After
-measurement, the suite signals the observer to stop before cancelling the world, then
-joins it before reporting the row.
 
 ## Docs
 

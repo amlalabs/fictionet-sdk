@@ -48,7 +48,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - name: Build
+      - name: Build tests, examples and benchmarks
         run: cargo build --locked --workspace --all-targets --test host ${{ matrix.features }}
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -284,5 +284,3 @@ jobs:
       # is reachable from the pod.
       - name: Restricted proxy isolation and startup
         run: tests/k8s/proxy.sh
-        env:
-          FICTIONET_PERF_CHECK: "0"

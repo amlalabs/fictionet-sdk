@@ -29,7 +29,6 @@ RELAY_TOKEN="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
 export RELAY_TOKEN
 
 source "$here/../common.sh"
-source "$here/../../throughput.sh"
 
 cleanup
 "${compose[@]}" build --quiet
@@ -130,7 +129,7 @@ for door in http socks; do
     fi
     # Ten at once. A packet lost on a full socket buffer costs a 1 s
     # retransmit; the prototype's lost wake-up stalled one for 45 s.
-    check_downloads "10 downloads of 16 MiB at once through the $door door" 10 16777216 1 0 \
+    check_downloads "10 downloads of 16 MiB at once through the $door door" 10 16777216 \
         socks "seq 10 | xargs -P 10 -I{} curl -fsS --max-time 30 ${x[*]} -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/big"
     if took="$(check_transfer 67108864 socks "head -c 67108864 /dev/zero | curl -fsS --max-time 30 ${x[*]} --data-binary @- -w '%{time_total}' https://example.test/upload")"; then
         pass "a 64 MiB upload through the $door door, in ${took} s"

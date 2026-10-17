@@ -85,6 +85,7 @@ etherparse = "0.21"
 libc = "0.2.189"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+divan = "0.1.21"
 
 # Example targets. `cargo test` also runs those marked with `test = true`.
 [[example]]
@@ -111,11 +112,24 @@ path = "examples/custom_protocol/main.rs"
 test = true
 required-features = ["std"]
 
-# The performance suite: `cargo bench --bench perf`. See CONTRIBUTING.md.
 [[bench]]
-name = "perf"
+name = "network"
 harness = false
 required-features = ["std", "tokio", "observe"]
+
+[[bench]]
+name = "services"
+harness = false
+required-features = ["std", "tokio", "observe"]
+
+[[bench]]
+name = "runtime"
+harness = false
+required-features = ["std", "tokio", "observe"]
+
+[[bench]]
+name = "decoders"
+harness = false
 
 # Dependencies are built optimized once and then cached; ring, rustls and
 # tokio are much faster that way, and debug builds of the crate itself are

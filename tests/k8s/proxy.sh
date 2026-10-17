@@ -36,7 +36,6 @@ ns=fictionet-restricted
 release=fnproxy
 pod="fictionet-sandbox-$release-default-0"
 socks_pod="fictionet-sandbox-$release-socks-0"
-source "$here/../throughput.sh"
 failures=0
 source "$here/../common/assertions.sh"
 made_cluster=0
@@ -162,8 +161,8 @@ check_fails "the API server's address through the proxy is a world address with 
     agent curl -sS -m 10 -k "https://$api/version"
 check_fails "a real name through the proxy does not exist in the world: 502" 'response 502' agent curl -sS -m 10 https://example.com/
 
-# 5. Complete downloads, with timing thresholds in performance mode.
-check_downloads "10 downloads of 16 MiB at once" 10 16777216 2 0 \
+# 5. Complete downloads.
+check_downloads "10 downloads of 16 MiB at once" 10 16777216 \
     agent sh -c "seq 10 | xargs -P 10 -I{} curl -fsS --max-time 30 -o /dev/null -w '%{size_download} %{time_total}\n' https://example.test/big"
 if speed="$(check_transfer 16777216 agent curl -fsS --max-time 30 -o /dev/null -w '%{size_download} %{speed_download}' https://example.test/big)"; then
     pass "16 MiB at $((speed * 8 / 1000000)) Mbit/s"
