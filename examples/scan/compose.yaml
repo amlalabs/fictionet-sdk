@@ -13,6 +13,8 @@
 #                       and pings. It does not see the world socket.
 #   dashboard         - fictionet dashboard, published on 127.0.0.1 only.
 
+name: fictionet-scan
+
 x-build: &build
   context: ../..
   dockerfile: examples/scan/docker/Dockerfile
@@ -41,6 +43,7 @@ services:
       target: fictionet
     image: fictionet-scan:dev
     command: ["scan", "/run/fictionet/sock/world.sock"]
+    init: true                      # passes SIGTERM on to the world
     network_mode: none
     volumes:
       - sock:/run/fictionet/sock
@@ -88,6 +91,7 @@ services:
     secrets: [dashboard-token]
     image: fictionet-scan:dev
     command: [fictionet, dashboard, --world, unix:/run/fictionet/sock/world.sock, --listen, "0.0.0.0:7878", --token-file, /run/secrets/dashboard-token]
+    init: true
     ports:
       - "127.0.0.1:${SCAN_DASHBOARD_PORT:-7880}:7878"
     volumes:
