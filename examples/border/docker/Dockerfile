@@ -2,18 +2,18 @@
 # Border on Fictionet. Build context: the fictionet-sdk root (see
 # ../compose.yaml), so the world and attach build from this crate.
 #
-#   build-attach - the fictionet binary (fictionet attach)
-#   build-world  - the Rust world in examples/border/world
+#   build        - the Rust world in examples/border/world, and the fictionet
+#                  binary (fictionet attach) from the same target dir
 #   ca           - the lab CA (border-world make-ca), made once and cached
 #   pki          - the home setting's root and intermediate (border-world make-pki)
 #   credentials  - the agent's credentials file (border-world credentials)
-#   world        - compose service "fictionet", lab setting: leaves from the lab CA
-#   world-home   - compose service "fictionet", home setting: leaves from the intermediate
+#   world        - compose service "world", lab setting: leaves from the lab CA
+#   world-home   - compose service "world", home setting: leaves from the intermediate
 #   attach       - compose service "attach": fictionet attach --type tun
 #   agent        - compose service "default", lab setting: curl, BIRD, the lab CA trusted
 #   home         - compose service "default", home setting: an ordinary user's machine
 
-FROM rust:1.92-slim-bookworm AS build-attach
+FROM rust:1.92-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
@@ -25,28 +25,13 @@ COPY xtask xtask
 COPY tests tests
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target,id=fictionet-border-attach-target \
-    cargo build --release --locked --bin fictionet \
-    && cp target/release/fictionet /usr/local/bin/
-
-FROM rust:1.92-slim-bookworm AS build-world
-WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
-COPY src src
-COPY docs docs
-COPY dashboard dashboard
-COPY benches benches
-COPY codegen codegen
-COPY xtask xtask
-COPY tests tests
-COPY examples examples
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target,id=fictionet-border-world-target \
+    --mount=type=cache,target=/src/target,id=fictionet-border-target \
     cargo build --release --locked -p border-world --bin border-world \
-    && cp target/release/border-world /usr/local/bin/
+    && cargo build --release --locked -p fictionet --bin fictionet \
+    && cp target/release/border-world target/release/fictionet /usr/local/bin/
 
 FROM debian:bookworm-slim AS tools
-COPY --from=build-world /usr/local/bin/border-world /usr/local/bin/
+COPY --from=build /usr/local/bin/border-world /usr/local/bin/
 
 # One lab CA per image set; only its certificate reaches the agent image.
 # BORDER_CA_EPOCH forces a fresh one: --build-arg BORDER_CA_EPOCH=$(date +%s)
@@ -67,7 +52,7 @@ RUN border-world credentials > /credentials
 FROM debian:bookworm-slim AS world
 # iproute2 only so a person can look at the world container's sockets.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
-COPY --from=build-world /usr/local/bin/border-world /usr/local/bin/
+COPY --from=build /usr/local/bin/border-world /usr/local/bin/
 COPY --from=ca /ca /app/ca
 CMD ["border-world"]
 
@@ -77,7 +62,7 @@ COPY --from=pki /ca/ca.pem /ca/ca.key /app/ca/
 CMD ["border-world", "--subnet", "192.168.1.0/24"]
 
 FROM debian:bookworm-slim AS attach
-COPY --from=build-attach /usr/local/bin/fictionet /fictionet
+COPY --from=build /usr/local/bin/fictionet /fictionet
 RUN ln -s /fictionet /usr/local/bin/fictionet
 
 # The lab agent: real, unmodified clients. curl for HTTPS, BIRD to peer
