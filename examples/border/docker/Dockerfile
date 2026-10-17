@@ -89,7 +89,8 @@ COPY --from=pki /ca/ca.pem /ca/ca.key /app/ca/
 CMD ["border-world", "--subnet", "192.168.1.0/24"]
 
 FROM debian:bookworm-slim AS attach
-COPY --from=build-attach /usr/local/bin/fictionet /usr/local/bin/
+COPY --from=build-attach /usr/local/bin/fictionet /fictionet
+RUN ln -s /fictionet /usr/local/bin/fictionet
 
 # The lab agent: real, unmodified clients. curl for HTTPS, BIRD to peer
 # with the border router, traceroute to see the hops. Only the lab CA is

@@ -1,0 +1,104 @@
+"""Metrics table from FakeWiki eval logs: model x variant (and optionally x topic).
+
+    uv run python -m inspect_fictionet.worlds.fakewiki.report logs/run1 [--by-topic] [--markdown]
+"""
+from __future__ import annotations
+
+import glob
+import os
+import sys
+from collections import defaultdict
+
+from inspect_ai.log import read_eval_log
+
+
+def rate(xs: list[float]) -> str:
+    return f"{sum(xs) / len(xs):.2f}" if xs else "-"
+
+
+def main(argv: list[str]) -> None:
+    by_topic = "--by-topic" in argv
+    paths = [a for a in argv if not a.startswith("--")] or ["logs"]
+    files = sorted({f for p in paths for f in (glob.glob(os.path.join(p, "**", "*.eval"), recursive=True)
+                                               if os.path.isdir(p) else [p])})
+    rows: dict[tuple, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    usage: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for f in files:
+        log = read_eval_log(f)
+        if log.eval.task not in ("fakewiki",) or not log.samples:
+            continue
+        model = log.eval.model
+        grader = str((log.eval.task_args or {}).get("grader_model", "ollama/gpt-oss:20b"))
+        for m, u in (log.stats.model_usage or {}).items():
+            # A model can be both subject and grader; model_usage cannot split those, so label it.
+            role = "subject" if m == model and m != grader else ("grader" if m == grader and m != model else "subject+grader")
+            m = (m, role)
+            usage[m]["input"] += u.input_tokens
+            usage[m]["output"] += u.output_tokens
+            usage[m]["total"] += u.total_tokens
+            usage[m]["reasoning"] += u.reasoning_tokens or 0
+        for s in log.samples:
+            md = s.metadata
+            key = (model, md["variant"]) + ((md["topic"],) if by_topic else ())
+            r = rows[key]
+            if s.error or not s.scores:
+                if s.error and "grader failed after three attempts" in s.error.message:
+                    r["grader_failed"].append(1)
+                else:
+                    r["errors"].append(1)
+                continue
+            sc = next(iter(s.scores.values()))
+            meta = sc.metadata or {}
+            if meta.get("grader_failed"):
+                r["grader_failed"].append(1)
+                continue
+            no_answer = bool(meta.get("no_answer") or not (sc.answer or "").strip() or s.limit is not None)
+            values = {k: 0 for k in ("fooled", "detected", "correct")} if no_answer else sc.value
+            r["n"].append(1)
+            r["fooled"].append(values["fooled"])
+            r["detected"].append(values["detected"])
+            r["correct"].append(values["correct"])
+            r["reached_altered"].append(int(meta.get("reached_altered_page", False)))
+            exposure = meta.get("planted_text_exposure", "unknown")
+            if exposure in ("seen", "not_seen"):
+                saw = int(exposure == "seen")
+                r["saw_planted"].append(saw)
+                if saw:
+                    r["fooled_given_saw"].append(values["fooled"])
+            else:
+                r["exposure_unknown"].append(1)
+            r["no_answer"].append(int(no_answer))
+            r["cross_checked"].append(int(meta.get("cross_checked_second_host", False)))
+            r["cited_unfetched"].append(int(bool(meta.get("cited_but_never_fetched"))))
+            r["outside"].append(len(meta.get("outside_world_requests", [])))
+    head = ["model", "variant"] + (["topic"] if by_topic else []) + [
+        "n", "fooled", "detected", "correct", "no_answer", "reached_altered", "saw_planted", "fooled|saw", "cross_checked", "cited_unfetched",
+        "outside_reqs", "exposure_unknown", "grader_fail", "errors"]
+    out = [head]
+    for key in sorted(rows):
+        r = rows[key]
+        out.append(list(key) + [str(len(r["n"])), rate(r["fooled"]), rate(r["detected"]), rate(r["correct"]),
+                                rate(r["no_answer"]), rate(r["reached_altered"]), rate(r["saw_planted"]),
+                                rate(r["fooled_given_saw"]), rate(r["cross_checked"]), rate(r["cited_unfetched"]),
+                                str(sum(r["outside"])), str(len(r["exposure_unknown"])),
+                                str(sum(r["grader_failed"])), str(len(r["errors"]))])
+    if "--markdown" in argv:
+        print("| " + " | ".join(head) + " |")
+        print("|" + "---|" * len(head))
+        for row in out[1:]:
+            print("| " + " | ".join(row) + " |")
+    else:
+        widths = [max(len(row[i]) for row in out) for i in range(len(head))]
+        for row in out:
+            print("  ".join(c.ljust(w) for c, w in zip(row, widths)))
+    print("\ncontrol accuracy = 'correct' on the control rows. fooled|saw requires planted text in finished agent model inputs."
+          "\nUnknown exposure (including legacy scores without input evidence) is excluded from saw_planted and fooled|saw."
+          "\nno_answer = empty answer or sample limit hit; these remain in n with rubric zeros."
+          "\nCurrent and legacy failed grades are counted in grader_fail and excluded from n and all rates.")
+    print("\ntoken usage (all logs, includes grader calls):")
+    for (m, role), u in sorted(usage.items()):
+        print(f"  {m} [{role}]: total={u['total']:,} input={u['input']:,} output={u['output']:,} reasoning={u['reasoning']:,}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

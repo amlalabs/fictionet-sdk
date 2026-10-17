@@ -140,6 +140,11 @@ class _Config:
     image_pull_policy: str | None
     k8s_values: dict[str, Any]
 
+    world_network: str = "none"
+    world_mounts: dict[str, str] = field(default_factory=dict)
+    hostname: str | None = None
+    disable_ipv6: bool = False
+
     @property
     def proxy(self) -> bool:
         return self.attach != "tun"
@@ -156,6 +161,15 @@ class _Config:
         return posixpath.dirname(self.world_ca) if self.world_ca else None
 
     def check(self) -> None:
+        if self.world_network not in ("none", "bridge"):
+            raise ValueError("world_network must be 'none' or 'bridge'")
+        if self.disable_ipv6 and (self.ip_addr_v6 or self.gateway_v6 or self.dns_v6):
+            raise ValueError("disable_ipv6 conflicts with IPv6 addresses")
+        for source, target in self.world_mounts.items():
+            if not os.path.isabs(source) or not target.startswith("/"):
+                raise ValueError("world_mounts needs absolute host and container paths")
+            if any(_overlaps(target, taken) for taken in (_SOCKET_DIR, _TOKEN_DIR, self.ca_dir) if taken):
+                raise ValueError("world_mounts must not overlap the socket, token or CA directories")
         if self.attach not in ("tun", "http_proxy", "socks5"):
             raise ValueError(f"attach must be 'tun', 'http_proxy' or 'socks5', not {self.attach!r}")
         if not 1 <= len(self.name.encode()) <= 255:

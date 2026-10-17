@@ -1,4 +1,4 @@
-# Border on Fictionet, home setting (border_eval `-T setting=home`): the same
+# Border on Fictionet, home setting (`cargo xtask eval border -T setting=home`): the same
 # world, with the agent on an ordinary user's machine (the Dockerfile's
 # `home` target) on a home network, 192.168.1.0/24, with the router and its
 # DNS at 192.168.1.1. The machine is called rw-desktop: the agent's

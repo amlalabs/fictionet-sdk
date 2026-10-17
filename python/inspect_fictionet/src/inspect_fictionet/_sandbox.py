@@ -33,6 +33,10 @@ def fictionet_sandbox(
     world_args: Sequence[str] = (),
     world_env: Mapping[str, str] | None = None,
     world_ca: str | None = None,
+    world_network: str = "none",
+    world_mounts: Mapping[str, str] | None = None,
+    hostname: str | None = None,
+    disable_ipv6: bool = False,
     world_healthcheck: Sequence[str] | None = None,
     agent_image: str | Build = "python:3.12-slim",
     agent_command: Sequence[str] = ("tail", "-f", "/dev/null"),
@@ -78,6 +82,12 @@ def fictionet_sandbox(
       world_healthcheck: A command that exits 0 once the world is up. It
         runs in the world's container, so the image must have it. Without
         one, attach waits for the world's socket (`world_wait`).
+      world_network: Docker only: `"none"` (default), or `"bridge"` when the
+        trusted world needs a model API. The agent remains isolated.
+      world_mounts: Docker only: absolute host paths mapped to paths in the
+        world's container, for persistent generated pages. Never mounted in the agent.
+      hostname: Docker only: attach's hostname, shared by the agent's network.
+      disable_ipv6: Docker only: disable IPv6 in the agent's network namespace.
       agent_image: The agent's image, or a `Build`.
       agent_command: The agent's command. It must keep running.
       agent_env: More environment for the agent.
@@ -117,6 +127,10 @@ def fictionet_sandbox(
     """
     cfg = _Config(
         world=world,
+        world_network=world_network,
+        world_mounts={source: _container_path(target) for source, target in (world_mounts or {}).items()},
+        hostname=hostname,
+        disable_ipv6=disable_ipv6,
         world_args=list(world_args),
         world_env=dict(world_env or {}),
         world_ca=_container_path(world_ca) if world_ca is not None else None,
@@ -152,5 +166,7 @@ def fictionet_sandbox(
         _quiet_working_dir_warnings()
         return SandboxEnvironmentSpec("docker", str(write_compose(cfg, cache)))
     if backend == "k8s":
+        if world_network != "none" or world_mounts or hostname or disable_ipv6:
+            raise ValueError("world_network, world_mounts, hostname and disable_ipv6 are Docker options")
         return _k8s_spec(cfg, cache)
     raise ValueError(f"backend must be 'docker' or 'k8s', not {backend!r}")

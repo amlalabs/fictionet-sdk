@@ -13,6 +13,22 @@ Without the package, each eval carries a compose file like
 lines of services, volumes, healthchecks and attach flags. With it, the
 sandbox is one argument.
 
+The four example evals share this project and its lockfile. From the repository
+root, run `cargo xtask eval <border|fakewiki|adaptive-web|artifactory> --model MODEL`.
+It builds the world's images and runs the task in `inspect_fictionet.worlds`.
+`--probes` runs Border, FakeWiki and adaptive web probes; Border and Artifactory have `--scripted`
+scorer tests. These tasks live in this package's `tests/` directories.
+`cargo xtask eval adaptive-web --live [seed] [query...]` prints generated searches
+and pages without an agent model. Use `--no-build` to reuse existing images.
+
+The realism judge runs as `python -m inspect_fictionet.worlds.adaptive_web.realism`;
+FakeWiki's negative control runs as
+`python -m inspect_fictionet.worlds.fakewiki.negative_control`. Run them through
+`uv run --project python/inspect_fictionet --locked` from the repository root.
+The backends remain in `examples/*/world/backend`; the package includes them and
+the seeds, corpus and rubric when built. All scorers share the log snapshot and
+finalization reader in `inspect_fictionet._common.world_io`.
+
 ## Install
 
 The package is not on PyPI. Install it from the repository:
@@ -23,7 +39,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 pip install "inspect-fictionet[k8s] @ git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/inspect_fictionet"
 ```
 
-It needs Python 3.12 or later and inspect-ai 0.3.276 or later. The docker
+It needs Python 3.12 or later and the locked inspect-ai 0.3.276. The docker
 backend needs a Linux host with `/dev/net/tun`, and Docker Compose 2.23.1 or
 later for the proxy types, which pass the token as an inline `configs`
 entry.
@@ -106,6 +122,8 @@ been rerun with them.
 | `world` | required | An image name, a `Build`, or a `CargoExample`. The world must listen on `/run/relay/relay.sock` (`WORLD_SOCKET`). |
 | `world_args` | none | The world's arguments: its image's CMD. |
 | `world_env` | none | The world's environment. |
+| `world_network` | `"none"` | Docker only: `"bridge"` lets the trusted world reach a model API. The agent remains isolated. |
+| `world_mounts` | none | Docker only: absolute host paths mapped to paths in the world, such as `{"/host/store": "/world/store"}`. These mounts never reach the agent. |
 | `world_ca` | none | Where the world writes its CA certificate, such as `/run/ca/ca.pem`. See [The world's CA](#the-worlds-ca). |
 | `world_healthcheck` | none | A command that exits with status 0 once the world is up. It runs in the world's container. Without one, attach waits for the world's socket. |
 | `world_wait` | `60` | How many seconds attach waits for the world's socket before it gives up. |
@@ -127,6 +145,8 @@ been rerun with them.
 |---|---|---|
 | `attach` | `"tun"` | `"tun"`, `"http_proxy"` or `"socks5"`. See [Proxy types](#proxy-types). |
 | `name` | `"agent"` | The name attach gives the world for this sandbox. |
+| `hostname` | none | Docker only: attach's hostname, shared by the agent's network. Border's home setting uses `"rw-desktop"`. |
+| `disable_ipv6` | `False` | Docker only: disable IPv6 in attach's network namespace, as Border does. Conflicts with IPv6 addresses. |
 | `ip_addr`, `gateway`, `dns` | `10.0.0.2/24`, `10.0.0.1`, `10.0.0.1` | The sandbox's IPv4 settings. These fit a world built on `web::Sites`. `None` turns a setting off. |
 | `ip_addr_v6`, `gateway_v6`, `dns_v6` | `None` | The sandbox's IPv6 settings, off by default. |
 | `mtu` | 1500 | `tun0`'s MTU. |
@@ -380,7 +400,7 @@ them in this order:
              +-----------------------+
 ```
 
-1. **The world** starts first, with no network at all. Its only way in is
+1. **The world** starts first, with no network by default. Its only way in is
    the socket at `/run/relay/relay.sock`, on a volume that only attach
    also mounts.
 2. **Attach** starts next and connects to the socket. It retries for up to
@@ -428,17 +448,17 @@ reads the CA certificate this way, and checks that the agent sees the same
 file.
 
 For log scoring, follow the existing composition in Artifactory's
-[`finalized_log`](../../examples/artifactory/src/artifactory_eval/tasks.py)
-and its [log parser](../../examples/artifactory/src/artifactory_eval/world.py):
+[`finalized_log`](src/inspect_fictionet/worlds/artifactory/tasks.py)
+and its [log parser](src/inspect_fictionet/worlds/artifactory/world.py):
 
-1. Await [`finalize_world(world, agent, log)`](../../examples/common/finalize.py).
+1. Await [`finalize_world(world, agent, log)`](src/inspect_fictionet/_common/finalize.py).
    It creates `finalize` beside the log and waits for `finalized` containing
    exactly `ok\n`. The world's control handler cancels the run, stopping
    input and exchanges. It drains the writer, closes pending folds, and
    checks for output failures and lost lines before acknowledging. A timeout
    or invalid acknowledgement makes the sample unscorable.
 2. Only after acknowledgement, call
-   [`read_log(world, log, read_file=read_world_file)`](../../examples/common/logs.py).
+   [`read_log(world, log, read_file=read_world_file)`](src/inspect_fictionet/_common/logs.py).
    It copies the log to `<log>.snapshot`, counts that file's bytes, and reads
    it as bytes through the trusted accessor. It rejects a byte-count mismatch
    or a nonempty snapshot without a final newline. A snapshot alone does not

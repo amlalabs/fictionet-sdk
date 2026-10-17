@@ -1,4 +1,5 @@
 mod docker;
+mod eval;
 mod fuzz;
 mod images;
 mod k8s;
@@ -27,6 +28,7 @@ fn main_result() -> Result {
     match command {
         "images" => images::run(args),
         "docker" => docker::run(args),
+        "eval" => eval::run(args),
         "k8s" => k8s::run(args),
         "fuzz" => fuzz::run(args),
         "scan" => scan::run(args),
@@ -34,6 +36,7 @@ fn main_result() -> Result {
             println!(
                 "cargo xtask images [artifactory|hosted]\n\
                       cargo xtask docker <ping|tcpudp|proxy|web>\n\
+                      cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [options]\n\
                       cargo xtask k8s [tun|proxy]\n\
                       cargo xtask fuzz [--check | <target> | <seconds>] [libFuzzer arguments...]\n\
                       cargo xtask scan [output directory]"

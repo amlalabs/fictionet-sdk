@@ -50,26 +50,25 @@ Fictionet. The pages, the eval and the probes are its own, carried over.
 * Linux, with Docker and Compose v2. The containers need `/dev/net/tun` and
   `NET_ADMIN` for `attach` (Compose sets this up).
 * [uv](https://docs.astral.sh/uv/), for the Python side.
-* No Rust toolchain: the images build the world inside Docker.
+* Rust 1.91 or later for `cargo xtask`; the images build the world inside Docker.
 
 ## Check it without a model
 
-These runs cost nothing. The probes run scripted commands in the agent's
+Run from the repository root. These runs cost nothing. The probes run scripted commands in the agent's
 container. The eval itself can run with Inspect's `mockllm/model`.
 
 ```bash
-cd examples/fakewiki
-uv sync
+uv sync --project python/inspect_fictionet --locked
 
 # Isolation, leak and extraction probes, all three variants at once (about 50 s once the images are built)
-uv run inspect eval src/fakewiki_eval/probes.py@fakewiki_probes --model mockllm/model --log-dir logs/probes
-uv run python scripts/show_probes.py
+cargo xtask eval fakewiki --probes --model mockllm/model --log-dir logs/probes
+uv run --project python/inspect_fictionet --locked inspect view --log-dir logs/probes
 # The leak checker must flag the control world's pages as leaks when told the variant is altered
-uv run python scripts/negative_control.py
+uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.fakewiki.negative_control
 
 # Eval smoke test: the mock agent reaches its message limit without submitting an answer
-uv run inspect eval src/fakewiki_eval/tasks.py@fakewiki --model mockllm/model -T grader_model=mockllm/model --limit 3 --no-fail-on-error --log-dir logs/mock
-uv run python -m fakewiki_eval.report logs/mock
+cargo xtask eval fakewiki --model mockllm/model -T grader_model=mockllm/model --limit 3 --no-fail-on-error --log-dir logs/mock
+uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.fakewiki.report logs/mock
 ```
 
 The mock agent returns `Default output from mockllm/model` and never calls a
@@ -98,10 +97,10 @@ rates, and gives it no `fooled`, `detected` or `correct` scores.
 the report still exposes grader failures and other `errors`. Without it,
 Inspect's default is to abort on the first sample error.
 
-The first Inspect run builds the images (`fictionet-fakewiki-*`), which takes a
+`cargo xtask eval` builds the images (`fictionet-fakewiki-*`), which takes a
 few minutes. Each run takes its containers down when it ends.
 
-By hand, without Inspect:
+By hand, without Inspect, from `examples/fakewiki`:
 
 ```bash
 SAMPLE_METADATA_VARIANT=altered_all docker compose -p fictionet-fw up -d --wait
@@ -114,7 +113,7 @@ docker compose -p fictionet-fw down -v -t 1
 
 The eval needs two models: the agent (`--model`) and the grader
 (`-T grader_model=...`, by default `ollama/gpt-oss:20b`). The grader follows
-[rubric.md](rubric.md) and answers three yes/no questions: `fooled`, `detected` and
+[rubric.md](../../python/inspect_fictionet/src/inspect_fictionet/worlds/fakewiki/rubric.md) and answers three yes/no questions: `fooled`, `detected` and
 `correct`.
 
 Blank answers and episodes stopped by a sample limit receive rubric zeros for
@@ -127,11 +126,12 @@ models first (`ollama pull qwen3`, `ollama pull gpt-oss:20b`). Inspect finds Oll
 at `http://localhost:11434`. Set `OLLAMA_BASE_URL` if it runs elsewhere.
 
 ```bash
-uv run inspect eval src/fakewiki_eval/tasks.py@fakewiki --model ollama/qwen3:latest --epochs 2 --log-dir logs/run
+cargo xtask eval fakewiki --model ollama/qwen3:latest --epochs 2 --log-dir logs/run
 ```
 
-`scripts/run_eval.sh [LOG_DIR] [MODEL...]` runs the eval for each model given
-(by default three local Ollama models), then prints the report table.
+`cargo xtask eval fakewiki --model MODEL,MODEL --log-dir logs/run` runs each
+model and prints the report table. With no model argument it uses the three local
+Ollama models; epochs default to `EPOCHS`, or two when unset.
 
 For a hosted model, Inspect reads the provider's key from the environment:
 `OPENAI_API_KEY` for `openai/...`, `ANTHROPIC_API_KEY` for `anthropic/...`,
@@ -144,8 +144,8 @@ Task options: `variants` and `topics` (comma-separated, default all),
 ## Where the results go
 
 * **Inspect logs:** one `.eval` file per run in the `--log-dir` you give, under
-  `logs/` (kept out of git). Open them with `uv run inspect view --log-dir logs/...`.
-* **A table per model and variant:** `uv run python -m fakewiki_eval.report logs/run`
+  `logs/` (kept out of git). Open them with `uv run --project python/inspect_fictionet --locked inspect view --log-dir logs/...`.
+* **A table per model and variant:** `uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.fakewiki.report logs/run`
   prints `fooled`, `detected` and `correct`, and checks from the world's log:
   whether the agent reached an altered page, saw planted text, cross-checked
   sources, or cited pages it never fetched. A cross-check requires a Wikipedia
@@ -166,10 +166,9 @@ Task options: `variants` and `topics` (comma-separated, default all),
   Citations retain their scheme, path, query and trailing slash; host case and
   percent encoding are normalized by the shared citation helper. A redirect
   earns citation credit only if its destination was delivered.
-* **One sample at a time:** `uv run python scripts/show_run.py logs/run/<file>.eval --calls`
-  prints each sample's tool calls, final answer, the grader's verdict and the
-  world's view.
-* **The world's log:** inside the `fictionet` container,
+* **One sample at a time:** Inspect View shows tool calls, final answers, grader
+  verdicts and the world's view from the saved log.
+* **The world's log:** inside the `world` sandbox,
   `/var/lib/fictionet/log.jsonl` (one line per DNS query, failed handshake and HTTP
   request) and `/var/lib/fictionet/state.json`.
 
@@ -306,13 +305,13 @@ It supplies the `Sites` callback and connects the request log.
 
 The backend's [`scenario.py`](world/backend/fictionet_world/scenario.py) owns
 variants, page identities and stance policy. `sites.py` renders the corpus using
-that contract. The eval's [`scenario.py`](src/fakewiki_eval/scenario.py) loads only
+that contract. The eval's [`scenario.py`](../../python/inspect_fictionet/src/inspect_fictionet/worlds/fakewiki/scenario.py) loads only
 the pure definitions with the standard library. Tasks and probes share them;
 probe coverage and grading remain eval policy. Probe targets carry their expected
 topic and source, and search results use the scenario's URL mapping, including
 both fictional Acts. Unknown variants raise `ValueError`. Unknown probe, extraction
 or search-result URLs raise `KeyError`.
-Independent fixtures in `tests/test_scenario.py` pin the authored stance rules and
+Independent fixtures in `../../python/inspect_fictionet/tests/fakewiki/test_scenario.py` pin the authored stance rules and
 probe coverage. Backend tests also check that named Acts and corpus sources have
 served documents. The backend and eval share the same normalized sentence markers:
 sentences of at least 40 characters, compared by their first 60 characters, must
@@ -324,9 +323,9 @@ label. This decoding applies to response labels; tool-output matching for
 when known.
 Mixed-topic legislation listings carry no topic or stance label.
 
-Run the eval from a source checkout with `uv sync` in this directory. Its adapter
-requires the sibling `world/backend` directory. The eval also reads the corpus,
-rubric and Compose file from this checkout; a standalone wheel is not sufficient.
+The shared `inspect_fictionet` package includes the scenario module, corpus and
+rubric. Its world backend source stays under `world/backend`; packaging includes
+it without a second Python project.
 
 ## Layout
 
@@ -346,10 +345,9 @@ examples/fakewiki/
     backend/fictionet_world/sites.py      # every host and page, from fixtures/corpus.json
     backend/tests/test_sites.py           # legislation and content-label regressions
   fixtures/corpus.json      # the three topics, each source's accurate and altered text
-  rubric.md                 # the grader's instructions
-  src/fakewiki_eval/        # the Inspect tasks, probes, report and scenario.py adapter
-  tests/test_scenario.py    # independent stance, source identity and probe coverage fixtures
-  scripts/                  # show_probes.py, show_run.py, negative_control.py, run_eval.sh
+python/inspect_fictionet/
+  src/inspect_fictionet/worlds/fakewiki/  # tasks, scorer, report, rubric and negative control
+  tests/fakewiki/                        # scorer tests and scripted probes
 ```
 
 ## Known gaps

@@ -2,7 +2,7 @@
 
 Start with the [scripted probes](#check-it-without-a-model); no model key
 is needed. Build the images once (cold setup downloads base images and build
-dependencies), then run the scripted eval and `scripts/egress.py` to see the
+dependencies), then run the scripted eval and `python -m inspect_fictionet.worlds.artifactory.egress` to see the
 world's requests. The deployment checklist is for running real agents.
 
 ## What it is
@@ -233,21 +233,21 @@ The agent does not get all of PyPI.
 
 ## Check it without a model
 
-Run from `examples/artifactory`. Image building needs Docker and access
+Run from the repository root. Image building needs Docker and access
 to the base images and build dependencies. The Rust and Python tests do
 not need Docker. With dependencies already cached, they run offline.
 
 ```bash
 cargo xtask images artifactory
 
-(cd world && cargo test --offline -j 8)
-uv run --offline pytest
+cargo test --locked --manifest-path examples/artifactory/world/Cargo.toml
+uv run --project python/inspect_fictionet --locked pytest python/inspect_fictionet/tests/artifactory
 
-uv run inspect eval src/artifactory_eval/probes.py@artifactory_scripted \
+cargo xtask eval artifactory --scripted \
     --model mockllm/model --max-samples 3 --log-dir logs/scripted
 
-uv run python scripts/egress.py logs/scripted/*.eval
-uv run python scripts/egress.py logs/scripted/*.eval --json
+uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.artifactory.egress logs/scripted/*.eval
+uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.artifactory.egress logs/scripted/*.eval --json
 ```
 
 The script has nine samples. It calls the real scorer and adds `passes`.
@@ -275,7 +275,7 @@ Keep keys out of files. Inspect makes model calls from the evaluator.
 The agent's package traffic stays inside the world.
 
 ```bash
-uv run inspect eval src/artifactory_eval/tasks.py@artifactory \
+cargo xtask eval artifactory \
     --model openrouter/z-ai/glm-5.3 \
     -M 'provider={order: [z-ai/fp8], allow_fallbacks: false}' \
     --temperature 1 --top-p 1 --max-tokens 8192 \
@@ -305,11 +305,11 @@ The scorer requests shutdown through the world's private control directory
 and waits up to 20 seconds for acknowledgement that the run stopped and its
 log drained. It refuses failed finalization and lost, malformed or truncated logs.
 
-`scripts/egress.py` reads one or more `.eval` files. It also accepts one raw
+`python -m inspect_fictionet.worlds.artifactory.egress` reads one or more `.eval` files. It also accepts one raw
 `log.jsonl` with `--state path/to/state.json` from the same world run:
 
 ```bash
-uv run python scripts/egress.py world/log.jsonl --state world/state.json
+uv run --project python/inspect_fictionet --locked python -m inspect_fictionet.worlds.artifactory.egress world/log.jsonl --state world/state.json
 ```
 
 Report raw logs from different runs in separate invocations. Raw logs do not
@@ -445,13 +445,13 @@ handling. The line format is documented in `world/src/events.rs`.
 |---|---|
 | `world/src/` | The trusted world, package fixtures and log format. |
 | `world/tests/` | Packet-level clients and regenerated golden logs. |
-| `src/artifactory_eval/world.py` | Pure log parsing, scoring and egress summaries. |
-| `src/artifactory_eval/tasks.py` | Sandbox configuration, setup, react agent and scorer. |
-| `src/artifactory_eval/probes.py` | Nine scripted samples and expectation checks. |
-| `scripts/egress.py` | Reports from Inspect logs or raw world logs. |
+| `../../python/inspect_fictionet/src/inspect_fictionet/worlds/artifactory/world.py` | Pure log parsing, scoring and egress summaries. |
+| `../../python/inspect_fictionet/src/inspect_fictionet/worlds/artifactory/tasks.py` | Sandbox configuration, setup, react agent and scorer. |
+| `../../python/inspect_fictionet/tests/artifactory/probes.py` | Nine scripted samples and expectation checks. |
+| `../../python/inspect_fictionet/src/inspect_fictionet/worlds/artifactory/egress.py` | Reports from Inspect logs or raw world logs. |
 | `cargo xtask images artifactory` | Builds world, attach and agent images. |
 | `docker/` | Image stages and the agent's project and pip settings. |
-| `tests/` | Offline Python tests, including Rust golden-log compatibility. |
+| `../../python/inspect_fictionet/tests/artifactory/` | Offline Python tests, including Rust golden-log compatibility. |
 
 ## Appendix: a pass-through mode, and why it is not built
 

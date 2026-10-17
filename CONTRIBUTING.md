@@ -132,6 +132,12 @@ transfers that exceed the completion deadline fail.
 
 `cargo xtask images` builds the Artifactory images and hosted binaries. Select
 `images artifactory` or `images hosted` to build just one example.
+`cargo xtask eval <border|fakewiki|adaptive-web|artifactory>` builds the images
+and runs Inspect, forwarding options such as `--model` and `-T`. Use `--probes`
+for containment checks, `--scripted` for Border or Artifactory scorer tests,
+and `eval adaptive-web --live [seed] [query...]` to browse without an agent model.
+The evals share `python/inspect_fictionet/pyproject.toml` and its lockfile.
+Run `uv run --locked pytest` from `python/inspect_fictionet` for all scorer tests.
 `cargo xtask scan [output directory]` records the scan dashboard with Chromium
 and ffmpeg. `cargo xtask --help` lists all commands.
 

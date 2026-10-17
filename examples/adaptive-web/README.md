@@ -29,7 +29,7 @@ they do outside.
 ## Quick start
 
 Prerequisites: Linux, Docker with Compose v2, `/dev/net/tun`, Python 3.12 or
-later, and uv. Cold setup downloads base images and packages and builds the
+later, Rust 1.91 or later, and uv. Cold setup downloads base images and packages and builds the
 world; allow several minutes before the first result.
 
 From the repository root, run this to print searches, pages and the world's
@@ -38,10 +38,7 @@ The deterministic stub generator needs no key. The runtime world has no
 network access after setup.
 
 ```bash
-(
-    cd examples/adaptive-web
-    ADAPTIVE_WEB_GENERATOR=stub scripts/live_demo.sh corvane-acquisition
-)
+ADAPTIVE_WEB_GENERATOR=stub cargo xtask eval adaptive-web --live corvane-acquisition
 ```
 
 The demo keeps its pages in `examples/adaptive-web/store/<seed>/`, owned by
@@ -55,10 +52,9 @@ or remove that seed's directory with `sudo`.
 Run the probes to check the world's requests:
 
 ```bash
-cd examples/adaptive-web
-uv sync
-uv run inspect eval src/adaptive_web_eval/probes.py@adaptive_web_probes --model mockllm/model --log-dir logs/probes
-uv run python scripts/show_probes.py
+uv sync --project python/inspect_fictionet --locked
+cargo xtask eval adaptive-web --probes --model mockllm/model --log-dir logs/probes
+uv run --project python/inspect_fictionet --locked inspect view --log-dir logs/probes
 ```
 
 Live, with pages written through [OpenRouter](https://openrouter.ai). The key
@@ -67,15 +63,15 @@ container only:
 
 ```bash
 export OPENROUTER_API_KEY=...
-scripts/live_demo.sh halvard-cve "halvard gateway vulnerability"
+cargo xtask eval adaptive-web --live halvard-cve "halvard gateway vulnerability"
 ```
 
 The demo with a real agent, here Claude Sonnet 5.5 doing the research:
 
 ```bash
 export ADAPTIVE_WEB_GENERATOR=openrouter ADAPTIVE_WEB_NETWORK=bridge
-uv run inspect eval src/adaptive_web_eval/tasks.py@adaptive_web --model openrouter/anthropic/claude-sonnet-5.5 --log-dir logs/live
-uv run python scripts/show_run.py
+cargo xtask eval adaptive-web --model openrouter/anthropic/claude-sonnet-5.5 --log-dir logs/live
+uv run --project python/inspect_fictionet --locked inspect view --log-dir logs/live
 ```
 
 The first run builds the images (`fictionet-adaptive-web-*`), which takes a
@@ -85,12 +81,12 @@ Settings, all from the environment:
 
 | variable | what it sets |
 |---|---|
-| `ADAPTIVE_WEB_GENERATOR` | `stub`, `openrouter`, `anthropic`, or `replay`; default: `stub` in Compose/Inspect, `openrouter` in `scripts/live_demo.sh` |
+| `ADAPTIVE_WEB_GENERATOR` | `stub`, `openrouter`, `anthropic`, or `replay`; default: `stub` in Compose/Inspect, `openrouter` in `cargo xtask eval adaptive-web --live` |
 | `ADAPTIVE_WEB_MODEL` | the model; by default `google/gemini-3.1-flash-lite` on OpenRouter and `claude-haiku-4-5-20251001` on Anthropic |
-| `ADAPTIVE_WEB_NETWORK` | the world container's network: `none` (default), or `bridge` to reach a model API |
+| `ADAPTIVE_WEB_NETWORK` | the world container's network: `none` for stub/replay; `bridge` for model APIs; overrides the automatic choice |
 | `ADAPTIVE_WEB_PREFETCH` | how many pages behind each new result list to make ahead of time (default 3 with a model) |
 | `ADAPTIVE_WEB_REASONING` | reasoning effort sent to OpenRouter, for models that think before writing (`none`, `minimal`, ...) |
-| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; default: a fresh volume per run under Inspect, the Compose project's named `store` volume under `docker compose` (kept until `docker compose down --volumes`), and `examples/adaptive-web/store` in `scripts/live_demo.sh` |
+| `ADAPTIVE_WEB_STORE_DIR` | an absolute host directory to keep pages in across runs; default: a fresh container store per run under Inspect, the Compose project's named `store` volume under `docker compose` (kept until `docker compose down --volumes`), and `examples/adaptive-web/store` in `cargo xtask eval adaptive-web --live` |
 | `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY` | the provider's key. It is sent in the API request's header and nowhere else: never logged, stored or put in an error message. |
 
 Only the world container gets a network, and only in live mode. The
@@ -325,7 +321,7 @@ two). `call_ms` is the accepted answer's call time alone, or null on failure.
 `cost_known` is the reported subtotal and `cost_unknown` counts attempts
 without a reported cost. `cost`, `input_tokens` and `output_tokens` are
 null if any included value is unknown. Attempt rows keep individual costs;
-their terminal `generation` object holds totals. Both report scripts use
+their terminal `generation` object holds totals. The backend accounting functions use
 these totals for generation statistics and count every attempt's cost once.
 They print a known subtotal, the number of unknown cost records, and a null
 recorded total if any cost is unknown. Cost means cover only fully known
@@ -350,13 +346,13 @@ Generation percentiles cover the `generated` measured totals carried by
 HTTP responses, including failed generations. `generation_untimed` and
 `generation_failed` show the other counts in that population. The score
 does not include casts or prefetches absent from HTTP responses; the store
-reports include them. The scripts report timed, untimed and failed generation
+reports include them. The accounting functions report timed, untimed and failed generation
 counts, and p50/p95 over timed generations. Each attempt's `ms` remains its
 individual HTTP call duration, excluding backoff.
 
 Four fast models, each making the result lists for the seeds' six queries
 and the twelve or so pages behind their first results, one at a time with no
-prefetch (`scripts/bench.py`, 7 October 2026). These historical timings
+prefetch (7 October 2026). These historical timings
 count successful HTTP calls only; they omit failed calls and backoff.
 The historical cost means cover reported costs of completed generations;
 their unknown-cost and failed-attempt populations were not published.
@@ -393,7 +389,7 @@ database, stock pages, package pages, docs and Hacker News threads. The
 judge was told that one was written by a model and asked which. Each pair
 was shown in both orders. The table gives how often the judge picked the
 real one as the fake; 50% means it cannot tell them apart
-(`scripts/realism.py`):
+(`python -m inspect_fictionet.worlds.adaptive_web.realism`):
 
 | model | result lists | pages | pages not backing their snippet (earlier lenient rule) | pages with tells |
 |---|---|---|---|---|
@@ -412,11 +408,8 @@ matched, and finding half the pieces was enough. These counts do not measure
 support under the current rule. A stricter check, run on the same pages
 before the rule was relaxed, flagged 6 of 12 Gemini pages and 6 of 12
 Haiku 4.5 pages, versus the published 0 and 2.
-To rescore retained output, run `python3 scripts/bench.py OUT_DIR --report`.
-It recomputes "pages not backing their snippet" from each stored generated
-page's `context.mentions` and body, and reports pages with unchecked snippets
-separately. Fixed pages are excluded. It checks only mentions present at
-page creation and leaves stored results unchanged.
+The backend's `adaptive.world.rescore_snippets` recomputes support from each
+stored page's `context.mentions` and body without changing the record.
 
 The historical judge counts used the first character of the judge's
 `written_by_ai` value after trimming whitespace and ignoring case. An
@@ -514,8 +507,8 @@ as 503.
 
 ## Keep the generated pages and serve them again
 
-By default an Inspect run gets a fresh store, a Compose volume that goes
-away with the run, and `scripts/live_demo.sh` keeps its store in `./store`.
+By default an Inspect run gets a fresh container store that goes
+away with the run, and `cargo xtask eval adaptive-web --live` keeps its store in `examples/adaptive-web/store`.
 Set `ADAPTIVE_WEB_STORE_DIR` to an absolute directory to keep the store
 there instead. A later run with the same seed and directory starts from
 everything the earlier one made: the same pages, results, cast and
@@ -550,8 +543,8 @@ requires a store initialized by a generator.
 
 ```bash
 export ADAPTIVE_WEB_STORE_DIR=$PWD/store
-OPENROUTER_API_KEY=... scripts/live_demo.sh halvard-cve
-ADAPTIVE_WEB_GENERATOR=replay scripts/live_demo.sh halvard-cve
+OPENROUTER_API_KEY=... cargo xtask eval adaptive-web --live halvard-cve
+ADAPTIVE_WEB_GENERATOR=replay cargo xtask eval adaptive-web --live halvard-cve
 ```
 
 The world runs as root, so the files it writes into a host directory belong
@@ -597,17 +590,18 @@ or `missing` cache states fail the inventory check.
 
 ## Tests
 
-* `cargo test --locked --manifest-path world/Cargo.toml` runs the world end to end
+* `cargo test --locked --manifest-path examples/adaptive-web/world/Cargo.toml` runs the world end to end
   with the stub generator and compares its log with the recorded one
   (`tests/golden/`). It also checks that every result resolves to a page
   with its title, that URLs return the same bytes, and that responses and
   certificates are dated from the seed's day.
   It also checks that missing or malformed backend metadata returns 502
   and records `meta_error`.
-* `uv run --locked python -m unittest discover -s tests -p 'test_*.py'`
+* `uv run --project python/inspect_fictionet --locked pytest python/inspect_fictionet/tests/adaptive_web`
   checks citation identity, complete delivery, checked preflights and probe
   diagnostics, request multiplicity and cache sequences. It needs no Docker.
-* `cd world/backend && python3 -m unittest discover tests` runs the
+* From `examples/adaptive-web/world/backend`,
+  `uv run --project ../../../../python/inspect_fictionet --locked python -m pytest tests` runs the
   backend's tests: the consistency rules, the make-once store across
   threads and processes, replay, reading model answers, the tells, and the
   model generator against a fake OpenRouter on 127.0.0.1, including that
@@ -631,8 +625,9 @@ examples/adaptive-web/
     backend/backend.py      # the HTTP server on 127.0.0.1
     backend/adaptive/       # seed, llm, prompts, generate, stub, world, store, render, tells, ca
     backend/tests/          # the backend's tests
-  src/adaptive_web_eval/    # the Inspect demo (tasks.py) and the probes
-  scripts/                  # live_demo.sh, bench.py, realism.py, show_run.py, latency.py, show_probes.py
+python/inspect_fictionet/
+  src/inspect_fictionet/worlds/adaptive_web/  # task, scorer and realism judge
+  tests/adaptive_web/                        # scorer tests and scripted probes
 ```
 
 ## Limits

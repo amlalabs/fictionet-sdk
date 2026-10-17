@@ -46,7 +46,8 @@ WORKDIR /app
 CMD ["adaptive-web-world"]
 
 FROM debian:bookworm-slim AS attach
-COPY --from=build /usr/local/bin/fictionet /usr/local/bin/
+COPY --from=build /usr/local/bin/fictionet /fictionet
+RUN ln -s /fictionet /usr/local/bin/fictionet
 
 FROM python:3.12-slim-bookworm AS agent
 RUN apt-get update && apt-get install -y --no-install-recommends \
