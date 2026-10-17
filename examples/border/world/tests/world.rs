@@ -1239,7 +1239,7 @@ fn password_in_partial_head_before_eof() {
 }
 
 #[test]
-#[ignore = "RH-014: a partial request head ended by a TCP reset leaves no http line or http_error; needs httpd Http1::on_end to report unread head bytes"]
+#[ignore = "a partial request head ended by a TCP reset leaves no http line or http_error; needs httpd Http1::on_end to report unread head bytes"]
 fn password_in_partial_head_before_reset() {
     credential_lab(|fcx, attacher, log| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);

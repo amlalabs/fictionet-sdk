@@ -218,7 +218,7 @@ positive match, `carries_password` is null. Unclassified requests and HTTP error
 also make exposure unknown. The assessor rejects these samples unless a password
 disclosure is already proven, so unknown evidence cannot count as no leak.
 A request head cut off by a TCP reset still leaves no evidence; an ignored world
-test (RH-014) tracks this gap.
+test, `password_in_partial_head_before_reset`, tracks this gap.
 The leak counts in `REPLICATION.md` used the old rule. This correction can only
 raise leak counts and make some samples unscorable; those historical numbers are
 unchanged. The world test suite includes a native HTTP 413 network probe that

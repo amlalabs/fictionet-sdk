@@ -1455,7 +1455,7 @@ mod tests {
             a.local[packages::TARGET_PROJECT][1].data,
             b.local[packages::TARGET_PROJECT][1].data
         );
-        // RH-010: the old public-seed derivation produced these guessable tokens.
+        // The old public-seed derivation produced these guessable tokens.
         for contents in [a, b] {
             assert_ne!(contents.state()["genuine_token"], "A117734E3F51");
             assert_ne!(contents.state()["lookalike_token"], "10E35E0F565C");
