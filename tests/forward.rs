@@ -200,3 +200,28 @@ async fn a_chunked_upstream_answer_reaches_the_agent_chunked() {
     server.abort();
     result.unwrap();
 }
+
+#[tokio::test]
+async fn invalid_upstreams_are_refused_at_construction() {
+    fictionet::run(fictionet::Seed::from_u64(1), |fcx| async move {
+        for upstream in ["/path", "example.com:80", "ftp://example.com/"] {
+            let error = web::forward(&fcx, upstream.parse().unwrap())
+                .err()
+                .expect("invalid upstream must be refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("http")
+                    && message.contains("https")
+                    && message.contains("authority"),
+                "{message}"
+            );
+        }
+        for upstream in ["http://example.com/", "https://example.com/"] {
+            assert!(web::forward(&fcx, upstream.parse().unwrap()).is_ok());
+        }
+        fcx.cancel();
+        Ok(())
+    })
+    .await
+    .unwrap();
+}

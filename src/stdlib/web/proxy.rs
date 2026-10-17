@@ -208,17 +208,29 @@ async fn dispatch(
 /// Forwards requests to a fixed HTTP or HTTPS origin through the world's
 /// network. Paths, queries, bodies, and the original `Host` header are
 /// preserved. Connection-specific headers are removed in both directions.
-/// The upstream must contain a scheme and authority. Its path is ignored.
+/// `upstream` must have an `http` or `https` scheme and an authority. Its
+/// path is ignored.
 /// The origin does not depend on [`Target`], so default-host requests can
 /// be forwarded here even when their routing is [`Routing::Fallback`].
 /// This handler requires a tokio runtime and real host I/O.
-/// Returns an error in a lab before constructing a client.
+/// Returns an error in a lab before constructing a client, and for an
+/// upstream without such a scheme or without an authority.
 pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
+    use http::uri::Scheme;
     fcx.require_real_io()?;
-    Ok(Forward {
-        upstream,
-        client: Arc::new(proxy_client()),
-    })
+    let parts = upstream.into_parts();
+    match (parts.scheme, parts.authority) {
+        (Some(scheme), Some(authority)) if scheme == Scheme::HTTP || scheme == Scheme::HTTPS => {
+            Ok(Forward {
+                scheme,
+                authority,
+                client: Arc::new(proxy_client()),
+            })
+        }
+        _ => Err(Error::msg(
+            "web::forward needs an upstream with an http or https scheme and an authority",
+        )),
+    }
 }
 
 /// A handler that forwards to one fixed origin.
@@ -226,7 +238,8 @@ pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
 /// returns upstream responses and needs no local routing rejections.
 #[derive(Clone)]
 pub struct Forward {
-    upstream: http::Uri,
+    scheme: http::uri::Scheme,
+    authority: http::uri::Authority,
     client: Arc<ProxyClient>,
 }
 
@@ -248,24 +261,15 @@ impl tower_service::Service<Request<Body>> for Forward {
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let client = self.client.clone();
-        let upstream = self.upstream.clone();
+        let scheme = self.scheme.clone();
+        let authority = self.authority.clone();
         Box::pin(dispatch(
             client,
             request,
             move |path| {
                 Ok(http::Uri::builder()
-                    .scheme(
-                        upstream
-                            .scheme()
-                            .cloned()
-                            .ok_or_else(|| Error::msg("upstream has no scheme"))?,
-                    )
-                    .authority(
-                        upstream
-                            .authority()
-                            .cloned()
-                            .ok_or_else(|| Error::msg("upstream has no authority"))?,
-                    )
+                    .scheme(scheme)
+                    .authority(authority)
                     .path_and_query(path)
                     .build()?)
             },

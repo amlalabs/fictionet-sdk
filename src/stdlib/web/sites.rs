@@ -170,7 +170,9 @@
 //! that name. The clone needs no change.
 //! `web::forward(&fcx, upstream)?` (feature `web-proxy`) forwards every
 //! request to one fixed origin over the world's own network. It takes the
-//! scheme and authority from `upstream` and ignores its path.
+//! scheme and authority from `upstream` and ignores its path. An upstream
+//! without an `http` or `https` scheme, or without an authority, is an
+//! error.
 //!
 //! The request's path, query, body, and original `Host` header are kept,
 //! so the Gmail clone sees `Host: gmail.googleapis.com`. Hop-by-hop headers
