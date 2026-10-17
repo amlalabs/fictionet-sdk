@@ -19,12 +19,8 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# The workspace member and the path dev-dependency, which Cargo loads for
-# any build. Examples link dev-dependencies, and tests/copy_and_own reads
-# a file in codegen/tests.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
 COPY examples examples
 ARG TARGETARCH

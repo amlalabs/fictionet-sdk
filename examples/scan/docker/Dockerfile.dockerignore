@@ -8,5 +8,7 @@
 !codegen
 !xtask
 !tests
-!examples/*.rs
-!examples/scan/main.rs
+!examples
+**/target
+**/.venv
+**/__pycache__

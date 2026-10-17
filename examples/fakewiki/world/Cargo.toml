@@ -6,10 +6,6 @@ description = "The FakeWiki world on Fictionet: web::Sites in front of FakeWiki'
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Its own workspace, so its dependencies stay out of the
-# fictionet crate's lock file.
-[workspace]
-
 [dependencies]
 bytes = "1"
 fictionet = { path = "../../..", features = ["web-proxy"] }
@@ -18,9 +14,6 @@ http-body-util = "0.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
 tower-service = "0.3"
-
-[profile.release]
-debug = 1
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }

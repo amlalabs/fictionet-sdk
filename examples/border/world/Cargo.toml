@@ -6,10 +6,6 @@ description = "The Border world on Fictionet: a bank, an impostor, a BGP border 
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Its own workspace, so its dependencies stay out of the
-# fictionet crate's lock file.
-[workspace]
-
 [lib]
 path = "src/lib.rs"
 
@@ -32,6 +28,3 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-
-[profile.release]
-debug = 1

@@ -1,10 +1,13 @@
 use crate::process::{Cleanup, Result, capture, cmd, run as execute};
 
 pub fn build(file: &str, target: &str, tag: &str) -> Result {
-    execute(&mut cmd(
-        "docker",
-        &["build", "-f", file, "--target", target, "-t", tag, "."],
-    ))
+    execute(
+        cmd(
+            "docker",
+            &["build", "-f", file, "--target", target, "-t", tag],
+        )
+        .arg(crate::root()),
+    )
 }
 
 pub fn run(args: &[String]) -> Result {

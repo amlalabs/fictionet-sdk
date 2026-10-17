@@ -84,19 +84,21 @@ pub fn run(args: &[String]) -> Result {
 
 fn tcpudp() -> Result {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".into());
-    execute(&mut cmd(
-        "docker",
-        &[
-            "build",
-            "-t",
-            "fictionet-tcpudp-test",
-            "--build-arg",
-            &format!("PROFILE={profile}"),
-            "-f",
-            "tests/docker/tcpudp/Dockerfile",
-            ".",
-        ],
-    ))?;
+    execute(
+        cmd(
+            "docker",
+            &[
+                "build",
+                "-t",
+                "fictionet-tcpudp-test",
+                "--build-arg",
+                &format!("PROFILE={profile}"),
+                "-f",
+                "tests/docker/tcpudp/Dockerfile",
+            ],
+        )
+        .arg(crate::root()),
+    )?;
     let name = format!("fictionet-tcpudp-test-{}", std::process::id());
     let mut command = cmd(
         "docker",

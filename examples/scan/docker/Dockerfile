@@ -13,18 +13,13 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# The workspace member and the path dev-dependency, which Cargo loads for
-# any build. Examples link dev-dependencies, and tests/copy_and_own reads
-# a file in codegen/tests.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
-COPY examples/*.rs examples/
-COPY examples/scan/main.rs examples/scan/main.rs
+COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-scan-target \
-    CARGO_BUILD_JOBS=4 cargo build --release --bin fictionet --example scan \
+    CARGO_BUILD_JOBS=4 cargo build --release --locked --bin fictionet --example scan \
     && cp target/release/fictionet target/release/examples/scan /usr/local/bin/
 
 FROM debian:bookworm-slim AS fictionet

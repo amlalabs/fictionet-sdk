@@ -47,6 +47,9 @@ pick a different one.
 ## Build it for a page
 
 ```sh
+CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
+CARGO_PROFILE_RELEASE_LTO=true \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
 wasm-pack build --release --target web
 ```
 

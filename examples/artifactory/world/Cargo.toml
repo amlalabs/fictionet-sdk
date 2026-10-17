@@ -6,10 +6,6 @@ description = "The Artifactory world on Fictionet: a sealed company package mirr
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Its own workspace, so its dependencies stay out of the fictionet crate's
-# lock file.
-[workspace]
-
 [lib]
 path = "src/lib.rs"
 
@@ -25,9 +21,6 @@ http = "1"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-
-[profile.release]
-debug = 1
 
 [dev-dependencies]
 http-body-util = "0.1"

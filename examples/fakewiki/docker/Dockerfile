@@ -20,17 +20,13 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# The workspace member and the path dev-dependency, which Cargo loads for
-# any build. Examples link dev-dependencies, and tests/copy_and_own reads
-# a file in codegen/tests.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
-COPY examples/*.rs examples/
+COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-fakewiki-attach-target \
-    cargo build --release --bin fictionet \
+    cargo build --release --locked --bin fictionet \
     && cp target/release/fictionet /usr/local/bin/
 
 FROM rust:1.92-slim-bookworm AS build-world
@@ -40,21 +36,13 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# The workspace member and the path dev-dependency, which Cargo loads for
-# any build. Examples link dev-dependencies, and tests/copy_and_own reads
-# a file in codegen/tests.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
-COPY examples/*.rs examples/
-COPY examples/fakewiki/world/Cargo.toml examples/fakewiki/world/Cargo.lock examples/fakewiki/world/
-COPY examples/common examples/common
-COPY examples/fakewiki/world/src examples/fakewiki/world/src
+COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/examples/fakewiki/world/target,id=fictionet-fakewiki-world-target \
-    cd examples/fakewiki/world \
-    && cargo build --release \
+    --mount=type=cache,target=/src/target,id=fictionet-fakewiki-world-target \
+    cargo build --release --locked -p fakewiki-world --bin fakewiki-world \
     && cp target/release/fakewiki-world /usr/local/bin/
 
 FROM python:3.12-slim-bookworm AS world

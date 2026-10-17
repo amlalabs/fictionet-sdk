@@ -16,23 +16,15 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# The workspace member and the path dev-dependency, which Cargo loads for
-# any build. Examples link dev-dependencies, and tests/copy_and_own reads
-# a file in codegen/tests.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
-COPY examples/*.rs examples/
-COPY examples/adaptive-web/world/Cargo.toml examples/adaptive-web/world/Cargo.lock examples/adaptive-web/world/
-COPY examples/common examples/common
-COPY examples/adaptive-web/world/src examples/adaptive-web/world/src
+COPY examples examples
 # At most 8 jobs, so the build fits next to other work on the machine.
 ARG CARGO_BUILD_JOBS=8
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/examples/adaptive-web/world/target,id=fictionet-adaptive-web-target \
-    cd examples/adaptive-web/world \
-    && cargo build --release --locked --bin adaptive-web-world \
+    --mount=type=cache,target=/src/target,id=fictionet-adaptive-web-target \
+    cargo build --release --locked -p adaptive-web-world --bin adaptive-web-world \
     && cargo build --release --locked -p fictionet --bin fictionet \
     && cp target/release/adaptive-web-world target/release/fictionet /usr/local/bin/
 

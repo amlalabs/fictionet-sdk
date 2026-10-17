@@ -9,3 +9,6 @@
 !xtask
 !tests
 !examples
+**/target
+**/.venv
+**/__pycache__

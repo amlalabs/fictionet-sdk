@@ -1,5 +1,12 @@
 [workspace]
-members = [".", "codegen", "codegen/tests/layouts", "xtask"]
+members = [
+    ".",
+    "codegen",
+    "codegen/tests/layouts",
+    "examples/*/world",
+    "examples/wasm_world",
+    "xtask",
+]
 exclude = ["fuzz"]
 resolver = "3"
 
@@ -143,6 +150,18 @@ opt-level = 2
 [profile.test]
 debug = "line-tables-only"
 opt-level = 1
+
+[profile.release.package.adaptive-web-world]
+debug = 1
+
+[profile.release.package.artifactory-world]
+debug = 1
+
+[profile.release.package.border-world]
+debug = 1
+
+[profile.release.package.fakewiki-world]
+debug = 1
 
 [[example]]
 name = "bottleneck_sites"

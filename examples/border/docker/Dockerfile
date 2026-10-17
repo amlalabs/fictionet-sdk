@@ -20,17 +20,13 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# The workspace member and the path dev-dependency, which Cargo loads for
-# any build. Examples link dev-dependencies, and tests/copy_and_own reads
-# a file in codegen/tests.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
-COPY examples/*.rs examples/
+COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-border-attach-target \
-    cargo build --release --bin fictionet \
+    cargo build --release --locked --bin fictionet \
     && cp target/release/fictionet /usr/local/bin/
 
 FROM rust:1.92-slim-bookworm AS build-world
@@ -40,21 +36,13 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# The workspace member and the path dev-dependency, which Cargo loads for
-# any build. Examples link dev-dependencies, and tests/copy_and_own reads
-# a file in codegen/tests.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
-COPY examples/*.rs examples/
-COPY examples/border/world/Cargo.toml examples/border/world/Cargo.lock examples/border/world/
-COPY examples/common examples/common
-COPY examples/border/world/src examples/border/world/src
+COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/examples/border/world/target,id=fictionet-border-world-target \
-    cd examples/border/world \
-    && cargo build --release --bin border-world \
+    --mount=type=cache,target=/src/target,id=fictionet-border-world-target \
+    cargo build --release --locked -p border-world --bin border-world \
     && cp target/release/border-world /usr/local/bin/
 
 FROM debian:bookworm-slim AS tools

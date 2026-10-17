@@ -15,12 +15,10 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# Cargo loads the workspace member and path dev-dependency for every build.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
-COPY examples/*.rs examples/
+COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-artifactory-attach-target \
     find src examples -type f -exec touch {} + \
@@ -41,18 +39,12 @@ COPY dashboard dashboard
 COPY benches benches
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
-COPY examples/*.rs examples/
-COPY examples/artifactory/world/Cargo.toml examples/artifactory/world/Cargo.lock examples/artifactory/world/
-COPY examples/common examples/common
-COPY examples/artifactory/world/src examples/artifactory/world/src
-COPY examples/artifactory/docker/agent/project/ledger.csv examples/artifactory/docker/agent/project/ledger.csv
+COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/examples/artifactory/world/target,id=fictionet-artifactory-world-target \
+    --mount=type=cache,target=/src/target,id=fictionet-artifactory-world-target \
     find src examples -type f -exec touch {} + \
-    && cd examples/artifactory/world \
-    && cargo build --release --locked -j 8 --bin artifactory-world \
+    && cargo build --release --locked -j 8 -p artifactory-world --bin artifactory-world \
     && cp target/release/artifactory-world /usr/local/bin/
 
 # The CA is made at startup. Only its certificate reaches the agent.

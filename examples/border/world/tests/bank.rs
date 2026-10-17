@@ -565,8 +565,10 @@ fn insufficient_funds() {
 fn exact_250_payment() {
     lab(|fcx| {
         // Python checks this same request and evidence against the prompt and scorer.
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/payment.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../python/inspect_fictionet/tests/border/fixtures/payment.json"
+        ))
+        .unwrap();
         let bank = bank(fcx, Variant::Legitimate, Task::Pay, ServedBy::Bank);
         let cookie = login_cookie(&bank);
         let got = ask(

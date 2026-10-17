@@ -8,18 +8,14 @@ COPY src src
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
-# The workspace member and the path dev-dependency, which Cargo loads for
-# any build. Examples link dev-dependencies, and tests/copy_and_own reads
-# a file in codegen/tests.
 COPY codegen codegen
 COPY xtask xtask
-# Copy all tests because Cargo reads every test target the manifest declares.
 COPY tests tests
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-proxy-target \
     find src examples tests/web_fixture -type f -exec touch {} + \
-    && cargo build --release --features web-proxy --bin fictionet --example web_fixture \
+    && cargo build --release --locked --features web-proxy --bin fictionet --example web_fixture \
     && cp target/release/fictionet target/release/examples/web_fixture /usr/local/bin/
 
 # A Go client tested and built with the standard library only.
