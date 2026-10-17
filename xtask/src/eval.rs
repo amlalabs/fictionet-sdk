@@ -10,7 +10,7 @@ Images are built from this checkout unless --no-build is given.
 Inspect arguments, including --model, --epochs, --log-dir and -T, pass through.
 Logs default to logs/<world>. FakeWiki defaults to the three local Ollama models.";
 
-fn uv(args: &[&str]) -> Command {
+pub(crate) fn uv(args: &[&str]) -> Command {
     let mut command = cmd(
         "uv",
         &["run", "--locked", "--project", "python/inspect_fictionet"],
