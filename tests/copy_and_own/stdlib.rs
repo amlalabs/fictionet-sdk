@@ -5,7 +5,6 @@
 #[path = "../../src/stdlib/mod.rs"]
 pub mod stdlib;
 
-pub use stdlib::codec::{self as combinators, self as demux, json_syntax};
 pub use stdlib::*;
 
 fictionet::cfg_observe! {

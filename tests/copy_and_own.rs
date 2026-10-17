@@ -913,14 +913,14 @@ fn copied_tls_provider_uses_public_run_entropy() {
 fn copied_collect_decodes_a_whole_wire_datagram_and_raw_bytes() {
     let message = dhcp::Message::new(dhcp::BOOTREQUEST, 42);
     let bytes = message.to_bytes().unwrap();
-    let mut decoded = Stream::new(combinators::Collect::<dhcp::Message>::new(65535));
+    let mut decoded = Stream::new(codec::Collect::<dhcp::Message>::new(65535));
     pump(&mut decoded, &bytes, |_| panic!("a datagram needs EOF")).unwrap();
     let mut items = Vec::new();
     finish(&mut decoded, |item| items.push(item)).unwrap();
     assert_eq!(items, [message]);
     assert!(decoded.next().is_none());
 
-    let mut raw = Stream::new(combinators::Collect::bytes(3));
+    let mut raw = Stream::new(codec::Collect::bytes(3));
     pump(&mut raw, b"abc", |_| panic!("a datagram needs EOF")).unwrap();
     let mut items = Vec::new();
     finish(&mut raw, |item| items.push(item)).unwrap();
@@ -930,7 +930,7 @@ fn copied_collect_decodes_a_whole_wire_datagram_and_raw_bytes() {
 #[test]
 fn copied_demux_bounds_input_allocation_growth() {
     use fictionet::stdlib::codec::{Ending, Lines};
-    let mut streams = demux::Demux::new(2, 8, |_: &u8| Lines::new(32, Ending::LfOrCrlf));
+    let mut streams = codec::Demux::new(2, 8, |_: &u8| Lines::new(32, Ending::LfOrCrlf));
     assert_eq!(streams.push_with_budget(&1, b"a\n", 2), 2);
     assert!(streams.next().unwrap().1.is_ok());
     assert_eq!(streams.total(), 2);
@@ -940,6 +940,8 @@ fn copied_demux_bounds_input_allocation_growth() {
 
 #[test]
 fn copied_json_syntax_reports_text_and_absolute_positions() {
+    use codec::json_syntax;
+
     let input = br#"["\ud800\udc00",-12.50e+2]"#;
     let (text, end) = json_syntax::read_string(input, 1).unwrap();
     assert_eq!(text, "\u{10000}");
