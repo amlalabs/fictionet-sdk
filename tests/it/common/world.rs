@@ -5,7 +5,7 @@ use std::time::Duration;
 use fictionet::run;
 use fictionet::{Cx, block_on, lab};
 
-use crate::common::done::Done;
+use crate::common::done::{Done, ended_with_done};
 use crate::common::within;
 
 /// Runs a closed lab world within the host limit and requires Done.
@@ -29,11 +29,7 @@ where
             Err(fictionet::Error::from(Done))
         }))
     });
-    match result {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
+    ended_with_done(result).unwrap_or_else(|e| panic!("the world failed: {e}"));
 }
 
 /// Runs a world on real time within the host limit and requires Done.
@@ -59,9 +55,5 @@ where
             Err(fictionet::Error::from(Done))
         }))
     });
-    match result {
-        Err(e) if e.downcast_ref::<Done>().is_some() => {}
-        Err(e) => panic!("the world failed: {e}"),
-        Ok(()) => panic!("the world should end with Done"),
-    }
+    ended_with_done(result).unwrap_or_else(|e| panic!("the world failed: {e}"));
 }

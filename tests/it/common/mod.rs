@@ -26,6 +26,10 @@ pub mod poll;
 #[cfg(all(feature = "std", feature = "tokio"))]
 pub mod rustls_client;
 #[cfg(feature = "std")]
+pub mod temp;
+#[cfg(feature = "std")]
+pub mod threads;
+#[cfg(feature = "std")]
 pub mod timeout;
 #[cfg(feature = "std")]
 pub mod world;

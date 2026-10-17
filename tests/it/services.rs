@@ -7,6 +7,7 @@
 use crate::common::certs;
 use crate::common::done;
 use crate::common::echo_service;
+use crate::common::io;
 use crate::common::timeout;
 use crate::common::world;
 
@@ -22,6 +23,7 @@ mod tls;
 use done::Done;
 use echo_service::{Echo, Ticker};
 use fictionet::stdlib::sandbox::{Machine, machine};
+use io::read_some;
 use timeout::timeout;
 use world::world;
 
@@ -55,7 +57,7 @@ use fictionet::stdlib::serve::{
     self, Budget, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan,
     ServeOptions, Served, Timer, Transcript, Upgrade,
 };
-use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};
+use fictionet::stdlib::{ConnError, ip, tcp, udp};
 use fictionet::{Cx, block_on, lab, pair};
 
 // ---------------------------------------------------------------------------
@@ -78,19 +80,6 @@ fn two_machines(fcx: &Cx) -> (tcp::Endpoint, udp::Endpoint, tcp::Endpoint, udp::
 }
 
 const SERVER: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);
-
-/// Reads until `want` bytes arrived, the stream ends, or a second passes.
-async fn read_some<C: Connection>(fcx: &Cx, conn: &mut C, want: usize) -> Vec<u8> {
-    let mut got = Vec::new();
-    let mut buf = [0u8; 4096];
-    while got.len() < want {
-        match timeout(fcx, Duration::from_secs(1), conn.read(fcx, &mut buf)).await {
-            Some(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
-            _ => break,
-        }
-    }
-    got
-}
 
 // ---------------------------------------------------------------------------
 // Services used below

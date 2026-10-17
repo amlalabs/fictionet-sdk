@@ -1,7 +1,7 @@
 //! `listen` when the process runs out of file descriptors. Each test runs
 //! in a process of its own, because it lowers the process's descriptor limit.
 
-use crate::common::poll;
+use crate::common::{poll, threads};
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
@@ -10,37 +10,6 @@ use fictionet::relay::{self, Hello, Message, unix};
 use fictionet::{WorldSocket, attachments, listen};
 
 static LIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// The `stat` files of the threads whose name starts with `prefix`, opened
-/// now, so they can be read when no descriptors are left.
-fn thread_stats(prefix: &str) -> Vec<std::fs::File> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir("/proc/self/task").unwrap() {
-        let dir = entry.unwrap().path();
-        let comm = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
-        if comm.trim_end().starts_with(prefix) {
-            files.push(std::fs::File::open(dir.join("stat")).unwrap());
-        }
-    }
-    files
-}
-
-/// CPU time the threads have used so far, in clock ticks.
-fn ticks(stats: &[std::fs::File]) -> u64 {
-    use std::os::unix::fs::FileExt;
-    let mut total = 0;
-    for file in stats {
-        let mut buf = [0u8; 1024];
-        let n = file.read_at(&mut buf, 0).unwrap();
-        let stat = std::str::from_utf8(&buf[..n]).unwrap();
-        // Fields after the ")" that ends the name: state is field 3, utime
-        // and stime are fields 14 and 15.
-        let rest = &stat[stat.rfind(')').unwrap() + 2..];
-        let fields: Vec<&str> = rest.split(' ').collect();
-        total += fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
-    }
-    total
-}
 
 /// When `accept` fails for lack of descriptors, the helper thread does not
 /// spin on the listening socket. It accepts again once descriptors are free.
@@ -60,9 +29,9 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     let (attacher, _attachments) = attachments();
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     // A new thread sets its own name, so it may not have one yet.
-    let mut stats = thread_stats("fictionet-liste");
+    let mut stats = threads::stats(&["fictionet-liste"]);
     poll::until(Duration::from_secs(10), "listener thread name", || {
-        stats = thread_stats("fictionet-liste");
+        stats = threads::stats(&["fictionet-liste"]);
         !stats.is_empty()
     });
     assert_eq!(stats.len(), 1);
@@ -87,9 +56,9 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     let client = unix::connect(&path).unwrap();
     // The table is full: the world cannot accept the connection.
 
-    let before = ticks(&stats);
+    let before = threads::ticks(&stats)[0].1;
     std::thread::sleep(Duration::from_millis(1000));
-    let used = ticks(&stats) - before;
+    let used = threads::ticks(&stats)[0].1 - before;
 
     drop(filler);
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };

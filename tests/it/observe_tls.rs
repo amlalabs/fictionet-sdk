@@ -3,6 +3,7 @@
 //! The observer watches the pair, and sees the HTTP inside the TLS.
 
 use crate::common::certs;
+use crate::common::temp;
 
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
@@ -14,16 +15,6 @@ use fictionet::stdlib::{Connection, ConnectionExt, tcp};
 use fictionet::{Cx, Interface, InterfaceExt, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
-
-fn temp_socket() -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("fn-obstls-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("world.sock").to_str().unwrap().to_owned()
-}
 
 /// A CA, and a server and client config for `secret.test`.
 fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
@@ -93,7 +84,7 @@ fn text(v: &Value) -> String {
 
 #[test]
 fn an_observer_sees_http_inside_tls() {
-    let path = temp_socket();
+    let path = temp::socket();
     let (attacher, mut attachments) = fictionet::attachments();
     let _listening = fictionet::listen(
         fictionet::WorldSocket::UnixSocket(path.clone().into()),

@@ -10,6 +10,8 @@
 mod logged;
 #[path = "../it/common/poll.rs"]
 mod poll;
+#[path = "../it/common/temp.rs"]
+mod temp;
 
 use logged::logged;
 
@@ -20,17 +22,6 @@ use fictionet::stdlib::ip::checksum;
 use fictionet::{Interface, InterfaceExt, Packet};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
-
-fn temp_dir() -> std::path::PathBuf {
-    // Unix socket paths must be short, so not under a long target dir.
-    let n: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let dir = std::env::temp_dir().join(format!("fn-attach-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn userns_works() -> bool {
     Command::new("unshare")
@@ -117,7 +108,7 @@ fn echo_request(seq: u16) -> Vec<u8> {
 #[test]
 fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
     assert!(userns_works(), "unshare -rnm is not allowed here");
-    let dir = temp_dir();
+    let dir = temp::dir();
     let sock = dir.join("w.sock").to_str().unwrap().to_owned();
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = fictionet::listen(
@@ -232,7 +223,7 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
 #[test]
 fn resolv_conf_flag_picks_the_file_and_a_failed_write_names_it() {
     assert!(userns_works(), "unshare -rnm is not allowed here");
-    let dir = temp_dir();
+    let dir = temp::dir();
     let sock = dir.join("w.sock").to_str().unwrap().to_owned();
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = fictionet::listen(
@@ -331,7 +322,7 @@ fn hold_until(attachments: fictionet::Attachments, name: &'static str, done: std
 #[test]
 fn down_link_clears_a_pods_eth0_before_tun0_takes_the_default_route() {
     assert!(userns_works(), "unshare -rnm is not allowed here");
-    let dir = temp_dir();
+    let dir = temp::dir();
     let sock = dir.join("w.sock").to_str().unwrap().to_owned();
     let (attacher, attachments) = fictionet::attachments();
     let listening = fictionet::listen(
@@ -434,7 +425,7 @@ fn down_link_with_no_such_link_fails() {
 #[test]
 fn world_wait_waits_for_a_late_world() {
     assert!(userns_works(), "unshare -rnm is not allowed here");
-    let dir = temp_dir();
+    let dir = temp::dir();
     let sock = dir.join("w.sock").to_str().unwrap().to_owned();
     let mut late = unshare(
         "-rn",

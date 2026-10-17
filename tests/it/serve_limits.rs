@@ -372,7 +372,7 @@ fn observer_sees_upgrade_path_body_limit() {
             .await?;
         conn.write_all(&fcx, b"POST / HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nContent-Length: 20\r\n\r\n01234567890123456789").await?;
         assert!(
-            read_some(&fcx, &mut conn, 200)
+            io::read_some(&fcx, &mut conn, 200)
                 .await
                 .starts_with(b"HTTP/1.1 413")
         );
@@ -430,25 +430,6 @@ fn serve_http(
         }
     });
     Ok(())
-}
-
-/// Reads until `want` bytes arrived, the stream ends, or a second passes.
-async fn read_some<C: Connection>(fcx: &Cx, conn: &mut C, want: usize) -> Vec<u8> {
-    let mut got = Vec::new();
-    let mut buf = [0u8; 4096];
-    while got.len() < want {
-        match fcx
-            .race(
-                Some(fcx.now() + Duration::from_secs(1)),
-                conn.read(fcx, &mut buf),
-            )
-            .await
-        {
-            Ok(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
-            _ => break,
-        }
-    }
-    got
 }
 
 fn field_u64(e: &Event, name: &str) -> Option<u64> {
@@ -832,7 +813,7 @@ fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
             .await?;
         conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
             .await?;
-        let head = read_some(&fcx, &mut conn, 64).await;
+        let head = io::read_some(&fcx, &mut conn, 64).await;
         assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
         conn.reset();
         let request = kept
@@ -891,11 +872,11 @@ fn http2_caps_the_streams_a_connection_opens() {
             b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00",
         )
         .await?;
-        let mut got = read_some(&fcx, &mut conn, 9).await;
+        let mut got = io::read_some(&fcx, &mut conn, 9).await;
         assert_eq!(got[3], 4, "the first frame is SETTINGS");
         let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
         if got.len() < 9 + len {
-            let more = read_some(&fcx, &mut conn, 9 + len - got.len()).await;
+            let more = io::read_some(&fcx, &mut conn, 9 + len - got.len()).await;
             got.extend_from_slice(&more);
         }
         let settings: Vec<(u16, u32)> = got[9..9 + len]
@@ -1633,7 +1614,7 @@ fn peer_admission_is_shared_by_machines_and_dns() {
         );
         let mut first = m.tcp.connect(&fcx, "198.18.0.2:7".parse()?).await?;
         first.write_all(&fcx, b"hello\n").await?;
-        assert_eq!(read_some(&fcx, &mut first, 1).await, b"x");
+        assert_eq!(io::read_some(&fcx, &mut first, 1).await, b"x");
         let mut second = m.tcp.connect(&fcx, "198.18.0.3:7".parse()?).await?;
         let result = fcx
             .race(

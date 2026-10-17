@@ -2,7 +2,7 @@
 //! It runs in a process of its own, because it measures the CPU time of
 //! Fictionet's threads.
 
-use crate::common::poll;
+use crate::common::{poll, threads};
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc;
@@ -11,39 +11,6 @@ use std::time::{Duration, Instant};
 use fictionet::prelude::*;
 use fictionet::relay::{self, Hello, Message, unix};
 use fictionet::{Interface, RecvError, attachments, block_on, listen, pair, run};
-
-/// The `stat` files of the threads whose name starts with one of `prefixes`.
-fn thread_stats(prefixes: &[&str]) -> Vec<(String, std::fs::File)> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir("/proc/self/task").unwrap() {
-        let dir = entry.unwrap().path();
-        let comm = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
-        let comm = comm.trim_end().to_owned();
-        if prefixes.iter().any(|p| comm.starts_with(p)) {
-            files.push((comm, std::fs::File::open(dir.join("stat")).unwrap()));
-        }
-    }
-    files
-}
-
-/// CPU time each thread has used so far, in clock ticks.
-fn ticks(stats: &[(String, std::fs::File)]) -> Vec<(String, u64)> {
-    use std::os::unix::fs::FileExt;
-    stats
-        .iter()
-        .map(|(name, file)| {
-            let mut buf = [0u8; 1024];
-            let n = file.read_at(&mut buf, 0).unwrap();
-            let stat = std::str::from_utf8(&buf[..n]).unwrap();
-            let rest = &stat[stat.rfind(')').unwrap() + 2..];
-            let fields: Vec<&str> = rest.split(' ').collect();
-            (
-                name.clone(),
-                fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap(),
-            )
-        })
-        .collect()
-}
 
 fn connect(path: &str, name: &str) -> OwnedFd {
     let fd = unix::connect(path).unwrap();
@@ -138,12 +105,12 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
         .collect();
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     // A new thread sets its own name, so it may not have one yet.
-    let mut stats = thread_stats(&["world", "fictionet-"]);
+    let mut stats = threads::stats(&["world", "fictionet-"]);
     poll::until(
         Duration::from_secs(10),
         "listener and world thread CPU state",
         || {
-            stats = thread_stats(&["world", "fictionet-"]);
+            stats = threads::stats(&["world", "fictionet-"]);
             stats.len() >= 3
         },
     );
@@ -154,7 +121,7 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
     );
 
     let started = Instant::now();
-    let before = ticks(&stats);
+    let before = threads::ticks(&stats);
     let clients: Vec<_> = fds
         .into_iter()
         .enumerate()
@@ -180,7 +147,7 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
         })
         .collect();
     let fds: Vec<OwnedFd> = clients.into_iter().map(|c| c.join().unwrap()).collect();
-    let busy = ticks(&stats);
+    let busy = threads::ticks(&stats);
     eprintln!(
         "{} packets each way in {:?}; CPU ticks: {:?}",
         CLIENTS * PACKETS,
@@ -198,15 +165,15 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
         Duration::from_secs(10),
         "listener and world thread CPU state",
         || {
-            let now = ticks(&stats);
+            let now = threads::ticks(&stats);
             let ready = settled.as_ref() == Some(&now);
             settled = Some(now);
             ready
         },
     );
-    let idle_start = ticks(&stats);
+    let idle_start = threads::ticks(&stats);
     std::thread::sleep(Duration::from_millis(1500));
-    let idle_end = ticks(&stats);
+    let idle_end = threads::ticks(&stats);
     for ((name, a), (_, b)) in idle_start.iter().zip(&idle_end) {
         assert!(
             b - a <= 2,

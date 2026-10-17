@@ -2,6 +2,7 @@
 //! a world in this process.
 
 use crate::common::logged;
+use crate::common::temp;
 
 use logged::logged;
 
@@ -13,16 +14,6 @@ use std::time::Duration;
 use fictionet::InterfaceExt;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
-
-fn temp_socket() -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("fn-obsbin-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("world.sock").to_str().unwrap().to_owned()
-}
 
 /// A world that takes attachments, and emits an event every 50 ms.
 fn start_world(path: &str) -> fictionet::Listening {
@@ -66,7 +57,7 @@ fn get(port: u16, path: &str) -> (String, String) {
 
 #[test]
 fn observe_prints_json_lines() {
-    let path = temp_socket();
+    let path = temp::socket();
     let _listening = start_world(&path);
     let world = format!("unix:{path}");
     let out = Command::new(BIN)
@@ -163,7 +154,7 @@ fn with_observer_action(
     use fictionet::relay::{self, Message, unix};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let path = temp_socket();
+    let path = temp::socket();
     let (addr, len) = unix::address(std::path::Path::new(&path)).unwrap();
     // SAFETY: the socket is owned here; addr is valid for len bytes.
     let listener = unsafe {
@@ -385,7 +376,7 @@ fn with_dashboard(path: &str, run: impl FnOnce(u16)) {
 
 #[test]
 fn dashboard_cleanup_preserves_callback_panic() {
-    let path = temp_socket();
+    let path = temp::socket();
     let listening = start_world(&path);
     let token_file = format!("{path}.token");
     let outcome = std::panic::catch_unwind(|| {
@@ -745,7 +736,7 @@ fn dashboard_sse_heartbeat_releases_an_idle_observer_after_browser_disconnect() 
 
 #[test]
 fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
-    let path = temp_socket();
+    let path = temp::socket();
     let _listening = start_world(&path);
     let world = format!("unix:{path}");
     let token_file = format!("{path}.token");
@@ -975,7 +966,7 @@ fn start_two_links(path: &str) -> fictionet::Listening {
 /// packets, each with its link, and one file with a section for each.
 #[test]
 fn the_dashboard_merges_the_packets_of_several_links() {
-    let path = temp_socket();
+    let path = temp::socket();
     let token_file = format!("{path}.token");
     std::fs::write(&token_file, "dashboard-test-token\n").unwrap();
     let _listening = start_two_links(&path);
@@ -1123,7 +1114,7 @@ fn capture_failure(port: u16, links: &str) -> String {
 
 #[test]
 fn the_dashboard_fails_a_capture_when_the_second_link_is_not_watched() {
-    let path = temp_socket();
+    let path = temp::socket();
     let _listening = start_two_links(&path);
     with_dashboard(&path, |port| {
         let links = two_dashboard_links(port);
@@ -1144,7 +1135,7 @@ fn the_dashboard_fails_a_capture_when_the_second_link_is_not_watched() {
 
 #[test]
 fn the_dashboard_fails_a_capture_when_a_requested_link_does_not_exist() {
-    let path = temp_socket();
+    let path = temp::socket();
     let _listening = start_two_links(&path);
     with_dashboard(&path, |port| {
         let links = two_dashboard_links(port);
@@ -1196,7 +1187,7 @@ fn the_dashboard_names_every_failed_capture_and_preserves_unexpected_replies() {
 /// and the stream's end.
 #[test]
 fn a_watch_exits_0_when_the_world_ends() {
-    let path = temp_socket();
+    let path = temp::socket();
     let world = format!("unix:{path}");
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = fictionet::listen(
@@ -1313,7 +1304,7 @@ fn version_reports_the_package_version() {
 
 #[test]
 fn dashboard_requires_a_readable_valid_token_file() {
-    let path = format!("{}.token", temp_socket());
+    let path = format!("{}.token", temp::socket());
     for invalid in [b"\n".as_slice(), b"two words", &[b'x'; 256]] {
         std::fs::write(&path, invalid).unwrap();
         let out = Command::new(BIN)

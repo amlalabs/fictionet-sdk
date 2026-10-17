@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::common::{poll, within};
+use crate::common::{poll, temp, within};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::dhcp;
 use fictionet::stdlib::ip::checksum;
@@ -20,16 +20,6 @@ use fictionet::{Interface, InterfaceExt, Packet, RecvError};
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 const VM: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const GATEWAY: [u8; 6] = [0x02, 0x66, 0x6e, 0x00, 0x00, 0x01];
-
-fn temp_dir() -> std::path::PathBuf {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let dir = std::env::temp_dir().join(format!("fn-tap-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn ipv4(src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
     let mut p = vec![0x45, 0];
@@ -95,7 +85,7 @@ fn recv(qemu: &mut UnixStream) -> Vec<u8> {
 /// socket, attach exits 0 and the world sees the detach.
 #[test]
 fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
-    let dir = temp_dir();
+    let dir = temp::dir();
     let world = dir.join("w.sock").to_str().unwrap().to_owned();
     let vm_sock = dir.join("vm.sock");
     let ready = dir.join("ready");
@@ -253,7 +243,7 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
 fn a_fake_qemu_gets_dhcpv6_after_malformed_requests() {
     use fictionet::stdlib::dhcpv6::{self, DhcpOption, Duid, IaNa, Message, msg};
 
-    let dir = temp_dir();
+    let dir = temp::dir();
     let world = dir.join("w.sock");
     let vm_sock = dir.join("vm.sock");
     let ready = dir.join("ready");
@@ -406,7 +396,7 @@ fn a_fake_qemu_gets_dhcpv6_after_malformed_requests() {
 /// with a space in the path; a stale one is.
 #[test]
 fn a_live_socket_is_refused_and_a_stale_one_replaced() {
-    let dir = temp_dir();
+    let dir = temp::dir();
     let path = dir.join("vm one.sock");
     let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let run = || {
@@ -444,7 +434,7 @@ fn a_live_socket_is_refused_and_a_stale_one_replaced() {
 /// file alone. The first still takes QEMU's connection.
 #[test]
 fn a_second_attach_leaves_the_waiting_one_alone() {
-    let dir = temp_dir();
+    let dir = temp::dir();
     let world = dir.join("w.sock").to_str().unwrap().to_owned();
     let vm_sock = dir.join("vm one.sock");
     let ready = dir.join("ready");
@@ -587,7 +577,7 @@ fn messages_from_the_world_are_checked_while_waiting_for_qemu() {
         ),
     ];
     for (what, message, error) in cases {
-        let dir = temp_dir();
+        let dir = temp::dir();
         let world = dir.join("w.sock");
         let vm_sock = dir.join("vm.sock");
         let ready = dir.join("ready");

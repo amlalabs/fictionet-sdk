@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::time::Duration;
 
 use fictionet::prelude::*;
 use fictionet::stdlib::{ConnError, Connection, codec, http1};
@@ -41,6 +42,25 @@ pub async fn read_to_end(
         }
     })
     .await
+}
+
+/// Reads until `want` bytes arrived, the stream ends, or a second passes.
+pub async fn read_some(fcx: &Cx, conn: &mut impl Connection, want: usize) -> Vec<u8> {
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while got.len() < want {
+        match fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(1)),
+                conn.read(fcx, &mut buf),
+            )
+            .await
+        {
+            Ok(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    got
 }
 
 /// Includes the delimiter without read-ahead. EOF and transport errors panic.

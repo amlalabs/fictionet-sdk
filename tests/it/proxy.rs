@@ -7,6 +7,7 @@
 
 use crate::common::certs;
 use crate::common::io;
+use crate::common::temp;
 
 use io::read_all;
 
@@ -32,17 +33,6 @@ const BASIC: &str = "Basic cmVsYXk6dG9rLTNmOWEyYw==";
 /// The address `secure.test` has, with TLS on 443.
 const SECURE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 
-fn temp_dir() -> PathBuf {
-    // Unix socket paths must be short, so not under a long target dir.
-    let n = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("fn-proxy-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// A world in a thread: `plain.test` (plain HTTP) and `secure.test`
 /// (HTTPS, at 203.0.113.10), every other name NXDOMAIN.
 struct World {
@@ -63,7 +53,7 @@ impl World {
     }
 
     fn with_site(raw: Option<ResetSite>) -> World {
-        let dir = temp_dir();
+        let dir = temp::dir();
         let sock = dir.join("w.sock").to_str().unwrap().to_owned();
         let ca_path = dir.join("ca.pem");
         let (stop, mut stopped) = fictionet::pair();
@@ -173,7 +163,7 @@ impl World {
     ) -> World {
         use fictionet::{Interface, InterfaceExt};
         let answer = Arc::new(answer);
-        let dir = temp_dir();
+        let dir = temp::dir();
         let sock = dir.join("w.sock").to_str().unwrap().to_owned();
         let (stop, mut stopped) = fictionet::pair();
         let seen: Arc<(Mutex<HashSet<[u8; 8]>>, Condvar)> = Arc::default();
@@ -1136,7 +1126,7 @@ fn proxy_types_refuse_tun_flags_and_need_a_token() {
 
     // A token file that is missing or empty stops attach before it
     // connects to the world.
-    let dir = temp_dir();
+    let dir = temp::dir();
     let empty = dir.join("empty");
     std::fs::write(&empty, "\n").unwrap();
     for (file, why) in [
@@ -1262,7 +1252,7 @@ fn answer_hello(sock: &Path, answer: Vec<u8>) -> std::thread::JoinHandle<()> {
 
 #[test]
 fn an_oversized_answer_to_hello_is_an_error_not_a_refusal() {
-    let dir = temp_dir();
+    let dir = temp::dir();
     let sock = dir.join("w.sock");
     let token = dir.join("token");
     std::fs::write(&token, format!("{TOKEN}\n")).unwrap();

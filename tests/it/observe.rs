@@ -5,21 +5,12 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+use crate::common::temp;
+
 use fictionet::Interface;
 use fictionet::prelude::*;
 use fictionet::relay::observer::{Client, Value};
 use fictionet::relay::{self, Hello, Message, unix};
-
-fn temp_socket() -> String {
-    // Unix socket paths must be short, so not under a long target dir.
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("fn-obs-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("world.sock").to_str().unwrap().to_owned()
-}
 
 fn observer_connection<T: Send + 'static>(
     path: &str,
@@ -53,7 +44,7 @@ fn observer_connection<T: Send + 'static>(
 }
 
 fn observer_peer(greeting: &[u8]) -> (Result<Client, String>, OwnedFd) {
-    let path = temp_socket();
+    let path = temp::socket();
     let client_path = path.clone();
     let (thread, peer) =
         observer_connection(&path, move || Client::connect(&client_path, "frame-limit"));
@@ -267,7 +258,7 @@ fn observer_rejects_oversized_or_truncated_greetings() {
 
 #[test]
 fn an_observer_times_out_when_an_accepted_connection_never_answers_hello() {
-    let path = temp_socket();
+    let path = temp::socket();
     let (tx, rx) = std::sync::mpsc::channel();
     let client_path = path.clone();
     let (thread, peer) = observer_connection(&path, move || {
@@ -432,7 +423,7 @@ fn number_after(json: &str, key: &str) -> u64 {
 
 #[test]
 fn an_observer_sees_the_graph_its_changes_events_and_packets() {
-    let path = temp_socket();
+    let path = temp::socket();
     let _listening = start_world(&path);
     let mut client = Client::connect(&path, "test").unwrap();
     client.set_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -607,7 +598,7 @@ fn an_observer_sees_the_graph_its_changes_events_and_packets() {
 
 #[test]
 fn observer_session_capacity_counts_idle_clients_and_reuses_slots() {
-    let path = temp_socket();
+    let path = temp::socket();
     let (attacher, _attachments) = fictionet::attachments();
     let listening = fictionet::listen(
         fictionet::WorldSocket::UnixSocket(path.clone().into()),
@@ -656,7 +647,7 @@ fn observer_session_capacity_counts_idle_clients_and_reuses_slots() {
 
 #[test]
 fn watch_capacity_errors_preserve_shared_streams_and_cancel_frees_admission() {
-    let path = temp_socket();
+    let path = temp::socket();
     let (attacher, mut attachments) = fictionet::attachments();
     let _listening = fictionet::listen(
         fictionet::WorldSocket::UnixSocket(path.clone().into()),
@@ -736,7 +727,7 @@ fn watch_capacity_errors_preserve_shared_streams_and_cancel_frees_admission() {
 
 #[test]
 fn an_observer_takes_no_name() {
-    let path = temp_socket();
+    let path = temp::socket();
     let _listening = start_world(&path);
     // An observer called "agent" does not stop a sandbox called "agent".
     let _a = Client::connect(&path, "agent").unwrap();
@@ -746,7 +737,7 @@ fn an_observer_takes_no_name() {
 
 #[test]
 fn an_observer_of_a_world_that_has_not_started_waits() {
-    let path = temp_socket();
+    let path = temp::socket();
     // A socket whose world never asks for an attachment: there is no run
     // to observe yet.
     let (attacher, _attachments) = fictionet::attachments();
@@ -771,7 +762,7 @@ fn an_observer_of_a_world_that_has_not_started_waits() {
 /// with its reason, and does not attach a sandbox.
 #[test]
 fn a_later_observer_type_is_refused() {
-    let path = temp_socket();
+    let path = temp::socket();
     let _listening = start_world(&path);
     let fd = unix::connect(&path).unwrap();
     let hello = Hello {

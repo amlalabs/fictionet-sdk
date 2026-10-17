@@ -2,23 +2,13 @@
 //! The tests that need a tun device are in `tests/host/attach_bin.rs`.
 
 use crate::common::logged;
+use crate::common::temp;
 
 use logged::logged;
 
 use std::process::{Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
-
-fn temp_dir() -> std::path::PathBuf {
-    // Unix socket paths must be short, so not under a long target dir.
-    let n: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let dir = std::env::temp_dir().join(format!("fn-attach-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 #[test]
 fn left_out_flags_exit_2_and_say_dhcp_is_missing() {
@@ -85,7 +75,7 @@ fn a_flag_after_a_value_flag_is_a_usage_error() {
 
 #[test]
 fn ready_exits_0_only_when_the_file_exists() {
-    let dir = temp_dir();
+    let dir = temp::dir();
     let file = dir.join("ready");
     let run = |args: &[&str]| Command::new(BIN).arg("ready").args(args).output().unwrap();
     let out = run(&[file.to_str().unwrap()]);
@@ -107,7 +97,7 @@ fn ready_exits_0_only_when_the_file_exists() {
 fn a_failed_ready_file_write_does_not_leave_a_successful_probe() {
     use std::os::unix::process::CommandExt;
 
-    let dir = temp_dir();
+    let dir = temp::dir();
     let sock = dir.join("w.sock");
     let ready = dir.join("ready");
     let token = dir.join("token");
