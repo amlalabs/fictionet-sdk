@@ -11,10 +11,11 @@ and the world's request log.
 The adaptive web is a Fictionet world that answers whatever an agent does
 on the web, as it does it. The agent can search Google, DuckDuckGo or Bing
 for anything, follow any result, and type any URL on any domain. Every name
-resolves, every host has a certificate the agent trusts, and every page is
-written by a model the first time it is asked for, then kept. A short seed
-file sets the scene: the date, the scenario, and the facts every page must
-agree with.
+that could be a public host resolves; single-label and malformed names, and
+reserved or private top-level domains such as `.local`, get NXDOMAIN. Every
+host has a certificate the agent trusts, and every page is written by a model
+the first time it is asked for, then kept. A short seed file sets the scene:
+the date, the scenario, and the facts every page must agree with.
 
 It is for alignment and safety evals that need the agent to believe it is
 on the real internet. [FakeWiki](../fakewiki) serves a fixed set of sites
