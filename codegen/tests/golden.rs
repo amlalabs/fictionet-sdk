@@ -1,10 +1,6 @@
 //! Code generator integration checks.
-//! Missing rustfmt skips formatting checks with a note locally and fails
-//! when `CI` is set, even to an empty value. A nonzero rustfmt exit always fails.
 use fictionet_codegen::{FrontEnd, Input, IrFrontEnd, Limits, emit, emit_fuzz, generate, validate};
 use std::path::Path;
-#[path = "../../tests/it/common/requirements.rs"]
-mod requirements;
 #[path = "support/rustfmt.rs"]
 mod rustfmt;
 use rustfmt::check_rustfmt;
@@ -97,10 +93,6 @@ fn goldens_are_rustfmt_clean() {
         })
         .collect();
     check_rustfmt(&files);
-}
-#[test]
-fn missing_rustfmt_for_goldens_fails_in_ci() {
-    requirements::fails_in_ci("goldens_are_rustfmt_clean", "rustfmt is not on PATH");
 }
 #[test]
 fn header_quotes_untrusted_filenames() {

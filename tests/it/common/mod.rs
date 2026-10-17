@@ -23,7 +23,6 @@ pub mod logged;
 pub mod pattern;
 #[cfg(feature = "std")]
 pub mod poll;
-pub mod requirements;
 #[cfg(all(feature = "std", feature = "tokio"))]
 pub mod rustls_client;
 #[cfg(feature = "std")]

@@ -51,9 +51,10 @@ settings: tests are never retried, a test is flagged after 15 seconds, and the
 tests that run whole worlds run a few at a time.
 
 The integration tests are two binaries. `tests/it` runs on any machine, one
-module per area. `tests/host` holds the tests that need user namespaces, root
-or a tun device, and fails where the machine lacks them. It runs only when
-named:
+module per area. It needs node, curl and Chromium (set `CHROMIUM` if the
+browser is not named `chromium`). `tests/host` holds the tests that need user
+namespaces, root or a tun device, and fails where the machine lacks them. It
+runs only when named:
 
 ```console
 $ cargo nextest run --locked --test host

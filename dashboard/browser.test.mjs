@@ -13,14 +13,8 @@ const exec = promisify(execFile);
 
 test('browser bootstrap, reconnect and downloads keep credentials away from another port', async (t) => {
   const chromium = process.env.CHROMIUM || 'chromium';
-  const unavailable = (error) => {
-    const reason = `Chromium is unavailable (${error.message}); set CHROMIUM to run the two-origin regression`;
-    assert.equal(process.env.CI, undefined, reason);
-    t.skip(reason);
-  };
   try { await exec(chromium, ['--version'], { timeout: 10000 }); } catch (error) {
-    unavailable(error);
-    return;
+    assert.fail(`Chromium is unavailable (${error.message}); set CHROMIUM to run the two-origin regression`);
   }
   const profile = await mkdtemp(join(tmpdir(), 'fictionet-browser-'));
   t.after(() => rm(profile, { recursive: true, force: true }));

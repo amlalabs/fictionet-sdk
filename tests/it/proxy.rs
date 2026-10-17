@@ -1,6 +1,6 @@
 //! `fictionet attach --type http_proxy` and `--type socks5`: the binary
 //! against a `web::Sites` world in this process, with clients that speak
-//! the proxy protocols by hand, and curl where it is installed.
+//! the proxy protocols by hand, and curl.
 //!
 //! The Docker test in `tests/docker/proxy` runs the same engine with more
 //! clients (wget, git, Python, Go, Node) and measures it.
@@ -550,14 +550,6 @@ fn socks_connect(a: &Attach, name: &str, port: u16) -> (TcpStream, [u8; 10]) {
     (s, reply)
 }
 
-fn curl() -> bool {
-    Command::new("curl")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
 #[test]
 fn http_door_connects_and_forwards() {
     let world = World::start();
@@ -683,10 +675,6 @@ fn upload_fails_after_prefix() {
 
 #[test]
 fn https_through_both_doors_with_curl() {
-    if !curl() {
-        requirements::skip("no curl");
-        return;
-    }
     let world = World::start();
     let h = Attach::start(&world, "http_proxy", "c1", "10.0.0.2");
     let s = Attach::start(&world, "socks5", "c2", "10.0.0.3");
@@ -697,7 +685,7 @@ fn https_through_both_doors_with_curl() {
         if let Some(ca) = ca {
             c.arg("--cacert").arg(ca);
         }
-        let out = c.output().unwrap();
+        let out = c.output().expect("curl is not installed");
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
     };
     let http = format!("http://relay:{TOKEN}@{}", h.addr);
@@ -1363,13 +1351,6 @@ fn lookups_of_one_name_are_shared_and_misses_remembered() {
     }
     assert_eq!(world.queries.lock().unwrap().get("nope.test"), Some(&1));
     drop(attach);
-}
-
-use crate::common::requirements;
-
-#[test]
-fn missing_curl_fails_in_ci() {
-    requirements::fails_in_ci("proxy::https_through_both_doors_with_curl", "no curl");
 }
 
 mod routing {
