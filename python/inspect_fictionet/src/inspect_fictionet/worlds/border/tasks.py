@@ -58,7 +58,7 @@ from inspect_fictionet.worlds.border.transcript import certificate_timeline
 from inspect_fictionet.worlds.border.world import world_sandbox, assess
 
 from inspect_fictionet._common import commands
-from inspect_fictionet._common.task import world_log, world_state
+from inspect_fictionet._common import task as shared
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -240,17 +240,7 @@ def home_machine(service: str = "default") -> Solver:
     return solve
 
 
-STATUS_PROBE: Final = [
-    *commands.CURL_DIRECT, "-sS", "-o", "/dev/null", "-w",
-    "%{http_code} verify=%{ssl_verify_result}", f"https://{STATUS_HOST}/",
-]
-
-
-def require_no_proxy(result) -> None:
-    """Require a checked env inventory with no name containing 'proxy', in any case."""
-    proxies = [name for name in commands.read_env(result) if "proxy" in name.lower()]
-    if proxies:
-        raise RuntimeError("proxy environment variables are present: " + ", ".join(proxies))
+STATUS_URL: Final = f"https://{STATUS_HOST}/"
 
 
 def routes_into_world(result) -> bool:
@@ -263,67 +253,47 @@ def routes_into_world(result) -> bool:
     )
 
 
-async def _contained(*, runner=None) -> None:
+@solver
+def contained() -> Solver:
     """A short containment check: only routes into the world, and the internet unreachable.
 
-    The full probes are the ``border_probes`` task. This runs before every scored sample, so
-    each one carries a check, as the original study's samples did.
-    """
-    runner = runner if runner is not None else sandbox().exec
-    routes = await commands.run_async(["ip", "route", "show", "table", "all"], runner=runner)
-    if not routes_into_world(routes):
-        raise RuntimeError(f"invalid containment routes (rc={routes.rc}): {routes.stdout} {routes.stderr}")
-    outside = await commands.run_async(
-        [*commands.CURL_DIRECT, "-sS", "-m", "5", "-o", "/dev/null", "http://1.1.1.1/"], runner=runner,
-    )
-    outcome = commands.classify_curl(outside)
-    if outside.rc != 7 or outcome != commands.Outcome.EXPECTED_FAILURE:
-        raise RuntimeError(
-            f"containment needs a connect denial (rc={outside.rc}, {outcome.value}): "
-            f"{outside.stdout} {outside.stderr}"
-        )
-    transcript().info(
-        {"contained": True, "routes": routes.stdout, "outside_rc": outside.rc, "outside": outside.stderr},
-        source="border.preflight",
-    )
-
-
-@solver
-def preflight(*, runner=None) -> Solver:
-    """Check the world before the agent starts, and note where its log stands.
-
-    - The world runs the variant and task this sample asked for (this catches a sample
-      whose metadata did not reach Compose).
-    - A successful env inventory has no proxy variable. Curl ignores its configuration
-      and proxies, and completes a status-host response over trusted TLS.
-    - Its checked, nonempty routes all lead into the world. An outside address must
-      fail to connect (curl exit 7); timeouts and tool failures are inconclusive.
-
-    The scorer then reads only the log lines that come after these checks.
+    The checked, nonempty routes must all lead into the world. An outside address must fail
+    to connect (curl exit 7); timeouts and tool failures are inconclusive. The full probes
+    are the ``border_probes`` task. This runs before every scored sample, so each one
+    carries a check, as the original study's samples did.
     """
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         del generate
-        world = await world_state()
-        for key in ("variant", "task"):
-            if world[key] != state.metadata[key]:
-                msg = f"the world runs {key} {world[key]!r}, the sample wants {state.metadata[key]!r}"
-                raise RuntimeError(msg)
-        execute = runner if runner is not None else sandbox().exec
-        require_no_proxy(await commands.run_async(["env"], runner=execute))
-        result = await commands.run_async(STATUS_PROBE, runner=execute)
-        if not commands.succeeded(result, stdout="200 verify=0"):
-            msg = f"the agent cannot reach the world (rc={result.rc}): {result.stdout} {result.stderr}"
-            raise RuntimeError(msg)
-        await _contained(runner=execute)
-        store().set("log_offset", len(await world_log(finalize=False)))
+        runner = sandbox().exec
+        routes = await commands.run_async(["ip", "route", "show", "table", "all"], runner=runner)
+        if not routes_into_world(routes):
+            raise RuntimeError(f"invalid containment routes (rc={routes.rc}): {routes.stdout} {routes.stderr}")
+        outside = await commands.run_async(
+            [*commands.CURL_DIRECT, "-sS", "-m", "5", "-o", "/dev/null", "http://1.1.1.1/"], runner=runner,
+        )
+        outcome = commands.classify_curl(outside)
+        if outside.rc != 7 or outcome != commands.Outcome.EXPECTED_FAILURE:
+            raise RuntimeError(
+                f"containment needs a connect denial (rc={outside.rc}, {outcome.value}): "
+                f"{outside.stdout} {outside.stderr}"
+            )
         transcript().info(
-            {"variant": world["variant"], "task": world["task"], "status_host": result.stdout.strip()},
+            {"contained": True, "routes": routes.stdout, "outside_rc": outside.rc, "outside": outside.stderr},
             source="border.preflight",
         )
         return state
 
     return solve
+
+
+def preflight() -> Solver:
+    """Check the world before the agent starts, and note where its log stands.
+
+    The containment check runs first, so its traffic precedes the log offset the shared
+    check records. The world must run the variant and task this sample asked for.
+    """
+    return chain(contained(), shared.preflight(("variant", "task"), STATUS_URL))
 
 
 _DEFAULT_VARIANTS: Final = ",".join(VARIANTS)
@@ -392,12 +362,6 @@ def _choose[T: str](value: str, options: tuple[T, ...], what: str) -> T:
     raise ValueError(msg)
 
 
-def split(value: str | list[str]) -> list[Variant]:
-    """The variants named in a task argument (``-T variants=legitimate,hijack``)."""
-    items = value.split(",") if isinstance(value, str) else value
-    return [_choose(item.strip(), VARIANTS, "variant") for item in items if item.strip()]
-
-
 def bank_task(value: str) -> BankTask:
     """The task named by ``value`` (``-T task_name=login``)."""
     return _choose(value, BANK_TASKS, "task")
@@ -415,8 +379,8 @@ def prompt_name(value: str) -> PromptName:
 
 async def score_episode(state: TaskState, *, read_messages: Sequence[ChatMessageTool] = ()) -> Score:
     """The Border score of one finished episode, from the world's log and the transcript."""
-    world = await world_state()
-    log = await world_log(store().get("log_offset", 0))
+    world = await shared.world_state()
+    log = await shared.world_log(store().get("log_offset", 0))
     score = score_evidence(state, world, log, list(transcript().events), read_messages=read_messages)
     transcript().info({"ground_truth": score.metadata}, source="fictionet")
     return score
@@ -614,7 +578,7 @@ def border(
         steps.append(home_machine())
     steps.append(as_solver(build_agent(system, bash_timeout)))
     return Task(
-        dataset=dataset(split(variants), chosen_task, chosen_prompt, chosen_setting),
+        dataset=dataset(shared.split(variants, VARIANTS, "variant"), chosen_task, chosen_prompt, chosen_setting),
         solver=chain(*steps),
         scorer=border_scorer(),
         sandbox=world_sandbox(chosen_setting),

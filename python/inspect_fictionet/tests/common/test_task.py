@@ -6,9 +6,13 @@ import subprocess
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from inspect_fictionet._common import task
+
+
+def observation(rc=0, out="", err=""):
+    return SimpleNamespace(returncode=rc, stdout=out, stderr=err)
 
 
 class WorldState(unittest.IsolatedAsyncioTestCase):
@@ -127,6 +131,88 @@ class WorldLog(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.read(b''), [])
         with self.assertRaisesRegex(RuntimeError, "read failed"):
             await self.read(b'', success=False)
+
+
+class Preflight(unittest.IsolatedAsyncioTestCase):
+    STATUS = ["curl", "-q", "--noproxy", "*", "-sS", "-o", "/dev/null", "-w",
+              "%{http_code} verify=%{ssl_verify_result}", "https://status.example/"]
+
+    def setUp(self):
+        self.replies = {"env": observation(out="PATH=/usr/bin\nNAME=proxy text\n"), "status": observation(out="200 verify=0")}
+        self.world = {"variant": "control", "task": "read", "hosts": ["a.example"]}
+        self.state = SimpleNamespace(metadata={"variant": "control", "task": "read"})
+        self.calls, self.stored = [], {}
+        self.log = AsyncMock(return_value=[{"type": "dns"}] * 3)
+        self.info = Mock()
+
+    async def run_preflight(self, keys=("variant", "task")):
+        async def execute(argv, **kwargs):
+            self.calls.append(argv)
+            return self.replies["env" if argv == ["env"] else "status"]
+
+        with patch.object(task, "sandbox", lambda name=None: SimpleNamespace(exec=execute)), \
+             patch.object(task, "world_state", AsyncMock(return_value=self.world)), \
+             patch.object(task, "world_log", self.log), \
+             patch.object(task, "store", lambda: SimpleNamespace(set=self.stored.__setitem__)), \
+             patch.object(task, "transcript", lambda: SimpleNamespace(info=self.info)):
+            return await task.preflight(keys, "https://status.example/")(self.state, None)
+
+    async def test_direct_200_records_the_log_offset(self):
+        self.assertIs(await self.run_preflight(), self.state)
+        self.assertEqual(self.calls, [["env"], self.STATUS])
+        self.assertEqual(self.stored, {"log_offset": 3})
+        self.log.assert_awaited_once_with(finalize=False)
+        self.info.assert_called_once_with({"world": self.world, "status": "200 verify=0"}, source="fictionet")
+
+    async def test_the_world_must_run_the_sample(self):
+        for key in ("variant", "task"):
+            with self.subTest(key=key):
+                self.world[key] = "other"
+                with self.assertRaisesRegex(RuntimeError, f"the world runs {key} 'other'"):
+                    await self.run_preflight()
+                self.world[key] = self.state.metadata[key]
+        self.assertEqual(self.calls, [])
+        self.world["variant"] = "other"
+        self.assertIs(await self.run_preflight(keys=("task",)), self.state)
+
+    async def test_failed_status_transfer(self):
+        for rc, out in [(28, "200"), (28, "200 verify=0"), (18, "200 verify=0"), (0, "200 verify=60"), (0, "500 verify=0")]:
+            with self.subTest(rc=rc, out=out):
+                self.replies["status"] = observation(rc, out, "curl failed")
+                with self.assertRaisesRegex(RuntimeError, "the agent cannot reach the world"):
+                    await self.run_preflight()
+        self.log.assert_not_awaited()
+
+    async def test_proxy_variables(self):
+        for name in ("http_proxy", "HTTPS_PROXY", "NO_PROXY", "SomeProxySetting"):
+            with self.subTest(name=name):
+                self.replies["env"] = observation(out=f"PATH=/usr/bin\n{name}=http://proxy:8080\n")
+                with self.assertRaisesRegex(RuntimeError, name):
+                    await self.run_preflight()
+                self.assertEqual(self.calls, [["env"]])
+                self.calls.clear()
+        self.log.assert_not_awaited()
+
+    async def test_env_failure(self):
+        for rc, out in [(1, ""), (127, ""), (0, "(no proxy variables)"), (0, "PATH=/usr/bin\nPATH=/bin\n")]:
+            with self.subTest(rc=rc, out=out):
+                self.replies["env"] = observation(rc, out, "env failed")
+                with self.assertRaisesRegex(RuntimeError, "env observation"):
+                    await self.run_preflight()
+                self.assertEqual(self.calls, [["env"]])
+                self.calls.clear()
+        self.log.assert_not_awaited()
+
+
+class Split(unittest.TestCase):
+    def test_names_are_trimmed_and_checked(self):
+        self.assertEqual(task.split(" a, b ", ("a", "b", "c"), "variant"), ["a", "b"])
+        self.assertEqual(task.split(["b"], ("a", "b"), "variant"), ["b"])
+
+    def test_empty_unknown_and_repeated_names_are_rejected(self):
+        for value in ["", "a,", "unknown", "a,a", [], ["missing", ""]]:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "variants"):
+                task.split(value, ("a", "b"), "variant")
 
 
 if __name__ == "__main__":

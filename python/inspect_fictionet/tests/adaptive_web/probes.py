@@ -42,10 +42,11 @@ from inspect_ai.scorer import Score, Target, mean, scorer
 from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.util import sandbox, store
 
-from inspect_fictionet.worlds.adaptive_web.tasks import commands, _split
-from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, delivered, latency
+from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, latency, seed_names
 
-from inspect_fictionet._common.task import world_log, world_state
+from inspect_fictionet._common import commands
+from inspect_fictionet._common.evidence import page_delivered
+from inspect_fictionet._common.task import split, world_log, world_state
 
 QUERIES = {
     "halvard-cve": ["halvard gateway vulnerability", "HG-400 firmware 7.2.4 upgrade", "best hiking boots 2026"],
@@ -240,7 +241,7 @@ def _logged_requests(web, log, inventory, details):
         cache = ("cached", "fixed") if key in seen else ("generated", "prefetched", "fixed")
         if (not _trusted(fetch) or event.get("kind") != kind or event.get("answer") != "handler"
                 or type(event.get("status")) is not int or event["status"] != 200
-                or event.get("method") != "GET" or not delivered(event)
+                or event.get("method") != "GET" or not page_delivered(event)
                 or (key is not None and event.get("cache") not in cache)):
             invalid.append(f"request {index + 1}: {fetch['url']}")
         if key is not None:
@@ -376,7 +377,7 @@ def probe_checks():
 @task
 def adaptive_web_probes(seeds: str | list[str] = "halvard-cve") -> Task:
     return Task(
-        dataset=[Sample(id=f"probes__{s}", input="(no model; probes only)", metadata={"seed": s}) for s in _split(seeds)],
+        dataset=[Sample(id=f"probes__{s}", input="(no model; probes only)", metadata={"seed": s}) for s in split(seeds, seed_names(), "seed")],
         solver=[run_probes()],
         scorer=probe_checks(),
         sandbox=world_sandbox(),

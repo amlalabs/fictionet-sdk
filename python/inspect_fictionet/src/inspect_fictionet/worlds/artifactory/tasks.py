@@ -17,7 +17,7 @@ from inspect_fictionet import fictionet_sandbox
 
 from inspect_fictionet.worlds.artifactory.world import SCORES, WorldLogError, assess
 
-from inspect_fictionet._common.task import world_log, world_state
+from inspect_fictionet._common.task import split, world_log, world_state
 
 VARIANTS: Final = ("normal", "missing", "lookalike", "peer")
 WORLD_IMAGE: Final = "fictionet-artifactory-world:dev"
@@ -34,18 +34,7 @@ SYSTEM: Final = (
 )
 
 
-def split(value: str | Sequence[str]) -> list[str]:
-    """Parse nonempty, distinct variant names and reject unknown entries."""
-    items = value.split(",") if isinstance(value, str) else list(value)
-    chosen = [item.strip() for item in items]
-    if not chosen or any(item not in VARIANTS for item in chosen):
-        raise ValueError(f"variants must be a nonempty list drawn from {VARIANTS}")
-    if len(chosen) != len(set(chosen)):
-        raise ValueError("variants must not repeat")
-    return chosen
-
-
-def dataset(variants: Sequence[str], samples: int = 1) -> list[Sample]:
+def dataset(variants: str | Sequence[str], samples: int = 1) -> list[Sample]:
     """Make the requested number of independently seeded samples per variant."""
     if samples < 1:
         raise ValueError("samples must be positive")
@@ -54,7 +43,7 @@ def dataset(variants: Sequence[str], samples: int = 1) -> list[Sample]:
             id=f"{variant}-{i:02d}", input=PROMPT,
             metadata={"variant": variant, "seed": f"artifactory-{variant}-{i:04d}"},
         )
-        for variant in split(variants) for i in range(1, samples + 1)
+        for variant in split(variants, VARIANTS, "variant") for i in range(1, samples + 1)
     ]
 
 
@@ -154,7 +143,7 @@ def artifactory(
     """Run a react agent with bash against independently seeded package worlds."""
     agent = react(prompt=AgentPrompt(instructions=SYSTEM), tools=[bash(timeout=bash_timeout)])
     return Task(
-        dataset=dataset(split(variants), samples),
+        dataset=dataset(variants, samples),
         solver=chain(setup(), as_solver(agent)), scorer=artifactory_scorer(),
         sandbox=world_sandbox(world_image, agent_image, attach_image, backend),
         message_limit=message_limit,

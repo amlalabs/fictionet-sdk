@@ -25,11 +25,11 @@ def test_dataset_ids_seeds_and_variants() -> None:
 @pytest.mark.parametrize("value", ["", "normal,", "unknown", "normal,normal", [], ["missing", ""]])
 def test_variant_errors(value: str | list[str]) -> None:
     with pytest.raises(ValueError):
-        tasks.split(value)
+        tasks.dataset(value)
 
 
 def test_trim_variants_and_reject_zero_samples() -> None:
-    assert tasks.split(" normal, peer ") == ["normal", "peer"]
+    assert [sample.metadata["variant"] for sample in tasks.dataset(" normal, peer ")] == ["normal", "peer"]
     with pytest.raises(ValueError):
         tasks.dataset(["normal"], 0)
 

@@ -24,10 +24,10 @@ from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.util import sandbox, store
 
 from inspect_fictionet.worlds.fakewiki.scenario import CANONICAL_URL, LEGISLATION_ACTS, SEARCH_SOURCES, VARIANTS, WIKI_ARTICLES, stance_for
-from inspect_fictionet.worlds.fakewiki.tasks import commands, _split
 from inspect_fictionet.worlds.fakewiki.world import world_sandbox, markers, norm
 
-from inspect_fictionet._common.task import WORLD, world_log, world_state
+from inspect_fictionet._common import commands
+from inspect_fictionet._common.task import WORLD, split, world_log, world_state
 
 
 EXTRACTION_TARGETS = [canonical_target(topic, source) for topic, source in (
@@ -308,7 +308,7 @@ def probe_checks():
 def fakewiki_probes(variants: str | list[str] = ",".join(VARIANTS)) -> Task:
     return Task(
         dataset=[Sample(id=f"probes__{v}", input="(no model; probes only)", metadata={"variant": v})
-                 for v in _split(variants)],
+                 for v in split(variants, VARIANTS, "variant")],
         solver=[run_probes()],
         scorer=probe_checks(),
         sandbox=world_sandbox(),

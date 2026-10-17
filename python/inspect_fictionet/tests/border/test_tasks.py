@@ -301,6 +301,7 @@ def network(monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
 
+    from inspect_fictionet._common import task as shared
     from inspect_fictionet.worlds.border import tasks
 
     state = episode()
@@ -321,17 +322,19 @@ def network(monkeypatch):
         assert argv[:4] == ["curl", "-q", "--noproxy", "*"]
         return replies["outside" if argv[-1] == "http://1.1.1.1/" else "status"]
 
+    agent = SimpleNamespace(exec=execute)
     offset = AsyncMock(return_value=[{"type": "dns"}] * 17)
-    monkeypatch.setattr(tasks, "world_state", AsyncMock(return_value=state.metadata))
-    monkeypatch.setattr(tasks, "world_log", offset)
-    monkeypatch.setattr(tasks, "store", lambda: state.store)
-    monkeypatch.setattr(tasks, "sandbox", lambda: SimpleNamespace(exec=execute))
+    monkeypatch.setattr(tasks, "sandbox", lambda: agent)
     monkeypatch.setattr(tasks, "transcript", lambda: SimpleNamespace(info=Mock()))
+    monkeypatch.setattr(shared, "sandbox", lambda name=None: agent)
+    monkeypatch.setattr(shared, "world_state", AsyncMock(return_value=state.metadata))
+    monkeypatch.setattr(shared, "world_log", offset)
+    monkeypatch.setattr(shared, "store", lambda: state.store)
+    monkeypatch.setattr(shared, "transcript", lambda: SimpleNamespace(info=Mock()))
     return SimpleNamespace(
         replies=replies, calls=calls, offset=offset, state=state,
-        contained=lambda: asyncio.run(tasks._contained(runner=execute)),
-        preflight=lambda: asyncio.run(tasks.preflight(runner=execute)(state, None)),
-        default_preflight=lambda: asyncio.run(tasks.preflight()(state, None)),
+        contained=lambda: asyncio.run(tasks.contained()(state, None)),
+        preflight=lambda: asyncio.run(tasks.preflight()(state, None)),
     )
 
 
@@ -369,51 +372,24 @@ def test_contained_curl_empty_diagnostic(network):
         network.contained()
 
 
-@pytest.mark.parametrize("default_runner", [False, True])
-def test_preflight_direct_200(network, default_runner):
-    result = network.default_preflight() if default_runner else network.preflight()
-    assert result is network.state
+def test_preflight_checks_containment_then_the_world(network):
+    assert network.preflight() is network.state
     assert network.state.store.get("log_offset") == 17
-    assert len(network.calls) == 4
-    assert network.calls[0] == ["env"]
-    assert network.calls[1] == [
+    assert network.calls[:2] == [
+        ["ip", "route", "show", "table", "all"],
+        ["curl", "-q", "--noproxy", "*", "-sS", "-m", "5", "-o", "/dev/null", "http://1.1.1.1/"],
+    ]
+    assert network.calls[2] == ["env"]
+    assert network.calls[3] == [
         "curl", "-q", "--noproxy", "*", "-sS", "-o", "/dev/null", "-w",
         "%{http_code} verify=%{ssl_verify_result}", "https://status.harbourline.net/",
     ]
-
-
-@pytest.mark.parametrize("rc,out", [(28, "200"), (28, "200 verify=0"), (18, "200 verify=0"),
-                                    (0, "200 verify=60"), (0, "500 verify=0")])
-def test_preflight_failed_status_transfer(network, rc, out):
-    network.replies["status"].returncode = rc
-    network.replies["status"].stdout = out
-    with pytest.raises(RuntimeError, match="agent cannot reach the world"):
-        network.preflight()
-    network.offset.assert_not_awaited()
-
-
-@pytest.mark.parametrize("variable", ["http_proxy", "HTTPS_PROXY", "NO_PROXY", "SomeProxySetting"])
-def test_preflight_proxy_env_present(network, variable):
-    network.replies["env"].stdout += f"{variable}=http://proxy:8080\n"
-    with pytest.raises(RuntimeError, match="proxy environment"):
-        network.preflight()
-    assert network.calls == [["env"]]
-    network.offset.assert_not_awaited()
-
-
-@pytest.mark.parametrize("rc,out", [(1, ""), (127, ""), (0, "(no proxy variables)"),
-                                    (0, "PATH=/usr/bin\nPATH=/bin\n")])
-def test_preflight_env_fails(network, rc, out):
-    network.replies["env"].returncode = rc
-    network.replies["env"].stdout = out
-    with pytest.raises(RuntimeError, match="env observation"):
-        network.preflight()
-    assert network.calls == [["env"]]
-    network.offset.assert_not_awaited()
+    assert len(network.calls) == 4
 
 
 def test_preflight_requires_containment_before_log_offset(network):
     network.replies["outside"].returncode = 0
     with pytest.raises(RuntimeError, match="connect denial"):
         network.preflight()
+    assert len(network.calls) == 2
     network.offset.assert_not_awaited()

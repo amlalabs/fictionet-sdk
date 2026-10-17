@@ -13,10 +13,9 @@ from typing import Any
 
 from inspect_fictionet import fictionet_sandbox
 
-from inspect_fictionet._common import evidence as _evidence
+from inspect_fictionet._common.evidence import PAGE_METHODS, page_delivered
 from inspect_fictionet._common import citations as _citations
 from adaptive import accounting as _accounting
-_METHODS = ("GET", "POST")
 SEEDS = Path(__file__).with_name("seeds")
 
 
@@ -81,18 +80,12 @@ def latency(log: list[dict[str, Any]]) -> dict[str, Any]:
             "serve_ms_p50": served["p50"], "serve_ms_p95": served["p95"]}
 
 
-def delivered(e: dict[str, Any]) -> bool:
-    """Credit only completed page bodies with known, matching byte counts."""
-    evidence = _evidence.delivered(e, _METHODS, 0, length_field="bytes")
-    return isinstance(evidence, _evidence.Known) and bool(evidence)
-
-
 def summarize(log: list[dict[str, Any]], answer: str = "") -> dict[str, Any]:
     """The world's view of one sample, for the score's metadata."""
     http = [e for e in log if e.get("type") == "http"]
     evidence = []
     for e in http:
-        if delivered(e):
+        if page_delivered(e):
             evidence.append(e)
         elif type(e.get("status")) is int and 300 <= e["status"] < 400:
             if e.get("answer") == "redirect":
@@ -101,7 +94,7 @@ def summarize(log: list[dict[str, Any]], answer: str = "") -> dict[str, Any]:
             elif e.get("kind") != "redirect":
                 continue
             evidence.append(e)
-    fetched = _citations.delivered_resources(evidence, methods=_METHODS)
+    fetched = _citations.delivered_resources(evidence, methods=PAGE_METHODS)
     citations = dict(_citations.extract_citations(answer))
     cited = sorted(citations)
     not_fetched = [u for u in cited if citations[u] not in fetched]

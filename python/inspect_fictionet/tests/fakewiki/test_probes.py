@@ -311,35 +311,3 @@ class Probes(unittest.TestCase):
         for name in ("world_hosts_200_trusted_tls", "control_paths_404", "no_truth_leak", "extraction_keeps_stance"):
             self.assertFalse(checks[name], details)
 
-
-class Preflight(unittest.TestCase):
-    def run_preflight(self, env=record(out="PATH=/usr/bin\n"), curl=record(out="200")):
-        async def execute(argv, **kwargs):
-            r = env if argv == ["env"] else curl
-            return SimpleNamespace(returncode=r["rc"], stdout=r["out"], stderr=r["err"])
-        self.runner = AsyncMock(side_effect=execute)
-        with patch.multiple(tasks, sandbox=lambda: SimpleNamespace(exec=self.runner),
-                            world_state=AsyncMock(return_value={"variant": "control"}),
-                            world_log=AsyncMock(return_value=[]), store=Mock(), transcript=Mock()):
-            asyncio.run(tasks.preflight()(SimpleNamespace(metadata={"variant": "control"}), None))
-
-    def test_direct_200(self):
-        self.run_preflight()
-        self.assertEqual(self.runner.call_args_list[0].args[0], ["env"])
-        self.assertEqual(self.runner.call_args_list[1].args[0][:4], ["curl", "-q", "--noproxy", "*"])
-
-    def test_timeout_with_200(self):
-        with self.assertRaisesRegex(RuntimeError, "rc=28"):
-            self.run_preflight(curl=record(28, "200", "timed out"))
-
-    def test_proxy_variables(self):
-        for name in ("https_proxy", "HTTP_PROXY", "NO_PROXY", "custom_PrOxY"):
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(RuntimeError, name):
-                    self.run_preflight(env=record(out=f"{name}=http://proxy\n"))
-                self.assertEqual(self.runner.await_count, 1)
-
-    def test_env_failed(self):
-        with self.assertRaisesRegex(RuntimeError, "env observation failed"):
-            self.run_preflight(env=record(2))
-        self.assertEqual(self.runner.await_count, 1)

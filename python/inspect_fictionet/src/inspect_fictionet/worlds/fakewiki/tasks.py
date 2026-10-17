@@ -22,15 +22,14 @@ from inspect_ai.event import ModelEvent, SampleLimitEvent, SpanBeginEvent
 from inspect_ai.log import transcript
 from inspect_ai.model import GenerateConfig, get_model
 from inspect_ai.scorer import Score, Target, grouped, mean, scorer
-from inspect_ai.solver import Generate, TaskState, solver
+from inspect_ai.solver import TaskState
 from inspect_ai.tool import bash
-from inspect_ai.util import sandbox, store
+from inspect_ai.util import store
 
 from inspect_fictionet.worlds.fakewiki.scenario import VARIANTS
 from inspect_fictionet.worlds.fakewiki.world import world_sandbox, CORPUS, RUBRIC, planted_text_exposure, summarize
 
-from inspect_fictionet._common import commands
-from inspect_fictionet._common.task import world_log, world_state
+from inspect_fictionet._common.task import preflight, split, world_log
 
 QUESTIONS = {
     "tv_licence": (
@@ -74,41 +73,6 @@ def dataset(variants: list[str], topics: list[str]) -> list[Sample]:
         for topic in topics
         for variant in variants
     ]
-
-
-def _split(s: str | list[str]) -> list[str]:
-    return [x.strip() for x in (s.split(",") if isinstance(s, str) else s) if x.strip()]
-
-
-@solver
-def preflight():
-    """Verify the world before the agent starts, via both sandboxes.
-
-    - the world reports the variant this sample asked for (catches a silent
-      SAMPLE_METADATA interpolation failure, which would default to 'unset');
-    - the agent container can resolve and fetch a world page over trusted TLS
-      with no proxy settings.
-    Then record the log offset so the agent's requests are scored alone.
-    """
-
-    async def solve(state: TaskState, generate: Generate) -> TaskState:
-        want = state.metadata["variant"]
-        got = (await world_state())["variant"]
-        if got != want:
-            raise RuntimeError(f"world variant is {got!r}, sample wants {want!r}")
-        runner = sandbox().exec
-        env = await commands.run_async(["env"], runner=runner)
-        commands.require_no_proxy(env)
-        r = await commands.run_async([*commands.CURL_DIRECT, "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-                                      "-A", "fakewiki-preflight", "https://en.wikipedia.org/wiki/Main_Page"], runner=runner)
-        if not commands.succeeded(r, stdout="200"):
-            raise RuntimeError(f"agent cannot reach the world (rc={r.rc}): {r.stdout} {r.stderr}")
-        store().set("log_offset", len(await world_log(finalize=False)))
-        transcript().info({"variant": got, "preflight_http": r.stdout.strip(),
-                           "agent_proxy_env": "(none)"}, source="fictionet")
-        return state
-
-    return solve
 
 
 def _parse_verdict(text: str) -> dict:
@@ -197,9 +161,9 @@ def fakewiki(
 ) -> Task:
     """FakeWiki eval. Samples = topics x variants; score metrics are grouped by variant."""
     return Task(
-        dataset=dataset(_split(variants), _split(topics)),
+        dataset=dataset(split(variants, VARIANTS, "variant"), split(topics, tuple(QUESTIONS), "topic")),
         solver=[
-            preflight(),
+            preflight(("variant",), "https://en.wikipedia.org/wiki/Main_Page"),
             react(prompt=AgentPrompt(instructions=SYSTEM), tools=[bash(timeout=bash_timeout)]),
         ],
         scorer=fakewiki_scorer(grader_model),
