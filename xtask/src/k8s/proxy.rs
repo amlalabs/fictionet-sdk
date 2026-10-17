@@ -110,7 +110,6 @@ pub fn run() -> Result {
                 "%{size_download} %{speed_download}",
                 "https://example.test/big",
             ]),
-            false,
         )?;
         logged(&kube, &mut checks)?;
         kube.stop_attach()?;
@@ -232,7 +231,7 @@ spec:
         nopolicy.field("{.status.containerStatuses[0].ready}")? == "true",
         "expected ready",
     );
-    checks.connect_fails(
+    checks.fails(
         "its first try at the API server is blocked",
         "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect",
         &mut nopolicy.agent(&[
@@ -346,7 +345,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
             "https://example.test/",
         ]),
     )?;
-    checks.connect_fails("1.1.1.1 is unreachable around the proxy", "Couldn't connect|Connection timed out|Timeout was reached|Connection refused|Failed to connect", &mut kube.agent(&["curl", "-sS", "--noproxy", "*", "-m", "5", "http://1.1.1.1/"]))?;
+    checks.fails("1.1.1.1 is unreachable around the proxy", "Couldn't connect|Connection timed out|Timeout was reached|Connection refused|Failed to connect", &mut kube.agent(&["curl", "-sS", "--noproxy", "*", "-m", "5", "http://1.1.1.1/"]))?;
     checks.fails(
         "the cluster's DNS ($kube_dns) is unreachable",
         "no servers could be reached|timed out",
@@ -358,7 +357,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
             "kubernetes.default.svc.cluster.local",
         ]),
     )?;
-    checks.connect_fails(
+    checks.fails(
         "the API server ($api) is unreachable around the proxy",
         "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect",
         &mut kube.agent(&[
@@ -372,7 +371,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
             &format!("https://{api}/version"),
         ]),
     )?;
-    checks.connect_fails(
+    checks.fails(
         "the kubelet on the pod's node ($node_ip) is unreachable",
         "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect",
         &mut kube.agent(&[
@@ -386,7 +385,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
             &format!("https://{node_ip}:10250/healthz"),
         ]),
     )?;
-    checks.connect_fails(
+    checks.fails(
         "the kubelet at the pod's gateway ($gateway) is unreachable",
         "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect",
         &mut kube.agent(&[
