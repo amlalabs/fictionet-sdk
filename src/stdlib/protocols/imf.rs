@@ -3161,7 +3161,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_standalone_writers_stay_in_bounds() {
+    fn standalone_writers_stay_in_bounds() {
         // A group of MAX_ADDRESSES members counts as one more entry.
         let group = Address::Group {
             name: "G".into(),
@@ -3213,7 +3213,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_encoded_lines_fit_76() {
+    fn encoded_lines_fit_76() {
         // RFC 2047 section 2: a line holding an encoded word is at most 76
         // characters long.
         let mut h = Header::default();
@@ -3248,7 +3248,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_no_fold_inside_quoted_pair() {
+    fn no_fold_inside_quoted_pair() {
         // RFC 5322 section 3.2.1: a quoted-pair is a backslash and the
         // character after it, with no fold between them.
         let v = format!("\"{}\\ b\"@example.com", "a".repeat(70));
@@ -3275,7 +3275,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_writer_refuses_controls() {
+    fn writer_refuses_controls() {
         // RFC 5322 sections 3.2.5 and 4: controls other than a tab are
         // obsolete text, which a writer may not write.
         for v in ["hello\u{7f}", "a\u{1}b", "\u{1b}[0m"] {
@@ -3305,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_obsolete_domain_literal_escapes() {
+    fn obsolete_domain_literal_escapes() {
         // RFC 5322 section 4.4: obs-dtext includes quoted-pair.
         assert_eq!(one(r"a@[127.0.0.\1]"), mailbox(None, "a", "[127.0.0.1]"));
         assert_eq!(
@@ -3327,7 +3327,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_source_routes() {
+    fn source_routes() {
         // RFC 5322 section 4.4: obs-route = obs-domain-list ":".
         for s in [
             "<,@route.example:a@example.com>",
@@ -3351,7 +3351,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_long_years() {
+    fn long_years() {
         // RFC 5322 section 3.3: a year is four or more digits.
         fictionet::assert_cases!(|input| DateTime::parse(input).unwrap().year;
             ("1 Jan 02024 00:00 +0000".as_bytes()) => 2024,
@@ -3368,7 +3368,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_base64_padding() {
+    fn base64_padding() {
         // RFC 2047 section 4.1 uses RFC 2045 base64: padding fills a
         // four-character group.
         for w in [
@@ -3388,7 +3388,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_encoded_word_length() {
+    fn encoded_word_length() {
         // RFC 2047 section 2: an encoded word is at most 75 characters.
         let w = format!("=?utf-8?q?{}?=", "A".repeat(63));
         assert_eq!(w.len(), ENCODED_WORD_LEN);
@@ -3433,7 +3433,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_unknown_zone() {
+    fn unknown_zone() {
         // RFC 5322 sections 3.3 and 4.3: -0000 means the local zone is
         // unknown, and military letters are read as -0000.
         for s in [
@@ -3551,7 +3551,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_writers_write_what_readers_read() {
+    fn writers_write_what_readers_read() {
         // Arbitrary values, not only those a reader made: whatever a
         // writer writes reads back as the same value, folded or not.
         let mut rng = Lcg::new(0xa57a);

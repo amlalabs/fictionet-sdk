@@ -81,7 +81,7 @@ another. It takes about a minute longer.
 
 Some regression tests guard fixes to tests and checks that once passed
 without doing their work. `tests/check_contracts.json` lists them, each with
-its finding id and reason. CI fails unless each one ran exactly once and
+its id and reason. CI fails unless each one ran exactly once and
 passed. `tools/check_test_contracts.py check` reads nextest's JUnit report,
 `target/nextest/default/junit.xml`, and pytest's `--junitxml` report. For
 unittest suites, `tools/check_test_contracts.py run` runs the discovery and

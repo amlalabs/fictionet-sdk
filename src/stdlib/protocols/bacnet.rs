@@ -3249,7 +3249,7 @@ mod tests {
         );
     }
 
-    // Findings from review: each case below failed before its fix.
+    // Each case below once failed.
 
     #[test]
     fn value_lists_are_bounded() {

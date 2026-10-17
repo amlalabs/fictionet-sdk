@@ -3645,9 +3645,8 @@ mod tests {
         assert_eq!(back.option_flags3, option_flags3::USER_INSTANCE);
     }
 
-    /// Review finding: the writer cut a 129-character user name or
-    /// password to 128 characters, so the login read back differently.
-    /// It now refuses what it cannot write as given.
+    /// The writer refuses a user name or password longer than 128
+    /// characters rather than cutting it, so the login reads back as given.
     #[test]
     fn login_writer_refuses_what_it_cannot_write() {
         let fits = Login7 {
@@ -4781,8 +4780,6 @@ mod tests {
         );
         assert!(w.to_bytes().unwrap().as_slice().is_empty());
     }
-
-    // Findings from a second review, one test each.
 
     /// A writer with one column and nothing else written, and whether it
     /// takes a row of `v`.

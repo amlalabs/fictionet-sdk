@@ -283,11 +283,11 @@ pub(crate) struct ListenShared {
 
 impl ListenShared {
     fn unwatch(&self, fd: RawFd) {
-        // RH-025: removing a watch is best-effort teardown. It grants no
+        // Removing a watch is best-effort teardown. It grants no
         // readiness and clears no retry state, unlike ADD and MOD.
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "RH-025: removing a watch is teardown; it grants no readiness and clears no retry state"
+            reason = "POL-TEARDOWN: removing a watch is teardown; it grants no readiness and clears no retry state"
         )]
         let _ = (self.ops.epoll_ctl)(self.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, 0, 0);
     }
@@ -342,7 +342,7 @@ impl ConnSlot {
         // and the helper ignores it while the queue is empty.
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "RH-025: if MOD fails, want_out stays true and EPOLLOUT stays registered, which the helper ignores while the queue is empty"
+            reason = "POL-HINT: if MOD fails, want_out stays true and EPOLLOUT stays registered, which the helper ignores while the queue is empty"
         )]
         let _ = self.watch_out(out, shared, false);
     }

@@ -2674,8 +2674,6 @@ mod tests {
         contract::check_decode_with_alloc_limit(Commands::new, &long, 2 * MAX_LINE);
     }
 
-    // One test for each finding of the October 2026 review.
-
     #[test]
     fn streams_bound_input_allocation() {
         let big = [vec![b'x'; 1 << 20], b"yy\r\nNOOP\r\n".to_vec()].concat();

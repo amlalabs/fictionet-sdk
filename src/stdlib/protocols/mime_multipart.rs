@@ -2393,7 +2393,7 @@ Content-Type: text/plain
         }
     }
 
-    // Finding: a boundary made of a header's name, the colon and its value.
+    // A boundary made of a header's name, the colon and its value.
     #[test]
     fn boundary_across_a_header_line() {
         let m = Multipart {
@@ -2431,7 +2431,7 @@ Content-Type: text/plain
         );
     }
 
-    // Finding: `--b--junk` closed the body.
+    // `--b--junk` does not close the body.
     #[test]
     fn closing_line_must_end() {
         assert_eq!(
@@ -2445,7 +2445,7 @@ Content-Type: text/plain
         check(b"--b\r\n\r\nx\r\n--b-- \t", "b");
     }
 
-    // Finding: a boundary line with too much padding became body data.
+    // A boundary line with too much padding is an error, not body data.
     #[test]
     fn too_much_padding_is_an_error() {
         let pad = " ".repeat(MAX_PADDING + 1);
@@ -2471,7 +2471,7 @@ Content-Type: text/plain
         );
     }
 
-    // Finding: comments and spaces in Content-Type hid the boundary.
+    // Comments and spaces in Content-Type do not hide the boundary.
     #[test]
     fn content_type_comments() {
         fictionet::assert_cases!(|input| boundary(input).as_deref();
@@ -2615,7 +2615,7 @@ Content-Type: text/plain
         }
     }
 
-    // Finding: RFC 2231 continuations of the boundary were not joined.
+    // RFC 2231 continuations of the boundary are joined.
     #[test]
     fn boundary_continuations() {
         assert_eq!(
@@ -2644,7 +2644,7 @@ Content-Type: text/plain
         assert_eq!(boundary(&long), None);
     }
 
-    // Finding: a header block the parser took could be too long to write.
+    // A header block the parser takes is short enough to write again.
     #[test]
     fn full_header_block_writes_again() {
         let mut block = Vec::new();

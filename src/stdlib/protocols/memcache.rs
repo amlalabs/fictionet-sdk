@@ -3719,8 +3719,6 @@ mod tests {
         }
     }
 
-    // Findings from review, one test each.
-
     #[test]
     fn decoders_hold_a_bounded_number_of_bytes() {
         let flood = vec![b'a'; 4 * MAX_LINE];

@@ -5228,7 +5228,7 @@ mod tests {
         assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
     }
 
-    // Findings from review, each checked against Part 6 or Part 3.
+    // Each test below is checked against Part 6 or Part 3.
 
     #[test]
     fn push_holds_a_bounded_amount() {

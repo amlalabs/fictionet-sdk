@@ -4587,7 +4587,7 @@ mod tests {
         assert_eq!(again.to_bytes().unwrap(), bytes);
     }
 
-    // Each test below follows one finding of a review against MS-SMB2.
+    // Each test below checks one rule of MS-SMB2.
 
     #[test]
     fn every_entry_point_refuses_a_payload_past_max_message() {
