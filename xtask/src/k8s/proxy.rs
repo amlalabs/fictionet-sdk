@@ -128,16 +128,6 @@ pub fn run() -> Result {
     cleanup.finish(result)
 }
 
-fn api() -> Result<String> {
-    capture(&mut kubectl(&[
-        "get",
-        "service",
-        "kubernetes",
-        "-o",
-        "jsonpath={.spec.clusterIP}",
-    ]))
-}
-
 fn install(release: &str, namespace: &str, proxy: bool, wait: bool) -> Command {
     let mut command = helm(&[
         "install",
@@ -189,21 +179,19 @@ fn startup(kube: &Kube, checks: &mut Checks) -> Result {
         install("fnnopolicy", kube.namespace, true, false)
             .args(["--set", "networkPolicy.enabled=false"]),
     )?;
-    let started = poll(Duration::from_secs(20), Duration::from_millis(200), || {
-        let running = capture(&mut nopolicy.command(&["get", "pods", "--field-selector", &format!("metadata.name={}", nopolicy.pod), "-o", "jsonpath={.items[*].status.containerStatuses[0].state.running.startedAt}{.items[*].status.containerStatuses[0].state.terminated.startedAt}"]))?;
-        Ok(!running.is_empty())
+    let mut logs = String::new();
+    let waiting = poll(Duration::from_secs(60), Duration::from_secs(1), || {
+        logs = combined(&nopolicy.logs("wait-blocked").output()?);
+        Ok(logs.contains("still reachable; waiting"))
     })?;
-    let logs = capture(&mut nopolicy.logs("wait-blocked"))?;
     checks.require(
         "with no NetworkPolicy, wait-blocked is still waiting",
-        logs.contains("still reachable; waiting"),
+        waiting,
         &logs,
     );
     checks.require(
         "with no NetworkPolicy, the agent has not started",
-        !started
-            && nopolicy.field("{.status.containerStatuses[0].state.waiting.reason}")?
-                == "PodInitializing",
+        nopolicy.field("{.status.containerStatuses[0].state.waiting.reason}")? == "PodInitializing",
         "expected PodInitializing",
     );
     input(
@@ -309,15 +297,7 @@ fn clients(kube: &Kube, checks: &mut Checks) -> Result {
 
 fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
     let api = api()?;
-    let kube_dns = capture(&mut kubectl(&[
-        "-n",
-        "kube-system",
-        "get",
-        "service",
-        "kube-dns",
-        "-o",
-        "jsonpath={.spec.clusterIP}",
-    ]))?;
+    let kube_dns = kube_dns()?;
     let node_ip = capture(&mut kubectl(&[
         "get",
         "node",
@@ -347,7 +327,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
     )?;
     checks.fails("1.1.1.1 is unreachable around the proxy", "Couldn't connect|Connection timed out|Timeout was reached|Connection refused|Failed to connect", &mut kube.agent(&["curl", "-sS", "--noproxy", "*", "-m", "5", "http://1.1.1.1/"]))?;
     checks.fails(
-        "the cluster's DNS ($kube_dns) is unreachable",
+        &format!("the cluster's DNS ({kube_dns}) is unreachable"),
         "no servers could be reached|timed out",
         &mut kube.agent(&[
             "dig",
@@ -358,7 +338,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
         ]),
     )?;
     checks.fails(
-        "the API server ($api) is unreachable around the proxy",
+        &format!("the API server ({api}) is unreachable around the proxy"),
         "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect",
         &mut kube.agent(&[
             "curl",
@@ -372,7 +352,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
         ]),
     )?;
     checks.fails(
-        "the kubelet on the pod's node ($node_ip) is unreachable",
+        &format!("the kubelet on the pod's node ({node_ip}) is unreachable"),
         "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect",
         &mut kube.agent(&[
             "curl",
@@ -386,7 +366,7 @@ fn isolation(kube: &Kube, checks: &mut Checks) -> Result {
         ]),
     )?;
     checks.fails(
-        "the kubelet at the pod's gateway ($gateway) is unreachable",
+        &format!("the kubelet at the pod's gateway ({gateway}) is unreachable"),
         "Couldn't connect|Connection timed out|Timeout was reached|Failed to connect",
         &mut kube.agent(&[
             "curl",

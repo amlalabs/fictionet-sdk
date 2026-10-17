@@ -98,6 +98,26 @@ fn helm(args: &[&str]) -> Command {
     command
 }
 
+fn cluster_ip(namespace: &str, service: &str) -> Result<String> {
+    capture(&mut kubectl(&[
+        "-n",
+        namespace,
+        "get",
+        "service",
+        service,
+        "-o",
+        "jsonpath={.spec.clusterIP}",
+    ]))
+}
+
+fn api() -> Result<String> {
+    cluster_ip("default", "kubernetes")
+}
+
+fn kube_dns() -> Result<String> {
+    cluster_ip("kube-system", "kube-dns")
+}
+
 pub fn run(args: &[String]) -> Result {
     let mode = match args {
         [] => "all",
