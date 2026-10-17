@@ -1,6 +1,7 @@
-# Border on Fictionet, lab setting, for Inspect's stock "docker" provider.
+# Border on Fictionet, lab setting, under Docker Compose: cargo xtask demo border
+# runs it in the VM, and the README says how to run it by hand.
 #
-#   fictionet - the world: web::Sites and the border routers, in Rust. No
+#   world     - the world: web::Sites and the border routers, in Rust. No
 #               network at all (network_mode: none). Its only door is the
 #               world socket on the `sock` volume, at /run/relay/relay.sock.
 #               The agent can see that path in /proc/net/unix (Unix sockets
@@ -16,16 +17,19 @@
 # when the sandbox config is a file path. The world refuses to start
 # without a valid variant.
 
+name: fictionet-border
+
 x-build: &build
   context: ../..
   dockerfile: examples/border/docker/Dockerfile
 
 services:
-  fictionet:
+  world:
     build:
       <<: *build
       target: world
     image: fictionet-border-world:dev
+    init: true                      # passes SIGTERM on to the world
     network_mode: none
     # The world is trusted. NET_ADMIN lets it raise its socket buffers to
     # attach past the system limit, so a burst of packets is not lost.
@@ -79,7 +83,7 @@ services:
     volumes:
       - sock:/run/relay
     depends_on:
-      fictionet:
+      world:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "test", "-f", "/run/attach-ready"]

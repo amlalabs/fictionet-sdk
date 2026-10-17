@@ -6,16 +6,19 @@
 # image tags are this file's own, so building it never replaces the lab
 # images.
 
+name: fictionet-border-home
+
 x-build: &build
   context: ../..
   dockerfile: examples/border/docker/Dockerfile
 
 services:
-  fictionet:
+  world:
     build:
       <<: *build
       target: world-home
     image: fictionet-border-world:home
+    init: true                      # passes SIGTERM on to the world
     network_mode: none
     cap_add: [NET_ADMIN]
     environment:
@@ -68,7 +71,7 @@ services:
     volumes:
       - sock:/run/relay
     depends_on:
-      fictionet:
+      world:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "test", "-f", "/run/attach-ready"]

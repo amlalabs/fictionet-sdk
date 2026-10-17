@@ -59,7 +59,7 @@ fn main_result() -> Result {
                       cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [options]\n\
                       cargo xtask k8s [tun|proxy]\n\
                       cargo xtask vm [--fetch | nested [--fetch] | up | down | prepare | sync | build | test | ssh | status | clean]\n\
-                      cargo xtask demo <border|dashboard|k8s|proxy|web>\n\
+                      cargo xtask demo <name>  (demos/README.md lists them)\n\
                       cargo xtask fuzz [--check | <target> | <seconds>] [libFuzzer arguments...]\n\
                       cargo xtask scan [output directory]"
             );

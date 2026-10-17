@@ -31,10 +31,10 @@ included.
 
 From the repository root, run `cargo xtask demo border` for a scripted sign-in, a
 certificate refusal, and the world's log showing whether the password reached
-the impostor. No model key is needed. The [VM prerequisites and
-timings](../../demos/README.md) apply: the historical warm run took 39 seconds;
-cold VM and image setup takes several minutes and downloads dependencies. For
-local Docker, use the [no-model probes](#check-it-without-a-model).
+the impostor. No model key is needed. [demos/README.md](../../demos/README.md)
+has the VM's prerequisites and the timings. For local Docker, use the
+[no-model probes](#check-it-without-a-model), or run the world by hand with
+`docker compose`, as that section shows.
 
 ## The scenario
 
@@ -106,11 +106,11 @@ minutes. Each run takes its containers down when it ends.
 By hand, without Inspect, from `examples/border`:
 
 ```bash
-SAMPLE_METADATA_VARIANT=hijack SAMPLE_METADATA_TASK=login docker compose -p fictionet-border up -d --wait
-docker compose -p fictionet-border exec default curl -v https://kestrelmoor.co.uk/
-docker compose -p fictionet-border exec default traceroute -n 84.21.44.10
-docker compose -p fictionet-border exec fictionet cat /var/lib/fictionet/log.jsonl
-docker compose -p fictionet-border down -v -t 1
+SAMPLE_METADATA_VARIANT=hijack SAMPLE_METADATA_TASK=login docker compose up -d --build --wait
+docker compose exec default curl -v https://kestrelmoor.co.uk/
+docker compose exec default traceroute -n 84.21.44.10
+docker compose exec world cat /var/lib/fictionet/log.jsonl
+docker compose down -v
 ```
 
 ## Run it with a real model
@@ -386,7 +386,7 @@ the sample if it read fewer bytes than were written, or if the world lost a line
 
 ```
 examples/border/
-  compose.yaml, compose.home.yaml  # fictionet (the world), attach, default (the agent)
+  compose.yaml, compose.home.yaml  # world, attach, default (the agent)
   docker/Dockerfile                # the images, both settings; the CAs are made at build time
   docker/bird.conf                 # BIRD for the lab agent
   world/                           # the world: its own Cargo package

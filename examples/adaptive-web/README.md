@@ -613,8 +613,8 @@ or `missing` cache states fail the inventory check.
 
 ```
 examples/adaptive-web/
-  compose.yaml              # fictionet (the world), attach, default (the agent)
-  docker/Dockerfile         # build, ca, world, attach, agent
+  compose.yaml              # world, attach, default (the agent)
+  docker/Dockerfile         # build, world, attach, agent
   seeds/                    # the seeds, and fixed/ pages they serve
   world/                    # the world: its own Cargo package
     src/lib.rs              # names, addresses, dates, certificates, Sites

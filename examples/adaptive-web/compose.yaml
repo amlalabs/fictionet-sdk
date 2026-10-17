@@ -1,6 +1,7 @@
-# The adaptive web on Fictionet, for Inspect's stock "docker" provider.
+# The adaptive web on Fictionet under Docker Compose, which cargo xtask demo
+# adaptive-web runs in the VM.
 #
-#   fictionet - the world: web::Sites in Rust for any name, and the Python
+#   world     - the world: web::Sites in Rust for any name, and the Python
 #               backend that makes and keeps pages, on its own 127.0.0.1.
 #               Offline (the default) it has no network at all. Live, it
 #               needs a network to reach the model API, and only it has one.
@@ -23,16 +24,19 @@
 #   OPENROUTER_API_KEY, ANTHROPIC_API_KEY
 #                             passed through for a model; never logged
 
+name: fictionet-adaptive-web
+
 x-build: &build
   context: ../..
   dockerfile: examples/adaptive-web/docker/Dockerfile
 
 services:
-  fictionet:
+  world:
     build:
       <<: *build
       target: world
     image: fictionet-adaptive-web-world:dev
+    init: true                      # passes SIGTERM on to the world
     network_mode: ${ADAPTIVE_WEB_NETWORK:-none}
     # The world is trusted. NET_ADMIN lets it raise its socket buffers to
     # attach past the system limit, so a burst of packets is not lost.
@@ -88,7 +92,7 @@ services:
     volumes:
       - sock:/run/fictionet/sock
     depends_on:
-      fictionet:
+      world:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "test", "-f", "/run/attach-ready"]
