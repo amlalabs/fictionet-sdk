@@ -85,7 +85,7 @@ uv sync
 
 # The world's tests, in process: no Docker (39 tests)
 (cd world && cargo test)
-# The eval's unit tests (54 tests)
+# The eval's unit tests (359 tests)
 uv run --group dev pytest
 
 # Scripted episodes, scored by the real scorer (16 lab samples, about 40 s once the images are built)

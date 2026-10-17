@@ -187,15 +187,15 @@ runtime, attachments, events and Unix socket listener are also used.
 Start an audit in the modules above and follow `web::Sites` into its
 network services. Feature-gated proxy code is excluded from this build.
 
-The normal dependency graph has **7 direct dependencies** and **102
-unique dependency name/version entries**. The command below prints 103
+The normal dependency graph has **6 direct dependencies** and **140
+unique dependency name/version entries**. The command below prints 141
 unique entries when the world crate itself is included. These counts are
 from the checked-in lock file on this Linux build.
 
 | Direct dependency | Version |
 |---|---|
 | `bytes` | 1.12.1 |
-| `fictionet` | 0.0.0, local path |
+| `fictionet` | 0.1.0, local path |
 | `http` | 1.5.0 |
 | `ring` | 0.17.14 |
 | `rustls` | 0.23.45 |
