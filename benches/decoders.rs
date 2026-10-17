@@ -71,7 +71,7 @@ fn itch_add_orders(bencher: Bencher) {
         order_ref: 1,
         side: itch::Side::Buy,
         shares: 300,
-        stock: itch::Alpha::right_padded("ZXZZT").unwrap(),
+        stock: fictionet::stdlib::codec::field::Alpha::right_padded("ZXZZT").unwrap(),
         price: itch::Price4(102_500),
     }
     .to_bytes()

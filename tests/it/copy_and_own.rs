@@ -2,119 +2,149 @@
 //! Copied modules compile without cfg(test) in fictionet-copy-modules.
 
 use fictionet::stdlib::codec::Frames;
+// The copied protocol modules name the SDK's field type, so their messages
+// are built with it. The copied type is checked on its own below.
+use fictionet::stdlib::codec::field::Alpha;
 use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
 use fictionet_copy_modules::*;
 
 #[test]
-fn copied_printable_fields_preserve_padding_and_rejections() {
-    macro_rules! right_padded {
-        ($module:ident) => {{
-            for (text, bytes) in [
-                ("", *b"    "),
-                ("AB", *b"AB  "),
-                (" A ", *b" A  "),
-                (" ~! ", *b" ~! "),
-            ] {
-                assert_eq!(
-                    $module::Alpha::<4>::right_padded(text).unwrap().as_bytes(),
-                    &bytes
-                );
-            }
-            for text in ["ABCDE", "\0", "\t", "\n", "\u{1f}", "\u{7f}", "é", "🦀"] {
-                assert_eq!(
-                    $module::Alpha::<4>::right_padded(text),
-                    Err($module::Error::Field)
-                );
-            }
-            assert_eq!(
-                $module::Alpha::<0>::right_padded("").unwrap().as_bytes(),
-                &[]
-            );
-            assert_eq!(
-                $module::Alpha::<0>::right_padded("A"),
-                Err($module::Error::Field)
-            );
-        }};
+fn copied_text_field_pads_validates_and_trims() {
+    use codec::field::{Alpha, Error};
+    for (text, left, right) in [
+        ("", *b"    ", *b"    "),
+        ("AB", *b"  AB", *b"AB  "),
+        (" A ", *b"  A ", *b" A  "),
+        (" ~! ", *b" ~! ", *b" ~! "),
+    ] {
+        assert_eq!(Alpha::<4>::left_padded(text).unwrap().as_bytes(), &left);
+        assert_eq!(Alpha::<4>::right_padded(text).unwrap().as_bytes(), &right);
     }
-    right_padded!(itch);
-    right_padded!(ouch);
-    right_padded!(soupbintcp);
-    right_padded!(cboe_pitch);
+    assert_eq!(Alpha::<0>::left_padded("").unwrap().as_bytes(), &[]);
+    assert_eq!(Alpha::<0>::right_padded("A"), Err(Error::Length));
+    assert_eq!(Alpha::<4>::left_padded("ABCDE"), Err(Error::Length));
+    for text in ["\0", "\t", "\n", "\u{1f}", "\u{7f}", "é", "🦀"] {
+        assert_eq!(Alpha::<4>::left_padded(text), Err(Error::Printable));
+        assert_eq!(Alpha::<4>::right_padded(text), Err(Error::Printable));
+    }
+    for byte in 0..=u8::MAX {
+        let bytes = [b' ', b'A', byte];
+        if (b' '..=b'~').contains(&byte) {
+            assert_eq!(Alpha::new(bytes).unwrap().as_bytes(), &bytes);
+        } else {
+            assert_eq!(Alpha::new(bytes), Err(Error::Printable));
+        }
+        assert_eq!(Alpha::from(bytes).as_bytes(), &bytes);
+    }
+    assert_eq!(Alpha::new(*b" A ").unwrap().trimmed(), "A");
+    assert_eq!(Alpha::from(*b" A \0Z").trimmed(), "A");
+    assert!(Alpha::<3>::blank().is_blank());
+}
 
+#[test]
+fn copied_protocols_keep_their_alpha_rules() {
+    // A NUL in an alpha field: Nasdaq's protocols refuse the message,
+    // Cboe's keeps the byte.
+    fn nul_in(bytes: &mut [u8], field: &[u8]) {
+        let at = bytes.windows(field.len()).position(|w| w == field).unwrap();
+        bytes[at] = 0;
+    }
+    let symbol = Alpha::right_padded("ZVZZT").unwrap();
+    let add = itch::AddOrder {
+        header: itch::Header {
+            locate: 3,
+            tracking: 0,
+            timestamp: itch::Timestamp::new(1).unwrap(),
+        },
+        order_ref: 5,
+        side: itch::Side::Sell,
+        shares: 100,
+        stock: symbol,
+        price: itch::Price4(10_000),
+    };
+    let mut bytes = itch::Message::from(add).to_bytes().unwrap();
+    nul_in(&mut bytes, symbol.as_bytes());
+    assert_eq!(
+        <itch::Message as Wire>::parse(&bytes),
+        Err(itch::Error::Field)
+    );
+    let enter = ouch::EnterOrder {
+        user_ref: 1,
+        side: ouch::Side::Buy,
+        quantity: 10,
+        symbol,
+        price: ouch::Price(10_000),
+        time_in_force: b'0',
+        display: b'Y',
+        capacity: b'A',
+        intermarket_sweep: b'N',
+        cross_type: b'N',
+        cl_ord_id: Alpha::right_padded("A1").unwrap(),
+        options: ouch::Options::default(),
+    };
+    let mut bytes = enter.to_bytes().unwrap();
+    nul_in(&mut bytes, symbol.as_bytes());
+    assert_eq!(
+        <ouch::Inbound as Wire>::parse(&bytes),
+        Err(ouch::Error::Field)
+    );
+    let login = soupbintcp::Login {
+        username: Alpha::right_padded("ALICE").unwrap(),
+        password: Alpha::right_padded("SECRET").unwrap(),
+        session: Alpha::blank(),
+        sequence: 1,
+    };
+    let mut bytes = soupbintcp::Packet::LoginRequest(login).to_bytes().unwrap();
+    nul_in(&mut bytes, login.username.as_bytes());
+    assert_eq!(
+        <soupbintcp::Packet as Wire>::parse(&bytes),
+        Err(soupbintcp::Error::Field)
+    );
+    let short = cboe_pitch::AddOrderShort {
+        time_offset: 447_000,
+        order_id: 5,
+        side: cboe_pitch::Side::Buy,
+        quantity: 737,
+        symbol: symbol.resized().unwrap(),
+        price: cboe_pitch::ShortPrice(1),
+        flags: 1,
+        extra: Vec::new(),
+    };
+    let mut bytes = cboe_pitch::Message::from(short).to_bytes().unwrap();
+    nul_in(&mut bytes, b"ZVZZT ");
+    let cboe_pitch::Message::AddOrderShort(parsed) =
+        <cboe_pitch::Message as Wire>::parse(&bytes).unwrap()
+    else {
+        panic!("not an Add Order (short)")
+    };
+    assert_eq!(parsed.symbol.as_bytes(), b"\0VZZT ");
+    assert_eq!(cboe_pitch::Message::from(parsed).to_bytes().unwrap(), bytes);
+
+    // MoldUDP64's session field is its own type, padded on the left.
     for (text, bytes) in [
         ("", *b"          "),
         ("AB", *b"        AB"),
-        (" A ", *b"        A "),
         ("0123456789", *b"0123456789"),
     ] {
         assert_eq!(
             moldudp64::Session::left_padded(text).unwrap().as_bytes(),
             &bytes
         );
-        assert_eq!(
-            soupbintcp::Alpha::<10>::left_padded(text)
-                .unwrap()
-                .as_bytes(),
-            &bytes
-        );
     }
-    for text in [
-        "01234567890",
-        "\0",
-        "\t",
-        "\n",
-        "\u{1f}",
-        "\u{7f}",
-        "é",
-        "🦀",
-    ] {
+    for text in ["01234567890", "\0", "é"] {
         assert_eq!(
             moldudp64::Session::left_padded(text),
             Err(moldudp64::Error::Field)
         );
-        assert_eq!(
-            soupbintcp::Alpha::<10>::left_padded(text),
-            Err(soupbintcp::Error::Field)
-        );
     }
-    assert_eq!(
-        soupbintcp::Alpha::<0>::left_padded("").unwrap().as_bytes(),
-        &[]
-    );
-    assert_eq!(
-        soupbintcp::Alpha::<0>::left_padded("A"),
-        Err(soupbintcp::Error::Field)
-    );
-}
-
-#[test]
-fn copied_exact_fields_keep_protocol_validation_and_trimming() {
-    for byte in 0..=u8::MAX {
-        let mut bytes = *b" A        ";
-        bytes[2] = byte;
-        macro_rules! printable {
-            ($constructor:path, $error:path) => {
-                if (b' '..=b'~').contains(&byte) {
-                    assert_eq!($constructor(bytes).unwrap().as_bytes(), &bytes);
-                } else {
-                    assert_eq!($constructor(bytes), Err($error));
-                }
-            };
-        }
-        printable!(itch::Alpha::new, itch::Error::Field);
-        printable!(ouch::Alpha::new, ouch::Error::Field);
-        printable!(soupbintcp::Alpha::new, soupbintcp::Error::Field);
-        printable!(moldudp64::Session::new, moldudp64::Error::Field);
-        assert_eq!(cboe_pitch::Alpha::new(bytes).as_bytes(), &bytes);
-    }
-    assert_eq!(itch::Alpha::new(*b" A ").unwrap().trimmed(), " A");
-    assert_eq!(ouch::Alpha::new(*b" A ").unwrap().trimmed(), " A");
-    assert_eq!(soupbintcp::Alpha::new(*b" A ").unwrap().trimmed(), "A");
     assert_eq!(
         moldudp64::Session::new(*b" A        ").unwrap().trimmed(),
         "A"
     );
-    assert_eq!(cboe_pitch::Alpha::new(*b" A \0Z").trimmed(), " A");
+    assert_eq!(
+        moldudp64::Session::new(*b"A\0        "),
+        Err(moldudp64::Error::Field)
+    );
 }
 
 #[test]
@@ -579,9 +609,9 @@ fn copied_soupbintcp_frames_through_the_public_driver() {
         .unwrap();
     let mut client = soupbintcp::Client::new(
         soupbintcp::Login {
-            username: soupbintcp::Alpha::right_padded("ALICE").unwrap(),
-            password: soupbintcp::Alpha::right_padded("SECRET").unwrap(),
-            session: soupbintcp::Alpha::blank(),
+            username: Alpha::right_padded("ALICE").unwrap(),
+            password: Alpha::right_padded("SECRET").unwrap(),
+            session: Alpha::blank(),
             sequence: 1,
         },
         soupbintcp::Timers::default(),
@@ -652,7 +682,7 @@ fn copied_itch_frames_a_file_and_builds_a_book() {
         order_ref: 5,
         side: itch::Side::Sell,
         shares: 100,
-        stock: itch::Alpha::right_padded("ZVZZT").unwrap(),
+        stock: Alpha::right_padded("ZVZZT").unwrap(),
         price: itch::Price4(10_000),
     };
     let executed = itch::OrderExecuted {
@@ -684,14 +714,14 @@ fn copied_ouch_exchange_accepts_through_wire() {
         user_ref: 1,
         side: ouch::Side::Buy,
         quantity: 10,
-        symbol: ouch::Alpha::right_padded("ZVZZT").unwrap(),
+        symbol: Alpha::right_padded("ZVZZT").unwrap(),
         price: ouch::Price(10_000),
         time_in_force: b'0',
         display: b'Y',
         capacity: b'A',
         intermarket_sweep: b'N',
         cross_type: b'N',
-        cl_ord_id: ouch::Alpha::right_padded("A1").unwrap(),
+        cl_ord_id: Alpha::right_padded("A1").unwrap(),
         options: ouch::Options::default(),
     };
     let bytes = enter.to_bytes().unwrap();
@@ -723,7 +753,7 @@ fn copied_cboe_pitch_frames_units_and_builds_a_book() {
         order_id: 5,
         side: cboe_pitch::Side::Buy,
         quantity: 737,
-        symbol: cboe_pitch::Alpha::right_padded("ZVZZT").unwrap(),
+        symbol: Alpha::right_padded("ZVZZT").unwrap(),
         price: cboe_pitch::ShortPrice(1),
         flags: 1,
         extra: Vec::new(),
@@ -752,7 +782,7 @@ fn copied_cboe_pitch_frames_units_and_builds_a_book() {
         .unwrap();
     }
     finish(&mut stream, |_| unreachable!()).unwrap();
-    let symbol = cboe_pitch::Alpha::right_padded("ZVZZT").unwrap();
+    let symbol = Alpha::right_padded("ZVZZT").unwrap();
     assert_eq!(book.best_bid(symbol).unwrap().quantity, 37);
     assert_eq!(gaps.expected(1), Some(3));
 }

@@ -35,7 +35,8 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::itch::{AddOrder, Alpha, Book, BookConfig, Header, Message, OrderDelete, Price4, Side, Timestamp};
+//! use fictionet::stdlib::codec::field::Alpha;
+//! use fictionet::stdlib::itch::{AddOrder, Book, BookConfig, Header, Message, OrderDelete, Price4, Side, Timestamp};
 //! use fictionet::stdlib::moldudp64::{Body, Downstream, Session};
 //!
 //! let header = Header { locate: 7, tracking: 0, timestamp: Timestamp::new(34_200_000_000_000)? };
@@ -69,7 +70,7 @@ use fictionet::stdlib::book_levels::{Aggregate, Levels};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::codec::field;
+use fictionet::stdlib::codec::field::{self, Alpha};
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -108,8 +109,7 @@ pub enum Error {
     /// An unknown message type byte, or bytes of another type than the
     /// one asked for.
     Type(u8),
-    /// An alpha field has a byte outside printable ASCII, or text longer
-    /// than the field.
+    /// An alpha field has a byte outside printable ASCII.
     Field,
     /// A buy/sell indicator other than "B" or "S".
     Side(u8),
@@ -269,52 +269,15 @@ impl Field for Price8 {
     }
 }
 
-/// A fixed-width alpha field: `N` bytes of printable ASCII, left justified
-/// and padded on the right with spaces ("Data Types"). Padding is part of
-/// the value, so fields round-trip byte for byte.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Alpha<const N: usize>([u8; N]);
-impl<const N: usize> Alpha<N> {
-    /// All spaces.
-    pub fn blank() -> Self {
-        Self([b' '; N])
-    }
-    /// The field's exact bytes. Refuses a byte outside 0x20..=0x7e.
-    pub fn new(bytes: [u8; N]) -> Result<Self, Error> {
-        field::validate_printable(bytes)
-            .map(Self)
-            .map_err(|_| Error::Field)
-    }
-    /// `text` padded on the right with spaces.
-    pub fn right_padded(text: &str) -> Result<Self, Error> {
-        field::right_padded(text)
-            .map(Self)
-            .map_err(|_| Error::Field)
-    }
-    /// The field's bytes, padding included.
-    pub fn as_bytes(&self) -> &[u8; N] {
-        &self.0
-    }
-    /// The text without trailing spaces.
-    pub fn trimmed(&self) -> &str {
-        // Every byte is printable ASCII, so this is valid UTF-8.
-        std::str::from_utf8(&self.0)
-            .unwrap_or_default()
-            .trim_end_matches(' ')
-    }
-}
-impl<const N: usize> fmt::Debug for Alpha<N> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", std::str::from_utf8(&self.0).unwrap_or_default())
-    }
-}
+// Alpha fields are printable ASCII ("Data Types"): a byte outside
+// 0x20..=0x7e refuses the message.
 impl<const N: usize> Field for Alpha<N> {
     const LEN: usize = N;
     fn get(b: &[u8]) -> Result<Self, Error> {
-        Self::new(array(b)?)
+        Alpha::new(array(b)?).map_err(|_| Error::Field)
     }
     fn put(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0);
+        out.extend_from_slice(self.as_bytes());
     }
 }
 
@@ -1179,9 +1142,6 @@ mod tests {
     #[test]
     fn alpha_padding_and_wire_errors() {
         let field = Alpha::<8>::right_padded("AAPL").unwrap();
-        assert_eq!(field.trimmed(), "AAPL");
-        assert_eq!(field.as_bytes(), b"AAPL    ");
-        assert_eq!(format!("{field:?}"), "\"AAPL    \"");
         let message = Message::from(AddOrder {
             header: header(1),
             order_ref: 1,
@@ -1491,7 +1451,6 @@ mod tests {
             Timestamp::new(MAX_TIMESTAMP).unwrap().nanos(),
             MAX_TIMESTAMP
         );
-        assert_eq!(Stock::right_padded("NINECHARS"), Err(Error::Field));
         for bad in ["", ".5", "1.", "1.23456", "4294967.2960", "a", "1.-1"] {
             assert_eq!(bad.parse::<Price4>(), Err(Error::Price), "{bad}");
         }

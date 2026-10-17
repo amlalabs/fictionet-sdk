@@ -31,7 +31,8 @@
 //! use fictionet::stdlib::session::Action;
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::soupbintcp::{Alpha, Client, Event, Login, Packet, Server, Timers};
+//! use fictionet::stdlib::codec::field::Alpha;
+//! use fictionet::stdlib::soupbintcp::{Client, Event, Login, Packet, Server, Timers};
 //!
 //! let login = Login {
 //!     username: Alpha::right_padded("ALICE")?,
@@ -69,14 +70,14 @@
 //!
 //! // A second of silence: the server owes a heartbeat.
 //! assert_eq!(server.tick(1030)?, [Action::Send(Packet::ServerHeartbeat)]);
-//! # Ok::<(), fictionet::stdlib::soupbintcp::Error>(())
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire, field};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::field::Alpha;
 use fictionet::stdlib::session::{self, Action};
-use std::fmt;
 
 /// Bytes in the length prefix.
 pub const LENGTH_PREFIX: usize = 2;
@@ -112,8 +113,7 @@ pub enum Error {
     TooLong,
     /// An unknown packet type byte.
     Type(u8),
-    /// An alphanumeric field has a byte outside printable ASCII, or text
-    /// longer than the field.
+    /// An alphanumeric field has a byte outside printable ASCII.
     Field,
     /// A numeric field is not digits padded with spaces, or does not fit
     /// in 64 bits.
@@ -152,67 +152,11 @@ fictionet::error_display!(FrameError, f, {
     FrameError::TooLong => f.write_str("SoupBinTCP payload is too long"),
 });
 
-/// A fixed-width alphanumeric field: `N` bytes of printable ASCII,
-/// spaces included. Padding is part of the value, so fields round-trip
-/// byte for byte.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Alpha<const N: usize>([u8; N]);
-impl<const N: usize> Alpha<N> {
-    /// All spaces. A blank requested session asks for the active one (2.3.1).
-    pub fn blank() -> Self {
-        Self([b' '; N])
-    }
-    /// The field's exact bytes. Refuses a byte outside 0x20..=0x7e.
-    pub fn new(bytes: [u8; N]) -> Result<Self, Error> {
-        field::validate_printable(bytes)
-            .map(Self)
-            .map_err(|_| Error::Field)
-    }
-    /// `text` padded on the left with spaces, as a session ID is (2.2.1).
-    pub fn left_padded(text: &str) -> Result<Self, Error> {
-        field::left_padded(text).map(Self).map_err(|_| Error::Field)
-    }
-    /// `text` padded on the right with spaces, as a username and password
-    /// are (2.3.1).
-    pub fn right_padded(text: &str) -> Result<Self, Error> {
-        field::right_padded(text)
-            .map(Self)
-            .map_err(|_| Error::Field)
-    }
-    /// The field's bytes, padding included.
-    pub fn as_bytes(&self) -> &[u8; N] {
-        &self.0
-    }
-    /// The text without leading or trailing spaces.
-    pub fn trimmed(&self) -> &str {
-        // Every byte is printable ASCII, so this is valid UTF-8.
-        std::str::from_utf8(&self.0)
-            .unwrap_or_default()
-            .trim_matches(' ')
-    }
-    /// Whether every byte is a space.
-    pub fn is_blank(&self) -> bool {
-        self.0.iter().all(|b| *b == b' ')
-    }
-    /// Whether two fields hold the same text, ignoring padding and ASCII
-    /// case. Usernames and passwords compare this way (2.3.1).
-    pub fn matches(&self, other: &Self) -> bool {
-        self.trimmed().eq_ignore_ascii_case(other.trimmed())
-    }
-    /// Whether two fields hold the same text, ignoring padding only.
-    /// Session IDs compare this way: the specification makes only
-    /// usernames and passwords case-insensitive.
-    pub fn same_text(&self, other: &Self) -> bool {
-        self.trimmed() == other.trimmed()
-    }
-    fn read(b: &[u8]) -> Result<Self, Error> {
-        Self::new(b.try_into().map_err(|_| Error::Length)?)
-    }
-}
-impl<const N: usize> fmt::Debug for Alpha<N> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", std::str::from_utf8(&self.0).unwrap_or_default())
-    }
+/// Reads an alphanumeric field of exactly `N` bytes. Alphanumeric fields
+/// are printable ASCII: a byte outside 0x20..=0x7e refuses the packet.
+fn read_alpha<const N: usize>(b: &[u8]) -> Result<Alpha<N>, Error> {
+    let bytes = b.try_into().map_err(|_| Error::Length)?;
+    Alpha::new(bytes).map_err(|_| Error::Field)
 }
 
 /// Why a server refused a login (2.2.2).
@@ -244,11 +188,15 @@ impl RejectReason {
 /// The fields of a Login Request Packet (2.3.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Login {
-    /// Username, padded on the right with spaces. Case-insensitive.
+    /// Username, padded on the right with spaces. Case-insensitive, so
+    /// it compares with [`Alpha::matches`].
     pub username: Alpha<USERNAME_LENGTH>,
-    /// Password, padded on the right with spaces. Case-insensitive.
+    /// Password, padded on the right with spaces. Case-insensitive, so
+    /// it compares with [`Alpha::matches`].
     pub password: Alpha<PASSWORD_LENGTH>,
-    /// The session to log into, or blank for the active session.
+    /// The session to log into, padded on the left with spaces, or blank
+    /// for the active session. Case-sensitive, so it compares with
+    /// [`Alpha::same_text`].
     pub session: Alpha<SESSION_LENGTH>,
     /// The next sequence number the client wants, or 0 for the most
     /// recently generated message.
@@ -335,7 +283,7 @@ impl Packet {
                 fixed(SESSION_LENGTH + SEQUENCE_LENGTH)?;
                 let (session, sequence) = p.split_at(SESSION_LENGTH);
                 Packet::LoginAccepted {
-                    session: Alpha::read(session)?,
+                    session: read_alpha(session)?,
                     sequence: read_number(sequence)?,
                 }
             }
@@ -349,9 +297,9 @@ impl Packet {
                 let (password, rest) = rest.split_at(PASSWORD_LENGTH);
                 let (session, sequence) = rest.split_at(SESSION_LENGTH);
                 Packet::LoginRequest(Login {
-                    username: Alpha::read(username)?,
-                    password: Alpha::read(password)?,
-                    session: Alpha::read(session)?,
+                    username: read_alpha(username)?,
+                    password: read_alpha(password)?,
+                    session: read_alpha(session)?,
                     sequence: read_number(sequence)?,
                 })
             }
@@ -1020,9 +968,6 @@ mod tests {
     };
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
-    fn alpha<const N: usize>(text: &[u8; N]) -> Alpha<N> {
-        Alpha::new(*text).unwrap()
-    }
     fn session() -> Alpha<SESSION_LENGTH> {
         Alpha::left_padded("ABCDEFGHIJ").unwrap()
     }
@@ -1179,19 +1124,6 @@ mod tests {
         assert_eq!(bytes.len(), MAX_PACKET);
         assert_eq!(&bytes[..2], &[0xff, 0xff]);
         check_wire_value(&full);
-    }
-
-    #[test]
-    fn alpha_fields() {
-        assert_eq!(Alpha::<4>::left_padded("ab").unwrap().as_bytes(), b"  ab");
-        assert_eq!(Alpha::<4>::right_padded("ab").unwrap().as_bytes(), b"ab  ");
-        assert_eq!(Alpha::<2>::left_padded("abc"), Err(Error::Field));
-        assert_eq!(Alpha::<2>::right_padded("abc"), Err(Error::Field));
-        assert_eq!(Alpha::<2>::right_padded("\u{e9}"), Err(Error::Field));
-        assert!(Alpha::<3>::blank().is_blank());
-        assert_eq!(alpha(b" x ").trimmed(), "x");
-        assert!(alpha(b"Ab  ").matches(&alpha(b"  aB")));
-        assert!(!alpha(b"Ab  ").matches(&alpha(b"  aC")));
     }
 
     #[test]

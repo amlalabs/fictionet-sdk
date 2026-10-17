@@ -37,8 +37,9 @@
 //! ```
 //! use fictionet::stdlib::session::Action;
 //! use fictionet::stdlib::codec::Wire;
+//! use fictionet::stdlib::codec::field::Alpha;
 //! use fictionet::stdlib::ouch::{
-//!     Alpha, EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Options, Outbound, Side, Token,
+//!     EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Options, Outbound, Side, Token,
 //! };
 //! use fictionet::stdlib::soupbintcp::Packet;
 //!
@@ -78,7 +79,7 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::field;
+use fictionet::stdlib::codec::field::{self, Alpha};
 use fictionet::stdlib::session::Action;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -116,8 +117,7 @@ pub enum Error {
     /// An unknown message type byte, or bytes of another type than the
     /// one asked for.
     Type(u8),
-    /// An alpha field has a byte outside printable ASCII, or text longer
-    /// than the field.
+    /// An alpha field has a byte outside printable ASCII.
     Field,
     /// A side other than "B", "S", "T" or "E".
     Side(u8),
@@ -189,56 +189,15 @@ impl Field for Price {
     }
 }
 
-/// A fixed-width alpha field: `N` bytes of printable ASCII, left justified
-/// and padded on the right with spaces (1.2). Padding is part of the
-/// value, so fields round-trip byte for byte.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Alpha<const N: usize>([u8; N]);
-impl<const N: usize> Alpha<N> {
-    /// All spaces.
-    pub fn blank() -> Self {
-        Self([b' '; N])
-    }
-    /// The field's exact bytes. Refuses a byte outside 0x20..=0x7e.
-    pub fn new(bytes: [u8; N]) -> Result<Self, Error> {
-        field::validate_printable(bytes)
-            .map(Self)
-            .map_err(|_| Error::Field)
-    }
-    /// `text` padded on the right with spaces.
-    pub fn right_padded(text: &str) -> Result<Self, Error> {
-        field::right_padded(text)
-            .map(Self)
-            .map_err(|_| Error::Field)
-    }
-    /// The field's bytes, padding included.
-    pub fn as_bytes(&self) -> &[u8; N] {
-        &self.0
-    }
-    /// The text without trailing spaces.
-    pub fn trimmed(&self) -> &str {
-        // Every byte is printable ASCII, so this is valid UTF-8.
-        std::str::from_utf8(&self.0)
-            .unwrap_or_default()
-            .trim_end_matches(' ')
-    }
-    /// Whether every byte is a space.
-    pub fn is_blank(&self) -> bool {
-        self.0.iter().all(|b| *b == b' ')
-    }
-}
-impl<const N: usize> fmt::Debug for Alpha<N> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", std::str::from_utf8(&self.0).unwrap_or_default())
-    }
-}
+// Alpha fields are printable ASCII (1.2): a byte outside 0x20..=0x7e
+// refuses the message.
 impl<const N: usize> Field for Alpha<N> {
     const LEN: usize = N;
     fn get(b: &[u8]) -> Result<Self, Error> {
-        Self::new(array(b)?)
+        Alpha::new(array(b)?).map_err(|_| Error::Field)
     }
     fn put(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0);
+        out.extend_from_slice(self.as_bytes());
     }
 }
 
@@ -1138,7 +1097,7 @@ pub struct ExchangeConfig {
 impl Default for ExchangeConfig {
     fn default() -> Self {
         Self {
-            default_firm: Alpha(*b"FCTN"),
+            default_firm: Alpha::from(*b"FCTN"),
             max_orders: DEFAULT_MAX_ORDERS,
             max_executions: DEFAULT_MAX_EXECUTIONS,
             first_order_ref: 1,
@@ -1953,11 +1912,6 @@ mod tests {
     #[test]
     fn alpha_padding_and_wire_errors() {
         let field = Alpha::<8>::right_padded("AAPL").unwrap();
-        assert_eq!(field.trimmed(), "AAPL");
-        assert_eq!(field.as_bytes(), b"AAPL    ");
-        assert_eq!(format!("{field:?}"), "\"AAPL    \"");
-        assert!(!field.is_blank());
-        assert!(Alpha::<8>::blank().is_blank());
         let mut order = enter(1, 100, Options::default());
         order.symbol = field;
         let mut bytes = order.to_bytes().unwrap();
@@ -3031,14 +2985,13 @@ mod tests {
     #[test]
     fn exchange_runs_over_soupbintcp() {
         use fictionet::stdlib::codec::{Stream, pump};
-        use fictionet::stdlib::soupbintcp::Alpha as SAlpha;
         use fictionet::stdlib::soupbintcp::Client;
         use fictionet::stdlib::soupbintcp::Event as SEvent;
         use fictionet::stdlib::soupbintcp::{Login, Packet, Server, Timers};
         let login = Login {
-            username: SAlpha::right_padded("ALICE").unwrap(),
-            password: SAlpha::right_padded("PW").unwrap(),
-            session: SAlpha::blank(),
+            username: Alpha::right_padded("ALICE").unwrap(),
+            password: Alpha::right_padded("PW").unwrap(),
+            session: Alpha::blank(),
             sequence: 1,
         };
         let mut client = Client::new(login, Timers::default(), 0).unwrap();
@@ -3057,7 +3010,7 @@ mod tests {
         }
         for p in packets(
             server
-                .accept(SAlpha::left_padded("1").unwrap(), 1, 0)
+                .accept(Alpha::left_padded("1").unwrap(), 1, 0)
                 .unwrap(),
         ) {
             client.receive(&p, 0).unwrap();
