@@ -162,6 +162,108 @@
 //! the answer it got. If the real site cannot be reached, the agent gets
 //! `502 Bad Gateway`.
 //!
+//! # Serving an existing HTTP service at a real name
+//!
+//! A team may have HTTP services that stand in for real ones, such as
+//! Python clones of Gmail or Slack on local ports. A world serves each
+//! clone at the real hostname over HTTPS, with the world's certificate for
+//! that name. The clone needs no change.
+//! `web::forward(&fcx, upstream)?` (feature `web-proxy`) forwards every
+//! request to one fixed origin over the world's own network. It takes the
+//! scheme and authority from `upstream` and ignores its path.
+//!
+//! The request's path, query, body, and original `Host` header are kept,
+//! so the Gmail clone sees `Host: gmail.googleapis.com`. Hop-by-hop headers
+//! are dropped both ways. An unreachable upstream gives `502 Bad Gateway`.
+//! It needs a tokio runtime polling the world and a run with real I/O:
+//! use [`fictionet::run`]. In a lab, `web::forward` returns an error.
+//!
+//! `web::proxy(&fcx)?` goes to the real site for the name; `web::forward`
+//! goes to the one origin you give it, whatever the name.
+//! Return one [`Site`] per name the clone answers, such as `slack.com` and
+//! `api.slack.com`, each with a certificate from the world's CA that lists
+//! that name. The sandbox must trust that CA.
+//!
+//! ```
+//! # fictionet::cfg_web_proxy! {
+//! # use fictionet::stdlib::{ca::Ca, codec::Wire, dns::rr::{RData, RecordType},
+//! #     http1, sandbox, web, x509::{Time, Validity}};
+//! # use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc, time::{Duration, UNIX_EPOCH}};
+//! # tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?
+//! #     .block_on(async {
+//! # tokio::time::timeout(Duration::from_secs(30), async {
+//! let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+//! let upstream: http::Uri = format!("http://{}", listener.local_addr()?).parse()?;
+//! // Stands in for the team's clone. Any HTTP server on a local port works.
+//! let service = hyper::service::service_fn(
+//!     |request: http::Request<hyper::body::Incoming>| async move {
+//!         http::Response::builder()
+//!             .status(200)
+//!             .header("content-type", "application/json")
+//!             .header("x-clone-host", request.headers()["host"].clone())
+//!             .body(r#"{"messages":[]}"#.to_owned())
+//!     },
+//! );
+//! # let server = tokio::spawn(async move {
+//! #     while let Ok((stream, _)) = listener.accept().await {
+//! #         tokio::spawn(async move {
+//! #             hyper::server::conn::http1::Builder::new()
+//! #                 .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+//! #                 .await
+//! #         });
+//! #     }
+//! # });
+//! fictionet::run(fictionet::Seed::random(), |fcx| async move {
+//! #     let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+//! #     let ca = Ca::new(&fcx, "World CA")?;
+//! #     let leaf = ca.issue(&fcx, &["gmail.googleapis.com"], Validity {
+//! #         not_before: Time::from_unix(1_700_000_000)?,
+//! #         not_after: Time::from_unix(1_900_000_000)?,
+//! #     })?;
+//! #     let config = leaf.server_config(&fcx, start)?;
+//! #     let mut roots = rustls::RootCertStore::empty();
+//! #     roots.add(ca.cert_der())?;
+//! #     let roots = Arc::new(roots);
+//! #     let (attacher, attachments) = fictionet::attachments();
+//!     let gmail = web::forward(&fcx, upstream)?;
+//!     web::Sites::new(move |name: &str| match name {
+//!         "gmail.googleapis.com" => Some(
+//!             web::Site::new(gmail.clone()).tls(config.clone()),
+//!         ),
+//!         _ => None,
+//!     })
+//!     .start(&fcx, attachments)?;
+//! #     let machine = sandbox::machine(
+//! #         &fcx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2),
+//! #     );
+//! #     let answer = machine.lookup(&fcx, Ipv4Addr::new(10, 0, 0, 1).into(),
+//! #         "gmail.googleapis.com", RecordType::A).await?;
+//! #     let address = answer.answers.iter().find_map(|r| match r.data {
+//! #         RData::A(a) => Some(a.0),
+//! #         _ => None,
+//! #     }).ok_or_else(|| fictionet::Error::msg("no IPv4 address"))?;
+//! #     let mut conn = machine.tls(&fcx, SocketAddr::new(address.into(), 443),
+//! #         "gmail.googleapis.com", Some(&roots), start).await?;
+//!     let request = http1::Request::parse(
+//!         b"GET /gmail/v1/users/me/messages HTTP/1.1\r\nHost: gmail.googleapis.com\r\n\r\n",
+//!     )?;
+//!     let response = sandbox::request(&fcx, &mut conn, &request).await?;
+//!     assert_eq!(response.head.status, 200);
+//!     assert_eq!(response.body, br#"{"messages":[]}"#);
+//!     assert!(response.head.headers.iter().any(|h|
+//!         h.name.eq_ignore_ascii_case("x-clone-host") && h.value == b"gmail.googleapis.com"
+//!     ));
+//!     fcx.cancel();
+//!     Ok(())
+//! }).await?;
+//! # server.abort();
+//! # Ok::<(), fictionet::Error>(())
+//! # }).await?
+//! # })?;
+//! # }
+//! # Ok::<(), fictionet::Error>(())
+//! ```
+//!
 //! # What `start` builds
 //!
 #![doc = include_str!("../../../docs/diagrams/sites-network.svg")]
