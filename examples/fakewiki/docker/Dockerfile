@@ -2,9 +2,9 @@
 # FakeWiki on Fictionet. Build context: the fictionet-sdk root (see
 # ../compose.yaml), so the world and attach build from this crate.
 #
-#   build-attach - the fictionet binary (fictionet attach)
-#   build-world  - the Rust world in examples/fakewiki/world
-#   world        - compose service "fictionet": the Rust world and FakeWiki's
+#   build        - the Rust world in examples/fakewiki/world, and the fictionet
+#                  binary (fictionet attach) from the same target dir
+#   world        - compose service "world": the Rust world and FakeWiki's
 #                  Python pages, which it serves on 127.0.0.1
 #   attach       - compose service "attach": fictionet attach --type tun
 #   agent        - compose service "default": the agent's box, which trusts the CA
@@ -13,7 +13,7 @@
 # (fixtures/corpus.json). It has no upstream and serves only the sandbox
 # attached to it.
 
-FROM rust:1.92-slim-bookworm AS build-attach
+FROM rust:1.92-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
@@ -25,37 +25,22 @@ COPY xtask xtask
 COPY tests tests
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target,id=fictionet-fakewiki-attach-target \
-    cargo build --release --locked --bin fictionet \
-    && cp target/release/fictionet /usr/local/bin/
-
-FROM rust:1.92-slim-bookworm AS build-world
-WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
-COPY src src
-COPY docs docs
-COPY dashboard dashboard
-COPY benches benches
-COPY codegen codegen
-COPY xtask xtask
-COPY tests tests
-COPY examples examples
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target,id=fictionet-fakewiki-world-target \
+    --mount=type=cache,target=/src/target,id=fictionet-fakewiki-target \
     cargo build --release --locked -p fakewiki-world --bin fakewiki-world \
-    && cp target/release/fakewiki-world /usr/local/bin/
+    && cargo build --release --locked -p fictionet --bin fictionet \
+    && cp target/release/fakewiki-world target/release/fictionet /usr/local/bin/
 
 FROM python:3.12-slim-bookworm AS world
 # iproute2 only so the probes can show `ss -lntup` from inside the world.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
-COPY --from=build-world /usr/local/bin/fakewiki-world /usr/local/bin/
+COPY --from=build /usr/local/bin/fakewiki-world /usr/local/bin/
 COPY examples/fakewiki/world/backend /app/backend
 COPY examples/fakewiki/fixtures/corpus.json /app/fixtures/corpus.json
 WORKDIR /app
 CMD ["fakewiki-world"]
 
 FROM debian:bookworm-slim AS attach
-COPY --from=build-attach /usr/local/bin/fictionet /fictionet
+COPY --from=build /usr/local/bin/fictionet /fictionet
 RUN ln -s /fictionet /usr/local/bin/fictionet
 
 FROM python:3.12-slim-bookworm AS agent

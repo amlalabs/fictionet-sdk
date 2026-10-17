@@ -253,6 +253,9 @@ impl Vm {
                 } else {
                     memory.trim_end_matches('M').parse::<u64>()?
                 };
+                // A fresh scope name for each boot: on the first run, the
+                // scope that prepared the image is still loaded when the
+                // prepared image boots, and systemd refuses a loaded name.
                 command = cmd(
                     "systemd-run",
                     &[
@@ -260,7 +263,7 @@ impl Vm {
                         "--scope",
                         "-q",
                         "--unit",
-                        &format!("fictionet-vm-{}", std::process::id()),
+                        &format!("fictionet-vm-{}", token(4)?),
                         "-p",
                         &format!(
                             "MemoryMax={}M",
@@ -578,11 +581,6 @@ impl Vm {
         result
     }
     pub fn build(&self, targets: &[String]) -> Result {
-        for target in targets {
-            if !matches!(target.as_str(), "sdk" | "border" | "fakewiki" | "none") {
-                return Err(format!("unknown build target: {target}").into());
-            }
-        }
         execute(&mut self.remote(&format!(
                 "bash /src/vm/guest/build.sh {}",
                 targets
@@ -638,7 +636,7 @@ pub fn run(args: &[String]) -> Result {
         }
         [help] if matches!(help.as_str(), "--help" | "-h") => {
             println!(
-                "cargo xtask vm [--fetch | nested [--fetch] | prepare | up | down | clean | status | sync | build [sdk|border|fakewiki] | test <name> | ssh [command]]"
+                "cargo xtask vm [--fetch | nested [--fetch] | prepare | up | down | clean | status | sync | build [sdk|border|fakewiki|adaptive-web] | test <name> | ssh [command]]"
             );
             return Ok(());
         }

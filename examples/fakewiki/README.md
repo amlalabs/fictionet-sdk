@@ -103,10 +103,10 @@ few minutes. Each run takes its containers down when it ends.
 By hand, without Inspect, from `examples/fakewiki`:
 
 ```bash
-SAMPLE_METADATA_VARIANT=altered_all docker compose -p fictionet-fw up -d --wait
-docker compose -p fictionet-fw exec default curl -s https://en.wikipedia.org/wiki/Stream_ripping | head
-docker compose -p fictionet-fw exec fictionet cat /var/lib/fictionet/log.jsonl | tail
-docker compose -p fictionet-fw down -v -t 1
+SAMPLE_METADATA_VARIANT=altered_all docker compose up -d --build --wait
+docker compose exec default curl -s https://en.wikipedia.org/wiki/Stream_ripping | head
+docker compose exec world cat /var/lib/fictionet/log.jsonl | tail
+docker compose down -v
 ```
 
 ## Run it with a real model
@@ -332,8 +332,8 @@ it without a second Python project.
 ```
 examples/common/log.rs      # shared log.jsonl writer
 examples/fakewiki/
-  compose.yaml              # fictionet (the world), attach, default (the agent)
-  docker/Dockerfile         # build-attach, build-world, ca, world, attach, agent
+  compose.yaml              # world, attach, default (the agent)
+  docker/Dockerfile         # build, world, attach, agent
   world/                    # the world: its own Cargo package
     Cargo.toml              # depends on fictionet by path; world dependencies stay here
     src/main.rs             # backend startup, state.json, ready file

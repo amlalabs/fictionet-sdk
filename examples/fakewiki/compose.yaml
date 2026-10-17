@@ -1,6 +1,7 @@
-# FakeWiki on Fictionet, for Inspect's stock "docker" provider.
+# FakeWiki on Fictionet under Docker Compose: cargo xtask demo fakewiki runs it
+# in the VM, and the README says how to run it by hand.
 #
-#   fictionet - the world: web::Sites in Rust, FakeWiki's pages in Python on
+#   world     - the world: web::Sites in Rust, FakeWiki's pages in Python on
 #               its own 127.0.0.1. No network at all (network_mode: none).
 #               Its only door is the world socket on the `sock` volume.
 #   attach    - fictionet attach --type tun: makes tun0 in its own network
@@ -12,16 +13,19 @@
 # The variant is interpolated from sample metadata (SAMPLE_METADATA_VARIANT),
 # which Inspect only does when the sandbox config is a file path.
 
+name: fictionet-fakewiki
+
 x-build: &build
   context: ../..
   dockerfile: examples/fakewiki/docker/Dockerfile
 
 services:
-  fictionet:
+  world:
     build:
       <<: *build
       target: world
     image: fictionet-fakewiki-world:dev
+    init: true                      # passes SIGTERM on to the world
     network_mode: none
     # The world is trusted. NET_ADMIN lets it raise its socket buffers to
     # attach past the system limit, so a burst of packets is not lost.
@@ -70,7 +74,7 @@ services:
     volumes:
       - sock:/run/fictionet/sock
     depends_on:
-      fictionet:
+      world:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "test", "-f", "/run/attach-ready"]

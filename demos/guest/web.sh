@@ -53,7 +53,7 @@ expect_fail 1 'No route to host' 'time timeout 3 bash -c "exec 3<>/dev/tcp/192.0
 step "An unknown host fails, and the real internet is not there"
 expect_fail 6 'Could not resolve host' 'curl -sS --cacert /run/agent-ca.pem https://nope.test/'
 expect_fail 6 'Could not resolve host' 'curl -sS -m 5 https://example.com/'
-expect_fail 7 "Couldn't connect" 'curl -sS -m 5 http://1.1.1.1/'
+expect_fail 7 "Could(n't| not) connect" 'curl -sS -m 5 http://1.1.1.1/'
 note "The VM itself has the internet (it pulled this demo's packages), but the sandbox only"
 note "ever reaches the world."
 

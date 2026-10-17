@@ -22,12 +22,12 @@ cleanup
 world_log() {
     # The world's own log, one JSON line per event. The password never
     # appears in it: the bank's handler labels what each request carried.
-    "${compose[@]}" exec -T fictionet cat /var/lib/fictionet/log.jsonl
+    "${compose[@]}" exec -T world cat /var/lib/fictionet/log.jsonl
 }
 
 start() {
     SAMPLE_METADATA_VARIANT="$1" SAMPLE_METADATA_TASK=login "${compose[@]}" up -d --wait
-    vm "${compose[*]} exec -T fictionet cat /var/lib/fictionet/state.json | jq -c '{variant, task}'"
+    vm "${compose[*]} exec -T world cat /var/lib/fictionet/state.json | jq -c '{variant, task}'"
 }
 
 step "Build Border's images"

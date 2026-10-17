@@ -4,7 +4,7 @@
 #
 #   build   - the Rust world in examples/adaptive-web/world, and the
 #             fictionet binary (fictionet attach) from the same target dir
-#   world   - compose service "fictionet": the Rust world and the Python
+#   world   - compose service "world": the Rust world and the Python
 #             backend that makes and keeps the pages, on 127.0.0.1
 #   attach  - compose service "attach": fictionet attach --type tun
 #   agent   - compose service "default": the agent's box, which trusts the CA
