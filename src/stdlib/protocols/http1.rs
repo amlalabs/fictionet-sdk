@@ -5,8 +5,9 @@
 //! `fictionet::stdlib::httpd`, and this module provides no live transport.
 //! Content-Length, chunked bodies, connection close, Expect: 100-continue,
 //! and CONNECT handoff use the shared codec drivers. Non-empty trailers and
-//! chunk extensions are refused. Requests ignore Upgrade offers and continue
-//! as HTTP; 101 responses end HTTP for handoff without handling Upgrade.
+//! chunk extensions are refused. Requests may use only the chunked
+//! transfer coding. Requests ignore Upgrade offers and continue as HTTP;
+//! 101 responses end HTTP for handoff without handling Upgrade.
 
 use fictionet::stdlib::codec::ascii::{self, trim_ows as trim};
 use fictionet::stdlib::codec::{
@@ -127,6 +128,9 @@ pub enum Error {
     ChunkedNotLast,
     /// A request's Transfer-Encoding does not end in chunked.
     RequestTransferEncoding,
+    /// A request names a transfer coding other than chunked, which this
+    /// module does not decode (RFC 9112 section 6.1).
+    UnsupportedTransferCoding,
     /// HTTP/1.0 cannot use Transfer-Encoding.
     Http10TransferEncoding,
     /// A writer found forbidden framing fields on 1xx, 204, or CONNECT 2xx.
@@ -178,6 +182,9 @@ impl fmt::Display for Error {
             Self::TransferEncoding => "invalid or unsupported HTTP Transfer-Encoding",
             Self::ChunkedNotLast => "chunked must occur once and last",
             Self::RequestTransferEncoding => "request transfer coding must end in chunked",
+            Self::UnsupportedTransferCoding => {
+                "request transfer codings other than chunked are not decoded"
+            }
             Self::Http10TransferEncoding => "HTTP/1.0 cannot use Transfer-Encoding",
             Self::ForbiddenFraming => "framing fields are forbidden for this response",
             Self::Upgrade => "HTTP Upgrade is not supported",
@@ -1398,6 +1405,7 @@ struct Fields {
     length: Option<u64>,
     transfer: bool,
     chunked: bool,
+    unsupported_transfer_coding: bool,
     close: bool,
 }
 fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
@@ -1405,6 +1413,7 @@ fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
         length: None,
         transfer: false,
         chunked: false,
+        unsupported_transfer_coding: false,
         close: false,
     };
     let mut keep = false;
@@ -1445,6 +1454,7 @@ fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
                 }
                 result.transfer = true;
                 result.chunked = value.eq_ignore_ascii_case(b"chunked");
+                result.unsupported_transfer_coding |= !result.chunked;
             }
         } else if h.name.eq_ignore_ascii_case("connection") {
             for value in h.value.split(|b| *b == b',') {
@@ -1470,6 +1480,9 @@ fn request_framing(info: Fields) -> Result<Framing, Error> {
     if info.transfer {
         if !info.chunked {
             return Err(Error::RequestTransferEncoding);
+        }
+        if info.unsupported_transfer_coding {
+            return Err(Error::UnsupportedTransferCoding);
         }
         Ok(Framing::Chunked)
     } else {
@@ -2384,6 +2397,36 @@ mod tests {
     }
 
     #[test]
+    fn requests_reject_unsupported_transfer_codings() {
+        let body = b"5\r\nhello\r\n0\r\n\r\n";
+        for fields in [
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: ,GZIP,, ChUnKeD, ,\r\n",
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            request_error(
+                &request_with(fields, body),
+                Error::UnsupportedTransferCoding,
+            );
+            let response = Response::parse(&response_with(fields, body)).unwrap();
+            assert_eq!(response.body, b"hello");
+        }
+        for fields in [
+            "Transfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: , ChUnKeD, ,\r\n",
+        ] {
+            assert_eq!(
+                Request::parse(&request_with(fields, body)).unwrap().body,
+                b"hello"
+            );
+        }
+        request_error(
+            &request_with("Transfer-Encoding: gzip\r\n", b"hello"),
+            Error::RequestTransferEncoding,
+        );
+    }
+
+    #[test]
     fn content_length_and_transfer_encoding_failures() {
         for (fields, error) in [
             (
@@ -2443,10 +2486,7 @@ mod tests {
             assert_eq!(Request::parse(&bytes).unwrap().body, b"hello");
             contract::check_wire::<Request>(&bytes);
         }
-        let bytes = request_with(
-            "Transfer-Encoding: gzip, CHUNKED\r\n",
-            b"3\r\nzip\r\n0\r\n\r\n",
-        );
+        let bytes = request_with("Transfer-Encoding: CHUNKED\r\n", b"3\r\nzip\r\n0\r\n\r\n");
         assert_eq!(Request::parse(&bytes).unwrap().body, b"zip");
         contract::check_wire::<Request>(&bytes);
     }
@@ -2472,7 +2512,7 @@ mod tests {
         for fields in [
             "Transfer-Encoding: , chunked\r\n",
             "Transfer-Encoding: chunked,\r\n",
-            "Transfer-Encoding: ,gzip,, chunked, ,\r\n",
+            "Transfer-Encoding: ,, chunked, ,\r\n",
             "Transfer-Encoding: ,\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: ,\r\n",
         ] {
             let request = request_with(fields, b"1\r\na\r\n0\r\n\r\n");
@@ -2484,6 +2524,13 @@ mod tests {
             contract::check_wire::<Request>(&request);
             contract::check_wire::<Response>(&response);
         }
+        let response = response_with(
+            "Transfer-Encoding: ,gzip,, chunked, ,\r\n",
+            b"1\r\na\r\n0\r\n\r\n",
+        );
+        assert_eq!(Response::parse(&response).unwrap().body, b"a");
+        contract::check_decode(ResponseEvents::default, &response);
+        contract::check_wire::<Response>(&response);
         request_error(
             &request_with("Content-Length: ,0\r\n", b""),
             Error::ContentLength,

@@ -566,12 +566,15 @@ impl serve::Service for Http1 {
             fictionet::ErrorChain(error).to_string(),
         ));
         let date = date_header(self.date, driver.now());
-        write_simple(
-            driver.reply(),
-            Version::HTTP_11,
-            StatusCode::BAD_REQUEST,
-            date,
-        );
+        let status = if matches!(
+            error,
+            fictionet::stdlib::codec::Fail::Protocol(http1::Error::UnsupportedTransferCoding)
+        ) {
+            StatusCode::NOT_IMPLEMENTED
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        write_simple(driver.reply(), Version::HTTP_11, status, date);
         Ok(())
     }
 

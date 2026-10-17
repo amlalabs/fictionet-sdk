@@ -837,6 +837,32 @@ fn http1_handler_connection_close_async() {
 }
 
 #[test]
+fn http1_rejects_unsupported_transfer_codings_before_dispatch() {
+    for (coding, status) in [
+        ("gzip, chunked", "501 Not Implemented"),
+        ("gzip", "400 Bad Request"),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let router = Router::new().post("/u", move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            http::Response::new(Bytes::new())
+        });
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+        let request = format!(
+            "POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: {coding}\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        );
+        let result = h.push(request.as_bytes());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{coding}");
+        assert!(result.is_err());
+        assert!(http_text(&h).starts_with(&format!("HTTP/1.1 {status}\r\n")));
+        assert!(h.closed());
+        assert!(h.events().iter().any(|e| e.is("http", "error")
+            && e.get("cause").and_then(json::Value::as_str) == Some("protocol")));
+    }
+}
+
+#[test]
 fn http1_answers_bytes_that_are_not_http_with_400_and_an_error_event() {
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
     assert!(h.push(b"\x16\x03\x01\x00\x05hello\r\n\r\n").is_err());

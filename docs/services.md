@@ -742,6 +742,13 @@ without calling the handler, and the connection closes (RFC 9112 section
 3.2). If its body is also too large, it gets `413` with `answer: too_large`
 instead. An HTTP/1.0 request without `Host` still reaches the handler.
 
+Native HTTP/1 decodes only the chunked transfer coding on requests. A
+request whose `Transfer-Encoding` also names another coding, such as
+`gzip, chunked`, gets `501 Not Implemented` (RFC 9112 section 6.1). One
+whose codings do not end in chunked gets `400` (RFC 9112 section 6.3).
+Both record an `http.error` with cause `protocol`, close the connection,
+and never reach the handler.
+
 An oversized request body gets `413` without calling the handler. Native
 HTTP/1 drains the request before answering and closes the connection.
 Hyper's HTTP/1 upgrade path and HTTP/2 reject it during body collection.
