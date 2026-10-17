@@ -25,7 +25,7 @@
 //! network. The harness that runs the agent supplies the rest of the
 //! sandbox, and decides what the agent may do.
 //!
-//! To try this without `sudo` on your own machine, run `demos/web` from the
+//! To try this without `sudo` on your own machine, run `cargo xtask demo web` from the
 //! repository. It boots a small Debian VM under QEMU, builds Fictionet
 //! inside it, and runs the same world and sandbox as this page there, with
 //! root inside the VM only. It needs QEMU, KVM and the host tools listed

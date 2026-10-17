@@ -42,5 +42,5 @@ jobs:
           path: |
             .vm/debian-*.qcow2
             .vm/prepared-*.qcow2
-          key: integration-vm-${{ runner.os }}-${{ hashFiles('tests/vm/common.sh', 'vm/debian-image.sh') }}
-      - run: tests/vm/run.sh --fetch
+          key: integration-vm-${{ runner.os }}-${{ hashFiles('xtask/src/vm.rs', 'xtask/src/vm/tap.rs') }}
+      - run: cargo xtask vm --fetch

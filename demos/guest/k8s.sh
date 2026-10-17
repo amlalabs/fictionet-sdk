@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# The Kubernetes demo, run inside the VM by demos/k8s. A kind cluster, the
+# The Kubernetes demo, run inside the VM by cargo xtask demo k8s. A kind cluster, the
 # Helm chart in charts/fictionet-sandbox, and an agent pod whose only
 # network is the world.
 # needs: sdk
 . "$(dirname "$0")/lib.sh"
-. /src/vm/versions.sh
 cluster=fictionet-demo
 release=demo
 pod="fictionet-sandbox-$release-default-0"

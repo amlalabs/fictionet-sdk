@@ -1,3 +1,4 @@
+mod demo;
 mod docker;
 mod eval;
 mod fuzz;
@@ -5,12 +6,23 @@ mod images;
 mod k8s;
 mod process;
 mod scan;
+mod vm;
 
 use process::Result;
 use std::path::Path;
 
 fn root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::env::var_os("FICTIONET_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            })
+    })
 }
 
 fn main() {
@@ -30,6 +42,14 @@ fn main_result() -> Result {
         "docker" => docker::run(args),
         "eval" => eval::run(args),
         "k8s" => k8s::run(args),
+        "vm" | "demo" => {
+            let _interrupts = process::Interrupts::new()?;
+            if command == "vm" {
+                vm::run(args)
+            } else {
+                demo::run(args)
+            }
+        }
         "fuzz" => fuzz::run(args),
         "scan" => scan::run(args),
         "help" | "--help" | "-h" if args.is_empty() => {
@@ -38,6 +58,8 @@ fn main_result() -> Result {
                       cargo xtask docker <ping|tcpudp|proxy|web>\n\
                       cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [options]\n\
                       cargo xtask k8s [tun|proxy]\n\
+                      cargo xtask vm [--fetch | nested [--fetch] | up | down | prepare | sync | build | test | ssh | status | clean]\n\
+                      cargo xtask demo <border|dashboard|k8s|proxy|web>\n\
                       cargo xtask fuzz [--check | <target> | <seconds>] [libFuzzer arguments...]\n\
                       cargo xtask scan [output directory]"
             );

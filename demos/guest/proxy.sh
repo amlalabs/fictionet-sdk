@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The proxy demo, run inside the VM by demos/proxy. A sandbox with no
+# The proxy demo, run inside the VM by cargo xtask demo proxy. A sandbox with no
 # privileges and no tun device reaches the world through attach's HTTP
 # proxy and SOCKS5 proxy.
 # needs: sdk
@@ -21,7 +21,7 @@ trap cleanup EXIT
 cleanup
 
 step "Start the world"
-note "The same web_world example as demos/web: example.test over HTTPS, plain.test over HTTP."
+note "The same web_world example as cargo xtask demo web: example.test over HTTPS, plain.test over HTTP."
 start_web
 install -m 0644 /run/fictionet/ca.pem /run/agent-ca.pem
 

@@ -1374,7 +1374,7 @@
 //! changes: its kernel has one network card, and every packet through it
 //! goes to the world.
 //!
-//! `tests/vm` exercises this attachment setup. The repository's separate
+//! `cargo xtask vm` exercises this attachment setup. The repository's separate
 //! [`vm/` development appliance](https://github.com/amlalabs/fictionet-sdk/blob/main/vm/README.md)
 //! hosts demos and tests; its own network is QEMU user-mode networking.
 //!
@@ -1724,13 +1724,13 @@
 //!
 //! ## Tested with
 //!
-//! `tests/vm/run.sh` boots the Debian 13 cloud image under QEMU with KVM,
+//! `cargo xtask vm` boots the Debian 13 cloud image under QEMU with KVM,
 //! with no root, and checks DHCP, `dig`, `curl --cacert`, `ping`, the two
 //! fast failures, and IPv6 by router advertisement and DHCPv6.
-//! `tests/vm/nested.sh` checks `--vm tap:` with real TAP devices: it boots
+//! `cargo xtask vm nested` checks `--vm tap:` with real TAP devices: it boots
 //! an outer VM with nested KVM and runs QEMU, Firecracker 1.17 and Cloud
 //! Hypervisor 53 inside it, one at a time, each with the same checks.
-//! Each needs one command, and skips when KVM, nesting or its images are
+//! Each needs one command, and fails when KVM, nesting or its images are
 //! missing (`--fetch` downloads them once).
 //!
 //! These numbers are from one Ryzen 9 9900X, with release builds and

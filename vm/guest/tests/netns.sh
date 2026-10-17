@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The `ip netns` test: the getting-started tutorial (docs/guide/getting_started.rs),
-# checked. Runs inside the VM as root (`vm/run test netns`), with the binaries
+# checked. Runs inside the VM as root (`cargo xtask vm test netns`), with the binaries
 # from vm/guest/build.sh.
 #
 # A world (the web_world example) on a Unix socket, a network namespace

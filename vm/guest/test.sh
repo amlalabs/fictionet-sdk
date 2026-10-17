@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # Runs one of the repository's test suites inside the VM, as root, from the
-# copy of the working tree at /src. `vm/run test <name>` runs it; `vm/run
+# copy of the working tree at /src. `cargo xtask vm test <name>` runs it; `cargo xtask vm
 # test list` lists the names. The suites run unchanged: this script only
 # starts them the way their READMEs say, and decides pass or fail.
 set -euo pipefail
 export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/cache/cargo
 export UV_CACHE_DIR=/cache/uv UV_PYTHON_INSTALL_DIR=/cache/uv/python UV_LINK_MODE=copy
-# shellcheck source=../versions.sh
-. /src/vm/versions.sh
 name="$1"
 cd /src
 
@@ -48,13 +46,13 @@ case "$name" in
         bash /src/vm/guest/tests/netns.sh
         ;;
     docker-web | docker-proxy | docker-ping | docker-tcpudp)
-        bash "/src/tests/docker/${name#docker-}/run.sh"
+        CARGO_TARGET_DIR=/cache/target/xtask cargo xtask docker "${name#docker-}"
         ;;
     k8s | k8s-proxy)
         # kind makes its cluster from the node image its release was built
-        # for, the one versions.sh names. Pulling it first only saves time.
+        # for, supplied by xtask. Pulling it first only saves time.
         pull "$KIND_NODE_IMAGE"
-        if [[ $name == k8s ]]; then bash /src/tests/k8s/run.sh; else bash /src/tests/k8s/proxy.sh; fi
+        if [[ $name == k8s ]]; then cargo xtask k8s tun; else cargo xtask k8s proxy; fi
         ;;
     border-world)
         cd /src/examples/border/world

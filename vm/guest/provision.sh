@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs once inside a fresh Debian 13 cloud VM, as root, to make the prepared
-# image that every later run of vm/run boots from. vm/run copies this file
-# with versions.sh and rust-toolchain.toml into the VM and runs it; it is
+# image that cargo xtask vm boots from. The command copies this file
+# with rust-toolchain.toml into the VM and supplies the tool versions; it is
 # not meant to be run by hand.
 #
 # It installs Docker Engine with the Compose and Buildx plugins, kind,
@@ -10,8 +10,6 @@
 # cache disk at /cache, so pulled images and build caches outlive each run.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=../versions.sh
-. "$here/../versions.sh"
 export DEBIAN_FRONTEND=noninteractive
 step() { printf '\n== %s\n' "$*"; }
 
@@ -24,7 +22,7 @@ systemctl disable --now apt-daily.timer apt-daily-upgrade.timer man-db.timer \
 apt-get remove -y -q --purge unattended-upgrades >/dev/null 2>&1 || true
 
 step "The cache disk: /cache, made on first use"
-# vm/run attaches a second disk with serial "fncache". systemd formats it
+# cargo xtask vm attaches a second disk with serial "fncache". systemd formats it
 # (x-systemd.makefs) the first time and mounts it at /cache on every boot.
 mkdir -p /cache
 grep -q ' /cache ' /etc/fstab ||

@@ -1,9 +1,63 @@
 use regex::Regex;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn interrupt(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+pub struct Interrupts(Vec<(libc::c_int, libc::sigaction)>);
+
+impl Interrupts {
+    pub fn new() -> Result<Self> {
+        let mut guard = Self(Vec::new());
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // Keep the parent alive to stop its children and remove VM overlays.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            let mut previous = action;
+            action.sa_sigaction = interrupt as *const () as usize;
+            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+            if unsafe { libc::sigaction(signal, &action, &mut previous) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            guard.0.push((signal, previous));
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for Interrupts {
+    fn drop(&mut self) {
+        for (signal, previous) in &self.0 {
+            unsafe { libc::sigaction(*signal, previous, std::ptr::null_mut()) };
+        }
+    }
+}
+
+pub fn interrupted() -> Result {
+    if INTERRUPTED.load(Ordering::Relaxed) {
+        Err("command interrupted".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn poll_interruptible(
+    timeout: Duration,
+    interval: Duration,
+    mut ready: impl FnMut() -> Result<bool>,
+) -> Result<bool> {
+    poll(timeout, interval, || {
+        interrupted()?;
+        ready()
+    })
+}
 
 pub fn cmd(program: &str, args: &[&str]) -> Command {
     let mut command = Command::new(program);

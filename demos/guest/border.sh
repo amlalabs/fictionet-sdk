@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The Border demo, run inside the VM by demos/border. Border's world
+# The Border demo, run inside the VM by cargo xtask demo border. Border's world
 # (examples/border) under Docker Compose, with a scripted agent: first the
 # real bank, then a BGP hijack that puts an impostor at the bank's address.
 # No model is involved.

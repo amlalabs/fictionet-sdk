@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds Fictionet's binaries inside the VM, from the copy of the working
-# tree at /src, as static musl executables. vm/run runs it; so can you,
-# with `vm/run build [sdk] [border] [fakewiki]`.
+# tree at /src, as static musl executables. cargo xtask vm runs it; so can you,
+# with `cargo xtask vm build [sdk] [border] [fakewiki]`.
 #
 #   sdk       fictionet, the web_world example and the web_fixture test world
 #   border    border-world, the world of examples/border
@@ -11,7 +11,7 @@
 # takes seconds. The binaries go to /opt/fictionet/bin, and also to
 # /opt/fictionet/prebuilt, laid out the way the examples' Dockerfiles copy
 # them out of their build stages (usr/local/bin/ and out/). A Compose file
-# can then use that folder in place of a build stage (see demos/border).
+# can then use that folder in place of a build stage (cargo xtask demo border).
 # Static binaries run anywhere: in the VM, and in any container image.
 # The SDK builds with --locked, as in CI. The two example worlds build the
 # way their Dockerfiles build them, without it.

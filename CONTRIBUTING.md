@@ -112,8 +112,8 @@ checks, and cleans up.
 CI runs the TCP/UDP, web, ping and proxy Docker commands and the restricted
 kind proxy test (`cargo xtask k8s proxy`) on every push and pull request.
 The nightly integration workflow runs the tun kind test (`cargo xtask k8s tun`)
-and the QEMU VM test, with its prepared image cached. Nested VM and gVisor
-tests remain manual. Missing host capabilities fail when `CI` is set.
+and `cargo xtask vm --fetch`, with its prepared image cached. Nested VM and gVisor
+tests remain manual. Missing host capabilities fail the command.
 
 The Docker web and proxy tests and `cargo xtask k8s proxy` check full transfer
 sizes and counts, with a 30-second deadline per bulk transfer (60 seconds for

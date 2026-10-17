@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The dashboard demo, run inside the VM by demos/dashboard. The web world
-# and its sandbox from demos/web, with `fictionet dashboard` showing them
+# The dashboard demo, run inside the VM by cargo xtask demo dashboard. The web world
+# and its sandbox from cargo xtask demo web, with `fictionet dashboard` showing them
 # live in your browser, and `fictionet observe` reading the same API from
 # a shell.
 # needs: sdk
@@ -19,13 +19,13 @@ trap cleanup EXIT
 cleanup
 
 step "Start the world, and attach a sandbox to it"
-note "The same web_world example and network namespace as demos/web."
+note "The same web_world example and network namespace as cargo xtask demo web."
 start_web
 attach_web
 
 step "Start the dashboard"
 note "fictionet dashboard connects to the world's socket as an observer: the world needs no"
-note "flag of its own. In the VM it listens on port 7878, which vm/run forwards to"
+note "flag of its own. In the VM it listens on port 7878, which cargo xtask vm forwards to"
 note "127.0.0.1:$host_port on your machine, and nowhere else."
 umask 077
 token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')

@@ -1,4 +1,4 @@
-# Added to examples/border/compose.yaml by demos/border. It builds the same
+# Added to examples/border/compose.yaml by cargo xtask demo border. It builds the same
 # images from the same Dockerfile, with one change: the stages that compile
 # border-world and fictionet are replaced by the static binaries that
 # vm/guest/build.sh already built, in /opt/fictionet/prebuilt. A build

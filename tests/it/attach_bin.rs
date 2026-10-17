@@ -229,22 +229,3 @@ fn wait_blocked_waits_while_an_address_answers_and_exits_0_once_it_stops() {
     assert_eq!(run(&[]).status.code(), Some(2));
     assert_eq!(run(&["example.com:443"]).status.code(), Some(2));
 }
-
-#[test]
-fn missing_vm_capability_fails_in_ci() {
-    for ci in [None, Some(""), Some("1")] {
-        let mut command = Command::new("bash");
-        command
-            .args([
-                "-c",
-                "source tests/vm/common.sh; skip 'missing test capability'",
-            ])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .env_remove("CI");
-        if let Some(value) = ci {
-            command.env("CI", value);
-        }
-        let out = command.output().unwrap();
-        assert_eq!(out.status.success(), ci.is_none(), "{out:?}");
-    }
-}

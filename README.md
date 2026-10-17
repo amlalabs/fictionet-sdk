@@ -66,7 +66,7 @@ event log and the same packets, byte for byte
 ## Try it
 
 ```console
-$ demos/web
+$ cargo xtask demo web
 ```
 
 The demo needs no root or Docker on your machine. It needs QEMU, KVM and
@@ -75,7 +75,7 @@ It boots a small Debian VM, builds Fictionet inside it, and shows a sandbox
 using a world of websites with `dig`, `curl` and `ping`. The first run downloads
 and prepares the VM image, which takes a few minutes. [demos/](demos/README.md)
 has more: the proxy types, Kubernetes, and the BGP hijack from the Border eval
-(`examples/border`). `vm/run test <name>` runs the test suites in the same VM
+(`examples/border`). `cargo xtask vm test <name>` runs the test suites in the same VM
 ([vm/README.md](vm/README.md)).
 
 ## Install
@@ -175,7 +175,7 @@ protocol of your own in the dashboard, see
 | Kubernetes: `world` and `attach` as native sidecars, from the Helm chart in [`charts/fictionet-sandbox`](charts/fictionet-sandbox), which the k8s sandbox of [Inspect](https://inspect.aisi.org.uk/), a framework for running AI evals, accepts | `tun`, under runc and gVisor | `cargo xtask k8s tun` on kind |
 | Daytona and E2B: the Compose setup inside one hosted sandbox | `tun` | [`examples/hosted`](examples/hosted) |
 | A sandbox with no privileges and no `tun`, where the platform blocks all other egress, including a pod under Pod Security "restricted" | `http_proxy` or `socks5` | `tests/docker/proxy`, `cargo xtask k8s proxy` |
-| A virtual machine: QEMU over its stream socket, with no root; Firecracker, Cloud Hypervisor or QEMU on a TAP device | `tap` | `tests/vm/run.sh`, and `tests/vm/nested.sh` under nested KVM |
+| A virtual machine: QEMU over its stream socket, with no root; Firecracker, Cloud Hypervisor or QEMU on a TAP device | `tap` | `cargo xtask vm`, and `cargo xtask vm nested` under nested KVM |
 
 Attach takes each sandbox's addresses as flags, and hands a VM its addresses by DHCP.
 Remote sandboxes, DHCP in attach for `tun`, Python worlds and more are on the

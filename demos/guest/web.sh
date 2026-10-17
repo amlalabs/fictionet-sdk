@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The web demo, run inside the VM by demos/web. A world of websites, and a
+# The web demo, run inside the VM by cargo xtask demo web. A world of websites, and a
 # sandbox that reaches it through a tun device, with ordinary tools.
 # needs: sdk
 . "$(dirname "$0")/lib.sh"
