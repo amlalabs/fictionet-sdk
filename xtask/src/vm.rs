@@ -253,6 +253,9 @@ impl Vm {
                 } else {
                     memory.trim_end_matches('M').parse::<u64>()?
                 };
+                // A fresh scope name for each boot: on the first run, the
+                // scope that prepared the image is still loaded when the
+                // prepared image boots, and systemd refuses a loaded name.
                 command = cmd(
                     "systemd-run",
                     &[
@@ -260,7 +263,7 @@ impl Vm {
                         "--scope",
                         "-q",
                         "--unit",
-                        &format!("fictionet-vm-{}", std::process::id()),
+                        &format!("fictionet-vm-{}", token(4)?),
                         "-p",
                         &format!(
                             "MemoryMax={}M",
