@@ -7,6 +7,7 @@ members = [
     "examples/wasm_world",
     "xtask",
 ]
+default-members = [".", "codegen", "codegen/tests/layouts", "xtask"]
 exclude = ["fuzz"]
 resolver = "3"
 
