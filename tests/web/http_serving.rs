@@ -422,6 +422,133 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
     assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
 }
 
+/// The proxy site wrapped so that whatever it forwards goes to a test-owned
+/// server on 127.0.0.1 instead of the real network: it points the request
+/// `Target` at that server and keeps its routing as `Sites` set it.
+#[cfg(feature = "web-proxy")]
+#[derive(Clone)]
+struct ToTestUpstream {
+    proxy: web::Proxy,
+    port: u16,
+}
+
+#[cfg(feature = "web-proxy")]
+impl tower_service::Service<Request<web::Body>> for ToTestUpstream {
+    type Response = <web::Proxy as tower_service::Service<Request<web::Body>>>::Response;
+    type Error = fictionet::Error;
+    type Future = <web::Proxy as tower_service::Service<Request<web::Body>>>::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), fictionet::Error>> {
+        self.proxy.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: Request<web::Body>) -> Self::Future {
+        let target = request
+            .extensions_mut()
+            .get_mut::<web::Target>()
+            .expect("Sites sets a Target");
+        target.host = "127.0.0.1".to_owned();
+        target.port = self.port;
+        self.proxy.call(request)
+    }
+}
+
+/// A plain HTTP/1.1 server that sends the head of each request it gets on
+/// `seen` and answers `200 upstream`, closing the connection.
+#[cfg(feature = "web-proxy")]
+async fn test_upstream(listener: tokio::net::TcpListener, seen: mpsc::Sender<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0; 4096];
+        while !received.ends_with(b"\r\n\r\n") {
+            let n = conn.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0);
+            received.extend_from_slice(&buf[..n]);
+        }
+        seen.send(String::from_utf8(received).unwrap()).unwrap();
+        conn.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nupstream",
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// A proxy site that is also the default host forwards only its own name.
+/// Hosts that reach it by default get 421 before any upstream I/O; the test
+/// upstream sees only the requests for allowed.test.
+#[cfg(feature = "web-proxy")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_refuses_hosts_routed_by_default_host() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (seen_tx, seen) = mpsc::channel();
+    let server = tokio::spawn(test_upstream(listener, seen_tx));
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        run(fictionet::Seed::random(), move |fcx| async move {
+            let log = super::events::Log::new(&fcx);
+            let (attacher, attachments) = fictionet::attachments();
+            let proxy = web::proxy(&fcx)?;
+            web::Sites::new(move |h| {
+                (h == "allowed.test").then(|| {
+                    web::Site::new(ToTestUpstream {
+                        proxy: proxy.clone(),
+                        port,
+                    })
+                    .default_host()
+                })
+            })
+            .start(&fcx, attachments)?;
+            let m = default_machine(&fcx, &attacher);
+            let addr = lookup(&fcx, &m, "allowed.test").await;
+            for h2 in [false, true] {
+                let mut client = plain_client(&fcx, &m, addr, h2).await;
+                let mut requests = vec![("127.0.0.1", "/"), ("forward-me.example", "/")];
+                if !h2 {
+                    requests.push(("allowed.test", "http://forward-me.example/"));
+                }
+                for (host, path) in requests {
+                    log.clear();
+                    let got = client.get("http", host, path).await;
+                    assert_eq!(got.status, StatusCode::MISDIRECTED_REQUEST, "{}", got.body);
+                    assert_eq!(got.body, "This proxy does not serve unregistered hosts.\n");
+                    let events = wait_for(&fcx, &log, 1, http_seen).await;
+                    assert_eq!(events[0].str("answer"), Some("misdirected"));
+                    assert_eq!(events[0].u64("status"), Some(421));
+                }
+                assert_eq!(seen.try_recv(), Err(mpsc::TryRecvError::Empty));
+                log.clear();
+                let got = client.get("http", "allowed.test", "/forwarded").await;
+                assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+                assert_eq!(got.body, "upstream");
+                let events = wait_for(&fcx, &log, 1, http_seen).await;
+                assert_eq!(events[0].str("answer"), Some("handler"));
+                assert_eq!(events[0].u64("status"), Some(200));
+                let request = seen.try_recv().expect("allowed.test reaches the upstream");
+                assert!(
+                    request.starts_with("GET /forwarded HTTP/1.1\r\n"),
+                    "{request}"
+                );
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains(&format!("host: 127.0.0.1:{port}\r\n")),
+                    "{request}"
+                );
+                assert_eq!(seen.try_recv(), Err(mpsc::TryRecvError::Empty));
+            }
+            Err(fictionet::Error::from(Done))
+        }),
+    )
+    .await
+    .expect("timed out");
+    server.abort();
+    assert!(result.unwrap_err().downcast_ref::<Done>().is_some());
+}
+
 /// An axum handler that echoes WebSocket text messages.
 #[cfg(feature = "tokio")]
 fn echo_socket() -> axum::Router {

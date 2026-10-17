@@ -24,7 +24,7 @@ impl Log {
     }
 
     /// Moves the mark past every event so far.
-    fn clear(&self) {
+    pub(super) fn clear(&self) {
         self.from.store(self.events.recorded(), Ordering::SeqCst);
     }
 }
