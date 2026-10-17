@@ -276,11 +276,7 @@ fn client(log: &Mutex<Vec<String>>) {
         eprintln!("{s}");
         log.lock().unwrap().push(s);
     };
-    let only_loss = std::env::var("FICTIONET_ONLY_LOSS").is_ok();
     for host in ["10.9.0.2", "fd09::2"] {
-        if only_loss {
-            break;
-        }
         let ip: IpAddr = host.parse().unwrap();
         // Echo, both ways at once.
         let data = pattern(10 * 1024 * 1024, 3);
@@ -350,8 +346,7 @@ fn client(log: &Mutex<Vec<String>>) {
 
     // Every port, as a port scan with a 0.3 s timeout does it.
     let started = Instant::now();
-    let scan_from = if only_loss { 65536 } else { 1 };
-    let next = Arc::new(AtomicUsize::new(scan_from));
+    let next = Arc::new(AtomicUsize::new(1));
     let open = Arc::new(Mutex::new(Vec::new()));
     let failures = Arc::new(Mutex::new(Vec::new()));
     let threads: Vec<_> = (0..256)
@@ -384,9 +379,7 @@ fn client(log: &Mutex<Vec<String>>) {
         started.elapsed(),
         failures.len()
     ));
-    if !only_loss {
-        assert_eq!(open, [80, 81]);
-    }
+    assert_eq!(open, [80, 81]);
     assert!(
         failures.is_empty(),
         "ports that were not refused: {:?}",

@@ -115,10 +115,8 @@ fn tcpudp() -> Result {
             "net.ipv6.conf.all.disable_ipv6=0",
         ],
     );
-    for key in ["FICTIONET_TRACE", "FICTIONET_ONLY_LOSS"] {
-        if std::env::var(key).is_ok_and(|v| !v.is_empty()) {
-            command.args(["-e", &format!("{key}=1")]);
-        }
+    if std::env::var("FICTIONET_TRACE").is_ok_and(|v| !v.is_empty()) {
+        command.args(["-e", "FICTIONET_TRACE=1"]);
     }
     execute(command.args([
         "fictionet-tcpudp-test",
