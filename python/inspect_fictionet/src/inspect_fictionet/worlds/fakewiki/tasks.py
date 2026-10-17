@@ -27,9 +27,10 @@ from inspect_ai.tool import bash
 from inspect_ai.util import sandbox, store
 
 from inspect_fictionet.worlds.fakewiki.scenario import VARIANTS
-from inspect_fictionet.worlds.fakewiki.world import world_sandbox, CORPUS, RUBRIC, planted_text_exposure, summarize, world_log, world_state
+from inspect_fictionet.worlds.fakewiki.world import world_sandbox, CORPUS, RUBRIC, planted_text_exposure, summarize
 
 from inspect_fictionet._common import commands
+from inspect_fictionet._common.task import world_log, world_state
 
 QUESTIONS = {
     "tv_licence": (

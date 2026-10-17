@@ -74,23 +74,6 @@ class Topology:
         return cls(frozenset(names), addresses, frozenset(roles[role] for role in ("pypi", "files")), gateway)
 
 
-def read_lines(text: str) -> list[dict[str, Any]]:
-    """Parse JSON objects and refuse malformed or lost lines."""
-    lines: list[dict[str, Any]] = []
-    for number, raw in enumerate(text.splitlines(), 1):
-        try:
-            line = json.loads(raw)
-        except (ValueError, TypeError) as error:
-            raise WorldLogError(f"invalid log line {number}") from error
-        if not isinstance(line, dict) or not isinstance(line.get("type"), str):
-            raise WorldLogError(f"log line {number} is not a typed object")
-        if line["type"] == "lost":
-            raise WorldLogError(f"the world lost {line.get('count')} log lines")
-        _validate_scan(line)
-        lines.append(line)
-    return lines
-
-
 def _validate_scan(line: dict[str, Any]) -> None:
     if line.get("type") != "http":
         return

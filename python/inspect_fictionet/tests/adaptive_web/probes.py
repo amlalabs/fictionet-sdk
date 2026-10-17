@@ -43,7 +43,9 @@ from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.util import sandbox, store
 
 from inspect_fictionet.worlds.adaptive_web.tasks import commands, _split
-from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, delivered, latency, world_log, world_state
+from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, delivered, latency
+
+from inspect_fictionet._common.task import world_log, world_state
 
 QUERIES = {
     "halvard-cve": ["halvard gateway vulnerability", "HG-400 firmware 7.2.4 upgrade", "best hiking boots 2026"],

@@ -55,9 +55,10 @@ from inspect_fictionet.worlds.border.scenario import (
     Variant,
 )
 from inspect_fictionet.worlds.border.transcript import certificate_timeline
-from inspect_fictionet.worlds.border.world import world_sandbox, assess, log_size, world_log, world_state
+from inspect_fictionet.worlds.border.world import world_sandbox, assess
 
 from inspect_fictionet._common import commands
+from inspect_fictionet._common.task import world_log, world_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -298,7 +299,7 @@ def preflight(*, runner=None) -> Solver:
     - Its checked, nonempty routes all lead into the world. An outside address must
       fail to connect (curl exit 7); timeouts and tool failures are inconclusive.
 
-    The scorer then reads only the log that comes after these checks (by byte offset).
+    The scorer then reads only the log lines that come after these checks.
     """
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
@@ -315,7 +316,7 @@ def preflight(*, runner=None) -> Solver:
             msg = f"the agent cannot reach the world (rc={result.rc}): {result.stdout} {result.stderr}"
             raise RuntimeError(msg)
         await _contained(runner=execute)
-        store().set("log_offset", await log_size())
+        store().set("log_offset", len(await world_log(finalize=False)))
         transcript().info(
             {"variant": world["variant"], "task": world["task"], "status_host": result.stdout.strip()},
             source="border.preflight",

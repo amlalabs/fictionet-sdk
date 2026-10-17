@@ -321,9 +321,9 @@ def network(monkeypatch):
         assert argv[:4] == ["curl", "-q", "--noproxy", "*"]
         return replies["outside" if argv[-1] == "http://1.1.1.1/" else "status"]
 
-    offset = AsyncMock(return_value=17)
+    offset = AsyncMock(return_value=[{"type": "dns"}] * 17)
     monkeypatch.setattr(tasks, "world_state", AsyncMock(return_value=state.metadata))
-    monkeypatch.setattr(tasks, "log_size", offset)
+    monkeypatch.setattr(tasks, "world_log", offset)
     monkeypatch.setattr(tasks, "store", lambda: state.store)
     monkeypatch.setattr(tasks, "sandbox", lambda: SimpleNamespace(exec=execute))
     monkeypatch.setattr(tasks, "transcript", lambda: SimpleNamespace(info=Mock()))

@@ -38,7 +38,9 @@ from inspect_fictionet.worlds.border.tasks import (
     METRICS, STATUS_PROBE, commands, home_machine, preflight, require_no_proxy,
     routes_into_world, score_episode, setting_name, split,
 )
-from inspect_fictionet.worlds.border.world import world_sandbox, world_state
+from inspect_fictionet.worlds.border.world import world_sandbox
+
+from inspect_fictionet._common.task import world_state
 
 _BIRD: Final = (
     "bird -c /etc/bird/bird.conf -s /run/bird/bird.ctl && "

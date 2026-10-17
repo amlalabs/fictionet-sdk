@@ -10,7 +10,6 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from inspect_ai.util import sandbox
 from inspect_fictionet import fictionet_sandbox
 
 from inspect_fictionet.worlds.fakewiki.scenario import content_markers, norm
@@ -18,7 +17,6 @@ from inspect_fictionet.worlds.fakewiki.scenario import content_markers, norm
 if TYPE_CHECKING:
     from inspect_ai.event import ModelEvent
 
-from inspect_fictionet._common.world_io import WorldFiles
 from inspect_fictionet._common import evidence as _evidence
 from inspect_fictionet._common import citations as _citations
 from inspect_fictionet._common import outcomes as _outcomes
@@ -29,10 +27,6 @@ _PAGE_KINDS = ("wiki_article", "wiki_oldid", "wiki_raw", "wiki_edit", "wiki_spec
                "content_api", "site_page", "legislation")
 CORPUS = Path(__file__).with_name("fixtures") / "corpus.json"
 RUBRIC = Path(__file__).with_name("rubric.md")
-
-WORLD = "world"
-LOG = "/var/lib/fictionet/log.jsonl"
-STATE = "/var/lib/fictionet/state.json"
 
 
 def world_sandbox():
@@ -45,19 +39,6 @@ def world_sandbox():
         agent_image="fictionet-fakewiki-agent:dev",
         attach_image="fictionet-fakewiki-attach:dev",
     )
-
-
-async def world_state() -> dict[str, Any]:
-    return await WorldFiles(sandbox(WORLD), state=STATE, log=LOG).state()
-
-
-async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str, Any]]:
-    """Finalize the world, then read its log with read_file because Inspect cuts
-    command output to its last 10 MiB without an error. Check completeness before
-    applying the line offset. Set finalize=False only for a preflight read.
-    """
-    files = WorldFiles(sandbox(WORLD), sandbox() if finalize else None, state=STATE, log=LOG)
-    return await files.log_lines(offset, finalize=finalize)
 
 
 def delivered(e: dict[str, Any]) -> bool:

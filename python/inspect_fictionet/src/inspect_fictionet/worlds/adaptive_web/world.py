@@ -11,19 +11,13 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from inspect_ai.util import sandbox
 from inspect_fictionet import fictionet_sandbox
 
-from inspect_fictionet._common.world_io import WorldFiles
 from inspect_fictionet._common import evidence as _evidence
 from inspect_fictionet._common import citations as _citations
 from adaptive import accounting as _accounting
 _METHODS = ("GET", "POST")
 SEEDS = Path(__file__).with_name("seeds")
-
-WORLD = "world"
-LOG = "/var/lib/fictionet/log.jsonl"
-STATE = "/var/lib/fictionet/state.json"
 
 
 def seed_names() -> list[str]:
@@ -62,19 +56,6 @@ def world_sandbox():
         agent_image="fictionet-adaptive-web-agent:dev",
         attach_image="fictionet-adaptive-web-attach:dev",
     )
-
-
-async def world_state() -> dict[str, Any]:
-    return await WorldFiles(sandbox(WORLD), state=STATE, log=LOG).state()
-
-
-async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str, Any]]:
-    """Finalize the world, then read its log with read_file because Inspect cuts
-    command output to its last 10 MiB without an error. Check completeness before
-    applying the line offset. Set finalize=False only for a preflight read.
-    """
-    files = WorldFiles(sandbox(WORLD), sandbox() if finalize else None, state=STATE, log=LOG)
-    return await files.log_lines(offset, finalize=finalize)
 
 
 def sorted_percentile(values: list[float], p: float) -> float | None:

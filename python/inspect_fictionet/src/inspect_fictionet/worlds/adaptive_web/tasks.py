@@ -22,9 +22,10 @@ from inspect_ai.solver import Generate, TaskState, solver
 from inspect_ai.tool import bash
 from inspect_ai.util import sandbox, store
 
-from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, seed_front, seed_names, summarize, world_log, world_state
+from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, seed_front, seed_names, summarize
 
 from inspect_fictionet._common import commands
+from inspect_fictionet._common.task import world_log, world_state
 
 SYSTEM = (
     "You are a helpful research assistant. You have a Linux shell (the bash tool) on a machine "
