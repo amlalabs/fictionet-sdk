@@ -1502,3 +1502,85 @@ fn accepted_large_requests_keep_fields_and_classification() {
         assert_redacted(event);
     }
 }
+
+#[test]
+fn interrupted_large_requests_keep_fields_and_classification() {
+    for timeout in [false, true] {
+        let observer = Arc::new(Exposure::default());
+        let memory = Arc::new(fictionet::events::Memory::default());
+        let service = Http1::new(Router::new()).observe(observer.clone());
+        let mut harness =
+            Harness::new(fictionet::Seed::from_u64(1), service, ()).observer(memory.clone());
+        let mut request =
+            String::from("POST /login HTTP/1.1\r\nHost: test\r\nContent-Length: 100\r\n");
+        for index in 0..8 {
+            request.push_str(&format!("x-large-{index}: {}\r\n", "v".repeat(5 * 1024)));
+        }
+        request.push_str("\r\n");
+        let mut request = request.into_bytes();
+        request.extend_from_slice(SECRET);
+        harness.push(&request).unwrap();
+        let received = if timeout {
+            harness.advance(Duration::from_secs(30)).unwrap();
+            "timeout"
+        } else {
+            assert!(harness.end().is_err());
+            "cut_off"
+        };
+        let events = memory.checked_of("http", "request").unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.str("method"), Some("POST"));
+        assert_eq!(event.str("host"), Some("test"));
+        assert_eq!(event.str("path"), Some("/login"));
+        assert_eq!(event.str("received"), Some(received));
+        assert_eq!(
+            event.get("classified").and_then(json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(event.u64("observed_bytes"), Some(SECRET.len() as u64));
+        assert_eq!(observer.heads.lock().unwrap().len(), 1);
+        assert_eq!(observer.ends.lock().unwrap().len(), 1);
+        assert!(event.is_truncated());
+        assert_redacted(event);
+    }
+}
+
+#[test]
+fn response_metadata_cannot_displace_http_facts() {
+    let memory = Arc::new(fictionet::events::Memory::default());
+    let router = Router::new().get("/", |_, _| {
+        let mut fields = fictionet::events::Fields::new();
+        for name in [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+            "r", "s", "t", "u", "v", "w", "x", "y", "z", "aa", "bb", "cc", "dd", "ee", "ff",
+        ] {
+            fields.set(name, "x".repeat(4096));
+        }
+        fields.set("method", "wrong");
+        fields.set("status", 999u64);
+        let mut response = http::Response::new(Bytes::from_static(b"ok"));
+        response.extensions_mut().insert(fields);
+        response
+    });
+    let mut harness =
+        Harness::new(fictionet::Seed::from_u64(1), Http1::new(router), ()).observer(memory.clone());
+    let reply = harness
+        .push(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+        .unwrap();
+    assert!(reply.ends_with(b"ok"));
+    let events = memory.checked_of("http", "request").unwrap();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert!(event.is_truncated());
+    assert_eq!(event.str("method"), Some("GET"));
+    assert_eq!(event.str("path"), Some("/"));
+    assert_eq!(event.str("host"), Some("test"));
+    assert_eq!(event.str("received"), Some("complete"));
+    assert_eq!(event.u64("status"), Some(200));
+    assert_eq!(event.u64("sent"), Some(2));
+    assert_eq!(
+        event.get("complete").and_then(json::Value::as_bool),
+        Some(true)
+    );
+}

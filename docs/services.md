@@ -862,7 +862,9 @@ status, rather than gaps, establishes whether evidence is incomplete.
 Observers receive borrowed events synchronously in sequence order and must return
 promptly without calling back into the world.
 
-`Memory` defaults to 50,000 events within 16 MiB. Oldest events are evicted first;
+`Memory` defaults to 50,000 ordinary events within 16 MiB, plus a separate
+5,000-record, 2 MiB budget for facts marked with `Event::repeat`. Oldest events
+in each budget are evicted first;
 loss persists even if a later query selects a different kind of fact. An optional
 `Aggregate` wraps retention with one-second run-time windows, at most 1,024
 pending facts and two MiB of event storage. Services mark repeatable facts with

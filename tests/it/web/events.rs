@@ -49,7 +49,7 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     run_world::seeded_world(
-        options.observer(evidence.clone()),
+        options.event_history(evidence.clone()),
         Duration::from_secs(60),
         move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
@@ -1476,10 +1476,13 @@ fn events_for_blocked_packets() {
 fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     const SCAN: u16 = 55_000;
     let path = std::env::temp_dir().join(format!("fictionet-scan-{}.jsonl", std::process::id()));
+    let jsonl = Arc::new(fictionet::events::Jsonl::open(&path, Default::default()).unwrap());
     let kept: Arc<std::sync::Mutex<Option<Arc<Memory>>>> = Arc::default();
     let keep = kept.clone();
     world_events_with_memory(
-        RunOptions::new(Seed::from_u64(1)).aggregate_events(),
+        RunOptions::new(Seed::from_u64(1))
+            .aggregate_events()
+            .observer(jsonl.clone()),
         Arc::new(Memory::default()),
         move |fcx, attacher, env, log| async move {
             // What a grader reads: a lookup, a TLS handshake and a request.
@@ -1528,7 +1531,7 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
             Ok(())
         },
     );
-    // The run is over: complete evidence can be serialized outside it.
+    jsonl.finish().unwrap();
     let events = kept.lock().unwrap().take().unwrap();
     fn from(e: &Event, name: &str) -> bool {
         sandbox_of(e).is_some_and(|s| &*s.name == name)
@@ -1550,7 +1553,7 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
         .iter()
         .filter(|e| e.is("net", "blocked") && from(e, "b"))
         .collect();
-    assert!(blocked.len() < 1000);
+    assert!(blocked.len() < 100, "{} events for the scan", blocked.len());
     assert_eq!(
         blocked
             .iter()
@@ -1558,10 +1561,11 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
             .sum::<u64>(),
         u64::from(SCAN)
     );
-    std::fs::write(&path, crate::common::evidence_bytes(&events)).unwrap();
+    assert_eq!(jsonl.lost(), 0);
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!(text.lines().count(), all.len());
+    assert_eq!(text.as_bytes(), crate::common::evidence_bytes(&events));
     assert!(
         text.lines()
             .any(|l| l.contains(r#""source":"http","kind":"request""#))

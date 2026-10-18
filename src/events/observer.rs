@@ -287,6 +287,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn caller_metadata_cannot_displace_run_identity() {
+        let memory = Arc::new(Memory::default());
+        let mut fields = crate::events::Fields::new();
+        for name in [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+            "r", "s", "t", "u", "v", "w", "x", "y", "z", "aa", "bb", "cc", "dd", "ee", "ff",
+        ] {
+            fields.set(name, "x".repeat(4096));
+        }
+        fields.set("seed", "wrong");
+        fields.set("rng", "wrong");
+        fields.set("wall", "wrong");
+        let seed = Seed::from_u64(1);
+        block_on(lab(
+            RunOptions::new(seed)
+                .observer(memory.clone())
+                .fields(fields),
+            |_| async { Ok(()) },
+        ))
+        .unwrap();
+        let events = memory.checked_all().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_truncated());
+        assert_eq!(events[0].str("seed"), Some(seed.to_string().as_str()));
+        assert_eq!(events[0].str("rng"), Some("chacha20-v1"));
+        assert!(events[0].get("wall").unwrap().is_null());
+    }
+
     fn records() -> Vec<Event> {
         let memory = Arc::new(Memory::default());
         let options = RunOptions::new(Seed::from_u64(42))

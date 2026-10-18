@@ -356,6 +356,27 @@ impl Event {
         self
     }
 
+    /// Prepends fields within the space left by existing facts.
+    /// Existing values take precedence and retain their construction budget.
+    pub fn prepend_fields(mut self, fields: Fields) -> Self {
+        let mut order = Vec::new();
+        for (name, value) in fields.0 {
+            if self.fields.get(name).is_none() {
+                self = self.field(name, value);
+            }
+            if self.fields.get(name).is_some() {
+                order.push(name);
+            }
+        }
+        self.fields.0.sort_by_key(|(name, _)| {
+            order
+                .iter()
+                .position(|first| first == name)
+                .unwrap_or(order.len())
+        });
+        self
+    }
+
     /// Marks a repeatable fact and adds per-occurrence detail.
     /// An optional [`super::Aggregate`] combines matching facts and summarizes
     /// numeric detail as ranges. Detail names must not replace identifying fields.

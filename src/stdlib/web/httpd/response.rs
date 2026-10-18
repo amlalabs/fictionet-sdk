@@ -260,8 +260,7 @@ impl Tracker {
         own.set("status", opt(status.map(|s| u32::from(s.as_u16()))));
         own.set("sent", sent);
         own.set("complete", complete);
-        fields.extend(own);
-        event = event.fields(fields);
+        event = event.fields(own).prepend_fields(fields);
         if let Some(s) = status {
             let _ = write!(event.summary, " {}", s.as_u16());
             if s.is_server_error() {

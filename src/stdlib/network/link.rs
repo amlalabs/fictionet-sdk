@@ -419,40 +419,19 @@ mod tests {
     /// its retention budget; the bottleneck still reports every raw drop.
     #[test]
     fn a_flooded_bottleneck_reports_raw_drops_and_retention_loss() {
-        use fictionet::events::{ConnInfo, Limits, Memory, Metadata, Observation, Observer, Stamp};
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-        struct Facts {
-            requests: Memory,
-            drops: AtomicUsize,
-        }
-        impl Observer for Facts {
-            fn enabled(&self, meta: Metadata, _: &ConnInfo) -> bool {
-                (meta.source == "bottleneck" && meta.kind == "drop")
-                    || (meta.source == "http" && meta.kind == "request")
-            }
-            fn observe(&self, stamp: Stamp, item: Observation<'_>) {
-                let Observation::Event(event) = item;
-                if event.is("bottleneck", "drop") {
-                    assert!(event.get("count").is_none());
-                    assert_eq!(event.str("why"), Some("the queue was full"));
-                    self.drops.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.requests.observe(stamp, item);
-                }
-            }
-        }
+        use fictionet::events::{Limits, Memory};
+        use std::sync::Arc;
         let flood = fictionet::events::MAX_EVENTS + 10_000;
-        let evidence = Arc::new(Facts {
-            requests: Memory::new(Limits::new(2, 4096)),
-            drops: AtomicUsize::new(0),
-        });
-        let bounded = std::sync::Arc::new(fictionet::events::Memory::new(
-            fictionet::events::Limits::new(32, 32 << 10),
+        let bounded = Arc::new(Memory::with_noise_limits(
+            Limits::new(3, 4 << 10), Limits::new(29, 28 << 10),
         ));
+        let aggregated = Arc::new(Memory::new(Limits::new(32, 32 << 10)));
         let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(
-            std::sync::Arc::new(fictionet::events::Fanout::new(vec![evidence.clone(), bounded.clone()])),
+            std::sync::Arc::new(fictionet::events::Fanout::new(vec![
+                bounded.clone(),
+                Arc::new(fictionet::events::Aggregate::new(aggregated.clone())),
+            ])),
         );
-        let retained = evidence.clone();
         block_on(fictionet::lab(options, move |fcx| async move {
             let (mut sandbox, inner) = pair();
             let _far = bottleneck(&fcx, 0, 10, inner);
@@ -464,16 +443,29 @@ mod tests {
                 }
             }
             fcx.idle().await?;
-            assert_eq!(retained.drops.load(Ordering::Relaxed), flood - 10);
             fcx.emit("http", "request", |event| event);
             fcx.cancel();
             Ok(())
         })).unwrap();
-        assert_eq!(evidence.requests.checked_of("http", "request").unwrap().len(), 2);
+        let raw = bounded.after(0, usize::MAX);
+        assert_eq!(raw.iter().filter(|event| event.is("http", "request")).count(), 2);
+        let raw_drops: Vec<_> = raw.iter().filter(|event| event.is("bottleneck", "drop")).collect();
+        for event in &raw_drops {
+            assert!(event.get("count").is_none());
+            assert_eq!(event.str("why"), Some("the queue was full"));
+        }
+        assert_eq!(bounded.dropped() + raw_drops.len() as u64, flood as u64 - 10);
         assert!(bounded.checked_all().is_err());
         assert!(bounded.dropped() > 0);
         let (count, bytes) = bounded.retained();
         assert!(count <= 32 && bytes <= 32 << 10);
+        assert_eq!(aggregated.checked_of("http", "request").unwrap().len(), 2);
+        let drops = aggregated.checked_of("bottleneck", "drop").unwrap();
+        assert!(!drops.is_empty() && drops.len() <= 4, "{drops:?}");
+        assert_eq!(
+            drops.iter().map(|event| event.u64("count").unwrap_or(1)).sum::<u64>(),
+            flood as u64 - 10
+        );
     }
 
     #[test]

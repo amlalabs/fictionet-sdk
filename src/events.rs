@@ -39,8 +39,10 @@
 //! Fixed inputs, observer configuration and lab scheduling produce repeatable
 //! evidence; see [Repeatable runs](crate::guide::running#repeatable-runs).
 //!
-//! [`Memory`] owns count- and byte-bounded history. Oldest events are evicted
-//! first, and loss remains visible through [`Memory::dropped`]. Graders use
+//! [`Memory`] owns count- and byte-bounded history. Its default reserves separate
+//! event and network-noise budgets, so a flood cannot evict unrelated facts.
+//! Oldest events in each budget are evicted first, and loss remains visible
+//! through [`Memory::dropped`]. Graders use
 //! [`Memory::checked_of`] or [`Memory::checked_all`] to reject incomplete
 //! evidence. Reads neither flush nor change retained events. Dashboard clients
 //! can attach late only to history explicitly installed with
@@ -79,14 +81,16 @@ mod observer;
 pub use aggregate::Aggregate;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub use jsonl::Jsonl;
+#[cfg(feature = "observe")]
+pub(crate) use memory::DisplayBatch;
 pub use memory::{Incomplete, Limits, Memory};
 pub(crate) use model::Origin;
 pub use model::{ConnInfo, Event, EventValue, Fields, Level, Sandbox, Transport, float, opt};
 pub use observer::{Dispatch, Emitter, Fanout, Metadata, Observation, Observer, Stamp};
 
-/// Default number of events retained by [`Memory`].
+/// Default number of ordinary events retained by [`Memory`], separate from noise.
 pub const MAX_EVENTS: usize = 50_000;
-/// Default retained event bytes, as counted by [`Event::size`].
+/// Default ordinary event bytes, as counted by [`Event::size`], separate from noise.
 pub const MAX_EVENT_BYTES: usize = 16 << 20;
 
 #[cfg(all(test, feature = "std"))]

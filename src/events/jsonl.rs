@@ -76,6 +76,7 @@ impl Jsonl {
                     writeln!(writer, "{{\"source\":\"events\",\"kind\":\"lost\",\"fields\":{{\"count\":{lost}}}}}")?;
                 }
                 writer.flush()?;
+                drop(writer);
                 guard.1 = true;
                 Ok(())
             })?;
@@ -323,6 +324,86 @@ mod tests {
         assert!(jsonl.finish().is_err());
         assert_eq!(jsonl.lost(), 1);
         assert!(jsonl.finish().is_err());
+    }
+
+    #[test]
+    fn writer_panics_remain_visible_after_finish() {
+        struct Panics(&'static str);
+        impl Write for Panics {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert_ne!(self.0, "write");
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                assert_ne!(self.0, "flush");
+                Ok(())
+            }
+        }
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                assert_ne!(self.0, "drop");
+            }
+        }
+        for stage in ["write", "flush", "drop"] {
+            for count in [0, 1] {
+                if stage == "write" && count == 0 {
+                    continue;
+                }
+                let jsonl = Jsonl::new(Panics(stage), Limits::new(10, 8192)).unwrap();
+                for seq in 1..=count {
+                    deliver(&jsonl, seq);
+                }
+                assert!(jsonl.finish().is_err(), "{stage}, {count}");
+                assert!(jsonl.finish().is_err(), "{stage}, {count}");
+                assert_eq!(jsonl.lost(), if stage == "drop" { 0 } else { count });
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_writer_counts_every_unflushed_event() {
+        struct Fails {
+            output: Output,
+            lines: usize,
+            panics: bool,
+        }
+        impl Write for Fails {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.lines == 100 {
+                    assert!(!self.panics, "writer panicked");
+                    return Err(io::Error::other("writer failed"));
+                }
+                self.lines += bytes.iter().filter(|&&byte| byte == b'\n').count();
+                self.output.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for panics in [false, true] {
+            let output = Output::default();
+            let writer = Fails {
+                output: output.clone(),
+                lines: 0,
+                panics,
+            };
+            let jsonl = Jsonl::new(writer, Limits::new(300, 1 << 20)).unwrap();
+            for seq in 1..=300 {
+                deliver(&jsonl, seq);
+            }
+            assert!(jsonl.finish().is_err());
+            assert!(jsonl.finish().is_err());
+            assert_eq!(
+                output
+                    .0
+                    .lock()
+                    .iter()
+                    .filter(|&&byte| byte == b'\n')
+                    .count(),
+                100
+            );
+            assert_eq!(jsonl.lost(), 200);
+        }
     }
 
     #[test]

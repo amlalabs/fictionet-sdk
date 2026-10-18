@@ -412,7 +412,6 @@ impl RunShared {
             .then(|| {
                 crate::events::Event::new("run", "start")
                     .summary("the run started")
-                    .fields(fields)
                     .field(
                         "wall",
                         if mode == crate::RunMode::Lab {
@@ -427,6 +426,7 @@ impl RunShared {
                     )
                     .field("seed", seed.to_string())
                     .field("rng", "chacha20-v1")
+                    .prepend_fields(fields)
             });
         #[cfg(feature = "observe")]
         let keys = Arc::new(crate::telemetry::KeyRecorder::default());

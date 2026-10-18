@@ -132,8 +132,6 @@ impl Http1 {
             tracker.received(received);
             if driver.event_enabled("http", "request")
                 && let Some(head) = &self.head
-                && head_held(head) <= 32 * 1024
-                && head.headers.len() <= 128
                 && let Some(request) = to_request(head, version_of(head), Body::empty())
             {
                 tracker.start(&request, driver.conn(), self.started);

@@ -26,7 +26,8 @@
 //! [`run`], [`lab`] and [`Cx`] document the runtime operations, and [`events`]
 //! documents lazy emission and optional retention. Integrators install observers
 //! through [`RunOptions`]: [`events::Memory`], native `Jsonl`, [`events::Aggregate`],
-//! dashboard retention, or their own. With none, recording costs nothing.
+//! dashboard retention, or their own. With none, an interest check skips event
+//! construction and recording.
 //! `run.start` emits the seed automatically to interested observers.
 //!
 //! # How a sandbox connects to a world

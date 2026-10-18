@@ -45,37 +45,89 @@ impl std::error::Error for Incomplete {}
 
 /// Bounded synchronous evidence, owned by the integrator.
 ///
-/// Oldest events are evicted first. Loss is persistent, even when later reads
+/// The default reserves separate budgets for ordinary events and network noise
+/// marked with [`Event::repeat`]. Oldest events in each budget are evicted first.
+/// Ordinary events get 50,000 records and sixteen MiB; noise gets 5,000 records
+/// and two MiB.
+/// Loss is persistent, even when later reads
 /// select a different kind of event. Graders use [`Self::checked_of`]. Reading
 /// does not mutate retention or flush pending work.
 pub struct Memory {
     limits: Limits,
+    noise_limits: Option<Limits>,
     state: Mutex<State>,
 }
 
 #[derive(Default)]
 struct State {
-    events: VecDeque<Arc<Event>>,
-    bytes: usize,
+    history: [History; 2],
     last: u64,
     dropped: u64,
-    evicted: u64,
-    evicted_through: u64,
     waiters: Vec<Weak<Mutex<Option<Waker>>>>,
+}
+
+#[derive(Default)]
+struct History {
+    events: VecDeque<Arc<Event>>,
+    bytes: usize,
+    evicted: u64,
+}
+
+#[derive(Default)]
+#[cfg(feature = "observe")]
+pub(crate) struct DisplayBatch {
+    pub events: Vec<Event>,
+    pub last: u64,
+    pub dropped: u64,
+    pub evicted: [u64; 2],
+    pub position: [u64; 2],
+}
+
+impl State {
+    fn after(&self, after: u64) -> impl Iterator<Item = &Arc<Event>> {
+        let mut parts = self.history.each_ref().map(|history| {
+            let start = history.events.partition_point(|event| event.seq <= after);
+            history.events.range(start..).peekable()
+        });
+        std::iter::from_fn(move || {
+            let index = match (
+                parts[0].peek().map(|e| e.seq),
+                parts[1].peek().map(|e| e.seq),
+            ) {
+                (Some(a), Some(b)) => usize::from(b < a),
+                (Some(_), None) => 0,
+                (None, Some(_)) => 1,
+                (None, None) => return None,
+            };
+            parts[index].next()
+        })
+    }
 }
 
 impl Default for Memory {
     fn default() -> Self {
-        Self::new(Limits::default())
+        Self::with_noise_limits(Limits::default(), Limits::new(5_000, 2 << 20))
     }
 }
 
 impl Memory {
-    /// Creates empty evidence with fixed bounds.
+    /// Creates empty evidence with one shared budget for all raw facts.
+    /// Use [`Self::with_noise_limits`] to keep network floods from evicting
+    /// ordinary events, as the default does.
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
+            noise_limits: None,
             state: Mutex::new(State::default()),
+        }
+    }
+
+    /// Reserves independent count and byte bounds for ordinary events and
+    /// facts marked with [`Event::repeat`], including aggregate summaries.
+    pub fn with_noise_limits(limits: Limits, noise: Limits) -> Self {
+        Self {
+            noise_limits: Some(noise),
+            ..Self::new(limits)
         }
     }
 
@@ -97,8 +149,7 @@ impl Memory {
             });
         }
         Ok(state
-            .events
-            .iter()
+            .after(0)
             .filter(|e| pick(e))
             .map(|e| (**e).clone())
             .collect())
@@ -147,8 +198,7 @@ impl Memory {
                     }
                     .into()));
                 }
-                let start = state.events.partition_point(|event| event.seq <= after);
-                state.events.range(start..).cloned().collect::<Vec<_>>()
+                state.after(after).cloned().collect::<Vec<_>>()
             };
             for event in events {
                 after = event.seq;
@@ -178,24 +228,44 @@ impl Memory {
 
     /// Reads a bounded display batch. This does not certify completeness.
     pub fn after(&self, after: u64, max: usize) -> Vec<Event> {
-        self.display_batch(after, max).0
+        self.state
+            .lock()
+            .after(after)
+            .take(max)
+            .map(|e| (**e).clone())
+            .collect()
     }
 
-    pub(crate) fn display_batch(&self, after: u64, max: usize) -> (Vec<Event>, u64, u64, u64, u64) {
+    #[cfg(feature = "observe")]
+    pub(crate) fn display_batch(&self, after: Option<u64>, max: usize) -> DisplayBatch {
         let state = self.state.lock();
-        (
+        let skip = if after.is_none() {
             state
-                .events
+                .history
                 .iter()
-                .filter(|e| e.seq > after)
-                .take(max)
-                .map(|e| (**e).clone())
-                .collect(),
-            state.last,
-            state.dropped,
-            state.evicted,
-            state.evicted_through,
-        )
+                .map(|h| h.events.len())
+                .sum::<usize>()
+                .saturating_sub(max)
+        } else {
+            0
+        };
+        let events: Vec<_> = state
+            .after(after.unwrap_or(0))
+            .skip(skip)
+            .take(max)
+            .map(|e| (**e).clone())
+            .collect();
+        let through = events.last().map_or(after.unwrap_or(state.last), |e| e.seq);
+        DisplayBatch {
+            events,
+            last: state.last,
+            dropped: state.dropped,
+            evicted: state.history.each_ref().map(|h| h.evicted),
+            position: state.history.each_ref().map(|h| {
+                h.evicted
+                    .saturating_add(h.events.partition_point(|e| e.seq <= through) as u64)
+            }),
+        }
     }
 
     /// Persistent loss count, independent of sequence gaps from filtering.
@@ -211,7 +281,10 @@ impl Memory {
     /// Retained count and charged bytes.
     pub fn retained(&self) -> (usize, usize) {
         let state = self.state.lock();
-        (state.events.len(), state.bytes)
+        (
+            state.history.iter().map(|h| h.events.len()).sum(),
+            state.history.iter().map(|h| h.bytes).sum(),
+        )
     }
 }
 
@@ -238,26 +311,31 @@ impl Observer for Memory {
         let size = event.size();
         let mut state = self.state.lock();
         state.last = stamp.seq;
-        if self.limits.events == 0 || size > self.limits.bytes {
+        let (index, limits) = match (event.repeat.is_some(), self.noise_limits) {
+            (true, Some(limits)) => (1, limits),
+            _ => (0, self.limits),
+        };
+        if limits.events == 0 || size > limits.bytes {
             state.dropped = state.dropped.saturating_add(1);
         } else {
-            while state.events.len() >= self.limits.events || state.bytes > self.limits.bytes - size
-            {
-                let oldest = state
+            let history = &mut state.history[index];
+            let before = history.evicted;
+            while history.events.len() >= limits.events || history.bytes > limits.bytes - size {
+                let oldest = history
                     .events
                     .pop_front()
                     .expect("retained event exceeds bounds");
-                state.bytes -= oldest.size();
-                state.evicted_through = oldest.seq;
-                state.evicted = state.evicted.saturating_add(1);
-                state.dropped = state.dropped.saturating_add(1);
+                history.bytes -= oldest.size();
+                history.evicted = history.evicted.saturating_add(1);
             }
             let mut event = event.clone();
             event.seq = stamp.seq;
             event.at = stamp.at;
             // Cloning strings can shrink their capacity; charge the retained copy.
-            state.bytes += event.size();
-            state.events.push_back(Arc::new(event));
+            history.bytes += event.size();
+            history.events.push_back(Arc::new(event));
+            let evicted = history.evicted - before;
+            state.dropped = state.dropped.saturating_add(evicted);
         }
         let waiters: Vec<_> = state.waiters.iter().filter_map(Weak::upgrade).collect();
         drop(state);
@@ -278,6 +356,88 @@ mod tests {
     use std::future::Future;
     use std::sync::Arc;
     use std::task::{Context, Waker};
+
+    #[test]
+    fn a_flood_of_distinct_noise_preserves_other_events() {
+        let memory = Arc::new(Memory::default());
+        let retained = memory.clone();
+        let flood = super::super::MAX_EVENTS as u64 + 10;
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1))
+                .aggregate_events()
+                .observer(retained),
+            |cx| async move {
+                for i in 0..10u64 {
+                    cx.emit("http", "request", |event| event.field("i", i));
+                }
+                for i in 0..flood {
+                    cx.emit("net", "blocked", |event| {
+                        event
+                            .field("destination", i)
+                            .repeat(super::super::Fields::new())
+                    });
+                    if i == flood / 2 {
+                        cx.emit("dns", "query", |event| event);
+                    }
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let events = memory.after(0, usize::MAX);
+        assert_eq!(
+            events.iter().filter(|e| e.is("http", "request")).count(),
+            10
+        );
+        assert_eq!(events.iter().filter(|e| e.is("dns", "query")).count(), 1);
+        assert!(events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+        let noise = events.iter().filter(|e| e.is("net", "blocked")).count();
+        assert!(noise > 0 && noise <= 5_000);
+        assert!(memory.state.lock().history[1].bytes <= 2 << 20);
+        assert_eq!(memory.dropped() + noise as u64, flood);
+        assert_eq!(
+            memory.checked_of("http", "request").unwrap_err().dropped,
+            flood - noise as u64
+        );
+    }
+
+    #[test]
+    fn noise_has_independent_count_and_byte_limits() {
+        let event = Event::new("net", "blocked").repeat(super::super::Fields::new());
+        for limits in [Limits::new(1, 8192), Limits::new(10, event.size())] {
+            let memory = Memory::with_noise_limits(Limits::new(2, 8192), limits);
+            for (seq, event) in [
+                Event::new("http", "request"),
+                event.clone(),
+                event.clone(),
+                Event::new("dns", "query"),
+                event.clone(),
+            ]
+            .iter()
+            .enumerate()
+            {
+                memory.observe(
+                    Stamp {
+                        seq: seq as u64 + 1,
+                        at: crate::time::Instant::ZERO,
+                    },
+                    Observation::Event(event),
+                );
+            }
+            assert_eq!(
+                memory
+                    .after(0, 10)
+                    .iter()
+                    .map(|e| e.seq)
+                    .collect::<Vec<_>>(),
+                [1, 4, 5]
+            );
+            assert_eq!(memory.dropped(), 2);
+            let state = memory.state.lock();
+            assert!(state.history[1].bytes <= limits.bytes);
+            assert!(state.history[1].events.len() <= limits.events);
+        }
+    }
 
     #[test]
     fn waits_are_bounded_and_dropping_them_releases_capacity() {
