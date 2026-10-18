@@ -406,6 +406,7 @@ fn observer_sees_upgrade_path_body_limit() {
     });
 }
 
+#[cfg(feature = "tokio")]
 #[test]
 fn observer_sees_a_handed_off_request_once() {
     struct Echo;
