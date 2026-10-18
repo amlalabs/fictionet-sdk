@@ -16,7 +16,7 @@ use fictionet::stdlib::network::ip::{
 };
 use fictionet::stdlib::network::{ConnError, Connection, tcp, udp};
 use fictionet::stdlib::test_support::thread_cpu_time;
-use fictionet::{Cx, Interface, Packet, RecvError, RunOptions, pair};
+use fictionet::{Cx, Interface, Packet, RecvError, pair};
 
 const A: &str = "10.0.0.1";
 const B: &str = "10.0.0.2";
@@ -860,7 +860,7 @@ fn tcp_syn(src: IpAddr, sport: u16, dst: IpAddr, dport: u16) -> Packet {
 #[cfg(feature = "tokio")]
 #[test]
 fn tcp_through_tokio_io() {
-    use fictionet::run;
+    use fictionet::{RunOptions, run};
     use fictionet_test_support::Done;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rt = tokio::runtime::Builder::new_multi_thread()
