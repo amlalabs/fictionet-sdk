@@ -2,7 +2,7 @@
 name = "example-common"
 version = "0.0.0"
 edition = "2024"
-description = "Code the example worlds share: the JSON Lines log, the projection of network events into it, and the Python backend's startup."
+description = "Code the example worlds share: the JSON Lines log, the projection of network events into it, the Python backend's startup, the quick-start world's sites, and hyper on simulated connections."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -10,5 +10,16 @@ publish = false
 path = "lib.rs"
 
 [dependencies]
-fictionet = { path = "../.." }
+# No default features: the SDK's tests and the browser example use this
+# crate too, and keep the SDK features they chose. The quick-start sites
+# turn on with `std`.
+fictionet = { path = "../..", default-features = false }
+hyper = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
+
+# The quick-start world listens on a host socket, which a browser has not.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum = { version = "0.8", default-features = false }
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -17,6 +17,7 @@ doctest = false
 fictionet = { path = "../..", default-features = false }
 bytes = "1"
 divan = "0.1.21"
+example-common = { path = "../../examples/common" }
 http = "1.5.0"
 http-body-util = "0.1"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }

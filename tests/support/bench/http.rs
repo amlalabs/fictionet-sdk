@@ -1,7 +1,7 @@
 mod observer;
 
 use super::World;
-use crate::hyper_io::{Exec, Io};
+use example_common::hyper_io::{Exec, Io};
 use bytes::Bytes;
 use fictionet::relay;
 use fictionet::stdlib::protocols::dns::op::{MessageType, ResponseCode};

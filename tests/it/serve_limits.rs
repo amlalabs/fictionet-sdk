@@ -8,7 +8,7 @@ use crate::common::io;
 use crate::common::world;
 use crate::http2_server::H2_INPUT;
 
-use fictionet_test_support::hyper_io;
+use example_common::hyper_io;
 use hyper_io::{Exec, Io};
 
 use world::world;

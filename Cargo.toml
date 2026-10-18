@@ -92,6 +92,7 @@ fictionet-test-support = { path = "tests/support" }
 axum = { version = "0.8", default-features = false, features = ["ws"] }
 hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
 etherparse = "0.21"
+example-common = { path = "examples/common" }
 libc = "0.2.189"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

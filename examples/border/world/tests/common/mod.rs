@@ -19,8 +19,8 @@ use fictionet::stdlib::services::ca::Ca;
 use fictionet::{Attacher, Cx, End, Packet};
 use rustls::RootCertStore;
 
+pub use example_common::hyper_io::Io;
 pub use fictionet_test_support::harness::*;
-pub use fictionet_test_support::hyper_io::Io;
 pub use fictionet_test_support::timeout;
 
 /// What a test gets.

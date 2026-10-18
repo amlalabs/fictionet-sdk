@@ -3,7 +3,6 @@
 
 pub mod certs;
 mod done;
-pub mod hyper_io;
 mod logged;
 mod pattern;
 pub mod poll;

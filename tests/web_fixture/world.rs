@@ -11,7 +11,7 @@ use fictionet::Result;
 use fictionet::stdlib::web;
 use rustls::pki_types::PrivateKeyDer;
 
-mod web_world;
+use example_common::web_world;
 
 fn main() -> Result {
     let args: Vec<String> = std::env::args().collect();

@@ -538,8 +538,13 @@ dependencies = [
 name = "example-common"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "fictionet",
+ "http",
+ "hyper",
+ "rustls",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -580,6 +585,7 @@ dependencies = [
  "bytes",
  "divan",
  "etherparse",
+ "example-common",
  "fictionet-codegen",
  "fictionet-codegen-golden",
  "fictionet-test-support",
@@ -658,6 +664,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "divan",
+ "example-common",
  "fictionet",
  "http",
  "http-body-util",
@@ -2288,6 +2295,7 @@ name = "wasm-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "example-common",
  "fictionet",
  "http",
  "http-body-util",

@@ -1,6 +1,6 @@
-//! The quick-start world's sites and startup, the same as in
-//! `examples/web_world.rs`: the fixture serves that world with routes of its
-//! own added. Keep the two the same.
+//! The sites and startup of the quick-start world, `examples/web_world.rs`.
+//! The web test's fixture, `tests/web_fixture`, serves the same world with
+//! routes of its own added.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
