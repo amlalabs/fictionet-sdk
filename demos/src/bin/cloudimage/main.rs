@@ -201,6 +201,7 @@ async fn run_checks(vm: &ch::Vm, identity: &ssh::Identity, boot: Instant) -> Res
         "cat /proc/cmdline",
         "sudo dmidecode -t system",
         "lspci 2>/dev/null || echo 'lspci not installed'",
+        "sudo dmesg | grep -iE 'DMI|Hypervisor|ACPI: RSDP|ACPI: XSDT|Command line|virtio|kvm-clock' | head -14",
         "ip -br link",
         "ip -4 addr show dev eth0 | grep inet || echo 'no DHCP lease'",
         "ip route | grep default || true",
