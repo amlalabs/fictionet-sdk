@@ -1099,6 +1099,49 @@ fn invalid_priority_on_an_idle_stream_is_a_connection_error() {
 }
 
 #[test]
+fn cookie_crumbs_reach_the_handler_as_one_header() {
+    let router = Router::new().get("/", |_, request| {
+        let cookies: Vec<&[u8]> = request
+            .headers()
+            .get_all("cookie")
+            .iter()
+            .map(|v| v.as_bytes())
+            .collect();
+        http::Response::new(Bytes::from(cookies.join(b"\n".as_slice())))
+    });
+    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(router), ());
+    let mut fragment = Vec::new();
+    for (name, value) in [
+        (":method", "GET"),
+        (":scheme", "https"),
+        (":authority", "localhost"),
+        (":path", "/"),
+        ("cookie", "a=1"),
+        ("accept", "*/*"),
+        ("cookie", "b=2"),
+    ] {
+        hpack::Field::new(name, value).write(&mut fragment).unwrap();
+    }
+    let mut input = preface();
+    http2::Headers {
+        stream: 1,
+        flags: 5,
+        fragment,
+        priority: None,
+        padding: None,
+    }
+    .write(&mut input)
+    .unwrap();
+    let output = frames(&harness.push(&input).unwrap());
+    assert_eq!(statuses(&output), [(1, b"200".to_vec())]);
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::Data(d) if d.data == b"a=1; b=2"))
+    );
+}
+
+#[test]
 fn failing_response_body_is_an_internal_stream_error() {
     struct Broken;
     impl http_body::Body for Broken {

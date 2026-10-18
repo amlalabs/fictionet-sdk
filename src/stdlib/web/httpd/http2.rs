@@ -991,6 +991,7 @@ fn request(block: hpack::Block, limits: Limits) -> Option<Request<Body>> {
     let mut path = None;
     let mut regular = false;
     let mut headers = http::HeaderMap::new();
+    let mut cookie: Option<Vec<u8>> = None;
     let mut list_size = 0usize;
     for h in block.headers {
         let (name, value) = (h.name?, h.value?);
@@ -1017,11 +1018,24 @@ fn request(block: hpack::Block, limits: Limits) -> Option<Request<Body>> {
             if !valid_name(&name) || (name == b"te" && value != b"trailers") {
                 return None;
             }
-            headers.append(
-                HeaderName::from_bytes(&name).ok()?,
-                HeaderValue::from_bytes(&value).ok()?,
-            );
+            // A client may split a cookie into several fields. They reach
+            // the application joined with "; " (RFC 9113 section 8.2.3).
+            if name == b"cookie"
+                && let Some(first) = headers.get(http::header::COOKIE)
+            {
+                let joined = cookie.get_or_insert_with(|| first.as_bytes().to_vec());
+                joined.extend_from_slice(b"; ");
+                joined.extend_from_slice(&value);
+            } else {
+                headers.append(
+                    HeaderName::from_bytes(&name).ok()?,
+                    HeaderValue::from_bytes(&value).ok()?,
+                );
+            }
         }
+    }
+    if let Some(cookie) = cookie {
+        headers.insert(http::header::COOKIE, HeaderValue::from_bytes(&cookie).ok()?);
     }
     let method = Method::from_bytes(method?.as_bytes()).ok()?;
     let mut uri = http::uri::Parts::default();
