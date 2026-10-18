@@ -1,0 +1,24 @@
+[package]
+name = "fictionet-microvm"
+version.workspace = true
+edition = "2024"
+rust-version = "1.91"
+description = "A microVM in a re-executed child of the program, with microsandbox's guest agent."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# msb_krun's bzip2 links the system libbz2 when pkg-config finds one. The
+# program carries its own instead.
+bzip2 = { version = "0.5", features = ["static"] }
+libc = "0.2.189"
+# The guest agent's protocol and client, at the release whose agentd
+# `cargo xtask microvm` builds for the guest.
+microsandbox-agent-client = { version = "=0.7.8", features = ["stream"] }
+microsandbox-protocol = "=0.7.8"
+# superradcompany/libkrun at the revision the microVM plan was written
+# against. `static-krunfw` takes the kernel from this program instead of
+# loading libkrunfw.
+msb_krun = { git = "https://github.com/superradcompany/libkrun", rev = "b35c7e118d7a1e48c8fad103b258e64ff5c49147", features = ["net", "blk", "static-krunfw"] }
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+zstd = "0.13"

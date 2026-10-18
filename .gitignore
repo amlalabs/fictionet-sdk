@@ -1,5 +1,7 @@
-# Build output, here and in the examples' own packages
+# Build output, here and in the examples' own packages, and the guest
+# assets `cargo xtask microvm` makes for the demo
 target/
+/demos/assets/
 # Python environments, caches and eval logs
 .venv/
 __pycache__/

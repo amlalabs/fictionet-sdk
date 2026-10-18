@@ -6,6 +6,7 @@ mod fuzz;
 mod h2spec;
 mod images;
 mod k8s;
+mod microvm;
 mod process;
 mod scan;
 mod vm;
@@ -44,6 +45,7 @@ fn main_result() -> Result {
         "docker" => docker::run(args),
         "eval" => eval::run(args),
         "k8s" => k8s::run(args),
+        "microvm" => microvm::run(args),
         "vm" | "demo" => {
             let _interrupts = process::Interrupts::new()?;
             if command == "vm" {
@@ -62,6 +64,7 @@ fn main_result() -> Result {
                       cargo xtask docker <ping|tcpudp|proxy|web>\n\
                       cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [options]\n\
                       cargo xtask k8s [tun|proxy]\n\
+                      cargo xtask microvm [assets | build]\n\
                       cargo xtask vm [--fetch | nested [--fetch] | up | down | prepare | sync | build | test | ssh | status | clean]\n\
                       cargo xtask demo <name>  (demos/README.md lists them)\n\
                       cargo xtask copy-check\n\

@@ -5,8 +5,10 @@ members = [
     "codegen",
     "codegen/tests/golden",
     "codegen/tests/layouts",
+    "demos",
     "examples/*/world",
     "examples/wasm_world",
+    "microvm",
     "xtask",
 ]
 default-members = [".", "cli", "codegen", "codegen/tests/golden", "codegen/tests/layouts", "xtask"]
