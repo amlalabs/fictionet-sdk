@@ -38,7 +38,7 @@ for what in "${@:-sdk}"; do
     case "$what" in
         sdk)
             echo "Building fictionet and the examples"
-            build --features web-proxy --bin fictionet --examples
+            build --features web-proxy,tokio --bin fictionet --examples
             put "$out/fictionet"
             for example in "$out"/examples/*; do
                 if [[ -f $example && -x $example ]]; then put "$example"; fi

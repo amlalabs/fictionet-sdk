@@ -38,13 +38,16 @@ jobs:
       fail-fast: false
       matrix:
         # The worlds enable web-proxy, so build them in the all-features run.
-        # The CLI turns on the SDK's default features, so the run without
-        # them names the packages it covers and leaves the CLI out.
+        # The CLI turns on the SDK's tokio feature, which is not a default,
+        # so the runs with and without the default features name the
+        # packages they cover and leave the CLI out. The CLI has its own run.
         include:
           - name: default features
-            args: ""
+            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts -p xtask
           - name: no default features
             args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts --no-default-features
+          - name: the command
+            args: -p fictionet-cli
           - name: all features
             args: --workspace --all-features
     steps:
@@ -73,9 +76,11 @@ jobs:
       matrix:
         include:
           - name: default features
-            args: ""
+            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts -p xtask
           - name: no default features
             args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts --no-default-features
+          - name: the command
+            args: -p fictionet-cli
           - name: all features
             args: --workspace --all-features
     steps:
@@ -197,6 +202,8 @@ jobs:
           tool: wasm-pack
       - name: Check
         run: cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown -p fictionet
+      - name: Check the tokio adapters
+        run: cargo check --locked --lib --no-default-features --features tokio --target wasm32-unknown-unknown -p fictionet
       - name: Clippy
         run: cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -p fictionet -- -D warnings
       - name: Check the browser example

@@ -9,13 +9,19 @@ The `fictionet` command is the `fictionet-cli` package in `cli/`, and Cargo
 builds it with the SDK from the top directory. Install it from a checkout with
 `cargo install --locked --path cli`.
 
-CI runs these commands in three feature sets: the default features,
-`-p fictionet -p fictionet-codegen -p fictionet-codegen-layouts
---no-default-features`, and `--workspace --all-features`. The command turns on
-the SDK's default features, so the set without them names its packages and
-leaves the command out. The example worlds enable `web-proxy`, so only the
-all-features set builds them. For the other two sets, add the flags to each
-Cargo command, before `-- -D warnings` for clippy:
+CI runs these commands with four sets of flags:
+
+- the default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-layouts -p xtask`
+- no default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-layouts --no-default-features`
+- the command: `-p fictionet-cli`
+- all features: `--workspace --all-features`
+
+The command turns on the SDK's `tokio` feature, which is not a default, and
+Cargo builds the SDK once for all the packages in one command. So the first
+two sets name their packages and leave the command out, and a plain
+`cargo nextest run` in the top directory tests the SDK with `tokio`. The
+example worlds enable `web-proxy`, so only the all-features set builds them.
+Add the set's flags to each Cargo command, before `-- -D warnings` for clippy:
 
 ```console
 $ cargo build --locked --all-targets
@@ -31,6 +37,7 @@ target and a clang with that target, which compiles ring's C code:
 
 ```console
 $ cargo check --locked -p fictionet --lib --no-default-features --target wasm32-unknown-unknown
+$ cargo check --locked -p fictionet --lib --no-default-features --features tokio --target wasm32-unknown-unknown
 $ cargo clippy --locked -p fictionet --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
 ```
 

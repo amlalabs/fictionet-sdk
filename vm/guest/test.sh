@@ -62,9 +62,9 @@ case "$name" in
         ;;
     cargo)
         export CARGO_TARGET_DIR=/cache/target/test
-        cargo test --locked --features web-proxy
+        cargo test --locked --features web-proxy,tokio
         # The tests that need user namespaces, root and a tun device, which the VM has.
-        cargo test --locked --features web-proxy --test host
+        cargo test --locked --features web-proxy,tokio --test host
         ;;
     *)
         echo "test.sh: no suite named $name" >&2

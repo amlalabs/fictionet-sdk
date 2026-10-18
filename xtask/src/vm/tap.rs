@@ -281,7 +281,7 @@ pub(super) fn build(release: bool) -> Result<PathBuf> {
             "build",
             "--locked",
             "--features",
-            "web-proxy",
+            "web-proxy,tokio",
             "--bin",
             "fictionet",
             "--example",

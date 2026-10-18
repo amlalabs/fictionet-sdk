@@ -16,7 +16,7 @@ COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-proxy-target \
     find src cli examples tests/web_fixture -type f -exec touch {} + \
-    && cargo build --release --locked --features web-proxy --bin fictionet --example web_fixture \
+    && cargo build --release --locked --features web-proxy,tokio --bin fictionet --example web_fixture \
     && cp target/release/fictionet target/release/examples/web_fixture /usr/local/bin/
 
 # A Go client tested and built with the standard library only.
