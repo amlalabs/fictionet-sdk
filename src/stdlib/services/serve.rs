@@ -592,9 +592,6 @@ impl Budget {
 
     /// Moves a charge from `from` bytes to `to`. Refuses, changing
     /// nothing, if that would pass the limit.
-    // Rust 1.99 deprecates fetch_update for try_update, which is newer than
-    // the MSRV (1.91).
-    #[allow(deprecated)]
     fn recharge(&self, from: usize, to: usize) -> bool {
         if to <= from {
             self.inner.used.fetch_sub(from - to, Ordering::Relaxed);
@@ -603,7 +600,7 @@ impl Budget {
         let more = to - from;
         self.inner
             .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(more).filter(|n| *n <= self.inner.limit)
             })
             .is_ok()
@@ -3149,11 +3146,8 @@ pub struct Counted(Arc<AtomicUsize>);
 
 impl Counted {
     /// Counts one more in `open`, unless it already counts `max`.
-    // Rust 1.99 deprecates fetch_update for try_update, which is newer than
-    // the MSRV (1.91).
-    #[allow(deprecated)]
     pub fn enter(open: &Arc<AtomicUsize>, max: usize) -> Option<Counted> {
-        open.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        open.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < max).then_some(n + 1)
         })
         .ok()?;

@@ -6,7 +6,7 @@
 #   container - compose service "container": a real nginx and OpenSSH
 #   scanner   - compose service "scanner": the agent, with nmap
 
-FROM rust:1.92-slim-bookworm AS build
+FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src

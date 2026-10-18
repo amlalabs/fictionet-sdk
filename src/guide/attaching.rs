@@ -183,7 +183,7 @@
 //!
 //! ## Run it on a host
 //!
-//! You need Linux, a root shell, iproute2, curl, and Rust 1.91 or later.
+//! You need Linux, a root shell, iproute2, curl, and Rust 1.99 or later.
 //! Run these from the top directory of the repository.
 //!
 //! **1. Build** `fictionet` and the `web_world` example, and put both on

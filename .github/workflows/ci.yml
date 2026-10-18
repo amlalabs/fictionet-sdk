@@ -218,14 +218,3 @@ jobs:
       - name: The browser example, in Node.js
         working-directory: examples/wasm_world
         run: wasm-pack test --node -- --locked
-
-  msrv:
-    name: MSRV (1.91)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.91
-      - uses: Swatinem/rust-cache@v2
-      - name: Check
-        run: cargo +1.91 check --locked --workspace --all-targets

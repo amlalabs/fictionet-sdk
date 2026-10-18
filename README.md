@@ -94,7 +94,7 @@ from a checkout with `cargo install --locked --path cli`.
 Follow [Getting started](src/guide/getting_started.rs) for the full Linux namespace
 walkthrough: build `web_world`, attach a namespace, make HTTPS requests, watch
 the world's events, and clean up. It includes expected output and troubleshooting.
-You need Linux, Rust 1.91 or later, `sudo`, iproute2 and `curl`.
+You need Linux, Rust 1.99 or later, `sudo`, iproute2 and `curl`.
 
 This is a **trusted connectivity demonstration**. A network namespace isolates
 networking only. The tutorial's root commands share the host's filesystem,

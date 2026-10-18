@@ -13,7 +13,7 @@
 # (fixtures/corpus.json). It has no upstream and serves only the sandbox
 # attached to it.
 
-FROM rust:1.92-slim-bookworm AS build
+FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src

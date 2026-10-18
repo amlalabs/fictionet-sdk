@@ -4,7 +4,7 @@
 name = "fictionet-test-support"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version.workspace = true
 publish = false
 
 [lib]

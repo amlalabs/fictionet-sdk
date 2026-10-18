@@ -11,7 +11,7 @@
 # Both binaries are linked with musl, statically, so their images hold
 # nothing else: no shell, no libc, no package manager.
 
-FROM rust:1.92-alpine AS build
+FROM rust:1.99-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

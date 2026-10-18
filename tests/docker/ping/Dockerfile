@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Built from the crate root: see compose.yaml.
 
-FROM rust:1.92-slim-bookworm AS build
+FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src

@@ -9,7 +9,7 @@
 #   attach  - compose service "attach": fictionet attach --type tun
 #   agent   - compose service "default": the agent's box, which trusts the CA
 
-FROM rust:1.92-slim-bookworm AS build
+FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src

@@ -50,7 +50,7 @@ Fictionet. The pages, the eval and the probes are its own, carried over.
 * Linux, with Docker and Compose v2. The containers need `/dev/net/tun` and
   `NET_ADMIN` for `attach` (Compose sets this up).
 * [uv](https://docs.astral.sh/uv/), for the Python side.
-* Rust 1.91 or later for `cargo xtask`; the images build the world inside Docker.
+* Rust 1.99 or later for `cargo xtask`; the images build the world inside Docker.
 
 ## Check it without a model
 

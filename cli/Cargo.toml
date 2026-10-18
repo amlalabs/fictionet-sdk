@@ -2,7 +2,7 @@
 name = "fictionet-cli"
 version.workspace = true
 edition = "2024"
-rust-version = "1.91"
+rust-version.workspace = true
 description = "Command-line tool for the Fictionet simulated internet."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/amlalabs/fictionet-sdk"

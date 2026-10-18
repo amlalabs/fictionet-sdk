@@ -108,7 +108,7 @@ class CargoExample:
     """Cargo features to turn on."""
     package: str | None = None
     """The package, in a workspace (`cargo build -p`)."""
-    rust_image: str = "rust:1.92-alpine"
+    rust_image: str = "rust:1.99-alpine"
     """The image the example is built in."""
 
 

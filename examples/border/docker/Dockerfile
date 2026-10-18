@@ -13,7 +13,7 @@
 #   agent        - compose service "default", lab setting: curl, BIRD, the lab CA trusted
 #   home         - compose service "default", home setting: an ordinary user's machine
 
-FROM rust:1.92-slim-bookworm AS build
+FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src

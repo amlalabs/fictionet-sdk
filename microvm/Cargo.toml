@@ -2,7 +2,7 @@
 name = "fictionet-microvm"
 version.workspace = true
 edition = "2024"
-rust-version = "1.91"
+rust-version.workspace = true
 description = "A microVM in a re-executed child of the program, with microsandbox's guest agent."
 license = "MIT OR Apache-2.0"
 publish = false

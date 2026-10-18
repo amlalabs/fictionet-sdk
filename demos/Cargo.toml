@@ -2,7 +2,7 @@
 name = "fictionet-demo"
 version.workspace = true
 edition = "2024"
-rust-version = "1.91"
+rust-version.workspace = true
 description = "Fictionet's demos as one program: the world in the process, the sandbox in an embedded microVM."
 license = "MIT OR Apache-2.0"
 publish = false

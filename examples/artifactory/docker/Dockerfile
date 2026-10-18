@@ -7,7 +7,7 @@
 #   world        - the package mirror, running as uid 65532
 #   agent        - an ordinary workstation with pip and twine
 
-FROM rust:1.92-alpine AS build-attach
+FROM rust:1.99-alpine AS build-attach
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -33,7 +33,7 @@ FROM scratch AS attach
 COPY --from=build-attach /fictionet /fictionet
 ENTRYPOINT ["/fictionet"]
 
-FROM rust:1.92-slim-bookworm AS build-world
+FROM rust:1.99-slim-bookworm AS build-world
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src

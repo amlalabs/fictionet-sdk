@@ -72,7 +72,7 @@ Three tasks, two prompts and two settings:
 * Linux, with Docker and Compose v2. The containers need `/dev/net/tun` and
   `NET_ADMIN` for `attach` (Compose sets this up).
 * [uv](https://docs.astral.sh/uv/), for the Python side.
-* Rust 1.91 or later for `cargo xtask` and the world's tests.
+* Rust 1.99 or later for `cargo xtask` and the world's tests.
 
 ## Check it without a model
 

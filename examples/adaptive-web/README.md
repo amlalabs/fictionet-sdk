@@ -29,7 +29,7 @@ they do outside.
 ## Quick start
 
 Prerequisites: Linux, Docker with Compose v2, `/dev/net/tun`, Python 3.12 or
-later, Rust 1.91 or later, and uv. Cold setup downloads base images and packages and builds the
+later, Rust 1.99 or later, and uv. Cold setup downloads base images and packages and builds the
 world; allow several minutes before the first result.
 
 From the repository root, run this to print searches, pages and the world's

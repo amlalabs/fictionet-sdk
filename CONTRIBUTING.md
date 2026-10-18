@@ -41,12 +41,6 @@ $ cargo check --locked -p fictionet --lib --no-default-features --features tokio
 $ cargo clippy --locked -p fictionet --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
 ```
 
-The minimum Rust version is 1.91:
-
-```console
-$ cargo +1.91 check --locked --workspace --all-targets
-```
-
 The fuzz crate is outside the workspace, since cargo-fuzz builds it on nightly.
 From `fuzz/`, CI checks every target with `RUSTFLAGS="--cfg fuzzing" cargo check --locked --bins`,
 and from the root it runs the fuzz helpers' tests and checks their formatting:

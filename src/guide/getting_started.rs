@@ -9,7 +9,7 @@
 //!
 //! You need:
 //!
-//! - Linux, with Rust 1.91 or later.
+//! - Linux, with Rust 1.99 or later.
 //! - Root through `sudo`. Attach makes a network device, which needs
 //!   `CAP_NET_ADMIN`.
 //! - `ip` (iproute2) and `curl`. `dig` (in Debian's `dnsutils`) is

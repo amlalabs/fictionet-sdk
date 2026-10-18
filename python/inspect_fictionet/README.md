@@ -222,7 +222,7 @@ here = Path(__file__).parent
 # A Dockerfile, with an optional context, target stage and build arguments:
 fictionet_sandbox(Build(here / "world.Dockerfile", context=here), agent_image=...)
 
-# A cargo example: built with musl on rust:1.92-alpine, and run alone on scratch.
+# A cargo example: built with musl on rust:1.99-alpine, and run alone on scratch.
 fictionet_sandbox(CargoExample("web_world", crate=here / "..", features=["tokio"]),
                   world_args=["/run/relay/relay.sock", "/run/ca/ca.pem"], ...)
 ```
