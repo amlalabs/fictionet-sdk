@@ -68,8 +68,9 @@ The SDK and the command each have two integration test binaries. `tests/it`
 and `cli/tests/it` run on any machine, one module per area. They need node,
 curl and Chromium (set `CHROMIUM` if the browser is not named `chromium`).
 `tests/host` and `cli/tests/host` hold the tests that need user namespaces,
-root or a tun device, and fail where the machine lacks them. They run only
-when named:
+root or a tun device, and fail where the machine lacks them. Helpers that
+several test binaries or benchmarks use are in `tests/support`, the
+`fictionet-test-support` crate. The host tests run only when named:
 
 ```console
 $ cargo nextest run --locked --test host
