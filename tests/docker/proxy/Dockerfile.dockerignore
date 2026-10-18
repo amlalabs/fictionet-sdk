@@ -2,6 +2,7 @@
 !Cargo.toml
 !Cargo.lock
 !src
+!cli
 !docs
 !dashboard
 !benches

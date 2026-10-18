@@ -10,6 +10,7 @@ FROM rust:1.92-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY cli cli
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches

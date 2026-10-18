@@ -38,11 +38,13 @@ jobs:
       fail-fast: false
       matrix:
         # The worlds enable web-proxy, so build them in the all-features run.
+        # The CLI turns on the SDK's default features, so the run without
+        # them names the packages it covers and leaves the CLI out.
         include:
           - name: default features
             args: ""
           - name: no default features
-            args: --no-default-features
+            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts --no-default-features
           - name: all features
             args: --workspace --all-features
     steps:
@@ -73,7 +75,7 @@ jobs:
           - name: default features
             args: ""
           - name: no default features
-            args: --no-default-features
+            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts --no-default-features
           - name: all features
             args: --workspace --all-features
     steps:
@@ -145,8 +147,8 @@ jobs:
       - name: Test attach in user namespaces
         if: matrix.test == 'namespaces'
         run: |
-          cargo nextest run --locked --test host attach_bin::
-          cargo nextest run --locked --test host --all-features attach_bin::
+          cargo nextest run --locked -p fictionet-cli --test host attach_bin::
+          cargo nextest run --locked -p fictionet-cli --test host --all-features attach_bin::
       - name: Docker tests
         if: matrix.test != '' && matrix.test != 'namespaces'
         run: cargo xtask docker ${{ matrix.test }}
