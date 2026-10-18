@@ -279,7 +279,7 @@
 //! | `std` | Real clocks, OS entropy, world sockets, event files, timer threads, relay, and the HTTP stack | — | Yes |
 //! | `tokio` | Tokio adapters, HTTP/2, and hyper upgrades | `std` | Yes |
 //! | `observe` | Observer sessions, TLS key capture, and built-in protocol presenters | `std` | Yes |
-//! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `tokio` | No |
+//! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `std` | No |
 //!
 //! Disabling default features leaves the simulated-time executor, seeded
 //! randomness, packet links, and protocol codecs. The crate still links

@@ -81,7 +81,8 @@ Add `fictionet` to your Cargo dependencies. The default features are
 `std`, `tokio`, and `observe`. Set `default-features = false` for a closed
 simulated-time world, or enable `std` for host integration and HTTP/1.1.
 `tokio` adds HTTP/2 and runtime adapters. Enable `web-proxy` explicitly
-for upstream HTTP requests. See the [feature table](src/lib.rs)
+for upstream HTTP/1.1 requests over host sockets and rustls; it requires
+`std` and works without tokio. See the [feature table](src/lib.rs)
 for the feature relationships. The crate still links Rust's standard library.
 
 The `fictionet` command is the `fictionet-cli` package in `cli/`. Install it

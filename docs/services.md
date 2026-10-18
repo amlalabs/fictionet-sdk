@@ -717,9 +717,10 @@ the proxy's site has `default_host()`. Its request event carries
 `web::forward(&fcx, upstream)?`: it always connects to that fixed origin and
 preserves the requested `Host`. Both `web::proxy` and `web::forward` require
 a real run's context and return an error in a lab before constructing a
-client. `Proxy`'s tower service returns
-`httpd::Body`, so it can answer with a local rejection as well as a
-streamed upstream response.
+client. The feature requires `std` and works without tokio. Host helper
+threads handle upstream HTTP/1.1 and rustls, reusing completed connections.
+Both tower services return streaming `httpd::Body` responses. `Proxy` can
+also answer with a local rejection.
 
 `Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. HTTP/2
 runs on hyper, behind the same `Handler` trait. The stdlib's `http2`

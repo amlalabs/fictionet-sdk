@@ -22,9 +22,7 @@ h2 = "0.4"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 http = "1.5.0"
 http-body = "1.1.0"
-hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server", "client"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server"] }
 ring = "0.17"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 p256 = { version = "0.13.2", features = ["ecdh", "ecdsa"] }
@@ -34,6 +32,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-reno", "async"] }
 tokio = { version = "1", default-features = false, features = ["rt", "time", "io-util", "sync"] }
 tower-service = "0.3.3"
+webpki-roots = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2.189"

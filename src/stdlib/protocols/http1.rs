@@ -5,7 +5,8 @@
 //! `fictionet::stdlib::httpd`, and this module provides no live transport.
 //! Content-Length, chunked bodies, connection close, Expect: 100-continue,
 //! and CONNECT handoff use the shared codec drivers. Non-empty trailers and
-//! chunk extensions are refused. Requests may use only the chunked
+//! chunk extensions are refused, unless a response decoder is told to skip
+//! them with [`ResponseEvents::skip_chunk_extras`]. Requests may use only the chunked
 //! transfer coding. Requests ignore Upgrade offers and continue as HTTP;
 //! 101 responses end HTTP for handoff without handling Upgrade.
 
@@ -143,10 +144,12 @@ pub enum Error {
     /// A chunk size is invalid or exceeds `u64`.
     ChunkSize,
     /// Chunk extensions are refused, including extensions on the last chunk.
+    /// A decoder that skips them refuses only control bytes in one.
     ChunkExtension,
     /// Chunk data is not followed by CRLF.
     ChunkEnding,
-    /// A non-empty trailer section is outside this module's scope.
+    /// A non-empty trailer section is outside this module's scope. A
+    /// decoder that drops trailers refuses only a line that is not a field.
     Trailers,
     /// An owned body exceeds its configured byte limit or [`MAX_BODY`].
     BodyTooLong,
@@ -500,6 +503,13 @@ impl ResponseEvents {
         }
         self.methods.push_back(method);
         Ok(())
+    }
+    /// Skips chunk extensions and drops trailer fields instead of refusing
+    /// them, as a client of real servers must. A chunk-size line may then
+    /// be as long as a header line, and the trailer section has the head's
+    /// line, field-count and size limits.
+    pub fn skip_chunk_extras(&mut self) {
+        self.core.chunk_extras = true;
     }
 }
 
@@ -1162,10 +1172,12 @@ enum State {
 struct Reader {
     limits: Limits,
     lines: Lines,
+    // Head bytes and fields so far, and then trailer bytes and fields.
     scanned: usize,
     count: usize,
     state: State,
     close: bool,
+    chunk_extras: bool,
 }
 
 impl Reader {
@@ -1178,13 +1190,21 @@ impl Reader {
             count: 0,
             state: State::Head,
             close: false,
+            chunk_extras: false,
         }
     }
     fn capacity(&self) -> usize {
         self.limits
             .head
             .max(self.limits.body_chunk)
-            .max(MAX_CHUNK_LINE.saturating_add(2))
+            .max(self.chunk_line().saturating_add(2))
+    }
+    fn chunk_line(&self) -> usize {
+        if self.chunk_extras {
+            self.limits.header_line
+        } else {
+            MAX_CHUNK_LINE
+        }
     }
     fn head(&mut self, input: &[u8]) -> Result<Option<usize>, Error> {
         loop {
@@ -1238,7 +1258,7 @@ impl Reader {
                 State::Close
             }
         };
-        self.lines = Lines::new(MAX_CHUNK_LINE, Ending::Crlf);
+        self.lines = Lines::new(self.chunk_line(), Ending::Crlf);
     }
     fn body<'a, H>(
         &mut self,
@@ -1291,15 +1311,13 @@ impl Reader {
                     Step::Need
                 }
             }
-            State::Size | State::DataEnd | State::Trailers => {
-                match chunk_framing(&mut self.lines, self.state, input)? {
-                    Some((state, n)) => {
-                        self.state = state;
-                        Step::Skip(n)
-                    }
-                    None => Step::Need,
+            State::Size | State::DataEnd | State::Trailers => match self.chunk_step(input)? {
+                Some((state, n)) => {
+                    self.state = state;
+                    Step::Skip(n)
                 }
-            }
+                None => Step::Need,
+            },
         };
         // Stream treats Need at empty EOF as a clean end. An unfinished
         // body with no buffered partial unit must still report a failure.
@@ -1307,6 +1325,52 @@ impl Reader {
             return Err(Error::Incomplete);
         }
         Ok(Some(step))
+    }
+    fn chunk_step(&mut self, input: &[u8]) -> Result<Option<(State, usize)>, Error> {
+        if !self.chunk_extras || matches!(self.state, State::DataEnd) {
+            return chunk_framing(&mut self.lines, self.state, input);
+        }
+        let step = match self.lines.decode(input, false) {
+            Ok(s) => s,
+            Err(e) => match e {},
+        };
+        let Step::Item(line, n) = step else {
+            return Ok(None);
+        };
+        let trailer = matches!(self.state, State::Trailers);
+        let line = line.map_err(|e| match e {
+            LineError::TooLong { .. } if trailer => Error::HeaderLineTooLong,
+            LineError::TooLong { .. } => Error::ChunkLineTooLong,
+            _ => Error::LineEnding,
+        })?;
+        if !trailer {
+            return Ok(Some((
+                match chunk_size_skipping_extensions(&line)? {
+                    0 => {
+                        self.scanned = 0;
+                        self.count = 0;
+                        State::Trailers
+                    }
+                    size => State::Data(size),
+                },
+                n,
+            )));
+        }
+        self.scanned = self.scanned.saturating_add(n);
+        if self.scanned > self.limits.head {
+            return Err(Error::HeadTooLong);
+        }
+        if line.is_empty() {
+            return Ok(Some((State::Done, n)));
+        }
+        if !header_line_ok(&line) {
+            return Err(Error::Trailers);
+        }
+        self.count = self.count.saturating_add(1);
+        if self.count > self.limits.headers {
+            return Err(Error::TooManyHeaders);
+        }
+        Ok(Some((State::Trailers, n)))
     }
 }
 
@@ -1398,6 +1462,19 @@ fn chunk_size(b: &[u8]) -> Result<u64, Error> {
         return Err(Error::ChunkExtension);
     }
     number(b, 16, Error::ChunkSize)
+}
+// A chunk size, then extensions, each after optional whitespace and a
+// semicolon (RFC 9112 section 7.1.1).
+fn chunk_size_skipping_extensions(b: &[u8]) -> Result<u64, Error> {
+    let end = b.iter().position(|b| *b == b';').unwrap_or(b.len());
+    if !b[end..].iter().copied().all(field_byte) {
+        return Err(Error::ChunkExtension);
+    }
+    let mut size = &b[..end];
+    while let [rest @ .., b' ' | b'\t'] = size {
+        size = rest;
+    }
+    number(size, 16, Error::ChunkSize)
 }
 
 #[derive(Clone, Copy)]
@@ -2828,6 +2905,61 @@ mod tests {
         );
         contract::check_decode(RequestEvents::default, request);
         contract::check_decode(ResponseEvents::default, response);
+    }
+
+    #[test]
+    fn a_client_decoder_skips_chunk_extensions_and_drops_trailers() {
+        let make = || {
+            let mut decoder = ResponseEvents::default();
+            decoder.skip_chunk_extras();
+            decoder
+        };
+        let bytes = response_with(
+            "Transfer-Encoding: chunked\r\n",
+            b"2 ;a=b;c\r\nhe\r\n3;x=\"y z\"\r\nllo\r\n0;last\r\nX-Sum: 1\r\nX-More: 2\r\n\r\n",
+        );
+        let (events, error) = test_support::decode_all(make, &bytes);
+        assert_eq!(error, None);
+        assert_eq!(
+            events[1..],
+            [
+                Event::Body(b"he".to_vec()),
+                Event::Body(b"llo".to_vec()),
+                Event::Done
+            ]
+        );
+        contract::check_decode(make, &bytes);
+        let small = || {
+            let mut decoder = ResponseEvents::with_limits(Limits {
+                header_line: 32,
+                headers: 1,
+                head: 64,
+                ..Limits::default()
+            });
+            decoder.skip_chunk_extras();
+            decoder
+        };
+        let long = format!("0\r\nA: {}\r\n\r\n", "x".repeat(30));
+        let many = format!("0\r\nA: {0}\r\nB: {0}\r\n\r\n", "x".repeat(28));
+        for (body, error) in [
+            (
+                format!("1;{}\r\nx\r\n0\r\n\r\n", "x".repeat(31)),
+                Error::ChunkLineTooLong,
+            ),
+            ("1;\x01\r\nx\r\n0\r\n\r\n".to_owned(), Error::ChunkExtension),
+            (
+                "0\r\nA: 1\r\nB: 2\r\n\r\n".to_owned(),
+                Error::TooManyHeaders,
+            ),
+            (long, Error::HeaderLineTooLong),
+            (many, Error::HeadTooLong),
+            ("0\r\nnot a field\r\n\r\n".to_owned(), Error::Trailers),
+        ] {
+            let bytes = response_with("Transfer-Encoding: chunked\r\n", body.as_bytes());
+            let (_, failure) = test_support::decode_all(small, &bytes);
+            assert_eq!(failure, Some(Fail::Protocol(error)), "{body:?}");
+            contract::check_decode(small, &bytes);
+        }
     }
 
     #[test]

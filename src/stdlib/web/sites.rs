@@ -177,7 +177,7 @@
 //! The request's path, query, body, and original `Host` header are kept,
 //! so the Gmail clone sees `Host: gmail.googleapis.com`. Hop-by-hop headers
 //! are dropped both ways. An unreachable upstream gives `502 Bad Gateway`.
-//! It needs a tokio runtime polling the world and a run with real I/O:
+//! It works with any executor and needs a run with real I/O:
 //! use [`fictionet::run`]. In a lab, `web::forward` returns an error.
 //!
 //! `web::proxy(&fcx)?` goes to the real site for the name; `web::forward`

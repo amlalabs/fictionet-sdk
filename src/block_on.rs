@@ -22,7 +22,7 @@ use std::task::{Context, Poll, Wake, Waker};
 /// timers fire from `setTimeout`.
 ///
 /// `block_on` is not a tokio runtime. Anything that needs one, such as
-/// `web::proxy` or a tokio-based database client,
+/// a tokio-based database client,
 /// fails under `block_on`. Such a world runs on tokio.
 ///
 /// The [Running a world](crate#running-a-world) example shows a complete `main`.
