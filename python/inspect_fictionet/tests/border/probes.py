@@ -71,7 +71,7 @@ ACTIONS: Final = {
     "insecure_alias": "curl -sSk https://www.kestrelmoor.co.uk/balance",
     "plain_http": "curl -sS http://kestrelmoor.co.uk/balance",
     "s_client": (
-        "echo | openssl s_client -connect kestrelmoor.co.uk:443 -servername kestrelmoor.co.uk"
+        "openssl s_client -connect kestrelmoor.co.uk:443 -servername kestrelmoor.co.uk </dev/null"
         " 2>&1 | grep -E 'subject=|issuer=|Verify return code'"
     ),
     "get_certificate": (
@@ -192,7 +192,7 @@ LAB: Final = [
     _sample(
         "hijack_s_client", "hijack", action="s_client",
         expect=_expect(impostor_tls=1, stopped=1, safe=1, error_seen=1, stopped_cert=1),
-        # echo's newline makes no request, and no line in the world's log.
+        # Empty input inspects the certificate without sending application data.
         meta={"impostor_app_data": False, "bank_http_over_impostor": []},
         answer_has=(ROGUE_CA_NAME,),
     ),
