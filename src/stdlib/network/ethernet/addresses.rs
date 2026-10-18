@@ -1,5 +1,6 @@
-//! How `--type tap` hands a VM the addresses given as flags: a DHCP server
-//! for IPv4, and router advertisements plus a DHCPv6 server for IPv6.
+//! How a [`Link`](super::Link) hands a VM addresses it was given: a DHCP
+//! server for IPv4, and router advertisements plus a DHCPv6 server for
+//! IPv6.
 //!
 //! These are small servers for one client on one link. Each always hands
 //! out the same lease, so there is no lease table: a VM that asks again,
@@ -15,26 +16,61 @@ use fictionet::stdlib::protocols::dhcpv6::{
     self, DhcpOption, Duid, IaAddr, IaNa, Message, StatusCode, msg, status,
 };
 
-use super::ether;
-use crate::config::{Lease, mask4};
+use super::frame;
+
+/// An address with its prefix length, such as `10.0.0.2/24`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cidr<A> {
+    /// The address.
+    pub addr: A,
+    /// The prefix length.
+    pub prefix: u8,
+}
+
+/// How a [`Link`](super::Link) gives a VM one address family (IPv4 or
+/// IPv6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Family<A> {
+    /// The link answers the VM's DHCP (and, for IPv6, router
+    /// solicitations) itself with this lease, and passes only packets from
+    /// its address.
+    Serve(Lease<A>),
+    /// The VM's DHCP goes to the world like any other packet, and the
+    /// world decides which source addresses it takes.
+    FromWorld,
+    /// The link gives no address and drops the VM's DHCP. A static address
+    /// set inside the VM still works.
+    Off,
+}
+
+/// What a link hands out by DHCP for one family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lease<A> {
+    /// The VM's address and its subnet.
+    pub addr: Cidr<A>,
+    /// The default gateway, if there is one.
+    pub gateway: Option<A>,
+    /// The DNS server, if there is one.
+    pub dns: Option<A>,
+}
 
 /// How long a lease lasts, in seconds, for both families. The VM renews
-/// it halfway through, and attach answers the renewal with the same lease.
+/// it halfway through, and the link answers the renewal with the same lease.
 const LEASE_SECS: u32 = 86_400;
 
-/// How often attach sends a router advertisement without being asked,
-/// when it hands out IPv6 addresses. It is well inside the advertised
+/// How often a link that hands out IPv6 addresses sends a router
+/// advertisement without being asked. It is well inside the advertised
 /// router lifetime of 30 minutes.
-pub(super) const RA_EVERY: Duration = Duration::from_secs(600);
+pub const RA_EVERY: Duration = Duration::from_secs(600);
 
 // DHCP for IPv4
 
-/// The address attach answers DHCP from, which the VM sends its renewals
+/// The address the link answers DHCP from, which the VM sends its renewals
 /// to. It is the gateway when there is one. Otherwise it is the DNS
 /// server, or else the subnet's first address that is not the VM's.
-/// Attach answers ARP for any address, so this address only has to be
+/// The link answers ARP for any address, so this address only has to be
 /// stable.
-pub(crate) fn server_id(lease: &Lease<Ipv4Addr>) -> Ipv4Addr {
+pub(super) fn server_id(lease: &Lease<Ipv4Addr>) -> Ipv4Addr {
     if let Some(gw) = lease.gateway.or(lease.dns) {
         return gw;
     }
@@ -63,7 +99,7 @@ pub(crate) fn server_id(lease: &Lease<Ipv4Addr>) -> Ipv4Addr {
 /// whether it goes to the broadcast MAC. `None` when no answer is due: a
 /// release, a decline, a request meant for another server, or a message
 /// that is not a request.
-pub(crate) fn dhcp4(lease: &Lease<Ipv4Addr>, mtu: u16, request: &[u8]) -> Option<(Vec<u8>, bool)> {
+pub(super) fn dhcp4(lease: &Lease<Ipv4Addr>, mtu: u16, request: &[u8]) -> Option<(Vec<u8>, bool)> {
     let m = dhcp::Message::parse(request).ok()?;
     if m.op != dhcp::BOOTREQUEST || m.htype != 1 || m.hlen != 6 {
         return None;
@@ -90,14 +126,14 @@ pub(crate) fn dhcp4(lease: &Lease<Ipv4Addr>, mtu: u16, request: &[u8]) -> Option
     let (r, to) = dhcp::ReplyConfig {
         server,
         lease_secs: LEASE_SECS,
-        subnet_mask: Ipv4Addr::from(mask4(lease.addr.prefix)),
+        subnet_mask: mask4(lease.addr.prefix),
         router: lease.gateway,
         dns: lease.dns,
         mtu: Some(mtu),
     }
     .build(&m, reply);
     Some((
-        ether::udp4(
+        frame::udp4(
             server,
             dhcp::SERVER_PORT,
             to,
@@ -108,25 +144,37 @@ pub(crate) fn dhcp4(lease: &Lease<Ipv4Addr>, mtu: u16, request: &[u8]) -> Option
     ))
 }
 
+/// The netmask of an IPv4 prefix length, 0 to 32.
+fn mask4(prefix: u8) -> Ipv4Addr {
+    let IpAddr::V4(mask) = (Prefix {
+        addr: Ipv4Addr::UNSPECIFIED.into(),
+        len: prefix,
+    })
+    .mask() else {
+        unreachable!("an IPv4 prefix has an IPv4 mask")
+    };
+    mask
+}
+
 // Router advertisements
 
 /// A router advertisement for the VM's link, as an IPv6 packet from
-/// attach's link-local address to all nodes. It says:
+/// the link's link-local address to all nodes. It says:
 ///
 /// - addresses come from DHCPv6 (the "managed" and "other" flags), so the
-///   VM takes the one address attach hands out, not one of its own making;
-/// - the subnet of `--ip-addr-v6` is on the link, so the VM reaches the
-///   rest of that subnet directly;
-/// - attach is the default router, unless `--no-gateway-v6` was given;
-/// - the MTU, and the DNS server from `--dns-v6`, if there is one.
-pub(crate) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16) -> Vec<u8> {
+///   VM takes the one address the link hands out, not one of its own making;
+/// - the lease's subnet is on the link, so the VM reaches the rest of
+///   that subnet directly;
+/// - the link is the default router, if the lease has a gateway;
+/// - the MTU, and the lease's DNS server, if there is one.
+pub(super) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16) -> Vec<u8> {
     let lifetime: u16 = if lease.gateway.is_some() { 1800 } else { 0 };
-    let mut b = vec![ether::ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0xc0];
+    let mut b = vec![frame::ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0xc0];
     b.extend_from_slice(&lifetime.to_be_bytes());
     b.extend_from_slice(&[0; 8]);
     // Source link-layer address.
     b.extend_from_slice(&[1, 1]);
-    b.extend_from_slice(&ether::GATEWAY_MAC);
+    b.extend_from_slice(&frame::GATEWAY_MAC);
     // MTU.
     b.extend_from_slice(&[5, 1, 0, 0]);
     b.extend_from_slice(&(mtu as u32).to_be_bytes());
@@ -150,23 +198,23 @@ pub(crate) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16) -> Vec<u8> {
         b.extend_from_slice(&u32::MAX.to_be_bytes());
         b.extend_from_slice(&dns.octets());
     }
-    ether::icmp6(ether::link_local(ether::GATEWAY_MAC), ALL_NODES, b)
+    frame::icmp6(frame::link_local(frame::GATEWAY_MAC), ALL_NODES, b)
 }
 
 const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
 // DHCPv6
 
-/// Attach's DHCPv6 server ID: a DUID made from its MAC (DUID-LL).
+/// The link's DHCPv6 server ID: a DUID made from its MAC (DUID-LL).
 fn server_duid() -> Duid {
-    Duid::ll(dhcpv6::hardware::ETHERNET, &ether::GATEWAY_MAC)
+    Duid::ll(dhcpv6::hardware::ETHERNET, &frame::GATEWAY_MAC)
 }
 
 /// The answer to one DHCPv6 message from the VM, as the UDP payload.
 /// `None` when no answer is due: a malformed message, one for another server,
 /// one with no client ID, or a type a server does not answer. Also returns
 /// `None` if the answer exceeds `budget` bytes or an option or UDP length limit.
-pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, budget: usize, request: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn dhcp6(lease: &Lease<Ipv6Addr>, budget: usize, request: &[u8]) -> Option<Vec<u8>> {
     let request = Message::parse(request).ok()?;
     let kind = request.msg_type;
     if request.client_id().is_none() && kind != msg::INFORMATION_REQUEST {
@@ -207,7 +255,7 @@ pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, budget: usize, request: &[u8]) -> O
         // Any other address the VM still holds, from a lease it kept across a
         // restore or a change of flags, comes back with lifetimes of 0 in a
         // Request, Renew or Rebind, so the VM drops it (RFC 8415, section
-        // 18.3.4). Attach passes packets only from the address it hands out.
+        // 18.3.4). The link passes packets only from the address it hands out.
         let retire = matches!(kind, msg::REQUEST | msg::RENEW | msg::REBIND);
         for (i, ia) in request.ia_na().enumerate() {
             // The first IA_NA the VM asked for gets the address.
@@ -252,9 +300,9 @@ pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, budget: usize, request: &[u8]) -> O
 }
 
 /// The answer to a Confirm: is the VM's address still right for this link?
-/// Success if every address in its IA_NAs is the one `--ip-addr-v6` gives,
+/// Success if every address in its IA_NAs is the lease's,
 /// NotOnLink if one is not, and no answer if it names no address (RFC
-/// 8415, section 18.3.3). Attach passes packets only from that one
+/// 8415, section 18.3.3). The link passes packets only from that one
 /// address, so an address it did not hand out is not usable on this link,
 /// even inside the prefix. NotOnLink sends the VM back to Solicit, which
 /// gets it the right one.
@@ -268,12 +316,12 @@ fn confirm(lease: &Lease<Ipv6Addr>, request: &Message) -> Option<u16> {
     })
 }
 
-/// The DHCPv6 answer as a packet: from attach's link-local address to the
+/// The DHCPv6 answer as a packet: from the link's link-local address to the
 /// VM's, which sent `request_packet`.
-pub(crate) fn dhcp6_packet(request_packet: &[u8], answer: &[u8]) -> Vec<u8> {
-    let to = ether::source_v6(request_packet);
-    ether::udp6(
-        ether::link_local(ether::GATEWAY_MAC),
+pub(super) fn dhcp6_packet(request_packet: &[u8], answer: &[u8]) -> Vec<u8> {
+    let to = frame::source_v6(request_packet);
+    frame::udp6(
+        frame::link_local(frame::GATEWAY_MAC),
         dhcpv6::SERVER_PORT,
         to,
         dhcpv6::CLIENT_PORT,
@@ -283,9 +331,8 @@ pub(crate) fn dhcp6_packet(request_packet: &[u8], answer: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::frame::tests::{VM, v6_checksum_ok};
     use super::*;
-    use crate::config::Cidr;
-    use crate::tap::ether::tests::{VM, v6_checksum_ok};
 
     fn lease4() -> Lease<Ipv4Addr> {
         Lease {
@@ -307,7 +354,7 @@ mod tests {
 
     /// The DHCP message in an answer packet, and the packet's destination.
     fn answer(packet: &[u8]) -> (dhcp::Message, Ipv4Addr) {
-        let (port, payload) = ether::udp_to(packet).unwrap();
+        let (port, payload) = frame::udp_to(packet).unwrap();
         assert_eq!(port, dhcp::CLIENT_PORT);
         assert_eq!(&packet[12..16], &[10, 0, 0, 1], "from the server ID");
         (
@@ -365,7 +412,7 @@ mod tests {
             }
             expected.push(255);
             expected.resize(300, 0);
-            assert_eq!(ether::udp_to(&packet).unwrap().1, expected, "{kind}");
+            assert_eq!(frame::udp_to(&packet).unwrap().1, expected, "{kind}");
         }
     }
 
@@ -468,7 +515,7 @@ mod tests {
         };
         assert_eq!(server_id(&bare), Ipv4Addr::new(10, 0, 0, 1));
         let (offer, _) = dhcp4(&bare, 1500, &client(dhcp::DISCOVER).to_bytes().unwrap()).unwrap();
-        let (_, payload) = ether::udp_to(&offer).unwrap();
+        let (_, payload) = frame::udp_to(&offer).unwrap();
         let m = dhcp::Message::parse(payload).unwrap();
         assert_eq!(m.option(opt::ROUTER), None);
         assert_eq!(m.option(opt::DNS), None);
@@ -498,10 +545,10 @@ mod tests {
         let p = router_advert(&lease6(), 1500);
         assert!(v6_checksum_ok(&p));
         assert_eq!(p[7], 255);
-        assert_eq!(ether::source_v6(&p), ether::link_local(ether::GATEWAY_MAC));
+        assert_eq!(frame::source_v6(&p), frame::link_local(frame::GATEWAY_MAC));
         assert_eq!(&p[24..40], &ALL_NODES.octets());
         let ra = &p[40..];
-        assert_eq!(ra[0], ether::ROUTER_ADVERTISEMENT);
+        assert_eq!(ra[0], frame::ROUTER_ADVERTISEMENT);
         assert_eq!(ra[5], 0xc0, "managed and other");
         assert_eq!(u16::from_be_bytes([ra[6], ra[7]]), 1800);
         let opts = &ra[16..];
@@ -734,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn dhcp6_renew_and_rebind_retire_an_address_attach_did_not_hand_out() {
+    fn dhcp6_renew_and_rebind_retire_an_address_the_link_did_not_hand_out() {
         for kind in [msg::RENEW, msg::REBIND, msg::REQUEST] {
             let r = reply6(&request6(
                 kind,
@@ -777,7 +824,7 @@ mod tests {
         let s = reply6(&request6(msg::SOLICIT, options));
         assert_eq!(s.ia_na().count(), 1);
         assert_eq!(s.ia_na().next().unwrap().addresses().count(), 1);
-        // The address attach hands out is not named twice, even across IAs.
+        // The address the link hands out is not named twice, even across IAs.
         let r = reply6(&request6(
             msg::RENEW,
             vec![
@@ -965,13 +1012,13 @@ mod tests {
 
     #[test]
     fn dhcp6_answer_goes_to_the_asker() {
-        let vm_ll = ether::link_local(VM);
-        let req = ether::udp6(vm_ll, 546, "ff02::1:2".parse().unwrap(), 547, b"x");
+        let vm_ll = frame::link_local(VM);
+        let req = frame::udp6(vm_ll, 546, "ff02::1:2".parse().unwrap(), 547, b"x");
         let p = dhcp6_packet(&req, b"answer");
         assert!(v6_checksum_ok(&p));
         assert_eq!(&p[24..40], &vm_ll.octets());
         assert_eq!(
-            ether::udp_to(&p),
+            frame::udp_to(&p),
             Some((dhcpv6::CLIENT_PORT, &b"answer"[..]))
         );
     }

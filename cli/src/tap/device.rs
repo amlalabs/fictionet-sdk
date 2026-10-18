@@ -10,7 +10,9 @@ use crate::linux;
 use crate::netlink::{self, Netlink};
 use crate::world::{self, Failure, context, err};
 
-use super::{End, Port, ether, greeting, relay_and_report, take_ready_file};
+use fictionet::stdlib::network::ethernet::frame;
+
+use super::{End, Port, greeting, relay_and_report, take_ready_file};
 
 /// `--vm tap:<name>`: makes attach's own TAP device, redirects frames
 /// between it and the VM's, then connects to the world.
@@ -43,7 +45,7 @@ pub(super) fn run_device(
     lifecycle::write_ready_file(args.ready_file.as_deref(), &args.name)?;
     let mut port = Port::Device {
         fd,
-        buf: vec![0u8; 65_536 + ether::HEADER],
+        buf: vec![0u8; 65_536 + frame::HEADER],
         name: name.to_owned(),
         index: vm_index,
     };

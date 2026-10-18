@@ -5,6 +5,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
+use fictionet::stdlib::network::ethernet::{Cidr, Family};
+
 /// One address setting: a value (`--dns 10.0.0.1`), turned off
 /// (`--no-dns`), or left out.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,13 +39,6 @@ pub(crate) enum ResolvConf {
     Path(PathBuf),
     /// `--no-resolv-conf`: no file. DNS is up to the harness.
     Off,
-}
-
-/// An address with its prefix length, such as `10.0.0.2/24`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Cidr<A> {
-    pub(crate) addr: A,
-    pub(crate) prefix: u8,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -104,32 +99,6 @@ pub(crate) struct ProxyArgs {
     pub(crate) dns: Ipv4Addr,
     pub(crate) ready_file: Option<PathBuf>,
     pub(crate) world_wait: std::time::Duration,
-}
-
-/// How attach gives a VM one address family (IPv4 or IPv6), for
-/// `--type tap`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Family<A> {
-    /// `--ip-addr` (or `--ip-addr-v6`) was given: attach answers the VM's
-    /// DHCP (and, for IPv6, router solicitations) itself, and passes only
-    /// packets from that address.
-    Serve(Lease<A>),
-    /// All three flags of the family were left out: the VM's DHCP goes to
-    /// the world like any other packet.
-    FromWorld,
-    /// `--no-ip-addr` (or `--no-ip-addr-v6`): attach gives no address and
-    /// drops the VM's DHCP. A static address set inside the VM still works.
-    Off,
-}
-
-/// What attach hands out by DHCP for one family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Lease<A> {
-    pub(crate) addr: Cidr<A>,
-    /// The default gateway, or `None` with `--no-gateway`.
-    pub(crate) gateway: Option<A>,
-    /// The DNS server, or `None` with `--no-dns`.
-    pub(crate) dns: Option<A>,
 }
 
 /// How the VM's frames reach attach (`--vm`).

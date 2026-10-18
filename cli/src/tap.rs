@@ -26,16 +26,13 @@ use crate::lifecycle;
 use crate::linux;
 use crate::world::{self, Failure, Greeting, err};
 
-mod addresses;
 mod device;
-mod ether;
-mod link;
 mod qemu;
 
-use addresses::RA_EVERY;
 use device::run_device;
-use link::{FromVm, Link, Why};
-use qemu::{Decoder, Outbox, flush, run_qemu};
+use fictionet::stdlib::network::ethernet::stream::{self, Decoder, Outbox};
+use fictionet::stdlib::network::ethernet::{FromVm, Link, RA_EVERY, Why};
+use qemu::{flush, run_qemu};
 
 /// Runs attach to the end. `Ok` means the VM's side or the world closed
 /// its connection.
@@ -422,7 +419,7 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
                             let frame = match decoder.next_frame() {
                                 Ok(Some(f)) => f,
                                 Ok(None) => break,
-                                Err(qemu::TooLong(len)) => {
+                                Err(stream::TooLong(len)) => {
                                     return Err(Failure::Error(format!(
                                         "QEMU's socket sent a frame length of {len} bytes; is it a -netdev stream socket?"
                                     )));

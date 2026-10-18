@@ -4,9 +4,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
-use crate::config::{
-    AttachArgs, Cidr, Family, Lease, ProxyArgs, ProxyKind, ResolvConf, Setting, TapArgs, VmLink,
-};
+use fictionet::stdlib::network::ethernet::{Cidr, Family, Lease};
+
+use crate::config::{AttachArgs, ProxyArgs, ProxyKind, ResolvConf, Setting, TapArgs, VmLink};
 
 pub(crate) const ATTACH_USAGE: &str = "\
 usage: fictionet attach --world unix:<path> --name <name> --type tun

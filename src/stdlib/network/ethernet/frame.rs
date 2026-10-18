@@ -1,6 +1,5 @@
-//! Ethernet for `--type tap`: reading and writing the frames of a VM's
-//! network card, and the link-local answers attach
-//! gives itself (ARP and IPv6 neighbor advertisements).
+//! Ethernet frames: reading and writing them, and the link-local answers
+//! the link gives itself (ARP and IPv6 neighbor advertisements).
 //!
 //! Everything here is pure: it takes bytes and returns bytes. The VM is
 //! run by the agent, so every frame is read as hostile input: no length
@@ -13,37 +12,44 @@ use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::udp;
 
 /// A MAC address.
-pub(crate) type Mac = [u8; 6];
+pub type Mac = [u8; 6];
 
 /// The broadcast MAC.
-pub(crate) const BROADCAST: Mac = [0xff; 6];
+pub const BROADCAST: Mac = [0xff; 6];
 
-/// Attach's own MAC on the VM's link: the gateway's, as the VM sees it.
-/// It is locally administered (`02:...`), and the same every run, so a VM
-/// that keeps running while attach restarts keeps a valid ARP entry.
-pub(crate) const GATEWAY_MAC: Mac = [0x02, 0x66, 0x6e, 0x00, 0x00, 0x01];
+/// The link's own MAC, on the VM's side: the gateway's, as the VM sees
+/// it. It is locally administered (`02:...`), and the same every run, so a
+/// VM that keeps running while the link restarts keeps a valid ARP entry.
+pub const GATEWAY_MAC: Mac = [0x02, 0x66, 0x6e, 0x00, 0x00, 0x01];
 
-pub(crate) const IPV4: u16 = 0x0800;
-pub(crate) const ARP: u16 = 0x0806;
-pub(crate) const IPV6: u16 = 0x86dd;
+/// The EtherType of IPv4.
+pub const IPV4: u16 = 0x0800;
+/// The EtherType of ARP.
+pub const ARP: u16 = 0x0806;
+/// The EtherType of IPv6.
+pub const IPV6: u16 = 0x86dd;
 
 /// The length of an Ethernet header.
-pub(crate) const HEADER: usize = 14;
+pub const HEADER: usize = 14;
 
-pub(crate) const UDP: u8 = 17;
-pub(crate) const ICMPV6: u8 = 58;
+pub(super) const UDP: u8 = 17;
+pub(super) const ICMPV6: u8 = 58;
 
 /// An Ethernet frame, read.
-pub(crate) struct Frame<'a> {
-    pub(crate) dst: Mac,
-    pub(crate) src: Mac,
-    pub(crate) ethertype: u16,
-    pub(crate) payload: &'a [u8],
+pub struct Frame<'a> {
+    /// The destination MAC.
+    pub dst: Mac,
+    /// The source MAC.
+    pub src: Mac,
+    /// The type of the payload, such as [`IPV4`].
+    pub ethertype: u16,
+    /// Everything after the header, padding included.
+    pub payload: &'a [u8],
 }
 
 impl<'a> Frame<'a> {
     /// Reads a frame. `None` if it is shorter than a header.
-    pub(crate) fn parse(b: &'a [u8]) -> Option<Frame<'a>> {
+    pub fn parse(b: &'a [u8]) -> Option<Frame<'a>> {
         if b.len() < HEADER {
             return None;
         }
@@ -57,12 +63,12 @@ impl<'a> Frame<'a> {
 }
 
 /// Whether a MAC is a group (broadcast or multicast) address.
-pub(crate) fn is_group(mac: &Mac) -> bool {
+pub fn is_group(mac: &Mac) -> bool {
     mac[0] & 1 == 1
 }
 
 /// An Ethernet header.
-pub(crate) fn header(dst: Mac, src: Mac, ethertype: u16) -> [u8; HEADER] {
+pub fn header(dst: Mac, src: Mac, ethertype: u16) -> [u8; HEADER] {
     let mut h = [0u8; HEADER];
     h[0..6].copy_from_slice(&dst);
     h[6..12].copy_from_slice(&src);
@@ -72,7 +78,7 @@ pub(crate) fn header(dst: Mac, src: Mac, ethertype: u16) -> [u8; HEADER] {
 
 /// A whole frame: a header, then `payload`, padded to Ethernet's minimum
 /// of 60 bytes.
-pub(crate) fn frame(dst: Mac, src: Mac, ethertype: u16, payload: &[u8]) -> Vec<u8> {
+pub fn frame(dst: Mac, src: Mac, ethertype: u16, payload: &[u8]) -> Vec<u8> {
     let mut f = Vec::with_capacity((HEADER + payload.len()).max(60));
     f.extend_from_slice(&header(dst, src, ethertype));
     f.extend_from_slice(payload);
@@ -89,8 +95,8 @@ pub(crate) fn frame(dst: Mac, src: Mac, ethertype: u16, payload: &[u8]) -> Vec<u
 ///
 /// A known subnet's directed broadcast also uses the broadcast MAC.
 /// Prefixes /31 and /32 have no directed broadcast. With Family::FromWorld,
-/// attach does not know the subnet and treats directed broadcasts as unicast.
-pub(crate) fn destination(
+/// the link does not know the subnet and treats directed broadcasts as unicast.
+pub(super) fn destination(
     packet: &[u8],
     vm: Option<Mac>,
     subnet: Option<(Ipv4Addr, u8)>,
@@ -131,7 +137,7 @@ pub(crate) fn destination(
 /// The IP packet in an IPv4 or IPv6 frame's payload, without the padding
 /// Ethernet may add after it. `None` if the header is broken or says the
 /// packet is longer than the payload.
-pub(crate) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
+pub(super) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
     match ethertype {
         IPV4 => {
             let b = payload;
@@ -164,7 +170,7 @@ pub(crate) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
 
 /// An IPv4 packet around `payload`, with TTL 64, identification 0, no
 /// flags and a correct header checksum.
-pub(crate) fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
+pub(super) fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
     ip::packet_with(
         src.into(),
         dst.into(),
@@ -179,7 +185,7 @@ pub(crate) fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> V
 }
 
 /// A UDP datagram in an IPv4 packet, with a correct checksum.
-pub(crate) fn udp4(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Vec<u8> {
+pub(super) fn udp4(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Vec<u8> {
     ipv4(
         src,
         dst,
@@ -203,7 +209,7 @@ fn udp(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, data: &[u8]) -> Vec<u8>
 }
 
 /// An IPv6 packet around `payload`.
-pub(crate) fn ipv6(
+pub(super) fn ipv6(
     src: Ipv6Addr,
     dst: Ipv6Addr,
     next: u8,
@@ -224,7 +230,7 @@ pub(crate) fn ipv6(
 }
 
 /// A UDP datagram in an IPv6 packet, with a correct checksum.
-pub(crate) fn udp6(src: Ipv6Addr, sport: u16, dst: Ipv6Addr, dport: u16, data: &[u8]) -> Vec<u8> {
+pub(super) fn udp6(src: Ipv6Addr, sport: u16, dst: Ipv6Addr, dport: u16, data: &[u8]) -> Vec<u8> {
     ipv6(
         src,
         dst,
@@ -237,14 +243,14 @@ pub(crate) fn udp6(src: Ipv6Addr, sport: u16, dst: Ipv6Addr, dport: u16, data: &
 /// An ICMPv6 message in an IPv6 packet with hop limit 255, as neighbor
 /// discovery requires. `body` is the whole message with its checksum
 /// field (bytes 2 and 3) zero; this fills it in.
-pub(crate) fn icmp6(src: Ipv6Addr, dst: Ipv6Addr, mut body: Vec<u8>) -> Vec<u8> {
+pub(super) fn icmp6(src: Ipv6Addr, dst: Ipv6Addr, mut body: Vec<u8>) -> Vec<u8> {
     let sum = ip::transport_checksum(src.into(), dst.into(), ICMPV6, &body);
     body[2..4].copy_from_slice(&sum.to_be_bytes());
     ipv6(src, dst, ICMPV6, 255, &body)
 }
 
 /// The link-local address made from a MAC (modified EUI-64).
-pub(crate) fn link_local(mac: Mac) -> Ipv6Addr {
+pub(super) fn link_local(mac: Mac) -> Ipv6Addr {
     let mut a = [0u8; 16];
     a[0] = 0xfe;
     a[1] = 0x80;
@@ -262,18 +268,18 @@ pub(crate) fn link_local(mac: Mac) -> Ipv6Addr {
 // ARP and neighbor discovery
 
 /// The answer to an ARP request from the VM: a reply frame that gives
-/// [`GATEWAY_MAC`] for the asked address. Attach answers for every
+/// [`GATEWAY_MAC`] for the asked address. The link answers for every
 /// address, as a proxy ARP router does, so every packet the VM sends
-/// reaches attach, and the world decides what is there. It does not
+/// reaches the link, and the world decides what is there. It does not
 /// answer:
 ///
 /// - probes (sender address 0.0.0.0) and gratuitous ARP (sender address
 ///   equal to the target): an answer would tell the VM its own address is
 ///   taken;
-/// - questions about `own`, the address attach handed the VM, for the same
+/// - questions about `own`, the address the link handed the VM, for the same
 ///   reason;
 /// - anything that is not an Ethernet/IPv4 request.
-pub(crate) fn arp_reply(arp: &[u8], vm: Mac, own: Option<Ipv4Addr>) -> Option<Vec<u8>> {
+pub(super) fn arp_reply(arp: &[u8], vm: Mac, own: Option<Ipv4Addr>) -> Option<Vec<u8>> {
     if arp.len() < 28 || arp[0..8] != [0, 1, 0x08, 0x00, 6, 4, 0, 1] {
         return None;
     }
@@ -293,22 +299,22 @@ pub(crate) fn arp_reply(arp: &[u8], vm: Mac, own: Option<Ipv4Addr>) -> Option<Ve
 }
 
 /// ICMPv6 types of neighbor discovery.
-pub(crate) const ROUTER_SOLICITATION: u8 = 133;
-pub(crate) const ROUTER_ADVERTISEMENT: u8 = 134;
-pub(crate) const NEIGHBOR_SOLICITATION: u8 = 135;
-pub(crate) const NEIGHBOR_ADVERTISEMENT: u8 = 136;
-pub(crate) const REDIRECT: u8 = 137;
+pub(super) const ROUTER_SOLICITATION: u8 = 133;
+pub(super) const ROUTER_ADVERTISEMENT: u8 = 134;
+pub(super) const NEIGHBOR_SOLICITATION: u8 = 135;
+pub(super) const NEIGHBOR_ADVERTISEMENT: u8 = 136;
+pub(super) const REDIRECT: u8 = 137;
 
-/// What attach needs to know about the transport of one IP packet from
+/// What the link needs to know about the transport of one IP packet from
 /// the VM. [`Header::check`] reads the extension headers and fragments,
 /// with the parser the world's own stack uses; this adds the UDP port and
 /// the ICMPv6 type.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Upper<'a> {
+pub(super) enum Upper<'a> {
     /// A whole UDP datagram: its destination port and payload.
     Udp { port: u16, payload: &'a [u8] },
     /// The first fragment of a UDP datagram: its destination port. The rest
-    /// of the datagram is in later fragments, which attach does not keep.
+    /// of the datagram is in later fragments, which the link does not keep.
     UdpFragment { port: u16 },
     /// An ICMPv6 message: its type, and the message from its first byte.
     /// With `fragment`, this is the first fragment of a longer message.
@@ -322,15 +328,15 @@ pub(crate) enum Upper<'a> {
     Other,
 }
 
-/// A packet whose transport attach cannot read: an IPv6 extension header
+/// A packet whose transport the link cannot read: an IPv6 extension header
 /// that runs past its end, a UDP or ICMPv6 header cut short (in a first
 /// fragment, too), or a UDP length that does not fit the packet.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Unreadable;
+pub(super) struct Unreadable;
 
 /// Reads the transport of an IP packet, which [`ip_packet`] has checked.
 /// Checks complete UDP lengths, but leaves checksums to the recipient.
-pub(crate) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
+pub(super) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
     let h = Header::check(packet).map_err(|_| Unreadable)?;
     // An atomic fragment is a whole packet, but neighbor discovery may not
     // carry a fragment header at all (RFC 6980), so it counts as a fragment
@@ -371,7 +377,7 @@ pub(crate) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
 
 /// The ICMPv6 types of neighbor discovery and redirects, which only make
 /// sense on one link.
-pub(crate) fn is_neighbor_discovery(kind: u8) -> bool {
+pub(super) fn is_neighbor_discovery(kind: u8) -> bool {
     (ROUTER_SOLICITATION..=REDIRECT).contains(&kind)
 }
 
@@ -381,7 +387,7 @@ pub(crate) fn is_neighbor_discovery(kind: u8) -> bool {
 /// duplicate address detection (source `::`), a target that is `own` or
 /// multicast, or a solicitation that is not valid (hop limit other than
 /// 255, code other than 0).
-pub(crate) fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
+pub(super) fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
     let Ok(Upper::Icmp6 {
         kind: NEIGHBOR_SOLICITATION,
         msg,
@@ -399,7 +405,7 @@ pub(crate) fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> 
         return None;
     }
     let mut body = Vec::with_capacity(32);
-    // Router, solicited and override: the VM may use attach as a router
+    // Router, solicited and override: the VM may use the link as a router
     // for any address, so the router flag is always set.
     body.extend_from_slice(&[NEIGHBOR_ADVERTISEMENT, 0, 0, 0, 0xe0, 0, 0, 0]);
     body.extend_from_slice(&target.octets());
@@ -413,7 +419,7 @@ pub(crate) fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> 
 /// The UDP destination port and payload of an IPv4 or IPv6 packet that
 /// holds a whole UDP datagram. `None` otherwise.
 #[cfg(test)]
-pub(crate) fn udp_to(packet: &[u8]) -> Option<(u16, &[u8])> {
+pub(super) fn udp_to(packet: &[u8]) -> Option<(u16, &[u8])> {
     match upper(packet) {
         Ok(Upper::Udp { port, payload }) => Some((port, payload)),
         _ => None,
@@ -422,11 +428,11 @@ pub(crate) fn udp_to(packet: &[u8]) -> Option<(u16, &[u8])> {
 
 /// The source address of an IPv4 or IPv6 packet. The packet must be at
 /// least a header long, as [`ip_packet`] checks.
-pub(crate) fn source_v4(packet: &[u8]) -> Ipv4Addr {
+pub(super) fn source_v4(packet: &[u8]) -> Ipv4Addr {
     Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15])
 }
 
-pub(crate) fn source_v6(packet: &[u8]) -> Ipv6Addr {
+pub(super) fn source_v6(packet: &[u8]) -> Ipv6Addr {
     Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap())
 }
 

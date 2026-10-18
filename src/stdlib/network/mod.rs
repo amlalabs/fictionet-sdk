@@ -4,6 +4,7 @@
 //! The [module table](super#network-modules) lists the modules.
 
 mod connection;
+pub mod ethernet;
 pub mod icmp;
 pub mod ip;
 mod link;

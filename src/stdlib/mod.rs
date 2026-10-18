@@ -244,6 +244,7 @@
 //!
 //! | Module | Description |
 //! | --- | --- |
+//! | [`network::ethernet`] | Ethernet frames to IP packets and back for a VM's network card, with ARP, neighbor discovery and the frame stream. |
 //! | [`network::icmp`] | ICMP echo replies and error messages. |
 //! | [`network::ip`] | IP packets, checksums, fragment reassembly and protocol splitting. |
 //! | [`network::ports`] | Ready-slot polling for packet interfaces. |

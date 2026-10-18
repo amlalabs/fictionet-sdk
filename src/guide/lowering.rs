@@ -130,9 +130,9 @@
 //!   the path, then listens on the socket (`listen` in `tap/qemu.rs`, mode
 //!   0600) and accepts one connection. A stream
 //!   has no message boundaries, so QEMU puts a 4-byte big-endian length in
-//!   front of each frame. `Decoder` splits the stream back into frames,
+//!   front of each frame. [`Decoder`](crate::stdlib::network::ethernet::stream::Decoder) splits the stream back into frames,
 //!   and treats a length over 69,632 bytes as a broken stream, which ends
-//!   attach with an error. Frames to the VM go through an `Outbox` that adds the same
+//!   attach with an error. Frames to the VM go through an [`Outbox`](crate::stdlib::network::ethernet::stream::Outbox) that adds the same
 //!   length, holds at most 4 MiB, and drops a frame that does not fit.
 //! - **`--vm tap:<name>`.** Firecracker, Cloud Hypervisor and QEMU's
 //!   `-netdev tap` hold the file side of a TAP device, and a second
@@ -154,7 +154,7 @@
 //!   finishes any checksums the VM program left to an offload, and splits
 //!   large segments into frames that fit the MTU.
 //!
-//! **The lowering.** `Link::frame_from_vm` decides what happens to each
+//! **The lowering.** [`Link::frame_from_vm`](crate::stdlib::network::ethernet::Link::frame_from_vm) decides what happens to each
 //! frame, with no I/O of its own. It reads the header, and drops a frame
 //! that is shorter than one, longer than the header plus `--mtu`, sent
 //! from a broadcast, multicast or zero MAC, or addressed to a unicast MAC
@@ -237,7 +237,7 @@
 //! sends no router advertisements and runs no DHCPv6. With `Sites`, a VM
 //! gets an IPv6 address from attach's flags, or sets one itself.
 //!
-//! **The way back.** `Link::to_vm` drops a packet from the world that is
+//! **The way back.** [`Link::to_vm`](crate::stdlib::network::ethernet::Link::to_vm) drops a packet from the world that is
 //! longer than `--mtu` or is not IPv4 or IPv6. For the rest, it builds an
 //! Ethernet header. The source is attach's MAC. The destination is the
 //! VM's MAC, or broadcast for `255.255.255.255` or while the VM's MAC is
