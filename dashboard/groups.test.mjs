@@ -128,3 +128,21 @@ test('a link between two closed groups is drawn between the groups', () => {
   const between = agg.edges.find((d) => d.members.some((m) => m.e.id === 'e6'));
   assert.deepEqual([between.a, between.b], ['g3', 'g1']);
 });
+
+test('closing a network containing its router hides host links and keeps sandbox links separate', () => {
+  const { groups, nodes, links } = world();
+  nodes.find((n) => n.id === 't3').group = 'g1';
+  nodes.push({ id: 's10', kind: 'sandbox', name: 'container', group: null, edges: new Set(['e6']) });
+  links.push({ id: 'e6', a: 't3', b: 's10', c: [0, 0, 0, 0] });
+  nodes.find((n) => n.id === 't3').edges.add('e6');
+  const agg = G.aggregate(groups, nodes, links, (gid) => gid !== 'g1');
+  assert.equal(agg.owner.get('t3'), 'g1');
+  assert.deepEqual(agg.edges.map((d) => [d.id, d.a, d.b, d.members.length]), [
+    ['e1', 't2', 's9', 1],
+    ['e2', 'g1', 't2', 1],
+    ['e6', 'g1', 's10', 1],
+  ]);
+  const reopened = G.aggregate(groups, nodes, links, () => true);
+  assert.equal(reopened.owner.get('t3'), 't3');
+  assert.equal(reopened.edges.length, links.length);
+});
