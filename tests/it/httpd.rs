@@ -21,7 +21,9 @@ fn observer_sees_no_host_body() {
     for version in ["1.0", "1.1"] {
         let observer = Arc::new(Exposure::default());
         let service = Http1::new(httpd::VirtualHosts::new()).observe(observer.clone());
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h =
+            Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
         let mut request = format!(
             "POST /login HTTP/{version}\r\nContent-Length: {}\r\n\r\n",
             SECRET.len()
@@ -52,7 +54,7 @@ fn observer_sees_no_host_body() {
             *observer.ends.lock().unwrap(),
             [("/login".into(), SECRET.len(), httpd::Received::Complete)]
         );
-        let events = h.events();
+        let events = evidence_h.checked_all().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("answer"), Some("no_host"));
         assert_eq!(events[0].str("received"), Some("complete"));
@@ -76,14 +78,22 @@ fn body_limit_exposure() {
         },
     )
     .observe(observer.clone());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h =
+        Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
     h.push(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 20\r\n\r\n01234567890123456789")
         .unwrap();
     assert_eq!(
         *observer.ends.lock().unwrap(),
         [("/".into(), 20, httpd::Received::TooLarge)]
     );
-    let e = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+    let e = evidence_h
+        .checked_all()
+        .unwrap()
+        .iter()
+        .find(|e| e.is("http", "request"))
+        .unwrap()
+        .clone();
     assert_eq!(e.str("answer"), Some("too_large"));
     assert_eq!(e.str("received"), Some("too_large"));
     assert_eq!(e.get("status").and_then(json::Value::as_u64), Some(413));
@@ -109,7 +119,9 @@ fn partial_timeout_exposure() {
         let observer = Arc::new(Exposure::default());
         let router = Router::new().post("/", |_, _| panic!("timed out body reached handler"));
         let service = Http1::new(router).observe(observer.clone());
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h =
+            Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
         h.push(format!("POST / HTTP/1.1\r\nHost: a\r\n{framing}\r\n\r\n").as_bytes())
             .unwrap();
         h.push(tail).unwrap();
@@ -120,7 +132,13 @@ fn partial_timeout_exposure() {
             *observer.ends.lock().unwrap(),
             [("/".into(), bytes, httpd::Received::Timeout)]
         );
-        let e = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        let e = evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .find(|e| e.is("http", "request"))
+            .unwrap()
+            .clone();
         assert_eq!(e.str("answer"), Some("timeout"));
         assert_eq!(e.str("received"), Some("timeout"));
         assert!(e.get("status").unwrap().is_null());
@@ -133,7 +151,9 @@ fn partial_timeout_exposure() {
             Some(classified)
         );
         assert!(
-            h.events()
+            evidence_h
+                .checked_all()
+                .unwrap()
                 .iter()
                 .any(|e| e.is("http", "error") && e.str("cause") == Some("timeout"))
         );
@@ -161,17 +181,27 @@ fn body_timeout_preserves_item_faults() {
                 }],
                 ..Plan::default()
             }));
-        let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts);
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts)
+            .observer(evidence_h.clone());
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nxy")
             .unwrap();
-        assert!(h.events().is_empty());
+        assert!(evidence_h.checked_all().unwrap().is_empty());
         h.advance(Duration::from_secs(30)).unwrap();
         assert!(h.closed());
-        let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        let event = evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .find(|e| e.is("http", "request"))
+            .unwrap()
+            .clone();
         assert_eq!(event.str("answer"), Some("timeout"));
         assert_eq!(event.str("received"), Some("timeout"));
         assert!(
-            !h.events()
+            !evidence_h
+                .checked_all()
+                .unwrap()
                 .iter()
                 .any(|e| e.is("conn", "faults") && e.str("stopped") == Some("decoder")),
             "observing a body timeout must not stop item faults"
@@ -206,7 +236,9 @@ fn body_decode_failure_preserves_item_faults() {
                 }],
                 ..Plan::default()
             }));
-        let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts);
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts)
+            .observer(evidence_h.clone());
         assert!(matches!(
             h.push(
                 b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n"
@@ -216,10 +248,18 @@ fn body_decode_failure_preserves_item_faults() {
             )))
         ));
         assert!(h.closed());
-        let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        let event = evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .find(|e| e.is("http", "request"))
+            .unwrap()
+            .clone();
         assert_eq!(event.str("received"), Some("cut_off"));
         assert!(
-            !h.events()
+            !evidence_h
+                .checked_all()
+                .unwrap()
                 .iter()
                 .any(|e| e.is("conn", "faults") && e.str("stopped") == Some("decoder")),
             "observing a body decode failure must not stop item faults"
@@ -246,11 +286,13 @@ fn hook_redacts_before_log() {
         );
         response
     });
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
     let mut h = Harness::new(
         fictionet::Seed::from_u64(0),
         Http1::new(router).observe(observer.clone()),
         (),
-    );
+    )
+    .observer(evidence_h.clone());
     for body in [SECRET, b"clean".as_slice()] {
         h.push(
             format!(
@@ -267,7 +309,7 @@ fn hook_redacts_before_log() {
         "Original.Test:80"
     );
     assert_eq!(observer.ends.lock().unwrap().len(), 2);
-    for (event, classified) in h.events().iter().zip([true, false]) {
+    for (event, classified) in evidence_h.checked_all().unwrap().iter().zip([true, false]) {
         assert_eq!(event.str("source"), Some("handler"));
         assert_eq!(event.str("method"), Some("POST"));
         assert_eq!(event.str("answer"), Some("handler"));
@@ -285,11 +327,13 @@ fn observer_sees_cut_off_body_without_framing() {
     for tail in [SECRET, b"64\r\nprivate-credential!!".as_slice()] {
         let observer = Arc::new(Exposure::default());
         let router = Router::new().post("/", |_, _| panic!("partial body reached byte handler"));
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
         let mut h = Harness::new(
             fictionet::Seed::from_u64(0),
             Http1::new(router).observe(observer.clone()),
             (),
-        );
+        )
+        .observer(evidence_h.clone());
         let framing = if tail == SECRET {
             "Content-Length: 100"
         } else {
@@ -299,7 +343,13 @@ fn observer_sees_cut_off_body_without_framing() {
             .unwrap();
         h.push(tail).unwrap();
         assert!(h.end().is_err());
-        let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        let event = evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .find(|e| e.is("http", "request"))
+            .unwrap()
+            .clone();
         assert_eq!(event.str("received"), Some("cut_off"));
         assert_eq!(
             *observer.ends.lock().unwrap(),
@@ -318,7 +368,9 @@ fn received_does_not_require_an_observer() {
                 ..httpd::Limits::default()
             },
         );
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h =
+            Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
         h.push(
             format!(
                 "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {length}\r\n\r\n01234567890123456789"
@@ -329,11 +381,13 @@ fn received_does_not_require_an_observer() {
         if received == "timeout" {
             h.advance(Duration::from_secs(30)).unwrap();
         }
-        let event = h
-            .events()
+        let event = evidence_h
+            .checked_all()
+            .unwrap()
             .iter()
             .find(|e| e.is("http", "request"))
-            .expect("rejected request event");
+            .expect("rejected request event")
+            .clone();
         assert_eq!(event.str("answer"), Some(received));
         assert_eq!(event.str("received"), Some(received));
     }
@@ -350,12 +404,20 @@ fn missing_host_does_not_hide_an_oversized_body() {
         },
     )
     .observe(observer.clone());
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), service, ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h =
+        Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
     assert!(
         h.push(b"POST / HTTP/1.1\r\nContent-Length: 20\r\n\r\n01234567890123456789")
             .is_err()
     );
-    let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+    let event = evidence_h
+        .checked_all()
+        .unwrap()
+        .iter()
+        .find(|e| e.is("http", "request"))
+        .unwrap()
+        .clone();
     assert_eq!(event.str("answer"), Some("too_large"));
     assert_eq!(event.str("received"), Some("too_large"));
     assert_eq!(
@@ -417,7 +479,9 @@ fn http1_streams_chunks_once_and_keeps_alive() {
         } else {
             answer
         };
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(StreamHandler), ());
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(StreamHandler), ())
+            .observer(evidence_h.clone());
         let request = format!("GET {path} HTTP/1.1\r\nHost: a.test\r\n\r\n");
         h.push(request.as_bytes()).unwrap();
         assert_eq!(http_text(&h), expected);
@@ -425,8 +489,8 @@ fn http1_streams_chunks_once_and_keeps_alive() {
         h.push(request.as_bytes()).unwrap();
         assert_eq!(http_text(&h), expected.repeat(2));
         assert!(!h.closed());
-        assert_eq!(h.events().len(), 2);
-        for event in h.events() {
+        assert_eq!(evidence_h.checked_all().unwrap().len(), 2);
+        for event in evidence_h.checked_all().unwrap() {
             assert!(event.is("http", "request"));
             assert_eq!(
                 event.get("sent").and_then(json::Value::as_u64),
@@ -458,7 +522,9 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
         .get("/files/*", |_, r| {
             http::Response::new(Bytes::from(r.uri().path().to_owned()))
         });
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
+        .observer(evidence_h.clone());
     // Two pipelined requests, then HEAD, then an unknown path and method.
     h.push(b"GET /hi HTTP/1.1\r\nHost: a.test\r\n\r\nPOST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 4\r\n\r\nping").unwrap();
     h.push(b"HEAD /hi HTTP/1.1\r\nHost: a.test\r\n\r\n")
@@ -490,7 +556,7 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
     assert!(answers[5].starts_with("405 Method Not Allowed"));
     assert!(!h.closed());
     // Every request is one event, with the handler's fields.
-    let events = h.events();
+    let events = evidence_h.checked_all().unwrap();
     assert_eq!(events.len(), 6);
     assert!(events.iter().all(|e| e.is("http", "request")));
     assert_eq!(
@@ -531,7 +597,9 @@ fn http1_response_policy_preserves_native_framing() {
                 .body(Bytes::from_static(b"body"))
                 .unwrap()
         });
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
+            .observer(evidence_h.clone());
         let request = format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n");
         let reply = String::from_utf8(h.push(request.as_bytes()).unwrap()).unwrap();
         let (head, got) = reply.split_once("\r\n\r\n").unwrap();
@@ -544,7 +612,13 @@ fn http1_response_policy_preserves_native_framing() {
             "{reply}"
         );
         assert!(!head.contains("Transfer-Encoding"), "{reply}");
-        let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
+        let event = evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .find(|e| e.is("http", "request"))
+            .unwrap()
+            .clone();
         assert_eq!(
             event.get("sent").and_then(json::Value::as_u64),
             Some(body.len() as u64)
@@ -643,7 +717,9 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
 #[test]
 fn an_http11_request_with_no_host_gets_400_from_the_service() {
     let vhosts = httpd::VirtualHosts::new();
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ())
+        .observer(evidence_h.clone());
     let _ = h.push(b"GET /x HTTP/1.1\r\nAccept: */*\r\n\r\n");
     assert!(
         http_text(&h).starts_with("HTTP/1.1 400 Bad Request"),
@@ -651,8 +727,8 @@ fn an_http11_request_with_no_host_gets_400_from_the_service() {
         http_text(&h)
     );
     assert!(h.closed());
-    assert_eq!(h.events().len(), 1);
-    let e = &h.events()[0];
+    assert_eq!(evidence_h.checked_all().unwrap().len(), 1);
+    let e = &evidence_h.checked_all().unwrap()[0];
     assert!(e.is("http", "request"));
     assert_eq!(
         e.get("answer").and_then(json::Value::as_str),
@@ -682,7 +758,9 @@ fn an_http11_absolute_request_with_no_host_gets_400_from_the_service() {
             http::Response::new(Bytes::from("ok"))
         })),
     );
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ())
+        .observer(evidence_h.clone());
     assert!(h.push(b"GET http://a.test/ HTTP/1.1\r\n\r\n").is_err());
     assert!(
         http_text(&h).starts_with("HTTP/1.1 400 Bad Request"),
@@ -692,8 +770,8 @@ fn an_http11_absolute_request_with_no_host_gets_400_from_the_service() {
     assert!(http_text(&h).ends_with("\r\n\r\nThe request names no host.\n"));
     assert!(h.closed());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(h.events().len(), 1);
-    let e = &h.events()[0];
+    assert_eq!(evidence_h.checked_all().unwrap().len(), 1);
+    let e = &evidence_h.checked_all().unwrap()[0];
     assert!(e.is("http", "request"));
     assert_eq!(
         e.get("answer").and_then(json::Value::as_str),
@@ -844,7 +922,9 @@ fn http1_rejects_unsupported_transfer_codings_before_dispatch() {
             count.fetch_add(1, Ordering::SeqCst);
             http::Response::new(Bytes::new())
         });
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
+            .observer(evidence_h.clone());
         let request = format!(
             "POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: {coding}\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
         );
@@ -853,19 +933,33 @@ fn http1_rejects_unsupported_transfer_codings_before_dispatch() {
         assert!(result.is_err());
         assert!(http_text(&h).starts_with(&format!("HTTP/1.1 {status}\r\n")));
         assert!(h.closed());
-        assert!(h.events().iter().any(|e| e.is("http", "error")
-            && e.get("cause").and_then(json::Value::as_str) == Some("protocol")));
+        assert!(
+            evidence_h
+                .checked_all()
+                .unwrap()
+                .iter()
+                .any(|e| e.is("http", "error")
+                    && e.get("cause").and_then(json::Value::as_str) == Some("protocol"))
+        );
     }
 }
 
 #[test]
 fn http1_answers_bytes_that_are_not_http_with_400_and_an_error_event() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
+        .observer(evidence_h.clone());
     assert!(h.push(b"\x16\x03\x01\x00\x05hello\r\n\r\n").is_err());
     assert!(http_text(&h).starts_with("HTTP/1.1 400 Bad Request"));
     assert!(h.closed());
-    assert!(h.events().iter().any(|e| e.is("http", "error")
-        && e.get("cause").and_then(json::Value::as_str) == Some("protocol")));
+    assert!(
+        evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.is("http", "error")
+                && e.get("cause").and_then(json::Value::as_str) == Some("protocol"))
+    );
 }
 
 #[test]
@@ -1059,7 +1153,10 @@ fn virtual_hosts_pick_a_site_by_host() {
         "203.0.113.1:80".parse().unwrap(),
         "10.0.0.2:5000".parse().unwrap(),
     );
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ()).with_conn(conn);
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ())
+        .observer(evidence_h.clone())
+        .with_conn(conn);
     h.push(b"GET / HTTP/1.1\r\nHost: A.Test.\r\n\r\n").unwrap();
     h.push(b"GET /x?y HTTP/1.1\r\nHost: b.test\r\n\r\n")
         .unwrap();
@@ -1073,8 +1170,8 @@ fn virtual_hosts_pick_a_site_by_host() {
     );
     assert!(text.contains("HTTP/1.1 421 Misdirected Request\r\n"));
     assert!(text.contains("HTTP/1.0 400 Bad Request\r\n"));
-    let answers: Vec<&str> = h
-        .events()
+    let events = evidence_h.checked_all().unwrap();
+    let answers: Vec<&str> = events
         .iter()
         .filter_map(|e| e.get("answer").and_then(json::Value::as_str))
         .collect();
@@ -1111,14 +1208,20 @@ fn http1_survives_mixed_and_random_input() {
             })
     };
     let run = |chunks: &[&[u8]]| {
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ());
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ())
+            .observer(evidence_h.clone());
         for c in chunks {
             if h.push(c).is_err() {
                 break;
             }
         }
         let _ = h.end();
-        (h.output().to_vec(), h.events().len(), h.closed())
+        (
+            h.output().to_vec(),
+            evidence_h.checked_all().unwrap().len(),
+            h.closed(),
+        )
     };
     let mut rng = fictionet::stdlib::codec::Lcg::new(42);
     for _ in 0..400 {
@@ -1186,15 +1289,21 @@ fn http1_oversized_body_returns_413_without_calling_handler() {
 /// Header timeouts close the connection and record their cause.
 #[test]
 fn http1_header_timeout_records_an_error() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
+        .observer(evidence_h.clone());
     h.open().unwrap();
     let _ = h.push(b"GET / HTTP/1.1\r\n");
     let _ = h.advance(Duration::from_secs(31));
     assert!(h.closed());
     assert!(
-        h.events().iter().any(|e| e.is("http", "error")
-            && e.str("cause") == Some("timeout")
-            && e.str("detail") == Some("request head timed out")),
+        evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.is("http", "error")
+                && e.str("cause") == Some("timeout")
+                && e.str("detail") == Some("request head timed out")),
         "no http.error with cause timeout"
     );
 }
@@ -1202,19 +1311,29 @@ fn http1_header_timeout_records_an_error() {
 #[test]
 fn http1_idle_keep_alive_timeout_closes_without_an_error() {
     let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("ok")));
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
+        .observer(evidence_h.clone());
     let reply = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap();
     assert!(reply.starts_with(b"HTTP/1.1 200"));
     assert!(!h.closed());
     h.advance(Duration::from_secs(31)).unwrap();
     assert!(h.closed());
-    assert!(!h.events().iter().any(|e| e.is("http", "error")));
+    assert!(
+        !evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.is("http", "error"))
+    );
 }
 
 #[test]
 fn http1_pipelined_partial_head_timeout_records_an_error() {
     let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("ok")));
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
+        .observer(evidence_h.clone());
     let reply = h
         .push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\nGET / HTTP/1.1\r\n")
         .unwrap();
@@ -1222,9 +1341,15 @@ fn http1_pipelined_partial_head_timeout_records_an_error() {
     assert!(!h.closed());
     h.advance(Duration::from_secs(31)).unwrap();
     assert!(h.closed());
-    assert!(h.events().iter().any(|e| e.is("http", "error")
-        && e.str("cause") == Some("timeout")
-        && e.str("detail") == Some("request head timed out")));
+    assert!(
+        evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.is("http", "error")
+                && e.str("cause") == Some("timeout")
+                && e.str("detail") == Some("request head timed out"))
+    );
 }
 
 /// A known path takes precedence over the fallback.
@@ -1243,13 +1368,21 @@ fn router_known_path_returns_405_before_fallback() {
 
 #[test]
 fn http1_body_timeout_records_an_error() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
+        .observer(evidence_h.clone());
     h.open().unwrap();
     h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 20\r\n\r\na")
         .unwrap();
     h.advance(Duration::from_secs(61)).unwrap();
     assert!(h.closed());
-    assert!(h.events().iter().any(|e| e.is("http", "error")
-        && e.str("cause") == Some("timeout")
-        && e.str("detail") == Some("request body timed out")));
+    assert!(
+        evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.is("http", "error")
+                && e.str("cause") == Some("timeout")
+                && e.str("detail") == Some("request body timed out"))
+    );
 }

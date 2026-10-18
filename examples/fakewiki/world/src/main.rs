@@ -84,12 +84,12 @@ fn real_main() -> fictionet::Result {
         .enable_all()
         .build()?;
     let result = runtime.block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
-            fakewiki_world::events::LogObserver {
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(Arc::new(fictionet::events::Memory::default()))
+            .observer(Arc::new(fakewiki_world::events::LogObserver {
                 log: log.clone(),
                 hosts: hosts.clone(),
-            },
-        )),
+            })),
         move |fcx| async move {
             let content = Content::new(&fcx, args.backend_port)?;
             let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys())?;

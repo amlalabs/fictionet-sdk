@@ -46,6 +46,7 @@ fn idle_http2_budget(budget: &Budget) {
 
 async fn hyper_exposure(
     fcx: Cx,
+    evidence: Arc<fictionet::events::Memory>,
     received: httpd::Received,
     expected_status: u16,
 ) -> fictionet::Result {
@@ -107,8 +108,7 @@ async fn hyper_exposure(
         let data = data?;
         response_body.flow_control().release_capacity(data.len())?;
     }
-    let events = fcx
-        .events()
+    let events = evidence
         .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
         .await?;
     assert_eq!(
@@ -149,7 +149,7 @@ async fn hyper_exposure(
 
 #[test]
 fn observer_sees_no_host_body() {
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
         let hosts = httpd::VirtualHosts::new();
@@ -201,8 +201,7 @@ fn observer_sees_no_host_body() {
         }
         .write(&mut request)?;
         conn.write_all(&fcx, &request).await?;
-        let events = fcx
-            .events()
+        let events = evidence
             .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
             .await?;
         let heads = observer.heads.lock().unwrap();
@@ -232,35 +231,35 @@ fn observer_sees_no_host_body() {
 
 #[test]
 fn body_limit_exposure() {
-    world(Duration::from_secs(10), |fcx| {
-        hyper_exposure(fcx, httpd::Received::TooLarge, 413)
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| {
+        hyper_exposure(fcx, evidence, httpd::Received::TooLarge, 413)
     });
 }
 
 #[test]
 fn partial_timeout_exposure() {
-    world(Duration::from_secs(10), |fcx| {
-        hyper_exposure(fcx, httpd::Received::Timeout, 408)
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| {
+        hyper_exposure(fcx, evidence, httpd::Received::Timeout, 408)
     });
 }
 
 #[test]
 fn hook_redacts_before_log() {
-    world(Duration::from_secs(10), |fcx| {
-        hyper_exposure(fcx, httpd::Received::Complete, 200)
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| {
+        hyper_exposure(fcx, evidence, httpd::Received::Complete, 200)
     });
 }
 
 #[test]
 fn body_budget_exposure() {
-    world(Duration::from_secs(10), |fcx| {
-        hyper_exposure(fcx, httpd::Received::Budget, 503)
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| {
+        hyper_exposure(fcx, evidence, httpd::Received::Budget, 503)
     });
 }
 
 #[test]
 fn observer_sees_metadata_budget_rejection() {
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
         let router = Router::new().get("/", |_, _| panic!("metadata was not admitted"));
@@ -290,7 +289,7 @@ fn observer_sees_metadata_budget_rejection() {
         let request = metadata_request().map(|_| ());
         let (response, _) = send.send_request(request, true)?;
         assert!(response.await.is_err());
-        let events = fcx.events().of("http", "request");
+        let events = evidence.checked_of("http", "request").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("answer"), Some("budget"));
         assert_eq!(events[0].str("received"), Some("budget"));
@@ -306,7 +305,7 @@ fn observer_sees_metadata_budget_rejection() {
 
 #[test]
 fn observer_keeps_concurrent_request_identity() {
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
         let router = Router::new().post("/clean", |_, _| http::Response::new(Bytes::new()));
@@ -342,8 +341,7 @@ fn observer_keeps_concurrent_request_identity() {
         assert_eq!(clean.await?.status(), 200);
         partial.send_reset(h2::Reason::CANCEL);
         assert!(cut_off.await.is_err());
-        let events = fcx
-            .events()
+        let events = evidence
             .wait(&fcx, 2, Duration::from_secs(1), |e| e.is("http", "request"))
             .await?;
         let clean = events
@@ -371,7 +369,7 @@ fn observer_keeps_concurrent_request_identity() {
 
 #[test]
 fn observer_sees_upgrade_path_body_limit() {
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
         let router = Router::new().post("/", |_, _| panic!("oversized body reached handler"));
@@ -398,7 +396,7 @@ fn observer_sees_upgrade_path_body_limit() {
                 .await
                 .starts_with(b"HTTP/1.1 413")
         );
-        let events = fcx.events().of("http", "request");
+        let events = evidence.checked_of("http", "request").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("answer"), Some("too_large"));
         assert_eq!(events[0].str("received"), Some("too_large"));
@@ -427,7 +425,7 @@ fn observer_sees_a_handed_off_request_once() {
             Reply::Now(http::Response::new(request.into_body()))
         }
     }
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
         let observer = Arc::new(Exposure::default());
         serve_http(
@@ -453,7 +451,7 @@ fn observer_sees_a_handed_off_request_once() {
         let response = keep_alive_response(&fcx, &mut conn).await;
         assert_eq!(response.head.status, 200);
         assert_eq!(response.body, SECRET);
-        fcx.events()
+        evidence
             .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
             .await?;
         assert_eq!(observer.heads.lock().unwrap().len(), 1);
@@ -461,7 +459,7 @@ fn observer_sees_a_handed_off_request_once() {
             *observer.ends.lock().unwrap(),
             [("/login".into(), SECRET.len(), httpd::Received::Complete)]
         );
-        let events = fcx.events().of("http", "request");
+        let events = evidence.checked_of("http", "request").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("received"), Some("complete"));
         assert_eq!(
@@ -588,33 +586,37 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
     let opts = ServeOptions::default()
         .idle(None)
         .budget(Budget::new(512 << 10));
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
     let mut h = Harness::with_options(
         fictionet::Seed::from_u64(0),
         Http1::new(page(1 << 20)),
         (),
         opts,
-    );
+    )
+    .observer(evidence_h.clone());
     assert_eq!(
         h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap(),
         b""
     );
     assert_eq!(h.end_reason(), Some(Ended::Budget));
-    let request = h
-        .events()
+    let request = evidence_h
+        .checked_all()
+        .unwrap()
         .iter()
         .find(|e| e.is("http", "request"))
-        .expect("an http.request event");
+        .expect("an http.request event")
+        .clone();
     assert_eq!(request.str("answer"), Some("cancelled"));
-    assert_eq!(field_u64(request, "sent"), Some(0));
+    assert_eq!(field_u64(&request, "sent"), Some(0));
 }
 
 /// A write that takes no bytes for the write timeout ends the connection.
 /// Before, the driver waited for ever on a client that stopped reading.
 #[test]
 fn a_client_that_stops_reading_times_out() {
-    world(Duration::from_secs(60), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
-        let kept = fcx.events();
+        let kept = evidence;
         let opts = ServeOptions::default()
             .idle(None)
             .write_timeout(Some(Duration::from_millis(300)));
@@ -653,13 +655,17 @@ fn item_faults_that_stop_record_why() {
         ..Plan::default()
     });
     let opts = ServeOptions::default().idle(None).faults(plan);
-    let mut h = Harness::with_options(fictionet::Seed::from_u64(0), Http1::new(page(2)), (), opts);
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::with_options(fictionet::Seed::from_u64(0), Http1::new(page(2)), (), opts)
+        .observer(evidence_h.clone());
     let _ = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n\x00\x01 not http\r\n\r\n");
-    let stopped = h
-        .events()
+    let stopped = evidence_h
+        .checked_all()
+        .unwrap()
         .iter()
         .find(|e| e.is("conn", "faults"))
-        .expect("a conn.faults event");
+        .expect("a conn.faults event")
+        .clone();
     assert_eq!(stopped.str("stopped"), Some("failed"));
 }
 
@@ -896,9 +902,9 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
 /// before reading it.
 #[test]
 fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
-    world(Duration::from_secs(60), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
-        let kept = fcx.events();
+        let kept = evidence;
         let size = 8 << 20;
         serve_http(
             &fcx,
@@ -920,9 +926,9 @@ fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
                 e.is("http", "request")
             })
             .await?;
-        let request = request.first().expect("an http.request event");
-        assert_eq!(field_bool(request, "complete"), Some(false));
-        assert!(field_u64(request, "sent").unwrap() < size as u64);
+        let request = request.first().expect("an http.request event").clone();
+        assert_eq!(field_bool(&request, "complete"), Some(false));
+        assert!(field_u64(&request, "sent").unwrap() < size as u64);
 
         // A response read to the end is complete.
         let mut conn = client
@@ -996,12 +1002,13 @@ fn http2_caps_the_streams_a_connection_opens() {
 /// a handler's randomness from the run's stream, as HTTP/1 does.
 #[test]
 fn http2_has_the_limits_budget_and_seed_of_http1() {
+    let evidence = Arc::new(fictionet::events::Memory::default());
     world::seeded_world(
-        fictionet::Seed::from_u64(7),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(evidence.clone()),
         Duration::from_secs(60),
-        |fcx| async move {
+        move |fcx| async move {
             let (server, client) = two_machines(&fcx);
-            let kept = fcx.events();
+            let kept = evidence;
             let router = Router::new()
                 .get("/dice", |ex, _| {
                     http::Response::new(Bytes::from(ex.random_u64().to_string()))
@@ -1220,7 +1227,7 @@ impl Handler for WaitingMetadata {
 
 #[test]
 fn http2_rejects_metadata_before_calling_the_handler() {
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
         let budget = Budget::new(H2_INPUT + 1024);
         let router = Router::new().get("/", |_, _| panic!("metadata was not admitted"));
@@ -1250,7 +1257,7 @@ fn http2_rejects_metadata_before_calling_the_handler() {
             Ok(())
         });
         assert!(send.send_request(metadata_request()).await.is_err());
-        let events = fcx.events().of("http", "request");
+        let events = evidence.checked_of("http", "request").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("answer"), Some("budget"));
         idle_http2_budget(&budget);
@@ -1260,7 +1267,7 @@ fn http2_rejects_metadata_before_calling_the_handler() {
 
 #[test]
 fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let budget = Budget::new(64 << 10);
         let shared = budget.clone();
         fcx.region(move |fcx| async move {
@@ -1292,7 +1299,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
                 Ok(())
             });
             let first = send.send_request(metadata_request());
-            fcx.events()
+            evidence
                 .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("test", "waiting"))
                 .await?;
             let one = budget.used();
@@ -1303,7 +1310,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
                 .unwrap();
             let second = send.send_request(metadata_request());
             assert_eq!(
-                fcx.events()
+                evidence
                     .wait(&fcx, 2, Duration::from_secs(1), |e| e.is("test", "waiting"))
                     .await?
                     .len(),
@@ -1312,7 +1319,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             let two = budget.used();
             assert!(two >= other.bytes() + 2 * 8192);
             assert!(send.send_request(metadata_request()).await.is_err());
-            assert_eq!(fcx.events().of("test", "waiting").len(), 2);
+            assert_eq!(evidence.checked_of("test", "waiting").unwrap().len(), 2);
             let rejected = budget.used();
             assert_eq!(rejected, two);
             let request_charge = two - one - other.bytes();
@@ -1322,7 +1329,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             assert_eq!(budget.used(), rejected - request_charge);
             let third = send.send_request(metadata_request());
             assert_eq!(
-                fcx.events()
+                evidence
                     .wait(&fcx, 3, Duration::from_secs(1), |e| e.is("test", "waiting"))
                     .await?
                     .len(),
@@ -1344,7 +1351,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
 
 #[test]
 fn http1_pending_metadata_releases_on_reset() {
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let (server, client) = two_machines(&fcx);
         let budget = Budget::new(1 << 20);
         serve_http(
@@ -1365,7 +1372,7 @@ fn http1_pending_metadata_releases_on_reset() {
             "x".repeat(4096)
         );
         conn.write_all(&fcx, head.as_bytes()).await?;
-        fcx.events()
+        evidence
             .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("test", "waiting"))
             .await?;
         assert!(budget.used() >= 8192);
@@ -1373,7 +1380,7 @@ fn http1_pending_metadata_releases_on_reset() {
         fcx.idle().await?;
         assert_eq!(budget.used(), 0);
         assert_eq!(
-            fcx.events().of("http", "request")[0].str("answer"),
+            evidence.checked_of("http", "request").unwrap()[0].str("answer"),
             Some("cancelled")
         );
         Ok(())
@@ -1404,14 +1411,16 @@ impl Handler for StreamingMetadata {
 
 #[test]
 fn request_events_stay_charged_while_responses_stream() {
-    world(Duration::from_secs(10), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
         let budget = Budget::new(1 << 20);
+        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
         let mut h = Harness::with_options(
             fictionet::Seed::from_u64(0),
             Http1::new(StreamingMetadata),
             (),
             ServeOptions::default().budget(budget.clone()),
-        );
+        )
+        .observer(evidence_h.clone());
         h.open().unwrap();
         let base = budget.used();
         let head = format!(
@@ -1425,7 +1434,13 @@ fn request_events_stay_charged_while_responses_stream() {
         );
         assert_eq!(h.pending(), (1, 0));
         assert!(budget.used() >= base + 4096);
-        assert!(!h.events().iter().any(|e| e.is("http", "request")));
+        assert!(
+            !evidence_h
+                .checked_all()
+                .unwrap()
+                .iter()
+                .any(|e| e.is("http", "request"))
+        );
         drop(h);
         assert_eq!(budget.used(), 0);
 
@@ -1458,7 +1473,7 @@ fn request_events_stay_charged_while_responses_stream() {
         let response = send.send_request(metadata_request()).await?;
         assert_eq!(response.status(), 200);
         assert!(budget.used() >= 4096);
-        assert!(fcx.events().of("http", "request").is_empty());
+        assert!(evidence.checked_of("http", "request").unwrap().is_empty());
         drop(response);
         fcx.idle().await?;
         idle_http2_budget(&budget);
@@ -1527,7 +1542,10 @@ async fn keep_alive_response(fcx: &Cx, conn: &mut impl Connection) -> http1::Res
 /// Requires a successful keep-alive request before rejecting an over-long
 /// header, on hyper's upgrade path.
 #[cfg(feature = "tokio")]
-async fn upgrade_keep_alive_line_limit(fcx: &Cx) -> fictionet::Result {
+async fn upgrade_keep_alive_line_limit(
+    fcx: &Cx,
+    evidence: &fictionet::events::Memory,
+) -> fictionet::Result {
     let (server, client) = two_machines(fcx);
     let opts = HttpOptions {
         limits: Limits {
@@ -1586,24 +1604,24 @@ async fn upgrade_keep_alive_line_limit(fcx: &Cx) -> fictionet::Result {
         .await;
     // The upgrade path rejects the head by closing without a status response.
     assert_eq!(result, Ok(Ok(0)));
-    assert_eq!(fcx.events().of("http", "request").len(), 2);
+    assert_eq!(evidence.checked_of("http", "request").unwrap().len(), 2);
     Ok(())
 }
 
 #[cfg(feature = "tokio")]
 #[test]
 fn upgrade_keep_alive_preserves_line_limits() {
-    world(Duration::from_secs(10), |fcx| async move {
-        upgrade_keep_alive_line_limit(&fcx).await
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
+        upgrade_keep_alive_line_limit(&fcx, &evidence).await
     });
 }
 
 #[cfg(feature = "tokio")]
 #[test]
 fn upgrade_keep_alive_line_limit_rejection_records_protocol_error() {
-    world(Duration::from_secs(10), |fcx| async move {
-        upgrade_keep_alive_line_limit(&fcx).await?;
-        let errors = fcx.events().of("http", "error");
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, evidence| async move {
+        upgrade_keep_alive_line_limit(&fcx, &evidence).await?;
+        let errors = evidence.checked_of("http", "error").unwrap();
         assert_eq!(errors.len(), 1, "missing limit rejection event");
         assert_eq!(errors[0].str("cause"), Some("protocol"));
         Ok(())

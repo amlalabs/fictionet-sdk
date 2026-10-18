@@ -17,8 +17,11 @@ where
 }
 
 /// Runs a seeded lab world within the host limit and requires Done.
-pub fn seeded_world<F, Fut>(seed: fictionet::Seed, limit: Duration, f: F)
-where
+pub fn seeded_world<F, Fut>(
+    seed: impl Into<fictionet::RunOptions> + Send + 'static,
+    limit: Duration,
+    f: F,
+) where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
@@ -43,8 +46,11 @@ where
 
 /// Runs a seeded real-time world within the host limit and requires Done.
 #[cfg(feature = "std")]
-pub fn seeded_real_world<F, Fut>(seed: fictionet::Seed, limit: Duration, f: F)
-where
+pub fn seeded_real_world<F, Fut>(
+    seed: impl Into<fictionet::RunOptions> + Send + 'static,
+    limit: Duration,
+    f: F,
+) where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
@@ -55,4 +61,18 @@ where
         }))
     });
     ended_with_done(result).unwrap_or_else(|e| panic!("the world failed: {e}"));
+}
+
+/// Runs a lab fixture with explicitly installed event evidence.
+pub fn observed_world<F, Fut>(limit: Duration, f: F)
+where
+    F: FnOnce(Cx, std::sync::Arc<fictionet::events::Memory>) -> Fut + Send + 'static,
+    Fut: Future<Output = fictionet::Result> + Send + 'static,
+{
+    let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+    seeded_world(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
+        limit,
+        move |cx| f(cx, evidence),
+    );
 }

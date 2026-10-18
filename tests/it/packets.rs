@@ -24,9 +24,9 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
 
     let kept = Arc::new(Mutex::new(None));
     let saved = kept.clone();
-    block_on(fictionet::lab(
+    block_on(crate::common::observed_lab(
         fictionet::Seed::from_u64(1),
-        |fcx| async move {
+        |fcx, evidence| async move {
             let conn = ConnInfo::new(9, "10.0.0.1:53".parse()?, "10.0.0.2:4000".parse()?);
             let udp = |port: u16, len| {
                 let mut payload = vec![0; len];
@@ -68,16 +68,16 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
                     |event| event.conn(&conn).field("owner", "edge"),
                 );
             }
-            assert_eq!(fcx.events().of("test", "drop").len(), 4);
-            *saved.lock().unwrap() = Some(fcx.events());
+            assert_eq!(evidence.checked_of("test", "drop").unwrap().len(), 6);
+            *saved.lock().unwrap() = Some(evidence);
             Ok(())
         },
     ))
     .unwrap();
 
     let log = kept.lock().unwrap().take().unwrap();
-    let events = log.all();
-    assert_eq!(events.len(), 5);
+    let events = log.checked_of("test", "drop").unwrap();
+    assert_eq!(events.len(), 6);
     let expected = [
         (
             "10.0.0.2 → 10.0.0.1: blocked",
@@ -96,13 +96,17 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
             r#"{"src":null,"dst":null,"protocol":null,"why":"blocked","owner":"edge","len":1,"dst_port":null,"waiting":3,"count":1}"#,
         ),
         (
-            "2 more: 10.0.0.2 → 10.0.0.1: blocked",
-            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","count":2,"len":[30,32],"dst_port":[80,443],"waiting":[4,5]}"#,
+            "10.0.0.2 → 10.0.0.1: blocked",
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":30,"dst_port":80,"waiting":4,"count":1}"#,
+        ),
+        (
+            "10.0.0.2 → 10.0.0.1: blocked",
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":32,"dst_port":443,"waiting":5,"count":1}"#,
         ),
     ];
     for (i, (event, (summary, fields))) in events.iter().zip(expected).enumerate() {
         assert!(event.is("test", "drop"));
-        assert_eq!(event.seq, i as u64 + 1);
+        assert_eq!(event.seq, i as u64 + 2);
         assert_eq!(event.at, fictionet::time::Instant::ZERO);
         assert_eq!(event.level, Level::Notice);
         assert_eq!(event.summary, summary);
@@ -1682,49 +1686,52 @@ fn every_task_stops_when_its_region_is_cancelled() {
 
 #[test]
 fn lan_drop_identity_comes_from_ingress_registration() {
-    world(|fcx| async move {
-        let lan = lan(&fcx, "10.0.0.0/24".parse()?, |event| {
-            event.field("lan", "test")
-        });
-        let identity = fictionet::events::Sandbox {
-            id: 17,
-            name: Arc::from("member"),
-            addr: Some(Ipv4Addr::new(10, 0, 0, 2)),
-            addr_v6: None,
-        };
-        let (member, mut peer) = pair();
-        lan.add("10.0.0.2".parse()?, member, Some(identity.clone()))?;
-        // The packet claims another member's source address.
-        peer.send(ip::packet(
-            "10.0.0.3".parse()?,
-            "10.0.0.99".parse()?,
-            253,
-            &[],
-        ));
-        peer.send(Packet(vec![1, 2, 3]));
-        let events = fcx.events();
-        let drops = events
-            .wait(&fcx, 2, Duration::from_secs(10), |e| e.is("lan", "drop"))
-            .await?;
-        assert_eq!(drops.len(), 2);
-        assert!(events.of("net", "blocked").is_empty());
-        for event in &drops {
-            assert_eq!(event.conn.sandbox.as_ref(), Some(&identity));
-            assert_eq!(event.str("lan"), Some("test"));
-            assert_eq!(event.u64("count"), Some(1));
-        }
-        assert_eq!(drops[0].str("src"), Some("10.0.0.3"));
-        assert_eq!(drops[1].str("why"), Some("not an IP packet"));
-        // Replacing the interface also replaces its registered identity.
-        let (member, mut peer) = pair();
-        lan.add("10.0.0.2".parse()?, member, None)?;
-        peer.send(Packet(vec![1, 2, 3]));
-        let drops = fcx
-            .events()
-            .wait(&fcx, 3, Duration::from_secs(10), |e| e.is("lan", "drop"))
-            .await?;
-        assert_eq!(drops.len(), 3);
-        assert!(drops[2].conn.sandbox.is_none());
-        Ok(())
-    });
+    block_on(crate::common::observed_lab(
+        fictionet::Seed::from_u64(1),
+        |fcx, evidence| async move {
+            let lan = lan(&fcx, "10.0.0.0/24".parse()?, |event| {
+                event.field("lan", "test")
+            });
+            let identity = fictionet::events::Sandbox {
+                id: 17,
+                name: Arc::from("member"),
+                addr: Some(Ipv4Addr::new(10, 0, 0, 2)),
+                addr_v6: None,
+            };
+            let (member, mut peer) = pair();
+            lan.add("10.0.0.2".parse()?, member, Some(identity.clone()))?;
+            // The packet claims another member's source address.
+            peer.send(ip::packet(
+                "10.0.0.3".parse()?,
+                "10.0.0.99".parse()?,
+                253,
+                &[],
+            ));
+            peer.send(Packet(vec![1, 2, 3]));
+            let events = evidence.clone();
+            let drops = events
+                .wait(&fcx, 2, Duration::from_secs(10), |e| e.is("lan", "drop"))
+                .await?;
+            assert_eq!(drops.len(), 2);
+            assert!(events.checked_of("net", "blocked").unwrap().is_empty());
+            for event in &drops {
+                assert_eq!(event.conn.sandbox.as_ref(), Some(&identity));
+                assert_eq!(event.str("lan"), Some("test"));
+                assert_eq!(event.u64("count"), Some(1));
+            }
+            assert_eq!(drops[0].str("src"), Some("10.0.0.3"));
+            assert_eq!(drops[1].str("why"), Some("not an IP packet"));
+            // Replacing the interface also replaces its registered identity.
+            let (member, mut peer) = pair();
+            lan.add("10.0.0.2".parse()?, member, None)?;
+            peer.send(Packet(vec![1, 2, 3]));
+            let drops = evidence
+                .wait(&fcx, 3, Duration::from_secs(10), |e| e.is("lan", "drop"))
+                .await?;
+            assert_eq!(drops.len(), 3);
+            assert!(drops[2].conn.sandbox.is_none());
+            Ok(())
+        },
+    ))
+    .unwrap();
 }

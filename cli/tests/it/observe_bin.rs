@@ -19,7 +19,8 @@ fn start_world(path: &str) -> fictionet::Listening {
         fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random())
+                .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
             move |fcx| async move {
                 fcx.spawn(move |fcx| async move {
                     while let Ok(a) = attachments.next(&fcx).await {
@@ -919,7 +920,8 @@ fn start_two_links(path: &str) -> fictionet::Listening {
     let (ready, started) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random())
+                .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
             move |fcx| async move {
                 // Observers find a world once it takes attachments.
                 fcx.spawn(move |fcx| async move {
@@ -1201,7 +1203,8 @@ fn a_watch_exits_0_when_the_world_ends() {
     let (stop, mut stopped) = fictionet::pair();
     let world_thread = std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random())
+                .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
             move |fcx| async move {
                 fcx.spawn(move |fcx| async move {
                     while let Ok(a) = attachments.next(&fcx).await {

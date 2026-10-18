@@ -17,7 +17,8 @@ fn main() -> fictionet::Result {
     println!("listening on {path}");
 
     fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         |fcx| async move {
             let app = axum::Router::new().route(
                 "/",

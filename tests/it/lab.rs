@@ -10,34 +10,37 @@ use fictionet::{Cancelled, JoinError, RaceError, RunMode, Seed, Timer, block_on,
 
 #[test]
 fn idle_drains_spawned_and_woken_work_before_advancing_time() {
-    block_on(lab(Seed::from_u64(1), |cx| async move {
-        let task = cx.spawn(|cx| async move {
-            for _ in 0..100 {
-                cx.yield_now().await?;
-            }
-            cx.spawn(|cx| async move {
-                cx.record(Event::new("test", "ready"));
-                cx.sleep(ms(1)).await?;
-                cx.record(Event::new("test", "later"));
+    block_on(crate::common::observed_lab(
+        Seed::from_u64(1),
+        |cx, evidence| async move {
+            let task = cx.spawn(|cx| async move {
+                for _ in 0..100 {
+                    cx.yield_now().await?;
+                }
+                cx.spawn(|cx| async move {
+                    cx.record(Event::new("test", "ready"));
+                    cx.sleep(ms(1)).await?;
+                    cx.record(Event::new("test", "later"));
+                    Ok(())
+                });
                 Ok(())
             });
+            cx.idle().await?;
+            assert_eq!(cx.now(), Instant::ZERO);
+            assert_eq!(evidence.checked_of("test", "ready").unwrap().len(), 1);
+            assert!(evidence.checked_of("test", "later").unwrap().is_empty());
+            task.join(&cx).await?;
+            cx.idle().await?;
+            assert_eq!(cx.now(), Instant::ZERO);
+            cx.sleep(ms(1)).await?;
+            cx.idle().await?;
+            assert_eq!(evidence.checked_of("test", "later").unwrap().len(), 1);
+            assert_eq!(cx.now(), Instant::ZERO + ms(1));
+            cx.cancel();
+            assert_eq!(cx.idle().await, Err(Cancelled));
             Ok(())
-        });
-        cx.idle().await?;
-        assert_eq!(cx.now(), Instant::ZERO);
-        assert_eq!(cx.events().of("test", "ready").len(), 1);
-        assert!(cx.events().of("test", "later").is_empty());
-        task.join(&cx).await?;
-        cx.idle().await?;
-        assert_eq!(cx.now(), Instant::ZERO);
-        cx.sleep(ms(1)).await?;
-        cx.idle().await?;
-        assert_eq!(cx.events().of("test", "later").len(), 1);
-        assert_eq!(cx.now(), Instant::ZERO + ms(1));
-        cx.cancel();
-        assert_eq!(cx.idle().await, Err(Cancelled));
-        Ok(())
-    }))
+        },
+    ))
     .unwrap();
 }
 
@@ -59,38 +62,41 @@ fn dropped_idle_waits_do_not_delay_the_clock() {
 }
 
 #[test]
-fn event_wait_wakes_at_the_event_and_repeat_deadlines() {
+fn event_wait_wakes_at_each_raw_fact() {
     for _ in 0..3 {
-        block_on(lab(Seed::from_u64(1), |cx| async move {
-            cx.spawn(|cx| async move {
-                cx.sleep(Duration::from_nanos(7)).await?;
-                cx.record(Event::new("test", "ready"));
-                cx.record_repeat(Event::new("test", "repeat"), Default::default());
-                cx.sleep(ms(2)).await?;
-                cx.record_repeat(Event::new("test", "repeat"), Default::default());
+        block_on(crate::common::observed_lab(
+            Seed::from_u64(1),
+            |cx, evidence| async move {
+                cx.spawn(|cx| async move {
+                    cx.sleep(Duration::from_nanos(7)).await?;
+                    cx.record(Event::new("test", "ready"));
+                    cx.record_repeat(Event::new("test", "repeat"), Default::default());
+                    cx.sleep(ms(2)).await?;
+                    cx.record_repeat(Event::new("test", "repeat"), Default::default());
+                    Ok(())
+                });
+                let log = evidence;
+                let got = log.wait(&cx, 1, ms(1), |e| e.is("test", "ready")).await?;
+                assert_eq!(got.len(), 1);
+                assert_eq!(cx.now().since_start(), Duration::from_nanos(7));
+                let mut checks = Vec::new();
+                let got = log
+                    .wait(&cx, 2, Duration::from_secs(2), |e| {
+                        if e.is("test", "repeat") {
+                            checks.push(cx.now());
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .await?;
+                assert_eq!(got.len(), 2);
+                let first = Instant::ZERO + Duration::from_nanos(7);
+                assert_eq!(cx.now(), first + ms(2));
+                assert_eq!(checks, [first, cx.now(), cx.now()]);
                 Ok(())
-            });
-            let log = cx.events();
-            let got = log.wait(&cx, 1, ms(1), |e| e.is("test", "ready")).await?;
-            assert_eq!(got.len(), 1);
-            assert_eq!(cx.now().since_start(), Duration::from_nanos(7));
-            let mut checks = Vec::new();
-            let got = log
-                .wait(&cx, 2, Duration::from_secs(2), |e| {
-                    if e.is("test", "repeat") {
-                        checks.push(cx.now());
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .await?;
-            assert_eq!(got.len(), 2);
-            let first = Instant::ZERO + Duration::from_nanos(7);
-            assert_eq!(cx.now(), first + Duration::from_secs(1));
-            assert_eq!(checks, [first, first + ms(2), cx.now(), cx.now()]);
-            Ok(())
-        }))
+            },
+        ))
         .unwrap();
     }
 }
@@ -98,59 +104,71 @@ fn event_wait_wakes_at_the_event_and_repeat_deadlines() {
 #[test]
 fn event_wait_stops_at_its_exact_limit() {
     for limit in [Duration::ZERO, Duration::from_nanos(1), ms(1), ms(15)] {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
-            fcx.sleep(ms(3)).await?;
-            fcx.record(Event::new("test", "tick"));
-            let start = fcx.now();
-            let got = fcx
-                .events()
-                .wait(&fcx, 2, limit, |event| event.is("test", "tick"))
-                .await?;
-            assert_eq!(got.len(), 1);
-            assert_eq!(fcx.now(), start + limit);
-            Ok(())
-        }))
+        block_on(crate::common::observed_lab(
+            Seed::from_u64(1),
+            |fcx, evidence| async move {
+                fcx.sleep(ms(3)).await?;
+                fcx.record(Event::new("test", "tick"));
+                let start = fcx.now();
+                let got = evidence
+                    .wait(&fcx, 2, limit, |event| event.is("test", "tick"))
+                    .await?;
+                assert_eq!(got.len(), 1);
+                assert_eq!(fcx.now(), start + limit);
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 }
 
 #[test]
 fn event_wait_accepts_an_overflowing_limit() {
-    block_on(lab(Seed::from_u64(1), |fcx| async move {
-        fcx.sleep(ms(1)).await?;
-        fcx.spawn(|fcx| async move {
+    block_on(crate::common::observed_lab(
+        Seed::from_u64(1),
+        |fcx, evidence| async move {
             fcx.sleep(ms(1)).await?;
-            fcx.record(Event::new("test", "tick"));
+            fcx.spawn(|fcx| async move {
+                fcx.sleep(ms(1)).await?;
+                fcx.record(Event::new("test", "tick"));
+                Ok(())
+            });
+            let got = evidence
+                .wait(&fcx, 1, Duration::MAX, |event| event.is("test", "tick"))
+                .await?;
+            assert_eq!(got.len(), 1);
+            assert_eq!(fcx.now().since_start(), ms(2));
             Ok(())
-        });
-        let got = fcx
-            .events()
-            .wait(&fcx, 1, Duration::MAX, |event| event.is("test", "tick"))
-            .await?;
-        assert_eq!(got.len(), 1);
-        assert_eq!(fcx.now().since_start(), ms(2));
-        Ok(())
-    }))
+        },
+    ))
     .unwrap();
 }
 
 #[test]
 fn event_wait_cancellation_wins_at_the_deadline() {
-    block_on(lab(Seed::from_u64(1), |fcx| async move {
-        let log = fcx.events();
-        let mut wait = pin!(log.wait(&fcx, 1, ms(1), |_| true));
-        poll_fn(|cx| {
-            assert!(wait.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        fcx.sleep(ms(1)).await?;
-        fcx.record(Event::new("test", "tick"));
-        fcx.cancel();
-        assert_eq!(wait.await.unwrap_err(), Cancelled);
-        assert_eq!(fcx.now().since_start(), ms(1));
-        Ok(())
-    }))
+    block_on(crate::common::observed_lab(
+        Seed::from_u64(1),
+        |fcx, evidence| async move {
+            let log = evidence;
+            let mut wait = pin!(log.wait(&fcx, 1, ms(1), |e| e.is("test", "tick")));
+            poll_fn(|cx| {
+                assert!(wait.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            fcx.sleep(ms(1)).await?;
+            fcx.record(Event::new("test", "tick"));
+            fcx.cancel();
+            assert!(
+                wait.await
+                    .unwrap_err()
+                    .downcast_ref::<Cancelled>()
+                    .is_some()
+            );
+            assert_eq!(fcx.now().since_start(), ms(1));
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
@@ -489,89 +507,38 @@ fn real_io_is_refused_before_opening_resources() {
     .unwrap();
 }
 
-#[derive(Clone)]
-struct Bytes(Arc<Mutex<Vec<u8>>>, std::thread::ThreadId);
-impl std::io::Write for Bytes {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        assert_eq!(self.1, std::thread::current().id());
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn recorded_world() -> Vec<u8> {
-    let bytes = Bytes(Arc::default(), std::thread::current().id());
-    let out = bytes.clone();
-    block_on(lab(Seed::from_u64(7), move |cx| async move {
-        use fictionet::events::{Event, Fields};
-        let log = cx.events();
-        log.to_writer(Box::new(out.clone()));
-        log.start(&cx, Fields::default());
-        assert!(
-            !out.0.lock().unwrap().is_empty(),
-            "the sink writes synchronously"
-        );
-        assert!(matches!(
-            log.of("run", "start")[0].get("wall"),
-            Some(fictionet::stdlib::protocols::json::Value::Null)
-        ));
-        for i in 0..4 {
-            cx.sleep(ms(15)).await?;
-            cx.record(
-                Event::new("test", "draw")
-                    .field("i", i)
-                    .field("draw", cx.random_u64()),
-            );
-        }
-        // Open repeat windows are flushed when the run ends, in order.
-        cx.record_repeat(Event::new("test", "repeat"), Fields::default());
-        cx.record_repeat(Event::new("test", "repeat"), Fields::default());
-        assert_eq!(log.lost(), 0);
-        Ok(())
-    }))
+    let evidence = Arc::new(fictionet::events::Memory::default());
+    let out = evidence.clone();
+    block_on(lab(
+        fictionet::RunOptions::new(Seed::from_u64(7)).observer(out.clone()),
+        move |cx| async move {
+            use fictionet::events::{Event, Fields};
+            assert!(matches!(
+                out.checked_of("run", "start").unwrap()[0].get("wall"),
+                Some(fictionet::stdlib::protocols::json::Value::Null)
+            ));
+            for i in 0..4 {
+                cx.sleep(ms(15)).await?;
+                cx.record(
+                    Event::new("test", "draw")
+                        .field("i", i)
+                        .field("draw", cx.random_u64()),
+                );
+            }
+            // Each repeat is delivered as a raw fact.
+            cx.record_repeat(Event::new("test", "repeat"), Fields::default());
+            cx.record_repeat(Event::new("test", "repeat"), Fields::default());
+            Ok(())
+        },
+    ))
     .unwrap();
-    bytes.0.lock().unwrap().clone()
+    crate::common::evidence_bytes(&evidence)
 }
 
 #[test]
 fn lab_event_bytes_repeat() {
     assert_eq!(recorded_world(), recorded_world());
-}
-
-#[test]
-fn reentrant_event_subscriptions_preserve_replay_and_sink_order() {
-    block_on(lab(Seed::from_u64(7), |fcx| async move {
-        let log = fcx.events();
-        fcx.record(Event::new("test", "first"));
-        fcx.record(Event::new("test", "second"));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let out = seen.clone();
-        let recording = fcx.clone();
-        log.subscribe(move |event| {
-            if event.is("test", "first") || event.is("test", "live") {
-                recording.record(Event::new("test", "reentrant"));
-            }
-            out.lock().unwrap().push(event.seq);
-        });
-        assert_eq!(*seen.lock().unwrap(), [1, 2, 3]);
-
-        let bytes = Bytes(Arc::default(), std::thread::current().id());
-        log.to_writer(Box::new(bytes.clone()));
-        fcx.record(Event::new("test", "live"));
-        assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4, 5]);
-        let expected: String = log
-            .all()
-            .iter()
-            .map(|event| event.to_line().unwrap() + "\n")
-            .collect();
-        assert_eq!(*bytes.0.lock().unwrap(), expected.as_bytes());
-        assert_eq!(log.lost(), 0);
-        Ok(())
-    }))
-    .unwrap();
 }
 
 #[test]
@@ -594,57 +561,58 @@ fn seeded_service_faults_repeat_at_the_same_points() {
     }
 
     let episode = |seed| {
-        let bytes = Bytes(Arc::default(), std::thread::current().id());
-        let output = bytes.clone();
+        let evidence = Arc::new(fictionet::events::Memory::default());
+        let output = evidence.clone();
         let points = Arc::new(Mutex::new(Vec::new()));
         let replies = points.clone();
-        block_on(lab(Seed::from_u64(seed), move |cx| async move {
-            cx.events().to_writer(Box::new(output));
-            let (a, b) = fictionet::pair();
-            let client = tcp::endpoint(&cx, a, "10.0.0.2".parse()?);
-            let server = tcp::endpoint(&cx, b, "10.0.0.1".parse()?);
-            let mut listener = server.listen(7)?;
-            cx.spawn(move |cx| async move {
-                let conn = listener.accept(&cx).await?;
-                let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
-                let options = ServeOptions::default().faults(FaultPlan::new(Plan {
-                    outbound: vec![Rule {
-                        when: Trigger::Chance { take: 1, out_of: 2 },
-                        fault: ByteFault::Corrupt {
-                            offset: Some(0),
-                            xor: 1,
-                        },
-                    }],
-                    ..Plan::default()
-                }));
-                serve::connection(&cx, conn, info, &mut Echo, &(), &options).await?;
-                Ok(())
-            });
-            let mut conn = client.connect(&cx, "10.0.0.1:7".parse()?).await?;
-            for i in 0..32 {
-                conn.write_all(&cx, b"a\n").await?;
-                let mut reply = [0; 2];
-                let mut filled = 0;
-                while filled < reply.len() {
-                    let n = conn.read(&cx, &mut reply[filled..]).await?;
-                    assert_ne!(n, 0);
-                    filled += n;
+        block_on(lab(
+            fictionet::RunOptions::new(Seed::from_u64(seed)).observer(output),
+            move |cx| async move {
+                let (a, b) = fictionet::pair();
+                let client = tcp::endpoint(&cx, a, "10.0.0.2".parse()?);
+                let server = tcp::endpoint(&cx, b, "10.0.0.1".parse()?);
+                let mut listener = server.listen(7)?;
+                cx.spawn(move |cx| async move {
+                    let conn = listener.accept(&cx).await?;
+                    let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+                    let options = ServeOptions::default().faults(FaultPlan::new(Plan {
+                        outbound: vec![Rule {
+                            when: Trigger::Chance { take: 1, out_of: 2 },
+                            fault: ByteFault::Corrupt {
+                                offset: Some(0),
+                                xor: 1,
+                            },
+                        }],
+                        ..Plan::default()
+                    }));
+                    serve::connection(&cx, conn, info, &mut Echo, &(), &options).await?;
+                    Ok(())
+                });
+                let mut conn = client.connect(&cx, "10.0.0.1:7".parse()?).await?;
+                for i in 0..32 {
+                    conn.write_all(&cx, b"a\n").await?;
+                    let mut reply = [0; 2];
+                    let mut filled = 0;
+                    while filled < reply.len() {
+                        let n = conn.read(&cx, &mut reply[filled..]).await?;
+                        assert_ne!(n, 0);
+                        filled += n;
+                    }
+                    assert!(reply == *b"a\n" || reply == *b"`\n");
+                    let fault = reply[0] == b'`';
+                    replies.lock().unwrap().push((i, cx.now(), fault));
+                    cx.record(
+                        Event::new("client", "reply")
+                            .field("i", i)
+                            .field("fault", fault),
+                    );
                 }
-                assert!(reply == *b"a\n" || reply == *b"`\n");
-                let fault = reply[0] == b'`';
-                replies.lock().unwrap().push((i, cx.now(), fault));
-                cx.record(
-                    Event::new("client", "reply")
-                        .field("i", i)
-                        .field("fault", fault),
-                );
-            }
-            assert_eq!(cx.events().lost(), 0);
-            cx.cancel();
-            Ok(())
-        }))
+                cx.cancel();
+                Ok(())
+            },
+        ))
         .unwrap();
-        let events = bytes.0.lock().unwrap().clone();
+        let events = crate::common::evidence_bytes(&evidence);
         let points = points.lock().unwrap().clone();
         (events, points)
     };

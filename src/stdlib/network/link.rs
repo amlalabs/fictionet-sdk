@@ -414,54 +414,65 @@ mod tests {
         .unwrap();
     }
 
-    /// A flooded bottleneck counts its drops: a few events, not one per
-    /// packet, so the flood pushes nothing else out of the log.
+    /// A bounded observer reports incomplete evidence when a flood exceeds
+    /// its retention budget; the bottleneck still reports every raw drop.
     #[test]
-    fn a_flooded_bottleneck_counts_its_drops() {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+    fn a_flooded_bottleneck_reports_raw_drops_and_retention_loss() {
+        use fictionet::events::{ConnInfo, Limits, Memory, Metadata, Observation, Observer, Stamp};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct Facts {
+            requests: Memory,
+            drops: AtomicUsize,
+        }
+        impl Observer for Facts {
+            fn enabled(&self, meta: Metadata, _: &ConnInfo) -> bool {
+                (meta.source == "bottleneck" && meta.kind == "drop")
+                    || (meta.source == "http" && meta.kind == "request")
+            }
+            fn observe(&self, stamp: Stamp, item: Observation<'_>) {
+                let Observation::Event(event) = item;
+                if event.is("bottleneck", "drop") {
+                    assert_eq!(event.u64("count"), Some(1));
+                    assert_eq!(event.str("why"), Some("the queue was full"));
+                    self.drops.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.requests.observe(stamp, item);
+                }
+            }
+        }
+        let flood = fictionet::events::MAX_EVENTS + 10_000;
+        let evidence = Arc::new(Facts {
+            requests: Memory::new(Limits::new(2, 4096)),
+            drops: AtomicUsize::new(0),
+        });
+        let bounded = std::sync::Arc::new(fictionet::events::Memory::new(
+            fictionet::events::Limits::new(32, 32 << 10),
+        ));
+        let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(
+            std::sync::Arc::new(fictionet::events::Fanout::new(vec![evidence.clone(), bounded.clone()])),
+        );
+        let retained = evidence.clone();
+        block_on(fictionet::lab(options, move |fcx| async move {
             let (mut sandbox, inner) = pair();
             let _far = bottleneck(&fcx, 0, 10, inner);
             fcx.record(fictionet::events::Event::new("http", "request"));
-            let flood = fictionet::events::MAX_EVENTS + 10_000;
             for i in 0..flood {
                 sandbox.send(Packet(vec![0x45; 20]));
                 if i % 32 == 31 {
                     fcx.yield_now().await?;
                 }
             }
-            let deadline = fcx.now() + 3 * fictionet::events::REPEAT_WINDOW;
-            let mut next = 1;
-            loop {
-                let drops = fcx
-                    .events()
-                    .wait(&fcx, next, Duration::from_millis(50), |e| {
-                        e.source == "bottleneck" && e.kind == "drop"
-                    })
-                    .await?;
-                let reported = drops.iter().map(|e| e.u64("count").unwrap()).sum::<u64>();
-                if reported == flood as u64 - 10 {
-                    break;
-                }
-                assert!(
-                    fcx.now() < deadline,
-                    "drop report counted {reported} of {} packets",
-                    flood - 10
-                );
-                next = drops.len() + 1;
-            }
+            fcx.idle().await?;
+            assert_eq!(retained.drops.load(Ordering::Relaxed), flood - 10);
             fcx.record(fictionet::events::Event::new("http", "request"));
-            let events = fcx.events();
-            assert_eq!(events.of("http", "request").len(), 2);
-            let drops = events.of("bottleneck", "drop");
-            assert!(drops.len() <= 4, "{drops:?}");
-            assert_eq!(
-                drops.iter().map(|e| e.u64("count").unwrap()).sum::<u64>(),
-                flood as u64 - 10
-            );
-            assert_eq!(drops[0].str("why"), Some("the queue was full"));
+            fcx.cancel();
             Ok(())
-        }))
-        .unwrap();
+        })).unwrap();
+        assert_eq!(evidence.requests.checked_of("http", "request").unwrap().len(), 2);
+        assert!(bounded.checked_all().is_err());
+        assert!(bounded.dropped() > 0);
+        let (count, bytes) = bounded.retained();
+        assert!(count <= 32 && bytes <= 32 << 10);
     }
 
     #[test]

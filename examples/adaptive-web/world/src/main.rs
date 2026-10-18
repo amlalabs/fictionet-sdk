@@ -82,9 +82,11 @@ fn real_main() -> fictionet::Result {
         .enable_all()
         .build()?;
     let result = runtime.block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
-            adaptive_web_world::events::LogObserver { log: log.clone() },
-        )),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(Arc::new(fictionet::events::Memory::default()))
+            .observer(Arc::new(adaptive_web_world::events::LogObserver {
+                log: log.clone(),
+            })),
         move |fcx| async move {
             let backend = Backend::new(&fcx, args.backend_port)?;
             let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);

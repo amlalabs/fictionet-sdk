@@ -49,11 +49,12 @@
 //!     }
 //! }
 //!
-//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
+//! let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(evidence.clone());
 //! assert_eq!(h.push(b"hello\nwor")?, b"hello\n");
 //! assert_eq!(h.push(b"ld\nquit\n")?, b"world\n");
 //! assert!(h.closed());
-//! assert_eq!(h.events().len(), 2);
+//! assert_eq!(evidence.checked_all().unwrap().len(), 2);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -3478,7 +3479,7 @@ pub struct Harness<S: Service> {
     opts: ServeOptions,
     now: Instant,
     opened: bool,
-    events: Vec<Event>,
+    observer: crate::events::Dispatch,
     output: Vec<u8>,
     upgraded: Option<Upgrade>,
     /// Whether a call returned the upgrade.
@@ -3502,8 +3503,8 @@ where
 
     /// The same with `opts`: an idle limit, a fault plan and a budget.
     /// The standalone entropy stream starts from `seed`. TLS and the
-    /// connection cap are not used, and events are kept in the harness
-    /// ([`Harness::events`]), not recorded.
+    /// connection cap are not used. Event retention requires an explicit
+    /// observer installed with [`Harness::observer`].
     pub fn with_options(seed: Seed, service: S, state: S::State, opts: ServeOptions) -> Harness<S> {
         let info = ConnInfo {
             id: Some(1),
@@ -3525,11 +3526,21 @@ where
             opts,
             now: Instant::ZERO,
             opened: false,
-            events: Vec::new(),
+            observer: crate::events::Dispatch::new(None),
             output: Vec::new(),
             upgraded: None,
             reported: false,
         }
+    }
+
+    /// Installs a destination for staged service events before opening.
+    pub fn observer(mut self, observer: Arc<dyn crate::events::Observer>) -> Self {
+        assert!(
+            !self.opened,
+            "install the observer before opening the harness"
+        );
+        self.observer = crate::events::Dispatch::new(Some(observer));
+        self
     }
 
     /// The connection the service sees.
@@ -3610,7 +3621,21 @@ where
     /// does.
     fn drain(&mut self, reply: &mut Vec<u8>) {
         self.core.recharge(&self.service);
-        self.events.append(&mut self.core.s.events);
+        for event in self.core.s.events.drain(..) {
+            let event = event.conn(&self.core.info);
+            if let Some(cx) = &self.core.fcx {
+                cx.record(event.clone());
+            }
+            if self.observer.enabled(
+                crate::events::Metadata {
+                    source: event.source,
+                    kind: event.kind,
+                },
+                &event.conn,
+            ) {
+                self.observer.emit(event, || self.now);
+            }
+        }
         while let Some(out) = self.core.out.pop_front() {
             if let Out::Bytes(b, credit) = out {
                 self.output.extend_from_slice(&b);
@@ -3781,11 +3806,6 @@ where
         self.upgraded
     }
 
-    /// Every event the service recorded.
-    pub fn events(&self) -> &[Event] {
-        &self.events
-    }
-
     /// Every byte the service sent.
     pub fn output(&self) -> &[u8] {
         &self.output
@@ -3799,5 +3819,11 @@ where
     /// The service's shared state.
     pub fn state(&self) -> &S::State {
         &self.state
+    }
+}
+
+impl<S: Service> Drop for Harness<S> {
+    fn drop(&mut self) {
+        self.observer.end(|| self.now);
     }
 }

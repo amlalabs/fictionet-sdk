@@ -11,21 +11,21 @@ use super::*;
 /// events it has checked.
 #[derive(Clone)]
 pub(super) struct Log {
-    events: EventLog,
+    pub(super) events: Arc<Memory>,
     from: Arc<AtomicU64>,
 }
 
 impl Log {
-    pub(super) fn new(fcx: &Cx) -> Log {
+    pub(super) fn new(events: Arc<Memory>) -> Log {
         Log {
-            events: fcx.events(),
+            events,
             from: Arc::default(),
         }
     }
 
     /// Moves the mark past every event so far.
     pub(super) fn clear(&self) {
-        self.from.store(self.events.recorded(), Ordering::SeqCst);
+        self.from.store(self.events.last(), Ordering::SeqCst);
     }
 }
 
@@ -35,21 +35,35 @@ where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    run_world::world(Duration::from_secs(60), move |fcx| async move {
-        let (attacher, attachments) = fictionet::attachments();
-        let t = sites(&fcx);
-        let env = t.serve_with(&fcx, attachments)?;
-        let log = Log::new(&fcx);
-        f(fcx, attacher, env, log).await?;
-        Ok(())
-    });
+    world_events_with_memory(Arc::new(Memory::default()), f)
+}
+
+fn world_events_with_memory<F, Fut>(evidence: Arc<Memory>, f: F)
+where
+    F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
+    Fut: Future<Output = fictionet::Result> + Send + 'static,
+{
+    run_world::seeded_world(
+        fictionet::RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()),
+        Duration::from_secs(60),
+        move |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            let t = sites(&fcx);
+            let env = t.serve_with(&fcx, attachments)?;
+            let log = Log::new(evidence);
+            f(fcx, attacher, env, log).await?;
+            Ok(())
+        },
+    );
 }
 
 /// The events after the log's mark that `pick` keeps.
 pub(super) fn picked<T>(log: &Log, pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
     log.events
-        .after(log.from.load(Ordering::SeqCst), usize::MAX)
+        .checked_all()
+        .unwrap()
         .iter()
+        .filter(|event| event.seq > log.from.load(Ordering::SeqCst))
         .filter_map(pick)
         .collect()
 }
@@ -71,7 +85,10 @@ pub(super) async fn wait_for<T>(
         .await
         .expect("the world stopped");
     if got.len() < n {
-        panic!("fewer than {n} such events: {:#?}", log.events.all());
+        panic!(
+            "fewer than {n} such events: {:#?}",
+            log.events.checked_all().unwrap()
+        );
     }
     got.iter().filter_map(pick).collect()
 }
@@ -1147,7 +1164,7 @@ fn events_for_bytes_that_are_not_http() {
 /// A client that connects and sends nothing reaches the configured timeout.
 #[test]
 fn events_for_clients_that_send_nothing() {
-    run_world::world(Duration::from_secs(60), |fcx| async move {
+    run_world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
         let (attacher, attachments) = fictionet::attachments();
         sites(&fcx)
             .sites
@@ -1158,7 +1175,7 @@ fn events_for_clients_that_send_nothing() {
                 ..Default::default()
             })
             .start(&fcx, attachments)?;
-        let log = Log::new(&fcx);
+        let log = Log::new(evidence);
         let m = default_machine(&fcx, &attacher);
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let started = fcx.now();
@@ -1322,9 +1339,7 @@ fn events_for_blocked_packets() {
                 .is_some()
         );
 
-        // Each is recorded as it comes, except a repeat within a second:
-        // the second closed TCP port at the same machine is counted, and
-        // its count recorded a second later.
+        // Each blocked packet is retained as a raw fact.
         let got = wait_for(&fcx, &log, 12, blocked_seen).await;
         let summary: Vec<_> = got.iter().map(blocked_row).collect();
         let v4 = |a: Ipv4Addr| Some(IpAddr::V4(a));
@@ -1386,6 +1401,14 @@ fn events_for_blocked_packets() {
                     Some(me),
                     Some(6),
                     v4(me),
+                    v4(plain),
+                    Some(443)
+                ),
+                (
+                    "ClosedPort",
+                    Some(me),
+                    Some(6),
+                    v4(me),
                     v4(GATEWAY),
                     Some(80)
                 ),
@@ -1405,8 +1428,6 @@ fn events_for_blocked_packets() {
                     v4(GATEWAY),
                     Some(5000)
                 ),
-                // The count: the port's lowest and highest.
-                ("ClosedPort", Some(me), Some(6), v4(me), v4(plain), None),
             ]
         );
         let counts: Vec<_> = got.iter().map(|b| b.u64("count")).collect();
@@ -1417,21 +1438,13 @@ fn events_for_blocked_packets() {
                 .chain([Some(1)])
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
-            got[11].get("dst_port"),
-            Some(&fictionet::stdlib::protocols::json::Value::Array(vec![
-                443u64.into(),
-                443u64.into()
-            ]))
-        );
         assert!(
             got.iter()
                 .all(|b| sandbox_of(b).is_some_and(|s| &*s.name == "a" && s.id == 1))
         );
         log.clear();
 
-        // Past the limit of connections to one machine: the first refused
-        // is recorded, and the rest counted.
+        // Past the connection limit, every refusal is recorded.
         let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "secure.test", 6)
             .await
             .unwrap();
@@ -1445,13 +1458,13 @@ fn events_for_blocked_packets() {
         )
         .await;
         assert_eq!(open, 300);
-        let got = wait_for(&fcx, &log, 2, blocked_seen).await;
-        assert_eq!(got.len(), 2);
+        let got = wait_for(&fcx, &log, 44, blocked_seen).await;
         assert_eq!(
             (got[0].u64("count"), got[0].u64("dst_port")),
             (Some(1), Some(443))
         );
-        assert_eq!(got[1].u64("count"), Some(43));
+        assert_eq!(got.len(), 44);
+        assert!(got.iter().all(|event| event.u64("count") == Some(1)));
         assert!(got.iter().all(
             |b| b.str("why") == Some("TooManyConnections") && addr(b, "dst") == v4(SECURE_ADDR)
         ));
@@ -1463,68 +1476,71 @@ fn events_for_blocked_packets() {
     });
 }
 
-/// A sandbox scans more closed ports than the log holds events. The
-/// refusals are counted, not kept one by one, so the events a grader reads
-/// all stay in the log, and a file sink loses nothing.
+/// A scan retains every raw refusal within an explicitly sized budget.
 #[test]
-fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
+fn a_port_scan_fits_an_explicit_evidence_budget() {
     const SCAN: u16 = 55_000;
     let path = std::env::temp_dir().join(format!("fictionet-scan-{}.jsonl", std::process::id()));
-    let kept: Arc<std::sync::Mutex<Option<EventLog>>> = Arc::default();
-    let (keep, file) = (kept.clone(), path.clone());
-    world_events(move |fcx, attacher, env, log| async move {
-        log.events.to_file(&file)?;
-        // What a grader reads: a lookup, a TLS handshake and a request.
-        let m = default_machine(&fcx, &attacher);
-        assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
-        let conn = tls_connect(&fcx, &m, &env, SECURE_ADDR, "secure.test", &[b"http/1.1"])
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, false).await;
-        assert_eq!(
-            client.get("https", "secure.test", "/").await.status,
-            StatusCode::OK
-        );
-
-        // The scan, from another sandbox: every port but the open ones.
-        let me = Ipv4Addr::new(10, 0, 0, 3);
-        let mut raw = attacher.attach("b").unwrap();
-        raw.send(ping(me, GATEWAY, 1));
-        assert!(
-            recv_within(&fcx, &mut raw, Duration::from_secs(2))
+    let kept: Arc<std::sync::Mutex<Option<Arc<Memory>>>> = Arc::default();
+    let keep = kept.clone();
+    world_events_with_memory(
+        Arc::new(Memory::new(fictionet::events::Limits::new(
+            60_000,
+            64 << 20,
+        ))),
+        move |fcx, attacher, env, log| async move {
+            // What a grader reads: a lookup, a TLS handshake and a request.
+            let m = default_machine(&fcx, &attacher);
+            assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
+            let conn = tls_connect(&fcx, &m, &env, SECURE_ADDR, "secure.test", &[b"http/1.1"])
                 .await
-                .is_some()
-        );
-        let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "plain.test", 2)
-            .await
-            .unwrap();
-        let plain = addrs[0];
-        let ports: Vec<u16> = (1..)
-            .filter(|p| ![80, 443].contains(p))
-            .take(usize::from(SCAN))
-            .collect();
-        for batch in ports.chunks(500) {
-            for &port in batch {
-                raw.send(tcp_seg(me, 40_000, plain, port, 1, 0, SYN, &[]));
+                .unwrap();
+            let mut client = Client::new(&fcx, conn, false).await;
+            assert_eq!(
+                client.get("https", "secure.test", "/").await.status,
+                StatusCode::OK
+            );
+
+            // The scan, from another sandbox: every port but the open ones.
+            let me = Ipv4Addr::new(10, 0, 0, 3);
+            let mut raw = attacher.attach("b").unwrap();
+            raw.send(ping(me, GATEWAY, 1));
+            assert!(
+                recv_within(&fcx, &mut raw, Duration::from_secs(2))
+                    .await
+                    .is_some()
+            );
+            let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "plain.test", 2)
+                .await
+                .unwrap();
+            let plain = addrs[0];
+            let ports: Vec<u16> = (1..)
+                .filter(|p| ![80, 443].contains(p))
+                .take(usize::from(SCAN))
+                .collect();
+            for batch in ports.chunks(500) {
+                for &port in batch {
+                    raw.send(tcp_seg(me, 40_000, plain, port, 1, 0, SYN, &[]));
+                }
+                for _ in batch {
+                    let (_, _, _, t) = parse(
+                        &recv_within(&fcx, &mut raw, Duration::from_secs(2))
+                            .await
+                            .expect("a RST"),
+                    );
+                    assert_eq!(t[13] & RST, RST);
+                }
             }
-            for _ in batch {
-                let (_, _, _, t) = parse(
-                    &recv_within(&fcx, &mut raw, Duration::from_secs(2))
-                        .await
-                        .expect("a RST"),
-                );
-                assert_eq!(t[13] & RST, RST);
-            }
-        }
-        *keep.lock().unwrap() = Some(log.events.clone());
-        Ok(())
-    });
-    // The run is over: every count is recorded, and the file is written.
+            *keep.lock().unwrap() = Some(log.events.clone());
+            Ok(())
+        },
+    );
+    // The run is over: complete evidence can be serialized outside it.
     let events = kept.lock().unwrap().take().unwrap();
     fn from(e: &Entry, name: &str) -> bool {
         sandbox_of(e).is_some_and(|s| &*s.name == name)
     }
-    let all = events.all();
+    let all = events.checked_all().unwrap();
     let graders: Vec<_> = all
         .iter()
         .filter(|e| from(e, "a") && e.source != "net")
@@ -1545,11 +1561,11 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
         blocked.iter().map(|e| e.u64("count").unwrap()).sum::<u64>(),
         u64::from(SCAN)
     );
-    assert!(blocked.len() < 100, "{} events for the scan", blocked.len());
-    assert_eq!(events.lost(), 0);
+    assert_eq!(blocked.len(), usize::from(SCAN));
+    std::fs::write(&path, crate::common::evidence_bytes(&events)).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
-    assert_eq!(text.lines().count() as u64, events.recorded());
+    assert_eq!(text.lines().count() as u64, events.last());
     assert!(
         text.lines()
             .any(|l| l.contains(r#""source":"http","kind":"request""#))

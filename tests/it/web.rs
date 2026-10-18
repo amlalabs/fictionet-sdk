@@ -40,7 +40,7 @@ use std::time::{Duration, SystemTime};
 
 use axum::Extension;
 use bytes::Bytes;
-use fictionet::events::{Event as Entry, EventLog, Fields, Sandbox};
+use fictionet::events::{Event as Entry, Fields, Memory, Sandbox};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};

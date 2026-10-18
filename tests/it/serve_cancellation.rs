@@ -49,9 +49,9 @@ service_fixture! {
 fn cancelling_deferred_end_work_keeps_the_world_running() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let r = fictionet::block_on(fictionet::lab(
+        let r = fictionet::block_on(crate::common::observed_lab(
             fictionet::Seed::from_u64(1),
-            |fcx| async move {
+            |fcx, evidence| async move {
                 let (a, b) = fictionet::pair();
                 let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
                 let server = tcp::endpoint(&fcx, b, "10.0.0.1".parse()?);
@@ -64,14 +64,15 @@ fn cancelling_deferred_end_work_keeps_the_world_running() {
                 );
                 let mut conn = client.connect(&fcx, "10.0.0.1:7".parse()?).await?;
                 conn.write_all(&fcx, b"bye\n").await?;
-                fcx.events()
+                evidence
                     .wait(&fcx, 1, ms(100), |e| {
                         e.is("conn", "close") && e.str("end") == Some("cancelled")
                     })
                     .await?;
                 assert!(
-                    fcx.events()
-                        .all()
+                    evidence
+                        .checked_all()
+                        .unwrap()
                         .iter()
                         .any(|e| e.is("conn", "close") && e.str("end") == Some("cancelled"))
                 );

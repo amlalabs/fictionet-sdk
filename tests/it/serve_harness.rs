@@ -9,7 +9,8 @@ use fictionet::stdlib::services::serve::{Ended, Flow, Harness, HarnessError};
 
 #[test]
 fn the_harness_runs_a_service_with_no_runtime() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(evidence_h.clone());
     assert_eq!(h.open().unwrap(), b"hello\n");
     assert_eq!(h.push(b"one\ntw").unwrap(), b"one\n");
     assert_eq!(h.push(b"o\n").unwrap(), b"two\n");
@@ -20,7 +21,12 @@ fn the_harness_runs_a_service_with_no_runtime() {
     assert!(h.closed());
     assert_eq!(h.end_reason(), Some(Ended::Closed));
     assert!(matches!(h.push(b"more\n"), Err(HarnessError::Closed)));
-    let lines: Vec<&str> = h.events().iter().map(|e| e.summary.as_str()).collect();
+    let lines: Vec<String> = evidence_h
+        .checked_all()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.summary)
+        .collect();
     assert_eq!(lines, ["one", "two", "three", "quit"]);
     assert_eq!(h.output(), b"hello\none\ntwo\ntoo long\nthree\nbye\n");
 }

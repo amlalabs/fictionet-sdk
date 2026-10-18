@@ -42,3 +42,28 @@ pub fn ran_in_own_process(name: &str) -> bool {
     );
     true
 }
+
+/// Runs a lab with explicitly retained, bounded evidence.
+pub async fn observed_lab<F, Fut>(seed: fictionet::Seed, world: F) -> fictionet::Result
+where
+    F: FnOnce(fictionet::Cx, std::sync::Arc<fictionet::events::Memory>) -> Fut + Send,
+    Fut: std::future::Future<Output = fictionet::Result> + Send + 'static,
+{
+    let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+    fictionet::lab(
+        fictionet::RunOptions::new(seed).observer(evidence.clone()),
+        move |cx| world(cx, evidence),
+    )
+    .await
+}
+
+/// Serializes complete evidence after a deterministic run.
+pub fn evidence_bytes(evidence: &fictionet::events::Memory) -> Vec<u8> {
+    evidence
+        .checked_all()
+        .unwrap()
+        .iter()
+        .map(|event| event.to_line().unwrap() + "\n")
+        .collect::<String>()
+        .into_bytes()
+}

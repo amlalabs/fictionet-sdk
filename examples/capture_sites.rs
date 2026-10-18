@@ -50,7 +50,8 @@ fn main() -> fictionet::Result {
         result
     });
     let result = fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         move |fcx| async move {
             let app = axum::Router::new()
                 .route("/", axum::routing::get(|| async { "hello, captured\n" }));

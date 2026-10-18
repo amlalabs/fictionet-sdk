@@ -22,15 +22,20 @@ pub async fn run(assets: Assets) -> Result {
     let (attacher, attachments) = fictionet::attachments();
     let sandbox = attacher.attach("agent")?;
     let (ready, world_ready) = tokio::sync::oneshot::channel();
-    let world = tokio::spawn(fictionet::run(Seed::random(), move |fcx| async move {
-        let (ca, leaf) = certificates(&fcx)?;
-        // The guest gets the CA before it boots, so its agent can install
-        // it in the trust store.
-        if ready.send((ca.cert_pem(), fcx.clone())).is_err() {
-            return Ok(());
-        }
-        web::Sites::new(sites(&fcx, leaf.chain, leaf.key, app(), plain())?).start(&fcx, attachments)
-    }));
+    let world = tokio::spawn(fictionet::run(
+        fictionet::RunOptions::new(Seed::random())
+            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
+        move |fcx| async move {
+            let (ca, leaf) = certificates(&fcx)?;
+            // The guest gets the CA before it boots, so its agent can install
+            // it in the trust store.
+            if ready.send((ca.cert_pem(), fcx.clone())).is_err() {
+                return Ok(());
+            }
+            web::Sites::new(sites(&fcx, leaf.chain, leaf.key, app(), plain())?)
+                .start(&fcx, attachments)
+        },
+    ));
     let (ca_pem, fcx) = world_ready
         .await
         .map_err(|_| Error::msg("the world stopped before it was ready"))?;

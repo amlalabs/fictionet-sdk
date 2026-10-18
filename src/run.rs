@@ -44,6 +44,7 @@ pub struct RunOptions {
     seed: crate::Seed,
     observer: Option<Arc<dyn crate::events::Observer>>,
     fields: crate::events::Fields,
+    event_history: Option<Arc<crate::events::Memory>>,
 }
 
 impl RunOptions {
@@ -52,6 +53,7 @@ impl RunOptions {
         Self {
             seed,
             observer: None,
+            event_history: None,
             fields: crate::events::Fields::new(),
         }
     }
@@ -59,6 +61,14 @@ impl RunOptions {
     /// Installs the run's event destination.
     pub fn observer(mut self, observer: Arc<dyn crate::events::Observer>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    /// Installs bounded event retention for world socket viewers, including
+    /// viewers that connect after events were emitted. Other observers also
+    /// receive the events, regardless of builder call order.
+    pub fn event_history(mut self, history: Arc<crate::events::Memory>) -> Self {
+        self.event_history = Some(history);
         self
     }
 
@@ -329,17 +339,28 @@ impl RunShared {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Self> {
         Self::with_options(seed.into(), mode)
     }
 
-    fn with_options(options: RunOptions, mode: crate::RunMode) -> Arc<Self> {
+    pub(crate) fn with_options(options: RunOptions, mode: crate::RunMode) -> Arc<Self> {
         let RunOptions {
             seed,
             observer,
             fields,
+            event_history,
         } = options;
+        let observer = match (observer, event_history.as_ref()) {
+            (Some(observer), Some(history)) => {
+                Some(
+                    Arc::new(crate::events::Fanout::new(vec![observer, history.clone()]))
+                        as Arc<dyn crate::events::Observer>,
+                )
+            }
+            (None, Some(history)) => Some(history.clone() as Arc<dyn crate::events::Observer>),
+            (observer, None) => observer,
+        };
         let observer = crate::events::Dispatch::new(observer);
         if observer.enabled(
             crate::events::Metadata {
@@ -372,7 +393,7 @@ impl RunShared {
             run_id,
             environment.clone(),
             start_wall,
-            events.clone(),
+            event_history,
             #[cfg(feature = "observe")]
             keys.clone(),
         );
@@ -752,34 +773,22 @@ mod tests {
     use crate::events::{Event, Fields};
 
     #[test]
-    fn retained_logs_outlive_completed_and_dropped_runs() {
+    fn retained_evidence_outlives_completed_and_dropped_runs() {
         for complete in [true, false] {
-            let shared = RunShared::new(crate::Seed::from_u64(7), crate::RunMode::Lab);
+            let evidence = Arc::new(crate::events::Memory::default());
+            let shared = RunShared::with_options(
+                RunOptions::new(crate::Seed::from_u64(7)).observer(evidence.clone()),
+                crate::RunMode::Lab,
+            );
             let graph = shared.graph.clone();
             let weak_run = Arc::downgrade(&shared);
             let weak_graph = Arc::downgrade(&graph);
             let weak_environment = Arc::downgrade(&shared.environment);
-            let kept = Arc::new(Mutex::new(None));
-            let keep = kept.clone();
-            let delivered = Arc::new(Mutex::new(Vec::new()));
-            let seen = delivered.clone();
-            let observed = graph.clone();
             let mut world = Box::pin(run_with(shared, move |fcx| async move {
-                let log = fcx.events();
-                log.subscribe(move |event| {
-                    if event.seq == 3 {
-                        let state = observed.state();
-                        assert!(state.ended);
-                        assert!(state.tasks.is_empty());
-                    }
-                    seen.lock().push(event.seq);
-                });
                 fcx.record(Event::new("test", "hello"));
                 for _ in 0..2 {
                     fcx.record_repeat(Event::new("test", "repeat"), Fields::new());
                 }
-                assert_eq!(log.recorded(), 2);
-                *keep.lock() = Some(log);
                 fcx.yield_now().await?;
                 Ok(())
             }));
@@ -794,32 +803,33 @@ mod tests {
             } else {
                 drop(world);
             }
-
-            let log = kept.lock().take().unwrap();
-            assert_eq!(*delivered.lock(), [1, 2, 3]);
-            assert_eq!(Arc::strong_count(&delivered), 1, "callbacks are released");
             assert!(weak_run.upgrade().is_none());
             assert!(graph.state().ended);
-            #[cfg(feature = "observe")]
-            assert_eq!(graph.events.last(), log.recorded());
+            assert!(graph.state().tasks.is_empty());
             drop(graph);
             assert!(weak_graph.upgrade().is_none());
             assert!(weak_environment.upgrade().is_none());
-
-            let events = log.all();
-            assert_eq!(events.len(), 3);
-            assert_eq!(events[2].u64("count"), Some(1));
-            for event in events {
+            assert_eq!(Arc::strong_count(&evidence), 1);
+            let events = evidence.checked_all().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|e| (e.seq, e.source, e.kind))
+                    .collect::<Vec<_>>(),
+                [
+                    (1, "run", "start"),
+                    (2, "test", "hello"),
+                    (3, "test", "repeat"),
+                    (4, "test", "repeat")
+                ]
+            );
+            for event in &events[1..] {
                 assert_eq!(event.at, crate::time::Instant::ZERO);
-                let origin = event.origin.unwrap();
+                let origin = event.origin.as_ref().unwrap();
                 assert_eq!(origin.task, 1);
                 assert_eq!(origin.name, "world");
             }
-            delivered.lock().clear();
-            let replayed = delivered.clone();
-            log.subscribe(move |event| replayed.lock().push(event.seq));
-            assert_eq!(*delivered.lock(), [1, 2, 3]);
-            assert_eq!(Arc::strong_count(&delivered), 1, "replay is not retained");
+            assert_eq!(evidence.checked_all().unwrap(), events);
         }
     }
 }

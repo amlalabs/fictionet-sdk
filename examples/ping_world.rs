@@ -28,7 +28,8 @@ fn main() -> Result {
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");
     fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         move |fcx| async move {
             // `next` returns `Cancelled` when the world stops, and `?` ends
             // the loop with it.

@@ -21,15 +21,34 @@ fn router() -> Router {
         })
 }
 
+#[derive(Default)]
+struct Count(std::sync::atomic::AtomicUsize);
+
+impl fictionet::events::Observer for Count {
+    fn enabled(&self, _: fictionet::events::Metadata, _: &fictionet::events::ConnInfo) -> bool {
+        true
+    }
+
+    fn observe(&self, _: fictionet::events::Stamp, _: fictionet::events::Observation<'_>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ());
+    let evidence_h = std::sync::Arc::new(Count::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ())
+        .observer(evidence_h.clone());
     for chunk in chunks {
         if h.push(chunk).is_err() {
             break;
         }
     }
     let _ = h.end();
-    (h.output().to_vec(), h.events().len(), h.closed())
+    (
+        h.output().to_vec(),
+        evidence_h.0.load(std::sync::atomic::Ordering::Relaxed),
+        h.closed(),
+    )
 }
 
 fuzz_target!(|data: &[u8]| {

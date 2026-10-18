@@ -106,7 +106,9 @@ fn serve() -> Result {
     let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
     let result = fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(log.clone())),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(Arc::new(fictionet::events::Memory::default()))
+            .observer(Arc::new(log.clone())),
         move |fcx| async move {
             let identity = Identity::new(&fcx)?;
             parent(&args.ca)?;

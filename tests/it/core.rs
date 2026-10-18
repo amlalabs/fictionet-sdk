@@ -147,26 +147,29 @@ fn naming_callback_can_cancel() {
 #[test]
 fn event_wait_predicate_can_read_same_log() {
     within(Duration::from_secs(5), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
-            fcx.record(Event::new("test", "tick"));
-            fcx.record_repeat(Event::new("test", "drop"), Fields::new());
-            fcx.record(Event::new("test", "tick"));
-            let log = fcx.events();
-            let other = log.clone();
-            let mut seen = Vec::new();
-            let got = log
-                .wait(&fcx, 2, ms(10), |event| {
-                    assert_eq!(other.recorded(), 3);
-                    assert_eq!(other.of("test", "tick").len(), 2);
-                    seen.push(event.seq);
-                    event.is("test", "tick")
-                })
-                .await?;
-            assert_eq!(seen, [1, 2, 3]);
-            assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 3]);
-            assert_eq!(fcx.now().since_start(), Duration::ZERO);
-            Ok(())
-        }))
+        block_on(crate::common::observed_lab(
+            Seed::from_u64(1),
+            |fcx, evidence| async move {
+                fcx.record(Event::new("test", "tick"));
+                fcx.record_repeat(Event::new("test", "drop"), Fields::new());
+                fcx.record(Event::new("test", "tick"));
+                let log = evidence;
+                let other = log.clone();
+                let mut seen = Vec::new();
+                let got = log
+                    .wait(&fcx, 2, ms(10), |event| {
+                        assert_eq!(other.last(), 4);
+                        assert_eq!(other.checked_of("test", "tick").unwrap().len(), 2);
+                        seen.push(event.seq);
+                        event.is("test", "tick")
+                    })
+                    .await?;
+                assert_eq!(seen, [1, 2, 3, 4]);
+                assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 4]);
+                assert_eq!(fcx.now().since_start(), Duration::ZERO);
+                Ok(())
+            },
+        ))
     })
     .unwrap();
 }
@@ -174,26 +177,31 @@ fn event_wait_predicate_can_read_same_log() {
 #[test]
 fn event_wait_predicate_can_record_into_same_log() {
     within(Duration::from_secs(5), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
-            fcx.record(Event::new("test", "tick"));
-            let mut recorded = false;
-            let mut seen = Vec::new();
-            let got = fcx
-                .events()
-                .wait(&fcx, 2, ms(20), |event| {
-                    seen.push((fcx.now().since_start(), event.seq));
-                    if !recorded {
-                        fcx.record(Event::new("test", "tick"));
-                        recorded = true;
-                    }
-                    event.is("test", "tick")
-                })
-                .await?;
-            assert_eq!(seen, [(ms(0), 1), (ms(0), 1), (ms(0), 2)]);
-            assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2]);
-            assert_eq!(fcx.now().since_start(), ms(0));
-            Ok(())
-        }))
+        block_on(crate::common::observed_lab(
+            Seed::from_u64(1),
+            |fcx, evidence| async move {
+                fcx.record(Event::new("test", "tick"));
+                let mut recorded = false;
+                let mut seen = Vec::new();
+                let got = evidence
+                    .wait(&fcx, 2, ms(20), |event| {
+                        seen.push((fcx.now().since_start(), event.seq));
+                        if !recorded {
+                            fcx.record(Event::new("test", "tick"));
+                            recorded = true;
+                        }
+                        event.is("test", "tick")
+                    })
+                    .await?;
+                assert_eq!(
+                    seen,
+                    [(ms(0), 1), (ms(0), 2), (ms(0), 1), (ms(0), 2), (ms(0), 3)]
+                );
+                assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 3]);
+                assert_eq!(fcx.now().since_start(), ms(0));
+                Ok(())
+            },
+        ))
     })
     .unwrap();
 }
@@ -201,18 +209,20 @@ fn event_wait_predicate_can_record_into_same_log() {
 #[test]
 fn event_wait_checks_cancellation_before_inspecting_matches() {
     for n in [0, 1] {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
-            fcx.record(Event::new("test", "tick"));
-            fcx.cancel();
-            let result = fcx
-                .events()
-                .wait(&fcx, n, ms(10), |_| {
-                    panic!("cancelled wait inspected events")
-                })
-                .await;
-            assert_eq!(result.unwrap_err(), Cancelled);
-            Ok(())
-        }))
+        block_on(crate::common::observed_lab(
+            Seed::from_u64(1),
+            |fcx, evidence| async move {
+                fcx.record(Event::new("test", "tick"));
+                fcx.cancel();
+                let result = evidence
+                    .wait(&fcx, n, ms(10), |_| {
+                        panic!("cancelled wait inspected events")
+                    })
+                    .await;
+                assert!(result.unwrap_err().downcast_ref::<Cancelled>().is_some());
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 }
@@ -220,18 +230,20 @@ fn event_wait_checks_cancellation_before_inspecting_matches() {
 #[test]
 fn event_wait_predicate_cancellation_wins_over_matches_and_timeout() {
     for n in [1, 2] {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
-            fcx.record(Event::new("test", "tick"));
-            let result = fcx
-                .events()
-                .wait(&fcx, n, Duration::ZERO, |_| {
-                    fcx.cancel();
-                    true
-                })
-                .await;
-            assert_eq!(result.unwrap_err(), Cancelled);
-            Ok(())
-        }))
+        block_on(crate::common::observed_lab(
+            Seed::from_u64(1),
+            |fcx, evidence| async move {
+                fcx.record(Event::new("test", "tick"));
+                let result = evidence
+                    .wait(&fcx, n, Duration::ZERO, |_| {
+                        fcx.cancel();
+                        true
+                    })
+                    .await;
+                assert!(result.unwrap_err().downcast_ref::<Cancelled>().is_some());
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 }
@@ -242,94 +254,97 @@ fn cancellation_ends_every_wait() {
     let results = Arc::new(Mutex::new(Vec::<String>::new()));
     let r = results.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(lab(Seed::from_u64(1), move |fcx| async move {
-            let (mut a, b) = pair();
-            let r1 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                let res = fcx.sleep(Duration::from_secs(60)).await;
-                r1.lock().unwrap().push(format!("sleep {res:?}"));
-                Ok(())
-            });
-            let r2 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                let _b = b;
-                let res = a.recv(&fcx).await;
-                r2.lock().unwrap().push(format!("recv {res:?}"));
-                Ok(())
-            });
-            let r3 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                fcx.cancelled().await;
-                r3.lock().unwrap().push("cancelled".into());
-                Ok(())
-            });
-            // Work that outlives the cancel until its joiner has seen it.
-            let joined = Arc::new(AtomicBool::new(false));
-            let j = joined.clone();
-            let forever = fcx.spawn(move |_fcx| async move {
-                std::future::poll_fn(|cx| {
-                    if j.load(Ordering::SeqCst) {
-                        return std::task::Poll::Ready(Ok(()));
+        block_on(crate::common::observed_lab(
+            Seed::from_u64(1),
+            move |fcx, evidence| async move {
+                let (mut a, b) = pair();
+                let r1 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    let res = fcx.sleep(Duration::from_secs(60)).await;
+                    r1.lock().unwrap().push(format!("sleep {res:?}"));
+                    Ok(())
+                });
+                let r2 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    let _b = b;
+                    let res = a.recv(&fcx).await;
+                    r2.lock().unwrap().push(format!("recv {res:?}"));
+                    Ok(())
+                });
+                let r3 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    fcx.cancelled().await;
+                    r3.lock().unwrap().push("cancelled".into());
+                    Ok(())
+                });
+                // Work that outlives the cancel until its joiner has seen it.
+                let joined = Arc::new(AtomicBool::new(false));
+                let j = joined.clone();
+                let forever = fcx.spawn(move |_fcx| async move {
+                    std::future::poll_fn(|cx| {
+                        if j.load(Ordering::SeqCst) {
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    })
+                    .await
+                });
+                let r4 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    let res = forever.join(&fcx).await;
+                    joined.store(true, Ordering::SeqCst);
+                    r4.lock().unwrap().push(format!("join {res:?}"));
+                    Ok(())
+                });
+                let (_attacher, mut attachments) = attachments();
+                let r5 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    let res = attachments.get(&fcx, "nope").await;
+                    r5.lock().unwrap().push(format!("get {:?}", res.err()));
+                    let res = attachments.next(&fcx).await;
+                    r5.lock().unwrap().push(format!("next {:?}", res.err()));
+                    Ok(())
+                });
+                let r7 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    let res = fcx.race(None, std::future::pending::<()>()).await;
+                    r7.lock().unwrap().push(format!("race {res:?}"));
+                    Ok(())
+                });
+                let (port, _other) = pair();
+                let r8 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    let mut ports =
+                        fictionet::stdlib::network::ports::Ports::new(vec![
+                            Box::new(port) as Box<dyn Interface>
+                        ]);
+                    let res = ports.next(&fcx, None, |_| std::task::Poll::Pending).await;
+                    r8.lock().unwrap().push(format!("ports {:?}", res.err()));
+                    Ok(())
+                });
+                let r9 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    let res = evidence
+                        .wait(&fcx, 1, Duration::from_secs(60), |_| false)
+                        .await;
+                    r9.lock().unwrap().push(format!("events {:?}", res.err()));
+                    Ok(())
+                });
+                let r6 = r.clone();
+                fcx.spawn(move |fcx| async move {
+                    // Busy: yield_now itself reports the cancel.
+                    loop {
+                        if let Err(c) = fcx.yield_now().await {
+                            r6.lock().unwrap().push(format!("yield {c:?}"));
+                            return Ok(());
+                        }
                     }
-                    cx.waker().wake_by_ref();
-                    std::task::Poll::Pending
-                })
-                .await
-            });
-            let r4 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                let res = forever.join(&fcx).await;
-                joined.store(true, Ordering::SeqCst);
-                r4.lock().unwrap().push(format!("join {res:?}"));
-                Ok(())
-            });
-            let (_attacher, mut attachments) = attachments();
-            let r5 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                let res = attachments.get(&fcx, "nope").await;
-                r5.lock().unwrap().push(format!("get {:?}", res.err()));
-                let res = attachments.next(&fcx).await;
-                r5.lock().unwrap().push(format!("next {:?}", res.err()));
-                Ok(())
-            });
-            let r7 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                let res = fcx.race(None, std::future::pending::<()>()).await;
-                r7.lock().unwrap().push(format!("race {res:?}"));
-                Ok(())
-            });
-            let (port, _other) = pair();
-            let r8 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                let mut ports = fictionet::stdlib::network::ports::Ports::new(vec![
-                    Box::new(port) as Box<dyn Interface>
-                ]);
-                let res = ports.next(&fcx, None, |_| std::task::Poll::Pending).await;
-                r8.lock().unwrap().push(format!("ports {:?}", res.err()));
-                Ok(())
-            });
-            let r9 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                let res = fcx
-                    .events()
-                    .wait(&fcx, 1, Duration::from_secs(60), |_| false)
-                    .await;
-                r9.lock().unwrap().push(format!("events {:?}", res.err()));
-                Ok(())
-            });
-            let r6 = r.clone();
-            fcx.spawn(move |fcx| async move {
-                // Busy: yield_now itself reports the cancel.
-                loop {
-                    if let Err(c) = fcx.yield_now().await {
-                        r6.lock().unwrap().push(format!("yield {c:?}"));
-                        return Ok(());
-                    }
-                }
-            });
-            fcx.yield_now().await?;
-            Err(Boom("stop").into())
-        }))
+                });
+                fcx.yield_now().await?;
+                Err(Boom("stop").into())
+            },
+        ))
     });
     assert_eq!(out.unwrap_err().to_string(), "stop");
     let mut results = results.lock().unwrap().clone();

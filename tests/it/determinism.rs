@@ -35,18 +35,6 @@ const DATE: u64 = 1_893_456_000;
 const ECHO: Ipv4Addr = Ipv4Addr::new(192, 168, 10, 10);
 const HTTPS: Ipv4Addr = Ipv4Addr::new(192, 168, 20, 10);
 
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
-impl std::io::Write for Log {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Trace {
     events: Vec<u8>,
@@ -158,24 +146,26 @@ async fn read_until(cx: &Cx, conn: &mut impl Connection, needle: &[u8]) -> Vec<u
 }
 
 fn world(seed: Seed, trace: Arc<Mutex<Trace>>) -> impl Future<Output = fictionet::Result> {
-    let log = Log::default();
+    let log = Arc::new(fictionet::events::Memory::default());
     let output = log.clone();
     async move {
         let packets = trace.clone();
         let loss_trace = trace.clone();
-        lab(seed, move |cx| episode(cx, output, packets, loss_trace)).await?;
-        trace.lock().unwrap().events = log.0.lock().unwrap().clone();
+        lab(
+            fictionet::RunOptions::new(seed).observer(output),
+            move |cx| episode(cx, packets, loss_trace),
+        )
+        .await?;
+        trace.lock().unwrap().events = crate::common::evidence_bytes(&log);
         Ok(())
     }
 }
 
 async fn episode(
     cx: Cx,
-    output: Log,
     packets: Arc<Mutex<Trace>>,
     loss_trace: Arc<Mutex<Trace>>,
 ) -> fictionet::Result {
-    cx.events().to_writer(Box::new(output));
     let cert = CertificateDer::from(include_bytes!("fixtures/tls/ed25519.cert.der").to_vec());
     let key =
         PrivateKeyDer::try_from(include_bytes!("fixtures/tls/ed25519.key.der").to_vec()).unwrap();
@@ -364,7 +354,6 @@ async fn episode(
         }
     }
     cx.idle().await?;
-    assert_eq!(cx.events().lost(), 0);
     cx.cancel();
     Ok(())
 }
@@ -386,68 +375,69 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
     };
 
     let episode = |seed| {
-        let log = Log::default();
+        let log = Arc::new(fictionet::events::Memory::default());
         let output = log.clone();
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let replies = bodies.clone();
-        block_on(lab(Seed::from_u64(seed), move |cx| async move {
-            cx.events().to_writer(Box::new(output));
-            let date = UNIX_EPOCH + Duration::from_secs(DATE);
-            let ca = Ca::new(&cx, "Lab CA")?;
-            let leaf = ca.issue(
-                &cx,
-                &["site.test"],
-                x509::Validity {
-                    not_before: x509::Time::from_unix(DATE as i64 - 86400)?,
-                    not_after: x509::Time::from_unix(DATE as i64 + 86400)?,
-                },
-            )?;
-            let mut roots = rustls::RootCertStore::empty();
-            roots.add(ca.cert_der())?;
-            let roots = Arc::new(roots);
-            let mut config = leaf.server_config(&cx, date)?;
-            Arc::get_mut(&mut config).unwrap().alpn_protocols = vec![b"http/1.1".to_vec()];
-            let handler_cx = cx.clone();
-            let app = axum::Router::new().fallback(move || {
-                let draw = handler_cx.random_u64();
-                async move { format!("hello {draw}") }
-            });
-            let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(move |name| {
-                (name == "site.test").then(|| web::Site::new(app.clone()).tls(config.clone()))
-            })
-            .date(date)
-            .start(&cx, attachments)?;
-            let machine =
-                sandbox::machine(&cx, attacher.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
-            let answer = machine
-                .lookup(&cx, "10.0.0.1".parse()?, "site.test", RecordType::A)
-                .await?;
-            let address = answer
-                .answers
-                .iter()
-                .find_map(|r| match r.data {
-                    RData::A(a) => Some(a.0),
-                    _ => None,
+        block_on(lab(
+            fictionet::RunOptions::new(Seed::from_u64(seed)).observer(output),
+            move |cx| async move {
+                let date = UNIX_EPOCH + Duration::from_secs(DATE);
+                let ca = Ca::new(&cx, "Lab CA")?;
+                let leaf = ca.issue(
+                    &cx,
+                    &["site.test"],
+                    x509::Validity {
+                        not_before: x509::Time::from_unix(DATE as i64 - 86400)?,
+                        not_after: x509::Time::from_unix(DATE as i64 + 86400)?,
+                    },
+                )?;
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(ca.cert_der())?;
+                let roots = Arc::new(roots);
+                let mut config = leaf.server_config(&cx, date)?;
+                Arc::get_mut(&mut config).unwrap().alpn_protocols = vec![b"http/1.1".to_vec()];
+                let handler_cx = cx.clone();
+                let app = axum::Router::new().fallback(move || {
+                    let draw = handler_cx.random_u64();
+                    async move { format!("hello {draw}") }
+                });
+                let (attacher, attachments) = fictionet::attachments();
+                web::Sites::new(move |name| {
+                    (name == "site.test").then(|| web::Site::new(app.clone()).tls(config.clone()))
                 })
-                .unwrap();
-            let mut conn = machine
-                .tls(&cx, (address, 443).into(), "site.test", Some(&roots), date)
-                .await?;
-            assert_eq!(conn.tls.alpn_protocol(), Some(b"http/1.1".as_slice()));
-            let request = http1::Request::parse(b"GET / HTTP/1.1\r\nHost: site.test\r\n\r\n")?;
-            for _ in 0..2 {
-                let response = sandbox::request(&cx, &mut conn, &request).await?;
-                assert_eq!(response.head.status, 200);
-                assert!(response.body.starts_with(b"hello "));
-                replies.lock().unwrap().push(response.body);
-            }
-            assert_eq!(cx.events().lost(), 0);
-            cx.cancel();
-            Ok(())
-        }))
+                .date(date)
+                .start(&cx, attachments)?;
+                let machine =
+                    sandbox::machine(&cx, attacher.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
+                let answer = machine
+                    .lookup(&cx, "10.0.0.1".parse()?, "site.test", RecordType::A)
+                    .await?;
+                let address = answer
+                    .answers
+                    .iter()
+                    .find_map(|r| match r.data {
+                        RData::A(a) => Some(a.0),
+                        _ => None,
+                    })
+                    .unwrap();
+                let mut conn = machine
+                    .tls(&cx, (address, 443).into(), "site.test", Some(&roots), date)
+                    .await?;
+                assert_eq!(conn.tls.alpn_protocol(), Some(b"http/1.1".as_slice()));
+                let request = http1::Request::parse(b"GET / HTTP/1.1\r\nHost: site.test\r\n\r\n")?;
+                for _ in 0..2 {
+                    let response = sandbox::request(&cx, &mut conn, &request).await?;
+                    assert_eq!(response.head.status, 200);
+                    assert!(response.body.starts_with(b"hello "));
+                    replies.lock().unwrap().push(response.body);
+                }
+                cx.cancel();
+                Ok(())
+            },
+        ))
         .unwrap();
-        let events = log.0.lock().unwrap().clone();
+        let events = crate::common::evidence_bytes(&log);
         let bodies = bodies.lock().unwrap().clone();
         (events, bodies)
     };
@@ -515,29 +505,42 @@ fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
     let episode = || {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let out = logs.clone();
-        block_on(lab(Seed::from_u64(1), move |fcx| async move {
-            out.lock().unwrap().push(fcx.events());
-            lab(Seed::from_u64(2), move |fcx| async move {
-                out.lock().unwrap().push(fcx.events());
-                fcx.record(Event::new("test", "inner"));
-                fcx.yield_now().await?;
-                fcx.record(Event::new("test", "inner_again"));
+        block_on(crate::common::observed_lab(
+            Seed::from_u64(1),
+            move |fcx, evidence| async move {
+                out.lock().unwrap().push(evidence.clone());
+                crate::common::observed_lab(Seed::from_u64(2), move |fcx, evidence| async move {
+                    out.lock().unwrap().push(evidence.clone());
+                    fcx.record(Event::new("test", "inner"));
+                    fcx.yield_now().await?;
+                    fcx.record(Event::new("test", "inner_again"));
+                    Ok(())
+                })
+                .await?;
+                fcx.record(Event::new("test", "outer"));
+                fcx.spawn(|fcx| async move {
+                    fcx.record(Event::new("test", "child"));
+                    Ok(())
+                })
+                .join(&fcx)
+                .await?;
                 Ok(())
-            })
-            .await?;
-            fcx.record(Event::new("test", "outer"));
-            fcx.spawn(|fcx| async move {
-                fcx.record(Event::new("test", "child"));
-                Ok(())
-            })
-            .join(&fcx)
-            .await?;
-            Ok(())
-        }))
+            },
+        ))
         .unwrap();
         let logs = logs.lock().unwrap();
-        let outer = logs[0].all();
-        let inner = logs[1].all();
+        let outer = logs[0]
+            .checked_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.source == "test")
+            .collect::<Vec<_>>();
+        let inner = logs[1]
+            .checked_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.source == "test")
+            .collect::<Vec<_>>();
         assert_eq!(outer.len(), 2);
         assert_eq!(inner.len(), 2);
         assert_task(&outer[0], "t1", None);
@@ -547,7 +550,8 @@ fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
         }
         logs.iter()
             .map(|log| {
-                log.all()
+                log.checked_all()
+                    .unwrap()
                     .iter()
                     .map(|e| e.to_line().unwrap())
                     .collect::<Vec<_>>()
@@ -561,56 +565,81 @@ fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
 fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
     let kept = Arc::new(Mutex::new(None));
     let out = kept.clone();
-    block_on(lab(Seed::from_u64(1), move |fcx| async move {
-        *out.lock().unwrap() = Some(fcx.events());
-        let foreign = fcx.clone();
-        lab(Seed::from_u64(2), move |_fcx| async move {
-            foreign.record(Event::new("test", "record"));
-            foreign.record_at(foreign.now(), Event::new("test", "record_at"));
-            foreign.record_repeat(Event::new("test", "repeat"), Fields::new());
-            foreign.spawn(|fcx| async move {
-                fcx.record(Event::new("test", "foreign_spawn"));
+    block_on(crate::common::observed_lab(
+        Seed::from_u64(1),
+        move |fcx, evidence| async move {
+            *out.lock().unwrap() = Some(evidence.clone());
+            let foreign = fcx.clone();
+            lab(Seed::from_u64(2), move |_fcx| async move {
+                foreign.record(Event::new("test", "record"));
+                foreign.record_at(foreign.now(), Event::new("test", "record_at"));
+                foreign.record_repeat(Event::new("test", "repeat"), Fields::new());
+                foreign.spawn(|fcx| async move {
+                    fcx.record(Event::new("test", "foreign_spawn"));
+                    Ok(())
+                });
                 Ok(())
-            });
+            })
+            .await?;
+            let events = evidence
+                .checked_all()
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.source == "test")
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 3);
+            for event in events {
+                let json = event.to_json();
+                assert!(json.get("node").is_none(), "{}", event.to_line().unwrap());
+                assert!(json.get("parent").is_none(), "{}", event.to_line().unwrap());
+            }
             Ok(())
-        })
-        .await?;
-        let events = fcx.events().all();
-        assert_eq!(events.len(), 3);
-        for event in events {
-            let json = event.to_json();
-            assert!(json.get("node").is_none(), "{}", event.to_line().unwrap());
-            assert!(json.get("parent").is_none(), "{}", event.to_line().unwrap());
-        }
-        Ok(())
-    }))
+        },
+    ))
     .unwrap();
-    let events = kept.lock().unwrap().take().unwrap().all();
+    let events = kept
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .checked_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.source == "test")
+        .collect::<Vec<_>>();
     assert_eq!(events.len(), 4);
     assert_task(&events[3], "t2", None);
 }
 
 #[test]
 fn a_nested_panic_restores_the_outer_task() {
-    block_on(lab(Seed::from_u64(1), |fcx| async move {
-        let result = std::panic::catch_unwind(|| {
-            block_on(lab(Seed::from_u64(2), |_fcx| async move {
-                panic!("inner world failed");
-            }))
-        });
-        assert!(result.is_err());
-        fcx.record(Event::new("test", "outer"));
-        fcx.spawn(|fcx| async move {
-            fcx.record(Event::new("test", "child"));
+    block_on(crate::common::observed_lab(
+        Seed::from_u64(1),
+        |fcx, evidence| async move {
+            let result = std::panic::catch_unwind(|| {
+                block_on(lab(Seed::from_u64(2), |_fcx| async move {
+                    panic!("inner world failed");
+                }))
+            });
+            assert!(result.is_err());
+            fcx.record(Event::new("test", "outer"));
+            fcx.spawn(|fcx| async move {
+                fcx.record(Event::new("test", "child"));
+                Ok(())
+            })
+            .join(&fcx)
+            .await?;
+            let events = evidence
+                .checked_all()
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.source == "test")
+                .collect::<Vec<_>>();
+            assert_task(&events[0], "t1", None);
+            assert_task(&events[1], "t2", Some("t1"));
             Ok(())
-        })
-        .join(&fcx)
-        .await?;
-        let events = fcx.events().all();
-        assert_task(&events[0], "t1", None);
-        assert_task(&events[1], "t2", Some("t1"));
-        Ok(())
-    }))
+        },
+    ))
     .unwrap();
 }
 

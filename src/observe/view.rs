@@ -23,6 +23,7 @@ pub(crate) struct View {
     counters: BTreeMap<String, [u64; 4]>,
     /// The number of the last event sent.
     event_seq: u64,
+    dropped: u64,
     ended: bool,
     revision: u64,
 }
@@ -34,7 +35,7 @@ impl View {
     }
 
     pub(crate) fn events_pending(&self, graph: &Graph) -> bool {
-        self.event_seq < graph.events.last()
+        self.event_seq < last_event(graph)
     }
 }
 
@@ -272,15 +273,38 @@ fn event_line(event: &Event) -> String {
     String::from_utf8(bytes).expect("JSON is UTF-8")
 }
 
+fn last_event(graph: &Graph) -> u64 {
+    graph.events.as_ref().map_or(0, |events| events.last())
+}
+
+fn retained_events(graph: &Graph, after: u64, max: usize) -> Vec<Event> {
+    history_batch(graph, after, max).0
+}
+
+fn history_batch(graph: &Graph, after: u64, max: usize) -> (Vec<Event>, u64, u64) {
+    graph.events.as_ref().map_or_else(
+        || (Vec::new(), 0, 0),
+        |events| events.display_batch(after, max),
+    )
+}
+
+fn loss_line(dropped: u64, seq: u64) -> String {
+    let mut event = Event::new("events", "dropped")
+        .summary(format!("{dropped} events lost from retained history"))
+        .field("count", dropped);
+    event.seq = seq;
+    event_line(&event)
+}
+
 /// The `events` reply: at most `max` events after number `after`.
 pub(crate) fn events(graph: &Graph, after: u64, max: usize) -> String {
-    let events: Vec<String> = graph
-        .events
-        .after(after, max)
-        .iter()
-        .map(|e| event_line(e))
-        .collect();
-    Object::new().raw("events", &json::array(events)).done()
+    let (events, last, dropped) = history_batch(graph, after, max);
+    let lines: Vec<String> = events.iter().map(event_line).collect();
+    Object::new()
+        .raw("events", &json::array(lines))
+        .num("last", last)
+        .num("dropped", dropped)
+        .done()
 }
 
 /// The `link` reply: one link's ends, label and counts, if it is shown.
@@ -325,8 +349,9 @@ pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
             Vec::new()
         }
         None => {
-            let last = graph.events.last();
-            let events = graph.events.after(
+            let last = last_event(graph);
+            let events = retained_events(
+                graph,
                 last.saturating_sub(SNAPSHOT_EVENTS),
                 SNAPSHOT_EVENTS as usize + 1,
             );
@@ -334,7 +359,13 @@ pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
             events
         }
     };
-    let events: Vec<String> = events.iter().map(|e| event_line(e)).collect();
+    let mut events: Vec<String> = events.iter().map(event_line).collect();
+    if after.is_none() {
+        view.dropped = graph.events.as_ref().map_or(0, |history| history.dropped());
+        if view.dropped != 0 {
+            events.insert(0, loss_line(view.dropped, 0));
+        }
+    }
     let data = Object::new()
         .secs("t", graph.since_start())
         .num(
@@ -377,6 +408,7 @@ pub(crate) fn changes(graph: &Graph, old: &mut View) -> Vec<Message> {
     drop(state);
     let mut new = build(c);
     new.event_seq = old.event_seq;
+    new.dropped = old.dropped;
     let mut out = Vec::new();
     // Edges go first, then nodes, so a browser never holds an edge to a
     // node it was told is gone, nor a new edge to a node it has not met.
@@ -436,13 +468,20 @@ fn counter_changes(
 
 /// A bounded event batch and whether another batch may be waiting.
 pub(crate) fn event_changes(graph: &Graph, view: &mut View) -> (Vec<Message>, bool) {
-    let events = graph.events.after(view.event_seq, EVENTS_PER_CHANGE);
+    let (events, last, dropped) = history_batch(graph, view.event_seq, EVENTS_PER_CHANGE);
     let full = events.len() == EVENTS_PER_CHANGE;
-    view.event_seq = events.last().map_or(view.event_seq, |e| e.seq);
-    (
-        events.iter().map(|e| ("event", event_line(e))).collect(),
-        full,
-    )
+    let mut messages = Vec::new();
+    if dropped > view.dropped {
+        messages.push(("event", loss_line(dropped - view.dropped, view.event_seq)));
+    }
+    view.dropped = dropped;
+    view.event_seq = if full {
+        events.last().unwrap().seq
+    } else {
+        last.max(view.event_seq)
+    };
+    messages.extend(events.iter().map(|event| ("event", event_line(event))));
+    (messages, full)
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -451,15 +490,88 @@ mod tests {
     use crate::watch::Meter;
     use std::panic::Location;
 
+    fn history_graph() -> Arc<Graph> {
+        let shared = crate::run::RunShared::new(crate::Seed::from_u64(7), crate::RunMode::Lab);
+        let mut graph = shared.graph.clone();
+        drop(shared);
+        Arc::get_mut(&mut graph).unwrap().events = Some(Arc::new(crate::events::Memory::default()));
+        graph
+    }
+
+    fn retain(graph: &Graph, event: Event) {
+        use crate::events::{Observation, Observer, Stamp};
+        let history = graph.events.as_ref().unwrap();
+        history.observe(
+            Stamp {
+                seq: history.last() + 1,
+                at: event.at,
+            },
+            Observation::Event(&event),
+        );
+    }
+
     fn serialization_graph() -> Arc<Graph> {
-        let graph = crate::run::RunShared::new(crate::Seed::from_u64(7), crate::RunMode::Lab)
-            .graph
-            .clone();
+        let graph = history_graph();
+        retain(
+            &graph,
+            Event::new("test", "big").summary("x".repeat(1 << 20)),
+        );
+        retain(&graph, Event::new("test", "normal"));
         graph
-            .events
-            .push(Event::new("test", "big").summary("x".repeat(1 << 20)));
-        graph.events.push(Event::new("test", "normal"));
-        graph
+    }
+
+    #[test]
+    fn socket_events_require_explicit_retention() {
+        let shared = crate::run::RunShared::new(crate::Seed::from_u64(7), crate::RunMode::Lab);
+        let graph = shared.graph.clone();
+        crate::block_on(crate::run::run_with(shared, |cx| async move {
+            cx.record(Event::new("test", "tick"));
+            Ok(())
+        }))
+        .unwrap();
+        let reply = Value::parse(events(&graph, 0, 10).as_bytes()).unwrap();
+        assert!(reply.get("events").unwrap().as_array().unwrap().is_empty());
+        assert_eq!(reply.get("last").and_then(Value::as_u64), Some(0));
+    }
+
+    #[test]
+    fn late_viewers_see_retained_history_and_loss() {
+        let history = Arc::new(crate::events::Memory::new(crate::events::Limits::new(
+            2, 4096,
+        )));
+        let shared = crate::run::RunShared::with_options(
+            crate::RunOptions::new(crate::Seed::from_u64(7)).event_history(history.clone()),
+            crate::RunMode::Lab,
+        );
+        let graph = shared.graph.clone();
+        crate::block_on(crate::run::run_with(shared, |cx| async move {
+            for i in 0..3u64 {
+                cx.emit("test", "tick", |event| event.field("i", i));
+            }
+            Ok(())
+        }))
+        .unwrap();
+        let (mut view, (_, data)) = snapshot(&graph, None);
+        let data = Value::parse(data.as_bytes()).unwrap();
+        let events = data.get("events").unwrap().as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].get("kind").and_then(Value::as_str),
+            Some("dropped")
+        );
+        assert_eq!(events[1].get("seq").and_then(Value::as_u64), Some(3));
+        assert_eq!(events[2].get("seq").and_then(Value::as_u64), Some(4));
+        assert!(event_changes(&graph, &mut view).0.is_empty());
+        let (mut replay, _) = snapshot(&graph, Some(0));
+        // A rejected final event must not leave a viewer waiting forever.
+        retain(
+            &graph,
+            Event::new("test", "large").summary("x".repeat(8192)),
+        );
+        let (messages, full) = event_changes(&graph, &mut replay);
+        assert!(!full);
+        assert_eq!(messages.len(), 3);
+        assert!(!replay.events_pending(&graph));
     }
 
     fn assert_serialization_error(event: &Value, seq: u64) {
@@ -516,7 +628,7 @@ mod tests {
             .collect();
         assert_serialization_error(&events[0], 1);
         assert_eq!(events[1].get("seq").and_then(Value::as_u64), Some(2));
-        assert_eq!(events[1], graph.events.after(1, 1)[0].to_json());
+        assert_eq!(events[1], retained_events(&graph, 1, 1)[0].to_json());
         assert!(event_changes(&graph, &mut view).0.is_empty());
         assert!(!view.events_pending(&graph));
     }
@@ -805,9 +917,7 @@ mod tests {
 
     #[test]
     fn changes_follow_the_graph() {
-        let graph = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real)
-            .graph
-            .clone();
+        let graph = history_graph();
         graph.task_started(1, "world".into(), Location::caller(), None);
         let (mut view, (name, data)) = snapshot(&graph, None);
         assert_eq!(name, "snapshot");
@@ -832,9 +942,10 @@ mod tests {
         assert_eq!(names(&changes(&graph, &mut view)), ["edge_end", "node_end"]);
 
         // Events are sent once each.
-        graph
-            .events
-            .push(crate::events::Event::new("bottleneck", "drop").summary("queue full"));
+        retain(
+            &graph,
+            crate::events::Event::new("bottleneck", "drop").summary("queue full"),
+        );
         let (m, full) = event_changes(&graph, &mut view);
         assert!(!full);
         assert_eq!(names(&m), ["event"]);

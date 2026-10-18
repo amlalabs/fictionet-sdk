@@ -124,9 +124,11 @@ fn main() -> Result {
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");
-    fictionet::block_on(fictionet::run(fictionet::Seed::random(), move |fcx| {
-        world(fcx, attachments)
-    }))
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
+        move |fcx| world(fcx, attachments),
+    ))
 }
 
 async fn world(fcx: Cx, attachments: Attachments) -> Result {

@@ -276,6 +276,7 @@ fn outbound_fault_error_cancels_work_with_written_bytes() {
             Ok(Flow::Continue)
         }
     }
+    let evidence_harness = std::sync::Arc::new(fictionet::events::Memory::default());
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
         Replies,
@@ -287,13 +288,15 @@ fn outbound_fault_error_cancels_work_with_written_bytes() {
             }],
             ..Plan::default()
         })),
-    );
+    )
+    .observer(evidence_harness.clone());
     assert!(matches!(harness.open(), Err(HarnessError::Faults(_))));
     assert_eq!(harness.output(), b"one\n");
     assert_eq!(harness.end_reason(), Some(Ended::Closed));
-    let cancelled: Vec<_> = harness
-        .events()
-        .iter()
+    let cancelled: Vec<_> = evidence_harness
+        .checked_all()
+        .unwrap()
+        .into_iter()
         .filter(|e| e.is("chunks", "cancel"))
         .collect();
     assert_eq!(cancelled.len(), 1);
@@ -415,14 +418,17 @@ service_fixture! {
 #[test]
 fn smtp_data_changes_the_active_decoder_and_stops_item_faults() {
     let opts = ServeOptions::default().faults(FaultPlan::new(Plan::default()));
-    let mut harness = Harness::with_options(Seed::from_u64(1), Mail::default(), (), opts);
+    let evidence_harness = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut harness = Harness::with_options(Seed::from_u64(1), Mail::default(), (), opts)
+        .observer(evidence_harness.clone());
     harness.push(b"DATA\r\n").unwrap();
     harness.push(b"..hello\r\n.\r\n").unwrap();
     assert_eq!(harness.service().messages, [b".hello\r\n".to_vec()]);
     assert_eq!(harness.output(), b"354 Send data\r\n250 Queued\r\n");
     assert_eq!(
-        harness
-            .events()
+        evidence_harness
+            .checked_all()
+            .unwrap()
             .iter()
             .filter(|event| event.get("stopped").and_then(|v| v.as_str()) == Some("decoder"))
             .count(),
@@ -599,12 +605,15 @@ fn decoder_upgrade_stops_faults_before_buffered_items() {
         }],
         ..Plan::default()
     }));
-    let mut harness = Harness::with_options(Seed::from_u64(1), Switch { seen: vec![] }, (), opts);
+    let evidence_harness = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut harness = Harness::with_options(Seed::from_u64(1), Switch { seen: vec![] }, (), opts)
+        .observer(evidence_harness.clone());
     harness.push(b"one\ntwo\n").unwrap();
     assert_eq!(harness.service().seen, [b"one".to_vec(), b"two".to_vec()]);
     assert_eq!(
-        harness
-            .events()
+        evidence_harness
+            .checked_all()
+            .unwrap()
             .iter()
             .filter(|event| event.get("stopped").and_then(|v| v.as_str()) == Some("upgrade"))
             .count(),
@@ -639,8 +648,10 @@ fn stuck_item_fault_decoder_passes_the_partial_item_through() {
         }],
         ..Plan::default()
     }));
+    let evidence_harness = std::sync::Arc::new(fictionet::events::Memory::default());
     let mut harness =
-        Harness::with_options(Seed::from_u64(1), LargeLine { seen: vec![] }, (), opts);
+        Harness::with_options(Seed::from_u64(1), LargeLine { seen: vec![] }, (), opts)
+            .observer(evidence_harness.clone());
     let bytes = vec![b'x'; (4 << 20) + 1];
     harness.push(&bytes).unwrap();
     assert!(harness.service().seen.is_empty());
@@ -648,8 +659,9 @@ fn stuck_item_fault_decoder_passes_the_partial_item_through() {
     assert_eq!(harness.service().seen.len(), 1);
     assert_eq!(harness.service().seen[0], bytes);
     assert_eq!(
-        harness
-            .events()
+        evidence_harness
+            .checked_all()
+            .unwrap()
             .iter()
             .filter(|event| event.is("conn", "faults")
                 && event.get("stopped").and_then(|v| v.as_str()) == Some("stuck"))

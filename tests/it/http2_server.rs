@@ -223,18 +223,6 @@ fn settings_acknowledgment_and_idle_stream_errors() {
     }
 }
 
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
-impl std::io::Write for Log {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Trace {
     events: Vec<u8>,
@@ -244,10 +232,10 @@ struct Trace {
 fn replay() -> Trace {
     let trace: Arc<Mutex<Trace>> = Arc::default();
     let packets = trace.clone();
-    let log = Log::default();
+    let log = Arc::new(fictionet::events::Memory::default());
     let writer = log.clone();
-    fictionet::block_on(fictionet::lab(Seed::from_u64(71), move |cx| async move {
-        cx.events().to_writer(Box::new(writer));
+    fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(Seed::from_u64(71)).observer(writer.clone()), move |cx| async move {
+        let evidence = writer;
         let cert = rustls::pki_types::CertificateDer::from(include_bytes!("fixtures/tls/ed25519.cert.der").to_vec());
         let key = rustls::pki_types::PrivateKeyDer::try_from(include_bytes!("fixtures/tls/ed25519.key.der").to_vec()).unwrap();
         let mut roots = rustls::RootCertStore::empty();
@@ -291,7 +279,7 @@ fn replay() -> Trace {
                 break;
             }
         }
-        let events = cx.events().of("http", "request");
+        let events = evidence.checked_of("http", "request").unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| e.str("version") == Some("HTTP/2.0")));
         cx.record(fictionet::events::Event::new("test", "complete").fields(Fields::new().with("requests", events.len() as u64)));
@@ -299,7 +287,7 @@ fn replay() -> Trace {
         Ok(())
     })).unwrap();
     let mut trace = std::mem::take(&mut *trace.lock().unwrap());
-    trace.events = log.0.lock().unwrap().clone();
+    trace.events = crate::common::evidence_bytes(&log);
     trace
 }
 
@@ -366,7 +354,7 @@ mod clients {
         dir: PathBuf,
         stop: Option<fictionet::End>,
         thread: Option<std::thread::JoinHandle<()>>,
-        events: Arc<Mutex<Vec<fictionet::events::Event>>>,
+        events: Arc<fictionet::events::Memory>,
     }
 
     impl World {
@@ -377,7 +365,7 @@ mod clients {
             let dir = fictionet_test_support::temp::dir();
             let ca_path = dir.join("ca.pem");
             let (stop, mut stopped) = fictionet::pair();
-            let events: Arc<Mutex<Vec<fictionet::events::Event>>> = Arc::default();
+            let events: Arc<fictionet::events::Memory> = Arc::default();
             let observed = events.clone();
             let (ready, started) = std::sync::mpsc::channel();
             let thread = std::thread::spawn(move || {
@@ -386,10 +374,7 @@ mod clients {
                     .enable_all()
                     .build()
                     .unwrap();
-                runtime.block_on(fictionet::run(Seed::from_u64(20), move |cx| async move {
-                    cx.events().subscribe(move |event| {
-                        if event.is("http", "request") { observed.lock().unwrap().push(event.clone()); }
-                    });
+                runtime.block_on(fictionet::run(fictionet::RunOptions::new(Seed::from_u64(20)).observer(observed.clone()), move |cx| async move {
                     let (ca, leaf) = fictionet_test_support::certs::issue(&cx, "HTTP test CA", &["localhost"])?;
                     std::fs::write(ca_path, ca.cert_pem())?;
                     let config = Arc::new(tls::config_builder(&cx, std::time::SystemTime::now()).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(leaf.chain, leaf.key)?);
@@ -408,10 +393,10 @@ window.addEventListener('load', () => {
                             let body = format!("/*{}*/completed++;", "x".repeat(1 << 20));
                             http::Response::builder().header("content-type", "application/javascript").body(Bytes::from(body)).unwrap()
                         })
-                        .route_async(Some(http::Method::GET), "/gate", |cx, _| async move {
-                            cx.events().wait(&cx, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();
+                        .route_async(Some(http::Method::GET), "/gate", move |cx, _| { let evidence = observed.clone(); async move {
+                            evidence.wait(&cx, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();
                             http::Response::builder().header("content-type", "application/javascript").body(Bytes::new()).unwrap()
-                        });
+                        }});
                     let (attach, arrivals) = fictionet::attachments();
                     net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site(router)).limits(httpd::Limits { body: 1024, ..Default::default() }).https())).start(&cx, arrivals)?;
                     let machine = sandbox::machine(&cx, attach.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
@@ -560,7 +545,7 @@ window.addEventListener('load', () => {
                 "{page}\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let events = world.events.lock().unwrap();
+            let events = world.events.checked_of("http", "request").unwrap();
             assert!(events.iter().all(|e| e.str("version") == Some("HTTP/2.0")));
             let large: Vec<_> = events
                 .iter()

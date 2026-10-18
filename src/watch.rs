@@ -439,9 +439,9 @@ pub(crate) struct Graph {
     /// Observer sessions connected to the world. While there are none,
     /// packet copies and TLS keys are not kept.
     pub(crate) viewers: AtomicUsize,
-    /// The run's events, kept whether or not anyone observes.
+    /// Event history explicitly installed by the world socket's owner.
     #[cfg(feature = "observe")]
-    pub(crate) events: Arc<crate::events::Store>,
+    pub(crate) events: Option<Arc<crate::events::Memory>>,
     /// TLS keys recorded by the run's protocol producers.
     #[cfg(feature = "observe")]
     pub(crate) keys: Arc<crate::telemetry::KeyRecorder>,
@@ -471,7 +471,7 @@ impl Graph {
         run_id: u64,
         environment: Arc<crate::environment::RunEnvironment>,
         start_wall: SystemTime,
-        events: Arc<crate::events::Store>,
+        events: Option<Arc<crate::events::Memory>>,
         #[cfg(feature = "observe")] keys: Arc<crate::telemetry::KeyRecorder>,
     ) -> Arc<Graph> {
         #[cfg(not(feature = "std"))]

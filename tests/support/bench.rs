@@ -43,9 +43,17 @@ impl World {
         F: FnOnce(Cx, Checkpoint) -> Fut + Send + 'static,
         Fut: Future<Output = fictionet::Result> + Send + 'static,
     {
+        Self::with_options(fictionet::Seed::random().into(), work)
+    }
+
+    pub fn with_options<F, Fut>(options: fictionet::RunOptions, work: F) -> Self
+    where
+        F: FnOnce(Cx, Checkpoint) -> Fut + Send + 'static,
+        Fut: Future<Output = fictionet::Result> + Send + 'static,
+    {
         let checkpoint = Arc::new(Mutex::new(None));
         let pause = Checkpoint(checkpoint.clone());
-        let future = Box::pin(run(fictionet::Seed::random(), move |fcx| work(fcx, pause)));
+        let future = Box::pin(run(options, move |fcx| work(fcx, pause)));
         let mut world = Self { future, checkpoint };
         world.advance();
         world

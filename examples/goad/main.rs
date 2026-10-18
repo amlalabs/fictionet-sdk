@@ -80,7 +80,8 @@ fn main() -> Result {
     }
 
     fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         move |fcx| async move {
             let lan = route::lan(&fcx, subnet, |event| event);
             loop {

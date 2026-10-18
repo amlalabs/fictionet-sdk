@@ -716,48 +716,55 @@ mod tests {
             fd: ours,
             subs: Vec::new(),
         };
-        crate::block_on(crate::run(crate::Seed::random(), |fcx| async move {
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            assert!(
-                std::future::Future::poll(std::pin::pin!(attachments.next(&fcx)).as_mut(), &mut cx)
+        crate::block_on(crate::run(
+            crate::RunOptions::new(crate::Seed::random())
+                .event_history(Arc::new(crate::events::Memory::default())),
+            |fcx| async move {
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    std::future::Future::poll(
+                        std::pin::pin!(attachments.next(&fcx)).as_mut(),
+                        &mut cx
+                    )
                     .is_pending()
-            );
-            session
-                .handle(1, json::parse_flat(r#"{"op":"watch","after":0}"#))
-                .unwrap();
-            session.pump().unwrap();
-            let graph_tick = match &session.subs[0] {
-                Sub::Graph { next_graph, .. } => *next_graph,
-                _ => unreachable!(),
-            };
-            for i in 0..2001u32 {
-                fcx.record(crate::events::Event::new("test", "tick").field("i", i));
-            }
-            if let Sub::Graph { next, .. } = &mut session.subs[0] {
-                *next = Instant::now();
-            }
-            session.pump().unwrap();
-            if let Sub::Graph {
-                next, next_graph, ..
-            } = &session.subs[0]
-            {
-                assert!(*next <= Instant::now());
-                assert_eq!(*next_graph, graph_tick);
-            }
-            session.pump().unwrap();
-            session.pump().unwrap();
-            if let Sub::Graph {
-                next, next_graph, ..
-            } = &session.subs[0]
-            {
-                assert!(*next > Instant::now());
-                assert_eq!(*next_graph, graph_tick);
-            }
-            drop(session);
-            Ok(())
-        }))
+                );
+                session
+                    .handle(1, json::parse_flat(r#"{"op":"watch","after":0}"#))
+                    .unwrap();
+                session.pump().unwrap();
+                let graph_tick = match &session.subs[0] {
+                    Sub::Graph { next_graph, .. } => *next_graph,
+                    _ => unreachable!(),
+                };
+                for i in 0..2001u32 {
+                    fcx.record(crate::events::Event::new("test", "tick").field("i", i));
+                }
+                if let Sub::Graph { next, .. } = &mut session.subs[0] {
+                    *next = Instant::now();
+                }
+                session.pump().unwrap();
+                if let Sub::Graph {
+                    next, next_graph, ..
+                } = &session.subs[0]
+                {
+                    assert!(*next <= Instant::now());
+                    assert_eq!(*next_graph, graph_tick);
+                }
+                session.pump().unwrap();
+                session.pump().unwrap();
+                if let Sub::Graph {
+                    next, next_graph, ..
+                } = &session.subs[0]
+                {
+                    assert!(*next > Instant::now());
+                    assert_eq!(*next_graph, graph_tick);
+                }
+                drop(session);
+                Ok(())
+            },
+        ))
         .unwrap();
-        assert_eq!(reader.join().unwrap(), 2001);
+        assert_eq!(reader.join().unwrap(), 2002);
     }
 
     /// A cancel with an id past `u32` cancels nothing, rather than the

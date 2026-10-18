@@ -81,8 +81,7 @@ pub struct HttpCase {
     pub body: usize,
     pub sites: usize,
     pub watch: Watch,
-    /// Whether the world subscribes a callback (one that does nothing) to
-    /// its events.
+    /// Whether the world installs an observer that does nothing.
     pub hooks: bool,
     pub writer: bool,
 }
@@ -186,7 +185,23 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
     let timing = measuring.clone();
     let stop_after = stop.clone();
     let wait_for = ready.clone();
-    World::new(move |fcx, checkpoint| async move {
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
+    if case.watch.enabled() {
+        options = options.event_history(Arc::new(fictionet::events::Memory::default()));
+    }
+    struct Hook;
+    impl fictionet::events::Observer for Hook {
+        fn enabled(&self, _: fictionet::events::Metadata, _: &fictionet::events::ConnInfo) -> bool { true }
+        fn observe(&self, _: fictionet::events::Stamp, _: fictionet::events::Observation<'_>) {}
+    }
+    let writer = case.writer.then(|| Arc::new(fictionet::events::Jsonl::new(std::io::sink(), fictionet::events::Limits::default()).unwrap()));
+    let mut destinations: Vec<Arc<dyn fictionet::events::Observer>> = Vec::new();
+    if let Some(writer) = &writer { destinations.push(writer.clone()); }
+    if case.hooks { destinations.push(Arc::new(Hook)); }
+    if !destinations.is_empty() {
+        options = options.observer(Arc::new(fictionet::events::Fanout::new(destinations)));
+    }
+    let mut world = World::with_options(options, move |fcx, checkpoint| async move {
         let (roots, chain, key) = certs(&fcx);
         let roots = Arc::new(roots);
         let config = Arc::new(
@@ -198,12 +213,6 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
         let page = Page(Bytes::from(vec![b'x'; case.body]));
         let sites =
             web::Sites::new(move |_| Some(web::Site::new(page.clone()).tls(config.clone())));
-        if case.writer {
-            fcx.events().to_writer(Box::new(std::io::sink()));
-        }
-        if case.hooks {
-            fcx.events().subscribe(|_| {});
-        }
         sites.start(&fcx, attachments)?;
         let machines: Vec<Machine> = (0..case.sandboxes)
             .map(|i| {
@@ -313,7 +322,6 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
         fcx.sleep(fictionet::time::ms(150)).await?;
         timing.store(false, Ordering::Release);
         stop_after.store(true, Ordering::Release);
-        assert_eq!(fcx.events().lost(), 0, "the writer lost events");
         let mut l = lat.lock().unwrap();
         l.sort_unstable();
         let total = l.len();
@@ -334,7 +342,15 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
         drop(listening);
         fcx.cancel();
         Ok(())
-    })
+    });
+    let future = std::mem::replace(&mut world.future, Box::pin(async { Ok(()) }));
+    world.future = Box::pin(async move {
+        let result = future.await;
+        if let Some(writer) = writer { writer.finish()?; }
+        result
+    });
+    world
+
 }
 
 // A hyper client over a `Connection`.

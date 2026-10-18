@@ -57,7 +57,8 @@ fn main() -> fictionet::Result {
     println!("listening on {path}");
 
     fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         move |fcx| async move {
             let agent = attachments.get(&fcx, "agent").await?;
             let (to_bank, bank_side) = pair();

@@ -720,7 +720,7 @@ fn malformed_dns_does_not_break_the_server() {
 /// the next sandbox that takes its address: the connections are ended.
 #[test]
 fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
-    world(|fcx, attacher, _env| async move {
+    super::events::world_events(|fcx, attacher, _env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         // a looks plain.test up and opens a connection by hand.
@@ -755,8 +755,8 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
             ACK,
             request,
         ));
-        let sent = fcx
-            .events()
+        let sent = log
+            .events
             .wait(&fcx, 1, Duration::from_secs(10), |e| {
                 e.is("http", "request") && e.str("path") == Some("/secret")
             })

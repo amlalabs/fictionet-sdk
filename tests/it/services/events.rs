@@ -43,11 +43,17 @@ fn event_layers_keep_field_order_and_render_json_values() {
 }
 
 #[test]
-fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
+fn installed_observers_keep_events_and_write_json_lines() {
     let path = std::env::temp_dir().join(format!("fictionet-events-{}.jsonl", std::process::id()));
-    let p = path.clone();
-    world(Duration::from_secs(60), move |fcx| async move {
-        let events = fcx.events();
+    let evidence = Arc::new(fictionet::events::Memory::default());
+    let jsonl = Arc::new(
+        fictionet::events::Jsonl::open(&path, fictionet::events::Limits::default()).unwrap(),
+    );
+    let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
+        fictionet::events::Fanout::new(vec![evidence.clone(), jsonl.clone()]),
+    ));
+    world::seeded_world(options, Duration::from_secs(60), move |fcx| async move {
+        let events = evidence;
         let conn = ConnInfo::new(
             9,
             "10.0.0.1:80".parse().unwrap(),
@@ -62,35 +68,38 @@ fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
                     .field("none", fictionet::events::opt(None::<u64>)),
             );
         }
-        // A file set after the first events still gets them all.
-        events.to_file(&p)?;
         assert_eq!(
-            events.all().iter().map(|e| e.seq).collect::<Vec<_>>(),
-            [1, 2, 3]
+            events
+                .checked_all()
+                .unwrap()
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
         );
         assert_eq!(events.dropped(), 0);
-        let layer = Layer::from_event(&events.all()[1]);
+        let layer = Layer::from_event(&events.checked_all().unwrap()[2]);
         assert_eq!(layer.name, "test.n");
         assert_eq!(layer.summary, "n=1");
-        assert_eq!(events.lost(), 0);
         Ok(())
     });
+    jsonl.finish().unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     let lines: Vec<json::Value> = text
         .lines()
         .map(|l| json::Value::parse(l.as_bytes()).unwrap())
         .collect();
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 4);
     assert_eq!(
-        lines[1].get("source").and_then(json::Value::as_str),
+        lines[2].get("source").and_then(json::Value::as_str),
         Some("test")
     );
-    assert_eq!(lines[1].get("conn").and_then(json::Value::as_u64), Some(9));
+    assert_eq!(lines[2].get("conn").and_then(json::Value::as_u64), Some(9));
     assert_eq!(
-        lines[1].get("peer").and_then(json::Value::as_str),
+        lines[2].get("peer").and_then(json::Value::as_str),
         Some("10.0.0.2:4000")
     );
-    let fields = lines[1].get("fields").unwrap();
+    let fields = lines[2].get("fields").unwrap();
     assert_eq!(fields.get("i").and_then(json::Value::as_u64), Some(1));
     assert!(fields.get("none").unwrap().is_null());
     let _ = std::fs::remove_file(&path);
@@ -100,7 +109,7 @@ fn every_run_keeps_its_events_and_writes_them_as_json_lines() {
 /// earlier events, and its later ones.
 #[test]
 fn a_reader_added_mid_connection_sees_its_events() {
-    world(Duration::from_secs(60), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -114,19 +123,24 @@ fn a_reader_added_mid_connection_sees_its_events() {
             .await?;
         conn.write_all(&fcx, b"before\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 13).await, b"hello\nbefore\n");
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let s = seen.clone();
-        fcx.events().subscribe(move |e| {
-            if e.is("echo", "line") {
-                s.lock().unwrap().push(e.summary.clone());
-            }
-        });
+        let seen = evidence.clone();
+        assert_eq!(
+            seen.checked_of("echo", "line").unwrap()[0].summary,
+            "before"
+        );
         conn.write_all(&fcx, b"after\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"after\n");
-        fcx.events()
+        evidence
             .wait(&fcx, 2, Duration::from_secs(2), |e| e.is("echo", "line"))
             .await?;
-        assert_eq!(*seen.lock().unwrap(), ["before", "after"]);
+        assert_eq!(
+            seen.checked_of("echo", "line")
+                .unwrap()
+                .iter()
+                .map(|e| e.summary.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "after"]
+        );
         Ok(())
     });
 }
@@ -135,15 +149,16 @@ fn a_reader_added_mid_connection_sees_its_events() {
 /// calendar.
 #[test]
 fn a_net_starts_its_events_with_a_wall_clock_anchor() {
+    let evidence = Arc::new(fictionet::events::Memory::default());
     world::seeded_real_world(
-        fictionet::Seed::from_u64(42),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(42)).observer(evidence.clone()),
         Duration::from_secs(60),
-        |fcx| async move {
-            let kept = fcx.events();
+        move |fcx| async move {
+            let kept = evidence;
             let (_attacher, attachments) = fictionet::attachments();
             let date = Fields::new().with("world_date", "2026-10-06");
             Net::new().start_fields(date).start(&fcx, attachments)?;
-            let first = &kept.all()[0];
+            let first = &kept.checked_all().unwrap()[1];
             assert!(first.is("run", "start"));
             assert_eq!(first.at, fictionet::time::Instant::ZERO);
             assert_eq!(
@@ -167,8 +182,8 @@ fn a_net_starts_its_events_with_a_wall_clock_anchor() {
 /// `Host::tcp_with` does by default. Before, `tcp` turned them off.
 #[test]
 fn net_records_connections_on_a_tcp_port() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let kept = fcx.events();
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
+        let kept = evidence;
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 1);
         Net::new()
@@ -182,7 +197,7 @@ fn net_records_connections_on_a_tcp_port() {
         let closed = kept
             .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "close"))
             .await?;
-        let opened = kept.of("conn", "open");
+        let opened = kept.checked_of("conn", "open").unwrap();
         assert_eq!(opened.len(), 1, "{opened:?}");
         assert_eq!((opened[0].conn.id, closed[0].conn.id), (Some(1), Some(1)));
         Ok(())

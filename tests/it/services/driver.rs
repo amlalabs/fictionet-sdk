@@ -90,9 +90,9 @@ fn replies_do_not_depend_on_chunk_boundaries() {
 
 #[test]
 fn listen_serves_each_connection_and_records_it() {
-    world(Duration::from_secs(60), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        let kept = fcx.events();
+        let kept = evidence;
         let transcript = Transcript::new(100, 1 << 16);
         let opts = ServeOptions::default().record(transcript.clone());
         serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, opts);
@@ -109,7 +109,11 @@ fn listen_serves_each_connection_and_records_it() {
             .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "close"))
             .await?;
         assert_eq!(entries.len(), 1);
-        let all = kept.all();
+        let events = kept.checked_all().unwrap();
+        let (start, all) = events.split_first().unwrap();
+        assert!(start.is("run", "start"));
+        assert_eq!(start.seq, 1);
+        assert_eq!(start.conn.id, None);
         let kinds: Vec<String> = all
             .iter()
             .map(|e| format!("{}.{}", e.source, e.kind))
@@ -159,7 +163,7 @@ fn listen_serves_each_connection_and_records_it() {
 
 #[test]
 fn timers_tick_and_idle_connections_close() {
-    world(Duration::from_secs(60), |fcx| async move {
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -175,7 +179,7 @@ fn timers_tick_and_idle_connections_close() {
         assert_eq!(read_some(&fcx, &mut conn, 100).await, b"tick\ntick\ntick\n");
         assert!(fcx.now().since_start() - started.since_start() >= Duration::from_millis(90));
 
-        let kept = fcx.events();
+        let kept = evidence;
         let opts = ServeOptions::default().idle(Some(Duration::from_millis(100)));
         serve::listen(&fcx, server.listen(2)?, Arc::new(()), || Echo, opts);
         let mut conn = client
@@ -279,8 +283,8 @@ fn fault_plans_change_bytes_and_items_both_ways() {
 
 #[test]
 fn a_connection_cap_resets_connections_past_it() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let events = fcx.events();
+    crate::common::world::observed_world(Duration::from_secs(60), |fcx, evidence| async move {
+        let events = evidence;
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -424,41 +428,51 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Short, ());
     assert_eq!(h.push(&input).unwrap(), b"long\nok\n");
     assert!(!h.closed());
-    world(Duration::from_secs(60), move |fcx| async move {
-        let (server, _su, client, _cu) = two_machines(&fcx);
-        let kept = fcx.events();
-        serve::listen(
-            &fcx,
-            server.listen(7)?,
-            Arc::new(()),
-            || Short,
-            ServeOptions::default(),
-        );
-        let mut conn = client
-            .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
-            .await?;
-        conn.write_all(&fcx, &input).await?;
-        assert_eq!(read_some(&fcx, &mut conn, 8).await, b"long\nok\n");
-        assert!(
-            kept.of("conn", "close").is_empty(),
-            "{:?}",
-            kept.of("conn", "close")
-        );
-        Ok(())
-    });
+    crate::common::world::observed_world(
+        Duration::from_secs(60),
+        move |fcx, evidence| async move {
+            let (server, _su, client, _cu) = two_machines(&fcx);
+            let kept = evidence;
+            serve::listen(
+                &fcx,
+                server.listen(7)?,
+                Arc::new(()),
+                || Short,
+                ServeOptions::default(),
+            );
+            let mut conn = client
+                .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
+                .await?;
+            conn.write_all(&fcx, &input).await?;
+            assert_eq!(read_some(&fcx, &mut conn, 8).await, b"long\nok\n");
+            assert!(
+                kept.checked_of("conn", "close").unwrap().is_empty(),
+                "{:?}",
+                kept.checked_of("conn", "close").unwrap()
+            );
+            Ok(())
+        },
+    );
 }
 
 /// The harness runs deferred work and reports an upgrade, as the driver
 /// does. Before, it dropped the work and took an upgrade for a close.
 #[test]
 fn the_harness_runs_deferred_work_and_reports_upgrades() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
+    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ()).observer(evidence_h.clone());
     let got = h.push(b"one\nlater\ntwo\n");
     assert_eq!(
         got.as_deref().map(String::from_utf8_lossy).unwrap(),
         "hello\none\nlater\ntwo\n"
     );
-    assert!(h.events().iter().any(|e| e.is("echo", "later")));
+    assert!(
+        evidence_h
+            .checked_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.is("echo", "later"))
+    );
     assert!(matches!(
         h.push(b"handoff\nrest"),
         Err(HarnessError::Upgraded(Upgrade::Handoff))
@@ -936,24 +950,27 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
 
     let addr = Ipv4Addr::new(10, 40, 0, 9);
     let to = SocketAddr::new(addr.into(), 7);
-    world(Duration::from_secs(60), move |fcx| async move {
-        let (attacher, attachments) = fictionet::attachments();
-        let kept = fcx.events();
-        Net::new()
-            .ipv4_only()
-            .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
-            .start(&fcx, attachments)?;
-        let s = machine(&fcx, attacher.attach("agent")?, ME);
-        let mut b = s.tcp.connect(&fcx, to).await?;
-        b.write_all(&fcx, b"hi\nfail\n").await?;
-        assert_eq!(read_some(&fcx, &mut b, 10).await, b"fine\n");
-        let error = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "error"))
-            .await?;
-        assert_eq!(error[0].str("error"), Some("the service gave up"));
-        assert_eq!(error[0].conn.id, Some(1));
-        Ok(())
-    });
+    crate::common::world::observed_world(
+        Duration::from_secs(60),
+        move |fcx, evidence| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            let kept = evidence;
+            Net::new()
+                .ipv4_only()
+                .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
+                .start(&fcx, attachments)?;
+            let s = machine(&fcx, attacher.attach("agent")?, ME);
+            let mut b = s.tcp.connect(&fcx, to).await?;
+            b.write_all(&fcx, b"hi\nfail\n").await?;
+            assert_eq!(read_some(&fcx, &mut b, 10).await, b"fine\n");
+            let error = kept
+                .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "error"))
+                .await?;
+            assert_eq!(error[0].str("error"), Some("the service gave up"));
+            assert_eq!(error[0].conn.id, Some(1));
+            Ok(())
+        },
+    );
 
     let ran = std::thread::spawn(move || {
         block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {

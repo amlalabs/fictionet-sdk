@@ -294,7 +294,8 @@ fn start_world(path: &str) -> fictionet::Listening {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random())
+                .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
             move |fcx| async move {
                 fcx.spawn(move |fcx| async move {
                     while let Ok(mut sandbox) = attachments.next(&fcx).await {

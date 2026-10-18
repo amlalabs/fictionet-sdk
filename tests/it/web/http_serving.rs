@@ -486,62 +486,66 @@ async fn the_proxy_refuses_hosts_routed_by_default_host() {
     let port = listener.local_addr().unwrap().port();
     let (seen_tx, seen) = mpsc::channel();
     let server = tokio::spawn(test_upstream(listener, seen_tx));
+    let evidence = Arc::new(Memory::default());
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run(fictionet::Seed::random(), move |fcx| async move {
-            let log = super::events::Log::new(&fcx);
-            let (attacher, attachments) = fictionet::attachments();
-            let proxy = web::proxy(&fcx)?;
-            web::Sites::new(move |h| {
-                (h == "allowed.test").then(|| {
-                    web::Site::new(ToTestUpstream {
-                        proxy: proxy.clone(),
-                        port,
+        run(
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            move |fcx| async move {
+                let log = super::events::Log::new(evidence);
+                let (attacher, attachments) = fictionet::attachments();
+                let proxy = web::proxy(&fcx)?;
+                web::Sites::new(move |h| {
+                    (h == "allowed.test").then(|| {
+                        web::Site::new(ToTestUpstream {
+                            proxy: proxy.clone(),
+                            port,
+                        })
+                        .default_host()
                     })
-                    .default_host()
                 })
-            })
-            .start(&fcx, attachments)?;
-            let m = default_machine(&fcx, &attacher);
-            let addr = lookup(&fcx, &m, "allowed.test").await;
-            for h2 in [false, true] {
-                let mut client = plain_client(&fcx, &m, addr, h2).await;
-                let mut requests = vec![("127.0.0.1", "/"), ("forward-me.example", "/")];
-                if !h2 {
-                    requests.push(("allowed.test", "http://forward-me.example/"));
-                }
-                for (host, path) in requests {
+                .start(&fcx, attachments)?;
+                let m = default_machine(&fcx, &attacher);
+                let addr = lookup(&fcx, &m, "allowed.test").await;
+                for h2 in [false, true] {
+                    let mut client = plain_client(&fcx, &m, addr, h2).await;
+                    let mut requests = vec![("127.0.0.1", "/"), ("forward-me.example", "/")];
+                    if !h2 {
+                        requests.push(("allowed.test", "http://forward-me.example/"));
+                    }
+                    for (host, path) in requests {
+                        log.clear();
+                        let got = client.get("http", host, path).await;
+                        assert_eq!(got.status, StatusCode::MISDIRECTED_REQUEST, "{}", got.body);
+                        assert_eq!(got.body, "This proxy does not serve unregistered hosts.\n");
+                        let events = wait_for(&fcx, &log, 1, http_seen).await;
+                        assert_eq!(events[0].str("answer"), Some("misdirected"));
+                        assert_eq!(events[0].u64("status"), Some(421));
+                    }
+                    assert_eq!(seen.try_recv(), Err(mpsc::TryRecvError::Empty));
                     log.clear();
-                    let got = client.get("http", host, path).await;
-                    assert_eq!(got.status, StatusCode::MISDIRECTED_REQUEST, "{}", got.body);
-                    assert_eq!(got.body, "This proxy does not serve unregistered hosts.\n");
+                    let got = client.get("http", "allowed.test", "/forwarded").await;
+                    assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+                    assert_eq!(got.body, "upstream");
                     let events = wait_for(&fcx, &log, 1, http_seen).await;
-                    assert_eq!(events[0].str("answer"), Some("misdirected"));
-                    assert_eq!(events[0].u64("status"), Some(421));
+                    assert_eq!(events[0].str("answer"), Some("handler"));
+                    assert_eq!(events[0].u64("status"), Some(200));
+                    let request = seen.try_recv().expect("allowed.test reaches the upstream");
+                    assert!(
+                        request.starts_with("GET /forwarded HTTP/1.1\r\n"),
+                        "{request}"
+                    );
+                    assert!(
+                        request
+                            .to_ascii_lowercase()
+                            .contains(&format!("host: 127.0.0.1:{port}\r\n")),
+                        "{request}"
+                    );
+                    assert_eq!(seen.try_recv(), Err(mpsc::TryRecvError::Empty));
                 }
-                assert_eq!(seen.try_recv(), Err(mpsc::TryRecvError::Empty));
-                log.clear();
-                let got = client.get("http", "allowed.test", "/forwarded").await;
-                assert_eq!(got.status, StatusCode::OK, "{}", got.body);
-                assert_eq!(got.body, "upstream");
-                let events = wait_for(&fcx, &log, 1, http_seen).await;
-                assert_eq!(events[0].str("answer"), Some("handler"));
-                assert_eq!(events[0].u64("status"), Some(200));
-                let request = seen.try_recv().expect("allowed.test reaches the upstream");
-                assert!(
-                    request.starts_with("GET /forwarded HTTP/1.1\r\n"),
-                    "{request}"
-                );
-                assert!(
-                    request
-                        .to_ascii_lowercase()
-                        .contains(&format!("host: 127.0.0.1:{port}\r\n")),
-                    "{request}"
-                );
-                assert_eq!(seen.try_recv(), Err(mpsc::TryRecvError::Empty));
-            }
-            Err(fictionet::Error::from(Done))
-        }),
+                Err(fictionet::Error::from(Done))
+            },
+        ),
     )
     .await
     .expect("timed out");

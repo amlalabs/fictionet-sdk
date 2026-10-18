@@ -452,11 +452,13 @@ reply.
 ```rust
 use fictionet::stdlib::services::serve::Harness;
 
-let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt, "hunter2".to_owned());
+let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt, "hunter2".to_owned())
+    .observer(evidence.clone());
 assert_eq!(h.open()?, b"password: ");
 assert_eq!(h.push(b"hunter2\n")?, b"welcome\n");
 assert!(h.closed());
-assert_eq!(h.events()[0].kind, "login");
+assert_eq!(evidence.checked_all()?[0].kind, "login");
 ```
 
 The harness runs the same state machine as the driver: `advance` moves
