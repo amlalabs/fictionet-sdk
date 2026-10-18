@@ -355,9 +355,8 @@ fn queued_head_and_get_responses_preserve_framing_after_edits() {
 }
 
 #[test]
-fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
-    use fictionet_copy_modules::protocols::http1 as copied;
-    let mut stream = Stream::new(copied::Requests::default());
+fn message_decoders_preserve_bytes_and_share_wire_traits() {
+    let mut stream = Stream::new(Requests::default());
     let input = [FIRST, SECOND].concat();
     assert_eq!(stream.push(&input), input.len());
     let mut raw = Vec::new();
@@ -375,15 +374,15 @@ fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
     assert_eq!(raw, input);
     assert_eq!(expected.len(), 2);
     assert_eq!(
-        test_support::decode_all(copied::Requests::default, &output),
+        test_support::decode_all(Requests::default, &output),
         (expected, None)
     );
-    let response = copied::Response::json(b"{}").unwrap();
+    let response = Response::json(b"{}").unwrap();
     assert_eq!(
         Response::parse(&response.to_bytes().unwrap()).unwrap().body,
         b"{}"
     );
-    contract::check_decode(copied::Responses::new, b"HTTP/1.1 204 \r\n\r\n");
+    contract::check_decode(Responses::new, b"HTTP/1.1 204 \r\n\r\n");
 }
 
 #[test]

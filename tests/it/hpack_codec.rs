@@ -72,14 +72,13 @@ fn settings_table_eviction_and_round_trips_through_public_api() {
 }
 
 #[test]
-fn copied_modules_use_the_same_public_contracts() {
-    use fictionet_copy_modules::protocols::{hpack as copied, huffman as shared};
-    let field = copied::Field::new("x-owned", [0, 255]);
+fn fields_huffman_strings_and_prefix_integers_keep_the_public_contracts() {
+    let field = hpack::Field::new("x-owned", [0, 255]);
     contract::check_wire_value(&field);
     let bytes = field.to_bytes().unwrap();
-    contract::check_decode(|| Collect::<copied::Field>::new(hpack::MAX_BLOCK), &bytes);
-    contract::check_wire_value(&shared::HuffmanString(vec![0, 255]));
-    let integer = fictionet_copy_modules::protocols::prefix_int::Integer::<5> {
+    contract::check_decode(|| Collect::<hpack::Field>::new(hpack::MAX_BLOCK), &bytes);
+    contract::check_wire_value(&huffman::HuffmanString(vec![0, 255]));
+    let integer = Integer::<5> {
         flags: 0x20,
         value: u64::MAX,
     };
@@ -90,18 +89,18 @@ fn copied_modules_use_the_same_public_contracts() {
             .value,
         u64::MAX
     );
-    let mut encoder = copied::Encoder::default();
+    let mut encoder = hpack::Encoder::default();
     let mut bytes = Vec::new();
     encoder.encode_block(&[field], &mut bytes).unwrap();
-    let result = copied::Table::default()
-        .decode_block(&bytes, copied::MAX_DECODED)
+    let result = hpack::Table::default()
+        .decode_block(&bytes, hpack::MAX_DECODED)
         .unwrap();
     assert_eq!(
         result.headers[0].name.as_deref(),
         Some(b"x-owned".as_slice())
     );
     assert_eq!(
-        huffman::decode(&shared::HuffmanString(vec![0, 255]).to_bytes().unwrap()).unwrap(),
+        huffman::decode(&huffman::HuffmanString(vec![0, 255]).to_bytes().unwrap()).unwrap(),
         [0, 255]
     );
 }

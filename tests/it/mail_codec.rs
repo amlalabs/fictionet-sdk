@@ -1843,3 +1843,19 @@ fn pop3_auth_after_a_challenge_keeps_the_reply_queue() {
     );
     assert_eq!(seen, [2, 2, 1, 0]);
 }
+
+#[test]
+fn mail_modules_write_through_wire() {
+    assert_eq!(
+        smtp::Reply::new(250, "Queued").to_bytes().unwrap(),
+        b"250 Queued\r\n"
+    );
+    assert_eq!(
+        pop3::Reply::ok("ready").to_bytes().unwrap(),
+        b"+OK ready\r\n"
+    );
+    assert_eq!(
+        imap::Response::greeting("ready").to_bytes().unwrap(),
+        b"* OK ready\r\n"
+    );
+}

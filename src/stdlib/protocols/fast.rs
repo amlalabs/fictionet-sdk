@@ -4626,4 +4626,37 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn fast_uses_templates_and_the_public_driver() {
+        use fictionet::stdlib::codec::{Stream, Wire};
+        use fictionet::stdlib::protocols::fast;
+        let templates = fast::Templates::from_xml(br#"<template xmlns="http://www.fixprotocol.org/ns/fast/td/1.1" name="Example" id="1"><uInt32 name="n"><increment value="1"/></uInt32></template>"#).unwrap();
+        let value = fast::Message {
+            template_id: 1,
+            fields: vec![fast::Value::UInt32(1)],
+        };
+        let mut bytes = Vec::new();
+        fast::Encoder::new(templates.clone())
+            .write(&value, &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [0xc0, 0x81]);
+        let mut stream = Stream::new(fast::Messages::new(templates.clone()));
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next().unwrap().unwrap(), value);
+        assert_eq!(fast::UInt64::parse(&[0x81]).unwrap(), fast::UInt64(1));
+        let mut blocks = Stream::new(fast::BlockMessages::new(fast::Messages::new(
+            templates.clone(),
+        )));
+        assert_eq!(blocks.push(&[0, 0x82, 0xc0, 0x81]), 4);
+        assert_eq!(blocks.next().unwrap().unwrap(), value);
+        let mut split = Stream::new(fast::BlockMessages::new(fast::Messages::new(templates)));
+        assert_eq!(split.push(&[0x81, 0xc0, 0x81, 0x81]), 4);
+        assert!(matches!(
+            split.next(),
+            Some(Err(fictionet::stdlib::codec::Fail::Protocol(
+                fast::Error::BlockBoundary
+            )))
+        ));
+    }
 }

@@ -1,3 +1,4 @@
+mod copy_check;
 mod demo;
 mod docker;
 mod eval;
@@ -51,6 +52,7 @@ fn main_result() -> Result {
                 demo::run(args)
             }
         }
+        "copy-check" => copy_check::run(args),
         "fuzz" => fuzz::run(args),
         "h2spec" => h2spec::run(args),
         "scan" => scan::run(args),
@@ -62,6 +64,7 @@ fn main_result() -> Result {
                       cargo xtask k8s [tun|proxy]\n\
                       cargo xtask vm [--fetch | nested [--fetch] | up | down | prepare | sync | build | test | ssh | status | clean]\n\
                       cargo xtask demo <name>  (demos/README.md lists them)\n\
+                      cargo xtask copy-check\n\
                       cargo xtask fuzz [--check | <target> | <seconds>] [libFuzzer arguments...]\n\
                       cargo xtask h2spec [section]\n\
                       cargo xtask scan [output directory]"

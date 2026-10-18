@@ -212,3 +212,23 @@ fn modbus_function(f: u8) -> &'static str {
         _ => "Other",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn modbus_session_stops_both_directions_after_bad_framing() {
+        use fictionet::observe::{Conversation, Decoded, Place, Registry};
+        let mut registry = Registry::new();
+        super::ModbusSession::register(&mut registry);
+        let mut conversation = Conversation::with_registry(40000, 502, registry);
+        let bad = [0, 9, 0, 5, 0, 6, 1, 3, 0, 0, 0, 1];
+        let reply = [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2];
+        for (reverse, bytes) in [(false, &bad[..]), (true, &reply[..])] {
+            let mut packet = Decoded::default();
+            conversation.data(reverse, bytes, Place::default(), &mut packet, &[]);
+            assert!(packet.layers.is_empty());
+            assert!(packet.tags.is_empty());
+            assert!(!conversation.waiting(reverse));
+        }
+    }
+}

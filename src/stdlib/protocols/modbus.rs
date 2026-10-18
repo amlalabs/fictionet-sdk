@@ -1821,4 +1821,35 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn modbus_uses_the_public_driver_and_map() {
+        use fictionet::stdlib::codec::{Decode, Frames, Stream, Wire, finish, pump};
+        use fictionet::stdlib::protocols::modbus;
+        let request = modbus::Request::ReadHoldingRegisters {
+            address: 2,
+            quantity: 1,
+        };
+        let frame = modbus::Frame {
+            transaction: 7,
+            unit: 1,
+            pdu: request.to_pdu().unwrap(),
+        };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).unwrap();
+        assert_eq!(<modbus::Frame as Wire>::parse(&bytes).unwrap(), frame);
+        let mut stream = Stream::new(
+            Frames::<modbus::Frame>::new().map(|frame| modbus::Request::parse(&frame.pdu)),
+        );
+        let mut requests = Vec::new();
+        for chunk in bytes.chunks(3) {
+            assert_eq!(
+                pump(&mut stream, chunk, |item| requests.push(item)).unwrap(),
+                chunk.len()
+            );
+        }
+        finish(&mut stream, |item| requests.push(item)).unwrap();
+        assert_eq!(requests, [Ok(request)]);
+        assert!(stream.is_done());
+    }
 }

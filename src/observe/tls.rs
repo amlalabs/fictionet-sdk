@@ -1118,4 +1118,33 @@ mod tests {
         assert!(feed(&mut tls, &seal(&secret, 0, 23, b"hello")));
         assert!(tls.keys[0].as_ref().unwrap().handshake.is_none());
     }
+
+    #[test]
+    fn tls_and_selection_driver_use_the_public_registry() {
+        use fictionet::observe::{Decoded, Place, Registry};
+        let mut registry = Registry::default();
+        super::TlsSession::register(&mut registry);
+        let mut conversation = crate::observe::Conversation::with_registry(40000, 443, registry);
+        let mut packet = Decoded::default();
+        let record = [22, 3, 3, 0, 4, 20, 0, 0, 0];
+        conversation.data(false, &record[..3], Place::default(), &mut packet, &[]);
+        assert!(conversation.waiting(false));
+        conversation.data(
+            false,
+            &record[3..],
+            Place {
+                stream_start: 3,
+                ..Place::default()
+            },
+            &mut packet,
+            &[],
+        );
+        assert_eq!(packet.proto, "TLS");
+        assert_eq!(packet.info, "Finished");
+        assert_eq!(packet.layers[0].range, (0, record.len()));
+        assert_eq!(packet.extra[0].1, record);
+        assert!(!conversation.waiting(false));
+        conversation.lost(false);
+        assert!(format!("{packet:?}").contains("Finished"));
+    }
 }

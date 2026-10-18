@@ -1135,4 +1135,19 @@ mod tests {
             Ok(Line::Comment("hello".into()))
         );
     }
+
+    #[test]
+    fn sse_uses_public_lines_and_wire() {
+        use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+        use fictionet::stdlib::protocols::sse;
+        let event = sse::Event::new("first\nsecond");
+        let bytes = event.to_bytes().unwrap();
+        let mut stream = Stream::new(sse::Events::default());
+        let mut events = Vec::new();
+        for chunk in bytes.chunks(1) {
+            pump(&mut stream, chunk, |event| events.push(event)).unwrap();
+        }
+        finish(&mut stream, |event| events.push(event)).unwrap();
+        assert_eq!(events, [event]);
+    }
 }

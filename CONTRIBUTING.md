@@ -120,6 +120,7 @@ commands. `cargo xtask --help` lists them.
 | `cargo xtask vm ...` | Boots the development VM and runs test suites in it ([vm/README.md](vm/README.md)). |
 | `cargo xtask demo <name>` | Runs a demo in the VM. [demos/README.md](demos/README.md) lists them. |
 | `cargo xtask eval <border\|fakewiki\|adaptive-web\|artifactory>` | Builds a world's images and runs its Inspect eval. |
+| `cargo xtask copy-check` | Copies the stdlib and the capture adapters into a crate of their own and builds it, with no SDK features and with all of them. |
 | `cargo xtask fuzz [--check \| <target> \| <seconds>]` | Runs the fuzz targets ([fuzz/README.md](fuzz/README.md)). |
 | `cargo xtask h2spec [section]` | Runs the h2spec conformance suite against the native HTTP/2 server, over TLS and h2c. |
 | `cargo xtask scan [output directory]` | Records the scan example's dashboard. |

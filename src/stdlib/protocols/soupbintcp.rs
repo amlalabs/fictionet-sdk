@@ -1628,4 +1628,45 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn soupbintcp_frames_through_the_public_driver() {
+        use fictionet::stdlib::codec::field::Alpha;
+        use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+        use fictionet::stdlib::protocols::soupbintcp;
+        // SoupBinTCP 3.00, 2.2.1: Login Accepted, then sequenced data.
+        let mut bytes = vec![0, 31, b'A'];
+        bytes.extend_from_slice(b"        S1                   7");
+        soupbintcp::Packet::SequencedData(b"msg".to_vec())
+            .write(&mut bytes)
+            .unwrap();
+        let mut client = soupbintcp::Client::new(
+            soupbintcp::Login {
+                username: Alpha::right_padded("ALICE").unwrap(),
+                password: Alpha::right_padded("SECRET").unwrap(),
+                session: Alpha::blank(),
+                sequence: 1,
+            },
+            soupbintcp::Timers::default(),
+            0,
+        )
+        .unwrap();
+        client.start(0).unwrap();
+        let mut stream = Stream::new(Frames::<soupbintcp::Packet>::default());
+        let mut events = Vec::new();
+        for chunk in bytes.chunks(5) {
+            pump(&mut stream, chunk, |frame| {
+                events.extend(client.receive_frame(&frame, 1).unwrap())
+            })
+            .unwrap();
+        }
+        finish(&mut stream, |_| unreachable!()).unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&fictionet::stdlib::protocols::session::Action::Event(
+                soupbintcp::Event::Sequenced { sequence: 7 }
+            ))
+        );
+        assert_eq!(client.next_sequence(), 8);
+    }
 }

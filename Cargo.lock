@@ -567,7 +567,6 @@ dependencies = [
  "divan",
  "etherparse",
  "fictionet-codegen",
- "fictionet-copy-modules",
  "getrandom 0.4.3",
  "h2",
  "hickory-proto",
@@ -625,32 +624,6 @@ version = "0.0.0"
 dependencies = [
  "fictionet",
  "fictionet-codegen",
-]
-
-[[package]]
-name = "fictionet-copy-modules"
-version = "0.0.0"
-dependencies = [
- "axum",
- "bytes",
- "fictionet",
- "h2",
- "hickory-proto",
- "http",
- "http-body",
- "hyper",
- "hyper-util",
- "libc",
- "p256",
- "p384",
- "ring",
- "rsa",
- "rustls",
- "smoltcp",
- "tokio",
- "tower-service",
- "webpki-roots",
- "x25519-dalek",
 ]
 
 [[package]]

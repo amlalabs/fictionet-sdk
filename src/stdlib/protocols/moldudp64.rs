@@ -1322,4 +1322,38 @@ mod tests {
             assert_eq!(got, want);
         }
     }
+
+    #[test]
+    fn moldudp64_recovers_a_gap() {
+        use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+        use fictionet::stdlib::protocols::moldudp64;
+        let session = moldudp64::Session::left_padded("S1").unwrap();
+        let mut server =
+            moldudp64::Retransmitter::new(session, 1, moldudp64::StoreConfig::default()).unwrap();
+        for m in [&b"a"[..], b"b", b"c"] {
+            server.push(m).unwrap();
+        }
+        let mut receiver = moldudp64::Receiver::new(moldudp64::ReceiverConfig::default()).unwrap();
+        receiver.receive(&server.packet(1, 1).unwrap(), 0).unwrap();
+        let bytes = server.packet(3, 1).unwrap().to_bytes().unwrap();
+        let live = <moldudp64::Downstream as Wire>::parse(&bytes).unwrap();
+        let actions = receiver.receive(&live, 1).unwrap();
+        let Some(fictionet::stdlib::protocols::session::Action::Send(request)) = actions.last()
+        else {
+            panic!("expected a request")
+        };
+        let wire = request.to_bytes().unwrap();
+        let request = <moldudp64::Request as Wire>::parse(&wire).unwrap();
+        let answer = server.answer(&request).unwrap();
+        receiver.receive(&answer, 2).unwrap();
+        assert_eq!(receiver.expected(), Some(4));
+        let mut blocks = Stream::new(moldudp64::Blocks);
+        let mut messages = Vec::new();
+        pump(&mut blocks, &bytes[moldudp64::HEADER_LENGTH..], |m| {
+            messages.push(m)
+        })
+        .unwrap();
+        finish(&mut blocks, |m| messages.push(m)).unwrap();
+        assert_eq!(messages, [b"c".to_vec()]);
+    }
 }

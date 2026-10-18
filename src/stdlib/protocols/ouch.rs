@@ -3338,4 +3338,43 @@ mod tests {
         assert!(x.is_disabled(full));
         assert_eq!(x.next_user_ref(4), Some(2));
     }
+
+    #[test]
+    fn ouch_exchange_accepts_through_wire() {
+        use fictionet::stdlib::codec::Wire;
+        use fictionet::stdlib::codec::field::Alpha;
+        use fictionet::stdlib::protocols::ouch;
+        let enter = ouch::EnterOrder {
+            user_ref: 1,
+            side: ouch::Side::Buy,
+            quantity: 10,
+            symbol: Alpha::right_padded("ZVZZT").unwrap(),
+            price: ouch::Price(10_000),
+            time_in_force: b'0',
+            display: b'Y',
+            capacity: b'A',
+            intermarket_sweep: b'N',
+            cross_type: b'N',
+            cl_ord_id: Alpha::right_padded("A1").unwrap(),
+            options: ouch::Options::default(),
+        };
+        let bytes = enter.to_bytes().unwrap();
+        let inbound = <ouch::Inbound as Wire>::parse(&bytes).unwrap();
+        let mut exchange = ouch::Exchange::new(ouch::ExchangeConfig::default()).unwrap();
+        let token = ouch::Token {
+            user_ref_idx: 0,
+            user_ref: 1,
+        };
+        assert_eq!(
+            exchange.receive(&inbound, 0).unwrap(),
+            [fictionet::stdlib::protocols::session::Action::Event(
+                ouch::Event::EnterRequested(token)
+            )]
+        );
+        let accepted = exchange.accept(token, 1).unwrap().to_bytes().unwrap();
+        assert!(matches!(
+            <ouch::Outbound as Wire>::parse(&accepted),
+            Ok(ouch::Outbound::OrderAccepted(_))
+        ));
+    }
 }

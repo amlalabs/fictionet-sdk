@@ -559,4 +559,59 @@ mod tests {
         .unwrap();
         assert!(super::CxRandom.fill(&mut byte).is_err());
     }
+
+    #[test]
+    fn crypto_provider_draws_follow_the_run_seed() {
+        use fictionet::{Seed, block_on, lab};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::{Arc, Mutex};
+
+        fn draw(provider: rustls::crypto::CryptoProvider) -> Vec<Vec<u8>> {
+            let mut bytes = vec![0; 17];
+            provider.secure_random.fill(&mut bytes).unwrap();
+            let mut result = vec![bytes];
+            for group in provider.kx_groups {
+                let first = group.start().unwrap();
+                let second = group.start().unwrap();
+                let a = first.pub_key().to_vec();
+                let b = second.pub_key().to_vec();
+                let shared = first.complete(&b).unwrap();
+                assert_eq!(
+                    shared.secret_bytes(),
+                    second.complete(&a).unwrap().secret_bytes()
+                );
+                result.extend([a, b, shared.secret_bytes().to_vec()]);
+            }
+            let key = provider
+                .key_provider
+                .load_private_key(
+                    PrivateKeyDer::try_from(
+                        include_bytes!("../../../../tests/it/fixtures/tls/rsa.key.der").to_vec(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            result.push(
+                key.choose_scheme(&[rustls::SignatureScheme::RSA_PSS_SHA256])
+                    .unwrap()
+                    .sign(b"copied TLS")
+                    .unwrap(),
+            );
+            result
+        }
+
+        let exercise = |seed| {
+            let result = Arc::new(Mutex::new(Vec::new()));
+            let output = result.clone();
+            block_on(lab(Seed::from_u64(seed), move |cx| async move {
+                *output.lock().unwrap() =
+                    super::with_context(&cx, || draw(super::crypto_provider()));
+                Ok(())
+            }))
+            .unwrap();
+            Arc::try_unwrap(result).unwrap().into_inner().unwrap()
+        };
+        assert_eq!(exercise(91), exercise(91));
+        assert_ne!(exercise(91), exercise(92));
+    }
 }

@@ -2114,4 +2114,47 @@ mod tests {
             assert_eq!(levels, book.level_count());
         }
     }
+
+    #[test]
+    fn itch_frames_a_file_and_builds_a_book() {
+        use fictionet::stdlib::codec::field::Alpha;
+        use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+        use fictionet::stdlib::protocols::itch;
+        // ITCH 5.0, 1.3.1: Add Order, then 1.4.1: Order Executed, each with a
+        // two-byte length in front as in a binary ITCH file.
+        let header = itch::Header {
+            locate: 3,
+            tracking: 0,
+            timestamp: itch::Timestamp::new(1).unwrap(),
+        };
+        let add = itch::AddOrder {
+            header,
+            order_ref: 5,
+            side: itch::Side::Sell,
+            shares: 100,
+            stock: Alpha::right_padded("ZVZZT").unwrap(),
+            price: itch::Price4(10_000),
+        };
+        let executed = itch::OrderExecuted {
+            header,
+            order_ref: 5,
+            executed_shares: 40,
+            match_number: 1,
+        };
+        let mut file = Vec::new();
+        for m in [itch::Message::from(add), executed.into()] {
+            file.extend_from_slice(&(m.wire_len() as u16).to_be_bytes());
+            m.write(&mut file).unwrap();
+        }
+        let mut stream = Stream::new(Frames::<itch::Message>::default());
+        let mut book = itch::Book::new(itch::BookConfig::default()).unwrap();
+        for chunk in file.chunks(7) {
+            pump(&mut stream, chunk, |m| {
+                book.apply(&m.unwrap()).unwrap();
+            })
+            .unwrap();
+        }
+        finish(&mut stream, |_| unreachable!()).unwrap();
+        assert_eq!(book.best_ask(3).unwrap().shares, 60);
+    }
 }

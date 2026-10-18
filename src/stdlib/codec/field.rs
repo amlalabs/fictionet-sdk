@@ -365,4 +365,144 @@ mod tests {
             assert_eq!(out, "price:");
         }
     }
+
+    #[test]
+    fn text_field_pads_validates_and_trims() {
+        for (text, left, right) in [
+            ("", *b"    ", *b"    "),
+            ("AB", *b"  AB", *b"AB  "),
+            (" A ", *b"  A ", *b" A  "),
+            (" ~! ", *b" ~! ", *b" ~! "),
+        ] {
+            assert_eq!(Alpha::<4>::left_padded(text).unwrap().as_bytes(), &left);
+            assert_eq!(Alpha::<4>::right_padded(text).unwrap().as_bytes(), &right);
+        }
+        assert_eq!(Alpha::<0>::left_padded("").unwrap().as_bytes(), &[]);
+        assert_eq!(Alpha::<0>::right_padded("A"), Err(Error::Length));
+        assert_eq!(Alpha::<4>::left_padded("ABCDE"), Err(Error::Length));
+        for text in ["\0", "\t", "\n", "\u{1f}", "\u{7f}", "é", "🦀"] {
+            assert_eq!(Alpha::<4>::left_padded(text), Err(Error::Printable));
+            assert_eq!(Alpha::<4>::right_padded(text), Err(Error::Printable));
+        }
+        for byte in 0..=u8::MAX {
+            let bytes = [b' ', b'A', byte];
+            if (b' '..=b'~').contains(&byte) {
+                assert_eq!(Alpha::new(bytes).unwrap().as_bytes(), &bytes);
+            } else {
+                assert_eq!(Alpha::new(bytes), Err(Error::Printable));
+            }
+            assert_eq!(Alpha::from(bytes).as_bytes(), &bytes);
+        }
+        assert_eq!(Alpha::new(*b" A ").unwrap().trimmed(), "A");
+        assert_eq!(Alpha::from(*b" A \0Z").trimmed(), "A");
+        assert!(Alpha::<3>::blank().is_blank());
+    }
+
+    #[test]
+    fn protocols_keep_their_alpha_rules() {
+        use fictionet::stdlib::codec::Wire;
+        use fictionet::stdlib::protocols::{cboe_pitch, itch, moldudp64, ouch, soupbintcp};
+        // A NUL in an alpha field: Nasdaq's protocols refuse the message,
+        // Cboe's keeps the byte.
+        fn nul_in(bytes: &mut [u8], field: &[u8]) {
+            let at = bytes.windows(field.len()).position(|w| w == field).unwrap();
+            bytes[at] = 0;
+        }
+        let symbol = Alpha::right_padded("ZVZZT").unwrap();
+        let add = itch::AddOrder {
+            header: itch::Header {
+                locate: 3,
+                tracking: 0,
+                timestamp: itch::Timestamp::new(1).unwrap(),
+            },
+            order_ref: 5,
+            side: itch::Side::Sell,
+            shares: 100,
+            stock: symbol,
+            price: itch::Price4(10_000),
+        };
+        let mut bytes = itch::Message::from(add).to_bytes().unwrap();
+        nul_in(&mut bytes, symbol.as_bytes());
+        assert_eq!(
+            <itch::Message as Wire>::parse(&bytes),
+            Err(itch::Error::Field)
+        );
+        let enter = ouch::EnterOrder {
+            user_ref: 1,
+            side: ouch::Side::Buy,
+            quantity: 10,
+            symbol,
+            price: ouch::Price(10_000),
+            time_in_force: b'0',
+            display: b'Y',
+            capacity: b'A',
+            intermarket_sweep: b'N',
+            cross_type: b'N',
+            cl_ord_id: Alpha::right_padded("A1").unwrap(),
+            options: ouch::Options::default(),
+        };
+        let mut bytes = enter.to_bytes().unwrap();
+        nul_in(&mut bytes, symbol.as_bytes());
+        assert_eq!(
+            <ouch::Inbound as Wire>::parse(&bytes),
+            Err(ouch::Error::Field)
+        );
+        let login = soupbintcp::Login {
+            username: Alpha::right_padded("ALICE").unwrap(),
+            password: Alpha::right_padded("SECRET").unwrap(),
+            session: Alpha::blank(),
+            sequence: 1,
+        };
+        let mut bytes = soupbintcp::Packet::LoginRequest(login).to_bytes().unwrap();
+        nul_in(&mut bytes, login.username.as_bytes());
+        assert_eq!(
+            <soupbintcp::Packet as Wire>::parse(&bytes),
+            Err(soupbintcp::Error::Field)
+        );
+        let short = cboe_pitch::AddOrderShort {
+            time_offset: 447_000,
+            order_id: 5,
+            side: cboe_pitch::Side::Buy,
+            quantity: 737,
+            symbol: symbol.resized().unwrap(),
+            price: cboe_pitch::ShortPrice(1),
+            flags: 1,
+            extra: Vec::new(),
+        };
+        let mut bytes = cboe_pitch::Message::from(short).to_bytes().unwrap();
+        nul_in(&mut bytes, b"ZVZZT ");
+        let cboe_pitch::Message::AddOrderShort(parsed) =
+            <cboe_pitch::Message as Wire>::parse(&bytes).unwrap()
+        else {
+            panic!("not an Add Order (short)")
+        };
+        assert_eq!(parsed.symbol.as_bytes(), b"\0VZZT ");
+        assert_eq!(cboe_pitch::Message::from(parsed).to_bytes().unwrap(), bytes);
+
+        // MoldUDP64's session field is its own type, padded on the left.
+        for (text, bytes) in [
+            ("", *b"          "),
+            ("AB", *b"        AB"),
+            ("0123456789", *b"0123456789"),
+        ] {
+            assert_eq!(
+                moldudp64::Session::left_padded(text).unwrap().as_bytes(),
+                &bytes
+            );
+        }
+        for text in ["01234567890", "\0", "é"] {
+            assert_eq!(
+                moldudp64::Session::left_padded(text),
+                Err(moldudp64::Error::Field)
+            );
+        }
+        assert_eq!(
+            moldudp64::Session::new(*b" A        ").unwrap().trimmed(),
+            "A"
+        );
+        assert_eq!(
+            moldudp64::Session::new(*b"A\0        "),
+            Err(moldudp64::Error::Field)
+        );
+    }
 }

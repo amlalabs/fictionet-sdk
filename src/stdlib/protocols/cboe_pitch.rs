@@ -3097,4 +3097,50 @@ mod tests {
             assert_eq!(b[1], m.kind());
         }
     }
+
+    #[test]
+    fn cboe_pitch_frames_units_and_builds_a_book() {
+        use fictionet::stdlib::codec::field::Alpha;
+        use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+        use fictionet::stdlib::protocols::cboe_pitch;
+        // Cboe Multicast PITCH, "Sequenced Unit Header with 2 Messages": an
+        // Add Order (short) and a Reduce Size (short) on unit 1.
+        let add = cboe_pitch::AddOrderShort {
+            time_offset: 447_000,
+            order_id: 5,
+            side: cboe_pitch::Side::Buy,
+            quantity: 737,
+            symbol: Alpha::right_padded("ZVZZT").unwrap(),
+            price: cboe_pitch::ShortPrice(1),
+            flags: 1,
+            extra: Vec::new(),
+        };
+        let reduce = cboe_pitch::ReduceSizeShort {
+            time_offset: 449_000,
+            order_id: 5,
+            canceled_quantity: 700,
+            extra: Vec::new(),
+        };
+        let unit = cboe_pitch::Unit::of(1, 1, &[add.into(), reduce.into()]).unwrap();
+        let bytes = unit.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 50);
+        let mut stream = Stream::new(Frames::<cboe_pitch::Unit>::default());
+        let mut book = cboe_pitch::Book::new(cboe_pitch::BookConfig::default()).unwrap();
+        let mut gaps = cboe_pitch::GapDetector::new();
+        for chunk in bytes.chunks(7) {
+            pump(&mut stream, chunk, |u| {
+                let u = u.unwrap();
+                let seen = gaps.receive(&u);
+                for m in &u.messages[seen.skip..] {
+                    book.apply(u.unit, &<cboe_pitch::Message as Wire>::parse(m).unwrap())
+                        .unwrap();
+                }
+            })
+            .unwrap();
+        }
+        finish(&mut stream, |_| unreachable!()).unwrap();
+        let symbol = Alpha::right_padded("ZVZZT").unwrap();
+        assert_eq!(book.best_bid(symbol).unwrap().quantity, 37);
+        assert_eq!(gaps.expected(1), Some(3));
+    }
 }

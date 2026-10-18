@@ -100,19 +100,15 @@ macro_rules! display_presenter {
     };
 }
 
-#[path = "protocols/modbus.rs"]
 mod modbus;
 pub use modbus::{Modbus, ModbusSession};
 
-#[path = "protocols/dns.rs"]
 mod dns;
 pub use dns::Dns;
 
-#[path = "protocols/dhcp.rs"]
 mod dhcp;
 pub use dhcp::Dhcp;
 
-#[path = "protocols/http1.rs"]
 mod http1;
 pub use http1::{Http1, body_preview};
 
@@ -279,5 +275,68 @@ mod tests {
         let (item, range) = tls.next_span().unwrap().unwrap();
         assert!(!item.oversized);
         assert_eq!(range, 40_005..40_011);
+    }
+
+    #[test]
+    fn presenters_plug_into_observe_and_construct_display_items() {
+        use fictionet::events::Transport;
+        use fictionet::observe::{
+            Decoded, Layer, Match, Observed, Place, Present, Registry, Selection,
+        };
+        let mut registry = Registry::new();
+        registry.register(
+            "modbus",
+            |_| Match::Yes,
+            |_| [super::Modbus::new(true), super::Modbus::new(false)],
+        );
+        let mut protocol = registry
+            .open(Selection {
+                transport: Transport::Tcp,
+                ports: (40000, 502),
+                first: &[],
+                alpn: None,
+            })
+            .unwrap();
+        let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
+        let mut packet = Decoded::default();
+        protocol.data(
+            false,
+            &bytes,
+            Place {
+                offset: Some(0),
+                len: bytes.len(),
+                ..Place::default()
+            },
+            &mut packet,
+            &[],
+        );
+        assert_eq!(packet.proto, "Modbus/TCP");
+        assert_eq!(packet.layers[0].range, (0, bytes.len()));
+        let item = super::Display::from_packet(packet, "Copied frame");
+        assert!(super::Modbus::summary(&item).contains("transaction 7"));
+        assert!(format!("{registry:?}").contains("modbus"));
+        assert!(format!("{:?}", Observed::new(super::Modbus::new(true))).contains("Modbus/TCP"));
+
+        let mut packet = Decoded::default();
+        packet.application(2, "Custom", "message");
+        assert_eq!(packet.level(), 2);
+        packet.push(Layer::new("Custom", 0, (0, 1)));
+        let item = super::Display::from_packet(packet, "Custom bytes");
+        let mut layer = Layer::new("Custom", 0, (0, 1));
+        super::Dns::fields(&item, b"x", &mut layer);
+        let mut packet = Decoded::default();
+        super::Dns::present(
+            &item,
+            b"x",
+            0,
+            &fictionet::observe::Placement::new(Place {
+                offset: Some(4),
+                len: 1,
+                ..Place::default()
+            }),
+            &mut packet,
+        );
+        assert_eq!(packet.layers[0].range, (4, 5));
+        assert_eq!(packet.info, "message");
     }
 }

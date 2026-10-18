@@ -331,4 +331,64 @@ mod tests {
             assert!(d.layers.len() + d.cut > 0);
         });
     }
+
+    #[test]
+    fn capture_registrations_keep_inventory_and_matching_precedence() {
+        use fictionet::events::Transport::{Tcp, Udp};
+        use fictionet::observe::{Match, Registry, Selection};
+
+        let mut registered = Registry::new();
+        crate::observe::protocols::Http1::register(&mut registered);
+        let budget = crate::observe::http2::CaptureBudget::default();
+        crate::observe::http2::Capture::register(&mut registered, &budget);
+        crate::observe::tls::TlsSession::register(&mut registered);
+        crate::observe::protocols::ModbusSession::register(&mut registered);
+        crate::observe::protocols::Dhcp::register(&mut registered);
+        crate::observe::protocols::Dns::register(&mut registered);
+
+        for registry in [Registry::default(), registered] {
+            assert_eq!(
+                registry.names().collect::<Vec<_>>(),
+                ["http1", "http2", "tls", "modbus", "dhcp", "dns"]
+            );
+            for (transport, ports, first, alpn, expected) in [
+                (Tcp, (40000, 53), &b"GET /"[..], None, Ok("dns")),
+                (Udp, (53, 68), b"", None, Ok("dns")),
+                (Tcp, (53, 502), b"\x16\x03", Some("h2"), Ok("dns")),
+                (Udp, (67, 68), b"GET /", None, Ok("dhcp")),
+                (Udp, (68, 67), b"", None, Ok("dhcp")),
+                (Udp, (67, 69), b"", None, Err(Match::No)),
+                (Tcp, (67, 68), b"other", None, Err(Match::No)),
+                (Tcp, (40000, 502), b"GET /", None, Ok("modbus")),
+                (Tcp, (502, 40000), b"\x16\x03", Some("h2"), Ok("modbus")),
+                (Udp, (40000, 502), b"other", None, Err(Match::No)),
+                (Tcp, (40000, 443), b"\x16\x03", Some("h2"), Ok("tls")),
+                (Tcp, (40000, 443), b"\x16", None, Err(Match::No)),
+                (Tcp, (40000, 80), b"PRI *", None, Err(Match::More)),
+                (
+                    Tcp,
+                    (40000, 80),
+                    fictionet::stdlib::protocols::http2::PREFACE,
+                    None,
+                    Ok("http2"),
+                ),
+                (Tcp, (40000, 443), b"GET /", Some("h2"), Ok("http2")),
+                (Tcp, (40000, 443), b"PRI *", Some("http/1.1"), Ok("http1")),
+                (Tcp, (40000, 80), b"HTTP/1.1", None, Ok("http1")),
+                (Tcp, (40000, 80), b"GET /", Some("unknown"), Ok("http1")),
+                (Tcp, (40000, 80), b"GE", None, Err(Match::No)),
+                (Udp, (40000, 80), b"GET /", Some("http/1.1"), Err(Match::No)),
+                (Udp, (40000, 443), b"\x16\x03", Some("h2"), Err(Match::No)),
+                (Tcp, (40000, 80), b"", None, Err(Match::More)),
+            ] {
+                let selection = Selection {
+                    transport,
+                    ports,
+                    first,
+                    alpn,
+                };
+                assert_eq!(registry.select(selection), expected, "{selection:?}");
+            }
+        }
+    }
 }

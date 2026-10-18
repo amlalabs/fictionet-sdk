@@ -733,4 +733,51 @@ mod tests {
         let _ = audit.decode(b"a", false);
         let _ = audit.decode(b"b", true);
     }
+
+    #[test]
+    fn contract_checks_fixed_capacity_and_returns_decoded_items() {
+        use fictionet::stdlib::codec::{Ending, Lines};
+        use fictionet::stdlib::test_support;
+        for data in [
+            b"one\ntwo\n".as_slice(),
+            b"unfinished",
+            b"too long for this limit\n",
+        ] {
+            let make = || Lines::new(16, Ending::LfOrCrlf);
+            let expected = test_support::contract::check_decode_with_alloc_limit(make, data, 36);
+            let got = test_support::contract::check_decode_capacity(make, data);
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn contract_checks_both_limits_and_returns_items_and_failure() {
+        use fictionet::stdlib::codec::Fail;
+        use fictionet::stdlib::codec::Frames;
+        use fictionet::stdlib::protocols::tpkt;
+        use fictionet::stdlib::test_support;
+        let make = Frames::<tpkt::Packet>::new;
+        let alloc_limit = 2 * make().capacity();
+        assert_eq!(
+            test_support::contract::check_decode_limits(
+                make,
+                &[3, 0, 0, 7, 1, 2, 3],
+                0,
+                alloc_limit
+            ),
+            (vec![tpkt::Packet::new(vec![1, 2, 3])], None)
+        );
+        assert_eq!(
+            test_support::contract::check_decode_limits(
+                make,
+                &[3, 0, 0, 7, 1, 2, 3, 3, 0, 0],
+                0,
+                alloc_limit,
+            ),
+            (
+                vec![tpkt::Packet::new(vec![1, 2, 3])],
+                Some(Fail::Truncated { unread: 3 })
+            )
+        );
+    }
 }

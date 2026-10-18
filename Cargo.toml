@@ -86,7 +86,6 @@ h2 = "0.4"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 http-body-util = "0.1"
 fictionet-codegen = { path = "codegen" }
-fictionet-copy-modules = { path = "tests/copy_and_own" }
 axum = { version = "0.8", default-features = false, features = ["ws"] }
 hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
 etherparse = "0.21"

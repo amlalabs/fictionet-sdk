@@ -112,9 +112,9 @@ fn openapi30_nullable_request_body_and_examples() {
 }
 
 #[test]
-fn copied_schema_module_composes_with_sdk_json() {
+fn schema_module_composes_with_sdk_json() {
     let source = parse(br#"{"type":"integer","minimum":4}"#);
-    let schema = fictionet_copy_modules::protocols::json_schema::Schema::compile(&source).unwrap();
+    let schema = Schema::compile(&source).unwrap();
     assert!(schema.validate(&Value::from(5)).is_valid());
     let example = schema.generate(12, Default::default()).unwrap();
     assert!(schema.validate(&example).is_valid());

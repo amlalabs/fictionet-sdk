@@ -5422,4 +5422,75 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn cboe_boe_logs_in_and_acknowledges() {
+        use cboe_boe::{Event, OrderEvent, Text};
+        use fictionet::stdlib::codec::{Frames, Stream, Wire};
+        use fictionet::stdlib::protocols::cboe_boe;
+        use fictionet::stdlib::protocols::session::Action;
+        let config = cboe_boe::ClientConfig {
+            session_sub_id: Text::new("0001").unwrap(),
+            username: Text::new("TEST").unwrap(),
+            password: Text::new("TESTING").unwrap(),
+            no_unspecified_unit_replay: false,
+            returns: vec![(0x25, vec![0, 0x40])],
+            timers: cboe_boe::Timers::default(),
+        };
+        let mut client = cboe_boe::Client::new(config, &[], 0).unwrap();
+        let mut server = cboe_boe::Server::new(cboe_boe::Timers::default(), 0).unwrap();
+        let mut frames = Stream::new(Frames::<cboe_boe::Inbound>::default());
+        for action in client.start(0).unwrap() {
+            if let Action::Send(m) = action {
+                let bytes = m.to_bytes().unwrap();
+                assert_eq!(frames.push(&bytes), bytes.len());
+            }
+        }
+        let login = frames.next().unwrap().unwrap().unwrap();
+        assert!(matches!(
+            &server.receive(&login, 1).unwrap()[..],
+            [Action::Event(Event::LoginRequested(_))]
+        ));
+        for action in server.accept(0, &[], 2).unwrap() {
+            if let Action::Send(m) = action {
+                client.receive(&m, 3).unwrap();
+            }
+        }
+        let order = cboe_boe::NewOrder {
+            header: cboe_boe::Header::default(),
+            cl_ord_id: Text::new("A1").unwrap(),
+            side: b'2',
+            order_qty: 10,
+            fields: cboe_boe::Optional::new()
+                .with(cboe_boe::Opt::Price("1.5".parse().unwrap()))
+                .unwrap()
+                .with(cboe_boe::Opt::Symbol(Text::new("ZVZZT").unwrap()))
+                .unwrap()
+                .with(cboe_boe::Opt::Capacity(b'A'))
+                .unwrap(),
+        };
+        let sent = client.send(order.into(), 4).unwrap();
+        let parsed = <cboe_boe::Inbound as Wire>::parse(&sent.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            server.receive(&parsed, 5).unwrap(),
+            [Action::Event(Event::Application)]
+        );
+        let mut exchange = cboe_boe::Exchange::new(
+            cboe_boe::ExchangeConfig::default(),
+            server.returns().clone(),
+        )
+        .unwrap();
+        let id = Text::new("A1").unwrap();
+        assert_eq!(
+            exchange.receive(&parsed, 6),
+            [Action::Event(OrderEvent::NewOrderRequested(id))]
+        );
+        let ack = server.send(exchange.accept(id, 2, 7).unwrap(), 7).unwrap();
+        let back = <cboe_boe::Outbound as Wire>::parse(&ack.to_bytes().unwrap()).unwrap();
+        let cboe_boe::Outbound::OrderAcknowledgment(a) = &back else {
+            panic!("{back:?}")
+        };
+        assert_eq!((a.header.unit, a.header.sequence), (2, 1));
+        assert_eq!(a.fields.fields(), [cboe_boe::Opt::Capacity(b'A')]);
+    }
 }

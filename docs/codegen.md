@@ -432,8 +432,9 @@ script is needed.
 Generated modules use public `fictionet::stdlib::codec` APIs. Each file
 invokes `fictionet::stdlib::codec::generated_runtime!` with its own names
 and limits to define its error type and file-local support code. The same
-file compiles in SDK integration tests and in the `tests/copy_and_own`
-fixture. Parsing is exact. Writing is strict and transactional. Count and
+file compiles in SDK integration tests and outside the SDK: `cargo xtask
+copy-check` builds the generated `stdlib::protocols::cme_mdp3` in a crate of
+its own. Parsing is exact. Writing is strict and transactional. Count and
 range arithmetic is checked; reads
 use checked slicing. Resource and depth checks precede allocation and
 recursive descent. Work is linear in visited fields, bytes, and entries,

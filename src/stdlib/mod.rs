@@ -207,8 +207,8 @@
 //! Copy the code you want to change into your crate and use it through the
 //! SDK's public traits. Keep the helpers and shared types it depends on.
 //! Crate-private helpers and shared types are fine; individual files need
-//! not compile on their own. `tests/copy_and_own/stdlib.rs` compiles the whole
-//! stdlib module tree in a separate crate.
+//! not compile on their own. `cargo xtask copy-check` copies the whole stdlib
+//! into a separate crate and builds it.
 //!
 //! For a Modbus gateway that accepts a nonzero protocol identifier, copy
 //! `src/stdlib/protocols/modbus.rs` into your crate and remove the two

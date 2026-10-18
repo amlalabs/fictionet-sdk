@@ -107,6 +107,9 @@ jobs:
         run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib
         env:
           RUSTFLAGS: --cfg fuzzing
+      - name: The stdlib copied into a crate of its own
+        if: matrix.args == '--workspace --all-features'
+        run: cargo xtask copy-check
 
   host:
     name: host (${{ matrix.test || matrix.dockerfile }})

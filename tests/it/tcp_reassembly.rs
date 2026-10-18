@@ -81,12 +81,10 @@ fn public_events_drive_a_user_decoder_with_gap_and_end_hooks() {
 }
 
 #[test]
-fn copied_module_compiles_and_runs_in_a_consumer_crate() {
-    use fictionet_copy_modules::protocols::tcp_reassembly as copied;
-
-    let mut tcp = copied::Reassembler::default();
+fn data_after_a_syn_at_the_end_of_sequence_space_reassembles_in_order() {
+    let mut tcp = Reassembler::default();
     let key = key();
-    let initial = copied::Segment {
+    let initial = Segment {
         key,
         seq: u32::MAX,
         ack: 0,
@@ -95,7 +93,7 @@ fn copied_module_compiles_and_runs_in_a_consumer_crate() {
     };
     tcp.push(initial);
     assert!(
-        tcp.push(copied::Segment {
+        tcp.push(Segment {
             seq: 2,
             flags: 0x18,
             payload: b"cd",
@@ -104,7 +102,7 @@ fn copied_module_compiles_and_runs_in_a_consumer_crate() {
         .events
         .is_empty()
     );
-    let result = tcp.push(copied::Segment {
+    let result = tcp.push(Segment {
         seq: 0,
         flags: 0x18,
         payload: b"ab",
@@ -113,7 +111,7 @@ fn copied_module_compiles_and_runs_in_a_consumer_crate() {
     let mut decoder = Stream::new(UserDecoder);
     let mut pairs = Vec::new();
     for event in result.events {
-        if let copied::Chunk::Bytes { bytes, .. } = event {
+        if let Chunk::Bytes { bytes, .. } = event {
             pump(&mut decoder, &bytes, |pair| pairs.push(pair)).unwrap();
         }
     }

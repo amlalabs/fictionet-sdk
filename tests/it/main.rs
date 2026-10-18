@@ -11,7 +11,6 @@ mod codec_tools;
 mod codegen;
 #[cfg(feature = "std")]
 mod compose;
-mod copy_and_own;
 #[cfg(feature = "std")]
 mod core;
 mod dashboard_js;

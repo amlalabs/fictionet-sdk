@@ -430,4 +430,26 @@ mod tests {
             "an unknown escape or non-hex digit at byte 5"
         );
     }
+
+    #[test]
+    fn json_syntax_reports_text_and_absolute_positions() {
+        use fictionet::stdlib::codec::Wire;
+        use fictionet::stdlib::codec::json_syntax;
+        use fictionet::stdlib::protocols::json;
+
+        let input = br#"["\ud800\udc00",-12.50e+2]"#;
+        let (text, end) = json_syntax::read_string(input, 1).unwrap();
+        assert_eq!(text, "\u{10000}");
+        assert_eq!(end, 15);
+        let end = json_syntax::scan_number(input, end + 1).unwrap();
+        assert_eq!(&input[16..end], b"-12.50e+2");
+        assert_eq!(
+            json::Value::parse(input).unwrap().as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            json_syntax::read_string(br#"["\u12g4"]"#, 1),
+            Err(json_syntax::Error::BadEscape(6))
+        );
+    }
 }

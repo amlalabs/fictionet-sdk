@@ -420,11 +420,11 @@ fn frames_split_between_packets_and_messages_split_between_frames_get_buffers() 
     assert!(!packet.tags.contains(&"malformed"));
 }
 #[test]
-fn copied_capture_replaces_the_builtin_through_the_same_registry() {
+fn registered_capture_replaces_the_builtin_through_the_same_registry() {
     let mut builtin = Registry::default();
-    let mut copied = Registry::default();
-    let budget = fictionet_copy_modules::observe_http2::CaptureBudget::default();
-    fictionet_copy_modules::observe_http2::Capture::register(&mut copied, &budget);
+    let mut registered = Registry::default();
+    let budget = capture::CaptureBudget::default();
+    capture::Capture::register(&mut registered, &budget);
     assert!(builtin.choose(Transport::Tcp, "http2"));
     let selection = Selection {
         transport: Transport::Tcp,
@@ -439,7 +439,7 @@ fn copied_capture_replaces_the_builtin_through_the_same_registry() {
     ]
     .concat();
     let mut packets = Vec::new();
-    for registry in [builtin, copied] {
+    for registry in [builtin, registered] {
         let mut protocol = registry.open(selection).unwrap();
         let mut packet = Decoded::default();
         protocol.data(
