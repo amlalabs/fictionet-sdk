@@ -276,13 +276,13 @@ fn replay() -> Trace {
         loop {
             if matches!(read_frame(&cx, &mut conn).await, Frame::Reset(r) if r.stream == 1) { break }
         }
-        // Expiry of the local reset must also follow the world clock.
+        // Expiry of the local reset must also follow the world clock: once
+        // it expires, HEADERS on the closed stream ends the connection.
         cx.sleep(Duration::from_millis(1100)).await?;
         conn.write_all(&cx, &headers(1, "/", true)).await?;
         loop {
-            if let Frame::Reset(reset) = read_frame(&cx, &mut conn).await {
-                assert_eq!(reset.stream, 1);
-                assert_eq!(reset.code, 5);
+            if let Frame::GoAway(goaway) = read_frame(&cx, &mut conn).await {
+                assert_eq!(goaway.code, 1);
                 break;
             }
         }
@@ -825,6 +825,47 @@ fn immediate_echo_releases_the_request_charge() {
 }
 
 #[test]
+fn split_echo_releases_the_charged_body() {
+    // The budget already holds the body from earlier frames, and an echo
+    // moves those bytes into the response, so they count once.
+    for parts in [1, 2, 4] {
+        let router = Router::new().post("/", |_, request| http::Response::new(request.into_body()));
+        let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 8000);
+        let mut harness = Harness::with_options(
+            Seed::from_u64(1),
+            Http2::new(router),
+            (),
+            fictionet::stdlib::serve::ServeOptions::default().budget(budget.clone()),
+        );
+        let mut input = preface();
+        input.extend(headers(1, "/", false));
+        harness.push(&input).unwrap();
+        let mut output = Vec::new();
+        for n in 0..parts {
+            output.extend(
+                harness
+                    .push(&data(1, 5000 / parts, n + 1 == parts))
+                    .unwrap(),
+            );
+        }
+        let output = frames(&output);
+        assert_eq!(statuses(&output), [(1, b"200".to_vec())]);
+        assert_eq!(
+            output
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Data(d) => Some(d.data.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            5000
+        );
+        assert!(!harness.closed());
+        assert_eq!(budget.used(), H2_INPUT);
+    }
+}
+
+#[test]
 fn oversized_response_refuses_only_its_stream() {
     let router = Router::new()
         .post("/small", |_, _| {
@@ -998,14 +1039,35 @@ fn trailers_after_end_stream_reset_only_that_stream() {
 }
 
 #[test]
+fn headers_on_a_closed_stream_end_the_connection() {
+    // HEADERS on a stream that has ended, and on a stream below one already
+    // opened (RFC 9113 sections 5.1 and 5.1.1).
+    for (open, again) in [(1, 1), (5, 3)] {
+        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        harness.push(&preface()).unwrap();
+        let output = frames(&harness.push(&headers(open, "/", true)).unwrap());
+        assert_eq!(statuses(&output), [(open, b"404".to_vec())]);
+        let output = frames(&harness.push(&headers(again, "/", true)).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::GoAway(g) if g.last_stream == open && g.code == 1))
+        );
+        assert!(!output.iter().any(|f| matches!(f, Frame::Reset(_))));
+        assert!(harness.closed());
+    }
+}
+
+#[test]
 fn invalid_priority_is_a_stream_error() {
-    for (invalid, code) in [
-        // PRIORITY with a 4-byte payload: FRAME_SIZE_ERROR.
-        (vec![0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0], 6),
-        // PRIORITY on stream 1 that depends on stream 1: PROTOCOL_ERROR.
-        (vec![0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0], 1),
+    for (open, invalid, code) in [
+        // PRIORITY with a 4-byte payload on an open stream: FRAME_SIZE_ERROR.
+        (true, vec![0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0], 6),
+        // PRIORITY on open stream 1 that depends on stream 1: PROTOCOL_ERROR.
+        (true, vec![0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0], 1),
         // GET / as HEADERS on stream 1 that depends on stream 1: PROTOCOL_ERROR.
         (
+            false,
             vec![
                 0, 0, 8, 1, 0x25, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0x83, 0x86, 0x84,
             ],
@@ -1014,6 +1076,9 @@ fn invalid_priority_is_a_stream_error() {
     ] {
         let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
         let mut input = preface();
+        if open {
+            input.extend(headers(1, "/", false));
+        }
         input.extend(invalid);
         input.extend(headers(3, "/", true));
         let output = frames(&harness.push(&input).unwrap());
@@ -1025,6 +1090,75 @@ fn invalid_priority_is_a_stream_error() {
         assert_eq!(statuses(&output), [(3, b"404".to_vec())]);
         assert!(!harness.closed());
     }
+}
+
+#[test]
+fn invalid_priority_on_an_idle_stream_is_a_connection_error() {
+    // RST_STREAM may not name an idle stream (RFC 9113 section 6.4), so
+    // these stream errors end the connection, as section 5.4.1 allows,
+    // rather than go unanswered.
+    for (invalid, code) in [
+        // PRIORITY with a 4-byte payload: FRAME_SIZE_ERROR.
+        ([0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0].as_slice(), 6),
+        // PRIORITY on stream 1 that depends on stream 1: PROTOCOL_ERROR.
+        (&[0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0], 1),
+    ] {
+        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        let mut input = preface();
+        input.extend(invalid);
+        input.extend(headers(1, "/", true));
+        let output = frames(&harness.push(&input).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::GoAway(g) if g.last_stream == 0 && g.code == code))
+        );
+        assert!(!output.iter().any(|f| matches!(f, Frame::Reset(_))));
+        assert!(harness.closed());
+    }
+}
+
+#[test]
+fn cookie_crumbs_reach_the_handler_as_one_header() {
+    let router = Router::new().get("/", |_, request| {
+        let cookies: Vec<&[u8]> = request
+            .headers()
+            .get_all("cookie")
+            .iter()
+            .map(|v| v.as_bytes())
+            .collect();
+        http::Response::new(Bytes::from(cookies.join(b"\n".as_slice())))
+    });
+    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(router), ());
+    let mut fragment = Vec::new();
+    for (name, value) in [
+        (":method", "GET"),
+        (":scheme", "https"),
+        (":authority", "localhost"),
+        (":path", "/"),
+        ("cookie", "a=1"),
+        ("accept", "*/*"),
+        ("cookie", "b=2"),
+    ] {
+        hpack::Field::new(name, value).write(&mut fragment).unwrap();
+    }
+    let mut input = preface();
+    http2::Headers {
+        stream: 1,
+        flags: 5,
+        fragment,
+        priority: None,
+        padding: None,
+    }
+    .write(&mut input)
+    .unwrap();
+    let output = frames(&harness.push(&input).unwrap());
+    assert_eq!(statuses(&output), [(1, b"200".to_vec())]);
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::Data(d) if d.data == b"a=1; b=2"))
+    );
 }
 
 #[test]
@@ -1047,15 +1181,18 @@ fn failing_response_body_is_an_internal_stream_error() {
         }
     }
     let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Handler), ());
-    let mut input = preface();
-    input.extend(headers(1, "/", true));
-    let output = frames(&harness.push(&input).unwrap());
-    assert!(
-        output
-            .iter()
-            .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1 && r.code == 2))
-    );
-    assert!(!harness.closed());
+    harness.push(&preface()).unwrap();
+    // The failures are the server's, so they never use up the client's
+    // allowance of error resets.
+    for n in 0..1100 {
+        let output = frames(&harness.push(&headers(2 * n + 1, "/", true)).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.stream == 2 * n + 1 && r.code == 2))
+        );
+        assert!(!harness.closed());
+    }
 }
 
 #[test]

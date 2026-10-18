@@ -435,9 +435,9 @@ pub async fn serve_connection<C: Connection + Unpin>(
             }
             fictionet::cfg_tokio! {
                 // Hyper reads the request again and carries out its upgrade.
-                if let Some(head) = service.take_handoff() {
+                if let Some((head, tracker)) = service.handoff.take() {
                     return upgrade::serve_upgrade(
-                        fcx, Prefixed::new(head, rest), handler, info, opts,
+                        fcx, Prefixed::new(head, rest), handler, info, opts, tracker,
                     ).await;
                 }
             }

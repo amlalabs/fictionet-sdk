@@ -63,7 +63,7 @@ fn fetch_base(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn download(url: &str, path: &Path, algorithm: &str, hash: &str) -> Result {
+pub fn download(url: &str, path: &Path, algorithm: &str, hash: &str) -> Result {
     if path.is_file() {
         return Ok(());
     }

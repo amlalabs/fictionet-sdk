@@ -17,6 +17,7 @@ use fictionet::stdlib::codec::{Buffer, Decode, Step};
 use fictionet::stdlib::http1::{self, Event as H1};
 use fictionet::stdlib::serve::{Budget, Charge, PanicNote, Prefixed};
 use fictionet::stdlib::{ConnError, Connection};
+use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, Error};
 
@@ -34,12 +35,15 @@ use super::{
 /// `OnUpgrade`, so `hyper::upgrade::on` and axum's `WebSocketUpgrade`
 /// work, and the connection goes to whatever awaits it once the `101`
 /// is sent. Other requests on the connection are answered as usual.
+/// `handed_off` is the tracker of the request at the start of `conn`, which
+/// has already observed its head and body.
 pub(super) async fn serve_upgrade<C: Connection + Unpin + Send + 'static>(
     fcx: &Cx,
     conn: C,
     handler: Arc<dyn Handler>,
     info: ConnInfo,
     opts: &HttpOptions,
+    handed_off: Tracker,
 ) -> Result<(), Cancelled> {
     let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut io = Io::new(
@@ -58,6 +62,7 @@ pub(super) async fn serve_upgrade<C: Connection + Unpin + Send + 'static>(
     ));
     let mut route = Route::new(fcx, handler, &info, opts);
     route.upgraded = Some(upgraded);
+    route.handed_off = Arc::new(Mutex::new(Some(handed_off)));
     let mut builder = hyper::server::conn::http1::Builder::new();
     // Hyper still refreshes its internal date cache using SystemTime,
     // but auto_date_header(false) prevents that value reaching the wire.
@@ -166,6 +171,9 @@ struct Route {
     budget: Option<Budget>,
     observe: Option<Arc<dyn Observer>>,
     upgraded: Option<Arc<AtomicBool>>,
+    /// The tracker for the first request, which the native server observed
+    /// before it handed the connection over.
+    handed_off: Arc<Mutex<Option<Tracker>>>,
 }
 
 impl Route {
@@ -179,6 +187,7 @@ impl Route {
             budget: opts.budget.clone(),
             observe: opts.observe.clone(),
             upgraded: None,
+            handed_off: Arc::default(),
         }
     }
 
@@ -268,8 +277,14 @@ impl hyper::service::Service<Request<Incoming>> for Route {
     type Future = Answer;
 
     fn call(&self, request: Request<Incoming>) -> Answer {
-        let mut tracker = Tracker::observing(&request, &self.info, self.observe.clone());
-        tracker.start(&request, &self.info, self.fcx.now());
+        // The observer has seen the handed-off request's head, body and end
+        // already, so its tracker is used as it is.
+        let handed_off = self.handed_off.lock().take();
+        let mut tracker = handed_off.unwrap_or_else(|| {
+            let mut tracker = Tracker::observing(&request, &self.info, self.observe.clone());
+            tracker.start(&request, &self.info, self.fcx.now());
+            tracker
+        });
         let metadata = self.budget.as_ref().map(|budget| {
             let head = budget.charge(request_held(&request))?;
             let event = budget.charge(tracker.held())?;
