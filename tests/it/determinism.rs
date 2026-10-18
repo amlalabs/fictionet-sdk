@@ -50,7 +50,7 @@ service_fixture! {
     }
     on_item(self, line: Result<Vec<u8>, LineError>; _, d) -> Flow {
         let line = line.unwrap();
-        d.record(Event::new("echo", "line").field("bytes", line.len() as u64));
+        d.emit("echo", "line", |event| event.field("bytes", line.len() as u64));
         d.reply().extend_from_slice(&line);
         d.reply().push(b'\n');
         Ok(Flow::Continue)
@@ -152,7 +152,9 @@ fn world(seed: Seed, trace: Arc<Mutex<Trace>>) -> impl Future<Output = fictionet
         let packets = trace.clone();
         let loss_trace = trace.clone();
         lab(
-            fictionet::RunOptions::new(seed).observer(output),
+            fictionet::RunOptions::new(seed)
+                .observer(output)
+                .fields(Fields::new().with("world_date", "2030-01-01")),
             move |cx| episode(cx, packets, loss_trace),
         )
         .await?;
@@ -184,7 +186,6 @@ async fn episode(
     let (attacher, attachments) = fictionet::attachments();
     Net::new()
         .ipv4_only()
-        .start_fields(Fields::new().with("world_date", "2030-01-01"))
         .lan("office", "192.168.10.0/24".parse()?)
         .lan("web", "192.168.20.0/24".parse()?)
         .host("echo", |h| {
@@ -226,10 +227,12 @@ async fn episode(
         if !keep {
             loss_trace.lock().unwrap().losses
                 [usize::from(direction == fictionet::stdlib::network::Direction::ToInner)] += 1;
-            cx.record(Event::new("link", "loss").field(
-                "inbound",
-                direction == fictionet::stdlib::network::Direction::ToInner,
-            ));
+            cx.emit("link", "loss", |event| {
+                event.field(
+                    "inbound",
+                    direction == fictionet::stdlib::network::Direction::ToInner,
+                )
+            });
         }
         keep
     });
@@ -319,9 +322,8 @@ async fn episode(
                         bytes.extend_from_slice(&chunk?);
                     }
                     assert!(bytes.starts_with(path.as_bytes()));
-                    cx.record(
-                        Event::new("client", "reply").field("body", String::from_utf8(bytes)?),
-                    );
+                    let body = String::from_utf8(bytes)?;
+                    cx.emit("client", "reply", |event| event.field("body", body));
                 }
             }
         } else {
@@ -511,15 +513,15 @@ fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
                 out.lock().unwrap().push(evidence.clone());
                 crate::common::observed_lab(Seed::from_u64(2), move |fcx, evidence| async move {
                     out.lock().unwrap().push(evidence.clone());
-                    fcx.record(Event::new("test", "inner"));
+                    fcx.emit("test", "inner", |event| event);
                     fcx.yield_now().await?;
-                    fcx.record(Event::new("test", "inner_again"));
+                    fcx.emit("test", "inner_again", |event| event);
                     Ok(())
                 })
                 .await?;
-                fcx.record(Event::new("test", "outer"));
+                fcx.emit("test", "outer", |event| event);
                 fcx.spawn(|fcx| async move {
-                    fcx.record(Event::new("test", "child"));
+                    fcx.emit("test", "child", |event| event);
                     Ok(())
                 })
                 .join(&fcx)
@@ -571,11 +573,11 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
             *out.lock().unwrap() = Some(evidence.clone());
             let foreign = fcx.clone();
             lab(Seed::from_u64(2), move |_fcx| async move {
-                foreign.record(Event::new("test", "record"));
-                foreign.record_at(foreign.now(), Event::new("test", "record_at"));
-                foreign.record_repeat(Event::new("test", "repeat"), Fields::new());
+                foreign.emit("test", "record", |event| event);
+                foreign.emit("test", "record_at", |event| event);
+                foreign.emit("test", "repeat", |event| event);
                 foreign.spawn(|fcx| async move {
-                    fcx.record(Event::new("test", "foreign_spawn"));
+                    fcx.emit("test", "foreign_spawn", |event| event);
                     Ok(())
                 });
                 Ok(())
@@ -622,9 +624,9 @@ fn a_nested_panic_restores_the_outer_task() {
                 }))
             });
             assert!(result.is_err());
-            fcx.record(Event::new("test", "outer"));
+            fcx.emit("test", "outer", |event| event);
             fcx.spawn(|fcx| async move {
-                fcx.record(Event::new("test", "child"));
+                fcx.emit("test", "child", |event| event);
                 Ok(())
             })
             .join(&fcx)

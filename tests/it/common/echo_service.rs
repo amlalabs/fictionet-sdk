@@ -2,7 +2,6 @@ use std::convert::Infallible;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use fictionet::events::Event;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::services::serve::{Ended, Flow, Pending, PendingDriver, Timer, Upgrade};
 
@@ -27,8 +26,7 @@ service_fixture! {
             driver.reply().extend_from_slice(b"too long\n");
             return Ok(Flow::Continue);
         };
-        driver.record(
-            Event::new("echo", "line")
+        driver.emit("echo", "line", |event| event
                 .summary(String::from_utf8_lossy(&line))
                 .field("bytes", line.len() as u64),
         );
@@ -79,7 +77,9 @@ impl Pending for Later {
         match self.step {
             2 => Poll::Ready(Some(Ok(b"la".to_vec()))),
             3 => {
-                driver.record(Event::new("echo", "later").field("written", driver.written()));
+                driver.emit("echo", "later", |event| {
+                    event.field("written", driver.written())
+                });
                 Poll::Ready(Some(Ok(b"ter\n".to_vec())))
             }
             _ => Poll::Ready(None),

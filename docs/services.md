@@ -431,7 +431,7 @@ Exhaustive matches on `tftp::Error` must handle the new
 date. A service that needs a date, such as for ticket lifetimes,
 certificate validity or a FIX `SendingTime`, takes it from its `State`,
 which decides what day it is in the world. Record the world's date in the
-network's first event (`Net::start_fields` with a `world_date` field), so
+run's first event (`RunOptions::fields` with a `world_date` field), so
 a reader can place every event. The `run.start` event's `wall` field
 holds the host's wall clock at the start of a real run, including in browsers.
 A lab records `null` for `wall`; its clock has no wall date.

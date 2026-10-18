@@ -109,6 +109,10 @@ impl Jsonl {
 }
 
 impl Observer for Jsonl {
+    fn lost(&self, count: u64) {
+        self.status.lost.fetch_add(count, Ordering::Relaxed);
+    }
+
     fn enabled(&self, _: Metadata, _: &ConnInfo) -> bool {
         true
     }

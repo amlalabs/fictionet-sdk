@@ -737,7 +737,7 @@ mod tests {
                     _ => unreachable!(),
                 };
                 for i in 0..2001u32 {
-                    fcx.record(crate::events::Event::new("test", "tick").field("i", i));
+                    fcx.emit("test", "tick", |event| event.field("i", i));
                 }
                 if let Sub::Graph { next, .. } = &mut session.subs[0] {
                     *next = Instant::now();

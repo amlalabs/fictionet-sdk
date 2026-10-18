@@ -30,14 +30,26 @@ pub(super) struct Hooks {
 }
 
 impl Hooks {
-    pub(super) fn record(&self, fcx: &Cx, conn: &ConnInfo, event: Event) {
-        fcx.record(event.conn(conn));
+    pub(super) fn emit(
+        &self,
+        fcx: &Cx,
+        conn: &ConnInfo,
+        kind: &'static str,
+        build: impl FnOnce(Event) -> Event,
+    ) {
+        fcx.emitter(conn).emit("net", kind, build);
     }
 
-    /// Records a `net.blocked` event, with its detail, as a repeat: a
-    /// flood of them is counted, not kept one by one.
-    pub(super) fn blocked(&self, fcx: &Cx, conn: &ConnInfo, (event, detail): (Event, Fields)) {
-        fcx.record_repeat(event.conn(conn), detail);
+    pub(super) fn blocked(
+        &self,
+        fcx: &Cx,
+        conn: &ConnInfo,
+        build: impl FnOnce() -> (Event, Fields),
+    ) {
+        fcx.emitter(conn).emit("net", "blocked", |_| {
+            let (event, detail) = build();
+            event.fields(detail).field("count", 1u64)
+        });
     }
 
     pub(super) fn sandbox_at(&self, addr: IpAddr) -> Sandbox {
@@ -133,18 +145,23 @@ impl Context {
             _attached: attached.clone(),
         };
         let joined = segment.add(addr, Box::new(member), Some(me.clone()));
-        let event = match joined {
-            Ok(()) => Event::new("net", "attached")
-                .summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
-            Err(e) => Event::new("net", "error")
-                .level(Level::Notice)
-                .summary(format!("sandbox {name} could not join LAN {lan}: {e}"))
-                .field("error", e.to_string()),
-        };
-        hooks.record(
+        hooks.emit(
             fcx,
             &sandbox_only(me),
-            event.field("lan", lan).field("addr", addr.to_string()),
+            if joined.is_ok() { "attached" } else { "error" },
+            |_| {
+                let event = match joined {
+                    Ok(()) => Event::new("net", "attached")
+                        .bounded()
+                        .summary(format_args!("sandbox {name} joined LAN {lan} at {addr}")),
+                    Err(e) => Event::new("net", "error")
+                        .bounded()
+                        .level(Level::Notice)
+                        .summary(format_args!("sandbox {name} could not join LAN {lan}: {e}"))
+                        .field("error", e.to_string()),
+                };
+                event.field("lan", lan).field("addr", addr.to_string())
+            },
         );
     }
 }
@@ -251,11 +268,11 @@ impl Drop for Attached {
             addr: bound,
             addr_v6: bound6,
         };
-        let event =
-            Event::new("net", "detached").summary(format!("sandbox {} detached", self.name));
         context
             .hooks
-            .record(&self.fcx, &sandbox_only(sandbox), event);
+            .emit(&self.fcx, &sandbox_only(sandbox), "detached", |event| {
+                event.summary(format_args!("sandbox {} detached", self.name))
+            });
     }
 }
 
@@ -303,8 +320,11 @@ pub(super) async fn filter(
         route6: None,
         reassembly: Reassembly::default(),
     };
-    let event = Event::new("net", "attached").summary(format!("sandbox {} attached", f.name));
-    context.hooks.record(&fcx, &sandbox_only(f.me()), event);
+    context
+        .hooks
+        .emit(&fcx, &sandbox_only(f.me()), "attached", |event| {
+            event.summary(format_args!("sandbox {} attached", f.name))
+        });
     // Detaches before the filter's links close.
     let _attached = attached;
     loop {
@@ -375,17 +395,22 @@ pub fn connection_limit(
     let guard = Counted::enter(open, max);
     if guard.is_none() {
         let (src, dst) = (info.peer, info.local);
-        let event = blocked_event(
-            BlockedWhy::TooManyConnections,
-            Some(PROTO_TCP),
-            src.map(|a| a.ip()),
-            dst.map(|a| a.ip()),
-        );
-        let conn = ConnInfo {
-            sandbox: info.sandbox.clone(),
-            ..ConnInfo::default()
-        };
-        fcx.record_repeat(event.conn(&conn), port_detail(dst.map(|a| a.port())));
+        fcx.emitter(info).emit("net", "blocked", |_| {
+            let event = blocked_event(
+                BlockedWhy::TooManyConnections,
+                Some(PROTO_TCP),
+                src.map(|a| a.ip()),
+                dst.map(|a| a.ip()),
+            );
+            let conn = ConnInfo {
+                sandbox: info.sandbox.clone(),
+                ..ConnInfo::default()
+            };
+            event
+                .conn(&conn)
+                .fields(port_detail(dst.map(|a| a.port())))
+                .field("count", 1u64)
+        });
     }
     guard
 }
@@ -399,8 +424,9 @@ pub(super) fn blocked_event(
     dst: Option<IpAddr>,
 ) -> Event {
     Event::new("net", "blocked")
+        .bounded()
         .level(Level::Notice)
-        .summary(format!(
+        .summary(format_args!(
             "blocked {}: {} -> {}",
             why.as_str(),
             src.map_or("-".into(), |a| a.to_string()),
@@ -453,7 +479,7 @@ impl Filter {
     fn block(&self, fcx: &Cx, why: BlockedWhy, packet: &[u8]) {
         self.context
             .hooks
-            .blocked(fcx, &sandbox_only(self.me()), blocked(why, packet));
+            .blocked(fcx, &sandbox_only(self.me()), || blocked(why, packet));
     }
 
     fn bound_now(&mut self, fcx: &Cx, addr: IpAddr, by_dhcp: bool) {
@@ -477,13 +503,14 @@ impl Filter {
             by_addr.insert(a, sandbox.clone());
         }
         drop(by_addr);
-        let event = Event::new("net", "bound")
-            .summary(format!("sandbox {} bound {addr}", self.name))
-            .field("by_dhcp", by_dhcp)
-            .field("addr", addr.to_string());
         self.context
             .hooks
-            .record(fcx, &sandbox_only(sandbox), event);
+            .emit(fcx, &sandbox_only(sandbox), "bound", |event| {
+                event
+                    .summary(format_args!("sandbox {} bound {addr}", self.name))
+                    .field("by_dhcp", by_dhcp)
+                    .field("addr", addr.to_string())
+            });
     }
 
     fn sent_v4(&mut self, fcx: &Cx, packet: Packet) {

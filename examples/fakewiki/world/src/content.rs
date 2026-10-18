@@ -38,6 +38,7 @@ impl Content {
         self,
         request: Request<Body>,
     ) -> Result<Response<Full<Bytes>>, fictionet::Error> {
+        let observing = fictionet::stdlib::web::httpd::EventInterest::of(&request);
         let target = request
             .extensions()
             .get::<web::Target>()
@@ -69,19 +70,27 @@ impl Content {
                     b"The site failed to answer.\n",
                 )));
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                let page = Page {
-                    kind: "backend_error".into(),
-                    topic: None,
-                    source: None,
-                    stance: None,
-                    bytes: 0,
-                    location: None,
-                    error: Some(e.to_string()),
-                };
-                response.extensions_mut().insert(page.fields());
+                if observing {
+                    let page = Page {
+                        kind: "backend_error".into(),
+                        topic: None,
+                        source: None,
+                        stance: None,
+                        bytes: 0,
+                        location: None,
+                        error: Some(e.to_string()),
+                    };
+                    response.extensions_mut().insert(page.fields());
+                }
                 return Ok(response);
             }
         };
+        if !observing {
+            for name in [KIND, TOPIC, SOURCE, STANCE] {
+                parts.headers.remove(name);
+            }
+            return Ok(Response::from_parts(parts, Full::new(body)));
+        }
         let mut take = |name: &str| {
             parts
                 .headers
@@ -170,6 +179,7 @@ mod tests {
             let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
             let request = Request::builder()
                 .uri("https://en.wikipedia.org/wiki/redirect")
+                .extension(httpd::EventInterest(true))
                 .body(Body::empty())?;
             let httpd::Reply::Later(work) = vhosts.call(request, &mut ex) else {
                 panic!("the content handler dispatches to the backend");

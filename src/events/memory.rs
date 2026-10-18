@@ -214,6 +214,14 @@ impl Memory {
 }
 
 impl Observer for Memory {
+    fn lost(&self, count: u64) {
+        let mut state = self.state.lock();
+        state.dropped = state.dropped.saturating_add(count);
+        for waker in state.waiters.iter().flatten() {
+            waker.wake_by_ref();
+        }
+    }
+
     fn enabled(&self, _: Metadata, _: &ConnInfo) -> bool {
         true
     }

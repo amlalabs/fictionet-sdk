@@ -44,7 +44,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use fictionet::Cx;
-use fictionet::events::Event;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use serde_json::{Value, json};
@@ -367,42 +366,40 @@ pub fn serve(
     let world = fcx.clone();
     let site_for = move |host: &str| {
         if let Err(why) = admit(host) {
-            world.record(
-                Event::new("adaptive", "refused")
-                    .summary(format!("{host}: {why}"))
+            world.emit("adaptive", "refused", |event| {
+                event
+                    .summary(format_args!("{host}: {why}"))
                     .field("host", host)
-                    .field("why", why),
-            );
+                    .field("why", why)
+            });
             return None;
         }
         let (addr, why) = match addresses.assign(host) {
             Ok(Some(assigned)) => assigned,
             Ok(None) => {
-                world.record(
-                    Event::new("adaptive", "refused")
+                world.emit("adaptive", "refused", |event| {
+                    event
                         .field("host", host)
-                        .field("why", "address pool exhausted"),
-                );
+                        .field("why", "address pool exhausted")
+                });
                 return None;
             }
             Err(e) => {
                 let why = format!("cannot record the address: {e}");
-                world.record(
-                    Event::new("adaptive", "refused")
-                        .field("host", host)
-                        .field("why", why.as_str()),
-                );
+                world.emit("adaptive", "refused", |event| {
+                    event.field("host", host).field("why", why.as_str())
+                });
                 log.fail(why);
                 return None;
             }
         };
-        world.record(
-            Event::new("adaptive", "site")
-                .summary(format!("{host} at {addr} ({why})"))
+        world.emit("adaptive", "site", |event| {
+            event
+                .summary(format_args!("{host} at {addr} ({why})"))
                 .field("host", host)
                 .field("addr", addr.to_string())
-                .field("why", why),
-        );
+                .field("why", why)
+        });
         let (ca, name) = (ca.clone(), host.to_owned());
         let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
         Some(
@@ -415,13 +412,13 @@ pub fn serve(
                             let (config, not_before, not_after) = ca
                                 .config(fcx, &name)
                                 .expect("a certificate for an admitted name");
-                            fcx.record(
-                                Event::new("adaptive", "cert")
-                                    .summary(format!("a certificate for {name}"))
+                            fcx.emit("adaptive", "cert", |event| {
+                                event
+                                    .summary(format_args!("a certificate for {name}"))
                                     .field("host", name.as_str())
                                     .field("not_before", not_before)
-                                    .field("not_after", not_after),
-                            );
+                                    .field("not_after", not_after)
+                            });
                             config
                         })
                         .clone()

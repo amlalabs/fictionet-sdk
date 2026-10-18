@@ -123,7 +123,7 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
     let out = Arc::new(fictionet::sync::Mutex::new(None));
     let o = out.clone();
     let evidence = Arc::new(fictionet::events::Memory::default());
-    fictionet::block_on(fictionet::run(
+    fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(evidence.clone()),
         move |fcx| async move {
             // This is the viewer count used by observer sessions, without a host socket.
@@ -152,10 +152,7 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
                 conn.shutdown(&fcx).await?;
                 Ok(())
             });
-            fcx.record_at(
-                fictionet::time::Instant::ZERO,
-                fictionet::events::Event::new("test", "before_tls"),
-            );
+            fcx.emit("test", "before_tls", |event| event);
             let conn = client.connect(&fcx, "10.0.0.1:443".parse()?).await?;
             let _ = fetch(
                 &fcx,
@@ -165,10 +162,7 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
             )
             .await?;
             fcx.sleep(ms(200)).await?;
-            fcx.record_at(
-                fictionet::time::Instant::ZERO,
-                fictionet::events::Event::new("test", "after_tls"),
-            );
+            fcx.emit("test", "after_tls", |event| event);
             assert_eq!(!fcx.graph().keys.state().keys.is_empty(), observe);
             let events = evidence.checked_all().unwrap();
             assert_eq!(events.len(), 3);

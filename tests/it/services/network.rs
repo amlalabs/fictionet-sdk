@@ -539,7 +539,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
                 Lines::new(64, Ending::LfOrCrlf)
             }
             on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> Flow {
-                driver.record(Event::new("udp", "datagram"));
+                driver.emit("udp", "datagram", |event| event);
                 driver.reply().extend_from_slice(
                     format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes(),
                 );

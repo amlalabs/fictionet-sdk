@@ -61,10 +61,11 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
             for (i, packet) in packets.iter().enumerate() {
                 ip::record_drop(
                     &fcx,
+                    &conn,
                     "test",
                     packet,
                     "blocked",
-                    Fields::new().with("waiting", i as u64),
+                    || Fields::new().with("waiting", i as u64),
                     |event| event.conn(&conn).field("owner", "edge"),
                 );
             }

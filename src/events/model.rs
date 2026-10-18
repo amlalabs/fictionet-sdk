@@ -267,6 +267,8 @@ pub struct Event {
     pub fields: Fields,
     /// The task that recorded it.
     pub(crate) origin: Option<Origin>,
+    pub(crate) truncated: bool,
+    bounded: bool,
 }
 
 impl Event {
@@ -283,13 +285,38 @@ impl Event {
             conn: ConnInfo::default(),
             fields: Fields::new(),
             origin: None,
+            truncated: false,
+            bounded: false,
         }
     }
 
-    /// Sets the summary.
-    pub fn summary(mut self, summary: impl Into<String>) -> Event {
-        self.summary = summary.into();
+    /// Marks evidence omitted to keep event construction bounded.
+    pub fn truncated(mut self) -> Self {
+        self.truncated = true;
+        self.fields.set("truncated", true);
         self
+    }
+
+    pub(crate) fn bounded(mut self) -> Self {
+        self.bounded = true;
+        self
+    }
+
+    /// Formats at most four KiB when emitted lazily.
+    pub fn summary(mut self, summary: impl EventSummary) -> Event {
+        let (text, truncated) = summary.into_summary(self.bounded);
+        self.summary = text;
+        if truncated {
+            self = self.truncated();
+        }
+        self
+    }
+
+    /// Formats a text field without constructing an unbounded intermediate string.
+    pub fn display(self, name: &'static str, value: impl std::fmt::Display) -> Self {
+        let (text, truncated) = bounded_text(value);
+        let event = if truncated { self.truncated() } else { self };
+        event.field(name, text)
     }
 
     /// Sets the level.
@@ -305,14 +332,26 @@ impl Event {
     }
 
     /// Sets one field.
-    pub fn field(mut self, name: &'static str, value: impl Into<Value>) -> Event {
-        self.fields.set(name, value);
+    pub fn field(mut self, name: &'static str, value: impl EventValue) -> Event {
+        if self.bounded && (self.fields.len() >= 64 || fields_size(&self.fields) >= 64 * 1024) {
+            return self.truncated();
+        }
+        if self.bounded && !value.fits(64 * 1024 - fields_size(&self.fields)) {
+            return self.truncated();
+        }
+        self.fields.set(name, value.into());
         self
     }
 
     /// Sets every field of `fields`.
     pub fn fields(mut self, fields: Fields) -> Event {
-        self.fields.extend(fields);
+        if self.bounded {
+            for (name, value) in fields.0 {
+                self = self.field(name, value);
+            }
+        } else {
+            self.fields.extend(fields);
+        }
         self
     }
 
@@ -468,4 +507,174 @@ fn value_size(v: &Value) -> usize {
                     .sum::<usize>()
         }
     }
+}
+
+/// A field value whose size can be checked before copying borrowed data.
+pub trait EventValue: Into<Value> {
+    /// Whether conversion fits the remaining event budget.
+    fn fits(&self, bytes: usize) -> bool;
+}
+
+impl EventValue for &str {
+    fn fits(&self, bytes: usize) -> bool {
+        self.len().saturating_add(64) <= bytes
+    }
+}
+impl EventValue for String {
+    fn fits(&self, bytes: usize) -> bool {
+        self.capacity().saturating_add(64) <= bytes
+    }
+}
+impl EventValue for Value {
+    fn fits(&self, mut bytes: usize) -> bool {
+        bounded_value(self, 0, &mut 1024, &mut bytes)
+    }
+}
+impl EventValue for Vec<Value> {
+    fn fits(&self, mut bytes: usize) -> bool {
+        let slots = self.capacity().saturating_mul(std::mem::size_of::<Value>());
+        if slots > bytes {
+            return false;
+        }
+        bytes -= slots;
+        let mut nodes = 1024;
+        self.len() <= 256
+            && self
+                .iter()
+                .all(|v| bounded_value(v, 1, &mut nodes, &mut bytes))
+    }
+}
+macro_rules! small_event_value {
+    ($($ty:ty),*) => { $(impl EventValue for $ty {
+        fn fits(&self, bytes: usize) -> bool { bytes >= 128 }
+    })* };
+}
+small_event_value!(bool, i32, u32, i64, u64);
+impl EventValue for Number {
+    fn fits(&self, bytes: usize) -> bool {
+        self.text().len().saturating_add(64) <= bytes
+    }
+}
+
+fn bounded_value(value: &Value, depth: usize, remaining: &mut usize, bytes: &mut usize) -> bool {
+    if depth > 8 || *remaining == 0 || *bytes < 128 {
+        return false;
+    }
+    *remaining -= 1;
+    *bytes -= 128;
+    match value {
+        Value::String(s) => {
+            if s.capacity() > *bytes {
+                return false;
+            }
+            *bytes -= s.capacity();
+            true
+        }
+        Value::Number(n) => {
+            if n.text().len() > *bytes {
+                return false;
+            }
+            *bytes -= n.text().len();
+            true
+        }
+        Value::Array(items) => {
+            let slots = items
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>());
+            if slots > *bytes {
+                return false;
+            }
+            *bytes -= slots;
+            items.len() <= 256
+                && items
+                    .iter()
+                    .all(|v| bounded_value(v, depth + 1, remaining, bytes))
+        }
+        Value::Object(items) => {
+            let slots = items
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Value)>());
+            if slots > *bytes {
+                return false;
+            }
+            *bytes -= slots;
+            items.len() <= 256
+                && items.iter().all(|(k, v)| {
+                    if k.capacity() > *bytes {
+                        return false;
+                    }
+                    *bytes -= k.capacity();
+                    bounded_value(v, depth + 1, remaining, bytes)
+                })
+        }
+        _ => true,
+    }
+}
+
+/// Text that can be formatted with a bound while preserving owned legacy summaries.
+pub trait EventSummary {
+    /// Produces summary text and whether it was shortened.
+    fn into_summary(self, bounded: bool) -> (String, bool);
+}
+
+impl EventSummary for String {
+    fn into_summary(self, bounded: bool) -> (String, bool) {
+        if bounded {
+            bounded_text(&self)
+        } else {
+            (self, false)
+        }
+    }
+}
+impl<T: std::fmt::Display + ?Sized> EventSummary for &T {
+    fn into_summary(self, bounded: bool) -> (String, bool) {
+        if bounded {
+            bounded_text(self)
+        } else {
+            (self.to_string(), false)
+        }
+    }
+}
+impl EventSummary for Cow<'_, str> {
+    fn into_summary(self, bounded: bool) -> (String, bool) {
+        if bounded {
+            bounded_text(&self)
+        } else {
+            (self.into_owned(), false)
+        }
+    }
+}
+impl EventSummary for std::fmt::Arguments<'_> {
+    fn into_summary(self, bounded: bool) -> (String, bool) {
+        if bounded {
+            bounded_text(self)
+        } else {
+            (self.to_string(), false)
+        }
+    }
+}
+
+fn bounded_text(value: impl std::fmt::Display) -> (String, bool) {
+    struct Text {
+        text: String,
+        truncated: bool,
+    }
+    impl std::fmt::Write for Text {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let room = 4096 - self.text.len();
+            let end = text.floor_char_boundary(room.min(text.len()));
+            self.text.push_str(&text[..end]);
+            if end < text.len() {
+                self.truncated = true;
+                return Err(std::fmt::Error);
+            }
+            Ok(())
+        }
+    }
+    let mut text = Text {
+        text: String::new(),
+        truncated: false,
+    };
+    let _ = std::fmt::write(&mut text, format_args!("{value}"));
+    (text.text, text.truncated)
 }

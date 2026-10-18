@@ -11,12 +11,12 @@ use http::uri::{Authority, Scheme};
 use http::{Request, StatusCode};
 
 use fictionet::Cx;
-use fictionet::stdlib::world::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
 use fictionet::stdlib::services::tls::ServerConfig;
+use fictionet::stdlib::world::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
 
 use super::response::answered;
 use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, BodyClassifier, Reply, serve_connection, text,
+    Body, BodyClassifier, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text,
 };
 
 pub use fictionet::stdlib::world::net::normalize;
@@ -165,11 +165,13 @@ impl VirtualHosts {
 
 impl Handler for VirtualHosts {
     fn call(&self, mut request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+        let observing = super::EventInterest::of(&request);
         let Some(host) = request_host(&request) else {
-            return Reply::Now(no_host());
+            return Reply::Now(no_host(observing));
         };
         let misdirected = || {
             Reply::Now(answered(
+                observing,
                 text(
                     StatusCode::MISDIRECTED_REQUEST,
                     "This server does not serve that host.\n",
@@ -197,7 +199,7 @@ impl Handler for VirtualHosts {
                 if let Ok(value) = location.parse() {
                     response.headers_mut().insert(LOCATION, value);
                 }
-                Reply::Now(answered(response, "redirect"))
+                Reply::Now(answered(observing, response, "redirect"))
             }
             _ => {
                 let conn = ex.conn();
@@ -218,8 +220,9 @@ impl Handler for VirtualHosts {
 /// The answer to a request that names no host: `400`, with `answer`
 /// `no_host` in its event. [`VirtualHosts`] gives it, and [`Http1`](super::Http1)
 /// gives it to an HTTP/1.1 request without `Host` before any handler.
-pub(super) fn no_host() -> http::Response<Body> {
+pub(super) fn no_host(observing: bool) -> http::Response<Body> {
     answered(
+        observing,
         text(StatusCode::BAD_REQUEST, "The request names no host.\n"),
         "no_host",
     )

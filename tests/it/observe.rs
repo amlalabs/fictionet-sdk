@@ -303,10 +303,9 @@ fn start_world(path: &str) -> fictionet::Listening {
                             let (mut mine, mut theirs) = fictionet::pair();
                             fcx.spawn(move |fcx| async move {
                                 while let Ok(p) = theirs.recv(&fcx).await {
-                                    fcx.record(
-                                        fictionet::events::Event::new("test", "echo")
-                                            .field("len", p.0.len() as u64),
-                                    );
+                                    fcx.emit("test", "echo", |event| {
+                                        event.field("len", p.0.len() as u64)
+                                    });
                                     theirs.send(p);
                                 }
                                 Ok(())

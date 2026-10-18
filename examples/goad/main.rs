@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 
-use fictionet::events::Event;
 use fictionet::stdlib::network::route::{self, Prefix};
 use fictionet::{Interface, Result};
 
@@ -92,11 +91,12 @@ fn main() -> Result {
                     continue;
                 };
                 println!("attached {name} at {addr}");
-                let event = Event::new("goad", "member_attached")
-                    .summary(format!("{name} attached at {addr}"))
-                    .field("name", name.as_str())
-                    .field("address", addr.to_string());
-                fcx.record(event);
+                fcx.emit("goad", "member_attached", |event| {
+                    event
+                        .summary(format_args!("{name} attached at {addr}"))
+                        .field("name", name.as_str())
+                        .field("address", addr.to_string())
+                });
                 lan.add(addr, Box::new(sandbox) as Box<dyn Interface>, None)?;
             }
         },

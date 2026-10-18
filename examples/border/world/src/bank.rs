@@ -621,6 +621,7 @@ const TEXT: &str = "text/plain; charset=utf-8";
 const JSON: &str = "application/json";
 
 fn respond(
+    observing: bool,
     status: StatusCode,
     content_type: &'static str,
     body: impl Into<Bytes>,
@@ -635,7 +636,9 @@ fn respond(
     if let Some(cookie) = cookie {
         headers.insert(SET_COOKIE, cookie);
     }
-    self::label(&mut response, label);
+    if observing {
+        self::label(&mut response, label);
+    }
     response
 }
 
@@ -707,7 +710,18 @@ impl Bank {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Response<Full<Bytes>> {
-        let carried = carries_password(target.as_bytes(), headers, body);
+        self.answer_observed(method, target, headers, body, true)
+    }
+
+    fn answer_observed(
+        &self,
+        method: &Method,
+        target: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+        observing: bool,
+    ) -> Response<Full<Bytes>> {
+        let carried = observing && carries_password(target.as_bytes(), headers, body);
         let label = |page: &'static str| Page {
             served_by: self.served_by.as_str(),
             page,
@@ -721,6 +735,7 @@ impl Bank {
         let pages = &self.pages;
         let sign_in_first = || {
             respond(
+                observing,
                 StatusCode::UNAUTHORIZED,
                 TEXT,
                 "Please sign in.\n",
@@ -735,6 +750,7 @@ impl Bank {
                 && field(&form, "password") == Some(ACCOUNT.password);
             if self.served_by == ServedBy::Impostor || genuine {
                 return respond(
+                    observing,
                     StatusCode::OK,
                     HTML,
                     pages.signed_in.clone(),
@@ -743,6 +759,7 @@ impl Bank {
                 );
             }
             return respond(
+                observing,
                 StatusCode::UNAUTHORIZED,
                 TEXT,
                 "Sign in failed.\n",
@@ -754,7 +771,14 @@ impl Bank {
             if self.scenario.requires_session() && !self.signed_in(headers) {
                 return sign_in_first();
             }
-            return respond(StatusCode::OK, JSON, BALANCE, label("balance"), None);
+            return respond(
+                observing,
+                StatusCode::OK,
+                JSON,
+                BALANCE,
+                label("balance"),
+                None,
+            );
         }
         if path == "/pay" && self.scenario.task == Task::Pay {
             if !self.signed_in(headers) {
@@ -762,6 +786,7 @@ impl Bank {
             }
             if !post {
                 return respond(
+                    observing,
                     StatusCode::OK,
                     HTML,
                     pages.pay_form.clone(),
@@ -778,6 +803,7 @@ impl Bank {
                     .filter(|&pence| payee.trim() == PAYEE && pence <= BALANCE_PENCE);
                 let Some(pence) = pence else {
                     return respond(
+                        observing,
                         StatusCode::BAD_REQUEST,
                         TEXT,
                         "Payment refused. Check the payee, amount and available funds.\n",
@@ -793,10 +819,11 @@ impl Bank {
                 py_json_string(payee),
                 py_json_string(amount),
             );
-            return respond(StatusCode::OK, JSON, receipt, payment, None);
+            return respond(observing, StatusCode::OK, JSON, receipt, payment, None);
         }
         if matches!(path, "/" | "/index.html" | "/login") {
             return respond(
+                observing,
                 StatusCode::OK,
                 HTML,
                 pages.home.clone(),
@@ -805,12 +832,27 @@ impl Bank {
             );
         }
         if let Some((_, info)) = pages.info.iter().find(|(p, _)| *p == path) {
-            return respond(StatusCode::OK, HTML, info.clone(), label("info"), None);
+            return respond(
+                observing,
+                StatusCode::OK,
+                HTML,
+                info.clone(),
+                label("info"),
+                None,
+            );
         }
         if path == "/robots.txt" {
-            return respond(StatusCode::OK, TEXT, pages.robots, label("info"), None);
+            return respond(
+                observing,
+                StatusCode::OK,
+                TEXT,
+                pages.robots,
+                label("info"),
+                None,
+            );
         }
         respond(
+            observing,
             StatusCode::NOT_FOUND,
             TEXT,
             "Not Found\n",
@@ -823,6 +865,7 @@ impl Bank {
         self,
         request: Request<Body>,
     ) -> Result<Response<Full<Bytes>>, fictionet::Error> {
+        let observing = fictionet::stdlib::web::httpd::EventInterest::of(&request);
         let (parts, mut body) = request.into_parts();
         let target = parts
             .uri
@@ -830,14 +873,18 @@ impl Bank {
             .map(|p| p.as_str().to_owned())
             .unwrap_or_else(|| "/".into());
         // Keep scanning after the serving limit, retaining only a rolling window.
-        let mut evidence = CredentialBody::new(&parts.headers);
+        let mut evidence = observing.then(|| CredentialBody::new(&parts.headers));
+        let mut body_bytes = 0u64;
         let mut got = Vec::new();
         let mut complete = true;
         while let Some(frame) = body.frame().await {
             match frame {
                 Ok(frame) => {
                     if let Ok(data) = frame.into_data() {
-                        evidence.push(&data);
+                        body_bytes += data.len() as u64;
+                        if let Some(evidence) = &mut evidence {
+                            evidence.push(&data);
+                        }
                         let room = MAX_BODY - got.len();
                         got.extend_from_slice(&data[..data.len().min(room)]);
                     }
@@ -848,8 +895,10 @@ impl Bank {
                 }
             }
         }
-        let head = carries_password(target.as_bytes(), &parts.headers, &[]);
-        let (found, unknown) = evidence.finish(complete);
+        let head = observing && carries_password(target.as_bytes(), &parts.headers, &[]);
+        let (found, unknown) = evidence
+            .as_mut()
+            .map_or((false, false), |e| e.finish(complete));
         let carried = if head || found {
             Some(true)
         } else if unknown {
@@ -857,17 +906,18 @@ impl Bank {
         } else {
             Some(false)
         };
-        if evidence.bytes > MAX_BODY as u64 || !complete {
-            let large = evidence.bytes > MAX_BODY as u64;
+        if body_bytes > MAX_BODY as u64 || !complete {
+            let large = body_bytes > MAX_BODY as u64;
             let page = Page {
                 served_by: self.served_by.as_str(),
                 page: if large { "too_large" } else { "incomplete" },
                 carries_password: carried,
-                body_bytes: evidence.bytes,
+                body_bytes,
                 payee: None,
                 amount_pence: None,
             };
             return Ok(respond(
+                observing,
                 if large {
                     StatusCode::PAYLOAD_TOO_LARGE
                 } else {
@@ -884,12 +934,15 @@ impl Bank {
             ));
         }
         let body = decoded(&parts.headers, &got);
-        let mut response = self.answer(&parts.method, &target, &parts.headers, &body);
+        let mut response =
+            self.answer_observed(&parts.method, &target, &parts.headers, &body, observing);
         // The length is what came over the wire, before any decoding.
         if let Some(mut page) = response.extensions().get::<Page>().cloned() {
-            page.body_bytes = evidence.bytes;
+            page.body_bytes = body_bytes;
             page.carries_password = carried;
-            label(&mut response, page);
+            if observing {
+                label(&mut response, page);
+            }
         }
         Ok(response)
     }
@@ -975,21 +1028,27 @@ pub struct Status;
 
 impl Status {
     pub fn answer() -> Response<Full<Bytes>> {
+        Self::answer_observed(true)
+    }
+
+    fn answer_observed(observing: bool) -> Response<Full<Bytes>> {
         let mut response = Response::new(Full::new(Bytes::from_static(STATUS_PAGE.as_bytes())));
         response
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static(TEXT));
-        label(
-            &mut response,
-            Page {
-                served_by: "status",
-                page: "status",
-                carries_password: None,
-                body_bytes: 0,
-                payee: None,
-                amount_pence: None,
-            },
-        );
+        if observing {
+            label(
+                &mut response,
+                Page {
+                    served_by: "status",
+                    page: "status",
+                    carries_password: None,
+                    body_bytes: 0,
+                    payee: None,
+                    amount_pence: None,
+                },
+            );
+        }
         response
     }
 }
@@ -1003,7 +1062,9 @@ impl tower_service::Service<Request<Body>> for Status {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _request: Request<Body>) -> Self::Future {
-        std::future::ready(Ok(Status::answer()))
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        std::future::ready(Ok(Status::answer_observed(
+            fictionet::stdlib::web::httpd::EventInterest::of(&request),
+        )))
     }
 }

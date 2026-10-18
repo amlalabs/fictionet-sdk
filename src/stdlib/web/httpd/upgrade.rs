@@ -14,9 +14,9 @@ use hyper::body::Incoming;
 use fictionet::RaceError;
 use fictionet::events::{ConnInfo, Fields};
 use fictionet::stdlib::codec::{Buffer, Decode, Step};
+use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::stdlib::protocols::http1::{self, Event as H1};
 use fictionet::stdlib::services::serve::{Budget, Charge, PanicNote, Prefixed};
-use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, Error};
@@ -25,8 +25,8 @@ use super::response::{
     ResponsePolicy, Track, Tracker, answered, error_event, error_response, request_held,
 };
 use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, BodyClassifier, PIECE, Received, Reply, UpgradeHandler,
-    date_header, text,
+    Body, BodyClassifier, Exchange, Handler, HttpOptions, Limits, PIECE, Received, Reply,
+    UpgradeHandler, date_header, text,
 };
 
 /// Runs hyper's HTTP/1 server on `conn`, with upgrades: where
@@ -113,19 +113,23 @@ fn report(
     refused: Option<&http1::Error>,
     result: Result<(), hyper::Error>,
 ) {
+    if !fcx.emitter(info).enabled("http", "error") {
+        return;
+    }
     let broke = broke.load(std::sync::atomic::Ordering::Relaxed);
-    let cause = match (&result, refused) {
-        (_, Some(e)) => Some(("protocol", e.to_string())),
+    let cause: Option<(&str, &dyn std::fmt::Display)> = match (&result, refused) {
+        (_, Some(e)) => Some(("protocol", e)),
         (Err(e), None) => match error_cause(e) {
-            Some(cause) => Some((cause, e.to_string())),
-            None if broke => Some(("transport", e.to_string())),
+            Some(cause) => Some((cause, e)),
+            None if broke => Some(("transport", e)),
             None => None,
         },
-        (Ok(()), None) if broke => Some(("transport", "a TLS record did not decrypt".to_owned())),
+        (Ok(()), None) if broke => Some(("transport", &"a TLS record did not decrypt")),
         (Ok(()), None) => None,
     };
     if let Some((cause, detail)) = cause {
-        fcx.record(error_event(info, cause, detail).conn(info));
+        fcx.emitter(info)
+            .emit("http", "error", |_| error_event(info, cause, detail));
     }
 }
 
@@ -206,6 +210,7 @@ impl Route {
                 let Ok(frame) = frame else {
                     tracker.received(Received::CutOff);
                     return Err(Box::new(answered(
+                        self.fcx.emitter(&self.info).enabled("http", "request"),
                         text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"),
                         "cut_off",
                     )));
@@ -218,6 +223,7 @@ impl Route {
                 if len > self.limits.body {
                     tracker.received(Received::TooLarge);
                     return Err(Box::new(answered(
+                        self.fcx.emitter(&self.info).enabled("http", "request"),
                         text(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             "The request body is too large.\n",
@@ -227,7 +233,9 @@ impl Route {
                 }
                 if !charge.as_mut().is_none_or(|c| c.set(len)) {
                     tracker.received(Received::Budget);
-                    return Err(Box::new(over_budget()));
+                    return Err(Box::new(over_budget(
+                        self.fcx.emitter(&self.info).enabled("http", "request"),
+                    )));
                 }
                 got.extend_from_slice(&data);
             }
@@ -247,6 +255,7 @@ impl Route {
                     Received::CutOff
                 });
                 Err(Box::new(answered(
+                    self.fcx.emitter(&self.info).enabled("http", "request"),
                     text(
                         StatusCode::REQUEST_TIMEOUT,
                         "The request body took too long.\n",
@@ -259,8 +268,9 @@ impl Route {
 }
 
 /// The answer when the sandbox's budget cannot hold a body.
-fn over_budget() -> Response<Body> {
+fn over_budget(observing: bool) -> Response<Body> {
     answered(
+        observing,
         text(
             StatusCode::SERVICE_UNAVAILABLE,
             "The server cannot hold this request now.\n",
@@ -281,7 +291,12 @@ impl hyper::service::Service<Request<Incoming>> for Route {
         // already, so its tracker is used as it is.
         let handed_off = self.handed_off.lock().take();
         let mut tracker = handed_off.unwrap_or_else(|| {
-            let mut tracker = Tracker::observing(&request, &self.info, self.observe.clone());
+            let mut tracker = Tracker::observing(
+                self.fcx.emitter(&self.info).enabled("http", "request"),
+                &request,
+                &self.info,
+                self.observe.clone(),
+            );
             tracker.start(&request, &self.info, self.fcx.now());
             tracker
         });
@@ -295,10 +310,15 @@ impl hyper::service::Service<Request<Incoming>> for Route {
             None => (None, None),
             Some(None) => {
                 tracker.received(Received::Budget);
-                if let Some(event) =
-                    tracker.finish(Some(Fields::new().with("answer", "budget")), None, 0, false)
-                {
-                    self.fcx.record(event.conn(&self.info));
+                if let Some(event) = tracker.finish(
+                    || Some(Fields::new().with("answer", "budget")),
+                    None,
+                    0,
+                    false,
+                ) {
+                    self.fcx
+                        .emitter(&self.info)
+                        .emit("http", "request", |_| event);
                 }
                 return Box::pin(std::future::ready(Err(Error::msg(
                     "request metadata exceeds budget",
@@ -337,18 +357,25 @@ impl hyper::service::Service<Request<Incoming>> for Route {
                 Ok(body) => {
                     let mut request = Request::from_parts(parts, Body::from(body));
                     request.extensions_mut().insert((*route.info).clone());
+                    request.extensions_mut().insert(super::EventInterest(
+                        route.fcx.emitter(&route.info).enabled("http", "request"),
+                    ));
                     let now = route.fcx.now();
                     let reply = route
                         .handler
                         .call(request, &mut Exchange::new(now, &route.fcx, &route.info));
                     match reply {
                         Reply::Now(r) => r,
-                        Reply::Handoff(_) => {
-                            error_response(&Error::msg("upgrade handoff repeated"))
-                        }
+                        Reply::Handoff(_) => error_response(
+                            &Error::msg("upgrade handoff repeated"),
+                            route.fcx.emitter(&route.info).enabled("http", "request"),
+                        ),
                         Reply::Later(work) => match work(route.fcx.clone()).await {
                             Ok(r) => r,
-                            Err(e) => error_response(&e),
+                            Err(e) => error_response(
+                                &e,
+                                route.fcx.emitter(&route.info).enabled("http", "request"),
+                            ),
                         },
                     }
                 }
@@ -382,7 +409,7 @@ impl hyper::service::Service<Request<Incoming>> for Route {
             let (mut parts, body) = if fits {
                 (parts, body)
             } else {
-                over_budget().into_parts()
+                over_budget(route.fcx.emitter(&route.info).enabled("http", "request")).into_parts()
             };
             let policy = ResponsePolicy::new(
                 &parts,
@@ -393,7 +420,7 @@ impl hyper::service::Service<Request<Incoming>> for Route {
             if let Some(date) = policy.date {
                 parts.headers.insert(DATE, date);
             }
-            track.extra = parts.extensions.get::<Fields>().cloned();
+            track.extra = parts.extensions.remove::<Fields>();
             track.status = Some(parts.status);
             let bodiless = policy.bodiless;
             let body = if bodiless {

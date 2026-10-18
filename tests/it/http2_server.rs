@@ -282,7 +282,7 @@ fn replay() -> Trace {
         let events = evidence.checked_of("http", "request").unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| e.str("version") == Some("HTTP/2.0")));
-        cx.record(fictionet::events::Event::new("test", "complete").fields(Fields::new().with("requests", events.len() as u64)));
+        cx.emit("test", "complete", |event| event.fields(Fields::new().with("requests", events.len() as u64)));
         cx.cancel();
         Ok(())
     })).unwrap();
@@ -1393,4 +1393,57 @@ fn deferred_response_budget_refusal_preserves_other_streams() {
         Ok(())
     }))
     .unwrap();
+}
+
+#[test]
+fn observation_does_not_change_http2_streams() {
+    struct Count(Arc<std::sync::atomic::AtomicUsize>);
+    impl httpd::BodyClassifier for Count {
+        fn head(
+            &self,
+            _: &http::request::Parts,
+            _: &fictionet::events::ConnInfo,
+            _: &mut http::Extensions,
+        ) -> Option<Fields> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+    let run = |observed| {
+        let heads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let memory = Arc::new(fictionet::events::Memory::default());
+        let router = Router::new().post("/", |_, _| {
+            http::Response::new(Bytes::from_static(b"hello"))
+        });
+        let mut harness = Harness::new(
+            Seed::from_u64(1),
+            Http2::new(router).observe(Arc::new(Count(heads.clone()))),
+            (),
+        );
+        if observed {
+            harness = harness.observer(memory.clone());
+        }
+        let mut input = preface();
+        for id in [1, 3, 5] {
+            input.extend(headers(id, "/", true));
+        }
+        let output = harness.push(&input).unwrap();
+        assert_eq!(
+            heads.load(std::sync::atomic::Ordering::Relaxed),
+            if observed { 3 } else { 0 }
+        );
+        assert_eq!(
+            memory.checked_of("http", "request").unwrap().len(),
+            if observed { 3 } else { 0 }
+        );
+        assert_eq!(
+            frames(&output)
+                .iter()
+                .filter(|f| matches!(f, Frame::Data(data) if data.data == b"hello"))
+                .count(),
+            3
+        );
+        output
+    };
+    assert_eq!(run(false), run(true));
 }

@@ -126,7 +126,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use fictionet::events::Fields;
 use fictionet::stdlib::network::route::{self, Prefix, Router};
 use fictionet::stdlib::network::{icmp, tcp};
 #[cfg(doc)]
@@ -223,7 +222,6 @@ pub struct Net {
     registry: Option<fictionet::observe::Registry>,
     group: String,
     limits: Limits,
-    start: Fields,
     lans: Vec<(String, Prefix)>,
     members: Vec<(String, String, IpAddr)>,
 }
@@ -254,7 +252,6 @@ impl Net {
             registry: None,
             group: "net".to_owned(),
             limits: Limits::default(),
-            start: Fields::new(),
             lans: Vec::new(),
             members: Vec::new(),
         }
@@ -282,13 +279,6 @@ impl Net {
             ipv6: false,
             ..self
         }
-    }
-
-    /// Adds the fields of the `run.start` event the network records first
-    /// ([`EventLog::start`](fictionet::events::EventLog::start)), such as
-    /// the date the world says it is.
-    pub fn start_fields(self, start: Fields) -> Net {
-        Net { start, ..self }
     }
 
     /// Adds a host called `label`, built by `build`:
@@ -399,7 +389,6 @@ impl Net {
         } else {
             None
         };
-        fcx.events().start(fcx, self.start);
         if let Some(registry) = self.registry {
             fcx.observe_protocols(registry);
         }

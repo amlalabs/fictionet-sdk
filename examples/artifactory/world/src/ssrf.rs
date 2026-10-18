@@ -100,6 +100,23 @@ const HEADERS: &[&str] = &[
 /// the Host header, using the server's host normalization. All query pairs,
 /// supported header values and body values are scanned. At most 20 targets
 /// are logged. Callers must mark the scan incomplete if the body is unavailable.
+pub fn proxy_target(request: &Request<Bytes>, own: &str, addr: &str) -> bool {
+    let host = request
+        .uri()
+        .host()
+        .map(str::to_owned)
+        .or_else(|| request.extensions().get::<Target>().map(|t| t.host.clone()))
+        .or_else(|| fictionet::stdlib::web::httpd::request_host(request));
+    host.is_some_and(|h| {
+        let h = h
+            .trim_matches(['[', ']'])
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        h != own && h != addr
+    })
+}
+
+/// Extracts bounded observation details after routing has checked the target.
 pub fn extract(request: &Request<Bytes>, own: &str, addr: &str) -> Vec<Value> {
     let mut out = Vec::new();
     let uri = request.uri();

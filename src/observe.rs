@@ -222,7 +222,7 @@
 //! # use fictionet::Cx;
 //! use fictionet::events::Event;
 //! fn sold(fcx: &Cx, item: &str, count: u32) {
-//!     fcx.record(Event::new("shop", "order").summary(format!("{count} × {item}")).field("item", item).field("count", count));
+//!     fcx.emit("shop", "order", |event| event.summary(format!("{count} × {item}")).field("item", item).field("count", count));
 //! }
 //! ```
 //!

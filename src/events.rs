@@ -13,13 +13,15 @@
 //! # #[cfg(feature = "std")]
 //! # {
 //! use fictionet::events::{Event, Level};
-//! # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
-//! fcx.record(Event::new("modbus", "write_register")
+//! let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+//! let observed = evidence.clone();
+//! # fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()).observer(observed), |fcx| async move {
+//! fcx.emit("modbus", "write_register", |event| event
 //!     .summary("register 40001 = 900")
 //!     .level(Level::Alarm)
 //!     .field("register", 40001u32)
 //!     .field("value", 900u32));
-//! let events = fcx.events().of("modbus", "write_register");
+//! let events = evidence.checked_of("modbus", "write_register")?;
 //! assert_eq!(events[0].u64("value"), Some(900));
 //! # Ok(()) }))?;
 //! # }
@@ -41,12 +43,11 @@
 //! that missed some is told how many, with an `events.dropped` event in
 //! their place ([`EventLog::after`]), including gaps from rejected events.
 //!
-//! [`Net::start`](crate::stdlib::world::net::Net::start) records `run.start`, with
-//! the seed and clock origin. Neither [`run`](crate::run) nor
-//! [`lab`](crate::lab) emits it automatically. A world built from lower-level
-//! pieces calls `fcx.events().start(&fcx, Fields::new())` itself. The event
-//! log reports what happened; it is not a recording of every input needed
-//! to replay a real run.
+//! [`run`](crate::run) and [`lab`](crate::lab) emit `run.start` automatically
+//! to an interested observer, once at zero, with the seed and clock origin.
+//! Add caller metadata with [`RunOptions::fields`](crate::RunOptions::fields).
+//! Events report what happened; they do not record every input needed to
+//! replay a real run.
 //!
 //! # Repeats
 //!
@@ -168,7 +169,9 @@ mod store;
 
 pub use log::EventLog;
 pub(crate) use model::Origin;
-pub use model::{ConnInfo, Event, Fields, Level, Sandbox, Transport, float, opt};
+pub use model::{
+    ConnInfo, Event, EventSummary, EventValue, Fields, Level, Sandbox, Transport, float, opt,
+};
 pub(crate) use store::Store;
 
 /// How many events a run's log holds. Past this, the oldest are dropped.

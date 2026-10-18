@@ -13,10 +13,16 @@ use fictionet::time::Instant;
 
 use super::{BadGateway, Body, BodyClassifier, Received, request_host, text};
 
-pub(super) fn answered(mut response: Response<Body>, answer: &'static str) -> Response<Body> {
-    response
-        .extensions_mut()
-        .insert(Fields::new().with("answer", answer));
+pub(super) fn answered(
+    observing: bool,
+    mut response: Response<Body>,
+    answer: &'static str,
+) -> Response<Body> {
+    if observing {
+        response
+            .extensions_mut()
+            .insert(Fields::new().with("answer", answer));
+    }
     response
 }
 
@@ -26,6 +32,8 @@ pub(super) fn answered(mut response: Response<Body>, answer: &'static str) -> Re
 /// One request's event, filled in as it goes.
 #[derive(Default)]
 pub(super) struct Tracker {
+    enabled: bool,
+    charge: usize,
     event: Option<Event>,
     observation: Option<Observation>,
     received: Option<Received>,
@@ -36,6 +44,18 @@ struct Observation {
     state: http::Extensions,
     // Kept separately so service head facts win when the event is finished.
     fields: Fields,
+    truncated: bool,
+}
+
+impl Observation {
+    fn extend(&mut self, fields: Fields) {
+        let event = Event::new("http", "request")
+            .bounded()
+            .fields(std::mem::take(&mut self.fields))
+            .fields(fields);
+        self.truncated |= event.truncated;
+        self.fields = event.fields;
+    }
 }
 
 /// Owned HTTP head storage. `http` hides allocation capacities, so charge
@@ -79,15 +99,40 @@ fn version_name(v: Version) -> &'static str {
 }
 
 impl Tracker {
+    pub(super) fn oversized() -> Self {
+        Self {
+            enabled: true,
+            event: Some(Event::new("http", "request").bounded().truncated()),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn tracking(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Self::default()
+        }
+    }
+
+    // Reserve identical protocol credit whether or not event storage is enabled.
+    // The charge is computed from borrowed headers, without building an event.
     pub(super) fn held(&self) -> usize {
-        self.event.as_ref().map_or(0, Event::size)
+        self.charge
+    }
+
+    fn bounded<B>(request: &Request<B>) -> bool {
+        request.headers().len() <= 128 && request_held(request) <= 32 * 1024
     }
 
     pub(super) fn observing<B>(
+        enabled: bool,
         request: &Request<B>,
         conn: &ConnInfo,
         observer: Option<Arc<dyn BodyClassifier>>,
     ) -> Tracker {
+        if !enabled || !Self::bounded(request) {
+            return Self::tracking(enabled);
+        }
         // Classify the head before constructing generic event metadata.
         let observation = observer.map(|observer| {
             let mut head = Request::new(());
@@ -98,13 +143,18 @@ impl Tracker {
             let (head, ()) = head.into_parts();
             let mut state = http::Extensions::new();
             let fields = observer.head(&head, conn, &mut state).unwrap_or_default();
-            Observation {
+            let mut observation = Observation {
                 observer,
                 state,
-                fields,
-            }
+                fields: Fields::new(),
+                truncated: false,
+            };
+            observation.extend(fields);
+            observation
         });
         Tracker {
+            enabled,
+            charge: 0,
             event: None,
             observation,
             received: None,
@@ -112,7 +162,10 @@ impl Tracker {
     }
 
     pub(super) fn start<B>(&mut self, request: &Request<B>, conn: &ConnInfo, started: Instant) {
-        self.event = Self::new(request, conn, started).event;
+        self.charge = request_held(request) + std::mem::size_of::<Event>();
+        if self.enabled {
+            self.event = Self::new(request, conn, started).event;
+        }
     }
 
     pub(super) fn body(&mut self, bytes: &[u8]) {
@@ -122,7 +175,7 @@ impl Tracker {
             && let Some(o) = &mut self.observation
             && let Some(fields) = o.observer.body(bytes, &mut o.state)
         {
-            o.fields.extend(fields);
+            o.extend(fields);
         }
     }
 
@@ -131,7 +184,7 @@ impl Tracker {
             self.received = Some(received);
             if let Some(o) = &mut self.observation {
                 if let Some(fields) = o.observer.end(received, &mut o.state) {
-                    o.fields.extend(fields);
+                    o.extend(fields);
                 }
                 o.state.clear();
             }
@@ -139,6 +192,15 @@ impl Tracker {
     }
 
     pub(super) fn new<B>(request: &Request<B>, conn: &ConnInfo, started: Instant) -> Tracker {
+        if !Self::bounded(request) {
+            return Self {
+                enabled: true,
+                charge: request_held(request) + std::mem::size_of::<Event>(),
+                event: Some(Event::new("http", "request").bounded().truncated()),
+                received: Some(Received::Complete),
+                observation: None,
+            };
+        }
         let host = request_host(request);
         let headers: Vec<Value> = request
             .headers()
@@ -166,6 +228,7 @@ impl Tracker {
             uri.path()
         );
         let event = Event::new("http", "request")
+            .bounded()
             .fields(Fields::with_capacity(16))
             .field("scheme", if conn.tls { "https" } else { "http" })
             .field("sni", opt(conn.sni.as_deref()))
@@ -179,6 +242,8 @@ impl Tracker {
             .field("started", float(started.since_start().as_secs_f64()))
             .summary(summary);
         Tracker {
+            enabled: true,
+            charge: request_held(request) + std::mem::size_of::<Event>(),
             event: Some(event),
             observation: None,
             received: Some(Received::Complete),
@@ -188,18 +253,21 @@ impl Tracker {
     /// The finished event: observer fields, handler fields, then service facts.
     pub(super) fn finish(
         &mut self,
-        extra: Option<Fields>,
+        extra: impl FnOnce() -> Option<Fields>,
         status: Option<StatusCode>,
         sent: u64,
         complete: bool,
     ) -> Option<Event> {
+        self.charge = 0;
         self.received(Received::CutOff);
         let mut event = self.event.take()?;
-        let mut fields = self
-            .observation
-            .take()
-            .map_or_else(Fields::new, |o| o.fields);
-        let mut extra = extra.unwrap_or_default();
+        let mut fields = self.observation.take().map_or_else(Fields::new, |o| {
+            if o.truncated {
+                event.truncated = true;
+            }
+            o.fields
+        });
+        let mut extra = extra().unwrap_or_default();
         let answer = extra.remove("answer").unwrap_or_else(|| {
             if status.is_none() {
                 "cancelled".into()
@@ -215,7 +283,7 @@ impl Tracker {
         own.set("sent", sent);
         own.set("complete", complete);
         fields.extend(own);
-        event.fields = fields;
+        event = event.fields(fields);
         if let Some(s) = status {
             let _ = write!(event.summary, " {}", s.as_u16());
             if s.is_server_error() {
@@ -227,7 +295,7 @@ impl Tracker {
 }
 
 /// The response for a handler error: `502` for [`BadGateway`], else `500`.
-pub(super) fn error_response(e: &Error) -> Response<Body> {
+pub(super) fn error_response(e: &Error, observing: bool) -> Response<Body> {
     let mut response = if e.is::<BadGateway>() {
         text(StatusCode::BAD_GATEWAY, &format!("{e}\n"))
     } else {
@@ -236,20 +304,27 @@ pub(super) fn error_response(e: &Error) -> Response<Body> {
             "The site failed to answer.\n",
         )
     };
-    response
-        .extensions_mut()
-        .insert(Fields::new().with("answer", "error"));
+    if observing {
+        response
+            .extensions_mut()
+            .insert(Fields::new().with("answer", "error"));
+    }
     response
 }
 
 /// Logs an `http.error` event.
-pub(super) fn error_event(conn: &ConnInfo, cause: &'static str, detail: String) -> Event {
+pub(super) fn error_event(
+    conn: &ConnInfo,
+    cause: &'static str,
+    detail: impl std::fmt::Display,
+) -> Event {
     Event::new("http", "error")
+        .bounded()
         .level(Level::Notice)
-        .summary(format!("HTTP {cause} error: {detail}"))
+        .summary(format_args!("HTTP {cause} error: {detail}"))
         .field("local", opt(conn.local.map(|a| a.to_string())))
         .field("cause", cause)
-        .field("detail", detail)
+        .display("detail", detail)
 }
 
 /// Shared response decisions, before either backend chooses wire framing.
@@ -359,9 +434,9 @@ impl Drop for Track {
     fn drop(&mut self) {
         if let Some(e) =
             self.tracker
-                .finish(self.extra.take(), self.status, self.sent, self.complete)
+                .finish(|| self.extra.take(), self.status, self.sent, self.complete)
         {
-            self.fcx.record(e.conn(&self.info));
+            self.fcx.emitter(&self.info).emit("http", "request", |_| e);
         }
     }
 }

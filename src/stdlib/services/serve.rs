@@ -42,7 +42,7 @@
 //!         if line == b"quit" {
 //!             return Ok(Flow::Close);
 //!         }
-//!         driver.record(Event::new("echo", "line").field("bytes", line.len() as u64));
+//!         driver.emit("echo", "line", |event| event.field("bytes", line.len() as u64));
 //!         driver.reply().extend_from_slice(&line);
 //!         driver.reply().push(b'\n');
 //!         Ok(Flow::Continue)
@@ -427,7 +427,7 @@ pub trait Pending: Send + 'static {
 /// What deferred work sees while it runs.
 pub struct PendingDriver<'a> {
     fcx: Option<&'a Cx>,
-    events: &'a mut Vec<Event>,
+    events: &'a mut Staged,
     written: u64,
     conn: &'a ConnInfo,
     close: bool,
@@ -453,9 +453,19 @@ impl PendingDriver<'_> {
         self.close = true;
     }
 
-    /// Records an event, from this connection.
-    pub fn record(&mut self, event: Event) {
-        self.events.push(event);
+    /// Checks interest before constructing event-specific state.
+    pub fn event_enabled(&self, source: &'static str, kind: &'static str) -> bool {
+        self.events.enabled(self.conn, source, kind)
+    }
+
+    /// Builds and stages a connection event only when wanted and space remains.
+    pub fn emit(
+        &self,
+        source: &'static str,
+        kind: &'static str,
+        build: impl FnOnce(Event) -> Event,
+    ) {
+        self.events.emit(self.conn, source, kind, build);
     }
 
     /// The connection.
@@ -735,9 +745,19 @@ impl<D> Driver<'_, D> {
             .map(|(_, at)| *at)
     }
 
-    /// Records `event` in the run's events, from this connection.
-    pub fn record(&mut self, event: Event) {
-        self.s.events.push(event);
+    /// Checks interest before constructing event-specific state.
+    pub fn event_enabled(&self, source: &'static str, kind: &'static str) -> bool {
+        self.s.events.enabled(self.conn, source, kind)
+    }
+
+    /// Builds and stages a connection event only when wanted and space remains.
+    pub fn emit(
+        &self,
+        source: &'static str,
+        kind: &'static str,
+        build: impl FnOnce(Event) -> Event,
+    ) {
+        self.s.events.emit(self.conn, source, kind, build);
     }
 
     /// The connection: its number, sandbox, addresses and transport.
@@ -793,11 +813,94 @@ impl<D> Driver<'_, D> {
     }
 }
 
+/// Event staging has its own bounds and never consumes protocol credit.
+#[derive(Default)]
+struct Staged {
+    fcx: Option<Cx>,
+    observer: Option<Arc<crate::events::Dispatch>>,
+    state: std::cell::RefCell<StagedState>,
+}
+
+#[derive(Default)]
+struct StagedState {
+    events: Vec<Event>,
+    bytes: usize,
+    lost: u64,
+}
+
+impl Staged {
+    fn enabled(&self, conn: &ConnInfo, source: &'static str, kind: &'static str) -> bool {
+        self.fcx
+            .as_ref()
+            .is_some_and(|cx| cx.emitter(conn).enabled(source, kind))
+            || self
+                .observer
+                .as_ref()
+                .is_some_and(|o| o.enabled(crate::events::Metadata { source, kind }, conn))
+    }
+
+    fn emit(
+        &self,
+        conn: &ConnInfo,
+        source: &'static str,
+        kind: &'static str,
+        build: impl FnOnce(Event) -> Event,
+    ) {
+        if !self.enabled(conn, source, kind) {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let reserve = (128usize << 10)
+            .saturating_add(conn.sandbox.as_ref().map_or(0, |s| s.name.len()))
+            .saturating_add(conn.sni.as_ref().map_or(0, |s| s.len()))
+            .saturating_add(conn.alpn.as_ref().map_or(0, |s| s.len()));
+        if state.events.len() >= 256 || reserve > (1 << 20) || state.bytes > (1 << 20) - reserve {
+            state.lost = state.lost.saturating_add(1);
+            return;
+        }
+        let event = build(Event::new(source, kind).bounded()).conn(conn);
+        let bytes = event.size();
+        if bytes > (1 << 20) - state.bytes {
+            state.lost = state.lost.saturating_add(1);
+            return;
+        }
+        state.bytes += bytes;
+        state.events.push(event);
+    }
+
+    fn drain(&mut self, now: impl Fn() -> Instant) {
+        let state = std::mem::take(self.state.get_mut());
+        for event in state.events {
+            if let Some(cx) = &self.fcx {
+                cx.emitter(&event.conn)
+                    .emit(event.source, event.kind, |_| event.clone());
+            }
+            if let Some(observer) = &self.observer
+                && observer.enabled(
+                    crate::events::Metadata {
+                        source: event.source,
+                        kind: event.kind,
+                    },
+                    &event.conn,
+                )
+            {
+                observer.emit(event, &now);
+            }
+        }
+        if let Some(cx) = &self.fcx {
+            cx.run.observer.lost(state.lost);
+        }
+        if let Some(observer) = &self.observer {
+            observer.lost(state.lost);
+        }
+    }
+}
+
 /// What the per-connection state looks like to a call.
 struct Scratch {
     decoder_touched: bool,
     reply: Vec<u8>,
-    events: Vec<Event>,
+    events: Staged,
     datagrams: Vec<(SocketAddr, Vec<u8>)>,
     entropy: Arc<dyn Entropy>,
     timers: Vec<(Timer, Option<Duration>)>,
@@ -813,7 +916,7 @@ impl Scratch {
         Scratch {
             decoder_touched: false,
             reply: Vec::new(),
-            events: Vec::new(),
+            events: Staged::default(),
             datagrams: Vec::new(),
             entropy,
             timers: Vec::new(),
@@ -1552,21 +1655,23 @@ where
 
     /// The `conn.faults` event for item rules that stopped since the last
     /// call: the client's bytes went on unchanged from there.
-    fn stopped(&mut self) -> Option<Event> {
-        let why = self.stopped.take()?;
-        let summary = match why {
-            "decoder" => "item faults stopped: the service accessed its decoder",
-            "upgrade" => "item faults stopped: the service upgraded the connection",
-            "failed" => "item faults stopped: the client's bytes did not decode",
-            "ended" => "item faults stopped: the decoder ended",
-            _ => "item faults stopped: the decoder could take no more",
+    fn stopped(&mut self, events: &Staged, info: &ConnInfo) {
+        let Some(why) = self.stopped.take() else {
+            return;
         };
-        Some(
-            Event::new("conn", "faults")
+        events.emit(info, "conn", "faults", |event| {
+            let summary = match why {
+                "decoder" => "item faults stopped: the service accessed its decoder",
+                "upgrade" => "item faults stopped: the service upgraded the connection",
+                "failed" => "item faults stopped: the client's bytes did not decode",
+                "ended" => "item faults stopped: the decoder ended",
+                _ => "item faults stopped: the decoder could take no more",
+            };
+            event
                 .level(Level::Notice)
                 .summary(summary)
-                .field("stopped", why),
-        )
+                .field("stopped", why)
+        });
     }
 
     /// Runs the outbound byte rules over one chunk: the bytes to write and
@@ -1701,6 +1806,7 @@ where
         now: Instant,
     ) -> Core<S> {
         let mut s = Scratch::new(entropy);
+        s.events.fcx = fcx.clone();
         if let Some(w) = wake {
             s.wake = w;
         }
@@ -1838,7 +1944,7 @@ where
         match &mut self.faults {
             Some(f) => {
                 let result = f.inbound(self.s.entropy.as_ref(), bytes, false, &mut self.queue);
-                self.s.events.extend(f.stopped());
+                f.stopped(&self.s.events, &self.info);
                 if let Err(e) = result {
                     self.fault_failed("inbound", e);
                 }
@@ -1859,7 +1965,7 @@ where
         self.eof = true;
         if let Some(f) = &mut self.faults {
             let result = f.inbound(self.s.entropy.as_ref(), &[], true, &mut self.queue);
-            self.s.events.extend(f.stopped());
+            f.stopped(&self.s.events, &self.info);
             if let Err(e) = result {
                 self.fault_failed("inbound", e);
             }
@@ -1975,7 +2081,7 @@ where
         }
         if let Some(faults) = &mut self.faults {
             let result = faults.stop(why, &mut self.queue);
-            self.s.events.extend(faults.stopped());
+            faults.stopped(&self.s.events, &self.info);
             if let Err(e) = result {
                 self.fault_failed("items", e);
             }
@@ -2139,7 +2245,7 @@ where
             && let Some(faults) = &mut self.faults
         {
             let result = faults.pump(self.s.entropy.as_ref(), &mut self.queue);
-            self.s.events.extend(faults.stopped());
+            faults.stopped(&self.s.events, &self.info);
             if let Err(e) = result {
                 self.fault_failed("items", e);
                 return 0;
@@ -2480,11 +2586,6 @@ fn conn_end(e: ConnError) -> Ended {
     }
 }
 
-/// Records an event from the connection `info`.
-fn record(fcx: &Cx, info: &ConnInfo, event: Event) {
-    fcx.record(event.conn(info));
-}
-
 /// Writes all of `data`, unless the client resets the connection, the
 /// world stops, or a write takes no bytes for `stall`: a client that
 /// stopped reading. Returns how the connection ends if it does.
@@ -2599,15 +2700,13 @@ where
             .any(|e| e.is::<Cancelled>());
         if !cancelled {
             let chain = ErrorChain(&*e);
-            record(
-                fcx,
-                &info,
-                Event::new("conn", "error")
+            fcx.emitter(&info).emit("conn", "error", |event| {
+                event
                     .level(Level::Notice)
-                    .summary(format!("a connection task failed: {chain}"))
-                    .field("error", chain.to_string())
-                    .field("kind", "task"),
-            );
+                    .summary(format_args!("a connection task failed: {chain}"))
+                    .display("error", chain)
+                    .field("kind", "task")
+            });
             return match result {
                 Err(ServeError::Service(_) | ServeError::Pending(_) | ServeError::Faults(_)) => {
                     result
@@ -2667,11 +2766,12 @@ where
             other => return Ok(other),
         };
         let Some(select) = &opts.starttls else {
-            let event = Event::new("conn", "error")
-                .level(Level::Notice)
-                .summary("the service asked for TLS, and there is no TLS config")
-                .field("error", "no TLS config for the upgrade");
-            record(fcx, &info, event);
+            fcx.emitter(&info).emit("conn", "error", |event| {
+                event
+                    .level(Level::Notice)
+                    .summary("the service asked for TLS, and there is no TLS config")
+                    .field("error", "no TLS config for the upgrade")
+            });
             return Ok(Served::Closed(Ended::Failed));
         };
         let deadline = fcx.now() + opts.handshake;
@@ -2711,11 +2811,8 @@ where
     <S::Decoder as Decode>::Error: Clone + Send,
 {
     if first && opts.connection_events {
-        record(
-            fcx,
-            &info,
-            Event::new("conn", "open").summary("connection opened"),
-        );
+        fcx.emitter(&info)
+            .emit("conn", "open", |event| event.summary("connection opened"));
     }
     let _note = PanicNote::new(std::any::type_name::<S>(), &info);
     let mut core: Core<S> = Core::new(
@@ -2735,11 +2832,7 @@ where
     loop {
         // What is out counts against the budget while it is written.
         core.recharge(service);
-        if !core.s.events.is_empty() {
-            for event in std::mem::take(&mut core.s.events) {
-                record(fcx, &core.info, event);
-            }
-        }
+        core.s.events.drain(|| fcx.now());
         // Write what is out, through the transcript.
         while let Some(out) = core.out.pop_front() {
             match out {
@@ -2842,17 +2935,13 @@ where
                 }
             }
             Next::Upgrade(how) => {
-                for event in std::mem::take(&mut core.s.events) {
-                    record(fcx, &core.info, event);
-                }
+                core.s.events.drain(|| fcx.now());
                 if opts.connection_events {
-                    record(
-                        fcx,
-                        &core.info,
-                        Event::new("conn", "upgrade")
-                            .summary(format!("connection upgraded: {}", how.as_str()))
-                            .field("to", how.as_str()),
-                    );
+                    fcx.emitter(&core.info).emit("conn", "upgrade", |event| {
+                        event
+                            .summary(format_args!("connection upgraded: {}", how.as_str()))
+                            .field("to", how.as_str())
+                    });
                 }
                 let unread = core.unread();
                 // The service goes on after TLS, with the same handle.
@@ -2862,9 +2951,7 @@ where
                 return Ok(Served::Upgraded(how, Prefixed::new(unread, conn)));
             }
             Next::Closed(end) => {
-                for event in std::mem::take(&mut core.s.events) {
-                    record(fcx, &core.info, event);
-                }
+                core.s.events.drain(|| fcx.now());
                 let shutdown = if end.writable() {
                     match fcx
                         .race(Some(fcx.now() + Duration::from_secs(5)), conn.shutdown(fcx))
@@ -2883,51 +2970,56 @@ where
                 match &failure {
                     Some(Failure::Service(e)) => {
                         let e = ErrorChain(e);
-                        let event = Event::new("conn", "error")
-                            .level(Level::Notice)
-                            .summary(format!("the service failed: {e}"))
-                            .field("error", e.to_string())
-                            .field("kind", "service");
-                        record(fcx, &info, event);
+                        fcx.emitter(&info).emit("conn", "error", |event| {
+                            event
+                                .level(Level::Notice)
+                                .summary(format_args!("the service failed: {e}"))
+                                .display("error", e)
+                                .field("kind", "service")
+                        });
                     }
                     Some(Failure::Pending(e)) => {
                         let e = ErrorChain(&**e);
-                        let event = Event::new("conn", "error")
-                            .level(Level::Notice)
-                            .summary(format!("deferred work failed: {e}"))
-                            .field("error", e.to_string())
-                            .field("kind", "deferred");
-                        record(fcx, &info, event);
+                        fcx.emitter(&info).emit("conn", "error", |event| {
+                            event
+                                .level(Level::Notice)
+                                .summary(format_args!("deferred work failed: {e}"))
+                                .display("error", e)
+                                .field("kind", "deferred")
+                        });
                     }
                     Some(Failure::Faults(e)) => {
                         let e = ErrorChain(e);
-                        let event = Event::new("conn", "error")
-                            .level(Level::Notice)
-                            .summary(format!("the fault plan failed: {e}"))
-                            .field("error", e.to_string())
-                            .field("kind", "faults")
-                            .field("direction", core.fault_direction.unwrap());
-                        record(fcx, &info, event);
+                        fcx.emitter(&info).emit("conn", "error", |event| {
+                            event
+                                .level(Level::Notice)
+                                .summary(format_args!("the fault plan failed: {e}"))
+                                .display("error", e)
+                                .field("kind", "faults")
+                                .field("direction", core.fault_direction.unwrap())
+                        });
                     }
                     None => {}
                 }
                 if opts.connection_events {
-                    let mut event = Event::new("conn", "close")
-                        .field("end", end.as_str())
-                        .summary(format!("connection closed: {}", end.as_str()));
-                    if let Some(e) = shutdown {
-                        let name = match e {
-                            ConnError::Refused => "refused",
-                            ConnError::Unreachable(_) => "unreachable",
-                            ConnError::Reset => "reset",
-                            ConnError::TimedOut => "timed_out",
-                            ConnError::Closed => "closed",
-                            ConnError::Broken => "broken",
-                            ConnError::Cancelled => "cancelled",
-                        };
-                        event = event.field("shutdown", name);
-                    }
-                    record(fcx, &info, event);
+                    fcx.emitter(&info).emit("conn", "close", |event| {
+                        let mut event = event
+                            .field("end", end.as_str())
+                            .summary(format_args!("connection closed: {}", end.as_str()));
+                        if let Some(e) = shutdown {
+                            let name = match e {
+                                ConnError::Refused => "refused",
+                                ConnError::Unreachable(_) => "unreachable",
+                                ConnError::Reset => "reset",
+                                ConnError::TimedOut => "timed_out",
+                                ConnError::Closed => "closed",
+                                ConnError::Broken => "broken",
+                                ConnError::Cancelled => "cancelled",
+                            };
+                            event = event.field("shutdown", name);
+                        }
+                        event
+                    });
                 }
                 drop(core);
                 return match failure {
@@ -3042,43 +3134,45 @@ pub async fn accept_tls<C: Connection>(
         Err(RaceError::Deadline) => Err(HandshakeError::TimedOut),
         Err(RaceError::Cancelled) => Err(HandshakeError::Cancelled),
     };
-    let outcome = match &done {
-        Ok(conn) => TlsOutcome::Accepted {
-            alpn: conn.alpn().map(<[u8]>::to_vec),
-        },
-        Err(e) => TlsOutcome::of(e, detached()),
-    };
-    let mut event = Event::new("tls", "handshake")
-        .summary(match &sni {
-            Some(n) => format!("TLS for {n}: {}", outcome.as_str()),
-            None => format!("TLS with no name: {}", outcome.as_str()),
-        })
-        .level(if matches!(outcome, TlsOutcome::Accepted { .. }) {
-            Level::Info
-        } else {
-            Level::Notice
-        })
-        .field("addr", opt(info.local.map(|a| a.ip().to_string())))
-        .field("sni", opt(sni.clone()))
-        .field("outcome", outcome.as_str());
-    match &outcome {
-        TlsOutcome::Accepted { alpn } => {
-            event = event.field(
-                "alpn",
-                opt(alpn
-                    .as_ref()
-                    .map(|a| String::from_utf8_lossy(a).into_owned())),
-            );
+    fcx.emitter(info).emit("tls", "handshake", |event| {
+        let outcome = match &done {
+            Ok(conn) => TlsOutcome::Accepted {
+                alpn: conn.alpn().map(<[u8]>::to_vec),
+            },
+            Err(e) => TlsOutcome::of(e, detached()),
+        };
+        let mut event = event
+            .summary(match &sni {
+                Some(n) => format!("TLS for {n}: {}", outcome.as_str()),
+                None => format!("TLS with no name: {}", outcome.as_str()),
+            })
+            .level(if matches!(outcome, TlsOutcome::Accepted { .. }) {
+                Level::Info
+            } else {
+                Level::Notice
+            })
+            .field("addr", opt(info.local.map(|a| a.ip().to_string())))
+            .field("sni", opt(sni.clone()))
+            .field("outcome", outcome.as_str());
+        match &outcome {
+            TlsOutcome::Accepted { alpn } => {
+                event = event.field(
+                    "alpn",
+                    opt(alpn
+                        .as_ref()
+                        .map(|a| String::from_utf8_lossy(a).into_owned())),
+                );
+            }
+            TlsOutcome::Alert(a) => {
+                event = event
+                    .field("alert", tls::alert_name(*a))
+                    .field("alert_code", u32::from(*a))
+            }
+            TlsOutcome::Failed(why) => event = event.field("detail", why.as_str()),
+            _ => {}
         }
-        TlsOutcome::Alert(a) => {
-            event = event
-                .field("alert", tls::alert_name(*a))
-                .field("alert_code", u32::from(*a))
-        }
-        TlsOutcome::Failed(why) => event = event.field("detail", why.as_str()),
-        _ => {}
-    }
-    record(fcx, info, event);
+        event
+    });
     let conn = done?;
     let info = info.clone().over_tls(sni.as_deref(), conn.alpn());
     Ok((conn, info))
@@ -3205,6 +3299,7 @@ where
     };
     let _note = PanicNote::new(std::any::type_name::<S>(), &base);
     let mut s = Scratch::new(Arc::new(fcx.clone()));
+    s.events.fcx = Some(fcx.clone());
     let mut timers: Vec<(Timer, Instant)> = Vec::new();
     let wake = s.wake.clone();
     // One call, then its datagrams and events. The reply stays for the
@@ -3228,18 +3323,17 @@ where
             };
             f(&mut driver)
         };
-        for event in std::mem::take(&mut s.events) {
-            record(fcx, info, event);
-        }
+        s.events.drain(|| fcx.now());
         let flow = match result {
             Err(e) => {
                 let e = ErrorChain(&e);
-                let event = Event::new("conn", "error")
-                    .level(Level::Notice)
-                    .summary(format!("the service failed: {e}"))
-                    .field("error", e.to_string())
-                    .field("kind", "service");
-                record(fcx, info, event);
+                fcx.emitter(info).emit("conn", "error", |event| {
+                    event
+                        .level(Level::Notice)
+                        .summary(format_args!("the service failed: {e}"))
+                        .display("error", e)
+                        .field("kind", "service")
+                });
                 Flow::Close
             }
             Ok(flow) => flow,
@@ -3479,7 +3573,7 @@ pub struct Harness<S: Service> {
     opts: ServeOptions,
     now: Instant,
     opened: bool,
-    observer: crate::events::Dispatch,
+    observer: Arc<crate::events::Dispatch>,
     output: Vec<u8>,
     upgraded: Option<Upgrade>,
     /// Whether a call returned the upgrade.
@@ -3526,7 +3620,7 @@ where
             opts,
             now: Instant::ZERO,
             opened: false,
-            observer: crate::events::Dispatch::new(None),
+            observer: Arc::new(crate::events::Dispatch::new(None)),
             output: Vec::new(),
             upgraded: None,
             reported: false,
@@ -3539,7 +3633,8 @@ where
             !self.opened,
             "install the observer before opening the harness"
         );
-        self.observer = crate::events::Dispatch::new(Some(observer));
+        self.observer = Arc::new(crate::events::Dispatch::new(Some(observer)));
+        self.core.s.events.observer = Some(self.observer.clone());
         self
     }
 
@@ -3556,6 +3651,7 @@ where
         self.now = fcx.now();
         self.core.idle_from = self.now;
         self.core.s.entropy = Arc::new(fcx.clone());
+        self.core.s.events.fcx = Some(fcx.clone());
         self.core.fcx = Some(fcx);
         self
     }
@@ -3621,21 +3717,7 @@ where
     /// does.
     fn drain(&mut self, reply: &mut Vec<u8>) {
         self.core.recharge(&self.service);
-        for event in self.core.s.events.drain(..) {
-            let event = event.conn(&self.core.info);
-            if let Some(cx) = &self.core.fcx {
-                cx.record(event.clone());
-            }
-            if self.observer.enabled(
-                crate::events::Metadata {
-                    source: event.source,
-                    kind: event.kind,
-                },
-                &event.conn,
-            ) {
-                self.observer.emit(event, || self.now);
-            }
-        }
+        self.core.s.events.drain(|| self.now);
         while let Some(out) = self.core.out.pop_front() {
             if let Out::Bytes(b, credit) = out {
                 self.output.extend_from_slice(&b);
@@ -3825,5 +3907,85 @@ where
 impl<S: Service> Drop for Harness<S> {
     fn drop(&mut self) {
         self.observer.end(|| self.now);
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    use crate::events::Memory;
+    use crate::stdlib::codec::{Ending, LineError, Lines};
+
+    struct Echo {
+        builds: Arc<AtomicUsize>,
+        count: usize,
+    }
+    impl Service for Echo {
+        type Decoder = Lines;
+        type State = ();
+        type Error = LineError;
+        fn decoder(&self) -> Lines {
+            Lines::new(64, Ending::LfOrCrlf)
+        }
+        fn on_item(
+            &mut self,
+            item: Result<Vec<u8>, LineError>,
+            _: &(),
+            driver: &mut Driver<'_, Lines>,
+        ) -> Result<Flow, LineError> {
+            let line = item?;
+            for _ in 0..self.count {
+                driver.emit("echo", "line", |event| {
+                    self.builds.fetch_add(1, Ordering::Relaxed);
+                    event.field("bytes", line.len() as u64)
+                });
+            }
+            driver.reply().extend_from_slice(&line);
+            Ok(Flow::Close)
+        }
+    }
+
+    #[test]
+    fn observation_does_not_change_service_output_and_absence_skips_building() {
+        for observed in [false, true] {
+            let builds = Arc::new(AtomicUsize::new(0));
+            let memory = Arc::new(Memory::default());
+            let mut harness = Harness::new(
+                Seed::from_u64(1),
+                Echo {
+                    builds: builds.clone(),
+                    count: 1,
+                },
+                (),
+            );
+            if observed {
+                harness = harness.observer(memory.clone());
+            }
+            assert_eq!(harness.push(b"hello\n").unwrap(), b"hello");
+            assert!(harness.closed());
+            assert_eq!(builds.load(Ordering::Relaxed), usize::from(observed));
+            assert_eq!(
+                memory.checked_of("echo", "line").unwrap().len(),
+                usize::from(observed)
+            );
+        }
+    }
+
+    #[test]
+    fn staging_stops_building_when_full_and_reports_loss() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let memory = Arc::new(Memory::default());
+        let mut harness = Harness::new(
+            Seed::from_u64(1),
+            Echo {
+                builds: builds.clone(),
+                count: 1000,
+            },
+            (),
+        )
+        .observer(memory.clone());
+        assert_eq!(harness.push(b"hello\n").unwrap(), b"hello");
+        assert_eq!(builds.load(Ordering::Relaxed), 256);
+        assert_eq!(memory.checked_all().unwrap_err().dropped, 744);
     }
 }

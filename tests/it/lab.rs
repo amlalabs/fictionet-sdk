@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use fictionet::events::Event;
 use fictionet::time::{Instant, ms};
 use fictionet::{Cancelled, JoinError, RaceError, RunMode, Seed, Timer, block_on, lab};
 
@@ -18,9 +17,9 @@ fn idle_drains_spawned_and_woken_work_before_advancing_time() {
                     cx.yield_now().await?;
                 }
                 cx.spawn(|cx| async move {
-                    cx.record(Event::new("test", "ready"));
+                    cx.emit("test", "ready", |event| event);
                     cx.sleep(ms(1)).await?;
-                    cx.record(Event::new("test", "later"));
+                    cx.emit("test", "later", |event| event);
                     Ok(())
                 });
                 Ok(())
@@ -69,10 +68,10 @@ fn event_wait_wakes_at_each_raw_fact() {
             |cx, evidence| async move {
                 cx.spawn(|cx| async move {
                     cx.sleep(Duration::from_nanos(7)).await?;
-                    cx.record(Event::new("test", "ready"));
-                    cx.record_repeat(Event::new("test", "repeat"), Default::default());
+                    cx.emit("test", "ready", |event| event);
+                    cx.emit("test", "repeat", |event| event);
                     cx.sleep(ms(2)).await?;
-                    cx.record_repeat(Event::new("test", "repeat"), Default::default());
+                    cx.emit("test", "repeat", |event| event);
                     Ok(())
                 });
                 let log = evidence;
@@ -108,7 +107,7 @@ fn event_wait_stops_at_its_exact_limit() {
             Seed::from_u64(1),
             |fcx, evidence| async move {
                 fcx.sleep(ms(3)).await?;
-                fcx.record(Event::new("test", "tick"));
+                fcx.emit("test", "tick", |event| event);
                 let start = fcx.now();
                 let got = evidence
                     .wait(&fcx, 2, limit, |event| event.is("test", "tick"))
@@ -130,7 +129,7 @@ fn event_wait_accepts_an_overflowing_limit() {
             fcx.sleep(ms(1)).await?;
             fcx.spawn(|fcx| async move {
                 fcx.sleep(ms(1)).await?;
-                fcx.record(Event::new("test", "tick"));
+                fcx.emit("test", "tick", |event| event);
                 Ok(())
             });
             let got = evidence
@@ -157,7 +156,7 @@ fn event_wait_cancellation_wins_at_the_deadline() {
             })
             .await;
             fcx.sleep(ms(1)).await?;
-            fcx.record(Event::new("test", "tick"));
+            fcx.emit("test", "tick", |event| event);
             fcx.cancel();
             assert!(
                 wait.await
@@ -513,22 +512,19 @@ fn recorded_world() -> Vec<u8> {
     block_on(lab(
         fictionet::RunOptions::new(Seed::from_u64(7)).observer(out.clone()),
         move |cx| async move {
-            use fictionet::events::{Event, Fields};
             assert!(matches!(
                 out.checked_of("run", "start").unwrap()[0].get("wall"),
                 Some(fictionet::stdlib::protocols::json::Value::Null)
             ));
             for i in 0..4 {
                 cx.sleep(ms(15)).await?;
-                cx.record(
-                    Event::new("test", "draw")
-                        .field("i", i)
-                        .field("draw", cx.random_u64()),
-                );
+                cx.emit("test", "draw", |event| {
+                    event.field("i", i).field("draw", cx.random_u64())
+                });
             }
             // Each repeat is delivered as a raw fact.
-            cx.record_repeat(Event::new("test", "repeat"), Fields::default());
-            cx.record_repeat(Event::new("test", "repeat"), Fields::default());
+            cx.emit("test", "repeat", |event| event);
+            cx.emit("test", "repeat", |event| event);
             Ok(())
         },
     ))
@@ -543,7 +539,7 @@ fn lab_event_bytes_repeat() {
 
 #[test]
 fn seeded_service_faults_repeat_at_the_same_points() {
-    use fictionet::events::{ConnInfo, Event};
+    use fictionet::events::ConnInfo;
     use fictionet::prelude::*;
     use fictionet::stdlib::codec::{ByteFault, Ending, LineError, Lines, Rule, Trigger};
     use fictionet::stdlib::network::tcp;
@@ -601,11 +597,9 @@ fn seeded_service_faults_repeat_at_the_same_points() {
                     assert!(reply == *b"a\n" || reply == *b"`\n");
                     let fault = reply[0] == b'`';
                     replies.lock().unwrap().push((i, cx.now(), fault));
-                    cx.record(
-                        Event::new("client", "reply")
-                            .field("i", i)
-                            .field("fault", fault),
-                    );
+                    cx.emit("client", "reply", |event| {
+                        event.field("i", i).field("fault", fault)
+                    });
                 }
                 cx.cancel();
                 Ok(())

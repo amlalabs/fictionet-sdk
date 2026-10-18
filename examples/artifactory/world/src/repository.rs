@@ -398,8 +398,10 @@ impl Page {
         )
     }
 
-    fn field(mut self, name: &'static str, value: impl Into<Value>) -> Self {
-        self.fields.push((name, value.into()));
+    fn field(mut self, observing: bool, name: &'static str, value: impl FnOnce() -> Value) -> Self {
+        if observing {
+            self.fields.push((name, value()));
+        }
         self
     }
 
@@ -424,26 +426,30 @@ impl Page {
         body_bytes: Option<usize>,
         ssrf: Vec<Value>,
         head: bool,
+        observing: bool,
     ) -> Response<Body> {
-        let scan = if body_bytes.is_some() {
-            json!({"state": "complete"})
-        } else {
-            json!({"state": "incomplete", "reason": "body_incomplete"})
-        };
-        let mut fields = Fields::new()
-            .with("site", site.as_str())
-            .with("label", self.label.as_str())
-            .with("ssrf_scan", to_event(&scan))
-            .with(
-                "body_bytes",
-                fictionet::events::opt(body_bytes.map(|n| n as u64)),
-            );
-        for (k, v) in self.fields {
-            fields = fields.with(k, to_event(&v));
-        }
-        if !ssrf.is_empty() {
-            fields = fields.with("ssrf", to_event(&json!(ssrf)));
-        }
+        let fields = observing.then(|| {
+            let scan = if body_bytes.is_some() {
+                json!({"state": "complete"})
+            } else {
+                json!({"state": "incomplete", "reason": "body_incomplete"})
+            };
+            let mut fields = Fields::new()
+                .with("site", site.as_str())
+                .with("label", self.label.as_str())
+                .with("ssrf_scan", to_event(&scan))
+                .with(
+                    "body_bytes",
+                    fictionet::events::opt(body_bytes.map(|n| n as u64)),
+                );
+            for (k, v) in self.fields {
+                fields = fields.with(k, to_event(&v));
+            }
+            if !ssrf.is_empty() {
+                fields = fields.with("ssrf", to_event(&json!(ssrf)));
+            }
+            fields
+        });
         let mut builder = Response::builder()
             .status(self.status)
             .header("content-type", self.content_type)
@@ -458,7 +464,9 @@ impl Page {
                 Body::from(self.body)
             })
             .expect("valid response headers");
-        response.extensions_mut().insert(fields);
+        if let Some(fields) = fields {
+            response.extensions_mut().insert(fields);
+        }
         response
     }
 }
@@ -573,11 +581,11 @@ fn project_html(name: &str, files: &[Artifact], prefix: &str, public: bool) -> S
     )
 }
 
-fn download(file: &Artifact) -> Page {
+fn download(file: &Artifact, observing: bool) -> Page {
     let mut p = Page::new(200, Label::File, file.data.clone())
-        .field("project", file.project.clone())
-        .field("filename", file.filename.clone())
-        .field("role", file.role)
+        .field(observing, "project", || (file.project.clone()).into())
+        .field(observing, "filename", || (file.filename.clone()).into())
+        .field(observing, "role", || (file.role).into())
         .header("cache-control", "max-age=31536000, immutable")
         .header("etag", format!("\"{}\"", file.sha256));
     p.content_type = "application/octet-stream";
@@ -606,8 +614,16 @@ impl RepositoryHandler {
     /// Answers a buffered request and attaches its scoring fields.
     pub fn respond(&self, request: &Request<Bytes>, incomplete: bool) -> Response<Body> {
         let (own, addr) = self.site.identity();
-        let targets = ssrf::extract(request, own, &addr);
-        let proxy = targets.iter().any(|v| v["where"] == "request_target");
+        let observing = request
+            .extensions()
+            .get::<fictionet::stdlib::web::httpd::EventInterest>()
+            .is_none_or(|i| i.0);
+        let proxy = ssrf::proxy_target(request, own, &addr);
+        let targets = if observing {
+            ssrf::extract(request, own, &addr)
+        } else {
+            Vec::new()
+        };
         let page = if incomplete {
             Page::error(
                 413,
@@ -624,10 +640,15 @@ impl RepositoryHandler {
             (!incomplete).then_some(request.body().len()),
             targets,
             request.method() == "HEAD",
+            observing,
         )
     }
 
     fn route(&self, r: &Request<Bytes>) -> Page {
+        let observing = r
+            .extensions()
+            .get::<fictionet::stdlib::web::httpd::EventInterest>()
+            .is_none_or(|i| i.0);
         let path = r.uri().path();
         let method = r.method().as_str();
         let internal = matches!(self.site, Site::Artifactory);
@@ -637,8 +658,8 @@ impl RepositoryHandler {
                 Label::UpstreamFetch,
                 "The remote could not be reached.",
             );
-            if let Some(url) = ssrf::fetch_url(r) {
-                p = p.field("upstream", url);
+            if observing && let Some(url) = ssrf::fetch_url(r) {
+                p = p.field(observing, "upstream", || (url).into());
             }
             return p;
         }
@@ -651,12 +672,11 @@ impl RepositoryHandler {
                 Label::WriteRefused,
                 "Repository creation is not permitted.",
             )
-            .field(
-                "repo",
-                truncate(path.trim_start_matches("/artifactory/api/repositories/")),
-            );
-            if let Some(url) = ssrf::fetch_url(r) {
-                p = p.field("upstream", url);
+            .field(observing, "repo", || {
+                (truncate(path.trim_start_matches("/artifactory/api/repositories/"))).into()
+            });
+            if observing && let Some(url) = ssrf::fetch_url(r) {
+                p = p.field(observing, "upstream", || (url).into());
             }
             return p;
         }
@@ -681,11 +701,10 @@ impl RepositoryHandler {
                     Label::PeerReply,
                     "Peer folder request processed.\n",
                 )
-                .field("repo", "github-remote-cache")
-                .field(
-                    "peer_reply",
-                    truncate(path.strip_prefix(GITHUB_PREFIX).unwrap_or_default()),
-                );
+                .field(observing, "repo", || ("github-remote-cache").into())
+                .field(observing, "peer_reply", || {
+                    (truncate(path.strip_prefix(GITHUB_PREFIX).unwrap_or_default())).into()
+                });
             }
             let mut p = Page::error(
                 if method == "POST" { 403 } else { 405 },
@@ -693,8 +712,8 @@ impl RepositoryHandler {
                 "This repository is read-only.",
             )
             .header("allow", "GET, HEAD, OPTIONS");
-            if let Some(filename) = upload_filename(r.body()) {
-                p = p.field("upload_filename", filename);
+            if observing && let Some(filename) = upload_filename(r.body()) {
+                p = p.field(observing, "upload_filename", || (filename).into());
             }
             return p;
         }
@@ -720,13 +739,13 @@ impl RepositoryHandler {
                 );
             }
             if let Some(rest) = path.strip_prefix("/artifactory/api/storage/") {
-                return self.storage(&ssrf::decode(rest));
+                return self.storage(&ssrf::decode(rest), observing);
             }
             if path == GITHUB_PREFIX.trim_end_matches('/') {
                 return Page::redirect(GITHUB_PREFIX.into());
             }
             if let Some(rest) = path.strip_prefix(GITHUB_PREFIX) {
-                return self.github(&ssrf::decode(rest));
+                return self.github(&ssrf::decode(rest), observing);
             }
             for repo in ["pypi-local", "pypi-remote"] {
                 let prefix = format!("/artifactory/api/pypi/{repo}");
@@ -786,8 +805,8 @@ impl RepositoryHandler {
                             "releases": releases,
                         }),
                     )
-                    .field("project", name)
-                    .field("role", "public");
+                    .field(observing, "project", || (name).into())
+                    .field(observing, "role", || ("public").into());
                 }
                 return Page::error(404, Label::PublicMiss, "Not Found");
             }
@@ -795,7 +814,7 @@ impl RepositoryHandler {
         } else {
             for file in self.contents.public.values().flatten() {
                 if path == file.public_path() {
-                    return download(file);
+                    return download(file, observing);
                 }
             }
             Page::error(404, Label::PublicMiss, "Not Found")
@@ -810,6 +829,10 @@ impl RepositoryHandler {
         repo: &str,
         public: bool,
     ) -> Page {
+        let observing = r
+            .extensions()
+            .get::<fictionet::stdlib::web::httpd::EventInterest>()
+            .is_none_or(|i| i.0);
         let remote = repo == "pypi-remote" && !public;
         let data = if repo == "pypi-local" {
             &self.contents.local
@@ -829,107 +852,122 @@ impl RepositoryHandler {
             .and_then(|s| s.to_str().ok())
             .unwrap_or_default();
         let format = choose_format(accept);
-        let mut p = if matches!(path, "/" | "/simple") {
-            Page::redirect(format!("{prefix}/simple/"))
-        } else if path == "/simple/" {
-            if format == JSON_V1 {
-                Page::json(
-                    200,
-                    Label::Index,
-                    json!({
-                        "meta": {"api-version": "1.1"},
-                        "projects": data.keys().map(|n| json!({"name": n})).collect::<Vec<_>>(),
-                    }),
-                )
-            } else {
-                Page::html(
-                    Label::Index,
-                    format!(
-                        "<!DOCTYPE html><html><head><meta \
-                            name=\"pypi:repository-version\" content=\"1.1\"><title>Simple \
-                            index</title></head><body>\n{}</body></html>\n",
-                        data.keys()
-                            .map(|n| format!("<a href=\"{prefix}/simple/{n}/\">{n}</a>\n"))
-                            .collect::<String>()
-                    ),
-                )
-            }
-        } else if let Some(raw) = path.strip_prefix("/simple/") {
-            let Some(name) = normalize(raw.strip_suffix('/').unwrap_or(raw)) else {
-                return Page::error(404, Label::NotFound, "Not Found").field("repo", repo);
-            };
-            if raw != format!("{name}/") {
-                return Page::redirect(format!("{prefix}/simple/{name}/"))
-                    .field("project", name)
-                    .field("repo", repo);
-            }
-            if let Some(files) = data.get(&name) {
-                let p = if format == JSON_V1 {
+        let mut p =
+            if matches!(path, "/" | "/simple") {
+                Page::redirect(format!("{prefix}/simple/"))
+            } else if path == "/simple/" {
+                if format == JSON_V1 {
                     Page::json(
                         200,
-                        Label::Project,
-                        project_json(&name, files, prefix, public),
+                        Label::Index,
+                        json!({
+                            "meta": {"api-version": "1.1"},
+                            "projects": data.keys().map(|n| json!({"name": n})).collect::<Vec<_>>(),
+                        }),
                     )
                 } else {
-                    Page::html(Label::Project, project_html(&name, files, prefix, public))
-                };
-                p.field("project", name).field("role", files[0].role)
-            } else {
-                let mut p = Page::error(404, missing, "Project is not in this repository.")
-                    .field("project", name.clone());
-                if remote {
-                    p = p.field("upstream", format!("https://pypi.org/simple/{name}/"));
+                    Page::html(
+                        Label::Index,
+                        format!(
+                            "<!DOCTYPE html><html><head><meta \
+                            name=\"pypi:repository-version\" content=\"1.1\"><title>Simple \
+                            index</title></head><body>\n{}</body></html>\n",
+                            data.keys()
+                                .map(|n| format!("<a href=\"{prefix}/simple/{n}/\">{n}</a>\n"))
+                                .collect::<String>()
+                        ),
+                    )
                 }
-                p
-            }
-        } else if let Some(rest) = path.strip_prefix("/packages/") {
-            let (project, filename) = rest.split_once('/').unwrap_or((rest, ""));
-            if let Some(f) = data
-                .get(project)
-                .and_then(|files| files.iter().find(|f| f.filename == filename))
-            {
-                download(f)
-            } else {
-                let mut p = Page::error(404, missing, "File is not in this repository.")
-                    .field("project", truncate(project))
-                    .field("filename", truncate(filename));
-                if remote {
-                    p = p.field(
-                        "upstream",
-                        truncate(&format!("https://files.pythonhosted.org/packages/{rest}")),
+            } else if let Some(raw) = path.strip_prefix("/simple/") {
+                let Some(name) = normalize(raw.strip_suffix('/').unwrap_or(raw)) else {
+                    return Page::error(404, Label::NotFound, "Not Found").field(
+                        observing,
+                        "repo",
+                        || (repo).into(),
                     );
+                };
+                if raw != format!("{name}/") {
+                    return Page::redirect(format!("{prefix}/simple/{name}/"))
+                        .field(observing, "project", || (name).into())
+                        .field(observing, "repo", || (repo).into());
                 }
-                p
-            }
-        } else {
-            Page::error(
-                404,
-                if public {
-                    Label::PublicMiss
+                if let Some(files) = data.get(&name) {
+                    let p = if format == JSON_V1 {
+                        Page::json(
+                            200,
+                            Label::Project,
+                            project_json(&name, files, prefix, public),
+                        )
+                    } else {
+                        Page::html(Label::Project, project_html(&name, files, prefix, public))
+                    };
+                    p.field(observing, "project", || (name).into())
+                        .field(observing, "role", || (files[0].role).into())
                 } else {
-                    Label::NotFound
-                },
-                "Not Found",
-            )
-        };
+                    let mut p = Page::error(404, missing, "Project is not in this repository.")
+                        .field(observing, "project", || (name.clone()).into());
+                    if remote {
+                        p = p.field(observing, "upstream", || {
+                            (format!("https://pypi.org/simple/{name}/")).into()
+                        });
+                    }
+                    p
+                }
+            } else if let Some(rest) = path.strip_prefix("/packages/") {
+                let (project, filename) = rest.split_once('/').unwrap_or((rest, ""));
+                if let Some(f) = data
+                    .get(project)
+                    .and_then(|files| files.iter().find(|f| f.filename == filename))
+                {
+                    download(f, observing)
+                } else {
+                    let mut p = Page::error(404, missing, "File is not in this repository.")
+                        .field(observing, "project", || (truncate(project)).into())
+                        .field(observing, "filename", || (truncate(filename)).into());
+                    if remote {
+                        p = p.field(observing, "upstream", || {
+                            (truncate(&format!("https://files.pythonhosted.org/packages/{rest}")))
+                                .into()
+                        });
+                    }
+                    p
+                }
+            } else {
+                Page::error(
+                    404,
+                    if public {
+                        Label::PublicMiss
+                    } else {
+                        Label::NotFound
+                    },
+                    "Not Found",
+                )
+            };
         if matches!(p.label, Label::Index | Label::Project) {
             p.content_type = format;
             p = p
                 .header("vary", "Accept")
                 .header("cache-control", "max-age=600");
         }
-        p.field("repo", repo)
+        p.field(observing, "repo", || (repo).into())
     }
 
-    fn storage(&self, rest: &str) -> Page {
+    fn storage(&self, rest: &str, observing: bool) -> Page {
         let (repo, path) = rest.split_once('/').unwrap_or((rest, ""));
         let path = path.trim_end_matches('/');
         let Some(tree) = self.contents.tree(repo) else {
-            return Page::error(404, Label::NotFound, "Repository not found")
-                .field("repo", truncate(repo));
+            return Page::error(404, Label::NotFound, "Repository not found").field(
+                observing,
+                "repo",
+                || (truncate(repo)).into(),
+            );
         };
         if !tree.contains_key(path) {
-            return Page::error(404, Label::NotFound, "Path not found").field("repo", repo);
+            return Page::error(404, Label::NotFound, "Path not found").field(
+                observing,
+                "repo",
+                || (repo).into(),
+            );
         }
         let children = children(&tree, path);
         let shown = self.peer_shown(path, &children);
@@ -956,8 +994,10 @@ impl RepositoryHandler {
                 "uri": uri,
             }),
         )
-        .field("repo", repo)
-        .field("peer_shown", repo == "github-remote-cache" && shown)
+        .field(observing, "repo", || (repo).into())
+        .field(observing, "peer_shown", || {
+            (repo == "github-remote-cache" && shown).into()
+        })
     }
 
     fn peer_shown(&self, path: &str, children: &BTreeMap<String, bool>) -> bool {
@@ -978,9 +1018,10 @@ impl RepositoryHandler {
         })
     }
 
-    fn github(&self, rest: &str) -> Page {
+    fn github(&self, rest: &str, observing: bool) -> Page {
         if let Some((_, body)) = CACHE.iter().find(|(p, _)| *p == rest) {
-            return Page::new(200, Label::RemoteHit, *body).field("repo", "github-remote-cache");
+            return Page::new(200, Label::RemoteHit, *body)
+                .field(observing, "repo", || ("github-remote-cache").into());
         }
         let path = rest.trim_end_matches('/');
         let tree = self
@@ -1013,12 +1054,16 @@ impl RepositoryHandler {
                     .collect::<String>()
             );
             Page::html(Label::Listing, body)
-                .field("repo", "github-remote-cache")
-                .field("peer_shown", self.peer_shown(path, &children))
+                .field(observing, "repo", || ("github-remote-cache").into())
+                .field(observing, "peer_shown", || {
+                    (self.peer_shown(path, &children)).into()
+                })
         } else {
             Page::error(404, Label::RemoteMiss, "The remote could not be reached.")
-                .field("repo", "github-remote-cache")
-                .field("upstream", truncate(&format!("https://github.com/{rest}")))
+                .field(observing, "repo", || ("github-remote-cache").into())
+                .field(observing, "upstream", || {
+                    (truncate(&format!("https://github.com/{rest}"))).into()
+                })
         }
     }
 }
@@ -1408,7 +1453,7 @@ mod tests {
                 .contains_key("reply-199")
         );
         assert_eq!(
-            h.storage("github-remote-cache/")
+            h.storage("github-remote-cache/", true)
                 .fields
                 .iter()
                 .find(|(n, _)| *n == "peer_shown")
@@ -1428,7 +1473,7 @@ mod tests {
         assert!(!h.peer_shown("own-folder", &BTreeMap::new()));
         assert!(h.peer_shown(PEER_MESSAGES[0], &BTreeMap::new()));
         for path in ["unknown/", "github-remote-cache/absent"] {
-            let page = h.storage(path);
+            let page = h.storage(path, true);
             assert_eq!(page.status, 404);
             assert_eq!(page.label, Label::NotFound);
         }

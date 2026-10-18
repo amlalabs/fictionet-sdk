@@ -206,7 +206,7 @@
 //!     }
 //!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder>) -> std::result::Result<Flow, Self::Error> {
 //!         let line = line.unwrap_or_default();
-//!         driver.record(Event::new("echo", "line").field("bytes", line.len() as u64));
+//!         driver.emit("echo", "line", |event| event.field("bytes", line.len() as u64));
 //!         driver.reply().extend_from_slice(&line);
 //!         driver.reply().push(b'\n');
 //!         Ok(Flow::Continue)

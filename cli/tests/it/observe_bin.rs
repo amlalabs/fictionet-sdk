@@ -30,7 +30,7 @@ fn start_world(path: &str) -> fictionet::Listening {
                 });
                 let mut n = 0i64;
                 loop {
-                    fcx.record(fictionet::events::Event::new("test", "tick").field("n", n));
+                    fcx.emit("test", "tick", |event| event.field("n", n));
                     n += 1;
                     fcx.sleep(fictionet::time::ms(50)).await?;
                 }

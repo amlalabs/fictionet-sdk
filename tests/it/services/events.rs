@@ -60,13 +60,13 @@ fn installed_observers_keep_events_and_write_json_lines() {
             "10.0.0.2:4000".parse().unwrap(),
         );
         for i in 0..3u64 {
-            fcx.record(
-                Event::new("test", "n")
+            fcx.emit("test", "n", |event| {
+                event
                     .conn(&conn)
                     .summary(format!("n={i}"))
                     .field("i", i)
-                    .field("none", fictionet::events::opt(None::<u64>)),
-            );
+                    .field("none", fictionet::events::opt(None::<u64>))
+            });
         }
         assert_eq!(
             events
@@ -151,14 +151,17 @@ fn a_reader_added_mid_connection_sees_its_events() {
 fn a_net_starts_its_events_with_a_wall_clock_anchor() {
     let evidence = Arc::new(fictionet::events::Memory::default());
     world::seeded_real_world(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(42)).observer(evidence.clone()),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(42))
+            .observer(evidence.clone())
+            .fields(Fields::new().with("world_date", "2026-10-06")),
         Duration::from_secs(60),
         move |fcx| async move {
             let kept = evidence;
             let (_attacher, attachments) = fictionet::attachments();
-            let date = Fields::new().with("world_date", "2026-10-06");
-            Net::new().start_fields(date).start(&fcx, attachments)?;
-            let first = &kept.checked_all().unwrap()[1];
+            Net::new().start(&fcx, attachments)?;
+            let starts = kept.checked_of("run", "start").unwrap();
+            assert_eq!(starts.len(), 1);
+            let first = &starts[0];
             assert!(first.is("run", "start"));
             assert_eq!(first.at, fictionet::time::Instant::ZERO);
             assert_eq!(

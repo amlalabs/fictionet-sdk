@@ -525,7 +525,7 @@ mod tests {
         let shared = crate::run::RunShared::new(crate::Seed::from_u64(7), crate::RunMode::Lab);
         let graph = shared.graph.clone();
         crate::block_on(crate::run::run_with(shared, |cx| async move {
-            cx.record(Event::new("test", "tick"));
+            cx.emit("test", "tick", |event| event);
             Ok(())
         }))
         .unwrap();

@@ -806,21 +806,23 @@ pub mod protocol {
     pub const DEST_OPTIONS: u8 = 60;
 }
 
-/// Records that `source` dropped `packet`, and `why`, as a `drop` event
-/// with the packet's addresses and protocol (a
-/// [repeat](fictionet::events#repeats)). Its length, its destination port and
-/// `detail` change with each packet, so they are its detail.
-/// `enrich` adds context to the owned event before it is recorded.
+/// Emits that `source` dropped `packet`, with its addresses, protocol and detail.
+/// Interest is checked with `conn` before parsing or invoking either closure.
+/// `enrich` may add attribution discovered from the parsed fields.
 pub fn record_drop<F>(
     fcx: &Cx,
+    conn: &events::ConnInfo,
     source: &'static str,
     packet: &Packet,
     why: &'static str,
-    detail: events::Fields,
+    detail: impl FnOnce() -> events::Fields,
     enrich: F,
 ) where
     F: FnOnce(events::Event) -> events::Event,
 {
+    if !fcx.emitter(conn).enabled(source, "drop") {
+        return;
+    }
     let h = Header::parse_truncated(&packet.0);
     let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
     let (src, dst) = match &h {
@@ -828,8 +830,9 @@ pub fn record_drop<F>(
         None => ("?".to_owned(), "?".to_owned()),
     };
     let event = events::Event::new(source, "drop")
+        .bounded()
         .level(Level::Notice)
-        .summary(format!("{src} → {dst}: {why}"))
+        .summary(format_args!("{src} → {dst}: {why}"))
         .field("src", opt(h.as_ref().map(|_| src)))
         .field("dst", opt(h.as_ref().map(|_| dst)))
         .field("protocol", opt(h.as_ref().map(|h| u32::from(h.protocol))))
@@ -837,8 +840,8 @@ pub fn record_drop<F>(
     let mut all = events::Fields::new()
         .with("len", packet.0.len() as u64)
         .with("dst_port", opt(port.map(u32::from)));
-    all.extend(detail);
-    fcx.record_repeat(enrich(event), all);
+    all.extend(detail());
+    fcx.emit_observation(enrich(event.conn(conn)).fields(all).field("count", 1u64));
 }
 
 /// The IP version of a packet, from the top four bits of its first byte:

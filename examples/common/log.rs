@@ -729,7 +729,7 @@ mod tests {
                 for port in 2..=65_535u32 {
                     // Packet capture and TCP bookkeeping surround each blocked-port event.
                     for kind in ["received", "sent", "decoded", "closed"] {
-                        fcx.record(fictionet::events::Event::new("tcp", kind).field("port", port));
+                        fcx.emit("tcp", kind, |event| event.field("port", port));
                     }
                     log.write(json!({"type": "blocked", "dst_port": port}));
                 }

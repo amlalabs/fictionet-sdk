@@ -4,7 +4,7 @@
 //! JavaScript also runs an event-loop case.
 //! The README says which requests a world cannot serve in a JavaScript engine.
 
-use fictionet::events::{ConnInfo, Fanout, Fields, Memory, Metadata, Observation, Observer, Stamp};
+use fictionet::events::{ConnInfo, Fanout, Memory, Metadata, Observation, Observer, Stamp};
 use fictionet::stdlib::protocols::json::Value;
 use http::Version;
 use std::io::Write;
@@ -78,8 +78,8 @@ fn real_run_writes_events_to_memory() {
         ))),
         |fcx| async move {
             assert_eq!(fcx.mode(), fictionet::RunMode::Real);
-            fcx.record(fictionet::events::Event::new("test", "before_writer"));
-            fcx.record(fictionet::events::Event::new("test", "after_writer"));
+            fcx.emit("test", "before_writer", |event| event);
+            fcx.emit("test", "after_writer", |event| event);
             assert_eq!(
                 out.0
                     .lock()
@@ -114,16 +114,13 @@ fn real_run_records_wall_time() {
     let evidence = Arc::new(Memory::default());
     fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(42)).observer(evidence.clone()),
-        |fcx| async move {
-            fcx.events().start(&fcx, Fields::new());
-            Ok(())
-        },
+        |_fcx| async move { Ok(()) },
     ))
     .unwrap();
     let events = evidence.checked_of("run", "start").unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     assert!(
-        events[1]
+        events[0]
             .get("wall")
             .and_then(Value::as_f64)
             .is_some_and(|w| w > 1.7e9)

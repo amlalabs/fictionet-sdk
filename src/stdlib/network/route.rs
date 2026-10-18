@@ -312,12 +312,13 @@ pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
                     }
                     ports::Event::Closed(i) => {
                         if let Some(prefix) = table.by_port.get(&i) {
-                            let prefix = format!("{}/{}", prefix.addr, prefix.len);
-                            let event = events::Event::new("router", "route_removed")
-                                .level(Level::Notice)
-                                .summary(format!("{prefix}: its interface closed"))
-                                .field("prefix", prefix);
-                            fcx.record(event);
+                            fcx.emit("router", "route_removed", |event| {
+                                let prefix = format!("{}/{}", prefix.addr, prefix.len);
+                                event
+                                    .level(Level::Notice)
+                                    .summary(format_args!("{prefix}: its interface closed"))
+                                    .field("prefix", prefix)
+                            });
                         }
                         table.remove_port(i)
                     }
@@ -347,10 +348,11 @@ fn expired<I: Interface>(
     };
     ip::record_drop(
         fcx,
+        &events::ConnInfo::default(),
         "router",
         &packet,
         why,
-        events::Fields::new(),
+        events::Fields::new,
         |event| event,
     );
     let (a4, a6) = addrs;
@@ -717,10 +719,14 @@ fn dropped<F>(
 {
     ip::record_drop(
         fcx,
+        &events::ConnInfo {
+            sandbox: sandbox.cloned(),
+            ..Default::default()
+        },
         "lan",
         packet,
         why,
-        events::Fields::new(),
+        events::Fields::new,
         |mut event| {
             event.conn.sandbox = sandbox.cloned();
             enrich(event)
@@ -729,13 +735,13 @@ fn dropped<F>(
 }
 
 /// Records a change to a LAN's members.
-fn member_event(fcx: &Cx, kind: &'static str, member: String, what: &str) {
-    fcx.record(
-        events::Event::new("lan", kind)
+fn member_event(fcx: &Cx, kind: &'static str, member: impl std::fmt::Display, what: &str) {
+    fcx.emit("lan", kind, |event| {
+        event
             .level(Level::Notice)
-            .summary(format!("{member}: {what}"))
-            .field("member", member),
-    );
+            .summary(format_args!("{member}: {what}"))
+            .field("member", member.to_string())
+    });
 }
 
 /// A LAN's members: which port each address goes out on, and the gateway.
@@ -786,7 +792,7 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
                         member_event(
                             fcx,
                             "member_replaced",
-                            addr.to_string(),
+                            addr,
                             "a new interface took over, and the old one is closed",
                         );
                         i
@@ -817,7 +823,7 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
                         member_event(
                             fcx,
                             "member_replaced",
-                            "the gateway".into(),
+                            "the gateway",
                             "a new interface took over, and the old one is closed",
                         );
                     }
@@ -832,20 +838,10 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
         self.attachments.remove(&port);
         if let Some(addr) = self.by_port.remove(&port) {
             self.by_addr.remove(&addr);
-            member_event(
-                fcx,
-                "member_removed",
-                addr.to_string(),
-                "its interface closed",
-            );
+            member_event(fcx, "member_removed", addr, "its interface closed");
         } else if self.gateway == Some(port) {
             self.gateway = None;
-            member_event(
-                fcx,
-                "member_removed",
-                "the gateway".into(),
-                "its interface closed",
-            );
+            member_event(fcx, "member_removed", "the gateway", "its interface closed");
         }
     }
 

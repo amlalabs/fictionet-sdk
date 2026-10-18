@@ -4,7 +4,7 @@ use super::{
     BlockedWhy, Hooks, LanSeg, PROTO_TCP, Resolver, blocked_event, connection_limit, link,
     normalize, port_detail, sandbox_only,
 };
-use fictionet::events::{ConnInfo, Event, Level};
+use fictionet::events::{ConnInfo, Level};
 use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
@@ -501,16 +501,13 @@ impl LookupContext<'_> {
                 match self.installation.place(&mut world, host) {
                     Ok(p) => Known::Host(p),
                     Err(e) => {
-                        let event = Event::new("net", "error")
-                            .level(Level::Notice)
-                            .summary(format!("host {label} for {name}: {e}"))
-                            .field("name", name)
-                            .field("error", e);
-                        self.installation.admission.hooks.record(
-                            self.installation.fcx,
-                            &ConnInfo::default(),
-                            event,
-                        );
+                        self.installation.fcx.emit("net", "error", |event| {
+                            event
+                                .level(Level::Notice)
+                                .summary(format_args!("host {label} for {name}: {e}"))
+                                .field("name", name)
+                                .field("error", e)
+                        });
                         Known::NoHost
                     }
                 }
@@ -1161,17 +1158,17 @@ pub(super) fn host_prefix(addr: IpAddr) -> Prefix {
 /// limit.
 pub(super) fn too_many(fcx: &Cx, hooks: &Hooks, conn: &tcp::TcpConnection) {
     let (peer, local) = (conn.peer_addr(), conn.local_addr());
-    let event = blocked_event(
-        BlockedWhy::TooManyConnections,
-        Some(PROTO_TCP),
-        Some(peer.ip()),
-        Some(local.ip()),
-    );
-    hooks.blocked(
-        fcx,
-        &sandbox_only(hooks.sandbox_at(peer.ip())),
-        (event, port_detail(Some(local.port()))),
-    );
+    hooks.blocked(fcx, &sandbox_only(hooks.sandbox_at(peer.ip())), || {
+        (
+            blocked_event(
+                BlockedWhy::TooManyConnections,
+                Some(PROTO_TCP),
+                Some(peer.ip()),
+                Some(local.ip()),
+            ),
+            port_detail(Some(local.port())),
+        )
+    });
 }
 
 /// Accepts connections on one port of a machine. Each is served in its own

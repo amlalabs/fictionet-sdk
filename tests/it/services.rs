@@ -100,8 +100,7 @@ service_fixture! {
         let pdu = match MbRequest::parse(&frame.pdu) {
             Ok(MbRequest::ReadHoldingRegisters { address, quantity }) => {
                 let (a, n) = (usize::from(address), usize::from(quantity));
-                driver.record(
-                    Event::new("modbus", "read")
+                driver.emit("modbus", "read", |event| event
                         .field("address", u32::from(address))
                         .field("quantity", u32::from(quantity)),
                 );
@@ -115,8 +114,7 @@ service_fixture! {
                     Some(r) => {
                         *r = value;
                         let unsafe_write = address == 0 && value > plant.limit;
-                        driver.record(
-                            Event::new("modbus", "write_register")
+                        driver.emit("modbus", "write_register", |event| event
                                 .summary(format!("register {address} = {value}"))
                                 .level(if unsafe_write {
                                     Level::Alarm

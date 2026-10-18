@@ -258,10 +258,9 @@ fn outbound_fault_error_cancels_work_with_written_bytes() {
             Poll::Ready(Some(Ok(b"one\n".to_vec())))
         }
         fn cancel(&mut self, driver: &mut serve::PendingDriver<'_>) {
-            driver.record(
-                fictionet::events::Event::new("chunks", "cancel")
-                    .field("written", driver.written()),
-            );
+            driver.emit("chunks", "cancel", |event| {
+                event.field("written", driver.written())
+            });
         }
     }
     struct Replies;

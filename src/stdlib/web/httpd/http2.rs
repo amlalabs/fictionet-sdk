@@ -17,7 +17,9 @@ use fictionet::events::Fields;
 use fictionet::stdlib::codec::{Fail, Wire};
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
-use fictionet::stdlib::services::serve::{self, Done, Driver, Ended, Flow, Pending, PendingDriver, Timer};
+use fictionet::stdlib::services::serve::{
+    self, Done, Driver, Ended, Flow, Pending, PendingDriver, Timer,
+};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
@@ -25,7 +27,7 @@ use fictionet::{Cx, Error};
 use super::response::{
     ResponsePolicy, Tracker, answered, error_event, error_response, request_held,
 };
-use super::{Body, Exchange, Handler, Later, Limits, BodyClassifier, Received, Reply, text};
+use super::{Body, BodyClassifier, Exchange, Handler, Later, Limits, Received, Reply, text};
 
 const DEADLINE: Timer = "http2 deadline";
 const RESET_LIFETIME: Duration = Duration::from_secs(1);
@@ -178,7 +180,9 @@ impl Http2 {
     }
 
     fn fail(&mut self, error: wire::Error, driver: &mut Driver<'_, Inputs>) -> Flow {
-        driver.record(error_event(driver.conn(), "protocol", error.to_string()));
+        driver.emit("http", "error", |_| {
+            error_event(driver.conn(), "protocol", error)
+        });
         self.goaway(error.code, self.last_stream, driver);
         Flow::Close
     }
@@ -189,13 +193,13 @@ impl Http2 {
         if let Some(mut stream) = self.streams.remove(&id)
             && let Some(tracker) = &mut stream.tracker
             && let Some(event) = tracker.finish(
-                Some(Fields::new().with("answer", "cut_off")),
+                || Some(Fields::new().with("answer", "cut_off")),
                 None,
                 0,
                 false,
             )
         {
-            driver.record(event);
+            driver.emit("http", "request", |_| event);
         }
     }
 
@@ -262,6 +266,7 @@ impl Http2 {
                 &mut Exchange::new(driver.now(), driver.entropy(), driver.conn()),
             ),
             Received::TooLarge => Reply::Now(answered(
+                driver.event_enabled("http", "request"),
                 text(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "The request body is too large.\n",
@@ -269,6 +274,7 @@ impl Http2 {
                 "too_large",
             )),
             Received::Budget => Reply::Now(answered(
+                driver.event_enabled("http", "request"),
                 text(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "The server cannot hold this request now.\n",
@@ -276,6 +282,7 @@ impl Http2 {
                 "budget",
             )),
             Received::Timeout => Reply::Now(answered(
+                driver.event_enabled("http", "request"),
                 text(
                     StatusCode::REQUEST_TIMEOUT,
                     "The request body took too long.\n",
@@ -283,6 +290,7 @@ impl Http2 {
                 "timeout",
             )),
             Received::CutOff => Reply::Now(answered(
+                driver.event_enabled("http", "request"),
                 text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"),
                 "cut_off",
             )),
@@ -295,16 +303,17 @@ impl Http2 {
                 let response = if fits(driver.budget(), response_held(&response), charged) {
                     response
                 } else {
-                    over_budget()
+                    over_budget(driver.event_enabled("http", "request"))
                 };
                 (None, Some(response))
             }
             Reply::Later(work) => (Some(work), None),
             Reply::Handoff(_) => (
                 None,
-                Some(error_response(&Error::msg(
-                    "only HTTP/1.1 requests can be handed off",
-                ))),
+                Some(error_response(
+                    &Error::msg("only HTTP/1.1 requests can be handed off"),
+                    driver.event_enabled("http", "request"),
+                )),
             ),
         };
         driver.defer_keyed(
@@ -425,7 +434,12 @@ impl Http2 {
         if read.end && remaining.is_some_and(|n| n != 0) {
             return self.reset(id, ErrorCode::ProtocolError, driver);
         }
-        let mut tracker = Tracker::observing(&request, driver.conn(), self.observe.clone());
+        let mut tracker = Tracker::observing(
+            driver.event_enabled("http", "request"),
+            &request,
+            driver.conn(),
+            self.observe.clone(),
+        );
         tracker.start(&request, driver.conn(), driver.now());
         if !fits(
             driver.budget(),
@@ -433,14 +447,20 @@ impl Http2 {
             0,
         ) {
             tracker.received(Received::Budget);
-            if let Some(event) =
-                tracker.finish(Some(Fields::new().with("answer", "budget")), None, 0, false)
-            {
-                driver.record(event);
+            if let Some(event) = tracker.finish(
+                || Some(Fields::new().with("answer", "budget")),
+                None,
+                0,
+                false,
+            ) {
+                driver.emit("http", "request", |_| event);
             }
             return self.reset(id, ErrorCode::RefusedStream, driver);
         }
         request.extensions_mut().insert(driver.conn().clone());
+        request.extensions_mut().insert(super::EventInterest(
+            driver.event_enabled("http", "request"),
+        ));
         self.streams.insert(
             id,
             Stream {
@@ -888,19 +908,17 @@ impl serve::Service for Http2 {
                 } else {
                     Received::CutOff
                 });
-                if let Some(event) = tracker.finish(None, None, 0, false) {
-                    driver.record(event);
+                if let Some(event) = tracker.finish(|| None, None, 0, false) {
+                    driver.emit("http", "request", |_| event);
                 }
             }
         }
         self.send.lock().streams.clear();
         self.resets = VecDeque::new();
         if end == Ended::Conn(fictionet::stdlib::network::ConnError::Broken) {
-            driver.record(error_event(
-                driver.conn(),
-                "transport",
-                "a TLS record did not decrypt".into(),
-            ));
+            driver.emit("http", "error", |_| {
+                error_event(driver.conn(), "transport", "a TLS record did not decrypt")
+            });
         }
         Ok(())
     }
@@ -1118,8 +1136,9 @@ fn response_held(response: &Response<Body>) -> usize {
             .sum::<usize>()
 }
 
-fn over_budget() -> Response<Body> {
+fn over_budget(observing: bool) -> Response<Body> {
     answered(
+        observing,
         text(
             StatusCode::SERVICE_UNAVAILABLE,
             "The server cannot hold this response now.\n",
@@ -1158,9 +1177,9 @@ impl Sending {
             self.finished = true;
             if let Some(event) =
                 self.tracker
-                    .finish(self.extra.take(), self.status, self.sent, complete)
+                    .finish(|| self.extra.take(), self.status, self.sent, complete)
             {
-                driver.record(event);
+                driver.emit("http", "request", |_| event);
             }
         }
     }
@@ -1216,7 +1235,9 @@ impl Pending for Sending {
             let response = match making.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(response)) => response,
-                Poll::Ready(Err(error)) => error_response(&error),
+                Poll::Ready(Err(error)) => {
+                    error_response(&error, driver.event_enabled("http", "request"))
+                }
             };
             self.making = None;
             // The response replaces the request in the budget. One it cannot
@@ -1227,10 +1248,14 @@ impl Pending for Sending {
                 self.request_held,
             );
             self.request_held = 0;
-            self.response = Some(if room { response } else { over_budget() });
+            self.response = Some(if room {
+                response
+            } else {
+                over_budget(driver.event_enabled("http", "request"))
+            });
         }
         if let Some(response) = self.response.take() {
-            let (parts, body) = response.into_parts();
+            let (mut parts, body) = response.into_parts();
             let now = driver.fcx().map_or(self.asked, Cx::now);
             let date = self.date.and_then(|date| {
                 HeaderValue::from_str(&super::http_date(
@@ -1241,7 +1266,7 @@ impl Pending for Sending {
             let policy =
                 ResponsePolicy::new(&parts, body.size_hint().exact(), self.head_only, date);
             self.status = Some(parts.status);
-            self.extra = parts.extensions.get::<Fields>().cloned();
+            self.extra = parts.extensions.remove::<Fields>();
             let mut fields = vec![hpack::Field::new(":status", parts.status.as_str())];
             for (name, value) in &parts.headers {
                 if matches!(
@@ -1380,8 +1405,8 @@ mod tests {
     use super::super::{HttpOptions, PREFACE, Router};
     use super::*;
     use fictionet::events::ConnInfo;
-    use fictionet::stdlib::protocols::json::Value;
     use fictionet::stdlib::network::{ConnError, Connection};
+    use fictionet::stdlib::protocols::json::Value;
     use std::future::poll_fn;
     use std::pin::pin;
     struct StalledBody {

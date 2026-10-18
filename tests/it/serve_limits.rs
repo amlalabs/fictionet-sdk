@@ -1216,7 +1216,7 @@ impl Handler for WaitingMetadata {
     fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
         Reply::Later(Box::new(move |fcx| {
             Box::pin(async move {
-                fcx.record(Event::new("test", "waiting"));
+                fcx.emit("test", "waiting", |event| event);
                 std::future::pending::<()>().await;
                 assert_eq!(request.headers()["x-large"].as_bytes().len(), 4096);
                 Ok(http::Response::new(Body::empty()))

@@ -97,7 +97,8 @@ impl Answered {
             DnsAnswer::None => ("none", None, None),
         };
         Event::new("dns", "query")
-            .summary(format!(
+            .bounded()
+            .summary(format_args!(
                 "{} {}: {}",
                 self.name.as_deref().unwrap_or("-"),
                 self.qtype.unwrap_or(0),
@@ -269,7 +270,7 @@ impl Service for Dns {
         driver: &mut serve::Driver<'_, DnsQueries>,
     ) -> Result<serve::Flow, Self::Error> {
         let answered = answer(&*state.lookup, &query);
-        driver.record(answered.event(self.tcp));
+        driver.emit("dns", "query", |_| answered.event(self.tcp));
         if let Some(reply) = answered.reply {
             if self.tcp {
                 if let Ok(n) = u16::try_from(reply.len()) {
@@ -358,4 +359,46 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
     )
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    use fictionet::events::Memory;
+    use fictionet::stdlib::protocols::dns::{op::Query, rr::Name};
+
+    #[test]
+    fn dns_replies_are_identical_without_observation() {
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_ascii("missing.test").unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        let mut wire = (query.len() as u16).to_be_bytes().to_vec();
+        wire.extend_from_slice(&query);
+        let run = |observed| {
+            let memory = Arc::new(Memory::default());
+            let mut harness = serve::Harness::new(
+                fictionet::Seed::from_u64(1),
+                Dns { tcp: true },
+                State {
+                    lookup: Arc::new(|_| Lookup::NoHost),
+                    tcp_idle: Duration::from_secs(1),
+                },
+            );
+            if observed {
+                harness = harness.observer(memory.clone());
+            }
+            let reply = harness.push(&wire).unwrap();
+            assert_eq!(
+                memory.checked_of("dns", "query").unwrap().len(),
+                usize::from(observed)
+            );
+            let parsed = Message::from_vec(&reply[2..]).unwrap();
+            assert_eq!(parsed.metadata.response_code, ResponseCode::NXDomain);
+            reply
+        };
+        assert_eq!(run(false), run(true));
+    }
 }

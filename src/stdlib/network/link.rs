@@ -287,10 +287,11 @@ where
                             let waiting = queues[i].packets.len();
                             fictionet::stdlib::network::ip::record_drop(
                                 &fcx,
+                                &fictionet::events::ConnInfo::default(),
                                 name,
                                 &packet,
                                 "the queue was full",
-                                fictionet::events::Fields::new().with("waiting", waiting as u64),
+                                || fictionet::events::Fields::new().with("waiting", waiting as u64),
                                 |event| event,
                             );
                         }
@@ -455,7 +456,7 @@ mod tests {
         block_on(fictionet::lab(options, move |fcx| async move {
             let (mut sandbox, inner) = pair();
             let _far = bottleneck(&fcx, 0, 10, inner);
-            fcx.record(fictionet::events::Event::new("http", "request"));
+            fcx.emit("http", "request", |event| event);
             for i in 0..flood {
                 sandbox.send(Packet(vec![0x45; 20]));
                 if i % 32 == 31 {
@@ -464,7 +465,7 @@ mod tests {
             }
             fcx.idle().await?;
             assert_eq!(retained.drops.load(Ordering::Relaxed), flood - 10);
-            fcx.record(fictionet::events::Event::new("http", "request"));
+            fcx.emit("http", "request", |event| event);
             fcx.cancel();
             Ok(())
         })).unwrap();

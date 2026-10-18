@@ -42,6 +42,8 @@ pub trait Observer: Send + Sync + 'static {
     fn enabled(&self, metadata: Metadata, connection: &ConnInfo) -> bool;
     /// Receives a borrowed fact with its run-assigned stamp.
     fn observe(&self, stamp: Stamp, observation: Observation<'_>);
+    /// Reports facts lost before delivery, such as a full producer staging buffer.
+    fn lost(&self, _count: u64) {}
     /// Seals input when the run ends, including cancellation or drop.
     fn end(&self, _at: Instant) {}
 }
@@ -71,6 +73,12 @@ impl Observer for Fanout {
             if observer.enabled(metadata, &event.conn) {
                 observer.observe(stamp, observation);
             }
+        }
+    }
+
+    fn lost(&self, count: u64) {
+        for observer in &self.0 {
+            observer.lost(count);
         }
     }
 
@@ -106,7 +114,7 @@ impl Emitter<'_> {
     ) {
         if self.enabled(source, kind) {
             self.cx
-                .emit_observation(build(Event::new(source, kind)).conn(self.connection));
+                .emit_observation(build(Event::new(source, kind).bounded()).conn(self.connection));
         }
     }
 }
@@ -151,7 +159,21 @@ impl Dispatch {
         };
         event.seq = stamp.seq;
         event.at = stamp.at;
+        if event.truncated {
+            observer.lost(1);
+        }
         observer.observe(stamp, Observation::Event(&event));
+    }
+
+    pub(crate) fn lost(&self, count: u64) {
+        if count != 0
+            && let Some(observer) = &self.observer
+        {
+            let state = self.state.lock();
+            if !state.ended {
+                observer.lost(count);
+            }
+        }
     }
 
     pub(crate) fn end(&self, at: impl FnOnce() -> Instant) {
@@ -189,6 +211,46 @@ mod tests {
         let dispatch = Dispatch::new(None);
         dispatch.emit(Event::new("shop", "order"), || panic!("clock read"));
         assert_eq!(dispatch.state.lock().seq, 0);
+    }
+
+    #[test]
+    fn unobserved_drop_details_are_not_extracted() {
+        block_on(lab(Seed::from_u64(1), |cx| async move {
+            crate::stdlib::network::ip::record_drop(
+                &cx,
+                &ConnInfo::default(),
+                "lan",
+                &crate::Packet(vec![0xff]),
+                "malformed",
+                || panic!("drop detail was built"),
+                |_| panic!("drop was enriched"),
+            );
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn bounded_builders_report_truncation_without_copying_large_text() {
+        let memory = Arc::new(Memory::default());
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
+            |cx| async move {
+                let text = "x".repeat(1 << 20);
+                cx.emit("test", "large", |event| {
+                    event
+                        .field("text", text.as_str())
+                        .summary(format_args!("{text}"))
+                });
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let events = memory.after(0, 10);
+        assert!(events[1].size() < 8192);
+        assert!(events[1].get("text").is_none());
+        assert_eq!(events[1].summary.len(), 4096);
+        assert_eq!(memory.checked_all().unwrap_err().dropped, 1);
     }
 
     fn records() -> Vec<Event> {

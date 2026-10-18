@@ -361,6 +361,13 @@ impl RunShared {
             (None, Some(history)) => Some(history.clone() as Arc<dyn crate::events::Observer>),
             (observer, None) => observer,
         };
+        let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
+        let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
+        let start_wall = if mode == crate::RunMode::Real {
+            SystemTime::now()
+        } else {
+            crate::sys::UNIX_EPOCH
+        };
         let observer = crate::events::Dispatch::new(observer);
         if observer.enabled(
             crate::events::Metadata {
@@ -375,17 +382,21 @@ impl RunShared {
                     .fields(fields)
                     .field("seed", seed.to_string())
                     .field("rng", "chacha20-v1")
-                    .field("wall", crate::stdlib::protocols::json::Value::Null),
+                    .field(
+                        "wall",
+                        if mode == crate::RunMode::Lab {
+                            crate::stdlib::protocols::json::Value::Null
+                        } else {
+                            start_wall
+                                .duration_since(crate::sys::UNIX_EPOCH)
+                                .map_or(crate::stdlib::protocols::json::Value::Null, |d| {
+                                    crate::events::float(d.as_secs_f64())
+                                })
+                        },
+                    ),
                 || crate::time::Instant::ZERO,
             );
         }
-        let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
-        let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
-        let start_wall = if mode == crate::RunMode::Real {
-            SystemTime::now()
-        } else {
-            crate::sys::UNIX_EPOCH
-        };
         let events = crate::events::Store::new(mode);
         #[cfg(feature = "observe")]
         let keys = Arc::new(crate::telemetry::KeyRecorder::default());
@@ -770,7 +781,6 @@ impl Drop for RunState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{Event, Fields};
 
     #[test]
     fn retained_evidence_outlives_completed_and_dropped_runs() {
@@ -785,9 +795,9 @@ mod tests {
             let weak_graph = Arc::downgrade(&graph);
             let weak_environment = Arc::downgrade(&shared.environment);
             let mut world = Box::pin(run_with(shared, move |fcx| async move {
-                fcx.record(Event::new("test", "hello"));
+                fcx.emit("test", "hello", |event| event);
                 for _ in 0..2 {
-                    fcx.record_repeat(Event::new("test", "repeat"), Fields::new());
+                    fcx.emit("test", "repeat", |event| event);
                 }
                 fcx.yield_now().await?;
                 Ok(())

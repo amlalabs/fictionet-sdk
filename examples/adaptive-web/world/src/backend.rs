@@ -88,6 +88,7 @@ impl Backend {
         self,
         request: Request<Body>,
     ) -> Result<Response<Full<Bytes>>, fictionet::Error> {
+        let observing = fictionet::stdlib::web::httpd::EventInterest::of(&request);
         let target = request
             .extensions()
             .get::<web::Target>()
@@ -124,11 +125,13 @@ impl Backend {
                     b"The site failed to answer.\n",
                 )));
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                let fields = Fields::new()
-                    .with("kind", "backend_error")
-                    .with("serve_ms", serve_ms)
-                    .with("error", e.to_string());
-                response.extensions_mut().insert(fields);
+                if observing {
+                    let fields = Fields::new()
+                        .with("kind", "backend_error")
+                        .with("serve_ms", serve_ms)
+                        .with("error", e.to_string());
+                    response.extensions_mut().insert(fields);
+                }
                 return Ok(response);
             }
         };
@@ -139,29 +142,33 @@ impl Backend {
                     b"The site returned invalid metadata.\n",
                 )));
                 *response.status_mut() = StatusCode::BAD_GATEWAY;
-                let fields = Fields::new()
-                    .with("kind", "meta_error")
-                    .with("serve_ms", serve_ms)
-                    .with("error", error);
-                response.extensions_mut().insert(fields);
+                if observing {
+                    let fields = Fields::new()
+                        .with("kind", "meta_error")
+                        .with("serve_ms", serve_ms)
+                        .with("error", error);
+                    response.extensions_mut().insert(fields);
+                }
                 return Ok(response);
             }
         };
 
-        let mut fields = Fields::new();
-        for name in PAGE_FIELDS {
-            if let Some(v) = meta.get(name) {
-                fields.set(name, to_field(v));
+        if observing {
+            let mut fields = Fields::new();
+            for name in PAGE_FIELDS {
+                if let Some(v) = meta.get(name) {
+                    fields.set(name, to_field(v));
+                }
             }
+            // The length of the page, also for HEAD.
+            let bytes = parts
+                .headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+                .unwrap_or(body.len() as u64);
+            fields.set("bytes", bytes);
+            parts.extensions.insert(fields);
         }
-        // The length of the page, also for HEAD.
-        let bytes = parts
-            .headers
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
-            .unwrap_or(body.len() as u64);
-        fields.set("bytes", bytes);
-        parts.extensions.insert(fields);
         Ok(Response::from_parts(parts, Full::new(body)))
     }
 }

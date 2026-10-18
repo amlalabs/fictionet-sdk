@@ -1386,3 +1386,65 @@ fn http1_body_timeout_records_an_error() {
                 && e.str("detail") == Some("request body timed out"))
     );
 }
+
+#[test]
+fn observation_does_not_change_http_responses_or_protocol_budgets() {
+    struct Count(Arc<AtomicUsize>);
+    impl httpd::BodyClassifier for Count {
+        fn head(
+            &self,
+            _: &http::request::Parts,
+            _: &ConnInfo,
+            _: &mut http::Extensions,
+        ) -> Option<Fields> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+    for budget in [1024, 4096, 64 * 1024] {
+        let run = |observed| {
+            let heads = Arc::new(AtomicUsize::new(0));
+            let memory = Arc::new(fictionet::events::Memory::default());
+            let service = Http1::with(
+                Arc::new(Router::new().get("/", |_, _| {
+                    http::Response::new(Bytes::from_static(b"hello"))
+                })),
+                httpd::Limits {
+                    head: fictionet::stdlib::protocols::http1::Limits {
+                        head: 8192,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .observe(Arc::new(Count(heads.clone())));
+            let options = ServeOptions {
+                budget: Some(fictionet::stdlib::services::serve::Budget::new(budget)),
+                ..Default::default()
+            };
+            let mut harness =
+                Harness::with_options(fictionet::Seed::from_u64(1), service, (), options);
+            if observed {
+                harness = harness.observer(memory.clone());
+            }
+            harness.open().unwrap();
+            let response = if harness.closed() {
+                Vec::new()
+            } else {
+                harness
+                    .push(b"GET / HTTP/1.1\r\nhost: test\r\nconnection: close\r\n\r\n")
+                    .unwrap()
+            };
+            if !observed {
+                assert_eq!(heads.load(Ordering::Relaxed), 0);
+            }
+            if observed && budget == 64 * 1024 {
+                assert_eq!(heads.load(Ordering::Relaxed), 1);
+                assert_eq!(memory.checked_of("http", "request").unwrap().len(), 1);
+                assert!(response.ends_with(b"hello"));
+            }
+            (response, harness.closed())
+        };
+        assert_eq!(run(false), run(true), "protocol budget {budget}");
+    }
+}

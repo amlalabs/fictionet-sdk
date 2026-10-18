@@ -214,8 +214,25 @@ impl Received {
     }
 }
 
+/// Whether the run wants this request's event. Installed in request extensions
+/// before the handler runs, so response metadata can be constructed lazily.
+#[derive(Clone, Copy, Debug)]
+pub struct EventInterest(pub bool);
+
+impl EventInterest {
+    /// Checks the interest supplied by the HTTP server. Direct handler callers
+    /// without this extension retain response metadata, as before.
+    pub fn of<B>(request: &http::Request<B>) -> bool {
+        request
+            .extensions()
+            .get::<Self>()
+            .is_none_or(|interest| interest.0)
+    }
+}
+
 /// Classifies arrivals before routing or admission, without retaining body bytes.
 ///
+/// Callbacks run only when the run observer wants the request event.
 /// Each request has its own `state`, separate from handler extensions. Use it
 /// to carry identity and bounded classification state from `head` to `body`
 /// and `end`, including across concurrent HTTP/2 streams. Callbacks run on
@@ -380,14 +397,14 @@ pub async fn serve_connection<C: Connection + Unpin>(
             Err(RaceError::Cancelled) => return Err(Cancelled),
             Err(RaceError::Deadline) => {
                 let secs = first_timeout.as_secs();
-                fcx.record(
+                fcx.emitter(&info).emit("http", "error", |_| {
                     error_event(
                         &info,
                         "timeout",
                         format!("no bytes within {secs} seconds of connecting"),
                     )
-                    .conn(&info),
-                );
+                    .conn(&info)
+                });
                 return Ok(());
             }
         }
