@@ -46,7 +46,7 @@
 //! can wire a network by hand when `Net` does not fit. To put a link in
 //! front of every sandbox, wrap the sandboxes with
 //! [`Attachments::map`](fictionet::Attachments::map). The
-//! [recipes](fictionet::recipes) show both ways, with commands to run.
+//! [recipes](fictionet::guide::recipes) show both ways, with commands to run.
 //!
 //! # Three kinds of functions
 //!

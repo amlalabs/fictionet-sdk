@@ -1,4 +1,4 @@
-//! The [relay protocol](crate::proto): its messages, and the
+//! The [relay protocol](crate::guide::proto): its messages, and the
 //! local transport, a Unix `SOCK_SEQPACKET` socket with one message per
 //! datagram.
 //!

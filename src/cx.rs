@@ -64,7 +64,7 @@ pub use timer::Timer;
 /// [`JoinError::Cancelled`]. Cancellation alone does not close admission:
 /// tasks in an active region can still spawn work to finish shutting down.
 ///
-/// [`running`](crate::running#what-ends-what) has a table of every way a
+/// [`running`](crate::guide::running#what-ends-what) has a table of every way a
 /// world and its tasks end.
 ///
 #[doc = include_str!("../docs/diagrams/regions.svg")]
@@ -110,7 +110,7 @@ pub use timer::Timer;
 /// else, such as a tokio socket or a database query, is not interrupted,
 /// and keeps its region open until that wait ends. Such a task races the
 /// wait against [`Cx::cancelled`], as
-/// [`running`](crate::running#cancellation-is-cooperative) shows.
+/// [`running`](crate::guide::running#cancellation-is-cooperative) shows.
 ///
 /// Stdlib tasks stop when their region is cancelled, or when they have
 /// nothing left to do because the [`Interface`](crate::Interface)s they
@@ -551,7 +551,7 @@ impl Cx {
     /// the world from there, keep a clone of the world's `Cx` and cancel
     /// that. A `Cx` is `Send` and
     /// `Clone`, so a harness can keep a clone and call this from another
-    /// thread or a tokio task. [In a test](crate::running#in-a-test) shows
+    /// thread or a tokio task. [In a test](crate::guide::running#in-a-test) shows
     /// the pattern.
     pub fn cancel(&self) {
         self.region.stopped.store(true, Ordering::Release);

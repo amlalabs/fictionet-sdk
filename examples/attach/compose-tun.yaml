@@ -1,7 +1,7 @@
 # One sandbox attached with `fictionet attach --type tun`, under Docker
 # Compose. The world is the web_world example. Attach makes tun0 in its
 # own network namespace, and the agent joins that namespace, so tun0 is
-# the agent's only interface. The fictionet::attaching docs show how to
+# the agent's only interface. The fictionet::guide::attaching docs show how to
 # build, start, check and remove it.
 name: fictionet-example-tun
 

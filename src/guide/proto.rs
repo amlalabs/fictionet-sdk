@@ -42,7 +42,7 @@
 //! | 6 | `reply` | the world, to an observer | the request's id (u32), flags (u8), then part of a value |
 //!
 //! Kind 0 is reserved for a remote transport (see the
-//! [roadmap](crate::roadmap#remote-attach-a-tls-transport)).
+//! [roadmap](crate::guide::roadmap#remote-attach-a-tls-transport)).
 //!
 //! A message is at most 65,536 bytes, counting its kind byte. So a `packet`
 //! carries at most 65,535 bytes of IP packet, the most an IPv4 packet can
@@ -58,7 +58,7 @@
 //! [observer](#observer-sessions).
 //!
 //! For example, attach started with `--name agent --type tun` (see
-//! [`attaching`](crate::attaching)) on a sandbox with an MTU of 1500 sends
+//! [`attaching`](crate::guide::attaching)) on a sandbox with an MTU of 1500 sends
 //! this 15-byte `hello`:
 //!
 //! ```text
@@ -78,7 +78,7 @@
 //! DHCP and router advertisements are ordinary packets, so they need no
 //! messages of their own. How each attach type turns its sandbox's
 //! traffic into the packets in `packet` messages, and what the world sees
-//! from each, is on its own page: [`lowering`](crate::lowering).
+//! from each, is on its own page: [`lowering`](crate::guide::lowering).
 //!
 //! # A connection, step by step
 //!

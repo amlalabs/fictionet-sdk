@@ -279,7 +279,7 @@
 //!   IPv4 addresses to sandboxes that ask for one, such as a test, or a VM
 //!   attached with `fictionet attach --type tap` and no IPv4 address flags,
 //!   whose DHCP then goes to the world (see
-//!   [The VM's addresses](fictionet::attaching#the-vms-addresses)). Attach sets a `tun` sandbox's
+//!   [The VM's addresses](fictionet::guide::attaching#the-vms-addresses)). Attach sets a `tun` sandbox's
 //!   addresses itself, from `--ip-addr` and `--ip-addr-v6`, and runs no
 //!   DHCP client. A sandbox with a fixed address is known by the source
 //!   address of its first packet. Either way, the router gets a `/32` or
@@ -383,7 +383,7 @@
 //!
 //! The network `Sites` builds is dual-stack, as most of the real internet
 //! is. A sandbox attached with IPv6 reaches every site over either family.
-//! These are its attach flags ([Addresses](fictionet::attaching#addresses)
+//! These are its attach flags ([Addresses](fictionet::guide::attaching#addresses)
 //! explains each one):
 //!
 //! ```text
@@ -425,7 +425,7 @@
 //!   packets with no link layer, so the sandbox's kernel sends to the
 //!   gateway directly, without asking for its hardware address. A VM
 //!   attached with `tap` does ask, and attach answers it on the VM's link
-//!   (see [`lowering`](fictionet::lowering#tap-ethernet-frames-with-the-ethernet-taken-off)).
+//!   (see [`lowering`](fictionet::guide::lowering#tap-ethernet-frames-with-the-ethernet-taken-off)).
 //!   `Sites` sends no router advertisements, so such a VM gets its IPv6
 //!   address from attach's `--ip-addr-v6`, or sets one itself.
 //! - **Fallback is quick.** A site made [`ipv4_only`](Site::ipv4_only) gets
@@ -527,7 +527,7 @@
 //! puts a [`filter`](fictionet::stdlib::network::filter) between each sandbox and
 //! `Sites`, as [Changing the network around the
 //! sites](#changing-the-network-around-the-sites) shows. The
-//! [packet capture recipe](fictionet::recipes#packet-capture) writes them all
+//! [packet capture recipe](fictionet::guide::recipes#packet-capture) writes them all
 //! to a pcap file.
 //!
 //! # Details
@@ -614,7 +614,7 @@
 //! binds its addresses and reports its events as usual. The same works with
 //! [`bottleneck`](fictionet::stdlib::network::bottleneck) for a slow link, and with
 //! [`filter`](fictionet::stdlib::network::filter) to watch or drop packets. The
-//! [recipes](fictionet::recipes) run each of these, with a route that changes
+//! [recipes](fictionet::guide::recipes) run each of these, with a route that changes
 //! mid-run, and show what the sandbox sees.
 //!
 //! [`Sites::into_net`] gives the [`fictionet::stdlib::world::net::Net`] before

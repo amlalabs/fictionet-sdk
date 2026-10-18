@@ -5,7 +5,7 @@
 //! sandbox's address. A proxied connection becomes a lookup at the world's
 //! DNS server (UDP from the sandbox's address) and a TCP connection from
 //! that address. The world sees ordinary IP packets from that address, but
-//! made by this stack, not by a sandbox kernel: `fictionet::lowering` lists
+//! made by this stack, not by a sandbox kernel: `fictionet::guide::lowering` lists
 //! the differences.
 //!
 //! Nothing here opens a socket on the host toward a destination a client

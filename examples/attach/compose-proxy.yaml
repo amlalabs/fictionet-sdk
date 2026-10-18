@@ -2,7 +2,7 @@
 # Compose. The world is the web_world example, with no network. Attach
 # reaches it through the socket volume, and listens as an HTTP proxy on
 # the sandbox's network, which is internal: the agent can reach attach,
-# and nothing else. The fictionet::attaching docs show how to build,
+# and nothing else. The fictionet::guide::attaching docs show how to build,
 # start, check and remove it.
 name: fictionet-example-proxy
 

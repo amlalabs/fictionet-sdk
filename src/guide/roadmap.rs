@@ -9,7 +9,7 @@
 //! # Attach types for remote sandboxes and tailnets
 //!
 //! `fictionet attach` has four types now: `tun`, `tap`, `http_proxy` and
-//! `socks5` (see [`attaching`](crate::attaching)). Two more are planned.
+//! `socks5` (see [`attaching`](crate::guide::attaching)). Two more are planned.
 //! Each still hands the world plain IP packets, so world code does not
 //! change.
 //!
@@ -17,7 +17,7 @@
 //!
 //! This type is for remote sandboxes that cannot run Docker inside them, on
 //! machines you do not control. (Daytona and E2B sandboxes can run Docker,
-//! and work now: see [Hosted sandboxes](crate::attaching#hosted-sandboxes).)
+//! and work now: see [Hosted sandboxes](crate::guide::attaching#hosted-sandboxes).)
 //! Attach runs next to the world, on a machine the sandbox can reach over
 //! UDP, and acts as a WireGuard server:
 //!
@@ -50,7 +50,7 @@
 //! writes `resolv.conf`, so a sandbox image without `resolvconf` needs it
 //! installed.
 //!
-#![doc = include_str!("../diagrams/attach-wireguard.svg")]
+#![doc = include_str!("../../docs/diagrams/attach-wireguard.svg")]
 //!
 //! ## `tailscale`: a sandbox on a tailnet
 //!
@@ -67,7 +67,7 @@
 //! # Remote attach: a TLS transport
 //!
 //! Attach and the world talk over a Unix socket on one machine (see
-//! [`proto`](crate::proto)). A TLS transport will let one world serve
+//! [`proto`](crate::guide::proto)). A TLS transport will let one world serve
 //! sandboxes on other machines, and let several Inspect services on
 //! Kubernetes share one world. `fictionet attach --world tls:...` is the
 //! planned form.
@@ -145,7 +145,7 @@
 //! reads [`RecvError::Closed`](crate::RecvError::Closed) and its name is
 //! free again. Until then, a new `hello` for that name is refused.
 //!
-//! **Observers.** [Observer sessions](crate::proto#observer-sessions) are
+//! **Observers.** [Observer sessions](crate::guide::proto#observer-sessions) are
 //! messages like any other, so a remote connection will carry them too,
 //! and `fictionet dashboard` will be able to watch a world on another
 //! machine.
@@ -170,7 +170,7 @@
 //! bytes from the middle of a packet as a length. Every message after that
 //! would be misread.
 //!
-#![doc = include_str!("../diagrams/stream-writer.svg")]
+#![doc = include_str!("../../docs/diagrams/stream-writer.svg")]
 //!
 //! So each side keeps one writer per remote connection, with three rules:
 //!
@@ -197,10 +197,10 @@
 //! # DHCP and router advertisements in attach
 //!
 //! With `tun`, attach needs every address setting as a flag (see
-//! [Addresses](crate::attaching#addresses)). The plan is that a setting
+//! [Addresses](crate::guide::attaching#addresses)). The plan is that a setting
 //! left out comes from the world: IPv4 by DHCP, IPv6 by router
 //! advertisements. (A VM attached with `tap` runs its own DHCP client
-//! already. See [its addresses](crate::attaching#the-vms-addresses).)
+//! already. See [its addresses](crate::guide::attaching#the-vms-addresses).)
 //! Attach will send a DHCP request or an IPv6 router
 //! solicitation into the world as ordinary packets, and the world will
 //! answer with stdlib code, like any other packets.
@@ -219,7 +219,7 @@
 //! `networkAllowList` from tier 3), the proxy types need no Docker in the
 //! sandbox. The world and attach run on a host of your own, attach listens
 //! on a public address, and the sandbox gets the proxy variables and the
-//! world's CA (see [What keeps the agent in](crate::attaching#what-keeps-the-agent-in)).
+//! world's CA (see [What keeps the agent in](crate::guide::attaching#what-keeps-the-agent-in)).
 //! This has not been run on a provider. Two things to check for each one:
 //! whether the sandbox can still reach the provider's own DNS server with
 //! egress blocked, and whether it has a metadata address.
@@ -232,7 +232,7 @@
 //!
 //! # `fictionet --world`
 //!
-//! A world is its own program (see [`running`](crate::running)). The
+//! A world is its own program (see [`running`](crate::guide::running)). The
 //! `fictionet` binary attaches sandboxes and observes worlds, with the
 //! commands `attach`, `ready`, `wait-blocked`, `observe` and `dashboard`,
 //! but does not run one. `fictionet --world` will start a world, written in Rust or Python,

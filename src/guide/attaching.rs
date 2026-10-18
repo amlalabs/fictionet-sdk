@@ -9,7 +9,7 @@
 //! `tun` setup, and [Every flag](#every-flag) lists the flags of
 //! `fictionet attach` with a link to where each is explained. If you have
 //! not attached a sandbox before, walk through
-//! [`getting_started`](crate::getting_started) first. This page owns the
+//! [`getting_started`](crate::guide::getting_started) first. This page owns the
 //! deployment procedures. The recipe files below are included directly from
 //! `examples/attach`, so the instructions and runnable examples use the same files.
 //!
@@ -20,7 +20,7 @@
 //! an [`Attachment`](crate::Attachment), an
 //! [`Interface`](crate::Interface) like any other. Whatever the setup, the
 //! world only ever sees IP packets.
-//! [`lowering`](crate::lowering) shows how each attach type turns its
+//! [`lowering`](crate::guide::lowering) shows how each attach type turns its
 //! sandbox's traffic into those packets, step by step.
 //!
 //! # Choose your setup
@@ -35,7 +35,7 @@
 //! | [A virtual machine](#a-virtual-machine-with-tap) | the agent runs in a VM of your own, under QEMU, Firecracker or Cloud Hypervisor | `tap` |
 //!
 //! Attaching remote sandboxes and tailnets is on the
-//! [roadmap](crate::roadmap).
+//! [roadmap](crate::guide::roadmap).
 //!
 //! The kinds of attach type work differently:
 //!
@@ -58,7 +58,7 @@
 //!   from its own addresses to the world. The agent may even be root
 //!   inside the VM.
 //!
-//! The [relay protocol](crate::proto) describes what attach and the world
+//! The [relay protocol](crate::guide::proto) describes what attach and the world
 //! say to each other.
 //!
 //! # How `tun` works
@@ -98,7 +98,7 @@
 //!    and its default routes ([Addresses](#addresses)), and brings it up.
 //! 5. It connects to the world's socket (`--world`), sends a `hello` with
 //!    the sandbox's name, and waits for the world to accept it (the
-//!    [relay protocol](crate::proto) has the messages). If the world
+//!    [relay protocol](crate::guide::proto) has the messages). If the world
 //!    refuses, for example because that name is already attached, attach
 //!    exits with status 3. With
 //!    `--world-wait <seconds>`, attach keeps trying for that long while the
@@ -134,7 +134,7 @@
 //! The simplest setup needs no containers at all. The sandbox is a Linux
 //! network namespace. `fictionet attach` runs on the host and puts a `tun0`
 //! device inside that namespace. Then you start the agent inside the
-//! namespace with `ip netns exec`. [`getting_started`](crate::getting_started)
+//! namespace with `ip netns exec`. [`getting_started`](crate::guide::getting_started)
 //! walks through this by hand.
 //!
 //! A network namespace isolates networking only. Inside it, the only
@@ -146,10 +146,10 @@
 //! the rest of the sandbox, and decides what the agent may do.
 //!
 //! The script `examples/attach/netns.sh` does what
-//! [`getting_started`](crate::getting_started) does, in one go, the way a
+//! [`getting_started`](crate::guide::getting_started) does, in one go, the way a
 //! test harness would. It makes the namespace and gives it its own
 //! `nsswitch.conf` (see
-//! [why](crate::getting_started#when-dig-works-but-programs-cannot-resolve-names)),
+//! [why](crate::guide::getting_started#when-dig-works-but-programs-cannot-resolve-names)),
 //! starts attach, waits until attach is ready, and runs one command as the agent. When the command
 //! ends, or the script is stopped, it stops attach and removes the
 //! namespace. This is the whole file:
@@ -244,7 +244,7 @@
 //!
 //! ## What the script relies on
 //!
-#![doc = include_str!("../diagrams/attach-tun-netns.svg")]
+#![doc = include_str!("../../docs/diagrams/attach-tun-netns.svg")]
 //!
 //! **Attach sets the address.** It enters `/run/netns/agent` before it
 //! makes `tun0`, so the device and its addresses are in that namespace.
@@ -340,7 +340,7 @@
 //! $ docker compose -f examples/attach/compose-tun.yaml down -v
 //! ```
 //!
-#![doc = include_str!("../diagrams/attach-tun-compose.svg")]
+#![doc = include_str!("../../docs/diagrams/attach-tun-compose.svg")]
 //!
 //! From inside the agent's container
 //! (`docker compose -f examples/attach/compose-tun.yaml exec agent ...`),
@@ -428,7 +428,7 @@
 //! `socks5` instead: no container then needs a privilege. See
 //! [The proxy on Kubernetes](#the-proxy-on-kubernetes).
 //!
-#![doc = include_str!("../diagrams/attach-tun-pod.svg")]
+#![doc = include_str!("../../docs/diagrams/attach-tun-pod.svg")]
 //!
 //! A pod is not an empty namespace, and Kubernetes gives a container no
 //! tun device node, so attach needs more there than in Docker Compose.
@@ -803,10 +803,10 @@
 //! UDP packet into the world. The world sees ordinary TCP and DNS traffic
 //! from that address, but not exactly what a `tun` sandbox would send:
 //! the TCP options are attach's, lookups ask only for `A` records, and
-//! there is no IPv6. [`lowering`](crate::lowering) compares the types
+//! there is no IPv6. [`lowering`](crate::guide::lowering) compares the types
 //! packet by packet.
 //!
-#![doc = include_str!("../diagrams/attach-proxy.svg")]
+#![doc = include_str!("../../docs/diagrams/attach-proxy.svg")]
 //!
 //! When it starts, attach does these steps in order:
 //!
@@ -1051,7 +1051,7 @@
 //!   a `/32`. Use rules on addresses, not on names. A rule on names matches
 //!   the world's names, which the proxy request carries, and some providers
 //!   then let DNS out to a public server. This setup has not been run on a
-//!   provider. The [roadmap](crate::roadmap#hosted-sandboxes-without-docker)
+//!   provider. The [roadmap](crate::guide::roadmap#hosted-sandboxes-without-docker)
 //!   lists what to check first.
 //!
 //! An agent that tries to get around the proxy has these options, and none
@@ -1391,13 +1391,13 @@
 //!   every frame between the two. This needs `CAP_NET_ADMIN` in the TAP
 //!   device's network namespace.
 //!
-#![doc = include_str!("../diagrams/attach-tap.svg")]
+#![doc = include_str!("../../docs/diagrams/attach-tap.svg")]
 //!
 //! ## With QEMU, over a socket
 //!
 //! This starts attach for the sandbox `agent` on the socket
 //! `/run/fictionet/agent.sock`, with the world from
-//! [`getting_started`](crate::getting_started) already listening:
+//! [`getting_started`](crate::guide::getting_started) already listening:
 //!
 //! ```sh
 //! fictionet attach --world unix:/run/fictionet/world.sock --name agent \
@@ -1761,7 +1761,7 @@
 //!
 //! Attach refuses to start if one of the six is left out, and it refuses
 //! both forms of the same flag. Getting addresses from the world instead is
-//! on the [roadmap](crate::roadmap#dhcp-and-router-advertisements-in-attach).
+//! on the [roadmap](crate::guide::roadmap#dhcp-and-router-advertisements-in-attach).
 //!
 //! For example, these are the flags for a world built on
 //! [`Sites`](crate::stdlib::web::Sites), whose network is dual-stack. Its
@@ -1867,8 +1867,8 @@
 //!
 //! # Checking that it works
 //!
-//! Follow getting started's [network checks](crate::getting_started#5-look-around-inside-the-sandbox)
-//! and [HTTPS check](crate::getting_started#6-trust-the-worlds-ca-and-make-an-https-request)
+//! Follow getting started's [network checks](crate::guide::getting_started#5-look-around-inside-the-sandbox)
+//! and [HTTPS check](crate::guide::getting_started#6-trust-the-worlds-ca-and-make-an-https-request)
 //! with `web_world` running. Run them inside the sandbox with
 //! `ip netns exec agent` or `examples/attach/netns.sh` on a host, or
 //! `docker compose -f examples/attach/compose-tun.yaml exec agent` in Compose.

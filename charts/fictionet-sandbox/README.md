@@ -1,7 +1,7 @@
 # Fictionet sandbox Helm chart
 
 This chart runs one world, attach relay and agent per service on Kubernetes.
-Use the [attachment guide](../../docs/guide/attaching.rs) for deployment instructions,
+Use the [attachment guide](../../src/guide/attaching.rs) for deployment instructions,
 startup and restart behavior, and isolation requirements:
 
 - **On Kubernetes** for TUN attachment.

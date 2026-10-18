@@ -5,7 +5,7 @@
 //! links between them, how many packets cross each link, and the packets
 //! themselves, decoded, with HTTPS decrypted. There is nothing to turn on
 //! in world code. An observer connects to the world socket, the same socket
-//! that [`fictionet attach`](crate::attaching) uses, and asks.
+//! that [`fictionet attach`](crate::guide::attaching) uses, and asks.
 //!
 //! # The dashboard
 //!
@@ -305,7 +305,7 @@
 //! network: the sandbox's network leads only into the world, and the
 //! socket is a file, not an address. Keep the socket out of the agent's
 //! file system too, as the examples do. In the Docker Compose example in
-//! [`attaching`](crate::attaching#in-docker-compose), the agent's container
+//! [`attaching`](crate::guide::attaching#in-docker-compose), the agent's container
 //! mounts the world's CA certificate, and not the socket's directory.
 //!
 //! An observer sees everything the world carries, and its TLS keys, so give
@@ -389,7 +389,7 @@
 //! socket and sends a `hello` with the type `observe`. When capacity allows,
 //! the world accepts it without taking a sandbox name. Then the observer
 //! sends requests, and the world answers each with one or more values. The
-//! [relay protocol](crate::proto#observer-sessions) describes the messages
+//! [relay protocol](crate::guide::proto#observer-sessions) describes the messages
 //! that carry them. This section describes what they say.
 //!
 //! A request is a JSON object with an `op`, such as `{"op":"graph"}`. A

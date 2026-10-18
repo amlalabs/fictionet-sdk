@@ -32,7 +32,7 @@
 //! with no sink to set. Recording numbers each event (`seq`, from 1, with
 //! no gaps) and dates it on the run's clock ([`Cx::now`]), never the
 //! host's. In a lab, repeatability depends on the world's inputs and clock
-//! use; see [Repeatable runs](crate::running#repeatable-runs), including
+//! use; see [Repeatable runs](crate::guide::running#repeatable-runs), including
 //! the HTTP/2 exception.
 //! The log is bounded: it holds the latest [`MAX_EVENTS`] events, and at
 //! most [`MAX_EVENT_BYTES`] of them ([`Event::size`]). Past either limit

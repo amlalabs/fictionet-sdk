@@ -8,22 +8,22 @@
 //! sandbox, the agent's own tools (`curl`, `dig`, `ping`, a browser) see the
 //! world as the whole network.
 //!
-//! Use it to build evals, RL environments and tests where the network is part of
-//! the task: a tampered website, a slow or lossy link, a hijacked route, an
+//! Use it to build evals, RL environments and tests where the network is part
+//! of the task: a tampered website, a slow or lossy link, a hijacked route, an
 //! impostor service. The repository's examples include an eval that serves
-//! agents tampered Wikipedia, gov.uk and BBC pages, and one with a BGP
-//! hijack and an impostor bank. [`recipes`] shows the pieces they are
-//! built from, with commands to run: a delayed website, a slow or lossy
-//! link, a packet capture and a route that changes mid-run.
+//! agents tampered Wikipedia, gov.uk and BBC pages, and one with a BGP hijack
+//! and an impostor bank. [`recipes`](guide::recipes) shows the pieces they are
+//! built from, with commands to run: a delayed website, a slow or lossy link, a
+//! packet capture and a route that changes mid-run.
 //!
 //! A world's time and randomness come from one place, its [`Cx`], and its
-//! randomness from a seed. With real sandboxes it runs on real time
-//! ([`run`]). In a test it runs on simulated time ([`lab`]), where the same
-//! seed and ordered inputs give the same event log and packets when the
-//! world is closed. [Repeatable runs](running#repeatable-runs) lists the
-//! requirements and the HTTP/2 host-clock exception. [`running`] is the
-//! guide; [`run`], [`lab`] and [`Cx`] document the runtime operations, and
-//! [`events`] documents recording. `run.start` records the seed only when
+//! randomness from a seed. With real sandboxes it runs on real time ([`run`]).
+//! In a test it runs on simulated time ([`lab`]), where the same seed and
+//! ordered inputs give the same event log and packets when the world is closed.
+//! [Repeatable runs](guide::running#repeatable-runs) lists the requirements and
+//! the HTTP/2 host-clock exception. [`running`](guide::running) is the guide;
+//! [`run`], [`lab`] and [`Cx`] document the runtime operations, and [`events`]
+//! documents recording. `run.start` records the seed only when
 //! [`Net::start`](stdlib::world::net::Net::start) or world code calls
 //! [`EventLog::start`](events::EventLog::start).
 //!
@@ -43,7 +43,7 @@
 //! has no other interface, such as a new one from `ip netns add`. In a
 //! namespace that already has one, such as a Kubernetes pod's `eth0`,
 //! attach can take that interface down first: [How `tun`
-//! works](attaching#how-tun-works) explains this.
+//! works](guide::attaching#how-tun-works) explains this.
 //!
 //! <style>.fn-attach > svg {display:block;width:100%;max-width:696px;min-width:480px;height:auto}</style>
 //! <div class="fn-attach" style="overflow-x:auto;margin:1.25em 0">
@@ -65,16 +65,15 @@
 //!     --ip-addr-v6 2001:db8::2/64 --gateway-v6 2001:db8::1 --dns-v6 2001:db8::1
 //! ```
 //!
-//! Sandboxes can attach and detach at any time while the world runs. Each
-//! one has a name, and the world receives it as an [`Attachment`]. A
-//! virtual machine attaches through its network card instead
-//! (`--type tap`). A sandbox that cannot have a network device, because it
-//! has no privileges at all, can attach through a proxy (`--type
-//! http_proxy` or `--type socks5`). [`attaching`] covers every setup: a
-//! namespace on the host, Docker Compose, Kubernetes, hosted sandboxes, the
-//! proxy and VMs. Whatever the type, the world receives IP packets:
-//! [`lowering`] shows how each type turns what its sandbox sends into
-//! them.
+//! Sandboxes can attach and detach at any time while the world runs. Each one
+//! has a name, and the world receives it as an [`Attachment`]. A virtual
+//! machine attaches through its network card instead (`--type tap`). A sandbox
+//! that cannot have a network device, because it has no privileges at all, can
+//! attach through a proxy (`--type http_proxy` or `--type socks5`).
+//! [`attaching`](guide::attaching) covers every setup: a namespace on the host,
+//! Docker Compose, Kubernetes, hosted sandboxes, the proxy and VMs. Whatever
+//! the type, the world receives IP packets: [`lowering`](guide::lowering) shows
+//! how each type turns what its sandbox sends into them.
 //!
 //! # A world in code
 //!
@@ -121,7 +120,7 @@
 //!   that are cancelled together. Cancelling the region stops all of its
 //!   tasks, and a region ends only after all of its tasks have ended. So a
 //!   task can outlive the function that started it, but never its region.
-//!   [What ends what](running#what-ends-what) lists every case.
+//!   [What ends what](guide::running#what-ends-what) lists every case.
 //! - [`Packet`] holds the raw bytes of one IP packet.
 //!
 //! These types, at the crate root, are the core of Fictionet. The core
@@ -153,15 +152,14 @@
 //! # fn main() {}
 //! ```
 //!
-//! [`attachments`] makes the channel that sandboxes arrive through.
-//! [`listen`] opens the world socket that the [`WorldSocket`] names, so
-//! that each `fictionet attach` that connects arrives in that channel.
-//! [`run`] turns the world function into one future, and [`block_on`]
-//! polls it until the world ends. Each world is
-//! its own process, with no central daemon. It has the host's real network,
-//! so world code can also reach the internet or a database.
-//! [`running`] explains each step, how a world stops, and how to run one in
-//! a test with no socket at all.
+//! [`attachments`] makes the channel that sandboxes arrive through. [`listen`]
+//! opens the world socket that the [`WorldSocket`] names, so that each
+//! `fictionet attach` that connects arrives in that channel. [`run`] turns the
+//! world function into one future, and [`block_on`] polls it until the world
+//! ends. Each world is its own process, with no central daemon. It has the
+//! host's real network, so world code can also reach the internet or a
+//! database. [`running`](guide::running) explains each step, how a world stops,
+//! and how to run one in a test with no socket at all.
 //!
 //! # Services on a network
 //!
@@ -254,23 +252,24 @@
 //!
 //! # Where to go next
 //!
-//! 1. [`getting_started`]: from `cargo build` to an HTTPS request from a
-//!    sandbox, with every command and its output.
-//! 2. [`running`]: the program around a world, and worlds in tests.
-//! 3. [`attaching`]: every way to attach a sandbox, its addresses and DNS,
-//!    and how to check that it works.
-//! 4. [`lowering`]: how each attach type turns what its sandbox sends
-//!    into IP packets, and what the world sees from each.
+//! 1. [`getting_started`](guide::getting_started): from `cargo build` to an
+//!    HTTPS request from a sandbox, with every command and its output.
+//! 2. [`running`](guide::running): the program around a world, and worlds in tests.
+//! 3. [`attaching`](guide::attaching): every way to attach a sandbox, its
+//!    addresses and DNS, and how to check that it works.
+//! 4. [`lowering`](guide::lowering): how each attach type turns what its
+//!    sandbox sends into IP packets, and what the world sees from each.
 //! 5. [`stdlib`], then [`stdlib::world::net`] and [`stdlib::services::serve`]: the
 //!    networking pieces a world is built from, and a network of hosts and
 //!    services in a few lines. [`stdlib::web`] does the same for websites.
-//! 6. [`recipes`]: a delayed website, a slow or lossy link, a packet
-//!    capture, and a route that changes mid-run.
+//! 6. [`recipes`](guide::recipes): a delayed website, a slow or lossy link, a
+//!    packet capture, and a route that changes mid-run.
 //! 7. [`observe`]: watching a running world, in the dashboard or from a
 //!    shell, and sending your own events from world code.
-//! 8. [`proto`]: the protocol between attach and a world, if you want to
-//!    write your own attach.
-//! 9. [`roadmap`]: what is planned, such as attaching remote sandboxes.
+//! 8. [`proto`](guide::proto): the protocol between attach and a world, if you
+//!    want to write your own attach.
+//! 9. [`roadmap`](guide::roadmap): what is planned, such as attaching remote
+//!    sandboxes.
 //!
 //! # Features and dependencies
 //!
@@ -328,8 +327,6 @@
 extern crate self as fictionet;
 
 mod attach;
-#[path = "../docs/guide/attaching.rs"]
-pub mod attaching;
 mod block_on;
 mod cable;
 mod cx;
@@ -340,29 +337,17 @@ pub mod events;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
-#[path = "../docs/guide/getting_started.rs"]
-pub mod getting_started;
+pub mod guide;
 mod interface;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 mod listen;
-#[path = "../docs/guide/lowering.rs"]
-pub mod lowering;
 pub mod observe;
-#[path = "relay/queue.rs"]
 mod packet_queue;
-#[path = "../docs/guide/proto.rs"]
-pub mod proto;
-#[path = "../docs/guide/recipes.rs"]
-pub mod recipes;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub mod relay;
-#[path = "../docs/guide/roadmap.rs"]
-pub mod roadmap;
 pub use entropy::{Entropy, Seed, SeededEntropy};
 mod run;
-#[path = "../docs/guide/running.rs"]
-pub mod running;
 pub mod stdlib;
 pub mod sync;
 mod sys;

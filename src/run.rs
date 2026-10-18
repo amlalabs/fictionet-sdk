@@ -132,7 +132,7 @@ where
 /// timers due at the same instant in the order they were set. With a closed
 /// world, the same seed and ordered inputs give the same event log and
 /// packets. This requires the world to use the run's clock, randomness and
-/// task scheduling. [Repeatable runs](crate::running#repeatable-runs)
+/// task scheduling. [Repeatable runs](crate::guide::running#repeatable-runs)
 /// lists the requirements and the HTTP/2 host-clock exception.
 ///
 /// Like [`run`], `lab` leaves `run.start` recording to

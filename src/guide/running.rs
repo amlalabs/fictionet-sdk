@@ -5,7 +5,7 @@
 //! This page shows the small `main` that runs it for real sandboxes, explains
 //! each call, and then shows how a test runs the same world with no socket
 //! and no `fictionet attach`. To run a world now, with real commands, start
-//! with [`getting_started`](crate::getting_started).
+//! with [`getting_started`](crate::guide::getting_started).
 //!
 //! This module is the running guide. The [`run`](crate::run) and
 //! [`lab`](crate::lab) functions own scheduling and the run's lifetime;
@@ -43,7 +43,7 @@
 //! # fn main() {}
 //! ```
 //!
-#![doc = include_str!("../diagrams/running.svg")]
+#![doc = include_str!("../../docs/diagrams/running.svg")]
 //!
 //! Here is what each call does:
 //!
@@ -58,7 +58,7 @@
 //!    flag takes. `listen` returns immediately, and the helper thread does
 //!    the rest in the background. Each `fictionet attach` that connects
 //!    first sends the sandbox's name. The helper accepts it, or refuses it
-//!    if that name is already attached ([the relay protocol](crate::proto)
+//!    if that name is already attached ([the relay protocol](crate::guide::proto)
 //!    has the messages). Each accepted sandbox goes into the channel as an
 //!    [`Attachment`](crate::Attachment). Keep the returned
 //!    [`Listening`](crate::Listening) in a named variable. Dropping it
@@ -209,10 +209,10 @@
 //!    `--ready-file <path>`, if you gave one.
 //! 3. **The agent,** once the ready file exists. The ready file says that
 //!    the sandbox's network is set up, not that the world answers yet:
-//!    [Readiness](crate::getting_started#readiness) shows how to check
+//!    [Readiness](crate::guide::getting_started#readiness) shows how to check
 //!    that end to end.
 //!
-//! The [Docker Compose setup](crate::attaching#in-docker-compose) does this
+//! The [Docker Compose setup](crate::guide::attaching#in-docker-compose) does this
 //! with `depends_on`: attach starts once the world's container has
 //! started, waits for the socket with `--world-wait`, and its healthcheck
 //! runs `fictionet ready` on the ready file. The agent starts once that

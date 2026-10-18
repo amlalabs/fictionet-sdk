@@ -43,7 +43,7 @@ pub enum RecvError {
 /// An interface holds no borrowed references (it is `'static`), because
 /// most interfaces end up inside background tasks. Such a task can outlive
 /// the function that started it, but not its owning [region](Cx#regions)
-/// (see [What ends what](crate::running#what-ends-what)).
+/// (see [What ends what](crate::guide::running#what-ends-what)).
 ///
 /// An interface is `Send`: it can move to another thread, for example into
 /// a tokio task.

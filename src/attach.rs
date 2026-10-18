@@ -22,7 +22,7 @@ use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 /// `fictionet attach` plays the part of the sandbox's kernel: its own TCP/IP
 /// stack turns each proxied connection into packets, so even a proxy client
 /// shows up here as packets. The world is not told which attach type it
-/// got. [`lowering`](crate::lowering) shows each type's path, and what the
+/// got. [`lowering`](crate::guide::lowering) shows each type's path, and what the
 /// world sees from it.
 ///
 /// Dropping an `Attachment` closes it: the sandbox is cut off, and its
@@ -32,7 +32,7 @@ use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 /// arrived, and then [`recv`](crate::InterfaceExt::recv) returns
 /// [`RecvError::Closed`]. Packets sent to it after that are dropped. A
 /// detach cancels nothing, so the world's other tasks keep running (see
-/// [What ends what](crate::running#what-ends-what)).
+/// [What ends what](crate::guide::running#what-ends-what)).
 pub struct Attachment {
     name: String,
     mtu: u16,
@@ -317,7 +317,7 @@ impl Attacher {
     /// longer than 255 bytes. The name stays taken until either end is
     /// dropped. Every attach goes through this check, including those from
     /// [`listen`](crate::listen): when it fails, `fictionet attach` gets a
-    /// `refuse` message (see [`proto`](crate::proto)).
+    /// `refuse` message (see [`proto`](crate::guide::proto)).
     pub fn attach(&self, name: &str) -> Result<End, AttachError> {
         let guard = self.reserve(name)?;
         let (world, sandbox) = pair_with_guard(Some(Box::new(guard)));

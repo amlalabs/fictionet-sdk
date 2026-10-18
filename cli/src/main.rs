@@ -2,7 +2,7 @@
 //! `tun`, `tap`, `http_proxy` and `socks5`; `ready`, a probe for attach's ready
 //! file; `wait-blocked`, which waits until a pod's NetworkPolicy blocks its
 //! direct traffic; `observe`, the observe API from a shell; and `dashboard`, which
-//! serves the dashboard app. See the crate docs, `fictionet::attaching`
+//! serves the dashboard app. See the crate docs, `fictionet::guide::attaching`
 //! and `fictionet::observe`.
 //!
 //! Exit status of `attach`: 0 when the world closed the connection (or,

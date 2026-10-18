@@ -30,7 +30,7 @@ use crate::{Attacher, Attachment, Cx, Packet, RecvError};
 /// ```
 ///
 /// The enum is `#[non_exhaustive]` so that other transports, such as the
-/// [TLS transport for remote sandboxes](crate::roadmap#remote-attach-a-tls-transport),
+/// [TLS transport for remote sandboxes](crate::guide::roadmap#remote-attach-a-tls-transport),
 /// can join it as variants.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -89,7 +89,7 @@ impl std::error::Error for ParseWorldSocketError {}
 /// for example when another live world is already listening at that path.
 /// A socket file left behind by a world that has exited is replaced.
 ///
-/// The socket speaks the [relay protocol](crate::proto).
+/// The socket speaks the [relay protocol](crate::guide::proto).
 /// With `observe` enabled, it admits at most 64 observer sessions,
 /// including idle clients. [`Listening::set_observer_limit`] changes
 /// that ceiling. See the [observer budgets](crate::observe#resource-limits).

@@ -3,7 +3,7 @@
 //! Each recipe on this page is a complete world in the crate's
 //! `examples/` directory, with the commands that run it and what they
 //! printed when they were run. Read this page when you have a world of
-//! websites running, as in [`getting_started`](crate::getting_started),
+//! websites running, as in [`getting_started`](crate::guide::getting_started),
 //! and want to change the network the agent sees.
 //!
 //! # Putting something in front of every sandbox
@@ -57,13 +57,13 @@
 //!
 //! # Running the recipes
 //!
-//! Follow [getting started](crate::getting_started): build the CLI, then
-//! [make the socket directory](crate::getting_started#2-make-the-sockets-directory).
+//! Follow [getting started](crate::guide::getting_started): build the CLI, then
+//! [make the socket directory](crate::guide::getting_started#2-make-the-sockets-directory).
 //! Substitute the recipe's world command for step 3, then
-//! [create and attach the sandbox](crate::getting_started#4-make-a-sandbox-and-attach-it),
+//! [create and attach the sandbox](crate::guide::getting_started#4-make-a-sandbox-and-attach-it),
 //! including its `nsswitch.conf`. Run the recipe's requests in a third terminal.
 //! Stop attach and the world between recipes. When finished, follow
-//! [step 7](crate::getting_started#7-stop) to remove the namespace and its files.
+//! [step 7](crate::guide::getting_started#7-stop) to remove the namespace and its files.
 //! These worlds serve plain HTTP, so the requests need no certificates.
 //!
 //! # A delayed website
@@ -289,7 +289,7 @@
 //!
 //! The world has IPv4 only, so attach the sandbox with `--no-ip-addr-v6
 //! --no-gateway-v6 --no-dns-v6` in place of the three IPv6 flags (see
-//! [Addresses](crate::attaching#addresses)). It runs
+//! [Addresses](crate::guide::attaching#addresses)). It runs
 //! no DNS server either, so the sandbox uses the bank's address. Start the
 //! world with a 10-second delay:
 //!

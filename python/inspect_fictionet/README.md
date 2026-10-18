@@ -287,7 +287,7 @@ the API server fail three times in a row. That needs a CNI that enforces
 NetworkPolicy, also on traffic to the pod's own node, and no other policy
 that selects the pod: policies add up, so one that allows traffic opens a
 way around the proxy. "What keeps the agent
-in" in [`docs/guide/attaching.rs`](../../docs/guide/attaching.rs) says exactly what is
+in" in [`src/guide/attaching.rs`](../../src/guide/attaching.rs) says exactly what is
 checked.
 
 The agent gets the token in `RELAY_TOKEN` and in the proxy URLs, with no
@@ -312,7 +312,7 @@ fictionet_sandbox(WEB_WORLD_IMAGE, attach="http_proxy", attach_image="fictionet-
 Programs that ignore the proxy variables cannot reach the world, and `dig`
 gets no answer, because there is no DNS server to ask: attach looks names up
 in the world itself. See "Behind a proxy" in
-[`docs/guide/attaching.rs`](../../docs/guide/attaching.rs) for which programs use the
+[`src/guide/attaching.rs`](../../src/guide/attaching.rs) for which programs use the
 variables.
 
 ### Kubernetes
@@ -333,7 +333,7 @@ agent's hostname, so the package names the release's objects as Inspect's
 own chart does (`global.nameOverride: agent-env`): the agent sees
 `agent-env-<release>-default-0`. The chart needs
 Kubernetes 1.29 or later. "On Kubernetes" in
-[`docs/guide/attaching.rs`](../../docs/guide/attaching.rs) explains the pod, and the chart's
+[`src/guide/attaching.rs`](../../src/guide/attaching.rs) explains the pod, and the chart's
 [`values.yaml`](../../charts/fictionet-sandbox/values.yaml) lists what else
 can be set. Pass any of them with `k8s_values`. Two differ from Docker:
 

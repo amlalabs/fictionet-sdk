@@ -2,7 +2,7 @@
 # Runs one command as the agent, in a network namespace attached to the
 # world with `fictionet attach --type tun`, and removes the namespace when
 # the command ends. Run it as root, with the world started at
-# /run/fictionet/world.sock. The fictionet::attaching docs explain it.
+# /run/fictionet/world.sock. The fictionet::guide::attaching docs explain it.
 #
 #   examples/attach/netns.sh curl -sS --cacert /run/fictionet/ca.pem https://example.test/
 
