@@ -168,9 +168,9 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 /// of `limit` and the input length times eight fifths.
 ///
 /// ```
-/// use fictionet::stdlib::huffman::decode_limited;
+/// use fictionet::stdlib::protocols::huffman::decode_limited;
 /// assert_eq!(decode_limited(&[0x1f], 1)?, b"a");
-/// # Ok::<(), fictionet::stdlib::huffman::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::huffman::Error>(())
 /// ```
 pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
     let h = &HUFFMAN;

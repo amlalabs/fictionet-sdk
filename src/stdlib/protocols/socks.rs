@@ -15,19 +15,21 @@
 //! 1929 (the username and password login), the SOCKS4 protocol document,
 //! and its SOCKS4a extension, which lets the client send a domain name.
 //!
-//! A proxy [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`ClientMessages`]. In `on_item`, it
-//! answers each [`ClientMessage`] and chooses the next phase with
-//! `driver.decoder().select()` or `driver.decoder().verified()`. A client uses
-//! [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). After the last handshake
-//! item, `swap` or `into_parts` hands unread bytes to the tunnel protocol.
-//! While a decision is pending, input stays buffered up to the unit limit.
-//! Choose the next phase before filling that allowance. Each reader checks
-//! lengths against named limits. Where a connection goes is up to world code.
+//! A proxy [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! [`ClientMessages`]. In `on_item`, it answers each [`ClientMessage`] and
+//! chooses the next phase with `driver.decoder().select()` or
+//! `driver.decoder().verified()`. A client uses
+//! [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). After the last
+//! handshake item, `swap` or `into_parts` hands unread bytes to the tunnel
+//! protocol. While a decision is pending, input stays buffered up to the unit
+//! limit. Choose the next phase before filling that allowance. Each reader
+//! checks lengths against named limits. Where a connection goes is up to world
+//! code.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::socks::{
+//! use fictionet::stdlib::protocols::socks::{
 //!     Address, ClientMessage, Command, Method, Reply, ReplyCode, Selection, ClientMessages, ServerPhase,
 //! };
 //! use std::net::Ipv4Addr;

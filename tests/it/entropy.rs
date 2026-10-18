@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 
-use fictionet::stdlib::{ConnectionExt, filter, tcp};
+use fictionet::stdlib::network::{ConnectionExt, filter, tcp};
 use fictionet::{Entropy, Seed, SeededEntropy, block_on, lab, pair};
 
 #[test]

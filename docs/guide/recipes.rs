@@ -23,7 +23,7 @@
 //! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
 //! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::network::delay(fcx, ms(200), sandbox));
 //! web::Sites::new(site_for).start(&fcx, far)?;
 //! # Ok(())
 //! # }
@@ -37,11 +37,11 @@
 //! The function can return any [`Interface`](crate::Interface). The
 //! stdlib has three that fit here:
 //!
-//! - [`stdlib::delay`](crate::stdlib::delay) holds every packet for a fixed
+//! - [`stdlib::network::delay`](crate::stdlib::network::delay) holds every packet for a fixed
 //!   time.
-//! - [`stdlib::bottleneck`](crate::stdlib::bottleneck) limits the rate,
+//! - [`stdlib::network::bottleneck`](crate::stdlib::network::bottleneck) limits the rate,
 //!   with a queue that drops packets when it is full.
-//! - [`stdlib::filter`](crate::stdlib::filter) calls your code with every
+//! - [`stdlib::network::filter`](crate::stdlib::network::filter) calls your code with every
 //!   packet. Your code can look at the packet, and can drop it.
 //!
 //! These nest: `bottleneck(fcx, rate, queue, delay(fcx, ms(40), sandbox))` is
@@ -52,7 +52,7 @@
 //!
 //! A world that needs more than one path per sandbox wires the network by
 //! hand from [`pair`](crate::pair) and
-//! [`route::router`](crate::stdlib::route::router). The last recipe does
+//! [`route::router`](crate::stdlib::network::route::router). The last recipe does
 //! that.
 //!
 //! # Running the recipes
@@ -112,8 +112,8 @@
 //! When packets arrive faster than the link sends them, they wait in the
 //! queue, and when the queue is full, new packets are dropped.
 //!
-//! To show the drops, the world puts a [`filter`](crate::stdlib::filter)
-//! on each side of the [`bottleneck`](crate::stdlib::bottleneck), and
+//! To show the drops, the world puts a [`filter`](crate::stdlib::network::filter)
+//! on each side of the [`bottleneck`](crate::stdlib::network::bottleneck), and
 //! counts the packets that pass each one. A packet that went in on one
 //! side and never came out of the other was dropped by the queue. Once the
 //! packets have stopped for a second, the world prints the counts:
@@ -151,14 +151,14 @@
 //! queue, lost 6 packets, and sent them again.
 //!
 //! The download lost 156 packets and ran at 425 kB/s. In this direction
-//! the sender is the world's own TCP ([`tcp`](crate::stdlib::tcp)), which
+//! the sender is the world's own TCP ([`tcp`](crate::stdlib::network::tcp)), which
 //! uses Reno congestion control and recovers from a burst of drops more
 //! slowly than Linux does.
 //!
 //! # Lost packets
 //!
 //! This world drops 5% of the packets in each direction, at random. The
-//! [`filter`](crate::stdlib::filter) decides for each packet with
+//! [`filter`](crate::stdlib::network::filter) decides for each packet with
 //! [`Cx::random_f64`](crate::Cx::random_f64):
 //!
 #![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/lossy_sites.rs"), "# }\n# fn main() {}\n```")]
@@ -188,7 +188,7 @@
 //! # Packet capture
 //!
 //! This world writes the packets between the sandboxes and `Sites` to a
-//! pcap file. The [`filter`](crate::stdlib::filter) sees each packet and
+//! pcap file. The [`filter`](crate::stdlib::network::filter) sees each packet and
 //! passes it on. The file is written on a thread of its own: all of a
 //! world's tasks share one thread, and a write to a file can block, so the
 //! filter only hands each packet to a channel that never waits. The file
@@ -256,15 +256,15 @@
 //! IPv6 address, and fetched the page over IPv6.
 //!
 //! The capture shows the packets as the sandbox sent and received them.
-//! To see them as they cross a [`delay`](crate::stdlib::delay) or a
-//! [`bottleneck`](crate::stdlib::bottleneck), chain a second `map` after
+//! To see them as they cross a [`delay`](crate::stdlib::network::delay) or a
+//! [`bottleneck`](crate::stdlib::network::bottleneck), chain a second `map` after
 //! the link, or wrap the link in a `filter` inside the same function.
 //!
 //! # A route that changes mid-run
 //!
 //! In a BGP hijack, a network announces a more specific route to someone
 //! else's addresses, and traffic for those addresses follows it. This
-//! world plays out the core of one. A [router](crate::stdlib::route::router)
+//! world plays out the core of one. A [router](crate::stdlib::network::route::router)
 //! sends the sandbox's traffic for `203.0.113.0/24` to a bank. The command
 //! line gives a number of seconds. That long after the sandbox attaches,
 //! the world adds a route for `203.0.113.10/32`, the bank's own address,
@@ -272,16 +272,18 @@
 //! machine. The longest matching prefix wins, so from then on every packet
 //! for the bank, and so every new connection, reaches the impostor.
 //!
-//! The world is wired by hand, without `Sites`: one [`pair`](crate::pair)
-//! for each machine, one router, and the
-//! [`Router`](crate::stdlib::route::Router) handle that adds the route
-//! later. The two machines are TCP endpoints that answer every HTTP
-//! request with one line through an [`httpd::Router`](crate::stdlib::httpd::Router).
-//! [`serve::listen`](crate::stdlib::serve::listen) runs the HTTP service on
-//! each machine. [`ServeOptions::max_conns`](crate::stdlib::serve::ServeOptions::max_conns)
+//! The world is wired by hand, without `Sites`: one [`pair`](crate::pair) for
+//! each machine, one router, and the
+//! [`Router`](crate::stdlib::network::route::Router) handle that adds the route
+//! later. The two machines are TCP endpoints that answer every HTTP request
+//! with one line through an
+//! [`httpd::Router`](crate::stdlib::web::httpd::Router).
+//! [`serve::listen`](crate::stdlib::services::serve::listen) runs the HTTP
+//! service on each machine.
+//! [`ServeOptions::max_conns`](crate::stdlib::services::serve::ServeOptions::max_conns)
 //! allows at most 64 connections at once and resets any past the cap.
-//! [`ServeOptions::idle`](crate::stdlib::serve::ServeOptions::idle) closes
-//! connections after 10 seconds without input while the service waits:
+//! [`ServeOptions::idle`](crate::stdlib::services::serve::ServeOptions::idle)
+//! closes connections after 10 seconds without input while the service waits:
 //!
 #![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/route_change.rs"), "# }\n# fn main() {}\n```")]
 //!

@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::urlencoded_form::{
+use fictionet::stdlib::protocols::urlencoded_form::{
     EncodeSet, Error, Field, Fields, Form, MAX_INPUT, MAX_PAIRS, PercentEncoded, decode_component,
     percent_decode, query_of,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

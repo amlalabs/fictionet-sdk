@@ -14,7 +14,7 @@ use std::net::SocketAddrV4;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use fictionet::stdlib::codec::{Fail, Stream, Wire};
-use fictionet::stdlib::socks::{
+use fictionet::stdlib::protocols::socks::{
     self, Address, AuthReply, ClientMessage, ClientMessages, Command, FrameError, Method, Reply,
     ReplyCode, Selection,
 };

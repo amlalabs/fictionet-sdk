@@ -15,7 +15,7 @@
 //! gitprotocol-v2.
 //!
 //! A world that plays a Git server passes bytes from a
-//! [`tcp`](fictionet::stdlib::tcp) connection to
+//! [`tcp`](fictionet::stdlib::network::tcp) connection to
 //! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), reads the client's [`ProtoRequest`],
 //! and writes back an
 //! [`Advertisement`] (version 0 or 1) or a [`CapabilityAdvertisement`]
@@ -30,7 +30,7 @@
 //! invalid fields and values beyond these limits.
 //!
 //! ```
-//! use fictionet::stdlib::git_protocol::{
+//! use fictionet::stdlib::protocols::git_protocol::{
 //!     Capability, CapabilityAdvertisement, LsRef, LsRefsArg, ObjectId, Packet, V2Request,
 //! };
 //! use fictionet::stdlib::codec::Wire;

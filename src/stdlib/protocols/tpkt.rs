@@ -16,7 +16,7 @@
 //! Nothing here reads a socket. A world pushes bytes from a
 //! TCP connection into a [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), takes each
 //! [`Packet`] out, and reads its payload. Most payloads are COTP TPDUs;
-//! [`fictionet::stdlib::cotp::over_tpkt`] provides conversions and a message writer.
+//! [`fictionet::stdlib::protocols::cotp::over_tpkt`] provides conversions and a message writer.
 //! A world may set a size limit lower than the 65535 bytes the header allows, as
 //! real stacks often do.
 //!
@@ -27,7 +27,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::tpkt::Packet;
+//! use fictionet::stdlib::protocols::tpkt::Packet;
 //!
 //! let mut decoder = Stream::new(Frames::<Packet>::new());
 //! // A COTP data TPDU marked as the last of its message, carrying "hi".

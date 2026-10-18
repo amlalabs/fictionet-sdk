@@ -21,7 +21,7 @@
 //!
 //! ```
 //! # use fictionet::{Cx, End, Result};
-//! # use fictionet::stdlib::{ip, tcp, udp};
+//! # use fictionet::stdlib::network::{ip, tcp, udp};
 //! # fn dns(fcx: Cx, dns_side: End) -> Result {
 //! let (tcp, udp, icmp, _other) = ip::split_protocols(&fcx, dns_side);
 //!
@@ -68,7 +68,7 @@
 //!   its addresses, protocol and reason.
 //!
 //! ```
-//! use fictionet::stdlib::ip::{self, Header, protocol};
+//! use fictionet::stdlib::network::ip::{self, Header, protocol};
 //!
 //! let (src, dst) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
 //! let mut udp = vec![0, 1, 0, 53, 0, 8, 0, 0];
@@ -88,7 +88,7 @@ use std::ops::Range;
 use std::task::Poll;
 
 use fictionet::events::{self, Level, opt};
-use fictionet::stdlib::{
+use fictionet::stdlib::network::{
     icmp,
     ports::{Event, Ports},
 };
@@ -229,10 +229,10 @@ async fn split(
 /// that caused it. An error about a TCP packet goes to the TCP end, and one
 /// about a UDP packet to the UDP end, so code that reads the TCP end sees
 /// the errors about its own connections without reading the ICMP
-/// interface. [`tcp::endpoint`](fictionet::stdlib::tcp::endpoint) uses ICMPv4
+/// interface. [`tcp::endpoint`](fictionet::stdlib::network::tcp::endpoint) uses ICMPv4
 /// destination-unreachable errors that quote a pending connect's current SYN,
 /// except code 4 (fragmentation needed). It drops other ICMP errors.
-/// [`udp::endpoint`](fictionet::stdlib::udp::endpoint) drops all of them.
+/// [`udp::endpoint`](fictionet::stdlib::network::udp::endpoint) drops all of them.
 /// Pings and other ICMP messages go to the ICMP end.
 ///
 /// **Fragments are put back together first.** A fragmented packet only
@@ -421,7 +421,7 @@ struct Partial {
 }
 
 /// Fragment reassembly, for [`split_protocols`] and for each sandbox's
-/// filter in [`net::Net`](fictionet::stdlib::net::Net).
+/// filter in [`net::Net`](fictionet::stdlib::world::net::Net).
 ///
 /// Every step costs at most a logarithm of the number of unfinished
 /// packets, since the agent decides how many there are. At most 4 MiB of

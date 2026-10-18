@@ -6,8 +6,8 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::snmp::harness::{check_message, check_scalars};
-use fictionet::stdlib::snmp::{
+use fictionet::stdlib::protocols::snmp::harness::{check_message, check_scalars};
+use fictionet::stdlib::protocols::snmp::{
     BasicPdu, Error, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind, Version,
 };
 use libfuzzer_sys::fuzz_target;

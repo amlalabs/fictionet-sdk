@@ -7,9 +7,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Fields};
 use fictionet::stdlib::codec::{Fail, ItemFault, Rewrite, Rule, Trigger};
-use fictionet::stdlib::httpd::{self, Http1, Router};
-use fictionet::stdlib::json;
-use fictionet::stdlib::serve::{FaultPlan, Harness, HarnessError, Plan, ServeOptions};
+use fictionet::stdlib::protocols::json;
+use fictionet::stdlib::services::serve::{FaultPlan, Harness, HarnessError, Plan, ServeOptions};
+use fictionet::stdlib::web::httpd::{self, Http1, Router};
 
 use crate::common::http_observer;
 use crate::common::world;
@@ -212,7 +212,7 @@ fn body_decode_failure_preserves_item_faults() {
                 b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n"
             ),
             Err(HarnessError::Decode(Fail::Protocol(
-                fictionet::stdlib::http1::Error::ChunkEnding
+                fictionet::stdlib::protocols::http1::Error::ChunkEnding
             )))
         ));
         assert!(h.closed());
@@ -562,7 +562,7 @@ fn http1_response_policy_preserves_native_framing() {
 /// chunk, so the client saw an empty body and misread what followed.
 #[test]
 fn an_http11_body_of_unknown_length_ends_only_at_eof() {
-    use fictionet::stdlib::httpd::{Body, Exchange, Handler, Reply};
+    use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Reply};
     use http_body::Frame;
 
     struct Frames(std::vec::IntoIter<Option<&'static [u8]>>);
@@ -626,8 +626,9 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
         h.push(b"GET /next HTTP/1.1\r\nHost: a.test\r\n\r\n")
             .unwrap(),
     );
-    let mut responses =
-        fictionet::stdlib::codec::Stream::new(fictionet::stdlib::http1::Responses::default());
+    let mut responses = fictionet::stdlib::codec::Stream::new(
+        fictionet::stdlib::protocols::http1::Responses::default(),
+    );
     assert_eq!(responses.push(&reply), reply.len());
     let first = responses.next().unwrap().unwrap();
     assert_eq!(first.head.status, 200);
@@ -1005,7 +1006,7 @@ fn http1_closes_after_its_header_timeout() {
 
 #[test]
 fn world_host_names_match_http_sites_and_tls_names() {
-    use fictionet::stdlib::net::Sni;
+    use fictionet::stdlib::world::net::Sni;
 
     for (name, expected) in [
         ("a.test", "a.test"),

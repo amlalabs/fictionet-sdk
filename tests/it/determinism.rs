@@ -15,12 +15,16 @@ use fictionet::events::{Event, Fields};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{ByteFault, Rule, Trigger};
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::net::Net;
-use fictionet::stdlib::sandbox::TlsClient;
-use fictionet::stdlib::serve::{FaultPlan, Flow, Plan, ServeOptions};
-use fictionet::stdlib::{Connection, delay, filter, httpd, tls};
+use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query};
+use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::services::serve::{FaultPlan, Flow, Plan, ServeOptions};
+use fictionet::stdlib::world::net::Net;
+use fictionet::stdlib::world::sandbox::TlsClient;
+use fictionet::stdlib::{
+    network::{Connection, delay, filter},
+    services::tls,
+    web::httpd,
+};
 use fictionet::{Cx, Seed, block_on, lab};
 use http::{Request, Response};
 use http_body::Frame;
@@ -222,7 +226,7 @@ async fn episode(
     // Capture next to the agent, before the loss and delay filters.
     let agent = filter(&cx, agent, move |_, direction, p| {
         packets.lock().unwrap().packets.push((
-            direction == fictionet::stdlib::Direction::FromInner,
+            direction == fictionet::stdlib::network::Direction::FromInner,
             p.0.clone(),
         ));
         true
@@ -231,16 +235,17 @@ async fn episode(
         let keep = cx.random_f64() >= 0.03;
         if !keep {
             loss_trace.lock().unwrap().losses
-                [usize::from(direction == fictionet::stdlib::Direction::ToInner)] += 1;
+                [usize::from(direction == fictionet::stdlib::network::Direction::ToInner)] += 1;
             cx.record(Event::new("link", "loss").field(
                 "inbound",
-                direction == fictionet::stdlib::Direction::ToInner,
+                direction == fictionet::stdlib::network::Direction::ToInner,
             ));
         }
         keep
     });
     let agent = delay(&cx, Duration::from_millis(2), agent);
-    let machine = fictionet::stdlib::sandbox::machine(&cx, agent, Ipv4Addr::new(10, 0, 0, 2));
+    let machine =
+        fictionet::stdlib::world::sandbox::machine(&cx, agent, Ipv4Addr::new(10, 0, 0, 2));
     let mut dns = machine.udp.bind(40000)?;
     for (name, expected) in [("echo.test", ECHO), ("localhost", HTTPS)] {
         let mut query = Message::new(cx.random_u64() as u16, MessageType::Query, OpCode::Query);
@@ -372,7 +377,13 @@ fn replay(seed: u64) -> Trace {
 
 #[test]
 fn https_sites_with_lab_ca_and_axum_repeat() {
-    use fictionet::stdlib::{ca::Ca, codec::Wire, http1, sandbox, web, x509};
+    use fictionet::stdlib::{
+        codec::Wire,
+        protocols::{http1, x509},
+        services::ca::Ca,
+        web,
+        world::sandbox,
+    };
 
     let episode = |seed| {
         let log = Log::default();
@@ -608,6 +619,9 @@ fn assert_task(event: &Event, task: &str, parent: Option<&str>) {
     assert_eq!(json.get("node").and_then(|v| v.as_str()), Some(task));
     assert_eq!(
         json.get("parent"),
-        Some(&parent.map_or(fictionet::stdlib::json::Value::Null, |id| id.into()))
+        Some(
+            &parent.map_or(fictionet::stdlib::protocols::json::Value::Null, |id| id
+                .into())
+        )
     );
 }

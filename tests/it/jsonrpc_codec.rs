@@ -6,8 +6,10 @@ use fictionet::stdlib::codec::{
 };
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::json::{self, Limits, Value};
-use fictionet::stdlib::jsonrpc::{self, Batch, Body, ErrorKind, Id, Message, Messages, Request};
+use fictionet::stdlib::protocols::json::{self, Limits, Value};
+use fictionet::stdlib::protocols::jsonrpc::{
+    self, Batch, Body, ErrorKind, Id, Message, Messages, Request,
+};
 use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
 #[test]

@@ -16,7 +16,7 @@
 //! sections 5 and 7.2.
 //!
 //! Nothing here reads a socket or touches a key. A world that plays a KDC
-//! pushes the bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection
+//! pushes the bytes it reads from a [`tcp`](fictionet::stdlib::network::tcp) connection
 //! to a [`Stream<Frames<Frame>>`](fictionet::stdlib::codec::Stream), or takes a UDP datagram as it is, and reads each
 //! message with [`Message::parse`]. It writes the reply with
 //! [`Wire::write`], with a [`Frame`] around its DER for TCP. The parts
@@ -33,7 +33,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Frames, Stream, Wire, pump, finish};
-//! use fictionet::stdlib::kerberos::{
+//! use fictionet::stdlib::protocols::kerberos::{
 //!     error_code, msg_type, name_type, padata_type, Frame, KdcReq, KdcReqBody, KerberosTime, KrbError, Message,
 //!     MethodData, PaData, PrincipalName,
 //! };
@@ -94,10 +94,10 @@
 //! assert_eq!(reply.msg_type(), msg_type::KRB_ERROR);
 //! ```
 
-use fictionet::stdlib::asn1::{self, Reader, Rules, StringKind, Tag, Writer};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Prefixed, Wire, write_checked};
+use fictionet::stdlib::protocols::asn1::{self, Reader, Rules, StringKind, Tag, Writer};
 use std::fmt;
 
 /// The port KDCs listen on, over UDP and TCP.

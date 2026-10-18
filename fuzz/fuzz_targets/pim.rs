@@ -1,14 +1,14 @@
 //! PIM version 2 messages, as a world playing a multicast router reads
 //! them.
 #![no_main]
-use fictionet::stdlib::ip::Endpoints;
+use fictionet::stdlib::network::ip::Endpoints;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::pim::{
+use fictionet::stdlib::protocols::pim::{
     ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Error, Message, checksum,
 };
-use fictionet::stdlib::{codec::Collect, pim, test_support::contract};
+use fictionet::stdlib::{codec::Collect, protocols::pim, test_support::contract};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -8,9 +8,9 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use arbitrary::Arbitrary;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::dhcp;
-use fictionet::stdlib::dns::op::{Message, Query};
-use fictionet::stdlib::dns::rr::{Name, RecordType};
+use fictionet::stdlib::protocols::dhcp;
+use fictionet::stdlib::protocols::dns::op::{Message, Query};
+use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
 use fictionet::{Interface, Packet};
 use fictionet_fuzz::web::{DEFAULT_ADDR, NAMES, SITE_ADDR, serve};
 use fictionet_fuzz::{Segment, fix_checksums, poll_once, settle, tcp_packet, udp_packet, world};

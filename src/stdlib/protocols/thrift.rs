@@ -46,7 +46,7 @@
 //! take its `items` or `entries` vector:
 //!
 //! ```
-//! use fictionet::stdlib::thrift::{List, Type, Value};
+//! use fictionet::stdlib::protocols::thrift::{List, Type, Value};
 //!
 //! let mut value = Value::List(List { elem: Type::I32, items: vec![Value::I32(7)] });
 //! let Value::List(list) = &mut value else { unreachable!() };
@@ -58,7 +58,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::thrift::{exception_kind, field, Field, EncodedMessage, Message, Protocol, Value};
+//! use fictionet::stdlib::protocols::thrift::{exception_kind, field, Field, EncodedMessage, Message, Protocol, Value};
 //!
 //! /// A calculator service with one method: i32 add(1: i32 a, 2: i32 b).
 //! fn answer(call: &Message) -> Message {
@@ -71,7 +71,7 @@
 //!     }
 //! }
 //!
-//! let mut stream = Stream::new(Frames::<fictionet::stdlib::thrift::Frame>::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::protocols::thrift::Frame>::new());
 //! let mut frames = Vec::new();
 //! // A framed call to add(2, 3), sequence number 1, in the strict binary form.
 //! pump(&mut stream, &[0, 0, 0, 30], |frame| frames.push(frame)).unwrap();
@@ -782,7 +782,7 @@ fictionet::prefixed! {
     /// ```
     /// use fictionet::stdlib::codec::Frames;
     /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-    /// use fictionet::stdlib::thrift::Frame;
+    /// use fictionet::stdlib::protocols::thrift::Frame;
     ///
     /// let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
     /// let mut frames = Vec::new();
@@ -790,7 +790,7 @@ fictionet::prefixed! {
     /// pump(&mut stream, &[0, 2, 7, 8], |frame| frames.push(frame))?;
     /// finish(&mut stream, |frame| frames.push(frame))?;
     /// assert_eq!(frames, [Frame(vec![7, 8])]);
-    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::thrift::Error>>(())
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::thrift::Error>>(())
     /// ```
     Frame => (Frame, Error, usize);
     name = "Thrift framed transport";
@@ -822,7 +822,7 @@ fictionet::prefixed! {
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::thrift::{EncodedMessage, EncodedMessages, Message, MessageType, Protocol};
+/// use fictionet::stdlib::protocols::thrift::{EncodedMessage, EncodedMessages, Message, MessageType, Protocol};
 ///
 /// let call = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
 /// let bytes = EncodedMessage { message: call.clone(), protocol: Protocol::Compact }.to_bytes()?;

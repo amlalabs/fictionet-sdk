@@ -53,7 +53,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
-//! use fictionet::stdlib::openvpn::{Ack, Control, ControlBody, ControlKind, Frame, Packet, Wrapping};
+//! use fictionet::stdlib::protocols::openvpn::{Ack, Control, ControlBody, ControlKind, Frame, Packet, Wrapping};
 //!
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //! let mut stream = Stream::new(Frames::<Frame>::new());

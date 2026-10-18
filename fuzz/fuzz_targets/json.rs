@@ -4,7 +4,7 @@
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::json::{self, Limits, Value, Values};
+use fictionet::stdlib::protocols::json::{self, Limits, Value, Values};
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 

@@ -5,8 +5,8 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use fictionet::stdlib::http1::header_line_ok;
-use fictionet::stdlib::tcp::TcpConnection;
+use fictionet::stdlib::network::tcp::TcpConnection;
+use fictionet::stdlib::protocols::http1::header_line_ok;
 use fictionet::tokio::{Compat, ConnectionTokioExt};
 use fictionet_cli::attach_proxy::auth::Token;
 use fictionet_cli::attach_proxy::http::{

@@ -2,12 +2,12 @@
 //! world playing a VPN gateway reads them.
 #![no_main]
 
-use fictionet::stdlib::ipsec::{
+use fictionet::stdlib::protocols::ipsec::{
     AhPacket, Datagram, Envelope, Error, EspPacket, MAX_DATAGRAM, MAX_PADDING, Plaintext,
 };
 use fictionet::stdlib::{
     codec::{Collect, Wire},
-    ipsec,
+    protocols::ipsec,
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

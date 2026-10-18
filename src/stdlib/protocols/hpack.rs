@@ -10,19 +10,22 @@
 //! at most [`MAX_TABLE`].
 //!
 //! ```
-//! use fictionet::stdlib::hpack::{Table, Encoder, Field, MAX_DECODED};
+//! use fictionet::stdlib::protocols::hpack::{Table, Encoder, Field, MAX_DECODED};
 //! let mut encoder = Encoder::new(4096);
 //! let fields = [Field::new(":method", "GET"), Field::new("x-color", "blue")];
 //! let mut bytes = Vec::new();
 //! encoder.encode_block(&fields, &mut bytes)?;
 //! let block = Table::new(4096).decode_block(&bytes, MAX_DECODED)?;
 //! assert_eq!(block.headers[1].value.as_deref(), Some(b"blue".as_slice()));
-//! # Ok::<(), fictionet::stdlib::hpack::Error>(())
+//! # Ok::<(), fictionet::stdlib::protocols::hpack::Error>(())
 //! ```
 
 use fictionet::stdlib::codec::{Reader, Trailing, Truncated};
 
-use fictionet::stdlib::{codec::Wire, huffman, prefix_int};
+use fictionet::stdlib::{
+    codec::Wire,
+    protocols::{huffman, prefix_int},
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -723,7 +726,7 @@ fictionet::codec_from!(Error, Trailing, |_| Error::Trailing);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::prefix_int::Integer;
+    use fictionet::stdlib::protocols::prefix_int::Integer;
     use fictionet::stdlib::test_support::hex;
 
     fn pairs(h: &[Header]) -> Vec<(&str, &str)> {

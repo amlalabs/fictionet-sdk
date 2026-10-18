@@ -29,7 +29,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::urlencoded_form::{Form, PercentEncoded, EncodeSet};
+//! use fictionet::stdlib::protocols::urlencoded_form::{Form, PercentEncoded, EncodeSet};
 //!
 //! let pairs = Form::parse(b"user=alice&note=hi+there%21&&flag").unwrap().pairs;
 //! assert_eq!(
@@ -497,7 +497,7 @@ impl Wire for Field {
 /// Drive it with [`Stream<Fields>`](fictionet::stdlib::codec::Stream).
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, finish, pump}, urlencoded_form::{Field, Fields}};
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, protocols::urlencoded_form::{Field, Fields}};
 ///
 /// let mut stream = Stream::new(Fields::new());
 /// let mut fields = Vec::new();
@@ -508,7 +508,7 @@ impl Wire for Field {
 ///     Field(("name".into(), "Alice Smith".into())),
 ///     Field(("flag".into(), String::new())),
 /// ]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::urlencoded_form::Error>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::urlencoded_form::Error>>(())
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct Fields {

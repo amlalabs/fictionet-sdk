@@ -39,7 +39,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::vxlan::{GpePacket, Packet, next_protocol};
+//! use fictionet::stdlib::protocols::vxlan::{GpePacket, Packet, next_protocol};
 //!
 //! // A datagram to port 4789: VNI 5001, then a 14-byte Ethernet header
 //! // (broadcast destination, a source, EtherType ARP) and no body.

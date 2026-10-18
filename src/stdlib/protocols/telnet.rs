@@ -15,21 +15,22 @@
 //! (terminal type) and RFC 1073 (window size), and negotiates options with
 //! the Q method of RFC 1143, which never loops.
 //!
-//! A terminal [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Events`] and hands each negotiation
-//! to [`Negotiation`]. In `on_item`, it writes each returned reply event and
-//! calls `driver.decoder().set_binary()` when binary mode changes.
-//! The default delivers each data byte immediately. Batch readers can use
-//! [`Events::with_limit`] to wait for larger runs. [`Event`] uses NVT
-//! encoding; [`BinaryEvent`] carries an event in binary mode.
-//! [`ControlScanner`] exposes the same bounded control framing without NVT
-//! conversion or payload allocation. Callers keep the input and receive spans.
-//! Unknown commands and interrupted or oversized subnegotiations produce
-//! [`Event::Error`] items. The stream then continues.
+//! A terminal [`Service`](fictionet::stdlib::services::serve::Service) served
+//! by [`serve::connection`](fictionet::stdlib::services::serve::connection)
+//! uses [`Events`] and hands each negotiation to [`Negotiation`]. In `on_item`,
+//! it writes each returned reply event and calls
+//! `driver.decoder().set_binary()` when binary mode changes. The default
+//! delivers each data byte immediately. Batch readers can use
+//! [`Events::with_limit`] to wait for larger runs. [`Event`] uses NVT encoding;
+//! [`BinaryEvent`] carries an event in binary mode. [`ControlScanner`] exposes
+//! the same bounded control framing without NVT conversion or payload
+//! allocation. Callers keep the input and receive spans. Unknown commands and
+//! interrupted or oversized subnegotiations produce [`Event::Error`] items. The
+//! stream then continues.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::telnet::{option, Change, Events, Event, Negotiation, Side, Subnegotiation, Verb};
+//! use fictionet::stdlib::protocols::telnet::{option, Change, Events, Event, Negotiation, Side, Subnegotiation, Verb};
 //!
 //! // The server agrees to let the client send its terminal type.
 //! let mut options = Negotiation::new();
@@ -532,7 +533,7 @@ pub enum ControlSpan {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Step;
-/// use fictionet::stdlib::telnet::{ControlScanner, ControlSpan, Command};
+/// use fictionet::stdlib::protocols::telnet::{ControlScanner, ControlSpan, Command};
 ///
 /// let mut scanner = ControlScanner::new();
 /// assert_eq!(scanner.scan(b"USER ", false), Ok(Step::Item(ControlSpan::Data, 5)));
@@ -691,7 +692,7 @@ impl ControlScanner {
 /// Change binary mode only between items. The session owns negotiation:
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, telnet::{self, Event, Negotiation, Side}};
+/// use fictionet::stdlib::{codec::Stream, protocols::telnet::{self, Event, Negotiation, Side}};
 /// let mut stream = Stream::new(telnet::Events::new());
 /// let mut options = Negotiation::new();
 /// options.allow_remote(telnet::option::BINARY, true);

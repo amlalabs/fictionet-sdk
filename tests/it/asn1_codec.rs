@@ -4,8 +4,8 @@ use crate::common::alloc::allocations;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
 use fictionet::stdlib::codec::{Frames, Prefixed};
+use fictionet::stdlib::protocols::{asn1, kerberos, ldap, ocsp, spnego, x509};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::{asn1, kerberos, ldap, ocsp, spnego, x509};
 
 #[test]
 fn announced_prefixes_keep_extents_without_bodies_or_allocations() {

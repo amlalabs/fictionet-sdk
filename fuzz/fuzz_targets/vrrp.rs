@@ -6,15 +6,15 @@
 //! built straight from the fuzz bytes, not only from what the parser
 //! accepts, so the writer sees values the parser never makes.
 #![no_main]
-use fictionet::stdlib::ip::Endpoints;
+use fictionet::stdlib::network::ip::Endpoints;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::vrrp::{
+use fictionet::stdlib::protocols::vrrp::{
     Addresses, Advertisement, AdvertisementV2, AdvertisementV3, Error, GROUP_V4, GROUP_V6,
     MAX_ADDRESSES, checksum, checksum_rfc5798,
 };
-use fictionet::stdlib::{codec::Collect, test_support::contract, vrrp};
+use fictionet::stdlib::{codec::Collect, protocols::vrrp, test_support::contract};
 use libfuzzer_sys::fuzz_target;
 
 const LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);

@@ -34,7 +34,7 @@
 //! they do not impose a venue's required fields or trading rules.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::Wire, fix::{Message, NewOrderSingle, Version}};
+//! use fictionet::stdlib::{codec::Wire, protocols::fix::{Message, NewOrderSingle, Version}};
 //! let mut order = NewOrderSingle::builder(Version::Fix44)?;
 //! order.cl_ord_id(b"order-7")?.symbol(b"XYZ")?.side(b"1")?
 //!     .order_qty(b"100")?.ord_type(b"2")?.price(b"12.50")?;
@@ -42,11 +42,11 @@
 //! let bytes = message.to_bytes()?;
 //! let parsed = Message::parse(&bytes)?;
 //! assert_eq!(NewOrderSingle::view(&parsed)?.cl_ord_id(), Some(&b"order-7"[..]));
-//! # Ok::<(), fictionet::stdlib::fix::Error>(())
+//! # Ok::<(), fictionet::stdlib::protocols::fix::Error>(())
 //! ```
 
 use fictionet::stdlib::codec::{Decode, Step, Wire, ascii, civil};
-use fictionet::stdlib::session::Action;
+use fictionet::stdlib::protocols::session::Action;
 use std::convert::Infallible;
 use std::fmt;
 
@@ -812,7 +812,7 @@ pub const MAX_RESYNC_DEBT: usize = 4 * MAX_MESSAGE_SIZE;
 /// Use [`Self::default`] to start with a zero garbled-message count.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, pump}, fix::Messages};
+/// use fictionet::stdlib::{codec::{Stream, pump}, protocols::fix::Messages};
 /// let mut stream = Stream::new(Messages::default());
 /// // FIX 4.4 Vol 2 case 3.b: a complete message with an incorrect checksum.
 /// pump(&mut stream, b"8=FIX.4.4\x019=5\x0135=0\x0110=164\x01", |_| unreachable!())?;

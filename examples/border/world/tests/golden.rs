@@ -9,7 +9,7 @@
 //!
 //! `BORDER_GOLDEN_WRITE=1 cargo test --test golden` records the files again.
 
-use fictionet::stdlib::sandbox::Machine;
+use fictionet::stdlib::world::sandbox::Machine;
 
 mod common;
 
@@ -42,7 +42,7 @@ async fn h2_head(
             tokio::spawn(fut);
         }
     }
-    let mut config = (*fictionet::stdlib::sandbox::client_config(
+    let mut config = (*fictionet::stdlib::world::sandbox::client_config(
         fcx,
         std::time::SystemTime::now(),
         None,
@@ -119,7 +119,7 @@ fn script(variant: Variant) {
             &m,
             BANK_ADDR,
             "kestrelmoor.co.uk",
-            fictionet::stdlib::sandbox::client_config(
+            fictionet::stdlib::world::sandbox::client_config(
                 &fcx,
                 std::time::SystemTime::now(),
                 None,
@@ -149,7 +149,7 @@ fn script(variant: Variant) {
             &m,
             BANK_ADDR,
             "www.kestrelmoor.co.uk",
-            fictionet::stdlib::sandbox::client_config(
+            fictionet::stdlib::world::sandbox::client_config(
                 &fcx,
                 std::time::SystemTime::now(),
                 None,
@@ -175,7 +175,7 @@ fn script(variant: Variant) {
             &m,
             STATUS_ADDR,
             "status.harbourline.net",
-            fictionet::stdlib::sandbox::client_config(
+            fictionet::stdlib::world::sandbox::client_config(
                 &fcx,
                 std::time::SystemTime::now(),
                 Some(&env.roots),
@@ -221,7 +221,7 @@ fn script(variant: Variant) {
                 &m,
                 BANK_ADDR,
                 "example.com",
-                fictionet::stdlib::sandbox::client_config(
+                fictionet::stdlib::world::sandbox::client_config(
                     &fcx,
                     std::time::SystemTime::now(),
                     None,

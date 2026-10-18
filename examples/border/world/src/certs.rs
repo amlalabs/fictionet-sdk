@@ -9,9 +9,9 @@
 
 use crate::scenario::ROGUE_CA_NAME;
 use fictionet::stdlib::{
-    ca::{Ca, Curve, Leaf},
     codec::Wire,
-    x509,
+    protocols::x509,
+    services::ca::{Ca, Curve, Leaf},
 };
 use fictionet::{Cx, Result};
 use std::net::Ipv4Addr;
@@ -72,7 +72,7 @@ pub fn make_ca(fcx: &Cx, dir: &Path) -> Result {
 }
 
 fn home_name(common_name: &str, unit: bool) -> x509::Name {
-    use fictionet::stdlib::asn1::{Oid, StringKind};
+    use fictionet::stdlib::protocols::asn1::{Oid, StringKind};
     let mut name = x509::Name::default();
     for (oid, text) in [
         (x509::oid::COUNTRY, "US"),

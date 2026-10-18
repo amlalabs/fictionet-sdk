@@ -129,7 +129,7 @@ pub enum SkipPolicy {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::{codec::{Interceptor, Rewrite, Stream}, modbus};
+/// use fictionet::stdlib::{codec::{Interceptor, Rewrite, Stream}, protocols::modbus};
 /// let mut stream = Stream::new(Frames::<modbus::Frame>::new());
 /// let proxy = Interceptor::new(1024);
 /// let input = [0, 1, 0, 0, 0, 2, 1, 3];
@@ -485,7 +485,10 @@ pub fn append_bounded<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::{json, modbus, test_support::decode_all};
+    use fictionet::stdlib::{
+        protocols::{json, modbus},
+        test_support::decode_all,
+    };
 
     #[test]
     fn bounded_append_keeps_clamp_and_rolls_back_refusals() {

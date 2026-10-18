@@ -28,7 +28,7 @@
 //! bound, including for hand-built packets. There is no unbounded parser.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Assembled, Stream, finish, pump}, cotp, tpkt};
+//! use fictionet::stdlib::{codec::{Assembled, Stream, finish, pump}, protocols::{cotp, tpkt}};
 //!
 //! let bytes = cotp::over_tpkt::write_message(b"hello", 128).unwrap();
 //! let mut stream = Stream::new(cotp::messages(tpkt::MAX_PACKET, cotp::MAX_MESSAGE));
@@ -52,8 +52,8 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::cotp::{Reassembler, Tpdu, over_tpkt, tpdus};
-//! use fictionet::stdlib::tpkt;
+//! use fictionet::stdlib::protocols::cotp::{Reassembler, Tpdu, over_tpkt, tpdus};
+//! use fictionet::stdlib::protocols::tpkt;
 //!
 //! let mut decoder = Stream::new(tpdus(tpkt::MAX_PACKET));
 //! // A connection request: source reference 1, class 0, TPDU size 1024
@@ -84,7 +84,7 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{Assemble, Decode, Fragment, Map, Wire},
-    tpkt,
+    protocols::tpkt,
 };
 
 /// The TCP port ISO transport servers listen on.
@@ -1017,8 +1017,8 @@ pub mod harness {
         Error, ErrorTpdu, MAX_MESSAGE, Reassembler, Tpdu, messages, over_tpkt, segment, tpdus,
     };
     use fictionet::stdlib::codec::{Frames, Wire};
+    use fictionet::stdlib::protocols::tpkt;
     use fictionet::stdlib::test_support::{contract, decode_all};
-    use fictionet::stdlib::tpkt;
 
     /// Checks decoder and writer contracts, TPDU round trips, connection
     /// confirms, error replies, and segment reassembly. `message_limit` bounds

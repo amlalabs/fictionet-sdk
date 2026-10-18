@@ -2,7 +2,7 @@
 
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Step, Stream, Wire},
-    imap, pop3, smtp,
+    protocols::{imap, pop3, smtp},
     test_support::{Scripted, contract},
 };
 

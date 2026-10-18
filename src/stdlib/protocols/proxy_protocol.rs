@@ -31,7 +31,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::proxy_protocol::{Addresses, Command, Headers, Header, Tlv, Transport, V2};
+//! use fictionet::stdlib::protocols::proxy_protocol::{Addresses, Command, Headers, Header, Tlv, Transport, V2};
 //! use std::net::Ipv4Addr;
 //!
 //! // A version 1 header that arrives in two reads, with the client's

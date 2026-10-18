@@ -9,24 +9,25 @@
 //! Command lines use the base 512-byte limit; extension-specific increases
 //! and BDAT binary chunk framing are not implemented.
 //!
-//! A mail [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Inputs`]. After accepting DATA and
-//! sending a 354 reply in `on_item`, call `driver.decoder().start_data()`.
-//! See the SMTP DATA section in `docs/services.md` for a service example.
-//! The next item is the complete unstuffed message. Its terminating dot
-//! returns the reader to commands. Use [`Stream<Replies>`](fictionet::stdlib::codec::Stream)
-//! on the client. Bad commands are error items; overlong lines are skipped.
-//! After sending an AUTH challenge (334), call [`Inputs::expect_line`] for
-//! one raw response, including an empty response or `*` cancellation. Call
-//! it again for each further challenge. SASL validation stays with the caller.
-//! Partial lines at EOF, DATA overflow, and malformed multiline replies end
-//! the stream. Call [`Inputs::handoff`] after accepting STARTTLS, then take
-//! the unread TLS bytes from the stream. Session state, authentication, TLS,
-//! and storage belong to the caller. Read headers separately with
-//! [`imf`](fictionet::stdlib::imf).
+//! A mail [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! [`Inputs`]. After accepting DATA and sending a 354 reply in `on_item`, call
+//! `driver.decoder().start_data()`. See the SMTP DATA section in
+//! `docs/services.md` for a service example. The next item is the complete
+//! unstuffed message. Its terminating dot returns the reader to commands. Use
+//! [`Stream<Replies>`](fictionet::stdlib::codec::Stream) on the client. Bad
+//! commands are error items; overlong lines are skipped. After sending an AUTH
+//! challenge (334), call [`Inputs::expect_line`] for one raw response,
+//! including an empty response or `*` cancellation. Call it again for each
+//! further challenge. SASL validation stays with the caller. Partial lines at
+//! EOF, DATA overflow, and malformed multiline replies end the stream. Call
+//! [`Inputs::handoff`] after accepting STARTTLS, then take the unread TLS bytes
+//! from the stream. Session state, authentication, TLS, and storage belong to
+//! the caller. Read headers separately with
+//! [`imf`](fictionet::stdlib::protocols::imf).
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Stream, Wire}, smtp::{Inputs, Input, Request, Reply}};
+//! use fictionet::stdlib::{codec::{Stream, Wire}, protocols::smtp::{Inputs, Input, Request, Reply}};
 //!
 //! let mut stream = Stream::new(Inputs::new());
 //! let bytes = b"DATA\r\nSubject: hello\r\n\r\n..a leading dot\r\n.\r\nQUIT\r\n";
@@ -41,7 +42,7 @@
 //! ```
 //!
 //! ```
-//! use fictionet::stdlib::{codec::Stream, smtp::{Inputs, Input}};
+//! use fictionet::stdlib::{codec::Stream, protocols::smtp::{Inputs, Input}};
 //!
 //! let mut stream = Stream::new(Inputs::new());
 //! let bytes = b"AUTH PLAIN\r\ndGVzdAB0ZXN0ADEyMzQ=\r\nNOOP\r\n";
@@ -845,7 +846,7 @@ enum Mode {
 /// [`codec::Stream::into_parts`] to obtain unread TLS bytes.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, smtp::{Inputs, Input}};
+/// use fictionet::stdlib::{codec::Stream, protocols::smtp::{Inputs, Input}};
 /// let mut stream = Stream::new(Inputs::new());
 /// assert_eq!(stream.push(b"DATA\r\n..x\r\n.\r\nQUIT\r\n"), 20);
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));

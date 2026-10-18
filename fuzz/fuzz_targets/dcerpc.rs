@@ -9,8 +9,8 @@ use input::{bytes, list};
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
-use fictionet::stdlib::dcerpc::harness::rewrite;
-use fictionet::stdlib::dcerpc::{
+use fictionet::stdlib::protocols::dcerpc::harness::rewrite;
+use fictionet::stdlib::protocols::dcerpc::{
     Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error, MAX_FRAG,
     MAX_FRAGMENTS, MAX_STUB, Pdu, Reassembler, SyntaxId, Uuid, flags,
 };

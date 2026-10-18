@@ -35,7 +35,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::gre::{protocol, Header, Packet, PlainHeader};
+//! use fictionet::stdlib::protocols::gre::{protocol, Header, Packet, PlainHeader};
 //!
 //! let packet = Packet {
 //!     header: Header::Gre(PlainHeader { protocol: protocol::IPV4, checksum: true, key: Some(7), sequence: None }),
@@ -52,7 +52,7 @@
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16, be32};
-use fictionet::stdlib::ip::checksum;
+use fictionet::stdlib::network::ip::checksum;
 
 /// The IP protocol number that marks a GRE packet.
 pub const IP_PROTOCOL: u8 = 47;

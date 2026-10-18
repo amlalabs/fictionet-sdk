@@ -4,7 +4,7 @@
 use fictionet::stdlib::codec::{Decode, Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::mime_multipart::{
+use fictionet::stdlib::protocols::mime_multipart::{
     Body, Entity, Error, Headers, MAX_BOUNDARY, MAX_ENTITY, MAX_HEADER_BYTES, Multipart,
     ParamValue, Part, Parts, boundary, valid_boundary,
 };

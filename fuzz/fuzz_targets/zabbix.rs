@@ -4,10 +4,12 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::json::{self, Limits, Value};
+use fictionet::stdlib::protocols::json::{self, Limits, Value};
+use fictionet::stdlib::protocols::zabbix::{
+    Error, Header, Kind, MAX_DEPTH, Message, Packet, SenderValue,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::zabbix::{Error, Header, Kind, MAX_DEPTH, Message, Packet, SenderValue};
 use libfuzzer_sys::fuzz_target;
 
 fn check_message(data: &[u8]) {
@@ -65,7 +67,7 @@ fuzz_target!(|data: &[u8]| {
         reserved,
         data: data
             .iter()
-            .take(fictionet::stdlib::zabbix::DEFAULT_LIMIT + 1)
+            .take(fictionet::stdlib::protocols::zabbix::DEFAULT_LIMIT + 1)
             .copied()
             .collect(),
     };

@@ -4,8 +4,8 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Fail, Wire};
-use fictionet::stdlib::grpc::harness::strings;
-use fictionet::stdlib::grpc::{
+use fictionet::stdlib::protocols::grpc::harness::strings;
+use fictionet::stdlib::protocols::grpc::{
     Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, MethodPath, Rejection, Request,
     Status, Timeout, decode_message, encode_message,
 };

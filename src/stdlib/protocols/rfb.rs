@@ -20,15 +20,19 @@
 //! the pixel format. After that both sides send messages whenever they
 //! like.
 //!
-//! A world that plays a server keeps a [`Server`] session. It pushes bytes
-//! from a [`tcp`](fictionet::stdlib::tcp) connection, takes [`ClientMessage`]s out, and
-//! answers with [`ServerMessage`]s. A client uses [`Client`]. Each session
-//! tracks both directions, since the next peer unit depends on what was
-//! sent. The byte layers are [`Stream<ClientMessages>`](fictionet::stdlib::codec::Stream)
-//! and [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). A [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) can instead use [`ClientMessages`] directly,
-//! calling `driver.decoder().set_phase()` in `on_item` as the handshake advances. Unsupported security and closed sessions preserve the unread
-//! suffix for `into_parts` or `swap`.
+//! A world that plays a server keeps a [`Server`] session. It pushes bytes from
+//! a [`tcp`](fictionet::stdlib::network::tcp) connection, takes
+//! [`ClientMessage`]s out, and answers with [`ServerMessage`]s. A client uses
+//! [`Client`]. Each session tracks both directions, since the next peer unit
+//! depends on what was sent. The byte layers are
+//! [`Stream<ClientMessages>`](fictionet::stdlib::codec::Stream) and
+//! [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). A
+//! [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) can
+//! instead use [`ClientMessages`] directly, calling
+//! `driver.decoder().set_phase()` in `on_item` as the handshake advances.
+//! Unsupported security and closed sessions preserve the unread suffix for
+//! `into_parts` or `swap`.
 //!
 //! The module carries the VNC Authentication challenge and response but
 //! does not compute them, since that needs DES. A world that wants to
@@ -51,7 +55,7 @@
 //! is outstanding.
 //!
 //! ```
-//! use fictionet::stdlib::rfb::{ClientMessage, PixelFormat, ServerInit, ServerMessage, Server, Version};
+//! use fictionet::stdlib::protocols::rfb::{ClientMessage, PixelFormat, ServerInit, ServerMessage, Server, Version};
 //!
 //! let mut server = Server::new();
 //! assert_eq!(server.send(&ServerMessage::Version(Version::V3_8)).unwrap(), b"RFB 003.008\n");

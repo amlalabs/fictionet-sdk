@@ -5,8 +5,8 @@ use fictionet::stdlib::codec::{
 };
 use fictionet::stdlib::test_support::contract;
 
+use fictionet::stdlib::protocols::{telnet as tn, websocket as ws};
 use fictionet::stdlib::test_support::{chunks, decode_all};
-use fictionet::stdlib::{telnet as tn, websocket as ws};
 
 fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where

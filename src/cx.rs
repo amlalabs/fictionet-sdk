@@ -75,8 +75,8 @@ pub use timer::Timer;
 /// "office LAN" or "simulated hosts". [`Cx::group`] returns a `Cx` whose
 /// tasks belong to a new group. Every task started with that `Cx`, and
 /// every task those tasks start, belongs to the group too, and so do the
-/// stdlib's own tasks, such as a [`router`](crate::stdlib::route::router)
-/// or a [`tcp::endpoint`](crate::stdlib::tcp::endpoint). Groups nest: a
+/// stdlib's own tasks, such as a [`router`](crate::stdlib::network::route::router)
+/// or a [`tcp::endpoint`](crate::stdlib::network::tcp::endpoint). Groups nest: a
 /// group made from a grouped `Cx` sits inside that group.
 ///
 /// Groups change nothing about how the world runs. A grouped `Cx` stays in
@@ -312,7 +312,7 @@ impl Cx {
     ///
     /// ```
     /// # use fictionet::{Cx, Interface, Result};
-    /// # use fictionet::stdlib::{ip, tcp};
+    /// # use fictionet::stdlib::network::{ip, tcp};
     /// fn office(fcx: &Cx, uplink: impl Interface) -> Result {
     ///     let lan = fcx.group("office LAN");
     ///     let (tcp, _udp, _icmp, _other) = ip::split_protocols(&lan, uplink);
@@ -324,7 +324,7 @@ impl Cx {
     ///
     /// A sandbox belongs to the group of the task that reads its
     /// [`Attachment`](crate::Attachment), such as a
-    /// [`delay`](crate::stdlib::delay) started with a grouped `Cx`. Each
+    /// [`delay`](crate::stdlib::network::delay) started with a grouped `Cx`. Each
     /// call makes a new group,
     /// even with a name used before. Making a group allocates its name and
     /// one small struct. A task in a group holds two more reference counts,
@@ -673,15 +673,15 @@ impl Cx {
 ///   [`Cx::sleep`], [`Cx::sleep_until`], [`Cx::yield_now`],
 ///   [`Attachments::get`](crate::Attachments::get),
 ///   [`Attachments::next`](crate::Attachments::next) and
-///   [`Ports::next`](crate::stdlib::ports::Ports::next).
+///   [`Ports::next`](crate::stdlib::network::ports::Ports::next).
 /// - Waits with an error type of their own return its `Cancelled` variant,
 ///   which `?` makes from this value and whose
 ///   [`source`](std::error::Error::source) is this value:
 ///   [`RecvError::Cancelled`](crate::RecvError::Cancelled),
-///   [`ConnError::Cancelled`](crate::stdlib::ConnError::Cancelled),
+///   [`ConnError::Cancelled`](crate::stdlib::network::ConnError::Cancelled),
 ///   [`RaceError::Cancelled`], [`JoinError::Cancelled`],
-///   [`HandshakeError::Cancelled`](crate::stdlib::tls::HandshakeError::Cancelled)
-///   and [`ServeError::Cancelled`](crate::stdlib::serve::ServeError::Cancelled).
+///   [`HandshakeError::Cancelled`](crate::stdlib::services::tls::HandshakeError::Cancelled)
+///   and [`ServeError::Cancelled`](crate::stdlib::services::serve::ServeError::Cancelled).
 ///
 /// A cancel is never reported as `None`, as `Ok`, or as another error such
 /// as a broken connection. A task passes the error up with `?`, and so

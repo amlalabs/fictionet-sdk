@@ -38,7 +38,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::tftp::{negotiate, Event, Packet, ReadTransfer, MAX_BLOCK_SIZE};
+//! use fictionet::stdlib::protocols::tftp::{negotiate, Event, Packet, ReadTransfer, MAX_BLOCK_SIZE};
 //!
 //! // A read request for boot.img, asking for 1024-byte blocks and the size.
 //! let rrq = b"\x00\x01boot.img\x00octet\x00blksize\x001024\x00tsize\x000\x00";

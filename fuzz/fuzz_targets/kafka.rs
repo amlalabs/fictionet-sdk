@@ -6,7 +6,7 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Reader, Wire, leb128};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::kafka::*;
+use fictionet::stdlib::protocols::kafka::*;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 

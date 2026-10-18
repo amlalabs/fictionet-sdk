@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use crate::common::{poll, temp, within};
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::dhcp;
-use fictionet::stdlib::ip::checksum;
+use fictionet::stdlib::network::ip::checksum;
+use fictionet::stdlib::protocols::dhcp;
 use fictionet::{Interface, InterfaceExt, Packet, RecvError};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
@@ -241,7 +241,7 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
 /// DHCPv6 validation happens before lease policy over the QEMU socket too.
 #[test]
 fn a_fake_qemu_gets_dhcpv6_after_malformed_requests() {
-    use fictionet::stdlib::dhcpv6::{self, DhcpOption, Duid, IaNa, Message, msg};
+    use fictionet::stdlib::protocols::dhcpv6::{self, DhcpOption, Duid, IaNa, Message, msg};
 
     let dir = temp::dir();
     let world = dir.join("w.sock");

@@ -3,8 +3,8 @@
 
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::syslog::harness::{check_round_trip, check_stream};
-use fictionet::stdlib::syslog::{
+use fictionet::stdlib::protocols::syslog::harness::{check_round_trip, check_stream};
+use fictionet::stdlib::protocols::syslog::{
     BsdMessage, Entry, Frame, Framing, MAX_MESSAGE_LEN, Message, Priority, SdElement,
 };
 use libfuzzer_sys::fuzz_target;

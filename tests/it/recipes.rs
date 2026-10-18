@@ -7,7 +7,7 @@ use common::within;
 use std::time::Duration;
 
 use fictionet::prelude::*;
-use fictionet::stdlib::{ConnError, tcp};
+use fictionet::stdlib::network::{ConnError, tcp};
 use fictionet::{Cx, block_on, lab, pair};
 
 #[allow(dead_code)]

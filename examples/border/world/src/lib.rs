@@ -27,7 +27,7 @@ pub mod scenario;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use fictionet::stdlib::{tls, web};
+use fictionet::stdlib::{services::tls, web};
 use fictionet::{Attachments, Cx};
 use serde_json::{Value, json};
 
@@ -36,7 +36,7 @@ use crate::log::Log;
 use crate::scenario::{
     BANK_ADDR, BANK_DOMAIN, BANK_NAMES, HOME, Identity, STATUS_ADDR, STATUS_HOST, Scenario,
 };
-use fictionet::stdlib::ca::{Ca, Leaf};
+use fictionet::stdlib::services::ca::{Ca, Leaf};
 
 pub type Result<T = ()> = fictionet::Result<T>;
 

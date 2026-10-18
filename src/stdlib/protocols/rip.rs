@@ -54,7 +54,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use std::net::Ipv4Addr;
-//! use fictionet::stdlib::rip::{Command, Entries, Message, RouteEntry, Version};
+//! use fictionet::stdlib::protocols::rip::{Command, Entries, Message, RouteEntry, Version};
 //!
 //! // A version 2 request for the whole routing table.
 //! let mut request = vec![1, 2, 0, 0];

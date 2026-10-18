@@ -5,11 +5,16 @@ use std::time::{Duration, UNIX_EPOCH};
 use bytes::Bytes;
 use fictionet::events::Fields;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::http2::{self, Frame};
-use fictionet::stdlib::httpd::{self, Http2, Router};
-use fictionet::stdlib::sandbox::TlsClient;
-use fictionet::stdlib::serve::Harness;
-use fictionet::stdlib::{Connection, ConnectionExt, filter, hpack, net, sandbox, tls};
+use fictionet::stdlib::protocols::http2::{self, Frame};
+use fictionet::stdlib::services::serve::Harness;
+use fictionet::stdlib::web::httpd::{self, Http2, Router};
+use fictionet::stdlib::world::sandbox::TlsClient;
+use fictionet::stdlib::{
+    network::{Connection, ConnectionExt, filter},
+    protocols::hpack,
+    services::tls,
+    world::{net, sandbox},
+};
 use fictionet::{Cx, Seed};
 
 const SITE: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
@@ -253,7 +258,7 @@ fn replay() -> Trace {
         let (attach, arrivals) = fictionet::attachments();
         net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(router).https())).start(&cx, arrivals)?;
         let cable = filter(&cx, attach.attach("client")?, move |_, direction, packet| {
-            packets.lock().unwrap().packets.push((direction == fictionet::stdlib::Direction::FromInner, packet.0.clone()));
+            packets.lock().unwrap().packets.push((direction == fictionet::stdlib::network::Direction::FromInner, packet.0.clone()));
             true
         });
         let machine = sandbox::machine(&cx, cable, Ipv4Addr::new(10, 0, 0, 2));
@@ -663,7 +668,7 @@ fn local_protocol_resets_eventually_close_the_connection() {
 #[test]
 fn zero_stream_window_is_a_stream_error_and_large_headers_get_431() {
     let limits = httpd::Limits {
-        head: fictionet::stdlib::http1::Limits {
+        head: fictionet::stdlib::protocols::http1::Limits {
             head: 256,
             ..Default::default()
         },
@@ -798,12 +803,12 @@ pub(crate) const H2_INPUT: usize = http2::DEFAULT_FRAME_SIZE
 #[test]
 fn immediate_echo_releases_the_request_charge() {
     let router = Router::new().post("/", |_, request| http::Response::new(request.into_body()));
-    let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 8000);
+    let budget = fictionet::stdlib::services::serve::Budget::new(H2_INPUT + 8000);
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
         Http2::new(router),
         (),
-        fictionet::stdlib::serve::ServeOptions::default().budget(budget.clone()),
+        fictionet::stdlib::services::serve::ServeOptions::default().budget(budget.clone()),
     );
     let mut input = preface();
     input.extend(headers(1, "/", false));
@@ -830,12 +835,12 @@ fn split_echo_releases_the_charged_body() {
     // moves those bytes into the response, so they count once.
     for parts in [1, 2, 4] {
         let router = Router::new().post("/", |_, request| http::Response::new(request.into_body()));
-        let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 8000);
+        let budget = fictionet::stdlib::services::serve::Budget::new(H2_INPUT + 8000);
         let mut harness = Harness::with_options(
             Seed::from_u64(1),
             Http2::new(router),
             (),
-            fictionet::stdlib::serve::ServeOptions::default().budget(budget.clone()),
+            fictionet::stdlib::services::serve::ServeOptions::default().budget(budget.clone()),
         );
         let mut input = preface();
         input.extend(headers(1, "/", false));
@@ -878,8 +883,8 @@ fn oversized_response_refuses_only_its_stream() {
         Seed::from_u64(1),
         Http2::new(router),
         (),
-        fictionet::stdlib::serve::ServeOptions::default()
-            .budget(fictionet::stdlib::serve::Budget::new(128 << 10)),
+        fictionet::stdlib::services::serve::ServeOptions::default()
+            .budget(fictionet::stdlib::services::serve::Budget::new(128 << 10)),
     );
     let mut input = preface();
     input.extend(headers(1, "/small", true));
@@ -1198,7 +1203,7 @@ fn failing_response_body_is_an_internal_stream_error() {
 #[test]
 fn repeated_header_refusals_exhaust_the_local_reset_limit() {
     let limits = httpd::Limits {
-        head: fictionet::stdlib::http1::Limits {
+        head: fictionet::stdlib::protocols::http1::Limits {
             head: 256,
             ..Default::default()
         },
@@ -1279,8 +1284,8 @@ fn streamed_chunk_over_budget_resets_only_its_stream() {
         Seed::from_u64(1),
         Http2::new(Streamed),
         (),
-        fictionet::stdlib::serve::ServeOptions::default()
-            .budget(fictionet::stdlib::serve::Budget::new(128 << 10)),
+        fictionet::stdlib::services::serve::ServeOptions::default()
+            .budget(fictionet::stdlib::services::serve::Budget::new(128 << 10)),
     );
     let mut input = preface();
     input.extend(headers(1, "/small", true));
@@ -1309,12 +1314,12 @@ fn streamed_chunk_over_budget_resets_only_its_stream() {
 
 #[test]
 fn connection_budget_exhaustion_sends_goaway() {
-    let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 1000);
+    let budget = fictionet::stdlib::services::serve::Budget::new(H2_INPUT + 1000);
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
         Http2::new(Router::new()),
         (),
-        fictionet::stdlib::serve::ServeOptions::default().budget(budget.clone()),
+        fictionet::stdlib::services::serve::ServeOptions::default().budget(budget.clone()),
     );
     harness.push(&preface()).unwrap();
     let _other = budget.charge(budget.limit() - budget.used()).unwrap();
@@ -1340,12 +1345,12 @@ fn connection_budget_exhaustion_sends_goaway() {
 
 #[test]
 fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
-    let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 1024);
+    let budget = fictionet::stdlib::services::serve::Budget::new(H2_INPUT + 1024);
     let mut harness = Harness::with_options(
         Seed::from_u64(1),
         Http2::new(Router::new()),
         (),
-        fictionet::stdlib::serve::ServeOptions::default().budget(budget),
+        fictionet::stdlib::services::serve::ServeOptions::default().budget(budget),
     );
     harness.push(&preface()).unwrap();
     for n in 0..1025 {
@@ -1386,8 +1391,8 @@ fn deferred_response_budget_refusal_preserves_other_streams() {
             Seed::from_u64(1),
             Http2::new(router),
             (),
-            fictionet::stdlib::serve::ServeOptions::default()
-                .budget(fictionet::stdlib::serve::Budget::new(128 << 10)),
+            fictionet::stdlib::services::serve::ServeOptions::default()
+                .budget(fictionet::stdlib::services::serve::Budget::new(128 << 10)),
         )
         .with_fcx(cx.clone());
         let mut input = preface();

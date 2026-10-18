@@ -6,7 +6,7 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::tds::*;
+use fictionet::stdlib::protocols::tds::*;
 use libfuzzer_sys::fuzz_target;
 
 const LIMIT: usize = 1 << 16;

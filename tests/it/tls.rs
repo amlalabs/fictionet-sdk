@@ -11,9 +11,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::prelude::*;
-use fictionet::stdlib::ca::Ca;
-use fictionet::stdlib::tls::{self, ServerConfig};
-use fictionet::stdlib::{ConnError, Connection};
+use fictionet::stdlib::network::{ConnError, Connection};
+use fictionet::stdlib::services::ca::Ca;
+use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::{Cx, Seed, block_on, lab};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::{AlertDescription, ClientConfig, RootCertStore};
@@ -146,9 +146,10 @@ type Client = rustls_client::Client<MemConn, true>;
 // Certificates.
 
 fn date(y: i32, m: u8, d: u8) -> SystemTime {
-    let secs = fictionet::stdlib::x509::Time::Generalized(format!("{y:04}{m:02}{d:02}000000Z"))
-        .unix()
-        .unwrap();
+    let secs =
+        fictionet::stdlib::protocols::x509::Time::Generalized(format!("{y:04}{m:02}{d:02}000000Z"))
+            .unix()
+            .unwrap();
     UNIX_EPOCH + Duration::from_secs(secs as u64)
 }
 
@@ -168,7 +169,7 @@ fn issue(
 ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     use fictionet::stdlib::{
         codec::Wire,
-        x509::{self, ExtensionValue},
+        protocols::x509::{self, ExtensionValue},
     };
     let time = |year| {
         x509::Time::from_unix(
@@ -193,7 +194,8 @@ fn issue(
         let mut tbs = x509::Certificate::parse(&leaf.chain[0]).unwrap().tbs;
         tbs.extensions
             .retain(|e| e.oid.as_bytes() != x509::oid::EXTENDED_KEY_USAGE);
-        let oid = fictionet::stdlib::asn1::Oid::from_contents(x509::oid::CLIENT_AUTH).unwrap();
+        let oid =
+            fictionet::stdlib::protocols::asn1::Oid::from_contents(x509::oid::CLIENT_AUTH).unwrap();
         tbs.extensions.push(
             x509::ExtendedKeyUsage(vec![oid])
                 .to_extension(false)
@@ -234,7 +236,7 @@ impl rustls::time_provider::TimeProvider for FixedTime {
 }
 
 fn client_config(fcx: &Cx, ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
-    fictionet::stdlib::sandbox::client_config(
+    fictionet::stdlib::world::sandbox::client_config(
         fcx,
         date(2030, 1, 1),
         Some(&Arc::new(roots(ca))),
@@ -816,7 +818,7 @@ fn sandbox_client_returns_invalid_server_name() {
     block_on(lab(Seed::from_u64(1), |fcx| async move {
         let (_, conn) = mem_pair();
         let roots = Arc::new(RootCertStore::empty());
-        let result = fictionet::stdlib::sandbox::TlsClient::new(
+        let result = fictionet::stdlib::world::sandbox::TlsClient::new(
             &fcx,
             conn,
             &roots,

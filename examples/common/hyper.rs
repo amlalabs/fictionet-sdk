@@ -1,7 +1,7 @@
 //! Hyper transport and executor for simulated connections.
 
 use fictionet::Cx;
-use fictionet::stdlib::Connection;
+use fictionet::stdlib::network::Connection;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};

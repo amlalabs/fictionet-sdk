@@ -3,13 +3,13 @@
 
 use fictionet::stdlib::{
     codec::Wire,
-    rfb::{ClientMessages, ServerMessages},
+    protocols::rfb::{ClientMessages, ServerMessages},
     test_support::chunks,
     test_support::contract,
 };
 
-use fictionet::stdlib::rfb::harness;
-use fictionet::stdlib::rfb::{
+use fictionet::stdlib::protocols::rfb::harness;
+use fictionet::stdlib::protocols::rfb::{
     ClientMessage, Dialect, Phase, PixelFormat, ServerInit, ServerMessage, Text, Version,
 };
 use libfuzzer_sys::fuzz_target;
@@ -26,12 +26,12 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(
         ClientMessages::new,
         data,
-        2 * fictionet::stdlib::rfb::MAX_CLIENT_MESSAGE,
+        2 * fictionet::stdlib::protocols::rfb::MAX_CLIENT_MESSAGE,
     );
     contract::check_decode_with_alloc_limit(
         ServerMessages::new,
         data,
-        2 * fictionet::stdlib::rfb::MAX_MESSAGE,
+        2 * fictionet::stdlib::protocols::rfb::MAX_MESSAGE,
     );
     let selectors = [
         data.first().copied().unwrap_or(0),

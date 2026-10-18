@@ -11,7 +11,7 @@
 //! helper paths for compatibility.
 //!
 //! ```
-//! use fictionet::stdlib::netbios::{decode_first_level, encode_first_level, write_name};
+//! use fictionet::stdlib::protocols::netbios::{decode_first_level, encode_first_level, write_name};
 //!
 //! let name = *b"FRED            ";
 //! let label = encode_first_level(&name);
@@ -20,7 +20,7 @@
 //! let mut wire = Vec::new();
 //! write_name(&mut wire, &name, &[b"NETBIOS".to_vec()]).unwrap();
 //! assert_eq!(&wire[33..], b"\x07NETBIOS\x00");
-//! let prefix = fictionet::stdlib::netbios::read_name(&wire, "truncated", "invalid").unwrap();
+//! let prefix = fictionet::stdlib::protocols::netbios::read_name(&wire, "truncated", "invalid").unwrap();
 //! assert_eq!(prefix.bytes, name);
 //! assert_eq!(prefix.len, wire.len());
 //! ```
@@ -242,8 +242,8 @@ pub fn write_name(
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::nbns::Name;
-    use fictionet::stdlib::{nbdgm, nbns, nbss};
+    use fictionet::stdlib::protocols::nbns::Name;
+    use fictionet::stdlib::protocols::{nbdgm, nbns, nbss};
 
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";
 
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(&out[prefix.len() + 1..prefix.len() + 33], FRED);
         assert_eq!(Name::parse(&out[prefix.len()..]).unwrap().scope, scope);
         let mut legacy = prefix.clone();
-        fictionet::stdlib::nbns::write_name(&mut legacy, &name, &scope).unwrap();
+        fictionet::stdlib::protocols::nbns::write_name(&mut legacy, &name, &scope).unwrap();
         assert_eq!(legacy, out);
 
         scope.last_mut().unwrap().push(b'y');
@@ -515,9 +515,12 @@ mod tests {
                 Err(Error::Unwritable)
             );
             assert_eq!(out, prefix);
-            let result: Result<(), fictionet::stdlib::nbns::Error> =
-                fictionet::stdlib::nbns::write_name(&mut out, &name, &invalid);
-            assert_eq!(result, Err(fictionet::stdlib::nbns::Error::Unwritable));
+            let result: Result<(), fictionet::stdlib::protocols::nbns::Error> =
+                fictionet::stdlib::protocols::nbns::write_name(&mut out, &name, &invalid);
+            assert_eq!(
+                result,
+                Err(fictionet::stdlib::protocols::nbns::Error::Unwritable)
+            );
             assert_eq!(out, prefix);
         }
     }

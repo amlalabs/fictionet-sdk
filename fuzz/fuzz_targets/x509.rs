@@ -2,14 +2,14 @@
 //! reads them from what the agent sends, and writes them back.
 #![no_main]
 
-use fictionet::stdlib::asn1::{Oid, StringKind};
 use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::x509::harness::check;
-use fictionet::stdlib::x509::{
+use fictionet::stdlib::protocols::asn1::{Oid, StringKind};
+use fictionet::stdlib::protocols::x509::harness::check;
+use fictionet::stdlib::protocols::x509::{
     BasicConstraints, ExtensionValue, GeneralName, KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name,
     PemBlock, PemBlocks, SubjectAltName, Value, pem_decode,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 /// A value built from the input, not read from it: its writer either
@@ -56,7 +56,7 @@ fn built(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    fictionet::stdlib::asn1::harness::check(data);
+    fictionet::stdlib::protocols::asn1::harness::check(data);
     if data.len() <= MAX_PEM_FRAME
         && let Ok(list) = pem_decode(data)
     {

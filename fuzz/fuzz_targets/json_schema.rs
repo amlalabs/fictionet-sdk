@@ -1,8 +1,8 @@
 //! Document entries, schema/instance pairs, formats, dependencies, and examples.
 #![no_main]
 
-use fictionet::stdlib::json::{self, Value};
-use fictionet::stdlib::json_schema::{
+use fictionet::stdlib::protocols::json::{self, Value};
+use fictionet::stdlib::protocols::json_schema::{
     CompileKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options,
     PatternPolicy, Schema,
 };

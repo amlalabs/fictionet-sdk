@@ -35,7 +35,7 @@
 //! ```
 //! use std::net::SocketAddr;
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::stun::{answer_binding, Class, Message, method};
+//! use fictionet::stdlib::protocols::stun::{answer_binding, Class, Message, method};
 //!
 //! // The client asks for its public address, with a FINGERPRINT.
 //! let tid = [7u8; 12];

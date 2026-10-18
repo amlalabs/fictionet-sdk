@@ -16,8 +16,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fictionet::stdlib::tcp::TcpConnection;
-use fictionet::stdlib::{ConnError, ip, tcp, udp};
+use fictionet::stdlib::network::tcp::TcpConnection;
+use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
 use fictionet::{Cx, RecvError};
 
 use super::link::Link;
@@ -285,9 +285,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_expired_alias_is_looked_up_again() {
-        use fictionet::stdlib::dns::op::Message;
-        use fictionet::stdlib::dns::rr::rdata::{A, CNAME};
-        use fictionet::stdlib::dns::rr::{Name, RData, Record};
+        use fictionet::stdlib::protocols::dns::op::Message;
+        use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME};
+        use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         for alias_ttl in [0, 1] {

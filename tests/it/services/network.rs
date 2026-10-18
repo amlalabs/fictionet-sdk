@@ -152,7 +152,7 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                     count.fetch_add(1, Ordering::SeqCst);
                     Echo
                 });
-            let config = |_: &Cx| -> Arc<fictionet::stdlib::tls::ServerConfig> {
+            let config = |_: &Cx| -> Arc<fictionet::stdlib::services::tls::ServerConfig> {
                 panic!("no handshake for a rejected host")
             };
             let bad = match failure {
@@ -343,11 +343,11 @@ fn a_rejected_host_does_not_install_http_names_or_a_default() {
             ("bad.test", 421),
             ("unknown.test", 421),
         ] {
-            let request = fictionet::stdlib::http1::Request::parse(
+            let request = fictionet::stdlib::protocols::http1::Request::parse(
                 format!("GET / HTTP/1.1\r\nHost: {name}\r\n\r\n").as_bytes(),
             )?;
             assert_eq!(
-                fictionet::stdlib::sandbox::request(&fcx, &mut conn, &request)
+                fictionet::stdlib::world::sandbox::request(&fcx, &mut conn, &request)
                     .await?
                     .head
                     .status,
@@ -383,7 +383,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         let captured = packets.clone();
         let attachments = attachments.map(&fcx, move |fcx, sandbox| {
             let captured = captured.clone();
-            fictionet::stdlib::filter(fcx, sandbox, move |_, _, p| {
+            fictionet::stdlib::network::filter(fcx, sandbox, move |_, _, p| {
                 captured.lock().unwrap().push(p.0.clone());
                 true
             })
@@ -650,7 +650,7 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
         let (attacher, attachments) = fictionet::attachments();
         let kept = fcx.events();
         let addr = Ipv4Addr::new(10, 40, 0, 3);
-        let limits = fictionet::stdlib::net::Limits {
+        let limits = fictionet::stdlib::world::net::Limits {
             sandbox_budget: 100 << 10,
             ..Default::default()
         };
@@ -736,7 +736,7 @@ fn net_refuses_a_host_it_cannot_serve() {
         assert!(udp.is_some(), "{udp:?}");
         // TLS and plain on one port, in either order. Before, the port
         // served only TLS.
-        let config = |_: &Cx| -> Arc<fictionet::stdlib::tls::ServerConfig> {
+        let config = |_: &Cx| -> Arc<fictionet::stdlib::services::tls::ServerConfig> {
             unreachable!("no handshake happens")
         };
         let at = Ipv4Addr::new(10, 40, 0, 3);

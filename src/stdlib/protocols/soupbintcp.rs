@@ -28,11 +28,11 @@
 //! write, then events.
 //!
 //! ```
-//! use fictionet::stdlib::session::Action;
+//! use fictionet::stdlib::protocols::session::Action;
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //! use fictionet::stdlib::codec::field::Alpha;
-//! use fictionet::stdlib::soupbintcp::{Client, Event, Login, Packet, Server, Timers};
+//! use fictionet::stdlib::protocols::soupbintcp::{Client, Event, Login, Packet, Server, Timers};
 //!
 //! let login = Login {
 //!     username: Alpha::right_padded("ALICE")?,
@@ -77,7 +77,7 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field::Alpha;
-use fictionet::stdlib::session::{self, Action};
+use fictionet::stdlib::protocols::session::{self, Action};
 
 /// Bytes in the length prefix.
 pub const LENGTH_PREFIX: usize = 2;
@@ -390,7 +390,7 @@ fictionet::prefixed! {
     /// ```
     /// use fictionet::stdlib::codec::Frames;
     /// use fictionet::stdlib::codec::{finish, pump, Stream};
-    /// use fictionet::stdlib::soupbintcp::Packet;
+    /// use fictionet::stdlib::protocols::soupbintcp::Packet;
     ///
     /// let mut stream = Stream::new(Frames::<Packet>::default());
     /// let mut packets = Vec::new();
@@ -399,7 +399,7 @@ fictionet::prefixed! {
     /// pump(&mut stream, &[b'S', b'h', b'i'], |p| packets.push(p))?;
     /// finish(&mut stream, |p| packets.push(p))?;
     /// assert_eq!(packets, [Ok(Packet::ServerHeartbeat), Ok(Packet::SequencedData(b"hi".to_vec()))]);
-    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::soupbintcp::FrameError>>(())
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::soupbintcp::FrameError>>(())
     /// ```
     Packet => (Result<Packet, Error>, FrameError, usize);
     name = "SoupBinTCP";
@@ -932,7 +932,7 @@ impl Server {
 pub mod harness {
     use super::{Alpha, Event, Login, Packet};
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::session::Action;
+    use fictionet::stdlib::protocols::session::Action;
     use fictionet::stdlib::test_support::contract::check_wire_value;
 
     /// Returns the session login fixture.

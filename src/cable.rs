@@ -23,7 +23,7 @@ use crate::{Cx, Interface, Packet, RecvError};
 /// `pair` is the basic building block: everything in
 /// [`stdlib`](crate::stdlib) is wired together with it. A world uses it to
 /// connect two pieces by hand, for example a
-/// [router](crate::stdlib::route::router) and the machine behind one of its
+/// [router](crate::stdlib::network::route::router) and the machine behind one of its
 /// routes. Sandboxes do not come from `pair`: each one reaches the
 /// world as an [`Attachment`](crate::Attachment).
 pub fn pair() -> (End, End) {

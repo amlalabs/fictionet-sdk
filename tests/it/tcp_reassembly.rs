@@ -1,5 +1,5 @@
 use fictionet::stdlib::codec::{Decode, Step, Stream, finish, pump};
-use fictionet::stdlib::tcp_reassembly::{Chunk, FlowKey, Limits, Reassembler, Segment};
+use fictionet::stdlib::protocols::tcp_reassembly::{Chunk, FlowKey, Limits, Reassembler, Segment};
 use std::convert::Infallible;
 
 struct UserDecoder;
@@ -82,7 +82,7 @@ fn public_events_drive_a_user_decoder_with_gap_and_end_hooks() {
 
 #[test]
 fn copied_module_compiles_and_runs_in_a_consumer_crate() {
-    use fictionet_copy_modules::tcp_reassembly as copied;
+    use fictionet_copy_modules::protocols::tcp_reassembly as copied;
 
     let mut tcp = copied::Reassembler::default();
     let key = key();

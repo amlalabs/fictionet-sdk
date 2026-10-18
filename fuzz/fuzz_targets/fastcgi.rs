@@ -3,7 +3,7 @@
 //! them.
 #![no_main]
 
-use fictionet::stdlib::fastcgi::harness;
+use fictionet::stdlib::protocols::fastcgi::harness;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

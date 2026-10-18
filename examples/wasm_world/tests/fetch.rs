@@ -5,7 +5,7 @@
 //! The README says which requests a world cannot serve in a JavaScript engine.
 
 use fictionet::events::Fields;
-use fictionet::stdlib::json::Value;
+use fictionet::stdlib::protocols::json::Value;
 use http::Version;
 use std::io::Write;
 use std::sync::{Arc, Mutex};

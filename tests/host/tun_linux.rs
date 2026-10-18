@@ -20,7 +20,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use fictionet::prelude::*;
-use fictionet::stdlib::{tcp, udp};
+use fictionet::stdlib::network::{tcp, udp};
 use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, pair, run};
 
 /// The world's side of the tun device: packets the kernel sends come out of

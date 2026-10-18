@@ -9,11 +9,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::dhcp::{self, opt};
-use fictionet::stdlib::dhcpv6::{
+use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::protocols::dhcp::{self, opt};
+use fictionet::stdlib::protocols::dhcpv6::{
     self, DhcpOption, Duid, IaAddr, IaNa, Message, StatusCode, msg, status,
 };
-use fictionet::stdlib::route::Prefix;
 
 use super::ether;
 use crate::config::{Lease, mask4};

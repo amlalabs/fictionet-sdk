@@ -22,7 +22,7 @@ mod tls;
 
 use done::Done;
 use echo_service::{Echo, Ticker};
-use fictionet::stdlib::sandbox::{Machine, machine};
+use fictionet::stdlib::world::sandbox::{Machine, machine};
 use io::read_some;
 use timeout::timeout;
 use world::world;
@@ -44,20 +44,20 @@ use fictionet::prelude::*;
 use fictionet::stdlib::codec::{
     ByteFault, Ending, ItemFault, LineError, Lines, RecordKind, Rewrite, Rule, Side, Trigger, Wire,
 };
-use fictionet::stdlib::dns::op::{Message, Query};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::httpd::{self, Http1, Router};
-use fictionet::stdlib::json;
-use fictionet::stdlib::modbus::{
+use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
+use fictionet::stdlib::protocols::dns::op::{Message, Query};
+use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::protocols::json;
+use fictionet::stdlib::protocols::modbus::{
     self, Exception, Frame, Request as MbRequest, Response as MbResponse,
 };
-use fictionet::stdlib::net::{Arrival, Host, Net, PortServer, PreparedShare, Sni};
-use fictionet::stdlib::route::Prefix;
-use fictionet::stdlib::serve::{
+use fictionet::stdlib::services::serve::{
     self, Budget, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan,
     ServeOptions, Served, Timer, Transcript, Upgrade,
 };
-use fictionet::stdlib::{ConnError, ip, tcp, udp};
+use fictionet::stdlib::web::httpd::{self, Http1, Router};
+use fictionet::stdlib::world::net::{Arrival, Host, Net, PortServer, PreparedShare, Sni};
 use fictionet::{Cx, block_on, lab, pair};
 
 // ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ struct Plant {
     limit: u16,
 }
 
-/// A Modbus/TCP PLC, built from `stdlib::modbus`.
+/// A Modbus/TCP PLC, built from `stdlib::protocols::modbus`.
 struct Plc;
 
 service_fixture! {

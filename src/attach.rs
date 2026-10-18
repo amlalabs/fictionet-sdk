@@ -497,7 +497,7 @@ impl Attachments {
     /// as a new `Attachments`.
     ///
     /// Use it to put something between every sandbox and the code that
-    /// serves it, such as a [`delay`](crate::stdlib::delay) in front of
+    /// serves it, such as a [`delay`](crate::stdlib::network::delay) in front of
     /// [`web::Sites`](crate::stdlib::web::Sites):
     ///
     /// ```
@@ -506,7 +506,7 @@ impl Attachments {
     /// # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
     /// # fn site_for(_host: &str) -> Option<web::Site> { None }
     /// # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-    /// let slow = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+    /// let slow = attachments.map(&fcx, |fcx, sandbox| stdlib::network::delay(fcx, ms(200), sandbox));
     /// web::Sites::new(site_for).start(&fcx, slow)?;
     /// # Ok(())
     /// # }
@@ -526,7 +526,7 @@ impl Attachments {
     /// `wrap` is closest to the sandbox.
     ///
     /// `wrap` waits for the world on purpose. A function such as
-    /// [`filter`](crate::stdlib::filter) reads the sandbox's packets as fast
+    /// [`filter`](crate::stdlib::network::filter) reads the sandbox's packets as fast
     /// as they come, and queues them for the interface it returns. If it
     /// started before the world took that interface, nothing would read the
     /// queue, and an agent that keeps sending would grow the world's memory

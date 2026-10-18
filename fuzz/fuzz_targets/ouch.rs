@@ -3,10 +3,10 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::ouch::{
+use fictionet::stdlib::protocols::ouch::{
     EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Outbound, Price,
 };
-use fictionet::stdlib::session::Action;
+use fictionet::stdlib::protocols::session::Action;
 use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
 use libfuzzer_sys::fuzz_target;
 

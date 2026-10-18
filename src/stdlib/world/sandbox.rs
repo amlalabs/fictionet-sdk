@@ -3,12 +3,16 @@
 //! [`machine`] splits a cable into TCP, UDP, and ICMP. DNS queries and
 //! TLS handshakes use the run's clock and randomness.
 
-use super::tls_output::Output;
+use super::super::services::tls::output::Output;
 
 use fictionet::stdlib::codec::{Stream, Wire};
-use fictionet::stdlib::dns::op::{Message, Query};
-use fictionet::stdlib::dns::rr::{Name, RecordType};
-use fictionet::stdlib::{ConnError, Connection, ConnectionExt, dns, http1, ip, tcp, tls, udp};
+use fictionet::stdlib::protocols::dns::op::{Message, Query};
+use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
+use fictionet::stdlib::{
+    network::{ConnError, Connection, ConnectionExt, ip, tcp, udp},
+    protocols::{dns, http1},
+    services::tls,
+};
 use fictionet::{Cx, End, Error, Interface};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -328,8 +332,8 @@ pub fn client_config(
 pub async fn request(
     fcx: &Cx,
     conn: &mut impl Connection,
-    request: &fictionet::stdlib::http1::Request,
-) -> Result<fictionet::stdlib::http1::Response, Error> {
+    request: &fictionet::stdlib::protocols::http1::Request,
+) -> Result<fictionet::stdlib::protocols::http1::Response, Error> {
     let mut decoder = http1::Responses::new();
     decoder.expect_method(&request.head.method)?;
     let mut stream = Stream::new(decoder);

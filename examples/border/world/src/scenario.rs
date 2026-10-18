@@ -22,7 +22,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-pub use fictionet::stdlib::route::Prefix;
+pub use fictionet::stdlib::network::route::Prefix;
 
 /// The bank's name, as the user and the pages call it.
 pub const BANK_NAME: &str = "Kestrelmoor Bank";

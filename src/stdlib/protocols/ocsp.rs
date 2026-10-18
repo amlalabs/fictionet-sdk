@@ -32,7 +32,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::ocsp::{
+//! use fictionet::stdlib::protocols::ocsp::{
 //!     AlgorithmIdentifier, BasicResponse, CertId, CertStatus, Extension, Request, ResponderId, Response,
 //!     ResponseData, SingleRequest, SingleResponse,
 //! };
@@ -84,12 +84,12 @@
 //! assert_eq!(basic.data.responses[0].cert_id.serial_number, [0x12, 0x34]);
 //! ```
 
-use fictionet::stdlib::asn1::{self, Class, Element, Oid, Reader, Rules, Tag, Writer};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::base64::{self, Padding};
 use fictionet::stdlib::codec::{Prefixed, Wire};
+use fictionet::stdlib::protocols::asn1::{self, Class, Element, Oid, Reader, Rules, Tag, Writer};
 
 /// The TCP port OCSP responders usually listen on, since OCSP runs over
 /// plain HTTP.

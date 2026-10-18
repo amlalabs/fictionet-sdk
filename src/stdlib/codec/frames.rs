@@ -75,7 +75,7 @@ pub trait Prefixed: Wire {
 /// No input is copied or retained by this wrapper.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Frames, Stream}, modbus};
+/// use fictionet::stdlib::{codec::{Frames, Stream}, protocols::modbus};
 /// let decoder = Frames::<modbus::Frame>::new();
 /// assert_eq!(decoder.capacity(), modbus::MAX_FRAME);
 /// let stream = Stream::new(decoder);

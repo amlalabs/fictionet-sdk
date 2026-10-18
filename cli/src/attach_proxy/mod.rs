@@ -3,9 +3,10 @@
 //! answers, with no sockets. The binary runs these over its connections;
 //! the fuzz targets call them directly.
 //!
-//! The HTTP door reads request heads with [`stdlib::http1`](fictionet::stdlib::http1)
-//! and the SOCKS5 door reads the handshake with
-//! [`stdlib::socks`](fictionet::stdlib::socks).
+//! The HTTP door reads request heads with
+//! [`stdlib::protocols::http1`](fictionet::stdlib::protocols::http1) and the
+//! SOCKS5 door reads the handshake with
+//! [`stdlib::protocols::socks`](fictionet::stdlib::protocols::socks).
 
 pub mod auth;
 pub mod dns;

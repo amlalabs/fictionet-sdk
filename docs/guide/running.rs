@@ -68,7 +68,7 @@
 //!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every random
 //!    number drawn through `Cx` comes from `seed`;
 //!    [`Seed::random`](crate::Seed::random) picks a fresh one.
-//!    [`Net::start`](crate::stdlib::net::Net::start) records it in `run.start`.
+//!    [`Net::start`](crate::stdlib::world::net::Net::start) records it in `run.start`.
 //!    Without `Net`, world code calls
 //!    [`EventLog::start`](crate::events::EventLog::start) explicitly.
 //!    `run` and `lab` do not emit that event. Every task the world starts
@@ -131,7 +131,7 @@
 //! | A task returns [`Cancelled`](crate::Cancelled), or an error whose `Cancelled` variant says a wait was cancelled | Nothing else stops. The region keeps no error and is not cancelled. `Task::join` on that task returns [`JoinError::Cancelled`](crate::JoinError::Cancelled). | The task ended because a region was cancelled, its own or that of a `Cx` it waited on. A cancel is not a failure. |
 //! | A task panics | The panic is not caught. It unwinds out of the future from `run`, and the run ends there, as when the future is dropped. | A panic is a bug in the world, and the world's author handles it. Nothing in Fictionet catches it to keep the world running. |
 //! | A [`Task`](crate::Task) handle is dropped | Nothing. The task is detached and keeps running. | The region owns the task, not the handle. |
-//! | A sandbox detaches | Its [`Attachment`](crate::Attachment) hands over the packets that already arrived, and then `recv` returns [`RecvError::Closed`](crate::RecvError::Closed). Packets sent to it are dropped. Stdlib tasks that read it each stop by their own rule, listed under [Three kinds of functions](crate::stdlib#three-kinds-of-functions). A [`delay`](crate::stdlib::delay), [`bottleneck`](crate::stdlib::bottleneck) or [`filter`](crate::stdlib::filter) stops as soon as either of its interfaces closes. A `filter` has passed on every packet by then, but packets that a `delay` or `bottleneck` still holds are lost, so a detach can cut off the packets in flight in a pipeline. The sandbox's name is free to attach again. | A detach closes an interface. It is not an error, so the region is not cancelled. A task of your own that passes `Closed` up with `?` does fail the world, so a world that should outlive one sandbox ends that loop on `Closed` instead. |
+//! | A sandbox detaches | Its [`Attachment`](crate::Attachment) hands over the packets that already arrived, and then `recv` returns [`RecvError::Closed`](crate::RecvError::Closed). Packets sent to it are dropped. Stdlib tasks that read it each stop by their own rule, listed under [Three kinds of functions](crate::stdlib#three-kinds-of-functions). A [`delay`](crate::stdlib::network::delay), [`bottleneck`](crate::stdlib::network::bottleneck) or [`filter`](crate::stdlib::network::filter) stops as soon as either of its interfaces closes. A `filter` has passed on every packet by then, but packets that a `delay` or `bottleneck` still holds are lost, so a detach can cut off the packets in flight in a pipeline. The sandbox's name is free to attach again. | A detach closes an interface. It is not an error, so the region is not cancelled. A task of your own that passes `Closed` up with `?` does fail the world, so a world that should outlive one sandbox ends that loop on `Closed` instead. |
 //! | The future from `run` is dropped | Everything stops immediately. The tasks are dropped without being polled again, so their own code gets no chance to clean up. A wait outside the run, such as in a tokio task, returns [`Cancelled`](crate::Cancelled) if it waited on a clone of one of the run's `Cx`s, or [`RecvError::Closed`](crate::RecvError::Closed) if it waited on an interface whose other end was inside the run. `Task::join` on a task that had not ended returns `Cancelled`. | Dropping a future is how Rust abandons work, for example when a timeout around it fires. |
 //! | A region is cancelled, by [`Cx::cancel`](crate::Cx::cancel) or by an error | Every Fictionet wait in the region returns `Cancelled`, and each task ends through its own code. Regions inside it are cancelled too. The region ends when its last task ends. After an error, `run` returns that error. After `Cx::cancel`, it returns `Ok(())`, unless a task failed before the cancel. A region made with [`Cx::region`](crate::Cx::region) that was cancelled because the region around it was returns `Cancelled`. | Cancellation is cooperative, as the next section explains. |
 //! | A region made with [`Cx::region`](crate::Cx::region) returns | A [`Cx`](crate::Cx) kept from it can start no more tasks there. [`Cx::spawn`](crate::Cx::spawn) on it gives a [`Task`](crate::Task) whose [`join`](crate::Task::join) returns [`JoinError::Cancelled`](crate::JoinError::Cancelled). The work never runs. A cancelled region that has not yet ended still accepts tasks, so cleanup work can run. | Once the region has returned, nothing is left to receive the task's failure. |
@@ -349,12 +349,12 @@
 //! and task scheduling. Do not let host clocks, OS entropy, external I/O,
 //! independently scheduled tasks or unordered collection iteration decide
 //! what the world does. Fix service data and dates too. TLS repeats with
-//! fixed certificates and the [`tls`](crate::stdlib::tls) provider, whose
+//! fixed certificates and the [`tls`](crate::stdlib::services::tls) provider, whose
 //! key exchange and signatures draw from the run's seed.
 //!
 //! **HTTP/2 has a host-clock exception.** The h2 dependency forgets an
 //! HTTP/2 stream that the world reset after one second of real time (see
-//! [`httpd`](crate::stdlib::httpd)). That expiry does not follow lab time,
+//! [`httpd`](crate::stdlib::web::httpd)). That expiry does not follow lab time,
 //! so runs whose behavior depends on it do not have an exact replay
 //! guarantee.
 //!

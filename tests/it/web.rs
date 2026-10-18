@@ -12,7 +12,7 @@ use hyper_io::{Exec, Io};
 use crate::common::done;
 use crate::common::timeout;
 use crate::common::world as run_world;
-use fictionet::stdlib::sandbox::{TlsClient, TlsError};
+use fictionet::stdlib::world::sandbox::{TlsClient, TlsError};
 
 #[path = "web/admission.rs"]
 mod admission;
@@ -32,8 +32,8 @@ mod sites;
 use certs::certs;
 use common::within;
 use done::Done;
-use fictionet::stdlib::sandbox::Machine;
-use fictionet::stdlib::sandbox::machine;
+use fictionet::stdlib::world::sandbox::Machine;
+use fictionet::stdlib::world::sandbox::machine;
 use fixture::{
     BIG, BOTH_ADDR, Client, DEFAULT_ADDR, DUAL_ADDR, DUAL_ADDR6, EVENTS_ADDR, Env, GATEWAY, Plain,
     SECURE_ADDR, SHORT, TLS_DEFAULT_ADDR, V6ONLY_ADDR6, bind_by_ping, default_machine, dns, ipv4,
@@ -54,10 +54,14 @@ use bytes::Bytes;
 use fictionet::events::{Event as Entry, EventLog, Fields, Sandbox};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::tls;
-use fictionet::stdlib::{ConnError, Connection, dhcp, http1, ip, tcp, web};
+use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::services::tls;
+use fictionet::stdlib::{
+    network::{ConnError, Connection, ip, tcp},
+    protocols::{dhcp, http1},
+    web,
+};
 use fictionet::{Attacher, Cx, End, Interface, Packet, Seed, block_on, lab, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};

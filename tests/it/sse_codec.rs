@@ -1,5 +1,5 @@
 use fictionet::stdlib::codec::{Lcg, Stream, StreamEvent, Wire, finish};
-use fictionet::stdlib::sse::{Event, Events, Limits, Line, RawLines};
+use fictionet::stdlib::protocols::sse::{Event, Events, Limits, Line, RawLines};
 use fictionet::stdlib::test_support::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value, check_written,
 };

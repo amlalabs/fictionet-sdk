@@ -1,13 +1,16 @@
 //! Services change protocol framing between items through the driver.
 use fictionet::Seed;
-use fictionet::stdlib::serve::{FaultPlan, Flow, Harness, Plan, ServeOptions};
-use fictionet::stdlib::{codec::Wire, imap, postgres, smtp};
+use fictionet::stdlib::services::serve::{FaultPlan, Flow, Harness, Plan, ServeOptions};
+use fictionet::stdlib::{
+    codec::Wire,
+    protocols::{imap, postgres, smtp},
+};
 
 use fictionet::stdlib::codec::{
     ByteFault, Ending, FaultError, ItemFault, LineError, Lines, Rewrite, RewriteError, Rule,
     Trigger,
 };
-use fictionet::stdlib::serve::{self, Ended, HarnessError, ServeError};
+use fictionet::stdlib::services::serve::{self, Ended, HarnessError, ServeError};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -49,13 +52,13 @@ struct FaultConnection {
     output: Arc<Mutex<Vec<u8>>>,
 }
 
-impl fictionet::stdlib::Connection for FaultConnection {
+impl fictionet::stdlib::network::Connection for FaultConnection {
     fn poll_read(
         &mut self,
         _: &fictionet::Cx,
         _: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<Result<usize, fictionet::stdlib::ConnError>> {
+    ) -> Poll<Result<usize, fictionet::stdlib::network::ConnError>> {
         use std::io::Read;
         Poll::Ready(Ok(self.input.read(buf).unwrap()))
     }
@@ -65,7 +68,7 @@ impl fictionet::stdlib::Connection for FaultConnection {
         _: &fictionet::Cx,
         _: &mut Context<'_>,
         bytes: &[u8],
-    ) -> Poll<Result<usize, fictionet::stdlib::ConnError>> {
+    ) -> Poll<Result<usize, fictionet::stdlib::network::ConnError>> {
         self.output.lock().unwrap().extend_from_slice(bytes);
         Poll::Ready(Ok(bytes.len()))
     }
@@ -74,7 +77,7 @@ impl fictionet::stdlib::Connection for FaultConnection {
         &mut self,
         _: &fictionet::Cx,
         _: &mut Context<'_>,
-    ) -> Poll<Result<(), fictionet::stdlib::ConnError>> {
+    ) -> Poll<Result<(), fictionet::stdlib::network::ConnError>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -335,7 +338,7 @@ fn outbound_fault_error_during_end_closes_once() {
 #[test]
 fn fault_decoder_failure_preserves_partial_bytes() {
     use fictionet::stdlib::codec::{Fail, Frames};
-    use fictionet::stdlib::modbus::{self, Frame};
+    use fictionet::stdlib::protocols::modbus::{self, Frame};
     #[derive(Default)]
     struct PartialFrame {
         unread: Vec<u8>,
@@ -425,7 +428,7 @@ fn smtp_data_changes_the_active_decoder_and_stops_item_faults() {
 
 #[test]
 fn smtp_auth_challenges_cancel_and_handoff_in_one_chunk() {
-    use fictionet::stdlib::serve::{HarnessError, Upgrade};
+    use fictionet::stdlib::services::serve::{HarnessError, Upgrade};
 
     #[derive(Default)]
     struct Auth {
@@ -564,7 +567,7 @@ fn smtp_mode_change_stops_faults_before_the_next_pipelined_item() {
 #[test]
 fn decoder_upgrade_stops_faults_before_buffered_items() {
     use fictionet::stdlib::codec::{Ending, ItemFault, LineError, Lines, Rewrite, Rule, Trigger};
-    use fictionet::stdlib::serve::Upgrade;
+    use fictionet::stdlib::services::serve::Upgrade;
     struct Switch {
         seen: Vec<Vec<u8>>,
     }
@@ -662,7 +665,7 @@ fn datagram_decoder_access_uses_the_current_datagram() {
         input: VecDeque<Vec<u8>>,
         output: Arc<Mutex<Vec<Vec<u8>>>>,
     }
-    impl fictionet::stdlib::DatagramSocket for Socket {
+    impl fictionet::stdlib::network::DatagramSocket for Socket {
         async fn recv(
             &mut self,
             _: &fictionet::Cx,
@@ -686,7 +689,7 @@ fn datagram_decoder_access_uses_the_current_datagram() {
             output: output.clone(),
         };
         let mut service = Mail::default();
-        fictionet::stdlib::serve::datagram(
+        fictionet::stdlib::services::serve::datagram(
             &cx,
             socket,
             "192.0.2.1:25".parse().unwrap(),

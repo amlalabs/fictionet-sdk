@@ -42,7 +42,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::dtls::{
+//! use fictionet::stdlib::protocols::dtls::{
 //!     Body, ClientHello, ContentType, Fragment, Handshake, HelloVerifyRequest, PlainRecord, Reassembler, Record,
 //!     handshake_type, Datagram, Fragments, version,
 //! };

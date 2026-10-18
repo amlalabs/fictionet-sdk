@@ -10,7 +10,10 @@ use std::sync::Arc;
 fn oversized_event_to_line_returns_error() {
     let event = Event::new("test", "big").summary("x".repeat(1 << 20));
     let error = event.to_line().unwrap_err();
-    assert_eq!(error.kind, crate::stdlib::json::ErrorKind::TooLarge);
+    assert_eq!(
+        error.kind,
+        crate::stdlib::protocols::json::ErrorKind::TooLarge
+    );
 }
 
 /// An event's JSON says whether its connection was TLS, and its ALPN.

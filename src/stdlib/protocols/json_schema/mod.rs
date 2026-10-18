@@ -20,11 +20,12 @@
 //! default. [`PatternPolicy::Annotate`] records and ignores them, including
 //! their effect on `additionalProperties`. Generation refuses such schemas.
 //!
-//! Numbers use their decimal text, including for equality and `multipleOf`.
-//! No floating point rounding or tolerance is used by validation. Precision
-//! is limited only by [`fictionet::stdlib::json::MAX_NUMBER_LEN`] and [`Limits::number_exponent`].
-//! Out-of-range exponents are errors, including in enum values and instances.
-//! Object order does not affect equality. Duplicate object keys are refused.
+//! Numbers use their decimal text, including for equality and `multipleOf`. No
+//! floating point rounding or tolerance is used by validation. Precision is
+//! limited only by [`fictionet::stdlib::protocols::json::MAX_NUMBER_LEN`] and
+//! [`Limits::number_exponent`]. Out-of-range exponents are errors, including in
+//! enum values and instances. Object order does not affect equality. Duplicate
+//! object keys are refused.
 //!
 //! [`Schema::compile_at`] selects a schema within a document, such as an OpenAPI
 //! component or request body. Only its reachable schemas are compiled.
@@ -45,7 +46,7 @@
 
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::{Lcg, Work};
-use fictionet::stdlib::json::{Number, Value};
+use fictionet::stdlib::protocols::json::{Number, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,7 +58,7 @@ use formats::{format_example, valid_format};
 /// Schema keyword dialect. The default is JSON Schema 2020-12.
 ///
 /// ```
-/// use fictionet::stdlib::json_schema::{Dialect, Options};
+/// use fictionet::stdlib::protocols::json_schema::{Dialect, Options};
 /// let options = Options { dialect: Dialect::OpenApi30, ..Options::default() };
 /// assert_eq!(options.dialect, Dialect::OpenApi30);
 /// ```
@@ -73,7 +74,7 @@ pub enum Dialect {
 /// Handling of keywords that require a regex engine.
 ///
 /// ```
-/// use fictionet::stdlib::{json::Value, json_schema::{Options, PatternPolicy, Schema}};
+/// use fictionet::stdlib::protocols::{json::Value, json_schema::{Options, PatternPolicy, Schema}};
 /// let source = Value::Object(vec![("pattern".into(), Value::from("^id-"))]);
 /// let options = Options { patterns: PatternPolicy::Annotate, ..Options::default() };
 /// let schema = Schema::compile_with(&source, options).unwrap();
@@ -104,7 +105,7 @@ pub enum FormatPolicy {
 /// Zero is allowed and means no work or storage for that resource.
 ///
 /// ```
-/// use fictionet::stdlib::json_schema::{Limits, Options};
+/// use fictionet::stdlib::protocols::json_schema::{Limits, Options};
 /// let limits = Limits { work: 10_000, ..Limits::default() };
 /// let options = Options { limits, ..Options::default() };
 /// assert_eq!(options.limits.work, 10_000);
@@ -174,7 +175,7 @@ impl Limits {
 /// Compilation settings.
 ///
 /// ```
-/// use fictionet::stdlib::json_schema::{Options, PatternPolicy};
+/// use fictionet::stdlib::protocols::json_schema::{Options, PatternPolicy};
 /// let options = Options { patterns: PatternPolicy::Annotate, ..Options::default() };
 /// assert_eq!(options.patterns, PatternPolicy::Annotate);
 /// ```
@@ -193,7 +194,7 @@ pub struct Options {
 /// Error collection policy.
 ///
 /// ```
-/// use fictionet::stdlib::{json::Value, json_schema::{ErrorMode, Schema}};
+/// use fictionet::stdlib::protocols::{json::Value, json_schema::{ErrorMode, Schema}};
 /// let schema = Schema::compile(&Value::Bool(false)).unwrap();
 /// assert_eq!(schema.validate_with(&Value::Null, ErrorMode::All).errors.len(), 1);
 /// ```
@@ -326,7 +327,7 @@ pub struct Annotation {
 /// Validation output. Static keyword annotations are available from [`Schema::annotations`].
 ///
 /// ```
-/// use fictionet::stdlib::{json::Value, json_schema::Schema};
+/// use fictionet::stdlib::protocols::{json::Value, json_schema::Schema};
 /// let schema = Schema::compile(&Value::Bool(false)).unwrap();
 /// let report = schema.validate(&Value::Null);
 /// assert!(!report.is_valid());
@@ -350,7 +351,7 @@ impl Validation {
 /// Containers are limited by `items`; strings and object names by `string_length`.
 ///
 /// ```
-/// use fictionet::stdlib::{json::Value, json_schema::{Schema, GenerationLimits}};
+/// use fictionet::stdlib::protocols::{json::Value, json_schema::{Schema, GenerationLimits}};
 /// let schema = Schema::compile(&Value::Bool(true)).unwrap();
 /// let limits = GenerationLimits { total_nodes: 8, ..GenerationLimits::default() };
 /// let value = schema.generate(7, limits).unwrap();
@@ -445,7 +446,7 @@ impl std::error::Error for GenerationError {
 /// budget; they can return a limit error instead of finishing a costly check.
 ///
 /// ```
-/// use fictionet::stdlib::{json, json_schema::Schema};
+/// use fictionet::stdlib::protocols::{json, json_schema::Schema};
 /// let source = json::parse_with(br#"{"type":"integer","minimum":1}"#,
 ///     &json::Limits::default()).unwrap();
 /// let schema = Schema::compile(&source).unwrap();
@@ -2990,7 +2991,7 @@ fn count_nodes(v: &Value) -> usize {
 mod tests {
     #[test]
     fn schema_errors_describe_the_failure_and_chain_validation() {
-        use fictionet::stdlib::json_schema::{
+        use fictionet::stdlib::protocols::json_schema::{
             CompileError, CompileKind, GenerationError, ValidationError, ValidationKind,
         };
         use std::error::Error;
@@ -3025,7 +3026,7 @@ mod tests {
     }
 
     use super::*;
-    use fictionet::stdlib::json;
+    use fictionet::stdlib::protocols::json;
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
 

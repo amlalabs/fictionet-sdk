@@ -9,46 +9,46 @@ use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
 
-use fictionet::stdlib::http3;
+use fictionet::stdlib::protocols::http3;
 
 use fictionet::stdlib::codec::Side;
 
-use fictionet::stdlib::http3::Event;
+use fictionet::stdlib::protocols::http3::Event;
 
-use fictionet::stdlib::http3::Frame;
+use fictionet::stdlib::protocols::http3::Frame;
 
-use fictionet::stdlib::http3::HeaderKind;
+use fictionet::stdlib::protocols::http3::HeaderKind;
 
-use fictionet::stdlib::http3::HeaderList;
+use fictionet::stdlib::protocols::http3::HeaderList;
 
-use fictionet::stdlib::http3::MessageSide;
+use fictionet::stdlib::protocols::http3::MessageSide;
 
-use fictionet::stdlib::http3::Priority;
+use fictionet::stdlib::protocols::http3::Priority;
 
-use fictionet::stdlib::http3::PriorityElement;
+use fictionet::stdlib::protocols::http3::PriorityElement;
 
-use fictionet::stdlib::http3::RequestResult;
+use fictionet::stdlib::protocols::http3::RequestResult;
 
-use fictionet::stdlib::http3::RequestStream;
+use fictionet::stdlib::protocols::http3::RequestStream;
 
-use fictionet::stdlib::http3::Session;
+use fictionet::stdlib::protocols::http3::Session;
 
-use fictionet::stdlib::http3::Settings;
+use fictionet::stdlib::protocols::http3::Settings;
 
-use fictionet::stdlib::http3::StreamHeader;
+use fictionet::stdlib::protocols::http3::StreamHeader;
 
-use fictionet::stdlib::http3::StreamHeaders;
+use fictionet::stdlib::protocols::http3::StreamHeaders;
 
-use fictionet::stdlib::http3::StreamItem;
+use fictionet::stdlib::protocols::http3::StreamItem;
 
-use fictionet::stdlib::http3::StreamItems;
+use fictionet::stdlib::protocols::http3::StreamItems;
 
-use fictionet::stdlib::qpack;
+use fictionet::stdlib::protocols::qpack;
 
-use fictionet::stdlib::qpack::SectionResult;
+use fictionet::stdlib::protocols::qpack::SectionResult;
 
-use fictionet::stdlib::http3::harness::check_session_budget;
-use fictionet::stdlib::qpack::Table;
+use fictionet::stdlib::protocols::http3::harness::check_session_budget;
+use fictionet::stdlib::protocols::qpack::Table;
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 16 << 10;

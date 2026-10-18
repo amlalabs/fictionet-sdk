@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use border_world::certs;
-use fictionet::stdlib::ca::Leaf;
+use fictionet::stdlib::services::ca::Leaf;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
@@ -119,7 +119,7 @@ fn the_home_chain_goes_through_the_intermediate_to_the_root() {
                 &intermediate,
                 "DigiCert Global G3 TLS ECC SHA384 2020 CA1"
             ));
-            use fictionet::stdlib::{codec::Wire, x509};
+            use fictionet::stdlib::{codec::Wire, protocols::x509};
             let root_cert = x509::Certificate::parse(&root).unwrap();
             let intermediate_cert = x509::Certificate::parse(&intermediate).unwrap();
             assert_eq!(root_cert.tbs.subject, root_cert.tbs.issuer);

@@ -49,7 +49,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::ipsec::{next_header, Datagram, EspPacket, Plaintext};
+//! use fictionet::stdlib::protocols::ipsec::{next_header, Datagram, EspPacket, Plaintext};
 //!
 //! // An IPv4 packet (cut short here), padded to a 4-byte boundary with
 //! // the default padding: 1, 2, and so on.
@@ -460,7 +460,7 @@ impl AhPacket {
 }
 
 /// A borrowed NAT-T envelope, without payload validation or a size limit.
-/// [`Datagram`] validates ESP and keeps IKE opaque. [`fictionet::stdlib::ike::NatT`]
+/// [`Datagram`] validates ESP and keeps IKE opaque. [`fictionet::stdlib::protocols::ike::NatT`]
 /// validates IKE and keeps ESP opaque. Each wrapper applies its own size limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Envelope<'a> {
@@ -479,7 +479,7 @@ impl<'a> Envelope<'a> {
     /// The payload is not validated, and there is no maximum length.
     ///
     /// ```
-    /// use fictionet::stdlib::ipsec::Envelope;
+    /// use fictionet::stdlib::protocols::ipsec::Envelope;
     ///
     /// assert_eq!(Envelope::classify(&[0xff]), Some(Envelope::Keepalive));
     /// assert_eq!(Envelope::classify(&[0, 0, 0, 0]), Some(Envelope::Ike(&[])));

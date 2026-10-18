@@ -33,7 +33,7 @@
 //! writing them.
 //!
 //! ```
-//! use fictionet::stdlib::asn1::{Error, Oid, Reader, Rules, Writer};
+//! use fictionet::stdlib::protocols::asn1::{Error, Oid, Reader, Rules, Writer};
 //!
 //! // An AlgorithmIdentifier for sha256WithRSAEncryption, as X.509 writes it.
 //! let oid: Oid = "1.2.840.113549.1.1.11".parse().unwrap();
@@ -473,7 +473,7 @@ impl Prefix {
     /// with the protocol's total limit before consuming a frame.
     ///
     /// ```
-    /// use fictionet::stdlib::asn1::{Error, Prefix, Rules, Tag};
+    /// use fictionet::stdlib::protocols::asn1::{Error, Prefix, Rules, Tag};
     /// assert_eq!(Prefix::parse(&[0x30, 0x82, 1], Rules::Der), Ok(None));
     /// let prefix = Prefix::parse(&[0x30, 0x82, 1, 0], Rules::Der).unwrap().unwrap();
     /// assert_eq!(prefix.header().unwrap().tag, Tag::SEQUENCE);
@@ -798,7 +798,7 @@ fn check_frame(bytes: &[u8]) -> Result<(), Error> {
 /// one byte at a time takes linear time. Only framing is checked.
 ///
 /// ```
-/// use fictionet::stdlib::{asn1::{Elements, Frame, Rules}, codec::{Stream, Wire, finish, pump}};
+/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, protocols::asn1::{Elements, Frame, Rules}};
 ///
 /// let bytes = Frame(vec![5, 0]).to_bytes()?;
 /// let mut stream = Stream::new(Elements::new(Rules::Der));
@@ -2415,7 +2415,7 @@ impl Writer {
 /// are not counted; use [`validate_der_wrapped`] to account for wrappers.
 ///
 /// ```
-/// use fictionet::stdlib::asn1::{validate_der, Error, MAX_DEPTH, MAX_INPUT};
+/// use fictionet::stdlib::protocols::asn1::{validate_der, Error, MAX_DEPTH, MAX_INPUT};
 /// assert_eq!(validate_der(&[5, 0], MAX_DEPTH, MAX_INPUT), Ok(()));
 /// assert_eq!(validate_der(&[0x30, 0], MAX_DEPTH, MAX_INPUT), Err(Error::TooDeep));
 /// assert_eq!(validate_der(&[5, 0], 0, 1), Err(Error::TooLong));
@@ -2450,7 +2450,7 @@ pub fn validate_der(der: &[u8], depth: usize, room: usize) -> Result<(), Error> 
 /// malformed input. The input slice and any caller's cursor stay unchanged.
 ///
 /// ```
-/// use fictionet::stdlib::asn1::{validate_der_wrapped, Error, MAX_DEPTH};
+/// use fictionet::stdlib::protocols::asn1::{validate_der_wrapped, Error, MAX_DEPTH};
 /// assert_eq!(validate_der_wrapped(&[5, 0], 8), Ok(()));
 /// assert_eq!(validate_der_wrapped(&[0x30, 0], MAX_DEPTH), Err(Error::TooDeep));
 /// ```

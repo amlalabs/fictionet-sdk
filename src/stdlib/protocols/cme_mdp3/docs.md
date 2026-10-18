@@ -23,7 +23,7 @@ reads the same size-prefixed messages from a byte stream. It yields a
 message it refuses as an `Err` item and reads on from the next size.
 
 ```
-use fictionet::stdlib::cme_mdp3::{AdminHeartbeat12, Message, Packet, PacketHeader};
+use fictionet::stdlib::protocols::cme_mdp3::{AdminHeartbeat12, Message, Packet, PacketHeader};
 use fictionet::stdlib::codec::Wire;
 
 let packet = Packet {
@@ -33,5 +33,5 @@ let packet = Packet {
 let bytes = packet.to_bytes()?;
 assert_eq!(bytes.len(), 12 + 2 + 8);
 assert_eq!(Packet::parse(&bytes)?, packet);
-# Ok::<(), fictionet::stdlib::cme_mdp3::Error>(())
+# Ok::<(), fictionet::stdlib::protocols::cme_mdp3::Error>(())
 ```

@@ -3,11 +3,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::moldudp64::{
+use fictionet::stdlib::protocols::moldudp64::{
     Blocks, Downstream, Event, HEADER_LENGTH, Receiver, ReceiverConfig, Request, Retransmitter,
     Session, StoreConfig,
 };
-use fictionet::stdlib::session::Action;
+use fictionet::stdlib::protocols::session::Action;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;

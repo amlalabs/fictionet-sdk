@@ -29,7 +29,7 @@ mod tests {
     use super::*;
     use crate::observe::Decoded;
     use crate::observe::{Conversation, Observed, Place};
-    use fictionet::stdlib::http2::PREFACE as HTTP2_PREFACE;
+    use fictionet::stdlib::protocols::http2::PREFACE as HTTP2_PREFACE;
     use fictionet::stdlib::test_support::hex;
 
     fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn expanded_huffman_headers_keep_dynamic_references() {
-        use fictionet::stdlib::{codec::Wire, prefix_int::Integer};
+        use fictionet::stdlib::{codec::Wire, protocols::prefix_int::Integer};
 
         let mut f = Feeder::h2();
         f.send(true, &frame(1, 0x4, 1, &hex(X_OLD)), 1500);

@@ -27,7 +27,7 @@
 //! The encoder only references entries the peer has acknowledged.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::Wire, qpack::{self, Encoder, Field, Table, SectionResult}};
+//! use fictionet::stdlib::{codec::Wire, protocols::qpack::{self, Encoder, Field, Table, SectionResult}};
 //!
 //! // RFC 9204 Appendix B.1: a literal value with static name entry 1.
 //! let mut bytes = vec![0x00, 0x00, 0x51, 0x0b];
@@ -56,12 +56,12 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Reader, Truncated};
-use fictionet::stdlib::quic::MAX_VARINT;
+use fictionet::stdlib::protocols::quic::MAX_VARINT;
 
 use std::collections::VecDeque;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
-use fictionet::stdlib::{huffman, prefix_int};
+use fictionet::stdlib::protocols::{huffman, prefix_int};
 
 /// The longest string before or after Huffman decoding.
 pub const MAX_STRING: usize = huffman::MAX_STRING;
@@ -1874,7 +1874,7 @@ fn section_fields(
 ///
 /// ```
 /// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::{codec::{Stream, Wire}, qpack::{self, EncoderInstruction, Table}};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, protocols::qpack::{self, EncoderInstruction, Table}};
 /// let mut table = Table::new(128);
 /// let mut input = Stream::new(Frames::<qpack::EncoderInstruction>::new());
 /// let bytes = Wire::to_bytes(&EncoderInstruction::SetCapacity(128))?;
@@ -2002,7 +2002,7 @@ fictionet::codec_from!(Stop, Truncated, |_| Stop::More);
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::prefix_int::Integer;
+    use fictionet::stdlib::protocols::prefix_int::Integer;
     use fictionet::stdlib::test_support::assert_linear;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;

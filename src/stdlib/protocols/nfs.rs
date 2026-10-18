@@ -17,19 +17,19 @@
 //! follows RFC 1813, which defines both, and RFC 1833 for the portmapper.
 //!
 //! Nothing here reads a socket. A world that plays a file server takes RPC
-//! calls from the [`onc_rpc`](fictionet::stdlib::onc_rpc) module, reads each one's
+//! calls from the [`onc_rpc`](fictionet::stdlib::protocols::onc_rpc) module, reads each one's
 //! arguments with [`Request::parse`] or [`MountRequest::parse`], and
 //! answers with the results of a [`Response`] or [`MountResponse`]. Which
 //! files exist, what they hold, and which handles name them is up to world
 //! code. A world that plays a client writes calls with [`Request::call`]
 //! and reads results with [`Response::parse`].
 //!
-//! For TCP, [`onc_rpc::messages`](fictionet::stdlib::onc_rpc::messages) combines record
+//! For TCP, [`onc_rpc::messages`](fictionet::stdlib::protocols::onc_rpc::messages) combines record
 //! marking, bounded assembly, and RPC parsing. Read NFS arguments with a
 //! closure that passes the call's procedure number:
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Decode, Stream}, nfs, onc_rpc};
+//! use fictionet::stdlib::{codec::{Decode, Stream}, protocols::{nfs, onc_rpc}};
 //!
 //! let requests = onc_rpc::messages(onc_rpc::MAX_RECORD).map(|message| {
 //!     message.map(|message| match message.body {
@@ -55,8 +55,8 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::nfs::{procedure, DirOp, FileHandle, LookupOk, Status, Request, Response};
-//! use fictionet::stdlib::onc_rpc::{Accept, Body, Message, Reply};
+//! use fictionet::stdlib::protocols::nfs::{procedure, DirOp, FileHandle, LookupOk, Status, Request, Response};
+//! use fictionet::stdlib::protocols::onc_rpc::{Accept, Body, Message, Reply};
 //!
 //! /// A server whose root directory, handle [1], holds one file: notes.txt.
 //! fn answer(request: &Request) -> Response {
@@ -94,7 +94,7 @@
 
 use std::num::NonZeroU32;
 
-use fictionet::stdlib::onc_rpc::{Accept, Call, Error, Message, Reader, Reply, Writer};
+use fictionet::stdlib::protocols::onc_rpc::{Accept, Call, Error, Message, Reader, Reply, Writer};
 
 /// The port NFS listens on, over TCP and UDP.
 pub const PORT: u16 = 2049;
@@ -1322,7 +1322,7 @@ impl Request {
         let call = Call::new(NFS_PROGRAM, NFS_VERSION, self.procedure(), self.to_args()?);
         Ok(Message {
             xid,
-            body: fictionet::stdlib::onc_rpc::Body::Call(call),
+            body: fictionet::stdlib::protocols::onc_rpc::Body::Call(call),
         })
     }
 }
@@ -2209,7 +2209,7 @@ impl MountRequest {
         );
         Ok(Message {
             xid,
-            body: fictionet::stdlib::onc_rpc::Body::Call(call),
+            body: fictionet::stdlib::protocols::onc_rpc::Body::Call(call),
         })
     }
 }
@@ -2221,7 +2221,7 @@ pub struct Mounted {
     /// sees.
     pub handle: FileHandle,
     /// The RPC authentication flavors the server takes, such as
-    /// [`flavor::SYS`](fictionet::stdlib::onc_rpc::flavor::SYS). At most
+    /// [`flavor::SYS`](fictionet::stdlib::protocols::onc_rpc::flavor::SYS). At most
     /// [`MAX_AUTH_FLAVORS`].
     pub auth_flavors: Vec<u32>,
 }
@@ -2517,7 +2517,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Wire};
-    use fictionet::stdlib::onc_rpc::{Body, MAX_RECORD, Record, records};
+    use fictionet::stdlib::protocols::onc_rpc::{Body, MAX_RECORD, Record, records};
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
@@ -3046,7 +3046,7 @@ mod tests {
     fn requests_compose_with_codec_records() {
         use fictionet::stdlib::{
             codec::{Decode, Wire},
-            onc_rpc,
+            protocols::onc_rpc,
             test_support::contract,
         };
 

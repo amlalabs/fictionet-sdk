@@ -3,7 +3,7 @@
 //! part of the API.
 
 use crate::Packet;
-use crate::stdlib::ip::{Intake, Reassembly, protocol_end};
+use crate::stdlib::network::ip::{Intake, Reassembly, protocol_end};
 use crate::time::{Duration, Instant};
 
 /// Feeds packets to fragment reassembly, as `split_protocols` takes them in

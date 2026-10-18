@@ -16,7 +16,7 @@
 //! 8926.
 //!
 //! Nothing here reads a socket. A world that plays a tunnel endpoint hands
-//! each datagram it reads from a [`udp`](fictionet::stdlib::udp) socket to
+//! each datagram it reads from a [`udp`](fictionet::stdlib::network::udp) socket to
 //! [`Packet::parse`], looks at the [`Header`], and does what it likes with
 //! the inner payload. To send, it builds a [`Packet`] and writes the bytes
 //! [`Wire::to_bytes`] returns. For pieces of one datagram, use
@@ -31,7 +31,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::geneve::{protocol, GeneveOption, Header, Packet};
+//! use fictionet::stdlib::protocols::geneve::{protocol, GeneveOption, Header, Packet};
 //!
 //! let packet = Packet {
 //!     header: Header {

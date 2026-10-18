@@ -3,8 +3,8 @@
 use core::fmt::Debug;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, Wire};
+use fictionet::stdlib::protocols::{openvpn, rtcp, rtp, snmp, ssh, stun};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::{openvpn, rtcp, rtp, snmp, ssh, stun};
 
 fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where

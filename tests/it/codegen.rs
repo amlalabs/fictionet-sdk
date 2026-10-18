@@ -16,7 +16,7 @@ mod edges;
 
 use fictionet::stdlib::{
     codec::{Decode, Lcg, Step, Wire},
-    onc_rpc::{self, Reader, Writer},
+    protocols::onc_rpc::{self, Reader, Writer},
     test_support::contract,
 };
 

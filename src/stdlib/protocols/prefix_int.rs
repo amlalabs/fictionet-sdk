@@ -51,7 +51,7 @@ fn mask(prefix: u8) -> Result<u8, Error> {
 /// truncation, and overflow. Reads at most [`MAX_BYTES`] bytes and allocates none.
 ///
 /// ```
-/// use fictionet::stdlib::prefix_int;
+/// use fictionet::stdlib::protocols::prefix_int;
 /// assert_eq!(prefix_int::read(&[0x1f, 0x9a, 0x0a, 0xff], 5)?, (1337, 3));
 /// # Ok::<(), prefix_int::Error>(())
 /// ```
@@ -106,12 +106,12 @@ pub fn write(out: &mut Vec<u8>, prefix: u8, flags: u8, value: u64) -> Result<(),
 /// their own limits. HPACK and QPACK use the same prefix representation.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Wire, prefix_int::Integer};
+/// use fictionet::stdlib::{codec::Wire, protocols::prefix_int::Integer};
 /// let integer = Integer::<5> { flags: 0x20, value: 1337 };
 /// let bytes = integer.to_bytes()?;
 /// assert_eq!(bytes, [0x3f, 0x9a, 0x0a]);
 /// assert_eq!(Integer::<5>::parse(&bytes)?, integer);
-/// # Ok::<(), fictionet::stdlib::prefix_int::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::prefix_int::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Integer<const PREFIX: u8> {

@@ -27,7 +27,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, try_pump};
-//! use fictionet::stdlib::sse::{Events, Limits};
+//! use fictionet::stdlib::protocols::sse::{Events, Limits};
 //!
 //! // Body chunks supplied by an HTTP response decoder after checking
 //! // Content-Type: text/event-stream and removing HTTP transfer framing.
@@ -140,12 +140,12 @@ fictionet::error_display!(Error, f, {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Wire;
-/// use fictionet::stdlib::sse::Line;
+/// use fictionet::stdlib::protocols::sse::Line;
 /// let mut body = Vec::new();
 /// Line::Comment(" keepalive".into()).write(&mut body)?;
 /// Line::Retry("3000".into()).write(&mut body)?;
 /// assert_eq!(body, b": keepalive\nretry:3000\n");
-/// # Ok::<(), fictionet::stdlib::sse::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::sse::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Line {

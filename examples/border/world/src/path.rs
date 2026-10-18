@@ -39,7 +39,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use fictionet::prelude::*;
-use fictionet::stdlib::{icmp, ip, tcp, udp};
+use fictionet::stdlib::network::{icmp, ip, tcp, udp};
 use fictionet::time::Instant;
 use fictionet::{Cx, End, Interface, Packet, RecvError, pair};
 use serde_json::json;
@@ -450,7 +450,7 @@ pub fn icmp_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::ip::checksum;
+    use fictionet::stdlib::network::ip::checksum;
 
     fn packet(proto: u8, ttl: u8, frag: u16, payload: &[u8]) -> Vec<u8> {
         let total = 20 + payload.len();

@@ -333,7 +333,7 @@ fn an_unknown_tls_name_is_rejected_with_unrecognized_name() {
 #[cfg(feature = "web-proxy")]
 #[tokio::test]
 async fn the_proxy_uses_its_target_and_removes_connection_headers() {
-    use fictionet::stdlib::httpd::{self, Handler, VHost, VirtualHosts};
+    use fictionet::stdlib::web::httpd::{self, Handler, VHost, VirtualHosts};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -577,9 +577,9 @@ async fn websocket_echo<C: Connection>(
     conn: &mut C,
     host: &str,
     text: &str,
-) -> fictionet::stdlib::websocket::Message {
+) -> fictionet::stdlib::protocols::websocket::Message {
     use fictionet::stdlib::codec::{Stream, Wire};
-    use fictionet::stdlib::websocket::{Message as Ws, Messages};
+    use fictionet::stdlib::protocols::websocket::{Message as Ws, Messages};
     let request = format!(
         "GET /echo HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
@@ -646,7 +646,7 @@ async fn websockets_work_through_sites() {
             let reply = websocket_echo(&fcx, &mut conn, "ws.test", "hello").await;
             assert_eq!(
                 reply,
-                fictionet::stdlib::websocket::Message::Text("echo: hello".into())
+                fictionet::stdlib::protocols::websocket::Message::Text("echo: hello".into())
             );
             Err(fictionet::Error::from(Done))
         }),

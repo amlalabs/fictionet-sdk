@@ -15,7 +15,7 @@
 //!
 //! Inside, an endpoint is one background task that runs the smoltcp TCP
 //! stack. The interface it takes comes from
-//! [`ip::split_protocols`](fictionet::stdlib::ip::split_protocols), which
+//! [`ip::split_protocols`](fictionet::stdlib::network::ip::split_protocols), which
 //! splits a machine's packets so that only TCP, and ICMP errors about it,
 //! reach this layer.
 //!
@@ -28,11 +28,11 @@
 //!
 //! This builds a machine at `104.18.32.7` and accepts connections on its
 //! port 443. The other end of the [`pair`](fictionet::pair) goes to a router,
-//! as the [`route`](fictionet::stdlib::route) page shows:
+//! as the [`route`](fictionet::stdlib::network::route) page shows:
 //!
 //! ```
 //! # use fictionet::{Cx, Result, pair};
-//! # use fictionet::stdlib::{ip, tcp};
+//! # use fictionet::stdlib::network::{ip, tcp};
 //! # async fn stripe(fcx: Cx) -> Result {
 //! // A link between the router and Stripe's machine.
 //! let (router_side, stripe_side) = pair();
@@ -64,12 +64,12 @@ use smoltcp::socket::tcp::{self as stcp, State as TcpState};
 use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Packet, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
-use fictionet::stdlib::ip::{
+use fictionet::stdlib::network::ip::{
     Header, checksum,
     protocol::{ICMP, TCP},
     set_header_checksum, strip_extension_headers, transport_checksum,
 };
-use fictionet::stdlib::{ConnError, Connection};
+use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, Error, Interface, Packet};
 
@@ -203,7 +203,7 @@ impl Options {
     /// Larger buffers cost memory only as data passes through them, but they
     /// let each connection put more packets in flight at once. Interfaces
     /// with a size limit on the way, such as those of
-    /// [`split_protocols`](fictionet::stdlib::ip::split_protocols), drop what
+    /// [`split_protocols`](fictionet::stdlib::network::ip::split_protocols), drop what
     /// does not fit, and TCP then sends it again.
     pub fn buffer(self, bytes: usize) -> Options {
         Options {
@@ -244,7 +244,7 @@ impl Options {
 ///
 /// ```
 /// # use fictionet::{Cx, End, Result};
-/// # use fictionet::stdlib::tcp;
+/// # use fictionet::stdlib::network::tcp;
 /// # fn machine(fcx: &Cx, tcp_packets: End) -> Result {
 /// let options = tcp::Options::default().buffer(1 << 20);
 /// let machine = tcp::endpoint_with(fcx, tcp_packets, "10.0.0.1".parse()?, options);
@@ -1782,7 +1782,7 @@ impl Listener {
     }
 }
 
-impl fictionet::stdlib::Accept for Listener {
+impl fictionet::stdlib::network::Accept for Listener {
     type Conn = TcpConnection;
 
     async fn accept(&mut self, fcx: &Cx) -> Result<Self::Conn, ConnError> {
@@ -1790,7 +1790,7 @@ impl fictionet::stdlib::Accept for Listener {
     }
 }
 
-impl fictionet::stdlib::Accepted for TcpConnection {
+impl fictionet::stdlib::network::Accepted for TcpConnection {
     fn local_addr(&self) -> SocketAddr {
         TcpConnection::local_addr(self)
     }
@@ -2069,7 +2069,7 @@ fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::ConnectionExt;
+    use fictionet::stdlib::network::ConnectionExt;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::{InterfaceExt, Seed, block_on, lab, pair, run};
 
@@ -2516,7 +2516,7 @@ mod tests {
         t[14..16].copy_from_slice(&65535u16.to_be_bytes());
         let sum = transport_checksum(src.ip(), dst.ip(), TCP, &t);
         t[16..18].copy_from_slice(&sum.to_be_bytes());
-        fictionet::stdlib::ip::packet(src.ip(), dst.ip(), TCP, &t)
+        fictionet::stdlib::network::ip::packet(src.ip(), dst.ip(), TCP, &t)
     }
 
     /// Drives the stack at one fixed time, without running its background task.
@@ -2533,7 +2533,7 @@ mod tests {
 
     #[test]
     fn icmp_requires_the_current_syn_and_a_valid_quote() {
-        use fictionet::stdlib::{icmp, ip};
+        use fictionet::stdlib::network::{icmp, ip};
 
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (_raw, side) = pair();

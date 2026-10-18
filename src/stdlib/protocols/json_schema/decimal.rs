@@ -3,7 +3,7 @@
 
 use super::{Limits, spend};
 use fictionet::stdlib::codec::Work;
-use fictionet::stdlib::json::{Number, Value};
+use fictionet::stdlib::protocols::json::{Number, Value};
 use std::cmp::Ordering;
 
 // Normalized coefficient digits times 10^exponent. Zero has empty digits.

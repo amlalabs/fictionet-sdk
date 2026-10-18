@@ -43,7 +43,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::smb2::{
+//! use fictionet::stdlib::protocols::smb2::{
 //!     Frame, Header, Message, NegotiateRequest, NegotiateResponse, Packet, Request, Response, command,
 //!     dialect, status,
 //! };
@@ -481,12 +481,12 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::{Frames, Decode, Stream, Wire};
-    /// use fictionet::stdlib::smb2::{Frame, Packet};
+    /// use fictionet::stdlib::protocols::smb2::{Frame, Packet};
     /// let bytes = Wire::to_bytes(&Frame { payload: b"\xffSMBhello".to_vec() })?;
     /// let mut stream = Stream::new(Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)));
     /// assert_eq!(stream.push(&bytes), bytes.len());
     /// assert!(matches!(stream.next(), Some(Ok(Ok(Packet::Smb1(_))))));
-    /// # Ok::<(), fictionet::stdlib::smb2::Error>(())
+    /// # Ok::<(), fictionet::stdlib::protocols::smb2::Error>(())
     /// ```
     Frame => (Frame, Error, usize);
     name = "SMB direct TCP";

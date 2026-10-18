@@ -30,8 +30,8 @@
 //! [`Upgrade::response_headers`]. It pushes connection bytes to
 //! [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for frames or
 //! [`Stream<Messages>`](fictionet::stdlib::codec::Stream) for whole [`Message`]s.
-//! After the handshake, a [`Service`](fictionet::stdlib::serve::Service)
-//! run by [`serve::connection`](fictionet::stdlib::serve::connection) can
+//! After the handshake, a [`Service`](fictionet::stdlib::services::serve::Service)
+//! run by [`serve::connection`](fictionet::stdlib::services::serve::connection) can
 //! use [`Frames`] or [`Messages`] to read the WebSocket connection.
 //! Replies become frames through [`Message::to_frame`] or
 //! [`Message::to_frames`]. Answering pings and deciding when to close
@@ -44,7 +44,7 @@
 //! ```
 //! # fictionet::cfg_std! {
 //! use fictionet::stdlib::codec::{Side, Stream, Wire};
-//! use fictionet::stdlib::websocket::{check_request, Frame, Message, Messages, Opcode};
+//! use fictionet::stdlib::protocols::websocket::{check_request, Frame, Message, Messages, Opcode};
 //!
 //! // The client's opening request, from RFC 6455 section 1.3.
 //! let headers = [
@@ -897,7 +897,7 @@ impl codec::Decode for Frames {
 /// handshake and write variants are not returned by this decoder.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Side, Stream, Wire}, websocket::{Messages, Frame, Opcode}};
+/// use fictionet::stdlib::{codec::{Side, Stream, Wire}, protocols::websocket::{Messages, Frame, Opcode}};
 /// let mut stream = Stream::new(Messages::for_receiver(Side::Server));
 /// let frame = Frame { fin: true, opcode: Opcode::Close, mask: Some([1; 4]), payload: vec![] };
 /// let mut bytes = Wire::to_bytes(&frame)?;

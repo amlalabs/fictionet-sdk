@@ -118,9 +118,9 @@ mod tests {
 
     use bytes::Bytes;
     use fictionet::prelude::*;
-    use fictionet::stdlib::dns::op::{Message, Query};
-    use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-    use fictionet::stdlib::{ip, tcp, udp};
+    use fictionet::stdlib::network::{ip, tcp, udp};
+    use fictionet::stdlib::protocols::dns::op::{Message, Query};
+    use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
     use fictionet::{Cx, End};
     use http_body_util::{BodyExt, Full};
     use rustls::pki_types::ServerName;

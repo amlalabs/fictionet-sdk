@@ -1,7 +1,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Collect;
-use fictionet::stdlib::http1::{Chunk, Header, Request, RequestEvents, RequestHead, Version};
+use fictionet::stdlib::protocols::http1::{
+    Chunk, Header, Request, RequestEvents, RequestHead, Version,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet_fuzz::http1::event_limits;
 use libfuzzer_sys::fuzz_target;

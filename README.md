@@ -139,7 +139,7 @@ fn world(
 ```
 
 A longer version, which the docs compile as a test, is at the top of
-[`stdlib::web`](src/stdlib/web/sites.rs), and [`examples/web_world.rs`](examples/web_world.rs)
+[`stdlib::web`](src/stdlib/web/mod.rs), and [`examples/web_world.rs`](examples/web_world.rs)
 is a complete world.
 
 Underneath, a world is a set of tasks joined by packet interfaces: a delay, a
@@ -147,11 +147,11 @@ bottleneck, a router, a TCP endpoint. The crate docs show each layer.
 
 ## Hosts, services and protocols
 
-`stdlib::net` builds a network of hosts, each with addresses, DNS names and
+`stdlib::world::net` builds a network of hosts, each with addresses, DNS names and
 services on its ports. A service is the server side of one protocol for one
 connection, written with no I/O: it gets decoded items and appends reply bytes,
 and one driver runs it over any connection. HTTP is a service
-(`stdlib::httpd`), and `web::Sites` is a preset on `Net` for websites. Every
+(`stdlib::web::httpd`), and `web::Sites` is a preset on `Net` for websites. Every
 service records what it sees in the run's one log of events
 (`fictionet::events`), which every run keeps: a file a grader reads after the
 run, callbacks, or the dashboard.
@@ -199,9 +199,9 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 | [`examples/ping_world.rs`](examples/ping_world.rs) | The smallest world: it answers every ping and drops everything else. |
 | [`examples/custom_protocol`](examples/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom dashboard presenter. Runs without network or root. |
 | [`examples/web_world.rs`](examples/web_world.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The getting-started tutorial runs it. |
-| [`examples/delayed_sites.rs`](examples/delayed_sites.rs) | Each site is 200 ms away, using `stdlib::delay` and `Attachments::map`. |
-| [`examples/lossy_sites.rs`](examples/lossy_sites.rs) | `stdlib::filter` drops 5% of packets each way. |
-| [`examples/bottleneck_sites.rs`](examples/bottleneck_sites.rs) | An 8 Mbit/s link using `stdlib::bottleneck`, with a count of queue drops. |
+| [`examples/delayed_sites.rs`](examples/delayed_sites.rs) | Each site is 200 ms away, using `stdlib::network::delay` and `Attachments::map`. |
+| [`examples/lossy_sites.rs`](examples/lossy_sites.rs) | `stdlib::network::filter` drops 5% of packets each way. |
+| [`examples/bottleneck_sites.rs`](examples/bottleneck_sites.rs) | An 8 Mbit/s link using `stdlib::network::bottleneck`, with a count of queue drops. |
 | [`examples/capture_sites.rs`](examples/capture_sites.rs) | Writes sandbox packets to a pcap file that tshark and Wireshark open. |
 | [`examples/route_change.rs`](examples/route_change.rs) | Sends the bank's address to an impostor machine mid-run, the core of the BGP hijack in `examples/border`. |
 | [`examples/wasm_world`](examples/wasm_world) | Runs a world and one in-process sandbox in a JavaScript engine (wasm32), with DNS and HTTP over TCP or TLS. |
@@ -235,9 +235,9 @@ Start at the crate root, which explains the main ideas, then read in this order:
 4. [`lowering`](docs/guide/lowering.rs): how each attach type turns what its sandbox
    sends into IP packets.
 5. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
-   protocol modules. Then [`stdlib::net`](src/stdlib/world/net.rs) and
-   [`stdlib::serve`](src/stdlib/services/serve.rs) for a network of hosts and
-   services, and [`stdlib::web`](src/stdlib/web/sites.rs) for a network of
+   protocol modules. Then [`stdlib::world::net`](src/stdlib/world/net.rs) and
+   [`stdlib::services::serve`](src/stdlib/services/serve.rs) for a network of hosts and
+   services, and [`stdlib::web`](src/stdlib/web/mod.rs) for a network of
    websites.
 6. [`recipes`](docs/guide/recipes.rs): a delayed website, a slow or lossy link, a packet
    capture, and a route that changes mid-run.

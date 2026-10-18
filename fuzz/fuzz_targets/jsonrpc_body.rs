@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Collect, CollectError, Decode, Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::{
+use fictionet::stdlib::protocols::{
     json::{self, Limits, Value},
     jsonrpc::{self, Batch, Body, Error, Incoming, Message},
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fn check_error(error: Error) {

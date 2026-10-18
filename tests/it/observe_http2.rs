@@ -1,7 +1,10 @@
 use fictionet::{
     events::Transport,
     observe::{Decoded, Observed, Place, Registry, Selection, http2 as capture},
-    stdlib::{codec::Wire, grpc, hpack, http2},
+    stdlib::{
+        codec::Wire,
+        protocols::{grpc, hpack, http2},
+    },
 };
 
 fn headers() -> Vec<u8> {

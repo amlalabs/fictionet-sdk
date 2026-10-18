@@ -1,7 +1,10 @@
 //! A rustls client over a simulated connection.
 
 use fictionet::Cx;
-use fictionet::stdlib::{ConnError, Connection, ConnectionExt, tls};
+use fictionet::stdlib::{
+    network::{ConnError, Connection, ConnectionExt},
+    services::tls,
+};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use std::io::{ErrorKind, Read, Write};

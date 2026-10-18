@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use fictionet::events::{self, Level};
-use fictionet::stdlib::{
+use fictionet::stdlib::network::{
     ip,
     ports::{self, Ports},
 };
@@ -199,7 +199,7 @@ impl Prefix {
 ///
 /// ```
 /// # use fictionet::{Cx, End, Interface, Result, pair};
-/// # use fictionet::stdlib::{ip, route, tcp};
+/// # use fictionet::stdlib::network::{ip, route, tcp};
 /// # fn wire(fcx: Cx, toward_sandbox: End) -> Result {
 /// let (router_side, stripe_side) = pair();
 /// let (router_side_dns, dns_side) = pair();
@@ -230,7 +230,7 @@ impl Prefix {
 /// other, cannot carry such a packet forever. The drop is recorded as a
 /// `router.drop` [event](fictionet::events), a [repeat](fictionet::events#repeats). Once the router has an [address](Router::address) of the
 /// packet's family, it also answers the sender with an ICMP "time
-/// exceeded" ([`icmp::time_exceeded`](fictionet::stdlib::icmp::time_exceeded)),
+/// exceeded" ([`icmp::time_exceeded`](fictionet::stdlib::network::icmp::time_exceeded)),
 /// which is what `traceroute` reads.
 ///
 /// Packets to or from the router's own addresses still go through route
@@ -359,7 +359,8 @@ fn expired<I: Interface>(
     } else {
         a6.map(IpAddr::V6)
     };
-    let answer = from.and_then(|from| fictionet::stdlib::icmp::time_exceeded(&packet.0, from));
+    let answer =
+        from.and_then(|from| fictionet::stdlib::network::icmp::time_exceeded(&packet.0, from));
     if let Some(answer) = answer
         && let Some(src) = ip::source(&packet.0)
         && let Some(i) = table.best(src)
@@ -568,7 +569,7 @@ impl<I: Interface> Router<I> {
     /// Makes the router a private one, invisible to the packets it
     /// forwards: from now on it leaves their TTL and hop limit as they are,
     /// and never drops a packet for running out. A network that should look
-    /// like one hop, such as [`Net`](fictionet::stdlib::net::Net), uses this.
+    /// like one hop, such as [`Net`](fictionet::stdlib::world::net::Net), uses this.
     /// Such a router can carry a packet around a loop of routes forever, so
     /// use it only where every way back to it passes something that lowers
     /// the TTL itself, such as a sandbox's kernel.
@@ -604,7 +605,7 @@ impl<I: Interface> Router<I> {
 /// or not an IP packet. A member that is replaced or whose interface closes
 /// is recorded too (`lan.member_replaced`, `lan.member_removed`). `enrich`
 /// adds context to each drop before recording it, as
-/// [`net::Net`](fictionet::stdlib::net::Net) uses to name the LAN.
+/// [`net::Net`](fictionet::stdlib::world::net::Net) uses to name the LAN.
 /// Attachment identity comes from the ingress registration.
 ///
 /// This is how virtual machines attached with `fictionet attach --type tap`
@@ -621,7 +622,7 @@ impl<I: Interface> Router<I> {
 ///
 /// ```
 /// # use fictionet::{Cx, End, Interface, Result, pair};
-/// # use fictionet::stdlib::route;
+/// # use fictionet::stdlib::network::route;
 /// # fn wire(fcx: Cx, toward_sandbox: End, dc_side: End, pc_side: End) -> Result {
 /// let lan = route::lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
 /// lan.add("192.168.56.10".parse()?, Box::new(dc_side), None)?;
@@ -1060,7 +1061,7 @@ mod tests {
 
     fn ip(src: &str, dst: &str, ttl: u8) -> Packet {
         let mut p =
-            fictionet::stdlib::ip::packet(src.parse().unwrap(), dst.parse().unwrap(), 17, &[0; 8]);
+            fictionet::stdlib::network::ip::packet(src.parse().unwrap(), dst.parse().unwrap(), 17, &[0; 8]);
         if p.0[0] >> 4 == 4 {
             p.0[8] = ttl;
             ip::set_header_checksum(&mut p.0[..20]);

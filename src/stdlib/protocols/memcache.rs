@@ -41,7 +41,7 @@
 //! ```
 //! use std::collections::HashMap;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::memcache::{Command, Commands, Response};
+//! use fictionet::stdlib::protocols::memcache::{Command, Commands, Response};
 //!
 //! let mut cache: HashMap<Vec<u8>, (u32, Vec<u8>)> = HashMap::new();
 //! let mut decoder = Stream::new(Commands::new());

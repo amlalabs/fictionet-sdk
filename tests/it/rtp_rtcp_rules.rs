@@ -1,8 +1,10 @@
 //! RTCP protocol cases moved from the former RTP control-packet implementation.
 use fictionet::stdlib::{
     codec::Wire,
-    rtcp::{self, *},
-    rtp,
+    protocols::{
+        rtcp::{self, *},
+        rtp,
+    },
     test_support::contract,
 };
 

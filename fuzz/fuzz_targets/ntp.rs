@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::ntp::{
+use fictionet::stdlib::protocols::ntp::{
     KissCode, Mode, Packet, ServerInfo, Timestamp, kiss_reply, server_reply,
 };
 use fictionet::stdlib::test_support::contract;

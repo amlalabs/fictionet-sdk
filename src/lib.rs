@@ -24,7 +24,7 @@
 //! requirements and the HTTP/2 host-clock exception. [`running`] is the
 //! guide; [`run`], [`lab`] and [`Cx`] document the runtime operations, and
 //! [`events`] documents recording. `run.start` records the seed only when
-//! [`Net::start`](stdlib::net::Net::start) or world code calls
+//! [`Net::start`](stdlib::world::net::Net::start) or world code calls
 //! [`EventLog::start`](events::EventLog::start).
 //!
 //! # How a sandbox connects to a world
@@ -87,9 +87,9 @@
 //!
 //! async fn world(fcx: Cx, mut attachments: Attachments) -> Result {
 //!     let agent = attachments.get(&fcx, "agent").await?;
-//!     let link = stdlib::delay(&fcx, ms(50), agent);
-//!     let (v4, v6, _) = stdlib::ip::split_versions(&fcx, link);
-//!     // route v4 and v6 with stdlib::route::router(&fcx, ...)
+//!     let link = stdlib::network::delay(&fcx, ms(50), agent);
+//!     let (v4, v6, _) = stdlib::network::ip::split_versions(&fcx, link);
+//!     // route v4 and v6 with stdlib::network::route::router(&fcx, ...)
 //!     Ok(())
 //! }
 //! ```
@@ -168,20 +168,20 @@
 //! Most worlds are a network of hosts, each answering some protocols. Three
 //! stdlib modules make one in a few lines:
 //!
-//! - [`stdlib::serve`]: a [`Service`](stdlib::serve::Service) is the server
-//!   side of one protocol for one connection, with no I/O: it gets decoded
-//!   items, appends reply bytes, and records facts. One driver runs any
-//!   service over any connection, with timers, TLS, a transcript and fault
-//!   plans.
-//! - [`stdlib::net`]: a [`Net`](stdlib::net::Net) builds the network around
-//!   the [`Host`](stdlib::net::Host)s it is given: the sandboxes' subnet with
-//!   DHCP, DNS for every host's names, a router, one machine per address, and
-//!   each host's services on their ports.
+//! - [`stdlib::services::serve`]: a [`Service`](stdlib::services::serve::Service)
+//!   is the server side of one protocol for one connection, with no I/O: it
+//!   gets decoded items, appends reply bytes, and records facts. One driver
+//!   runs any service over any connection, with timers, TLS, a transcript and
+//!   fault plans.
+//! - [`stdlib::world::net`]: a [`Net`](stdlib::world::net::Net) builds the
+//!   network around the [`Host`](stdlib::world::net::Host)s it is given: the
+//!   sandboxes' subnet with DHCP, DNS for every host's names, a router, one
+//!   machine per address, and each host's services on their ports.
 //! - [`events`]: one log for everything the network and its services do,
 //!   kept by every run, and read as a file a grader reads after the run,
 //!   callbacks, or the dashboard.
 //!
-//! HTTP is a service too ([`stdlib::httpd`]): a router whose handlers get
+//! HTTP is a service too ([`stdlib::web::httpd`]): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
 //! server and a line-echo service run on two hosts, with the events on disk:
 //!
@@ -191,10 +191,10 @@
 //! use std::sync::Arc;
 //! use fictionet::{Attachments, Cx, Result};
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
-//! use fictionet::stdlib::httpd::{Router, Server};
+//! use fictionet::stdlib::web::httpd::{Router, Server};
 //! use fictionet::events::Event;
-//! use fictionet::stdlib::net::Net;
-//! use fictionet::stdlib::serve::{Flow, Driver, Service};
+//! use fictionet::stdlib::world::net::Net;
+//! use fictionet::stdlib::services::serve::{Flow, Driver, Service};
 //!
 //! /// Echoes each line back.
 //! struct Echo;
@@ -236,9 +236,9 @@
 //! data formats, listed in the [module table](stdlib#modules). Their message
 //! types parse and write bytes ([`Wire`](stdlib::codec::Wire)), and their
 //! decoders cut items out of input ([`Decode`](stdlib::codec::Decode)).
-//! HTTP has a ready server, [`stdlib::net::Net`] serves DNS and DHCP, and
+//! HTTP has a ready server, [`stdlib::world::net::Net`] serves DNS and DHCP, and
 //! TLS is built in. For other protocols, a world writes a
-//! [`Service`](stdlib::serve::Service) around the module's decoder.
+//! [`Service`](stdlib::services::serve::Service) around the module's decoder.
 //! The codecs also work in unit tests, fuzz targets and dashboard presenters.
 //! See [Changing a protocol by copying it](stdlib#changing-a-protocol-by-copying-it).
 //!
@@ -261,7 +261,7 @@
 //!    and how to check that it works.
 //! 4. [`lowering`]: how each attach type turns what its sandbox sends
 //!    into IP packets, and what the world sees from each.
-//! 5. [`stdlib`], then [`stdlib::net`] and [`stdlib::serve`]: the
+//! 5. [`stdlib`], then [`stdlib::world::net`] and [`stdlib::services::serve`]: the
 //!    networking pieces a world is built from, and a network of hosts and
 //!    services in a few lines. [`stdlib::web`] does the same for websites.
 //! 6. [`recipes`]: a delayed website, a slow or lossy link, a packet
@@ -374,14 +374,14 @@ pub mod tokio;
 mod watch;
 
 /// The extension traits. Import this to call methods such as
-/// [`recv`](InterfaceExt::recv) and [`read`](stdlib::ConnectionExt::read).
+/// [`recv`](InterfaceExt::recv) and [`read`](stdlib::network::ConnectionExt::read).
 ///
 /// ```
 /// use fictionet::prelude::*;
 /// ```
 pub mod prelude {
     pub use crate::InterfaceExt;
-    pub use crate::stdlib::ConnectionExt;
+    pub use crate::stdlib::network::ConnectionExt;
     #[cfg(feature = "tokio")]
     pub use crate::tokio::ConnectionTokioExt;
 }

@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::{dhcp, dhcpv6};
+use fictionet::stdlib::protocols::{dhcp, dhcpv6};
 
 use super::addresses;
 use super::ether::{self, Frame, Mac, Upper};

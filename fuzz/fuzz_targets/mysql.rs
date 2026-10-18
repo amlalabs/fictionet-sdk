@@ -6,8 +6,8 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::mysql::harness::check_payload;
-use fictionet::stdlib::mysql::*;
+use fictionet::stdlib::protocols::mysql::harness::check_payload;
+use fictionet::stdlib::protocols::mysql::*;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 

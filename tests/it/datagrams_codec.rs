@@ -9,8 +9,10 @@ use fictionet::stdlib::codec::{
 };
 use fictionet::stdlib::test_support::contract;
 
+use fictionet::stdlib::protocols::{
+    geneve, gre, igmp, ipsec, ospf, pim, rip, vrrp, wake_on_lan as wol,
+};
 use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
-use fictionet::stdlib::{geneve, gre, igmp, ipsec, ospf, pim, rip, vrrp, wake_on_lan as wol};
 
 fn round_trip<M>(value: &M, limit: usize) -> Vec<u8>
 where
@@ -153,7 +155,7 @@ fn gre_packets_and_exact_pptp_boundary() {
 
 fn igmp_checksum(bytes: &mut [u8]) {
     bytes.get_mut(2..4).unwrap().fill(0);
-    let checksum = fictionet::stdlib::ip::checksum(bytes);
+    let checksum = fictionet::stdlib::network::ip::checksum(bytes);
     bytes
         .get_mut(2..4)
         .unwrap()
@@ -335,21 +337,23 @@ fn raw_too_long(limit: usize) {
 #[test]
 fn ospf_context_stays_in_the_mapping() {
     let endpoints = [
-        fictionet::stdlib::ip::Endpoints::V4 {
+        fictionet::stdlib::network::ip::Endpoints::V4 {
             source: Ipv4Addr::new(192, 0, 2, 1),
             destination: ospf::ALL_SPF_ROUTERS_V4,
         },
-        fictionet::stdlib::ip::Endpoints::V6 {
+        fictionet::stdlib::network::ip::Endpoints::V6 {
             source: "fe80::1".parse().unwrap(),
             destination: ospf::ALL_SPF_ROUTERS_V6,
         },
     ];
     for endpoints in endpoints {
         let header = match endpoints {
-            fictionet::stdlib::ip::Endpoints::V4 { .. } => ospf::Header::V2 {
+            fictionet::stdlib::network::ip::Endpoints::V4 { .. } => ospf::Header::V2 {
                 auth: ospf::Auth::Null,
             },
-            fictionet::stdlib::ip::Endpoints::V6 { .. } => ospf::Header::V3 { instance_id: 1 },
+            fictionet::stdlib::network::ip::Endpoints::V6 { .. } => {
+                ospf::Header::V3 { instance_id: 1 }
+            }
         };
         let packet = ospf::Packet {
             router_id: Ipv4Addr::new(192, 0, 2, 1),
@@ -386,11 +390,11 @@ fn ospf_context_stays_in_the_mapping() {
 #[test]
 fn pim_context_stays_in_the_mapping() {
     let endpoints = [
-        fictionet::stdlib::ip::Endpoints::V4 {
+        fictionet::stdlib::network::ip::Endpoints::V4 {
             source: Ipv4Addr::new(192, 0, 2, 1),
             destination: pim::ALL_PIM_ROUTERS_V4,
         },
-        fictionet::stdlib::ip::Endpoints::V6 {
+        fictionet::stdlib::network::ip::Endpoints::V6 {
             source: "fe80::1".parse().unwrap(),
             destination: pim::ALL_PIM_ROUTERS_V6,
         },
@@ -419,11 +423,11 @@ fn pim_context_stays_in_the_mapping() {
 
 #[test]
 fn vrrp_context_stays_in_the_mapping() {
-    let v4 = fictionet::stdlib::ip::Endpoints::V4 {
+    let v4 = fictionet::stdlib::network::ip::Endpoints::V4 {
         source: Ipv4Addr::new(192, 0, 2, 1),
         destination: vrrp::GROUP_V4,
     };
-    let v6 = fictionet::stdlib::ip::Endpoints::V6 {
+    let v6 = fictionet::stdlib::network::ip::Endpoints::V6 {
         source: "fe80::1".parse().unwrap(),
         destination: vrrp::GROUP_V6,
     };

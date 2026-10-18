@@ -3,11 +3,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::wireguard::{
+use fictionet::stdlib::protocols::wireguard::{
     CookieReply, Data, Error, Initiation, MAX_ENCRYPTED, MAX_PLAINTEXT, Message, Plaintext,
     REJECT_AFTER_MESSAGES, ReplayWindow, Response, TAG_LEN, padding,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

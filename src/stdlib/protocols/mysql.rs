@@ -19,21 +19,23 @@
 //! ERR packet or a result set. This module follows the client/server
 //! protocol chapter of the MySQL source documentation.
 //!
-//! Nothing here reads a socket. A world that plays a database server
-//! sends a [`Handshake`] inside a [`Message`]. A [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses `codec::Frames<Packet>` for packets
-//! or [`Messages`] to join split packets and check their sequence IDs. It reads
-//! each payload as a [`HandshakeResponse`] or [`Command`], then builds
-//! reply messages from [`OkPacket`], [`ErrPacket`], or [`ResultSet`].
-//! World code decides which users, databases, and tables exist and what
-//! queries return. A client uses [`ResultReader`] to follow a result set.
+//! Nothing here reads a socket. A world that plays a database server sends a
+//! [`Handshake`] inside a [`Message`]. A
+//! [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! `codec::Frames<Packet>` for packets or [`Messages`] to join split packets
+//! and check their sequence IDs. It reads each payload as a
+//! [`HandshakeResponse`] or [`Command`], then builds reply messages from
+//! [`OkPacket`], [`ErrPacket`], or [`ResultSet`]. World code decides which
+//! users, databases, and tables exist and what queries return. A client uses
+//! [`ResultReader`] to follow a result set.
 //!
 //! Every reader checks lengths. Bad bytes give an [`Error`] or a
 //! [`Error`]. Writers refuse fields that cannot be preserved.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::mysql::{
+//! use fictionet::stdlib::protocols::mysql::{
 //!     capability, column_type, status, Column, Command, Handshake, Message, Messages,
 //!     ResultEvent, ResultReader, ResultSet, Row,
 //! };

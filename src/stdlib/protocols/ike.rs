@@ -39,7 +39,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::ike::{
+//! use fictionet::stdlib::protocols::ike::{
 //!     Body, KeyExchange, Message, Notify, Payload, Proposal, Transform, exchange, flags, notify, payload, protocol,
 //!     transform,
 //! };
@@ -90,7 +90,7 @@
 use fictionet::stdlib::codec::{Reader, Truncated, be16};
 
 use fictionet::stdlib::codec::{Wire, write_checked};
-use fictionet::stdlib::ipsec::Envelope;
+use fictionet::stdlib::protocols::ipsec::Envelope;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -98,7 +98,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 pub const PORT: u16 = 500;
 /// The UDP port IKE moves to when there is a NAT between the peers. IKE
 /// messages on it follow the [`NON_ESP_MARKER`].
-pub use fictionet::stdlib::ipsec::NAT_T_PORT;
+pub use fictionet::stdlib::protocols::ipsec::NAT_T_PORT;
 /// The length of the IKE header.
 pub const HEADER_LEN: usize = 28;
 /// The length of the generic payload header.
@@ -133,10 +133,10 @@ pub const MAX_SPI: usize = 255;
 pub const MAJOR_VERSION: u8 = 2;
 /// The single byte a peer behind a NAT sends on port 4500 to keep the
 /// NAT's mapping open (RFC 3948).
-pub use fictionet::stdlib::ipsec::KEEPALIVE as NAT_KEEPALIVE;
+pub use fictionet::stdlib::protocols::ipsec::KEEPALIVE as NAT_KEEPALIVE;
 /// The four zero bytes before an IKE message on port 4500. ESP packets
 /// start with a nonzero SPI there instead.
-pub use fictionet::stdlib::ipsec::NON_ESP_MARKER;
+pub use fictionet::stdlib::protocols::ipsec::NON_ESP_MARKER;
 
 /// Exchange types, from the header.
 pub mod exchange {
@@ -769,7 +769,7 @@ impl EncryptedFragment {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Wire;
-/// use fictionet::stdlib::ike::{Body, Message, Payload, HEADER_LEN, exchange, parse_payloads};
+/// use fictionet::stdlib::protocols::ike::{Body, Message, Payload, HEADER_LEN, exchange, parse_payloads};
 /// let payloads = vec![Payload::new(Body::Nonce(vec![7; 32]))];
 /// let envelope = Message {
 ///     initiator_spi: 0, responder_spi: 0, minor_version: 0,
@@ -1529,7 +1529,7 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Short);
 #[doc(hidden)]
 pub mod harness {
     use super::*;
-    use fictionet::stdlib::ipsec::Envelope;
+    use fictionet::stdlib::protocols::ipsec::Envelope;
     use fictionet::stdlib::test_support::contract;
 
     fn check_chain(first: u8, data: &[u8]) {
@@ -2431,7 +2431,7 @@ mod tests {
 
     #[test]
     fn nat_t_wrapper_policies() {
-        use fictionet::stdlib::ipsec::{self, Datagram, EspPacket};
+        use fictionet::stdlib::protocols::ipsec::{self, Datagram, EspPacket};
 
         assert_eq!(NAT_T_PORT, ipsec::NAT_T_PORT);
         assert_eq!(NON_ESP_MARKER, ipsec::NON_ESP_MARKER);

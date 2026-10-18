@@ -31,7 +31,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use fictionet::stdlib::{route, tls, web};
+use fictionet::stdlib::{network::route, services::tls, web};
 use fictionet::{Attachments, Cx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -68,15 +68,17 @@ pub struct Identity {
 impl Identity {
     /// Issues a fresh CA and one certificate per site.
     pub fn new(fcx: &Cx) -> Result<Self> {
-        let ca = fictionet::stdlib::ca::Ca::new(fcx, "Artifactory World CA")?;
+        let ca = fictionet::stdlib::services::ca::Ca::new(fcx, "Artifactory World CA")?;
         let mut leaves = Vec::new();
         for (name, _) in NAMES {
             let mut leaf = ca.issue(
                 fcx,
                 &[name],
-                fictionet::stdlib::x509::Validity {
-                    not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                    not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+                fictionet::stdlib::protocols::x509::Validity {
+                    not_before: fictionet::stdlib::protocols::x509::Time::from_unix(946684800)
+                        .unwrap(),
+                    not_after: fictionet::stdlib::protocols::x509::Time::from_unix(4102444800)
+                        .unwrap(),
                 },
             )?;
             leaves.push((leaf.chain.remove(0), leaf.key));

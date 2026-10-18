@@ -4,11 +4,11 @@
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::{Fail, Wire};
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::wake_on_lan::{
+use fictionet::stdlib::protocols::wake_on_lan::{
     Error, MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, MagicPackets, PACKET_LEN, Password, wakes,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 /// Whether `payload` wakes the card, checked the slow way: some offset

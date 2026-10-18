@@ -4,8 +4,8 @@
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::resp::harness::wire_same;
-use fictionet::stdlib::resp::{
+use fictionet::stdlib::protocols::resp::harness::wire_same;
+use fictionet::stdlib::protocols::resp::{
     Command, Commands, Error, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, Resp2, Value, Values,
 };
 use fictionet::stdlib::test_support::decode_all;

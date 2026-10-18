@@ -1,5 +1,5 @@
 use super::*;
-use fictionet::stdlib::sandbox::TlsClient;
+use fictionet::stdlib::world::sandbox::TlsClient;
 
 // ---------------------------------------------------------------------------
 // TLS by name
@@ -97,7 +97,7 @@ fn net_routes_tls_by_name_to_each_service() {
         Net::new()
             .ipv4_only()
             .add_host(
-                fictionet::stdlib::net::Host::new("tls")
+                fictionet::stdlib::world::net::Host::new("tls")
                     .at(addr)
                     .tls(6514, "a.test", move |_| ca.clone(), Arc::new(()), || Echo)
                     .tls(6514, "b.test", move |_| cb.clone(), Arc::new(()), || Upper),
@@ -265,7 +265,7 @@ fn net_limits_a_starttls_handshake() {
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 25);
-        let limits = fictionet::stdlib::net::Limits {
+        let limits = fictionet::stdlib::world::net::Limits {
             handshake: Duration::from_millis(200),
             ..Default::default()
         };

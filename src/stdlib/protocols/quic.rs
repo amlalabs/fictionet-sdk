@@ -34,7 +34,7 @@
 //! the connection with.
 //!
 //! ```
-//! use fictionet::stdlib::quic::{
+//! use fictionet::stdlib::protocols::quic::{
 //!     Datagram, Frame, Packet, PacketNumber, Payload, VERSION_1, VERSION_2,
 //! };
 //! use fictionet::stdlib::codec::Wire;

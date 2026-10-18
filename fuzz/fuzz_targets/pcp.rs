@@ -2,7 +2,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::pcp::*;
+use fictionet::stdlib::protocols::pcp::*;
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;

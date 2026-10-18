@@ -2,8 +2,10 @@
 //! certificate the agent sends, and writes them back.
 #![no_main]
 
-use fictionet::stdlib::asn1::harness::check;
-use fictionet::stdlib::asn1::{Frame, MAX_INPUT, Reader, Rules, StringKind, Tag, Writer};
+use fictionet::stdlib::protocols::asn1::harness::check;
+use fictionet::stdlib::protocols::asn1::{
+    Frame, MAX_INPUT, Reader, Rules, StringKind, Tag, Writer,
+};
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 

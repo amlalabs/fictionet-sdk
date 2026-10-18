@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use fictionet::Cx;
 use fictionet::events::{Event as Entry, Fields, opt};
-use fictionet::stdlib::json::Value as J;
+use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
 use crate::log::Log;

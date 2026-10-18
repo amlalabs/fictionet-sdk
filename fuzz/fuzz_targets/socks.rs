@@ -3,7 +3,7 @@
 
 use fictionet::stdlib::{
     codec::{Decode, Step},
-    socks::*,
+    protocols::socks::*,
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use fictionet::events::Event;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::serve::{Ended, Flow, Pending, PendingDriver, Timer, Upgrade};
+use fictionet::stdlib::services::serve::{Ended, Flow, Pending, PendingDriver, Timer, Upgrade};
 
 /// Echoes each line, closes on `quit`, hands over on `handoff`, and on
 /// `later` answers through deferred work.

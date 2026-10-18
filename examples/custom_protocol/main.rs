@@ -2,12 +2,10 @@
 use fictionet::events::Transport;
 use fictionet::observe::{Conversation, Decoded, Layer, Match, Place, Present, Registry};
 use fictionet::stdlib::{
-    ConnectionExt,
     codec::{Decode, Frames, Step, Wire},
-    ip,
-    net::Net,
-    serve::{Driver, Flow, Service},
-    tcp,
+    network::{ConnectionExt, ip, tcp},
+    services::serve::{Driver, Flow, Service},
+    world::net::Net,
 };
 use fictionet::{Cx, Seed, block_on, lab};
 use std::{convert::Infallible, net::Ipv4Addr, sync::Arc};
@@ -109,7 +107,7 @@ async fn read_planted_register(fcx: Cx) -> fictionet::Result {
     }
     .to_bytes()?;
     request[3] = 1;
-    assert!(fictionet::stdlib::modbus::Frame::parse(&request).is_err());
+    assert!(fictionet::stdlib::protocols::modbus::Frame::parse(&request).is_err());
     conn.write_all(&fcx, &request).await?;
     let mut bytes = Vec::new();
     let reply = loop {

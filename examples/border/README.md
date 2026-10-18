@@ -393,7 +393,7 @@ examples/border/
     src/scenario.rs                # names, addresses, routes, variants, hops
     src/bank.rs                    # the bank's pages and answers, the status page
     src/certs.rs                   # the lab CA, the home chain, the impostor's CA, leaves
-    src/bgp.rs                     # The border router's speaker on stdlib::bgp
+    src/bgp.rs                     # The border router's speaker on stdlib::protocols::bgp
     src/path.rs                    # each sandbox's path: hops, the two routers
     src/events.rs, src/log.rs      # the log, from the network's events and the world's own tasks
     src/lib.rs, src/main.rs        # the network, state.json, the ready file

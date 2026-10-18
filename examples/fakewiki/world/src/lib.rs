@@ -49,7 +49,7 @@ pub use backend_process::{Args, args, secs, start_backend, watch_backend};
 pub fn serve(
     fcx: &Cx,
     hosts: &HashMap<String, Ipv4Addr>,
-    leaves: HashMap<String, fictionet::stdlib::ca::Leaf>,
+    leaves: HashMap<String, fictionet::stdlib::services::ca::Leaf>,
     content: Content,
     log: Arc<Log>,
     attachments: fictionet::Attachments,
@@ -81,10 +81,10 @@ pub fn issue_leaves<'a>(
     fcx: &Cx,
     ca_dir: &Path,
     hosts: impl Iterator<Item = &'a String>,
-) -> fictionet::Result<HashMap<String, fictionet::stdlib::ca::Leaf>> {
+) -> fictionet::Result<HashMap<String, fictionet::stdlib::services::ca::Leaf>> {
     use fictionet::stdlib::{
-        ca::Ca,
-        x509::{Time, Validity},
+        protocols::x509::{Time, Validity},
+        services::ca::Ca,
     };
     let ca = Ca::new(fcx, "Internet Security Root CA")?;
     std::fs::create_dir_all(ca_dir)?;

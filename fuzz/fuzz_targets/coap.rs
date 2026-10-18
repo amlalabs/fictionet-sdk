@@ -2,39 +2,39 @@
 //! reads them.
 #![no_main]
 
-use fictionet::stdlib::coap::Reassembler;
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::protocols::coap::Reassembler;
 
-use fictionet::stdlib::coap::Block;
+use fictionet::stdlib::protocols::coap::Block;
 
-use fictionet::stdlib::coap::Error;
+use fictionet::stdlib::protocols::coap::Error;
 
-use fictionet::stdlib::coap::Code;
+use fictionet::stdlib::protocols::coap::Code;
 
-use fictionet::stdlib::coap::Frame;
+use fictionet::stdlib::protocols::coap::Frame;
 
-use fictionet::stdlib::coap::MAX_BUFFERED;
+use fictionet::stdlib::protocols::coap::MAX_BUFFERED;
 
-use fictionet::stdlib::coap::MAX_DATAGRAM;
+use fictionet::stdlib::protocols::coap::MAX_DATAGRAM;
 
-use fictionet::stdlib::coap::Message;
+use fictionet::stdlib::protocols::coap::Message;
 
-use fictionet::stdlib::coap::Options;
+use fictionet::stdlib::protocols::coap::Options;
 
-use fictionet::stdlib::coap::Type;
+use fictionet::stdlib::protocols::coap::Type;
 
-use fictionet::stdlib::coap::option;
+use fictionet::stdlib::protocols::coap::option;
 
-use fictionet::stdlib::coap::harness::check_blocks;
-use fictionet::stdlib::coap::peek_header;
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::protocols::coap::harness::check_blocks;
+use fictionet::stdlib::protocols::coap::peek_header;
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_BUFFERED);
-    contract::check_wire::<fictionet::stdlib::coap::Uint>(data);
+    contract::check_wire::<fictionet::stdlib::protocols::coap::Uint>(data);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Frame>(data);
     let mut built = Message::new(Type::Reset, Code(data.first().copied().unwrap_or(0)), 1);

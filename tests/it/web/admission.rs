@@ -306,7 +306,7 @@ fn connections_that_send_nothing_are_closed() {
         sites(&fcx)
             .sites
             .into_net()
-            .limits(fictionet::stdlib::net::Limits {
+            .limits(fictionet::stdlib::world::net::Limits {
                 handshake: Duration::from_secs(1),
                 dns_tcp_idle: Duration::from_secs(1),
                 ..Default::default()

@@ -1,7 +1,7 @@
 //! Header lookup for the legacy request logs.
 
 use fictionet::events::Event as Entry;
-use fictionet::stdlib::json::Value as J;
+use fictionet::stdlib::protocols::json::Value as J;
 
 /// The first matching header's string value, or none if it is missing or malformed.
 pub(super) fn header<'a>(e: &'a Entry, name: &str) -> Option<&'a str> {
@@ -20,7 +20,7 @@ mod tests {
 
     #[test]
     fn the_first_matching_name_controls_the_value() {
-        let headers = fictionet::stdlib::json::parse_with(
+        let headers = fictionet::stdlib::protocols::json::parse_with(
             br#"[null, [], ["user-agent", null], ["user-agent", "later"],
                 ["referer", "first"], ["referer", "second"], ["empty", ""]]"#,
             &Default::default(),

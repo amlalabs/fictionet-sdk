@@ -187,7 +187,7 @@ impl PartialOrd for Held {
 /// for inner replacements. Honor returned delay offsets when sending output.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Side, Faults, ItemFault, Recorder, Rule, Stream, Trigger, write_bounded}, json};
+/// use fictionet::stdlib::{codec::{Side, Faults, ItemFault, Recorder, Rule, Stream, Trigger, write_bounded}, protocols::json};
 /// let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
 /// let mut faults = Faults::new(1024, 8);
 /// let mut log = Recorder::new(16, 1024);
@@ -572,7 +572,7 @@ impl Faults {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::{modbus, test_support};
+    use fictionet::stdlib::{protocols::modbus, test_support};
 
     fn byte_fault_repeat(range: Option<Range<usize>>, copies: usize) -> ByteFault {
         ByteFault::Repeat { range, copies }

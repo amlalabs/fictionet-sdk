@@ -9,8 +9,8 @@ use input::{bytes, list};
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::rtcp::Frame;
-use fictionet::stdlib::rtcp::{
+use fictionet::stdlib::protocols::rtcp::Frame;
+use fictionet::stdlib::protocols::rtcp::{
     App, Body, Bye, Compound, Datagram, DlrrItem, ExtendedReport, Fir, MAX_DATAGRAM, MAX_PACKET,
     Nack, Packet, PayloadFeedback, PayloadMessage, ReceiverReport, Remb, ReportBlock, Rpsi,
     SdesChunk, SdesItem, SenderReport, Sli, Tmmb, TransportFeedback, TransportMessage, XrBlock,

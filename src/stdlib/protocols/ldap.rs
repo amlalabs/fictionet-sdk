@@ -16,7 +16,7 @@
 //! text) and RFC 4514 (DNs as text).
 //!
 //! Nothing here reads a socket. A world that plays a directory server pushes
-//! the bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection to a
+//! the bytes it reads from a [`tcp`](fictionet::stdlib::network::tcp) connection to a
 //! [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream), gets [`Message`]s back, matches on each one's [`Op`], and
 //! writes the reply's bytes with [`Message::write`]. A CLDAP server reads
 //! each datagram with [`Message::parse`], and a client reads a reply that
@@ -37,9 +37,9 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::ldap::{Authentication, BindResponse, Dn, Filter, LdapResult, Op, ResultCode};
+//! use fictionet::stdlib::protocols::ldap::{Authentication, BindResponse, Dn, Filter, LdapResult, Op, ResultCode};
 //!
-//! let mut decoder = Stream::new(Frames::<fictionet::stdlib::ldap::Message>::new());
+//! let mut decoder = Stream::new(Frames::<fictionet::stdlib::protocols::ldap::Message>::new());
 //! // An anonymous simple bind: message 1, LDAP version 3, no name, no password.
 //! let bind = [0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00];
 //! assert_eq!(decoder.push(&bind), bind.len());
@@ -63,11 +63,11 @@
 //! assert_eq!(dn.to_text().unwrap(), "uid=jdoe,dc=example,dc=com");
 //! ```
 
-use fictionet::stdlib::asn1::{self, Class, Element, Reader, Rules, Tag};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii::{hex_lower, hex_value as hex_digit};
 use fictionet::stdlib::codec::{Wire, write_checked};
+use fictionet::stdlib::protocols::asn1::{self, Class, Element, Reader, Rules, Tag};
 use std::fmt;
 
 /// The port LDAP servers listen on, over TCP, and CLDAP over UDP.

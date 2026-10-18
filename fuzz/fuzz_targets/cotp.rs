@@ -2,7 +2,7 @@
 //! transport server reads them.
 #![no_main]
 
-use fictionet::stdlib::cotp::harness;
+use fictionet::stdlib::protocols::cotp::harness;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -7,12 +7,12 @@ mod input;
 
 use input::list;
 
-use fictionet::stdlib::ip::Endpoints;
+use fictionet::stdlib::network::ip::Endpoints;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::ospf::{
+use fictionet::stdlib::protocols::ospf::{
     ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body,
     DatabaseDescription, ExternalRoute, Header, HelloV2, HelloV3, InterAreaPrefixLsa,
     InterAreaRouterLsa, IntraAreaPrefixLsa, LinkLsa, Lsa, LsaBody, LsaHeader, LsaKey, MAX_MESSAGE,
@@ -22,7 +22,7 @@ use fictionet::stdlib::ospf::{
 };
 use fictionet::stdlib::{
     codec::{Collect, Wire},
-    ospf,
+    protocols::ospf,
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

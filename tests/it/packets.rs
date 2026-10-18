@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use etherparse::PacketBuilder;
 use fictionet::prelude::*;
-use fictionet::stdlib::route::{Prefix, lan, router};
-use fictionet::stdlib::{bottleneck, delay, icmp, ip, udp};
+use fictionet::stdlib::network::route::{Prefix, lan, router};
+use fictionet::stdlib::network::{bottleneck, delay, icmp, ip, udp};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, lab, pair};
 

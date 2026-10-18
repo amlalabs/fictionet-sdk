@@ -16,7 +16,7 @@
 //! reference and the BSON 1.1 specification at bsonspec.org.
 //!
 //! A world that plays a database server passes bytes from a
-//! [`tcp`](fictionet::stdlib::tcp) connection to
+//! [`tcp`](fictionet::stdlib::network::tcp) connection to
 //! [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream), reads each message's command document,
 //! and writes the reply's bytes back to the connection. Which databases
 //! and collections exist, and what they hold, is up to world code.
@@ -37,7 +37,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
-//! use fictionet::stdlib::mongodb::{Body, Bson, Document, Message, Msg, Reply};
+//! use fictionet::stdlib::protocols::mongodb::{Body, Bson, Document, Message, Msg, Reply};
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! /// Answers the handshake and `ping`, and nothing else.

@@ -5,8 +5,8 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::smb2::harness::no_longer;
-use fictionet::stdlib::smb2::{
+use fictionet::stdlib::protocols::smb2::harness::no_longer;
+use fictionet::stdlib::protocols::smb2::{
     ChainedPayload, Compressed, Error, ErrorResponse, Frame, HEADER_LEN, Header, IoctlResponse,
     MAX_FRAME, MAX_MESSAGE, Message, NegotiateContext, NegotiateResponse, Packet, ReadRequest,
     Request, Response, Transform, TreeConnectRequest, WriteRequest, command, status,

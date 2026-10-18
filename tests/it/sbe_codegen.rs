@@ -1,10 +1,10 @@
-//! Generated SBE modules against the runtime SBE decoder, `stdlib::sbe`,
-//! loaded with the same schema: CME MDP 3.0 in `stdlib::cme_mdp3`, and the
+//! Generated SBE modules against the runtime SBE decoder, `stdlib::protocols::sbe`,
+//! loaded with the same schema: CME MDP 3.0 in `stdlib::protocols::cme_mdp3`, and the
 //! front end's sample schema in `codegen/tests/golden/sbe_sample.rs`.
 //!
 //! Messages come from a third, IR-driven encoder in this file. Each one is
 //! decoded by both sides and compared value by value, re-encoded by both
-//! sides and compared byte by byte, re-encoded by `stdlib::sbe` with longer
+//! sides and compared byte by byte, re-encoded by `stdlib::protocols::sbe` with longer
 //! blocks and a newer version for the generated decoder, and mutated to
 //! check that both sides accept and refuse the same bytes.
 #![allow(dead_code)]
@@ -13,7 +13,7 @@ mod sample;
 
 use fictionet::stdlib::{
     codec::{Lcg, Wire},
-    sbe,
+    protocols::sbe,
 };
 use fictionet_codegen::{
     Constant, Definition, Field, FrontEnd, IdentifierCase, Input, Length, Limits, NamedType,
@@ -130,7 +130,7 @@ fn sample_open_enums_preserve_values_and_refuse_aliases() {
 
 #[test]
 fn cme_open_enums_preserve_values_and_refuse_aliases() {
-    use fictionet::stdlib::cme_mdp3::{Error, SecurityUpdateAction};
+    use fictionet::stdlib::protocols::cme_mdp3::{Error, SecurityUpdateAction};
     check_open_enum(
         SecurityUpdateAction::Unknown,
         &[
@@ -504,7 +504,7 @@ fn debug_tokens(text: &str, ir: &Ir<'_>) -> Vec<Tok> {
     toks
 }
 
-/// Tokens from a `stdlib::sbe` message, walking the IR beside it. Also
+/// Tokens from a `stdlib::protocols::sbe` message, walking the IR beside it. Also
 /// checks that the runtime's constants equal the IR's.
 fn sbe_tokens(message: &sbe::Message, ir: &Ir<'_>) -> Vec<Tok> {
     let (_, cases) = ir.union();
@@ -697,7 +697,7 @@ where
 
 #[test]
 fn cme_mdp3_decoders_agree_on_every_template() {
-    let stats = differential::<fictionet::stdlib::cme_mdp3::Message>(XML, 64);
+    let stats = differential::<fictionet::stdlib::protocols::cme_mdp3::Message>(XML, 64);
     eprintln!("CME MDP 3.0: {stats:?}");
     assert_eq!(stats.messages, 31 * 64);
     assert!(stats.agreed > 1000 && stats.refused > 1000 && stats.tokens > 100_000);

@@ -2,9 +2,9 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{self, Decode, Fail, Lcg, Step, Stream, Wire, finish, pump};
+use fictionet::stdlib::protocols::{ftp, memcache, whois};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::{decode_all, mutate};
-use fictionet::stdlib::{ftp, memcache, whois};
 use std::fmt::Debug;
 
 fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
@@ -116,7 +116,7 @@ fn ftp_telnet_faults_and_eof() {
 
 #[test]
 fn ftp_telnet_limits_and_recovery() {
-    use fictionet::stdlib::telnet::MAX_SUBNEGOTIATION;
+    use fictionet::stdlib::protocols::telnet::MAX_SUBNEGOTIATION;
 
     for size in [
         MAX_SUBNEGOTIATION,

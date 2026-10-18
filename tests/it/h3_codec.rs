@@ -3,10 +3,12 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Stream, Wire, finish, pump},
-    http3::{self, Frame, Session, StreamHeader, StreamItem},
-    qpack::{
-        self, DecoderInstruction as DI, EncoderInstruction as EI, Field, Representation as Rep,
-        SectionResult, Table,
+    protocols::{
+        http3::{self, Frame, Session, StreamHeader, StreamItem},
+        qpack::{
+            self, DecoderInstruction as DI, EncoderInstruction as EI, Field, Representation as Rep,
+            SectionResult, Table,
+        },
     },
     test_support::contract,
     test_support::{self, chunks},
@@ -227,14 +229,14 @@ fn request_field_limit_rejects_oversized_fields() {
     // Keep literal strings uncompressed so the section exceeds the field limit.
     let mut section = vec![0, 0];
     for field in fields {
-        fictionet::stdlib::prefix_int::Integer::<3> {
+        fictionet::stdlib::protocols::prefix_int::Integer::<3> {
             flags: 0x20,
             value: field.name.len() as u64,
         }
         .write(&mut section)
         .unwrap();
         section.extend_from_slice(&field.name);
-        fictionet::stdlib::prefix_int::Integer::<7> {
+        fictionet::stdlib::protocols::prefix_int::Integer::<7> {
             flags: 0,
             value: field.value.len() as u64,
         }
@@ -848,9 +850,9 @@ fn decoder_instruction_capacity_is_one_bounded_integer() {
         qpack::MAX_INTEGER_BYTES
     );
     for ins in [
-        DI::SectionAck(fictionet::stdlib::quic::MAX_VARINT),
-        DI::StreamCancel(fictionet::stdlib::quic::MAX_VARINT),
-        DI::InsertCountIncrement(fictionet::stdlib::quic::MAX_VARINT),
+        DI::SectionAck(fictionet::stdlib::protocols::quic::MAX_VARINT),
+        DI::StreamCancel(fictionet::stdlib::protocols::quic::MAX_VARINT),
+        DI::InsertCountIncrement(fictionet::stdlib::protocols::quic::MAX_VARINT),
     ] {
         let bytes = contract::check_written(&ins);
         assert_eq!(bytes.len(), qpack::MAX_INTEGER_BYTES);
@@ -1031,7 +1033,7 @@ fn http3_invalid_frame_headers_fail_without_buffering_payloads() {
     for kind in [3, 7, 0x0d] {
         for length in [0, 9, 262_128] {
             let mut bytes = vec![kind];
-            fictionet::stdlib::quic::VarInt(length)
+            fictionet::stdlib::protocols::quic::VarInt(length)
                 .write(&mut bytes)
                 .unwrap();
             assert_eq!(
@@ -1040,7 +1042,7 @@ fn http3_invalid_frame_headers_fail_without_buffering_payloads() {
             );
         }
         let mut bytes = vec![kind];
-        fictionet::stdlib::quic::VarInt(http3::MAX_FRAME_PAYLOAD as u64 + 1)
+        fictionet::stdlib::protocols::quic::VarInt(http3::MAX_FRAME_PAYLOAD as u64 + 1)
             .write(&mut bytes)
             .unwrap();
         assert_eq!(<Frame as Wire>::parse(&bytes), Err(http3::Error::Limit));
@@ -1349,7 +1351,7 @@ fn qpack_blocked_retry_preserves_insert_count_across_wrapping() {
 #[test]
 fn qpack_instruction_failures_and_eof() {
     let mut over = vec![0xc0];
-    fictionet::stdlib::prefix_int::Integer::<7> {
+    fictionet::stdlib::protocols::prefix_int::Integer::<7> {
         flags: 0,
         value: qpack::MAX_STRING as u64 + 1,
     }
@@ -1427,8 +1429,8 @@ fn qpack_instruction_failures_and_eof() {
 fn qpack_strict_writers() {
     for invalid in [
         EI::SetCapacity(qpack::MAX_TABLE_CAPACITY + 1),
-        EI::SetCapacity(fictionet::stdlib::quic::MAX_VARINT + 1),
-        EI::Duplicate(fictionet::stdlib::quic::MAX_VARINT + 1),
+        EI::SetCapacity(fictionet::stdlib::protocols::quic::MAX_VARINT + 1),
+        EI::Duplicate(fictionet::stdlib::protocols::quic::MAX_VARINT + 1),
         EI::InsertWithNameRef {
             static_table: true,
             index: 99,
@@ -1436,7 +1438,7 @@ fn qpack_strict_writers() {
         },
         EI::InsertWithNameRef {
             static_table: false,
-            index: fictionet::stdlib::quic::MAX_VARINT + 1,
+            index: fictionet::stdlib::protocols::quic::MAX_VARINT + 1,
             value: vec![],
         },
         EI::InsertWithNameRef {
@@ -1460,7 +1462,7 @@ fn qpack_strict_writers() {
     }
     for invalid in [
         DI::InsertCountIncrement(0),
-        DI::InsertCountIncrement(fictionet::stdlib::quic::MAX_VARINT + 1),
+        DI::InsertCountIncrement(fictionet::stdlib::protocols::quic::MAX_VARINT + 1),
         DI::SectionAck(u64::MAX),
         DI::StreamCancel(u64::MAX),
     ] {
@@ -1470,9 +1472,9 @@ fn qpack_strict_writers() {
     for invalid in [
         Rep::Indexed {
             static_table: true,
-            index: fictionet::stdlib::quic::MAX_VARINT + 1,
+            index: fictionet::stdlib::protocols::quic::MAX_VARINT + 1,
         },
-        Rep::IndexedPostBase(fictionet::stdlib::quic::MAX_VARINT + 1),
+        Rep::IndexedPostBase(fictionet::stdlib::protocols::quic::MAX_VARINT + 1),
         Rep::LiteralNameRef {
             never_index: false,
             static_table: false,
@@ -1807,7 +1809,7 @@ fn http3_errors_are_items_or_terminal_according_to_boundary() {
     );
 
     let mut over = vec![0];
-    fictionet::stdlib::quic::VarInt(http3::MAX_FRAME_PAYLOAD as u64 + 1)
+    fictionet::stdlib::protocols::quic::VarInt(http3::MAX_FRAME_PAYLOAD as u64 + 1)
         .write(&mut over)
         .unwrap();
     let mut stream = Stream::new(Frames::<http3::Frame>::new());

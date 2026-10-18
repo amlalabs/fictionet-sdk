@@ -17,7 +17,7 @@
 //! names the user and carries responses computed from the challenge and
 //! the user's password. The three messages travel inside SMB, HTTP
 //! (`Authorization: NTLM`), RPC, LDAP and others, often wrapped in a
-//! [`spnego`](fictionet::stdlib::spnego) token. This module follows Microsoft's
+//! [`spnego`](fictionet::stdlib::protocols::spnego) token. This module follows Microsoft's
 //! \[MS-NLMP\] section 2.2.
 //!
 //! Nothing here reads a socket, decodes base64 or computes a hash. A world
@@ -37,7 +37,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::ntlmssp::{
+//! use fictionet::stdlib::protocols::ntlmssp::{
 //!     AvPair, Authenticate, Challenge, ClientChallenge, Message, Negotiate, NtResponse, NtlmV2Response,
 //!     av_id, UnicodeName, AvPairs, flags,
 //! };

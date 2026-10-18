@@ -1,4 +1,4 @@
-// A website 200 ms away from every sandbox: `stdlib::delay` in front of
+// A website 200 ms away from every sandbox: `stdlib::network::delay` in front of
 // `web::Sites`, with `Attachments::map`.
 //
 //     cargo run --example delayed_sites -- /run/fictionet/world.sock
@@ -23,7 +23,9 @@ fn main() -> fictionet::Result {
             );
 
             // Every sandbox, as it attaches, gets a 200 ms delay each way.
-            let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+            let far = attachments.map(&fcx, |fcx, sandbox| {
+                stdlib::network::delay(fcx, ms(200), sandbox)
+            });
 
             web::Sites::new(move |host: &str| match host {
                 "example.test" => Some(web::Site::new(app.clone())),

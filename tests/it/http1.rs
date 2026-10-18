@@ -1,6 +1,6 @@
 use crate::common::alloc::allocations;
 use fictionet::stdlib::codec::{Decode, Step, Stream, Wire};
-use fictionet::stdlib::http1::{
+use fictionet::stdlib::protocols::http1::{
     Event, Header, Limits, Request, RequestEvents, Requests, Response, ResponseEvents, Responses,
 };
 use fictionet::stdlib::test_support;
@@ -356,7 +356,7 @@ fn queued_head_and_get_responses_preserve_framing_after_edits() {
 
 #[test]
 fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
-    use fictionet_copy_modules::http1 as copied;
+    use fictionet_copy_modules::protocols::http1 as copied;
     let mut stream = Stream::new(copied::Requests::default());
     let input = [FIRST, SECOND].concat();
     assert_eq!(stream.push(&input), input.len());
@@ -427,7 +427,7 @@ fn message_buffer_bounds_do_not_change_between_messages() {
 
 #[test]
 fn header_line_check_matches_lenient_field_parsing() {
-    use fictionet::stdlib::http1::{RequestHead, header_line_ok};
+    use fictionet::stdlib::protocols::http1::{RequestHead, header_line_ok};
 
     for (line, valid) in [
         (b"X-Name: value".as_slice(), true),

@@ -1,6 +1,6 @@
 //! Value comparisons for hickory's DNS writer and parser.
 
-use fictionet::stdlib::dns::{ProtoError, op::Message};
+use fictionet::stdlib::protocols::dns::{ProtoError, op::Message};
 
 /// Checks a parsed message's write/reparse using hickory's value equality.
 /// Only questions exceeding the DNS size limit may prevent serialization.
@@ -62,8 +62,8 @@ fn written_matches(m: &Message, back: &Message) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::dns::op::{Edns, MessageType, OpCode, Query};
-    use fictionet::stdlib::dns::rr::{
+    use fictionet::stdlib::protocols::dns::op::{Edns, MessageType, OpCode, Query};
+    use fictionet::stdlib::protocols::dns::rr::{
         Name, RData, Record, RecordType,
         rdata::{A, CNAME},
     };

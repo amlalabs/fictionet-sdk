@@ -45,7 +45,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::ftp::{code, Commands, Reply, Replies, Request};
+//! use fictionet::stdlib::protocols::ftp::{code, Commands, Reply, Replies, Request};
 //! use std::net::{Ipv4Addr, SocketAddrV4};
 //!
 //! // A server answers three commands.
@@ -84,7 +84,7 @@
 
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::{self, Decode, Step, Wire};
-use fictionet::stdlib::telnet::{self, ControlScanner, ControlSpan};
+use fictionet::stdlib::protocols::telnet::{self, ControlScanner, ControlSpan};
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU8;

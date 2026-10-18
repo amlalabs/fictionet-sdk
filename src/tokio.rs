@@ -19,7 +19,7 @@
 //! use fictionet::prelude::*;
 //! use tokio::io::AsyncWriteExt;
 //! # use std::sync::Arc;
-//! # use fictionet::{Cx, Result, stdlib::{tcp, tls}};
+//! # use fictionet::{Cx, Result, stdlib::{network::tcp, services::tls}};
 //! # async fn serve(fcx: Cx, hello: tls::ClientHello<tcp::TcpConnection>, config: Arc<rustls::ServerConfig>) -> Result {
 //!
 //! let conn = hello.finish(&fcx, config).await?;
@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::Cx;
-use crate::stdlib::Connection;
+use crate::stdlib::network::Connection;
 
 /// Adds [`into_tokio`](ConnectionTokioExt::into_tokio) to every
 /// [`Connection`]. Imported by [`prelude`](crate::prelude).
@@ -45,9 +45,9 @@ pub trait ConnectionTokioExt: Connection + Sized {
     /// context. Its reads and writes still stop when `fcx`'s
     /// [region](crate::Cx#regions) is cancelled: they fail with an I/O
     /// error whose source is
-    /// [`ConnError::Cancelled`](crate::stdlib::ConnError::Cancelled), since
+    /// [`ConnError::Cancelled`](crate::stdlib::network::ConnError::Cancelled), since
     /// an I/O error is the only way tokio's traits can report it. Every
-    /// [`ConnError`](crate::stdlib::ConnError) converts the same way, with
+    /// [`ConnError`](crate::stdlib::network::ConnError) converts the same way, with
     /// the matching I/O error kind, such as `ConnectionReset`, by
     /// `ConnError`'s `From` impl for `std::io::Error`.
     fn into_tokio(self, fcx: &Cx) -> Compat<Self> {

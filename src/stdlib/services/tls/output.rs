@@ -1,15 +1,15 @@
 //! Ciphertext delivery and plaintext credit shared by the TLS adapters.
 
 use fictionet::Cx;
-use fictionet::stdlib::{ConnError, Connection};
+use fictionet::stdlib::network::{ConnError, Connection};
 use rustls::ConnectionCommon;
 use std::task::{Context, Poll};
 
 /// Ciphertext waiting for the connection underneath, and the write it completes.
 #[derive(Default)]
-pub(super) struct Output {
+pub(crate) struct Output {
     /// Encrypted bytes for the connection, not yet taken from `pos` onward.
-    pub(super) bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     pos: usize,
     /// Plaintext encrypted for a pending write, credited once its output is sent.
     taken: Option<Vec<u8>>,
@@ -17,7 +17,7 @@ pub(super) struct Output {
 
 impl Output {
     /// Moves what rustls wants to send into `bytes`.
-    pub(super) fn take_output<Data>(
+    pub(crate) fn take_output<Data>(
         &mut self,
         tls: &mut ConnectionCommon<Data>,
     ) -> Result<(), ConnError> {
@@ -30,7 +30,7 @@ impl Output {
 
     /// Hands all queued ciphertext to the connection underneath.
     #[must_use = "transport failures and backpressure must be handled"]
-    pub(super) fn poll_flush<C: Connection>(
+    pub(crate) fn poll_flush<C: Connection>(
         &mut self,
         conn: &mut C,
         fcx: &Cx,
@@ -51,7 +51,7 @@ impl Output {
 
     /// A read can defer output when there is no room, but must report failure.
     #[must_use = "a read must report transport output failures"]
-    pub(super) fn flush_for_read<C: Connection>(
+    pub(crate) fn flush_for_read<C: Connection>(
         &mut self,
         conn: &mut C,
         fcx: &Cx,
@@ -64,7 +64,7 @@ impl Output {
     }
 
     /// Finishes an earlier write, crediting it only if these are its bytes.
-    pub(super) fn poll_credit<C: Connection>(
+    pub(crate) fn poll_credit<C: Connection>(
         &mut self,
         conn: &mut C,
         fcx: &Cx,
@@ -86,7 +86,7 @@ impl Output {
     }
 
     /// Reports newly encrypted plaintext only once its ciphertext is taken.
-    pub(super) fn poll_written<C: Connection>(
+    pub(crate) fn poll_written<C: Connection>(
         &mut self,
         conn: &mut C,
         fcx: &Cx,

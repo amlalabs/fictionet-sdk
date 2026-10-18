@@ -1,7 +1,7 @@
 //! Internet Message Format headers and structured field values.
 #![no_main]
 
-use fictionet::stdlib::imf::harness;
+use fictionet::stdlib::protocols::imf::harness;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

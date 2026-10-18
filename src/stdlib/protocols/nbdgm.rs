@@ -44,7 +44,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::nbdgm::{Body, DatagramKind, Name, Packet, Reassembler};
+//! use fictionet::stdlib::protocols::nbdgm::{Body, DatagramKind, Name, Packet, Reassembler};
 //! use std::net::Ipv4Addr;
 //!
 //! // The agent's machine tells the workgroup's master browser it exists.
@@ -85,7 +85,7 @@
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16, write_checked};
-use fictionet::stdlib::netbios::{self, ENCODED_LEN, NAME_LEN};
+use fictionet::stdlib::protocols::netbios::{self, ENCODED_LEN, NAME_LEN};
 
 use std::net::Ipv4Addr;
 
@@ -898,7 +898,7 @@ impl Wire for Packet {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::netbios::{MAX_LABEL, MAX_NAME_LEN, decode_first_level};
+    use fictionet::stdlib::protocols::netbios::{MAX_LABEL, MAX_NAME_LEN, decode_first_level};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::{assert_linear, rounds};

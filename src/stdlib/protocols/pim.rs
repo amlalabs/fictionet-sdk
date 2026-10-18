@@ -58,9 +58,9 @@
 //! group, but RFC 5059 forbids sending one, so it is not written.
 //!
 //! ```
-//! use fictionet::stdlib::ip::Endpoints;
+//! use fictionet::stdlib::network::ip::Endpoints;
 //! use std::net::Ipv4Addr;
-//! use fictionet::stdlib::pim::{ALL_PIM_ROUTERS_V4, HelloOption, Message};
+//! use fictionet::stdlib::protocols::pim::{ALL_PIM_ROUTERS_V4, HelloOption, Message};
 //!
 //! /// The holdtime a neighbor's Hello asks for, if it gives one.
 //! fn holdtime(m: &Message) -> Option<u16> {
@@ -161,7 +161,7 @@ pub mod family {
     pub const IPV6: u8 = 2;
 }
 
-use fictionet::stdlib::ip::{self, Endpoints};
+use fictionet::stdlib::network::ip::{self, Endpoints};
 
 /// An Encoded-Group address: a multicast group or range of groups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

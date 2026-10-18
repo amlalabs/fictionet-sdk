@@ -14,9 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use fictionet::stdlib::dns::op::{Message, Query, ResponseCode};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::{Connection, ip, tcp, tls, udp, web};
+use fictionet::stdlib::protocols::dns::op::{Message, Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::{
+    network::{Connection, ip, tcp, udp},
+    services::tls,
+    web,
+};
 use fictionet::{Cx, Result, run};
 use http::{Request, Response, Version};
 use http_body_util::{BodyExt, Empty, Full};
@@ -24,7 +28,7 @@ use hyper::body::Incoming;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use fictionet::stdlib::sandbox::TlsClient;
+use fictionet::stdlib::world::sandbox::TlsClient;
 
 #[path = "../../common/hyper.rs"]
 mod hyper_io;
@@ -233,14 +237,14 @@ struct Certs {
 }
 
 fn certs(fcx: &Cx) -> Result<Certs> {
-    let ca = fictionet::stdlib::ca::Ca::new(fcx, "browser CA").unwrap();
+    let ca = fictionet::stdlib::services::ca::Ca::new(fcx, "browser CA").unwrap();
     let leaf = ca
         .issue(
             fcx,
             &[NAME],
-            fictionet::stdlib::x509::Validity {
-                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+            fictionet::stdlib::protocols::x509::Validity {
+                not_before: fictionet::stdlib::protocols::x509::Time::from_unix(946684800).unwrap(),
+                not_after: fictionet::stdlib::protocols::x509::Time::from_unix(4102444800).unwrap(),
             },
         )
         .unwrap();

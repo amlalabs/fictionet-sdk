@@ -40,7 +40,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::rtcp::{
+//! use fictionet::stdlib::protocols::rtcp::{
 //!     Body, Demux, Nack, Packet, PayloadFeedback, PayloadMessage, ReceiverReport, SdesChunk, SdesItem,
 //!     TransportFeedback, TransportMessage, classify, sdes, Compound,
 //! };
@@ -1560,7 +1560,8 @@ pub fn classify(b: &[u8]) -> Demux {
 /// [`Wire`] includes the prefix. Payloads are opaque and bounded by
 /// [`MAX_FRAME`]. An empty payload is a null frame. For RTCP, map nonempty
 /// payloads through [`Datagram::parse`] or [`Compound::parse`]. For RTP, use
-/// [`fictionet::stdlib::rtp::Packet::parse`]. A payload parse error leaves framing intact.
+/// [`fictionet::stdlib::protocols::rtp::Packet::parse`]. A payload parse error
+/// leaves framing intact.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frame(
     /// Datagram bytes, or an empty vector for a null frame.

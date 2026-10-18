@@ -2,8 +2,10 @@
 #![no_main]
 use fictionet::stdlib::{
     codec::Collect,
-    hpack::{self, Encoder, Field, StringLiteral, Table},
-    prefix_int::Integer,
+    protocols::{
+        hpack::{self, Encoder, Field, StringLiteral, Table},
+        prefix_int::Integer,
+    },
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

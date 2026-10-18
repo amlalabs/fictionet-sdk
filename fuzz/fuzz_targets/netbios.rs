@@ -2,8 +2,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::nbns::Name;
-use fictionet::stdlib::netbios::{
+use fictionet::stdlib::protocols::nbns::Name;
+use fictionet::stdlib::protocols::netbios::{
     ENCODED_LEN, Error, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level, encode_first_level,
     write_name,
 };

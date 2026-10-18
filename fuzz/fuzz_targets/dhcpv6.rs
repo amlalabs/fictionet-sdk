@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::dhcpv6::{
+use fictionet::stdlib::protocols::dhcpv6::{
     DhcpOption, Duid, Frame, HOP_COUNT_LIMIT, MAX_BUFFERED, MAX_MESSAGE, Message, msg,
 };
 use fictionet::stdlib::test_support::contract;

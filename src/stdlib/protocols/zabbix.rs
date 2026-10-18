@@ -17,7 +17,7 @@
 //! manual.
 //!
 //! Nothing here reads a socket. A world that plays a Zabbix server
-//! passes the bytes a [`tcp`](fictionet::stdlib::tcp) connection reads to a
+//! passes the bytes a [`tcp`](fictionet::stdlib::network::tcp) connection reads to a
 //! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! reads each one's [`Message`], and writes the reply's bytes back to
 //! the connection. Compressed data is reported with
@@ -32,7 +32,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::zabbix::{Kind, Message};
+//! use fictionet::stdlib::protocols::zabbix::{Kind, Message};
 //!
 //! // What zabbix_sender sends for one value.
 //! let json = br#"{"request":"sender data","data":[{"host":"web1","key":"cpu","value":"0.5"}]}"#;
@@ -41,7 +41,7 @@
 //! sent.extend_from_slice(&[0, 0, 0, 0]);
 //! sent.extend_from_slice(json);
 //!
-//! let mut stream = Stream::new(Frames::<fictionet::stdlib::zabbix::Packet>::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::protocols::zabbix::Packet>::new());
 //! let mut packets = Vec::new();
 //! pump(&mut stream, &sent, |packet| packets.push(packet)).unwrap();
 //! finish(&mut stream, |_| unreachable!()).unwrap();
@@ -388,7 +388,7 @@ fictionet::prefixed! {
     /// ```
     /// use fictionet::stdlib::codec::Frames;
     /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-    /// use fictionet::stdlib::zabbix::Packet;
+    /// use fictionet::stdlib::protocols::zabbix::Packet;
     ///
     /// let packet = Packet::new(b"hello".to_vec());
     /// let bytes = Wire::to_bytes(&packet)?;

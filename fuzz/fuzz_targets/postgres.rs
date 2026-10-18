@@ -4,7 +4,7 @@
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::postgres::{
+use fictionet::stdlib::protocols::postgres::{
     BackendEvent, BackendEvents, BackendMessage, EncryptionReply, FrontendMessage,
     FrontendMessages, Password, SMALL_MESSAGE, SaslInitialResponse, Startup,
 };

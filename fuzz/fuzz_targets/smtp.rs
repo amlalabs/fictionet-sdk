@@ -4,7 +4,7 @@
 use fictionet::stdlib::codec::{Decode, Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::smtp::{
+use fictionet::stdlib::protocols::smtp::{
     Command, Data, Error, FrameError, Input, Inputs, MAX_AUTH_LINE, MAX_DATA, MAX_DATA_LINE,
     MAX_LINE, MAX_REPLY_TEXT, Replies, Reply, Request,
 };

@@ -11,23 +11,23 @@ use fictionet::stdlib::test_support::decode_all;
 
 use fictionet::stdlib::codec::try_pump;
 
-use fictionet::stdlib::huffman::HuffmanString;
+use fictionet::stdlib::protocols::huffman::HuffmanString;
 
-use fictionet::stdlib::prefix_int::Integer;
+use fictionet::stdlib::protocols::prefix_int::Integer;
 
-use fictionet::stdlib::qpack;
+use fictionet::stdlib::protocols::qpack;
 
-use fictionet::stdlib::qpack::DecoderInstruction;
+use fictionet::stdlib::protocols::qpack::DecoderInstruction;
 
-use fictionet::stdlib::qpack::EncoderInstruction;
+use fictionet::stdlib::protocols::qpack::EncoderInstruction;
 
-use fictionet::stdlib::qpack::FieldSection;
+use fictionet::stdlib::protocols::qpack::FieldSection;
 
-use fictionet::stdlib::qpack::Representation;
+use fictionet::stdlib::protocols::qpack::Representation;
 
-use fictionet::stdlib::qpack::SectionResult;
+use fictionet::stdlib::protocols::qpack::SectionResult;
 
-use fictionet::stdlib::qpack::Table;
+use fictionet::stdlib::protocols::qpack::Table;
 use libfuzzer_sys::fuzz_target;
 
 /// Retains sections from two streams across a partial encoder instruction.

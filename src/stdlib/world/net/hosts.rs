@@ -6,10 +6,10 @@ use super::{
 };
 use fictionet::events::{ConnInfo, Event, Level};
 use fictionet::stdlib::codec::Decode;
-use fictionet::stdlib::route::{Prefix, Router};
-use fictionet::stdlib::serve::{self, Budget, ServeOptions, Service, TlsSelect};
-use fictionet::stdlib::tls::ServerConfig;
-use fictionet::stdlib::{ConnError, Connection, icmp, ip, tcp, udp};
+use fictionet::stdlib::network::route::{Prefix, Router};
+use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
+use fictionet::stdlib::services::serve::{self, Budget, ServeOptions, Service, TlsSelect};
+use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, End, Interface, InterfaceExt};
@@ -27,7 +27,7 @@ use super::{Limits, Net};
 
 fictionet::cfg_std! {
 #[cfg(doc)]
-use fictionet::stdlib::httpd;
+use fictionet::stdlib::web::httpd;
 }
 
 /// At most this many names that have no host are remembered (about 35 MB).

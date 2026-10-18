@@ -4,7 +4,7 @@
 #![no_main]
 
 use fictionet::stdlib::{
-    socks::{AuthRequest, ClientMessages, Greeting, MAX_MESSAGE, Request},
+    protocols::socks::{AuthRequest, ClientMessages, Greeting, MAX_MESSAGE, Request},
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

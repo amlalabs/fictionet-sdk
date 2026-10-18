@@ -43,7 +43,7 @@
 //! header size or over the configured limit ends the stream with [`FrameError`].
 //!
 //! ```
-//! use fictionet::stdlib::cboe_pitch::{
+//! use fictionet::stdlib::protocols::cboe_pitch::{
 //!     AddOrderShort, Book, BookConfig, GapDetector, Message, ReduceSizeShort, ShortPrice, Side,
 //!     Unit,
 //! };
@@ -87,11 +87,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::book_levels::{Aggregate, Levels};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field::{self, Alpha};
+use fictionet::stdlib::protocols::book_levels::{Aggregate, Levels};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
@@ -1171,7 +1171,7 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::Frames;
-    /// use fictionet::stdlib::cboe_pitch::{Control, LoginResponse, Unit};
+    /// use fictionet::stdlib::protocols::cboe_pitch::{Control, LoginResponse, Unit};
     /// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
     ///
     /// let response = Control::from(LoginResponse { status: b'A', extra: Vec::new() });

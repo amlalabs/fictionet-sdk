@@ -3,11 +3,11 @@
 //! Use this module to read and answer DNS queries in a world that runs its
 //! own DNS server. If the world is a set of websites,
 //! [`web::Sites`](fictionet::stdlib::web::Sites) already runs one for you.
-//! [`net::Net`](fictionet::stdlib::net::Net) serves DNS over UDP and TCP on
+//! [`net::Net`](fictionet::stdlib::world::net::Net) serves DNS over UDP and TCP on
 //! port 53 at each gateway. It answers A and AAAA queries from declared hosts
-//! and hosts created by [`Net::resolve`](fictionet::stdlib::net::Net::resolve).
+//! and hosts created by [`Net::resolve`](fictionet::stdlib::world::net::Net::resolve).
 //! Unknown names get NXDOMAIN, and new names past
-//! [`Net::max_hosts`](fictionet::stdlib::net::Net::max_hosts) get SERVFAIL.
+//! [`Net::max_hosts`](fictionet::stdlib::world::net::Net::max_hosts) get SERVFAIL.
 //! A known host without the requested address family gets an empty answer.
 //! Answers have a 60-second TTL.
 //!
@@ -16,16 +16,16 @@
 //! World code parses it, matches on it, and builds a reply.
 //!
 //! A DNS server is a loop on a UDP socket from
-//! [`udp::endpoint`](fictionet::stdlib::udp::endpoint). Which names exist, and
+//! [`udp::endpoint`](fictionet::stdlib::network::udp::endpoint). Which names exist, and
 //! whether answers are wrong, slow or missing, is all up to world code.
 //! This server knows one name, `api.stripe.com`, and answers NXDOMAIN for
 //! every other:
 //!
 //! ```no_run
 //! use fictionet::prelude::*;
-//! use fictionet::stdlib::dns::op::{Message, ResponseCode};
-//! use fictionet::stdlib::dns::rr::{RData, Record, rdata::A};
-//! use fictionet::{Cx, Result, stdlib::udp};
+//! use fictionet::stdlib::protocols::dns::op::{Message, ResponseCode};
+//! use fictionet::stdlib::protocols::dns::rr::{RData, Record, rdata::A};
+//! use fictionet::{Cx, Result, stdlib::network::udp};
 //!
 //! async fn serve_dns(fcx: &Cx, socket: &mut udp::Socket) -> Result {
 //!     while let Ok((bytes, from)) = socket.recv(fcx).await {

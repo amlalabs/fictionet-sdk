@@ -2,7 +2,7 @@
 //!
 //! Complete requests, responses, and heads implement `Wire`. Directional
 //! decoders yield whole messages or head/body events. Serving belongs to
-//! `fictionet::stdlib::httpd`, and this module provides no live transport.
+//! `fictionet::stdlib::web::httpd`, and this module provides no live transport.
 //! Content-Length, chunked bodies, connection close, Expect: 100-continue,
 //! and CONNECT handoff use the shared codec drivers. Non-empty trailers and
 //! chunk extensions are refused, unless a response decoder is told to skip
@@ -14,7 +14,7 @@ use fictionet::stdlib::codec::ascii::{self, trim_ows as trim};
 use fictionet::stdlib::codec::{
     Buffer, Decode, Ending, Fail, LineError, Lines, PumpError, Step, Stream, Wire, finish, try_pump,
 };
-use fictionet::stdlib::json;
+use fictionet::stdlib::protocols::json;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -245,11 +245,11 @@ pub struct Header {
 /// is refused. Upgrade offers are accepted without switching protocols.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Wire, http1::RequestHead};
+/// use fictionet::stdlib::{codec::Wire, protocols::http1::RequestHead};
 /// let head = RequestHead::parse(b"POST /tools HTTP/1.1\r\nHost: example.test\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n")?;
 /// assert!(head.expects_continue());
 /// assert!(head.keep_alive()?);
-/// # Ok::<(), fictionet::stdlib::http1::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::http1::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestHead {
@@ -301,10 +301,10 @@ impl RequestHead {
 /// parser refuse those fields because RFC 9110 forbids sending them.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Wire, http1::ResponseHead};
+/// use fictionet::stdlib::{codec::Wire, protocols::http1::ResponseHead};
 /// let bytes = ResponseHead::continue_100().to_bytes()?;
 /// assert_eq!(bytes, b"HTTP/1.1 100 Continue\r\n\r\n");
-/// # Ok::<(), fictionet::stdlib::http1::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::http1::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResponseHead {
@@ -388,7 +388,7 @@ pub enum Event<H> {
 /// [`Error::Incomplete`]; Need on an empty buffer would mean a clean end.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, http1::{Event, Limits, RequestEvents}};
+/// use fictionet::stdlib::{codec::Stream, protocols::http1::{Event, Limits, RequestEvents}};
 /// let mut stream = Stream::new(RequestEvents::new());
 /// let bytes = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
 /// assert_eq!(stream.push(bytes), bytes.len());
@@ -464,7 +464,7 @@ impl Decode for RequestEvents {
 /// Writers additionally refuse framing fields forbidden by HTTP semantics.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, http1::{Event, ResponseEvents}};
+/// use fictionet::stdlib::{codec::Stream, protocols::http1::{Event, ResponseEvents}};
 /// let mut decoder = ResponseEvents::default();
 /// decoder.expect_method("HEAD")?;
 /// let mut stream = Stream::new(decoder);
@@ -472,7 +472,7 @@ impl Decode for RequestEvents {
 /// assert_eq!(stream.push(bytes), bytes.len());
 /// assert!(matches!(stream.next(), Some(Ok(Event::Head(_)))));
 /// assert_eq!(stream.next(), Some(Ok(Event::Done)));
-/// # Ok::<(), fictionet::stdlib::http1::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::http1::Error>(())
 /// ```
 pub struct ResponseEvents {
     core: Reader,
@@ -550,7 +550,7 @@ impl Decode for ResponseEvents {
 /// [`RequestEvents`] when the body must be streamed without accumulation.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, test_support, http1::Requests};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, test_support, protocols::http1::Requests};
 /// let bytes = b"GET / HTTP/1.1\r\nHost:test\r\n\r\nGET /next HTTP/1.1\r\nHost:test\r\n\r\n";
 /// let mut stream = Stream::new(Requests::default());
 /// assert_eq!(stream.push(bytes), bytes.len());
@@ -936,7 +936,7 @@ fn collect_body(
 /// Writers validate the entire message before appending any bytes.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Collect, Stream, Wire}, http1::Request};
+/// use fictionet::stdlib::{codec::{Collect, Stream, Wire}, protocols::http1::Request};
 /// let mut stream = Stream::new(Collect::<Request>::new(4096));
 /// let bytes = b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 3\r\n\r\none";
 /// assert_eq!(stream.push(bytes), bytes.len());
@@ -963,11 +963,11 @@ pub struct Request {
 /// the supplied slice as EOF; the sender must then close its connection.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Wire, http1::Response};
+/// use fictionet::stdlib::{codec::Wire, protocols::http1::Response};
 /// let mut response = Response::parse(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
 /// response.body = b"[]".to_vec();
 /// assert!(response.to_bytes()?.ends_with(b"[]"));
-/// # Ok::<(), fictionet::stdlib::http1::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::http1::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
@@ -1016,12 +1016,12 @@ impl Response {
     /// Invalid session field bytes are refused when the head is written.
     ///
     /// ```
-    /// use fictionet::stdlib::{codec::Wire, http1::{Chunk, Response}};
+    /// use fictionet::stdlib::{codec::Wire, protocols::http1::{Chunk, Response}};
     /// let mut out = Response::event_stream("session-1").to_bytes()?;
     /// Chunk(b"data: {}\n\n".to_vec()).write(&mut out)?;
     /// Chunk(Vec::new()).write(&mut out)?;
     /// assert_eq!(Response::parse(&out)?.body, b"data: {}\n\n");
-    /// # Ok::<(), fictionet::stdlib::http1::Error>(())
+    /// # Ok::<(), fictionet::stdlib::protocols::http1::Error>(())
     /// ```
     pub fn event_stream(session_id: &str) -> ResponseHead {
         ResponseHead {
@@ -1116,11 +1116,11 @@ impl Response {
 /// Extensions and trailers are refused. Each value is bounded by [`MAX_BODY`].
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Wire, http1::Chunk};
+/// use fictionet::stdlib::{codec::Wire, protocols::http1::Chunk};
 /// let mut out = Chunk(b"hello".to_vec()).to_bytes()?;
 /// Chunk(Vec::new()).write(&mut out)?;
 /// assert_eq!(out, b"5\r\nhello\r\n0\r\n\r\n");
-/// # Ok::<(), fictionet::stdlib::http1::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::http1::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chunk(

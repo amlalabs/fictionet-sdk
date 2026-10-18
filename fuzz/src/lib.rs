@@ -7,8 +7,8 @@ use std::net::IpAddr;
 use std::pin::pin;
 use std::task::{Context, Poll};
 
-use fictionet::stdlib::ip::{self, transport_checksum};
-use fictionet::stdlib::{ConnError, Connection};
+use fictionet::stdlib::network::ip::{self, transport_checksum};
+use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::{Cx, block_on, run};
 
 pub mod dns;
@@ -18,13 +18,14 @@ pub mod http1;
 pub mod web;
 
 /// The cached certificate and key for the TLS fuzz sites.
-pub fn cert() -> &'static fictionet::stdlib::ca::Leaf {
-    static CERT: std::sync::OnceLock<fictionet::stdlib::ca::Leaf> = std::sync::OnceLock::new();
+pub fn cert() -> &'static fictionet::stdlib::services::ca::Leaf {
+    static CERT: std::sync::OnceLock<fictionet::stdlib::services::ca::Leaf> =
+        std::sync::OnceLock::new();
     CERT.get_or_init(make_cert)
 }
 
-fn make_cert() -> fictionet::stdlib::ca::Leaf {
-    use fictionet::stdlib::{ca::Ca, x509};
+fn make_cert() -> fictionet::stdlib::services::ca::Leaf {
+    use fictionet::stdlib::{protocols::x509, services::ca::Ca};
 
     let mut leaf = None;
     world_seeded(0, |fcx| {
@@ -293,7 +294,7 @@ mod tests {
                     .unwrap();
             }
             world(move |fcx| async move {
-                fictionet::stdlib::tls::config_builder(
+                fictionet::stdlib::services::tls::config_builder(
                     &fcx,
                     std::time::UNIX_EPOCH + Duration::from_secs(time),
                 )

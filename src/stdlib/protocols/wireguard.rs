@@ -33,7 +33,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::wireguard::{Data, Initiation, Message, ReplayWindow, INITIATION_LEN};
+//! use fictionet::stdlib::protocols::wireguard::{Data, Initiation, Message, ReplayWindow, INITIATION_LEN};
 //!
 //! // A handshake initiation from sender index 7, with stand-in crypto bytes.
 //! let init = Initiation {

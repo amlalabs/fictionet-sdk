@@ -1,11 +1,11 @@
 //! RDP connection messages from MS-RDPBCGR, with no I/O.
 //!
-//! A [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses `codec::Frames<Frame>` to separate
-//! TPKT slow-path packets from fast-path packets.
-//! [`Connection`] reads X.224 connection requests and confirms, including
-//! cookies, routing tokens and security negotiation. [`McsConnect`] reads
-//! the BER connection exchange and its PER GCC data. [`McsPdu`] reads the
+//! A [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! `codec::Frames<Frame>` to separate TPKT slow-path packets from fast-path
+//! packets. [`Connection`] reads X.224 connection requests and confirms,
+//! including cookies, routing tokens and security negotiation. [`McsConnect`]
+//! reads the BER connection exchange and its PER GCC data. [`McsPdu`] reads the
 //! following PER domain, user, channel and data messages. [`ClientInfo`],
 //! [`LicenseError`] and [`ActivePdu`] read the plaintext carried in them.
 //!
@@ -30,7 +30,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::rdp::{Connection, Frame, Negotiation, Protocols};
+//! use fictionet::stdlib::protocols::rdp::{Connection, Frame, Negotiation, Protocols};
 //!
 //! // MS-RDPBCGR connection request: TLS and CredSSP are supported.
 //! let bytes = [3, 0, 0, 19, 14, 0xe0, 0, 0, 0, 0, 0,
@@ -51,7 +51,10 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Reader, Trailing, Truncated};
 
-use fictionet::stdlib::{codec::Wire, cotp, tpkt};
+use fictionet::stdlib::{
+    codec::Wire,
+    protocols::{cotp, tpkt},
+};
 
 /// The usual RDP TCP port.
 pub const PORT: u16 = 3389;
@@ -972,7 +975,7 @@ impl DataBlock {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Wire;
-/// use fictionet::stdlib::rdp::{DataBlock, DataBlocks};
+/// use fictionet::stdlib::protocols::rdp::{DataBlock, DataBlocks};
 ///
 /// let bytes = [0x06, 0xc0, 0x08, 0x00, 0, 0, 0, 0];
 /// let blocks = DataBlocks::parse(&bytes)?;
@@ -980,7 +983,7 @@ impl DataBlock {
 /// let mut out = Vec::new();
 /// blocks.write(&mut out)?;
 /// assert_eq!(out, bytes);
-/// # Ok::<(), fictionet::stdlib::rdp::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::rdp::Error>(())
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DataBlocks(

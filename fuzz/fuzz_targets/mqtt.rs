@@ -3,34 +3,34 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::mqtt::ConnAck;
+use fictionet::stdlib::protocols::mqtt::ConnAck;
 
-use fictionet::stdlib::mqtt::ConnectReturnCode;
+use fictionet::stdlib::protocols::mqtt::ConnectReturnCode;
 
-use fictionet::stdlib::mqtt::MAX_PACKET;
+use fictionet::stdlib::protocols::mqtt::MAX_PACKET;
 
-use fictionet::stdlib::mqtt::Packet;
+use fictionet::stdlib::protocols::mqtt::Packet;
 
-use fictionet::stdlib::mqtt::Publish;
+use fictionet::stdlib::protocols::mqtt::Publish;
 
-use fictionet::stdlib::mqtt::QoS;
+use fictionet::stdlib::protocols::mqtt::QoS;
 
-use fictionet::stdlib::mqtt::check_topic_filter;
+use fictionet::stdlib::protocols::mqtt::check_topic_filter;
 
-use fictionet::stdlib::mqtt::check_topic_name;
+use fictionet::stdlib::protocols::mqtt::check_topic_name;
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::mqtt::topic_matches;
+use fictionet::stdlib::protocols::mqtt::topic_matches;
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Packet>(data);
-    contract::check_wire::<fictionet::stdlib::mqtt::RemainingLength>(data);
+    contract::check_wire::<fictionet::stdlib::protocols::mqtt::RemainingLength>(data);
     let small = usize::from(data.first().copied().unwrap_or(0) & 0x3f);
     for limit in [
-        fictionet::stdlib::mqtt::DEFAULT_MAX_PACKET,
+        fictionet::stdlib::protocols::mqtt::DEFAULT_MAX_PACKET,
         MAX_PACKET,
         small,
     ] {
@@ -39,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let packets = decode_all(Frames::<Packet>::new, data).0;
     if let Ok(packet) = Packet::parse(data) {
-        if data.len() <= fictionet::stdlib::mqtt::DEFAULT_MAX_PACKET {
+        if data.len() <= fictionet::stdlib::protocols::mqtt::DEFAULT_MAX_PACKET {
             assert_eq!(packets.first(), Some(&packet));
         } else {
             // Exact parsing allows packets above the default stream limit.

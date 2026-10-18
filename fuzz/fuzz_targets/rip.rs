@@ -1,12 +1,12 @@
 //! RIP and RIPng messages, as a world playing a router reads them.
 #![no_main]
 
-use fictionet::stdlib::rip::{
+use fictionet::stdlib::protocols::rip::{
     Entries, MAX_PREFIX_LEN, Message, NgEntries, NgEntry, NgMessage, Received,
 };
 use fictionet::stdlib::{
     codec::{Collect, Stream, Wire},
-    rip,
+    protocols::rip,
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

@@ -30,15 +30,15 @@ pub enum RecvError {
 /// packets takes interfaces and returns new ones, so the pieces of a
 /// network plug into each other.
 ///
-/// Dropping one end closes the link. The other end then receives every
-/// packet that was already sent to it, and after that
-/// [`recv`](InterfaceExt::recv) returns [`RecvError::Closed`]. That
-/// holds for one interface. A chain of them, such as a sandbox behind a
-/// [`stdlib::delay`](crate::stdlib::delay), may lose packets on the way: each stdlib task stops
-/// when its region is cancelled, and on `Closed` by its own rule. A
-/// `delay` stops as soon as either side closes, and drops what it still
-/// holds. [Three kinds of functions](crate::stdlib#three-kinds-of-functions)
-/// lists the rule of each.
+/// Dropping one end closes the link. The other end then receives every packet
+/// that was already sent to it, and after that [`recv`](InterfaceExt::recv)
+/// returns [`RecvError::Closed`]. That holds for one interface. A chain of
+/// them, such as a sandbox behind a
+/// [`stdlib::network::delay`](crate::stdlib::network::delay), may lose packets
+/// on the way: each stdlib task stops when its region is cancelled, and on
+/// `Closed` by its own rule. A `delay` stops as soon as either side closes, and
+/// drops what it still holds. [Three kinds of
+/// functions](crate::stdlib#three-kinds-of-functions) lists the rule of each.
 ///
 /// An interface holds no borrowed references (it is `'static`), because
 /// most interfaces end up inside background tasks. Such a task can outlive
@@ -77,7 +77,7 @@ pub trait Interface: Send + 'static {
     /// An interface from [`pair`](crate::pair) has no size limit, so its `send` never
     /// drops a packet while the other end exists. To model a link whose
     /// queue fills up and drops packets, add one on purpose with
-    /// [`stdlib::bottleneck`](crate::stdlib::bottleneck).
+    /// [`stdlib::network::bottleneck`](crate::stdlib::network::bottleneck).
     ///
     /// An [`Attachment`](crate::Attachment) is different, because its packets leave the
     /// process. When the connection to `fictionet attach` is full, the packet

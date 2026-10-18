@@ -75,7 +75,7 @@ pub struct Record<T, E> {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::{codec::{Side, Interceptor, Recorder, Rewrite, Stream}, modbus};
+/// use fictionet::stdlib::{codec::{Side, Interceptor, Recorder, Rewrite, Stream}, protocols::modbus};
 /// let mut stream = Stream::new(Frames::<modbus::Frame>::new());
 /// let mut log = Recorder::new(16, 1024);
 /// let proxy = Interceptor::new(1024);
@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::{
         codec::{Ending, Lines, Stream},
-        json, modbus,
+        protocols::{json, modbus},
     };
 
     #[test]

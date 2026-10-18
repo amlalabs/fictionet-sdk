@@ -17,7 +17,7 @@
 //! are little-endian.
 //!
 //! Nothing here reads a socket. A world that plays a device pushes the
-//! bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection to a
+//! bytes it reads from a [`tcp`](fictionet::stdlib::network::tcp) connection to a
 //! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! checks each one with [`Packet::check`], reads its command, and for the
 //! data commands reads the [`SendData`] envelope, its [`Cpf`] items and
@@ -36,7 +36,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::enip::{
+//! use fictionet::stdlib::protocols::enip::{
 //!     Command, Cpf, CpfItem, MessageRequest, Packet, PathSegment, SendData, item, service,
 //! };
 //!

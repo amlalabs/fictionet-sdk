@@ -435,7 +435,7 @@ mod tests {
     use super::super::tests::Sink;
     use super::super::{ConnInfo, Origin, Sandbox};
     use super::*;
-    use crate::stdlib::json::Value;
+    use crate::stdlib::protocols::json::Value;
     use std::borrow::Cow;
 
     fn numbered(store: &Store, n: u64) {

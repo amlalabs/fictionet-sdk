@@ -1,5 +1,5 @@
 use super::*;
-use fictionet::stdlib::{ca::Ca, httpd, x509};
+use fictionet::stdlib::{services::ca::Ca, web::httpd, protocols::x509};
 use fictionet::{Cx, Seed};
 use http_body_util::BodyExt;
 use std::net::TcpListener;
@@ -558,13 +558,13 @@ struct Downstream {
     input: Bytes,
     output: Arc<Mutex<Vec<u8>>>,
 }
-impl fictionet::stdlib::Connection for Downstream {
+impl fictionet::stdlib::network::Connection for Downstream {
     fn poll_read(
         &mut self,
         _: &Cx,
         _: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<Result<usize, fictionet::stdlib::ConnError>> {
+    ) -> Poll<Result<usize, fictionet::stdlib::network::ConnError>> {
         if self.input.is_empty() {
             return Poll::Pending;
         }
@@ -577,7 +577,7 @@ impl fictionet::stdlib::Connection for Downstream {
         _: &Cx,
         _: &mut Context<'_>,
         bytes: &[u8],
-    ) -> Poll<Result<usize, fictionet::stdlib::ConnError>> {
+    ) -> Poll<Result<usize, fictionet::stdlib::network::ConnError>> {
         self.output.lock().extend_from_slice(bytes);
         Poll::Ready(Ok(bytes.len()))
     }
@@ -585,7 +585,7 @@ impl fictionet::stdlib::Connection for Downstream {
         &mut self,
         _: &Cx,
         _: &mut Context<'_>,
-    ) -> Poll<Result<(), fictionet::stdlib::ConnError>> {
+    ) -> Poll<Result<(), fictionet::stdlib::network::ConnError>> {
         Poll::Ready(Ok(()))
     }
 }

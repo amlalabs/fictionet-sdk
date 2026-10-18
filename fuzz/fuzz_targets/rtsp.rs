@@ -4,8 +4,8 @@
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::rtsp::harness::{round_trip, text_value};
-use fictionet::stdlib::rtsp::{
+use fictionet::stdlib::protocols::rtsp::harness::{round_trip, text_value};
+use fictionet::stdlib::protocols::rtsp::{
     Frame, Frames, Interleaved, MAX_BODY, MAX_HEAD, MAX_INTERLEAVED, MAX_MESSAGE, Message, Range,
     Session, Transport, Transports, Version,
 };

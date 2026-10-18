@@ -41,7 +41,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use std::net::Ipv6Addr;
-//! use fictionet::stdlib::dhcpv6::{msg, opt, DhcpOption, Duid, IaAddr, IaNa, Message};
+//! use fictionet::stdlib::protocols::dhcpv6::{msg, opt, DhcpOption, Duid, IaAddr, IaNa, Message};
 //!
 //! // A client asks for an address: a Solicit with its DUID and one IA_NA.
 //! let client = Duid::ll(1, &[0x02, 0, 0, 0, 0, 0x01]);
@@ -970,7 +970,7 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::Frames;
-    /// use fictionet::stdlib::dhcpv6::{Frame, Message, msg};
+    /// use fictionet::stdlib::protocols::dhcpv6::{Frame, Message, msg};
     /// use fictionet::stdlib::codec::{Stream, Wire};
     ///
     /// let message = Message::new(msg::SOLICIT, 7);
@@ -980,7 +980,7 @@ fictionet::prefixed! {
     /// assert_eq!(stream.next(), Some(Ok(Ok(message))));
     /// stream.end();
     /// assert_eq!(stream.next(), None);
-    /// # Ok::<(), fictionet::stdlib::dhcpv6::Error>(())
+    /// # Ok::<(), fictionet::stdlib::protocols::dhcpv6::Error>(())
     /// ```
     Message => (Result<Message, Error>, Infallible, ());
     name = "DHCPv6 over TCP";

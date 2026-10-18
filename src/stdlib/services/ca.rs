@@ -7,9 +7,9 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use fictionet::stdlib::asn1::{BitString, Oid, StringKind, Writer};
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::{tls, x509};
+use fictionet::stdlib::protocols::asn1::{BitString, Oid, StringKind, Writer};
+use fictionet::stdlib::{protocols::x509, services::tls};
 use fictionet::{Cx, Error};
 use p256::ecdsa::signature::Signer;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};

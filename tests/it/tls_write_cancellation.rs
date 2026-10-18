@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::SystemTime;
 
-use fictionet::stdlib::tls::{self, ServerConfig};
-use fictionet::stdlib::{Connection, ConnectionExt, tcp};
+use fictionet::stdlib::network::{Connection, ConnectionExt, tcp};
+use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::time::ms;
 use fictionet::{Cx, Interface, InterfaceExt, Result};
 use rustls::pki_types::ServerName;
@@ -183,7 +183,7 @@ fn control_no_dropped_write() {
 
 mod contract {
     use super::*;
-    use fictionet::stdlib::{ConnError, sandbox::TlsClient};
+    use fictionet::stdlib::{network::ConnError, world::sandbox::TlsClient};
     use std::io::Write;
     use std::sync::Mutex;
     use std::task::{Context, Waker};
@@ -251,9 +251,13 @@ mod contract {
         let config = leaf.server_config(fcx, start).unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(ca.cert_der()).unwrap();
-        let client_config =
-            fictionet::stdlib::sandbox::client_config(fcx, start, Some(&Arc::new(roots)), &[])
-                .unwrap();
+        let client_config = fictionet::stdlib::world::sandbox::client_config(
+            fcx,
+            start,
+            Some(&Arc::new(roots)),
+            &[],
+        )
+        .unwrap();
         let session = if server {
             let client = tls::with_context(fcx, || {
                 ClientConnection::new(

@@ -192,8 +192,8 @@
 //! - **Anything else,** such as VLAN-tagged frames or LLDP, is dropped.
 //!
 //! `ether::upper` finds the transport with
-//! [`ip::Header::check`](crate::stdlib::ip::Header::check), the parser that
-//! [`ip::split_protocols`](crate::stdlib::ip::split_protocols) uses. So
+//! [`ip::Header::check`](crate::stdlib::network::ip::Header::check), the parser that
+//! [`ip::split_protocols`](crate::stdlib::network::ip::split_protocols) uses. So
 //! attach walks the same IPv6 extension headers as the world's stack
 //! (hop-by-hop, routing, destination options, authentication and
 //! fragment), with no limit on how many. A packet whose
@@ -276,9 +276,9 @@
 //! **The lowering.** Attach runs a TCP/IP stack of its own, the same one
 //! worlds use. `Stack::new` takes the world socket as an `Interface`
 //! (`proxy/link.rs`), splits it with
-//! [`ip::split_protocols`](crate::stdlib::ip::split_protocols), and starts
-//! [`tcp::endpoint`](crate::stdlib::tcp::endpoint) and
-//! [`udp::endpoint`](crate::stdlib::udp::endpoint) at `--ip-addr`. To the
+//! [`ip::split_protocols`](crate::stdlib::network::ip::split_protocols), and starts
+//! [`tcp::endpoint`](crate::stdlib::network::tcp::endpoint) and
+//! [`udp::endpoint`](crate::stdlib::network::udp::endpoint) at `--ip-addr`. To the
 //! world, that address is the sandbox. For each request,
 //! `Stack::connect` makes two kinds of packets:
 //!
@@ -309,11 +309,11 @@
 //! `200 Connection established` and the SOCKS5 proxy answers reply 0.
 //! Then `pump::tunnel` copies bytes both ways, in pieces of up to 64 KiB,
 //! between the client's socket and the
-//! [`TcpConnection`](crate::stdlib::tcp::TcpConnection). A side that
+//! [`TcpConnection`](crate::stdlib::network::tcp::TcpConnection). A side that
 //! closes its sending half closes the other's too. Attach's stack decides
 //! how those bytes become segments: up to 1,460 bytes each, with a 256 KiB
 //! window (a window scale shift of 3, which Wireshark and the observer
-//! show as `WS=8`), as [`tcp::endpoint`](crate::stdlib::tcp::endpoint)
+//! show as `WS=8`), as [`tcp::endpoint`](crate::stdlib::network::tcp::endpoint)
 //! describes.
 //!
 //! The HTTP proxy also takes plain-HTTP requests in absolute form

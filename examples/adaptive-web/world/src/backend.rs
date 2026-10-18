@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use fictionet::events::{Fields, float};
-use fictionet::stdlib::json::Value as J;
+use fictionet::stdlib::protocols::json::Value as J;
 use fictionet::stdlib::web::{self, Body};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, REFERER, USER_AGENT};
 use http::{Request, Response, StatusCode};
@@ -223,7 +223,7 @@ impl tower_service::Service<Request<Body>> for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::httpd::{self, Handler, VHost, VirtualHosts};
+    use fictionet::stdlib::web::httpd::{self, Handler, VHost, VirtualHosts};
     use std::io::{Read, Write};
     use std::net::TcpListener;
 

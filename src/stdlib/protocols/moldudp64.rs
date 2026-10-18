@@ -28,9 +28,9 @@
 //! messages that fit.
 //!
 //! ```
-//! use fictionet::stdlib::session::Action;
+//! use fictionet::stdlib::protocols::session::Action;
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::moldudp64::{
+//! use fictionet::stdlib::protocols::moldudp64::{
 //!     Downstream, Event, Receiver, ReceiverConfig, Retransmitter, Session, StoreConfig,
 //! };
 //!
@@ -54,11 +54,11 @@
 //! let actions = receiver.receive(&answer, 6)?;
 //! assert_eq!(actions, [Action::Event(Event::Deliver { sequence: 2, skip: 0, count: 2 })]);
 //! assert_eq!(receiver.expected(), Some(4));
-//! # Ok::<(), fictionet::stdlib::moldudp64::Error>(())
+//! # Ok::<(), fictionet::stdlib::protocols::moldudp64::Error>(())
 //! ```
 
 use fictionet::stdlib::codec::{Decode, Step, Wire, field};
-use fictionet::stdlib::session::Action;
+use fictionet::stdlib::protocols::session::Action;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -340,7 +340,7 @@ impl Wire for Request {
 ///
 /// ```
 /// use fictionet::stdlib::codec::{finish, pump, Stream};
-/// use fictionet::stdlib::moldudp64::Blocks;
+/// use fictionet::stdlib::protocols::moldudp64::Blocks;
 ///
 /// let mut stream = Stream::new(Blocks);
 /// let mut messages = Vec::new();
@@ -348,7 +348,7 @@ impl Wire for Request {
 /// pump(&mut stream, &[0], |m| messages.push(m))?;
 /// finish(&mut stream, |m| messages.push(m))?;
 /// assert_eq!(messages, [b"hi".to_vec(), Vec::new()]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::moldudp64::Error>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::moldudp64::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Blocks;

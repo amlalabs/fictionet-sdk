@@ -4,8 +4,8 @@ use fictionet::stdlib::codec::head_body::Header;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 
+use fictionet::stdlib::protocols::{rtsp, sdp, sip};
 use fictionet::stdlib::test_support::{decode_all, mutate};
-use fictionet::stdlib::{rtsp, sdp, sip};
 
 const SDP: &[u8] = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=media\r\nt=0 0\r\n";
 const SDP_CALL: &[u8] = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=call\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49170 RTP/AVP 96\r\na=rtpmap:96 opus/48000/2\r\na=sendonly\r\n";

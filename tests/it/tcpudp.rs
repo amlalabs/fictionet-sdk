@@ -11,11 +11,11 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use fictionet::prelude::*;
-use fictionet::stdlib::ip::{
+use fictionet::stdlib::network::ip::{
     Fields, checksum, destination, packet_with, source, transport_checksum,
 };
+use fictionet::stdlib::network::{ConnError, Connection, tcp, udp};
 use fictionet::stdlib::test_support::thread_cpu_time;
-use fictionet::stdlib::{ConnError, Connection, tcp, udp};
 use fictionet::{Cx, Interface, Packet, RecvError, pair};
 
 const A: &str = "10.0.0.1";
@@ -191,7 +191,7 @@ fn a_closed_port_refuses_at_once() {
 
 #[test]
 fn icmp_fails_only_the_quoted_connect() {
-    use fictionet::stdlib::{icmp, ip};
+    use fictionet::stdlib::network::{icmp, ip};
 
     world(Duration::from_secs(10), |fcx| async move {
         let (side, mut raw) = pair();
@@ -1007,7 +1007,7 @@ fn lost_final_ack(simultaneous: bool) {
         let (c, d) = pair();
         let mut fin_end = None;
         lossy_relay(&fcx, b, c, move |p| {
-            let header = fictionet::stdlib::ip::Header::parse_whole(&p.0).unwrap();
+            let header = fictionet::stdlib::network::ip::Header::parse_whole(&p.0).unwrap();
             let t = header.payload(&p.0);
             let flags = t[13];
             let mut seen = log.lock().unwrap();

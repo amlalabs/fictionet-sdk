@@ -33,7 +33,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::json::{Number, Value};
+//! use fictionet::stdlib::protocols::json::{Number, Value};
 //!
 //! let body = br#"{"method": "transfer", "amount": 12.50, "to": "Caf\u00e9 \ud83d\ude00"}"#;
 //! let request = Value::parse(body).unwrap();
@@ -809,7 +809,7 @@ impl Wire for Value {
 /// use a line decoder and parse each line for that format.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, finish, pump}, json::{Value, Values}};
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, protocols::json::{Value, Values}};
 ///
 /// let mut stream = Stream::new(Values::new());
 /// let mut values = Vec::new();
@@ -817,7 +817,7 @@ impl Wire for Value {
 /// pump(&mut stream, b"null", |value| values.push(value))?;
 /// finish(&mut stream, |value| values.push(value))?;
 /// assert_eq!(values, vec![Value::Bool(true), Value::Null]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::json::Error>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::json::Error>>(())
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct Values {

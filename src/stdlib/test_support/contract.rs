@@ -446,7 +446,7 @@ where
 /// Empty input must end cleanly.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Frames, test_support::contract, tpkt};
+/// use fictionet::stdlib::{codec::Frames, test_support::contract, protocols::tpkt};
 /// let bytes = [3, 0, 0, 7, 2, 0xf0, 0x80];
 /// contract::check_truncated(Frames::<tpkt::Packet>::new, &bytes);
 /// ```
@@ -468,7 +468,7 @@ where
 /// Checks successful writing and wire round trips. Returns the written bytes.
 ///
 /// ```
-/// use fictionet::stdlib::{smtp, test_support::contract};
+/// use fictionet::stdlib::{test_support::contract, protocols::smtp};
 /// let value = smtp::Request::Helo("example.com".into());
 /// assert_eq!(contract::check_written(&value), b"HELO example.com\r\n");
 /// ```
@@ -484,7 +484,7 @@ pub fn check_written<M: Wire + PartialEq + Debug>(value: &M) -> Vec<u8> {
 /// Checks writing and exact parsing, including strict prefixes and trailing bytes.
 ///
 /// ```
-/// use fictionet::stdlib::{smtp, test_support::contract};
+/// use fictionet::stdlib::{test_support::contract, protocols::smtp};
 /// let value = smtp::Request::Helo("example.com".into());
 /// assert_eq!(contract::check_exact(&value), b"HELO example.com\r\n");
 /// ```
@@ -505,7 +505,7 @@ pub fn check_exact<M: Wire + PartialEq + Debug>(value: &M) -> Vec<u8> {
 /// Also checks that writing into a new vector fails. Returns the write error.
 ///
 /// ```
-/// use fictionet::stdlib::{smtp, test_support::contract};
+/// use fictionet::stdlib::{test_support::contract, protocols::smtp};
 /// let value = smtp::Request::Helo("bad\r\nhost".into());
 /// assert_eq!(contract::check_refused(&value), smtp::Error::Unwritable);
 /// ```

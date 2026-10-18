@@ -22,7 +22,7 @@
 //! the page only. HTTP errors can contain unclassifiable bytes.
 
 use fictionet::events::Event as Entry;
-use fictionet::stdlib::json::Value as J;
+use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
 use crate::bank::{ACCOUNT, carries_password, unquote_to_bytes};

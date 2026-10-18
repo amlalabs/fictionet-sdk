@@ -1,9 +1,11 @@
 //! Public HPACK and shared Huffman values through the codec tools.
 use fictionet::stdlib::{
     codec::{Collect, Lcg, Wire},
-    hpack::{self, Encoder, Field, StringLiteral, Table},
-    huffman::{self, HuffmanString},
-    prefix_int::Integer,
+    protocols::{
+        hpack::{self, Encoder, Field, StringLiteral, Table},
+        huffman::{self, HuffmanString},
+        prefix_int::Integer,
+    },
     test_support,
     test_support::contract,
 };
@@ -71,13 +73,13 @@ fn settings_table_eviction_and_round_trips_through_public_api() {
 
 #[test]
 fn copied_modules_use_the_same_public_contracts() {
-    use fictionet_copy_modules::{hpack as copied, huffman as shared};
+    use fictionet_copy_modules::protocols::{hpack as copied, huffman as shared};
     let field = copied::Field::new("x-owned", [0, 255]);
     contract::check_wire_value(&field);
     let bytes = field.to_bytes().unwrap();
     contract::check_decode(|| Collect::<copied::Field>::new(hpack::MAX_BLOCK), &bytes);
     contract::check_wire_value(&shared::HuffmanString(vec![0, 255]));
-    let integer = fictionet_copy_modules::prefix_int::Integer::<5> {
+    let integer = fictionet_copy_modules::protocols::prefix_int::Integer::<5> {
         flags: 0x20,
         value: u64::MAX,
     };

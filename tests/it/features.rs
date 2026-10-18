@@ -3,7 +3,7 @@
 #[cfg(feature = "std")]
 #[test]
 fn http_alpn_matches_transport_features() {
-    use fictionet::stdlib::{httpd, net::PortServer};
+    use fictionet::stdlib::{web::httpd, world::net::PortServer};
     let server = httpd::Server::new(httpd::Router::new());
     assert_eq!(server.alpn(), [b"h2".to_vec(), b"http/1.1".to_vec()]);
 }
@@ -35,7 +35,11 @@ fn world_socket_refuses_disabled_observer_sessions() {
 
 #[cfg(feature = "std")]
 mod http {
-    use fictionet::stdlib::{ConnectionExt, httpd, ip, net, tcp};
+    use fictionet::stdlib::{
+        network::{ConnectionExt, ip, tcp},
+        web::httpd,
+        world::net,
+    };
     use fictionet::{Cx, Seed};
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -75,7 +79,7 @@ mod http {
 
     #[test]
     fn http2_prior_knowledge_works_with_std() {
-        use fictionet::stdlib::{codec::Wire, http2};
+        use fictionet::stdlib::{codec::Wire, protocols::http2};
         fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
             let router =
                 httpd::Router::new().get("/", |_, _| http::Response::new("hello over h2".into()));
@@ -93,7 +97,8 @@ mod http {
                 (":authority", "example.test"),
                 (":path", "/"),
             ] {
-                fictionet::stdlib::hpack::Field::new(name, value).write(&mut fragment)?;
+                fictionet::stdlib::protocols::hpack::Field::new(name, value)
+                    .write(&mut fragment)?;
             }
             http2::Headers {
                 stream: 1,
@@ -250,8 +255,8 @@ mod http {
     fn websocket_continuation_exchanges_messages_through_server() {
         use fictionet::stdlib::{
             codec::{Side, Stream, Wire},
-            serve,
-            websocket::{self, Message, Messages},
+            protocols::websocket::{self, Message, Messages},
+            services::serve,
         };
         struct Echo;
         service_fixture! {

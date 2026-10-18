@@ -3,7 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::nbdgm::{Body, Error, ErrorCode, MAX_PENDING, Name, Packet, Reassembler};
+use fictionet::stdlib::protocols::nbdgm::{
+    Body, Error, ErrorCode, MAX_PENDING, Name, Packet, Reassembler,
+};
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;

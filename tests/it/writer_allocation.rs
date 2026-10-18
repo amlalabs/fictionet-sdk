@@ -1,7 +1,7 @@
 //! Bounded protocol appends return allocation refusals without changing output.
 
 use fictionet::stdlib::codec::{Buffer, Frames, Stream, Wire, pump};
-use fictionet::stdlib::{dhcpv6, kafka, onc_rpc, opcua, syslog, thrift};
+use fictionet::stdlib::protocols::{dhcpv6, kafka, onc_rpc, opcua, syslog, thrift};
 
 use crate::common::alloc::{AllocationStats, MEASUREMENT, measuring, refusing_large};
 

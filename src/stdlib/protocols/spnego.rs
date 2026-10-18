@@ -36,7 +36,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::spnego::{InitialContextToken, Mech, NegState, NegTokenInit, NegTokenResp, NegotiationToken};
+//! use fictionet::stdlib::protocols::spnego::{InitialContextToken, Mech, NegState, NegTokenInit, NegTokenResp, NegotiationToken};
 //!
 //! // What a client sends first: NTLM offered, with its NEGOTIATE message.
 //! let negotiate = b"NTLMSSP\0\x01\0\0\0".to_vec();
@@ -64,12 +64,12 @@
 //! assert_eq!(NegotiationToken::parse(&bytes).unwrap(), reply);
 //! ```
 
-use fictionet::stdlib::asn1::{
-    self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer,
-};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Prefixed, Wire};
+use fictionet::stdlib::protocols::asn1::{
+    self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer,
+};
 use std::fmt;
 
 /// The longest token, wrapper included, a reader accepts and a writer

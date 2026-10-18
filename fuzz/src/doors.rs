@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use arbitrary::Arbitrary;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use fictionet::stdlib::http1::{RequestHead, ResponseHead};
+use fictionet::stdlib::protocols::http1::{RequestHead, ResponseHead};
 use fictionet_cli::attach_proxy::Host;
 use fictionet_cli::attach_proxy::auth::{Token, base64_decode};
 use fictionet_cli::attach_proxy::dns;

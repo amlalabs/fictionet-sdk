@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::{
+use fictionet::stdlib::protocols::{
     json::Limits,
     jsonrpc::{Message, Messages},
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {
@@ -46,8 +46,8 @@ fuzz_target!(|input: &[u8]| {
         }
     }
     // Direct envelope edits must either round-trip or refuse transactionally.
-    if let Ok(value) = fictionet::stdlib::json::Value::parse(data) {
-        let message = Message::Response(fictionet::stdlib::jsonrpc::Response { value });
+    if let Ok(value) = fictionet::stdlib::protocols::json::Value::parse(data) {
+        let message = Message::Response(fictionet::stdlib::protocols::jsonrpc::Response { value });
         contract::check_wire_value(&message);
         let mut out = vec![42];
         if message.write_line(&mut out).is_err() {

@@ -16,8 +16,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use fictionet::prelude::*;
-use fictionet::stdlib::tls::{self, ServerConfig};
-use fictionet::stdlib::{delay, ip, route, tcp};
+use fictionet::stdlib::network::{delay, ip, route, tcp};
+use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::{Cx, Interface, Packet, RecvError, pair};
 use rustls::ClientConfig;
 

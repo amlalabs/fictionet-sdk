@@ -7,7 +7,8 @@ use fictionet::stdlib::{
         ByteFault, Carry, Decode, Ending, Faults, Interceptor, ItemFault, Lines, Pipe, PumpError,
         Recorder, Rewrite, Rule, Side, Stream, StreamEvent, Trigger, Wire, write_bounded,
     },
-    json, modbus, test_support,
+    protocols::{json, modbus},
+    test_support,
 };
 use libfuzzer_sys::fuzz_target;
 

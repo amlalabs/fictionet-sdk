@@ -3,9 +3,9 @@
 use core::fmt::Debug;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire, finish, pump};
+use fictionet::stdlib::protocols::{dnp3, enip, iec104, opcua, rdp, tpkt};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::{dnp3, enip, iec104, opcua, rdp, tpkt};
 
 fn check_frames<D>(make: impl Fn() -> D, values: &[D::Item]) -> Vec<u8>
 where

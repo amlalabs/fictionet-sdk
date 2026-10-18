@@ -46,7 +46,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::bacnet::{Apdu, Bvlc, IAm, Npdu, ObjectId, Segmentation, WhoIs, unconfirmed};
+//! use fictionet::stdlib::protocols::bacnet::{Apdu, Bvlc, IAm, Npdu, ObjectId, Segmentation, WhoIs, unconfirmed};
 //!
 //! // A Who-Is with no range, broadcast by a workstation to port 47808.
 //! let datagram = [0x81, 0x0b, 0x00, 0x08, 0x01, 0x00, 0x10, 0x08];
@@ -2075,7 +2075,7 @@ impl<const TYPE: u8> Wire for ContextValue<TYPE> {
     ///
     /// ~~~
     /// use fictionet::stdlib::codec::Wire;
-    /// use fictionet::stdlib::bacnet::{ContextValue, Value, tag};
+    /// use fictionet::stdlib::protocols::bacnet::{ContextValue, Value, tag};
     /// let property = ContextValue::<{ tag::ENUMERATED }>::parse(&[0x19, 0x55]).unwrap();
     /// assert_eq!(property.number, 1);
     /// assert_eq!(property.value, Value::Enumerated(85));

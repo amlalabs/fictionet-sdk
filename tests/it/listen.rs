@@ -641,7 +641,7 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
         block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let mut mapped = attachments.map(&fcx, move |fcx, sandbox| {
                 let _ = wrapped_tx.send(sandbox.mtu());
-                fictionet::stdlib::filter(fcx, sandbox, |_, _, _| true)
+                fictionet::stdlib::network::filter(fcx, sandbox, |_, _, _| true)
             });
             let barrier = mapped.get(&fcx, "barrier").await?;
             queued_tx.send(()).unwrap();

@@ -34,7 +34,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::nbns::{Name, NbEntry, NodeType, Packet, RData, Request};
+//! use fictionet::stdlib::protocols::nbns::{Name, NbEntry, NodeType, Packet, RData, Request};
 //! use std::net::Ipv4Addr;
 //!
 //! // The agent's machine broadcasts a query for the file server FILES.
@@ -63,11 +63,11 @@
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16, write_checked};
-use fictionet::stdlib::netbios;
+use fictionet::stdlib::protocols::netbios;
 
 use std::net::Ipv4Addr;
 
-pub use fictionet::stdlib::netbios::{
+pub use fictionet::stdlib::protocols::netbios::{
     ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level, encode_first_level,
 };
 

@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
-use fictionet::stdlib::tls;
+use fictionet::stdlib::services::tls;
 use fictionet::{Cx, Seed, block_on};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::{

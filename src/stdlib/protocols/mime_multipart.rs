@@ -36,7 +36,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::mime_multipart::{boundary, Entity, Multipart, Part};
+//! use fictionet::stdlib::protocols::mime_multipart::{boundary, Entity, Multipart, Part};
 //!
 //! let content_type = "multipart/form-data; boundary=XyZ";
 //! let body = b"--XyZ\r\n\
@@ -730,7 +730,7 @@ fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error>
 /// while a preamble-only body is an error.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, finish, pump}, mime_multipart::Parts};
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, protocols::mime_multipart::Parts};
 ///
 /// let mut stream = Stream::new(Parts::new("b").unwrap());
 /// let mut parts = Vec::new();
@@ -739,7 +739,7 @@ fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error>
 /// finish(&mut stream, |part| parts.push(part))?;
 /// assert_eq!(parts.len(), 1);
 /// assert_eq!(parts[0].body, b"hello");
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::mime_multipart::Error>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::mime_multipart::Error>>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct Parts {

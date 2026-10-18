@@ -2,14 +2,14 @@
 //! playing a file server, or a client, reads them.
 #![no_main]
 
-use fictionet::stdlib::nfs::harness::check;
-use fictionet::stdlib::nfs::{
+use fictionet::stdlib::protocols::nfs::harness::check;
+use fictionet::stdlib::protocols::nfs::{
     DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, Request, Response, Status, procedure,
 };
-use fictionet::stdlib::onc_rpc::{Body, Message};
+use fictionet::stdlib::protocols::onc_rpc::{Body, Message};
 use fictionet::stdlib::{
     codec::{Assembled, Decode, Wire},
-    onc_rpc,
+    protocols::onc_rpc,
     test_support::contract,
     test_support::decode_all,
 };

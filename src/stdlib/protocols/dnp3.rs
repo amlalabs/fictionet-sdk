@@ -19,7 +19,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::dnp3::{Frame, Fragment, Segment};
+//! use fictionet::stdlib::protocols::dnp3::{Frame, Fragment, Segment};
 //!
 //! // Read class 0 data: group 60, variation 1, all objects.
 //! let request = Fragment { control: 0xc0, function: 1, indications: None,

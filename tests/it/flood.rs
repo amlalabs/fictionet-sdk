@@ -9,8 +9,8 @@
 
 use crate::common::timeout;
 
-use fictionet::stdlib::sandbox::Machine;
-use fictionet::stdlib::sandbox::machine;
+use fictionet::stdlib::world::sandbox::Machine;
+use fictionet::stdlib::world::sandbox::machine;
 use timeout::timeout;
 
 use std::convert::Infallible;
@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::prelude::*;
-use fictionet::stdlib::dns::op::{Message, Query};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::{ip, web};
+use fictionet::stdlib::protocols::dns::op::{Message, Query};
+use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::{network::ip, web};
 use fictionet::{Cx, End, Interface, Packet, block_on, lab, run};
 use http::{Request, Response};
 use http_body_util::Full;

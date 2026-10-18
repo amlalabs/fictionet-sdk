@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::memcache::{
+use fictionet::stdlib::protocols::memcache::{
     BINARY_HEADER_LEN, Command, Commands, CounterExtras, Error, MAX_BINARY_BUFFERED, MAX_LINE,
     MAX_TEXT_HELD, MetaFlag, MetaStatus, Packet, Response, Responses, Status, StoreExtras,
     UDP_HEADER_LEN, UDP_MAX_DATAGRAM, UdpFrame,

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use fictionet::prelude::*;
-use fictionet::stdlib::{ConnError, Connection};
+use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::{Cx, RaceError, time::Instant};
 
 #[path = "../../common/response.rs"]

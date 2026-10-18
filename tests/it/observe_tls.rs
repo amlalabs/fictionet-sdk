@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use fictionet::relay::observer::{Client, Value};
-use fictionet::stdlib::tls::{self, ServerConfig};
-use fictionet::stdlib::{Connection, ConnectionExt, tcp};
+use fictionet::stdlib::network::{Connection, ConnectionExt, tcp};
+use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::{Cx, Interface, InterfaceExt, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};

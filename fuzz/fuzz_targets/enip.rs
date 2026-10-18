@@ -6,7 +6,7 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 
-use fictionet::stdlib::enip::{
+use fictionet::stdlib::protocols::enip::{
     Cpf, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
     Packet, RegisterSession, SendData, harness,
 };
@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
     check_wire::<Packet>(data);
     let (packets, _) = decode_all(Frames::<Packet>::new, data);
     let built = Packet {
-        command: fictionet::stdlib::enip::Command::Other(u16::from(
+        command: fictionet::stdlib::protocols::enip::Command::Other(u16::from(
             data.first().copied().unwrap_or(0),
         )),
         session_handle: 1,
@@ -25,7 +25,11 @@ fuzz_target!(|data: &[u8]| {
         sender_context: [0; 8],
         options: u32::from(data.get(1).copied().unwrap_or(0)),
         data: data
-            .get(..data.len().min(fictionet::stdlib::enip::MAX_PACKET))
+            .get(
+                ..data
+                    .len()
+                    .min(fictionet::stdlib::protocols::enip::MAX_PACKET),
+            )
             .unwrap_or_default()
             .to_vec(),
     };

@@ -2,7 +2,7 @@ use super::Display;
 use fictionet::events::Transport;
 use fictionet::observe::{Decoded, Layer, Match, Placement, Present, Registry};
 use fictionet::stdlib::codec::{Decode, Step};
-use fictionet::stdlib::dhcp;
+use fictionet::stdlib::protocols::dhcp;
 use std::convert::Infallible;
 
 /// One DHCP datagram, parsed at EOF with the stdlib message parser.
@@ -56,7 +56,10 @@ impl Present for Dhcp {
 
 fn dhcp_display(bytes: &[u8]) -> Display {
     let mut packet = Decoded::default();
-    let Ok(m) = <fictionet::stdlib::dhcp::Message as fictionet::stdlib::codec::Wire>::parse(bytes)
+    let Ok(m) =
+        <fictionet::stdlib::protocols::dhcp::Message as fictionet::stdlib::codec::Wire>::parse(
+            bytes,
+        )
     else {
         return Display::from_packet(packet, "DHCP message");
     };

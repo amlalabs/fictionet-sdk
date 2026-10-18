@@ -42,7 +42,7 @@ use std::time::SystemTime;
 use axum::Extension;
 use axum::routing::get;
 use fictionet::Result;
-use fictionet::stdlib::tls;
+use fictionet::stdlib::services::tls;
 use fictionet::stdlib::web;
 use http::Version;
 use rustls::pki_types::PrivateKeyDer;
@@ -85,7 +85,7 @@ pub fn run(
     runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
-            let ca = fictionet::stdlib::ca::Ca::new(&fcx, "web_world CA")?;
+            let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "web_world CA")?;
             let leaf = ca.issue(
                 &fcx,
                 &[
@@ -94,9 +94,11 @@ pub fn run(
                     "v4only.test",
                     "v6only.test",
                 ],
-                fictionet::stdlib::x509::Validity {
-                    not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                    not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+                fictionet::stdlib::protocols::x509::Validity {
+                    not_before: fictionet::stdlib::protocols::x509::Time::from_unix(946684800)
+                        .unwrap(),
+                    not_after: fictionet::stdlib::protocols::x509::Time::from_unix(4102444800)
+                        .unwrap(),
                 },
             )?;
             std::fs::write(&ca_path, ca.cert_pem())?;

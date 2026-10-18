@@ -4,8 +4,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::ocsp::harness::check;
-use fictionet::stdlib::ocsp::{
+use fictionet::stdlib::protocols::ocsp::harness::check;
+use fictionet::stdlib::protocols::ocsp::{
     AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, MAX_NONCE,
     Request, ResponderId, Response, ResponseBytes, ResponseData, ResponseStatus, SingleRequest,
     SingleResponse, decode_get_path, find_nonce,

@@ -6,7 +6,10 @@ use divan::{
     counter::{BytesCount, ItemsCount},
 };
 use fictionet::prelude::*;
-use fictionet::stdlib::{self, ip, tcp};
+use fictionet::stdlib::{
+    self,
+    network::{ip, tcp},
+};
 use fictionet::{Cx, End, Interface, Packet, RecvError, pair};
 use std::future::poll_fn;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -196,13 +199,13 @@ fn tcp_bulk(
             }
             Topology::Delay(ms) => {
                 let (a, b) = pair();
-                let b = stdlib::delay(&fcx, fictionet::time::ms(ms), b);
+                let b = stdlib::network::delay(&fcx, fictionet::time::ms(ms), b);
                 (a, b, Vec::new())
             }
             Topology::Path => {
                 let (a, ar) = pair();
                 let (br, b) = pair();
-                let router = stdlib::route::router(
+                let router = stdlib::network::route::router(
                     &fcx,
                     vec![("10.0.0.1/32".parse()?, ar), ("10.0.0.2/32".parse()?, br)],
                 );
@@ -370,9 +373,9 @@ fn unread(delayed: bool, n: usize, result: Arc<Mutex<Option<u64>>>) -> World {
     World::new(move |fcx, checkpoint| async move {
         let (mut a, b) = pair();
         let mut far = if delayed {
-            stdlib::delay(&fcx, fictionet::time::ms(60_000), b)
+            stdlib::network::delay(&fcx, fictionet::time::ms(60_000), b)
         } else {
-            stdlib::bottleneck(&fcx, 1_000_000_000_000, 64, b)
+            stdlib::network::bottleneck(&fcx, 1_000_000_000_000, 64, b)
         };
         checkpoint.wait().await;
         for i in 0..n {

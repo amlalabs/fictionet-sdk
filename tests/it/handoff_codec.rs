@@ -3,7 +3,7 @@
 use core::{convert::Infallible, fmt::Debug};
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Step, Stream, Wire},
-    proxy_protocol as proxy, rfb, socks,
+    protocols::{proxy_protocol as proxy, rfb, socks},
     test_support::chunks,
     test_support::contract,
 };

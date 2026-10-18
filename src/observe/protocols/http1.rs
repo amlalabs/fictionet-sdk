@@ -3,7 +3,7 @@ use fictionet::events::Transport;
 use fictionet::observe::{Decoded, Layer, Match, Placement, Present, Registry};
 use fictionet::stdlib::codec::ascii::{hex_value, trim_ows};
 use fictionet::stdlib::codec::{Decode, Step};
-use fictionet::stdlib::http1;
+use fictionet::stdlib::protocols::http1;
 use fictionet::sync::Mutex;
 use std::collections::VecDeque;
 use std::convert::Infallible;

@@ -14,8 +14,10 @@ use super::KeyLine;
 use super::json;
 use crate::events::Event;
 use fictionet::stdlib::codec::{Wire, be16, be32};
-use fictionet::stdlib::json::Value;
-use fictionet::stdlib::tcp_reassembly::{Chunk, FlowKey, Reassembler, Segment, conversation_key};
+use fictionet::stdlib::protocols::json::Value;
+use fictionet::stdlib::protocols::tcp_reassembly::{
+    Chunk, FlowKey, Reassembler, Segment, conversation_key,
+};
 
 /// A field of a layer, and where its bytes are.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1191,7 +1193,7 @@ mod tests {
     fn captured_payload_after_close_still_completes_http2_headers() {
         for flags in [0x11, 0x14] {
             let mut dis = Dissector::default();
-            let mut first = fictionet::stdlib::http2::PREFACE.to_vec();
+            let mut first = fictionet::stdlib::protocols::http2::PREFACE.to_vec();
             first.extend(h2_frame(1, 0, 1, &[0x82]));
             dis.decode(&tcp(40000, 80, 100, 2, b""), &[]);
             dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
@@ -1321,7 +1323,7 @@ mod tests {
 
     #[test]
     fn reassembly_gap_resets_the_http2_header_table() {
-        use fictionet::stdlib::tcp_reassembly::Limits;
+        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
         let mut dis = Dissector {
             tcp: Reassembler::new(Limits {
                 segments: 1,
@@ -1363,7 +1365,7 @@ mod tests {
 
     #[test]
     fn reassembly_gap_before_the_first_bytes_also_stops_http2() {
-        use fictionet::stdlib::tcp_reassembly::Limits;
+        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
         let mut dis = Dissector {
             tcp: Reassembler::new(Limits {
                 segments: 1,
@@ -1383,7 +1385,7 @@ mod tests {
 
     #[test]
     fn reassembly_gap_without_held_data_keeps_the_packet_tag() {
-        use fictionet::stdlib::tcp_reassembly::Limits;
+        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
         let mut dis = Dissector {
             tcp: Reassembler::new(Limits {
                 buffered: 0,

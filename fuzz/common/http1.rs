@@ -1,6 +1,6 @@
 //! Shared HTTP/1 fuzz fixture limits.
 
-use fictionet::stdlib::http1::Limits;
+use fictionet::stdlib::protocols::http1::Limits;
 
 /// Limits for streaming HTTP/1 events.
 pub fn event_limits() -> Limits {

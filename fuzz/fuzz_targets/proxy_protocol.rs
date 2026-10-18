@@ -4,11 +4,11 @@
 
 use fictionet::stdlib::{
     codec::{Decode, Step, Wire},
-    proxy_protocol::Headers,
+    protocols::proxy_protocol::Headers,
     test_support::contract,
 };
 
-use fictionet::stdlib::proxy_protocol::{
+use fictionet::stdlib::protocols::proxy_protocol::{
     Addresses, Command, Header, MAX_HEADER_LEN, MAX_TLV_VALUE, Ssl, SslTlv, Tlv, Transport, V1, V2,
     V2_MAX_BODY, V2_SIGNATURE,
 };

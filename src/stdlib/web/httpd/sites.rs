@@ -11,15 +11,15 @@ use http::uri::{Authority, Scheme};
 use http::{Request, StatusCode};
 
 use fictionet::Cx;
-use fictionet::stdlib::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
-use fictionet::stdlib::tls::ServerConfig;
+use fictionet::stdlib::world::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
+use fictionet::stdlib::services::tls::ServerConfig;
 
 use super::response::answered;
 use super::{
     Body, Exchange, Handler, HttpOptions, Limits, Observer, Reply, serve_connection, text,
 };
 
-pub use fictionet::stdlib::net::normalize;
+pub use fictionet::stdlib::world::net::normalize;
 
 /// Where a request arrived: the scheme and port from the connection, the
 /// host from the request. [`VirtualHosts`] puts one in the extensions of
@@ -243,7 +243,7 @@ pub fn request_host<B>(request: &Request<B>) -> Option<String> {
 // ---------------------------------------------------------------------------
 // HTTP on a network
 
-/// HTTP on one port of a [`Net`](fictionet::stdlib::net::Net) host: an
+/// HTTP on one port of a [`Net`](fictionet::stdlib::world::net::Net) host: an
 /// [`PortServer`] that serves the host's site for each of its DNS names.
 ///
 /// Every host at one address that serves HTTP on a port shares that port:
@@ -254,7 +254,7 @@ pub fn request_host<B>(request: &Request<B>) -> Option<String> {
 /// Over TLS, ALPN offers `h2` and `http/1.1` with `std` alone.
 ///
 /// ```
-/// # use fictionet::stdlib::{httpd, net::Host};
+/// # use fictionet::stdlib::{web::httpd, world::net::Host};
 /// let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
 /// let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
 /// # drop(host);

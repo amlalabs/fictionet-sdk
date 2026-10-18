@@ -21,8 +21,8 @@
 //! bytes it reads into [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits the
 //! stream into [`Frame`]s: messages, by their Content-Length, and
 //! interleaved frames, by their length. A camera can also use [`Frames`] as
-//! the decoder of a [`Service`](fictionet::stdlib::serve::Service) run by
-//! [`serve::connection`](fictionet::stdlib::serve::connection).
+//! the decoder of a [`Service`](fictionet::stdlib::services::serve::Service) run by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection).
 //! World code reads the headers it needs with
 //! [`Message::cseq`], [`Message::session`], [`Message::transports`] and
 //! [`Message::range`], builds its answer (often with [`Message::reply`]),
@@ -52,11 +52,11 @@
 //! untrusted Content-Length is a stream error. An RTSP 2.0 head with bare
 //! LF also ends the stream because its CRLF boundary cannot be trusted.
 //! Header-count errors are items. The driver reports truncated input at
-//! EOF. Bodies remain bytes; SDP belongs to [`fictionet::stdlib::sdp`].
+//! EOF. Bodies remain bytes; SDP belongs to [`fictionet::stdlib::protocols::sdp`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::rtsp::{Frame, Frames, Interleaved, TransportParam};
+//! use fictionet::stdlib::protocols::rtsp::{Frame, Frames, Interleaved, TransportParam};
 //!
 //! let mut stream = Stream::new(Frames::new());
 //! let request_bytes = b"SETUP rtsp://example.com/foo/bar/baz.rm RTSP/1.0\r\n\
@@ -549,16 +549,16 @@ pub enum Frame {
 /// Each call yields at most one unit and returns control to the caller.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, rtsp::{Frames, Message}};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, protocols::rtsp::{Frames, Message}};
 ///
 /// let bytes = b"RTSP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n";
 /// let message = <Message as Wire>::parse(bytes)?;
 /// let mut stream = Stream::new(Frames::new());
 /// assert_eq!(stream.push(bytes), bytes.len());
-/// assert_eq!(stream.next(), Some(Ok(Ok(fictionet::stdlib::rtsp::Frame::Message(message)))));
+/// assert_eq!(stream.next(), Some(Ok(Ok(fictionet::stdlib::protocols::rtsp::Frame::Message(message)))));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::rtsp::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::rtsp::Error>(())
 /// ```
 pub struct Frames {
     scanner: Scanner,

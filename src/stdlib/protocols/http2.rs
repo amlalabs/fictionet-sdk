@@ -3,7 +3,7 @@
 //! `Frame` implements `Wire`, `Inputs` decodes the stream, and `Session` tracks
 //! one direction rather than a whole client or server. This module has no
 //! `Service` or live transport. The native server in
-//! `fictionet::stdlib::httpd` and the observe presenter share this frame layer.
+//! `fictionet::stdlib::web::httpd` and the observe presenter share this frame layer.
 //!
 //! Use [`Session`] for strict decoding. A capture reads frames with
 //! [`Inputs::for_observation`] and header blocks with
@@ -25,7 +25,7 @@
 //! Later pending HPACK increases do not cancel required size updates.
 //!
 //! ```
-//! use fictionet::stdlib::http2::{Limits, Session, WindowUpdate};
+//! use fictionet::stdlib::protocols::http2::{Limits, Session, WindowUpdate};
 //!
 //! let mut response = Session::server_side(Limits::default());
 //! // The request direction has emitted opening HEADERS for stream 1.
@@ -34,13 +34,13 @@
 //!     stream: 1, flags: 0, increment: 65_536,
 //! })?;
 //! assert_eq!(response.stream_window(1), Some(131_071));
-//! # Ok::<(), fictionet::stdlib::http2::Error>(())
+//! # Ok::<(), fictionet::stdlib::protocols::http2::Error>(())
 //! ```
 
 use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{
     codec::{Decode, Fail, Step, Stream, Wire, be32},
-    hpack,
+    protocols::hpack,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -2154,7 +2154,13 @@ pub mod harness {
                         _ => &[],
                     };
                     for &size in updates {
-                        fictionet::stdlib::prefix_int::write(&mut fragment, 5, 0x20, size).unwrap();
+                        fictionet::stdlib::protocols::prefix_int::write(
+                            &mut fragment,
+                            5,
+                            0x20,
+                            size,
+                        )
+                        .unwrap();
                     }
                     fragment.push(if dir == 0 { 0x82 } else { 0x88 });
                     self.frame(
@@ -3360,7 +3366,7 @@ mod tests {
         })
         .unwrap();
         let mut block = Vec::new();
-        fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 8192).unwrap();
+        fictionet::stdlib::protocols::prefix_int::write(&mut block, 5, 0x20, 8192).unwrap();
         block.push(0x88);
         accept(&mut c, &raw(1, 4, 1, &block));
         accept(&mut c, &raw(4, 1, 0, &[]));
@@ -3375,8 +3381,8 @@ mod tests {
         .unwrap();
         accept(&mut c, &raw(4, 1, 0, &[]));
         block.clear();
-        fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 1024).unwrap();
-        fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 2048).unwrap();
+        fictionet::stdlib::protocols::prefix_int::write(&mut block, 5, 0x20, 1024).unwrap();
+        fictionet::stdlib::protocols::prefix_int::write(&mut block, 5, 0x20, 2048).unwrap();
         block.push(0x88);
         accept(&mut c, &raw(1, 4, 5, &block));
         assert_eq!(c.blocks.table.table_capacity(), Some(2048));
@@ -3401,8 +3407,8 @@ mod tests {
 
         accept(&mut c, &raw(4, 1, 0, &[]));
         let mut block = Vec::new();
-        fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 1024).unwrap();
-        fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 2048).unwrap();
+        fictionet::stdlib::protocols::prefix_int::write(&mut block, 5, 0x20, 1024).unwrap();
+        fictionet::stdlib::protocols::prefix_int::write(&mut block, 5, 0x20, 2048).unwrap();
         block.push(0x88);
         accept(&mut c, &raw(1, 4, 3, &block));
         assert_eq!(c.blocks.table.settings_limit(), Some(2048));
@@ -3426,8 +3432,8 @@ mod tests {
         for (stream, minimum) in [(3, 2048), (5, 1024)] {
             accept(&mut c, &raw(4, 1, 0, &[]));
             let mut block = Vec::new();
-            fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, minimum).unwrap();
-            fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, 8192).unwrap();
+            fictionet::stdlib::protocols::prefix_int::write(&mut block, 5, 0x20, minimum).unwrap();
+            fictionet::stdlib::protocols::prefix_int::write(&mut block, 5, 0x20, 8192).unwrap();
             block.push(0x88);
             accept(&mut c, &raw(1, 4, stream, &block));
             assert_eq!(c.blocks.table.table_capacity(), Some(8192));
@@ -3455,7 +3461,8 @@ mod tests {
                 }
                 let mut block = Vec::new();
                 if let Some(value) = update {
-                    fictionet::stdlib::prefix_int::write(&mut block, 5, 0x20, value).unwrap();
+                    fictionet::stdlib::protocols::prefix_int::write(&mut block, 5, 0x20, value)
+                        .unwrap();
                 }
                 block.push(0x88);
                 let frame = raw(1, 4, 1, &block);

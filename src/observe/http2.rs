@@ -1,9 +1,13 @@
-//! HTTP/2 and gRPC in a capture: [`Capture`](fictionet::observe::http2::Capture) presents each
-//! direction's frames, header blocks and gRPC messages, on
-//! [`stdlib::http2`](fictionet::stdlib::http2)'s observation readers
-//! ([`Inputs::for_observation`](fictionet::stdlib::http2::Inputs::for_observation)
-//! and [`HeaderBlocks::for_observation`](fictionet::stdlib::http2::HeaderBlocks::for_observation))
-//! and [`codec::Frames<grpc::Message>`](fictionet::stdlib::codec::Frames<grpc::Message>).
+//! HTTP/2 and gRPC in a capture:
+//! [`Capture`](fictionet::observe::http2::Capture) presents each direction's
+//! frames, header blocks and gRPC messages, on
+//! [`stdlib::protocols::http2`](fictionet::stdlib::protocols::http2)'s
+//! observation readers
+//! ([`Inputs::for_observation`](fictionet::stdlib::protocols::http2::Inputs::for_observation)
+//! and
+//! [`HeaderBlocks::for_observation`](fictionet::stdlib::protocols::http2::HeaderBlocks::for_observation))
+//! and
+//! [`codec::Frames<grpc::Message>`](fictionet::stdlib::codec::Frames<grpc::Message>).
 //!
 //! The file uses only public observe and stdlib APIs, so a copy of it can
 //! replace the built-in, registered the same way.
@@ -11,11 +15,11 @@
 use fictionet::events::Transport;
 use fictionet::observe::{Decoded, Layer, Match, Placement, Present, Registry};
 use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire, be32};
-use fictionet::stdlib::http2::{
+use fictionet::stdlib::protocols::http2::{
     BlockDiagnostic, Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderBlocks, Input, Inputs,
     MAX_WINDOW, PREFACE, Setting,
 };
-use fictionet::stdlib::{grpc, hpack};
+use fictionet::stdlib::protocols::{grpc, hpack};
 use fictionet::sync::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -222,11 +226,12 @@ impl core::fmt::Display for CaptureError {
 }
 impl core::error::Error for CaptureError {}
 
-/// HTTP/2 capture decoding through [`Present`] and [`fictionet::observe::Observed`].
-/// Uses the same frame parser and header assembly as [`Session`](fictionet::stdlib::http2::Session), with
-/// tolerant HPACK and header-only oversized items followed by `Skip`.
-/// Complete frames already available in bounded read-ahead are displayed.
-/// Missing bytes stop the direction and clear HPACK and DATA state.
+/// HTTP/2 capture decoding through [`Present`] and
+/// [`fictionet::observe::Observed`]. Uses the same frame parser and header
+/// assembly as [`Session`](fictionet::stdlib::protocols::http2::Session), with
+/// tolerant HPACK and header-only oversized items followed by `Skip`. Complete
+/// frames already available in bounded read-ahead are displayed. Missing bytes
+/// stop the direction and clear HPACK and DATA state.
 ///
 /// Recognized gRPC streams use [`Demux`] of [`codec::Frames<grpc::Message>`](fictionet::stdlib::codec::Frames). Both directions
 /// share at most 256 call entries, each with at most 256 provenance spans.

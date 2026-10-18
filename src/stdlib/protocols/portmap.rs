@@ -31,7 +31,7 @@
 //! directly when the caller has already checked the RPC header.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Decode, Stream}, onc_rpc, portmap};
+//! use fictionet::stdlib::{codec::{Decode, Stream}, protocols::{onc_rpc, portmap}};
 //!
 //! let requests = onc_rpc::messages(onc_rpc::MAX_RECORD).map(|message| {
 //!     message.map(|message| match message.body {
@@ -52,8 +52,8 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::onc_rpc::{Accept, Body, Call, Message, Reject, Reply};
-//! use fictionet::stdlib::portmap::{
+//! use fictionet::stdlib::protocols::onc_rpc::{Accept, Body, Call, Message, Reject, Reply};
+//! use fictionet::stdlib::protocols::portmap::{
 //!     silent_on_failure, format_uaddr, parse_uaddr, procedure, Error, PmapRequest, PmapResult, Request, Rpcb,
 //!     RpcbRequest, RpcbResult, IPPROTO_TCP,
 //! };
@@ -123,7 +123,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use fictionet::stdlib::onc_rpc::{
+use fictionet::stdlib::protocols::onc_rpc::{
     self, Accept, Body, Call, Message, RPC_VERSION, Reader, Reject, Reply, Writer,
 };
 
@@ -190,7 +190,7 @@ pub struct Rpcb {
     /// The network ID, such as "tcp", "udp", "tcp6" or "udp6".
     pub netid: String,
     /// The universal address, such as "10.0.0.5.8.1" for port 2049. See
-    /// [`portmap::format_uaddr`](fictionet::stdlib::portmap::format_uaddr).
+    /// [`portmap::format_uaddr`](fictionet::stdlib::protocols::portmap::format_uaddr).
     pub addr: String,
     /// Who registered it, usually a user ID as a string.
     pub owner: String,
@@ -770,7 +770,8 @@ impl PmapResult {
         }
     }
 
-    /// The results' bytes, for [`Reply::success`](fictionet::stdlib::onc_rpc::Reply::success).
+    /// The results' bytes, for
+    /// [`Reply::success`](fictionet::stdlib::protocols::onc_rpc::Reply::success).
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
         match self {
@@ -992,7 +993,8 @@ impl RpcbResult {
         }
     }
 
-    /// The results' bytes, for [`Reply::success`](fictionet::stdlib::onc_rpc::Reply::success).
+    /// The results' bytes, for
+    /// [`Reply::success`](fictionet::stdlib::protocols::onc_rpc::Reply::success).
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
         match self {
@@ -1161,7 +1163,7 @@ fn string(w: &mut Writer, s: &str) -> Result<(), Error> {
 #[doc(hidden)]
 pub mod harness {
     use super::{PmapResult, Request, RpcbResult, format_uaddr, parse_uaddr};
-    use fictionet::stdlib::onc_rpc::{Call, PMAP_PROGRAM};
+    use fictionet::stdlib::protocols::onc_rpc::{Call, PMAP_PROGRAM};
 
     /// Reads any bytes as the arguments of every procedure of versions 1 to
     /// 5, and as the results of every procedure. Whatever reads is written
@@ -1202,7 +1204,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Stream, Wire, finish, pump};
-    use fictionet::stdlib::onc_rpc::{MAX_RECORD, Record, records};
+    use fictionet::stdlib::protocols::onc_rpc::{MAX_RECORD, Record, records};
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
 
@@ -1750,7 +1752,10 @@ mod tests {
             assert_eq!(e, Error::RpcVersion(v));
             assert_eq!(
                 e.reply(),
-                Reply::Denied(fictionet::stdlib::onc_rpc::Reject::RpcMismatch { low: 2, high: 2 })
+                Reply::Denied(fictionet::stdlib::protocols::onc_rpc::Reject::RpcMismatch {
+                    low: 2,
+                    high: 2
+                })
             );
             assert!(!e.to_string().is_empty());
             // Before the program is checked.
@@ -1898,7 +1903,7 @@ mod tests {
     /// limit, crosses TCP in fragments and a byte at a time.
     #[test]
     fn largest_getstat_reply_over_tcp() {
-        use fictionet::stdlib::onc_rpc::encode_fragments;
+        use fictionet::stdlib::protocols::onc_rpc::encode_fragments;
         let netid = "z".repeat(MAX_STRING);
         let s = RpcbStat {
             info: [i32::MAX; STAT_PROCEDURES],
@@ -1967,7 +1972,7 @@ mod tests {
     /// when they fail. INDIRECT and the rest are not.
     #[test]
     fn silent_calls() {
-        use fictionet::stdlib::portmap::silent_on_failure;
+        use fictionet::stdlib::protocols::portmap::silent_on_failure;
         let c = CallArgs::default();
         let silent = [
             Request::Pmap(PmapRequest::CallIt(c.clone())),
@@ -2160,7 +2165,7 @@ mod tests {
             contract::check_decode_with_alloc_limit(
                 || records(MAX_RECORD),
                 &stream,
-                2 * (MAX_RECORD + fictionet::stdlib::onc_rpc::RECORD_MARK_LEN),
+                2 * (MAX_RECORD + fictionet::stdlib::protocols::onc_rpc::RECORD_MARK_LEN),
             );
             {
                 let (items, failure) = test_support::decode_all(|| records(MAX_RECORD), &stream);

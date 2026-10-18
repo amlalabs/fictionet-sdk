@@ -516,7 +516,7 @@ fn recorded_world() -> Vec<u8> {
         );
         assert!(matches!(
             log.of("run", "start")[0].get("wall"),
-            Some(fictionet::stdlib::json::Value::Null)
+            Some(fictionet::stdlib::protocols::json::Value::Null)
         ));
         for i in 0..4 {
             cx.sleep(ms(15)).await?;
@@ -579,8 +579,8 @@ fn seeded_service_faults_repeat_at_the_same_points() {
     use fictionet::events::{ConnInfo, Event};
     use fictionet::prelude::*;
     use fictionet::stdlib::codec::{ByteFault, Ending, LineError, Lines, Rule, Trigger};
-    use fictionet::stdlib::serve::{self, FaultPlan, Flow, Plan, ServeOptions};
-    use fictionet::stdlib::tcp;
+    use fictionet::stdlib::network::tcp;
+    use fictionet::stdlib::services::serve::{self, FaultPlan, Flow, Plan, ServeOptions};
 
     struct Echo;
     service_fixture! {

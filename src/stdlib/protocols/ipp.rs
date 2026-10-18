@@ -33,7 +33,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::ipp::{operation, status, tag, Attribute, Head, Header, Message, Value};
+//! use fictionet::stdlib::protocols::ipp::{operation, status, tag, Attribute, Head, Header, Message, Value};
 //!
 //! // An HTTP request body asking for the printer's attributes.
 //! let request = Message::request(operation::GET_PRINTER_ATTRIBUTES, 7);
@@ -1331,7 +1331,7 @@ fn write_value(out: &mut Vec<u8>, name: &[u8], v: &Value, depth: usize) -> Resul
 /// in the [`Header`] or [`Error::BadRequest`] item instead.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Collect, Stream, Wire, finish, pump}, ipp::{Head, MAX_DOCUMENT}};
+/// use fictionet::stdlib::{codec::{Collect, Stream, Wire, finish, pump}, protocols::ipp::{Head, MAX_DOCUMENT}};
 /// use core::convert::Infallible;
 ///
 /// struct Document(Vec<u8>);

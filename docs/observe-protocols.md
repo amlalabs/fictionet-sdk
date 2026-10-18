@@ -105,7 +105,7 @@ that name is registered. Other cases use the registry matchers, including
 across split plaintext prefixes. Eight unmatched bytes permanently reject
 plaintext selection in both directions, as in the outer conversation.
 Selection is not retried at each record. User replacements apply inside TLS
-too. HTTP/1 capture reads each head with `stdlib::http1`'s lenient reader
+too. HTTP/1 capture reads each head with `stdlib::protocols::http1`'s lenient reader
 (`RequestHead::parse_lenient`), which checks syntax but not the framing
 rules an endpoint applies, and frames bodies itself. Chunked bodies end after
 the empty line that terminates all trailers. Trailer bytes do not enter the
@@ -132,8 +132,8 @@ can retain a terminal error while reporting it once.
 HTTP/2's `Capture::register` uses `register_with_buffer` with
 `observe::http2::CAPTURE_READ_AHEAD`. Copy `src/observe/http2.rs` to
 customize presentation; it uses only public SDK APIs. It reads frames with
-`stdlib::http2::Inputs::for_observation` and header blocks with
-`stdlib::http2::HeaderBlocks::for_observation`, the same frame parser and
+`stdlib::protocols::http2::Inputs::for_observation` and header blocks with
+`stdlib::protocols::http2::HeaderBlocks::for_observation`, the same frame parser and
 header assembly that strict `Frames` and `Session` use, which notes what
 it cannot read instead of failing. Strict `Frames` and `Session` check
 RFC 9113 framing and directional state. Announce a request's opening HEADERS

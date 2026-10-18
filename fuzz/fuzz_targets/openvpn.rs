@@ -4,8 +4,8 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::openvpn::Frame;
-use fictionet::stdlib::openvpn::{
+use fictionet::stdlib::protocols::openvpn::Frame;
+use fictionet::stdlib::protocols::openvpn::{
     Ack, Authenticated, Control, ControlBody, ControlKind, Encrypted, Error, MAX_HMAC_LEN,
     MAX_PACKET, MAX_TCP_FRAME, Packet, TlsAuth, TlsCrypt, Wrapping, split_first_byte,
 };

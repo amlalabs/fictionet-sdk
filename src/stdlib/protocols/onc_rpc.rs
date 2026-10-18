@@ -1,5 +1,5 @@
 //! ONC RPC and XDR: reading and writing calls, replies, and TCP records
-//! with no I/O. [`portmap`](fictionet::stdlib::portmap) handles portmap procedures.
+//! with no I/O. [`portmap`](fictionet::stdlib::protocols::portmap) handles portmap procedures.
 //!
 //! `Message`, `Fragment`, and `Record` implement `Wire`. `Fragments`,
 //! `records`, and `messages` decode and assemble TCP records. There is no
@@ -17,7 +17,7 @@
 //! port a program listens on by asking the portmapper (version 2) or
 //! rpcbind (versions 3 and 4) on port 111. This module follows RFC 4506
 //! for XDR and RFC 5531 for ONC RPC and record marking. The
-//! [`portmap`](fictionet::stdlib::portmap) module follows RFC 1833 for
+//! [`portmap`](fictionet::stdlib::protocols::portmap) module follows RFC 1833 for
 //! portmap and rpcbind.
 //!
 //! For TCP, [`Stream<Fragments>`](fictionet::stdlib::codec::Stream) reads record
@@ -27,12 +27,12 @@
 //! [`Writer::finish`] reports values that exceed its record budget.
 //! World code selects the program, procedure, and reply.
 //! The example below wraps a NULL call and its empty result in RPC envelopes.
-//! See [`portmap`](fictionet::stdlib::portmap) for procedure dispatch,
+//! See [`portmap`](fictionet::stdlib::protocols::portmap) for procedure dispatch,
 //! including RPC-version checks and silent failures for unforwarded CALLITs.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Assembled, Wire};
-//! use fictionet::stdlib::onc_rpc::{
+//! use fictionet::stdlib::protocols::onc_rpc::{
 //!     records, Body, Call, Record, Message, MAX_RECORD, Reply,
 //! };
 //!
@@ -64,7 +64,7 @@ use fictionet::stdlib::codec::{
     self, Assemble, AssembleError, Assembled, Decode, Reader as ByteReader, Step, Truncated, Wire,
 };
 
-pub use fictionet::stdlib::portmap::{
+pub use fictionet::stdlib::protocols::portmap::{
     IPPROTO_TCP, IPPROTO_UDP, MAX_RPCB_STRING, PMAP_PROGRAM, PMAP_VERSION, PORT, RPCB_VERSION_HIGH,
     RPCB_VERSION_LOW,
 };
@@ -109,9 +109,9 @@ pub mod flavor {
 
 /// Procedure numbers of the portmapper (version 2) and rpcbind (versions
 /// 3 and 4). GETPORT and GETADDR share a number.
-/// Re-exported from [`portmap::procedure`](fictionet::stdlib::portmap::procedure).
+/// Re-exported from [`portmap::procedure`](fictionet::stdlib::protocols::portmap::procedure).
 pub mod procedure {
-    pub use fictionet::stdlib::portmap::procedure::{
+    pub use fictionet::stdlib::protocols::portmap::procedure::{
         CALLIT, DUMP, GETADDR, GETPORT, NULL, SET, UNSET,
     };
 }
@@ -1429,7 +1429,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
-    use fictionet::stdlib::portmap::{
+    use fictionet::stdlib::protocols::portmap::{
         self, Mapping, PmapRequest, PmapResult, Request, Rpcb, RpcbRequest, RpcbResult,
         silent_on_failure,
     };

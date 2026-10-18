@@ -26,8 +26,8 @@
 //! TLS and QUIC transport are outside this module.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::Wire, http3::{HeaderKind, HeaderList, Frame,
-//!     RequestStream, RequestResult, MessageSide, Event, MAX_FIELD_SECTION_SIZE}, qpack};
+//! use fictionet::stdlib::{codec::Wire, protocols::{http3::{HeaderKind, HeaderList, Frame,
+//!     RequestStream, RequestResult, MessageSide, Event, MAX_FIELD_SECTION_SIZE}, qpack}};
 //! let headers = HeaderList { fields: vec![
 //!     qpack::Field::new(":method", "GET"),
 //!     qpack::Field::new(":scheme", "https"),
@@ -41,14 +41,14 @@
 //! let table = qpack::Table::new(0);
 //! assert_eq!(state.step(&frame, &table)?, RequestResult::Event { event: Ok(Event::Headers(headers)), ack: None });
 //! state.finish()?;
-//! # Ok::<(), fictionet::stdlib::http3::Error>(())
+//! # Ok::<(), fictionet::stdlib::protocols::http3::Error>(())
 //! ```
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii::{self, is_tchar as token, trim_ows};
 use fictionet::stdlib::{
     codec::{self, Decode, Step, Wire},
-    qpack, quic,
+    protocols::{qpack, quic},
 };
 
 /// The greatest QUIC variable-length integer, including a stream or push ID.
@@ -1348,7 +1348,7 @@ pub enum RequestResult {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::{codec::{Side, Stream, Wire}, http3::{self, Frame, MessageSide}, qpack};
+/// use fictionet::stdlib::{codec::{Side, Stream, Wire}, protocols::{http3::{self, Frame, MessageSide}, qpack}};
 /// let headers = http3::HeaderList { fields: vec![
 ///     qpack::Field::new(":status", "200"), qpack::Field::new("content-length", "0"),
 /// ] };
@@ -1844,7 +1844,7 @@ fictionet::prefixed! {
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Frames, Stream, Wire};
-/// use fictionet::stdlib::http3::{Frame, StreamHeader, StreamHeaders};
+/// use fictionet::stdlib::protocols::http3::{Frame, StreamHeader, StreamHeaders};
 /// let mut bytes = Wire::to_bytes(&StreamHeader::Push(7))?;
 /// Wire::write(&Frame::Data(vec![1, 2]), &mut bytes)?;
 /// let mut stream = Stream::new(StreamHeaders::new());
@@ -1853,7 +1853,7 @@ fictionet::prefixed! {
 /// assert_eq!(stream.next(), None); // End leaves the DATA bytes unread.
 /// let mut stream = stream.swap(Frames::<Frame>::new());
 /// assert_eq!(stream.next(), Some(Ok(Ok(Frame::Data(vec![1, 2])))));
-/// # Ok::<(), fictionet::stdlib::http3::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::http3::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StreamHeaders {
@@ -2083,7 +2083,7 @@ type StreamFactory = Box<dyn FnMut(&u64) -> StreamItems + Send>;
 
 /// Ordered QUIC stream input under one aggregate connection budget.
 ///
-/// This is an input owner, separate from the I/O [`fictionet::stdlib::Connection`] trait.
+/// This is an input owner, separate from the I/O [`fictionet::stdlib::network::Connection`] trait.
 /// Each stream has its own decoder inside [`codec::Demux`]. The constructor
 /// bounds both stream count and the sum of input allocations and decoder-held bytes.
 /// Buffers allocate as input arrives. Metadata and allocator overhead are

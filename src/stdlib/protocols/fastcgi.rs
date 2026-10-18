@@ -34,7 +34,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::fastcgi::{Pairs, Request, Role, Server, ServerEvent};
+//! use fictionet::stdlib::protocols::fastcgi::{Pairs, Request, Role, Server, ServerEvent};
 //!
 //! // What a web server sends for GET /hello: two parameters and no body.
 //! let sent = Request {
@@ -50,7 +50,7 @@
 //! }
 //! .to_bytes().unwrap();
 //!
-//! let mut stream = Stream::new(Frames::<fictionet::stdlib::fastcgi::Record>::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::protocols::fastcgi::Record>::new());
 //! let mut server = Server::new();
 //! let mut reply = Vec::new();
 //! pump(&mut stream, &sent, |record| {
@@ -480,7 +480,7 @@ fictionet::prefixed! {
     /// ```
     /// use fictionet::stdlib::codec::Frames;
     /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-    /// use fictionet::stdlib::fastcgi::{Record, kind};
+    /// use fictionet::stdlib::protocols::fastcgi::{Record, kind};
     ///
     /// let record = Record { kind: kind::STDIN, request_id: 1, content: vec![7, 8], padding: 0 };
     /// let bytes = Wire::to_bytes(&record)?;

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 
 use fictionet::events::Event;
-use fictionet::stdlib::route::{self, Prefix};
+use fictionet::stdlib::network::route::{self, Prefix};
 use fictionet::{Interface, Result};
 
 const MEMBERS: &[(&str, u8)] = &[

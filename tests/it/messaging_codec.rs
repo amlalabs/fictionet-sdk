@@ -3,8 +3,8 @@
 use core::fmt::Debug;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire};
+use fictionet::stdlib::protocols::{amqp, coap, dhcpv6, mqtt, syslog};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::{amqp, coap, dhcpv6, mqtt, syslog};
 
 fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where

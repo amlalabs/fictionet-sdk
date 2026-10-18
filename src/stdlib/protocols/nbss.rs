@@ -36,7 +36,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Frames, Stream, Wire};
-//! use fictionet::stdlib::nbss::{Name, NegativeCode, Packet};
+//! use fictionet::stdlib::protocols::nbss::{Name, NegativeCode, Packet};
 //!
 //! /// A server that answers to FILESERVER and to *SMBSERVER.
 //! fn answer(packet: &Packet) -> Option<Packet> {
@@ -77,7 +77,7 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::netbios::{self, ENCODED_LEN, MAX_NAME_LEN, NAME_LEN};
+use fictionet::stdlib::protocols::netbios::{self, ENCODED_LEN, MAX_NAME_LEN, NAME_LEN};
 
 /// The TCP port the session service listens on.
 pub const PORT: u16 = 139;
@@ -399,7 +399,7 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
-    /// use fictionet::stdlib::nbss::Packet;
+    /// use fictionet::stdlib::protocols::nbss::Packet;
     /// let packet = Packet::Message(b"hello".to_vec());
     /// let bytes = Wire::to_bytes(&packet)?;
     /// let mut stream = Stream::new(Frames::<Packet>::with_limit(1024));
@@ -502,7 +502,7 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::netbios::{MAX_LABEL, decode_first_level};
+    use fictionet::stdlib::protocols::netbios::{MAX_LABEL, decode_first_level};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};

@@ -21,13 +21,14 @@
 //! it sends the bytes. For a non-synchronizing one, `{n+}`, it does not
 //! wait. A binary literal, `~{n}`, may also hold NUL bytes.
 //!
-//! A mailbox [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Inputs`]; in `on_item`, call
-//! `driver.decoder().refuse_literal()` to refuse a pending literal or
-//! `driver.decoder().expect_line()` for AUTHENTICATE and IDLE. Each item is a [`Command`],
-//! a literal continuation, or a syntax error. Send a [`Response`] for each
-//! command. Clients read [`Stream<Responses>`](fictionet::stdlib::codec::Stream).
-//! Mailboxes, messages, and command execution belong to world code.
+//! A mailbox [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! [`Inputs`]; in `on_item`, call `driver.decoder().refuse_literal()` to refuse
+//! a pending literal or `driver.decoder().expect_line()` for AUTHENTICATE and
+//! IDLE. Each item is a [`Command`], a literal continuation, or a syntax error.
+//! Send a [`Response`] for each command. Clients read
+//! [`Stream<Responses>`](fictionet::stdlib::codec::Stream). Mailboxes,
+//! messages, and command execution belong to world code.
 //!
 //! Readers require CRLF and bound lines, literals, messages, and nesting.
 //! Syntax errors at known boundaries allow the next command. An oversized
@@ -43,7 +44,7 @@
 //! Writers refuse oversized responses without changing the output.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Stream, Wire}, imap::{Inputs, Input, Response, Status}};
+//! use fictionet::stdlib::{codec::{Stream, Wire}, protocols::imap::{Inputs, Input, Response, Status}};
 //!
 //! let mut stream = Stream::new(Inputs::new());
 //! let line = b"a1 LOGIN alice {6}\r\n";
@@ -1584,7 +1585,7 @@ impl MessageLines {
 /// [`Input::Line`] under the same [`MAX_LINE`] limit, then resumes commands.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, imap::{Inputs, Input}};
+/// use fictionet::stdlib::{codec::Stream, protocols::imap::{Inputs, Input}};
 /// let mut stream = Stream::new(Inputs::new());
 /// let bytes = b"a LOGIN user {3}\r\nabc\r\n";
 /// assert_eq!(stream.push(bytes), bytes.len());

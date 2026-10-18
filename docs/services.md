@@ -131,7 +131,7 @@ service appends its reply and records what it saw:
 ```rust
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::events::{Event, Level};
-use fictionet::stdlib::serve::{Flow, Driver, Service};
+use fictionet::stdlib::services::serve::{Flow, Driver, Service};
 
 /// A login prompt that takes one password and closes.
 struct Prompt;
@@ -334,7 +334,7 @@ side. Masking checks, limits, and decoding behavior are unchanged.
 
 ### Passive session clocks
 
-`stdlib::session::Clock` tracks caller-supplied milliseconds. Advance it before
+`stdlib::protocols::session::Clock` tracks caller-supplied milliseconds. Advance it before
 marking a start, send, or receive. Elapsed queries measure from each mark;
 advancing alone leaves the marks unchanged. Equal timestamps are allowed.
 Backward time returns `session::Error::Time` and leaves the clock unchanged.
@@ -346,7 +346,7 @@ Copied protocol modules use the same public helper.
 
 ### Price-level aggregates
 
-`stdlib::book_levels::Levels` stores quantity and order count for one side
+`stdlib::protocols::book_levels::Levels` stores quantity and order count for one side
 of an instrument. It iterates by ascending price; reverse the iterator for
 highest bids first. Adds report level creation. Reductions report removal
 when the last order leaves. Quantity and order-count arithmetic saturates.
@@ -450,7 +450,7 @@ sets itself goes out as it is.
 reply.
 
 ```rust
-use fictionet::stdlib::serve::Harness;
+use fictionet::stdlib::services::serve::Harness;
 
 let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt, "hunter2".to_owned());
 assert_eq!(h.open()?, b"password: ");
@@ -479,7 +479,7 @@ and services on its ports:
 
 ```rust
 use std::sync::Arc;
-use fictionet::stdlib::net::Net;
+use fictionet::stdlib::world::net::Net;
 
 let password = Arc::new("hunter2".to_owned());
 let at: std::net::Ipv4Addr = "10.20.0.5".parse()?;
@@ -639,7 +639,7 @@ with its body as bytes, and return a response:
 
 ```rust
 use bytes::Bytes;
-use fictionet::stdlib::httpd::Router;
+use fictionet::stdlib::web::httpd::Router;
 
 let api = Router::new()
     .get("/status", |_, _| http::Response::new(Bytes::from("ok\n")))
@@ -676,7 +676,7 @@ port, and `httpd::Server::served_by` puts one on ports 80 and 443 as `web::Sites
 does:
 
 ```rust
-use fictionet::stdlib::httpd::Server;
+use fictionet::stdlib::web::httpd::Server;
 
 Net::new()
     .host("intranet", |h| h.dns_name("intranet.corp.test").port_server(80, Server::new(api.clone())))
@@ -910,7 +910,7 @@ past an original event.
 
 ### Packet drops and event layers
 
-Packet-drop construction lives in [`fictionet::stdlib::ip::record_drop`](../src/stdlib/network/ip.rs).
+Packet-drop construction lives in [`fictionet::stdlib::network::ip::record_drop`](../src/stdlib/network/ip.rs).
 It reads the packet's addresses and protocol and records a `drop` repeat.
 [`fictionet::observe::Layer::from_event(&event)`](../src/observe/decode.rs)
 turns an event into a display layer, with its summary and fields as notes.
@@ -918,7 +918,7 @@ If a non-string field cannot be serialized, its note is
 `unserializable: <error>`.
 
 Migration: replace `fictionet::events::record_drop` with
-`fictionet::stdlib::ip::record_drop`, using the same arguments. Replace
+`fictionet::stdlib::network::ip::record_drop`, using the same arguments. Replace
 `event.layer()` with `fictionet::observe::Layer::from_event(&event)`.
 The old entry points are removed so generic events no longer depend on
 packet parsing or display-layer construction. These are source-breaking
@@ -1047,7 +1047,7 @@ and `dns`.
 A service can use a protocol module's decoder directly. `Driver::decoder()` returns the active decoder, so a mode change applies before the next item, including bytes already buffered from the same read. For SMTP, accept `DATA`, send `354`, and call `start_data()`:
 
 ```rust
-use fictionet::stdlib::{smtp, serve::{Driver, Flow, Service}};
+use fictionet::stdlib::{protocols::smtp, services::serve::{Driver, Flow, Service}};
 
 #[derive(Default)]
 struct Mailbox {

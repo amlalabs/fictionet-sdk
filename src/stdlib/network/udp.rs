@@ -1,7 +1,7 @@
 //! UDP: sockets for a machine on the simulated network.
 //!
 //! Use this module to give a machine UDP, for example to run a DNS server
-//! (see [`dns`](fictionet::stdlib::dns)). [`endpoint`] takes an [`Interface`]
+//! (see [`dns`](fictionet::stdlib::protocols::dns)). [`endpoint`] takes an [`Interface`]
 //! that carries the machine's UDP packets, and the machine's address. It returns an [`Endpoint`], on which you
 //! [`bind`](Endpoint::bind) a [`Socket`] for each port. A socket receives
 //! datagrams with [`recv`](Socket::recv) and sends them with
@@ -23,7 +23,7 @@
 //! fragments. The caller owns MTU and IP header policy.
 //!
 //! ```
-//! use fictionet::stdlib::udp::{self, Datagram};
+//! use fictionet::stdlib::network::udp::{self, Datagram};
 //! let src = "192.0.2.1:1000".parse().unwrap();
 //! let dst = "192.0.2.2:53".parse().unwrap();
 //! let mut bytes = [0; 32];
@@ -34,7 +34,6 @@
 //! # Ok::<(), udp::Error>(())
 //! ```
 
-#[path = "udp/wire.rs"]
 mod wire;
 pub use wire::{Datagram, Error, encode, encoded_len};
 
@@ -46,8 +45,8 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use fictionet::CancelWait;
-use fictionet::stdlib::icmp;
-use fictionet::stdlib::ip::{self, Fields, Header, protocol};
+use fictionet::stdlib::network::icmp;
+use fictionet::stdlib::network::ip::{self, Fields, Header, protocol};
 use fictionet::{Cx, Interface, Packet, RecvError};
 
 /// How many bytes of datagrams a socket holds before it drops new ones,
@@ -259,7 +258,7 @@ impl Endpoint {
     /// Joins the multicast group `group`: datagrams sent to it reach this
     /// endpoint's sockets on their ports, as datagrams to its own address
     /// do. Delivering them is the network's job: a
-    /// [`route::lan`](fictionet::stdlib::route::lan) floods multicast to every
+    /// [`route::lan`](fictionet::stdlib::network::route::lan) floods multicast to every
     /// member.
     ///
     /// Fails if `group` is not a multicast address of the endpoint's family.
@@ -329,7 +328,7 @@ pub struct Socket {
     wait: CancelWait,
 }
 
-impl fictionet::stdlib::DatagramSocket for Socket {
+impl fictionet::stdlib::network::DatagramSocket for Socket {
     async fn recv(&mut self, fcx: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
         Socket::recv(self, fcx).await
     }

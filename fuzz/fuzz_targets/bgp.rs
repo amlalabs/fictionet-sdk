@@ -6,37 +6,37 @@
 use fictionet::stdlib::codec::Frames;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::bgp::Attribute;
+use fictionet::stdlib::protocols::bgp::Attribute;
 
-use fictionet::stdlib::bgp::Context;
+use fictionet::stdlib::protocols::bgp::Context;
 
-use fictionet::stdlib::bgp::Frame;
+use fictionet::stdlib::protocols::bgp::Frame;
 
-use fictionet::stdlib::bgp::MAX_BODY_LEN;
+use fictionet::stdlib::protocols::bgp::MAX_BODY_LEN;
 
-use fictionet::stdlib::bgp::Message;
+use fictionet::stdlib::protocols::bgp::Message;
 
-use fictionet::stdlib::bgp::MpReach;
+use fictionet::stdlib::protocols::bgp::MpReach;
 
-use fictionet::stdlib::bgp::Nlri;
+use fictionet::stdlib::protocols::bgp::Nlri;
 
-use fictionet::stdlib::bgp::Open;
+use fictionet::stdlib::protocols::bgp::Open;
 
-use fictionet::stdlib::bgp::Origin;
+use fictionet::stdlib::protocols::bgp::Origin;
 
-use fictionet::stdlib::bgp::Prefix;
+use fictionet::stdlib::protocols::bgp::Prefix;
 
-use fictionet::stdlib::bgp::Segment;
+use fictionet::stdlib::protocols::bgp::Segment;
 
-use fictionet::stdlib::bgp::SegmentKind;
+use fictionet::stdlib::protocols::bgp::SegmentKind;
 
-use fictionet::stdlib::bgp::Update;
+use fictionet::stdlib::protocols::bgp::Update;
 
-use fictionet::stdlib::bgp::afi;
+use fictionet::stdlib::protocols::bgp::afi;
 
-use fictionet::stdlib::bgp::harness::{CONTEXTS, check_frame, encode, mixes};
-use fictionet::stdlib::bgp::safi;
 use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::protocols::bgp::harness::{CONTEXTS, check_frame, encode, mixes};
+use fictionet::stdlib::protocols::bgp::safi;
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;

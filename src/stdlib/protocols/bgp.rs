@@ -43,7 +43,7 @@
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 //! use core::net::Ipv4Addr;
-//! use fictionet::stdlib::bgp::{
+//! use fictionet::stdlib::protocols::bgp::{
 //!     afi, safi, Attribute, Capability, Context, Message, Open, Origin, Prefix, Segment, SegmentKind,
 //!     Update, AS_TRANS,
 //! };
@@ -53,7 +53,7 @@
 //!     afi: afi::IPV4,
 //!     safi: safi::UNICAST,
 //! }]);
-//! let mut stream = Stream::new(Frames::<fictionet::stdlib::bgp::Frame>::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::protocols::bgp::Frame>::new());
 //! let mut frames = Vec::new();
 //! let bytes = Message::Open(theirs).to_frame(&Context::default()).and_then(|frame| frame.to_bytes()).unwrap();
 //! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
@@ -609,11 +609,11 @@ fictionet::prefixed! {
     /// ```
     /// use fictionet::stdlib::codec::Frames;
     /// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
-    /// use fictionet::stdlib::bgp::{Context, Message};
+    /// use fictionet::stdlib::protocols::bgp::{Context, Message};
     ///
     /// let context = Context::default();
     /// let bytes = Message::Keepalive.to_frame(&context).and_then(|frame| frame.to_bytes())?;
-    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::bgp::Frame>::new().map(|frame| Message::decode(&frame, &context)));
+    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::protocols::bgp::Frame>::new().map(|frame| Message::decode(&frame, &context)));
     /// let mut messages = Vec::new();
     /// pump(&mut stream, &bytes, |message| messages.push(message))?;
     /// finish(&mut stream, |message| messages.push(message))?;

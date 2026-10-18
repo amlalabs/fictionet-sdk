@@ -7,7 +7,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fictionet::Packet;
 use fictionet::stdlib::test_support::contract::check_wire;
-use fictionet::stdlib::{dhcp, icmp, udp};
+use fictionet::stdlib::{
+    network::{icmp, udp},
+    protocols::dhcp,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

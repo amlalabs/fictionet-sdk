@@ -2,10 +2,10 @@
 //! them.
 #![no_main]
 
-use fictionet::stdlib::gre::{Header, Packet};
+use fictionet::stdlib::protocols::gre::{Header, Packet};
 use fictionet::stdlib::{
     codec::{Collect, Wire},
-    gre,
+    protocols::gre,
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

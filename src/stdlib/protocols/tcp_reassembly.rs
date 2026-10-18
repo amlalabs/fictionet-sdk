@@ -227,7 +227,7 @@ impl Flow {
 /// are copied only when inserted or delivered, never rescanned per arrival.
 ///
 /// ```
-/// use fictionet::stdlib::tcp_reassembly::{Reassembler, Segment, Chunk};
+/// use fictionet::stdlib::protocols::tcp_reassembly::{Reassembler, Segment, Chunk};
 /// let key = ("192.0.2.1".parse()?, 40000, "192.0.2.2".parse()?, 80);
 /// let mut tcp = Reassembler::default();
 /// let result = tcp.push(Segment { key, seq: 10, ack: 0, flags: 0x18, payload: b"hello" });

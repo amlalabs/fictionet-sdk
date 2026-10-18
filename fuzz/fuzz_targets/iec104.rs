@@ -6,7 +6,7 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 
-use fictionet::stdlib::iec104::{Asdu, Frame, Object};
+use fictionet::stdlib::protocols::iec104::{Asdu, Frame, Object};
 use libfuzzer_sys::fuzz_target;
 
 fn asdu(bytes: &[u8]) {

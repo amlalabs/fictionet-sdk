@@ -12,7 +12,7 @@
 //! quantity reaches zero.
 //!
 //! ```
-//! use fictionet::stdlib::book_levels::{Aggregate, Levels};
+//! use fictionet::stdlib::protocols::book_levels::{Aggregate, Levels};
 //!
 //! let mut bids = Levels::default();
 //! assert!(bids.add(102_500u32, 300));

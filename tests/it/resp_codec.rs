@@ -3,7 +3,7 @@
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::resp;
+use fictionet::stdlib::protocols::resp;
 use fictionet::stdlib::test_support::{decode_all, mutate};
 
 const RESP_LIMIT: usize = 128;

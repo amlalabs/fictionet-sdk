@@ -42,11 +42,11 @@
 //! untrusted Content-Length is a stream error. Bare LF also ends the
 //! stream because it cannot establish a SIP message boundary. Header-count
 //! errors are items. The driver reports truncated input at EOF.
-//! Bodies remain bytes; SDP belongs to [`fictionet::stdlib::sdp`].
+//! Bodies remain bytes; SDP belongs to [`fictionet::stdlib::protocols::sdp`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::sip::{Message, Uri};
+//! use fictionet::stdlib::protocols::sip::{Message, Uri};
 //!
 //! let datagram = b"OPTIONS sip:carol@chicago.com SIP/2.0\r\n\
 //!     Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKhjhs8ass877\r\n\
@@ -513,7 +513,7 @@ impl Message {
 /// Each call yields at most one unit and returns control to the caller.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, sip::{Message, Messages}};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, protocols::sip::{Message, Messages}};
 ///
 /// let bytes = b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n";
 /// let message = <Message as Wire>::parse(bytes)?;
@@ -522,7 +522,7 @@ impl Message {
 /// assert_eq!(stream.next(), Some(Ok(Ok(message))));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::sip::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::sip::Error>(())
 /// ```
 pub struct Messages {
     scanner: Scanner,

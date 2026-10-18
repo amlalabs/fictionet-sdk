@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use fictionet::stdlib::{ConnectionExt, tls};
+use fictionet::stdlib::{network::ConnectionExt, services::tls};
 use fictionet_fuzz::{MemConn, cert, world};
 use libfuzzer_sys::fuzz_target;
 

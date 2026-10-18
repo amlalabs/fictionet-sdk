@@ -41,7 +41,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::syslog::{
+//! use fictionet::stdlib::protocols::syslog::{
 //!     Frames, Entry, Facility, Frame, Framing, Message, Priority, SdElement, Severity,
 //! };
 //!
@@ -1214,7 +1214,7 @@ enum Skip {
 /// as items by mapping each frame through [`Entry::parse`].
 ///
 /// ```
-/// use fictionet::stdlib::{syslog::{Frame, Frames, Framing}, codec::Stream};
+/// use fictionet::stdlib::{codec::Stream, protocols::syslog::{Frame, Frames, Framing}};
 ///
 /// let mut stream = Stream::new(Frames::new());
 /// assert_eq!(stream.push(b"last message"), 12);

@@ -5,7 +5,7 @@
 //! `Http1` is a caller-driven `Service` on the `http1` decoder.
 //! [`Http2`] uses the shared HTTP/2 frame layer and HPACK. Both servers run
 //! with `std` alone. `serve_connection` runs them over a live connection. TLS comes from
-//! `fictionet::stdlib::tls`. This module supplies no HTTP client.
+//! `fictionet::stdlib::services::tls`. This module supplies no HTTP client.
 //!
 //! A [`Handler`] answers one request. Three kinds come ready:
 //!
@@ -22,15 +22,15 @@
 //!   with several sites at one address does, with the redirect to https and
 //!   the `421 Misdirected Request` of [`web::Sites`](fictionet::stdlib::web::Sites).
 //!
-//! On a [`Net`](fictionet::stdlib::net::Net), a [`Server`] is the
-//! [`PortServer`](fictionet::stdlib::net::PortServer) that serves HTTP on a host's
+//! On a [`Net`](fictionet::stdlib::world::net::Net), a [`Server`] is the
+//! [`PortServer`](fictionet::stdlib::world::net::PortServer) that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
 //! hosts. [`Server::served_by`] puts a site on ports 80 and 443 the way
 //! websites are served. `Net` knows nothing of HTTP, so a copy of this
 //! component with its own handlers plugs in the same way. Copy `httpd.rs`
 //! together with the `httpd/` directory, keeping the relative paths.
 //!
-//! [`Http1`] is the [`Service`](fictionet::stdlib::serve::Service) that speaks
+//! [`Http1`] is the [`Service`](fictionet::stdlib::services::serve::Service) that speaks
 //! HTTP/1.0 and 1.1 to a client, on [`http1`]'s
 //! decoder: keep-alive, pipelining, `Expect: 100-continue`, `HEAD`, chunked
 //! responses for bodies of unknown length, and 30-second limits on each
@@ -51,7 +51,7 @@
 //! An upgrade request reaches the native HTTP/1 handler. A synchronous handler
 //! returns `101` with an [`UpgradeHandler`] extension to receive the connection
 //! after the response is written, including unread bytes. The stdlib's
-//! [`websocket`](fictionet::stdlib::websocket) codec can serve it directly.
+//! [`websocket`](fictionet::stdlib::protocols::websocket) codec can serve it directly.
 //! With the opt-in `tokio` feature, tower handlers use hyper's HTTP/1 upgrade
 //! extension so axum's `WebSocketUpgrade` continues to work: the tower adapter
 //! returns [`Reply::Handoff`], and the native server replays the request, body
@@ -81,8 +81,8 @@
 //!
 //! ```
 //! use bytes::Bytes;
-//! use fictionet::stdlib::httpd::{Http1, Router};
-//! use fictionet::stdlib::serve::Harness;
+//! use fictionet::stdlib::web::httpd::{Http1, Router};
+//! use fictionet::stdlib::services::serve::Harness;
 //!
 //! let router = Router::new()
 //!     .get("/hello", |_, _| http::Response::new(Bytes::from("hi\n")))
@@ -153,29 +153,22 @@ use std::time::{Duration, SystemTime};
 
 use fictionet::RaceError;
 use fictionet::events::{ConnInfo, Fields};
-use fictionet::stdlib::Connection;
-use fictionet::stdlib::ConnectionExt;
-use fictionet::stdlib::http1;
-use fictionet::stdlib::serve::Prefixed;
-use fictionet::stdlib::serve::{self, Budget, ServeOptions};
+use fictionet::stdlib::network::Connection;
+use fictionet::stdlib::network::ConnectionExt;
+use fictionet::stdlib::protocols::http1;
+use fictionet::stdlib::services::serve::Prefixed;
+use fictionet::stdlib::services::serve::{self, Budget, ServeOptions};
 use fictionet::{Cancelled, Cx};
 
-#[path = "httpd/body.rs"]
 mod body;
-#[path = "httpd/handlers.rs"]
 mod handlers;
-#[path = "httpd/http2.rs"]
 mod http2;
-#[path = "httpd/http1.rs"]
 mod native;
-#[path = "httpd/response.rs"]
 mod response;
-#[path = "httpd/sites.rs"]
 mod sites;
 
 fictionet::cfg_tokio! {
 /// The opt-in tower HTTP/1 upgrade adapter.
-#[path = "httpd/hyper.rs"]
 mod upgrade;
 }
 
@@ -339,7 +332,7 @@ pub struct HttpOptions {
     pub date: Option<SystemTime>,
 }
 
-use fictionet::stdlib::http2::PREFACE;
+use fictionet::stdlib::protocols::http2::PREFACE;
 
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1

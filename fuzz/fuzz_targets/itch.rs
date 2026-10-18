@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::itch::{
+use fictionet::stdlib::protocols::itch::{
     AddOrder, Book, BookConfig, MAX_MESSAGE_LENGTH, Message, Noii, OrderReplace, StockDirectory,
 };
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};

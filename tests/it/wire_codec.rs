@@ -1,7 +1,9 @@
 //! Public wire units preserve protocol boundaries and constructor choices.
 
 use fictionet::stdlib::{
-    bacnet, codec::Wire, dtls, l2tp, nbns, ntlmssp, pcp, test_support::contract,
+    codec::Wire,
+    protocols::{bacnet, dtls, l2tp, nbns, ntlmssp, pcp},
+    test_support::contract,
 };
 use std::net::Ipv4Addr;
 

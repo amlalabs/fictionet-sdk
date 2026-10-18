@@ -4,11 +4,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::tftp::{
+use fictionet::stdlib::protocols::tftp::{
     DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, NetasciiByte,
     NetasciiBytes, Packet, ReadTransfer, TftpOption, negotiate, parse_number,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 /// Runs a transfer to the end as a client would: ACK 0 for an OACK, then

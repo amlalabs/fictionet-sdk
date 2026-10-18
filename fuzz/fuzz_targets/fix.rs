@@ -1,9 +1,9 @@
 #![no_main]
 
-use fictionet::stdlib::session::Action;
+use fictionet::stdlib::protocols::session::Action;
 use fictionet::stdlib::{
     codec::{Stream, Wire},
-    fix::{
+    protocols::fix::{
         ExecutionReport, GroupLayout, MAX_ACTIONS, MAX_MESSAGE_SIZE, MarketDataIncrementalRefresh,
         MarketDataRequest, MarketDataSnapshotFullRefresh, Message, Messages, NewOrderSingle,
         OrderCancelReplaceRequest, OrderCancelRequest, Role, Session, SessionConfig, Version,
@@ -23,7 +23,7 @@ const GROUP: GroupLayout<'static> = GroupLayout {
     nested: &[],
 };
 
-fn check_actions(actions: &[Action<Message, fictionet::stdlib::fix::Event>]) {
+fn check_actions(actions: &[Action<Message, fictionet::stdlib::protocols::fix::Event>]) {
     assert!(actions.len() <= MAX_ACTIONS);
     for action in actions {
         if let Action::Send(message) = action {

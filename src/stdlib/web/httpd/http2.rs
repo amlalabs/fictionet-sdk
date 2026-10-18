@@ -15,9 +15,9 @@ use http_body::Body as _;
 
 use fictionet::events::Fields;
 use fictionet::stdlib::codec::{Fail, Wire};
-use fictionet::stdlib::hpack;
-use fictionet::stdlib::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
-use fictionet::stdlib::serve::{self, Done, Driver, Ended, Flow, Pending, PendingDriver, Timer};
+use fictionet::stdlib::protocols::hpack;
+use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
+use fictionet::stdlib::services::serve::{self, Done, Driver, Ended, Flow, Pending, PendingDriver, Timer};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
@@ -895,7 +895,7 @@ impl serve::Service for Http2 {
         }
         self.send.lock().streams.clear();
         self.resets = VecDeque::new();
-        if end == Ended::Conn(fictionet::stdlib::ConnError::Broken) {
+        if end == Ended::Conn(fictionet::stdlib::network::ConnError::Broken) {
             driver.record(error_event(
                 driver.conn(),
                 "transport",
@@ -1380,8 +1380,8 @@ mod tests {
     use super::super::{HttpOptions, PREFACE, Router};
     use super::*;
     use fictionet::events::ConnInfo;
-    use fictionet::stdlib::json::Value;
-    use fictionet::stdlib::{ConnError, Connection};
+    use fictionet::stdlib::protocols::json::Value;
+    use fictionet::stdlib::network::{ConnError, Connection};
     use std::future::poll_fn;
     use std::pin::pin;
     struct StalledBody {

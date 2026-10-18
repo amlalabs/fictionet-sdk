@@ -3,7 +3,7 @@ use divan::{
     counter::{BytesCount, ItemsCount},
 };
 use fictionet::stdlib::codec::{Decode, Frames, Stream, Wire, finish, pump};
-use fictionet::stdlib::{http1, itch, tpkt};
+use fictionet::stdlib::protocols::{http1, itch, tpkt};
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();

@@ -12,10 +12,10 @@ use std::time::Duration;
 use border_world::log::Log;
 use border_world::scenario::{Scenario, Task, Variant, parse_prefix};
 use fictionet::prelude::*;
-use fictionet::stdlib::bgp;
-use fictionet::stdlib::ca::Ca;
 use fictionet::stdlib::codec::{Frames, Stream, Wire};
-use fictionet::stdlib::{ConnError, ip, tcp};
+use fictionet::stdlib::network::{ConnError, ip, tcp};
+use fictionet::stdlib::protocols::bgp;
+use fictionet::stdlib::services::ca::Ca;
 use fictionet::{Attacher, Cx, End, Packet};
 use rustls::RootCertStore;
 
@@ -105,7 +105,7 @@ pub async fn bgp_read(
 // ---------------------------------------------------------------------------
 // Raw packets
 
-pub use fictionet::stdlib::ip::checksum;
+pub use fictionet::stdlib::network::ip::checksum;
 
 /// An IPv4 packet with `ttl`.
 pub fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, ttl: u8, payload: &[u8]) -> Packet {

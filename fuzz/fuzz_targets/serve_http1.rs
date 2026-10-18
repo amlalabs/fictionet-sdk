@@ -6,8 +6,8 @@
 #![no_main]
 
 use bytes::Bytes;
-use fictionet::stdlib::httpd::{Http1, Router};
-use fictionet::stdlib::serve::Harness;
+use fictionet::stdlib::services::serve::Harness;
+use fictionet::stdlib::web::httpd::{Http1, Router};
 use libfuzzer_sys::fuzz_target;
 
 fn router() -> Router {

@@ -1,6 +1,6 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Wire};
-use fictionet::stdlib::grpc::{Code, Error, HEADER_LEN, Message, fail_status};
+use fictionet::stdlib::protocols::grpc::{Code, Error, HEADER_LEN, Message, fail_status};
 use fictionet::stdlib::test_support;
 use fictionet::stdlib::test_support::contract;
 use std::collections::BTreeMap;
@@ -12,14 +12,14 @@ const MAX_DATA: usize = 64;
 const H2_HEADER_LEN: usize = 9;
 
 type Key = (u8, u32);
-type Calls = Demux<Key, Frames<fictionet::stdlib::grpc::Message>>;
+type Calls = Demux<Key, Frames<fictionet::stdlib::protocols::grpc::Message>>;
 type Results = BTreeMap<Key, Vec<Result<Message, Fail<Error>>>>;
 
 #[test]
 fn partial_message_prefix_ends_the_call_with_internal() {
     for prefix in 1..HEADER_LEN {
         let (_, failure) = test_support::decode_all(
-            Frames::<fictionet::stdlib::grpc::Message>::new,
+            Frames::<fictionet::stdlib::protocols::grpc::Message>::new,
             &vec![0; prefix],
         );
         let failure = failure.unwrap();
@@ -110,7 +110,7 @@ fn drain(calls: &mut Calls, results: &mut Results) {
 
 fn route(chunk_size: usize) {
     let mut calls = Calls::new(MAX_STREAMS, MAX_BYTES, |_| {
-        Frames::<fictionet::stdlib::grpc::Message>::with_limit(MESSAGE_LIMIT)
+        Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(MESSAGE_LIMIT)
     });
     let mut results = Results::new();
     let mut saw_backpressure = false;
@@ -198,12 +198,12 @@ fn route(chunk_size: usize) {
             // The writer round-trips through the decoder bytewise.
             let bytes = message.to_bytes().unwrap();
             contract::check_decode_with_alloc_limit(
-                || Frames::<fictionet::stdlib::grpc::Message>::with_limit(MESSAGE_LIMIT),
+                || Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(MESSAGE_LIMIT),
                 &bytes,
                 2 * (HEADER_LEN + MESSAGE_LIMIT),
             );
             let (decoded, failure) = test_support::decode_all(
-                || Frames::<fictionet::stdlib::grpc::Message>::with_limit(MESSAGE_LIMIT),
+                || Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(MESSAGE_LIMIT),
                 &bytes,
             );
             assert_eq!(failure, None);
@@ -294,7 +294,7 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
                 stream: 1,
                 ended: false,
             },
-            Frames::<fictionet::stdlib::grpc::Message>::with_limit(MESSAGE_LIMIT),
+            Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(MESSAGE_LIMIT),
             Carry::Bytes,
         )
     };

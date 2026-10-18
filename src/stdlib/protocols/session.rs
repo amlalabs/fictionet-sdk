@@ -9,7 +9,7 @@
 /// A session's ordered output. Send messages before acting on later events.
 ///
 /// ```
-/// use fictionet::stdlib::session::Action;
+/// use fictionet::stdlib::protocols::session::Action;
 ///
 /// let actions = [Action::Send(vec![1, 2]), Action::Event("ready")];
 /// assert_eq!(actions[0].clone(), Action::Send(vec![1, 2]));
@@ -51,7 +51,7 @@ impl core::error::Error for Error {}
 /// what to do at a deadline. Copies advance independently.
 ///
 /// ```
-/// use fictionet::stdlib::session::Clock;
+/// use fictionet::stdlib::protocols::session::Clock;
 ///
 /// let mut clock = Clock::new(100);
 /// clock.advance(150)?;
@@ -60,7 +60,7 @@ impl core::error::Error for Error {}
 /// assert_eq!(clock.elapsed_ms(), 100);
 /// assert_eq!(clock.sent_elapsed_ms(), 50);
 /// assert_eq!(clock.received_elapsed_ms(), 100);
-/// # Ok::<(), fictionet::stdlib::session::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::session::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clock {

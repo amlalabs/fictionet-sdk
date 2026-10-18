@@ -2,7 +2,7 @@
 //! server reads them.
 #![no_main]
 
-use fictionet::stdlib::diameter::{Avp, MAX_AVP_DATA, Message, harness};
+use fictionet::stdlib::protocols::diameter::{Avp, MAX_AVP_DATA, Message, harness};
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 

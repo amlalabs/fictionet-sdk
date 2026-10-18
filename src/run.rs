@@ -40,7 +40,7 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// through its [`Cx`] is the next part of one stream started from it. Use
 /// [`Seed::random`](crate::Seed::random) for a fresh seed, or
 /// [`Seed::from_u64`](crate::Seed::from_u64) for a fixed one.
-/// [`Net::start`](crate::stdlib::net::Net::start) records the seed in
+/// [`Net::start`](crate::stdlib::world::net::Net::start) records the seed in
 /// `run.start`. Worlds without `Net` call
 /// [`EventLog::start`](crate::events::EventLog::start) explicitly; neither
 /// `run` nor [`lab`] emits that event itself.
@@ -136,7 +136,7 @@ where
 /// lists the requirements and the HTTP/2 host-clock exception.
 ///
 /// Like [`run`], `lab` leaves `run.start` recording to
-/// [`Net::start`](crate::stdlib::net::Net::start) or an explicit call to
+/// [`Net::start`](crate::stdlib::world::net::Net::start) or an explicit call to
 /// [`EventLog::start`](crate::events::EventLog::start).
 ///
 /// Each run has its own task identities. A lab started inside another

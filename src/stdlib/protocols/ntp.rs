@@ -21,7 +21,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::ntp::{Mode, Packet, ServerInfo, Timestamp, server_reply};
+//! use fictionet::stdlib::protocols::ntp::{Mode, Packet, ServerInfo, Timestamp, server_reply};
 //!
 //! // A client asks for the time. Its own clock says 2023-11-14 22:13:20 UTC.
 //! let request = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0));

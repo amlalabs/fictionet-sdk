@@ -6,11 +6,12 @@
 //! network around the answers: DNS, addresses, a router, one machine per
 //! address, TLS, and HTTP. You write only the sites.
 //!
-//! `Sites` is a preset on [`net::Net`](fictionet::stdlib::net::Net): each site
-//! is a [`fictionet::stdlib::net::Host`] with a DNS name per site and a [`fictionet::stdlib::httpd::Server`] on ports 80
-//! and 443, made when its name is first looked up. HTTP is [`fictionet::stdlib::httpd`], a
-//! service like any other. A world that needs other services next to its
-//! websites builds on `Net` directly.
+//! `Sites` is a preset on [`net::Net`](fictionet::stdlib::world::net::Net):
+//! each site is a [`fictionet::stdlib::world::net::Host`] with a DNS name per
+//! site and a [`fictionet::stdlib::web::httpd::Server`] on ports 80 and 443,
+//! made when its name is first looked up. HTTP is
+//! [`fictionet::stdlib::web::httpd`], a service like any other. A world that
+//! needs other services next to its websites builds on `Net` directly.
 //!
 //! In this world, two sites are served by the world's own axum routers.
 //! `en.wikipedia.org` has the IPv4 and IPv6 addresses it has on the real
@@ -188,8 +189,8 @@
 //!
 //! ```
 //! # fictionet::cfg_web_proxy! {
-//! # use fictionet::stdlib::{ca::Ca, codec::Wire, dns::rr::{RData, RecordType},
-//! #     http1, sandbox, web, x509::{Time, Validity}};
+//! # use fictionet::stdlib::{codec::Wire, services::ca::Ca, web, world::sandbox};
+//! # use fictionet::stdlib::protocols::{dns::rr::{RData, RecordType}, http1, x509::{Time, Validity}};
 //! # use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc, time::{Duration, UNIX_EPOCH}};
 //! # tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?
 //! #     .block_on(async {
@@ -283,7 +284,7 @@
 //!   DHCP client. A sandbox with a fixed address is known by the source
 //!   address of its first packet. Either way, the router gets a `/32` or
 //!   `/128` route for each address through
-//!   [`Router::add`](fictionet::stdlib::route::Router::add), and loses it when
+//!   [`Router::add`](fictionet::stdlib::network::route::Router::add), and loses it when
 //!   the sandbox detaches.
 //! - **Each sandbox owns one address of each family, and only those.** The
 //!   agent is the adversary and can send any packet it likes, so addresses
@@ -304,7 +305,7 @@
 //!     Otherwise the packet is dropped and the attachment stays unbound.
 //!   - After binding, every other packet from that attachment must carry
 //!     its address as the source. Others are dropped. A sandbox cannot take
-//!     another's route, because [`Router::add`](fictionet::stdlib::route::Router::add)
+//!     another's route, because [`Router::add`](fictionet::stdlib::network::route::Router::add)
 //!     is only called for a newly bound, free address.
 //!   - The binding ends when the sandbox detaches, and the address becomes
 //!     free again. Its TCP connections to the sites and the gateway are
@@ -315,12 +316,12 @@
 //!   addressed to the sandboxes' subnet other than the gateway. There is no
 //!   option to turn this off: two agents in separate eval samples must not
 //!   see each other. A world that wants sandboxes on one shared network wires it
-//!   by hand with [`router`](fictionet::stdlib::route::router).
+//!   by hand with [`router`](fictionet::stdlib::network::route::router).
 //! - **Fragments are put back together in each sandbox's filter.** Each
 //!   fragment must pass the checks above on its own. The filter then holds
 //!   it until its packet is whole, and sends the router only whole packets,
 //!   with the rules and limits of
-//!   [`split_protocols`](fictionet::stdlib::ip::split_protocols): overlapping
+//!   [`split_protocols`](fictionet::stdlib::network::ip::split_protocols): overlapping
 //!   fragments drop the packet, unfinished packets are dropped after 30
 //!   seconds (IPv4) or 60 seconds (IPv6), and at most 4 MiB of fragments
 //!   wait in each filter. A filter's fragments end with it, so a fragment a
@@ -447,7 +448,7 @@
 //!   Only the gateway and the machines answer that way. A packet to an
 //!   address no machine has gets "address unreachable", whatever its
 //!   headers say.
-//!   [`split_protocols`](fictionet::stdlib::ip::split_protocols) lists the
+//!   [`split_protocols`](fictionet::stdlib::network::ip::split_protocols) lists the
 //!   rules.
 //! - **UDP always has a checksum.** A UDP datagram over IPv6 whose checksum
 //!   field is zero is dropped, as RFC 8200 requires. Over IPv4, zero means
@@ -479,11 +480,11 @@
 //!   `handler`, `error`, `redirect`, `misdirected`, `no_host` or
 //!   `cancelled`), its status, and how much of the body was sent, also
 //!   when the client gave up before the answer
-//!   ([`fictionet::stdlib::httpd`] lists the fields);
+//!   ([`fictionet::stdlib::web::httpd`] lists the fields);
 //! - `http.error`: every connection on port 80 or 443 that ended in an HTTP
 //!   error (`cause`: `protocol`, `timeout` or `transport`);
 //! - `net.blocked`: the packets `Sites` itself drops or refuses, with
-//!   `why` (see [`BlockedWhy`](fictionet::stdlib::net::BlockedWhy)),
+//!   `why` (see [`BlockedWhy`](fictionet::stdlib::world::net::BlockedWhy)),
 //!   `protocol`, `src`, `dst`, `dst_port` and `count`. These are
 //!   [repeats](fictionet::events#repeats): a scan or a flood is counted, not
 //!   kept packet by packet.
@@ -523,7 +524,7 @@
 //! it was shown.
 //!
 //! Events do not hold packets or bodies. A world that wants every packet
-//! puts a [`filter`](fictionet::stdlib::filter) between each sandbox and
+//! puts a [`filter`](fictionet::stdlib::network::filter) between each sandbox and
 //! `Sites`, as [Changing the network around the
 //! sites](#changing-the-network-around-the-sites) shows. The
 //! [packet capture recipe](fictionet::recipes#packet-capture) writes them all
@@ -603,7 +604,7 @@
 //! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
 //! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::network::delay(fcx, ms(200), sandbox));
 //! web::Sites::new(site_for).start(&fcx, far)?;
 //! # Ok(())
 //! # }
@@ -611,27 +612,30 @@
 //!
 //! `Sites` sees each sandbox through its delay, under the same name, and
 //! binds its addresses and reports its events as usual. The same works with
-//! [`bottleneck`](fictionet::stdlib::bottleneck) for a slow link, and with
-//! [`filter`](fictionet::stdlib::filter) to watch or drop packets. The
+//! [`bottleneck`](fictionet::stdlib::network::bottleneck) for a slow link, and with
+//! [`filter`](fictionet::stdlib::network::filter) to watch or drop packets. The
 //! [recipes](fictionet::recipes) run each of these, with a route that changes
 //! mid-run, and show what the sandbox sees.
 //!
-//! [`Sites::into_net`] gives the [`fictionet::stdlib::net::Net`] before it starts, to add hosts with
-//! other services next to the websites. [`Site::into_host`] turns a site into
-//! a host; [`net`](fictionet::stdlib::net) binds addresses and answers DNS.
-//! To change those parts, see
-//! [Changing a protocol by copying it](fictionet::stdlib#changing-a-protocol-by-copying-it).
+//! [`Sites::into_net`] gives the [`fictionet::stdlib::world::net::Net`] before
+//! it starts, to add hosts with other services next to the websites.
+//! [`Site::into_host`] turns a site into a host;
+//! [`net`](fictionet::stdlib::world::net) binds addresses and answers DNS. To
+//! change those parts, see [Changing a protocol by copying
+//! it](fictionet::stdlib#changing-a-protocol-by-copying-it).
+
+pub mod httpd;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use http::{Request, Response};
 
-use fictionet::stdlib::httpd::{self, Handler, Server};
-pub use fictionet::stdlib::httpd::{Body, Routing, Target};
-use fictionet::stdlib::net::{Host, Net};
-use fictionet::stdlib::route::Prefix;
-use fictionet::stdlib::tls::ServerConfig;
+use httpd::{Handler, Server};
+pub use httpd::{Body, Routing, Target};
+use fictionet::stdlib::world::net::{Host, Net};
+use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::{Attachments, Cx, Error};
 
 /// Websites by hostname, and the network around them. See the
@@ -668,7 +672,7 @@ impl Sites {
     /// Sets the world's date and time at the start of the run. Every site
     /// then sends a `Date` header: this date plus the run's clock. Without
     /// it, responses have no `Date` header; the host's clock is never used.
-    /// See [`httpd`'s Dates](fictionet::stdlib::httpd#dates).
+    /// See [`httpd`'s Dates](fictionet::stdlib::web::httpd#dates).
     pub fn date(self, start: std::time::SystemTime) -> Sites {
         Sites {
             date: Some(start),
@@ -908,7 +912,7 @@ impl Site {
         }
     }
 
-    /// The site as a host of a [`fictionet::stdlib::net::Net`], named `name`.
+    /// The site as a host of a [`fictionet::stdlib::world::net::Net`], named `name`.
     pub fn into_host(self, name: &str) -> Host {
         let mut host = self.server.served_by(Host::new(name).dns_name(name));
         if let Some(a) = self.at {
@@ -926,7 +930,6 @@ impl Site {
 }
 
 fictionet::cfg_web_proxy! {
-#[path = "proxy.rs"]
 mod proxy;
 pub use proxy::{Forward, Proxy, forward, proxy};
 }

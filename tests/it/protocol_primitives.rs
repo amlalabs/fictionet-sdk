@@ -1,6 +1,6 @@
 use fictionet::stdlib::{
     codec::{self, Wire},
-    dhcpv6, json, protobuf, spnego,
+    protocols::{dhcpv6, json, protobuf, spnego},
 };
 
 #[derive(Debug, PartialEq, Eq)]

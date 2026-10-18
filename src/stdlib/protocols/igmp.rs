@@ -53,7 +53,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use std::net::Ipv4Addr;
-//! use fictionet::stdlib::igmp::{ALL_SYSTEMS, GroupRecord, Message, QueryV3, RecordType};
+//! use fictionet::stdlib::protocols::igmp::{ALL_SYSTEMS, GroupRecord, Message, QueryV3, RecordType};
 //!
 //! /// The reports a host that joined `groups`, from every source, sends
 //! /// for a query.
@@ -107,7 +107,7 @@
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16};
-use fictionet::stdlib::ip::checksum;
+use fictionet::stdlib::network::ip::checksum;
 
 use std::net::Ipv4Addr;
 

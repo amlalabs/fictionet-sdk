@@ -7,8 +7,8 @@ use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Version};
 
 use fictionet::Error;
 use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
-use fictionet::stdlib::http1::{self, RequestHead};
-use fictionet::stdlib::json::Value;
+use fictionet::stdlib::protocols::http1::{self, RequestHead};
+use fictionet::stdlib::protocols::json::Value;
 use fictionet::time::Instant;
 
 use super::{BadGateway, Body, Observer, Received, request_host, text};
@@ -304,7 +304,7 @@ pub fn date_header(start: Option<SystemTime>, now: Instant) -> Option<HeaderValu
 /// `Sun, 06 Nov 1994 08:49:37 GMT`, for `secs` since the Unix epoch.
 ///
 /// ```
-/// use fictionet::stdlib::httpd::http_date;
+/// use fictionet::stdlib::web::httpd::http_date;
 /// assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
 /// assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
 /// assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
@@ -339,7 +339,7 @@ pub fn http_date(secs: u64) -> String {
 
 fictionet::cfg_tokio! {
 use fictionet::Cx;
-use fictionet::stdlib::serve::{Charge, PanicNote};
+use fictionet::stdlib::services::serve::{Charge, PanicNote};
 
 /// One request's event, sent when it is dropped.
 pub(super) struct Track {

@@ -498,7 +498,7 @@ fn events_for_tls_handshakes() {
                 .is_err()
         );
         // 4. A client that does not trust the world's CA: it sends unknown_ca.
-        let other_ca = fictionet::stdlib::ca::Ca::new(&fcx, "Another CA").unwrap();
+        let other_ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "Another CA").unwrap();
         let mut other = RootCertStore::empty();
         other.add(other_ca.cert_der()).unwrap();
         let other = Arc::new(other);
@@ -517,7 +517,7 @@ fn events_for_tls_handshakes() {
         let mut tcp = m.tcp.connect(&fcx, to(EVENTS_ADDR)).await.unwrap();
         let mut tls = tls::with_context(&fcx, || {
             ClientConnection::new(
-                fictionet::stdlib::sandbox::client_config(
+                fictionet::stdlib::world::sandbox::client_config(
                     &fcx,
                     std::time::UNIX_EPOCH + Duration::from_secs(1_893_456_000),
                     Some(&env.roots),
@@ -1063,7 +1063,7 @@ fn events_for_bytes_that_are_not_http() {
         let mut bad = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         bad.extend_from_slice(&[0, 0, 5, 4, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5]);
         // The invalid frame gets SETTINGS and a protocol-error GOAWAY, then clean EOF.
-        use fictionet::stdlib::http2;
+        use fictionet::stdlib::protocols::http2;
         let reply = raw_http(&fcx, &m, plain, &bad).await.unwrap();
         let head = http2::FrameHeader::parse(&reply[..http2::HEADER_LEN]).unwrap();
         let (settings, goaway) = reply.split_at(http2::HEADER_LEN + head.length);
@@ -1147,7 +1147,7 @@ fn events_for_clients_that_send_nothing() {
         sites(&fcx)
             .sites
             .into_net()
-            .limits(fictionet::stdlib::net::Limits {
+            .limits(fictionet::stdlib::world::net::Limits {
                 handshake: Duration::from_secs(1),
                 dns_tcp_idle: Duration::from_secs(1),
                 ..Default::default()
@@ -1414,7 +1414,7 @@ fn events_for_blocked_packets() {
         );
         assert_eq!(
             got[11].get("dst_port"),
-            Some(&fictionet::stdlib::json::Value::Array(vec![
+            Some(&fictionet::stdlib::protocols::json::Value::Array(vec![
                 443u64.into(),
                 443u64.into()
             ]))

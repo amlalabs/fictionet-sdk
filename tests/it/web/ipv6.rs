@@ -371,9 +371,9 @@ fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
 #[test]
 fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
     use fictionet::stdlib::codec::{Ending, LineError, Lines};
-    use fictionet::stdlib::httpd;
-    use fictionet::stdlib::net::{Host, Net};
-    use fictionet::stdlib::serve::{Driver, Flow, Service};
+    use fictionet::stdlib::services::serve::{Driver, Flow, Service};
+    use fictionet::stdlib::web::httpd;
+    use fictionet::stdlib::world::net::{Host, Net};
 
     struct Quiet;
     impl Service for Quiet {

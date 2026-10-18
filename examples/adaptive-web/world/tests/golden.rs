@@ -27,13 +27,13 @@ use adaptive_web_world::log::Log;
 use adaptive_web_world::{Addresses, Args, Ca, fixed_addresses, serve, start_backend, world_start};
 use bytes::Bytes;
 use fictionet::Cx;
-use fictionet::stdlib::dns::rr::{RData, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
 use serde_json::Value;
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-use fictionet::stdlib::sandbox::{Machine, machine};
+use fictionet::stdlib::world::sandbox::{Machine, machine};
 
 /// Looks `name` up; returns its A record, or `None` for NXDOMAIN.
 async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Option<Ipv4Addr> {
@@ -48,7 +48,7 @@ async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Option<Ipv4Addr> {
 }
 
 /// One HTTP/1.1 request; returns the status and the body.
-async fn get<C: fictionet::stdlib::Connection>(
+async fn get<C: fictionet::stdlib::network::Connection>(
     fcx: &Cx,
     io: C,
     host: &str,
@@ -58,13 +58,13 @@ async fn get<C: fictionet::stdlib::Connection>(
     (status, body)
 }
 
-async fn request<C: fictionet::stdlib::Connection>(
+async fn request<C: fictionet::stdlib::network::Connection>(
     fcx: &Cx,
     mut io: C,
     host: &str,
     path: &str,
 ) -> (u16, String, Bytes) {
-    use fictionet::stdlib::{codec::Wire, http1, sandbox};
+    use fictionet::stdlib::{codec::Wire, protocols::http1, world::sandbox};
     let request = http1::Request::parse(
         format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: curl/8.5.0\r\n\r\n").as_bytes(),
     )

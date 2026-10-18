@@ -34,7 +34,7 @@
 //! or a group's message. [`Message::fields`] can still be moved out directly:
 //!
 //! ```
-//! use fictionet::stdlib::protobuf::{Message, Value};
+//! use fictionet::stdlib::protocols::protobuf::{Message, Value};
 //!
 //! let mut message = Message::new();
 //! message.push_uint64(1, 7);
@@ -48,7 +48,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::protobuf::{Frame, Message};
+//! use fictionet::stdlib::protocols::protobuf::{Frame, Message};
 //!
 //! // A delimited request carrying `{ name: "tank-3", level: 150 }`, where
 //! // name is field 1 (a string) and level is field 2 (an int32).
@@ -855,7 +855,7 @@ fn write_fields(
 }
 
 /// One varint-delimited message, still as bytes.
-/// For gRPC framing use [`grpc::Message`](fictionet::stdlib::grpc::Message).
+/// For gRPC framing use [`grpc::Message`](fictionet::stdlib::protocols::grpc::Message).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// The message bytes, bounded by [`MAX_MESSAGE`] on read and write.
@@ -953,7 +953,7 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::{Frames, Stream, finish, pump};
-    /// use fictionet::stdlib::protobuf::Frame;
+    /// use fictionet::stdlib::protocols::protobuf::Frame;
     ///
     /// let mut stream = Stream::new(Frames::<Frame>::new());
     /// let mut frames = Vec::new();
@@ -961,7 +961,7 @@ fictionet::prefixed! {
     /// pump(&mut stream, &[1], |frame| frames.push(frame))?;
     /// finish(&mut stream, |frame| frames.push(frame))?;
     /// assert_eq!(frames, vec![Frame { data: vec![0x08, 1] }]);
-    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protobuf::Error>>(())
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::protobuf::Error>>(())
     /// ```
     Frame => (Frame, Error, ());
     name = "Protobuf";
@@ -1440,7 +1440,7 @@ mod tests {
 
     #[test]
     fn grpc_composition() {
-        use fictionet::stdlib::grpc;
+        use fictionet::stdlib::protocols::grpc;
         let frame = grpc::Message {
             compressed: true,
             data: vec![0x08, 0x01],

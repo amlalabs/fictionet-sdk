@@ -10,8 +10,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use fictionet::Cx;
 use fictionet::prelude::*;
-use fictionet::stdlib::ConnError;
-use fictionet::stdlib::tcp::TcpConnection;
+use fictionet::stdlib::network::ConnError;
+use fictionet::stdlib::network::tcp::TcpConnection;
 use fictionet_fuzz::web::{Client, NAMES, client_config, serve};
 use fictionet_fuzz::{poll_once, settle, world};
 use libfuzzer_sys::fuzz_target;

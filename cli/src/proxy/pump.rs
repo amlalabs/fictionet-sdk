@@ -6,7 +6,7 @@ use std::io;
 use std::task::Poll;
 use std::time::Duration;
 
-use fictionet::stdlib::tcp::TcpConnection;
+use fictionet::stdlib::network::tcp::TcpConnection;
 use fictionet::tokio::Compat;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;

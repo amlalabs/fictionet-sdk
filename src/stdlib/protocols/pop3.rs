@@ -16,17 +16,18 @@
 //! `[IN-USE]`), RFC 2595 (`STLS`) and RFC 3206 (the `SYS` and `AUTH`
 //! response codes).
 //!
-//! A mail [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Inputs`] to interpret each [`Request`]
-//! and write a [`Reply`]; in `on_item`, call `driver.decoder().expect_line()`
-//! to read an AUTH answer. Clients use [`Stream<Outputs>`](fictionet::stdlib::codec::Stream)
-//! and queue whether each reply has a body with [`Outputs::expect`]. CRLF is
-//! required. Bad or overlong commands are error items. Overlong command
-//! remainders are skipped through LF, including at EOF. Short partial lines
-//! at EOF end the stream. Bad status lines end the stream when a body was
-//! expected; other bad status lines are error items. Bodies are bounded by
-//! [`MAX_BODY`] and their wire lines by [`MAX_DATA_LINE`]. Mailboxes,
-//! authentication, and message storage belong to world code.
+//! A mail [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! [`Inputs`] to interpret each [`Request`] and write a [`Reply`]; in
+//! `on_item`, call `driver.decoder().expect_line()` to read an AUTH answer.
+//! Clients use [`Stream<Outputs>`](fictionet::stdlib::codec::Stream) and queue
+//! whether each reply has a body with [`Outputs::expect`]. CRLF is required.
+//! Bad or overlong commands are error items. Overlong command remainders are
+//! skipped through LF, including at EOF. Short partial lines at EOF end the
+//! stream. Bad status lines end the stream when a body was expected; other bad
+//! status lines are error items. Bodies are bounded by [`MAX_BODY`] and their
+//! wire lines by [`MAX_DATA_LINE`]. Mailboxes, authentication, and message
+//! storage belong to world code.
 //!
 //! During AUTH (RFC 5034), select one raw line between items with
 //! [`Inputs::expect_line`] or [`Outputs::expect_line`]. A challenge (`+`
@@ -34,7 +35,7 @@
 //! status line consumes it.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Stream, Wire}, pop3::{Inputs, Input, Request, Reply, Outputs, Output}};
+//! use fictionet::stdlib::{codec::{Stream, Wire}, protocols::pop3::{Inputs, Input, Request, Reply, Outputs, Output}};
 //!
 //! let mut commands = Stream::new(Inputs::new());
 //! assert_eq!(commands.push(b"USER alice\r\n"), 12);
@@ -1138,7 +1139,7 @@ impl Decode for Inputs {
 /// end the stream. Retained state is bounded by [`MAX_REPLY_HELD`].
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, pop3::{Outputs, Output}};
+/// use fictionet::stdlib::{codec::Stream, protocols::pop3::{Outputs, Output}};
 /// let mut replies = Stream::new(Outputs::new());
 /// replies.decoder().expect(true).unwrap();
 /// let bytes = b"+OK message\r\n..x\r\n.\r\n";

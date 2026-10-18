@@ -6,7 +6,7 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 
-use fictionet::stdlib::dnp3::{Fragment, Frame, MAX_FRAGMENT, Reassembler, Segment};
+use fictionet::stdlib::protocols::dnp3::{Fragment, Frame, MAX_FRAGMENT, Reassembler, Segment};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -39,7 +39,11 @@ fuzz_target!(|data: &[u8]| {
         destination: 1,
         source: 1024,
         data: data
-            .get(..data.len().min(fictionet::stdlib::dnp3::MAX_DATA + 1))
+            .get(
+                ..data
+                    .len()
+                    .min(fictionet::stdlib::protocols::dnp3::MAX_DATA + 1),
+            )
             .unwrap_or_default()
             .to_vec(),
     });

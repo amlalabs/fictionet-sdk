@@ -4,8 +4,8 @@
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::sip::harness::{cseq_round_trip, round_trip, text_value};
-use fictionet::stdlib::sip::{
+use fictionet::stdlib::protocols::sip::harness::{cseq_round_trip, round_trip, text_value};
+use fictionet::stdlib::protocols::sip::{
     CSeq, Contacts, MAX_BODY, MAX_HEAD, MAX_MESSAGE, Message, Messages, NameAddr, Param, Scheme,
     Uri, Via,
 };

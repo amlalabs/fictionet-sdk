@@ -1,7 +1,7 @@
 //! Schema validation and mock values using only the public API.
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::json::{self, Value};
-use fictionet::stdlib::json_schema::{
+use fictionet::stdlib::protocols::json::{self, Value};
+use fictionet::stdlib::protocols::json_schema::{
     Dialect, ErrorMode, GenerationLimits, Options, Schema, ValidationKind,
 };
 use fictionet::stdlib::test_support;
@@ -114,7 +114,7 @@ fn openapi30_nullable_request_body_and_examples() {
 #[test]
 fn copied_schema_module_composes_with_sdk_json() {
     let source = parse(br#"{"type":"integer","minimum":4}"#);
-    let schema = fictionet_copy_modules::json_schema::Schema::compile(&source).unwrap();
+    let schema = fictionet_copy_modules::protocols::json_schema::Schema::compile(&source).unwrap();
     assert!(schema.validate(&Value::from(5)).is_valid());
     let example = schema.generate(12, Default::default()).unwrap();
     assert!(schema.validate(&example).is_valid());

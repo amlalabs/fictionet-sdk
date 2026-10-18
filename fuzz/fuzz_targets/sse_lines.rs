@@ -6,7 +6,7 @@ use fictionet::stdlib::test_support::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
 };
 
-use fictionet::stdlib::sse::{Line, RawLines};
+use fictionet::stdlib::protocols::sse::{Line, RawLines};
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 

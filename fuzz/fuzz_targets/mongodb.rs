@@ -5,7 +5,7 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::mongodb::{
+use fictionet::stdlib::protocols::mongodb::{
     Body, Bson, Compressed, Document, MAX_MESSAGE_SIZE, Message, Msg, Query, Reply, Sequence,
 };
 use fictionet::stdlib::test_support::contract::{

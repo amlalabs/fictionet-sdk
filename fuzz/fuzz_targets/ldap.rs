@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::ldap::{
+use fictionet::stdlib::protocols::ldap::{
     DerefAliases, Error, Filter, MAX_TEXT, Message, Op, Scope, SearchRequest, harness,
 };
 use fictionet::stdlib::test_support::contract;

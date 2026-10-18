@@ -3,7 +3,7 @@
 use fictionet::stdlib::codec::{Stream, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::http1::{Request, Requests};
+use fictionet::stdlib::protocols::http1::{Request, Requests};
 use fictionet::stdlib::test_support;
 use fictionet_fuzz::http1::message_limits;
 use libfuzzer_sys::fuzz_target;

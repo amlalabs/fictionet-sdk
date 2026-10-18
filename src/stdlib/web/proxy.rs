@@ -1,11 +1,10 @@
 //! Forwarding HTTP requests to real sites.
 
-use fictionet::stdlib::httpd::{self, Body, Handler, Routing, Target};
+use fictionet::stdlib::web::httpd::{self, Body, Handler, Routing, Target};
 use fictionet::{Cx, Error};
 use http::{Request, Response};
 use std::sync::Arc;
 
-#[path = "upstream.rs"]
 mod upstream;
 use upstream::Client as ProxyClient;
 
@@ -43,7 +42,7 @@ use upstream::Client as ProxyClient;
 /// `Transfer-Encoding` and the like) are not passed on in either direction,
 /// so it carries no protocol upgrades: a WebSocket handshake reaches the
 /// real site as a plain `GET`. A world that wants WebSockets serves them
-/// itself, with a handler on the site (see [`httpd`'s upgrades](fictionet::stdlib::httpd)).
+/// itself, with a handler on the site (see [`httpd`'s upgrades](fictionet::stdlib::web::httpd)).
 /// If the real site cannot be reached, the agent gets `502 Bad Gateway`.
 /// Returns an error in a lab before constructing a client.
 pub fn proxy(fcx: &Cx) -> Result<Proxy, Error> {

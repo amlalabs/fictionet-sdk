@@ -48,7 +48,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::tds::{
+//! use fictionet::stdlib::protocols::tds::{
 //!     data_type, done_status, encryption, packet_type, Column, Done, Login7,
 //!     Message, Messages, Prelogin, SqlBatch, Token, TokenStream, TypeInfo, Value, Version,
 //! };

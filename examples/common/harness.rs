@@ -8,10 +8,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use fictionet::stdlib::dns::op::ResponseCode;
-use fictionet::stdlib::dns::rr::{RData, RecordType};
-use fictionet::stdlib::sandbox::Machine;
-use fictionet::stdlib::{http1, sandbox, tcp};
+use fictionet::stdlib::protocols::dns::op::ResponseCode;
+use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
+use fictionet::stdlib::world::sandbox::Machine;
+use fictionet::stdlib::{network::tcp, protocols::http1, world::sandbox};
 use fictionet::{Attacher, Cx};
 use http::{HeaderMap, StatusCode};
 use rustls::ClientConfig;
@@ -116,7 +116,7 @@ where
 }
 
 pub fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
-    fictionet::stdlib::sandbox::machine(fcx, attacher.attach(name).unwrap(), addr)
+    fictionet::stdlib::world::sandbox::machine(fcx, attacher.attach(name).unwrap(), addr)
 }
 
 /// Looks `name` up at the gateway. Returns the response code and the
@@ -165,7 +165,7 @@ pub struct Got {
 
 /// Sends one HTTP/1.1 request over `io`.
 #[allow(clippy::too_many_arguments)]
-pub async fn request<C: fictionet::stdlib::Connection>(
+pub async fn request<C: fictionet::stdlib::network::Connection>(
     fcx: &Cx,
     mut io: C,
     method: &str,

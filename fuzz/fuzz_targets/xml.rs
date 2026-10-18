@@ -7,20 +7,20 @@ use std::sync::Arc;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::xml::{
+use fictionet::stdlib::protocols::xml::{
     Attribute, Builder, Document, ErrorKind, Event, Events, Name, Start, XMLNS_NAMESPACE,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(
         Events::new,
         data,
-        2 * (fictionet::stdlib::xml::MAX_DOCUMENT + 1),
+        2 * (fictionet::stdlib::protocols::xml::MAX_DOCUMENT + 1),
     );
-    contract::check_wire::<fictionet::stdlib::xml::Document>(data);
-    contract::check_wire_value(&fictionet::stdlib::xml::Document {
+    contract::check_wire::<fictionet::stdlib::protocols::xml::Document>(data);
+    contract::check_wire_value(&fictionet::stdlib::protocols::xml::Document {
         data: data.to_vec(),
     });
     let whole = decode_all(Events::new, data);

@@ -4,7 +4,7 @@
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::imap::{
+use fictionet::stdlib::protocols::imap::{
     Command, Error, FrameError, Input, Inputs, MAX_HELD, MAX_LINE, MAX_LITERAL, MAX_TEXT, Response,
     Responses, Value,
 };

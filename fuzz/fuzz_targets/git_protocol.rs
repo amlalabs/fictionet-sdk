@@ -1,6 +1,6 @@
 //! Git packets and payloads through shared contracts.
 #![no_main]
-use fictionet::stdlib::git_protocol::{MAX_DATA, Packet, harness};
+use fictionet::stdlib::protocols::git_protocol::{MAX_DATA, Packet, harness};
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 

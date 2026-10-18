@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use fictionet::Cx;
 use fictionet::events::Event as Entry;
-use fictionet::stdlib::json::Value as J;
+use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
 use crate::backend::PAGE_FIELDS;

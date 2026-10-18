@@ -1,7 +1,7 @@
 //! Shared network event projection.
 
 use fictionet::events::Event as Entry;
-use fictionet::stdlib::json::Value as J;
+use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
 /// An event's field value as JSON for the log.
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn header_names_keep_wire_order_and_skip_malformed_values() {
-        let headers = fictionet::stdlib::json::parse_with(
+        let headers = fictionet::stdlib::protocols::json::parse_with(
             br#"[null, [], ["ignored"], ["user-agent", null], ["host", "a"],
                 ["user-agent", "first"], ["host", "b"], ["user-agent", "second"],
                 ["User-Agent", "upper"]]"#,

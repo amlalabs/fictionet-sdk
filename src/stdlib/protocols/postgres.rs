@@ -18,14 +18,14 @@
 //! reads protocols 3.0 and 3.2, which differ only in the length of the
 //! cancel key.
 //!
-//! A database [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`FrontendMessages`] to receive each
-//! [`FrontendMessage`]. In `on_item`, call `driver.decoder().refuse_encryption()`
-//! after answering an encryption request with N. It answers with a [`BackendMessage`] for each
-//! reply, written by [`Wire::write`].
-//! Which users exist, which passwords they have, and what a query returns
-//! are up to world code. A world that plays a client does the reverse,
-//! with [`BackendEvents`] and [`Wire::write`] on [`FrontendMessage`].
+//! A database [`Service`](fictionet::stdlib::services::serve::Service) served
+//! by [`serve::connection`](fictionet::stdlib::services::serve::connection)
+//! uses [`FrontendMessages`] to receive each [`FrontendMessage`]. In `on_item`,
+//! call `driver.decoder().refuse_encryption()` after answering an encryption
+//! request with N. It answers with a [`BackendMessage`] for each reply, written
+//! by [`Wire::write`]. Which users exist, which passwords they have, and what a
+//! query returns are up to world code. A world that plays a client does the
+//! reverse, with [`BackendEvents`] and [`Wire::write`] on [`FrontendMessage`].
 //!
 //! Every reader checks lengths, counts, format codes and text, because
 //! the agent can send any bytes it likes. A message longer than
@@ -38,7 +38,7 @@
 //! be written unchanged.
 //!
 //! ```
-//! use fictionet::stdlib::postgres::{
+//! use fictionet::stdlib::protocols::postgres::{
 //!     oid, Authentication, BackendMessage, Field, FrontendMessage, FrontendMessages, Startup, TransactionStatus,
 //! };
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -1798,7 +1798,7 @@ impl Wire for BackendMessage {
 /// Keep any unaccepted part of a pushed slice for the next transport.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, postgres::{FrontendMessage, FrontendMessages, Startup}};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, protocols::postgres::{FrontendMessage, FrontendMessages, Startup}};
 ///
 /// let mut input = Wire::to_bytes(&FrontendMessage::SslRequest).unwrap();
 /// FrontendMessage::Startup(Startup::new("alice", "shop")).write(&mut input).unwrap();
@@ -2031,7 +2031,7 @@ pub enum BackendEvent {
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, finish, pump};
-/// use fictionet::stdlib::postgres::{BackendEvent, BackendEvents, BackendMessage, EncryptionReply, TransactionStatus};
+/// use fictionet::stdlib::protocols::postgres::{BackendEvent, BackendEvents, BackendMessage, EncryptionReply, TransactionStatus};
 ///
 /// let mut decoder = BackendEvents::with_limit(64);
 /// decoder.expect_encryption();
@@ -2043,7 +2043,7 @@ pub enum BackendEvent {
 ///     BackendEvent::Encryption(EncryptionReply::Refused),
 ///     BackendEvent::Message(BackendMessage::ReadyForQuery(TransactionStatus::Idle)),
 /// ]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::postgres::FrameError>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::postgres::FrameError>>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct BackendEvents {

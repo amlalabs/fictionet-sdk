@@ -410,7 +410,7 @@ pub fn thread_cpu_time() -> core::time::Duration {
 /// This audits counted work; use contract checks for decoded results.
 ///
 /// ```
-/// use fictionet::stdlib::{test_support::check_work, thrift::EncodedMessages};
+/// use fictionet::stdlib::{test_support::check_work, protocols::thrift::EncodedMessages};
 /// check_work(EncodedMessages::new, &[0x82], EncodedMessages::examined, 16, 16);
 /// ```
 pub fn check_work<D: Decode>(
@@ -479,7 +479,7 @@ pub fn check_work<D: Decode>(
 /// Zero work is allowed, but then both runs must report zero.
 ///
 /// ```
-/// use fictionet::stdlib::{test_support::assert_linear_work, thrift::EncodedMessages};
+/// use fictionet::stdlib::{test_support::assert_linear_work, protocols::thrift::EncodedMessages};
 /// use fictionet::stdlib::codec::{Stream, pump};
 /// assert_linear_work("empty thrift calls", "messages", 16, |size| {
 ///     let bytes = [0x82, 0x21, 0, 0, 0].repeat(size);
@@ -511,7 +511,7 @@ pub fn assert_linear_work(
 /// same number of bytes. Zero work is allowed in both runs.
 ///
 /// ```
-/// use fictionet::stdlib::{test_support::assert_constant_work, thrift::EncodedMessages};
+/// use fictionet::stdlib::{test_support::assert_constant_work, protocols::thrift::EncodedMessages};
 /// use fictionet::stdlib::codec::{Decode, Step};
 /// assert_constant_work("first thrift call", "unread suffix bytes", 16, |size| {
 ///     let mut bytes = vec![0x82, 0x21, 0, 0, 0];

@@ -113,7 +113,8 @@ pub fn extract(request: &Request<Bytes>, own: &str, addr: &str) -> Vec<Value> {
                 .map(|t| ("host", t.host.clone(), t.host.clone()))
         })
         .or_else(|| {
-            fictionet::stdlib::httpd::request_host(request).map(|host| ("host", host.clone(), host))
+            fictionet::stdlib::web::httpd::request_host(request)
+                .map(|host| ("host", host.clone(), host))
         });
     if let Some((name, host, target)) = named {
         let host = host

@@ -30,7 +30,7 @@
 //! refuse.
 //!
 //! ```
-//! use fictionet::stdlib::imf::{
+//! use fictionet::stdlib::protocols::imf::{
 //!     decode_text, parse_address_list, AddressList, Address, DateTime, Head, Header,
 //! };
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -294,7 +294,7 @@ impl Wire for Header {
 /// [`Error::TooLarge`]. Field errors are error items, followed by End too.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Collect, Stream, Wire, finish, pump}, imf::Head};
+/// use fictionet::stdlib::{codec::{Collect, Stream, Wire, finish, pump}, protocols::imf::Head};
 /// use core::convert::Infallible;
 ///
 /// // The world chooses a body type and a total size limit.

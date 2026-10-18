@@ -1,4 +1,4 @@
-// A sandbox on a slow link: `stdlib::bottleneck` in front of `web::Sites`,
+// A sandbox on a slow link: `stdlib::network::bottleneck` in front of `web::Sites`,
 // with a count of the packets its queues drop.
 //
 //     cargo run --example bottleneck_sites -- /run/fictionet/world.sock
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use fictionet::stdlib::{self, Direction, web};
+use fictionet::stdlib::{self, network::Direction, web};
 use fictionet::time::ms;
 
 /// 8 Mbit/s: one megabyte a second, each way.
@@ -22,7 +22,7 @@ type Counts = Arc<[AtomicU64; 2]>;
 
 /// A filter that counts packets by direction and passes them all.
 fn count(fcx: &fictionet::Cx, inner: impl fictionet::Interface, counts: Counts) -> fictionet::End {
-    stdlib::filter(fcx, inner, move |_, direction, _| {
+    stdlib::network::filter(fcx, inner, move |_, direction, _| {
         let i = if direction == Direction::ToInner {
             0
         } else {
@@ -64,7 +64,7 @@ fn main() -> fictionet::Result {
             let near: Counts = Arc::default();
             let far: Counts = Arc::default();
             let link = count(fcx, sandbox, near.clone());
-            let link = stdlib::bottleneck(fcx, RATE, QUEUE, link);
+            let link = stdlib::network::bottleneck(fcx, RATE, QUEUE, link);
             let link = count(fcx, link, far.clone());
 
             // Each time the packets stop for a second, report. The queues

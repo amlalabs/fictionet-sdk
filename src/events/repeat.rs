@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::stdlib::json::Value;
+use crate::stdlib::protocols::json::Value;
 use crate::time::Instant;
 
 use super::model::{ARC_COUNTS, conn_size, fields_size, heap};

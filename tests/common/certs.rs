@@ -1,8 +1,8 @@
 use fictionet::{
     Cx, Result,
     stdlib::{
-        ca::{Ca, Leaf},
-        x509::{Time, Validity},
+        protocols::x509::{Time, Validity},
+        services::ca::{Ca, Leaf},
     },
 };
 use rustls::RootCertStore;

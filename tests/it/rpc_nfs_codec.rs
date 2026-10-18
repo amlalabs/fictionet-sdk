@@ -3,8 +3,8 @@
 use fictionet::stdlib::codec::{self, Assembled, Decode, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 
+use fictionet::stdlib::protocols::{nfs, onc_rpc, portmap};
 use fictionet::stdlib::test_support::chunks;
-use fictionet::stdlib::{nfs, onc_rpc, portmap};
 use onc_rpc::{Accept, Body, Message, Reply};
 
 const RECORD_LIMIT: usize = 4096;

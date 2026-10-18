@@ -35,13 +35,13 @@
 //! decides what to accept, execute and cancel.
 //!
 //! ```
-//! use fictionet::stdlib::session::Action;
+//! use fictionet::stdlib::protocols::session::Action;
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::codec::field::Alpha;
-//! use fictionet::stdlib::ouch::{
+//! use fictionet::stdlib::protocols::ouch::{
 //!     EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Options, Outbound, Side, Token,
 //! };
-//! use fictionet::stdlib::soupbintcp::Packet;
+//! use fictionet::stdlib::protocols::soupbintcp::Packet;
 //!
 //! // The client's Enter Order, in a SoupBinTCP unsequenced data packet.
 //! let enter = EnterOrder {
@@ -80,7 +80,7 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::field::{self, Alpha};
-use fictionet::stdlib::session::Action;
+use fictionet::stdlib::protocols::session::Action;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::str::FromStr;
@@ -2985,9 +2985,9 @@ mod tests {
     #[test]
     fn exchange_runs_over_soupbintcp() {
         use fictionet::stdlib::codec::{Stream, pump};
-        use fictionet::stdlib::soupbintcp::Client;
-        use fictionet::stdlib::soupbintcp::Event as SEvent;
-        use fictionet::stdlib::soupbintcp::{Login, Packet, Server, Timers};
+        use fictionet::stdlib::protocols::soupbintcp::Client;
+        use fictionet::stdlib::protocols::soupbintcp::Event as SEvent;
+        use fictionet::stdlib::protocols::soupbintcp::{Login, Packet, Server, Timers};
         let login = Login {
             username: Alpha::right_padded("ALICE").unwrap(),
             password: Alpha::right_padded("PW").unwrap(),
@@ -3022,7 +3022,8 @@ mod tests {
             .unwrap()
             .to_bytes()
             .unwrap();
-        let mut frames = Stream::new(Frames::<fictionet::stdlib::soupbintcp::Packet>::default());
+        let mut frames =
+            Stream::new(Frames::<fictionet::stdlib::protocols::soupbintcp::Packet>::default());
         let mut inbound = Vec::new();
         pump(&mut frames, &wire, |f| inbound.push(f)).unwrap();
         let Ok(Packet::UnsequencedData(payload)) = &inbound[0] else {

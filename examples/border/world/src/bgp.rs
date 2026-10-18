@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use fictionet::Cx;
 use fictionet::events::ConnInfo;
-use fictionet::stdlib::bgp::{
+use fictionet::stdlib::codec::{Fail, Frames, Wire};
+use fictionet::stdlib::network::tcp::Listener;
+use fictionet::stdlib::protocols::bgp::{
     self, Attribute, Context, Error, Frame, Message, Notification, Open, Origin, Segment,
     SegmentKind, Update, kind,
 };
-use fictionet::stdlib::codec::{Fail, Frames, Wire};
-use fictionet::stdlib::serve::{self, Driver, Flow, ServeOptions, Service, Timer};
-use fictionet::stdlib::tcp::Listener;
+use fictionet::stdlib::services::serve::{self, Driver, Flow, ServeOptions, Service, Timer};
 use fictionet::time::Duration;
 use serde_json::{Value, json};
 use std::convert::Infallible;

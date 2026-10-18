@@ -5,10 +5,12 @@ use super::hosts::{Admission, Lookup, pings};
 use super::normalize;
 use fictionet::events::{ConnInfo, Event, opt as jopt};
 use fictionet::stdlib::codec::{Collect, CollectError, Decode, Step};
-use fictionet::stdlib::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
-use fictionet::stdlib::dns::rr::{DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA};
-use fictionet::stdlib::serve::{self, ServeOptions, Service};
-use fictionet::stdlib::{ConnError, ip, tcp, udp};
+use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
+use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::{
+    DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA,
+};
+use fictionet::stdlib::services::serve::{self, ServeOptions, Service};
 use fictionet::{Cx, End, Error};
 use std::net::IpAddr;
 use std::sync::Arc;

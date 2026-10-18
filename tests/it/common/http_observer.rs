@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use fictionet::events::{ConnInfo, Event, Fields};
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::httpd::{Observer, Received};
+use fictionet::stdlib::web::httpd::{Observer, Received};
 
 pub const SECRET: &[u8] = b"private-credential!!";
 

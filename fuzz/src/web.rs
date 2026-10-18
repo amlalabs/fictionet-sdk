@@ -14,7 +14,7 @@ use http::{Request, Response};
 use http_body_util::{BodyExt, Full, Limited};
 use rustls::pki_types::CertificateDer;
 
-use fictionet::stdlib::{tls, web};
+use fictionet::stdlib::{services::tls, web};
 use fictionet::{Attacher, Cx, attachments};
 
 /// Where the fixed-address sites are.
@@ -84,7 +84,7 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Broken {
 }
 
 /// Starts the sites, with events on, and returns the attacher.
-pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::ca::Leaf) -> Attacher {
+pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::services::ca::Leaf) -> Attacher {
     let config = Arc::new(
         tls::config_builder(fcx, UNIX_EPOCH + Duration::from_secs(1_800_000_000))
             .with_safe_default_protocol_versions()
@@ -119,14 +119,14 @@ pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::ca::Leaf) -> Attacher {
 /// A sandbox's side, made of stdlib parts: its TCP and UDP endpoints at
 /// `addr`, on an attachment named `name`.
 pub struct Client {
-    pub tcp: fictionet::stdlib::tcp::Endpoint,
-    pub udp: fictionet::stdlib::udp::Endpoint,
+    pub tcp: fictionet::stdlib::network::tcp::Endpoint,
+    pub udp: fictionet::stdlib::network::udp::Endpoint,
     _icmp: fictionet::End,
 }
 
 impl Client {
     pub fn new(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Client {
-        use fictionet::stdlib::{ip, tcp, udp};
+        use fictionet::stdlib::network::{ip, tcp, udp};
         let end = attacher.attach(name).unwrap();
         let (t, u, icmp, _other) = ip::split_protocols(fcx, end);
         Client {
@@ -138,8 +138,8 @@ impl Client {
 
     /// Looks `name` up at the gateway. `None` if there is no address.
     pub async fn lookup(&self, fcx: &Cx, name: &str) -> Option<Ipv4Addr> {
-        use fictionet::stdlib::dns::op::{Message, Query};
-        use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
+        use fictionet::stdlib::protocols::dns::op::{Message, Query};
+        use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
         let mut socket = self.udp.bind(5353).ok()?;
         let mut m = Message::query();
         m.metadata.id = 7;

@@ -47,7 +47,7 @@ use std::time::SystemTime;
 
 use fictionet::Cx;
 use fictionet::events::Event;
-use fictionet::stdlib::tls::ServerConfig;
+use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use serde_json::{Value, json};
 
@@ -303,14 +303,14 @@ pub fn world_start(date: &str) -> fictionet::Result<SystemTime> {
 /// The world's certificate authority, which signs a certificate for each
 /// host at its first handshake.
 pub struct Ca {
-    issuer: fictionet::stdlib::ca::Ca,
+    issuer: fictionet::stdlib::services::ca::Ca,
     start: SystemTime,
 }
 
 impl Ca {
     /// Makes a seeded CA and writes its public certificate for the agent.
     pub fn new(fcx: &Cx, dir: &Path, start: SystemTime) -> fictionet::Result<Ca> {
-        let issuer = fictionet::stdlib::ca::Ca::new(fcx, "Internet Security Root CA")?;
+        let issuer = fictionet::stdlib::services::ca::Ca::new(fcx, "Internet Security Root CA")?;
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("ca.pem"), issuer.cert_pem())?;
         Ok(Ca { issuer, start })
@@ -337,9 +337,13 @@ impl Ca {
         let leaf = self.issuer.issue(
             fcx,
             &[host],
-            fictionet::stdlib::x509::Validity {
-                not_before: fictionet::stdlib::x509::Time::from_unix(not_before.unix_timestamp())?,
-                not_after: fictionet::stdlib::x509::Time::from_unix(not_after.unix_timestamp())?,
+            fictionet::stdlib::protocols::x509::Validity {
+                not_before: fictionet::stdlib::protocols::x509::Time::from_unix(
+                    not_before.unix_timestamp(),
+                )?,
+                not_after: fictionet::stdlib::protocols::x509::Time::from_unix(
+                    not_after.unix_timestamp(),
+                )?,
             },
         )?;
         let config = leaf.server_config(fcx, self.start)?;
@@ -657,8 +661,8 @@ mod tests {
     #[test]
     fn serve_latches_a_failed_record() {
         use fictionet::stdlib::{
-            dns::{op::ResponseCode, rr::RecordType},
-            sandbox::machine,
+            protocols::dns::{op::ResponseCode, rr::RecordType},
+            world::sandbox::machine,
         };
 
         let dir = test_dir("serve-failed-record");
@@ -680,7 +684,7 @@ mod tests {
                 )?);
                 let start = SystemTime::UNIX_EPOCH;
                 let ca = Arc::new(Ca {
-                    issuer: fictionet::stdlib::ca::Ca::new(&fcx, "Test CA")?,
+                    issuer: fictionet::stdlib::services::ca::Ca::new(&fcx, "Test CA")?,
                     start,
                 });
                 let (attacher, attachments) = fictionet::attachments();

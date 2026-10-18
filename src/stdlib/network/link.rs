@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::task::Poll;
 
 use fictionet::PACKET_COST;
-use fictionet::stdlib::ports;
+use fictionet::stdlib::network::ports;
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, End, Interface, Packet};
 
@@ -28,10 +28,11 @@ use fictionet::{Cx, End, Interface, Packet};
 /// packet is delayed on its own: ten packets sent together all arrive `by`
 /// later, together.
 ///
-/// A delay also caps how fast one TCP connection can go, as it does on a
-/// real long link: a connection carries at most one buffer of data per
-/// round trip. With the stdlib's default 256 KiB buffers, a 100 ms round
-/// trip allows about 2.6 MB/s. [`fictionet::stdlib::tcp::Options::buffer`] sets larger ones.
+/// A delay also caps how fast one TCP connection can go, as it does on a real
+/// long link: a connection carries at most one buffer of data per round trip.
+/// With the stdlib's default 256 KiB buffers, a 100 ms round trip allows about
+/// 2.6 MB/s. [`fictionet::stdlib::network::tcp::Options::buffer`] sets larger
+/// ones.
 ///
 /// The task stops when either interface closes, or when the caller's
 /// [region](Cx#regions) is cancelled. Packets it still holds are lost.
@@ -96,7 +97,7 @@ pub fn delay(fcx: &Cx, by: Duration, inner: impl Interface) -> End {
 /// # use fictionet::{Attachment, Cx, stdlib};
 /// # fn wire(fcx: Cx, sandbox: Attachment) {
 /// // A 10 Mbit/s link with room for 100 waiting packets each way.
-/// let link = stdlib::bottleneck(&fcx, 10_000_000, 100, sandbox);
+/// let link = stdlib::network::bottleneck(&fcx, 10_000_000, 100, sandbox);
 /// # drop(link);
 /// # }
 /// ```
@@ -156,7 +157,7 @@ pub enum Direction {
 /// ```
 /// # use fictionet::{Attachment, Cx, stdlib};
 /// # fn wire(fcx: Cx, sandbox: Attachment) {
-/// let lossy = stdlib::filter(&fcx, sandbox, |fcx, _direction, _packet| fcx.random_f64() >= 0.02);
+/// let lossy = stdlib::network::filter(&fcx, sandbox, |fcx, _direction, _packet| fcx.random_f64() >= 0.02);
 /// # drop(lossy);
 /// # }
 /// ```
@@ -284,7 +285,7 @@ where
                             queues[i].packets.push_back((leaves, packet));
                         } else {
                             let waiting = queues[i].packets.len();
-                            fictionet::stdlib::ip::record_drop(
+                            fictionet::stdlib::network::ip::record_drop(
                                 &fcx,
                                 name,
                                 &packet,

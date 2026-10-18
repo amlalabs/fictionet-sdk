@@ -4,12 +4,12 @@
 
 use std::net::Ipv4Addr;
 
-use fictionet::stdlib::igmp::Message;
-use fictionet::stdlib::igmp::harness::conforms;
-use fictionet::stdlib::ip::checksum;
+use fictionet::stdlib::network::ip::checksum;
+use fictionet::stdlib::protocols::igmp::Message;
+use fictionet::stdlib::protocols::igmp::harness::conforms;
 use fictionet::stdlib::{
     codec::{Collect, Wire},
-    igmp,
+    protocols::igmp,
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

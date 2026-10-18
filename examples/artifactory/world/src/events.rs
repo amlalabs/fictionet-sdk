@@ -84,7 +84,7 @@
 //!   malformed or ambiguous calls fall through to `write_refused`.
 
 use fictionet::events::Event as Entry;
-use fictionet::stdlib::json::Value as J;
+use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
 /// The sources of the events [`line()`] makes lines of.

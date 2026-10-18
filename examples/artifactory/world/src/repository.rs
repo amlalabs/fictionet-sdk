@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use fictionet::events::Fields;
 use fictionet::stdlib::codec::Stream;
-use fictionet::stdlib::httpd::{Body, Exchange, Handler, Reply};
-use fictionet::stdlib::json::Value as J;
-use fictionet::stdlib::xml::{Event, Events};
+use fictionet::stdlib::protocols::json::Value as J;
+use fictionet::stdlib::protocols::xml::{Event, Events};
+use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Reply};
 use http::{Request, Response};
 use serde_json::{Value, json};
 

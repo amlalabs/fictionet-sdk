@@ -7,15 +7,15 @@ mod input;
 use input::bytes;
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::onc_rpc::{Body, Message};
-use fictionet::stdlib::portmap::{
+use fictionet::stdlib::protocols::onc_rpc::{Body, Message};
+use fictionet::stdlib::protocols::portmap::{
     AddrStat, CallArgs, CallResult, Error, MAX_UADDR, Mapping, Netbuf, PmapRequest, PmapResult,
     Request, RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult, RpcbStat,
     format_uaddr, harness::check, parse_uaddr,
 };
 use fictionet::stdlib::{
     codec::{Decode, Wire},
-    onc_rpc,
+    protocols::onc_rpc,
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

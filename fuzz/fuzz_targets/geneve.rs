@@ -2,10 +2,10 @@
 //! headers built from any field values, as a world writes them.
 #![no_main]
 
-use fictionet::stdlib::geneve::{GeneveOption, Header, Packet};
+use fictionet::stdlib::protocols::geneve::{GeneveOption, Header, Packet};
 use fictionet::stdlib::{
     codec::{Collect, Wire},
-    geneve,
+    protocols::geneve,
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

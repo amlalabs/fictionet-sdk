@@ -12,7 +12,7 @@
 //!
 //! ```
 //! # use fictionet::prelude::*;
-//! # use fictionet::{Cx, Interface, stdlib::icmp};
+//! # use fictionet::{Cx, Interface, stdlib::network::icmp};
 //! # async fn answer(fcx: Cx, mut icmp: impl Interface, addr: std::net::IpAddr) {
 //! while let Ok(packet) = icmp.recv(&fcx).await {
 //!     if let Some(reply) = icmp::echo_reply(&packet, addr) {
@@ -30,7 +30,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::Packet;
-use fictionet::stdlib::ip::{self, Fields, Header, protocol};
+use fictionet::stdlib::network::ip::{self, Fields, Header, protocol};
 
 /// The reply to `packet`, if it is an echo request (a ping) sent to `addr`.
 ///
@@ -40,7 +40,7 @@ use fictionet::stdlib::ip::{self, Fields, Header, protocol};
 /// the request's identifier, sequence number and data, with a TTL or hop
 /// limit of 64 and correct checksums. A request with a wrong ICMP checksum
 /// gets no reply, as from a kernel. So does a fragment: put fragments back
-/// together first, as [`split_protocols`](fictionet::stdlib::ip::split_protocols)
+/// together first, as [`split_protocols`](fictionet::stdlib::network::ip::split_protocols)
 /// does. IPv4 options and IPv6 extension headers of the request are not
 /// copied into the reply. A request with IPv6 extension headers that a host
 /// must not accept, such as an unknown option whose type says to discard

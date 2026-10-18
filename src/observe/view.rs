@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::events::Event;
 use crate::stdlib::codec::Wire;
-use crate::stdlib::json::Value;
+use crate::stdlib::protocols::json::Value;
 use crate::watch::{Graph, GraphState, Group, TaskInfo, short_name};
 
 /// What one browser has been told.
@@ -534,7 +534,7 @@ mod tests {
         assert!(layer.fields[0].value.starts_with("unserializable:"));
         assert_eq!(
             event.to_line().unwrap_err().kind,
-            crate::stdlib::json::ErrorKind::TooDeep
+            crate::stdlib::protocols::json::ErrorKind::TooDeep
         );
         let replacement = Value::parse(event_line(&event).as_bytes()).unwrap();
         assert_serialization_error(&replacement, 0);
@@ -544,10 +544,16 @@ mod tests {
     fn many_value_failure_visible() {
         let event = Event::new("test", "many").field(
             "many",
-            Value::Array(vec![Value::Null; crate::stdlib::json::MAX_ELEMENTS]),
+            Value::Array(vec![
+                Value::Null;
+                crate::stdlib::protocols::json::MAX_ELEMENTS
+            ]),
         );
         let error = event.to_line().unwrap_err();
-        assert_eq!(error.kind, crate::stdlib::json::ErrorKind::TooManyElements);
+        assert_eq!(
+            error.kind,
+            crate::stdlib::protocols::json::ErrorKind::TooManyElements
+        );
         let layer = crate::observe::Layer::from_event(&event);
         assert!(layer.fields[0].value.starts_with("unserializable:"));
         let replacement = Value::parse(event_line(&event).as_bytes()).unwrap();
@@ -648,7 +654,7 @@ mod tests {
     fn tasks_and_sandboxes_report_their_groups() {
         use crate::Interface;
         use crate::prelude::*;
-        use crate::stdlib::{delay, route};
+        use crate::stdlib::network::{delay, route};
         use crate::time::ms;
         let shared = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real);
         let graph = shared.graph.clone();

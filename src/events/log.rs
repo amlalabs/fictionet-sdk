@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::Cx;
-use crate::stdlib::json::Value;
+use crate::stdlib::protocols::json::Value;
 use crate::time::Instant;
 
 use super::store::held;
@@ -83,7 +83,7 @@ impl EventLog {
     /// contiguous-byte consumption convention. `fields` add the world's own
     /// facts, such as the date the world says it is (`world_date`): the world owns its dates, and services take
     /// them from it, never from the host's clock.
-    /// [`Net::start`](crate::stdlib::net::Net::start) calls this when it
+    /// [`Net::start`](crate::stdlib::world::net::Net::start) calls this when it
     /// starts serving. Neither [`run`](crate::run) nor [`lab`](crate::lab)
     /// calls it. Worlds without `Net` call it explicitly, usually before
     /// recording other events. Each call records another event; it is not

@@ -6,9 +6,9 @@
 //! ```
 //!
 //! Each sandbox's interface is split by protocol with
-//! [`ip::split_protocols`](fictionet::stdlib::ip::split_protocols), which
+//! [`ip::split_protocols`](fictionet::stdlib::network::ip::split_protocols), which
 //! also puts fragmented pings back together. The ICMP end gets a loop that
-//! answers with [`icmp::echo_reply`](fictionet::stdlib::icmp::echo_reply).
+//! answers with [`icmp::echo_reply`](fictionet::stdlib::network::icmp::echo_reply).
 //! The TCP, UDP and other ends are dropped, so those packets go nowhere.
 //!
 //! It prints `attached <name>` and `detached <name>` lines, which the
@@ -17,7 +17,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::prelude::*;
-use fictionet::stdlib::{icmp, ip};
+use fictionet::stdlib::network::{icmp, ip};
 use fictionet::{Attachment, Cx, Interface, Packet, RecvError, Result};
 
 fn main() -> Result {

@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
-use fictionet::stdlib::spnego::{
+use fictionet::stdlib::protocols::spnego::{
     Error, Frame, InitialContextToken, MAX_TOKEN, Mech, NegotiationToken, token_len,
 };
 use fictionet::stdlib::test_support::contract;

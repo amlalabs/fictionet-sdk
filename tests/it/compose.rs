@@ -1,5 +1,5 @@
 //! Putting things between sandboxes and the world: `Attachments::map` and
-//! `stdlib::filter`.
+//! `stdlib::network::filter`.
 
 use crate::common;
 
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fictionet::prelude::*;
-use fictionet::stdlib::{self, Direction};
+use fictionet::stdlib::{self, network::Direction};
 use fictionet::time::ms;
 use fictionet::{Interface, Packet, RecvError, attachments, block_on, lab};
 
@@ -24,7 +24,7 @@ fn map_wraps_each_sandbox_and_keeps_its_name() {
         block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
             let mut mapped = attachments.map(&fcx, move |fcx, sandbox| {
                 c.fetch_add(1, Ordering::SeqCst);
-                stdlib::delay(fcx, ms(30), sandbox)
+                stdlib::network::delay(fcx, ms(30), sandbox)
             });
             let mut world = mapped.get(&fcx, "agent").await?;
             assert_eq!(world.name(), "agent");
@@ -78,7 +78,7 @@ fn a_sandbox_that_detached_before_it_was_taken_is_skipped() {
         let (attacher, attachments) = attachments();
         block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
             let mut mapped = attachments.map(&fcx, |fcx, sandbox| {
-                stdlib::filter(fcx, sandbox, |_, _, _| true)
+                stdlib::network::filter(fcx, sandbox, |_, _, _| true)
             });
             // Taking the barrier puts the first sandbox in the mapped queue.
             let first = attacher.attach("agent").unwrap();
@@ -110,7 +110,7 @@ fn a_mapped_sandbox_is_not_read_until_the_world_takes_it() {
             let counting = move |fcx: &fictionet::Cx, sandbox: fictionet::Attachment| {
                 w.fetch_add(1, Ordering::SeqCst);
                 let s = s.clone();
-                stdlib::filter(fcx, sandbox, move |_, direction, _| {
+                stdlib::network::filter(fcx, sandbox, move |_, direction, _| {
                     if direction == Direction::FromInner {
                         s.fetch_add(1, Ordering::SeqCst);
                     }
@@ -151,11 +151,11 @@ fn maps_chain_with_the_first_closest_to_the_sandbox() {
             let s = seen.clone();
             let mut mapped = attachments
                 .map(&fcx, |fcx, sandbox| {
-                    stdlib::filter(fcx, sandbox, |_, _, p| p.0[0] != 0)
+                    stdlib::network::filter(fcx, sandbox, |_, _, p| p.0[0] != 0)
                 })
                 .map(&fcx, move |fcx, sandbox| {
                     let s = s.clone();
-                    stdlib::filter(fcx, sandbox, move |_, _, _| {
+                    stdlib::network::filter(fcx, sandbox, move |_, _, _| {
                         s.fetch_add(1, Ordering::SeqCst);
                         true
                     })
@@ -178,7 +178,7 @@ fn filter_sees_both_directions_and_drops_what_it_rejects() {
         block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
             let log = Arc::new(std::sync::Mutex::new(Vec::new()));
             let l = log.clone();
-            let mut outer = stdlib::filter(&fcx, b, move |_, direction, packet| {
+            let mut outer = stdlib::network::filter(&fcx, b, move |_, direction, packet| {
                 l.lock().unwrap().push((direction, packet.0.clone()));
                 packet.0 != [9]
             });

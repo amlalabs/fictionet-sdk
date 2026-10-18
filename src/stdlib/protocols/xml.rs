@@ -36,7 +36,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::xml::{Event, Events, Builder};
+//! use fictionet::stdlib::protocols::xml::{Event, Events, Builder};
 //!
 //! let mut stream = Stream::new(Events::new());
 //! let body = br#"<?xml version="1.0"?>
@@ -392,7 +392,7 @@ impl Wire for Document {
 /// whitespace-only input is an error.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, finish, pump}, xml::{Event, Events}};
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, protocols::xml::{Event, Events}};
 ///
 /// let mut stream = Stream::new(Events::new());
 /// let mut events = Vec::new();
@@ -401,7 +401,7 @@ impl Wire for Document {
 /// finish(&mut stream, |event| events.push(event))?;
 /// assert!(matches!(events.as_slice(),
 ///     [Event::Start(_), Event::Text(text), Event::End(_)] if text == "hi"));
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::xml::Error>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::xml::Error>>(())
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct Events {

@@ -23,12 +23,17 @@ use std::time::Duration;
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Event};
 use fictionet::stdlib::codec::{Ending, ItemFault, LineError, Lines, Rewrite, Rule, Trigger, Wire};
-use fictionet::stdlib::httpd::{
+use fictionet::stdlib::protocols::json;
+use fictionet::stdlib::services::serve::{
+    self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeOptions,
+};
+use fictionet::stdlib::web::httpd::{
     self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply, Router,
 };
-use fictionet::stdlib::json;
-use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeOptions};
-use fictionet::stdlib::{Connection, ConnectionExt, hpack, http1, http2, ip, tcp};
+use fictionet::stdlib::{
+    network::{Connection, ConnectionExt, ip, tcp},
+    protocols::{hpack, http1, http2},
+};
 use fictionet::{Cx, pair};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
@@ -1526,7 +1531,7 @@ async fn upgrade_keep_alive_line_limit(fcx: &Cx) -> fictionet::Result {
     let (server, client) = two_machines(fcx);
     let opts = HttpOptions {
         limits: Limits {
-            head: fictionet::stdlib::http1::Limits {
+            head: fictionet::stdlib::protocols::http1::Limits {
                 header_line: 32,
                 ..Default::default()
             },
@@ -1707,9 +1712,9 @@ fn partial_200_not_rejection() {
 fn peer_admission_is_shared_by_machines_and_dns() {
     world(Duration::from_secs(10), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        fictionet::stdlib::net::Net::new()
+        fictionet::stdlib::world::net::Net::new()
             .ipv4_only()
-            .limits(fictionet::stdlib::net::Limits {
+            .limits(fictionet::stdlib::world::net::Limits {
                 connections_per_peer: 1,
                 ..Default::default()
             })
@@ -1722,7 +1727,7 @@ fn peer_admission_is_shared_by_machines_and_dns() {
                     .tcp(7, Arc::new(()), || Loud { size: 1 })
             })
             .start(&fcx, attachments)?;
-        let m = fictionet::stdlib::sandbox::machine(
+        let m = fictionet::stdlib::world::sandbox::machine(
             &fcx,
             attacher.attach("a")?,
             Ipv4Addr::new(10, 0, 0, 2),
@@ -1739,7 +1744,7 @@ fn peer_admission_is_shared_by_machines_and_dns() {
             .await;
         assert!(matches!(
             result,
-            Ok(Err(fictionet::stdlib::ConnError::Reset))
+            Ok(Err(fictionet::stdlib::network::ConnError::Reset))
         ));
         let mut dns = m.tcp.connect(&fcx, "10.0.0.1:53".parse()?).await?;
         let result = fcx
@@ -1750,7 +1755,7 @@ fn peer_admission_is_shared_by_machines_and_dns() {
             .await;
         assert!(matches!(
             result,
-            Ok(Err(fictionet::stdlib::ConnError::Reset))
+            Ok(Err(fictionet::stdlib::network::ConnError::Reset))
         ));
         Ok(())
     });
@@ -1760,14 +1765,14 @@ fn peer_admission_is_shared_by_machines_and_dns() {
 fn dns_tcp_uses_the_sandbox_service_budget() {
     world(Duration::from_secs(10), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        fictionet::stdlib::net::Net::new()
+        fictionet::stdlib::world::net::Net::new()
             .ipv4_only()
-            .limits(fictionet::stdlib::net::Limits {
+            .limits(fictionet::stdlib::world::net::Limits {
                 sandbox_budget: 1,
                 ..Default::default()
             })
             .start(&fcx, attachments)?;
-        let m = fictionet::stdlib::sandbox::machine(
+        let m = fictionet::stdlib::world::sandbox::machine(
             &fcx,
             attacher.attach("a")?,
             Ipv4Addr::new(10, 0, 0, 2),

@@ -33,7 +33,7 @@
 //! ```
 //! use std::collections::HashMap;
 //! use fictionet::stdlib::codec::{Stream, Wire, pump, finish};
-//! use fictionet::stdlib::resp::{Commands, Resp2, Value};
+//! use fictionet::stdlib::protocols::resp::{Commands, Resp2, Value};
 //!
 //! let mut store: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 //! let mut stream = Stream::new(Commands::new());
@@ -243,7 +243,7 @@ pub enum Value {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Wire;
-/// use fictionet::stdlib::resp::{Resp2, Value};
+/// use fictionet::stdlib::protocols::resp::{Resp2, Value};
 ///
 /// let missing = Resp2(Value::Null);
 /// assert_eq!(missing.to_bytes().unwrap(), b"$-1\r\n");

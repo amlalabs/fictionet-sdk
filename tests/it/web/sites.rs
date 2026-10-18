@@ -307,7 +307,7 @@ where
     F: FnOnce(Cx, Attacher) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    let subnet: fictionet::stdlib::route::Prefix = subnet.parse().unwrap();
+    let subnet: fictionet::stdlib::network::route::Prefix = subnet.parse().unwrap();
     run_world::world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         web::Sites::new(|host| {

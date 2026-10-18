@@ -48,7 +48,7 @@ use fictionet::Cx;
 /// randomness. Keep configs within their run because the clock holds `fcx`:
 ///
 /// ```
-/// # use fictionet::{Cx, Result, stdlib::tls};
+/// # use fictionet::{Cx, Result, stdlib::services::tls};
 /// # use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// # fn make(fcx: Cx, start: std::time::SystemTime, chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result {
 /// let config = tls::config_builder(&fcx, start)

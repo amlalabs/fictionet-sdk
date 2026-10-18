@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::nbns::{
+use fictionet::stdlib::protocols::nbns::{
     Error, MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, RrName,
     decode_first_level, rcode,
 };

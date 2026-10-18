@@ -2,9 +2,9 @@
 //! them.
 #![no_main]
 
-use fictionet::stdlib::asn1::Rules;
 use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
-use fictionet::stdlib::kerberos::{
+use fictionet::stdlib::protocols::asn1::Rules;
+use fictionet::stdlib::protocols::kerberos::{
     EncryptedData, Error, Frame, KdcReqBody, MAX_MESSAGE, Message, MethodData, Ticket,
 };
 use fictionet::stdlib::test_support::contract;
@@ -39,7 +39,7 @@ fn round_trip(b: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    fictionet::stdlib::asn1::harness::check(data);
+    fictionet::stdlib::protocols::asn1::harness::check(data);
     contract::check_decode(Frames::<Frame>::new, data);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Frame>(data);

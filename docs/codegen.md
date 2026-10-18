@@ -369,7 +369,7 @@ composite fields, and header or dimension composites with `numGroups` or
 an IR bound exceeded during conversion. Errors include the input name
 and the element path in the location.
 
-`stdlib::cme_mdp3` is generated this way from CME's public MDP 3.0
+`stdlib::protocols::cme_mdp3` is generated this way from CME's public MDP 3.0
 schema, kept at `data/cme/templates_FixBinary.xml`. The generated code is
 in `src/stdlib/protocols/cme_mdp3/mod.rs`. It is followed by a short hand-written
 tail that declares the hand-written packet framing in
@@ -457,7 +457,7 @@ rustfmt exit always fails. Random modules also compile with warnings denied
 and run their generated tests. They use clippy when it is installed.
 
 `tests/it/sbe_codegen.rs` compares generated SBE code with the runtime
-decoder `stdlib::sbe`, loaded with the same XML, for every template of
+decoder `stdlib::protocols::sbe`, loaded with the same XML, for every template of
 CME MDP 3.0 and of `codegen/tests/schemas/sbe_sample.xml`. A third,
 IR-driven encoder in the test makes random messages. Both decoders read
 each one, and their values are compared field by field: the generated

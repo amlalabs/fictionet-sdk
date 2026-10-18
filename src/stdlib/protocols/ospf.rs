@@ -51,9 +51,9 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::ip::Endpoints;
+//! use fictionet::stdlib::network::ip::Endpoints;
 //! use std::net::Ipv4Addr;
-//! use fictionet::stdlib::ospf::{ALL_SPF_ROUTERS_V4, Auth, Body, Header, HelloV2, Packet};
+//! use fictionet::stdlib::protocols::ospf::{ALL_SPF_ROUTERS_V4, Auth, Body, Header, HelloV2, Packet};
 //!
 //! /// A Hello from router `me` on a /24 link, listing the routers it has
 //! /// heard on the link.
@@ -250,7 +250,7 @@ impl Version {
     }
 }
 
-use fictionet::stdlib::ip::{self, Endpoints};
+use fictionet::stdlib::network::ip::{self, Endpoints};
 
 /// OSPFv2 authentication, from the header's type and 8-byte field.
 #[derive(Clone, Debug, PartialEq, Eq)]

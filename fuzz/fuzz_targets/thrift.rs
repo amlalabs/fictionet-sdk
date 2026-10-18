@@ -3,11 +3,11 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::thrift::{
+use fictionet::stdlib::protocols::thrift::{
     EncodedMessage, EncodedMessages, Frame, MAX_FRAME, ValueBody, harness,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

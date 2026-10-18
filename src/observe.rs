@@ -129,8 +129,8 @@
 //!
 //! **Each task is a node.** That is the world function, everything started
 //! with [`Cx::spawn`](crate::Cx::spawn), and each stdlib function that runs
-//! in the background, such as [`delay`](crate::stdlib::delay) or a
-//! [`router`](crate::stdlib::route::router). A node shows a name and the
+//! in the background, such as [`delay`](crate::stdlib::network::delay) or a
+//! [`router`](crate::stdlib::network::route::router). A node shows a name and the
 //! file and line that started it. A stdlib function shows its own name,
 //! and the line in your code that called it, so `delay` called at
 //! `world.rs:5` appears as `delay` at `world.rs:5`. Other tasks are named
@@ -163,7 +163,7 @@
 //!
 //! ```
 //! # use fictionet::{Cx, End, Result};
-//! # use fictionet::stdlib::{ip, tcp};
+//! # use fictionet::stdlib::network::{ip, tcp};
 //! fn machine(fcx: &Cx, side: End, name: &str, addr: std::net::IpAddr) -> Result {
 //!     let host = fcx.group(format!("{name} {addr}"));
 //!     let (tcp, _udp, _icmp, _other) = ip::split_protocols(&host, side);
@@ -230,14 +230,14 @@
 //! [repeats](crate::events#repeats): the first of a run is recorded, the
 //! rest counted in its `count` field.
 //!
-//! - [`bottleneck`](crate::stdlib::bottleneck) records the packets its
+//! - [`bottleneck`](crate::stdlib::network::bottleneck) records the packets its
 //!   full queue drops (`bottleneck.drop`), and the dashboard counts them on
 //!   its node.
-//! - A [router](crate::stdlib::route::router) records a route it removes
+//! - A [router](crate::stdlib::network::route::router) records a route it removes
 //!   because the route's interface closed (`router.route_removed`), and
 //!   the packets it drops because their TTL or hop limit ran out
 //!   (`router.drop`).
-//! - A [LAN](crate::stdlib::route::lan) records the packets it drops
+//! - A [LAN](crate::stdlib::network::route::lan) records the packets it drops
 //!   (`lan.drop`) and each member replaced or gone (`lan.member_replaced`,
 //!   `lan.member_removed`).
 //!
@@ -739,7 +739,7 @@ mod tests {
         crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
             let (a, _b) = crate::pair();
             let line = line!() + 1;
-            let _f = crate::stdlib::filter(&fcx, a, |_, _, _| true);
+            let _f = crate::stdlib::network::filter(&fcx, a, |_, _, _| true);
             let tasks: Vec<_> = fcx.graph().state().tasks.values().cloned().collect();
             assert!(
                 tasks
@@ -758,8 +758,10 @@ mod tests {
         crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
             let (a, b) = crate::pair();
             let (c, d) = crate::pair();
-            let router =
-                crate::stdlib::route::router(&fcx, vec![("10.0.0.0/24".parse().unwrap(), a)]);
+            let router = crate::stdlib::network::route::router(
+                &fcx,
+                vec![("10.0.0.0/24".parse().unwrap(), a)],
+            );
             router.add("10.0.1.0/24".parse().unwrap(), c);
             assert!(!fcx.observed());
             drop(b);

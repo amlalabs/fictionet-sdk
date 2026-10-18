@@ -34,7 +34,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::snmp::{Message, Oid, Pdu, Value, VarBind};
+//! use fictionet::stdlib::protocols::snmp::{Message, Oid, Pdu, Value, VarBind};
 //!
 //! // A version 2c GetRequest for sysDescr.0, community "public".
 //! let datagram = [
@@ -62,9 +62,9 @@
 //! assert_eq!(back.pdu.bindings()[0].value, Value::OctetString(b"pump controller".to_vec()));
 //! ```
 
-use fictionet::stdlib::asn1;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::protocols::asn1;
 use std::fmt;
 use std::str::FromStr;
 

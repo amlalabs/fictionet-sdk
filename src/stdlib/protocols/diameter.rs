@@ -35,7 +35,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::diameter::{avp, command, result, Avp, Identity, Message, Value};
+//! use fictionet::stdlib::protocols::diameter::{avp, command, result, Avp, Identity, Message, Value};
 //!
 //! /// Answers a Device-Watchdog-Request, as the HSS of a pretend network.
 //! fn answer(request: &Message, host: &Identity, realm: &Identity) -> Option<Message> {
@@ -735,7 +735,7 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
-    /// use fictionet::stdlib::diameter::{command, Message};
+    /// use fictionet::stdlib::protocols::diameter::{command, Message};
     /// let message = Message::request(command::DEVICE_WATCHDOG, 0, 7, 9);
     /// let bytes = Wire::to_bytes(&message)?;
     /// let mut stream = Stream::new(Frames::<Message>::new());

@@ -7,21 +7,21 @@ use fictionet::stdlib::codec::{Decode, Fail, Frames, Step};
 
 /// Modbus/TCP capture frames. Framing is provided by the stdlib decoder.
 pub struct Modbus {
-    frames: Frames<fictionet::stdlib::modbus::Frame>,
+    frames: Frames<fictionet::stdlib::protocols::modbus::Frame>,
     request: bool,
 }
 impl Modbus {
     /// Selects request or response presentation for this direction.
     pub fn new(request: bool) -> Self {
         Self {
-            frames: Frames::<fictionet::stdlib::modbus::Frame>::new(),
+            frames: Frames::<fictionet::stdlib::protocols::modbus::Frame>::new(),
             request,
         }
     }
 }
 impl Decode for Modbus {
     type Item = Display;
-    type Error = fictionet::stdlib::modbus::Error;
+    type Error = fictionet::stdlib::protocols::modbus::Error;
     const NAME: &'static str = "Modbus/TCP";
     fn capacity(&self) -> usize {
         self.frames.capacity()
@@ -56,8 +56,8 @@ impl ModbusSession {
             "modbus",
             |s| {
                 if s.transport == Transport::Tcp
-                    && (s.ports.0 == fictionet::stdlib::modbus::PORT
-                        || s.ports.1 == fictionet::stdlib::modbus::PORT)
+                    && (s.ports.0 == fictionet::stdlib::protocols::modbus::PORT
+                        || s.ports.1 == fictionet::stdlib::protocols::modbus::PORT)
                 {
                     Match::Yes
                 } else {
@@ -73,10 +73,10 @@ impl ModbusSession {
         Self {
             dirs: [
                 Some(Observed::new(Modbus::new(
-                    ports.1 == fictionet::stdlib::modbus::PORT,
+                    ports.1 == fictionet::stdlib::protocols::modbus::PORT,
                 ))),
                 Some(Observed::new(Modbus::new(
-                    ports.0 == fictionet::stdlib::modbus::PORT,
+                    ports.0 == fictionet::stdlib::protocols::modbus::PORT,
                 ))),
             ],
             stopped: false,
@@ -105,8 +105,12 @@ impl Protocol for ModbusSession {
     }
 }
 
-fn modbus_display(frame: &fictionet::stdlib::modbus::Frame, used: usize, request: bool) -> Display {
-    use fictionet::stdlib::modbus::{Request, Response};
+fn modbus_display(
+    frame: &fictionet::stdlib::protocols::modbus::Frame,
+    used: usize,
+    request: bool,
+) -> Display {
+    use fictionet::stdlib::protocols::modbus::{Request, Response};
     let mut decoded = Decoded::default();
     let d = &mut decoded;
     let (buf, base) = (0, 0);

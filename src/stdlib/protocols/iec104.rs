@@ -16,7 +16,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::iec104::{Asdu, Frame, Object, UFunction};
+//! use fictionet::stdlib::protocols::iec104::{Asdu, Frame, Object, UFunction};
 //!
 //! assert_eq!(Frame::Unnumbered(UFunction::StartDtAct).to_bytes().unwrap(),
 //!            [0x68, 4, 7, 0, 0, 0]);

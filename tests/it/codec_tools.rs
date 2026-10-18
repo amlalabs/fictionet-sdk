@@ -6,7 +6,8 @@ use fictionet::stdlib::{
         ItemFault, Layered, Lines, RecordKind, Recorder, Rewrite, RewriteError, Rule, Side, Stream,
         Trigger, Wire, write_bounded,
     },
-    json, modbus, test_support,
+    protocols::{json, modbus},
+    test_support,
     test_support::contract,
 };
 
@@ -459,7 +460,7 @@ fn seeded_item_plans_are_repeatable_across_input_chunking() {
 
 #[test]
 fn recorded_end_leaves_handoff_bytes_and_is_not_repeated() {
-    use fictionet::stdlib::proxy_protocol;
+    use fictionet::stdlib::protocols::proxy_protocol;
     let header = b"PROXY UNKNOWN\r\n";
     let tail = frame(7).to_bytes().unwrap();
     let bytes = [header.as_slice(), tail.as_slice()].concat();
@@ -810,7 +811,7 @@ fn intercept_helper_keeps_prior_items_and_handoff_bytes() {
     out.truncate(1);
     let header = b"PROXY UNKNOWN\r\n";
     let input = [header.as_slice(), b"rest"].concat();
-    let mut stream = Stream::new(fictionet::stdlib::proxy_protocol::Headers::new());
+    let mut stream = Stream::new(fictionet::stdlib::protocols::proxy_protocol::Headers::new());
     let taken = rewrite_input(
         &proxy,
         &mut stream,

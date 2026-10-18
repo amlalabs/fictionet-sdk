@@ -7,8 +7,8 @@ use fictionet::stdlib::codec::Frames;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::radius::harness::check_datagram;
-use fictionet::stdlib::radius::{
+use fictionet::stdlib::protocols::radius::harness::check_datagram;
+use fictionet::stdlib::protocols::radius::{
     Attribute, Code, Error, Evs, Extended, MAX_PACKET, MAX_VALUE, Packet, RESERVED_EXTENDED_TYPES,
     Value, Vsa,
 };

@@ -4,9 +4,11 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Lcg;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
+use fictionet::stdlib::protocols::{
+    json, mime_multipart as mime, protobuf, urlencoded_form as form, xml,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::{decode_all, mutate};
-use fictionet::stdlib::{json, mime_multipart as mime, protobuf, urlencoded_form as form, xml};
 use std::fmt::Debug;
 
 fn check<D: Decode>(make: impl Fn() -> D, input: &[u8])
@@ -344,7 +346,7 @@ fn document_streams_distinguish_empty_from_unfinished() {
 
 #[test]
 fn grpc_composes_with_protobuf_messages() {
-    use fictionet::stdlib::grpc;
+    use fictionet::stdlib::protocols::grpc;
     let message = protobuf::Message {
         fields: vec![protobuf::Field {
             number: 1,

@@ -321,7 +321,7 @@ fn padded_read_requests_keep_their_targets_in_the_log() {
 fn an_oversized_upload_stays_in_the_log() {
     use artifactory_world::NAMES;
     use common::*;
-    use fictionet::stdlib::ConnectionExt;
+    use fictionet::stdlib::network::ConnectionExt;
 
     run_variant(Variant::Missing, |fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
@@ -330,7 +330,7 @@ fn an_oversized_upload_stays_in_the_log() {
             &m,
             NAMES[0].1,
             NAMES[0].0,
-            fictionet::stdlib::sandbox::client_config(
+            fictionet::stdlib::world::sandbox::client_config(
                 &fcx,
                 std::time::SystemTime::now(),
                 Some(&env.roots),
@@ -397,7 +397,7 @@ fn http2_pre_handler_body_without_content_length_is_unavailable() {
 
     run_variant(Variant::Missing, |fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
-        let config = fictionet::stdlib::sandbox::client_config(
+        let config = fictionet::stdlib::world::sandbox::client_config(
             &fcx,
             std::time::SystemTime::now(),
             Some(&env.roots),
@@ -454,7 +454,7 @@ fn http2_size_refusal_keeps_the_method_and_targets() {
 
     run_variant(Variant::Missing, |fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
-        let mut config = (*fictionet::stdlib::sandbox::client_config(
+        let mut config = (*fictionet::stdlib::world::sandbox::client_config(
             &fcx,
             std::time::SystemTime::now(),
             Some(&env.roots),

@@ -1,7 +1,7 @@
 use super::udp_packet;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::dhcp::{self, opt};
-use fictionet::stdlib::route::Prefix;
+use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::protocols::dhcp::{self, opt};
 use fictionet::sync::Mutex;
 use fictionet::{Error, Packet};
 use std::collections::{BTreeMap, HashMap};

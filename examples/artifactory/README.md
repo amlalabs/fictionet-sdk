@@ -475,7 +475,7 @@ and the fresh per-host TLS configuration. It uses Tower's service helpers.
 The world's normal HTTP event subscription would log each 403.
 
 ```rust
-use fictionet::stdlib::{httpd, web};
+use fictionet::stdlib::web::{self, httpd};
 use http::{Request, StatusCode};
 use tower::{ServiceExt, service_fn};
 

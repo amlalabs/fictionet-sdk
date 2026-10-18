@@ -90,8 +90,8 @@ def test_httpd_answer_inventory_matches_border_projection() -> None:
     kinds: set[str] = set()
     for path in (
         "web/httpd.rs",
-        "web/httpd/http1.rs",
-        "web/httpd/hyper.rs",
+        "web/httpd/native.rs",
+        "web/httpd/upgrade.rs",
         "web/httpd/sites.rs",
         "web/httpd/response.rs",
     ):

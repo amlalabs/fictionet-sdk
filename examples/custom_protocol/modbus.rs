@@ -15,7 +15,7 @@
 //! Implementation Guide v1.0b.
 //!
 //! Nothing here reads a socket. A world that plays a PLC pushes bytes
-//! from a [`tcp`](fictionet::stdlib::tcp) connection into a
+//! from a [`tcp`](fictionet::stdlib::network::tcp) connection into a
 //! [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream), gets [`Frame`]s back, reads each one's [`Request`], and
 //! writes the reply's bytes back to the connection. Which coils and
 //! registers exist, and what they hold, is up to world code. So is whether
@@ -30,7 +30,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::modbus::{Exception, Frame, Request, Response};
+//! use fictionet::stdlib::protocols::modbus::{Exception, Frame, Request, Response};
 //!
 //! /// Holding registers 0 to 9 of a pretend tank controller.
 //! fn answer(registers: &mut [u16; 10], frame: &Frame) -> Frame {
@@ -260,9 +260,9 @@ impl Wire for Frame {
 /// ```
 /// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
-/// use fictionet::stdlib::modbus::Request;
+/// use fictionet::stdlib::protocols::modbus::Request;
 ///
-/// let mut requests = Stream::new(Frames::<fictionet::stdlib::modbus::Frame>::new().map(|frame| Request::parse(&frame.pdu)));
+/// let mut requests = Stream::new(Frames::<fictionet::stdlib::protocols::modbus::Frame>::new().map(|frame| Request::parse(&frame.pdu)));
 /// let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
 /// let mut count = 0;
 /// pump(&mut requests, &bytes, |request| {
@@ -271,7 +271,7 @@ impl Wire for Frame {
 /// })?;
 /// finish(&mut requests, |_| unreachable!())?;
 /// assert_eq!(count, 1);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::modbus::Error>>(())
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::modbus::Error>>(())
 /// ```
 impl Prefixed for Frame {
     type Item = Frame;

@@ -25,7 +25,7 @@ use http_body::{Body as _, Frame, SizeHint};
 
 use fictionet::Error;
 use fictionet::stdlib::codec::{Fail, Stream, Wire};
-use fictionet::stdlib::{http1, httpd::Body};
+use fictionet::stdlib::{protocols::http1, web::httpd::Body};
 use fictionet::sync::Mutex;
 
 /// The most exchanges one client runs at once. Each holds a host thread and
@@ -1370,5 +1370,4 @@ impl<T> Drop for Receiver<T> {
 }
 
 #[cfg(test)]
-#[path = "upstream/tests.rs"]
 mod tests;

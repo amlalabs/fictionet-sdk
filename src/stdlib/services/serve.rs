@@ -29,7 +29,7 @@
 //! ```
 //! use fictionet::stdlib::codec::{Ending, LineError, Lines};
 //! use fictionet::events::Event;
-//! use fictionet::stdlib::serve::{Flow, Harness, Service, Driver};
+//! use fictionet::stdlib::services::serve::{Flow, Harness, Service, Driver};
 //!
 //! struct Echo;
 //! impl Service for Echo {
@@ -61,7 +61,7 @@
 //!
 //! ```
 //! # use std::sync::Arc;
-//! # use fictionet::{Cx, Result, stdlib::{ip, tcp, serve}};
+//! # use fictionet::{Cx, Result, stdlib::{network::{ip, tcp}, services::serve}};
 //! # struct Echo;
 //! # impl serve::Service for Echo {
 //! #     type Decoder = fictionet::stdlib::codec::Lines; type State = (); type Error = std::convert::Infallible;
@@ -76,8 +76,8 @@
 //! # }
 //! ```
 //!
-//! [`net::Net`](fictionet::stdlib::net::Net) does this for every host and
-//! port of a network, and [`httpd`](fictionet::stdlib::httpd) is HTTP as a
+//! [`net::Net`](fictionet::stdlib::world::net::Net) does this for every host and
+//! port of a network, and [`httpd`](fictionet::stdlib::web::httpd) is HTTP as a
 //! service.
 //!
 //! # What the driver promises
@@ -160,9 +160,9 @@ use fictionet::stdlib::codec::{
     Buffer, ByteFault, Decode, Fail, FaultDelay, FaultError, Faults, ItemFault, PumpError, Record,
     Recorder, RewriteError, Rule, Side, Stream, StreamEvent,
 };
-use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
-use fictionet::stdlib::{Accept, Accepted, DatagramSocket};
-use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
+use fictionet::stdlib::network::{Accept, Accepted, DatagramSocket};
+use fictionet::stdlib::network::{ConnError, Connection, ConnectionExt};
+use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, ErrorChain, RaceError, RecvError, Task};
 
@@ -539,7 +539,7 @@ impl WakeHandle {
 }
 
 /// Bytes connections may hold, shared by every connection charged to it:
-/// one sandbox's connections in [`Net`](fictionet::stdlib::net::Net). Cheap to
+/// one sandbox's connections in [`Net`](fictionet::stdlib::world::net::Net). Cheap to
 /// clone; clones share the count.
 ///
 /// Each connection charges the larger of its decoder's capacity and
@@ -863,7 +863,7 @@ fn due(timers: &[(Timer, Instant)], now: Instant) -> Option<usize> {
 /// it ends the run. The panic's own message says where in the code it
 /// happened; a `PanicNote` alive while it unwinds adds which service and
 /// connection, on standard error. [`connection`], [`datagram`] and
-/// HTTP/2 in [`httpd`](fictionet::stdlib::httpd) keep one while they call
+/// HTTP/2 in [`httpd`](fictionet::stdlib::web::httpd) keep one while they call
 /// world code.
 pub struct PanicNote {
     service: &'static str,
@@ -1112,7 +1112,7 @@ pub struct ServeOptions {
     /// The bytes each connection's holdings are charged to. Default none.
     pub budget: Option<Budget>,
     /// Names the sandbox each datagram came from, in its [`ConnInfo`].
-    /// [`Net`](fictionet::stdlib::net::Net) sets it; a connection's sandbox is
+    /// [`Net`](fictionet::stdlib::world::net::Net) sets it; a connection's sandbox is
     /// given with its `ConnInfo` instead.
     pub sandbox: Option<SandboxOf>,
 }
@@ -3127,7 +3127,7 @@ where
                 .peer
                 .and_then(|peer| opts.sandbox.as_ref().and_then(|f| f(peer.ip())));
             let Some(guard) =
-                fictionet::stdlib::net::connection_limit(&fcx, &info, &open, opts.max_conns)
+                fictionet::stdlib::world::net::connection_limit(&fcx, &info, &open, opts.max_conns)
             else {
                 conn.reset();
                 continue;

@@ -7,7 +7,11 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use fictionet::stdlib::{httpd, ip, route, serve, tcp};
+use fictionet::stdlib::{
+    network::{ip, route, tcp},
+    services::serve,
+    web::httpd,
+};
 use fictionet::time::Duration;
 use fictionet::{Cx, Interface, pair};
 

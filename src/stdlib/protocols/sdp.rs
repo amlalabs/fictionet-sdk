@@ -35,7 +35,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::sdp::{Direction, SessionDescription};
+//! use fictionet::stdlib::protocols::sdp::{Direction, SessionDescription};
 //!
 //! let offer = b"v=0\r\n\
 //!     o=alice 2890844526 2890844526 IN IP4 198.51.100.1\r\n\

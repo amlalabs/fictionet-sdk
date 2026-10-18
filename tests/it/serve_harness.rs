@@ -4,8 +4,8 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use echo_service::{Echo, Ticker};
-use fictionet::stdlib::modbus::{self, Frame};
-use fictionet::stdlib::serve::{Ended, Flow, Harness, HarnessError};
+use fictionet::stdlib::protocols::modbus::{self, Frame};
+use fictionet::stdlib::services::serve::{Ended, Flow, Harness, HarnessError};
 
 #[test]
 fn the_harness_runs_a_service_with_no_runtime() {

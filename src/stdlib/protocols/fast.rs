@@ -19,7 +19,7 @@
 //! including nonminimal encodings, are refused. Block sizes may be overlong (§10).
 //!
 //! ```
-//! use fictionet::stdlib::{codec::{Stream, Wire}, fast::*};
+//! use fictionet::stdlib::{codec::{Stream, Wire}, protocols::fast::*};
 //! let templates = Templates::from_xml(br#"
 //! <templates xmlns="http://www.fixprotocol.org/ns/fast/td/1.1">
 //!   <template name="Sample" id="1">
@@ -40,7 +40,7 @@
 //! [spec]: https://www.fixtrading.org/wp-content/uploads/download-manager-files/FAST-Specification-1-x-1.pdf
 
 use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire};
-use fictionet::stdlib::xml;
+use fictionet::stdlib::protocols::xml;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -2671,7 +2671,7 @@ fn block_header(input: &[u8]) -> Result<Option<(usize, usize)>, Error> {
 /// `codec::Pipe` and `Carry::Bytes`) loses those boundaries.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, fast::Blocks};
+/// use fictionet::stdlib::{codec::Stream, protocols::fast::Blocks};
 /// let mut stream = Stream::new(Blocks);
 /// assert_eq!(stream.push(&[0x82, 0xc0, 0x81]), 3);
 /// assert_eq!(stream.next().transpose()?, Some(vec![0xc0, 0x81]));
@@ -2716,7 +2716,7 @@ impl Decode for Blocks {
 /// of its [`Messages`].
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, fast::{BlockMessages, Error, Messages, Templates}};
+/// use fictionet::stdlib::{codec::Stream, protocols::fast::{BlockMessages, Error, Messages, Templates}};
 /// let templates = Templates::from_xml(br#"<template
 ///     xmlns="http://www.fixprotocol.org/ns/fast/td/1.1" name="Empty" id="1"/>"#)?;
 /// let mut stream = Stream::new(BlockMessages::new(Messages::new(templates.clone())));

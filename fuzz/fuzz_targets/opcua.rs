@@ -4,9 +4,9 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::opcua::Messages;
-use fictionet::stdlib::opcua::harness::check_reader;
-use fictionet::stdlib::opcua::{
+use fictionet::stdlib::protocols::opcua::Messages;
+use fictionet::stdlib::protocols::opcua::harness::check_reader;
+use fictionet::stdlib::protocols::opcua::{
     Chunk, ChunkType, DataValue, DiagnosticInfo, ExpandedNodeId, ExtensionObject, Limits,
     LocalizedText, Message, MessageType, NodeId, QualifiedName, ResponseHeader, Service, Variant,
 };
@@ -52,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
             .get(
                 ..data
                     .len()
-                    .min(fictionet::stdlib::opcua::MAX_BUFFER_SIZE as usize),
+                    .min(fictionet::stdlib::protocols::opcua::MAX_BUFFER_SIZE as usize),
             )
             .unwrap_or_default()
             .to_vec(),

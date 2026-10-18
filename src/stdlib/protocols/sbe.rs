@@ -6,14 +6,15 @@
 //! (Message Schema), and section 5 (Schema Extension Mechanism). No private
 //! schemas or licensed documents are needed.
 //!
-//! [`Schema::parse`] reads a bounded XML subset with [`stdlib::xml`](fictionet::stdlib::xml),
-//! including namespaces, comments, an XML declaration, and character references.
-//! Namespaces and whitespace follow the XML module's validation and normalization.
-//! DTDs, entity declarations, processing instructions other than the initial
-//! XML declaration, CDATA, and external includes are refused. Metadata such
-//! as descriptions and semantic types does not drive application validation.
-//! Character arrays and variable data remain bytes; character encoding and
-//! FIX business semantics belong to the caller.
+//! [`Schema::parse`] reads a bounded XML subset with
+//! [`stdlib::protocols::xml`](fictionet::stdlib::protocols::xml), including
+//! namespaces, comments, an XML declaration, and character references.
+//! Namespaces and whitespace follow the XML module's validation and
+//! normalization. DTDs, entity declarations, processing instructions other than
+//! the initial XML declaration, CDATA, and external includes are refused.
+//! Metadata such as descriptions and semantic types does not drive application
+//! validation. Character arrays and variable data remain bytes; character
+//! encoding and FIX business semantics belong to the caller.
 //!
 //! [`Schema::decode`] reads one exact message. [`Messages`] reads a sequence
 //! of header-prefixed messages (section 3.1). It caches a schema walk rather
@@ -38,7 +39,7 @@
 //! [differential-testing comparison]: https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md#guarantees-and-checks
 
 use fictionet::stdlib::codec::{Decode, Step, Wire, Work};
-use fictionet::stdlib::xml;
+use fictionet::stdlib::protocols::xml;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 

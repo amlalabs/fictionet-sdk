@@ -204,7 +204,7 @@ impl ReplyConfig {
     ///
     /// ```
     /// use std::net::Ipv4Addr;
-    /// use fictionet::stdlib::dhcp::{self, Message, Reply, ReplyConfig};
+    /// use fictionet::stdlib::protocols::dhcp::{self, Message, Reply, ReplyConfig};
     /// let settings = ReplyConfig {
     ///     server: Ipv4Addr::new(10, 0, 0, 1),
     ///     lease_secs: 3600,

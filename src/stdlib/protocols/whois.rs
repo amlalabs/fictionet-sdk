@@ -40,7 +40,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire, pump};
-//! use fictionet::stdlib::whois::{CollectedResponses, Field, Query, Queries, ReferralKind, Response};
+//! use fictionet::stdlib::protocols::whois::{CollectedResponses, Field, Query, Queries, ReferralKind, Response};
 //!
 //! // A client asks the RIPE database about an address, with two flags.
 //! let query = Query::new("-B -T inetnum 193.0.0.1").unwrap();

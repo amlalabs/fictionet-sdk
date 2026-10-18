@@ -6,8 +6,8 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     Decode, Fail, Prefixed, Stream, Wire, finish, pump, signed_frame_prefix,
 };
+use fictionet::stdlib::protocols::{bgp, fastcgi, kafka, thrift, zabbix};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::{bgp, fastcgi, kafka, thrift, zabbix};
 
 #[test]
 fn signed_prefix_waits_for_header_and_payload() {

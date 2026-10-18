@@ -40,8 +40,8 @@
 //! canceling to the world.
 //!
 //! ```
-//! use fictionet::stdlib::session::Action;
-//! use fictionet::stdlib::cboe_boe::{
+//! use fictionet::stdlib::protocols::session::Action;
+//! use fictionet::stdlib::protocols::cboe_boe::{
 //!     Client, ClientConfig, Event, Exchange, ExchangeConfig, FieldId, Inbound, NewOrder,
 //!     Opt, Optional, OrderEvent, Outbound, Server, Text, Timers, UnitSequence,
 //! };
@@ -108,7 +108,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
-//! use fictionet::stdlib::cboe_boe::{ClientHeartbeat, Inbound};
+//! use fictionet::stdlib::protocols::cboe_boe::{ClientHeartbeat, Inbound};
 //! use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
 //!
 //! let bytes = ClientHeartbeat::default().to_bytes()?;
@@ -127,7 +127,7 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field;
-use fictionet::stdlib::session::{self, Action};
+use fictionet::stdlib::protocols::session::{self, Action};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;

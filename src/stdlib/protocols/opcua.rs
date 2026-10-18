@@ -39,7 +39,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::opcua::{
+//! use fictionet::stdlib::protocols::opcua::{
 //!     AsymmetricHeader, ChannelSecurityToken, Messages, Limits, Message, OpenSecureChannelRequest,
 //!     OpenSecureChannelResponse, RequestHeader, RequestType, ResponseHeader, SecureKind,
 //!     SecureMessage, SecurityMode, Service, SECURITY_POLICY_NONE,

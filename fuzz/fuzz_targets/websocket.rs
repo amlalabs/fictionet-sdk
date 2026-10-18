@@ -1,7 +1,7 @@
 //! WebSocket frames, messages, close payloads, and handshake fields.
 #![no_main]
 
-use fictionet::stdlib::websocket::{
+use fictionet::stdlib::protocols::websocket::{
     Error, MAX_HEADERS, MAX_MESSAGE, check_request, check_response, harness, request_headers,
 };
 use libfuzzer_sys::fuzz_target;

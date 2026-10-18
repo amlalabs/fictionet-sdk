@@ -1,7 +1,7 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{Demux, Wire},
-    grpc, hpack, http2, tcp_reassembly,
+    protocols::{grpc, hpack, http2, tcp_reassembly},
 };
 use tcp_reassembly::{Chunk, FlowKey, Segment};
 

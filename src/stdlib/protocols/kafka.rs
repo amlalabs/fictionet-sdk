@@ -48,12 +48,12 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::kafka::{
+//! use fictionet::stdlib::protocols::kafka::{
 //!     api_key, ApiVersion, ApiVersionsResponse, Request, RequestBody, Response, ResponseBody,
 //!     ResponseHeader,
 //! };
 //!
-//! let mut stream = Stream::new(Frames::<fictionet::stdlib::kafka::Frame>::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::protocols::kafka::Frame>::new());
 //! let mut frames = Vec::new();
 //! // ApiVersions version 0, correlation ID 1, client ID "x".
 //! let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
@@ -890,17 +890,17 @@ fictionet::prefixed! {
     /// ```
     /// use fictionet::stdlib::codec::Frames;
     /// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
-    /// use fictionet::stdlib::kafka::Request;
+    /// use fictionet::stdlib::protocols::kafka::Request;
     ///
     /// let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
-    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::kafka::Frame>::new().map(|frame| Request::parse(&frame.0)));
+    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::protocols::kafka::Frame>::new().map(|frame| Request::parse(&frame.0)));
     /// let mut requests = Vec::new();
     /// pump(&mut stream, &bytes[..2], |request| requests.push(request))?;
     /// pump(&mut stream, &bytes[2..], |request| requests.push(request))?;
     /// finish(&mut stream, |request| requests.push(request))?;
     /// assert_eq!(requests.len(), 1);
     /// assert_eq!(requests[0].as_ref().unwrap().header.client_id.as_deref(), Some("x"));
-    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::kafka::Error>>(())
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::kafka::Error>>(())
     /// ```
     Frame => (Frame, Error, usize);
     name = "Kafka";

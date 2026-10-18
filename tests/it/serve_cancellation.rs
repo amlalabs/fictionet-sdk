@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::serve::{self, Flow, Pending, PendingDriver};
-use fictionet::stdlib::tcp;
-use fictionet::stdlib::{ConnError, Connection};
+use fictionet::stdlib::network::tcp;
+use fictionet::stdlib::network::{ConnError, Connection};
+use fictionet::stdlib::services::serve::{self, Flow, Pending, PendingDriver};
 use fictionet::time::ms;
 
 /// Work that never finishes.

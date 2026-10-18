@@ -1,9 +1,13 @@
 use fictionet::stdlib::{
-    ca::Ca,
     codec::Wire,
-    dns::rr::{RData, RecordType},
-    http1, sandbox, web,
-    x509::{Time, Validity},
+    protocols::{
+        dns::rr::{RData, RecordType},
+        http1,
+        x509::{Time, Validity},
+    },
+    services::ca::Ca,
+    web,
+    world::sandbox,
 };
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -83,8 +87,8 @@ fn sandbox_looks_up_connects_and_requests_with_optional_roots() {
 #[test]
 fn installing_cloned_servers_keeps_virtual_hosts_separate() {
     use fictionet::stdlib::{
-        httpd,
-        net::{Host, Net},
+        web::httpd,
+        world::net::{Host, Net},
     };
     fictionet::block_on(fictionet::lab(
         fictionet::Seed::from_u64(10),

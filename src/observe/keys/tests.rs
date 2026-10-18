@@ -8,8 +8,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::tls::{self, ServerConfig};
-use fictionet::stdlib::{Connection, ConnectionExt, tcp};
+use fictionet::stdlib::network::{Connection, ConnectionExt, tcp};
+use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::time::ms;
 use fictionet::{Cx, Result};
 use rustls::pki_types::ServerName;
@@ -49,14 +49,14 @@ fn config_keeps_its_logger_unless_observed() {
 
 /// A CA, and a server and client config for `secret.test`.
 fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
-    let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
+    let ca = fictionet::stdlib::services::ca::Ca::new(fcx, "Test CA").unwrap();
     let leaf = ca
         .issue(
             fcx,
             &["secret.test"],
-            fictionet::stdlib::x509::Validity {
-                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
-                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+            fictionet::stdlib::protocols::x509::Validity {
+                not_before: fictionet::stdlib::protocols::x509::Time::from_unix(946684800).unwrap(),
+                not_after: fictionet::stdlib::protocols::x509::Time::from_unix(4102444800).unwrap(),
             },
         )
         .unwrap();

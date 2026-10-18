@@ -1,4 +1,4 @@
-// A lossy link: `stdlib::filter` in front of `web::Sites` drops 5% of the
+// A lossy link: `stdlib::network::filter` in front of `web::Sites` drops 5% of the
 // packets in each direction, at random.
 //
 //     cargo run --example lossy_sites -- /run/fictionet/world.sock
@@ -26,7 +26,7 @@ fn main() -> fictionet::Result {
 
             // `fcx.random_f64()` is below 0.05 one time in twenty: drop those.
             let lossy = attachments.map(&fcx, |fcx, sandbox| {
-                stdlib::filter(fcx, sandbox, |fcx, _direction, _packet| {
+                stdlib::network::filter(fcx, sandbox, |fcx, _direction, _packet| {
                     fcx.random_f64() >= LOSS
                 })
             });

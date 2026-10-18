@@ -5,11 +5,11 @@
 //! [`web::Sites`](fictionet::stdlib::web::Sites) does TLS for you.
 //!
 //! TLS here is middleware. It takes a [`Connection`], usually a
-//! [`TcpConnection`](fictionet::stdlib::tcp::TcpConnection), and gives back a
+//! [`TcpConnection`](fictionet::stdlib::network::tcp::TcpConnection), and gives back a
 //! `Connection` that carries the decrypted bytes.
 //!
 //! The world supplies a rustls [`ServerConfig`], using certificate files
-//! or certificates issued by [`ca`](fictionet::stdlib::ca). This module
+//! or certificates issued by [`ca`](fictionet::stdlib::services::ca). This module
 //! handles the TLS connection.
 //!
 //! The handshake has two steps, so the world can decide how to answer after
@@ -21,7 +21,7 @@
 //! ```
 //! # use std::sync::Arc;
 //! # use fictionet::Cx;
-//! # use fictionet::stdlib::{tcp, tls, Connection};
+//! # use fictionet::stdlib::{network::{tcp, Connection}, services::tls};
 //! # use rustls::ServerConfig;
 //! # async fn serve_stripe(_fcx: &Cx, _conn: impl Connection) {}
 //! # async fn accept(fcx: Cx, mut listener: tcp::Listener, real: Arc<ServerConfig>, fake: Arc<ServerConfig>) {
@@ -51,12 +51,13 @@
 //! can run rustls, OpenSSL, or anything else over a connection itself,
 //! since [`Connection`] is an open trait.
 
-#[path = "tls/provider.rs"]
+// The sandbox's TLS client shares the ciphertext buffer.
+pub(crate) mod output;
 mod provider;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider, with_context};
 
-use super::tls_output::Output;
+use output::Output;
 use std::future::poll_fn;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
@@ -67,7 +68,7 @@ pub use rustls::ServerConfig;
 use rustls::server::{Acceptor, ServerConnection};
 
 use fictionet::Cx;
-use fictionet::stdlib::{ConnError, Connection};
+use fictionet::stdlib::network::{ConnError, Connection};
 
 /// The name of a TLS alert, or "unknown" for an unrecognized code.
 pub fn alert_name(code: u8) -> &'static str {
@@ -197,7 +198,7 @@ impl<C: Connection> Io<C> {
 
 /// How a handshake failed, in more detail than [`ConnError`]: what
 /// [`server_detailed`], [`ClientHello::finish_detailed`] and
-/// [`serve::accept_tls`](fictionet::stdlib::serve::accept_tls) return, for a
+/// [`serve::accept_tls`](fictionet::stdlib::services::serve::accept_tls) return, for a
 /// world that logs how each handshake ended.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -345,7 +346,7 @@ pub async fn server_detailed<C: Connection>(
     })
     .await;
     if let Some(mut alert) = alert {
-        use fictionet::stdlib::ConnectionExt;
+        use fictionet::stdlib::network::ConnectionExt;
         // Best effort: tell the client why, then close. The hello already
         // failed, and that is the error returned.
         let _ = alert.write_all(&mut io.output.bytes);
@@ -405,7 +406,7 @@ impl<C: Connection> ClientHello<C> {
     /// alert and closes the connection. Dropping the hello instead closes the
     /// connection with no alert.
     pub async fn reject(self, fcx: &Cx) -> Result<(), ConnError> {
-        use fictionet::stdlib::ConnectionExt;
+        use fictionet::stdlib::network::ConnectionExt;
         let mut conn = self.conn;
         conn.write_all(fcx, &UNRECOGNIZED_NAME).await?;
         conn.shutdown(fcx).await

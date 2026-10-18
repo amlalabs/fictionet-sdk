@@ -18,7 +18,7 @@
 //! # fictionet::cfg_std! {
 //! # use std::sync::Arc;
 //! # use fictionet::{Attachments, Cx, Result};
-//! # use fictionet::stdlib::{httpd, net::{Host, Net}, serve};
+//! # use fictionet::stdlib::{web::httpd, world::net::{Host, Net}, services::serve};
 //! # struct Ldap; struct Plc; struct Directory; struct Plant;
 //! # macro_rules! svc { ($t:ty, $w:ty) => {
 //! # impl serve::Service for $t {
@@ -70,11 +70,11 @@
 //! - **Addresses.** A host with [`Host::at`] uses that address; otherwise
 //!   it gets a free one from `198.18.0.0/15` (IPv4) and `2001:2::/48`
 //!   (IPv6). Hosts with the same address share one machine.
-//! - **A router** with one route per machine. A packet for any other
-//!   address gets ICMP "host unreachable" (ICMPv6 "address unreachable").
-//!   The router is private ([`Router::keep_ttl`](super::route::Router::keep_ttl)):
-//!   it leaves TTLs as they are, so every machine is one hop from the
-//!   sandbox.
+//! - **A router** with one route per machine. A packet for any other address
+//!   gets ICMP "host unreachable" (ICMPv6 "address unreachable"). The router is
+//!   private
+//!   ([`Router::keep_ttl`](fictionet::stdlib::network::route::Router::keep_ttl)):
+//!   it leaves TTLs as they are, so every machine is one hop from the sandbox.
 //! - **LANs.** [`Net::lan`] adds an IP subnet that hosts join with
 //!   [`Host::on`] and attached virtual machines with [`Net::member`], as
 //!   machines on one Ethernet: broadcast and multicast reach every member.
@@ -127,30 +127,21 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use fictionet::events::Fields;
-use fictionet::stdlib::route::{self, Prefix, Router};
+use fictionet::stdlib::network::route::{self, Prefix, Router};
+use fictionet::stdlib::network::{icmp, tcp};
 #[cfg(doc)]
-use fictionet::stdlib::serve::{Budget, ServeOptions, Service};
-use fictionet::stdlib::{icmp, tcp};
+use fictionet::stdlib::services::serve::{Budget, ServeOptions, Service};
 use fictionet::{Attachments, Cx, End, Error, Interface, InterfaceExt};
 
 fictionet::cfg_std! {
 #[cfg(doc)]
-use fictionet::stdlib::httpd;
+use fictionet::stdlib::web::httpd;
 }
 
-#[path = "net/addresses.rs"]
 mod addresses;
-
-#[path = "net/attachments.rs"]
 mod attachments;
-
-#[path = "net/dns.rs"]
 mod dns;
-
-#[path = "net/hosts.rs"]
 mod hosts;
-
-#[path = "names.rs"]
 mod names;
 
 use addresses::{AUTO, AUTO6, Leases, Subnet, Subnet6};
@@ -774,7 +765,7 @@ fictionet::cfg_std! {
 mod tests {
     use super::*;
     use super::attachments::answered_closed;
-    use fictionet::stdlib::{ip, udp};
+    use fictionet::stdlib::network::{ip, udp};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

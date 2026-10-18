@@ -2,7 +2,7 @@
 //! them (hickory-proto's `Message`), and the resolver's check of an answer.
 #![no_main]
 
-use fictionet::stdlib::dns::op::Message;
+use fictionet::stdlib::protocols::dns::op::Message;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

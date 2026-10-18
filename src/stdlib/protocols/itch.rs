@@ -36,8 +36,8 @@
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::codec::field::Alpha;
-//! use fictionet::stdlib::itch::{AddOrder, Book, BookConfig, Header, Message, OrderDelete, Price4, Side, Timestamp};
-//! use fictionet::stdlib::moldudp64::{Body, Downstream, Session};
+//! use fictionet::stdlib::protocols::itch::{AddOrder, Book, BookConfig, Header, Message, OrderDelete, Price4, Side, Timestamp};
+//! use fictionet::stdlib::protocols::moldudp64::{Body, Downstream, Session};
 //!
 //! let header = Header { locate: 7, tracking: 0, timestamp: Timestamp::new(34_200_000_000_000)? };
 //! let add = AddOrder {
@@ -66,11 +66,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::book_levels::{Aggregate, Levels};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field::{self, Alpha};
+use fictionet::stdlib::protocols::book_levels::{Aggregate, Levels};
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -746,7 +746,7 @@ fictionet::prefixed! {
     /// ```
     /// use fictionet::stdlib::codec::Frames;
     /// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
-    /// use fictionet::stdlib::itch::{Header, Message, MwcbStatus};
+    /// use fictionet::stdlib::protocols::itch::{Header, Message, MwcbStatus};
     ///
     /// let status = MwcbStatus { header: Header::default(), breached_level: b'1' };
     /// let mut file = vec![0, 12];
@@ -1694,7 +1694,7 @@ mod tests {
 
     #[test]
     fn messages_ride_moldudp64_blocks() {
-        use fictionet::stdlib::moldudp64::{Blocks, Body, Downstream, Session};
+        use fictionet::stdlib::protocols::moldudp64::{Blocks, Body, Downstream, Session};
         let samples = samples();
         let packet = Downstream {
             session: Session::left_padded("ITCH").unwrap(),

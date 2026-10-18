@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::stdlib::codec::Wire;
-use crate::stdlib::json::{self, Number, Value};
+use crate::stdlib::protocols::json::{self, Number, Value};
 use crate::time::Instant;
 
 /// How much an event matters to the people and graders reading the log.
@@ -39,7 +39,7 @@ impl Level {
 /// under one name as a JSON object or array of pairs.
 ///
 /// An HTTP handler adds fields to its request's event by putting `Fields`
-/// in its response's extensions (see [`httpd`](crate::stdlib::httpd)).
+/// in its response's extensions (see [`httpd`](crate::stdlib::web::httpd)).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Fields(Vec<(&'static str, Value)>);
 
@@ -184,7 +184,7 @@ pub struct ConnInfo {
     /// The connection's number, from whoever accepted it. [`Net`]
     /// numbers its connections from 1, on every port.
     ///
-    /// [`Net`]: crate::stdlib::net::Net
+    /// [`Net`]: crate::stdlib::world::net::Net
     pub id: Option<u64>,
     /// The sandbox the connection came from, as it was when it arrived.
     pub sandbox: Option<Sandbox>,

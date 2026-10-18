@@ -42,7 +42,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::radius::{attr, enum_name, Code, Packet, Value};
+//! use fictionet::stdlib::protocols::radius::{attr, enum_name, Code, Packet, Value};
 //!
 //! // An Accounting-Request: a session for "bob" has started.
 //! let mut bytes = vec![4, 7, 0, 36];
@@ -722,7 +722,7 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
-    /// use fictionet::stdlib::radius::{Code, Packet};
+    /// use fictionet::stdlib::protocols::radius::{Code, Packet};
     /// let packet = Packet::new(Code::AccessRequest, 7, [0; 16]);
     /// let bytes = Wire::to_bytes(&packet)?;
     /// let mut stream = Stream::new(Frames::<Packet>::with_limit(1024));

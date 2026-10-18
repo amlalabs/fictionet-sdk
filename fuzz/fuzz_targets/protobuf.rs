@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::protobuf::harness::total_fields;
-use fictionet::stdlib::protobuf::{
+use fictionet::stdlib::protocols::protobuf::harness::total_fields;
+use fictionet::stdlib::protocols::protobuf::{
     Frame, MAX_FIELDS, MAX_MESSAGE, MAX_VARINT_LEN, Message, Varint,
 };
 use fictionet::stdlib::test_support::decode_all;

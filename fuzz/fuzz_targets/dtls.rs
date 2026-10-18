@@ -2,7 +2,7 @@
 //! DTLS server reads them from UDP datagrams.
 #![no_main]
 
-use fictionet::stdlib::dtls::{
+use fictionet::stdlib::protocols::dtls::{
     ContentType, Handshake, MAX_MESSAGE_LEN, MAX_RECORDS_PER_DATAGRAM, PlainRecord, Record,
     Sequence, UnifiedRecord, harness,
 };

@@ -5,7 +5,9 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::modbus::{Exception, Frame, MAX_PDU, Request, Response, function};
+use fictionet::stdlib::protocols::modbus::{
+    Exception, Frame, MAX_PDU, Request, Response, function,
+};
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;

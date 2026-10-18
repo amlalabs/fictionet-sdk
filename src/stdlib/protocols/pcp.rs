@@ -39,7 +39,7 @@
 //! ```
 //! use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::pcp::{receive, Incoming, Map, Operation, Request, Response, ResultCode, Speaks};
+//! use fictionet::stdlib::protocols::pcp::{receive, Incoming, Map, Operation, Request, Response, ResultCode, Speaks};
 //!
 //! let laptop = Ipv4Addr::new(192, 168, 1, 20);
 //! // The laptop asks for TCP port 8080 to be reachable from outside, for two hours.

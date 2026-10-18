@@ -47,7 +47,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::l2tp::{attribute, Avp, ControlMessage, MessageType, Packet, V2Packet};
+//! use fictionet::stdlib::protocols::l2tp::{attribute, Avp, ControlMessage, MessageType, Packet, V2Packet};
 //!
 //! // An SCCRQ from a client: the L2TPv2 control header (T, L and S set,
 //! // version 2, length 55, tunnel 0, session 0, Ns 0, Nr 0), then five

@@ -2,20 +2,20 @@
 //! as a world playing an RPC server reads them.
 #![no_main]
 
-use fictionet::stdlib::onc_rpc::{
+use fictionet::stdlib::protocols::onc_rpc::{
     AuthSys, Body, MAX_ARRAY_RESERVE, Message, Reader, encode_fragments,
 };
-use fictionet::stdlib::portmap::{PmapResult, Request, procedure};
+use fictionet::stdlib::protocols::portmap::{PmapResult, Request, procedure};
 use fictionet::stdlib::{
     codec::{Assembled, Wire},
-    onc_rpc,
+    protocols::onc_rpc,
     test_support::contract,
     test_support::decode_all,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    fictionet::stdlib::portmap::harness::check(data);
+    fictionet::stdlib::protocols::portmap::harness::check(data);
     // The stream, split two ways: all at once, and a byte at a time.
     let limit = 4096;
     contract::check_decode(|| onc_rpc::Fragments::with_limit(limit), data);

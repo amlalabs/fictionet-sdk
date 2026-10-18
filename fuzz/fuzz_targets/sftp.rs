@@ -2,8 +2,10 @@
 #![no_main]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::sftp::harness::check_packet;
-use fictionet::stdlib::sftp::{Attrs, MAX_FRAME, MAX_PACKET, Packet, Request, Response, Status};
+use fictionet::stdlib::protocols::sftp::harness::check_packet;
+use fictionet::stdlib::protocols::sftp::{
+    Attrs, MAX_FRAME, MAX_PACKET, Packet, Request, Response, Status,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;

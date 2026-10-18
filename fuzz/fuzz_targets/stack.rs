@@ -8,7 +8,7 @@ use std::net::IpAddr;
 
 use arbitrary::Arbitrary;
 use fictionet::prelude::*;
-use fictionet::stdlib::{icmp, ip, tcp, udp};
+use fictionet::stdlib::network::{icmp, ip, tcp, udp};
 use fictionet::{Interface, Packet, pair};
 use fictionet_fuzz::{fix_checksums, poll_once, settle, world};
 use libfuzzer_sys::fuzz_target;

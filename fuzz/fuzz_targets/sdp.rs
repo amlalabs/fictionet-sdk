@@ -5,8 +5,8 @@
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::sdp::harness::check_attribute;
-use fictionet::stdlib::sdp::{
+use fictionet::stdlib::protocols::sdp::harness::check_attribute;
+use fictionet::stdlib::protocols::sdp::{
     Attribute, MAX_LINE_LEN, MAX_LINES, SessionDescription, SessionDescriptions,
 };
 use fictionet::stdlib::test_support::decode_all;
@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_held_limit(
         SessionDescriptions::new,
         data,
-        fictionet::stdlib::sdp::MAX_LEN,
+        fictionet::stdlib::protocols::sdp::MAX_LEN,
     );
     contract::check_wire::<SessionDescription>(data);
     // The input as one attribute value, as a trickled ICE candidate comes

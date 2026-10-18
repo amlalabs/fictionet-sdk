@@ -33,7 +33,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::wake_on_lan::{wakes, MagicPacket, Password, PACKET_LEN, PORT};
+//! use fictionet::stdlib::protocols::wake_on_lan::{wakes, MagicPacket, Password, PACKET_LEN, PORT};
 //!
 //! let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
 //! let packet = MagicPacket::new(mac);

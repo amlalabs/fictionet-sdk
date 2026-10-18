@@ -31,7 +31,7 @@
 //! ```
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::grpc::{response_headers, Code, Message, Request, Status};
+//! use fictionet::stdlib::protocols::grpc::{response_headers, Code, Message, Request, Status};
 //!
 //! let request = Request::parse([
 //!     (":method", "POST"),
@@ -310,7 +310,7 @@ fictionet::prefixed! {
     /// ```
     /// use fictionet::stdlib::codec::{Frames, Stream, finish, pump};
     ///
-    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::grpc::Message>::with_limit(16));
+    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(16));
     /// let mut messages = Vec::new();
     /// // Two DATA payloads split the message header.
     /// pump(&mut stream, &[0, 0], |m| messages.push(m))?;
@@ -318,7 +318,7 @@ fictionet::prefixed! {
     /// finish(&mut stream, |m| messages.push(m))?;
     /// assert_eq!(messages.len(), 1);
     /// assert_eq!(messages.first().map(|m| m.data.as_slice()), Some(&[7, 8][..]));
-    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::grpc::Error>>(())
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::grpc::Error>>(())
     /// ```
     Message => (Message, Error, usize);
     name = "gRPC";

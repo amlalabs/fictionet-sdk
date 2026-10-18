@@ -21,10 +21,10 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use fictionet::InterfaceExt;
-use fictionet::stdlib::net::{Net, Sni};
-use fictionet::stdlib::tcp;
-use fictionet::stdlib::x509::{Time, Validity};
-use fictionet::stdlib::{ca::Ca, httpd, sandbox};
+use fictionet::stdlib::network::tcp;
+use fictionet::stdlib::protocols::x509::{Time, Validity};
+use fictionet::stdlib::world::net::{Net, Sni};
+use fictionet::stdlib::{services::ca::Ca, web::httpd, world::sandbox};
 use fictionet::tokio::ConnectionTokioExt;
 
 const SITE: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);

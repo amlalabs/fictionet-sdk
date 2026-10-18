@@ -3,8 +3,8 @@
 use core::fmt::Debug;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, Wire, finish};
+use fictionet::stdlib::protocols::{git_protocol, mongodb, mysql, sftp, tds};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::{git_protocol, mongodb, mysql, sftp, tds};
 
 fn check_frames<D>(make: impl Fn() -> D, values: &[D::Item])
 where

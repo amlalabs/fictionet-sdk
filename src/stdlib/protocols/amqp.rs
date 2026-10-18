@@ -16,12 +16,13 @@
 //! reference for it, including RabbitMQ's field value types and its
 //! extensions to the connection and basic classes.
 //!
-//! A broker [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Frames`] to receive [`Frame`]s.
-//! In `on_item`, call `driver.decoder().set_frame_max()` after negotiation. It
-//! reads each method frame's [`Method`], and writes the reply's bytes back
-//! to the connection. Which exchanges and queues exist, and where a message
-//! goes, is up to world code.
+//! A broker [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! [`Frames`] to receive [`Frame`]s. In `on_item`, call
+//! `driver.decoder().set_frame_max()` after negotiation. It reads each method
+//! frame's [`Method`], and writes the reply's bytes back to the connection.
+//! Which exchanges and queues exist, and where a message goes, is up to world
+//! code.
 //!
 //! A frame the stream cannot hold breaks the stream with a
 //! [`Error`]. A payload that breaks the specification gives a
@@ -37,7 +38,7 @@
 //! to extract an array, table, or byte string:
 //!
 //! ```
-//! use fictionet::stdlib::amqp::FieldValue;
+//! use fictionet::stdlib::protocols::amqp::FieldValue;
 //!
 //! let mut value = FieldValue::Array(vec![FieldValue::I32(7)]);
 //! let FieldValue::Array(items) = &mut value else { unreachable!() };
@@ -48,7 +49,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::amqp::{
+//! use fictionet::stdlib::protocols::amqp::{
 //!     content_frames, BasicProperties, ContentHeader, Frames, Frame, FrameKind, Method, Table, DEFAULT_FRAME_MAX,
 //!     PROTOCOL_HEADER,
 //! };
@@ -540,7 +541,7 @@ impl Wire for Frame {
 /// their [`Error`] values as items with [`Decode::map`].
 ///
 /// ```
-/// use fictionet::stdlib::{amqp::{Frame, Frames}, codec::{Stream, Wire}};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, protocols::amqp::{Frame, Frames}};
 ///
 /// let frame = Frame::heartbeat();
 /// let bytes = Wire::to_bytes(&frame)?;
@@ -549,7 +550,7 @@ impl Wire for Frame {
 /// assert_eq!(stream.next(), Some(Ok(frame)));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::amqp::Error>(())
+/// # Ok::<(), fictionet::stdlib::protocols::amqp::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {

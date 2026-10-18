@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Decode, Frames, Stream, Wire};
-use fictionet::stdlib::stun::{Attribute, Frame, MAX_VALUE, Message, answer_binding};
+use fictionet::stdlib::protocols::stun::{Attribute, Frame, MAX_VALUE, Message, answer_binding};
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 

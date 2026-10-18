@@ -8,9 +8,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use fictionet::stdlib::ip::{self, Fields, Header};
-use fictionet::stdlib::route::Prefix;
-use fictionet::stdlib::udp;
+use fictionet::stdlib::network::ip::{self, Fields, Header};
+use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::network::udp;
 
 /// A MAC address.
 pub(crate) type Mac = [u8; 6];

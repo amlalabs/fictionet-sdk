@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use fictionet::stdlib::ip::{self, protocol};
+use fictionet::stdlib::network::ip::{self, protocol};
 
 /// A complete UDP datagram borrowed from an IP payload.
 ///

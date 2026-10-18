@@ -18,27 +18,27 @@ use fakewiki_world::content::Content;
 use fakewiki_world::log::Log;
 use fakewiki_world::{Args, issue_leaves, serve, start_backend};
 use fictionet::Cx;
-use fictionet::stdlib::dns::rr::RecordType;
+use fictionet::stdlib::protocols::dns::rr::RecordType;
 use serde_json::Value;
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-use fictionet::stdlib::sandbox::{Machine, machine};
+use fictionet::stdlib::world::sandbox::{Machine, machine};
 
 async fn lookup(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) {
     m.lookup(fcx, GATEWAY.into(), name, kind).await.unwrap();
 }
 
 /// One HTTP/1.1 request; returns the status.
-async fn get<C: fictionet::stdlib::Connection>(
+async fn get<C: fictionet::stdlib::network::Connection>(
     fcx: &Cx,
     mut io: C,
     method: &str,
     host: &str,
     path: &str,
 ) -> u16 {
-    use fictionet::stdlib::{codec::Wire, http1, sandbox};
+    use fictionet::stdlib::{codec::Wire, protocols::http1, world::sandbox};
     let request = http1::Request::parse(
         format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: curl/8.5.0\r\n\r\n")
             .as_bytes(),
@@ -62,7 +62,9 @@ async fn tls(
     m: &Machine,
     addr: Ipv4Addr,
     sni: &str,
-) -> std::io::Result<fictionet::stdlib::sandbox::TlsClient<fictionet::stdlib::tcp::TcpConnection>> {
+) -> std::io::Result<
+    fictionet::stdlib::world::sandbox::TlsClient<fictionet::stdlib::network::tcp::TcpConnection>,
+> {
     m.tls(
         fcx,
         SocketAddr::new(addr.into(), 443),

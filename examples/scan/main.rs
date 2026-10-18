@@ -28,10 +28,13 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use fictionet::stdlib::codec::{Collect, Wire};
-use fictionet::stdlib::net::{Host, Net};
-use fictionet::stdlib::route::Prefix;
-use fictionet::stdlib::serve::{Driver, Flow, Service};
-use fictionet::stdlib::{ftp, httpd, imap, pop3, smtp, ssh};
+use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::services::serve::{Driver, Flow, Service};
+use fictionet::stdlib::world::net::{Host, Net};
+use fictionet::stdlib::{
+    protocols::{ftp, imap, pop3, smtp, ssh},
+    web::httpd,
+};
 use fictionet::time::{Duration, ms};
 use fictionet::{Attachments, Cx, Result};
 
@@ -153,7 +156,7 @@ async fn world(fcx: Cx, attachments: Attachments) -> Result {
             _ => ("scanner", ms(2)),
         };
         println!("attached {}", sandbox.name());
-        fictionet::stdlib::delay(&fcx.group(group), by, sandbox)
+        fictionet::stdlib::network::delay(&fcx.group(group), by, sandbox)
     });
     net.route(
         "container",
@@ -320,7 +323,7 @@ mod tests {
     use std::sync::mpsc;
 
     use fictionet::prelude::*;
-    use fictionet::stdlib::{ConnError, ip, tcp};
+    use fictionet::stdlib::network::{ConnError, ip, tcp};
     use fictionet::time::{Duration, ms};
     use fictionet::{Cx, End, Interface, Packet};
 
@@ -366,7 +369,7 @@ mod tests {
         let tcp = tcp::endpoint(fcx, t, addr);
         fcx.spawn(move |fcx| async move {
             while let Ok(p) = icmp.recv(&fcx).await {
-                if let Some(r) = fictionet::stdlib::icmp::echo_reply(&p, addr) {
+                if let Some(r) = fictionet::stdlib::network::icmp::echo_reply(&p, addr) {
                     icmp.send(r);
                 }
             }
@@ -447,7 +450,7 @@ mod tests {
 
     #[test]
     fn ssh_identification_is_followed_by_kexinit_and_disconnect() {
-        use fictionet::stdlib::{codec::Wire, serve::Harness, ssh};
+        use fictionet::stdlib::{codec::Wire, protocols::ssh, services::serve::Harness};
         let mut h = Harness::new(fictionet::Seed::from_u64(42), super::Ssh, ());
         assert_eq!(
             h.open().unwrap(),

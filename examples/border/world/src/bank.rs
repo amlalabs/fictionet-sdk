@@ -419,7 +419,7 @@ impl CredentialBody {
 /// Retains rolling raw and decoded windows, and at most [`MAX_BODY`] compressed bytes.
 pub(crate) struct Credentials;
 
-impl fictionet::stdlib::httpd::Observer for Credentials {
+impl fictionet::stdlib::web::httpd::Observer for Credentials {
     fn head(
         &self,
         head: &http::request::Parts,
@@ -445,14 +445,14 @@ impl fictionet::stdlib::httpd::Observer for Credentials {
 
     fn end(
         &self,
-        received: fictionet::stdlib::httpd::Received,
+        received: fictionet::stdlib::web::httpd::Received,
         state: &mut http::Extensions,
     ) -> Option<Fields> {
         let body = state
             .get_mut::<CredentialBody>()
             .expect("credential head observed");
         let (found, unknown) =
-            body.finish(received == fictionet::stdlib::httpd::Received::Complete);
+            body.finish(received == fictionet::stdlib::web::httpd::Received::Complete);
         Some(
             Fields::new()
                 .with("observed_password", found)

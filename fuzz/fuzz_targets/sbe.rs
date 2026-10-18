@@ -2,8 +2,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::sbe::harness::{CAR_BYTES, Car};
-use fictionet::stdlib::sbe::{
+use fictionet::stdlib::protocols::sbe::harness::{CAR_BYTES, Car};
+use fictionet::stdlib::protocols::sbe::{
     MAX_MESSAGE_BYTES, MessageWire, Messages, Scalar, Schema, SchemaSource, Value,
 };
 use fictionet::stdlib::test_support::contract;

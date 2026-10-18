@@ -21,7 +21,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, try_pump};
-//! use fictionet::stdlib::{json::Value, jsonrpc::{ErrorKind, Message, Messages}};
+//! use fictionet::stdlib::protocols::{json::Value, jsonrpc::{ErrorKind, Message, Messages}};
 //!
 //! let mut stdin = Stream::new(Messages::new());
 //! let mut stdout = Vec::new();
@@ -57,7 +57,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Collect, CollectError, Fail, Stream, Wire, finish, pump};
-//! use fictionet::stdlib::{json, jsonrpc::{Batch, Body, Error, Incoming, Message}};
+//! use fictionet::stdlib::protocols::{json, jsonrpc::{Batch, Body, Error, Incoming, Message}};
 //!
 //! let mut post = Stream::new(Collect::<json::Value>::new(json::MAX_SIZE));
 //! let mut values = Vec::new();
@@ -106,7 +106,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::{json::Value, jsonrpc::Message};
+//! use fictionet::stdlib::protocols::{json::Value, jsonrpc::Message};
 //!
 //! // Joined data from a message event in either HTTP+SSE transport.
 //! let event_data = br#"{"id":1e400,"result":"old","jsonrpc":"2.0","x":-0}"#;
@@ -124,7 +124,7 @@
 
 use core::{convert::Infallible, fmt};
 use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Map, Step, Wire};
-use fictionet::stdlib::json::{self, Limits, Number, Value};
+use fictionet::stdlib::protocols::json::{self, Limits, Number, Value};
 
 /// Invalid JSON text.
 pub const PARSE_ERROR: i64 = -32700;

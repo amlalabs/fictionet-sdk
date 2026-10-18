@@ -5,14 +5,14 @@
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::protocols::whois::{
+    CollectedResponses, Field, MAX_QUERY, MAX_RESPONSE, Queries, Query, RESPONSE_WINDOW, Referral,
+    ReferralKind, Response, find_referral, parse_fields,
+};
 use fictionet::stdlib::test_support::contract::{
     check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value,
 };
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::whois::{
-    CollectedResponses, Field, MAX_QUERY, MAX_RESPONSE, Queries, Query, RESPONSE_WINDOW, Referral,
-    ReferralKind, Response, find_referral, parse_fields,
-};
 use libfuzzer_sys::fuzz_target;
 
 /// Values a world builds: whatever a writer accepts reads back the same.

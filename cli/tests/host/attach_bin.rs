@@ -20,7 +20,7 @@ use logged::logged;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use fictionet::stdlib::ip::checksum;
+use fictionet::stdlib::network::ip::checksum;
 use fictionet::{Interface, InterfaceExt, Packet};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");

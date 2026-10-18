@@ -141,7 +141,7 @@ mod tests {
     #[tokio::test]
     async fn non_ascii_location_is_logged_without_changing_the_redirect() {
         use fictionet::events::Fields;
-        use fictionet::stdlib::httpd::{self, Handler, VHost, VirtualHosts};
+        use fictionet::stdlib::web::httpd::{self, Handler, VHost, VirtualHosts};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

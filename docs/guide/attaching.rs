@@ -1652,7 +1652,7 @@
 //! for the address attach passes packets from.
 //!
 //! Attach reads DHCPv6 requests with the shared
-//! [`stdlib::dhcpv6::Message`](crate::stdlib::dhcpv6::Message) codec before
+//! [`stdlib::protocols::dhcpv6::Message`](crate::stdlib::protocols::dhcpv6::Message) codec before
 //! making lease decisions. Malformed requests get no reply. This includes
 //! malformed options that attach does not use, later duplicate options, and
 //! options nested inside identity associations or addresses. A malformed

@@ -3,8 +3,8 @@
 use fictionet::stdlib::codec::{Collect, CollectError, Decode, Fail, Step, Stream, Wire, pump};
 use fictionet::stdlib::test_support::contract;
 
+use fictionet::stdlib::protocols::{imf, ipp, postgres as pg};
 use fictionet::stdlib::test_support::chunks;
-use fictionet::stdlib::{imf, ipp, postgres as pg};
 
 fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where

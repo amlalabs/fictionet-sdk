@@ -47,9 +47,9 @@
 //! read back.
 //!
 //! ```
-//! use fictionet::stdlib::ip::Endpoints;
+//! use fictionet::stdlib::network::ip::Endpoints;
 //! use std::net::{IpAddr, Ipv4Addr};
-//! use fictionet::stdlib::vrrp::{
+//! use fictionet::stdlib::protocols::vrrp::{
 //!     Addresses, Advertisement, AdvertisementV3, GROUP_V4, PRIORITY_STOP,
 //! };
 //!
@@ -150,7 +150,7 @@ pub mod auth {
     pub const IP_AH: u8 = 2;
 }
 
-use fictionet::stdlib::ip::{self, Endpoints};
+use fictionet::stdlib::network::ip::{self, Endpoints};
 
 /// A version 2 advertisement (RFC 3768). It is always carried over IPv4.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

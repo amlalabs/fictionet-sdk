@@ -2,7 +2,7 @@
 #![no_main]
 use fictionet::stdlib::{
     codec::Wire,
-    huffman::{self, HuffmanString},
+    protocols::huffman::{self, HuffmanString},
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

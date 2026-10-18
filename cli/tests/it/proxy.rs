@@ -22,8 +22,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use fictionet::stdlib::net::{Arrival, PortServer};
-use fictionet::stdlib::{http1, tls, web};
+use fictionet::stdlib::world::net::{Arrival, PortServer};
+use fictionet::stdlib::{protocols::http1, services::tls, web};
 use rustls::pki_types::PrivateKeyDer;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
@@ -720,7 +720,7 @@ fn https_through_both_doors_with_curl() {
 #[test]
 fn websockets_pass_through_the_http_door() {
     use fictionet::stdlib::codec::{Stream, Wire};
-    use fictionet::stdlib::websocket::{Message, Messages};
+    use fictionet::stdlib::protocols::websocket::{Message, Messages};
     let world = World::start();
     let a = Attach::start(&world, "http_proxy", "ws1", "10.0.0.2");
     let mut s = a.connect();
@@ -827,7 +827,7 @@ fn tokens_are_checked() {
 
 #[test]
 fn an_icmp_error_fails_only_one_proxy_connect_to_the_same_destination() {
-    use fictionet::stdlib::{icmp, ip};
+    use fictionet::stdlib::network::{icmp, ip};
 
     let pending = Mutex::new(Vec::<Vec<u8>>::new());
     let world = World::with_packets(move |p| {
@@ -1345,7 +1345,9 @@ fn lookups_of_one_name_are_shared_and_misses_remembered() {
 
 mod routing {
     use fictionet::Seed;
-    use fictionet::stdlib::httpd::{self, Body, Handler, Routing, Target, VHost, VirtualHosts};
+    use fictionet::stdlib::web::httpd::{
+        self, Body, Handler, Routing, Target, VHost, VirtualHosts,
+    };
     use http::{Request, Response};
     use std::net::SocketAddr;
 
@@ -1411,8 +1413,8 @@ mod routing {
 #[cfg(feature = "web-proxy")]
 mod upstream {
     use super::routing::{request, route};
-    use fictionet::stdlib::httpd::{self, Body, VHost, VirtualHosts};
     use fictionet::stdlib::web;
+    use fictionet::stdlib::web::httpd::{self, Body, VHost, VirtualHosts};
     use fictionet::{Cx, Seed};
     use http::{Response, StatusCode};
     use http_body_util::BodyExt;

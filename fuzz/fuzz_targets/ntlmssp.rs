@@ -8,7 +8,7 @@ use input::bytes;
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::ntlmssp::{
+use fictionet::stdlib::protocols::ntlmssp::{
     Authenticate, AvPair, AvPairs, Challenge, ClientChallenge, LmV2Response, MAX_AV_PAIRS,
     MAX_FIELD, MAX_MESSAGE, MIC_END, MIC_LEN, Message, MicInput, Negotiate, NtResponse,
     NtlmV2Response, UnicodeName, Version, av_id, flags,

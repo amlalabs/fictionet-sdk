@@ -41,7 +41,7 @@
 //! that missed some is told how many, with an `events.dropped` event in
 //! their place ([`EventLog::after`]), including gaps from rejected events.
 //!
-//! [`Net::start`](crate::stdlib::net::Net::start) records `run.start`, with
+//! [`Net::start`](crate::stdlib::world::net::Net::start) records `run.start`, with
 //! the seed and clock origin. Neither [`run`](crate::run) nor
 //! [`lab`](crate::lab) emits it automatically. A world built from lower-level
 //! pieces calls `fcx.events().start(&fcx, Fields::new())` itself. The event
@@ -144,8 +144,8 @@
 //! line of a decoded packet's layer ([`Layer::note`]), and the log that
 //! holds events is the event log.
 //!
-//! [bottleneck]: crate::stdlib::bottleneck
-//! [router]: crate::stdlib::route::router
+//! [bottleneck]: crate::stdlib::network::bottleneck
+//! [router]: crate::stdlib::network::route::router
 //! [`Cx::now`]: crate::Cx::now
 //! [`Cx::record_repeat`]: crate::Cx::record_repeat
 //! [`Layer::note`]: crate::observe::Layer::note

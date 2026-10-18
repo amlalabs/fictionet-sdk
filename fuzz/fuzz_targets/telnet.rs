@@ -4,8 +4,8 @@
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::telnet::harness::merged;
-use fictionet::stdlib::telnet::{
+use fictionet::stdlib::protocols::telnet::harness::merged;
+use fictionet::stdlib::protocols::telnet::{
     self, BinaryEvent, Event, Events, Negotiation, Side, Subnegotiation, option,
 };
 use fictionet::stdlib::test_support::decode_all;

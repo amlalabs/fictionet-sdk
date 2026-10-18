@@ -12,9 +12,9 @@ use artifactory_world::packages::Variant;
 use artifactory_world::repository::{Contents, GITHUB_PREFIX, JSON_V1, PEER_MESSAGES};
 use artifactory_world::{Identity, NAMES, REPOSITORY_NAME};
 use fictionet::prelude::*;
-use fictionet::stdlib::dns::op::ResponseCode;
-use fictionet::stdlib::ip;
-use fictionet::stdlib::sandbox::Machine;
+use fictionet::stdlib::network::ip;
+use fictionet::stdlib::protocols::dns::op::ResponseCode;
+use fictionet::stdlib::world::sandbox::Machine;
 use fictionet::{Attacher, Cx, Interface};
 use rustls::RootCertStore;
 use serde_json::Value;
@@ -82,7 +82,7 @@ pub async fn https(
         m,
         NAMES[site].1,
         NAMES[site].0,
-        fictionet::stdlib::sandbox::client_config(
+        fictionet::stdlib::world::sandbox::client_config(
             fcx,
             std::time::SystemTime::now(),
             Some(&env.roots),
@@ -429,7 +429,7 @@ pub async fn script(fcx: Cx, attacher: Attacher, env: Env) -> fictionet::Result 
             &m,
             NAMES[0].1,
             "unserved.test",
-            fictionet::stdlib::sandbox::client_config(
+            fictionet::stdlib::world::sandbox::client_config(
                 &fcx,
                 std::time::SystemTime::now(),
                 Some(&env.roots),

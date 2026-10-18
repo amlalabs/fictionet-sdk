@@ -4,7 +4,7 @@
 //! Certificate and CRL values implement `Wire`, while `PemBlocks` decodes a PEM
 //! stream. This module supplies no signing, signature verification, trust-path
 //! validation, TLS session, or certificate `Service`.
-//! [`ca`](fictionet::stdlib::ca) issues certificates using these types.
+//! [`ca`](fictionet::stdlib::services::ca) issues certificates using these types.
 //!
 //! A certificate binds a public key to a name. An issuer signs a
 //! TBSCertificate (the part "to be signed") that holds a serial number,
@@ -45,8 +45,8 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::asn1::{BitString, Oid, StringKind};
-//! use fictionet::stdlib::x509::{
+//! use fictionet::stdlib::protocols::asn1::{BitString, Oid, StringKind};
+//! use fictionet::stdlib::protocols::x509::{
 //!     AlgorithmIdentifier, BasicConstraints, Certificate, ExtensionValue, GeneralName, Name, PublicKeyInfo,
 //!     PemBlock, PEM_CERTIFICATE, SubjectAltName, TbsCertificate, Time, Validity, Value, Version, oid,
 //! };
@@ -100,13 +100,13 @@
 //! assert_eq!(san.0, [GeneralName::Dns("www.example.com".into())]);
 //! ```
 
-use fictionet::stdlib::asn1::{
-    self, BitString, Class, Element, Oid, Reader, Rules, StringKind, Tag, Writer,
-};
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::base64::{self, Padding, encode as base64_encode};
 use fictionet::stdlib::codec::civil::days_in_month;
 use fictionet::stdlib::codec::{Decode, Step as DecodeStep, Wire};
+use fictionet::stdlib::protocols::asn1::{
+    self, BitString, Class, Element, Oid, Reader, Rules, StringKind, Tag, Writer,
+};
 use std::fmt;
 use std::fmt::Write as _;
 

@@ -72,7 +72,7 @@ pub trait DatagramSocket: Send + 'static {
 ///
 /// A connection knows nothing about addresses. To see who connected, ask
 /// the TCP connection underneath:
-/// [`TcpConnection::peer_addr`](fictionet::stdlib::tcp::TcpConnection::peer_addr).
+/// [`TcpConnection::peer_addr`](fictionet::stdlib::network::tcp::TcpConnection::peer_addr).
 ///
 /// Dropping a connection closes it.
 pub trait Connection: Send + 'static {

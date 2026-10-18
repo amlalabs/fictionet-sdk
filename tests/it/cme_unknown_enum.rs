@@ -1,8 +1,8 @@
-use fictionet::stdlib::cme_mdp3::{
+use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::protocols::cme_mdp3::{
     AdminHeartbeat12, HaltReason, MatchEventIndicator, Message, Messages, Packet, PacketHeader,
     SecurityStatus30, SecurityTradingEvent,
 };
-use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 #[test]
 fn unknown_enum_preserves_every_message_in_the_datagram() {

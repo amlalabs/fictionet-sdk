@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 
 use fictionet::events::ConnInfo;
-use fictionet::stdlib::Connection;
+use fictionet::stdlib::network::Connection;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};

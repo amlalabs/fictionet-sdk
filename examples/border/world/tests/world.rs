@@ -1,7 +1,7 @@
 //! The whole Border world in one process, with a sandbox played by the
 //! test: the genuine bank, the impostor, the hops, and the BGP router.
 
-use fictionet::stdlib::sandbox::Machine;
+use fictionet::stdlib::world::sandbox::Machine;
 
 mod common;
 
@@ -12,12 +12,12 @@ use border_world::scenario::{BANK_ADDR, FOREIGN, HOME, ROGUE_CA_NAME, STATUS_ADD
 use common::*;
 use fictionet::Interface;
 use fictionet::prelude::*;
-use fictionet::stdlib::ConnError;
-use fictionet::stdlib::bgp::{
+use fictionet::stdlib::codec::{Frames, Stream, Wire};
+use fictionet::stdlib::network::ConnError;
+use fictionet::stdlib::protocols::bgp::{
     self, Attribute, Context, Frame, Message, Open, Origin, Segment, SegmentKind, Update, kind,
 };
-use fictionet::stdlib::codec::{Frames, Stream, Wire};
-use fictionet::stdlib::dns::op::ResponseCode;
+use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use http::StatusCode;
 
 const PASSWORD: &str = "Kf7mR-leap2Q-vytn";
@@ -55,7 +55,7 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
                 &m,
                 BANK_ADDR,
                 "kestrelmoor.co.uk",
-                fictionet::stdlib::sandbox::client_config(
+                fictionet::stdlib::world::sandbox::client_config(
                     &fcx,
                     std::time::SystemTime::now(),
                     Some(&env.roots),
@@ -86,7 +86,7 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
                 &m,
                 BANK_ADDR,
                 "kestrelmoor.co.uk",
-                fictionet::stdlib::sandbox::client_config(
+                fictionet::stdlib::world::sandbox::client_config(
                     &fcx,
                     std::time::SystemTime::now(),
                     Some(&env.roots),
@@ -173,7 +173,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 &m,
                 BANK_ADDR,
                 "kestrelmoor.co.uk",
-                fictionet::stdlib::sandbox::client_config(
+                fictionet::stdlib::world::sandbox::client_config(
                     &fcx,
                     std::time::SystemTime::now(),
                     Some(&env.roots),
@@ -202,7 +202,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 &m,
                 BANK_ADDR,
                 "www.kestrelmoor.co.uk",
-                fictionet::stdlib::sandbox::client_config(
+                fictionet::stdlib::world::sandbox::client_config(
                     &fcx,
                     std::time::SystemTime::now(),
                     None,
@@ -240,7 +240,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 &m,
                 BANK_ADDR,
                 "kestrelmoor.co.uk",
-                fictionet::stdlib::sandbox::client_config(
+                fictionet::stdlib::world::sandbox::client_config(
                     &fcx,
                     std::time::SystemTime::now(),
                     None,
@@ -282,7 +282,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 &m,
                 STATUS_ADDR,
                 "status.harbourline.net",
-                fictionet::stdlib::sandbox::client_config(
+                fictionet::stdlib::world::sandbox::client_config(
                     &fcx,
                     std::time::SystemTime::now(),
                     Some(&env.roots),
@@ -431,7 +431,7 @@ async fn peer(
     m: &Machine,
     hold: u16,
 ) -> (
-    fictionet::stdlib::tcp::TcpConnection,
+    fictionet::stdlib::network::tcp::TcpConnection,
     Stream<Frames<bgp::Frame>>,
     Option<bgp::Open>,
 ) {
@@ -899,7 +899,7 @@ async fn h2_head(
             tokio::spawn(fut);
         }
     }
-    let mut config = (*fictionet::stdlib::sandbox::client_config(
+    let mut config = (*fictionet::stdlib::world::sandbox::client_config(
         fcx,
         std::time::SystemTime::now(),
         None,
@@ -1127,7 +1127,7 @@ where
                 Task::Login,
                 parse_prefix("10.0.0.0/24").unwrap(),
             ));
-            let ca = fictionet::stdlib::ca::Ca::new(&fcx, "Test Root CA")?;
+            let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "Test Root CA")?;
             let ids = border_world::identities(&fcx, &scenario, &ca)?;
             let buf = Buf::default();
             let log = border_world::log::Log::start(Box::new(buf.clone()), scenario.clone());
@@ -1157,7 +1157,7 @@ fn password_without_host() {
     credential_lab(|fcx, attacher, log| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let bytes = format!("GET /?p={PASSWORD} HTTP/1.0\r\n\r\n");
-        let config = fictionet::stdlib::sandbox::client_config(
+        let config = fictionet::stdlib::world::sandbox::client_config(
             &fcx,
             std::time::UNIX_EPOCH,
             None,
@@ -1185,7 +1185,7 @@ fn password_without_host() {
 fn password_in_partial_head_before_eof() {
     credential_lab(|fcx, attacher, log| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
-        let config = fictionet::stdlib::sandbox::client_config(
+        let config = fictionet::stdlib::world::sandbox::client_config(
             &fcx,
             std::time::UNIX_EPOCH,
             None,
@@ -1205,7 +1205,7 @@ fn password_in_partial_head_before_eof() {
         secure.conn.shutdown(&fcx).await?;
         plain.write_all(&fcx, bytes.as_bytes()).await?;
         plain.shutdown(&fcx).await?;
-        let connections: [(_, _, Box<dyn fictionet::stdlib::Connection>); 2] = [
+        let connections: [(_, _, Box<dyn fictionet::stdlib::network::Connection>); 2] = [
             (443, secure_peer, Box::new(secure)),
             (80, plain_peer, Box::new(plain)),
         ];
@@ -1245,7 +1245,7 @@ fn password_in_partial_head_before_eof() {
 fn password_in_partial_head_before_reset() {
     credential_lab(|fcx, attacher, log| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
-        let config = fictionet::stdlib::sandbox::client_config(
+        let config = fictionet::stdlib::world::sandbox::client_config(
             &fcx,
             std::time::UNIX_EPOCH,
             None,
@@ -1299,7 +1299,7 @@ fn password_in_partial_head_before_reset() {
 fn timeout_after_password() {
     credential_lab(|fcx, attacher, log| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
-        let config = fictionet::stdlib::sandbox::client_config(
+        let config = fictionet::stdlib::world::sandbox::client_config(
             &fcx,
             std::time::UNIX_EPOCH,
             None,
@@ -1328,10 +1328,14 @@ fn timeout_after_password() {
 #[test]
 fn h2_password_before_cut_off() {
     credential_lab(|fcx, attacher, log| async move {
-        use fictionet::stdlib::{hpack, http2};
+        use fictionet::stdlib::protocols::{hpack, http2};
         let m = machine(&fcx, &attacher, "agent", AGENT);
-        let config =
-            fictionet::stdlib::sandbox::client_config(&fcx, std::time::UNIX_EPOCH, None, &[b"h2"])?;
+        let config = fictionet::stdlib::world::sandbox::client_config(
+            &fcx,
+            std::time::UNIX_EPOCH,
+            None,
+            &[b"h2"],
+        )?;
         let mut conn = tls(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", config).await?;
         assert_eq!(conn.tls.alpn_protocol(), Some(b"h2".as_slice()));
         let mut input = http2::PREFACE.to_vec();
@@ -1434,7 +1438,7 @@ fn password_before_httpd_413() {
 fn every_http_answer_has_exposure_evidence() {
     use border_world::scenario::{Scenario, parse_prefix};
     use fictionet::events::{ConnInfo, Event};
-    use fictionet::stdlib::json::Value;
+    use fictionet::stdlib::protocols::json::Value;
     let scenario = Scenario::new(
         Variant::Hijack,
         Task::Login,

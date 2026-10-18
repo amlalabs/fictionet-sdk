@@ -4,7 +4,7 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use fictionet::stdlib::socks::ReplyCode;
+use fictionet::stdlib::protocols::socks::ReplyCode;
 use fictionet::tokio::ConnectionTokioExt;
 use fictionet_cli::attach_proxy::auth::Token;
 use fictionet_cli::attach_proxy::socks5_handshake::{Connect, Refusal, handshake, reply};

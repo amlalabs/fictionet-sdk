@@ -23,13 +23,13 @@
 //! packets. A world can send DISCONNECT when the client requests a key
 //! exchange.
 //!
-//! A [`Service`](fictionet::stdlib::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Events`] for the version exchange and
-//! numbered packets, or `codec::Frames<Packet>` after the version exchange.
-//! It reads payloads with [`Message::parse`] and builds replies with
-//! [`Identification::new`] and [`Packet::from_message`]. Which
-//! algorithms the world offers, and what its software line says, is up to
-//! world code.
+//! A [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! [`Events`] for the version exchange and numbered packets, or
+//! `codec::Frames<Packet>` after the version exchange. It reads payloads with
+//! [`Message::parse`] and builds replies with [`Identification::new`] and
+//! [`Packet::from_message`]. Which algorithms the world offers, and what its
+//! software line says, is up to world code.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Every buffer is bounded by a named limit, such as
@@ -37,7 +37,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
-//! use fictionet::stdlib::ssh::{Events, Event, Identification, KexInit, Message, Packet};
+//! use fictionet::stdlib::protocols::ssh::{Events, Event, Identification, KexInit, Message, Packet};
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! // The world plays a server, and sends its own line first.

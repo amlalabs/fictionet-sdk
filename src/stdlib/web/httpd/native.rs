@@ -11,10 +11,10 @@ use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Versi
 use http_body::{Body as _, Frame};
 
 use fictionet::events::{ConnInfo, Fields};
-use fictionet::stdlib::ConnError;
+use fictionet::stdlib::network::ConnError;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
-use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
-use fictionet::stdlib::serve::{self, Driver, Ended, Flow, Pending, PendingDriver, Timer};
+use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestHead};
+use fictionet::stdlib::services::serve::{self, Driver, Ended, Flow, Pending, PendingDriver, Timer};
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
@@ -607,7 +607,7 @@ impl serve::Service for Http1 {
 }
 
 mod serve_fail {
-    pub type Fail = fictionet::stdlib::codec::Fail<fictionet::stdlib::http1::Error>;
+    pub type Fail = fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::http1::Error>;
 }
 
 /// A handler's response, on its way.
@@ -870,7 +870,7 @@ mod router_tests {
     #[test]
     fn response_suffix_keeps_the_original_charge() {
         use fictionet::stdlib::codec::{Ending, Lines};
-        use fictionet::stdlib::serve::{Harness, Service};
+        use fictionet::stdlib::services::serve::{Harness, Service};
         struct Checked {
             inner: Streaming,
             held: Arc<Mutex<Vec<usize>>>,

@@ -19,8 +19,8 @@
 //!
 //! An RTP packet is a [`Packet`]. It may list contributing sources,
 //! carry padding, and carry a [`HeaderExtension`] in either RFC 8285 form.
-//! RTCP datagrams use [`fictionet::stdlib::rtcp::Datagram`]; compound packets use
-//! [`fictionet::stdlib::rtcp::Compound`].
+//! RTCP datagrams use [`fictionet::stdlib::protocols::rtcp::Datagram`]; compound packets use
+//! [`fictionet::stdlib::protocols::rtcp::Compound`].
 //!
 //! Nothing here reads a socket. A world reads each UDP datagram with
 //! [`Demux::parse`], which tells RTP from RTCP using RFC 5761. Over TCP,
@@ -29,7 +29,7 @@
 //! report policy belong to world code. SRTP and SRTCP are not handled here.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::Wire, rtcp, rtp::{Demux, Packet}};
+//! use fictionet::stdlib::{codec::Wire, protocols::{rtcp, rtp::{Demux, Packet}}};
 //! let packet = Packet {
 //!     marker: false, payload_type: 111, sequence: 1, timestamp: 160,
 //!     ssrc: 7, csrcs: vec![], extension: None, payload: vec![0xf8], padding: 0,
@@ -66,7 +66,7 @@ pub const TWO_BYTE_PROFILE: u16 = 0x1000;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Reader, Truncated};
 
-use fictionet::stdlib::{codec::Wire, rtcp};
+use fictionet::stdlib::{codec::Wire, protocols::rtcp};
 
 /// One RTP packet: the header's fields, the extension and the payload.
 /// The version is always 2, and the padding, extension and CSRC count bits

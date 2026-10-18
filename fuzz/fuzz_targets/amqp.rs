@@ -2,11 +2,11 @@
 //! world playing a broker reads them.
 #![no_main]
 
-use fictionet::stdlib::amqp::{
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::protocols::amqp::{
     BasicProperties, ContentHeader, Frame, FrameKind, Frames, MAX_PAYLOAD, Method, Table,
     content_frames, frame_limit, plain_credentials,
 };
-use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;

@@ -1,10 +1,10 @@
 //! QUIC datagrams and frame payloads after protection is removed.
 #![no_main]
 
-use fictionet::stdlib::quic::harness::check_payload;
+use fictionet::stdlib::protocols::quic::harness::check_payload;
 use fictionet::stdlib::{
     codec::Wire,
-    quic::{self, Datagram, Frame, Reassembler, VarInt},
+    protocols::quic::{self, Datagram, Frame, Reassembler, VarInt},
     test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;

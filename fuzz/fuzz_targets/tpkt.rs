@@ -5,13 +5,13 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Assembled, Wire};
-use fictionet::stdlib::cotp::{Connect, Data, Parameter, Tpdu, Variable};
-use fictionet::stdlib::cotp::{messages, over_tpkt};
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::tpkt::{
+use fictionet::stdlib::protocols::cotp::{Connect, Data, Parameter, Tpdu, Variable};
+use fictionet::stdlib::protocols::cotp::{messages, over_tpkt};
+use fictionet::stdlib::protocols::tpkt::{
     Error, HEADER_LEN, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, MIN_PAYLOAD, Packet,
 };
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 /// Values a world builds: whatever a writer accepts reads back the same.
@@ -59,7 +59,7 @@ fn built(data: &[u8]) -> Result<()> {
         }
         Err(e) => {
             assert!(!fits);
-            assert_eq!(e, fictionet::stdlib::cotp::Error::Unwritable);
+            assert_eq!(e, fictionet::stdlib::protocols::cotp::Error::Unwritable);
         }
     }
     // A connection request a world builds, with any fields, parameters,
@@ -111,7 +111,7 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    fictionet::stdlib::cotp::harness::check_buffer(data, 4000);
+    fictionet::stdlib::protocols::cotp::harness::check_buffer(data, 4000);
     check_wire::<Packet>(data);
     check_wire::<Header>(data);
     // The size limit comes from the first two bytes.

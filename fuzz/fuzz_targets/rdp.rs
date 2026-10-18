@@ -6,8 +6,8 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 
-use fictionet::stdlib::rdp::harness::{check_parsers, plaintext, roundtrip};
-use fictionet::stdlib::rdp::{
+use fictionet::stdlib::protocols::rdp::harness::{check_parsers, plaintext, roundtrip};
+use fictionet::stdlib::protocols::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
     Connection, ConnectionKind, DataBlock, DataBlocks, FailureCode, Frame, GccConference,
     INFO_RESERVED, INFO_UNICODE, LicenseError, MAX_CAPABILITY, MAX_CHANNELS, MAX_CONNECTION_DATA,

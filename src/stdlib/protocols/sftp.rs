@@ -29,7 +29,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
-//! use fictionet::stdlib::sftp::{Attrs, Packet, Request, Response, Status, VERSION};
+//! use fictionet::stdlib::protocols::sftp::{Attrs, Packet, Request, Response, Status, VERSION};
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! /// A server holding one file, `/motd`, 12 bytes long.

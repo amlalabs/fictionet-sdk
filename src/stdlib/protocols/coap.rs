@@ -28,7 +28,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::coap::{Code, Message, Type, content_format};
+//! use fictionet::stdlib::protocols::coap::{Code, Message, Type, content_format};
 //!
 //! /// A pretend thermometer with one resource, /temp.
 //! fn answer(request: &Message) -> Message {
@@ -1319,7 +1319,7 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::Frames;
-    /// use fictionet::stdlib::coap::Frame;
+    /// use fictionet::stdlib::protocols::coap::Frame;
     /// use fictionet::stdlib::codec::{Stream, Wire};
     ///
     /// let frame = Frame::csm(4096, true);
@@ -1329,7 +1329,7 @@ fictionet::prefixed! {
     /// assert_eq!(stream.next(), Some(Ok(frame)));
     /// stream.end();
     /// assert_eq!(stream.next(), None);
-    /// # Ok::<(), fictionet::stdlib::coap::Error>(())
+    /// # Ok::<(), fictionet::stdlib::protocols::coap::Error>(())
     /// ```
     Frame => (Frame, Error, ());
     name = "CoAP over TCP";

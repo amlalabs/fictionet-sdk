@@ -36,7 +36,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
-//! use fictionet::stdlib::dcerpc::{Bind, BindAck, Body, Context, ContextResult, EPMAPPER, NDR, Pdu, reason};
+//! use fictionet::stdlib::protocols::dcerpc::{Bind, BindAck, Body, Context, ContextResult, EPMAPPER, NDR, Pdu, reason};
 //!
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
@@ -1187,13 +1187,13 @@ fictionet::prefixed! {
     ///
     /// ```
     /// use fictionet::stdlib::codec::{Frames, Stream, Wire};
-    /// use fictionet::stdlib::dcerpc::{Body, Pdu};
+    /// use fictionet::stdlib::protocols::dcerpc::{Body, Pdu};
     /// let pdu = Pdu::new(7, Body::Shutdown);
     /// let bytes = Wire::to_bytes(&pdu)?;
     /// let mut stream = Stream::new(Frames::<Pdu>::new());
     /// assert_eq!(stream.push(&bytes), bytes.len());
     /// assert_eq!(stream.next(), Some(Ok(Ok(pdu))));
-    /// # Ok::<(), fictionet::stdlib::dcerpc::Error>(())
+    /// # Ok::<(), fictionet::stdlib::protocols::dcerpc::Error>(())
     /// ```
     Pdu => (Result<Pdu, Error>, Error, usize);
     name = "DCE/RPC";

@@ -6,10 +6,10 @@ mod observer;
 use crate::common::World;
 use bytes::Bytes;
 use fictionet::relay;
-use fictionet::stdlib::dns::op::{MessageType, ResponseCode};
-use fictionet::stdlib::dns::rr::{RData, RecordType};
-use fictionet::stdlib::sandbox::{self, Machine, TlsClient};
-use fictionet::stdlib::{Connection, tls, web};
+use fictionet::stdlib::protocols::dns::op::{MessageType, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
+use fictionet::stdlib::world::sandbox::{self, Machine, TlsClient};
+use fictionet::stdlib::{network::Connection, services::tls, web};
 use fictionet::{Attacher, Cx, WorldSocket, listen};
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
@@ -149,8 +149,8 @@ fn certs(
     PrivateKeyDer<'static>,
 ) {
     use fictionet::stdlib::{
-        ca::Ca,
-        x509::{Time, Validity},
+        protocols::x509::{Time, Validity},
+        services::ca::Ca,
     };
     let ca = Ca::new(fcx, "benchmark CA").unwrap();
     let leaf = ca
