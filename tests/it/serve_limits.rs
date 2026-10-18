@@ -6,6 +6,7 @@
 use crate::common::http_observer;
 use crate::common::io;
 use crate::common::world;
+use crate::http2_server::H2_INPUT;
 
 use crate::common::hyper_io;
 use hyper_io::{Exec, Io};
@@ -34,6 +35,10 @@ use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 use http_observer::{Exposure, SECRET, assert_redacted};
 
+fn idle_http2_budget(budget: &Budget) {
+    assert_eq!(budget.used(), H2_INPUT);
+}
+
 async fn hyper_exposure(
     fcx: Cx,
     received: httpd::Received,
@@ -49,7 +54,7 @@ async fn hyper_exposure(
         );
         http::Response::new(Bytes::new())
     });
-    let budget = Budget::new(8000);
+    let budget = Budget::new(H2_INPUT + 8000);
     let opts = HttpOptions {
         limits: Limits {
             body: if received == httpd::Received::TooLarge {
@@ -129,7 +134,7 @@ async fn hyper_exposure(
     );
     assert_eq!(field_bool(event, "classified"), Some(true));
     assert_redacted(event);
-    assert_eq!(budget.used(), 0);
+    idle_http2_budget(&budget);
     Ok(())
 }
 
@@ -256,7 +261,7 @@ fn observer_sees_metadata_budget_rejection() {
             80,
             Arc::new(router),
             HttpOptions {
-                budget: Some(Budget::new(1024)),
+                budget: Some(Budget::new(H2_INPUT + 1024)),
                 observe: Some(observer.clone()),
                 ..HttpOptions::default()
             },
@@ -611,6 +616,14 @@ fn response_policy_agrees_across_native_and_hyper() {
 
     impl Handler for Responses {
         fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            if request.headers().contains_key("upgrade")
+                && request
+                    .extensions()
+                    .get::<hyper::upgrade::OnUpgrade>()
+                    .is_none()
+            {
+                return Reply::Handoff(request);
+            }
             let status: u16 = request.uri().path()[1..].parse().unwrap();
             let bytes = Bytes::from_static(b"body");
             let body = if request.headers().contains_key("x-unknown") {
@@ -915,7 +928,7 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
                     body: 9000,
                     ..Limits::default()
                 },
-                budget: Some(Budget::new(8000)),
+                budget: Some(Budget::new(H2_INPUT + 8000)),
                 ..HttpOptions::default()
             };
             serve_http(&fcx, &server, 80, Arc::new(router), opts)?;
@@ -1123,7 +1136,7 @@ impl Handler for WaitingMetadata {
 fn http2_rejects_metadata_before_calling_the_handler() {
     world(Duration::from_secs(10), |fcx| async move {
         let (server, client) = two_machines(&fcx);
-        let budget = Budget::new(1024);
+        let budget = Budget::new(H2_INPUT + 1024);
         let router = Router::new().get("/", |_, _| panic!("metadata was not admitted"));
         serve_http(
             &fcx,
@@ -1154,7 +1167,7 @@ fn http2_rejects_metadata_before_calling_the_handler() {
         let events = fcx.events().of("http", "request");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].str("answer"), Some("budget"));
-        assert_eq!(budget.used(), 0);
+        idle_http2_budget(&budget);
         Ok(())
     });
 }
@@ -1199,7 +1212,9 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             let one = budget.used();
             assert!(one >= 8192, "request and event headers both count");
             // Event timestamps can differ in size between requests.
-            let other = budget.charge(budget.limit() - 2 * one - 1024).unwrap();
+            let other = budget
+                .charge(budget.limit() - one - (one - H2_INPUT) - 1024)
+                .unwrap();
             let second = send.send_request(metadata_request());
             assert_eq!(
                 fcx.events()
@@ -1212,11 +1227,13 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             assert!(two >= other.bytes() + 2 * 8192);
             assert!(send.send_request(metadata_request()).await.is_err());
             assert_eq!(fcx.events().of("test", "waiting").len(), 2);
-            assert_eq!(budget.used(), two);
+            let rejected = budget.used();
+            assert_eq!(rejected, two);
+            let request_charge = two - one - other.bytes();
 
             drop(first);
             fcx.idle().await?;
-            assert_eq!(budget.used(), two - one);
+            assert_eq!(budget.used(), rejected - request_charge);
             let third = send.send_request(metadata_request());
             assert_eq!(
                 fcx.events()
@@ -1358,7 +1375,7 @@ fn request_events_stay_charged_while_responses_stream() {
         assert!(fcx.events().of("http", "request").is_empty());
         drop(response);
         fcx.idle().await?;
-        assert_eq!(budget.used(), 0);
+        idle_http2_budget(&budget);
         Ok(())
     });
 }
@@ -1434,7 +1451,21 @@ async fn upgrade_keep_alive_line_limit(fcx: &Cx) -> fictionet::Result {
         },
         ..HttpOptions::default()
     };
-    serve_http(fcx, &server, 80, Arc::new(page(4)), opts)?;
+    struct UpgradePage;
+    impl Handler for UpgradePage {
+        fn call(&self, request: http::Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+            if request.headers().contains_key("upgrade")
+                && request
+                    .extensions()
+                    .get::<hyper::upgrade::OnUpgrade>()
+                    .is_none()
+            {
+                return Reply::Handoff(request);
+            }
+            page(4).call(request, ex)
+        }
+    }
+    serve_http(fcx, &server, 80, Arc::new(UpgradePage), opts)?;
     let mut conn = client
         .connect(fcx, SocketAddr::new(SERVER.into(), 80))
         .await?;

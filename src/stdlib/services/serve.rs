@@ -549,7 +549,7 @@ impl WakeHandle {
 /// and [`Pending::held`]. A connection that would take the total past the
 /// limit closes with [`Ended::Budget`]; one that cannot get its first charge
 /// is closed before the service sees it. Code that holds bytes outside a
-/// service, such as HTTP/2 on hyper, takes a [`Charge`] of its own.
+/// service, such as the hyper upgrade adapter, takes a [`Charge`] of its own.
 #[derive(Clone)]
 pub struct Budget {
     inner: Arc<BudgetInner>,
@@ -667,9 +667,16 @@ pub struct Driver<'a, D> {
     now: Instant,
     conn: &'a ConnInfo,
     timers: &'a [(Timer, Instant)],
+    budget: Option<&'a Budget>,
 }
 
 impl<D> Driver<'_, D> {
+    /// The connection's budget, for rejecting a request before retaining it.
+    /// The driver still charges all service and deferred-work holdings.
+    pub fn budget(&self) -> Option<&Budget> {
+        self.budget
+    }
+
     /// The active decoder, read-only. Access does not stop item faults.
     /// Over UDP, this selects the same decoder as [`Self::decoder`].
     pub fn peek_decoder(&self) -> &D {
@@ -747,8 +754,8 @@ impl<D> Driver<'_, D> {
 
     /// In [`Service::on_fail`], the bytes the decoder could not use: a
     /// message cut off by the end of input, or bytes that are not this
-    /// protocol. In [`Service::on_timer`], the bytes still buffered by the
-    /// stream decoder. Empty in every other call.
+    /// protocol. In [`Service::on_timer`] and [`Service::on_end`], the bytes
+    /// still buffered by the stream decoder. Empty in every other call.
     pub fn unread(&self) -> &[u8] {
         &self.s.unread
     }
@@ -1750,8 +1757,8 @@ where
             .queue
             .iter()
             .map(|s| {
-                if let Segment::Bytes(b, at) = s {
-                    b.len() - at
+                if let Segment::Bytes(b, _) = s {
+                    b.capacity()
                 } else {
                     0
                 }
@@ -1760,7 +1767,13 @@ where
         let out: usize = self
             .out
             .iter()
-            .map(|o| if let Out::Bytes(b, _) = o { b.len() } else { 0 })
+            .map(|o| {
+                if let Out::Bytes(b, _) = o {
+                    b.capacity()
+                } else {
+                    0
+                }
+            })
             .sum();
         let work: usize = self
             .ordered
@@ -1772,6 +1785,7 @@ where
             .decoder()
             .capacity()
             .max(self.read_buffer)
+            .max(self.stream.allocated())
             .saturating_add(self.stream.held())
             .saturating_add(queued)
             .saturating_add(self.faults.as_ref().map_or(0, |f| {
@@ -2029,6 +2043,7 @@ where
                 now,
                 conn: &self.info,
                 timers: &self.timers,
+                budget: self.budget.as_ref(),
             };
             f(&mut driver)
         };
@@ -2106,6 +2121,7 @@ where
                 now,
                 conn: &self.info,
                 timers: &self.timers,
+                budget: self.budget.as_ref(),
             };
             service.on_fail(&fail, state, &mut driver)
         };
@@ -2309,6 +2325,7 @@ where
             return Next::Closed(end);
         }
         self.state = State::Ending { end, called: true };
+        self.s.unread = self.stream.unread().to_vec();
         let result = {
             let mut driver = Driver {
                 decoder: self.stream.decoder(),
@@ -2316,9 +2333,11 @@ where
                 now,
                 conn: &self.info,
                 timers: &self.timers,
+                budget: self.budget.as_ref(),
             };
             service.on_end(end, state, &mut driver)
         };
+        self.s.unread = Vec::new();
         if std::mem::take(&mut self.s.decoder_touched) {
             self.stop_item_faults("decoder");
         }
@@ -2818,7 +2837,9 @@ where
                     Some(Err(e)) => core.broken(conn_end(e)),
                     None => {}
                 }
-                if woke.gone {
+                // A reset both fails the read and wakes the gone watch. Count it
+                // once: a second end would close the connection without `on_end`.
+                if woke.gone && !matches!(woke.read, Some(Err(_))) {
                     core.broken(Ended::Conn(ConnError::Reset));
                 }
             }
@@ -3208,6 +3229,7 @@ where
                 now: fcx.now(),
                 conn: info,
                 timers,
+                budget: opts.budget.as_ref(),
             };
             f(&mut driver)
         };

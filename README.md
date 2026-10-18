@@ -60,7 +60,7 @@ The crate is not on crates.io, so build it from this repository.
 A world's time and randomness come from one place, and its randomness from a
 seed. With real sandboxes it runs on real time. In a test it can run on
 simulated time instead, where the same seed and the same inputs give the same
-event log and the same packets, byte for byte
+event log and the same packets, byte for byte, including HTTP/2 reset expiry
 ([running a world](docs/guide/running.rs)).
 
 ## Try it
@@ -79,8 +79,8 @@ demo, what each one needs and shows, and how to make a demo of your own.
 
 Add `fictionet` to your Cargo dependencies. The default features are
 `std`, `tokio`, and `observe`. Set `default-features = false` for a closed
-simulated-time world, or enable `std` for host integration and HTTP/1.1.
-`tokio` adds HTTP/2 and runtime adapters. Enable `web-proxy` explicitly
+simulated-time world, or enable `std` for host integration, HTTP/1.1 and HTTP/2.
+`tokio` adds runtime adapters and axum WebSocket upgrades. Enable `web-proxy` explicitly
 for upstream HTTP/1.1 requests over host sockets and rustls; it requires
 `std` and works without tokio. See the [feature table](src/lib.rs)
 for the feature relationships. The crate still links Rust's standard library.

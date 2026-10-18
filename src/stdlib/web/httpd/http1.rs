@@ -12,7 +12,7 @@ use http_body::{Body as _, Frame};
 
 use fictionet::events::{ConnInfo, Fields};
 use fictionet::stdlib::ConnError;
-use fictionet::stdlib::codec::{Decode, Step};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::serve::{self, Driver, Ended, Flow, Pending, PendingDriver, Timer};
 use fictionet::time::Instant;
@@ -45,8 +45,8 @@ pub struct Http1 {
     opts: Limits,
     /// The world's date at the start of the run, for `Date` headers.
     pub(super) date: Option<SystemTime>,
-    /// The head of a request that asked for a protocol upgrade, as bytes,
-    /// once the connection is handed over for it.
+    /// A request handed to hyper ([`Reply::Handoff`]), as bytes, once the
+    /// connection is handed over for it.
     handoff: Option<Vec<u8>>,
     pub(super) upgrade: Option<UpgradeHandler>,
     head: Option<RequestHead>,
@@ -80,10 +80,10 @@ impl Http1 {
         }
     }
 
-    /// The head of the request that asked for a protocol upgrade, such as
-    /// a WebSocket handshake, after the service handed the connection back
-    /// for it ([`Upgrade::Handoff`](serve::Upgrade::Handoff)): its bytes,
-    /// to be read again in front of the connection's unread ones.
+    /// The request a handler handed off ([`Reply::Handoff`]), such as a
+    /// WebSocket handshake for axum, after the service handed the connection
+    /// back for it ([`Upgrade::Handoff`](serve::Upgrade::Handoff)): its head
+    /// and body as bytes, to be read again in front of the connection's unread ones.
     /// [`serve_connection`](super::serve_connection) serves such a
     /// connection on hyper's HTTP/1, which carries out the upgrade.
     pub fn take_handoff(&mut self) -> Option<Vec<u8>> {
@@ -120,9 +120,6 @@ impl Http1 {
         received: Received,
     ) {
         if let Some(mut tracker) = self.tracker.take() {
-            let buffered = driver.unread().len();
-            let len = driver.peek_decoder().pending_body_len(buffered);
-            tracker.body(&driver.unread()[..len]);
             tracker.received(received);
             if let Some(head) = &self.head
                 && let Some(request) = to_request(head, version_of(head), Body::empty())
@@ -212,6 +209,25 @@ impl Http1 {
         let (work, response) = match reply {
             Reply::Now(response) => (None, Some(response)),
             Reply::Later(work) => (Some(work), None),
+            Reply::Handoff(request) => {
+                // Hyper reads the request again, body included, in front of
+                // the bytes still unread.
+                if let Some(body) = request.body().bytes() {
+                    self.handoff = http1::Request {
+                        head,
+                        body: body.to_vec(),
+                    }
+                    .to_bytes()
+                    .ok();
+                    driver.cancel_timer(BODY);
+                    return Flow::Upgrade(serve::Upgrade::Handoff);
+                }
+                // A body that was cut off cannot be read again.
+                (
+                    None,
+                    Some(answered(status_only(StatusCode::BAD_REQUEST), "cut_off")),
+                )
+            }
         };
         driver.defer(
             Streaming::new(work, response, version, head_only, close, tracker)
@@ -234,28 +250,6 @@ impl Http1 {
         driver.set_timer(HEAD, self.opts.header_timeout);
         Flow::Continue
     }
-}
-
-fictionet::cfg_tokio! {
-/// Whether an HTTP/1.1 request asks to switch protocols (RFC 9110 section
-/// 7.8): it has an `Upgrade` field and names `upgrade` in `Connection`.
-fn asks_upgrade(head: &RequestHead) -> bool {
-    let has = |name: &str| {
-        head.headers
-            .iter()
-            .any(|h| h.name.eq_ignore_ascii_case(name))
-    };
-    let connection_upgrade = head.headers.iter().any(|h| {
-        h.name.eq_ignore_ascii_case("connection")
-            && h.value
-                .split(|b| *b == b',')
-                .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
-    });
-    head.version == http1::Version::Http11
-        && head.method != "CONNECT"
-        && has("upgrade")
-        && connection_upgrade
-}
 }
 
 /// The head at the start of `unread`, read with an empty Host field added
@@ -431,15 +425,6 @@ impl serve::Service for Http1 {
         match item {
             H1::Head(head) => {
                 driver.cancel_timer(HEAD);
-                fictionet::cfg_tokio! {
-                if asks_upgrade(&head) {
-                    let mut bytes = Vec::new();
-                    if fictionet::stdlib::codec::Wire::write(&head, &mut bytes).is_ok() {
-                        self.handoff = Some(bytes);
-                        return Ok(Flow::Upgrade(serve::Upgrade::Handoff));
-                    }
-                }
-                }
                 driver.set_timer(BODY, self.opts.body_timeout);
                 if head.expects_continue() {
                     driver
@@ -482,6 +467,11 @@ impl serve::Service for Http1 {
         };
         if let Some(detail) = detail {
             driver.record(error_event(driver.conn(), "timeout", detail.into()));
+        }
+        // The observer still sees the body bytes the decoder buffers.
+        if let Some(tracker) = &mut self.tracker {
+            let len = driver.peek_decoder().pending_body_len(driver.unread().len());
+            tracker.body(&driver.unread()[..len]);
         }
         self.finish_receipt(driver, Received::Timeout);
         Ok(Flow::Close)
@@ -584,6 +574,16 @@ impl serve::Service for Http1 {
         _: &(),
         driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<(), Infallible> {
+        // The client broke off inside a request head, as by a reset. A head
+        // cut off by the end of input fails the decoder and is logged there.
+        if let Ended::Conn(e) = end
+            && e != ConnError::Broken
+            && self.head.is_none()
+            && !driver.unread().is_empty()
+        {
+            let detail = format!("the connection ended inside a request head: {e}");
+            driver.record(error_event(driver.conn(), "protocol", detail));
+        }
         self.finish_receipt(
             driver,
             if end == Ended::Budget {

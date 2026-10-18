@@ -82,6 +82,13 @@ impl httpd::Handler for Http {
         ex: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
         if request.uri().path() == "/upgrade" {
+            if request
+                .extensions()
+                .get::<hyper::upgrade::OnUpgrade>()
+                .is_none()
+            {
+                return httpd::Reply::Handoff(request);
+            }
             let upgrade = hyper::upgrade::on(&mut request);
             return httpd::Reply::Later(Box::new(move |cx| {
                 Box::pin(async move {

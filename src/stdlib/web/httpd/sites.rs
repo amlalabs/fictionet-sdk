@@ -150,14 +150,16 @@ impl VirtualHosts {
     }
 
     fn site_or_default(&self, host: &str) -> Option<(VHost, Routing)> {
-        self.get(host).map(|site| (site, Routing::Exact)).or_else(|| {
-            self.inner
-                .default
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-                .map(|site| (site, Routing::Fallback))
-        })
+        self.get(host)
+            .map(|site| (site, Routing::Exact))
+            .or_else(|| {
+                self.inner
+                    .default
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .map(|site| (site, Routing::Fallback))
+            })
     }
 }
 
@@ -249,8 +251,7 @@ pub fn request_host<B>(request: &Request<B>) -> Option<String> {
 /// [`VirtualHosts`], and each request goes to the site its host names.
 /// Names and defaults belong to the local address and port where `Net`
 /// installed them. Sharing one address does not add sites at another.
-/// Over TLS, ALPN offers `h2` and `http/1.1` with `tokio`, or only
-/// `http/1.1` without it.
+/// Over TLS, ALPN offers `h2` and `http/1.1` with `std` alone.
 ///
 /// ```
 /// # use fictionet::stdlib::{httpd, net::Host};
@@ -398,11 +399,7 @@ impl PortServer for Server {
     }
 
     fn alpn(&self) -> Vec<Vec<u8>> {
-        fictionet::cfg_tokio!({
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        } else {
-            vec![b"http/1.1".to_vec()]
-        })
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     }
 
     fn prepare_share(

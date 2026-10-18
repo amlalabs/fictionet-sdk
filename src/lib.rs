@@ -276,8 +276,8 @@
 //!
 //! | Feature | What it gates | Implies | Default |
 //! |---|---|---|---|
-//! | `std` | Real clocks, OS entropy, world sockets, event files, timer threads, relay, and the HTTP stack | — | Yes |
-//! | `tokio` | Tokio adapters, HTTP/2, and hyper upgrades | `std` | Yes |
+//! | `std` | Real clocks, OS entropy, world sockets, event files, timer threads, relay, and native HTTP/1 and HTTP/2 servers | — | Yes |
+//! | `tokio` | Tokio adapters and axum upgrades | `std` | Yes |
 //! | `observe` | Observer sessions, TLS key capture, and built-in protocol presenters | `std` | Yes |
 //! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `std` | No |
 //!
@@ -290,8 +290,7 @@
 //! # In a browser
 //!
 //! The library also builds for `wasm32-unknown-unknown`, with
-//! `default-features = false, features = ["std"]` for HTTP/1.1, or
-//! `features = ["tokio"]` for HTTP/2 as in `examples/wasm_world`. A world
+//! `default-features = false, features = ["std"]` for HTTP/1.1 and HTTP/2. A world
 //! then runs inside a page: [`run`],
 //! [`Cx`] and its timers, [`block_on`], [`pair`], [`attachments`], the
 //! [`stdlib`] with smoltcp, DNS, `web::Sites` and TLS (rustls with the
@@ -304,10 +303,9 @@
 //! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
 //! from `setTimeout`. In a page, hand [`run`] to the event loop with
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
-//! timers. With `tokio`, two cases read `std`'s clock, which panics on
-//! this target. An HTTP/1 Upgrade request goes to hyper's
-//! HTTP/1 server, and an HTTP/2 stream that the world's side resets goes
-//! through h2's timer. `examples/wasm_world` runs DNS, HTTP/1.1, HTTP/2
+//! timers. Native HTTP/2 reset expiry uses the world clock. Opt-in axum
+//! upgrades still use hyper, whose internal clock is unavailable on this
+//! target. `examples/wasm_world` runs DNS, HTTP/1.1, HTTP/2
 //! and HTTPS through a world in Node.js.
 
 #![warn(missing_docs)]

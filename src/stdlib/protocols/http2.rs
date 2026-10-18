@@ -2,9 +2,8 @@
 //!
 //! `Frame` implements `Wire`, `Inputs` decodes the stream, and `Session` tracks
 //! one direction rather than a whole client or server. This module has no
-//! `Service` or live transport. HTTP/2 serving uses hyper through
-//! `fictionet::stdlib::httpd`. The observe presenter uses this frame layer
-//! independently of that server.
+//! `Service` or live transport. The native server in
+//! `fictionet::stdlib::httpd` and the observe presenter share this frame layer.
 //!
 //! Use [`Session`] for strict decoding. A capture reads frames with
 //! [`Inputs::for_observation`] and header blocks with
@@ -471,6 +470,11 @@ fn setting_valid(s: Setting) -> Result<(), Error> {
 }
 impl Frame {
     fn parse_payload(h: FrameHeader, b: &[u8]) -> Result<Self, Error> {
+        Self::parse_payload_for(h, b, false)
+    }
+    /// With `stream_errors`, a HEADERS frame that depends on itself parses, so a
+    /// server can decode its header block before it resets the stream.
+    fn parse_payload_for(h: FrameHeader, b: &[u8], stream_errors: bool) -> Result<Self, Error> {
         h.validate()?;
         if b.len() != h.length {
             return Err(size("payload length does not match header"));
@@ -490,7 +494,7 @@ impl Frame {
                 let payload = HeaderPayload::parse(b, h.kind, flags)?;
                 let priority = if flags & 0x20 != 0 {
                     let p = dependency(payload.fields)?;
-                    if p.stream == stream {
+                    if p.stream == stream && !stream_errors {
                         return Err(protocol("stream depends on itself"));
                     }
                     Some(p)
@@ -821,6 +825,7 @@ pub struct Inputs {
     limit: usize,
     preface: u8,
     capture: bool,
+    stream_errors: bool,
     skip: usize,
 }
 impl Default for Inputs {
@@ -836,6 +841,7 @@ impl Inputs {
             limit: limit.min(MAX_FRAME_SIZE),
             preface: 0,
             capture: false,
+            stream_errors: false,
             skip: 0,
         }
     }
@@ -844,6 +850,16 @@ impl Inputs {
         Self {
             preface: 1,
             ..Self::with_limit(limit)
+        }
+    }
+    /// Requires the client preface and reports recoverable stream errors as
+    /// [`Input::Refused`], so a server can reset a stream and continue reading.
+    /// A HEADERS frame that depends on itself comes as a frame, for the server
+    /// to decode its header block and then reset the stream.
+    pub fn for_server(limit: usize) -> Self {
+        Self {
+            stream_errors: true,
+            ..Self::client_side(limit)
         }
     }
     /// Enables capture policy: accepts an optional preface, reports bad
@@ -922,14 +938,30 @@ impl Decode for Inputs {
                 HEADER_LEN,
             ));
         }
-        if !self.capture {
+        // A PRIORITY frame of the wrong length is a stream error (RFC 9113
+        // section 6.3), so a server checks its length with the payload.
+        if !self.capture && !(self.stream_errors && header.kind == 2 && header.stream != 0) {
             header.validate()?;
         }
         let Some(bytes) = input.get(..total) else {
             return Ok(Step::Need);
         };
-        let item = match Frame::parse_payload(header, &bytes[HEADER_LEN..]) {
+        let item = match Frame::parse_payload_for(header, &bytes[HEADER_LEN..], self.stream_errors)
+        {
             Ok(frame) => Input::Frame(frame),
+            Err(error)
+                if self.stream_errors
+                    && header.stream != 0
+                    && matches!(header.kind, 2 | 8)
+                    && (error.code == ErrorCode::ProtocolError
+                        || (header.kind == 2 && error.code == ErrorCode::FrameSizeError)) =>
+            {
+                Input::Refused {
+                    header,
+                    error,
+                    oversized: false,
+                }
+            }
             Err(error) if self.capture => Input::Refused {
                 header,
                 error,
@@ -1173,8 +1205,18 @@ pub struct HeaderBlocks {
     limit: usize,
     decoded: usize,
     capture: bool,
+    reject_large_list: bool,
 }
 impl HeaderBlocks {
+    /// Strict header assembly with bounded encoded and decoded storage.
+    /// Oversized lists retain HPACK synchronization and set [`hpack::Block::more`].
+    /// The caller must reject that stream before using its partial headers.
+    pub fn with_limits(limits: Limits) -> Self {
+        Self {
+            reject_large_list: false,
+            ..Self::new(limits.bounded(), false)
+        }
+    }
     fn new(limits: Limits, capture: bool) -> Self {
         Self {
             table: if capture {
@@ -1186,6 +1228,7 @@ impl HeaderBlocks {
             limit: limits.header_block,
             decoded: limits.header_list,
             capture,
+            reject_large_list: !capture,
         }
     }
     /// Reads a capture with the default [`Limits`]: an HPACK table that
@@ -1207,6 +1250,21 @@ impl HeaderBlocks {
                 .and_then(|p| p.bytes.as_ref())
                 .map_or(0, Vec::len),
         )
+    }
+    /// The table's settings bound, or its storage when that is larger or
+    /// unbounded, plus allocated fragment storage, including spare capacity.
+    /// The bound keeps the charge for an idle connection constant.
+    pub fn allocated(&self) -> usize {
+        let table = self.table.held();
+        self.table
+            .settings_limit()
+            .map_or(table, |limit| limit.max(table))
+            .saturating_add(
+                self.pending
+                    .as_ref()
+                    .and_then(|p| p.bytes.as_ref())
+                    .map_or(0, Vec::capacity),
+            )
     }
     /// Whether a header block waits for its CONTINUATION.
     pub fn pending(&self) -> bool {
@@ -1240,6 +1298,11 @@ impl HeaderBlocks {
         };
         self.read_fragment(h, fragment)
     }
+    /// Reads a frame already validated by the shared frame decoder.
+    pub fn read_frame(&mut self, frame: &Frame) -> Result<BlockRead, Error> {
+        self.read_parsed(frame.header(0), frame)
+    }
+
     fn read_parsed(&mut self, h: FrameHeader, frame: &Frame) -> Result<BlockRead, Error> {
         let fragment = match frame {
             Frame::Headers(f) => Some(HeaderFragment {
@@ -1368,7 +1431,7 @@ impl HeaderBlocks {
         }
         match self.table.decode_block(bytes, self.decoded) {
             Ok(block) => {
-                if !self.capture && block.more != 0 {
+                if self.reject_large_list && block.more != 0 {
                     return Err(budget("decoded header list exceeds limit"));
                 }
                 out.promised = p.promised;
