@@ -703,7 +703,8 @@ are matched without case or a trailing dot. `Net` itself knows nothing of
 HTTP, so a copy of `httpd` with its own handlers plugs in the same way.
 Copy `src/stdlib/web/httpd.rs` together with `src/stdlib/web/httpd/`, keeping the
 relative paths. Each serving engine has its own file there: `http1.rs` for
-native HTTP/1, and `hyper.rs` for HTTP/2 and upgrades on hyper.
+native HTTP/1, `http2.rs` for native HTTP/2, and `hyper.rs` for the tower
+upgrades that the opt-in `tokio` feature hands to hyper.
 
 Each routed request carries an `httpd::Target`. Its `routing` field is
 `Routing::Exact` when the requested host matches a registered name, or
@@ -722,11 +723,11 @@ threads handle upstream HTTP/1.1 and rustls, reusing completed connections.
 Both tower services return streaming `httpd::Body` responses. `Proxy` can
 also answer with a local rejection.
 
-`Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. HTTP/2
-runs on hyper, behind the same `Handler` trait. The stdlib's `http2`
-module reads and writes HTTP/2 frames and tracks a session's state, but it
-does not serve. Both versions share one set of `httpd::Limits`: body size,
-body and write timers, and 100 streams at once on an HTTP/2 connection.
+`Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. `Http2`
+serves HTTP/2 on the stdlib's `http2` frames and HPACK, behind the same
+`Handler` trait. Both need only `std`. Both versions share one set of
+`httpd::Limits`: body size, body and write timers, and 100 streams at once
+on an HTTP/2 connection.
 Both charge retained request heads, request events and bodies to the sandbox's
 budget. A pending handler keeps its request charge. The copied event metadata
 stays charged until the event is recorded, including while the response streams.

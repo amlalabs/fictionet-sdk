@@ -195,9 +195,9 @@
 //!
 //! [`http1`](super::http1) supplies wire values and decoders. With `std`,
 //! `httpd::Http1` supplies the service and `httpd::serve_connection` drives
-//! it. With `tokio`, that driver uses hyper for HTTP/2 and HTTP/1 upgrade
-//! handoffs. The service also supports explicit `httpd::UpgradeHandler`
-//! continuations without `tokio`; see the `httpd` module docs.
+//! it. With `tokio`, that driver hands tower HTTP/1 upgrades to hyper. The
+//! service also supports explicit `httpd::UpgradeHandler` continuations
+//! without `tokio`; see the `httpd` module docs.
 //!
 //! HTTP/1 capture uses [`RequestHead::parse_lenient`](super::http1::RequestHead::parse_lenient)
 //! to check syntax without endpoint framing rules, and frames bodies in

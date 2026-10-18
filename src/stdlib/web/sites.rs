@@ -857,8 +857,8 @@ impl Site {
     /// returns the TLS config to use, so it can choose differently each time,
     /// with randomness from `fcx`. For one config, use [`tls`](Self::tls).
     ///
-    /// `start` replaces the ALPN list with `http/1.1` and, when the
-    /// `tokio` feature is enabled, `h2`, so the config does not need one.
+    /// `start` replaces the ALPN list with `h2` and `http/1.1`, so the
+    /// config does not need one.
     pub fn tls_with<F>(self, config_for: F) -> Site
     where
         F: Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,

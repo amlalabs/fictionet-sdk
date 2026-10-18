@@ -181,7 +181,6 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
- "hyper-util",
  "rustls",
  "serde_json",
  "tokio",

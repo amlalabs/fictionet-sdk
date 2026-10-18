@@ -13,19 +13,22 @@ pub mod done;
 pub mod echo_service;
 #[cfg(feature = "std")]
 pub mod http_observer;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 #[path = "../../../examples/common/hyper.rs"]
 pub mod hyper_io;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 pub mod io;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 pub mod pattern;
 #[cfg(feature = "std")]
 #[path = "../../common/poll.rs"]
 pub mod poll;
-#[cfg(all(feature = "std", feature = "tokio"))]
-pub mod rustls_client;
 #[cfg(feature = "std")]
+pub mod rustls_client;
+// Only the observer tests call `temp::socket`. The command's tests share
+// the file and have no `observe` feature, so it cannot be gated inside.
+#[cfg(feature = "std")]
+#[cfg_attr(not(feature = "observe"), allow(dead_code))]
 #[path = "../../common/temp.rs"]
 pub mod temp;
 #[cfg(feature = "std")]

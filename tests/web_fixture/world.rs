@@ -110,7 +110,7 @@ mod tests {
     //! (`tests/web_fixture/golden.txt`): DNS answers, and the status, the
     //! headers that matter and the body of each request.
     //!
-    //! `WEB_FIXTURE_GOLDEN_WRITE=1 cargo test --features web-proxy --example web_fixture` records it
+    //! `WEB_FIXTURE_GOLDEN_WRITE=1 cargo test --features web-proxy,tokio --example web_fixture` records it
     //! again.
 
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};

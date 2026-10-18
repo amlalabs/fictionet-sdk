@@ -17,9 +17,9 @@ mod core;
 mod dashboard_js;
 mod datagrams_codec;
 mod db_codec;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 mod determinism;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 mod e2e;
 #[cfg(feature = "std")]
 mod entropy;
@@ -37,7 +37,6 @@ mod h3_codec;
 mod handoff_codec;
 mod hpack_codec;
 mod http1;
-#[cfg(feature = "tokio")]
 mod http2_grpc;
 #[cfg(feature = "std")]
 mod http2_server;
@@ -53,9 +52,9 @@ mod listen;
 mod mail_codec;
 mod media_codec;
 mod messaging_codec;
-#[cfg(all(feature = "std", feature = "tokio", feature = "observe"))]
+#[cfg(all(feature = "std", feature = "observe"))]
 mod observe;
-#[cfg(all(feature = "tokio", feature = "observe"))]
+#[cfg(feature = "observe")]
 mod observe_http2;
 #[cfg(all(feature = "std", feature = "observe"))]
 mod observe_present;
@@ -77,25 +76,25 @@ mod sbe_codegen;
 mod serve_cancellation;
 mod serve_decoder;
 mod serve_harness;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 mod serve_limits;
-#[cfg(all(feature = "std", feature = "tokio", feature = "observe"))]
+#[cfg(all(feature = "std", feature = "observe"))]
 mod services;
 mod sse_codec;
 mod streams_codec;
 #[cfg(feature = "std")]
 mod stress;
 mod tcp_reassembly;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 mod tcpudp;
 mod text_codec;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 mod tls;
 #[cfg(feature = "std")]
 mod tls_determinism;
 #[cfg(feature = "std")]
 mod tls_write_cancellation;
-#[cfg(all(feature = "std", feature = "tokio"))]
+#[cfg(feature = "std")]
 mod web;
 mod wire_codec;
 mod writer_allocation;

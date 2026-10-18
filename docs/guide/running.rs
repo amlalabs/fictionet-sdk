@@ -223,7 +223,10 @@
 //! [`block_on`](crate::block_on) is not a tokio runtime. A world that uses
 //! a tokio-based library such as a database client polls `run` on a tokio
 //! runtime instead. Upstream requests with `web-proxy` work with either
-//! executor. Steps
+//! executor. A world runs on a tokio runtime without Fictionet's `tokio`
+//! feature. One that hands a connection to a library built on tokio's I/O
+//! traits, such as hyper, enables that opt-in feature for
+//! [`into_tokio`](crate::tokio::ConnectionTokioExt::into_tokio). Steps
 //! 1 to 3 stay the same. The `web_world` example does this:
 //!
 //! ```no_run

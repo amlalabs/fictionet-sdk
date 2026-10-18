@@ -1088,8 +1088,8 @@ where
 }
 
 /// Every wait of the serving stack reports a cancel the one way: an
-/// accept, `serve`, `datagram`, `httpd::serve_connection`, and a
-/// connection read through tokio's traits.
+/// accept, `serve`, `datagram`, `httpd::serve_connection`, and, with the
+/// `tokio` feature, a connection read through tokio's traits.
 #[test]
 fn every_serving_wait_reports_a_cancel() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -1164,26 +1164,29 @@ fn every_serving_wait_reports_a_cancel() {
 
         // A read through tokio's traits fails with an I/O error whose
         // source is the connection's cancel, of a kind std does not retry.
-        let mut listener = server.listen(9)?;
-        let _c3 = client
-            .connect(&fcx, SocketAddr::new(SERVER.into(), 9))
-            .await?;
-        let conn = listener.accept(&fcx).await?;
-        let got = after_a_cancel(&fcx, |region_fcx| async move {
-            use tokio::io::AsyncReadExt;
-            let mut io = conn.into_tokio(&region_fcx);
-            let mut buf = [0; 8];
-            match io.read(&mut buf).await {
-                Ok(n) => format!("read {n}"),
-                Err(e) => format!(
-                    "{:?} {:?}",
-                    e.kind(),
-                    e.get_ref().and_then(|e| e.downcast_ref::<ConnError>())
-                ),
-            }
-        })
-        .await;
-        assert_eq!(got, "\"Other Some(Cancelled)\"");
+        #[cfg(feature = "tokio")]
+        {
+            let mut listener = server.listen(9)?;
+            let _c3 = client
+                .connect(&fcx, SocketAddr::new(SERVER.into(), 9))
+                .await?;
+            let conn = listener.accept(&fcx).await?;
+            let got = after_a_cancel(&fcx, |region_fcx| async move {
+                use tokio::io::AsyncReadExt;
+                let mut io = conn.into_tokio(&region_fcx);
+                let mut buf = [0; 8];
+                match io.read(&mut buf).await {
+                    Ok(n) => format!("read {n}"),
+                    Err(e) => format!(
+                        "{:?} {:?}",
+                        e.kind(),
+                        e.get_ref().and_then(|e| e.downcast_ref::<ConnError>())
+                    ),
+                }
+            })
+            .await;
+            assert_eq!(got, "\"Other Some(Cancelled)\"");
+        }
         Ok(())
     });
 }

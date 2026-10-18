@@ -277,10 +277,11 @@
 //! | Feature | What it gates | Implies | Default |
 //! |---|---|---|---|
 //! | `std` | Real clocks, OS entropy, world sockets, event files, timer threads, relay, and native HTTP/1 and HTTP/2 servers | — | Yes |
-//! | `tokio` | Tokio adapters and axum upgrades | `std` | Yes |
+//! | `tokio` | Tokio adapters and axum upgrades | `std` | No |
 //! | `observe` | Observer sessions, TLS key capture, and built-in protocol presenters | `std` | Yes |
 //! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `std` | No |
 //!
+//! The default features build without tokio, hyper or h2.
 //! Disabling default features leaves the simulated-time executor, seeded
 //! randomness, packet links, and protocol codecs. The crate still links
 //! the Rust standard library; this is not a `no_std` build. Mutexes use a

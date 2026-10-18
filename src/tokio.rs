@@ -6,7 +6,7 @@
 //! [`Connection`] trait is not tied to any runtime. Calling
 //! [`into_tokio`](ConnectionTokioExt::into_tokio) on a connection wraps it
 //! in a [`Compat`], which implements tokio's traits. Nothing in the core
-//! depends on this module.
+//! depends on this module, which the opt-in `tokio` feature turns on.
 //!
 //! A library that spawns tasks or sets timers on tokio needs the world to
 //! run on a tokio runtime: [`block_on`](crate::block_on) is not one. Await

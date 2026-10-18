@@ -29,11 +29,11 @@ use fictionet::stdlib::httpd::{
 use fictionet::stdlib::json;
 use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeOptions};
 use fictionet::stdlib::{Connection, ConnectionExt, hpack, http1, http2, ip, tcp};
-use fictionet::tokio::ConnectionTokioExt;
 use fictionet::{Cx, pair};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 use http_observer::{Exposure, SECRET, assert_redacted};
+use hyper_util::rt::TokioIo;
 
 fn idle_http2_budget(budget: &Budget) {
     assert_eq!(budget.used(), H2_INPUT);
@@ -73,7 +73,11 @@ async fn hyper_exposure(
     let conn = client
         .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
         .await?;
-    let (mut send, driving) = h2::client::handshake(conn.into_tokio(&fcx)).await?;
+    let (mut send, driving) = h2::client::handshake(TokioIo::new(Io {
+        fcx: fcx.clone(),
+        conn,
+    }))
+    .await?;
     fcx.spawn(move |_| async move {
         driving.await?;
         Ok(())
@@ -269,7 +273,11 @@ fn observer_sees_metadata_budget_rejection() {
         let conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
             .await?;
-        let (mut send, driving) = h2::client::handshake(conn.into_tokio(&fcx)).await?;
+        let (mut send, driving) = h2::client::handshake(TokioIo::new(Io {
+            fcx: fcx.clone(),
+            conn,
+        }))
+        .await?;
         fcx.spawn(move |_| async move {
             driving.await?;
             Ok(())
@@ -310,7 +318,11 @@ fn observer_keeps_concurrent_request_identity() {
         let conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
             .await?;
-        let (mut send, driving) = h2::client::handshake(conn.into_tokio(&fcx)).await?;
+        let (mut send, driving) = h2::client::handshake(TokioIo::new(Io {
+            fcx: fcx.clone(),
+            conn,
+        }))
+        .await?;
         fcx.spawn(move |_| async move {
             driving.await?;
             Ok(())
@@ -657,7 +669,13 @@ fn response_policy_agrees_across_native_and_hyper() {
                     ..HttpOptions::default()
                 },
             )?;
-            for backend in ["native", "upgrade", "h2"] {
+            // Only the `tokio` feature hands upgrade requests to hyper.
+            let backends: &[&str] = if cfg!(feature = "tokio") {
+                &["native", "upgrade", "h2"]
+            } else {
+                &["native", "h2"]
+            };
+            for &backend in backends {
                 // Method, status, unknown size, supplied length, wire lengths
                 // (native HTTP/1, hyper HTTP/1, HTTP/2), and received body.
                 for (method, status, unknown, given, lengths, body) in [
@@ -1438,7 +1456,9 @@ async fn keep_alive_response(fcx: &Cx, conn: &mut impl Connection) -> http1::Res
     io::response(&bytes, "GET", false)
 }
 
-/// Requires a successful keep-alive request before rejecting an over-long header.
+/// Requires a successful keep-alive request before rejecting an over-long
+/// header, on hyper's upgrade path.
+#[cfg(feature = "tokio")]
 async fn upgrade_keep_alive_line_limit(fcx: &Cx) -> fictionet::Result {
     let (server, client) = two_machines(fcx);
     let opts = HttpOptions {
@@ -1502,6 +1522,7 @@ async fn upgrade_keep_alive_line_limit(fcx: &Cx) -> fictionet::Result {
     Ok(())
 }
 
+#[cfg(feature = "tokio")]
 #[test]
 fn upgrade_keep_alive_preserves_line_limits() {
     world(Duration::from_secs(10), |fcx| async move {
@@ -1509,6 +1530,7 @@ fn upgrade_keep_alive_preserves_line_limits() {
     });
 }
 
+#[cfg(feature = "tokio")]
 #[test]
 fn upgrade_keep_alive_line_limit_rejection_records_protocol_error() {
     world(Duration::from_secs(10), |fcx| async move {

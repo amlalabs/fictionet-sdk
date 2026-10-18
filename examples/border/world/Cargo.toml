@@ -25,6 +25,5 @@ tower-service = "0.3"
 
 [dev-dependencies]
 hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

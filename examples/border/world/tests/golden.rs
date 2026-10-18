@@ -56,7 +56,10 @@ async fn h2_head(
         .unwrap();
     let (mut send, conn) = hyper::client::conn::http2::handshake(
         Spawn,
-        hyper_util::rt::TokioIo::new(stream.into_tokio(fcx)),
+        Io {
+            fcx: fcx.clone(),
+            conn: stream,
+        },
     )
     .await
     .unwrap();

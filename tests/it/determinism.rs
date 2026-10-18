@@ -1,5 +1,7 @@
 //! The same closed world repeats its event bytes and every agent packet.
 
+use crate::common::hyper_io::Io;
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -22,6 +24,7 @@ use fictionet::stdlib::{Connection, delay, filter, httpd, tls};
 use fictionet::{Cx, Seed, block_on, lab};
 use http::{Request, Response};
 use http_body::Frame;
+use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 const DATE: u64 = 1_893_456_000;
 
@@ -74,39 +77,60 @@ impl http_body::Body for BrokenBody {
     }
 }
 
+/// Switches `/upgrade` to a protocol that sends `upgraded\n`: through
+/// hyper's upgrade with the `tokio` feature.
+#[cfg(feature = "tokio")]
+fn upgrade(mut request: Request<httpd::Body>) -> httpd::Reply {
+    if request
+        .extensions()
+        .get::<hyper::upgrade::OnUpgrade>()
+        .is_none()
+    {
+        return httpd::Reply::Handoff(request);
+    }
+    let upgrade = hyper::upgrade::on(&mut request);
+    httpd::Reply::Later(Box::new(move |cx| {
+        Box::pin(async move {
+            cx.spawn(move |_| async move {
+                let mut io = upgrade.await?;
+                std::future::poll_fn(|cx| {
+                    hyper::rt::Write::poll_write(Pin::new(&mut io), cx, b"upgraded\n")
+                })
+                .await?;
+                Ok(())
+            });
+            Ok(Response::builder()
+                .status(101)
+                .header("connection", "upgrade")
+                .header("upgrade", "echo")
+                .body(httpd::Body::empty())?)
+        })
+    }))
+}
+
+/// Switches `/upgrade` to a protocol that sends `upgraded\n`: through the
+/// native server's upgrade without the `tokio` feature.
+#[cfg(not(feature = "tokio"))]
+fn upgrade(_: Request<httpd::Body>) -> httpd::Reply {
+    let mut response = Response::builder()
+        .status(101)
+        .header("connection", "upgrade")
+        .header("upgrade", "echo")
+        .body(httpd::Body::empty())
+        .unwrap();
+    response
+        .extensions_mut()
+        .insert(httpd::UpgradeHandler::new(|cx, mut conn| async move {
+            let _ = conn.write_all(&cx, b"upgraded\n").await;
+        }));
+    httpd::Reply::Now(response)
+}
+
 struct Http;
 impl httpd::Handler for Http {
-    fn call(
-        &self,
-        mut request: Request<httpd::Body>,
-        ex: &mut httpd::Exchange<'_>,
-    ) -> httpd::Reply {
+    fn call(&self, request: Request<httpd::Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
         if request.uri().path() == "/upgrade" {
-            if request
-                .extensions()
-                .get::<hyper::upgrade::OnUpgrade>()
-                .is_none()
-            {
-                return httpd::Reply::Handoff(request);
-            }
-            let upgrade = hyper::upgrade::on(&mut request);
-            return httpd::Reply::Later(Box::new(move |cx| {
-                Box::pin(async move {
-                    cx.spawn(move |_| async move {
-                        let mut io = upgrade.await?;
-                        std::future::poll_fn(|cx| {
-                            hyper::rt::Write::poll_write(Pin::new(&mut io), cx, b"upgraded\n")
-                        })
-                        .await?;
-                        Ok(())
-                    });
-                    Ok(Response::builder()
-                        .status(101)
-                        .header("connection", "upgrade")
-                        .header("upgrade", "echo")
-                        .body(httpd::Body::empty())?)
-                })
-            }));
+            return upgrade(request);
         }
         if request.uri().path() == "/reset" {
             return httpd::Reply::Now(Response::new(httpd::Body::new(BrokenBody)));
@@ -265,7 +289,11 @@ async fn episode(
         )?;
         secure.handshake(&cx).await.unwrap();
         if h2 {
-            let (mut sender, connection) = h2::client::handshake(secure.into_tokio(&cx)).await?;
+            let (mut sender, connection) = h2::client::handshake(TokioIo::new(Io {
+                fcx: cx.clone(),
+                conn: secure,
+            }))
+            .await?;
             cx.spawn(move |_| async move {
                 let _ = connection.await;
                 Ok(())

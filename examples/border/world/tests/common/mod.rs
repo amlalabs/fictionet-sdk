@@ -23,6 +23,10 @@ use rustls::RootCertStore;
 mod harness;
 pub use harness::*;
 
+#[path = "../../../../common/hyper.rs"]
+mod hyper_io;
+pub use hyper_io::Io;
+
 /// What a test gets.
 pub struct Env {
     /// The roots the agent trusts: the world's CA.

@@ -68,7 +68,7 @@ pub trait DatagramSocket: Send + 'static {
 ///
 /// For libraries that expect tokio's `AsyncRead` and `AsyncWrite`, such as
 /// hyper and axum, call `conn.into_tokio(&fcx)` from the `fictionet::tokio`
-/// module.
+/// module, which the opt-in `tokio` feature turns on.
 ///
 /// A connection knows nothing about addresses. To see who connected, ask
 /// the TCP connection underneath:

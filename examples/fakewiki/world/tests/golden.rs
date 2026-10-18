@@ -18,7 +18,6 @@ use fakewiki_world::content::Content;
 use fakewiki_world::log::Log;
 use fakewiki_world::{Args, issue_leaves, serve, start_backend};
 use fictionet::Cx;
-use fictionet::prelude::*;
 use fictionet::stdlib::dns::rr::RecordType;
 use serde_json::Value;
 
@@ -34,7 +33,7 @@ async fn lookup(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) {
 /// One HTTP/1.1 request; returns the status.
 async fn get<C: fictionet::stdlib::Connection>(
     fcx: &Cx,
-    io: fictionet::tokio::Compat<C>,
+    mut io: C,
     method: &str,
     host: &str,
     path: &str,
@@ -45,9 +44,7 @@ async fn get<C: fictionet::stdlib::Connection>(
             .as_bytes(),
     )
     .unwrap();
-    let response = sandbox::request(fcx, &mut io.into_inner(), &request)
-        .await
-        .unwrap();
+    let response = sandbox::request(fcx, &mut io, &request).await.unwrap();
     if (300..400).contains(&response.head.status) {
         assert!(
             response
@@ -65,11 +62,7 @@ async fn tls(
     m: &Machine,
     addr: Ipv4Addr,
     sni: &str,
-) -> std::io::Result<
-    fictionet::tokio::Compat<
-        fictionet::stdlib::sandbox::TlsClient<fictionet::stdlib::tcp::TcpConnection>,
-    >,
-> {
+) -> std::io::Result<fictionet::stdlib::sandbox::TlsClient<fictionet::stdlib::tcp::TcpConnection>> {
     m.tls(
         fcx,
         SocketAddr::new(addr.into(), 443),
@@ -78,7 +71,6 @@ async fn tls(
         std::time::SystemTime::now(),
     )
     .await
-    .map(|conn| conn.into_tokio(fcx))
     .map_err(std::io::Error::other)
 }
 
@@ -186,14 +178,7 @@ fn the_log_is_the_recorded_one() {
                     .await
                     .unwrap();
                 assert_eq!(
-                    get(
-                        &fcx,
-                        conn.into_tokio(&fcx),
-                        "GET",
-                        "en.wikipedia.org",
-                        "/wiki/X"
-                    )
-                    .await,
+                    get(&fcx, conn, "GET", "en.wikipedia.org", "/wiki/X").await,
                     301
                 );
                 // A name the world does not serve.

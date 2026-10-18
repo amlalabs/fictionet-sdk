@@ -1,9 +1,7 @@
 //! TCP and UDP endpoints, two machines joined by a `pair()` cable.
 
-use crate::common::done;
 use crate::common::world;
 
-use done::Done;
 use world::world;
 
 use std::future::poll_fn;
@@ -18,7 +16,7 @@ use fictionet::stdlib::ip::{
 };
 use fictionet::stdlib::test_support::thread_cpu_time;
 use fictionet::stdlib::{ConnError, Connection, tcp, udp};
-use fictionet::{Cx, Interface, Packet, RecvError, pair, run};
+use fictionet::{Cx, Interface, Packet, RecvError, pair};
 
 const A: &str = "10.0.0.1";
 const B: &str = "10.0.0.2";
@@ -860,8 +858,11 @@ fn tcp_syn(src: IpAddr, sport: u16, dst: IpAddr, dport: u16) -> Packet {
 /// tasks on other threads while a tokio runtime polls the run. It has no
 /// wall-clock limit of its own, so a loaded machine cannot fail it;
 /// nextest's slow-timeout (`.config/nextest.toml`) stops a run that hangs.
+#[cfg(feature = "tokio")]
 #[test]
 fn tcp_through_tokio_io() {
+    use crate::common::done::Done;
+    use fictionet::run;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

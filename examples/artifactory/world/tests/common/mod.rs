@@ -23,6 +23,9 @@ use serde_json::Value;
 mod harness;
 pub use harness::*;
 
+#[path = "../../../../common/hyper.rs"]
+pub mod hyper_io;
+
 /// What a test gets.
 pub struct Env {
     /// The roots the agent trusts: the world's CA.

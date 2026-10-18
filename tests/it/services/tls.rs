@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::stdlib::sandbox::TlsClient;
 
 // ---------------------------------------------------------------------------
 // TLS by name
@@ -87,12 +88,7 @@ fn net_routes_tls_by_name_to_each_service() {
             Ok(Flow::Continue)
         }
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let result = rt.block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
+    let result = block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
         let (config, roots) = tls_pair(&fcx, &["a.test", "b.test"]);
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
@@ -108,41 +104,21 @@ fn net_routes_tls_by_name_to_each_service() {
             )
             .start(&fcx, attachments)?;
         let s = machine(&fcx, attacher.attach("agent")?, ME);
-        let connect = |name: &'static str| {
-            let roots = roots.clone();
-            let s = &s;
-            let fcx = &fcx;
-            async move {
-                let tcp = s
-                    .tcp
-                    .connect(fcx, SocketAddr::new(addr.into(), 6514))
-                    .await
-                    .map_err(std::io::Error::other)?;
-                let client = rustls::ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-                tokio_rustls::TlsConnector::from(Arc::new(client))
-                    .connect(
-                        rustls::pki_types::ServerName::try_from(name).unwrap(),
-                        tcp.into_tokio(fcx),
-                    )
-                    .await
-            }
-        };
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut a = connect("a.test").await?;
+        let to = SocketAddr::new(addr.into(), 6514);
+        let start = std::time::SystemTime::now();
+        let mut a = s.tls(&fcx, to, "a.test", Some(&roots), start).await?;
         let mut buf = [0u8; 64];
-        let n = a.read(&mut buf).await?;
+        let n = a.read(&fcx, &mut buf).await?;
         assert_eq!(&buf[..n], b"hello\n");
-        let mut b = connect("b.test").await?;
-        b.write_all(b"shout\n").await?;
-        let n = b.read(&mut buf).await?;
+        let mut b = s.tls(&fcx, to, "b.test", Some(&roots), start).await?;
+        b.write_all(&fcx, b"shout\n").await?;
+        let n = b.read(&fcx, &mut buf).await?;
         assert_eq!(&buf[..n], b"SHOUT\n");
-        assert!(connect("c.test").await.is_err());
+        assert!(
+            s.tls(&fcx, to, "c.test", Some(&roots), start)
+                .await
+                .is_err()
+        );
         let tls = kept
             .wait(&fcx, 3, Duration::from_secs(2), |e| {
                 e.is("tls", "handshake")
@@ -231,12 +207,7 @@ fn the_harness_resumes_after_starttls() {
 
 #[test]
 fn net_performs_starttls_for_a_service_that_asks() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let result = rt.block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
+    let result = block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
         let (config, roots) = tls_pair(&fcx, &["mail.test"]);
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
@@ -261,23 +232,18 @@ fn net_performs_starttls_for_a_service_that_asks() {
         assert_eq!(read_some(&fcx, &mut tcp, 16).await, b"220 mail ready\r\n");
         tcp.write_all(&fcx, b"STARTTLS\r\n").await?;
         assert_eq!(read_some(&fcx, &mut tcp, 14).await, b"220 go ahead\r\n");
-        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
-            .connect(
-                rustls::pki_types::ServerName::try_from("mail.test").unwrap(),
-                tcp.into_tokio(&fcx),
-            )
-            .await?;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        tls.write_all(b"EHLO\r\n").await?;
+        let mut tls = TlsClient::new(
+            &fcx,
+            tcp,
+            &roots,
+            "mail.test",
+            &[],
+            std::time::SystemTime::now(),
+        )?;
+        tls.handshake(&fcx).await?;
+        tls.write_all(&fcx, b"EHLO\r\n").await?;
         let mut buf = [0u8; 128];
-        let n = tls.read(&mut buf).await?;
+        let n = tls.read(&fcx, &mut buf).await?;
         assert_eq!(&buf[..n], b"250 hello tls=true sni=mail.test\r\n");
         let handshakes = kept
             .wait(&fcx, 1, Duration::from_secs(2), |e| {

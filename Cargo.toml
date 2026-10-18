@@ -36,7 +36,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["std", "tokio", "observe"]
+default = ["std", "observe"]
 observe = ["std"]
 std = ["dep:libc", "dep:http", "dep:http-body", "dep:tower-service"]
 tokio = ["std", "dep:tokio", "dep:hyper"]
@@ -88,7 +88,7 @@ http-body-util = "0.1"
 fictionet-codegen = { path = "codegen" }
 fictionet-copy-modules = { path = "tests/copy_and_own" }
 axum = { version = "0.8", default-features = false, features = ["ws"] }
-hyper = { version = "1.11.1", features = ["client", "http2"] }
+hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }
 etherparse = "0.21"
 libc = "0.2.189"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
@@ -123,12 +123,12 @@ required-features = ["std"]
 [[bench]]
 name = "network"
 harness = false
-required-features = ["std", "tokio", "observe"]
+required-features = ["std", "observe"]
 
 [[bench]]
 name = "runtime"
 harness = false
-required-features = ["std", "tokio", "observe"]
+required-features = ["std", "observe"]
 
 [[bench]]
 name = "decoders"

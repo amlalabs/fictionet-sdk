@@ -29,7 +29,7 @@ divan = "0.1.21"
 etherparse = "0.21"
 http = "1.5.0"
 http-body-util = "0.1"
-hyper = { version = "1.11.1", features = ["client"] }
+hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio = { version = "1", features = ["macros"] }
 tower-service = "0.3.3"

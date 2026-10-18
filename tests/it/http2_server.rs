@@ -307,11 +307,11 @@ fn reset_late_frames_replay_on_lab_time_over_tls() {
     assert_eq!(first, second);
 }
 
-#[cfg(feature = "tokio")]
 mod clients {
     use super::*;
+    use crate::common::hyper_io::Io;
     use fictionet::InterfaceExt;
-    use fictionet::tokio::ConnectionTokioExt;
+    use hyper_util::rt::TokioIo;
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::process::Command;
@@ -417,7 +417,7 @@ window.addEventListener('load', () => {
                             let tcp = machine.tcp.clone();
                             cx.spawn(move |cx| async move {
                                 let conn = tcp.connect(&cx, SocketAddr::new(SITE.into(), 443)).await?;
-                                let mut simulated = conn.into_tokio(&cx);
+                                let mut simulated = TokioIo::new(Io { fcx: cx.clone(), conn });
                                 let _ = tokio::io::copy_bidirectional(&mut host, &mut simulated).await;
                                 Ok(())
                             });
