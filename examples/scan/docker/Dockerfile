@@ -16,6 +16,8 @@ COPY dashboard dashboard
 COPY benches benches
 COPY codegen codegen
 COPY xtask xtask
+COPY demos demos
+COPY microvm microvm
 COPY tests tests
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

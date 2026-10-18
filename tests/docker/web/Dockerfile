@@ -11,6 +11,8 @@ COPY dashboard dashboard
 COPY benches benches
 COPY codegen codegen
 COPY xtask xtask
+COPY demos demos
+COPY microvm microvm
 COPY tests tests
 COPY examples examples
 # The hosted example also copies web_world out of this image.
