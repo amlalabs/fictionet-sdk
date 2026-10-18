@@ -66,6 +66,13 @@ struct Stream {
     recv_closed: bool,
 }
 
+impl Stream {
+    /// The bytes its request's head and body hold.
+    fn request_held(&self) -> usize {
+        self.request.as_ref().map_or(0, request_held) + self.body.capacity()
+    }
+}
+
 struct Outbound {
     recv_window: i32,
     window: i32,
@@ -136,13 +143,6 @@ impl Http2 {
     /// those requests finish before the connection closes.
     pub fn graceful_shutdown(&mut self) {
         self.shutdown_requested = true;
-    }
-
-    fn room(driver: &Driver<'_, Inputs>, additional: usize) -> bool {
-        driver
-            .budget()
-            .as_ref()
-            .is_none_or(|b| additional <= b.limit().saturating_sub(b.used()))
     }
 
     fn arm(&self, driver: &mut Driver<'_, Inputs>) {
@@ -239,13 +239,22 @@ impl Http2 {
         self.resets.iter().any(|(s, _)| *s == id)
     }
 
-    fn dispatch(&mut self, id: u32, received: Received, driver: &mut Driver<'_, Inputs>) {
+    /// Answers stream `id`'s request. `charged` is what the budget already
+    /// counts for its head and body. That is nothing for a stream the
+    /// current frame opened, and never the body bytes the current frame added.
+    fn dispatch(
+        &mut self,
+        id: u32,
+        received: Received,
+        charged: usize,
+        driver: &mut Driver<'_, Inputs>,
+    ) {
         let stream = self.streams.get_mut(&id).expect("an admitted stream");
         stream.deadline = None;
+        let held = stream.request_held();
         let mut request = stream.request.take().expect("request dispatched once");
         let mut tracker = stream.tracker.take().expect("request has a tracker");
         tracker.received(received);
-        let held = request_held(&request) + stream.body.capacity();
         *request.body_mut() = Body::from(std::mem::take(&mut stream.body));
         let head_only = request.method() == Method::HEAD;
         let reply = match received {
@@ -281,9 +290,10 @@ impl Http2 {
         };
         let (work, response) = match reply {
             Reply::Now(response) => {
-                // A response the budget cannot hold gets 503 instead, so it
-                // does not end the connection's other streams.
-                let response = if Self::room(driver, response_held(&response)) {
+                // The response replaces the request in the budget. One the
+                // budget cannot hold gets 503 instead, so it does not end
+                // the connection's other streams.
+                let response = if fits(driver.budget(), response_held(&response), charged) {
                     response
                 } else {
                     over_budget()
@@ -356,7 +366,8 @@ impl Http2 {
             let stream = self.streams.get_mut(&id).unwrap();
             stream.recv_closed = true;
             if stream.request.is_some() {
-                self.dispatch(id, Received::Complete, driver);
+                let charged = stream.request_held();
+                self.dispatch(id, Received::Complete, charged, driver);
             }
             return Ok(());
         }
@@ -411,9 +422,10 @@ impl Http2 {
         }
         let mut tracker = Tracker::observing(&request, driver.conn(), self.observe.clone());
         tracker.start(&request, driver.conn(), driver.now());
-        if !Self::room(
-            driver,
+        if !fits(
+            driver.budget(),
             request_held(&request) + tracker.held() + std::mem::size_of::<Stream>(),
+            0,
         ) {
             tracker.received(Received::Budget);
             if let Some(event) =
@@ -451,7 +463,7 @@ impl Http2 {
         // accumulate abandoned requests faster than the application drains them.
         driver.defer_keyed(0, Accept(self.send.clone()));
         if read.end {
-            self.dispatch(id, Received::Complete, driver);
+            self.dispatch(id, Received::Complete, 0, driver);
         }
         Ok(())
     }
@@ -496,12 +508,13 @@ impl Http2 {
             return self.reset(id, ErrorCode::FlowControlError, driver);
         }
         drop(send);
+        let charged = stream.request_held();
         let growth = stream
             .body
             .len()
             .saturating_add(data.data.len())
             .saturating_sub(stream.body.capacity());
-        let room = Self::room(driver, growth);
+        let room = fits(driver.budget(), growth, 0);
         let stream = self.streams.get_mut(&id).unwrap();
         if let Some(remaining) = &mut stream.remaining {
             let Some(n) = remaining.checked_sub(data.data.len() as u64) else {
@@ -516,13 +529,13 @@ impl Http2 {
         if let Some(tracker) = &mut stream.tracker {
             tracker.body(&data.data);
             if stream.body.len().saturating_add(data.data.len()) > self.limits.body {
-                self.dispatch(id, Received::TooLarge, driver);
+                self.dispatch(id, Received::TooLarge, charged, driver);
             } else if !room || stream.body.try_reserve_exact(data.data.len()).is_err() {
-                self.dispatch(id, Received::Budget, driver);
+                self.dispatch(id, Received::Budget, charged, driver);
             } else {
                 stream.body.extend_from_slice(&data.data);
                 if stream.recv_closed {
-                    self.dispatch(id, Received::Complete, driver);
+                    self.dispatch(id, Received::Complete, charged, driver);
                 }
             }
         }
@@ -796,7 +809,8 @@ impl serve::Service for Http2 {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            self.dispatch(id, Received::Timeout, driver);
+            let charged = self.streams[&id].request_held();
+            self.dispatch(id, Received::Timeout, charged, driver);
         }
         Ok(self.flow(driver))
     }
@@ -902,6 +916,12 @@ impl serve::Service for Http2 {
                 send.streams.len() * std::mem::size_of::<(u32, Window)>() + send.encoder.held()
             }
     }
+}
+
+/// Whether `budget` can hold `size` more bytes once the `released` bytes
+/// it counts now are let go.
+fn fits(budget: Option<&serve::Budget>, size: usize, released: usize) -> bool {
+    budget.is_none_or(|b| size <= b.limit().saturating_sub(b.used().saturating_sub(released)))
 }
 
 fn problem(code: ErrorCode, reason: &'static str) -> wire::Error {
@@ -1124,14 +1144,6 @@ impl Sending {
         }
     }
 
-    /// Whether the budget can hold `size` more bytes once the `released`
-    /// bytes it holds for this response now are let go.
-    fn fits(&self, size: usize, released: usize) -> bool {
-        self.budget.as_ref().is_none_or(|b| {
-            size <= b.limit().saturating_sub(b.used().saturating_sub(released))
-        })
-    }
-
     fn headers(&self, fields: &[hpack::Field], end: bool) -> Result<Vec<u8>, Error> {
         let mut block = Vec::new();
         // A zero-capacity table keeps response storage bounded while still
@@ -1188,9 +1200,13 @@ impl Pending for Sending {
             self.making = None;
             // The response replaces the request in the budget. One it cannot
             // hold gets 503, so the other streams go on.
-            let fits = self.fits(response_held(&response), self.request_held);
+            let room = fits(
+                self.budget.as_ref(),
+                response_held(&response),
+                self.request_held,
+            );
             self.request_held = 0;
-            self.response = Some(if fits { response } else { over_budget() });
+            self.response = Some(if room { response } else { over_budget() });
         }
         if let Some(response) = self.response.take() {
             let (parts, body) = response.into_parts();
@@ -1300,7 +1316,7 @@ impl Pending for Sending {
                     Ok(data) => {
                         // The headers are out, so a chunk the budget cannot
                         // hold resets this stream alone.
-                        if !self.fits(data.len(), held) {
+                        if !fits(self.budget.as_ref(), data.len(), held) {
                             self.end(driver, false);
                             return Poll::Ready(Some(Err(Error::msg(
                                 "response body exceeds budget",

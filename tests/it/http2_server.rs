@@ -825,6 +825,47 @@ fn immediate_echo_releases_the_request_charge() {
 }
 
 #[test]
+fn split_echo_releases_the_charged_body() {
+    // The budget already holds the body from earlier frames, and an echo
+    // moves those bytes into the response, so they count once.
+    for parts in [1, 2, 4] {
+        let router = Router::new().post("/", |_, request| http::Response::new(request.into_body()));
+        let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 8000);
+        let mut harness = Harness::with_options(
+            Seed::from_u64(1),
+            Http2::new(router),
+            (),
+            fictionet::stdlib::serve::ServeOptions::default().budget(budget.clone()),
+        );
+        let mut input = preface();
+        input.extend(headers(1, "/", false));
+        harness.push(&input).unwrap();
+        let mut output = Vec::new();
+        for n in 0..parts {
+            output.extend(
+                harness
+                    .push(&data(1, 5000 / parts, n + 1 == parts))
+                    .unwrap(),
+            );
+        }
+        let output = frames(&output);
+        assert_eq!(statuses(&output), [(1, b"200".to_vec())]);
+        assert_eq!(
+            output
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Data(d) => Some(d.data.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            5000
+        );
+        assert!(!harness.closed());
+        assert_eq!(budget.used(), H2_INPUT);
+    }
+}
+
+#[test]
 fn oversized_response_refuses_only_its_stream() {
     let router = Router::new()
         .post("/small", |_, _| {
