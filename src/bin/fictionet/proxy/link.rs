@@ -89,6 +89,15 @@ impl Shared {
         self.queued.notify_one();
     }
 
+    fn write_error(&self, error: io::Error) {
+        // A write can observe the peer closing before the reader sees EOF.
+        let why = match error.kind() {
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => None,
+            _ => Some(format!("sending to the world: {error}")),
+        };
+        self.close(why);
+    }
+
     /// Why the link closed, if it closed on an error rather than the
     /// world closing the connection.
     pub(crate) fn error(&self) -> Option<String> {
@@ -111,7 +120,7 @@ impl Shared {
                 Ok(false) => {}
                 Err(e) => {
                     drop(q);
-                    self.close(Some(format!("sending to the world: {e}")));
+                    self.write_error(e);
                     return;
                 }
             }
@@ -166,7 +175,7 @@ async fn write_queued(shared: Arc<Shared>) {
                     }
                     Err(e) => {
                         drop(q);
-                        shared.close(Some(format!("sending to the world: {e}")));
+                        shared.write_error(e);
                         return;
                     }
                 }
@@ -247,6 +256,17 @@ mod tests {
             );
             (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
         }
+    }
+
+    #[tokio::test]
+    async fn closed_world_is_clean_when_a_send_observes_it_first() {
+        let (socket, peer) = pair();
+        unix::set_nonblocking(socket.as_raw_fd(), true).unwrap();
+        let link = Link::new(socket).unwrap();
+        drop(peer);
+        link.shared.send(Packet(vec![1]));
+        assert!(link.shared.closed.load(Ordering::SeqCst));
+        assert_eq!(link.shared.error(), None);
     }
 
     #[tokio::test]
