@@ -402,7 +402,7 @@ impl Cx {
         build: impl FnOnce(Event) -> Event,
     ) {
         if self.event_enabled(source, kind) {
-            self.emit_observation(build(Event::new(source, kind).bounded()));
+            self.emit_observation(build(Event::new(source, kind)));
         }
     }
 

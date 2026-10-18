@@ -155,7 +155,7 @@ impl Region {
             && self.state.lock().cancel_ended
     }
 
-    pub(super) fn try_start_task(&self) -> bool {
+    pub(crate) fn try_start_task(&self) -> bool {
         let mut state = self.state.lock();
         if state.completed {
             return false;

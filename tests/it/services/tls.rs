@@ -61,7 +61,7 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
         // Not a closed connection, nor a broken one: the one cancel.
         assert_eq!(result, "Err(Cancelled)");
         let tls = evidence
-            .wait(&fcx, 1, Duration::from_secs(2), |e| {
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
                 e.is("tls", "handshake")
             })
             .await?;
@@ -121,7 +121,7 @@ fn net_routes_tls_by_name_to_each_service() {
                     .is_err()
             );
             let tls = kept
-                .wait(&fcx, 3, Duration::from_secs(2), |e| {
+                .wait(&fcx, 0, 3, Duration::from_secs(2), |e| {
                     e.is("tls", "handshake")
                 })
                 .await?;
@@ -164,6 +164,7 @@ service_fixture! {
     }
     on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         let line = line.unwrap_or_default();
+        driver.emit("mail", "command", |event| event.field("line", String::from_utf8_lossy(&line).as_ref()));
         match line.as_slice() {
             b"STARTTLS" if !self.tls => {
                 driver.reply().extend_from_slice(b"220 go ahead\r\n");
@@ -186,7 +187,9 @@ service_fixture! {
 
 #[test]
 fn the_harness_resumes_after_starttls() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Mail { tls: false }, ());
+    let memory = Arc::new(fictionet::events::Memory::default());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Mail { tls: false }, ())
+        .observer(memory.clone());
     assert_eq!(h.open().unwrap(), b"220 mail ready\r\n");
     let wake = h.wake_handle();
     let got = h.push(b"STARTTLS\r\n");
@@ -203,6 +206,11 @@ fn the_harness_resumes_after_starttls() {
         h.push(b"EHLO\r\n").unwrap(),
         b"250 hello tls=true sni=mail.test\r\n"
     );
+    let commands = memory.checked_of("mail", "command").unwrap();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[1].str("line"), Some("EHLO"));
+    assert!(commands[1].conn.tls);
+    assert!(commands[1].seq > commands[0].seq);
     // A handle taken before STARTTLS still wakes the service after it.
     assert!(!wake.is_closed());
 }
@@ -250,7 +258,7 @@ fn net_performs_starttls_for_a_service_that_asks() {
             let n = tls.read(&fcx, &mut buf).await?;
             assert_eq!(&buf[..n], b"250 hello tls=true sni=mail.test\r\n");
             let handshakes = kept
-                .wait(&fcx, 1, Duration::from_secs(2), |e| {
+                .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
                     e.is("tls", "handshake")
                 })
                 .await?;
@@ -295,7 +303,7 @@ fn net_limits_a_starttls_handshake() {
             assert_eq!(read_some(&fcx, &mut conn, 14).await, b"220 go ahead\r\n");
             // The client never starts its handshake.
             let handshake = kept
-                .wait(&fcx, 1, Duration::from_secs(2), |e| {
+                .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
                     e.is("tls", "handshake")
                 })
                 .await?;

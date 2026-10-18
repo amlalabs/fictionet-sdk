@@ -107,7 +107,9 @@ fn listen_serves_each_connection_and_records_it() {
         conn.write_all(&fcx, b"quit\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 100).await, b"bye\n");
         let entries = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "close"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("conn", "close")
+            })
             .await?;
         assert_eq!(entries.len(), 1);
         let events = kept.checked_all().unwrap();
@@ -188,7 +190,7 @@ fn timers_tick_and_idle_connections_close() {
             .await?;
         assert_eq!(read_some(&fcx, &mut conn, 100).await, b"hello\n");
         let on_2 = |e: &Event| e.is("conn", "close") && e.conn.local.map(|a| a.port()) == Some(2);
-        let closed = kept.wait(&fcx, 1, Duration::from_secs(2), on_2).await?;
+        let closed = kept.wait(&fcx, 0, 1, Duration::from_secs(2), on_2).await?;
         assert_eq!(
             closed[0].get("end").and_then(json::Value::as_str),
             Some("idle")
@@ -306,7 +308,9 @@ fn a_connection_cap_resets_connections_past_it() {
             .expect("an answer");
         assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
         let blocked = events
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("net", "blocked"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("net", "blocked")
+            })
             .await?;
         assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
         assert_eq!(blocked[0].str("dst"), Some("10.9.0.1"));
@@ -965,7 +969,9 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
             b.write_all(&fcx, b"hi\nfail\n").await?;
             assert_eq!(read_some(&fcx, &mut b, 10).await, b"fine\n");
             let error = kept
-                .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "error"))
+                .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                    e.is("conn", "error")
+                })
                 .await?;
             assert_eq!(error[0].str("error"), Some("the service gave up"));
             assert_eq!(error[0].conn.id, Some(1));

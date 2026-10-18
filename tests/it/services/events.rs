@@ -131,7 +131,7 @@ fn a_reader_added_mid_connection_sees_its_events() {
         conn.write_all(&fcx, b"after\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"after\n");
         evidence
-            .wait(&fcx, 2, Duration::from_secs(2), |e| e.is("echo", "line"))
+            .wait(&fcx, 0, 2, Duration::from_secs(2), |e| e.is("echo", "line"))
             .await?;
         assert_eq!(
             seen.checked_of("echo", "line")
@@ -198,7 +198,9 @@ fn net_records_connections_on_a_tcp_port() {
         conn.write_all(&fcx, b"quit\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 10).await, b"hello\nbye\n");
         let closed = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "close"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("conn", "close")
+            })
             .await?;
         let opened = kept.checked_of("conn", "open").unwrap();
         assert_eq!(opened.len(), 1, "{opened:?}");

@@ -268,7 +268,6 @@ pub struct Event {
     /// The task that recorded it.
     pub(crate) origin: Option<Origin>,
     pub(crate) truncated: bool,
-    bounded: bool,
     pub(crate) repeat: Option<Vec<&'static str>>,
 }
 
@@ -287,7 +286,6 @@ impl Event {
             fields: Fields::new(),
             origin: None,
             truncated: false,
-            bounded: false,
             repeat: None,
         }
     }
@@ -304,20 +302,9 @@ impl Event {
         self.truncated
     }
 
-    /// Enables count, byte, nesting and summary bounds for staged construction.
-    /// Lazy emitters enable these bounds before invoking the builder.
-    pub fn bounded(mut self) -> Self {
-        self.bounded = true;
-        self
-    }
-
-    /// Formats at most four KiB when emitted lazily.
+    /// Formats at most four KiB, marking omitted text.
     pub fn summary(mut self, summary: impl std::fmt::Display) -> Event {
-        let (text, truncated) = if self.bounded {
-            bounded_text(summary)
-        } else {
-            (summary.to_string(), false)
-        };
+        let (text, truncated) = bounded_text(summary);
         self.summary = text;
         if truncated {
             self = self.truncated();
@@ -346,24 +333,25 @@ impl Event {
 
     /// Sets one field.
     pub fn field(mut self, name: &'static str, value: impl EventValue) -> Event {
-        if self.bounded && (self.fields.len() >= 64 || fields_size(&self.fields) >= 64 * 1024) {
+        if self.fields.get(name).is_none() && self.fields.len() >= 64 {
             return self.truncated();
         }
-        if self.bounded && !value.fits(64 * 1024 - fields_size(&self.fields)) {
-            return self.truncated();
+        let (mut value, mut truncated) = value.into_event_value();
+        if value_size(&value) > (128 * 1024usize).saturating_sub(fields_size(&self.fields) + 128) {
+            value = "[truncated]".into();
+            truncated = true;
         }
-        self.fields.set(name, value.into());
+        self.fields.set(name, value);
+        if truncated {
+            self = self.truncated();
+        }
         self
     }
 
-    /// Sets every field of `fields`.
+    /// Sets every field of `fields`, applying the same construction bounds.
     pub fn fields(mut self, fields: Fields) -> Event {
-        if self.bounded {
-            for (name, value) in fields.0 {
-                self = self.field(name, value);
-            }
-        } else {
-            self.fields.extend(fields);
+        for (name, value) in fields.0 {
+            self = self.field(name, value);
         }
         self
     }
@@ -535,107 +523,83 @@ fn value_size(v: &Value) -> usize {
     }
 }
 
-/// A field value whose size can be checked before copying borrowed data.
-pub trait EventValue: Into<Value> {
-    /// Whether conversion fits the remaining event budget.
-    fn fits(&self, bytes: usize) -> bool;
+/// A field value that bounds borrowed text before copying it.
+pub trait EventValue {
+    /// Converts the value, marking omitted text or nested data.
+    fn into_event_value(self) -> (Value, bool);
 }
 
 impl EventValue for &str {
-    fn fits(&self, bytes: usize) -> bool {
-        self.len().saturating_add(64) <= bytes
+    fn into_event_value(self) -> (Value, bool) {
+        let (text, truncated) = bounded_text(self);
+        (text.into(), truncated)
     }
 }
 impl EventValue for String {
-    fn fits(&self, bytes: usize) -> bool {
-        self.capacity().saturating_add(64) <= bytes
+    fn into_event_value(self) -> (Value, bool) {
+        if self.capacity() <= 4096 {
+            return (self.into(), false);
+        }
+        self.as_str().into_event_value()
     }
 }
 impl EventValue for Value {
-    fn fits(&self, mut bytes: usize) -> bool {
-        bounded_value(self, 0, &mut 1024, &mut bytes)
+    fn into_event_value(self) -> (Value, bool) {
+        fn bound(mut value: Value, depth: usize, nodes: &mut usize, truncated: &mut bool) -> Value {
+            if depth > 8 || *nodes == 0 {
+                *truncated = true;
+                return "[truncated]".into();
+            }
+            *nodes -= 1;
+            match &mut value {
+                Value::String(text) => {
+                    let (value, cut) = std::mem::take(text).into_event_value();
+                    *truncated |= cut;
+                    value
+                }
+                Value::Array(items) => {
+                    *truncated |= items.len() > 256;
+                    Value::Array(
+                        std::mem::take(items)
+                            .into_iter()
+                            .take(256)
+                            .map(|v| bound(v, depth + 1, nodes, truncated))
+                            .collect(),
+                    )
+                }
+                Value::Object(items) => {
+                    *truncated |= items.len() > 256;
+                    Value::Object(
+                        std::mem::take(items)
+                            .into_iter()
+                            .take(256)
+                            .map(|(key, value)| {
+                                let (key, cut) = bounded_text(key);
+                                *truncated |= cut;
+                                (key, bound(value, depth + 1, nodes, truncated))
+                            })
+                            .collect(),
+                    )
+                }
+                _ => value,
+            }
+        }
+        let mut truncated = false;
+        let value = bound(self, 0, &mut 1024, &mut truncated);
+        (value, truncated)
     }
 }
 impl EventValue for Vec<Value> {
-    fn fits(&self, mut bytes: usize) -> bool {
-        let slots = self.capacity().saturating_mul(std::mem::size_of::<Value>());
-        if slots > bytes {
-            return false;
-        }
-        bytes -= slots;
-        let mut nodes = 1024;
-        self.len() <= 256
-            && self
-                .iter()
-                .all(|v| bounded_value(v, 1, &mut nodes, &mut bytes))
+    fn into_event_value(self) -> (Value, bool) {
+        Value::Array(self).into_event_value()
     }
 }
 macro_rules! small_event_value {
     ($($ty:ty),*) => { $(impl EventValue for $ty {
-        fn fits(&self, bytes: usize) -> bool { bytes >= 128 }
+        fn into_event_value(self) -> (Value, bool) { (self.into(), false) }
     })* };
 }
-small_event_value!(bool, i32, u32, i64, u64);
-impl EventValue for Number {
-    fn fits(&self, bytes: usize) -> bool {
-        self.text().len().saturating_add(64) <= bytes
-    }
-}
-
-fn bounded_value(value: &Value, depth: usize, remaining: &mut usize, bytes: &mut usize) -> bool {
-    if depth > 8 || *remaining == 0 || *bytes < 128 {
-        return false;
-    }
-    *remaining -= 1;
-    *bytes -= 128;
-    match value {
-        Value::String(s) => {
-            if s.capacity() > *bytes {
-                return false;
-            }
-            *bytes -= s.capacity();
-            true
-        }
-        Value::Number(n) => {
-            if n.text().len() > *bytes {
-                return false;
-            }
-            *bytes -= n.text().len();
-            true
-        }
-        Value::Array(items) => {
-            let slots = items
-                .capacity()
-                .saturating_mul(std::mem::size_of::<Value>());
-            if slots > *bytes {
-                return false;
-            }
-            *bytes -= slots;
-            items.len() <= 256
-                && items
-                    .iter()
-                    .all(|v| bounded_value(v, depth + 1, remaining, bytes))
-        }
-        Value::Object(items) => {
-            let slots = items
-                .capacity()
-                .saturating_mul(std::mem::size_of::<(String, Value)>());
-            if slots > *bytes {
-                return false;
-            }
-            *bytes -= slots;
-            items.len() <= 256
-                && items.iter().all(|(k, v)| {
-                    if k.capacity() > *bytes {
-                        return false;
-                    }
-                    *bytes -= k.capacity();
-                    bounded_value(v, depth + 1, remaining, bytes)
-                })
-        }
-        _ => true,
-    }
-}
+small_event_value!(bool, i32, u32, i64, u64, Number);
 
 fn bounded_text(value: impl std::fmt::Display) -> (String, bool) {
     struct Text {
@@ -659,5 +623,11 @@ fn bounded_text(value: impl std::fmt::Display) -> (String, bool) {
         truncated: false,
     };
     let _ = std::fmt::write(&mut text, format_args!("{value}"));
+    if text.truncated {
+        const MARKER: &str = "[truncated]";
+        text.text
+            .truncate(text.text.floor_char_boundary(4096 - MARKER.len()));
+        text.text.push_str(MARKER);
+    }
     (text.text, text.truncated)
 }

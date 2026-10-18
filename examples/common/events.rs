@@ -59,7 +59,7 @@ pub fn line(e: &Event) -> Option<Value> {
             "src": f("src"),
             "dst": f("dst"),
             "count": f("count"),
-            "ports": f("dst_port"),
+            "ports": e.u64("dst_port").map_or_else(|| f("dst_port"), |port| json!([port, port])),
         })),
         ("net", "blocked") => Some(json!({
             "type": "blocked",

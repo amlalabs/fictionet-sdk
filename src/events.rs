@@ -56,7 +56,8 @@
 //! Services emit every occurrence. [`Event::repeat`] marks facts such as a
 //! blocked packet or network drop and identifies variable detail, such as the
 //! destination port. An optional [`Aggregate`] wraps a destination, counts
-//! matching facts within bounded run-time windows, and records first and last
+//! repeats within bounded run-time windows, delivering the first occurrence
+//! immediately. Summaries record first and last
 //! sequence references and numeric detail ranges. Reads cannot close windows.
 //! Ordinary events, window expiry on the next emission, capacity pressure and
 //! run end deliver pending summaries in sequence order. Without aggregation,

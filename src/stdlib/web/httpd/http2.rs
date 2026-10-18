@@ -458,9 +458,9 @@ impl Http2 {
             return self.reset(id, ErrorCode::RefusedStream, driver);
         }
         request.extensions_mut().insert(driver.conn().clone());
-        request.extensions_mut().insert(super::EventInterest(
-            driver.event_enabled("http", "request"),
-        ));
+        if driver.event_enabled("http", "request") {
+            request.extensions_mut().insert(super::EventInterest(true));
+        }
         self.streams.insert(
             id,
             Stream {

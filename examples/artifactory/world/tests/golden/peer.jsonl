@@ -76,6 +76,7 @@
 {"outcome":"accepted","type":"tls","sandbox":{"addr":"10.0.0.2","name":"agent"},"alpn":"http/1.1","addr":"151.101.0.223","sni":"pypi.org"}
 {"outcome":"accepted","type":"tls","sandbox":{"addr":"10.0.0.2","name":"agent"},"alpn":"http/1.1","addr":"151.101.64.223","sni":"files.pythonhosted.org"}
 {"outcome":"rejected","type":"tls","sandbox":{"addr":"10.0.0.2","name":"agent"},"sni":"unserved.test","addr":"10.20.0.15"}
+{"ports":[23,24],"type":"blocked","sandbox":{"addr":"10.0.0.2","name":"agent"},"why":"ClosedPort","protocol":6,"src":"10.0.0.2","dst":"10.20.0.15","count":2}
 {"sandbox":{"addr":"10.0.0.3","name":"probe"},"type":"detached"}
 {"sandbox":{"addr":null,"name":"agent"},"type":"attached"}
 {"sandbox":{"addr":null,"name":"probe"},"type":"attached"}

@@ -757,7 +757,7 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
         ));
         let sent = log
             .events
-            .wait(&fcx, 1, Duration::from_secs(10), |e| {
+            .wait(&fcx, 0, 1, Duration::from_secs(10), |e| {
                 e.is("http", "request") && e.str("path") == Some("/secret")
             })
             .await?;

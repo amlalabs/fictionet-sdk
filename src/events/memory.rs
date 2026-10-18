@@ -59,6 +59,8 @@ struct State {
     bytes: usize,
     last: u64,
     dropped: u64,
+    evicted: u64,
+    evicted_through: u64,
     waiters: Vec<Weak<Mutex<Option<Waker>>>>,
 }
 
@@ -103,14 +105,16 @@ impl Memory {
     }
 
     /// Waits for matching complete evidence, bounded by the run's clock.
+    /// Inspects only events after `after`, once each, using a pure predicate.
     /// Returns the matches so far at the deadline. Cancellation and retention
     /// loss are errors. At most thirty-two waits may be outstanding.
     pub async fn wait(
         &self,
         cx: &crate::Cx,
+        mut after: u64,
         count: usize,
         limit: std::time::Duration,
-        mut pick: impl FnMut(&Event) -> bool,
+        pick: impl Fn(&Event) -> bool,
     ) -> crate::Result<Vec<Event>> {
         if cx.is_cancelled() {
             return Err(crate::Cancelled.into());
@@ -128,6 +132,7 @@ impl Memory {
         let deadline =
             crate::time::Instant::from_since_start(cx.now().since_start().saturating_add(limit));
         let mut timer = crate::Timer::new(cx);
+        let mut matches = Vec::new();
         std::future::poll_fn(|task| {
             if cx.is_cancelled() {
                 return Poll::Ready(Err(crate::Cancelled.into()));
@@ -142,9 +147,15 @@ impl Memory {
                     }
                     .into()));
                 }
-                state.events.iter().cloned().collect::<Vec<_>>()
+                let start = state.events.partition_point(|event| event.seq <= after);
+                state.events.range(start..).cloned().collect::<Vec<_>>()
             };
-            let matches: Vec<_> = events.into_iter().filter(|event| pick(event)).collect();
+            for event in events {
+                after = event.seq;
+                if pick(&event) {
+                    matches.push(event);
+                }
+            }
             if cx.is_cancelled() {
                 return Poll::Ready(Err(crate::Cancelled.into()));
             }
@@ -170,7 +181,7 @@ impl Memory {
         self.display_batch(after, max).0
     }
 
-    pub(crate) fn display_batch(&self, after: u64, max: usize) -> (Vec<Event>, u64, u64) {
+    pub(crate) fn display_batch(&self, after: u64, max: usize) -> (Vec<Event>, u64, u64, u64, u64) {
         let state = self.state.lock();
         (
             state
@@ -182,6 +193,8 @@ impl Memory {
                 .collect(),
             state.last,
             state.dropped,
+            state.evicted,
+            state.evicted_through,
         )
     }
 
@@ -235,6 +248,8 @@ impl Observer for Memory {
                     .pop_front()
                     .expect("retained event exceeds bounds");
                 state.bytes -= oldest.size();
+                state.evicted_through = oldest.seq;
+                state.evicted = state.evicted.saturating_add(1);
                 state.dropped = state.dropped.saturating_add(1);
             }
             let mut event = event.clone();
@@ -271,7 +286,7 @@ mod tests {
             RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
             move |cx| async move {
                 let mut waits: Vec<_> = (0..32)
-                    .map(|_| Box::pin(memory.wait(&cx, 1, ms(100), |_| false)))
+                    .map(|_| Box::pin(memory.wait(&cx, 0, 1, ms(100), |_| false)))
                     .collect();
                 {
                     let mut task = Context::from_waker(Waker::noop());
@@ -281,7 +296,7 @@ mod tests {
                 }
                 assert_eq!(
                     memory
-                        .wait(&cx, 1, ms(100), |_| false)
+                        .wait(&cx, 0, 1, ms(100), |_| false)
                         .await
                         .unwrap_err()
                         .to_string(),
@@ -291,12 +306,42 @@ mod tests {
                 cx.emit("test", "ready", |event| event);
                 assert_eq!(
                     memory
-                        .wait(&cx, 1, ms(100), |event| event.is("test", "ready"))
+                        .wait(&cx, 0, 1, ms(100), |event| event.is("test", "ready"))
                         .await?
                         .len(),
                     1
                 );
                 assert_eq!(cx.now(), crate::time::Instant::ZERO);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_wait_inspects_only_new_events_after_its_cursor() {
+        let memory = Arc::new(Memory::default());
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
+            |cx| async move {
+                cx.emit("test", "old", |event| event);
+                let after = memory.last();
+                let seen = std::sync::Mutex::new(Vec::new());
+                let mut wait = Box::pin(memory.wait(&cx, after, 2, ms(100), |event| {
+                    seen.lock().unwrap().push(event.seq);
+                    event.is("test", "new")
+                }));
+                let mut task = Context::from_waker(Waker::noop());
+                assert!(wait.as_mut().poll(&mut task).is_pending());
+                cx.emit("test", "new", |event| event);
+                assert!(wait.as_mut().poll(&mut task).is_pending());
+                assert!(wait.as_mut().poll(&mut task).is_pending());
+                cx.emit("test", "new", |event| event);
+                let Poll::Ready(Ok(events)) = wait.as_mut().poll(&mut task) else {
+                    panic!("matches ready")
+                };
+                assert_eq!(events.len(), 2);
+                assert_eq!(*seen.lock().unwrap(), [after + 1, after + 2]);
                 Ok(())
             },
         ))
@@ -321,7 +366,7 @@ mod tests {
                 let memory = Arc::new(Memory::default());
                 let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let waker = Waker::from(Arc::new(Reader(memory.clone(), wakes.clone())));
-                let mut wait = Box::pin(memory.wait(&cx, 2, ms(100), |_| true));
+                let mut wait = Box::pin(memory.wait(&cx, 0, 2, ms(100), |_| true));
                 assert!(
                     wait.as_mut()
                         .poll(&mut Context::from_waker(&waker))
@@ -359,7 +404,7 @@ mod tests {
             RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
             move |cx| async move {
                 let error = memory
-                    .wait(&cx, 1, ms(100), |_| {
+                    .wait(&cx, 0, 1, ms(100), |_| {
                         cx.emit("test", "overflow", |event| event);
                         true
                     })

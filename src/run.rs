@@ -243,12 +243,38 @@ where
         turn: VecDeque::new(),
         incoming: Vec::new(),
     };
-    Cx {
-        run: shared,
-        region: root,
-        group: None,
+    // Register the world before invoking its builder, which may itself emit
+    // events or spawn tasks before returning a future.
+    let id = {
+        let mut queue = shared.queue.lock();
+        let id = queue.next_id;
+        queue.next_id += 1;
+        id
+    };
+    shared
+        .graph
+        .task_started(id, Cow::Borrowed("world"), Location::caller(), None);
+    let start = shared.start.lock().take();
+    if let Some(mut event) = start {
+        event.origin = shared.graph.origin(id);
+        shared.observer.emit(event, || crate::time::Instant::ZERO);
     }
-    .spawn_as(|| Cow::Borrowed("world"), world);
+    let cx = Cx {
+        run: shared.clone(),
+        region: root.clone(),
+        group: None,
+    };
+    let future = world(cx);
+    if root.try_start_task() {
+        shared.queue.lock().incoming.push(NewTask {
+            id,
+            future: Box::pin(future),
+            region: root,
+            join: Arc::new(JoinState::default()),
+        });
+    } else {
+        shared.graph.task_ended(id);
+    }
     std::future::poll_fn(move |cx| state.poll(cx)).await
 }
 
@@ -258,6 +284,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 pub(crate) struct RunShared {
     pub(crate) environment: Arc<crate::environment::RunEnvironment>,
     pub(crate) observer: crate::events::Dispatch,
+    start: Mutex<Option<crate::events::Event>>,
     /// The run's TLS key log, shared with the graph for observers.
     #[cfg(feature = "observe")]
     pub(crate) keys: Arc<crate::telemetry::KeyRecorder>,
@@ -374,20 +401,18 @@ impl RunShared {
             crate::sys::UNIX_EPOCH
         };
         let observer = crate::events::Dispatch::new(observer);
-        if observer.enabled(
-            crate::events::Metadata {
-                source: "run",
-                kind: "start",
-            },
-            &crate::events::ConnInfo::default(),
-        ) {
-            observer.emit(
+        let start = observer
+            .enabled(
+                crate::events::Metadata {
+                    source: "run",
+                    kind: "start",
+                },
+                &crate::events::ConnInfo::default(),
+            )
+            .then(|| {
                 crate::events::Event::new("run", "start")
-                    .bounded()
                     .summary("the run started")
                     .fields(fields)
-                    .field("seed", seed.to_string())
-                    .field("rng", "chacha20-v1")
                     .field(
                         "wall",
                         if mode == crate::RunMode::Lab {
@@ -399,10 +424,10 @@ impl RunShared {
                                     crate::events::float(d.as_secs_f64())
                                 })
                         },
-                    ),
-                || crate::time::Instant::ZERO,
-            );
-        }
+                    )
+                    .field("seed", seed.to_string())
+                    .field("rng", "chacha20-v1")
+            });
         #[cfg(feature = "observe")]
         let keys = Arc::new(crate::telemetry::KeyRecorder::default());
         let graph = Graph::new(
@@ -416,6 +441,7 @@ impl RunShared {
         Arc::new(Self {
             environment,
             observer,
+            start: Mutex::new(start),
             #[cfg(feature = "observe")]
             keys,
             queue: Mutex::new(Queue {

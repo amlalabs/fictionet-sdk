@@ -1714,7 +1714,7 @@ fn lan_drop_identity_comes_from_ingress_registration() {
             peer.send(Packet(vec![1, 2, 3]));
             let events = evidence.clone();
             let drops = events
-                .wait(&fcx, 2, Duration::from_secs(10), |e| e.is("lan", "drop"))
+                .wait(&fcx, 0, 2, Duration::from_secs(10), |e| e.is("lan", "drop"))
                 .await?;
             assert_eq!(drops.len(), 2);
             assert!(events.checked_of("net", "blocked").unwrap().is_empty());
@@ -1730,7 +1730,7 @@ fn lan_drop_identity_comes_from_ingress_registration() {
             lan.add("10.0.0.2".parse()?, member, None)?;
             peer.send(Packet(vec![1, 2, 3]));
             let drops = evidence
-                .wait(&fcx, 3, Duration::from_secs(10), |e| e.is("lan", "drop"))
+                .wait(&fcx, 0, 3, Duration::from_secs(10), |e| e.is("lan", "drop"))
                 .await?;
             assert_eq!(drops.len(), 3);
             assert!(drops[2].conn.sandbox.is_none());

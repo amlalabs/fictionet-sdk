@@ -109,10 +109,6 @@ impl Http1 {
 
     fn track(&mut self, head: &RequestHead, driver: &Driver<'_, http1::RequestEvents>) {
         let enabled = driver.event_enabled("http", "request");
-        if enabled && (head_held(head) > 32 * 1024 || head.headers.len() > 128) {
-            self.tracker = Some(Tracker::oversized());
-            return;
-        }
         if !enabled || self.observe.is_none() {
             self.tracker = Some(Tracker::tracking(enabled));
             return;
@@ -192,9 +188,9 @@ impl Http1 {
         };
         let mut request = request;
         request.extensions_mut().insert(driver.conn().clone());
-        request.extensions_mut().insert(super::EventInterest(
-            driver.event_enabled("http", "request"),
-        ));
+        if driver.event_enabled("http", "request") {
+            request.extensions_mut().insert(super::EventInterest(true));
+        }
         let head_only = request.method() == Method::HEAD;
         let mut tracker = self.tracker.take().expect("a parsed request has a tracker");
         tracker.start(&request, driver.conn(), self.started);

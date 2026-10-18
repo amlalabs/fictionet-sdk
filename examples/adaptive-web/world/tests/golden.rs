@@ -197,9 +197,12 @@ fn the_log_is_the_recorded_one() {
             .unwrap();
         let drain = log.clone();
         let result = rt.block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
-                adaptive_web_world::events::LogObserver { log: log.clone() },
-            )),
+            fictionet::RunOptions::new(fictionet::Seed::random())
+                .aggregate_events()
+                .event_history(Arc::new(fictionet::events::Memory::default()))
+                .observer(Arc::new(adaptive_web_world::events::LogObserver {
+                    log: log.clone(),
+                })),
             move |fcx| async move {
                 let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();

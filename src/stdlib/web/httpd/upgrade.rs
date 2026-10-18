@@ -357,9 +357,9 @@ impl hyper::service::Service<Request<Incoming>> for Route {
                 Ok(body) => {
                     let mut request = Request::from_parts(parts, Body::from(body));
                     request.extensions_mut().insert((*route.info).clone());
-                    request.extensions_mut().insert(super::EventInterest(
-                        route.fcx.emitter(&route.info).enabled("http", "request"),
-                    ));
+                    if route.fcx.emitter(&route.info).enabled("http", "request") {
+                        request.extensions_mut().insert(super::EventInterest(true));
+                    }
                     let now = route.fcx.now();
                     let reply = route
                         .handler

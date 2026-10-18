@@ -67,6 +67,8 @@ impl fictionet::events::Observer for Log {
     fn lost(&self, count: u64) {
         if count != 0 {
             self.inner
+                .write(serde_json::json!({"type": "lost", "count": count}));
+            self.inner
                 .fail(format!("{count} events lost before log delivery"));
         }
     }
@@ -94,14 +96,89 @@ mod tests {
     use super::*;
     use example_common::log::fold_key;
 
+    #[derive(Clone, Default)]
+    struct Output(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Output {
+        fn lines(&self) -> Vec<Value> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn gateway_dns_stays_separate_from_other_ports() {
+        use fictionet::events::{Aggregate, ConnInfo};
+        use std::sync::{Arc, atomic::AtomicUsize};
+        let output = Output::default();
+        let log = Arc::new(Log::start(Box::new(output.clone())).unwrap());
+        let aggregate = Arc::new(Aggregate::new(log.clone()));
+        let drain = log.clone();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(aggregate),
+            |cx| async move {
+                log.attach(&cx);
+                let open = Arc::new(AtomicUsize::new(0));
+                for (id, port) in [53, 80, 53, 53, 80, 80].into_iter().enumerate() {
+                    let conn = ConnInfo::new(
+                        id as u64,
+                        ([10, 0, 0, 1], port).into(),
+                        ([10, 0, 0, 2], 1234).into(),
+                    );
+                    assert!(
+                        fictionet::stdlib::world::net::connection_limit(&cx, &conn, &open, 0)
+                            .is_none()
+                    );
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        drain.finish().unwrap();
+        let lines = output.lines();
+        for (port, count) in [(53, 3), (80, 3)] {
+            let matching: u64 = lines
+                .iter()
+                .filter(|line| line["dst_port"] == port || line["ports"] == json!([port, port]))
+                .map(|line| line["count"].as_u64().unwrap_or(1))
+                .sum();
+            assert_eq!(matching, count);
+        }
+        assert!(lines.iter().all(|line| line["ports"] != json!([53, 80])));
+    }
+
     #[test]
     fn producer_loss_prevents_successful_finalization() {
-        let log = Log::start(Box::new(std::io::sink())).unwrap();
-        fictionet::events::Observer::lost(&log, 3);
+        let output = Output::default();
+        let log = Log::start(Box::new(output.clone())).unwrap();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            |cx| {
+                log.attach(&cx);
+                fictionet::events::Observer::lost(&log, 3);
+                async { Ok(()) }
+            },
+        ))
+        .unwrap();
         assert_eq!(
             log.finish().unwrap_err().to_string(),
             "3 events lost before log delivery"
         );
+        let lines = output.lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["type"], "lost");
+        assert_eq!(lines[0]["count"], 3);
     }
 
     /// The observer's counted `blocked` lines are written as they come,

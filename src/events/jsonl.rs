@@ -55,7 +55,15 @@ impl Jsonl {
                 }
                 let mut guard = Failure(worker_status, false);
                 for event in receiver {
-                    let bytes = event.to_json().to_bytes().map_err(io::Error::other)?;
+                    let bytes = match event.to_json().to_bytes() {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            guard.0.lost.fetch_add(1, Ordering::Relaxed);
+                            guard.0.bytes.fetch_sub(event.size(), Ordering::Relaxed);
+                            guard.0.pending.fetch_sub(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
                     writer.write_all(&bytes)?;
                     writer.write_all(b"\n")?;
                     // Release the queue budget only after a successful flush.
@@ -202,6 +210,41 @@ mod tests {
         bytes.push(b'\n');
         assert_eq!(*output.0.lock(), bytes);
         assert_eq!(jsonl.lost(), 0);
+    }
+
+    #[test]
+    fn serialization_failure_skips_only_that_event() {
+        let output = Output::default();
+        let jsonl = Jsonl::new(output.clone(), Limits::new(10, 4 << 20)).unwrap();
+        // Public fields may be mutated after bounded construction.
+        let mut event = Event::new("test", "invalid");
+        event.summary = "x".repeat(1 << 20);
+        jsonl.observe(
+            Stamp {
+                seq: 1,
+                at: Instant::ZERO,
+            },
+            Observation::Event(&event),
+        );
+        deliver(&jsonl, 2);
+        assert!(jsonl.finish().is_err());
+        assert_eq!(jsonl.lost(), 1);
+        let output = output.0.lock();
+        let lines: Vec<_> = output
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| crate::stdlib::protocols::json::Value::parse(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].get("seq").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            lines[1]
+                .get("fields")
+                .unwrap()
+                .get("count")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
     }
 
     struct Blocked {

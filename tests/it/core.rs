@@ -160,16 +160,16 @@ fn event_wait_predicate_can_read_same_log() {
                 fcx.emit("test", "tick", |event| event);
                 let log = evidence;
                 let other = log.clone();
-                let mut seen = Vec::new();
+                let seen = std::sync::Mutex::new(Vec::new());
                 let got = log
-                    .wait(&fcx, 2, ms(10), |event| {
+                    .wait(&fcx, 0, 2, ms(10), |event| {
                         assert_eq!(other.last(), 4);
                         assert_eq!(other.checked_of("test", "tick").unwrap().len(), 2);
-                        seen.push(event.seq);
+                        seen.lock().unwrap().push(event.seq);
                         event.is("test", "tick")
                     })
                     .await?;
-                assert_eq!(seen, [1, 2, 3, 4]);
+                assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4]);
                 assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 4]);
                 assert_eq!(fcx.now().since_start(), Duration::ZERO);
                 Ok(())
@@ -186,22 +186,20 @@ fn event_wait_predicate_can_record_into_same_log() {
             Seed::from_u64(1),
             |fcx, evidence| async move {
                 fcx.emit("test", "tick", |event| event);
-                let mut recorded = false;
-                let mut seen = Vec::new();
+                let recorded = std::sync::atomic::AtomicBool::new(false);
+                let seen = std::sync::Mutex::new(Vec::new());
                 let got = evidence
-                    .wait(&fcx, 2, ms(20), |event| {
-                        seen.push((fcx.now().since_start(), event.seq));
-                        if !recorded {
+                    .wait(&fcx, 0, 2, ms(20), |event| {
+                        seen.lock()
+                            .unwrap()
+                            .push((fcx.now().since_start(), event.seq));
+                        if !recorded.swap(true, Ordering::SeqCst) {
                             fcx.emit("test", "tick", |event| event);
-                            recorded = true;
                         }
                         event.is("test", "tick")
                     })
                     .await?;
-                assert_eq!(
-                    seen,
-                    [(ms(0), 1), (ms(0), 2), (ms(0), 1), (ms(0), 2), (ms(0), 3)]
-                );
+                assert_eq!(*seen.lock().unwrap(), [(ms(0), 1), (ms(0), 2), (ms(0), 3)]);
                 assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 3]);
                 assert_eq!(fcx.now().since_start(), ms(0));
                 Ok(())
@@ -220,7 +218,7 @@ fn event_wait_checks_cancellation_before_inspecting_matches() {
                 fcx.emit("test", "tick", |event| event);
                 fcx.cancel();
                 let result = evidence
-                    .wait(&fcx, n, ms(10), |_| {
+                    .wait(&fcx, 0, n, ms(10), |_| {
                         panic!("cancelled wait inspected events")
                     })
                     .await;
@@ -240,7 +238,7 @@ fn event_wait_predicate_cancellation_wins_over_matches_and_timeout() {
             |fcx, evidence| async move {
                 fcx.emit("test", "tick", |event| event);
                 let result = evidence
-                    .wait(&fcx, n, Duration::ZERO, |_| {
+                    .wait(&fcx, 0, n, Duration::ZERO, |_| {
                         fcx.cancel();
                         true
                     })
@@ -331,7 +329,7 @@ fn cancellation_ends_every_wait() {
                 let r9 = r.clone();
                 fcx.spawn(move |fcx| async move {
                     let res = evidence
-                        .wait(&fcx, 1, Duration::from_secs(60), |_| false)
+                        .wait(&fcx, 0, 1, Duration::from_secs(60), |_| false)
                         .await;
                     r9.lock().unwrap().push(format!("events {:?}", res.err()));
                     Ok(())

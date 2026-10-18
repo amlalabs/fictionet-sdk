@@ -109,7 +109,9 @@ async fn hyper_exposure(
         response_body.flow_control().release_capacity(data.len())?;
     }
     let events = evidence
-        .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
+        .wait(&fcx, 0, 1, Duration::from_secs(1), |e| {
+            e.is("http", "request")
+        })
         .await?;
     assert_eq!(
         *observer.ends.lock().unwrap(),
@@ -202,7 +204,9 @@ fn observer_sees_no_host_body() {
         .write(&mut request)?;
         conn.write_all(&fcx, &request).await?;
         let events = evidence
-            .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
+            .wait(&fcx, 0, 1, Duration::from_secs(1), |e| {
+                e.is("http", "request")
+            })
             .await?;
         let heads = observer.heads.lock().unwrap();
         assert_eq!(heads.len(), 1);
@@ -342,7 +346,9 @@ fn observer_keeps_concurrent_request_identity() {
         partial.send_reset(h2::Reason::CANCEL);
         assert!(cut_off.await.is_err());
         let events = evidence
-            .wait(&fcx, 2, Duration::from_secs(1), |e| e.is("http", "request"))
+            .wait(&fcx, 0, 2, Duration::from_secs(1), |e| {
+                e.is("http", "request")
+            })
             .await?;
         let clean = events
             .iter()
@@ -452,7 +458,9 @@ fn observer_sees_a_handed_off_request_once() {
         assert_eq!(response.head.status, 200);
         assert_eq!(response.body, SECRET);
         evidence
-            .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
+            .wait(&fcx, 0, 1, Duration::from_secs(1), |e| {
+                e.is("http", "request")
+            })
             .await?;
         assert_eq!(observer.heads.lock().unwrap().len(), 1);
         assert_eq!(
@@ -632,7 +640,9 @@ fn a_client_that_stops_reading_times_out() {
             .await?;
         conn.write_all(&fcx, b"go\n").await?;
         let closed = kept
-            .wait(&fcx, 1, Duration::from_secs(10), |e| e.is("conn", "close"))
+            .wait(&fcx, 0, 1, Duration::from_secs(10), |e| {
+                e.is("conn", "close")
+            })
             .await?;
         assert_eq!(closed.first().and_then(|e| e.str("end")), Some("timed_out"));
         drop(conn);
@@ -922,7 +932,7 @@ fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
         assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
         conn.reset();
         let request = kept
-            .wait(&fcx, 1, Duration::from_secs(10), |e| {
+            .wait(&fcx, 0, 1, Duration::from_secs(10), |e| {
                 e.is("http", "request")
             })
             .await?;
@@ -949,7 +959,7 @@ fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
         }
         assert!(all.len() > size);
         let done = kept
-            .wait(&fcx, 2, Duration::from_secs(10), |e| {
+            .wait(&fcx, 0, 2, Duration::from_secs(10), |e| {
                 e.is("http", "request")
             })
             .await?;
@@ -1074,7 +1084,9 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
             assert_eq!(status, 413);
 
             let events = kept
-                .wait(&fcx, 4, Duration::from_secs(5), |e| e.is("http", "request"))
+                .wait(&fcx, 0, 4, Duration::from_secs(5), |e| {
+                    e.is("http", "request")
+                })
                 .await?;
             let answers: Vec<_> = events
                 .iter()
@@ -1300,7 +1312,9 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             });
             let first = send.send_request(metadata_request());
             evidence
-                .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("test", "waiting"))
+                .wait(&fcx, 0, 1, Duration::from_secs(1), |e| {
+                    e.is("test", "waiting")
+                })
                 .await?;
             let one = budget.used();
             assert!(one >= 8192, "request and event headers both count");
@@ -1311,7 +1325,8 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             let second = send.send_request(metadata_request());
             assert_eq!(
                 evidence
-                    .wait(&fcx, 2, Duration::from_secs(1), |e| e.is("test", "waiting"))
+                    .wait(&fcx, 0, 2, Duration::from_secs(1), |e| e
+                        .is("test", "waiting"))
                     .await?
                     .len(),
                 2
@@ -1330,7 +1345,8 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             let third = send.send_request(metadata_request());
             assert_eq!(
                 evidence
-                    .wait(&fcx, 3, Duration::from_secs(1), |e| e.is("test", "waiting"))
+                    .wait(&fcx, 0, 3, Duration::from_secs(1), |e| e
+                        .is("test", "waiting"))
                     .await?
                     .len(),
                 3
@@ -1373,7 +1389,9 @@ fn http1_pending_metadata_releases_on_reset() {
         );
         conn.write_all(&fcx, head.as_bytes()).await?;
         evidence
-            .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("test", "waiting"))
+            .wait(&fcx, 0, 1, Duration::from_secs(1), |e| {
+                e.is("test", "waiting")
+            })
             .await?;
         assert!(budget.used() >= 8192);
         conn.reset();

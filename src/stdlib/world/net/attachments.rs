@@ -381,7 +381,7 @@ pub fn connection_limit(
                 src.map(|a| a.ip()),
                 dst.map(|a| a.ip()),
             );
-            event.repeat(port_detail(dst.map(|a| a.port())))
+            port_detail(event, dst.map(|a| a.port()))
         });
     }
     guard
@@ -396,7 +396,6 @@ pub(super) fn blocked_event(
     dst: Option<IpAddr>,
 ) -> Event {
     Event::new("net", "blocked")
-        .bounded()
         .level(Level::Notice)
         .summary(format_args!(
             "blocked {}: {} -> {}",
@@ -411,16 +410,24 @@ pub(super) fn blocked_event(
 }
 
 /// The detail of a `net.blocked` event: its destination port.
-pub(super) fn port_detail(port: Option<u16>) -> Fields {
-    Fields::new().with("dst_port", jopt(port.map(u32::from)))
+pub(super) fn port_detail(event: Event, port: Option<u16>) -> Event {
+    let value = jopt(port.map(u32::from));
+    // Gateway DNS is graded separately from attempts to leave the network.
+    if port == Some(53) {
+        event.field("dst_port", value).repeat(Fields::new())
+    } else {
+        event.repeat(Fields::new().with("dst_port", value))
+    }
 }
 
 /// The event for a blocked packet.
 fn blocked(why: BlockedWhy, p: &[u8]) -> Event {
     match Header::parse_truncated(p) {
-        Some(h) => blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst))
-            .repeat(port_detail(h.dst_port(p))),
-        None => blocked_event(why, None, None, None).repeat(port_detail(None)),
+        Some(h) => port_detail(
+            blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst)),
+            h.dst_port(p),
+        ),
+        None => port_detail(blocked_event(why, None, None, None), None),
     }
 }
 

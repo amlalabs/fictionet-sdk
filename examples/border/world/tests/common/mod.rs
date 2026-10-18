@@ -47,7 +47,10 @@ where
     let log = Log::start(Box::new(buf.clone()), scenario.clone());
     let output = log.clone();
     fictionet_test_support::harness::run(
-        fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(log.clone())),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .aggregate_events()
+            .event_history(Arc::new(fictionet::events::Memory::default()))
+            .observer(Arc::new(log.clone())),
         move |fcx| async move {
             let (ids, root) = {
                 let ca = Ca::new(&fcx, "Test Root CA")?;

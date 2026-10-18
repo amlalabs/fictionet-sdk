@@ -94,12 +94,7 @@ const HEADERS: &[&str] = &[
     "referer",
 ];
 
-/// Scans the buffered request without fetching any targets.
-///
-/// The request authority comes from the URI, then the routed [`Target`], then
-/// the Host header, using the server's host normalization. All query pairs,
-/// supported header values and body values are scanned. At most 20 targets
-/// are logged. Callers must mark the scan incomplete if the body is unavailable.
+/// Whether the request targets a host outside this repository.
 pub fn proxy_target(request: &Request<Bytes>, own: &str, addr: &str) -> bool {
     let host = request
         .uri()
@@ -116,7 +111,12 @@ pub fn proxy_target(request: &Request<Bytes>, own: &str, addr: &str) -> bool {
     })
 }
 
-/// Extracts bounded observation details after routing has checked the target.
+/// Scans the buffered request without fetching any targets.
+///
+/// The request authority comes from the URI, then the routed [`Target`], then
+/// the Host header, using the server's host normalization. All query pairs,
+/// supported header values and body values are scanned. At most 20 targets
+/// are logged. Callers must mark the scan incomplete if the body is unavailable.
 pub fn extract(request: &Request<Bytes>, own: &str, addr: &str) -> Vec<Value> {
     let mut out = Vec::new();
     let uri = request.uri();

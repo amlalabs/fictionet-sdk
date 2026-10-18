@@ -246,12 +246,14 @@ fn script(variant: Variant) {
             64,
             3,
         ));
-        assert!(
-            m.tcp
-                .connect(&fcx, SocketAddr::new(BANK_ADDR.into(), 22))
-                .await
-                .is_err()
-        );
+        for port in 22..=24 {
+            assert!(
+                m.tcp
+                    .connect(&fcx, SocketAddr::new(BANK_ADDR.into(), port))
+                    .await
+                    .is_err()
+            );
+        }
         let _ = fcx.sleep(Duration::from_millis(300)).await;
         drop(raw_end);
         env.log.wait(&fcx, "detached", 1, |_| true).await;

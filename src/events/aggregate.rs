@@ -12,7 +12,8 @@ use super::{ConnInfo, Event, Limits, Metadata, Observation, Observer, Stamp};
 /// Matching source, kind, level, connection, task, summary and identifying fields
 /// share a window. Numeric detail becomes a `[low, high]` range; other detail
 /// must match. Summaries carry `count`, `first_seq` and `last_seq`, using the last
-/// occurrence's stamp. Single occurrences keep their original fields.
+/// occurrence's stamp. The first occurrence is delivered immediately; only
+/// subsequent occurrences are counted in summaries.
 ///
 /// Windows use run time. The next event after the window expires, an ordinary
 /// event, capacity pressure, or [`Observer::end`] delivers pending facts in
@@ -111,17 +112,27 @@ impl Observer for Aggregate {
 
 impl State {
     fn flush(&mut self, ready: &mut Vec<Event>) {
-        self.pending.sort_unstable_by_key(|p| p.event.seq);
-        ready.extend(self.pending.drain(..).map(|mut pending| {
-            if pending.count > 1 {
-                pending.event.fields.set("count", pending.count);
-                pending.event.fields.set("first_seq", pending.first);
-                pending.event.fields.set("last_seq", pending.event.seq);
-            }
-            pending.event
-        }));
+        self.deliver_repeats(ready);
+        self.pending.clear();
         self.bytes = 0;
         self.start = None;
+    }
+
+    fn deliver_repeats(&mut self, ready: &mut Vec<Event>) {
+        self.pending.sort_unstable_by_key(|p| p.event.seq);
+        for pending in &mut self.pending {
+            if pending.count == 0 {
+                continue;
+            }
+            let mut event = pending.event.clone();
+            if pending.count > 1 {
+                event.fields.set("count", pending.count);
+                event.fields.set("first_seq", pending.first);
+                event.fields.set("last_seq", event.seq);
+            }
+            ready.push(event);
+            pending.count = 0;
+        }
     }
 
     fn stage(
@@ -143,8 +154,13 @@ impl State {
             return true;
         }
         if let Some(pending) = self.pending.iter_mut().find(|p| matches(&p.event, event)) {
+            if pending.count == 0 {
+                pending.event = event.clone();
+                pending.first = stamp.seq;
+            }
             for name in event.repeat.as_ref().unwrap() {
-                if let Some(n) = event.u64(name)
+                if pending.count != 0
+                    && let Some(n) = event.u64(name)
                     && let Some((low, high)) = pending.event.get(name).and_then(range)
                 {
                     pending.event.fields.set(
@@ -170,6 +186,8 @@ impl State {
         if limits.events == 0 || size > limits.bytes {
             return true;
         }
+        // A new first occurrence must not overtake buffered repeats.
+        self.deliver_repeats(ready);
         self.start.get_or_insert(stamp.at);
         let mut event = event.clone();
         event.seq = stamp.seq;
@@ -177,10 +195,10 @@ impl State {
         self.pending.push(Pending {
             event,
             first: stamp.seq,
-            count: 1,
+            count: 0,
         });
         self.bytes += size;
-        false
+        true
     }
 }
 
@@ -235,7 +253,7 @@ mod tests {
                             .repeat(Fields::new().with("dst_port", port))
                     });
                     if read {
-                        assert_eq!(evidence.checked_all()?.len(), 1);
+                        assert_eq!(evidence.checked_all()?.len(), 2);
                     }
                 }
                 {
@@ -256,14 +274,15 @@ mod tests {
     fn scan_stays_complete_bounded_and_independent_of_reads() {
         let events = flood(false);
         assert_eq!(events, flood(true));
-        assert_eq!(events.len(), 3);
-        let summary = &events[1];
-        assert_eq!(summary.u64("count"), Some(65536));
-        assert_eq!(summary.u64("first_seq"), Some(2));
+        assert_eq!(events.len(), 4);
+        assert!(events[1].get("count").is_none());
+        let summary = &events[2];
+        assert_eq!(summary.u64("count"), Some(65535));
+        assert_eq!(summary.u64("first_seq"), Some(3));
         assert_eq!(summary.u64("last_seq"), Some(65537));
         assert_eq!(summary.seq, 65537);
-        assert_eq!(range(summary.get("dst_port").unwrap()), Some((0, 65535)));
-        assert!(events[2].is("shop", "order"));
+        assert_eq!(range(summary.get("dst_port").unwrap()), Some((1, 65535)));
+        assert!(events[3].is("shop", "order"));
     }
 
     fn send(observer: &dyn Observer, seq: u64, seconds: u64, key: u32) {
@@ -286,7 +305,7 @@ mod tests {
         send(&aggregate, 1, 0, 1);
         send(&aggregate, 2, 0, 2);
         send(&aggregate, 3, 0, 1);
-        assert!(memory.checked_all().unwrap().is_empty());
+        assert_eq!(memory.checked_all().unwrap().len(), 2);
         send(&aggregate, 4, 1, 1);
         assert_eq!(
             memory
@@ -294,12 +313,12 @@ mod tests {
                 .iter()
                 .map(|e| e.seq)
                 .collect::<Vec<_>>(),
-            [2, 3]
+            [1, 2, 3, 4]
         );
         aggregate.end(Instant::ZERO + Duration::from_secs(1));
         assert_eq!(memory.after(3, 10)[0].seq, 4);
         aggregate.end(Instant::ZERO);
-        assert_eq!(memory.checked_all().unwrap().len(), 3);
+        assert_eq!(memory.checked_all().unwrap().len(), 4);
         aggregate.lost(7);
         assert_eq!(memory.checked_all().unwrap_err().dropped, 7);
     }
@@ -326,8 +345,8 @@ mod tests {
             evidence.checked_all().unwrap()
         );
         assert_eq!(
-            history.checked_of("lan", "drop").unwrap()[0].u64("count"),
-            Some(1000)
+            history.checked_of("lan", "drop").unwrap()[1].u64("count"),
+            Some(999)
         );
     }
 
@@ -403,11 +422,11 @@ mod tests {
         let aggregate = Aggregate::with_limits(memory.clone(), Duration::MAX, Limits::default());
         send(&aggregate, 1, 1, 7);
         send(&aggregate, 2, 2, 7);
-        assert!(memory.checked_all().unwrap().is_empty());
+        assert_eq!(memory.checked_all().unwrap().len(), 1);
         aggregate.end(Instant::ZERO + Duration::from_secs(2));
         let events = memory.checked_all().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].u64("count"), Some(2));
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.get("count").is_none()));
     }
 
     #[test]

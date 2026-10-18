@@ -181,8 +181,9 @@ impl Finalization {
 
     /// Acknowledges only after the run ended and its output drained successfully.
     pub fn acknowledge(&self, result: fictionet::Result) -> fictionet::Result {
+        let finished = self.log.finish();
         result?;
-        self.log.finish()?;
+        finished?;
         if !self.request.try_exists()? {
             return Err(std::io::Error::other("world ended without finalization").into());
         }
@@ -255,7 +256,8 @@ pub fn fold_key(line: &Map<String, Value>, folded: &[&str]) -> Option<String> {
             field("src"),
             field("dst"),
             field("hop"),
-            field("from")
+            field("from"),
+            field("dst_port") == json!(53)
         ])
         .to_string(),
     )
@@ -411,18 +413,19 @@ pub fn assert_repeated_lines_fold(
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(got.len(), 4, "{text}");
+    assert_eq!(got.len(), 5, "{text}");
     assert_eq!(got[0]["type"], "dns");
     assert_eq!(
         (got[1]["dst_port"].as_u64(), got[1].get("count")),
         (Some(1), None)
     );
-    assert_eq!(got[2]["dst"], "84.21.60.20");
+    assert_eq!(got[2]["dst_port"], 53);
+    assert_eq!(got[3]["dst"], "84.21.60.20");
     assert_eq!(
-        (got[3]["count"].as_u64(), got[3]["ports"].clone()),
-        (Some(999), json!([2, 1000]))
+        (got[4]["count"].as_u64(), got[4]["ports"].clone()),
+        (Some(998), json!([2, 1000]))
     );
-    assert_eq!(got[3]["dst"], "84.21.44.10");
+    assert_eq!(got[4]["dst"], "84.21.44.10");
 }
 
 #[cfg(test)]
@@ -667,6 +670,41 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn failed_world_drains_queued_lines_and_open_folds() {
+        for lab in [false, true] {
+            let output = Output(Arc::new(Mutex::new(Vec::new())));
+            let log = Log::new(Box::new(output.clone()), &["blocked"], |s| s);
+            let finalization = Finalization {
+                log: log.clone(),
+                request: std::path::PathBuf::new(),
+                acknowledgement: std::path::PathBuf::new(),
+            };
+            let world = move |cx: Cx| async move {
+                log.attach(&cx);
+                for port in 10..13 {
+                    log.write(json!({"type": "blocked", "dst_port": port}));
+                }
+                Err(fictionet::Error::msg("world failed"))
+            };
+            let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1));
+            let result = if lab {
+                fictionet::block_on(fictionet::lab(options, world))
+            } else {
+                fictionet::block_on(fictionet::run(options, world))
+            };
+            assert_eq!(
+                finalization.acknowledge(result).unwrap_err().to_string(),
+                "world failed"
+            );
+            let lines = lines(&output);
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0]["dst_port"], 10);
+            assert_eq!(lines[1]["count"], 2);
+            assert_eq!(lines[1]["ports"], json!([11, 12]));
+        }
     }
 
     #[test]

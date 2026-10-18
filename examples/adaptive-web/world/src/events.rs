@@ -37,6 +37,8 @@ impl fictionet::events::Observer for LogObserver {
     fn lost(&self, count: u64) {
         if count != 0 {
             self.log
+                .write(serde_json::json!({"type": "lost", "count": count}));
+            self.log
                 .fail(format!("{count} events lost before log delivery"));
         }
     }
@@ -163,6 +165,25 @@ fn http(e: &Event) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_loss_prevents_successful_finalization() {
+        let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |text| text));
+        let observer = LogObserver { log: log.clone() };
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            |cx| {
+                log.attach(&cx);
+                fictionet::events::Observer::lost(&observer, 3);
+                async { Ok(()) }
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            log.finish().unwrap_err().to_string(),
+            "3 events lost before log delivery"
+        );
+    }
 
     #[test]
     fn delivery_is_separate_from_declared_length() {

@@ -50,7 +50,6 @@ struct Observation {
 impl Observation {
     fn extend(&mut self, fields: Fields) {
         let event = Event::new("http", "request")
-            .bounded()
             .fields(std::mem::take(&mut self.fields))
             .fields(fields);
         self.truncated |= event.is_truncated();
@@ -99,14 +98,6 @@ fn version_name(v: Version) -> &'static str {
 }
 
 impl Tracker {
-    pub(super) fn oversized() -> Self {
-        Self {
-            enabled: true,
-            event: Some(Event::new("http", "request").bounded().truncated()),
-            ..Self::default()
-        }
-    }
-
     pub(super) fn tracking(enabled: bool) -> Self {
         Self {
             enabled,
@@ -120,17 +111,13 @@ impl Tracker {
         self.charge
     }
 
-    fn bounded<B>(request: &Request<B>) -> bool {
-        request.headers().len() <= 128 && request_held(request) <= 32 * 1024
-    }
-
     pub(super) fn observing<B>(
         enabled: bool,
         request: &Request<B>,
         conn: &ConnInfo,
         observer: Option<Arc<dyn BodyClassifier>>,
     ) -> Tracker {
-        if !enabled || !Self::bounded(request) {
+        if !enabled {
             return Self::tracking(enabled);
         }
         // Classify the head before constructing generic event metadata.
@@ -192,15 +179,6 @@ impl Tracker {
     }
 
     pub(super) fn new<B>(request: &Request<B>, conn: &ConnInfo, started: Instant) -> Tracker {
-        if !Self::bounded(request) {
-            return Self {
-                enabled: true,
-                charge: request_held(request) + std::mem::size_of::<Event>(),
-                event: Some(Event::new("http", "request").bounded().truncated()),
-                received: Some(Received::Complete),
-                observation: None,
-            };
-        }
         let host = request_host(request);
         let headers: Vec<Value> = request
             .headers()
@@ -228,7 +206,6 @@ impl Tracker {
             uri.path()
         );
         let event = Event::new("http", "request")
-            .bounded()
             .fields(Fields::with_capacity(16))
             .field("scheme", if conn.tls { "https" } else { "http" })
             .field("sni", opt(conn.sni.as_deref()))
@@ -320,7 +297,6 @@ pub(super) fn error_event(
     detail: impl std::fmt::Display,
 ) -> Event {
     Event::new("http", "error")
-        .bounded()
         .level(Level::Notice)
         .summary(format_args!("HTTP {cause} error: {detail}"))
         .field("local", opt(conn.local.map(|a| a.to_string())))

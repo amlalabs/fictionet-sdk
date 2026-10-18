@@ -75,14 +75,16 @@ fn event_wait_wakes_at_each_raw_fact() {
                     Ok(())
                 });
                 let log = evidence;
-                let got = log.wait(&cx, 1, ms(1), |e| e.is("test", "ready")).await?;
+                let got = log
+                    .wait(&cx, 0, 1, ms(1), |e| e.is("test", "ready"))
+                    .await?;
                 assert_eq!(got.len(), 1);
                 assert_eq!(cx.now().since_start(), Duration::from_nanos(7));
-                let mut checks = Vec::new();
+                let checks = std::sync::Mutex::new(Vec::new());
                 let got = log
-                    .wait(&cx, 2, Duration::from_secs(2), |e| {
+                    .wait(&cx, 0, 2, Duration::from_secs(2), |e| {
                         if e.is("test", "repeat") {
-                            checks.push(cx.now());
+                            checks.lock().unwrap().push(cx.now());
                             true
                         } else {
                             false
@@ -92,7 +94,7 @@ fn event_wait_wakes_at_each_raw_fact() {
                 assert_eq!(got.len(), 2);
                 let first = Instant::ZERO + Duration::from_nanos(7);
                 assert_eq!(cx.now(), first + ms(2));
-                assert_eq!(checks, [first, cx.now(), cx.now()]);
+                assert_eq!(*checks.lock().unwrap(), [first, cx.now()]);
                 Ok(())
             },
         ))
@@ -110,7 +112,7 @@ fn event_wait_stops_at_its_exact_limit() {
                 fcx.emit("test", "tick", |event| event);
                 let start = fcx.now();
                 let got = evidence
-                    .wait(&fcx, 2, limit, |event| event.is("test", "tick"))
+                    .wait(&fcx, 0, 2, limit, |event| event.is("test", "tick"))
                     .await?;
                 assert_eq!(got.len(), 1);
                 assert_eq!(fcx.now(), start + limit);
@@ -133,7 +135,7 @@ fn event_wait_accepts_an_overflowing_limit() {
                 Ok(())
             });
             let got = evidence
-                .wait(&fcx, 1, Duration::MAX, |event| event.is("test", "tick"))
+                .wait(&fcx, 0, 1, Duration::MAX, |event| event.is("test", "tick"))
                 .await?;
             assert_eq!(got.len(), 1);
             assert_eq!(fcx.now().since_start(), ms(2));
@@ -149,7 +151,7 @@ fn event_wait_cancellation_wins_at_the_deadline() {
         Seed::from_u64(1),
         |fcx, evidence| async move {
             let log = evidence;
-            let mut wait = pin!(log.wait(&fcx, 1, ms(1), |e| e.is("test", "tick")));
+            let mut wait = pin!(log.wait(&fcx, 0, 1, ms(1), |e| e.is("test", "tick")));
             poll_fn(|cx| {
                 assert!(wait.as_mut().poll(cx).is_pending());
                 Poll::Ready(())

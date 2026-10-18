@@ -114,7 +114,7 @@ impl Emitter<'_> {
     ) {
         if self.enabled(source, kind) {
             self.cx
-                .emit_observation(build(Event::new(source, kind).bounded()).conn(self.connection));
+                .emit_observation(build(Event::new(source, kind)).conn(self.connection));
         }
     }
 }
@@ -164,9 +164,6 @@ impl Dispatch {
         };
         event.seq = stamp.seq;
         event.at = stamp.at;
-        if event.truncated {
-            observer.lost(1);
-        }
         observer.observe(stamp, Observation::Event(&event));
     }
 
@@ -260,14 +257,18 @@ mod tests {
         ))
         .unwrap();
         let events = memory.after(0, 10);
-        assert!(events[1].size() < 8192);
-        assert!(events[1].get("text").is_none());
+        assert!(events[1].size() < 16 * 1024);
+        assert!(events[1].str("text").unwrap().ends_with("[truncated]"));
         assert_eq!(events[1].summary.len(), 4096);
-        assert_eq!(memory.checked_all().unwrap_err().dropped, 1);
+        assert!(
+            memory.checked_all().unwrap()[0..]
+                .iter()
+                .any(Event::is_truncated)
+        );
     }
 
     #[test]
-    fn run_metadata_is_bounded_and_reports_incomplete_evidence() {
+    fn run_metadata_is_bounded_without_losing_the_event() {
         let memory = Arc::new(Memory::default());
         block_on(lab(
             RunOptions::new(Seed::from_u64(1))
@@ -277,14 +278,20 @@ mod tests {
         ))
         .unwrap();
         let start = &memory.after(0, 1)[0];
-        assert!(start.get("large").is_none());
+        assert!(start.str("large").unwrap().ends_with("[truncated]"));
         assert!(start.size() < 8192);
-        assert_eq!(memory.checked_all().unwrap_err().dropped, 1);
+        assert!(
+            memory.checked_all().unwrap()[0..]
+                .iter()
+                .any(Event::is_truncated)
+        );
     }
 
     fn records() -> Vec<Event> {
         let memory = Arc::new(Memory::default());
-        let options = RunOptions::new(Seed::from_u64(42)).observer(memory.clone());
+        let options = RunOptions::new(Seed::from_u64(42))
+            .observer(memory.clone())
+            .fields(crate::events::Fields::new().with("world", "shop"));
         block_on(lab(options, |cx| async move {
             cx.emit("shop", "order", |e| e.field("item", "pump"));
             cx.sleep(Duration::from_secs(2)).await?;
@@ -303,8 +310,48 @@ mod tests {
         assert!(events[0].is("run", "start"));
         assert_eq!(events[0].at, Instant::ZERO);
         assert_eq!(events[0].u64("unused"), None);
+        assert_eq!(
+            events[0]
+                .fields
+                .iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            ["world", "wall", "seed", "rng"]
+        );
+        let start = events[0].to_json();
+        assert_eq!(
+            start.get("node").and_then(|value| value.as_str()),
+            Some("t1")
+        );
+        assert_eq!(
+            start.get("task").and_then(|value| value.as_str()),
+            Some("world")
+        );
         assert_eq!(events[2].at.since_start(), Duration::from_secs(2));
         assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn start_precedes_world_builder_emissions() {
+        let memory = Arc::new(Memory::default());
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
+            |cx| {
+                cx.emit("test", "building", |event| event);
+                cx.spawn(|cx| async move {
+                    cx.emit("test", "child", |event| event);
+                    Ok(())
+                });
+                async { Ok(()) }
+            },
+        ))
+        .unwrap();
+        let events = memory.checked_all().unwrap();
+        assert!(events[0].is("run", "start"));
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[0].origin.as_ref().unwrap().task, 1);
+        assert!(events[1].is("test", "building"));
+        assert_eq!(events[2].origin.as_ref().unwrap().task, 2);
     }
 
     struct Orders(Arc<Memory>);

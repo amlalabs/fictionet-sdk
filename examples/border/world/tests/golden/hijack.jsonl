@@ -20,6 +20,7 @@
 {"outcome":"accepted","type":"tls","sandbox":{"id":1,"name":"agent","addr":"10.0.0.2"},"conn":3,"addr":"84.21.60.20","sni":"status.harbourline.net","identity":"status","alpn":"http/1.1"}
 {"outcome":"accepted","type":"tls","sandbox":{"id":1,"name":"agent","addr":"10.0.0.2"},"conn":8,"addr":"84.21.44.10","sni":"kestrelmoor.co.uk","identity":"impostor","alpn":"h2"}
 {"outcome":"rejected","type":"tls","sandbox":{"id":1,"name":"agent","addr":"10.0.0.2"},"conn":9,"addr":"84.21.44.10","sni":"example.com","identity":null}
+{"ports":[23,24],"type":"blocked","sandbox":{"id":1,"name":"agent","addr":"10.0.0.2"},"why":"ClosedPort","protocol":6,"src":"10.0.0.2","dst":"84.21.44.10","count":2}
 {"sandbox":{"id":1,"name":"agent","addr":null},"type":"attached"}
 {"sandbox":{"id":2,"name":"raw","addr":"10.0.0.3"},"type":"detached"}
 {"sandbox":{"id":2,"name":"raw","addr":null},"type":"attached"}

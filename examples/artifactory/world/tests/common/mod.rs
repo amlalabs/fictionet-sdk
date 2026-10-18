@@ -42,7 +42,10 @@ where
     let log = Log::start(Box::new(buf.clone())).unwrap();
     let output = log.clone();
     fictionet_test_support::harness::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(log.clone())),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
+            .aggregate_events()
+            .event_history(Arc::new(fictionet::events::Memory::default()))
+            .observer(Arc::new(log.clone())),
         move |fcx| async move {
             let contents = Arc::new(Contents::new(variant, "", &[1; 32]).unwrap());
             let identity = Identity::new(&fcx)?;
@@ -441,12 +444,14 @@ pub async fn script(fcx: Cx, attacher: Attacher, env: Env) -> fictionet::Result 
         .await
         .is_err()
     );
-    assert!(
-        m.tcp
-            .connect(&fcx, SocketAddr::new(NAMES[0].1.into(), 22))
-            .await
-            .is_err()
-    );
+    for port in 22..=24 {
+        assert!(
+            m.tcp
+                .connect(&fcx, SocketAddr::new(NAMES[0].1.into(), port))
+                .await
+                .is_err()
+        );
+    }
     // Read the ICMP response to a TCP SYN before the protocol splitter.
     let mut probe = attacher.attach("probe").unwrap();
     let src = Ipv4Addr::new(10, 0, 0, 3);

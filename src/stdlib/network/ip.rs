@@ -830,7 +830,6 @@ pub fn emit_drop<F>(
         None => ("?".to_owned(), "?".to_owned()),
     };
     let event = events::Event::new(source, "drop")
-        .bounded()
         .level(Level::Notice)
         .summary(format_args!("{src} → {dst}: {why}"))
         .field("src", opt(h.as_ref().map(|_| src)))

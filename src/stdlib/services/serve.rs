@@ -850,7 +850,7 @@ impl Staged {
             return;
         }
         let mut state = self.state.borrow_mut();
-        let reserve = (128usize << 10)
+        let reserve = (256usize << 10)
             .saturating_add(conn.sandbox.as_ref().map_or(0, |s| s.name.len()))
             .saturating_add(conn.sni.as_ref().map_or(0, |s| s.len()))
             .saturating_add(conn.alpn.as_ref().map_or(0, |s| s.len()));
@@ -858,9 +858,11 @@ impl Staged {
             state.lost = state.lost.saturating_add(1);
             return;
         }
-        let event = build(Event::new(source, kind).bounded()).conn(conn);
+        drop(state);
+        let event = build(Event::new(source, kind)).conn(conn);
         let bytes = event.size();
-        if bytes > (1 << 20) - state.bytes {
+        let mut state = self.state.borrow_mut();
+        if state.events.len() >= 256 || bytes > (1 << 20) - state.bytes {
             state.lost = state.lost.saturating_add(1);
             return;
         }
@@ -3970,6 +3972,31 @@ mod observation_tests {
                 usize::from(observed)
             );
         }
+    }
+
+    #[test]
+    fn staged_builders_can_emit_nested_events() {
+        let memory = Arc::new(Memory::default());
+        let mut staged = Staged {
+            observer: Some(Arc::new(fictionet::events::Dispatch::new(Some(
+                memory.clone(),
+            )))),
+            ..Staged::default()
+        };
+        let conn = ConnInfo::default();
+        staged.emit(&conn, "test", "outer", |event| {
+            staged.emit(&conn, "test", "inner", |event| event.field("value", 7u64));
+            event.field("value", 9u64)
+        });
+        staged.drain(|| Instant::ZERO);
+        let events = memory.checked_all().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.kind, event.u64("value")))
+                .collect::<Vec<_>>(),
+            [("inner", Some(7)), ("outer", Some(9))]
+        );
     }
 
     #[test]

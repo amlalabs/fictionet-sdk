@@ -97,7 +97,6 @@ impl Answered {
             DnsAnswer::None => ("none", None, None),
         };
         Event::new("dns", "query")
-            .bounded()
             .summary(format_args!(
                 "{} {}: {}",
                 self.name.as_deref().unwrap_or("-"),

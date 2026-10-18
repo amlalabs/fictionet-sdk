@@ -78,6 +78,8 @@ impl fictionet::events::Observer for Log {
     fn lost(&self, count: u64) {
         if count != 0 {
             self.inner
+                .write(serde_json::json!({"type": "lost", "count": count}));
+            self.inner
                 .fail(format!("{count} events lost before log delivery"));
         }
     }
@@ -118,6 +120,30 @@ mod tests {
     use super::*;
     use example_common::log::fold_key;
     use serde_json::json;
+
+    #[test]
+    fn producer_loss_prevents_successful_finalization() {
+        use crate::scenario::{Task, Variant, parse_prefix};
+        let scenario = Arc::new(Scenario::new(
+            Variant::Legitimate,
+            Task::Pay,
+            parse_prefix("10.0.0.0/24").unwrap(),
+        ));
+        let log = Log::start(Box::new(std::io::sink()), scenario);
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            |cx| {
+                log.attach(&cx);
+                fictionet::events::Observer::lost(&log, 3);
+                async { Ok(()) }
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            log.finish().unwrap_err().to_string(),
+            "3 events lost before log delivery"
+        );
+    }
 
     #[test]
     fn the_password_never_reaches_a_line() {

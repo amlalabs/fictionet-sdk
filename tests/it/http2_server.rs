@@ -394,7 +394,7 @@ window.addEventListener('load', () => {
                             http::Response::builder().header("content-type", "application/javascript").body(Bytes::from(body)).unwrap()
                         })
                         .route_async(Some(http::Method::GET), "/gate", move |cx, _| { let evidence = observed.clone(); async move {
-                            evidence.wait(&cx, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();
+                            evidence.wait(&cx, 0, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();
                             http::Response::builder().header("content-type", "application/javascript").body(Bytes::new()).unwrap()
                         }});
                     let (attach, arrivals) = fictionet::attachments();
@@ -1403,7 +1403,11 @@ fn observation_does_not_change_http2_streams() {
     let run = |observed| {
         let heads = Arc::new(crate::common::http_observer::CountHeads::default());
         let memory = Arc::new(fictionet::events::Memory::default());
-        let router = Router::new().post("/", |_, _| {
+        let router = Router::new().post("/", move |_, request| {
+            assert_eq!(
+                request.extensions().get::<httpd::EventInterest>().is_some(),
+                observed
+            );
             http::Response::new(Bytes::from_static(b"hello"))
         });
         let mut harness = Harness::new(

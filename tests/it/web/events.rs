@@ -36,16 +36,20 @@ where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    world_events_with_memory(Arc::new(Memory::default()), f)
+    world_events_with_memory(
+        RunOptions::new(Seed::from_u64(1)),
+        Arc::new(Memory::default()),
+        f,
+    )
 }
 
-fn world_events_with_memory<F, Fut>(evidence: Arc<Memory>, f: F)
+fn world_events_with_memory<F, Fut>(options: RunOptions, evidence: Arc<Memory>, f: F)
 where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     run_world::seeded_world(
-        RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()),
+        options.observer(evidence.clone()),
         Duration::from_secs(60),
         move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
@@ -75,14 +79,12 @@ pub(super) async fn wait_for<T>(
     fcx: &Cx,
     log: &Log,
     n: usize,
-    mut pick: impl FnMut(&Event) -> Option<T>,
+    pick: impl Fn(&Event) -> Option<T>,
 ) -> Vec<T> {
     let from = log.from.load(Ordering::SeqCst);
     let got = log
         .events
-        .wait(fcx, n, Duration::from_secs(5), |e| {
-            e.seq > from && pick(e).is_some()
-        })
+        .wait(fcx, from, n, Duration::from_secs(5), |e| pick(e).is_some())
         .await
         .expect("the world stopped");
     if got.len() < n {
@@ -104,10 +106,7 @@ pub(super) fn sandbox_of(e: &Event) -> Option<&Sandbox> {
 }
 
 /// Picks the events of `source`'s `kind`.
-pub(super) fn seen(
-    source: &'static str,
-    kind: &'static str,
-) -> impl FnMut(&Event) -> Option<Event> {
+pub(super) fn seen(source: &'static str, kind: &'static str) -> impl Fn(&Event) -> Option<Event> {
     move |e| e.is(source, kind).then(|| e.clone())
 }
 
@@ -1212,11 +1211,11 @@ fn events_for_clients_that_send_nothing() {
 }
 
 /// Waits up to 10 s for the first event `pick` keeps.
-async fn wait_for_long<T>(fcx: &Cx, log: &Log, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
+async fn wait_for_long<T>(fcx: &Cx, log: &Log, pick: impl Fn(&Event) -> Option<T>) -> T {
     let from = log.from.load(Ordering::SeqCst);
     let got = log
         .events
-        .wait(fcx, 1, Duration::from_secs(10), |e| {
+        .wait(fcx, 0, 1, Duration::from_secs(10), |e| {
             e.seq > from && pick(e).is_some()
         })
         .await
@@ -1472,18 +1471,16 @@ fn events_for_blocked_packets() {
     });
 }
 
-/// A scan retains every raw refusal within an explicitly sized budget.
+/// A scan cannot evict grading evidence under the production observer limits.
 #[test]
-fn a_port_scan_fits_an_explicit_evidence_budget() {
+fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     const SCAN: u16 = 55_000;
     let path = std::env::temp_dir().join(format!("fictionet-scan-{}.jsonl", std::process::id()));
     let kept: Arc<std::sync::Mutex<Option<Arc<Memory>>>> = Arc::default();
     let keep = kept.clone();
     world_events_with_memory(
-        Arc::new(Memory::new(fictionet::events::Limits::new(
-            60_000,
-            64 << 20,
-        ))),
+        RunOptions::new(Seed::from_u64(1)).aggregate_events(),
+        Arc::new(Memory::default()),
         move |fcx, attacher, env, log| async move {
             // What a grader reads: a lookup, a TLS handshake and a request.
             let m = default_machine(&fcx, &attacher);
@@ -1553,12 +1550,18 @@ fn a_port_scan_fits_an_explicit_evidence_budget() {
         .iter()
         .filter(|e| e.is("net", "blocked") && from(e, "b"))
         .collect();
-    assert!(blocked.iter().all(|event| event.get("count").is_none()));
-    assert_eq!(blocked.len(), usize::from(SCAN));
+    assert!(blocked.len() < 1000);
+    assert_eq!(
+        blocked
+            .iter()
+            .map(|event| event.u64("count").unwrap_or(1))
+            .sum::<u64>(),
+        u64::from(SCAN)
+    );
     std::fs::write(&path, crate::common::evidence_bytes(&events)).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
-    assert_eq!(text.lines().count() as u64, events.last());
+    assert_eq!(text.lines().count(), all.len());
     assert!(
         text.lines()
             .any(|l| l.contains(r#""source":"http","kind":"request""#))

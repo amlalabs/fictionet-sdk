@@ -24,6 +24,7 @@ pub(crate) struct View {
     /// The number of the last event sent.
     event_seq: u64,
     dropped: u64,
+    evicted: u64,
     ended: bool,
     revision: u64,
 }
@@ -277,9 +278,9 @@ fn last_event(graph: &Graph) -> u64 {
     graph.events.as_ref().map_or(0, |events| events.last())
 }
 
-fn history_batch(graph: &Graph, after: u64, max: usize) -> (Vec<Event>, u64, u64) {
+fn history_batch(graph: &Graph, after: u64, max: usize) -> (Vec<Event>, u64, u64, u64, u64) {
     graph.events.as_ref().map_or_else(
-        || (Vec::new(), 0, 0),
+        || (Vec::new(), 0, 0, 0, 0),
         |events| events.display_batch(after, max),
     )
 }
@@ -294,7 +295,7 @@ fn loss_line(dropped: u64, seq: u64) -> String {
 
 /// The `events` reply: at most `max` events after number `after`.
 pub(crate) fn events(graph: &Graph, after: u64, max: usize) -> String {
-    let (events, last, dropped) = history_batch(graph, after, max);
+    let (events, last, dropped, _, _) = history_batch(graph, after, max);
     let lines: Vec<String> = events.iter().map(event_line).collect();
     Object::new()
         .raw("events", &json::array(lines))
@@ -346,13 +347,14 @@ pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
         }
         None => {
             let last = last_event(graph);
-            let (events, last, dropped) = history_batch(
+            let (events, last, dropped, evicted, _) = history_batch(
                 graph,
                 last.saturating_sub(SNAPSHOT_EVENTS),
                 SNAPSHOT_EVENTS as usize + 1,
             );
             view.event_seq = events.last().map_or(last, |e| e.seq);
             view.dropped = dropped;
+            view.evicted = evicted;
             events
         }
     };
@@ -403,6 +405,7 @@ pub(crate) fn changes(graph: &Graph, old: &mut View) -> Vec<Message> {
     let mut new = build(c);
     new.event_seq = old.event_seq;
     new.dropped = old.dropped;
+    new.evicted = old.evicted;
     let mut out = Vec::new();
     // Edges go first, then nodes, so a browser never holds an edge to a
     // node it was told is gone, nor a new edge to a node it has not met.
@@ -462,13 +465,20 @@ fn counter_changes(
 
 /// A bounded event batch and whether another batch may be waiting.
 pub(crate) fn event_changes(graph: &Graph, view: &mut View) -> (Vec<Message>, bool) {
-    let (events, last, dropped) = history_batch(graph, view.event_seq, EVENTS_PER_CHANGE);
+    let (events, last, dropped, evicted, evicted_through) =
+        history_batch(graph, view.event_seq, EVENTS_PER_CHANGE);
     let full = events.len() == EVENTS_PER_CHANGE;
     let mut messages = Vec::new();
-    if dropped > view.dropped {
-        messages.push(("event", loss_line(dropped - view.dropped, view.event_seq)));
+    let rejected = (dropped - evicted).saturating_sub(view.dropped - view.evicted);
+    let missed = rejected
+        + evicted
+            .saturating_sub(view.evicted)
+            .min(evicted_through.saturating_sub(view.event_seq));
+    if missed != 0 {
+        messages.push(("event", loss_line(missed, view.event_seq)));
     }
     view.dropped = dropped;
+    view.evicted = evicted;
     view.event_seq = if full {
         events.last().unwrap().seq
     } else {
@@ -506,10 +516,9 @@ mod tests {
 
     fn serialization_graph() -> Arc<Graph> {
         let graph = history_graph();
-        retain(
-            &graph,
-            Event::new("test", "big").summary("x".repeat(1 << 20)),
-        );
+        let mut event = Event::new("test", "big");
+        event.summary = "x".repeat(1 << 20);
+        retain(&graph, event);
         retain(&graph, Event::new("test", "normal"));
         graph
     }
@@ -566,6 +575,69 @@ mod tests {
         assert!(!full);
         assert_eq!(messages.len(), 3);
         assert!(!replay.events_pending(&graph));
+    }
+
+    #[test]
+    fn live_viewers_only_report_evictions_after_their_cursor() {
+        let history = Arc::new(crate::events::Memory::new(crate::events::Limits::new(
+            2, 4096,
+        )));
+        let shared = crate::run::RunShared::with_options(
+            crate::RunOptions::new(crate::Seed::from_u64(7)).event_history(history),
+            crate::RunMode::Lab,
+        );
+        let graph = shared.graph.clone();
+        let (mut live, _) = snapshot(&graph, Some(0));
+        let (mut slow, _) = snapshot(&graph, Some(0));
+        for i in 0..6 {
+            retain(&graph, Event::new("test", "tick").field("i", i));
+            let (messages, _) = event_changes(&graph, &mut live);
+            assert_eq!(messages.len(), 1);
+            let event = Value::parse(messages[0].1.as_bytes()).unwrap();
+            assert_eq!(event.get("kind").and_then(Value::as_str), Some("tick"));
+        }
+        let (messages, _) = event_changes(&graph, &mut slow);
+        assert_eq!(messages.len(), 3);
+        let loss = Value::parse(messages[0].1.as_bytes()).unwrap();
+        assert_eq!(
+            loss.get("fields")
+                .unwrap()
+                .get("count")
+                .and_then(Value::as_u64),
+            Some(4)
+        );
+        assert!(event_changes(&graph, &mut slow).0.is_empty());
+    }
+
+    #[test]
+    fn a_reported_rejection_does_not_turn_seen_evictions_into_loss() {
+        let history = Arc::new(crate::events::Memory::new(crate::events::Limits::new(
+            2, 4096,
+        )));
+        let shared = crate::run::RunShared::with_options(
+            crate::RunOptions::new(crate::Seed::from_u64(7)).event_history(history),
+            crate::RunMode::Lab,
+        );
+        let graph = shared.graph.clone();
+        retain(&graph, Event::new("test", "first"));
+        retain(&graph, Event::new("test", "second"));
+        retain(
+            &graph,
+            Event::new("test", "large").summary("x".repeat(4096)),
+        );
+        let mut view = View {
+            event_seq: 1,
+            dropped: 1,
+            ..View::default()
+        };
+        retain(&graph, Event::new("test", "fourth"));
+        let (messages, _) = event_changes(&graph, &mut view);
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|(_, line)| !line.contains("events lost"))
+        );
     }
 
     fn assert_serialization_error(event: &Value, seq: u64) {
@@ -633,7 +705,8 @@ mod tests {
         for _ in 0..129 {
             value = Value::Array(vec![value]);
         }
-        let event = Event::new("test", "nested").field("nested", value);
+        let mut event = Event::new("test", "nested");
+        event.fields.set("nested", value);
         let layer = crate::observe::Layer::from_event(&event);
         assert_eq!(layer.fields.len(), 1);
         assert_eq!(layer.fields[0].name, "nested");
@@ -648,7 +721,8 @@ mod tests {
 
     #[test]
     fn many_value_failure_visible() {
-        let event = Event::new("test", "many").field(
+        let mut event = Event::new("test", "many");
+        event.fields.set(
             "many",
             Value::Array(vec![
                 Value::Null;
@@ -688,8 +762,8 @@ mod tests {
         let mut event = Event::new("test", "big")
             .level(Level::Alarm)
             .conn(&conn)
-            .summary("x".repeat(1 << 20))
             .field("original", "discarded");
+        event.summary = "x".repeat(1 << 20);
         event.seq = u64::MAX;
         event.at = crate::time::Instant::from_since_start(crate::time::ms(42));
         event.origin = Some(Origin {

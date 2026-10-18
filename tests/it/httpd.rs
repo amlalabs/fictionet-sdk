@@ -1394,7 +1394,11 @@ fn observation_does_not_change_http_responses_or_protocol_budgets() {
             let heads = Arc::new(crate::common::http_observer::CountHeads::default());
             let memory = Arc::new(fictionet::events::Memory::default());
             let service = Http1::with(
-                Arc::new(Router::new().get("/", |_, _| {
+                Arc::new(Router::new().get("/", move |_, request| {
+                    assert_eq!(
+                        request.extensions().get::<httpd::EventInterest>().is_some(),
+                        observed
+                    );
                     http::Response::new(Bytes::from_static(b"hello"))
                 })),
                 httpd::Limits {
@@ -1434,5 +1438,67 @@ fn observation_does_not_change_http_responses_or_protocol_budgets() {
             (response, harness.closed())
         };
         assert_eq!(run(false), run(true), "protocol budget {budget}");
+    }
+}
+
+#[test]
+fn accepted_large_requests_keep_fields_and_classification() {
+    for (path_len, head_len, headers) in [
+        (6 * 1024, 16 * 1024, 4),
+        (1, 60 * 1024, 100),
+        (8192 - "POST  HTTP/1.1".len(), 64 * 1024, 100),
+    ] {
+        let path = format!("/{}", "p".repeat(path_len - 1));
+        let observer = Arc::new(Exposure::default());
+        let memory = Arc::new(fictionet::events::Memory::default());
+        let service =
+            Http1::new(Router::new().fallback(|_, _| http::Response::new(Bytes::from("ok"))))
+                .observe(observer.clone());
+        let mut harness =
+            Harness::new(fictionet::Seed::from_u64(1), service, ()).observer(memory.clone());
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n",
+            SECRET.len()
+        );
+        // One large value is truncated; all remaining header pairs must survive.
+        request.push_str(&format!("x-large: {}\r\n", "v".repeat(6 * 1024)));
+        for i in 3..headers {
+            let remaining = headers - i;
+            let size = (head_len - request.len() - 2) / remaining - format!("x-{i}: \r\n").len();
+            request.push_str(&format!("x-{i}: {}\r\n", "v".repeat(size)));
+        }
+        request.push_str("\r\n");
+        assert_eq!(request.len(), head_len);
+        let mut request = request.into_bytes();
+        request.extend_from_slice(SECRET);
+        let response = harness.push(&request).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        let all = memory.checked_all().unwrap();
+        let event = all
+            .iter()
+            .find(|event| event.is("http", "request"))
+            .unwrap();
+        assert_eq!(event.str("method"), Some("POST"));
+        assert_eq!(event.str("host"), Some("test"));
+        for name in ["uri", "path"] {
+            let value = event.str(name).unwrap();
+            if path_len > 4096 {
+                assert!(value.ends_with("[truncated]"));
+                assert!(value.starts_with("/ppp"));
+            } else {
+                assert_eq!(value, path);
+            }
+        }
+        let pairs = event.get("headers").unwrap().as_array().unwrap();
+        assert_eq!(pairs.len(), headers);
+        assert!(event.is_truncated());
+        assert_eq!(
+            event.get("classified").and_then(json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(event.u64("observed_bytes"), Some(SECRET.len() as u64));
+        assert_eq!(observer.heads.lock().unwrap().len(), 1);
+        assert_eq!(observer.ends.lock().unwrap().len(), 1);
+        assert_redacted(event);
     }
 }

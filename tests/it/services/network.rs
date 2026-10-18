@@ -463,7 +463,9 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         );
 
         let alarm = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.level == Level::Alarm)
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.level == Level::Alarm
+            })
             .await?;
         assert_eq!(alarm[0].kind, "write_register");
         let sandbox_name = |e: &Event| e.conn.sandbox.as_ref().map(|s| s.name.to_string());
@@ -472,8 +474,10 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             alarm[0].conn.local,
             Some(SocketAddr::new(PLC_ADDR.into(), 502))
         );
-        kept.wait(&fcx, 1, Duration::from_secs(2), |e| e.is("http", "request"))
-            .await?;
+        kept.wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+            e.is("http", "request")
+        })
+        .await?;
         let kinds: BTreeSet<String> = kept
             .checked_all()
             .unwrap()
@@ -576,7 +580,9 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         assert_eq!(u.recv(&fcx).await?.0, b"1\n");
         // A datagram's events name its sandbox, as a connection's do.
         let datagram = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("udp", "datagram"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("udp", "datagram")
+            })
             .await?;
         assert_eq!(
             datagram[0]
@@ -619,7 +625,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         );
         conn.write_all(&fcx, b"hi\n").await?;
         let lines = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("echo", "line"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| e.is("echo", "line"))
             .await?;
         assert_eq!(lines[0].conn.id, Some(1));
         assert_eq!(lines[0].conn.sandbox.as_ref().map(|s| s.id), Some(1));
@@ -681,7 +687,9 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
             .expect("an answer");
         assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
         let blocked = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("net", "blocked"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("net", "blocked")
+            })
             .await?;
         assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
 
@@ -694,7 +702,9 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
         let mut e = s.tcp.connect(&fcx, to).await?;
         assert_eq!(read_some(&fcx, &mut e, 6).await, b"");
         let closed = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "close"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("conn", "close")
+            })
             .await?;
         assert_eq!(closed[0].str("end"), Some("budget"));
         Ok(())
@@ -881,7 +891,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7),
         );
         let drops = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| {
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
                 e.is("lan", "drop") && e.str("lan") == Some("corp")
             })
             .await?;
@@ -901,7 +911,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             SocketAddr::new(Ipv4Addr::new(192, 168, 56, 99).into(), 7),
         );
         let drops = kept
-            .wait(&fcx, 2, Duration::from_secs(2), |e| {
+            .wait(&fcx, 0, 2, Duration::from_secs(2), |e| {
                 e.is("lan", "drop") && e.str("lan") == Some("corp")
             })
             .await?;
@@ -1075,8 +1085,10 @@ fn net_keeps_one_budget_per_attachment() {
             })
             .await,
         )?;
-        kept.wait(&fcx, 1, Duration::from_secs(2), |e| e.is("net", "detached"))
-            .await?;
+        kept.wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+            e.is("net", "detached")
+        })
+        .await?;
         let a = budgets.lock().unwrap()[0].clone().expect("a budget");
 
         // Another sandbox at the same address: its own budget.
@@ -1130,13 +1142,17 @@ fn a_lan_member_detaches_like_any_sandbox() {
             .await,
         )?;
         let detached = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("net", "detached"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("net", "detached")
+            })
             .await?;
         let first = detached[0].conn.sandbox.clone().expect("a sandbox");
         assert_eq!((&*first.name, first.addr), ("ws01", Some(ws)));
         // The server's side of the connection was reset.
         let closed = kept
-            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("conn", "close"))
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |e| {
+                e.is("conn", "close")
+            })
             .await?;
         assert_eq!(
             closed[0].conn.sandbox.as_ref().map(|s| s.id),
@@ -1229,8 +1245,9 @@ fn refused_connections_share_a_bounded_aggregate() {
     ))
     .unwrap();
     let blocked = evidence.checked_of("net", "blocked").unwrap();
-    assert_eq!(blocked.len(), 1);
-    assert_eq!(blocked[0].u64("count"), Some(1000));
+    assert_eq!(blocked.len(), 2);
+    assert!(blocked[0].get("count").is_none());
+    assert_eq!(blocked[1].u64("count"), Some(999));
     assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
     assert!(blocked[0].conn.id.is_none());
 }
