@@ -67,16 +67,25 @@ pub async fn start(config: Config) -> Result<World> {
     tokio::spawn(fictionet::run(Seed::random(), move |fcx| async move {
         let z = zscaler(&fcx, DEFAULT_CLOUD, now_unix)?;
         let www = format!("www.{site}");
-        let config = z.server_config(&fcx, &[site.as_str(), www.as_str()], now_sys, now_unix)?;
+        let site_cfg = z.server_config(&fcx, &[site.as_str(), www.as_str()], now_sys, now_unix)?;
+        // The Zscaler leaf the world presents for Mozilla's HTTPS mirror.
+        let mozilla_cfg = z.server_config(&fcx, &["packages.mozilla.org"], now_sys, now_unix)?;
         if ready.send((z.root_pem().to_string(), fcx.clone())).is_err() {
             return Ok(());
         }
-        web::Sites::new(move |host: &str| {
-            if host == site || host == www {
-                Some(web::Site::new(app()).at(SHARED).tls(config.clone()))
-            } else {
-                None
+        // The apt mirror: the world forwards these names to the real servers
+        // over the host's network, so the guest installs the desktop at
+        // boot. apt's signatures verify everything.
+        let mirror = web::proxy(&fcx)?;
+        web::Sites::new(move |host: &str| match host {
+            h if h == site || h == www => {
+                Some(web::Site::new(app()).at(SHARED).tls(site_cfg.clone()))
             }
+            "archive.ubuntu.com" | "security.ubuntu.com" | "ports.ubuntu.com" => {
+                Some(web::Site::new(mirror.clone()))
+            }
+            "packages.mozilla.org" => Some(web::Site::new(mirror.clone()).tls(mozilla_cfg.clone())),
+            _ => None,
         })
         .date(now_sys)
         .start(&fcx, attachments)

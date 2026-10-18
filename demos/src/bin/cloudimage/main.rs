@@ -211,6 +211,8 @@ async fn run_checks(vm: &ch::Vm, identity: &ssh::Identity, boot: Instant) -> Res
              </dev/null 2>&1 | grep -E 'Verify return code|subject=|issuer='"
         ),
         "env | grep -iE 'SSL_CERT|REQUESTS_CA|NODE_USE' || echo 'no trust env (milestone 2)'",
+        "sudo apt-get update 2>&1 | tail -4",
+        "sudo apt-get install -y --no-install-recommends xfce4-terminal 2>&1 | tail -4; which xfce4-terminal",
     ] {
         let out = session.run(command).await?;
         println!("guest$ {command}");

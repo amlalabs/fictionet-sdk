@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 example-common = { path = "../examples/common" }
-fictionet = { path = ".." }
+fictionet = { path = "..", features = ["web-proxy"] }
 fictionet-microvm = { path = "../microvm" }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util"] }
