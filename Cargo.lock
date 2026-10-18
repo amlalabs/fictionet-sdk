@@ -639,6 +639,7 @@ dependencies = [
  "http",
  "http-body",
  "hyper",
+ "hyper-util",
  "libc",
  "p256",
  "p384",

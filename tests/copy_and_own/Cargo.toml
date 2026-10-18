@@ -37,6 +37,8 @@ webpki-roots = "1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2.189"
 
-# The web module's doc examples serve axum routers, as the README's does.
+# The web module's doc examples serve axum routers, as the README's does,
+# and the forwarding example's stand-in upstream runs on hyper.
 [dev-dependencies]
 axum = { version = "0.8", default-features = false }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
