@@ -10,7 +10,8 @@ use std::time::SystemTime;
 use axum::Extension;
 use axum::routing::get;
 use fictionet::Result;
-use fictionet::stdlib::services::tls;
+use fictionet::stdlib::protocols::x509;
+use fictionet::stdlib::services::{ca, tls};
 use fictionet::stdlib::web;
 use http::Version;
 use rustls::pki_types::PrivateKeyDer;
@@ -49,26 +50,31 @@ pub fn run(
     runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
-            let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "web_world CA")?;
-            let leaf = ca.issue(
-                &fcx,
-                &[
-                    "example.test",
-                    "www.example.test",
-                    "v4only.test",
-                    "v6only.test",
-                ],
-                fictionet::stdlib::protocols::x509::Validity {
-                    not_before: fictionet::stdlib::protocols::x509::Time::from_unix(946684800)
-                        .unwrap(),
-                    not_after: fictionet::stdlib::protocols::x509::Time::from_unix(4102444800)
-                        .unwrap(),
-                },
-            )?;
+            let (ca, leaf) = certificates(&fcx)?;
             std::fs::write(&ca_path, ca.cert_pem())?;
             start(&fcx, leaf.chain, leaf.key, attachments)
         },
     ))
+}
+
+/// The world's certificate authority, and the certificate it issues for
+/// every HTTPS name.
+pub fn certificates(fcx: &fictionet::Cx) -> Result<(ca::Ca, ca::Leaf)> {
+    let ca = ca::Ca::new(fcx, "web_world CA")?;
+    let leaf = ca.issue(
+        fcx,
+        &[
+            "example.test",
+            "www.example.test",
+            "v4only.test",
+            "v6only.test",
+        ],
+        x509::Validity {
+            not_before: x509::Time::from_unix(946684800).unwrap(),
+            not_after: x509::Time::from_unix(4102444800).unwrap(),
+        },
+    )?;
+    Ok((ca, leaf))
 }
 
 /// The HTTPS app, shared by all four HTTPS names.
