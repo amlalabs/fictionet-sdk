@@ -11,9 +11,10 @@ use std::time::{Duration, SystemTime};
 
 use example_common::web_world::{SHARED, app};
 use example_common::zscaler::{DEFAULT_CLOUD, zscaler};
+use fictionet::events::{ConnInfo, Metadata, Observation, Observer, Stamp};
 use fictionet::stdlib::network::ethernet::{Family, FromVm, Link};
 use fictionet::stdlib::web;
-use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RecvError, Result, Seed};
+use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RecvError, Result, RunOptions, Seed};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::oneshot;
 
@@ -58,6 +59,27 @@ impl World {
     }
 }
 
+/// Watches the world's `http.request` events for the site, which only
+/// Firefox's GET produces.
+struct SiteLoaded {
+    host: String,
+    loaded: Arc<AtomicBool>,
+}
+
+impl Observer for SiteLoaded {
+    fn enabled(&self, metadata: Metadata, _connection: &ConnInfo) -> bool {
+        metadata.source == "http" && metadata.kind == "request"
+    }
+
+    fn observe(&self, _stamp: Stamp, observation: Observation<'_>) {
+        if let Observation::Event(event) = observation
+            && event.str("host") == Some(self.host.as_str())
+        {
+            self.loaded.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Starts the world and the frame bridge, and returns once the CA is minted.
 pub async fn start(config: Config) -> Result<World> {
     let (attacher, attachments) = fictionet::attachments();
@@ -75,8 +97,11 @@ pub async fn start(config: Config) -> Result<World> {
     let firefox_loaded = Arc::new(AtomicBool::new(false));
 
     let (ready, world_ready) = oneshot::channel();
-    let loaded = firefox_loaded.clone();
-    tokio::spawn(fictionet::run(Seed::random(), move |fcx| async move {
+    let options = RunOptions::new(Seed::random()).observer(Arc::new(SiteLoaded {
+        host: site.clone(),
+        loaded: firefox_loaded.clone(),
+    }));
+    tokio::spawn(fictionet::run(options, move |fcx| async move {
         let z = zscaler(&fcx, DEFAULT_CLOUD, now_unix)?;
         let www = format!("www.{site}");
         let site_cfg = z.server_config(&fcx, &[site.as_str(), www.as_str()], now_sys, now_unix)?;
@@ -85,16 +110,6 @@ pub async fn start(config: Config) -> Result<World> {
         if ready.send((z.root_pem().to_string(), fcx.clone())).is_err() {
             return Ok(());
         }
-        // Firefox's GET of the site, seen in the world's http.request events.
-        let site_name = site.clone();
-        fcx.events().subscribe(move |e| {
-            if e.source == "http"
-                && e.kind == "request"
-                && e.str("host") == Some(site_name.as_str())
-            {
-                loaded.store(true, Ordering::SeqCst);
-            }
-        });
         // The apt mirror: the world forwards these names to the real servers
         // over the host's network, so the guest installs the desktop at
         // boot. apt's signatures verify everything.
