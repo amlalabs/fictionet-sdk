@@ -394,6 +394,68 @@ fn observer_sees_upgrade_path_body_limit() {
     });
 }
 
+#[test]
+fn observer_sees_a_handed_off_request_once() {
+    struct Echo;
+    impl Handler for Echo {
+        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            if request
+                .extensions()
+                .get::<hyper::upgrade::OnUpgrade>()
+                .is_none()
+            {
+                return Reply::Handoff(request);
+            }
+            Reply::Now(http::Response::new(request.into_body()))
+        }
+    }
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let observer = Arc::new(Exposure::default());
+        serve_http(
+            &fcx,
+            &server,
+            80,
+            Arc::new(Echo),
+            HttpOptions {
+                observe: Some(observer.clone()),
+                ..HttpOptions::default()
+            },
+        )?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let mut request = format!(
+            "POST /login HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nContent-Length: {}\r\n\r\n",
+            SECRET.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(SECRET);
+        conn.write_all(&fcx, &request).await?;
+        let response = keep_alive_response(&fcx, &mut conn).await;
+        assert_eq!(response.head.status, 200);
+        assert_eq!(response.body, SECRET);
+        fcx.events()
+            .wait(&fcx, 1, Duration::from_secs(1), |e| e.is("http", "request"))
+            .await?;
+        assert_eq!(observer.heads.lock().unwrap().len(), 1);
+        assert_eq!(
+            *observer.ends.lock().unwrap(),
+            [("/login".into(), SECRET.len(), httpd::Received::Complete)]
+        );
+        let events = fcx.events().of("http", "request");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].str("received"), Some("complete"));
+        assert_eq!(
+            field_u64(&events[0], "observed_bytes"),
+            Some(SECRET.len() as u64)
+        );
+        assert_eq!(field_bool(&events[0], "classified"), Some(true));
+        assert_redacted(&events[0]);
+        Ok(())
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Running a world in a test
 

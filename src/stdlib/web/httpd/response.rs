@@ -116,7 +116,10 @@ impl Tracker {
     }
 
     pub(super) fn body(&mut self, bytes: &[u8]) {
-        if let Some(o) = &mut self.observation
+        // An observer sees no body bytes after its end, such as those of a
+        // handed-off request, which hyper reads again.
+        if self.received.is_none()
+            && let Some(o) = &mut self.observation
             && let Some(fields) = o.observer.body(bytes, &mut o.state)
         {
             o.fields.extend(fields);

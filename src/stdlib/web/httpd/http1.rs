@@ -46,8 +46,9 @@ pub struct Http1 {
     /// The world's date at the start of the run, for `Date` headers.
     pub(super) date: Option<SystemTime>,
     /// A request handed to hyper ([`Reply::Handoff`]), as bytes, once the
-    /// connection is handed over for it.
-    handoff: Option<Vec<u8>>,
+    /// connection is handed over for it, with the tracker that has already
+    /// observed its head and body.
+    pub(super) handoff: Option<(Vec<u8>, Tracker)>,
     pub(super) upgrade: Option<UpgradeHandler>,
     head: Option<RequestHead>,
     body: Vec<u8>,
@@ -87,7 +88,7 @@ impl Http1 {
     /// [`serve_connection`](super::serve_connection) serves such a
     /// connection on hyper's HTTP/1, which carries out the upgrade.
     pub fn take_handoff(&mut self) -> Option<Vec<u8>> {
-        self.handoff.take()
+        self.handoff.take().map(|(bytes, _)| bytes)
     }
 
     /// Sends a `Date` header with each response: `start`, the world's date
@@ -218,7 +219,8 @@ impl Http1 {
                         body: body.to_vec(),
                     }
                     .to_bytes()
-                    .ok();
+                    .ok()
+                    .map(|bytes| (bytes, tracker));
                     driver.cancel_timer(BODY);
                     return Flow::Upgrade(serve::Upgrade::Handoff);
                 }
