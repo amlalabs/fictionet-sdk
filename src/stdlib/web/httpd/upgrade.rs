@@ -210,9 +210,9 @@ impl Route {
                 let Ok(frame) = frame else {
                     tracker.received(Received::CutOff);
                     return Err(Box::new(answered(
-                        self.fcx.emitter(&self.info).enabled("http", "request"),
                         text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"),
                         "cut_off",
+                        self.fcx.emitter(&self.info).enabled("http", "request"),
                     )));
                 };
                 let Ok(data) = frame.into_data() else {
@@ -223,12 +223,12 @@ impl Route {
                 if len > self.limits.body {
                     tracker.received(Received::TooLarge);
                     return Err(Box::new(answered(
-                        self.fcx.emitter(&self.info).enabled("http", "request"),
                         text(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             "The request body is too large.\n",
                         ),
                         "too_large",
+                        self.fcx.emitter(&self.info).enabled("http", "request"),
                     )));
                 }
                 if !charge.as_mut().is_none_or(|c| c.set(len)) {
@@ -255,12 +255,12 @@ impl Route {
                     Received::CutOff
                 });
                 Err(Box::new(answered(
-                    self.fcx.emitter(&self.info).enabled("http", "request"),
                     text(
                         StatusCode::REQUEST_TIMEOUT,
                         "The request body took too long.\n",
                     ),
                     "timeout",
+                    self.fcx.emitter(&self.info).enabled("http", "request"),
                 )))
             }
         }
@@ -270,12 +270,12 @@ impl Route {
 /// The answer when the sandbox's budget cannot hold a body.
 fn over_budget(observing: bool) -> Response<Body> {
     answered(
-        observing,
         text(
             StatusCode::SERVICE_UNAVAILABLE,
             "The server cannot hold this request now.\n",
         ),
         "budget",
+        observing,
     )
 }
 

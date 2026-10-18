@@ -126,6 +126,7 @@ fn main() -> Result {
     println!("listening on {path}");
     fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
+            .aggregate_events()
             .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         move |fcx| world(fcx, attachments),
     ))

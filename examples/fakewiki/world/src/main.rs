@@ -85,6 +85,7 @@ fn real_main() -> fictionet::Result {
         .build()?;
     let result = runtime.block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
+            .aggregate_events()
             .event_history(Arc::new(fictionet::events::Memory::default()))
             .observer(Arc::new(fakewiki_world::events::LogObserver {
                 log: log.clone(),

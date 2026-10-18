@@ -19,13 +19,15 @@
 //! A world's time and randomness come from one place, its [`Cx`], and its
 //! randomness from a seed. With real sandboxes it runs on real time ([`run`]).
 //! In a test it runs on simulated time ([`lab`]), where the same seed and
-//! ordered inputs give the same event log and packets when the world is closed.
+//! ordered inputs and observer configuration give the same observed events and
+//! packets when the world is closed.
 //! [Repeatable runs](guide::running#repeatable-runs) lists the requirements and
 //! the HTTP/2 host-clock exception. [`running`](guide::running) is the guide;
 //! [`run`], [`lab`] and [`Cx`] document the runtime operations, and [`events`]
-//! documents recording. `run.start` records the seed only when
-//! [`Net::start`](stdlib::world::net::Net::start) or world code calls
-//! [`EventLog::start`](events::EventLog::start).
+//! documents lazy emission and optional retention. Integrators install observers
+//! through [`RunOptions`]: [`events::Memory`], native `Jsonl`, [`events::Aggregate`],
+//! dashboard retention, or their own. With none, recording costs nothing.
+//! `run.start` emits the seed automatically to interested observers.
 //!
 //! # How a sandbox connects to a world
 //!
@@ -175,13 +177,14 @@
 //!   network around the [`Host`](stdlib::world::net::Host)s it is given: the
 //!   sandboxes' subnet with DHCP, DNS for every host's names, a router, one
 //!   machine per address, and each host's services on their ports.
-//! - [`events`]: one log for everything the network and its services do,
-//!   kept by every run, and read as a file a grader reads after the run,
-//!   callbacks, or the dashboard.
+//! - [`events`]: structured facts emitted lazily to installed observers, such as
+//!   bounded memory for grading, a JSON Lines exporter or dashboard retention.
+//!   Optional aggregation summarizes repeated network facts.
 //!
 //! HTTP is a service too ([`stdlib::web::httpd`]): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
-//! server and a line-echo service run on two hosts, with the events on disk:
+//! server and a line-echo service run on two hosts; installed observers can
+//! retain their events:
 //!
 //! ```
 //! # #[cfg(feature = "std")]
@@ -215,7 +218,6 @@
 //!
 //! async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //!     let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
-//!     fcx.events().to_file(std::env::temp_dir().join("events.jsonl"))?;
 //!     Net::new()
 //!         .host("www", |h| h.dns_name("www.example.test").port_server(80, Server::new(site)))
 //!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
@@ -242,10 +244,10 @@
 //!
 //! # Watching a world
 //!
-//! Everything the network and its services do goes to one log of
-//! [`events`], which every run keeps: a file a grader reads after the run,
-//! callbacks, or the dashboard. The world itself can be watched while it
-//! runs, with nothing to turn on in world code ([`observe`]):
+//! Services emit [`events`] to observers explicitly installed by the integrator.
+//! Dashboard history requires [`RunOptions::event_history`] before execution;
+//! late viewers see only retained evidence. The world itself can be watched
+//! while it runs ([`observe`]):
 //! `fictionet dashboard` draws its tasks and links and decodes the packets
 //! that cross them, HTTPS included, and `fictionet observe` prints the
 //! graph, its changes and the world's events as lines of JSON for scripts.

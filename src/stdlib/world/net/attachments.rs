@@ -48,7 +48,7 @@ impl Hooks {
     ) {
         fcx.emitter(conn).emit("net", "blocked", |_| {
             let (event, detail) = build();
-            event.fields(detail).field("count", 1u64)
+            event.repeat(detail)
         });
     }
 
@@ -406,10 +406,7 @@ pub fn connection_limit(
                 sandbox: info.sandbox.clone(),
                 ..ConnInfo::default()
             };
-            event
-                .conn(&conn)
-                .fields(port_detail(dst.map(|a| a.port())))
-                .field("count", 1u64)
+            event.conn(&conn).repeat(port_detail(dst.map(|a| a.port())))
         });
     }
     guard

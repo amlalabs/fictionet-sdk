@@ -13,9 +13,9 @@
 //! folded: the first line of a kind for one sandbox, source and destination
 //! in each second is written as it comes, and the rest of that second are
 //! counted and written as one more line of the same kind with `"count": n`
-//! (and for `blocked`, `"ports": [lowest, highest]`). The network already
-//! counts the packets it blocks the same way, so its counted `blocked`
-//! lines are written as they come.
+//! (and for `blocked`, `"ports": [lowest, highest]`). The runner installs an
+//! aggregating observer before this projection; its counted `blocked` lines
+//! are written as they come.
 //!
 //! **No password.** A line never holds the account's password: the writer
 //! takes it out of every line, in any case, as `[password]`.
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(scrub("nothing here".into()), "nothing here");
     }
 
-    /// The network's own counted `blocked` lines are written as they come,
+    /// The observer's counted `blocked` lines are written as they come,
     /// not counted again.
     #[test]
     fn counted_lines_are_not_folded_again() {

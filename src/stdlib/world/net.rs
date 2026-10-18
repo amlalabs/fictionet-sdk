@@ -9,7 +9,9 @@
 //! name-based virtual hosting. Every sandbox that attaches is put on the
 //! sandboxes' subnet, given an address by DHCP or by its first packet, and
 //! kept from reaching the other sandboxes. A world then writes only its
-//! services.
+//! services. Services emit events lazily; the integrator installs observers with
+//! [`RunOptions`](fictionet::RunOptions) before execution. No observer means no
+//! event construction or retention.
 //!
 //! An office: a domain controller that answers LDAP and Kerberos, a web
 //! server, and a PLC, with DNS names for each:
@@ -31,7 +33,6 @@
 //! let directory = Arc::new(Directory);
 //! let plant = Arc::new(Plant);
 //! let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
-//! fcx.events().to_file("/tmp/office-events.jsonl")?;
 //! Net::new()
 //!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
 //!     .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))
@@ -80,7 +81,7 @@
 //!   machines on one Ethernet: broadcast and multicast reach every member.
 //!   The router sends the LAN's prefix to its gateway, the LAN's first
 //!   address answers DNS, and the packets the LAN drops are recorded
-//!   (as [repeats](fictionet::events#repeats)).
+//!   (optionally summarized by [`Aggregate`](fictionet::events::Aggregate)).
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". UDP delivery and closed-port
 //!   events use the declared UDP length. Invalid lengths are dropped;
@@ -98,10 +99,10 @@
 //!   detaches. A trusted sandbox ([`Net::route`]) has none.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
-//! - **Events.** The network records every fact in the run's
-//!   [events](fictionet::events): a `run.start` event first, `net` events for
+//! - **Events.** The network emits facts to interested installed
+//!   [observers](fictionet::events). The run emits `run.start`; `Net` emits `net` events for
 //!   sandboxes attaching,
-//!   binding, detaching and packets dropped (`net.blocked`, counted as
+//!   binding, detaching and packets dropped (`net.blocked`, optionally counted as
 //!   [repeats](fictionet::events#repeats)), `dns.query`
 //!   for every DNS message, `tls.handshake` for every handshake on a TLS
 //!   port, and each service's own events. Every event names its sandbox

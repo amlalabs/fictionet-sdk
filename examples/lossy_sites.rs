@@ -18,6 +18,7 @@ fn main() -> fictionet::Result {
 
     fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
+            .aggregate_events()
             .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         |fcx| async move {
             let app = axum::Router::new().route(

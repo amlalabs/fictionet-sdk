@@ -14,9 +14,9 @@ use fictionet::time::Instant;
 use super::{BadGateway, Body, BodyClassifier, Received, request_host, text};
 
 pub(super) fn answered(
-    observing: bool,
     mut response: Response<Body>,
     answer: &'static str,
+    observing: bool,
 ) -> Response<Body> {
     if observing {
         response
@@ -53,7 +53,7 @@ impl Observation {
             .bounded()
             .fields(std::mem::take(&mut self.fields))
             .fields(fields);
-        self.truncated |= event.truncated;
+        self.truncated |= event.is_truncated();
         self.fields = event.fields;
     }
 }
@@ -261,12 +261,13 @@ impl Tracker {
         self.charge = 0;
         self.received(Received::CutOff);
         let mut event = self.event.take()?;
-        let mut fields = self.observation.take().map_or_else(Fields::new, |o| {
-            if o.truncated {
-                event.truncated = true;
-            }
-            o.fields
-        });
+        if self.observation.as_ref().is_some_and(|o| o.truncated) {
+            event = event.truncated();
+        }
+        let mut fields = self
+            .observation
+            .take()
+            .map_or_else(Fields::new, |o| o.fields);
         let mut extra = extra().unwrap_or_default();
         let answer = extra.remove("answer").unwrap_or_else(|| {
             if status.is_none() {

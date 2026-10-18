@@ -45,6 +45,7 @@ pub struct RunOptions {
     observer: Option<Arc<dyn crate::events::Observer>>,
     fields: crate::events::Fields,
     event_history: Option<Arc<crate::events::Memory>>,
+    aggregate_events: bool,
 }
 
 impl RunOptions {
@@ -54,6 +55,7 @@ impl RunOptions {
             seed,
             observer: None,
             event_history: None,
+            aggregate_events: false,
             fields: crate::events::Fields::new(),
         }
     }
@@ -69,6 +71,14 @@ impl RunOptions {
     /// receive the events, regardless of builder call order.
     pub fn event_history(mut self, history: Arc<crate::events::Memory>) -> Self {
         self.event_history = Some(history);
+        self
+    }
+
+    /// Aggregates repeatable facts before all installed destinations, including
+    /// dashboard retention. Uses [`crate::events::Aggregate`]'s default bounds.
+    /// Builder call order does not affect which destinations receive summaries.
+    pub fn aggregate_events(mut self) -> Self {
+        self.aggregate_events = true;
         self
     }
 
@@ -105,10 +115,9 @@ impl From<crate::Seed> for RunOptions {
 /// through its [`Cx`] is the next part of one stream started from it. Use
 /// [`Seed::random`](crate::Seed::random) for a fresh seed, or
 /// [`Seed::from_u64`](crate::Seed::from_u64) for a fixed one.
-/// [`Net::start`](crate::stdlib::world::net::Net::start) records the seed in
-/// `run.start`. Worlds without `Net` call
-/// [`EventLog::start`](crate::events::EventLog::start) explicitly; neither
-/// `run` nor [`lab`] emits that event itself.
+/// The run emits `run.start` automatically to interested observers, once at
+/// zero, with the seed and clock origin. Install observers through [`RunOptions`];
+/// without one, events are neither constructed nor retained.
 ///
 /// # When the future finishes
 ///
@@ -199,14 +208,14 @@ where
 /// from `seed` in the same way. Only the clock differs. It starts at zero,
 /// and when every task is waiting it jumps to the earliest deadline, waking
 /// timers due at the same instant in the order they were set. With a closed
-/// world, the same seed and ordered inputs give the same event log and
+/// world, the same seed and ordered inputs give the same observed events and
 /// packets. This requires the world to use the run's clock, randomness and
 /// task scheduling. [Repeatable runs](crate::guide::running#repeatable-runs)
 /// lists the requirements and the HTTP/2 host-clock exception.
 ///
-/// Like [`run`], `lab` leaves `run.start` recording to
-/// [`Net::start`](crate::stdlib::world::net::Net::start) or an explicit call to
-/// [`EventLog::start`](crate::events::EventLog::start).
+/// Like [`run`], `lab` emits `run.start` automatically when an observer wants it.
+/// Observer configuration is part of a repeatable run; synchronous
+/// [`Memory`](crate::events::Memory) retains deterministic evidence.
 ///
 /// Each run has its own task identities. A lab started inside another
 /// run's task has a world root with no parent in the outer run.
@@ -258,10 +267,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 /// The part of a run that wakers and every [`Cx`] share.
 pub(crate) struct RunShared {
     pub(crate) environment: Arc<crate::environment::RunEnvironment>,
-    pub(crate) start_wall: SystemTime,
     pub(crate) observer: crate::events::Dispatch,
-    /// The run's events, kept whether or not anyone observes.
-    pub(crate) events: Arc<crate::events::Store>,
     /// The run's TLS key log, shared with the graph for observers.
     #[cfg(feature = "observe")]
     pub(crate) keys: Arc<crate::telemetry::KeyRecorder>,
@@ -350,6 +356,7 @@ impl RunShared {
             observer,
             fields,
             event_history,
+            aggregate_events,
         } = options;
         let observer = match (observer, event_history.as_ref()) {
             (Some(observer), Some(history)) => {
@@ -361,6 +368,14 @@ impl RunShared {
             (None, Some(history)) => Some(history.clone() as Arc<dyn crate::events::Observer>),
             (observer, None) => observer,
         };
+        let observer = observer.map(|observer| {
+            if aggregate_events {
+                Arc::new(crate::events::Aggregate::new(observer))
+                    as Arc<dyn crate::events::Observer>
+            } else {
+                observer
+            }
+        });
         let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
         let start_wall = if mode == crate::RunMode::Real {
@@ -397,7 +412,6 @@ impl RunShared {
                 || crate::time::Instant::ZERO,
             );
         }
-        let events = crate::events::Store::new(mode);
         #[cfg(feature = "observe")]
         let keys = Arc::new(crate::telemetry::KeyRecorder::default());
         let graph = Graph::new(
@@ -410,9 +424,7 @@ impl RunShared {
         );
         Arc::new(Self {
             environment,
-            start_wall,
             observer,
-            events,
             #[cfg(feature = "observe")]
             keys,
             queue: Mutex::new(Queue {
@@ -426,8 +438,6 @@ impl RunShared {
     pub(crate) fn end(&self) {
         self.graph.run_ended();
         self.observer.end(|| self.environment.clock.now());
-        // Nothing more is recorded: let callbacks and file writers go.
-        self.events.close();
         // Nothing more crosses the world's links: stop watching them.
         #[cfg(feature = "observe")]
         self.graph.watches.end_run();

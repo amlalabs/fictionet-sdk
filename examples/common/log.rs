@@ -236,7 +236,7 @@ fn write_all(
 /// folded.
 pub fn fold_key(line: &Map<String, Value>, folded: &[&str]) -> Option<String> {
     let kind = line.get("type")?.as_str()?;
-    // A line with a count is a fold already: the network's own.
+    // A line with a count is already summarized by an observer.
     if !folded.contains(&kind) || line.contains_key("count") {
         return None;
     }

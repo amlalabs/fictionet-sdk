@@ -817,7 +817,7 @@ impl<D> Driver<'_, D> {
 #[derive(Default)]
 struct Staged {
     fcx: Option<Cx>,
-    observer: Option<Arc<crate::events::Dispatch>>,
+    observer: Option<Arc<fictionet::events::Dispatch>>,
     state: std::cell::RefCell<StagedState>,
 }
 
@@ -836,7 +836,7 @@ impl Staged {
             || self
                 .observer
                 .as_ref()
-                .is_some_and(|o| o.enabled(crate::events::Metadata { source, kind }, conn))
+                .is_some_and(|o| o.enabled(fictionet::events::Metadata { source, kind }, conn))
     }
 
     fn emit(
@@ -877,7 +877,7 @@ impl Staged {
             }
             if let Some(observer) = &self.observer
                 && observer.enabled(
-                    crate::events::Metadata {
+                    fictionet::events::Metadata {
                         source: event.source,
                         kind: event.kind,
                     },
@@ -888,7 +888,7 @@ impl Staged {
             }
         }
         if let Some(cx) = &self.fcx {
-            cx.run.observer.lost(state.lost);
+            cx.events_lost(state.lost);
         }
         if let Some(observer) = &self.observer {
             observer.lost(state.lost);
@@ -3573,7 +3573,7 @@ pub struct Harness<S: Service> {
     opts: ServeOptions,
     now: Instant,
     opened: bool,
-    observer: Arc<crate::events::Dispatch>,
+    observer: Arc<fictionet::events::Dispatch>,
     output: Vec<u8>,
     upgraded: Option<Upgrade>,
     /// Whether a call returned the upgrade.
@@ -3620,7 +3620,7 @@ where
             opts,
             now: Instant::ZERO,
             opened: false,
-            observer: Arc::new(crate::events::Dispatch::new(None)),
+            observer: Arc::new(fictionet::events::Dispatch::new(None)),
             output: Vec::new(),
             upgraded: None,
             reported: false,
@@ -3628,12 +3628,12 @@ where
     }
 
     /// Installs a destination for staged service events before opening.
-    pub fn observer(mut self, observer: Arc<dyn crate::events::Observer>) -> Self {
+    pub fn observer(mut self, observer: Arc<dyn fictionet::events::Observer>) -> Self {
         assert!(
             !self.opened,
             "install the observer before opening the harness"
         );
-        self.observer = Arc::new(crate::events::Dispatch::new(Some(observer)));
+        self.observer = Arc::new(fictionet::events::Dispatch::new(Some(observer)));
         self.core.s.events.observer = Some(self.observer.clone());
         self
     }
@@ -3913,8 +3913,8 @@ impl<S: Service> Drop for Harness<S> {
 #[cfg(test)]
 mod observation_tests {
     use super::*;
-    use crate::events::Memory;
     use crate::stdlib::codec::{Ending, LineError, Lines};
+    use fictionet::events::Memory;
 
     struct Echo {
         builds: Arc<AtomicUsize>,

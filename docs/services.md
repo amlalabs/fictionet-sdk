@@ -3,13 +3,13 @@
 This guide builds a small world step by step: a service, a test for it,
 a network of hosts that serve it, and a log a grader reads. Every piece is
 a public module of `fictionet::stdlib`, so each file can be copied into a world's crate and
-changed there. The events every piece records go to `fictionet::events`,
-the one log each run keeps.
+changed there. Each piece emits structured facts through `fictionet::events`
+to optional observers installed by the integrator.
 
 | Module | What it gives |
 |---|---|
 | `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests, transcripts and fault plans |
-| `fictionet::events` | Not in the stdlib: the run's log of `Event`s, in one shape, kept whether or not anyone reads it, and read as a file, by callbacks, by a grader in the same process, and by the dashboard |
+| `fictionet::events` | Not in the stdlib: lazy structured events and optional observers (`Memory`, `Jsonl`, `Aggregate`, dashboard retention, or custom observers); no observer means no recording work |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Router`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
@@ -153,8 +153,7 @@ impl Service for Prompt {
     fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_, Self::Decoder>) -> Result<Flow, Self::Error> {
         let line = line.unwrap_or_default();
         let right = line == password.as_bytes();
-        driver.record(
-            Event::new("prompt", "login")
+        driver.emit("prompt", "login", |event| event
                 .summary(if right { "login" } else { "wrong password" })
                 .level(if right { Level::Alarm } else { Level::Info })
                 .field("right", right),
@@ -810,31 +809,33 @@ See [`httpd`'s event contract](../src/stdlib/web/httpd.rs) for `sent` and
 
 ## 5. Events
 
-Every run keeps a log of events, with nothing to set up, and every fact
-lands in it: sandboxes attaching and binding addresses, DNS queries, TLS
-handshakes, HTTP requests, packets the network dropped, routes and LAN
-members that went away, and every service's own events. World code
-records its own with `fcx.record(Event::new(..))`. Each event carries its
-sandbox and connection number, a sequence number from 1, and its time on
-the run's clock:
+Services emit structured facts: sandboxes attaching and binding addresses, DNS
+queries, TLS handshakes, HTTP requests, dropped packets, route changes and
+service-specific events. World code uses `fcx.emit("source", "kind", |event| ...)`.
+The integrator installs observers through `RunOptions` before execution: none,
+bounded `Memory`, native `Jsonl`, optional `Aggregate`, dashboard retention, or
+its own implementation. `Fanout` combines destinations. Without an observer,
+emission performs no allocation, formatting, clock read, task lookup or numbering.
 
 ```rust
-let events = fcx.events();
-events.to_file("/var/lib/fictionet/events.jsonl")?; // for a grader after the run
-Net::new() /* ... */.start(&fcx, attachments)?;
-// For a grader in the same process, during the run or after it:
-let logins = events.of("prompt", "login");
+use std::sync::Arc;
+use fictionet::{RunOptions, Seed, block_on, lab};
+use fictionet::events::{Aggregate, Memory};
+let evidence = Arc::new(Memory::default());
+let options = RunOptions::new(Seed::from_u64(7))
+    .observer(Arc::new(Aggregate::new(evidence.clone())));
+block_on(lab(options, |fcx| async move {
+    fcx.emit("prompt", "login", |event| event.field("right", true));
+    Ok(())
+}))?;
+let logins = evidence.checked_of("prompt", "login")?;
 ```
 
-`EventLog::wait` checks a snapshot of the held events, oldest first, with
-the log unlocked. Its predicate may read or record events in the same log.
-Events recorded by the predicate are considered on the next check.
-It checks every 10 ms on the run's clock, shortening the last sleep to
-the remaining time limit. At the deadline it returns the matches so far.
-A limit that overflows the clock's range has no deadline. Cancellation
-returns `Cancelled` before inspecting events and before returning matches,
-even when enough events are already held, `n` is zero, or the deadline
-has arrived.
+`Memory::wait` waits for matching complete evidence on the run's clock, bounded
+by a deadline. At the deadline it returns matches so far. Retention loss and
+cancellation are errors. Reads do not flush aggregation or change history.
+Use `checked_of` or `checked_all` for grading; `after` supplies bounded display
+batches without certifying completeness.
 
 Task identities belong to one run. An event recorded through a `Cx` from
 another run has no task metadata. The same applies outside any world task.
@@ -845,60 +846,44 @@ Link owners and creators name only tasks from the graph's own run.
 The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
 `level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
 `tls`, `sni`, `alpn`, `fields`, then the task that recorded it (`node`,
-`task`, `file`, `line`, `parent`). The network's first event is
-`run.start`, whose `wall` field puts a real run's clock on a calendar. A lab
-records `null` for `wall`. The `seed` field contains the 32-byte run seed as
+`task`, `file`, `line`, `parent`). The run automatically emits
+`run.start` at zero to interested observers. Its `wall` field puts a real run's
+clock on a calendar; a lab records `null` for `wall`. The `seed` field contains the 32-byte run seed as
 64 lowercase hexadecimal digits.
 The `rng` field is `chacha20-v1`: ChaCha20 with contiguous byte consumption,
 little-endian integers and the high 53 bits for fractions. Field
 names are fixed by the code that records; names that come from the wire,
 such as LDAP attributes, go under one field as an object.
 
-The [event log](../src/events.rs) documents retention, repeat aggregation,
-late subscribers and dropped-event reporting. Sum `count` when grading
-packet repeats; a port scan of 65,535 ports to one machine costs a couple of
-events a second while its repeat windows fit.
+The [events module](../src/events.rs) documents delivery, retention and repeat
+aggregation. The dispatch assigns sequence numbers and run-clock timestamps
+before fan-out. Filtering and aggregation may leave sequence gaps; explicit loss
+status, rather than gaps, establishes whether evidence is incomplete.
+Observers receive borrowed events synchronously in sequence order and must return
+promptly without calling back into the world.
 
-Each subscription receives replay and live events in sequence order, one
-callback at a time, outside the log and delivery locks. A callback may read,
-record, or subscribe to the same log. Reentrant or concurrent recording queues
-events for the caller already draining that subscription. Recording or
-subscribing may return before those callbacks finish. A callback can run in a
-different task or thread from the one that recorded its event, and must return
-quickly without blocking. A callback panic propagates to the caller draining it.
-If the run ends during a callback, its caller still drains the queued events.
+`Memory` defaults to 50,000 events within 16 MiB. Oldest events are evicted first;
+loss persists even if a later query selects a different kind of fact. An optional
+`Aggregate` wraps retention with one-second run-time windows, at most 1,024
+pending facts and two MiB of event storage. Services mark repeatable facts with
+`Event::repeat`, including detail such as the destination port. Matching facts
+become summaries with `count`, `first_seq`, `last_seq` and numeric detail ranges.
+Sum `count` when grading repeats. Ordinary events, the next emission after window
+expiry, capacity pressure and run end deliver pending summaries in sequence order.
+Reads never flush them. Unlimited distinct traffic can still overflow retention.
 
-History holds up to 50,000 ordinary events within 16 MiB and 5,000 repeats
-within 2 MiB. An event larger than its history's byte limit is numbered but
-not kept. It does not evict other events. Readers see an `events.dropped`
-gap in its place; live callbacks still receive it. Open repeat windows have
-a separate 2 MiB budget and a limit of 1,024 windows. The oldest counts
-close early to make room, including when numeric detail ranges grow. A
-repeat too large for a window is recorded individually with `count` 1.
+Byte accounting includes owned capacities, task names and shared connection
+metadata charged in full per copy, plus estimated allocation overhead. It excludes
+spare collection capacity and copies held by readers. Retention limits do not
+bound total process memory.
 
-Byte accounting includes owned capacities, task names, and the full shared
-connection metadata for each retained copy, plus estimated allocation
-overhead. It excludes spare capacity in history queues and window indexes,
-static strings, temporary allocations while recording or reading, and
-copies held by readers, callbacks, or pending subscription deliveries. These
-fixed retention limits do not bound total process memory.
-
-Native real runs use writer threads and wait for them at shutdown. In
-browsers, labs and builds without `std`, event sinks write and flush each line
-synchronously in the subscription's drainer, in sequence order. Browser runs
-can use an in-memory sink with `EventLog::to_writer`. Native writer queues
-have their own limit of 100,000 events or 16 MiB of event data; oversized
-events are lost there too.
-After a native writer fails to write or flush, or panics, it writes nothing
-more, including an `events.lost` line. Lines written since its last successful
-flush count as lost too. A panic's remaining batch is counted during unwind;
-events still in its channel are counted when the thread is joined. Shutdown
-and replay after shutdown do not rethrow that panic. A send racing with
-finalization can be counted twice, at most one per writer. Native writer
-failures are latched: `EventLog::lost()` stays at least one even if no lines
-were pending. Synchronous sink panics still propagate to the drainer's caller.
-Discard a sample if
-[`EventLog::lost`](../src/events.rs) is nonzero.
+Native `Jsonl` enqueues events within explicit count and byte bounds; its worker
+serializes and writes the existing JSON Lines format. Full queues count loss
+without blocking the world. `end` seals input; the host calls `finish` outside the
+run to drain output and report errors. `lost` reports rejected or unwritten events.
+Discard samples with incomplete output. Worker scheduling can affect overflow,
+so use synchronous `Memory` for deterministic lab evidence. Browser and builds
+without `std` can use `Memory` or a custom observer without a filesystem worker.
 
 `Event::to_line()` now returns `Result<String, json::Error>`. Callers must
 handle JSON size, depth and value-count errors. File sinks count events
@@ -919,12 +904,9 @@ turns an event into a display layer, with its summary and fields as notes.
 If a non-string field cannot be serialized, its note is
 `unserializable: <error>`.
 
-Migration: replace `fictionet::events::record_drop` with
-`fictionet::stdlib::network::ip::record_drop`, using the same arguments. Replace
-`event.layer()` with `fictionet::observe::Layer::from_event(&event)`.
-The old entry points are removed so generic events no longer depend on
-packet parsing or display-layer construction. These are source-breaking
-path changes. Event data, repeat aggregation and display output are unchanged.
+The helper checks interest before parsing packet details. It emits each occurrence;
+optional aggregation and retention belong to installed observers. Generic event
+construction stays independent of packet parsing and display-layer construction.
 
 ## 6. The dashboard
 
@@ -1038,7 +1020,7 @@ An existing attachment's next receive reports `RecvError::Closed`, and its
 queued outgoing packets are dropped. After a resource shortage pauses accepts,
 the listener keeps retrying registration until it can accept again.
 
-The dashboard lists the events under **Events**, from what the log held
+The dashboard lists the events under **Events**, from explicitly installed retention
 when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The
 built-in registry has six decoders: `http1`, `http2`, `tls`, `modbus`, `dhcp`

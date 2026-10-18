@@ -119,7 +119,9 @@ impl Emitter<'_> {
     }
 }
 
-pub(crate) struct Dispatch {
+/// Serialized numbering and delivery for a run or a standalone service harness.
+/// All destinations share stamps. Call [`Self::enabled`] before constructing events.
+pub struct Dispatch {
     observer: Option<Arc<dyn Observer>>,
     state: Mutex<State>,
 }
@@ -131,20 +133,23 @@ struct State {
 }
 
 impl Dispatch {
-    pub(crate) fn new(observer: Option<Arc<dyn Observer>>) -> Self {
+    /// Creates a dispatch with an optional, fixed destination.
+    pub fn new(observer: Option<Arc<dyn Observer>>) -> Self {
         Self {
             observer,
             state: Mutex::new(State::default()),
         }
     }
 
-    pub(crate) fn enabled(&self, metadata: Metadata, connection: &ConnInfo) -> bool {
+    /// Checks interest without reading the clock or numbering an event.
+    pub fn enabled(&self, metadata: Metadata, connection: &ConnInfo) -> bool {
         self.observer
             .as_ref()
             .is_some_and(|o| o.enabled(metadata, connection))
     }
 
-    pub(crate) fn emit(&self, mut event: Event, at: impl FnOnce() -> Instant) {
+    /// Delivers an interested event, assigning its sequence and reading run time.
+    pub fn emit(&self, mut event: Event, at: impl FnOnce() -> Instant) {
         let Some(observer) = &self.observer else {
             return;
         };
@@ -165,7 +170,8 @@ impl Dispatch {
         observer.observe(stamp, Observation::Event(&event));
     }
 
-    pub(crate) fn lost(&self, count: u64) {
+    /// Reports facts omitted by a producer before delivery.
+    pub fn lost(&self, count: u64) {
         if count != 0
             && let Some(observer) = &self.observer
         {
@@ -176,7 +182,8 @@ impl Dispatch {
         }
     }
 
-    pub(crate) fn end(&self, at: impl FnOnce() -> Instant) {
+    /// Seals delivery and ends the observer once.
+    pub fn end(&self, at: impl FnOnce() -> Instant) {
         let Some(observer) = &self.observer else {
             return;
         };
@@ -310,54 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn recordings_and_emissions_share_dispatch_order_and_stamps() {
-        let all = Arc::new(Memory::default());
-        let orders = Arc::new(Memory::default());
-        let fanout = Fanout::new(vec![all.clone(), Arc::new(Orders(orders.clone()))]);
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)).observer(Arc::new(fanout)),
-            |cx| async move {
-                cx.record(Event::new("shop", "order").field("item", "pump"));
-                cx.emit("shop", "order", |e| e.field("item", "valve"));
-                cx.sleep(Duration::from_secs(2)).await?;
-                cx.record_at(
-                    Instant::ZERO,
-                    Event::new("shop", "order").field("item", "pipe"),
-                );
-                for port in [1u64, 2] {
-                    cx.record_repeat(
-                        Event::new("shop", "order"),
-                        super::super::Fields::new().with("port", port),
-                    );
-                }
-                cx.emitter(&ConnInfo::default())
-                    .emit("shop", "order", |e| e.field("item", "tap"));
-                let old = cx.events().of("shop", "order");
-                assert_eq!(old.len(), 3);
-                assert_eq!(old[0].str("item"), Some("pump"));
-                assert_eq!(old[1].str("item"), Some("pipe"));
-                Ok(())
-            },
-        ))
-        .unwrap();
-        let events = orders.checked_of("shop", "order").unwrap();
-        assert_eq!(events, all.checked_of("shop", "order").unwrap());
-        assert_eq!(
-            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            [2, 3, 4, 5, 6, 7]
-        );
-        assert_eq!(
-            events
-                .iter()
-                .map(|e| e.at.since_start().as_secs())
-                .collect::<Vec<_>>(),
-            [0, 0, 0, 2, 2, 2]
-        );
-        assert_eq!(events[3].u64("port"), Some(1));
-        assert_eq!(events[4].u64("port"), Some(2));
-    }
-
-    #[test]
     fn memory_flood_is_bounded_and_cannot_be_graded() {
         let memory = Arc::new(Memory::new(Limits::new(3, 4096)));
         block_on(lab(
@@ -422,9 +381,6 @@ mod tests {
             RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Ended(ended.clone()))),
             |cx| async move {
                 cx.emit("shop", "order", |_| panic!("filtered event was built"));
-                cx.record(Event::new("shop", "order"));
-                cx.record_at(Instant::ZERO, Event::new("shop", "order"));
-                cx.record_repeat(Event::new("shop", "order"), Default::default());
                 cx.cancel();
                 Ok(())
             },

@@ -64,7 +64,7 @@
 //!   a protocol chooses its own checksum coverage.
 //! - [`packet`] and [`packet_with`] put an IP header in front of a payload.
 //!   [`hop`] lowers the TTL as a router does.
-//! - [`record_drop`] records a dropped packet in the run's event log, with
+//! - [`record_drop`] emits a dropped-packet fact to interested observers, with
 //!   its addresses, protocol and reason.
 //!
 //! ```
@@ -841,7 +841,9 @@ pub fn record_drop<F>(
         .with("len", packet.0.len() as u64)
         .with("dst_port", opt(port.map(u32::from)));
     all.extend(detail());
-    fcx.emit_observation(enrich(event.conn(conn)).fields(all).field("count", 1u64));
+    let event = enrich(event.conn(conn)).repeat(all);
+    let connection = event.conn.clone();
+    fcx.emitter(&connection).emit(source, "drop", |_| event);
 }
 
 /// The IP version of a packet, from the top four bits of its first byte:

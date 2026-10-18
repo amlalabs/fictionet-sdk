@@ -486,8 +486,8 @@
 //! - `net.blocked`: the packets `Sites` itself drops or refuses, with
 //!   `why` (see [`BlockedWhy`](fictionet::stdlib::world::net::BlockedWhy)),
 //!   `protocol`, `src`, `dst`, `dst_port` and `count`. These are
-//!   [repeats](fictionet::events#repeats): a scan or a flood is counted, not
-//!   kept packet by packet.
+//!   repeatable facts: an optional [`Aggregate`](fictionet::events::Aggregate)
+//!   counts a scan or flood within bounded run-time windows.
 //!
 //! Every event names the sandbox it came from; events about a connection
 //! carry its number, from 1, on both ports. A connection's `tls.handshake`
@@ -500,20 +500,27 @@
 //!
 #![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
 //!
-//! [`EventLog::subscribe`](fictionet::events::EventLog::subscribe) documents callback delivery.
-//! Callbacks must not block the world's thread. For file output, use
-//! [`EventLog::to_file`](fictionet::events::EventLog::to_file):
+//! The integrator installs observers before running the world. With no observer,
+//! services skip event construction. [`Memory`](fictionet::events::Memory) retains
+//! bounded evidence; native `Jsonl` writes files and requires an explicit `finish`
+//! outside the run. Custom observers must return promptly without calling back
+//! into the world. A grader can install memory and optional repeat aggregation:
 //!
 //! ```
-//! # use fictionet::{Attachments, Cx, Result, stdlib::web};
-//! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let events = fcx.events();
-//! events.to_file("/var/lib/fictionet/events.jsonl")?;
-//! web::Sites::new(site_for).start(&fcx, attachments)?;
-//! // At the end of the sample: events.lost() must be zero.
-//! # Ok(())
-//! # }
+//! use std::sync::Arc;
+//! use fictionet::{RunOptions, Seed, block_on, lab};
+//! use fictionet::events::{Aggregate, Memory};
+//! let evidence = Arc::new(Memory::default());
+//! let options = RunOptions::new(Seed::from_u64(7))
+//!     .observer(Arc::new(Aggregate::new(evidence.clone())));
+//! block_on(lab(options, |fcx| async move {
+//!     // Start the sites and simulated clients here.
+//!     fcx.emit("shop", "order", |event| event.field("item", "pump"));
+//!     Ok(())
+//! }))?;
+//! let events = evidence.checked_all()?;
+//! assert!(events.iter().any(|event| event.is("shop", "order")));
+//! # Ok::<(), fictionet::Error>(())
 //! ```
 //!
 //! A handler can add its own fields to its request's event. It puts

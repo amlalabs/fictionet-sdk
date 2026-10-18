@@ -288,7 +288,7 @@ mod tests {
                     "too many evidence waits"
                 );
                 drop(waits);
-                cx.record(Event::new("test", "ready"));
+                cx.emit("test", "ready", |event| event);
                 assert_eq!(
                     memory
                         .wait(&cx, 1, ms(100), |event| event.is("test", "ready"))
@@ -311,7 +311,7 @@ mod tests {
             move |cx| async move {
                 let error = memory
                     .wait(&cx, 1, ms(100), |_| {
-                        cx.record(Event::new("test", "overflow"));
+                        cx.emit("test", "overflow", |event| event);
                         true
                     })
                     .await

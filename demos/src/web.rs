@@ -24,6 +24,7 @@ pub async fn run(assets: Assets) -> Result {
     let (ready, world_ready) = tokio::sync::oneshot::channel();
     let world = tokio::spawn(fictionet::run(
         fictionet::RunOptions::new(Seed::random())
+            .aggregate_events()
             .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         move |fcx| async move {
             let (ca, leaf) = certificates(&fcx)?;

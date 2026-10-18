@@ -9,8 +9,9 @@
 //! per packet. The first line for a sandbox, protocol, source, destination and
 //! refusal reason is written immediately. Repeats within one second become
 //! one line with a count and the lowest and highest destination ports.
-//! The network also folds packets. Its already-counted lines pass through
-//! without further folding. Open folds are bounded and flushed early if full.
+//! The runner installs an aggregating observer before this projection. Its
+//! counted lines pass through without further folding. Open folds are bounded
+//! and flushed early if full.
 
 use crate::events;
 use fictionet::{Cx, events::Event as Entry};
@@ -87,7 +88,7 @@ mod tests {
     use super::*;
     use example_common::log::fold_key;
 
-    /// The network's own counted `blocked` lines are written as they come,
+    /// The observer's counted `blocked` lines are written as they come,
     /// not counted again.
     #[test]
     fn counted_lines_are_not_folded_again() {

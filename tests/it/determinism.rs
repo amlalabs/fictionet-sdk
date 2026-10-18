@@ -574,7 +574,7 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
             let foreign = fcx.clone();
             lab(Seed::from_u64(2), move |_fcx| async move {
                 foreign.emit("test", "record", |event| event);
-                foreign.emit("test", "record_at", |event| event);
+                foreign.emit("test", "foreign_emission", |event| event);
                 foreign.emit("test", "repeat", |event| event);
                 foreign.spawn(|fcx| async move {
                     fcx.emit("test", "foreign_spawn", |event| event);

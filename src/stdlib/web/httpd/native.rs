@@ -207,9 +207,9 @@ impl Http1 {
         let lacks_host = version == Version::HTTP_11 && !request.headers().contains_key(HOST);
         let reply = if self.too_big {
             Reply::Now(answered(
-                driver.event_enabled("http", "request"),
                 status_only(StatusCode::PAYLOAD_TOO_LARGE),
                 "too_large",
+                driver.event_enabled("http", "request"),
             ))
         } else if lacks_host {
             Reply::Now(no_host(driver.event_enabled("http", "request")))
@@ -247,9 +247,9 @@ impl Http1 {
                 (
                     None,
                     Some(answered(
-                        driver.event_enabled("http", "request"),
                         status_only(StatusCode::BAD_REQUEST),
                         "cut_off",
+                        driver.event_enabled("http", "request"),
                     )),
                 )
             }

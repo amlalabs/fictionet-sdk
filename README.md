@@ -59,8 +59,8 @@ The crate is not on crates.io, so build it from this repository.
 
 A world's time and randomness come from one place, and its randomness from a
 seed. With real sandboxes it runs on real time. In a test it can run on
-simulated time instead, where the same seed and the same inputs give the same
-event log and the same packets, byte for byte, including HTTP/2 reset expiry
+simulated time instead. In a closed world, the same seed, inputs and observer
+configuration give the same observed events and packets; see the HTTP/2 clock exception
 ([running a world](src/guide/running.rs)).
 
 ## Try it
@@ -152,9 +152,11 @@ services on its ports. A service is the server side of one protocol for one
 connection, written with no I/O: it gets decoded items and appends reply bytes,
 and one driver runs it over any connection. HTTP is a service
 (`stdlib::web::httpd`), and `web::Sites` is a preset on `Net` for websites. Every
-service records what it sees in the run's one log of events
-(`fictionet::events`), which every run keeps: a file a grader reads after the
-run, callbacks, or the dashboard.
+service emits structured events (`fictionet::events`). The integrator installs
+observers through `RunOptions`: none, bounded `Memory`, native `Jsonl`, an
+`Aggregate` around retention, the dashboard's retention, or a custom observer.
+With no observer, event construction and recording cost nothing. Graders check
+retention completeness before using evidence.
 [docs/services.md](docs/services.md) builds a small world this way, step by
 step.
 

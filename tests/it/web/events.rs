@@ -7,7 +7,7 @@ use super::*;
 // ---------------------------------------------------------------------------
 // Tests: events
 
-/// A test world's event log, read from a mark the test moves past the
+/// A test world's retained events, read from a mark the test moves past the
 /// events it has checked.
 #[derive(Clone)]
 pub(super) struct Log {
@@ -29,7 +29,7 @@ impl Log {
     }
 }
 
-/// [`world`], with the run's event log.
+/// [`world`], with explicit event retention.
 pub(super) fn world_events<F, Fut>(f: F)
 where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,

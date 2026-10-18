@@ -305,8 +305,9 @@
 //! Location: https://example.test/
 //! ```
 //!
-//! The observer shows the world's side. Every world keeps a log of events, and
-//! `web_world`'s sites record one for each DNS query, TLS handshake and HTTP request.
+//! The observer shows the world's side. `web_world` explicitly installs bounded
+//! retention and repeat aggregation. Its sites emit each DNS query, TLS handshake
+//! and HTTP request; worlds without observers construct and retain no events.
 //! `fictionet observe` prints each event as a line of JSON while it watches.
 //! These lines come from a separate run of the same two requests (cut short
 //! here):

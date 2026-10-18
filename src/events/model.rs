@@ -6,7 +6,7 @@ use crate::stdlib::codec::Wire;
 use crate::stdlib::protocols::json::{self, Number, Value};
 use crate::time::Instant;
 
-/// How much an event matters to the people and graders reading the log.
+/// How much an event matters to the people and graders observing it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Level {
     /// An ordinary fact: a query, a request, a connection.
@@ -244,12 +244,12 @@ pub(crate) struct Origin {
 
 /// One fact a world recorded. See the [module docs](crate::events).
 ///
-/// Build one with [`Event::new`] and the methods after it, and record it
-/// with [`Cx::record`](crate::Cx::record). Recording sets
+/// Build one lazily with [`Cx::emit`](crate::Cx::emit) or a connection's
+/// [`Emitter`](super::Emitter). Delivery sets
 /// [`seq`](Self::seq), [`at`](Self::at) and the task that recorded it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
-    /// Its place in the run's log, from 1. 0 until it is recorded.
+    /// Its sequence in the observed stream, from 1. Zero until emitted.
     pub seq: u64,
     /// When it happened, on the run's clock.
     pub at: Instant,
@@ -269,6 +269,7 @@ pub struct Event {
     pub(crate) origin: Option<Origin>,
     pub(crate) truncated: bool,
     bounded: bool,
+    pub(crate) repeat: Option<Vec<&'static str>>,
 }
 
 impl Event {
@@ -287,6 +288,7 @@ impl Event {
             origin: None,
             truncated: false,
             bounded: false,
+            repeat: None,
         }
     }
 
@@ -297,7 +299,14 @@ impl Event {
         self
     }
 
-    pub(crate) fn bounded(mut self) -> Self {
+    /// Whether construction omitted evidence to stay within its bounds.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Enables count, byte, nesting and summary bounds for staged construction.
+    /// Lazy emitters enable these bounds before invoking the builder.
+    pub fn bounded(mut self) -> Self {
         self.bounded = true;
         self
     }
@@ -355,6 +364,31 @@ impl Event {
         self
     }
 
+    /// Marks a repeatable fact and adds per-occurrence detail, with `count = 1`.
+    /// An optional [`super::Aggregate`] combines matching facts and summarizes
+    /// numeric detail as ranges. Detail names must not replace identifying fields.
+    /// Without that observer, every occurrence is delivered unchanged.
+    pub fn repeat(mut self, detail: Fields) -> Self {
+        if detail
+            .iter()
+            .any(|(name, _)| self.fields.get(name).is_some())
+        {
+            return self.fields(detail).field("count", 1u64).truncated();
+        }
+        let names = detail
+            .iter()
+            .take(64)
+            .filter(|(_, value)| value.as_u64().is_some())
+            .map(|(name, _)| name)
+            .collect();
+        if detail.len() > 64 {
+            self = self.truncated();
+        }
+        self = self.fields(detail).field("count", 1u64);
+        self.repeat = Some(names);
+        self
+    }
+
     /// The value of the field `name`.
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.fields.get(name)
@@ -376,12 +410,15 @@ impl Event {
     }
 
     /// About how many bytes the event holds in memory, each allocation's
-    /// overhead included, as the log counts them against
+    /// overhead included, as retention counts them against
     /// [`MAX_EVENT_BYTES`](super::MAX_EVENT_BYTES). Shared connection metadata is charged in full
     /// for each event. Owned task names are included; static strings are not.
     pub fn size(&self) -> usize {
         heap(std::mem::size_of::<Event>() + ARC_COUNTS)
             + heap(self.summary.capacity())
+            + self.repeat.as_ref().map_or(0, |names| {
+                heap(names.capacity() * std::mem::size_of::<&str>())
+            })
             + fields_size(&self.fields)
             + conn_size(&self.conn)
             + self.origin.as_ref().map_or(0, |o| match &o.name {
@@ -449,20 +486,6 @@ impl Event {
     pub fn to_line(&self) -> Result<String, json::Error> {
         let bytes = self.to_json().to_bytes()?;
         Ok(String::from_utf8(bytes).expect("JSON is UTF-8"))
-    }
-
-    /// The `events.dropped` event that stands for `count` events a reader
-    /// missed, the last of which was number `seq`.
-    pub(super) fn dropped(seq: u64, at: Instant, count: u64) -> Event {
-        let mut event = Event::new("events", "dropped")
-            .level(Level::Notice)
-            .summary(format!(
-                "{count} earlier events were dropped for the log's limits"
-            ))
-            .field("count", count);
-        event.seq = seq;
-        event.at = at;
-        event
     }
 }
 
@@ -611,7 +634,7 @@ fn bounded_value(value: &Value, depth: usize, remaining: &mut usize, bytes: &mut
     }
 }
 
-/// Text that can be formatted with a bound while preserving owned legacy summaries.
+/// Text that can be formatted with a bound while accepting owned summaries.
 pub trait EventSummary {
     /// Produces summary text and whether it was shortened.
     fn into_summary(self, bounded: bool) -> (String, bool);

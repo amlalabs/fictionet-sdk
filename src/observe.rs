@@ -208,15 +208,14 @@
 //!
 //! # Events
 //!
-//! Every run keeps its [events](crate::events): what the stdlib's
-//! services and network pieces saw, and what world code records with
-//! [`Cx::record`](crate::Cx::record). The log keeps them whether or not
-//! anyone watches, so an observer that connects late first sees what the
-//! log still holds, then each new event as it comes. The dashboard lists
-//! them under **Events**, each with the task that recorded it and the time
-//! on the world's clock, and a click shows the task. The `web_world`
-//! example's sites record one event per DNS query, TLS handshake and HTTP
-//! request.
+//! Services and world code emit [events](crate::events) through
+//! [`Cx::emit`](crate::Cx::emit). The integrator installs retention before the run
+//! with [`RunOptions::event_history`](crate::RunOptions::event_history), optionally
+//! preceded by [`Aggregate`](crate::events::Aggregate). A late dashboard client
+//! sees retained history, then new events. Without installed retention there is
+//! no event history to replay. The dashboard lists events under **Events**, with
+//! the emitting task and run-clock time. The `web_world` example installs retention
+//! for its DNS queries, TLS handshakes and HTTP requests.
 //!
 //! ```
 //! # use fictionet::Cx;
@@ -226,9 +225,9 @@
 //! }
 //! ```
 //!
-//! The core records events of its own. Packet drops are
-//! [repeats](crate::events#repeats): the first of a run is recorded, the
-//! rest counted in its `count` field.
+//! Network components emit events of their own. Packet drops are repeatable
+//! facts: [`Aggregate`](crate::events::Aggregate), when installed, summarizes
+//! them with `count`, `first_seq`, `last_seq` and numeric detail ranges.
 //!
 //! - [`bottleneck`](crate::stdlib::network::bottleneck) records the packets its
 //!   full queue drops (`bottleneck.drop`), and the dashboard counts them on
@@ -333,8 +332,8 @@
 //! one lock. A task that does nothing but read one end of a pair costs
 //! about 165 ns more to spawn and end: a median of 586 ns, against 420 ns.
 //! TLS keys and packet copies cost nothing until someone observes. Events
-//! are recorded either way; [`events`](crate::events#what-it-costs) says
-//! what that costs.
+//! are built only for interested installed observers; [`events`](crate::events)
+//! describes delivery and retention costs.
 //!
 //! Watching links is not free once traffic is heavy. Each watched packet
 //! takes two locks, and the packets kept are decoded and turned into JSON
@@ -518,17 +517,17 @@
 //!  "node":"t7","task":"net::serve_dns","file":"src/stdlib/world/net.rs","line":1750,"parent":"t1"}
 //! ```
 //!
-//! `seq` numbers the run's events from 1, with no gaps, and `at` is when it
-//! happened, in seconds on the world's clock. `tls` says whether the
+//! `seq` numbers emitted events from 1; filtering and aggregation can leave gaps.
+//! `at` is when it happened, in seconds on the world's clock. `tls` says whether the
 //! connection was TLS, and `sni` and `alpn` are what its handshake named
 //! and agreed. `node` is the task that
 //! recorded it, and `task`, `file`, `line` and `parent` describe that task,
 //! since a short task may have ended before anyone reads the event. The
-//! world keeps its latest 50,000 events, up to 16 MiB of them, and apart
-//! from them its latest 5,000 [repeats](crate::events#repeats). Where a
-//! reader asks for events the log no longer holds, an `events.dropped`
-//! event stands in their place, whose `count` field says how many it
-//! missed.
+//! installed retention sets count and byte limits (by default, 50,000 events and
+//! 16 MiB). Overflow is explicit: event replies include `dropped`, and watch
+//! streams show `events.dropped` with the lost count. Sequence gaps alone do not
+//! establish loss. Graders use [`Memory::checked_of`](crate::events::Memory::checked_of)
+//! to reject incomplete evidence.
 //!
 //! If an event exceeds the JSON writer's size, depth or value-count limit,
 //! the observer sends a replacement. It keeps `seq`, `at`, `source`, `kind`,
@@ -537,8 +536,8 @@
 //! `{"unserializable":"<error>"}`. Replacement text values longer than
 //! 1,024 bytes are shortened at a UTF-8 boundary and end in `…`, so the
 //! replacement itself fits the writer's limits. Cursors advance past these
-//! explicit error records just as they do past original events. File sinks
-//! instead count unserializable events as lost ([`EventLog::lost`](crate::events::EventLog::lost)).
+//! explicit error records just as they do past original events. Native `Jsonl`
+//! counts unserializable events as lost and reports the error from `finish`.
 //!
 //! ## Packets
 //!

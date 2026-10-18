@@ -48,7 +48,9 @@ pub fn run(
         .enable_all()
         .build()?;
     runtime.block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random()).event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
+        fictionet::RunOptions::new(fictionet::Seed::random())
+            .aggregate_events()
+            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
         move |fcx| async move {
             let (ca, leaf) = certificates(&fcx)?;
             std::fs::write(&ca_path, ca.cert_pem())?;

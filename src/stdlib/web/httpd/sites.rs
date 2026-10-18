@@ -171,12 +171,12 @@ impl Handler for VirtualHosts {
         };
         let misdirected = || {
             Reply::Now(answered(
-                observing,
                 text(
                     StatusCode::MISDIRECTED_REQUEST,
                     "This server does not serve that host.\n",
                 ),
                 "misdirected",
+                observing,
             ))
         };
         let Some((site, routing)) = self.site_or_default(&host) else {
@@ -199,7 +199,7 @@ impl Handler for VirtualHosts {
                 if let Ok(value) = location.parse() {
                     response.headers_mut().insert(LOCATION, value);
                 }
-                Reply::Now(answered(observing, response, "redirect"))
+                Reply::Now(answered(response, "redirect", observing))
             }
             _ => {
                 let conn = ex.conn();
@@ -222,9 +222,9 @@ impl Handler for VirtualHosts {
 /// gives it to an HTTP/1.1 request without `Host` before any handler.
 pub(super) fn no_host(observing: bool) -> http::Response<Body> {
     answered(
-        observing,
         text(StatusCode::BAD_REQUEST, "The request names no host.\n"),
         "no_host",
+        observing,
     )
 }
 

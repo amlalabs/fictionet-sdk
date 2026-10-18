@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Poll, Waker};
 
-use crate::events::{Event, EventLog};
+use crate::events::Event;
 use crate::run::RunShared;
 use crate::time::{Duration, Instant};
 use crate::watch::Group;
@@ -342,9 +342,9 @@ impl Cx {
     /// Whether an observer, such as the dashboard or `fictionet observe
     /// watch`, is connected to this world right now.
     ///
-    /// Events are recorded either way ([`Cx::record`]). Only packet copies
-    /// and TLS session keys wait for an observer. It reads one number, so
-    /// it is cheap to call on every packet.
+    /// Packet copies and TLS session keys depend on connected viewers. Event
+    /// emission instead checks the observer installed through [`crate::RunOptions`].
+    /// This reads one number, so it is cheap to call on every packet.
     pub fn observed(&self) -> bool {
         self.run.graph.observed()
     }
@@ -417,77 +417,16 @@ impl Cx {
         }
     }
 
+    /// Reports facts omitted by a bounded producer before event delivery.
+    /// Installed observers retain this loss status for completeness checks.
+    pub fn events_lost(&self, count: u64) {
+        self.run.observer.lost(count);
+    }
+
     pub(crate) fn emit_observation(&self, mut event: Event) {
         let graph = &self.run.graph;
         event.origin = graph.origin(crate::run::current_task(graph));
         self.run.observer.emit(event, || self.now());
-    }
-
-    /// Records `event` in the run's [event log](crate::events), dated now
-    /// on the run's clock, with the task that records it. Every run keeps
-    /// its events, whether or not anyone reads them.
-    /// The task is included only when it belongs to this `Cx`'s run.
-    /// Recording from outside that run leaves the task metadata absent.
-    ///
-    /// ```
-    /// # fn handled(fcx: &fictionet::Cx) {
-    /// use fictionet::events::Event;
-    /// fcx.record(Event::new("shop", "order").summary("an order for 3 pumps").field("count", 3u32));
-    /// # }
-    /// ```
-    pub fn record(&self, event: Event) {
-        self.record_at(self.now(), event);
-    }
-
-    /// Records `event` as having happened at `at`, which may be earlier
-    /// than now. Task attribution follows [`record`](Self::record).
-    pub fn record_at(&self, at: Instant, mut event: Event) {
-        let graph = &self.run.graph;
-        event.at = at;
-        event.origin = graph.origin(crate::run::current_task(graph));
-        if self.run.observer.enabled(
-            crate::events::Metadata {
-                source: event.source,
-                kind: event.kind,
-            },
-            &event.conn,
-        ) {
-            self.run.observer.emit(event.clone(), || at);
-        }
-        self.run.events.push(event);
-    }
-
-    /// Records `event` as a repeat: one of a run of alike events that a
-    /// flood can make, such as a packet the network refused or dropped.
-    /// `detail` holds the facts that change with each repeat, such as a
-    /// port or a length. The log records the first of a run, then counts
-    /// the rest, and keeps repeats within bounds of their own, so they
-    /// never push out other events. See
-    /// [Repeats](crate::events#repeats). Task attribution follows
-    /// [`record`](Self::record).
-    pub fn record_repeat(&self, mut event: Event, detail: crate::events::Fields) {
-        let graph = &self.run.graph;
-        event.at = self.now();
-        event.origin = graph.origin(crate::run::current_task(graph));
-        if self.run.observer.enabled(
-            crate::events::Metadata {
-                source: event.source,
-                kind: event.kind,
-            },
-            &event.conn,
-        ) {
-            self.run.observer.emit(
-                event.clone().fields(detail.clone()).field("count", 1u64),
-                || event.at,
-            );
-        }
-        self.run.events.push_repeat(event, detail);
-    }
-
-    /// The run's [event log](crate::events): what it holds, and readers
-    /// for what comes. The handle stays readable after the run is over.
-    pub fn events(&self) -> EventLog {
-        EventLog::new(self.run.events.clone())
     }
 
     /// Waits until every task in this run is waiting, before a lab's clock

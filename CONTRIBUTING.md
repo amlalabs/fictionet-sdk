@@ -96,7 +96,7 @@ $ cargo bench --locked --bench network -- --list
 
 `network` covers TCP throughput, routed paths, idle connections, delayed links,
 scheduling and unread-link memory. `services` covers relay traffic, HTTPS sites
-and proxy DNS caching. `runtime` covers timers, event logging and observation.
+and proxy DNS caching. `runtime` covers timers, event emission and observation.
 `decoders` feeds TPKT/COTP, HTTP/1 requests and ITCH add orders in 16 KiB
 chunks. Divan reports timings, rates and allocation counts; no benchmark has a
 pass or fail threshold. Compare two commits on the same machine. CI compiles

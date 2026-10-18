@@ -266,33 +266,33 @@ impl Http2 {
                 &mut Exchange::new(driver.now(), driver.entropy(), driver.conn()),
             ),
             Received::TooLarge => Reply::Now(answered(
-                driver.event_enabled("http", "request"),
                 text(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "The request body is too large.\n",
                 ),
                 "too_large",
+                driver.event_enabled("http", "request"),
             )),
             Received::Budget => Reply::Now(answered(
-                driver.event_enabled("http", "request"),
                 text(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "The server cannot hold this request now.\n",
                 ),
                 "budget",
+                driver.event_enabled("http", "request"),
             )),
             Received::Timeout => Reply::Now(answered(
-                driver.event_enabled("http", "request"),
                 text(
                     StatusCode::REQUEST_TIMEOUT,
                     "The request body took too long.\n",
                 ),
                 "timeout",
+                driver.event_enabled("http", "request"),
             )),
             Received::CutOff => Reply::Now(answered(
-                driver.event_enabled("http", "request"),
                 text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"),
                 "cut_off",
+                driver.event_enabled("http", "request"),
             )),
         };
         let (work, response) = match reply {
@@ -1138,12 +1138,12 @@ fn response_held(response: &Response<Body>) -> usize {
 
 fn over_budget(observing: bool) -> Response<Body> {
     answered(
-        observing,
         text(
             StatusCode::SERVICE_UNAVAILABLE,
             "The server cannot hold this response now.\n",
         ),
         "budget",
+        observing,
     )
 }
 

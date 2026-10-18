@@ -68,10 +68,9 @@
 //!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every random
 //!    number drawn through `Cx` comes from `seed`;
 //!    [`Seed::random`](crate::Seed::random) picks a fresh one.
-//!    [`Net::start`](crate::stdlib::world::net::Net::start) records it in `run.start`.
-//!    Without `Net`, world code calls
-//!    [`EventLog::start`](crate::events::EventLog::start) explicitly.
-//!    `run` and `lab` do not emit that event. Every task the world starts
+//!    Pass [`RunOptions`](crate::RunOptions) to install observers before execution.
+//!    `run` and `lab` emit `run.start` once at zero to interested observers;
+//!    without an observer they construct and retain no events. Every task the world starts
 //!    with [`Cx::spawn`](crate::Cx::spawn), and every stdlib task, is polled
 //!    inside this same future.
 //! 4. **[`block_on`](crate::block_on)** polls the future on the current
@@ -342,8 +341,8 @@
 //! - **Nothing waits forever.** A lab whose tasks all wait with no deadline
 //!   ends with an error that says so.
 //!
-//! With those conditions, a lab run repeats its event log, including
-//! timestamps, and its packets byte for byte, subject to the HTTP/2
+//! With those conditions, a lab run with fixed observers repeats its observed
+//! events, including timestamps, and its packets byte for byte, subject to the HTTP/2
 //! exception below. The seed alone is not enough. Keep the world code,
 //! configuration and ordered inputs fixed. Use `Cx` for time, randomness
 //! and task scheduling. Do not let host clocks, OS entropy, external I/O,
@@ -360,8 +359,8 @@
 //!
 //! A real run with the same seed makes the same random choices for the
 //! same inputs in the same order. But real sandboxes decide when packets
-//! arrive and in which order, so the times in its log, and anything that
+//! arrive and in which order, so the times in its observations, and anything that
 //! depends on them, differ from run to run. Repeating the world's side of
 //! a real run would take a log of every input: each inbound packet's
-//! bytes and the moment it arrived, and the order of attachments. The event
-//! log does not record that.
+//! bytes and the moment it arrived, and the order of attachments. Service
+//! events do not record all those inputs.
