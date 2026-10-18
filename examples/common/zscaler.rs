@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn a_client_that_trusts_only_the_root_validates_a_reissued_leaf() {
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(7),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
             |fcx| async move {
                 let now = 1_800_000_000;
                 let z = zscaler(&fcx, DEFAULT_CLOUD, now)?;
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn the_fields_match_the_zscaler_layout() {
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(11),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(11)),
             |fcx| async move {
                 let now = 1_800_000_000;
                 let z = zscaler(&fcx, DEFAULT_CLOUD, now)?;
