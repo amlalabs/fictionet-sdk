@@ -1,3 +1,4 @@
+mod cloudimage;
 mod copy_check;
 mod demo;
 mod docker;
@@ -46,6 +47,7 @@ fn main_result() -> Result {
         "eval" => eval::run(args),
         "k8s" => k8s::run(args),
         "microvm" => microvm::run(args),
+        "cloudimage" => cloudimage::run(args),
         "vm" | "demo" => {
             let _interrupts = process::Interrupts::new()?;
             if command == "vm" {
