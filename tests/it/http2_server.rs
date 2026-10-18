@@ -1040,13 +1040,14 @@ fn trailers_after_end_stream_reset_only_that_stream() {
 
 #[test]
 fn invalid_priority_is_a_stream_error() {
-    for (invalid, code) in [
-        // PRIORITY with a 4-byte payload: FRAME_SIZE_ERROR.
-        (vec![0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0], 6),
-        // PRIORITY on stream 1 that depends on stream 1: PROTOCOL_ERROR.
-        (vec![0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0], 1),
+    for (open, invalid, code) in [
+        // PRIORITY with a 4-byte payload on an open stream: FRAME_SIZE_ERROR.
+        (true, vec![0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0], 6),
+        // PRIORITY on open stream 1 that depends on stream 1: PROTOCOL_ERROR.
+        (true, vec![0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0], 1),
         // GET / as HEADERS on stream 1 that depends on stream 1: PROTOCOL_ERROR.
         (
+            false,
             vec![
                 0, 0, 8, 1, 0x25, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0x83, 0x86, 0x84,
             ],
@@ -1055,6 +1056,9 @@ fn invalid_priority_is_a_stream_error() {
     ] {
         let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
         let mut input = preface();
+        if open {
+            input.extend(headers(1, "/", false));
+        }
         input.extend(invalid);
         input.extend(headers(3, "/", true));
         let output = frames(&harness.push(&input).unwrap());
@@ -1065,6 +1069,32 @@ fn invalid_priority_is_a_stream_error() {
         );
         assert_eq!(statuses(&output), [(3, b"404".to_vec())]);
         assert!(!harness.closed());
+    }
+}
+
+#[test]
+fn invalid_priority_on_an_idle_stream_is_a_connection_error() {
+    // RST_STREAM may not name an idle stream (RFC 9113 section 6.4), so
+    // these stream errors end the connection, as section 5.4.1 allows,
+    // rather than go unanswered.
+    for (invalid, code) in [
+        // PRIORITY with a 4-byte payload: FRAME_SIZE_ERROR.
+        ([0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0].as_slice(), 6),
+        // PRIORITY on stream 1 that depends on stream 1: PROTOCOL_ERROR.
+        (&[0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0], 1),
+    ] {
+        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        let mut input = preface();
+        input.extend(invalid);
+        input.extend(headers(1, "/", true));
+        let output = frames(&harness.push(&input).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::GoAway(g) if g.last_stream == 0 && g.code == code))
+        );
+        assert!(!output.iter().any(|f| matches!(f, Frame::Reset(_))));
+        assert!(harness.closed());
     }
 }
 

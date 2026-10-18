@@ -757,17 +757,19 @@ impl serve::Service for Http2 {
         let result = match item {
             Input::Frame(frame) => self.frame(frame, driver),
             Input::Refused { header, error, .. } => {
-                // PRIORITY may name a stream in any state, idle ones included
-                // (RFC 9113 section 6.3), so a bad one resets just that stream.
+                // PRIORITY may name a stream in any state (RFC 9113 section
+                // 6.3), so a bad one resets just that stream. RST_STREAM may
+                // not name an idle stream (section 6.4), so there it ends the
+                // connection instead, as section 5.4.1 allows.
                 let priority = header.kind == 2;
-                if !self.received_settings
-                    || self.headers.pending()
-                    || (!priority && (header.stream > self.last_stream || header.stream & 1 == 0))
-                {
+                let idle = header.stream > self.last_stream || header.stream & 1 == 0;
+                if !self.received_settings || self.headers.pending() || (!priority && idle) {
                     Err(problem(
                         ErrorCode::ProtocolError,
                         "invalid frame on an idle stream or inside headers",
                     ))
+                } else if idle {
+                    Err(error)
                 } else if priority || self.streams.contains_key(&header.stream) {
                     self.reset(header.stream, error.code, driver)
                 } else {
