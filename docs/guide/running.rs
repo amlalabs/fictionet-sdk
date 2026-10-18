@@ -221,9 +221,9 @@
 //! # On tokio
 //!
 //! [`block_on`](crate::block_on) is not a tokio runtime. A world that uses
-//! the `web-proxy` feature (such as `web::proxy(&fcx)`, which passes requests to a
-//! real site), or a tokio-based library
-//! such as a database client, polls `run` on a tokio runtime instead. Steps
+//! a tokio-based library such as a database client polls `run` on a tokio
+//! runtime instead. Upstream requests with `web-proxy` work with either
+//! executor. Steps
 //! 1 to 3 stay the same. The `web_world` example does this:
 //!
 //! ```no_run

@@ -456,7 +456,7 @@ handling. The line format is documented in `world/src/events.rs`.
 ## Appendix: a pass-through mode, and why it is not built
 
 This is documentation only. A pass-through would enable Fictionet's
-`web-proxy` feature and run the world on a Tokio runtime. It would create one
+`web-proxy` feature and use real host I/O. It would create one
 `web::Site` for each exact hostname, `pypi.org` and
 `files.pythonhosted.org`. A wrapper around `web::proxy()` would allow
 only GET and HEAD with no query string. It would strip `Authorization`

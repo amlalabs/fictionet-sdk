@@ -5,9 +5,18 @@ use fictionet::{Cx, Error};
 use http::{Request, Response};
 use std::sync::Arc;
 
+#[path = "upstream.rs"]
+mod upstream;
+use upstream::Client as ProxyClient;
+
 /// A handler that forwards each request to the real site, over the world's
-/// own network. Needs the `web-proxy` feature and a tokio
-/// runtime polling the world.
+/// own network. Needs the `web-proxy` feature, which enables `std`.
+/// Host helper threads handle DNS, sockets and TLS, waking the world when
+/// data is ready. Works with [`fictionet::block_on`] or another executor.
+/// Upstream connections use HTTP/1.1 and are reused after complete bodies.
+/// Connecting, with the name lookup and the TLS handshake, has thirty
+/// seconds. After that a response may take as long as the site does. At
+/// most 64 requests are upstream at once, and later ones wait their turn.
 ///
 /// It needs no arguments: it forwards to the [`Target`] that [`Sites`](fictionet::stdlib::web::Sites) puts
 /// on every request. The scheme and port come from the connection the
@@ -40,7 +49,7 @@ use std::sync::Arc;
 pub fn proxy(fcx: &Cx) -> Result<Proxy, Error> {
     fcx.require_real_io()?;
     Ok(Proxy {
-        client: Arc::new(proxy_client()),
+        client: Arc::new(ProxyClient::new()),
     })
 }
 
@@ -68,24 +77,6 @@ impl tower_service::Service<Request<Body>> for Proxy {
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         Box::pin(send_upstream(self.client.clone(), request))
     }
-}
-
-type ProxyClient = hyper_util::client::legacy::Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    Body,
->;
-
-fn proxy_client() -> ProxyClient {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_provider_and_webpki_roots(provider)
-        .expect("ring supports the default TLS versions")
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(connector)
 }
 
 /// Headers that belong to one connection and are not passed on (RFC 9110,
@@ -157,7 +148,6 @@ async fn send_upstream(
         Some(&target.host),
     )
     .await
-    .map(|response| response.map(Body::new))
 }
 
 /// What [`dispatch`] does with the request's `Host` header.
@@ -177,7 +167,7 @@ async fn dispatch(
     destination: impl FnOnce(&str) -> Result<http::Uri, Error>,
     host: Host<'_>,
     error_context: Option<&str>,
-) -> Result<Response<hyper::body::Incoming>, Error> {
+) -> Result<Response<Body>, Error> {
     let (mut parts, body) = request.into_parts();
     parts.uri = destination(
         parts
@@ -212,7 +202,8 @@ async fn dispatch(
 /// path is ignored.
 /// The origin does not depend on [`Target`], so default-host requests can
 /// be forwarded here even when their routing is [`Routing::Fallback`].
-/// This handler requires a tokio runtime and real host I/O.
+/// This handler requires real host I/O and works with any executor.
+/// It uses the same HTTP/1.1 transport and limits as [`proxy`].
 /// Returns an error in a lab before constructing a client, and for an
 /// upstream without such a scheme or without an authority.
 pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
@@ -224,7 +215,7 @@ pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
             Ok(Forward {
                 scheme,
                 authority,
-                client: Arc::new(proxy_client()),
+                client: Arc::new(ProxyClient::new()),
             })
         }
         _ => Err(Error::msg(
@@ -234,8 +225,7 @@ pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
 }
 
 /// A handler that forwards to one fixed origin.
-/// Its tower response body is [`hyper::body::Incoming`], since it only
-/// returns upstream responses and needs no local routing rejections.
+/// Its tower response body is [`Body`], streaming the upstream response.
 #[derive(Clone)]
 pub struct Forward {
     scheme: http::uri::Scheme,
@@ -250,7 +240,7 @@ impl Handler for Forward {
 }
 
 impl tower_service::Service<Request<Body>> for Forward {
-    type Response = Response<hyper::body::Incoming>;
+    type Response = Response<Body>;
     type Error = Error;
     type Future =
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
