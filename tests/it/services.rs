@@ -10,13 +10,9 @@ use crate::common::world;
 use fictionet_test_support::certs;
 use fictionet_test_support::{Done, timeout};
 
-#[path = "services/driver.rs"]
 mod driver;
-#[path = "services/events.rs"]
 mod events;
-#[path = "services/network.rs"]
 mod network;
-#[path = "services/tls.rs"]
 mod tls;
 
 use echo_service::{Echo, Ticker};

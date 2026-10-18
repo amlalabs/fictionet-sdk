@@ -12,19 +12,12 @@ use crate::common::world as run_world;
 use fictionet::stdlib::world::sandbox::{TlsClient, TlsError};
 use fictionet_test_support::{Done, timeout};
 
-#[path = "web/admission.rs"]
 mod admission;
-#[path = "web/dns_dhcp.rs"]
 mod dns_dhcp;
-#[path = "web/events.rs"]
 mod events;
-#[path = "web/fixture.rs"]
 mod fixture;
-#[path = "web/http_serving.rs"]
 mod http_serving;
-#[path = "web/ipv6.rs"]
 mod ipv6;
-#[path = "web/sites.rs"]
 mod sites;
 
 use certs::certs;
