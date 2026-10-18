@@ -13,7 +13,9 @@ use fictionet::stdlib::protocols::dns::op::{Message, Query};
 use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
 use fictionet::{Interface, Packet};
 use fictionet_fuzz::web::{DEFAULT_ADDR, NAMES, SITE_ADDR, serve};
-use fictionet_fuzz::{Segment, fix_checksums, poll_once, settle, tcp_packet, udp_packet, world};
+use fictionet_fuzz::{
+    Segment, fix_checksums, poll_once, settle, tcp_packet, udp_packet, world_with_options,
+};
 use libfuzzer_sys::fuzz_target;
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -67,7 +69,9 @@ fn dst(to: u8) -> Ipv4Addr {
 
 fuzz_target!(|steps: Vec<Step>| {
     let cert = fictionet_fuzz::cert();
-    world(move |fcx| async move {
+    let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(0))
+        .observer(std::sync::Arc::new(fictionet_fuzz::web::EventFormatting));
+    world_with_options(options, move |fcx| async move {
         let attacher = serve(&fcx, cert);
         let mut end = attacher.attach("agent").unwrap();
         let me = IpAddr::V4(ME);

@@ -52,6 +52,10 @@ impl Log {
     pub fn attach(&self, fcx: &Cx) {
         self.inner.attach(fcx);
     }
+    /// Drains the log after the run and reports output errors.
+    pub fn finish(&self) -> std::io::Result<()> {
+        self.inner.finish()
+    }
     /// Converts a network event to a log line when it is relevant.
     pub fn entry(&self, entry: &Entry) {
         if let Some(line) = events::line(&self.scenario, entry) {
@@ -63,6 +67,25 @@ impl Log {
         self.inner.write(line);
     }
 }
+impl fictionet::events::Observer for Log {
+    fn enabled(
+        &self,
+        metadata: fictionet::events::Metadata,
+        _: &fictionet::events::ConnInfo,
+    ) -> bool {
+        events::LOGGED.contains(&metadata.source)
+    }
+    fn observe(
+        &self,
+        _: fictionet::events::Stamp,
+        observation: fictionet::events::Observation<'_>,
+    ) {
+        if let fictionet::events::Observation::Event(event) = observation {
+            self.entry(event);
+        }
+    }
+}
+
 /// `text` with every copy of the account's password, in any case, replaced.
 fn scrub(text: String) -> String {
     let secret = ACCOUNT.password.to_ascii_lowercase();

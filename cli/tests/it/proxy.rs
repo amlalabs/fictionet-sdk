@@ -34,6 +34,31 @@ const SECURE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 
 /// A world in a thread: `plain.test` (plain HTTP) and `secure.test`
 /// (HTTPS, at 203.0.113.10), every other name NXDOMAIN.
+#[derive(Default)]
+struct Queries(Mutex<std::collections::HashMap<String, usize>>);
+
+impl fictionet::events::Observer for Queries {
+    fn enabled(
+        &self,
+        metadata: fictionet::events::Metadata,
+        _: &fictionet::events::ConnInfo,
+    ) -> bool {
+        metadata.source == "dns" && metadata.kind == "query"
+    }
+    fn observe(
+        &self,
+        _: fictionet::events::Stamp,
+        observation: fictionet::events::Observation<'_>,
+    ) {
+        if let fictionet::events::Observation::Event(e) = observation
+            && e.u64("qtype") == Some(1)
+            && let Some(name) = e.str("name")
+        {
+            *self.0.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+        }
+    }
+}
+
 struct World {
     dir: PathBuf,
     sock: String,
@@ -43,7 +68,7 @@ struct World {
     /// [`World::black_hole`] has taken in.
     seen: Arc<(Mutex<HashSet<[u8; 8]>>, Condvar)>,
     /// How many `A` queries for each name reached the world's DNS.
-    queries: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    queries: Arc<Queries>,
 }
 
 impl World {
@@ -57,7 +82,7 @@ impl World {
         let ca_path = dir.join("ca.pem");
         let (stop, mut stopped) = fictionet::pair();
         let sock2 = sock.clone();
-        let queries: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+        let queries: Arc<Queries> = Arc::default();
         let queries2 = queries.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -75,7 +100,7 @@ impl World {
                 .build()
                 .unwrap();
             let _ = rt.block_on(fictionet::run(
-                fictionet::Seed::random(),
+                fictionet::RunOptions::new(fictionet::Seed::random()).observer(queries2),
                 move |fcx| async move {
                     let (chain, key) = certs(&fcx, &ca_path);
                     ready_tx.send(()).unwrap();
@@ -90,14 +115,7 @@ impl World {
                         .route("/mb", get(|| async { vec![b'x'; 1 << 20] }))
                         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
                     let secure = axum::Router::new().route("/", get(|| async { "secure site\n" }));
-                    fcx.events().subscribe(move |e| {
-                        if e.is("dns", "query")
-                            && e.u64("qtype") == Some(1)
-                            && let Some(name) = e.str("name")
-                        {
-                            *queries2.lock().unwrap().entry(name.to_owned()).or_default() += 1;
-                        }
-                    });
+
                     let ws = axum::Router::new().route(
                         "/echo",
                         get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
@@ -1331,7 +1349,7 @@ fn lookups_of_one_name_are_shared_and_misses_remembered() {
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert_eq!(body(&answer), "plain site\n");
     }
-    assert_eq!(world.queries.lock().unwrap().get("plain.test"), Some(&1));
+    assert_eq!(world.queries.0.lock().unwrap().get("plain.test"), Some(&1));
     for _ in 0..5 {
         let mut s = attach.connect();
         write!(s, "GET http://nope.test/ HTTP/1.1\r\nHost: nope.test\r\nProxy-Authorization: {BASIC}\r\n\r\n").unwrap();
@@ -1343,7 +1361,7 @@ fn lookups_of_one_name_are_shared_and_misses_remembered() {
         );
         assert_eq!(body(&answer), "no such name in the world\n");
     }
-    assert_eq!(world.queries.lock().unwrap().get("nope.test"), Some(&1));
+    assert_eq!(world.queries.0.lock().unwrap().get("nope.test"), Some(&1));
     drop(attach);
 }
 

@@ -112,11 +112,7 @@ pub fn start(
         })
         .collect::<Result<Vec<_>>>()?;
     log.attach(fcx);
-    fcx.events().subscribe(move |event| {
-        if events::LOGGED.contains(&event.source) {
-            log.entry(event);
-        }
-    });
+
     let site_for = move |host: &str| {
         let i = NAMES.iter().position(|(name, _)| *name == host)?;
         let site = SITES[i];

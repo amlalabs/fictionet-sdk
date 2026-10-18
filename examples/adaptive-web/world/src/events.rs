@@ -12,7 +12,6 @@
 
 use std::sync::Arc;
 
-use fictionet::Cx;
 use fictionet::events::Event as Entry;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
@@ -22,14 +21,30 @@ use example_common::log::Log;
 
 use example_common::headers;
 
-/// Writes the request log from `fcx`'s run's events.
-pub fn log_to(fcx: &Cx, log: Arc<Log>) {
-    log.attach(fcx);
-    fcx.events().subscribe(move |event| {
-        if let Some(line) = line(event) {
-            log.write(line);
+/// Projects run events into the world's JSON Lines format.
+pub struct LogObserver {
+    pub log: Arc<Log>,
+}
+
+impl fictionet::events::Observer for LogObserver {
+    fn enabled(
+        &self,
+        metadata: fictionet::events::Metadata,
+        _: &fictionet::events::ConnInfo,
+    ) -> bool {
+        matches!(metadata.source, "net" | "dns" | "tls" | "http" | "adaptive")
+    }
+    fn observe(
+        &self,
+        _: fictionet::events::Stamp,
+        observation: fictionet::events::Observation<'_>,
+    ) {
+        if let fictionet::events::Observation::Event(event) = observation
+            && let Some(line) = line(event)
+        {
+            self.log.write(line);
         }
-    });
+    }
 }
 
 /// An event field's value as JSON.

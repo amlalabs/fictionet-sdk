@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use fictionet::Cx;
 use fictionet::events::{Event as Entry, Fields, opt};
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
@@ -54,14 +53,31 @@ impl Page {
     }
 }
 
-/// Writes the request log from `fcx`'s run's events.
-pub fn log_to(fcx: &Cx, hosts: HashMap<String, Ipv4Addr>, log: Arc<Log>) {
-    log.attach(fcx);
-    fcx.events().subscribe(move |event| {
-        if let Some(line) = line(&hosts, event) {
-            log.write(line);
+/// Projects run events into the world's JSON Lines format.
+pub struct LogObserver {
+    pub log: Arc<Log>,
+    pub hosts: HashMap<String, Ipv4Addr>,
+}
+
+impl fictionet::events::Observer for LogObserver {
+    fn enabled(
+        &self,
+        metadata: fictionet::events::Metadata,
+        _: &fictionet::events::ConnInfo,
+    ) -> bool {
+        matches!(metadata.source, "net" | "dns" | "tls" | "http")
+    }
+    fn observe(
+        &self,
+        _: fictionet::events::Stamp,
+        observation: fictionet::events::Observation<'_>,
+    ) {
+        if let fictionet::events::Observation::Event(event) = observation
+            && let Some(line) = line(&self.hosts, event)
+        {
+            self.log.write(line);
         }
-    });
+    }
 }
 
 fn text(e: &Entry, name: &str) -> Option<String> {

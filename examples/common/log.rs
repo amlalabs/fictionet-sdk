@@ -5,7 +5,7 @@
 //! The writer's timeout closes fold windows when no new line arrives. It uses
 //! wall time without spawning a run task or recording transport events, so it
 //! cannot keep a lab alive or add lines to observations and golden transcripts.
-//! Closing the run drains the queue and closes the remaining folds. Finalization
+//! Finishing the log drains the queue and closes the remaining folds. Finalization
 //! checks output failures and lost lines before acknowledging the harness.
 
 use fictionet::{Cx, sync::Mutex};
@@ -42,12 +42,6 @@ enum Backend {
     Lab(Writer),
     Real(SyncSender<Value>, std::thread::JoinHandle<()>),
     Closed,
-}
-struct Finish(Arc<Inner>);
-impl Drop for Finish {
-    fn drop(&mut self) {
-        let _ = Log(self.0.clone()).finish();
-    }
 }
 impl Log {
     /// Prepares a JSON Lines output with folding and text transformation.
@@ -118,7 +112,7 @@ impl Log {
         })
     }
 
-    /// Starts delivery and arranges for the run's end to drain the output.
+    /// Starts delivery. Call `finish` after the run to drain output and report errors.
     pub fn attach(&self, fcx: &Cx) {
         let mut backend = self.0.backend.lock();
         let Backend::Pending(writer) = std::mem::replace(&mut *backend, Backend::Closed) else {
@@ -140,11 +134,6 @@ impl Log {
                 .expect("the log writer starts");
             Backend::Real(sender, thread)
         };
-        drop(backend);
-        let finish = Finish(self.0.clone());
-        fcx.events().subscribe(move |_| {
-            let _ = &finish;
-        });
     }
     /// Delivers a JSON object with its timestamp to the output.
     pub fn write(&self, value: Value) {
@@ -632,17 +621,18 @@ mod tests {
         let (release, waiting) = mpsc::channel();
         let (recorded, returned) = mpsc::channel();
         let callback = std::thread::spawn(move || {
+            let log = Log::new(
+                Box::new(SlowWriter {
+                    entered,
+                    release: waiting,
+                }),
+                &[],
+                |s| s,
+            );
+            let drain = log.clone();
             fictionet::block_on(fictionet::run(
                 fictionet::Seed::from_u64(1),
                 move |fcx| async move {
-                    let log = Log::new(
-                        Box::new(SlowWriter {
-                            entered,
-                            release: waiting,
-                        }),
-                        &[],
-                        |s| s,
-                    );
                     log.attach(&fcx);
                     log.write(serde_json::json!({"type": "http"}));
                     recorded.send(()).unwrap();
@@ -650,6 +640,7 @@ mod tests {
                 },
             ))
             .unwrap();
+            drain.finish().unwrap();
         });
         writing.recv_timeout(Duration::from_secs(2)).unwrap();
         let completed = returned.recv_timeout(Duration::from_secs(2));
@@ -727,10 +718,11 @@ mod tests {
             entered: Some(entered),
             release: paused,
         };
+        let log = Log::new(Box::new(out), &["blocked"], |s| s);
+        let drain = log.clone();
         let result = fictionet::block_on(fictionet::run(
             fictionet::Seed::from_u64(1),
             move |fcx| async move {
-                let log = Log::new(Box::new(out), &["blocked"], |s| s);
                 log.attach(&fcx);
                 log.write(json!({"type": "blocked", "dst_port": 1}));
                 waiting.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -745,6 +737,7 @@ mod tests {
                 Err(std::io::Error::other("scan complete").into())
             },
         ));
+        drain.finish().unwrap();
         assert!(result.is_err());
         let lines = lines(&output);
         assert!(lines.iter().all(|line| line["type"] == "blocked"));
@@ -773,10 +766,12 @@ mod tests {
             }
         }
         let (sent, received) = mpsc::channel();
+        let log = Log::new(Box::new(Lines(sent)), &["blocked"], |s| s);
+        let evidence = Arc::new(fictionet::events::Memory::default());
+        let drain = log.clone();
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::from_u64(1),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
             move |fcx| async move {
-                let log = Log::new(Box::new(Lines(sent)), &["blocked"], |s| s);
                 log.attach(&fcx);
                 log.write(json!({"type": "blocked", "dst_port": 1}));
                 log.write(json!({"type": "blocked", "dst_port": 2}));
@@ -789,8 +784,9 @@ mod tests {
                 assert_eq!(first["dst_port"], 1);
                 assert_eq!(summary["count"], 1);
                 assert!(
-                    fcx.events()
-                        .all()
+                    evidence
+                        .checked_all()
+                        .unwrap()
                         .iter()
                         .all(|event| event.source != "example")
                 );
@@ -798,22 +794,26 @@ mod tests {
             },
         ))
         .unwrap();
+        drain.finish().unwrap();
     }
 
     #[test]
     fn lab_ends_and_transport_stays_out_of_events() {
         let output = Output(Arc::new(Mutex::new(Vec::new())));
         let out = output.clone();
+        let log = Log::new(Box::new(out), &["blocked"], |s| s);
+        let evidence = Arc::new(fictionet::events::Memory::default());
+        let drain = log.clone();
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(evidence.clone()),
             move |fcx| async move {
-                let log = Log::new(Box::new(out), &["blocked"], |s| s);
                 log.attach(&fcx);
                 log.write(json!({"type": "blocked", "dst_port": 1}));
                 log.write(json!({"type": "blocked", "dst_port": 2}));
                 assert!(
-                    fcx.events()
-                        .all()
+                    evidence
+                        .checked_all()
+                        .unwrap()
                         .iter()
                         .all(|event| event.source != "example")
                 );
@@ -821,6 +821,7 @@ mod tests {
             },
         ))
         .unwrap();
+        drain.finish().unwrap();
         let lines = lines(&output);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1]["count"], 1);

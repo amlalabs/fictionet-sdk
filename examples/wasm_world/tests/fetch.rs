@@ -4,7 +4,7 @@
 //! JavaScript also runs an event-loop case.
 //! The README says which requests a world cannot serve in a JavaScript engine.
 
-use fictionet::events::Fields;
+use fictionet::events::{ConnInfo, Fanout, Fields, Memory, Metadata, Observation, Observer, Stamp};
 use fictionet::stdlib::protocols::json::Value;
 use http::Version;
 use std::io::Write;
@@ -40,7 +40,7 @@ fn requests_with_block_on() {
     }
 }
 
-/// A real run replays retained events and writes new ones to memory.
+/// A real run delivers matching retained events and JSON Lines to memory.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn real_run_writes_events_to_memory() {
@@ -58,18 +58,28 @@ fn real_run_writes_events_to_memory() {
         }
     }
 
+    impl Observer for Sink {
+        fn enabled(&self, _: Metadata, _: &ConnInfo) -> bool {
+            true
+        }
+        fn observe(&self, _: Stamp, observation: Observation<'_>) {
+            if let Observation::Event(event) = observation {
+                writeln!(self.clone(), "{}", event.to_line().unwrap()).unwrap();
+            }
+        }
+    }
+
     let sink = Sink::default();
     let out = sink.clone();
-    let kept = Arc::new(Mutex::new(None));
-    let keep = kept.clone();
+    let evidence = Arc::new(Memory::default());
     fictionet::block_on(fictionet::run(
-        fictionet::Seed::from_u64(42),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(42)).observer(Arc::new(Fanout::new(
+            vec![evidence.clone(), Arc::new(sink.clone())],
+        ))),
         |fcx| async move {
             assert_eq!(fcx.mode(), fictionet::RunMode::Real);
             fcx.record(fictionet::events::Event::new("test", "before_writer"));
-            fcx.events().to_writer(Box::new(out.clone()));
             fcx.record(fictionet::events::Event::new("test", "after_writer"));
-            #[cfg(target_arch = "wasm32")]
             assert_eq!(
                 out.0
                     .lock()
@@ -77,43 +87,43 @@ fn real_run_writes_events_to_memory() {
                     .iter()
                     .filter(|b| **b == b'\n')
                     .count(),
-                2,
-                "browser writers deliver synchronously"
+                3,
+                "memory observers deliver synchronously"
             );
-            *keep.lock().unwrap() = Some(fcx.events());
             Ok(())
         },
     ))
     .unwrap();
-    let log = kept.lock().unwrap().take().unwrap();
-    let events = log.all();
-    assert_eq!(events.len(), 2);
+    let events = evidence.checked_all().unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(events[0].is("run", "start"));
+    assert!(events[1].is("test", "before_writer"));
+    assert!(events[2].is("test", "after_writer"));
     let expected: String = events
         .iter()
         .map(|event| format!("{}\n", event.to_line().unwrap()))
         .collect();
     assert_eq!(*sink.0.lock().unwrap(), expected.as_bytes());
-    assert_eq!(log.lost(), 0);
+    assert_eq!(evidence.dropped(), 0);
 }
 
 /// A real run records its wall date on the host and in a JavaScript engine.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn real_run_records_wall_time() {
-    let kept = Arc::new(Mutex::new(None));
-    let keep = kept.clone();
+    let evidence = Arc::new(Memory::default());
     fictionet::block_on(fictionet::run(
-        fictionet::Seed::from_u64(42),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(42)).observer(evidence.clone()),
         |fcx| async move {
             fcx.events().start(&fcx, Fields::new());
-            *keep.lock().unwrap() = Some(fcx.events());
             Ok(())
         },
     ))
     .unwrap();
-    let log = kept.lock().unwrap().take().unwrap();
+    let events = evidence.checked_of("run", "start").unwrap();
+    assert_eq!(events.len(), 2);
     assert!(
-        log.of("run", "start")[0]
+        events[1]
             .get("wall")
             .and_then(Value::as_f64)
             .is_some_and(|w| w > 1.7e9)

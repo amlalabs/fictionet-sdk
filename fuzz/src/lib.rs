@@ -64,7 +64,19 @@ where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let result = block_on(run(fictionet::Seed::from_u64(seed), move |fcx| {
+    world_with_options(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(seed)),
+        f,
+    )
+}
+
+/// Runs a fuzz world with explicitly selected observation.
+pub fn world_with_options<F, Fut>(options: fictionet::RunOptions, f: F)
+where
+    F: FnOnce(Cx) -> Fut + Send,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let result = block_on(run(options, move |fcx| {
         let fut = f(fcx);
         async move {
             fut.await;

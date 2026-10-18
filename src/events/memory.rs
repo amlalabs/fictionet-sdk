@@ -76,18 +76,22 @@ impl Memory {
 
     /// Reads matching evidence only if no event has been lost.
     pub fn checked_of(&self, source: &str, kind: &str) -> Result<Vec<Event>, Incomplete> {
+        self.checked(|event| event.is(source, kind))
+    }
+
+    /// Reads all retained evidence only if no event has been lost.
+    pub fn checked_all(&self) -> Result<Vec<Event>, Incomplete> {
+        self.checked(|_| true)
+    }
+
+    fn checked(&self, pick: impl Fn(&Event) -> bool) -> Result<Vec<Event>, Incomplete> {
         let state = self.state.lock();
         if state.dropped != 0 {
             return Err(Incomplete {
                 dropped: state.dropped,
             });
         }
-        Ok(state
-            .events
-            .iter()
-            .filter(|e| e.is(source, kind))
-            .cloned()
-            .collect())
+        Ok(state.events.iter().filter(|e| pick(e)).cloned().collect())
     }
 
     /// Reads a bounded display batch. This does not certify completeness.

@@ -126,7 +126,7 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
     let result = fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(log.clone())),
         move |fcx| async move {
             let ids = border_world::identities(&fcx, &scenario, &world_ca)?;
             border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;

@@ -218,6 +218,7 @@ mod sites {
                 let elapsed = start.elapsed();
                 let queries = proxy
                     .queries
+                    .0
                     .lock()
                     .unwrap()
                     .get(host)
@@ -235,9 +236,34 @@ mod sites {
 const PROXY_TOKEN: &str = "bench-token";
 const PROXY_AUTH: &str = "Basic cmVsYXk6YmVuY2gtdG9rZW4=";
 
+#[derive(Default)]
+struct Queries(Mutex<std::collections::HashMap<String, u64>>);
+
+impl fictionet::events::Observer for Queries {
+    fn enabled(
+        &self,
+        metadata: fictionet::events::Metadata,
+        _: &fictionet::events::ConnInfo,
+    ) -> bool {
+        metadata.source == "dns" && metadata.kind == "query"
+    }
+    fn observe(
+        &self,
+        _: fictionet::events::Stamp,
+        observation: fictionet::events::Observation<'_>,
+    ) {
+        if let fictionet::events::Observation::Event(e) = observation
+            && e.u64("qtype") == Some(1)
+            && let Some(name) = e.str("name")
+        {
+            *self.0.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+        }
+    }
+}
+
 struct Proxy {
     addr: SocketAddr,
-    queries: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    queries: Arc<Queries>,
     child: std::process::Child,
     stderr: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
@@ -252,7 +278,7 @@ impl Proxy {
         let path = socket_path("proxy");
         let token = path.with_extension("token");
         std::fs::write(&token, PROXY_TOKEN).unwrap();
-        let queries: Arc<Mutex<std::collections::HashMap<String, u64>>> = Arc::default();
+        let queries: Arc<Queries> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let (attacher, attachments) = fictionet::attachments();
         let listening = listen(WorldSocket::UnixSocket(path.clone()), attacher).unwrap();
@@ -260,17 +286,10 @@ impl Proxy {
             let (queries, stop) = (queries.clone(), stop.clone());
             std::thread::spawn(move || {
                 finish(block_on(run(
-                    fictionet::Seed::random(),
+                    fictionet::RunOptions::new(fictionet::Seed::random()).observer(queries),
                     move |fcx| async move {
                         let page = Page(Bytes::from_static(b"plain site\n"));
-                        fcx.events().subscribe(move |e| {
-                            if e.is("dns", "query")
-                                && let Some(name) = e.str("name")
-                                && e.u64("qtype") == Some(1)
-                            {
-                                *queries.lock().unwrap().entry(name.to_owned()).or_default() += 1;
-                            }
-                        });
+
                         web::Sites::new(move |host: &str| {
                             (host == "plain.test")
                                 .then(|| web::Site::new(page.clone()).plain_http())

@@ -362,7 +362,7 @@ pub fn serve(
     start: SystemTime,
     attachments: fictionet::Attachments,
 ) -> fictionet::Result {
-    events::log_to(fcx, log.clone());
+    log.attach(fcx);
     let names = addresses.fixed.clone();
     let world = fcx.clone();
     let site_for = move |host: &str| {
@@ -668,7 +668,8 @@ mod tests {
         ));
         let output = log.clone();
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::from_u64(1),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
+                .observer(Arc::new(events::LogObserver { log: log.clone() })),
             move |fcx| async move {
                 let addresses = Arc::new(Addresses::from_record(
                     HashMap::new(),
@@ -708,6 +709,7 @@ mod tests {
             log.health().unwrap_err().to_string(),
             "cannot record the address: injected address write failure"
         );
+        assert!(log.finish().is_err());
         let lines: Vec<Value> = std::fs::read_to_string(&path)
             .unwrap()
             .lines()

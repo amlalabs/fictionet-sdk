@@ -195,8 +195,11 @@ fn the_log_is_the_recorded_one() {
             .enable_all()
             .build()
             .unwrap();
+        let drain = log.clone();
         let result = rt.block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
+                adaptive_web_world::events::LogObserver { log: log.clone() },
+            )),
             move |fcx| async move {
                 let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();
@@ -278,6 +281,7 @@ fn the_log_is_the_recorded_one() {
                 Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
             },
         ));
+        drain.finish().unwrap();
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
     let result = rx.recv_timeout(Duration::from_secs(90));

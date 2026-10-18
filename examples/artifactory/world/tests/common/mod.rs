@@ -38,27 +38,32 @@ where
     F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    fictionet_test_support::harness::run(fictionet::Seed::from_u64(1), move |fcx| async move {
-        let contents = Arc::new(Contents::new(variant, "", &[1; 32]).unwrap());
-        let identity = Identity::new(&fcx)?;
-        let root = identity.ca_der.clone();
-        let mut roots = RootCertStore::empty();
-        roots.add(root)?;
-        let buf = Buf::default();
-        let log = Log::start(Box::new(buf.clone()))?;
-        let (attacher, attachments) = fictionet::attachments();
-        artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
-        f(
-            fcx,
-            attacher,
-            Env {
-                roots: Arc::new(roots),
-                log: buf,
-                contents,
-            },
-        )
-        .await
-    });
+    let buf = Buf::default();
+    let log = Log::start(Box::new(buf.clone())).unwrap();
+    let output = log.clone();
+    fictionet_test_support::harness::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(log.clone())),
+        move |fcx| async move {
+            let contents = Arc::new(Contents::new(variant, "", &[1; 32]).unwrap());
+            let identity = Identity::new(&fcx)?;
+            let root = identity.ca_der.clone();
+            let mut roots = RootCertStore::empty();
+            roots.add(root)?;
+            let (attacher, attachments) = fictionet::attachments();
+            artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
+            f(
+                fcx,
+                attacher,
+                Env {
+                    roots: Arc::new(roots),
+                    log: buf,
+                    contents,
+                },
+            )
+            .await
+        },
+    );
+    output.finish().unwrap();
 }
 
 /// One HTTPS request with the world's CA checked.

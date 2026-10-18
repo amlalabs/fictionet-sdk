@@ -388,8 +388,9 @@ mod tests {
 
     #[test]
     fn a_ten_packet_queue_drops_the_eleventh_packet_of_a_burst() {
+        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
         block_on(fictionet::lab(
-            fictionet::Seed::from_u64(0),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(0)).observer(evidence.clone()),
             |fcx| async move {
                 let (mut sandbox, inner) = pair();
                 let mut far = bottleneck(&fcx, 1_000_000, 10, inner);
@@ -404,7 +405,7 @@ mod tests {
                     );
                 }
                 assert_eq!(drain(&fcx, &mut far).await, 0);
-                let drops = fcx.events().of("bottleneck", "drop");
+                let drops = evidence.checked_of("bottleneck", "drop").unwrap();
                 assert_eq!(drops.len(), 1);
                 assert_eq!(drops[0].u64("count"), Some(1));
                 Ok(())

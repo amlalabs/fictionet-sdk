@@ -74,7 +74,7 @@ impl Buf {
 }
 
 /// Runs a test script on a runtime and ends the world when it returns.
-pub fn run<F, Fut>(seed: fictionet::Seed, f: F)
+pub fn run<F, Fut>(options: impl Into<fictionet::RunOptions> + Send + 'static, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
@@ -86,7 +86,7 @@ where
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(fictionet::run(seed, move |fcx| async move {
+        let result = rt.block_on(fictionet::run(options, move |fcx| async move {
             f(fcx).await?;
             Err(fictionet::Error::from(Done))
         }));

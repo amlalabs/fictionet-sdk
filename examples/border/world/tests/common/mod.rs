@@ -38,36 +38,41 @@ where
     F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    fictionet_test_support::harness::run(fictionet::Seed::random(), move |fcx| async move {
-        let scenario = Arc::new(Scenario::new(
-            variant,
-            task,
-            parse_prefix("10.0.0.0/24").unwrap(),
-        ));
-        let (ids, root) = {
-            let ca = Ca::new(&fcx, "Test Root CA")?;
-            (
-                border_world::identities(&fcx, &scenario, &ca)?,
-                ca.cert_der(),
+    let buf = Buf::default();
+    let scenario = Arc::new(Scenario::new(
+        variant,
+        task,
+        parse_prefix("10.0.0.0/24").unwrap(),
+    ));
+    let log = Log::start(Box::new(buf.clone()), scenario.clone());
+    let output = log.clone();
+    fictionet_test_support::harness::run(
+        fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(log.clone())),
+        move |fcx| async move {
+            let (ids, root) = {
+                let ca = Ca::new(&fcx, "Test Root CA")?;
+                (
+                    border_world::identities(&fcx, &scenario, &ca)?,
+                    ca.cert_der(),
+                )
+            };
+            let mut roots = RootCertStore::empty();
+            roots.add(root)?;
+            let (attacher, attachments) = fictionet::attachments();
+            border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
+            f(
+                fcx,
+                attacher,
+                Env {
+                    roots: Arc::new(roots),
+                    log: buf,
+                    scenario,
+                },
             )
-        };
-        let mut roots = RootCertStore::empty();
-        roots.add(root)?;
-        let buf = Buf::default();
-        let log = Log::start(Box::new(buf.clone()), scenario.clone());
-        let (attacher, attachments) = fictionet::attachments();
-        border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
-        f(
-            fcx,
-            attacher,
-            Env {
-                roots: Arc::new(roots),
-                log: buf,
-                scenario,
-            },
-        )
-        .await
-    });
+            .await
+        },
+    );
+    output.finish().unwrap();
 }
 
 /// Writes a message with two-octet AS numbers.

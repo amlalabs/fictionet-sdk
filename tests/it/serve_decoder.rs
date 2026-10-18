@@ -107,44 +107,48 @@ fn assert_fault_error(
 
     let input = input.to_vec();
     let seen = seen.to_vec();
-    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let conn = FaultConnection {
-            input: std::io::Cursor::new(input),
-            output: output.clone(),
-        };
-        let mut service = FaultLines::default();
-        let result = serve::connection(
-            &fcx,
-            conn,
-            fictionet::events::ConnInfo::default(),
-            &mut service,
-            &(),
-            &ServeOptions::default().faults(FaultPlan::new(plan)),
-        )
-        .await;
-        let Err(result) = result else {
-            panic!("fault failure was not returned")
-        };
-        assert_eq!(
-            std::error::Error::source(&result).unwrap().to_string(),
-            error.to_string()
-        );
-        assert!(matches!(result, ServeError::Faults(e) if e == error));
-        assert_eq!(service.seen, seen);
-        assert_eq!(service.ended, [Ended::Closed]);
-        assert!(output.lock().unwrap().is_empty());
-        let events = fcx.events().of("conn", "error");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].level, fictionet::events::Level::Notice);
-        assert_eq!(events[0].str("kind"), Some("faults"));
-        assert_eq!(events[0].str("direction"), Some(direction));
-        assert_eq!(
-            events[0].str("error"),
-            Some(fictionet::ErrorChain(&error).to_string().as_str())
-        );
-        Ok(())
-    }))
+    let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()),
+        |fcx| async move {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let conn = FaultConnection {
+                input: std::io::Cursor::new(input),
+                output: output.clone(),
+            };
+            let mut service = FaultLines::default();
+            let result = serve::connection(
+                &fcx,
+                conn,
+                fictionet::events::ConnInfo::default(),
+                &mut service,
+                &(),
+                &ServeOptions::default().faults(FaultPlan::new(plan)),
+            )
+            .await;
+            let Err(result) = result else {
+                panic!("fault failure was not returned")
+            };
+            assert_eq!(
+                std::error::Error::source(&result).unwrap().to_string(),
+                error.to_string()
+            );
+            assert!(matches!(result, ServeError::Faults(e) if e == error));
+            assert_eq!(service.seen, seen);
+            assert_eq!(service.ended, [Ended::Closed]);
+            assert!(output.lock().unwrap().is_empty());
+            let events = evidence.checked_of("conn", "error").unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].level, fictionet::events::Level::Notice);
+            assert_eq!(events[0].str("kind"), Some("faults"));
+            assert_eq!(events[0].str("direction"), Some(direction));
+            assert_eq!(
+                events[0].str("error"),
+                Some(fictionet::ErrorChain(&error).to_string().as_str())
+            );
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 

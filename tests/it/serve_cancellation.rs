@@ -260,8 +260,9 @@ fn service_error_stays_primary_when_background_work_fails() {
 }
 
 fn background_failure(fail: bool) {
+    let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
     fictionet::block_on(fictionet::lab(
-        fictionet::Seed::from_u64(3),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(3)).observer(evidence.clone()),
         |fcx| async move {
             let mut service = TerminalSvc {
                 background: true,
@@ -302,7 +303,7 @@ fn background_failure(fail: bool) {
                 assert!(fictionet::ErrorChain(&error).to_string().contains("boom"));
                 assert_eq!(service.ended, [serve::Ended::Cancelled]);
             }
-            let errors = fcx.events().of("conn", "error");
+            let errors = evidence.checked_of("conn", "error").unwrap();
             assert_eq!(errors.len(), if fail { 2 } else { 1 });
             if fail {
                 assert_eq!(errors[0].str("kind"), Some("service"));
@@ -311,7 +312,7 @@ fn background_failure(fail: bool) {
             assert_eq!(task.str("kind"), Some("task"));
             assert_eq!(task.str("error"), Some("boom"));
             assert_eq!(task.conn.id, Some(42));
-            let closes = fcx.events().of("conn", "close");
+            let closes = evidence.checked_of("conn", "close").unwrap();
             assert_eq!(closes.len(), 1);
             assert!(closes[0].seq < task.seq, "the region ends after the run");
             assert!(!fcx.is_cancelled());
@@ -323,8 +324,9 @@ fn background_failure(fail: bool) {
 
 fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Option<&'static str>) {
     use std::future::{Future, poll_fn};
+    let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
     fictionet::block_on(fictionet::lab(
-        fictionet::Seed::from_u64(4),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(4)).observer(evidence.clone()),
         |fcx| async move {
             let polled = Arc::new(std::sync::Mutex::new(None));
             let mut service = TerminalSvc {
@@ -375,11 +377,14 @@ fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Opt
                 [end],
                 "on_end runs once with the primary cause"
             );
-            let closes = fcx.events().of("conn", "close");
+            let closes = evidence.checked_of("conn", "close").unwrap();
             assert_eq!(closes.len(), 1);
             assert_eq!(closes[0].str("end"), Some(end.as_str()));
             assert_eq!(closes[0].str("shutdown"), secondary);
-            assert_eq!(fcx.events().of("conn", "error").len(), usize::from(fail));
+            assert_eq!(
+                evidence.checked_of("conn", "error").unwrap().len(),
+                usize::from(fail)
+            );
             assert!(!fcx.is_cancelled());
             Ok(())
         },

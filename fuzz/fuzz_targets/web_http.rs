@@ -13,7 +13,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::network::ConnError;
 use fictionet::stdlib::network::tcp::TcpConnection;
 use fictionet_fuzz::web::{Client, NAMES, client_config, serve};
-use fictionet_fuzz::{poll_once, settle, world};
+use fictionet_fuzz::{poll_once, settle, world_with_options};
 use libfuzzer_sys::fuzz_target;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -136,7 +136,9 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let cert = fictionet_fuzz::cert();
-    world(move |fcx| async move {
+    let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(0))
+        .observer(std::sync::Arc::new(fictionet_fuzz::web::EventFormatting));
+    world_with_options(options, move |fcx| async move {
         let attacher = serve(&fcx, cert);
         let client = Client::new(&fcx, &attacher, "agent", Ipv4Addr::new(10, 0, 0, 2));
         let (addr, port) = if input.dns {

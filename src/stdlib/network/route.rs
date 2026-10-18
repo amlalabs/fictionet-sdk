@@ -1076,8 +1076,9 @@ mod tests {
     /// says so, and the sender hears "time exceeded".
     #[test]
     fn a_routing_loop_ends_when_the_ttl_runs_out() {
+        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
             |fcx| async move {
                 let (r1_s4, mut s4) = fictionet::pair();
                 let (r1_s6, mut s6) = fictionet::pair();
@@ -1128,9 +1129,8 @@ mod tests {
                 // r1 forwarded r2's answer: one hop.
                 assert_eq!(answer.0[7], 63);
 
-                let drops: Vec<String> = fcx
-                    .events()
-                    .of("router", "drop")
+                let drops: Vec<String> = evidence
+                    .checked_of("router", "drop").unwrap()
                     .into_iter()
                     .map(|e| e.summary)
                     .collect();
@@ -1336,11 +1336,12 @@ mod tests {
     }
 
     /// Each kind of drop, a replaced member and a closed one are recorded,
-    /// each with its reason, with no observer.
+    /// each with its reason, in the installed observer.
     #[test]
     fn drops_and_member_changes_are_recorded() {
+        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
             |fcx| async move {
                 let lan =
                     lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
@@ -1360,9 +1361,8 @@ mod tests {
                 drop(b2);
                 fcx.sleep(Duration::from_millis(20)).await?;
 
-                let events: Vec<(&str, String)> = fcx
-                    .events()
-                    .all()
+                let events: Vec<(&str, String)> = evidence
+                    .checked_all().unwrap()
                     .into_iter()
                     .filter(|e| e.source == "lan")
                     .map(|e| (e.kind, e.summary))

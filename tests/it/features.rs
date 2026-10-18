@@ -215,14 +215,15 @@ mod http {
     #[cfg(feature = "tokio")]
     #[test]
     fn tower_upgrade_with_a_cut_off_body_is_answered() {
-        fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
+        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+        fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()), |fcx| async move {
             let app = axum::Router::new().route("/", axum::routing::post(|| async { "reached" }));
             let mut conn = client(&fcx, httpd::tower(app)).await;
             conn.write_all(&fcx, b"POST / HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 10\r\n\r\nbody").await?;
             conn.shutdown(&fcx).await?;
             assert!(head(&fcx, &mut conn).await.starts_with("http/1.1 400"));
             while conn.read(&fcx, &mut [0; 64]).await? != 0 {}
-            let events = fcx.events().of("http", "request");
+            let events = evidence.checked_of("http", "request").unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].str("answer"), Some("cut_off"));
             assert_eq!(events[0].str("received"), Some("cut_off"));

@@ -752,26 +752,30 @@ mod tests {
         .unwrap();
     }
 
-    /// A router records a route it removes, with no observer.
+    /// A router delivers a removed route to the installed observer.
     #[test]
     fn routers_record_routes_they_remove() {
-        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
-            let (a, b) = crate::pair();
-            let (c, d) = crate::pair();
-            let router = crate::stdlib::network::route::router(
-                &fcx,
-                vec![("10.0.0.0/24".parse().unwrap(), a)],
-            );
-            router.add("10.0.1.0/24".parse().unwrap(), c);
-            assert!(!fcx.observed());
-            drop(b);
-            fcx.sleep(Duration::from_millis(10)).await?;
-            let removed = fcx.events().of("router", "route_removed");
-            assert_eq!(removed.len(), 1);
-            assert_eq!(removed[0].str("prefix"), Some("10.0.0.0/24"));
-            drop(d);
-            Ok(())
-        }))
+        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+        crate::block_on(crate::run(
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            |fcx| async move {
+                let (a, b) = crate::pair();
+                let (c, d) = crate::pair();
+                let router = crate::stdlib::network::route::router(
+                    &fcx,
+                    vec![("10.0.0.0/24".parse().unwrap(), a)],
+                );
+                router.add("10.0.1.0/24".parse().unwrap(), c);
+                assert!(!fcx.observed());
+                drop(b);
+                fcx.sleep(Duration::from_millis(10)).await?;
+                let removed = evidence.checked_of("router", "route_removed").unwrap();
+                assert_eq!(removed.len(), 1);
+                assert_eq!(removed[0].str("prefix"), Some("10.0.0.0/24"));
+                drop(d);
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 }

@@ -445,6 +445,15 @@ impl Cx {
         let graph = &self.run.graph;
         event.at = at;
         event.origin = graph.origin(crate::run::current_task(graph));
+        if self.run.observer.enabled(
+            crate::events::Metadata {
+                source: event.source,
+                kind: event.kind,
+            },
+            &event.conn,
+        ) {
+            self.run.observer.emit(event.clone(), || at);
+        }
         self.run.events.push(event);
     }
 
@@ -460,6 +469,18 @@ impl Cx {
         let graph = &self.run.graph;
         event.at = self.now();
         event.origin = graph.origin(crate::run::current_task(graph));
+        if self.run.observer.enabled(
+            crate::events::Metadata {
+                source: event.source,
+                kind: event.kind,
+            },
+            &event.conn,
+        ) {
+            self.run.observer.emit(
+                event.clone().fields(detail.clone()).field("count", 1u64),
+                || event.at,
+            );
+        }
         self.run.events.push_repeat(event, detail);
     }
 

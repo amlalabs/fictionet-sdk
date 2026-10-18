@@ -1114,31 +1114,43 @@ fn the_genuine_bank_redirects_its_bare_address() {
 // These probes run on Fictionet's clock, including the native body deadline.
 fn credential_lab<F, Fut>(test: F)
 where
-    F: FnOnce(fictionet::Cx, fictionet::Attacher, Buf) -> Fut + Send + 'static,
+    F: FnOnce(
+            fictionet::Cx,
+            fictionet::Attacher,
+            Buf,
+            std::sync::Arc<fictionet::events::Memory>,
+        ) -> Fut
+        + Send
+        + 'static,
     Fut: std::future::Future<Output = fictionet::Result> + Send + 'static,
 {
+    use border_world::scenario::{Scenario, parse_prefix};
+    use std::sync::Arc;
+    let scenario = Arc::new(Scenario::new(
+        Variant::Hijack,
+        Task::Login,
+        parse_prefix("10.0.0.0/24").unwrap(),
+    ));
+    let buf = Buf::default();
+    let log = border_world::log::Log::start(Box::new(buf.clone()), scenario.clone());
+    let drain = log.clone();
+    let recorded = Arc::new(fictionet::events::Memory::default());
     fictionet::block_on(fictionet::lab(
-        fictionet::Seed::from_u64(9),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(9)).observer(Arc::new(
+            fictionet::events::Fanout::new(vec![Arc::new(log.clone()), recorded.clone()]),
+        )),
         |fcx| async move {
-            use border_world::scenario::{Scenario, parse_prefix};
-            use std::sync::Arc;
-            let scenario = Arc::new(Scenario::new(
-                Variant::Hijack,
-                Task::Login,
-                parse_prefix("10.0.0.0/24").unwrap(),
-            ));
             let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "Test Root CA")?;
             let ids = border_world::identities(&fcx, &scenario, &ca)?;
-            let buf = Buf::default();
-            let log = border_world::log::Log::start(Box::new(buf.clone()), scenario.clone());
             let (attacher, attachments) = fictionet::attachments();
             border_world::start(&fcx, scenario, ids, log, attachments)?;
-            test(fcx.clone(), attacher, buf).await?;
+            test(fcx.clone(), attacher, buf, recorded).await?;
             fcx.cancel();
             Ok(())
         },
     ))
     .unwrap();
+    drain.finish().unwrap();
 }
 
 fn redacted(log: &Buf) {
@@ -1154,7 +1166,7 @@ fn redacted(log: &Buf) {
 
 #[test]
 fn password_without_host() {
-    credential_lab(|fcx, attacher, log| async move {
+    credential_lab(|fcx, attacher, log, _recorded| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let bytes = format!("GET /?p={PASSWORD} HTTP/1.0\r\n\r\n");
         let config = fictionet::stdlib::world::sandbox::client_config(
@@ -1183,7 +1195,7 @@ fn password_without_host() {
 
 #[test]
 fn password_in_partial_head_before_eof() {
-    credential_lab(|fcx, attacher, log| async move {
+    credential_lab(|fcx, attacher, log, _recorded| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let config = fictionet::stdlib::world::sandbox::client_config(
             &fcx,
@@ -1218,7 +1230,7 @@ fn password_in_partial_head_before_eof() {
             redacted(&log);
             let lines = log.lines();
             let local = SocketAddr::new(BANK_ADDR.into(), port);
-            let classified = fcx.events().all().iter().any(|event| {
+            let classified = _recorded.checked_all().unwrap().iter().any(|event| {
                 event.source == "http"
                     && event.conn.local == Some(local)
                     && event.conn.peer == Some(peer)
@@ -1243,7 +1255,7 @@ fn password_in_partial_head_before_eof() {
 
 #[test]
 fn password_in_partial_head_before_reset() {
-    credential_lab(|fcx, attacher, log| async move {
+    credential_lab(|fcx, attacher, log, _recorded| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let config = fictionet::stdlib::world::sandbox::client_config(
             &fcx,
@@ -1272,7 +1284,7 @@ fn password_in_partial_head_before_reset() {
         let mut evidence = Vec::new();
         for (port, peer) in [(443, secure_peer), (80, plain_peer)] {
             let local = SocketAddr::new(BANK_ADDR.into(), port);
-            let classified = fcx.events().all().iter().any(|event| {
+            let classified = _recorded.checked_all().unwrap().iter().any(|event| {
                 event.source == "http"
                     && event.conn.local == Some(local)
                     && event.conn.peer == Some(peer)
@@ -1297,7 +1309,7 @@ fn password_in_partial_head_before_reset() {
 
 #[test]
 fn timeout_after_password() {
-    credential_lab(|fcx, attacher, log| async move {
+    credential_lab(|fcx, attacher, log, _recorded| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let config = fictionet::stdlib::world::sandbox::client_config(
             &fcx,
@@ -1327,7 +1339,7 @@ fn timeout_after_password() {
 
 #[test]
 fn h2_password_before_cut_off() {
-    credential_lab(|fcx, attacher, log| async move {
+    credential_lab(|fcx, attacher, log, _recorded| async move {
         use fictionet::stdlib::protocols::{hpack, http2};
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let config = fictionet::stdlib::world::sandbox::client_config(
@@ -1414,7 +1426,7 @@ fn h2_password_before_cut_off() {
 
 #[test]
 fn password_before_httpd_413() {
-    credential_lab(|fcx, attacher, log| async move {
+    credential_lab(|fcx, attacher, log, _recorded| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let mut conn = plain(&fcx, &m, BANK_ADDR).await;
         let length = (64 << 20) + PASSWORD.len();

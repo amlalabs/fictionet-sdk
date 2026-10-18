@@ -109,15 +109,7 @@ pub fn start(
         net = net.add_host(site_for(name).unwrap().into_host(name));
     }
     log.attach(fcx);
-    let hook = log.clone();
     let (inner, inner_attachments) = fictionet::attachments();
-    // The events of everything the network does: the ones the log keeps
-    // become log lines ([`events::line`]).
-    fcx.events().subscribe(move |event| {
-        if events::LOGGED.contains(&event.source) {
-            hook.entry(event);
-        }
-    });
     net.subnet(scenario.subnet)
         // The scenarios are IPv4 networks, and the agent has IPv6 off.
         .ipv4_only()

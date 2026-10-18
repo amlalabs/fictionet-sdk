@@ -106,11 +106,6 @@ pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::services::ca::Leaf) -> Attacher
             _ => None,
         }
     });
-    // Format each event, as a world that logs them would.
-    fcx.events().subscribe(|e| {
-        let _ = format!("{e:?}");
-        let _ = fictionet::stdlib::codec::Wire::to_bytes(&e.to_json());
-    });
     let (attacher, attachments) = attachments();
     sites.start(fcx, attachments).unwrap();
     attacher
@@ -211,4 +206,23 @@ pub fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     .with_no_client_auth();
     c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Arc::new(c)
+}
+
+/// Exercises both event renderers while the web world handles fuzz input.
+pub struct EventFormatting;
+
+impl fictionet::events::Observer for EventFormatting {
+    fn enabled(&self, _: fictionet::events::Metadata, _: &fictionet::events::ConnInfo) -> bool {
+        true
+    }
+    fn observe(
+        &self,
+        _: fictionet::events::Stamp,
+        observation: fictionet::events::Observation<'_>,
+    ) {
+        if let fictionet::events::Observation::Event(event) = observation {
+            let _ = format!("{event:?}");
+            let _ = fictionet::stdlib::codec::Wire::to_bytes(&event.to_json());
+        }
+    }
 }
