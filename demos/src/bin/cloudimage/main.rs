@@ -267,13 +267,25 @@ async fn run_checks(
         "pgrep -a Xvnc || echo 'no Xvnc'",
         "pgrep -af firefox | head -1 || echo 'no firefox'",
         "ls /etc/ssl/certs | grep -i zscaler || echo 'no zscaler cert'",
+        // How much the guest pulled from the world's mirror at boot.
+        "echo \"packages downloaded: $(du -shc /var/cache/apt/archives/*.deb 2>/dev/null | tail -1 | cut -f1) in $(ls /var/cache/apt/archives/*.deb 2>/dev/null | wc -l) files\"",
     ] {
         guest_cmd(&session, command).await?;
     }
 
     // Required: the services, the trust store, the Zscaler chain, Firefox.
-    let services = guest_cmd(&session, "systemctl is-active vnc.service vnc-vsock.socket sshd-vsock.socket").await?;
-    if services.stdout.lines().filter(|l| l.trim() == "active").count() != 3 {
+    let services = guest_cmd(
+        &session,
+        "systemctl is-active vnc.service vnc-vsock.socket sshd-vsock.socket",
+    )
+    .await?;
+    if services
+        .stdout
+        .lines()
+        .filter(|l| l.trim() == "active")
+        .count()
+        != 3
+    {
         failures.push("a required service is not active".into());
     }
     let login_env = guest_cmd(
