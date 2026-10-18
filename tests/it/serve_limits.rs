@@ -871,7 +871,7 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
     let text = String::from_utf8(reply).unwrap();
     assert!(text.starts_with("HTTP/1.0 200 OK\r\n"), "{text}");
     assert!(
-        !text.contains("content-length") && !text.contains("keep-alive"),
+        !text.contains("Content-Length") && !text.contains("keep-alive"),
         "{text}"
     );
     assert!(text.ends_with("\r\n\r\nstreamed\n"), "{text}");
@@ -885,7 +885,7 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
     assert!(
         String::from_utf8(reply)
             .unwrap()
-            .contains("connection: keep-alive")
+            .contains("Connection: keep-alive")
     );
     assert_eq!(h.end_reason(), None);
 }

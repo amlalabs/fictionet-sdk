@@ -49,7 +49,7 @@ fn route_change_answers_get_with_the_body_and_head_without() {
             let get = std::str::from_utf8(&get).unwrap();
             let (headers, body) = get.split_once("\r\n\r\n").unwrap();
             assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
-            assert!(headers.lines().any(|line| line == "content-length: 14"));
+            assert!(headers.lines().any(|line| line == "Content-Length: 14"));
             assert_eq!(body, "the real bank\n");
             let head = ask(
                 &fcx,
@@ -60,7 +60,7 @@ fn route_change_answers_get_with_the_body_and_head_without() {
             let head = std::str::from_utf8(&head).unwrap();
             let (headers, body) = head.split_once("\r\n\r\n").unwrap();
             assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
-            assert!(headers.lines().any(|line| line == "content-length: 14"));
+            assert!(headers.lines().any(|line| line == "Content-Length: 14"));
             assert!(body.is_empty());
             fcx.cancel();
             Ok(())

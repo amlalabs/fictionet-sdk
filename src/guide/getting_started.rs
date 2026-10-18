@@ -242,8 +242,8 @@
 //! ```text
 //! $ sudo ip netns exec agent curl -sS -i http://example.test/ | head -3
 //! HTTP/1.1 301 Moved Permanently
-//! content-type: text/plain; charset=utf-8
-//! location: https://example.test/
+//! Content-Type: text/plain; charset=utf-8
+//! Location: https://example.test/
 //! $ sudo ip netns exec agent curl -sS --cacert /run/fictionet/ca.pem https://nope.test/
 //! curl: (6) Could not resolve host: nope.test
 //! ```
@@ -301,8 +301,8 @@
 //! 2001:db8:113::10
 //! $ sudo ip netns exec agent curl -sS -i http://example.test/ | head -3
 //! HTTP/1.1 301 Moved Permanently
-//! content-type: text/plain; charset=utf-8
-//! location: https://example.test/
+//! Content-Type: text/plain; charset=utf-8
+//! Location: https://example.test/
 //! ```
 //!
 //! The observer shows the world's side. Every world keeps a log of events, and

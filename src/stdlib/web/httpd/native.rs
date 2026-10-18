@@ -356,31 +356,43 @@ fn encode(
         ) {
             continue;
         }
-        out.extend_from_slice(name.as_str().as_bytes());
+        title_case(out, name.as_str());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     if let Some(date) = &policy.date {
-        out.extend_from_slice(b"date: ");
+        out.extend_from_slice(b"Date: ");
         out.extend_from_slice(date.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     match policy.len {
-        Some(n) => out.extend_from_slice(format!("content-length: {n}\r\n").as_bytes()),
+        Some(n) => out.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes()),
         None if policy.bodiless => {}
         None if v10 => close = true,
-        None => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
+        None => out.extend_from_slice(b"Transfer-Encoding: chunked\r\n"),
     }
     if status == StatusCode::SWITCHING_PROTOCOLS {
-        out.extend_from_slice(b"connection: upgrade\r\n");
+        out.extend_from_slice(b"Connection: upgrade\r\n");
     } else if close && !v10 {
-        out.extend_from_slice(b"connection: close\r\n");
+        out.extend_from_slice(b"Connection: close\r\n");
     } else if !close && v10 {
-        out.extend_from_slice(b"connection: keep-alive\r\n");
+        out.extend_from_slice(b"Connection: keep-alive\r\n");
     }
     out.extend_from_slice(b"\r\n");
     close
+}
+
+/// Writes a field name with each word capitalized (`Content-Type`), as
+/// Apache, nginx and most other HTTP/1 servers do. The `http` crate keeps
+/// names in lowercase, and tools that recognize servers by their replies,
+/// such as `nmap -sV`, match `Server:` with its capital.
+fn title_case(out: &mut Vec<u8>, name: &str) {
+    let mut start = true;
+    for b in name.bytes() {
+        out.push(if start { b.to_ascii_uppercase() } else { b });
+        start = b == b'-';
+    }
 }
 
 fn write_simple(

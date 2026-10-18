@@ -348,7 +348,7 @@ async fn episode(
                     let head = String::from_utf8_lossy(&response[..at]);
                     let len: usize = head
                         .lines()
-                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
                         .unwrap()
                         .parse()?;
                     if response.len() == at + 4 + len {

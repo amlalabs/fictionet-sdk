@@ -410,10 +410,10 @@ impl httpd::Handler for StreamHandler {
 
 #[test]
 fn http1_streams_chunks_once_and_keeps_alive() {
-    let answer = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    let answer = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
     for path in ["/", "/empty-frame", "/empty"] {
         let expected = if path == "/empty" {
-            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
         } else {
             answer
         };
@@ -474,14 +474,14 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
     assert_eq!(answers.len(), 6, "{text}");
     assert!(
         answers[0].starts_with("200 OK\r\n")
-            && answers[0].ends_with("content-length: 3\r\n\r\nhi\n"),
+            && answers[0].ends_with("Content-Length: 3\r\n\r\nhi\n"),
         "{}",
         answers[0]
     );
     assert!(answers[1].ends_with("\r\n\r\nping"));
     // HEAD: the length a GET would have, and no body.
     assert!(
-        answers[2].ends_with("content-length: 3\r\n\r\n"),
+        answers[2].ends_with("Content-Length: 3\r\n\r\n"),
         "{}",
         answers[2]
     );
@@ -539,11 +539,11 @@ fn http1_response_policy_preserves_native_framing() {
         assert_eq!(got, body, "{reply}");
         assert_eq!(
             head.lines()
-                .find_map(|line| line.strip_prefix("content-length: ")),
+                .find_map(|line| line.strip_prefix("Content-Length: ")),
             length,
             "{reply}"
         );
-        assert!(!head.contains("transfer-encoding"), "{reply}");
+        assert!(!head.contains("Transfer-Encoding"), "{reply}");
         let event = h.events().iter().find(|e| e.is("http", "request")).unwrap();
         assert_eq!(
             event.get("sent").and_then(json::Value::as_u64),
@@ -615,7 +615,7 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
     let mut reply = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap();
     let text = std::str::from_utf8(&reply).unwrap();
     let (head, body) = text.split_once("\r\n\r\n").unwrap();
-    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
     assert_eq!(
         body, "6\r\nstream\r\n3\r\ned\n\r\n0\r\n\r\n",
         "wire: {text:?}"
@@ -743,7 +743,7 @@ fn http1_closes_when_asked_and_on_http10() {
     h.push(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
         .unwrap();
     assert!(h.closed());
-    assert!(http_text(&h).contains("connection: close\r\n"));
+    assert!(http_text(&h).contains("Connection: close\r\n"));
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
     h.push(b"GET / HTTP/1.0\r\n\r\n").unwrap();
     assert!(h.closed());
@@ -753,7 +753,7 @@ fn http1_closes_when_asked_and_on_http10() {
     h.push(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
         .unwrap();
     assert!(!h.closed());
-    assert!(http_text(&h).contains("connection: keep-alive\r\n"));
+    assert!(http_text(&h).contains("Connection: keep-alive\r\n"));
 }
 
 #[test]
@@ -768,7 +768,7 @@ fn http1_handler_connection_close() {
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
         h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
         assert!(
-            http_text(&h).contains("connection: close\r\n"),
+            http_text(&h).contains("Connection: close\r\n"),
             "{connection}"
         );
         assert!(http_text(&h).ends_with("\r\n\r\nfirst"));
@@ -792,7 +792,7 @@ fn http1_handler_connection_close_stops_pipeline() {
         .unwrap();
     assert_eq!(http_text(&h).matches("HTTP/1.1 200 OK").count(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(http_text(&h).contains("connection: close\r\n"));
+    assert!(http_text(&h).contains("Connection: close\r\n"));
     assert!(h.closed());
 }
 
@@ -807,7 +807,7 @@ fn http1_handler_connection_keep_alive_is_stripped() {
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
     h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
     assert!(http_text(&h).starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(!http_text(&h).contains("connection:"));
+    assert!(!http_text(&h).contains("Connection:"));
     assert!(!h.closed());
 }
 
@@ -824,7 +824,7 @@ fn http1_handler_connection_close_async() {
             Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ()).with_fcx(fcx);
         h.push(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n")
             .unwrap();
-        assert!(http_text(&h).contains("connection: close\r\n"));
+        assert!(http_text(&h).contains("Connection: close\r\n"));
         assert_eq!(http_text(&h).matches("HTTP/1.1 200 OK").count(), 1);
         assert!(http_text(&h).ends_with("\r\n\r\nfirst"));
         assert!(h.closed());
@@ -1069,7 +1069,7 @@ fn virtual_hosts_pick_a_site_by_host() {
     assert!(text.contains("\r\n\r\na a.test 80"), "{text}");
     assert!(
         text.contains("HTTP/1.1 301 Moved Permanently\r\n")
-            && text.contains("location: https://b.test/x?y\r\n")
+            && text.contains("Location: https://b.test/x?y\r\n")
     );
     assert!(text.contains("HTTP/1.1 421 Misdirected Request\r\n"));
     assert!(text.contains("HTTP/1.0 400 Bad Request\r\n"));

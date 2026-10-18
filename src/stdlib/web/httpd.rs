@@ -47,6 +47,9 @@
 //! Native HTTP/1 writes its own `Connection` header. It closes the
 //! connection after a response, other than `101`, whose handler's
 //! `Connection` header names `close`, and drops the handler's other tokens.
+//! It writes field names with each word capitalized (`Content-Type`), as
+//! most HTTP/1 servers do. HTTP/2 names stay lowercase, as that protocol
+//! requires.
 //!
 //! An upgrade request reaches the native HTTP/1 handler. A synchronous handler
 //! returns `101` with an [`UpgradeHandler`] extension to receive the connection
