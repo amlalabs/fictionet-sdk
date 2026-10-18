@@ -5,10 +5,7 @@
 //! The container's kernel is the client: it has 10.9.0.1/24 and fd09::1/64
 //! on the tun device, and the endpoints are 10.9.0.2 and fd09::2.
 
-#[path = "../it/common/done.rs"]
-mod done;
-
-use done::Done;
+use fictionet_test_support::{Done, ended_with_done, pattern};
 
 use std::future::poll_fn;
 use std::io::{ErrorKind, Read, Write};
@@ -206,10 +203,6 @@ fn trace_packet(fcx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool
     }
     ring.push_back(line);
 }
-
-#[path = "../it/common/pattern.rs"]
-mod payload;
-use payload::pattern;
 
 /// Serves on a TCP endpoint: port 80 echoes until EOF, port 81 sends
 /// `DOWNLOAD` bytes and closes.
@@ -433,5 +426,5 @@ fn a_linux_client_through_tun() {
         checks.join().unwrap();
         Err(fictionet::Error::from(Done))
     }));
-    done::ended_with_done(result).unwrap();
+    ended_with_done(result).unwrap();
 }

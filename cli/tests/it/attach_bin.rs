@@ -1,10 +1,7 @@
 //! The `fictionet attach` binary against a real `listen` in this process.
 //! The tests that need a tun device are in `tests/host/attach_bin.rs`.
 
-use crate::common::logged;
-use crate::common::temp;
-
-use logged::logged;
+use fictionet_test_support::{logged, temp};
 
 use std::process::{Command, Stdio};
 

@@ -6,16 +6,7 @@
 //! are not allowed. The Docker test in `tests/docker/ping` covers the same
 //! ground with real containers.
 
-#[path = "../it/common/logged.rs"]
-mod logged;
-#[path = "../../../tests/common/poll.rs"]
-mod poll;
-// Only `dir` is used here.
-#[allow(dead_code)]
-#[path = "../../../tests/common/temp.rs"]
-mod temp;
-
-use logged::logged;
+use fictionet_test_support::{logged, poll, temp};
 
 use std::process::{Command, Stdio};
 use std::time::Duration;

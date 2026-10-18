@@ -5,7 +5,7 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use crate::common::temp;
+use fictionet_test_support::temp;
 
 use fictionet::Interface;
 use fictionet::prelude::*;
@@ -620,7 +620,7 @@ fn observer_session_capacity_counts_idle_clients_and_reuses_slots() {
     assert!(text(&first.call(r#"{"op":"world"}"#).unwrap()).contains(r#""running":false"#));
     drop(second);
     let mut reused = None;
-    crate::common::poll::until(
+    fictionet_test_support::poll::until(
         Duration::from_secs(5),
         "disconnected observer slot to be released",
         || match Client::connect(&path, "reused") {

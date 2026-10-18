@@ -1,3 +1,8 @@
+//! The benchmarks' worlds: a fixture that stops at checkpoints, and the HTTP
+//! cases that the SDK's and the command's benchmarks share.
+
+pub mod http;
+
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};

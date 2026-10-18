@@ -27,6 +27,7 @@ axum = { version = "0.8", default-features = false, features = ["ws"] }
 bytes = "1"
 divan = "0.1.21"
 etherparse = "0.21"
+fictionet-test-support = { path = "../tests/support" }
 http = "1.5.0"
 http-body-util = "0.1"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }

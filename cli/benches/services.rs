@@ -1,15 +1,11 @@
-#[path = "../../benches/common/mod.rs"]
-mod common;
-#[path = "../../benches/common/http.rs"]
-mod http_world;
-
 use bytes::Bytes;
-use common::finish;
 use divan::{Bencher, counter::ItemsCount};
 use fictionet::prelude::*;
 use fictionet::relay::{self, Hello, Message as RelayMessage, unix};
 use fictionet::stdlib::web;
 use fictionet::{Interface, WorldSocket, block_on, listen, run};
+use fictionet_test_support::bench::finish;
+use fictionet_test_support::bench::http as http_world;
 use http_world::{HttpCase, Page, Watch, socket_path};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};

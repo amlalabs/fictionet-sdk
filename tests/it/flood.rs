@@ -7,11 +7,10 @@
 //! Each test runs in a process of its own, because it measures the
 //! process's memory.
 
-use crate::common::timeout;
+use fictionet_test_support::timeout;
 
 use fictionet::stdlib::world::sandbox::Machine;
 use fictionet::stdlib::world::sandbox::machine;
-use timeout::timeout;
 
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};

@@ -1,9 +1,7 @@
 //! TLS: the world as a TLS server, with a rustls client over an in-memory
 //! connection, all under the lab, with a real-time throughput test.
 
-use crate::common;
-
-use common::within;
+use fictionet_test_support::within;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, mpsc};

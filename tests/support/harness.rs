@@ -1,7 +1,5 @@
 //! Clients and log capture for example world tests.
 
-#![allow(dead_code)]
-
 use std::future::Future;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -17,9 +15,7 @@ use http::{HeaderMap, StatusCode};
 use rustls::ClientConfig;
 use serde_json::Value;
 
-#[path = "../../tests/it/common/timeout.rs"]
-mod timing;
-pub use timing::timeout;
+use crate::{Done, timeout};
 
 /// The scripted agent address.
 pub const AGENT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -76,15 +72,6 @@ impl Buf {
         panic!("fewer than {n} {kind} lines: {:#?}", self.lines());
     }
 }
-
-#[derive(Debug)]
-struct Done;
-impl std::fmt::Display for Done {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("done")
-    }
-}
-impl std::error::Error for Done {}
 
 /// Runs a test script on a runtime and ends the world when it returns.
 pub fn run<F, Fut>(seed: fictionet::Seed, f: F)

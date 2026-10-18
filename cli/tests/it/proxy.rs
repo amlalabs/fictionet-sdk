@@ -5,9 +5,8 @@
 //! The Docker test in `tests/docker/proxy` runs the same engine with more
 //! clients (wget, git, Python, Go, Node) and measures it.
 
-use crate::common::certs;
 use crate::common::io;
-use crate::common::temp;
+use fictionet_test_support::{certs, temp};
 
 use io::read_all;
 
@@ -397,7 +396,7 @@ impl Attach {
     /// Waits for attach to exit, at most 10 s.
     fn wait(&mut self) -> std::process::ExitStatus {
         let mut child = self.child.take().unwrap();
-        let (child, status) = crate::common::within(Duration::from_secs(10), move || {
+        let (child, status) = fictionet_test_support::within(Duration::from_secs(10), move || {
             let status = child.wait().unwrap();
             (child, status)
         });
@@ -641,7 +640,12 @@ fn upload_fails_after_prefix() {
     // Keep the upload open. Its count must survive the proxy dropping it.
     let mut response = Vec::new();
     s.read_to_end(&mut response).expect("complete proxy error");
-    assert_eq!(io::response(&response, "POST", false).head.status, 502);
+    assert_eq!(
+        fictionet_test_support::response(&response, "POST", false)
+            .head
+            .status,
+        502
+    );
     // The log can follow the 502 by the documented five-second upload grace.
     assert!(
         a.logged_within(
@@ -796,7 +800,7 @@ fn tokens_are_checked() {
     )
     .unwrap();
     let answer = read_all(&mut s);
-    let answer = io::response(&answer, "GET", false);
+    let answer = fictionet_test_support::response(&answer, "GET", false);
     assert_eq!(answer.head.version, http1::Version::Http11);
     assert_eq!(answer.head.status, 407);
     assert_eq!(

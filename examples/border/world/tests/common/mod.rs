@@ -19,13 +19,9 @@ use fictionet::stdlib::services::ca::Ca;
 use fictionet::{Attacher, Cx, End, Packet};
 use rustls::RootCertStore;
 
-#[path = "../../../../common/harness.rs"]
-mod harness;
-pub use harness::*;
-
-#[path = "../../../../common/hyper.rs"]
-mod hyper_io;
-pub use hyper_io::Io;
+pub use fictionet_test_support::harness::*;
+pub use fictionet_test_support::hyper_io::Io;
+pub use fictionet_test_support::timeout;
 
 /// What a test gets.
 pub struct Env {
@@ -42,7 +38,7 @@ where
     F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    harness::run(fictionet::Seed::random(), move |fcx| async move {
+    fictionet_test_support::harness::run(fictionet::Seed::random(), move |fcx| async move {
         let scenario = Arc::new(Scenario::new(
             variant,
             task,

@@ -1,9 +1,7 @@
 //! Putting things between sandboxes and the world: `Attachments::map` and
 //! `stdlib::network::filter`.
 
-use crate::common;
-
-use common::within;
+use fictionet_test_support::within;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

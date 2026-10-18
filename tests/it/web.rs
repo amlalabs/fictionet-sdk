@@ -3,16 +3,14 @@
 //! parts (`split_protocols`, `tcp::endpoint`, `udp::endpoint`) with a
 //! rustls client and a hyper client on top.
 
-use crate::common;
-use crate::common::certs;
-use crate::common::hyper_io;
 use crate::common::io;
+use fictionet_test_support::certs;
+use fictionet_test_support::hyper_io;
 use hyper_io::{Exec, Io};
 
-use crate::common::done;
-use crate::common::timeout;
 use crate::common::world as run_world;
 use fictionet::stdlib::world::sandbox::{TlsClient, TlsError};
+use fictionet_test_support::{Done, timeout};
 
 #[path = "web/admission.rs"]
 mod admission;
@@ -30,16 +28,14 @@ mod ipv6;
 mod sites;
 
 use certs::certs;
-use common::within;
-use done::Done;
 use fictionet::stdlib::world::sandbox::Machine;
 use fictionet::stdlib::world::sandbox::machine;
+use fictionet_test_support::within;
 use fixture::{
     BIG, BOTH_ADDR, Client, DEFAULT_ADDR, DUAL_ADDR, DUAL_ADDR6, EVENTS_ADDR, Env, GATEWAY, Plain,
     SECURE_ADDR, SHORT, TLS_DEFAULT_ADDR, V6ONLY_ADDR6, bind_by_ping, default_machine, dns, ipv4,
     lookup, parse, parse_dns, ping, plain_client, recv_within, sites, tls_connect, udp, world,
 };
-use timeout::timeout;
 
 use std::convert::Infallible;
 use std::future::Future;

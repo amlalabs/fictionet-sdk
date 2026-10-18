@@ -5,8 +5,7 @@ use std::time::Duration;
 use fictionet::run;
 use fictionet::{Cx, block_on, lab};
 
-use crate::common::done::{Done, ended_with_done};
-use crate::common::within;
+use fictionet_test_support::{Done, ended_with_done, within};
 
 /// Runs a closed lab world within the host limit and requires Done.
 pub fn world<F, Fut>(limit: Duration, f: F)

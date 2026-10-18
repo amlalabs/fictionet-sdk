@@ -1039,7 +1039,12 @@ fn partial_preface_eof() {
         assert_eq!(errors.len(), 1, "a truncated preface must be reported once");
         assert_eq!(errors[0].str("cause"), Some("protocol"));
         assert_eq!(local(&errors[0]), SocketAddr::from((plain, 80)));
-        assert_eq!(io::response(&reply, "PRI", false).head.status, 400);
+        assert_eq!(
+            fictionet_test_support::response(&reply, "PRI", false)
+                .head
+                .status,
+            400
+        );
         Ok(())
     });
 }
@@ -1055,7 +1060,7 @@ fn events_for_bytes_that_are_not_http() {
         let bad_head = raw_http(&fcx, &m, plain, b"\x16\x03\x01\x00\x05hello\r\n\r\n")
             .await
             .unwrap();
-        let response = io::response(&bad_head, "GET", false);
+        let response = fictionet_test_support::response(&bad_head, "GET", false);
         assert_eq!(response.head.status, 400);
         assert!(response.body.is_empty());
         // HTTP/2 with prior knowledge, then a SETTINGS frame of a size no

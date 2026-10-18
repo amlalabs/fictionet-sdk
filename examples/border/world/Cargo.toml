@@ -24,6 +24,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tower-service = "0.3"
 
 [dev-dependencies]
+fictionet-test-support = { path = "../../../tests/support" }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

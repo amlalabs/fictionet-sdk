@@ -8,7 +8,7 @@ use crate::common::io;
 use crate::common::world;
 use crate::http2_server::H2_INPUT;
 
-use crate::common::hyper_io;
+use fictionet_test_support::hyper_io;
 use hyper_io::{Exec, Io};
 
 use world::world;
@@ -1521,7 +1521,7 @@ async fn keep_alive_response(fcx: &Cx, conn: &mut impl Connection) -> http1::Res
     })
     .await
     .expect("complete response body");
-    io::response(&bytes, "GET", false)
+    fictionet_test_support::response(&bytes, "GET", false)
 }
 
 /// Requires a successful keep-alive request before rejecting an over-long

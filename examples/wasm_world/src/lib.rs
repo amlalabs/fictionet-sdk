@@ -30,7 +30,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use fictionet::stdlib::world::sandbox::TlsClient;
 
-#[path = "../../common/hyper.rs"]
 mod hyper_io;
 use hyper_io::{Exec, Io};
 

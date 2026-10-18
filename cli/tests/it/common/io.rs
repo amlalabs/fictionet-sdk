@@ -1,9 +1,5 @@
 use std::io::Read;
 
-#[path = "../../../../tests/common/response.rs"]
-mod response;
-pub use response::response;
-
 /// Requires EOF. The caller must bound blocking reads with a socket timeout.
 pub fn read_all(reader: &mut impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();

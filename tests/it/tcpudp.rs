@@ -99,8 +99,7 @@ async fn duplex(fcx: &Cx, conn: &mut impl Connection, data: &[u8]) -> Result<Vec
     .await
 }
 
-use crate::common::pattern as payload;
-use payload::pattern;
+use fictionet_test_support::pattern;
 
 #[test]
 fn connect_accept_echo_and_addresses() {
@@ -861,8 +860,8 @@ fn tcp_syn(src: IpAddr, sport: u16, dst: IpAddr, dport: u16) -> Packet {
 #[cfg(feature = "tokio")]
 #[test]
 fn tcp_through_tokio_io() {
-    use crate::common::done::Done;
     use fictionet::run;
+    use fictionet_test_support::Done;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

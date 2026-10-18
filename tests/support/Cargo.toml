@@ -1,0 +1,27 @@
+# Helpers shared by the tests and benchmarks of the SDK and the command, and
+# by the example worlds' tests. Only dev-dependencies use it.
+[package]
+name = "fictionet-test-support"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[lib]
+path = "lib.rs"
+doctest = false
+
+[dependencies]
+# No default features, so each test build keeps the SDK features it chose.
+# The helpers that need `std` or `observe` turn on with the SDK's features.
+fictionet = { path = "../..", default-features = false }
+bytes = "1"
+divan = "0.1.21"
+http = "1.5.0"
+http-body-util = "0.1"
+hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
+libc = "0.2.189"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tower-service = "0.3.3"

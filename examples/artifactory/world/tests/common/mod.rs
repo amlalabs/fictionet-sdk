@@ -19,12 +19,8 @@ use fictionet::{Attacher, Cx, Interface};
 use rustls::RootCertStore;
 use serde_json::Value;
 
-#[path = "../../../../common/harness.rs"]
-mod harness;
-pub use harness::*;
-
-#[path = "../../../../common/hyper.rs"]
-pub mod hyper_io;
+pub use fictionet_test_support::harness::*;
+use fictionet_test_support::timeout;
 
 /// What a test gets.
 pub struct Env {
@@ -42,7 +38,7 @@ where
     F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
-    harness::run(fictionet::Seed::from_u64(1), move |fcx| async move {
+    fictionet_test_support::harness::run(fictionet::Seed::from_u64(1), move |fcx| async move {
         let contents = Arc::new(Contents::new(variant, "", &[1; 32]).unwrap());
         let identity = Identity::new(&fcx)?;
         let root = identity.ca_der.clone();

@@ -1,8 +1,6 @@
 //! The core: cables, the context, regions, `run` and `block_on`.
 
-use crate::common;
-
-use common::within;
+use fictionet_test_support::within;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};

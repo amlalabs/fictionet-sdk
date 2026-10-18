@@ -314,8 +314,8 @@ fn reset_late_frames_replay_on_lab_time_over_tls() {
 
 mod clients {
     use super::*;
-    use crate::common::hyper_io::Io;
     use fictionet::InterfaceExt;
+    use fictionet_test_support::hyper_io::Io;
     use hyper_util::rt::TokioIo;
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -374,7 +374,7 @@ mod clients {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
-            let dir = crate::common::temp::dir();
+            let dir = fictionet_test_support::temp::dir();
             let ca_path = dir.join("ca.pem");
             let (stop, mut stopped) = fictionet::pair();
             let events: Arc<Mutex<Vec<fictionet::events::Event>>> = Arc::default();
@@ -390,7 +390,7 @@ mod clients {
                     cx.events().subscribe(move |event| {
                         if event.is("http", "request") { observed.lock().unwrap().push(event.clone()); }
                     });
-                    let (ca, leaf) = crate::common::certs::issue(&cx, "HTTP test CA", &["localhost"])?;
+                    let (ca, leaf) = fictionet_test_support::certs::issue(&cx, "HTTP test CA", &["localhost"])?;
                     std::fs::write(ca_path, ca.cert_pem())?;
                     let config = Arc::new(tls::config_builder(&cx, std::time::SystemTime::now()).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(leaf.chain, leaf.key)?);
                     let page = r#"<!doctype html><html><body><script>
@@ -458,7 +458,7 @@ window.addEventListener('load', () => {
 
     #[test]
     fn curl_and_chromium_use_tls_http2() {
-        crate::common::within(Duration::from_secs(60), || {
+        fictionet_test_support::within(Duration::from_secs(60), || {
             let world = World::start();
             let url = format!("https://localhost:{}", world.address.port());
             let output = Command::new("curl")

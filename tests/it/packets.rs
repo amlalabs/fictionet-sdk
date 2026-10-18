@@ -2,9 +2,7 @@
 //! router and echo replies. Every test wires cables made with `pair()` and
 //! runs under `lab()` on simulated time.
 
-use crate::common;
-
-use common::within;
+use fictionet_test_support::within;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};

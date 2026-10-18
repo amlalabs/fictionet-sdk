@@ -4,8 +4,8 @@
 //! rustls client. Every byte crosses as IP packets through both splits, the
 //! router and a delayed link.
 
-use crate::common::certs;
 use crate::common::world;
+use fictionet_test_support::certs;
 
 use certs::certs;
 use world::world;
@@ -27,8 +27,7 @@ use rustls::ClientConfig;
 use crate::common::rustls_client;
 type Client<C> = rustls_client::Client<C, false>;
 
-use crate::common::pattern as payload;
-use payload::pattern;
+use fictionet_test_support::pattern;
 
 // ---------------------------------------------------------------------------
 // The test.

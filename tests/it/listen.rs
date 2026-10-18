@@ -1,7 +1,7 @@
 //! `listen` end to end, with a test client that speaks the relay protocol
 //! over a real Unix SOCK_SEQPACKET socket.
 
-use crate::common::poll;
+use fictionet_test_support::poll;
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};

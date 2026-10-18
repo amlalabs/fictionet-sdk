@@ -1,6 +1,6 @@
 //! Dropped TLS writes never credit old bytes to a later write.
 
-use crate::common::certs;
+use fictionet_test_support::certs;
 
 use std::future::{Future, poll_fn};
 use std::io::{ErrorKind, Read};

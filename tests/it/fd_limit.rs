@@ -1,7 +1,8 @@
 //! `listen` when the process runs out of file descriptors. Each test runs
 //! in a process of its own, because it lowers the process's descriptor limit.
 
-use crate::common::{poll, threads};
+use crate::common::threads;
+use fictionet_test_support::poll;
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;

@@ -1,8 +1,6 @@
 //! The recipes' worlds, run against a client inside the test.
 
-use crate::common;
-
-use common::within;
+use fictionet_test_support::within;
 
 use std::time::Duration;
 

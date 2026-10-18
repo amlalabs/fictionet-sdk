@@ -1,5 +1,5 @@
 use super::*;
-use crate::common::done::ended_with_done;
+use fictionet_test_support::ended_with_done;
 
 // ---------------------------------------------------------------------------
 // A network: a PLC and a web server

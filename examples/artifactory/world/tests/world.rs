@@ -406,7 +406,7 @@ fn http2_pre_handler_body_without_content_length_is_unavailable() {
         let io = tls(&fcx, &m, NAMES[1].1, NAMES[1].0, Arc::clone(&config)).await?;
         let (mut send, connection) = hyper::client::conn::http2::handshake(
             TokioExecutor::new(),
-            hyper_io::Io {
+            fictionet_test_support::hyper_io::Io {
                 fcx: fcx.clone(),
                 conn: io,
             },
@@ -466,7 +466,7 @@ fn http2_size_refusal_keeps_the_method_and_targets() {
         let io = tls(&fcx, &m, NAMES[0].1, NAMES[0].0, Arc::new(config)).await?;
         let (mut send, connection) = hyper::client::conn::http2::handshake(
             TokioExecutor::new(),
-            hyper_io::Io {
+            fictionet_test_support::hyper_io::Io {
                 fcx: fcx.clone(),
                 conn: io,
             },

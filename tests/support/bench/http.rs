@@ -1,9 +1,7 @@
-#[path = "../../examples/common/hyper.rs"]
-mod hyper_io;
-#[path = "observer.rs"]
 mod observer;
 
-use crate::common::World;
+use super::World;
+use crate::hyper_io::{Exec, Io};
 use bytes::Bytes;
 use fictionet::relay;
 use fictionet::stdlib::protocols::dns::op::{MessageType, ResponseCode};
@@ -13,7 +11,6 @@ use fictionet::stdlib::{network::Connection, services::tls, web};
 use fictionet::{Attacher, Cx, WorldSocket, listen};
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
-use hyper_io::{Exec, Io};
 use observer::ObserverStatus;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};

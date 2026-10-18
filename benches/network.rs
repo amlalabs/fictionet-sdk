@@ -1,6 +1,3 @@
-mod common;
-
-use common::World;
 use divan::{
     Bencher,
     counter::{BytesCount, ItemsCount},
@@ -11,6 +8,7 @@ use fictionet::stdlib::{
     network::{ip, tcp},
 };
 use fictionet::{Cx, End, Interface, Packet, RecvError, pair};
+use fictionet_test_support::bench::World;
 use std::future::poll_fn;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

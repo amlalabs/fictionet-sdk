@@ -2,8 +2,8 @@
 //! server and a rustls client, joined by two TCP endpoints and one pair.
 //! The observer watches the pair, and sees the HTTP inside the TLS.
 
-use crate::common::certs;
-use crate::common::temp;
+use fictionet_test_support::certs;
+use fictionet_test_support::temp;
 
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;

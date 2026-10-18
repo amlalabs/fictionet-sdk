@@ -2,7 +2,8 @@
 //! It runs in a process of its own, because it measures the CPU time of
 //! Fictionet's threads.
 
-use crate::common::{poll, threads};
+use crate::common::threads;
+use fictionet_test_support::poll;
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc;

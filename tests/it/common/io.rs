@@ -4,10 +4,6 @@ use fictionet::prelude::*;
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::{Cx, RaceError, time::Instant};
 
-#[path = "../../common/response.rs"]
-mod response;
-pub use response::response;
-
 /// Requires EOF by the deadline. Race failures stay separate from transport errors.
 pub async fn read_to_end(
     fcx: &Cx,

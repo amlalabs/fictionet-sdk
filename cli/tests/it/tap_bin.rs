@@ -11,11 +11,11 @@ use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::common::{poll, temp, within};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::ip::checksum;
 use fictionet::stdlib::protocols::dhcp;
 use fictionet::{Interface, InterfaceExt, Packet, RecvError};
+use fictionet_test_support::{poll, temp, within};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 const VM: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];

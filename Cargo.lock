@@ -49,6 +49,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "fictionet",
+ "fictionet-test-support",
  "http",
  "http-body-util",
  "hyper",
@@ -177,6 +178,7 @@ dependencies = [
  "base64",
  "bytes",
  "fictionet",
+ "fictionet-test-support",
  "flate2",
  "http",
  "http-body-util",
@@ -567,6 +569,7 @@ dependencies = [
  "divan",
  "etherparse",
  "fictionet-codegen",
+ "fictionet-test-support",
  "getrandom 0.4.3",
  "h2",
  "hickory-proto",
@@ -602,6 +605,7 @@ dependencies = [
  "divan",
  "etherparse",
  "fictionet",
+ "fictionet-test-support",
  "http",
  "http-body-util",
  "hyper",
@@ -624,6 +628,23 @@ version = "0.0.0"
 dependencies = [
  "fictionet",
  "fictionet-codegen",
+]
+
+[[package]]
+name = "fictionet-test-support"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "divan",
+ "fictionet",
+ "http",
+ "http-body-util",
+ "hyper",
+ "libc",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tower-service",
 ]
 
 [[package]]

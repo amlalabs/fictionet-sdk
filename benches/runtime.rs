@@ -1,9 +1,5 @@
-mod common;
-#[path = "common/http.rs"]
-mod http;
-
-use common::World;
 use divan::{Bencher, counter::ItemsCount};
+use fictionet_test_support::bench::{World, http};
 use http::{HttpCase, Watch};
 use std::task::Context;
 use std::time::Duration;

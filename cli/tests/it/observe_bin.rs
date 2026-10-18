@@ -1,10 +1,7 @@
 //! `fictionet observe` and `fictionet dashboard`, run as the binary against
 //! a world in this process.
 
-use crate::common::logged;
-use crate::common::temp;
-
-use logged::logged;
+use fictionet_test_support::{logged, temp};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -1222,7 +1219,8 @@ fn a_watch_exits_0_when_the_world_ends() {
     });
     let log = logged(child.stdout.take().unwrap(), r#""event":"snapshot""#);
     drop(stop);
-    let status = crate::common::within(Duration::from_secs(20), move || child.wait().unwrap());
+    let status =
+        fictionet_test_support::within(Duration::from_secs(20), move || child.wait().unwrap());
     world_thread.join().unwrap();
     let out = log.join().unwrap();
     assert_eq!(status.code(), Some(0), "{out}");
