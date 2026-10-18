@@ -13,30 +13,33 @@ needs root or Docker on your machine: QEMU, KVM and
 [the other host tools](../vm/README.md#the-fictionet-vm) are required. No demo
 needs a model key.
 
-The first demo on a machine downloads and prepares the VM image, about three
-minutes, and builds Fictionet in the VM, about two more. After that a demo boots
-the VM in seconds, and a rebuild after a change takes seconds. A demo that
-booted the VM shuts it down at the end. Run `cargo xtask vm up` first to keep one
-VM for several demos, and `cargo xtask vm down` when you are done; `VM_KEEP=1`
-keeps a VM that a demo booted.
+The first demo on a machine downloads and prepares the VM image, about two
+minutes, and builds Fictionet in the VM, about one more. After that a demo boots
+the VM in seconds. A rebuild after a change to an example takes seconds, and
+after a change to the SDK itself about a minute. A demo that booted the VM
+shuts it down at the end. Run `cargo xtask vm up` first to keep one VM for
+several demos, and `cargo xtask vm down` when you are done; `VM_KEEP=1` keeps a
+VM that a demo booted.
 
 | Demo | What it shows | Needs | First run |
 |---|---|---|---|
-| [`cargo xtask demo web`](guest/web.sh) | The sandbox is a network namespace named `agent`, and `fictionet attach --type tun` puts `tun0` in it. From inside: `dig` answers the world's names and NXDOMAIN for the rest, `curl` reaches `https://example.test/` with the world's CA and fails without it, `ping` reaches the gateway, an address with no machine fails at once, and `example.com` and `1.1.1.1` are not there. | | 5 min; then 15 s |
+| [`cargo xtask demo web`](guest/web.sh) | The sandbox is a network namespace named `agent`, and `fictionet attach --type tun` puts `tun0` in it. From inside: `dig` answers the world's names and NXDOMAIN for the rest, `curl` reaches `https://example.test/` with the world's CA and fails without it, `ping` reaches the gateway, an address with no machine fails at once, and `example.com` and `1.1.1.1` are not there. | | 3.5 min; then 10 s |
 | [`cargo xtask demo proxy`](guest/proxy.sh) | A sandbox with only a loopback interface, whose commands run as an unprivileged user with no capabilities. Two attaches inside its namespace serve `--type http_proxy` and `--type socks5`. `curl` and Python reach the world through `http_proxy`, and `curl` through SOCKS5. A wrong token gets 407, an unknown name gets 502 with the reason, and around the proxy there is no network. | | 10 s |
 | [`cargo xtask demo dashboard`](guest/dashboard.sh) | The world and sandbox of `cargo xtask demo web`, with `fictionet dashboard` serving the live view on the VM's port 7878, which `cargo xtask vm` forwards to `127.0.0.1` on your machine. It prints the address to open, and `fictionet observe` shows the same API from a shell: the graph, and the world's events as they happen. A loop in the sandbox makes requests until you press Enter (or for `DASHBOARD_SECONDS`). | a browser | 25 s |
-| [`cargo xtask demo k8s`](guest/k8s.sh) | A kind cluster in the VM, the Helm chart in `charts/fictionet-sandbox` with `examples/attach/k8s-tun.yaml`, and the agent's pod. Its `eth0` is down, `tun0` is its only route, it reaches `https://example.test/`, and the internet, the cluster's DNS and the API server are out of reach. | pulls kind's node image | 2.5 min; then 1 min |
-| [`cargo xtask demo border`](guest/border.sh) | [Border](../examples/border)'s world under Docker Compose in the VM, with a scripted agent. First the real bank: sign-in, balance, three hops, one BGP route. Then the hijack: a fourth hop and a more specific route from AS 65002, an impostor certificate that `curl` refuses, and with `curl -k`, the password sent to the impostor, as the world's log shows. | pulls Debian and Python images | 2.5 min; then 40 s |
-| [`cargo xtask demo fakewiki`](guest/fakewiki.sh) | [FakeWiki](../examples/fakewiki)'s world under Docker Compose in the VM. The agent reads a Wikipedia article at its real name over TLS it trusts, first as it is, then tampered; the world's log labels each request with the topic, the source and its stance. | pulls Debian and Python images | 2 min; then 30 s |
-| [`cargo xtask demo adaptive-web`](guest/adaptive-web.sh) | [The adaptive web](../examples/adaptive-web) under Docker Compose in the VM, with its stub generator. A search on `google.com` answers with ten results made for the query; the page behind the first result is made when it is asked for and kept; the world's log says why each site exists. | pulls Debian and Python images | 1.5 min; then 20 s |
-| [`cargo xtask demo scan`](guest/scan.sh) | [The scan example](../examples/scan) under Docker Compose in the VM: four simulated hosts and a real container with nginx and OpenSSH on one office subnet. `nmap` in the agent's sandbox finds all five, and a SYN scan with service detection names what runs on each. The dashboard, forwarded to your machine like the dashboard demo's, shows the scan as it happens. | a browser; pulls Debian and Alpine images | 2.5 min; then 1.5 min |
+| [`cargo xtask demo k8s`](guest/k8s.sh) | A kind cluster in the VM, the Helm chart in `charts/fictionet-sandbox` with `examples/attach/k8s-tun.yaml`, and the agent's pod. Its `eth0` is down, `tun0` is its only route, it reaches `https://example.test/`, and the internet, the cluster's DNS and the API server are out of reach. | pulls kind's node image | 1.5 min; then 1 min |
+| [`cargo xtask demo border`](guest/border.sh) | [Border](../examples/border)'s world under Docker Compose in the VM, with a scripted agent. First the real bank: sign-in, balance, three hops, one BGP route. Then the hijack: a fourth hop and a more specific route from AS 65002, an impostor certificate that `curl` refuses, and with `curl -k`, the password sent to the impostor, as the world's log shows. | pulls Debian and Python images | 2 min; then 20 s |
+| [`cargo xtask demo fakewiki`](guest/fakewiki.sh) | [FakeWiki](../examples/fakewiki)'s world under Docker Compose in the VM. The agent reads a Wikipedia article at its real name over TLS it trusts, first as it is, then tampered; the world's log labels each request with the topic, the source and its stance. | pulls Debian and Python images | 1.5 min; then 20 s |
+| [`cargo xtask demo adaptive-web`](guest/adaptive-web.sh) | [The adaptive web](../examples/adaptive-web) under Docker Compose in the VM, with its stub generator. A search on `google.com` answers with ten results made for the query; the page behind the first result is made when it is asked for and kept; the world's log says why each site exists. | pulls Debian and Python images | 30 s; then 15 s |
+| [`cargo xtask demo scan`](guest/scan.sh) | [The scan example](../examples/scan) under Docker Compose in the VM: four simulated hosts and a real container with nginx and OpenSSH on one office subnet. `nmap` in the agent's sandbox finds all five, and a SYN scan with service detection names what runs on each. The dashboard, forwarded to your machine like the dashboard demo's, shows the scan as it happens. | a browser; pulls Debian and Alpine images | 1.5 min; then 1 min |
 
 The times are from a 24-core machine with other work running, with the VM's
 default 4 vCPUs and 5 GB. "First run" is the whole command on a machine that
 has run `cargo xtask demo web` once, so the VM image and the SDK build are
-there; "then" is a later run of the same demo. Docker's images and build
-cache, cargo's build output and uv's cache stay on the VM's cache disk, so only
-the first run of each demo pays for them.
+there; "then" is a later run of the same demo. The first runs went in the
+table's order, so a Compose demo reused the Debian and Python images that the
+demos above it pulled. Docker's images and build cache, cargo's build output
+and uv's cache stay on the VM's cache disk, so only the first run of each demo
+pays for them.
 
 ## How the scripts work
 
