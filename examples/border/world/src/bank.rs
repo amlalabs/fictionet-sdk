@@ -419,7 +419,7 @@ impl CredentialBody {
 /// Retains rolling raw and decoded windows, and at most [`MAX_BODY`] compressed bytes.
 pub(crate) struct Credentials;
 
-impl fictionet::stdlib::web::httpd::Observer for Credentials {
+impl fictionet::stdlib::web::httpd::BodyClassifier for Credentials {
     fn head(
         &self,
         head: &http::request::Parts,

@@ -20,6 +20,61 @@ use crate::{Cx, Result};
 /// sees, so they do not affect determinism.
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
+/// Configuration installed before a run starts.
+///
+/// Passing a seed to [`run`] or [`lab`] uses no event observer. Pass options
+/// instead to install one immutable destination, shared by every region.
+///
+/// ```
+/// use std::sync::Arc;
+/// use fictionet::{RunOptions, Seed, block_on, lab};
+/// use fictionet::events::{Limits, Memory};
+///
+/// let evidence = Arc::new(Memory::new(Limits::new(1000, 1 << 20)));
+/// let options = RunOptions::new(Seed::from_u64(7)).observer(evidence.clone());
+/// block_on(lab(options, |fcx| async move {
+///     fcx.emit("shop", "order", |e| e.field("item", "pump"));
+///     Ok(())
+/// }))?;
+/// let orders = evidence.checked_of("shop", "order")?;
+/// assert_eq!(orders[0].str("item"), Some("pump"));
+/// # Ok::<(), fictionet::Error>(())
+/// ```
+pub struct RunOptions {
+    seed: crate::Seed,
+    observer: Option<Arc<dyn crate::events::Observer>>,
+    fields: crate::events::Fields,
+}
+
+impl RunOptions {
+    /// Uses this seed with no observer.
+    pub fn new(seed: crate::Seed) -> Self {
+        Self {
+            seed,
+            observer: None,
+            fields: crate::events::Fields::new(),
+        }
+    }
+
+    /// Installs the run's event destination.
+    pub fn observer(mut self, observer: Arc<dyn crate::events::Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Adds caller-owned metadata to the automatic `run.start` event.
+    pub fn fields(mut self, fields: crate::events::Fields) -> Self {
+        self.fields = fields;
+        self
+    }
+}
+
+impl From<crate::Seed> for RunOptions {
+    fn from(seed: crate::Seed) -> Self {
+        Self::new(seed)
+    }
+}
+
 /// Runs a world in real time, as one future that any executor can poll.
 ///
 /// `world` is called with the [`Cx`] of a new [region](Cx#regions), and
@@ -116,12 +171,16 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// # fn main() {}
 /// ```
 #[cfg(feature = "std")]
-pub async fn run<F, Fut>(seed: crate::Seed, world: F) -> Result
+pub async fn run<F, Fut>(options: impl Into<RunOptions> + Send, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    run_with(RunShared::new(seed, crate::RunMode::Real), world).await
+    run_with(
+        RunShared::with_options(options.into(), crate::RunMode::Real),
+        world,
+    )
+    .await
 }
 
 /// Runs a closed world on simulated time, for tests.
@@ -149,12 +208,16 @@ where
 /// the lab on their first `get`, `next` or `map`, before handing out an
 /// attachment, and `get` and `next` return [`Cancelled`](crate::Cancelled).
 /// Observer sessions, `web::proxy` and `web::forward` refuse a lab too.
-pub async fn lab<F, Fut>(seed: crate::Seed, world: F) -> Result
+pub async fn lab<F, Fut>(options: impl Into<RunOptions> + Send, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    run_with(RunShared::new(seed, crate::RunMode::Lab), world).await
+    run_with(
+        RunShared::with_options(options.into(), crate::RunMode::Lab),
+        world,
+    )
+    .await
 }
 
 /// Runs the world using the shared runtime services.
@@ -186,6 +249,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 pub(crate) struct RunShared {
     pub(crate) environment: Arc<crate::environment::RunEnvironment>,
     pub(crate) start_wall: SystemTime,
+    pub(crate) observer: crate::events::Dispatch,
     /// The run's events, kept whether or not anyone observes.
     pub(crate) events: Arc<crate::events::Store>,
     /// The run's TLS key log, shared with the graph for observers.
@@ -265,7 +329,35 @@ impl RunShared {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Self> {
+        Self::with_options(seed.into(), mode)
+    }
+
+    fn with_options(options: RunOptions, mode: crate::RunMode) -> Arc<Self> {
+        let RunOptions {
+            seed,
+            observer,
+            fields,
+        } = options;
+        let observer = crate::events::Dispatch::new(observer);
+        if observer.enabled(
+            crate::events::Metadata {
+                source: "run",
+                kind: "start",
+            },
+            &crate::events::ConnInfo::default(),
+        ) {
+            observer.emit(
+                crate::events::Event::new("run", "start")
+                    .summary("the run started")
+                    .fields(fields)
+                    .field("seed", seed.to_string())
+                    .field("rng", "chacha20-v1")
+                    .field("wall", crate::stdlib::protocols::json::Value::Null),
+                || crate::time::Instant::ZERO,
+            );
+        }
         let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
         let start_wall = if mode == crate::RunMode::Real {
@@ -287,6 +379,7 @@ impl RunShared {
         Arc::new(Self {
             environment,
             start_wall,
+            observer,
             events,
             #[cfg(feature = "observe")]
             keys,
@@ -300,6 +393,7 @@ impl RunShared {
 
     pub(crate) fn end(&self) {
         self.graph.run_ended();
+        self.observer.end(|| self.environment.clock.now());
         // Nothing more is recorded: let callbacks and file writers go.
         self.events.close();
         // Nothing more crosses the world's links: stop watching them.

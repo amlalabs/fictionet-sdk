@@ -16,7 +16,7 @@ use fictionet::stdlib::services::tls::ServerConfig;
 
 use super::response::answered;
 use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, Observer, Reply, serve_connection, text,
+    Body, Exchange, Handler, HttpOptions, Limits, BodyClassifier, Reply, serve_connection, text,
 };
 
 pub use fictionet::stdlib::world::net::normalize;
@@ -265,7 +265,7 @@ pub struct Server {
     default_host: bool,
     limits: Limits,
     date: Option<SystemTime>,
-    observe: Option<Arc<dyn Observer>>,
+    observe: Option<Arc<dyn BodyClassifier>>,
     vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
     tls: Option<ConfigFor>,
 }
@@ -337,7 +337,7 @@ impl Server {
 
     /// Observes requests before virtual hosting and admission. Sites sharing
     /// an endpoint use the first server's observer, as they do its date.
-    pub fn observe(mut self, observer: Arc<dyn Observer>) -> Server {
+    pub fn observe(mut self, observer: Arc<dyn BodyClassifier>) -> Server {
         self.observe = Some(observer);
         self
     }

@@ -380,9 +380,9 @@ pub use error::{Error, ErrorChain};
 pub use interface::{Interface, InterfaceExt, Packet, Recv, RecvError};
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
-pub use run::lab;
 #[cfg(feature = "std")]
 pub use run::run;
+pub use run::{RunOptions, lab};
 mod clock;
 #[cfg(feature = "std")]
 pub use sys::random_bytes;

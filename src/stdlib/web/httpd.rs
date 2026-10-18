@@ -118,13 +118,13 @@
 //! (whether it took the whole body). Over HTTP/1 a byte counts once it is
 //! written, and the event is made after the last one is; over HTTP/2 once
 //! the service queues it for the stream. A handler adds its own fields by putting
-//! [`Fields`] in its response's extensions. An opt-in [`Observer`] sees the
+//! [`Fields`] in its response's extensions. An opt-in [`BodyClassifier`] sees the
 //! head before virtual hosting and admission, body chunks before limits
 //! discard them, and the receipt outcome. Install it with [`Http1::observe`],
 //! [`HttpOptions::observe`], [`Server::observe`] or
 //! [`web::Site::observe`](fictionet::stdlib::web::Site::observe). Its request-local
 //! state can retain authority and classification across chunks without logging
-//! plaintext bodies. Observer fields come first, handler fields override them,
+//! plaintext bodies. BodyClassifier fields come first, handler fields override them,
 //! and service facts win last. `answer` comes from the response, never the
 //! observer. No body bytes are added to the event automatically.
 //!
@@ -226,7 +226,7 @@ impl Received {
 /// Handler fields then override them, and service facts win last.
 /// The service never logs body bytes itself. Head fields keep their ordinary
 /// event representation; this hook does not redact URI or header values.
-pub trait Observer: Send + Sync + 'static {
+pub trait BodyClassifier: Send + Sync + 'static {
     /// A parsed head, including its original authority and connection identity.
     /// Runs before virtual hosting, body limits and request budget admission.
     fn head(
@@ -313,7 +313,7 @@ const PIECE: usize = 16 * 1024;
 #[derive(Clone, Default)]
 pub struct HttpOptions {
     /// Observes parsed heads and body receipt before routing or admission.
-    pub observe: Option<Arc<dyn Observer>>,
+    pub observe: Option<Arc<dyn BodyClassifier>>,
     /// Limits and timers, for both versions.
     pub limits: Limits,
     /// On a connection without TLS, how long the client has from

@@ -25,7 +25,7 @@ use fictionet::{Cx, Error};
 use super::response::{
     ResponsePolicy, Tracker, answered, error_event, error_response, request_held,
 };
-use super::{Body, Exchange, Handler, Later, Limits, Observer, Received, Reply, text};
+use super::{Body, Exchange, Handler, Later, Limits, BodyClassifier, Received, Reply, text};
 
 const DEADLINE: Timer = "http2 deadline";
 const RESET_LIFETIME: Duration = Duration::from_secs(1);
@@ -39,7 +39,7 @@ const ERROR_RESET_MAX: usize = 1024;
 pub struct Http2 {
     handler: Arc<dyn Handler>,
     limits: Limits,
-    pub(super) observe: Option<Arc<dyn Observer>>,
+    pub(super) observe: Option<Arc<dyn BodyClassifier>>,
     pub(super) date: Option<u64>,
     headers: wire::HeaderBlocks,
     streams: BTreeMap<u32, Stream>,
@@ -133,7 +133,7 @@ impl Http2 {
     }
 
     /// Observes request heads, body chunks and receipt outcomes.
-    pub fn observe(mut self, observer: Arc<dyn Observer>) -> Self {
+    pub fn observe(mut self, observer: Arc<dyn BodyClassifier>) -> Self {
         self.observe = Some(observer);
         self
     }

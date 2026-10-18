@@ -385,6 +385,44 @@ impl Cx {
         self.run.graph.watches.set_limit(limit);
     }
 
+    /// Checks interest before constructing event-specific tracking state.
+    pub fn event_enabled(&self, source: &'static str, kind: &'static str) -> bool {
+        self.run.observer.enabled(
+            crate::events::Metadata { source, kind },
+            &crate::events::ConnInfo::default(),
+        )
+    }
+
+    /// Builds and emits an event only when a destination is interested.
+    /// With no observer this does not invoke `build`, read time, or number a record.
+    pub fn emit(
+        &self,
+        source: &'static str,
+        kind: &'static str,
+        build: impl FnOnce(Event) -> Event,
+    ) {
+        if self.event_enabled(source, kind) {
+            self.emit_observation(build(Event::new(source, kind)));
+        }
+    }
+
+    /// Borrows an emitter carrying explicit connection context.
+    pub fn emitter<'a>(
+        &'a self,
+        connection: &'a crate::events::ConnInfo,
+    ) -> crate::events::Emitter<'a> {
+        crate::events::Emitter {
+            cx: self,
+            connection,
+        }
+    }
+
+    pub(crate) fn emit_observation(&self, mut event: Event) {
+        let graph = &self.run.graph;
+        event.origin = graph.origin(crate::run::current_task(graph));
+        self.run.observer.emit(event, || self.now());
+    }
+
     /// Records `event` in the run's [event log](crate::events), dated now
     /// on the run's clock, with the task that records it. Every run keeps
     /// its events, whether or not anyone reads them.

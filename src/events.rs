@@ -150,8 +150,18 @@
 //! [`Cx::record_repeat`]: crate::Cx::record_repeat
 //! [`Layer::note`]: crate::observe::Layer::note
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+mod jsonl;
 mod log;
+mod memory;
 mod model;
+mod observer;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub use jsonl::Jsonl;
+
+pub use memory::{Incomplete, Limits, Memory};
+pub(crate) use observer::Dispatch;
+pub use observer::{Emitter, Fanout, Metadata, Observation, Observer, Stamp};
 mod repeat;
 mod sink;
 mod store;

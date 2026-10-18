@@ -785,7 +785,7 @@ impl Site {
 
     /// Observes requests before routing and admission, including rejected
     /// requests. Sites sharing an endpoint use the first site's observer.
-    pub fn observe(self, observer: Arc<dyn httpd::Observer>) -> Site {
+    pub fn observe(self, observer: Arc<dyn httpd::BodyClassifier>) -> Site {
         Site {
             server: self.server.observe(observer),
             ..self

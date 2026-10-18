@@ -25,7 +25,7 @@ use super::response::{
     ResponsePolicy, Track, Tracker, answered, error_event, error_response, request_held,
 };
 use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, Observer, PIECE, Received, Reply, UpgradeHandler,
+    Body, Exchange, Handler, HttpOptions, Limits, BodyClassifier, PIECE, Received, Reply, UpgradeHandler,
     date_header, text,
 };
 
@@ -169,7 +169,7 @@ struct Route {
     date: Option<SystemTime>,
     limits: Limits,
     budget: Option<Budget>,
-    observe: Option<Arc<dyn Observer>>,
+    observe: Option<Arc<dyn BodyClassifier>>,
     upgraded: Option<Arc<AtomicBool>>,
     /// The tracker for the first request, which the native server observed
     /// before it handed the connection over.

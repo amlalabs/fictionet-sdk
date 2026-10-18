@@ -25,7 +25,7 @@ use super::response::{
 };
 use super::sites::no_host;
 use super::{
-    Body, Exchange, Handler, Later, Limits, Observer, PIECE, Received, Reply, UpgradeHandler,
+    Body, Exchange, Handler, Later, Limits, BodyClassifier, PIECE, Received, Reply, UpgradeHandler,
     date_header,
 };
 
@@ -40,7 +40,7 @@ const BODY: Timer = "body";
 /// HTTP/1.0 and 1.1 for one connection, answering with a [`Handler`].
 pub struct Http1 {
     handler: Arc<dyn Handler>,
-    pub(super) observe: Option<Arc<dyn Observer>>,
+    pub(super) observe: Option<Arc<dyn BodyClassifier>>,
     tracker: Option<Tracker>,
     opts: Limits,
     /// The world's date at the start of the run, for `Date` headers.
@@ -100,7 +100,7 @@ impl Http1 {
     }
 
     /// Observes each request before routing and while its body arrives.
-    pub fn observe(mut self, observer: Arc<dyn Observer>) -> Http1 {
+    pub fn observe(mut self, observer: Arc<dyn BodyClassifier>) -> Http1 {
         self.observe = Some(observer);
         self
     }

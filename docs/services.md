@@ -764,7 +764,7 @@ An empty half-close before the first request makes no HTTP error event.
 EOF partway through an HTTP/2 preface is a truncated HTTP/1 head: it records
 one `http.error` with cause `protocol` and answers `400 Bad Request`.
 
-An opt-in `httpd::Observer` sees the parsed request head before virtual hosting
+An opt-in `httpd::BodyClassifier` sees the parsed request head before virtual hosting
 and admission, each decoded body chunk before it can be discarded, and the
 receipt outcome. Set it with `HttpOptions.observe`, `Http1::observe`,
 `Server::observe` or `web::Site::observe`. Shared endpoints use the first
@@ -773,7 +773,7 @@ concurrent HTTP/2 streams. Keep that state and returned fields bounded, and
 return redacted facts. Both are outside the service budget, like handler
 extensions.
 The hook does not change URI or header values in the ordinary event fields.
-Observer fields are merged first, then handler fields, then service facts.
+Classifier fields are merged first, then handler fields, then service facts.
 
 Every request event has `received`: `complete`, `cut_off`, `too_large`,
 `timeout` or `budget`. This describes request receipt; `complete` still

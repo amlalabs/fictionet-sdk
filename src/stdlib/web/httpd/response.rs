@@ -11,7 +11,7 @@ use fictionet::stdlib::protocols::http1::{self, RequestHead};
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::time::Instant;
 
-use super::{BadGateway, Body, Observer, Received, request_host, text};
+use super::{BadGateway, Body, BodyClassifier, Received, request_host, text};
 
 pub(super) fn answered(mut response: Response<Body>, answer: &'static str) -> Response<Body> {
     response
@@ -32,7 +32,7 @@ pub(super) struct Tracker {
 }
 
 struct Observation {
-    observer: Arc<dyn Observer>,
+    observer: Arc<dyn BodyClassifier>,
     state: http::Extensions,
     // Kept separately so service head facts win when the event is finished.
     fields: Fields,
@@ -86,7 +86,7 @@ impl Tracker {
     pub(super) fn observing<B>(
         request: &Request<B>,
         conn: &ConnInfo,
-        observer: Option<Arc<dyn Observer>>,
+        observer: Option<Arc<dyn BodyClassifier>>,
     ) -> Tracker {
         // Classify the head before constructing generic event metadata.
         let observation = observer.map(|observer| {

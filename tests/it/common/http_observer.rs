@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use fictionet::events::{ConnInfo, Event, Fields};
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::web::httpd::{Observer, Received};
+use fictionet::stdlib::web::httpd::{BodyClassifier, Received};
 
 pub const SECRET: &[u8] = b"private-credential!!";
 
@@ -24,7 +24,7 @@ pub struct Exposure {
     pub ends: Mutex<Vec<(String, usize, Received)>>,
 }
 
-impl Observer for Exposure {
+impl BodyClassifier for Exposure {
     fn head(
         &self,
         head: &http::request::Parts,
