@@ -4,11 +4,16 @@
 //! from our vhost-user backend.
 
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
+
+// `pub static CH_BIN: Option<&[u8]>`: Cloud Hypervisor's static binary when
+// `cargo xtask cloudimage` has downloaded it (see build.rs), else `None`.
+include!(concat!(env!("OUT_DIR"), "/ch_bin.rs"));
 
 /// How to boot one VM.
 pub struct Config<'a> {
@@ -36,6 +41,9 @@ pub struct Vm {
     vsock_socket: PathBuf,
     console_log: PathBuf,
     stderr_log: PathBuf,
+    /// The sealed memfd the embedded binary runs from, held open for the
+    /// child's life so its `/proc/self/fd` entry stays valid.
+    _ch_memfd: Option<OwnedFd>,
 }
 
 impl Vm {
@@ -47,7 +55,18 @@ impl Vm {
         let stderr_log = dir.join("ch.stderr.log");
         let api_socket = dir.join("api.sock");
 
-        let mut command = Command::new(config.cloud_hypervisor);
+        // Prefer the embedded binary, run from a sealed in-memory file with
+        // nothing written to disk; fall back to the downloaded path.
+        let (program, ch_memfd) = match CH_BIN {
+            Some(bytes) => {
+                let memfd = memfd_exe(bytes)?;
+                let path = PathBuf::from(format!("/proc/self/fd/{}", memfd.as_raw_fd()));
+                (path, Some(memfd))
+            }
+            None => (config.cloud_hypervisor.to_path_buf(), None),
+        };
+
+        let mut command = Command::new(&program);
         command
             .arg("--kernel")
             .arg(config.vmlinuz)
@@ -108,6 +127,7 @@ impl Vm {
             vsock_socket,
             console_log,
             stderr_log,
+            _ch_memfd: ch_memfd,
         })
     }
 
@@ -154,6 +174,42 @@ impl Vm {
         let lines: Vec<&str> = clean.lines().collect();
         lines[lines.len().saturating_sub(40)..].join("\n")
     }
+}
+
+/// Writes `bytes` to a sealed, in-memory file and returns it, ready to exec
+/// through `/proc/self/fd/<n>`. The bytes never touch disk, and the seals stop
+/// their contents changing before or after exec.
+fn memfd_exe(bytes: &[u8]) -> io::Result<OwnedFd> {
+    let name = c"cloud-hypervisor";
+    // SAFETY: a valid C-string name and known flags.
+    let raw =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned a fresh, owned fd.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut written = 0;
+    while written < bytes.len() {
+        // SAFETY: writing `len` bytes from a valid slice to the owned fd.
+        let n = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                bytes[written..].as_ptr() as *const libc::c_void,
+                bytes.len() - written,
+            )
+        };
+        if n <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        written += n as usize;
+    }
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: the owned fd and the seal flags.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 /// Removes ANSI escape sequences from console text.

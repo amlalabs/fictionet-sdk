@@ -2,7 +2,10 @@
 //! so a workspace build without them still compiles; the program then says
 //! how to make them. The same goes for noVNC, which `cargo xtask cloudimage`
 //! unpacks into `downloads/cloudimage/novnc`: its files become a table in
-//! `OUT_DIR/novnc.rs`, empty without them.
+//! `OUT_DIR/novnc.rs`, empty without them. Cloud Hypervisor's static binary,
+//! when `cargo xtask cloudimage` has downloaded it, is embedded the same way
+//! (`OUT_DIR/ch_bin.rs`, `None` without it) so the cloud-image demo can run it
+//! from memory with nothing written to disk.
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -42,6 +45,22 @@ fn main() {
     table.push_str("];\n");
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets it"));
     std::fs::write(out.join("novnc.rs"), table).expect("writing novnc.rs");
+
+    // Cloud Hypervisor's static binary, embedded when it has been downloaded.
+    println!("cargo::rerun-if-changed=downloads/cloudimage/cloud-hypervisor");
+    let ch = manifest.join("downloads/cloudimage/cloud-hypervisor");
+    let ch_rs = if ch.is_file() {
+        format!(
+            "/// Cloud Hypervisor's static binary (Apache-2.0 / BSD-3-Clause,\n\
+             /// (c) The Cloud Hypervisor Authors), embedded to run from memory.\n\
+             pub static CH_BIN: Option<&[u8]> = Some(include_bytes!({ch:?}));\n"
+        )
+    } else {
+        "/// Set once `cargo xtask cloudimage` has downloaded the binary.\n\
+         pub static CH_BIN: Option<&[u8]> = None;\n"
+            .to_string()
+    };
+    std::fs::write(out.join("ch_bin.rs"), ch_rs).expect("writing ch_bin.rs");
 }
 
 fn walk(dir: &Path, files: &mut Vec<PathBuf>) {

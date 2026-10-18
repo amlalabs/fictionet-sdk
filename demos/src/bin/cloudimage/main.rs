@@ -167,6 +167,14 @@ async fn gate(ch_bin: &Path, image: &Path, vmlinuz: &Path, initrd: &Path) -> Res
     let viewer = tokio::spawn(page.serve(vm.vsock_socket().to_path_buf()));
     println!("desktop viewer: {page_url}");
 
+    // Show where Cloud Hypervisor runs from: a memfd when the binary is
+    // embedded (nothing on disk), the downloaded path otherwise.
+    if let Some(pid) = vm.pid()
+        && let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+    {
+        println!("Cloud Hypervisor (pid {pid}) runs from {}\n", exe.display());
+    }
+
     let result = run_checks(&vm, &identity, boot, &shots, &world, &page_url, page_port).await;
     viewer.abort();
 
