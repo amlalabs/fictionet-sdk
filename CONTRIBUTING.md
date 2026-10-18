@@ -5,10 +5,17 @@ Security problems go by email, not in issues: see [SECURITY.md](SECURITY.md).
 
 ## Building and checking
 
+The `fictionet` command is the `fictionet-cli` package in `cli/`, and Cargo
+builds it with the SDK from the top directory. Install it from a checkout with
+`cargo install --locked --path cli`.
+
 CI runs these commands in three feature sets: the default features,
-`--no-default-features`, and `--workspace --all-features`. The example worlds
-enable `web-proxy`, so only the all-features set builds them. For the other two
-sets, add the flags to each Cargo command, before `-- -D warnings` for clippy:
+`-p fictionet -p fictionet-codegen -p fictionet-codegen-layouts
+--no-default-features`, and `--workspace --all-features`. The command turns on
+the SDK's default features, so the set without them names its packages and
+leaves the command out. The example worlds enable `web-proxy`, so only the
+all-features set builds them. For the other two sets, add the flags to each
+Cargo command, before `-- -D warnings` for clippy:
 
 ```console
 $ cargo build --locked --all-targets
@@ -23,8 +30,8 @@ The library also builds for the browser. That needs the `wasm32-unknown-unknown`
 target and a clang with that target, which compiles ring's C code:
 
 ```console
-$ cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
-$ cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+$ cargo check --locked -p fictionet --lib --no-default-features --target wasm32-unknown-unknown
+$ cargo clippy --locked -p fictionet --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
 ```
 
 The minimum Rust version is 1.91:
@@ -50,11 +57,12 @@ doctests, so `cargo test --doc` runs them. `.config/nextest.toml` holds the
 settings: tests are never retried, a test is flagged after 15 seconds, and the
 tests that run whole worlds run a few at a time.
 
-The integration tests are two binaries. `tests/it` runs on any machine, one
-module per area. It needs node, curl and Chromium (set `CHROMIUM` if the
-browser is not named `chromium`). `tests/host` holds the tests that need user
-namespaces, root or a tun device, and fails where the machine lacks them. It
-runs only when named:
+The SDK and the command each have two integration test binaries. `tests/it`
+and `cli/tests/it` run on any machine, one module per area. They need node,
+curl and Chromium (set `CHROMIUM` if the browser is not named `chromium`).
+`tests/host` and `cli/tests/host` hold the tests that need user namespaces,
+root or a tun device, and fail where the machine lacks them. They run only
+when named:
 
 ```console
 $ cargo nextest run --locked --test host
@@ -75,7 +83,7 @@ $ uv run --project python/inspect_fictionet --locked --extra k8s pytest python/i
 
 ## Benchmarks
 
-The benchmarks in `benches/` use [Divan](https://docs.rs/divan) and run with
+The benchmarks in `benches/` and `cli/benches/` use [Divan](https://docs.rs/divan) and run with
 `cargo bench`. Pass a name after `--` to filter them:
 
 ```console
