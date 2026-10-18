@@ -13,6 +13,7 @@ arbitrary = { version = "1", features = ["derive"] }
 bytes = "1"
 fictionet = { path = ".." }
 fictionet-cli = { path = "../cli" }
+fictionet-codegen-golden = { path = "../codegen/tests/golden" }
 http = "1"
 http-body-util = "0.1"
 libfuzzer-sys = "0.4"

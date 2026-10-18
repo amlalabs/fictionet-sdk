@@ -11,8 +11,8 @@ builds it with the SDK from the top directory. Install it from a checkout with
 
 CI runs these commands with four sets of flags:
 
-- the default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-layouts -p xtask`
-- no default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-layouts --no-default-features`
+- the default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts -p xtask`
+- no default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts --no-default-features`
 - the command: `-p fictionet-cli`
 - all features: `--workspace --all-features`
 

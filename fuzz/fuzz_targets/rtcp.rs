@@ -2,9 +2,7 @@
 //! reads them, and packets a world builds, as it writes them.
 #![no_main]
 
-#[path = "../common/input.rs"]
-mod input;
-use input::{bytes, list};
+use fictionet_fuzz::input::{bytes, list};
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Frames;

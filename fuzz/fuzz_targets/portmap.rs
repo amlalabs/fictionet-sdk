@@ -2,9 +2,7 @@
 //! portmapper reads them, and values a world builds, as it writes them.
 #![no_main]
 
-#[path = "../common/input.rs"]
-mod input;
-use input::bytes;
+use fictionet_fuzz::input::bytes;
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::protocols::onc_rpc::{Body, Message};

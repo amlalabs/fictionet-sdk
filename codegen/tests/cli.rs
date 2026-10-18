@@ -78,6 +78,8 @@ fn generate_limits_fuzz_and_bad_files() {
         o,
         "--fuzz",
         f,
+        "--fuzz-module",
+        "my_fuzz::protocol",
         "--max-message",
         "512",
         "--max-depth",
@@ -100,13 +102,32 @@ fn generate_limits_fuzz_and_bad_files() {
     assert!(
         std::fs::read_to_string(&fuzz)
             .unwrap()
-            .contains("#[path = \"module.rs\"]")
+            .contains("\nuse my_fuzz::protocol as protocol;\n")
     );
     let invalid = cli(&["ir", i, "-o", o, "--max-depth", "65"]);
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("InvalidLimit"));
     assert_eq!(std::fs::read_to_string(&output).unwrap(), source);
     assert!(!cli(&["ir", i, "-o", i]).status.success());
-    assert!(!cli(&["ir", i, "-o", o, "--fuzz", o]).status.success());
+    assert!(
+        !cli(&[
+            "ir",
+            i,
+            "-o",
+            o,
+            "--fuzz",
+            o,
+            "--fuzz-module",
+            "my_fuzz::protocol"
+        ])
+        .status
+        .success()
+    );
+    // The target and its module path go together.
+    assert!(String::from_utf8_lossy(&cli(&["ir", i, "-o", o, "--fuzz", f]).stderr).contains("Cli"));
+    assert!(
+        String::from_utf8_lossy(&cli(&["ir", i, "-o", o, "--fuzz-module", "a::b"]).stderr)
+            .contains("Cli")
+    );
 }
 
 #[test]
@@ -126,6 +147,8 @@ fn recorded_recipes_reproduce_bounded_artifacts() {
             "module.rs",
             "--fuzz",
             "fuzz.rs",
+            "--fuzz-module",
+            "my_fuzz::protocol",
             "--max-nodes",
             "100",
             "--max-allocation",
@@ -151,7 +174,8 @@ fn recorded_recipes_reproduce_bounded_artifacts() {
             .lines()
             .find_map(|line| line.strip_prefix("// Regenerate with: fictionet-codegen "))
             .unwrap()
-            .replace("<this file>", filename);
+            .replace("<this file>", filename)
+            .replace("<module file>", "module.rs");
         std::fs::remove_file(scratch.0.join("module.rs")).unwrap();
         if filename == "fuzz.rs" {
             std::fs::remove_file(scratch.0.join("fuzz.rs")).unwrap();
@@ -189,9 +213,27 @@ fn outputs_cannot_alias_inputs_or_each_other() {
     let scratch = Scratch::new();
     let schema = include_str!("schemas/recursive.json");
     for args in [
-        vec!["ir", "input.json", "-o", "out.rs", "--fuzz", "./input.json"],
+        vec![
+            "ir",
+            "input.json",
+            "-o",
+            "out.rs",
+            "--fuzz",
+            "./input.json",
+            "--fuzz-module",
+            "my_fuzz::protocol",
+        ],
         vec!["ir", "input.json", "-o", "./input.json"],
-        vec!["ir", "input.json", "-o", "out.rs", "--fuzz", "./out.rs"],
+        vec![
+            "ir",
+            "input.json",
+            "-o",
+            "out.rs",
+            "--fuzz",
+            "./out.rs",
+            "--fuzz-module",
+            "my_fuzz::protocol",
+        ],
     ] {
         std::fs::write(scratch.0.join("input.json"), schema).unwrap();
         let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
@@ -220,7 +262,16 @@ fn outputs_cannot_alias_inputs_through_links() {
     for args in [
         vec!["ir", "link.json", "-o", "input.json"],
         vec!["ir", "input.json", "-o", "link.json"],
-        vec!["ir", "input.json", "-o", "out.rs", "--fuzz", "link.json"],
+        vec![
+            "ir",
+            "input.json",
+            "-o",
+            "out.rs",
+            "--fuzz",
+            "link.json",
+            "--fuzz-module",
+            "my_fuzz::protocol",
+        ],
         vec!["ir", "hard.json", "-o", "input.json"],
     ] {
         let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
@@ -255,6 +306,8 @@ fn failed_fuzz_staging_keeps_existing_module() {
             "out.rs",
             "--fuzz",
             "missing/fuzz.rs",
+            "--fuzz-module",
+            "my_fuzz::protocol",
         ])
         .output()
         .unwrap();
@@ -280,6 +333,8 @@ fn checks_all_paths_before_opening_inputs() {
             "out.rs",
             "--fuzz",
             "./input.json",
+            "--fuzz-module",
+            "my_fuzz::protocol",
         ])
         .output()
         .unwrap();

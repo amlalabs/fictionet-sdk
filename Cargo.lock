@@ -581,6 +581,7 @@ dependencies = [
  "divan",
  "etherparse",
  "fictionet-codegen",
+ "fictionet-codegen-golden",
  "fictionet-test-support",
  "getrandom 0.4.3",
  "h2",
@@ -630,6 +631,15 @@ dependencies = [
 [[package]]
 name = "fictionet-codegen"
 version = "0.1.0"
+dependencies = [
+ "fictionet",
+ "fictionet-codegen-golden",
+ "fictionet-codegen-layouts",
+]
+
+[[package]]
+name = "fictionet-codegen-golden"
+version = "0.0.0"
 dependencies = [
  "fictionet",
 ]

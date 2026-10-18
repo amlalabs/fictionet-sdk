@@ -13,8 +13,8 @@ use fictionet::{Cx, block_on, run};
 
 pub mod dns;
 pub mod doors;
-#[path = "../common/http1.rs"]
 pub mod http1;
+pub mod input;
 pub mod web;
 
 /// The cached certificate and key for the TLS fuzz sites.

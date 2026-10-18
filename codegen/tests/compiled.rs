@@ -1,16 +1,7 @@
-//! Compile generated modules against the public SDK and run their contracts.
-#![allow(dead_code)]
+//! Generated modules, compiled against the public SDK in the
+//! fictionet-codegen-golden crate, checked through their public items.
 
-#[path = "golden/blocks.rs"]
-mod blocks;
-#[path = "golden/float_nulls.rs"]
-mod float_nulls;
-#[path = "golden/long_names.rs"]
-mod long_names;
-#[path = "golden/one_field.rs"]
-mod one_field;
-#[path = "golden/short_names.rs"]
-mod short_names;
+use fictionet_codegen_golden::{blocks, float_nulls};
 
 #[test]
 fn optional_flags_and_float_null_bits() {

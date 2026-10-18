@@ -16,6 +16,8 @@ doc = false
 [dependencies]
 # No default features, as codegen's own dev-dependency.
 fictionet = { path = "../../..", default-features = false }
+# The schemas module builds the random schemas with the generator's types.
+fictionet-codegen = { path = "../.." }
 
 [build-dependencies]
 fictionet-codegen = { path = "../.." }

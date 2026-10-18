@@ -1,18 +1,7 @@
-//! Generated files compile as consumer-owned modules and run their own tests.
-#![allow(dead_code)]
-#[path = "../../codegen/tests/golden/groups.rs"]
-mod groups;
-#[path = "../../codegen/tests/golden/primitives.rs"]
-mod primitives;
-#[path = "../../codegen/tests/golden/recursive.rs"]
-mod recursive;
-#[path = "../../codegen/tests/golden/xdr.rs"]
-mod xdr;
+//! Generated files, compiled as consumer-owned modules in the
+//! fictionet-codegen-golden crate, against the SDK's own codecs.
 
-#[path = "../../codegen/tests/golden/budgets.rs"]
-mod budgets;
-#[path = "../../codegen/tests/golden/edges.rs"]
-mod edges;
+use fictionet_codegen_golden::{budgets, groups, primitives, recursive, xdr};
 
 use fictionet::stdlib::{
     codec::{Decode, Lcg, Step, Wire},

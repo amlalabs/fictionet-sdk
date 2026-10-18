@@ -4,6 +4,10 @@
 #![allow(dead_code)]
 #![deny(warnings)]
 
+pub mod schemas;
+
+// Build output can only come in through include!: build.rs writes the
+// generated modules into OUT_DIR, outside the source tree.
 include!(concat!(env!("OUT_DIR"), "/layouts.rs"));
 
 #[cfg(test)]

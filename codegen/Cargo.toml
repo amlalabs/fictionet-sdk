@@ -10,6 +10,8 @@ license = "MIT OR Apache-2.0"
 # No default features, so `--workspace --no-default-features` builds
 # fictionet without host integration or runtime adapters.
 fictionet = { path = "..", default-features = false }
+fictionet-codegen-golden = { path = "tests/golden" }
+fictionet-codegen-layouts = { path = "tests/layouts" }
 
 [lints.rust]
 missing_docs = "deny"

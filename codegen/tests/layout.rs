@@ -2,12 +2,32 @@
 //! crate in `codegen/tests/layouts` compiles the random schemas against
 //! the SDK and runs their generated tests.
 use fictionet_codegen::*;
-#[path = "support/rustfmt.rs"]
-mod rustfmt;
+use fictionet_codegen_layouts::schemas::{SEEDS, layout_schema, random_schema};
 mod support;
-use rustfmt::check_rustfmt;
-use support::Scratch;
-use support::schemas::{SEEDS, layout_schema, random_schema};
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+use support::check_rustfmt;
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+struct Scratch(PathBuf);
+impl Scratch {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "fictionet-layout-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 fn all_name_lengths_are_rustfmt_clean() {
@@ -21,7 +41,7 @@ fn all_name_lengths_are_rustfmt_clean() {
         let path = scratch.0.join(format!("fuzz_{n}.rs"));
         std::fs::write(
             &path,
-            emit_fuzz("ir", &checked, &format!("length_{n}.rs"), &[]).unwrap(),
+            emit_fuzz("ir", &checked, &format!("protocol::length_{n}"), &[]).unwrap(),
         )
         .unwrap();
         files.push(path);

@@ -3,12 +3,13 @@ members = [
     ".",
     "cli",
     "codegen",
+    "codegen/tests/golden",
     "codegen/tests/layouts",
     "examples/*/world",
     "examples/wasm_world",
     "xtask",
 ]
-default-members = [".", "cli", "codegen", "codegen/tests/layouts", "xtask"]
+default-members = [".", "cli", "codegen", "codegen/tests/golden", "codegen/tests/layouts", "xtask"]
 exclude = ["fuzz"]
 resolver = "3"
 
@@ -86,6 +87,7 @@ h2 = "0.4"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 http-body-util = "0.1"
 fictionet-codegen = { path = "codegen" }
+fictionet-codegen-golden = { path = "codegen/tests/golden" }
 fictionet-test-support = { path = "tests/support" }
 axum = { version = "0.8", default-features = false, features = ["ws"] }
 hyper = { version = "1.11.1", features = ["client", "http1", "http2", "server"] }

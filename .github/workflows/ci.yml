@@ -43,9 +43,9 @@ jobs:
         # packages they cover and leave the CLI out. The CLI has its own run.
         include:
           - name: default features
-            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts -p xtask
+            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts -p xtask
           - name: no default features
-            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts --no-default-features
+            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts --no-default-features
           - name: the command
             args: -p fictionet-cli
           - name: all features
@@ -76,9 +76,9 @@ jobs:
       matrix:
         include:
           - name: default features
-            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts -p xtask
+            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts -p xtask
           - name: no default features
-            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-layouts --no-default-features
+            args: -p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts --no-default-features
           - name: the command
             args: -p fictionet-cli
           - name: all features

@@ -2,10 +2,7 @@
 //! them, and values a world builds, as it writes them.
 #![no_main]
 
-#[path = "../common/input.rs"]
-mod input;
-
-use input::list;
+use fictionet_fuzz::input::list;
 
 use fictionet::stdlib::network::ip::Endpoints;
 

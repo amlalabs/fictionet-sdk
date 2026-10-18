@@ -56,8 +56,7 @@ Codec and fuzz headers also record a regeneration command. It includes
 nondefault limits in the order shown below and omits limits equal to the
 defaults. To reproduce the output, use the recorded generator version and
 schema, resolve the input basenames, and replace `<this file>` with the
-output path. Run a fuzz recipe from the target's directory so its
-target-relative module path resolves correctly.
+output path, and in a fuzz recipe `<module file>` with the module's path.
 Declaration order is preserved. Identical validated inputs produce
 identical output bytes, without a formatter installed.
 
@@ -492,9 +491,10 @@ arbitrary bytes.
 
 Goldens live in `codegen/tests/golden`. The `blocks` example covers
 offsets, blocks, block groups, unions, ranges, constants, and enum nulls;
-`sbe_sample` is the golden for the `sbe` front end. The codegen test target compiles
-them and runs their emitted tests. The SDK test target runs the integration
-checks in `tests/it/codegen.rs`. Additional fixtures check small allocation and
+`sbe_sample` is the golden for the `sbe` front end. That folder is also the
+`fictionet-codegen-golden` crate, which compiles the goldens against the
+SDK and runs their emitted tests. The codegen tests check them through it,
+and the SDK test target runs the integration checks in `tests/it/codegen.rs`. Additional fixtures check small allocation and
 work budgets, long identifiers, and maximum-sized stream headers. To update:
 
 ```sh
@@ -507,7 +507,8 @@ Review changes to both the schema and its golden before accepting them.
 To emit another target:
 
 ```sh
-cargo run -p fictionet-codegen -- ir schema.json -o protocol.rs --fuzz fuzz/fuzz_targets/protocol.rs
+cargo run -p fictionet-codegen -- ir schema.json -o src/protocol.rs \
+    --fuzz fuzz/fuzz_targets/protocol.rs --fuzz-module my_crate::protocol
 ```
 
 Output paths are checked against every input and each other before any
@@ -516,8 +517,11 @@ compared. The module and fuzz target are staged in temporary files before
 renaming them into place. Each rename replaces one file; the pair is not
 a filesystem transaction.
 
-`--fuzz` writes a target-relative module path. The target needs the fuzz
+`--fuzz-module` is the Rust path by which the target reaches the module.
+A cargo-fuzz target is a crate of its own, so the module must be public in
+a crate the target depends on. The target needs the fuzz
 workspace's `libfuzzer-sys` and `fictionet` dependencies. The generated
 module itself still needs only Fictionet and the standard library. The
-registered `codegen_ir` target checks recursive values and stream frames.
+registered `codegen_ir` target checks recursive values and stream frames,
+and reaches the `recursive` golden as `fictionet_codegen_golden::recursive`.
 `fuzz/` keeps its separate workspace and builds on its own.

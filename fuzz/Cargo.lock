@@ -354,6 +354,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-codegen-golden"
+version = "0.0.0"
+dependencies = [
+ "fictionet",
+]
+
+[[package]]
 name = "fictionet-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -361,6 +368,7 @@ dependencies = [
  "bytes",
  "fictionet",
  "fictionet-cli",
+ "fictionet-codegen-golden",
  "http",
  "http-body-util",
  "libfuzzer-sys",

@@ -1,8 +1,6 @@
-//! Writes one module per random schema into OUT_DIR, and `layouts.rs`,
-//! which declares them.
+//! Writes `layouts.rs` into OUT_DIR: one inline module per random schema.
 use std::{fmt::Write, path::PathBuf};
 
-#[path = "../support/schemas.rs"]
 mod schemas;
 
 fn main() {
@@ -13,14 +11,7 @@ fn main() {
     let mut modules = String::new();
     for seed in 0..schemas::SEEDS {
         let source = fictionet_codegen::emit("ir", &schemas::random_schema(seed), &[]).unwrap();
-        let path = out.join(format!("seed_{seed}.rs"));
-        std::fs::write(&path, source).unwrap();
-        writeln!(
-            modules,
-            "#[path = {:?}]\nmod seed_{seed};",
-            path.display().to_string()
-        )
-        .unwrap();
+        writeln!(modules, "mod seed_{seed} {{\n{source}}}").unwrap();
     }
     std::fs::write(out.join("layouts.rs"), modules).unwrap();
 }

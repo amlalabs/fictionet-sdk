@@ -20,6 +20,7 @@ Options:
   --max-allocation <bytes>  Decoded heap budget (default 8388608)
   --max-nodes <count>       Structural work budget (default 65536)
   --fuzz <target.rs>        Also write a cargo-fuzz target
+  --fuzz-module <path>      The Rust path the target uses for the module
   --list                   List registered formats
   --help                   Show this help
 ";
@@ -57,28 +58,6 @@ fn absolute(path: &Path) -> Result<PathBuf, Error> {
     }
     Ok(clean)
 }
-fn relative_module(module: &Path, target: &Path) -> Result<String, Error> {
-    let module = absolute(module)?;
-    let target = absolute(target)?;
-    let parent = target
-        .parent()
-        .ok_or_else(|| error(ErrorKind::Cli, "--fuzz", "target has no parent"))?;
-    let a: Vec<_> = module.components().collect();
-    let b: Vec<_> = parent.components().collect();
-    let common = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
-    let mut result = PathBuf::new();
-    for _ in common..b.len() {
-        result.push("..");
-    }
-    for c in a.iter().skip(common) {
-        result.push(c.as_os_str());
-    }
-    result
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| error(ErrorKind::Cli, "--fuzz", "paths must be UTF-8"))
-}
-
 struct FileIdentity {
     absolute: PathBuf,
     resolved: PathBuf,
@@ -227,6 +206,7 @@ fn run() -> Result<(), Error> {
     let mut paths = Vec::new();
     let mut output = None;
     let mut fuzz = None;
+    let mut fuzz_module = None;
     let mut limits = Limits::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -263,6 +243,12 @@ fn run() -> Result<(), Error> {
                 }
                 fuzz = Some(PathBuf::from(argument(&mut args, &arg)?));
             }
+            "--fuzz-module" => {
+                if fuzz_module.is_some() {
+                    return Err(error(ErrorKind::Cli, "--fuzz-module", "module given twice"));
+                }
+                fuzz_module = Some(argument(&mut args, &arg)?);
+            }
             "--max-message" | "--max-collection" | "--max-depth" | "--max-allocation"
             | "--max-nodes" => {
                 let n = argument(&mut args, &arg)?
@@ -287,6 +273,24 @@ fn run() -> Result<(), Error> {
         return Err(error(ErrorKind::UnknownFormat, "format", format));
     }
     let output = output.ok_or_else(|| error(ErrorKind::Cli, "-o", "output is required"))?;
+    let fuzz = match (fuzz, fuzz_module) {
+        (Some(target), Some(module)) => Some((target, module)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(error(
+                ErrorKind::Cli,
+                "--fuzz-module",
+                "required with --fuzz",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(error(
+                ErrorKind::Cli,
+                "--fuzz",
+                "required with --fuzz-module",
+            ));
+        }
+    };
     if paths.is_empty() {
         return Err(error(
             ErrorKind::Cli,
@@ -297,7 +301,11 @@ fn run() -> Result<(), Error> {
     if paths.len() > MAX_TYPES {
         return Err(error(ErrorKind::InputLimit, "input", "too many files"));
     }
-    check_paths(&output, fuzz.as_deref(), &paths)?;
+    check_paths(
+        &output,
+        fuzz.as_ref().map(|(target, _)| target.as_path()),
+        &paths,
+    )?;
     let mut inputs = Vec::new();
     let mut total = 0usize;
     for path in paths {
@@ -322,20 +330,13 @@ fn run() -> Result<(), Error> {
     let names = inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
     let fuzz_source = fuzz
         .as_ref()
-        .map(|p| {
-            emit_fuzz(
-                &format,
-                &generated.schema,
-                &relative_module(&output, p)?,
-                &names,
-            )
-        })
+        .map(|(_, module)| emit_fuzz(&format, &generated.schema, module, &names))
         .transpose()?;
     let module = StagedFile::new(&output, &generated.source)?;
     let target = fuzz
         .as_ref()
         .zip(fuzz_source.as_ref())
-        .map(|(path, source)| StagedFile::new(path, source))
+        .map(|((path, _), source)| StagedFile::new(path, source))
         .transpose()?;
     module.finish()?;
     if let Some(target) = target {

@@ -1653,20 +1653,37 @@ fn tests(out: &mut Output, checked: &ValidatedSchema) -> Result<(), Error> {
 }
 
 /// Emits a cargo-fuzz target for all generated wire types and framers.
-/// `module_path` is the target-relative path to the generated module file.
+/// `module` is the Rust path by which the target reaches the generated
+/// module, such as `my_crate::protocol`: the target is a crate of its own,
+/// so the module must be public in a crate the target depends on.
 /// The header's regeneration command records the same nondefault limits as [`emit`].
 /// The target needs `fictionet` and `libfuzzer-sys`; the generator does not.
 pub fn emit_fuzz(
     format: &str,
     checked: &ValidatedSchema,
-    module_path: &str,
+    module: &str,
     inputs: &[String],
 ) -> Result<String, Error> {
-    if module_path.len() > MAX_INPUT {
+    if module.len() > MAX_INPUT {
+        return Err(Error::new(ErrorKind::InputLimit, "module", "path too long"));
+    }
+    // The path is written into the target as code, so it may hold only
+    // identifiers joined by `::`.
+    let identifier = |segment: &str| {
+        segment != "_"
+            && segment
+                .bytes()
+                .next()
+                .is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
+            && segment
+                .bytes()
+                .all(|b| b == b'_' || b.is_ascii_alphanumeric())
+    };
+    if !module.split("::").all(identifier) {
         return Err(Error::new(
-            ErrorKind::InputLimit,
-            "module_path",
-            "path too long",
+            ErrorKind::InvalidName,
+            "module",
+            "not a Rust path",
         ));
     }
     let mut out = Output::default();
@@ -1675,11 +1692,13 @@ pub fn emit_fuzz(
         format,
         inputs,
         checked.limits,
-        &format!("-o {module_path:?} --fuzz <this file>"),
+        &format!("-o <module file> --fuzz <this file> --fuzz-module {module}"),
     )?;
+    // The module's import is a group of its own, so rustfmt keeps it in place
+    // whatever its path sorts after.
     writeln!(
         out,
-        "#![no_main]\n\n#[allow(dead_code)]\n#[path = {module_path:?}]\nmod protocol;\n\nuse fictionet::stdlib::test_support::contract;\nuse libfuzzer_sys::fuzz_target;\n\nfuzz_target!(|data: &[u8]| {{"
+        "#![no_main]\n\nuse fictionet::stdlib::test_support::contract;\nuse libfuzzer_sys::fuzz_target;\n\nuse {module} as protocol;\n\nfuzz_target!(|data: &[u8]| {{"
     )?;
     for t in &checked.schema.types {
         writeln!(

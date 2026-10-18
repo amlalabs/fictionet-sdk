@@ -1,9 +1,8 @@
 //! Code generator integration checks.
 use fictionet_codegen::{FrontEnd, Input, IrFrontEnd, Limits, emit, emit_fuzz, generate, validate};
 use std::path::Path;
-#[path = "support/rustfmt.rs"]
-mod rustfmt;
-use rustfmt::check_rustfmt;
+mod support;
+use support::check_rustfmt;
 
 const EXAMPLES: &[&str] = &[
     "primitives",
@@ -73,7 +72,7 @@ fn goldens_and_determinism() {
             let target = emit_fuzz(
                 "ir",
                 &checked,
-                "../../codegen/tests/golden/recursive.rs",
+                "fictionet_codegen_golden::recursive",
                 &["recursive.json".into()],
             )
             .unwrap();
@@ -99,6 +98,16 @@ fn header_quotes_untrusted_filenames() {
     let checked = validate(Default::default(), Limits::default()).unwrap();
     let source = emit("ir", &checked, &["file\n#[bad].json".into()]).unwrap();
     assert!(source.contains(r#"// Schema: "file\n#[bad].json""#));
+    // The fuzz target's module path is written as code.
+    for module in ["", "a::", "::a", "a::b;\nfn evil() {}", "1a", "_", "a-b"] {
+        let error = emit_fuzz("ir", &checked, module, &[]).unwrap_err();
+        assert_eq!(
+            error.kind,
+            fictionet_codegen::ErrorKind::InvalidName,
+            "{module:?}"
+        );
+    }
+    assert!(emit_fuzz("ir", &checked, "crate_a::_b::C1", &[]).is_ok());
 }
 
 #[test]
@@ -128,8 +137,8 @@ fn headers_record_only_nondefault_limits_in_order() {
         for (source, outputs) in [
             (emit("ir", &checked, &inputs).unwrap(), "-o <this file>"),
             (
-                emit_fuzz("ir", &checked, "module.rs", &inputs).unwrap(),
-                "-o \"module.rs\" --fuzz <this file>",
+                emit_fuzz("ir", &checked, "my_fuzz::protocol", &inputs).unwrap(),
+                "-o <module file> --fuzz <this file> --fuzz-module my_fuzz::protocol",
             ),
         ] {
             assert_eq!(

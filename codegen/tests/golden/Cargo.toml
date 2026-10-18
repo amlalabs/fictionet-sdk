@@ -1,0 +1,18 @@
+# The goldens of codegen/tests/golden.rs, compiled against the SDK through a
+# path dependency. The codegen and SDK tests and the codegen_ir fuzz target
+# use them, and `cargo test` runs the tests the generator writes into each.
+[package]
+name = "fictionet-codegen-golden"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[lib]
+path = "lib.rs"
+doctest = false
+doc = false
+
+[dependencies]
+# No default features, as codegen's own dev-dependency.
+fictionet = { path = "../../..", default-features = false }

@@ -7,9 +7,7 @@
 //! sides and compared byte by byte, re-encoded by `stdlib::protocols::sbe` with longer
 //! blocks and a newer version for the generated decoder, and mutated to
 //! check that both sides accept and refuse the same bytes.
-#![allow(dead_code)]
-#[path = "../../codegen/tests/golden/sbe_sample.rs"]
-mod sample;
+use fictionet_codegen_golden::sbe_sample;
 
 use fictionet::stdlib::{
     codec::{Lcg, Wire},
@@ -110,7 +108,7 @@ where
 
 #[test]
 fn sample_open_enums_preserve_values_and_refuse_aliases() {
-    use sample::{Error, QuoteKind, Side, Status};
+    use sbe_sample::{Error, QuoteKind, Side, Status};
     check_open_enum(
         Side::Unknown,
         &[(b'1', Side::Buy), (b'2', Side::Sell)],
@@ -144,7 +142,7 @@ fn cme_open_enums_preserve_values_and_refuse_aliases() {
 
 #[test]
 fn nested_open_enum_alias_refusal_is_transactional() {
-    use sample::{Error, Price, Quote, QuoteKind, Side};
+    use sbe_sample::{Error, Price, Quote, QuoteKind, Side};
     let mut value = Quote {
         price: Price { mantissa: 123 },
         side: Side::Unknown(b'?'),
@@ -164,7 +162,7 @@ fn nested_open_enum_alias_refusal_is_transactional() {
 
 #[test]
 fn optional_enum_null_collision_is_transactional() {
-    use sample::{Error, Flags, Order, Price, Quote, QuoteKind, Side, Status};
+    use sbe_sample::{Error, Flags, Order, Price, Quote, QuoteKind, Side, Status};
     let mut value = Order {
         id: 0,
         symbol: b"ABCDEF".to_vec(),
@@ -705,7 +703,7 @@ fn cme_mdp3_decoders_agree_on_every_template() {
 
 #[test]
 fn sample_decoders_agree_on_every_template() {
-    let stats = differential::<sample::Message>(SAMPLE, 512);
+    let stats = differential::<sbe_sample::Message>(SAMPLE, 512);
     eprintln!("sample: {stats:?}");
     assert!(stats.agreed > 500 && stats.refused > 500);
 }
