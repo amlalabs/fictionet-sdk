@@ -164,13 +164,6 @@ impl VirtualHosts {
 }
 
 impl Handler for VirtualHosts {
-    fictionet::cfg_tokio! {
-    fn hyper_upgrade(&self, request: &Request<Body>) -> bool {
-        request_host(request).and_then(|host| self.site_or_default(&host))
-            .is_some_and(|(site, _)| site.handler.hyper_upgrade(request))
-    }
-    }
-
     fn call(&self, mut request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
         let Some(host) = request_host(&request) else {
             return Reply::Now(no_host());

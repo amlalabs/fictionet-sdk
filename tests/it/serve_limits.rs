@@ -6,6 +6,7 @@
 use crate::common::http_observer;
 use crate::common::io;
 use crate::common::world;
+use crate::http2_server::H2_INPUT;
 
 use crate::common::hyper_io;
 use hyper_io::{Exec, Io};
@@ -34,16 +35,8 @@ use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 use http_observer::{Exposure, SECRET, assert_redacted};
 
-// Native framing reserves input storage that hyper kept outside the budget.
-const H2_INPUT: usize = 2 * http2::DEFAULT_FRAME_SIZE + http2::HEADER_LEN;
-
 fn idle_http2_budget(budget: &Budget) {
-    // Only the input reservation, HPACK table and bounded reset history remain.
-    assert!(
-        (H2_INPUT..H2_INPUT + 4096).contains(&budget.used()),
-        "{}",
-        budget.used()
-    );
+    assert_eq!(budget.used(), H2_INPUT);
 }
 
 async fn hyper_exposure(
@@ -622,11 +615,15 @@ fn response_policy_agrees_across_native_and_hyper() {
     struct Responses;
 
     impl Handler for Responses {
-        fn hyper_upgrade(&self, _: &http::Request<Body>) -> bool {
-            true
-        }
-
         fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            if request.headers().contains_key("upgrade")
+                && request
+                    .extensions()
+                    .get::<hyper::upgrade::OnUpgrade>()
+                    .is_none()
+            {
+                return Reply::Handoff(request);
+            }
             let status: u16 = request.uri().path()[1..].parse().unwrap();
             let bytes = Bytes::from_static(b"body");
             let body = if request.headers().contains_key("x-unknown") {
@@ -1231,7 +1228,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             assert!(send.send_request(metadata_request()).await.is_err());
             assert_eq!(fcx.events().of("test", "waiting").len(), 2);
             let rejected = budget.used();
-            assert!((two..=two + 4096).contains(&rejected));
+            assert_eq!(rejected, two);
             let request_charge = two - one - other.bytes();
 
             drop(first);
@@ -1456,10 +1453,15 @@ async fn upgrade_keep_alive_line_limit(fcx: &Cx) -> fictionet::Result {
     };
     struct UpgradePage;
     impl Handler for UpgradePage {
-        fn hyper_upgrade(&self, _: &http::Request<Body>) -> bool {
-            true
-        }
         fn call(&self, request: http::Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+            if request.headers().contains_key("upgrade")
+                && request
+                    .extensions()
+                    .get::<hyper::upgrade::OnUpgrade>()
+                    .is_none()
+            {
+                return Reply::Handoff(request);
+            }
             page(4).call(request, ex)
         }
     }

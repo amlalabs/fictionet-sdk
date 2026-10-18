@@ -24,8 +24,8 @@ use super::response::{
     ResponsePolicy, Track, Tracker, answered, error_event, error_response, request_held,
 };
 use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, Observer, PIECE, Received, Reply,
-    UpgradeHandler, date_header, text,
+    Body, Exchange, Handler, HttpOptions, Limits, Observer, PIECE, Received, Reply, UpgradeHandler,
+    date_header, text,
 };
 
 /// Runs hyper's HTTP/1 server on `conn`, with upgrades: where
@@ -116,9 +116,7 @@ fn report(
             None if broke => Some(("transport", e.to_string())),
             None => None,
         },
-        (Ok(()), None) if broke => {
-            Some(("transport", "a TLS record did not decrypt".to_owned()))
-        }
+        (Ok(()), None) if broke => Some(("transport", "a TLS record did not decrypt".to_owned())),
         (Ok(()), None) => None,
     };
     if let Some((cause, detail)) = cause {
@@ -282,9 +280,9 @@ impl hyper::service::Service<Request<Incoming>> for Route {
             None => (None, None),
             Some(None) => {
                 tracker.received(Received::Budget);
-                if let Some(event) = tracker.finish(
-                    Some(Fields::new().with("answer", "budget")), None, 0, false,
-                ) {
+                if let Some(event) =
+                    tracker.finish(Some(Fields::new().with("answer", "budget")), None, 0, false)
+                {
                     self.fcx.record(event.conn(&self.info));
                 }
                 return Box::pin(std::future::ready(Err(Error::msg(
@@ -330,6 +328,9 @@ impl hyper::service::Service<Request<Incoming>> for Route {
                         .call(request, &mut Exchange::new(now, &route.fcx, &route.info));
                     match reply {
                         Reply::Now(r) => r,
+                        Reply::Handoff(_) => {
+                            error_response(&Error::msg("upgrade handoff repeated"))
+                        }
                         Reply::Later(work) => match work(route.fcx.clone()).await {
                             Ok(r) => r,
                             Err(e) => error_response(&e),
@@ -647,12 +648,7 @@ struct Io<C> {
 }
 
 impl<C: Connection + Unpin> Io<C> {
-    fn new(
-        fcx: &Cx,
-        conn: C,
-        broke: Arc<std::sync::atomic::AtomicBool>,
-        stall: Duration,
-    ) -> Io<C> {
+    fn new(fcx: &Cx, conn: C, broke: Arc<std::sync::atomic::AtomicBool>, stall: Duration) -> Io<C> {
         Io {
             fcx: fcx.clone(),
             conn,
@@ -858,13 +854,11 @@ mod tests {
                     budget: Some(budget.clone()),
                 };
                 let mut cx = Context::from_waker(std::task::Waker::noop());
-                let Poll::Ready(Some(Ok(first))) = Pin::new(&mut body).poll_frame(&mut cx)
-                else {
+                let Poll::Ready(Some(Ok(first))) = Pin::new(&mut body).poll_frame(&mut cx) else {
                     panic!("first frame")
                 };
                 assert_eq!(budget.used(), 2 * PIECE);
-                let Poll::Ready(Some(Ok(last))) = Pin::new(&mut body).poll_frame(&mut cx)
-                else {
+                let Poll::Ready(Some(Ok(last))) = Pin::new(&mut body).poll_frame(&mut cx) else {
                     panic!("last frame")
                 };
                 drop(body);

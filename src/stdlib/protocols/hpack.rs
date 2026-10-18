@@ -697,6 +697,8 @@ impl Encoder {
             }
             let (prefix, flags) = if field.never_index {
                 (4, 0x10)
+            } else if self.table.max == Some(0) {
+                (4, 0)
             } else {
                 (6, 0x40)
             };
@@ -705,7 +707,7 @@ impl Encoder {
                 put_string(out, &field.name, self.huffman)?;
             }
             put_string(out, &field.value, self.huffman)?;
-            if !field.never_index {
+            if !field.never_index && self.table.max != Some(0) {
                 self.table
                     .insert(field.name.as_slice().into(), field.value.clone());
             }
@@ -1200,6 +1202,19 @@ mod tests {
             Table::default().decode_block(&bytes, MAX_DECODED),
             Err(Error::StringTooLong)
         );
+    }
+
+    #[test]
+    fn zero_capacity_encoder_does_not_allocate_a_table() {
+        let mut encoder = Encoder::new(0);
+        let mut decoder = Table::new(0);
+        let mut bytes = Vec::new();
+        encoder
+            .encode_block(&[Field::new("x-name", "value")], &mut bytes)
+            .unwrap();
+        assert_eq!(pairs(&decoder.decode_all(&bytes)), [("x-name", "value")]);
+        assert_eq!(encoder.held(), 0);
+        assert_eq!(decoder.table_size(), 0);
     }
 
     #[test]

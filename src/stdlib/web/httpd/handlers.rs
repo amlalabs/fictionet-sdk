@@ -63,6 +63,10 @@ pub enum Reply {
     Now(Response<Body>),
     /// Work that makes the response.
     Later(Later),
+    /// Hand this HTTP/1.1 upgrade request to hyper's HTTP/1 server, which reads
+    /// it again and supplies hyper's upgrade extension. [`tower`] returns it for
+    /// axum's `WebSocketUpgrade`. HTTP/2 answers it with `500`.
+    Handoff(Request<Body>),
 }
 
 /// Answers HTTP requests. See the [module docs](super).
@@ -70,21 +74,11 @@ pub trait Handler: Send + Sync + 'static {
     /// Answers `request`. The request's extensions hold its connection's
     /// [`ConnInfo`].
     fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply;
-
-    fictionet::cfg_tokio! {
-    /// Whether upgrade requests need hyper's upgrade extension, as axum does.
-    /// Native handlers receive the connection through [`UpgradeHandler`].
-    fn hyper_upgrade(&self, _request: &Request<Body>) -> bool { false }
-    }
 }
 
 impl<H: Handler + ?Sized> Handler for Arc<H> {
     fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
         (**self).call(request, ex)
-    }
-
-    fictionet::cfg_tokio! {
-    fn hyper_upgrade(&self, request: &Request<Body>) -> bool { (**self).hyper_upgrade(request) }
     }
 }
 
@@ -291,11 +285,12 @@ where
     B::Data: Send,
     B::Error: Into<Error>,
 {
-    fictionet::cfg_tokio! {
-    fn hyper_upgrade(&self, _request: &Request<Body>) -> bool { true }
-    }
-
     fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
+        fictionet::cfg_tokio! {
+            if needs_hyper_upgrade(&request) {
+                return Reply::Handoff(request);
+            }
+        }
         let mut service = self.service.lock().clone();
         Reply::Later(Box::new(move |_fcx| {
             Box::pin(async move {
@@ -307,6 +302,31 @@ where
             })
         }))
     }
+}
+
+fictionet::cfg_tokio! {
+/// Whether an HTTP/1.1 request asks to switch protocols (RFC 9110 section
+/// 7.8) without hyper's upgrade extension, which axum's `WebSocketUpgrade`
+/// needs and only hyper's HTTP/1 server supplies.
+fn needs_hyper_upgrade(request: &Request<Body>) -> bool {
+    let connection_upgrade = request
+        .headers()
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .any(|v| {
+            v.as_bytes()
+                .split(|b| *b == b',')
+                .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
+        });
+    request.version() == http::Version::HTTP_11
+        && request.method() != Method::CONNECT
+        && request.headers().contains_key(http::header::UPGRADE)
+        && connection_upgrade
+        && request
+            .extensions()
+            .get::<hyper::upgrade::OnUpgrade>()
+            .is_none()
+}
 }
 
 /// Runs a protocol after an HTTP/1 switching-protocols response is written.

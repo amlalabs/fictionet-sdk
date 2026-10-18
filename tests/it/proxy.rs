@@ -1423,6 +1423,7 @@ mod upstream {
         match reply {
             httpd::Reply::Now(response) => response,
             httpd::Reply::Later(work) => work(fcx.clone()).await.unwrap(),
+            httpd::Reply::Handoff(_) => panic!("ordinary request asked for an upgrade handoff"),
         }
     }
 

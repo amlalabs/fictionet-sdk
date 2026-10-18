@@ -280,8 +280,9 @@ fn replay() -> Trace {
         cx.sleep(Duration::from_millis(1100)).await?;
         conn.write_all(&cx, &headers(1, "/", true)).await?;
         loop {
-            if let Frame::GoAway(goaway) = read_frame(&cx, &mut conn).await {
-                assert_eq!(goaway.code, 1);
+            if let Frame::Reset(reset) = read_frame(&cx, &mut conn).await {
+                assert_eq!(reset.stream, 1);
+                assert_eq!(reset.code, 5);
                 break;
             }
         }
@@ -407,7 +408,7 @@ window.addEventListener('load', () => {
                             http::Response::builder().header("content-type", "application/javascript").body(Bytes::new()).unwrap()
                         });
                     let (attach, arrivals) = fictionet::attachments();
-                    net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site(router)).https())).start(&cx, arrivals)?;
+                    net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site(router)).limits(httpd::Limits { body: 1024, ..Default::default() }).https())).start(&cx, arrivals)?;
                     let machine = sandbox::machine(&cx, attach.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
                     let listener = tokio::net::TcpListener::from_std(listener)?;
                     cx.spawn(move |cx| async move {
@@ -491,6 +492,37 @@ window.addEventListener('load', () => {
                     .unwrap()
                     > 1 << 20
             );
+            let upload = world.dir.join("upload");
+            std::fs::write(&upload, vec![b'x'; 200_000]).unwrap();
+            let output = Command::new("curl")
+                .args([
+                    "--http2",
+                    "--noproxy",
+                    "*",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "20",
+                    "--cacert",
+                ])
+                .arg(world.dir.join("ca.pem"))
+                .args([
+                    "--output",
+                    "/dev/null",
+                    "--write-out",
+                    "%{http_version} %{http_code}",
+                    "--data-binary",
+                ])
+                .arg(format!("@{}", upload.display()))
+                .arg(format!("{url}/upload"))
+                .output()
+                .expect("curl is installed");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"2 413");
             let chromium = std::env::var_os("CHROMIUM").unwrap_or_else(|| "chromium".into());
             let output = Command::new(chromium)
                 .args([
@@ -725,4 +757,513 @@ fn graceful_goaway_drains_streams_after_the_ping_round_trip() {
             .any(|f| matches!(f, Frame::Data(d) if d.data == b"ok"))
     );
     assert!(harness.closed());
+}
+
+fn data(stream: u32, size: usize, end: bool) -> Vec<u8> {
+    http2::Data {
+        stream,
+        flags: u8::from(end),
+        data: vec![b'x'; size],
+        padding: None,
+    }
+    .to_bytes()
+    .unwrap()
+}
+
+fn statuses(output: &[Frame]) -> Vec<(u32, Vec<u8>)> {
+    let mut blocks = http2::HeaderBlocks::with_limits(Default::default());
+    output
+        .iter()
+        .filter_map(|frame| {
+            let read = blocks.read_frame(frame).unwrap();
+            read.block.and_then(|block| {
+                block
+                    .headers
+                    .into_iter()
+                    .find(|h| h.name.as_deref() == Some(b":status"))
+                    .and_then(|h| h.value)
+                    .map(|value| (read.stream, value))
+            })
+        })
+        .collect()
+}
+
+// An idle connection holds its frame buffer, its HPACK table at the bound
+// it advertises and its full list of recent resets.
+pub(crate) const H2_INPUT: usize = http2::DEFAULT_FRAME_SIZE
+    + http2::HEADER_LEN
+    + 4096
+    + 50 * std::mem::size_of::<(u32, fictionet::time::Instant)>();
+
+#[test]
+fn immediate_echo_releases_the_request_charge() {
+    let router = Router::new().post("/", |_, request| http::Response::new(request.into_body()));
+    let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 8000);
+    let mut harness = Harness::with_options(
+        Seed::from_u64(1),
+        Http2::new(router),
+        (),
+        fictionet::stdlib::serve::ServeOptions::default().budget(budget.clone()),
+    );
+    let mut input = preface();
+    input.extend(headers(1, "/", false));
+    harness.push(&input).unwrap();
+    let output = frames(&harness.push(&data(1, 3000, true)).unwrap());
+    assert_eq!(statuses(&output), [(1, b"200".to_vec())]);
+    assert_eq!(
+        output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) => Some(d.data.len()),
+                _ => None,
+            })
+            .sum::<usize>(),
+        3000
+    );
+    assert!(!harness.closed());
+    assert_eq!(budget.used(), H2_INPUT);
+}
+
+#[test]
+fn oversized_response_refuses_only_its_stream() {
+    let router = Router::new()
+        .post("/small", |_, _| {
+            http::Response::new(Bytes::from_static(b"ok"))
+        })
+        .post("/large", |_, _| {
+            http::Response::new(Bytes::from(vec![b'x'; 200_000]))
+        });
+    let mut harness = Harness::with_options(
+        Seed::from_u64(1),
+        Http2::new(router),
+        (),
+        fictionet::stdlib::serve::ServeOptions::default()
+            .budget(fictionet::stdlib::serve::Budget::new(128 << 10)),
+    );
+    let mut input = preface();
+    input.extend(headers(1, "/small", true));
+    input.extend(headers(3, "/large", true));
+    let output = frames(&harness.push(&input).unwrap());
+    assert_eq!(
+        statuses(&output),
+        [(1, b"200".to_vec()), (3, b"503".to_vec())]
+    );
+    for id in [1, 3] {
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Data(d) if d.stream == id && d.flags & 1 != 0))
+        );
+    }
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::Data(d) if d.stream == 1 && d.data == b"ok"))
+    );
+    assert!(!harness.closed());
+    assert_eq!(
+        statuses(&frames(&harness.push(&headers(5, "/small", true)).unwrap())),
+        [(5, b"200".to_vec())]
+    );
+}
+
+#[test]
+fn early_response_ends_with_a_successful_reset() {
+    let limits = httpd::Limits {
+        body: 10,
+        ..Default::default()
+    };
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::with(Arc::new(Router::new()), limits),
+        (),
+    );
+    let mut input = preface();
+    input.extend(headers(1, "/", false));
+    input.extend(data(1, 11, false));
+    let output = frames(&harness.push(&input).unwrap());
+    assert_eq!(statuses(&output), [(1, b"413".to_vec())]);
+    let end = output
+        .iter()
+        .position(|f| matches!(f, Frame::Data(d) if d.stream == 1 && d.flags & 1 != 0))
+        .unwrap();
+    let reset = output
+        .iter()
+        .position(|f| matches!(f, Frame::Reset(r) if r.stream == 1 && r.code == 0))
+        .unwrap();
+    assert!(end < reset);
+    assert!(!harness.closed());
+}
+
+#[test]
+fn connection_receive_window_rejects_a_data_burst() {
+    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut input = preface();
+    input.extend(headers(1, "/", false));
+    for _ in 0..8 {
+        input.extend(data(1, 16_384, false));
+    }
+    let output = frames(&harness.push(&input).unwrap());
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::GoAway(g) if g.code == 3))
+    );
+    assert!(harness.closed());
+}
+
+#[test]
+fn stream_receive_window_rejects_only_the_overflowing_stream() {
+    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut input = preface();
+    for id in [1, 3] {
+        input.extend(headers(id, "/", false));
+        input.extend(data(id, 10_000, false));
+        input.extend(data(id, 10_000, false));
+    }
+    let output = frames(&harness.push(&input).unwrap());
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::WindowUpdate(w) if w.stream == 0 && w.increment == 40_000))
+    );
+    assert!(
+        !output
+            .iter()
+            .any(|f| matches!(f, Frame::WindowUpdate(w) if w.stream != 0))
+    );
+    let mut input = Vec::new();
+    for size in [16_384, 16_384, 12_768] {
+        input.extend(data(1, size, false));
+    }
+    let output = frames(&harness.push(&input).unwrap());
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1 && r.code == 3))
+    );
+    assert!(!harness.closed());
+    let output = frames(&harness.push(&data(3, 0, true)).unwrap());
+    assert_eq!(statuses(&output), [(3, b"404".to_vec())]);
+}
+
+#[test]
+fn tiny_data_frames_release_capacity_in_batches() {
+    let limits = httpd::Limits {
+        body: 2 << 20,
+        ..Default::default()
+    };
+    let router = Router::new().post("/", |_, r| {
+        assert_eq!(r.body().len(), 1 << 20);
+        http::Response::new(Bytes::new())
+    });
+    let mut harness = Harness::new(Seed::from_u64(1), Http2::with(Arc::new(router), limits), ());
+    let mut input = preface();
+    input.extend(headers(1, "/", false));
+    harness.push(&input).unwrap();
+    let batch = data(1, 1, false).repeat(32_768);
+    for _ in 0..32 {
+        let bytes = harness.push(&batch).unwrap();
+        assert_eq!(bytes.len(), 26);
+        let output = frames(&bytes);
+        assert_eq!(output.len(), 2);
+        for (frame, id) in output.iter().zip([0, 1]) {
+            assert!(
+                matches!(frame, Frame::WindowUpdate(w) if w.stream == id && w.increment == 32_768)
+            );
+        }
+    }
+    assert_eq!(
+        statuses(&frames(&harness.push(&data(1, 0, true)).unwrap())),
+        [(1, b"200".to_vec())]
+    );
+    assert!(!harness.closed());
+}
+
+#[test]
+fn trailers_after_end_stream_reset_only_that_stream() {
+    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+    let mut input = preface();
+    input.extend(headers(1, "/", true));
+    input.extend(headers(1, "/", true));
+    input.extend(headers(3, "/", true));
+    let output = frames(&harness.push(&input).unwrap());
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1 && r.code == 5))
+    );
+    assert_eq!(statuses(&output), [(3, b"404".to_vec())]);
+    assert!(!harness.closed());
+}
+
+#[test]
+fn invalid_priority_is_a_stream_error() {
+    for (invalid, code) in [
+        // PRIORITY with a 4-byte payload: FRAME_SIZE_ERROR.
+        (vec![0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0], 6),
+        // PRIORITY on stream 1 that depends on stream 1: PROTOCOL_ERROR.
+        (vec![0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0], 1),
+        // GET / as HEADERS on stream 1 that depends on stream 1: PROTOCOL_ERROR.
+        (
+            vec![
+                0, 0, 8, 1, 0x25, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0x83, 0x86, 0x84,
+            ],
+            1,
+        ),
+    ] {
+        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        let mut input = preface();
+        input.extend(invalid);
+        input.extend(headers(3, "/", true));
+        let output = frames(&harness.push(&input).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1 && r.code == code))
+        );
+        assert_eq!(statuses(&output), [(3, b"404".to_vec())]);
+        assert!(!harness.closed());
+    }
+}
+
+#[test]
+fn failing_response_body_is_an_internal_stream_error() {
+    struct Broken;
+    impl http_body::Body for Broken {
+        type Data = Bytes;
+        type Error = fictionet::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Ready(Some(Err(fictionet::Error::msg("body failed"))))
+        }
+    }
+    struct Handler;
+    impl httpd::Handler for Handler {
+        fn call(&self, _: http::Request<httpd::Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+            httpd::Reply::Now(http::Response::new(httpd::Body::new(Broken)))
+        }
+    }
+    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Handler), ());
+    let mut input = preface();
+    input.extend(headers(1, "/", true));
+    let output = frames(&harness.push(&input).unwrap());
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1 && r.code == 2))
+    );
+    assert!(!harness.closed());
+}
+
+#[test]
+fn repeated_header_refusals_exhaust_the_local_reset_limit() {
+    let limits = httpd::Limits {
+        head: fictionet::stdlib::http1::Limits {
+            head: 256,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::with(Arc::new(Router::new()), limits),
+        (),
+    );
+    harness.push(&preface()).unwrap();
+    for n in 0..1025 {
+        let Frame::Headers(mut h) = Frame::parse(&headers(2 * n + 1, "/", true)).unwrap() else {
+            unreachable!()
+        };
+        h.fragment.extend_from_slice(&[0xaf; 10]);
+        let output = frames(&harness.push(&h.to_bytes().unwrap()).unwrap());
+        assert_eq!(statuses(&output), [(2 * n + 1, b"431".to_vec())]);
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.code == 7))
+        );
+        assert_eq!(harness.closed(), n == 1024);
+        if n == 1024 {
+            assert!(
+                output
+                    .iter()
+                    .any(|f| matches!(f, Frame::GoAway(g) if g.code == 11))
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrency_refusals_do_not_exhaust_the_local_reset_limit() {
+    let limits = httpd::Limits {
+        streams: 1,
+        ..Default::default()
+    };
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::with(Arc::new(Router::new()), limits),
+        (),
+    );
+    let mut input = preface();
+    input.extend(headers(1, "/", false));
+    harness.push(&input).unwrap();
+    for n in 1..1100 {
+        let output = frames(&harness.push(&headers(2 * n + 1, "/", true)).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.stream == 2 * n + 1 && r.code == 7))
+        );
+        assert!(!harness.closed());
+    }
+}
+
+#[test]
+fn streamed_chunk_over_budget_resets_only_its_stream() {
+    struct Streamed;
+    impl httpd::Handler for Streamed {
+        fn call(
+            &self,
+            request: http::Request<httpd::Body>,
+            _: &mut httpd::Exchange<'_>,
+        ) -> httpd::Reply {
+            let body = if request.uri().path() == "/large" {
+                httpd::Body::new(http_body_util::Full::new(Bytes::from(vec![b'x'; 200_000])))
+            } else {
+                httpd::Body::from("ok")
+            };
+            httpd::Reply::Now(http::Response::new(body))
+        }
+    }
+    let mut harness = Harness::with_options(
+        Seed::from_u64(1),
+        Http2::new(Streamed),
+        (),
+        fictionet::stdlib::serve::ServeOptions::default()
+            .budget(fictionet::stdlib::serve::Budget::new(128 << 10)),
+    );
+    let mut input = preface();
+    input.extend(headers(1, "/small", true));
+    input.extend(headers(3, "/large", true));
+    let output = frames(&harness.push(&input).unwrap());
+    assert_eq!(
+        statuses(&output),
+        [(1, b"200".to_vec()), (3, b"200".to_vec())]
+    );
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::Data(d) if d.stream == 1 && d.data == b"ok"))
+    );
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::Reset(r) if r.stream == 3 && r.code == 2))
+    );
+    assert!(!harness.closed());
+    assert_eq!(
+        statuses(&frames(&harness.push(&headers(5, "/small", true)).unwrap())),
+        [(5, b"200".to_vec())]
+    );
+}
+
+#[test]
+fn connection_budget_exhaustion_sends_goaway() {
+    let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 1000);
+    let mut harness = Harness::with_options(
+        Seed::from_u64(1),
+        Http2::new(Router::new()),
+        (),
+        fictionet::stdlib::serve::ServeOptions::default().budget(budget.clone()),
+    );
+    harness.push(&preface()).unwrap();
+    let _other = budget.charge(budget.limit() - budget.used()).unwrap();
+    let output = frames(
+        &harness
+            .push(
+                &http2::Ping {
+                    flags: 0,
+                    opaque: [0; 8],
+                }
+                .to_bytes()
+                .unwrap(),
+            )
+            .unwrap(),
+    );
+    assert!(
+        output
+            .iter()
+            .any(|f| matches!(f, Frame::GoAway(g) if g.code == 11))
+    );
+    assert!(harness.closed());
+}
+
+#[test]
+fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
+    let budget = fictionet::stdlib::serve::Budget::new(H2_INPUT + 1024);
+    let mut harness = Harness::with_options(
+        Seed::from_u64(1),
+        Http2::new(Router::new()),
+        (),
+        fictionet::stdlib::serve::ServeOptions::default().budget(budget),
+    );
+    harness.push(&preface()).unwrap();
+    for n in 0..1025 {
+        let Frame::Headers(mut h) = Frame::parse(&headers(2 * n + 1, "/", true)).unwrap() else {
+            unreachable!()
+        };
+        hpack::Field::new("x-large", "x".repeat(4096))
+            .write(&mut h.fragment)
+            .unwrap();
+        let output = frames(&harness.push(&h.to_bytes().unwrap()).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.code == 7))
+        );
+        assert_eq!(harness.closed(), n == 1024);
+        if n == 1024 {
+            assert!(
+                output
+                    .iter()
+                    .any(|f| matches!(f, Frame::GoAway(g) if g.code == 11))
+            );
+        }
+    }
+}
+
+#[test]
+fn deferred_response_budget_refusal_preserves_other_streams() {
+    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |cx| async move {
+        let router = Router::new()
+            .post("/small", |_, _| {
+                http::Response::new(Bytes::from_static(b"ok"))
+            })
+            .route_async(Some(http::Method::POST), "/large", |_, _| async {
+                http::Response::new(Bytes::from(vec![b'x'; 200_000]))
+            });
+        let mut harness = Harness::with_options(
+            Seed::from_u64(1),
+            Http2::new(router),
+            (),
+            fictionet::stdlib::serve::ServeOptions::default()
+                .budget(fictionet::stdlib::serve::Budget::new(128 << 10)),
+        )
+        .with_fcx(cx.clone());
+        let mut input = preface();
+        input.extend(headers(1, "/small", true));
+        input.extend(headers(3, "/large", true));
+        let output = frames(&harness.push(&input).unwrap());
+        assert_eq!(
+            statuses(&output),
+            [(1, b"200".to_vec()), (3, b"503".to_vec())]
+        );
+        assert!(!harness.closed());
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
 }

@@ -470,6 +470,11 @@ fn setting_valid(s: Setting) -> Result<(), Error> {
 }
 impl Frame {
     fn parse_payload(h: FrameHeader, b: &[u8]) -> Result<Self, Error> {
+        Self::parse_payload_for(h, b, false)
+    }
+    /// With `stream_errors`, a HEADERS frame that depends on itself parses, so a
+    /// server can decode its header block before it resets the stream.
+    fn parse_payload_for(h: FrameHeader, b: &[u8], stream_errors: bool) -> Result<Self, Error> {
         h.validate()?;
         if b.len() != h.length {
             return Err(size("payload length does not match header"));
@@ -489,7 +494,7 @@ impl Frame {
                 let payload = HeaderPayload::parse(b, h.kind, flags)?;
                 let priority = if flags & 0x20 != 0 {
                     let p = dependency(payload.fields)?;
-                    if p.stream == stream {
+                    if p.stream == stream && !stream_errors {
                         return Err(protocol("stream depends on itself"));
                     }
                     Some(p)
@@ -849,6 +854,8 @@ impl Inputs {
     }
     /// Requires the client preface and reports recoverable stream errors as
     /// [`Input::Refused`], so a server can reset a stream and continue reading.
+    /// A HEADERS frame that depends on itself comes as a frame, for the server
+    /// to decode its header block and then reset the stream.
     pub fn for_server(limit: usize) -> Self {
         Self {
             stream_errors: true,
@@ -931,19 +938,23 @@ impl Decode for Inputs {
                 HEADER_LEN,
             ));
         }
-        if !self.capture {
+        // A PRIORITY frame of the wrong length is a stream error (RFC 9113
+        // section 6.3), so a server checks its length with the payload.
+        if !self.capture && !(self.stream_errors && header.kind == 2 && header.stream != 0) {
             header.validate()?;
         }
         let Some(bytes) = input.get(..total) else {
             return Ok(Step::Need);
         };
-        let item = match Frame::parse_payload(header, &bytes[HEADER_LEN..]) {
+        let item = match Frame::parse_payload_for(header, &bytes[HEADER_LEN..], self.stream_errors)
+        {
             Ok(frame) => Input::Frame(frame),
             Err(error)
                 if self.stream_errors
                     && header.stream != 0
                     && matches!(header.kind, 2 | 8)
-                    && error.code == ErrorCode::ProtocolError =>
+                    && (error.code == ErrorCode::ProtocolError
+                        || (header.kind == 2 && error.code == ErrorCode::FrameSizeError)) =>
             {
                 Input::Refused {
                     header,
@@ -1240,14 +1251,20 @@ impl HeaderBlocks {
                 .map_or(0, Vec::len),
         )
     }
-    /// Allocated table and fragment storage, including spare capacity.
+    /// The table's settings bound, or its storage when that is larger or
+    /// unbounded, plus allocated fragment storage, including spare capacity.
+    /// The bound keeps the charge for an idle connection constant.
     pub fn allocated(&self) -> usize {
-        self.table.held().saturating_add(
-            self.pending
-                .as_ref()
-                .and_then(|p| p.bytes.as_ref())
-                .map_or(0, Vec::capacity),
-        )
+        let table = self.table.held();
+        self.table
+            .settings_limit()
+            .map_or(table, |limit| limit.max(table))
+            .saturating_add(
+                self.pending
+                    .as_ref()
+                    .and_then(|p| p.bytes.as_ref())
+                    .map_or(0, Vec::capacity),
+            )
     }
     /// Whether a header block waits for its CONTINUATION.
     pub fn pending(&self) -> bool {

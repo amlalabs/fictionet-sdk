@@ -76,16 +76,19 @@ impl http_body::Body for BrokenBody {
 
 struct Http;
 impl httpd::Handler for Http {
-    fn hyper_upgrade(&self, _: &Request<httpd::Body>) -> bool {
-        true
-    }
-
     fn call(
         &self,
         mut request: Request<httpd::Body>,
         ex: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
         if request.uri().path() == "/upgrade" {
+            if request
+                .extensions()
+                .get::<hyper::upgrade::OnUpgrade>()
+                .is_none()
+            {
+                return httpd::Reply::Handoff(request);
+            }
             let upgrade = hyper::upgrade::on(&mut request);
             return httpd::Reply::Later(Box::new(move |cx| {
                 Box::pin(async move {

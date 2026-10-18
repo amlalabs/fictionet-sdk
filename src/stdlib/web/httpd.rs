@@ -53,8 +53,9 @@
 //! after the response is written, including unread bytes. The stdlib's
 //! [`websocket`](fictionet::stdlib::websocket) codec can serve it directly.
 //! With the opt-in `tokio` feature, tower handlers use hyper's HTTP/1 upgrade
-//! extension so axum's `WebSocketUpgrade` continues to work. Custom handlers
-//! that need that extension opt in through `Handler::hyper_upgrade`.
+//! extension so axum's `WebSocketUpgrade` continues to work: the tower adapter
+//! returns [`Reply::Handoff`], and the native server replays the request, body
+//! included, on hyper's HTTP/1 server.
 //!
 //! # Dates
 //!

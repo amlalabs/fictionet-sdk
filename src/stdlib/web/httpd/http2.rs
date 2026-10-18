@@ -1,6 +1,5 @@
 // Copyright (c) 2017 h2 authors
-// Portions adapted from h2 under the MIT license. Permission to use, copy,
-// modify and distribute is granted by the notice in LICENSE-h2 in this directory.
+// Portions adapted from h2 under the MIT license; see LICENSE-h2 in this directory.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
@@ -65,10 +64,10 @@ struct Stream {
     deadline: Option<Instant>,
     remaining: Option<u64>,
     recv_closed: bool,
-    recv_window: i32,
 }
 
 struct Outbound {
+    recv_window: i32,
     window: i32,
     initial: i32,
     frame: usize,
@@ -78,6 +77,7 @@ struct Outbound {
 }
 
 struct Window {
+    recv_window: i32,
     available: i32,
     waker: Option<Waker>,
     accepted: bool,
@@ -104,13 +104,14 @@ impl Http2 {
             streams: BTreeMap::new(),
             send: Arc::new(Mutex::new(Outbound {
                 window: 65_535,
+                recv_window: 65_535,
                 initial: 65_535,
                 frame: wire::DEFAULT_FRAME_SIZE,
                 streams: BTreeMap::new(),
                 pending_resets: 0,
                 encoder: hpack::Encoder::new(0),
             })),
-            resets: VecDeque::new(),
+            resets: VecDeque::with_capacity(RESET_MAX),
             last_stream: 0,
             received_settings: false,
             awaiting_ack: true,
@@ -198,12 +199,8 @@ impl Http2 {
         }
     }
 
-    fn reset(
-        &mut self,
-        id: u32,
-        code: ErrorCode,
-        driver: &mut Driver<'_, Inputs>,
-    ) -> Result<(), wire::Error> {
+    /// Resets stream `id` and ignores its late frames for a while.
+    fn write_reset(&mut self, id: u32, code: ErrorCode, driver: &mut Driver<'_, Inputs>) {
         self.cancel(id, driver);
         write(
             &wire::Reset {
@@ -216,7 +213,17 @@ impl Http2 {
         if self.resets.len() < RESET_MAX && !self.resets.iter().any(|(s, _)| *s == id) {
             self.resets.push_back((id, driver.now() + RESET_LIFETIME));
         }
-        if code != ErrorCode::Cancel && code != ErrorCode::RefusedStream {
+    }
+
+    /// Resets stream `id`. Too many resets for errors end the connection.
+    fn reset(
+        &mut self,
+        id: u32,
+        code: ErrorCode,
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<(), wire::Error> {
+        self.write_reset(id, code, driver);
+        if code != ErrorCode::NoError {
             self.error_resets += 1;
             if self.error_resets > ERROR_RESET_MAX {
                 return Err(problem(
@@ -273,25 +280,38 @@ impl Http2 {
             )),
         };
         let (work, response) = match reply {
-            Reply::Now(response) => (None, Some(response)),
+            Reply::Now(response) => {
+                // A response the budget cannot hold gets 503 instead, so it
+                // does not end the connection's other streams.
+                let response = if Self::room(driver, response_held(&response)) {
+                    response
+                } else {
+                    over_budget()
+                };
+                (None, Some(response))
+            }
             Reply::Later(work) => (Some(work), None),
+            Reply::Handoff(_) => (
+                None,
+                Some(error_response(&Error::msg(
+                    "only HTTP/1.1 requests can be handed off",
+                ))),
+            ),
         };
         driver.defer_keyed(
             u64::from(id),
             Sending {
                 id,
                 send: self.send.clone(),
+                // Only work still making its response holds the request.
+                request_held: if work.is_some() { held } else { 0 },
+                budget: driver.budget().cloned(),
                 work,
                 making: None,
                 response,
                 body: None,
                 rest: Bytes::new(),
                 rest_held: 0,
-                request_held: if received == Received::Complete {
-                    held
-                } else {
-                    0
-                },
                 tracker,
                 extra: None,
                 status: None,
@@ -324,7 +344,10 @@ impl Http2 {
             return Ok(());
         }
         if let Some(stream) = self.streams.get(&id) {
-            if stream.recv_closed || !read.end || !valid_trailers(&block) {
+            if stream.recv_closed {
+                return self.reset(id, ErrorCode::StreamClosed, driver);
+            }
+            if !read.end || !valid_trailers(&block) {
                 return self.reset(id, ErrorCode::ProtocolError, driver);
             }
             if stream.remaining.is_some_and(|n| n != 0) {
@@ -338,14 +361,14 @@ impl Http2 {
             return Ok(());
         }
         if id <= self.last_stream {
-            return Err(problem(
-                ErrorCode::ProtocolError,
-                "headers reopened a closed stream",
-            ));
+            return self.reset(id, ErrorCode::StreamClosed, driver);
         }
         self.last_stream = id;
         if self.draining || self.streams.len() >= self.limits.streams as usize {
-            return self.reset(id, ErrorCode::RefusedStream, driver);
+            // A client can open streams before it reads our SETTINGS or GOAWAY,
+            // so, as in h2, these refusals do not count as errors.
+            self.write_reset(id, ErrorCode::RefusedStream, driver);
+            return Ok(());
         }
         let list_size: usize = block
             .headers
@@ -410,7 +433,6 @@ impl Http2 {
                 deadline: (!read.end).then_some(driver.now() + self.limits.body_timeout),
                 remaining,
                 recv_closed: read.end,
-                recv_window: 65_535,
             },
         );
         let mut send = self.send.lock();
@@ -418,6 +440,7 @@ impl Http2 {
         send.streams.insert(
             id,
             Window {
+                recv_window: 65_535,
                 available: initial,
                 waker: None,
                 accepted: false,
@@ -440,17 +463,19 @@ impl Http2 {
     ) -> Result<(), wire::Error> {
         let id = data.stream;
         let size = data.data.len() + data.padding.as_ref().map_or(0, |p| p.len() + 1);
-        // Collected or discarded bytes are released before another frame is read.
-        // Padding consumes the connection window even on an ignored reset stream.
-        if size > 65_535 {
+        let mut send = self.send.lock();
+        send.recv_window -= size as i32;
+        if send.recv_window < 0 {
             return Err(problem(
                 ErrorCode::FlowControlError,
                 "connection receive window exceeded",
             ));
         }
-        if size != 0 {
-            window_update(0, size, driver.reply());
-        }
+        drop(send);
+        // The connection window counts every DATA frame, padding and frames for
+        // reset streams included. Credit returns after the input batch, so DATA
+        // sent before the client saw a WINDOW_UPDATE must fit the old window.
+        driver.defer_keyed(0, Accept(self.send.clone()));
         if self.ignored(id) {
             return Ok(());
         }
@@ -463,9 +488,14 @@ impl Http2 {
         if stream.recv_closed {
             return self.reset(id, ErrorCode::StreamClosed, driver);
         }
-        if size > stream.recv_window.max(0) as usize {
+        let mut send = self.send.lock();
+        let window = send.streams.get_mut(&id).expect("an admitted stream");
+        window.recv_window -= size as i32;
+        if window.recv_window < 0 {
+            drop(send);
             return self.reset(id, ErrorCode::FlowControlError, driver);
         }
+        drop(send);
         let growth = stream
             .body
             .len()
@@ -483,9 +513,6 @@ impl Http2 {
             }
         }
         stream.recv_closed = data.flags & 1 != 0;
-        if size != 0 && !stream.recv_closed {
-            window_update(id, size, driver.reply());
-        }
         if let Some(tracker) = &mut stream.tracker {
             tracker.body(&data.data);
             if stream.body.len().saturating_add(data.data.len()) > self.limits.body {
@@ -523,6 +550,18 @@ impl Http2 {
         }
         let headers = self.headers.read_frame(&frame)?;
         match frame {
+            // A stream that depends on itself is a stream error (RFC 9113
+            // section 5.3.1). Its block was decoded above, so HPACK stays in step.
+            Frame::Headers(h) if h.priority.is_some_and(|p| p.stream == h.stream) => {
+                if h.stream & 1 == 0 {
+                    return Err(problem(
+                        ErrorCode::ProtocolError,
+                        "client opened an even stream",
+                    ));
+                }
+                self.last_stream = self.last_stream.max(h.stream);
+                self.reset(h.stream, ErrorCode::ProtocolError, driver)?;
+            }
             Frame::Headers(_) | Frame::Continuation(_) => self.headers(headers, driver)?,
             Frame::Data(data) => self.data(data, driver)?,
             Frame::Settings(settings) => {
@@ -706,16 +745,18 @@ impl serve::Service for Http2 {
         let result = match item {
             Input::Frame(frame) => self.frame(frame, driver),
             Input::Refused { header, error, .. } => {
+                // PRIORITY may name a stream in any state, idle ones included
+                // (RFC 9113 section 6.3), so a bad one resets just that stream.
+                let priority = header.kind == 2;
                 if !self.received_settings
                     || self.headers.pending()
-                    || header.stream > self.last_stream
-                    || header.stream & 1 == 0
+                    || (!priority && (header.stream > self.last_stream || header.stream & 1 == 0))
                 {
                     Err(problem(
                         ErrorCode::ProtocolError,
                         "invalid frame on an idle stream or inside headers",
                     ))
-                } else if self.streams.contains_key(&header.stream) {
+                } else if priority || self.streams.contains_key(&header.stream) {
                     self.reset(header.stream, error.code, driver)
                 } else {
                     Ok(())
@@ -775,9 +816,17 @@ impl serve::Service for Http2 {
         if id == 0 {
             return Ok(self.flow(driver));
         }
-        if matches!(done, Done::Failed(_)) || self.streams.get(&id).is_some_and(|s| !s.recv_closed)
-        {
-            if let Err(error) = self.reset(id, ErrorCode::Cancel, driver) {
+        let code = match done {
+            Done::Failed(_) => Some(ErrorCode::InternalError),
+            // The response is complete but the request is not: ask the client
+            // to stop sending it, without an error (RFC 9113 section 8.1).
+            Done::Finished if self.streams.get(&id).is_some_and(|s| !s.recv_closed) => {
+                Some(ErrorCode::NoError)
+            }
+            Done::Finished => None,
+        };
+        if let Some(code) = code {
+            if let Err(error) = self.reset(id, code, driver) {
                 return Ok(self.fail(error, driver));
             }
         } else {
@@ -807,6 +856,10 @@ impl serve::Service for Http2 {
         _: &(),
         driver: &mut Driver<'_, Inputs>,
     ) -> Result<(), Infallible> {
+        if end == Ended::Budget {
+            // Tell the client why its streams stop, rather than just closing.
+            self.goaway(ErrorCode::EnhanceYourCalm, self.last_stream, driver);
+        }
         for (_, mut stream) in std::mem::take(&mut self.streams) {
             if let Some(tracker) = &mut stream.tracker {
                 tracker.received(if end == Ended::Budget {
@@ -832,9 +885,7 @@ impl serve::Service for Http2 {
     }
 
     fn held(&self) -> usize {
-        // The live driver also holds a read scratch buffer while input is decoded.
-        wire::DEFAULT_FRAME_SIZE
-            + self.headers.allocated()
+        self.headers.allocated()
             + self.resets.capacity() * std::mem::size_of::<(u32, Instant)>()
             + self
                 .streams
@@ -990,17 +1041,56 @@ impl Pending for Accept {
         _: &mut Context<'_>,
     ) -> Poll<Option<Result<Vec<u8>, Error>>> {
         let mut send = self.0.lock();
-        for stream in send.streams.values_mut() {
+        let mut out = Vec::new();
+        release_window(0, &mut send.recv_window, &mut out);
+        for (&id, stream) in &mut send.streams {
             stream.accepted = true;
+            release_window(id, &mut stream.recv_window, &mut out);
         }
         send.pending_resets = 0;
-        Poll::Ready(None)
+        if out.is_empty() {
+            Poll::Ready(None)
+        } else {
+            Poll::Ready(Some(Ok(out)))
+        }
     }
+}
+
+/// Returns the credit DATA used once it is at least half of what the client
+/// has left, as h2 does, so many small frames share one WINDOW_UPDATE.
+fn release_window(id: u32, window: &mut i32, out: &mut Vec<u8>) {
+    let used = 65_535 - *window;
+    if used > 0 && used >= *window / 2 {
+        window_update(id, used as usize, out);
+        *window = 65_535;
+    }
+}
+
+fn response_held(response: &Response<Body>) -> usize {
+    let headers = response.headers();
+    let slots = headers.capacity() + headers.len() - headers.keys_len();
+    response.body().full_len()
+        + slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
+        + headers
+            .iter()
+            .map(|(n, v)| n.as_str().len() + v.as_bytes().len())
+            .sum::<usize>()
+}
+
+fn over_budget() -> Response<Body> {
+    answered(
+        text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The server cannot hold this response now.\n",
+        ),
+        "budget",
+    )
 }
 
 type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
 
 struct Sending {
+    budget: Option<serve::Budget>,
     id: u32,
     send: Arc<Mutex<Outbound>>,
     work: Option<Later>,
@@ -1032,6 +1122,14 @@ impl Sending {
                 driver.record(event);
             }
         }
+    }
+
+    /// Whether the budget can hold `size` more bytes once the `released`
+    /// bytes it holds for this response now are let go.
+    fn fits(&self, size: usize, released: usize) -> bool {
+        self.budget.as_ref().is_none_or(|b| {
+            size <= b.limit().saturating_sub(b.used().saturating_sub(released))
+        })
     }
 
     fn headers(&self, fields: &[hpack::Field], end: bool) -> Result<Vec<u8>, Error> {
@@ -1088,10 +1186,13 @@ impl Pending for Sending {
                 Poll::Ready(Err(error)) => error_response(&error),
             };
             self.making = None;
-            self.response = Some(response);
+            // The response replaces the request in the budget. One it cannot
+            // hold gets 503, so the other streams go on.
+            let fits = self.fits(response_held(&response), self.request_held);
+            self.request_held = 0;
+            self.response = Some(if fits { response } else { over_budget() });
         }
         if let Some(response) = self.response.take() {
-            self.request_held = 0;
             let (parts, body) = response.into_parts();
             let now = driver.fcx().map_or(self.asked, Cx::now);
             let date = self.date.and_then(|date| {
@@ -1187,6 +1288,7 @@ impl Pending for Sending {
                     .map_err(Into::into),
                 ));
             };
+            let held = body.full_len();
             match Pin::new(body).poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => self.body = None,
@@ -1196,6 +1298,14 @@ impl Pending for Sending {
                 }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(data) => {
+                        // The headers are out, so a chunk the budget cannot
+                        // hold resets this stream alone.
+                        if !self.fits(data.len(), held) {
+                            self.end(driver, false);
+                            return Poll::Ready(Some(Err(Error::msg(
+                                "response body exceeds budget",
+                            ))));
+                        }
                         self.rest_held = data.len();
                         self.rest = data;
                     }
@@ -1224,16 +1334,7 @@ impl Pending for Sending {
             + self.tracker.held()
             + self.rest_held
             + self.body.as_ref().map_or(0, Body::full_len)
-            + self.response.as_ref().map_or(0, |r| {
-                let headers = r.headers();
-                let slots = headers.capacity() + headers.len() - headers.keys_len();
-                r.body().full_len()
-                    + slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
-                    + headers
-                        .iter()
-                        .map(|(n, v)| n.as_str().len() + v.as_bytes().len())
-                        .sum::<usize>()
-            })
+            + self.response.as_ref().map_or(0, response_held)
     }
 }
 
