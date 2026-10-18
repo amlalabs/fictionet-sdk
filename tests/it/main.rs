@@ -42,6 +42,8 @@ mod http1;
 #[cfg(feature = "tokio")]
 mod http2_grpc;
 #[cfg(feature = "std")]
+mod http2_server;
+#[cfg(feature = "std")]
 mod httpd;
 mod industrial_codec;
 mod interactive_codec;

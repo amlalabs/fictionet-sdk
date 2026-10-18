@@ -28,31 +28,6 @@ use super::{
     UpgradeHandler, date_header, text,
 };
 
-/// Runs hyper's HTTP/2 server on `conn`.
-pub(super) async fn serve<C: Connection + Unpin>(
-    fcx: &Cx,
-    conn: C,
-    handler: Arc<dyn Handler>,
-    info: ConnInfo,
-    opts: &HttpOptions,
-) -> Result<(), Cancelled> {
-    let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let io = Io::new(fcx, conn, broke.clone(), opts.limits.write_timeout);
-    let route = Route::new(fcx, handler, &info, opts);
-    let mut builder = hyper::server::conn::http2::Builder::new(Executor { fcx: fcx.clone() });
-    // hyper would take a `Date` header from the host's clock: the route
-    // writes the world's.
-    // Hyper still refreshes its internal date cache using SystemTime,
-    // but auto_date_header(false) prevents that value reaching the wire.
-    builder.auto_date_header(false);
-    builder.max_concurrent_streams(opts.limits.streams);
-    // h2 retains reset streams using its own host clock. Its public API
-    // cannot inject Cx time; that third-party limitation remains in labs.
-    // hyper reads all the time on HTTP/2, so a reset ends it on its own.
-    let served = builder.serve_connection(io, route);
-    finish(fcx, &info, &broke, None, fcx.race(None, served).await)
-}
-
 /// Runs hyper's HTTP/1 server on `conn`, with upgrades: where
 /// [`Http1`](super::Http1) hands over a connection whose request asks for a protocol
 /// upgrade, such as a WebSocket handshake. The request carries hyper's
@@ -152,21 +127,13 @@ fn report(
 }
 
 /// Why hyper ended a connection with `e`, if it is an error worth an
-/// event: the client's bytes broke HTTP/2, or the TLS under it failed.
+/// event: the client's bytes broke HTTP/1, or the TLS under it failed.
 fn error_cause(e: &hyper::Error) -> Option<&'static str> {
     if e.is_parse() || e.is_parse_too_large() || e.is_parse_status() {
         return Some("protocol");
     }
     let mut source = std::error::Error::source(e);
     while let Some(s) = source {
-        if let Some(e) = s.downcast_ref::<::h2::Error>() {
-            if let Some(io) = e.get_io() {
-                return transport(io);
-            }
-            let protocol =
-                e.is_library() && e.reason().is_some_and(|r| r != ::h2::Reason::NO_ERROR);
-            return protocol.then_some("protocol");
-        }
         if let Some(io) = s.downcast_ref::<std::io::Error>() {
             return transport(io);
         }
@@ -339,7 +306,7 @@ impl hyper::service::Service<Request<Incoming>> for Route {
             status: None,
             sent: 0,
             complete: false,
-            _note: PanicNote::new("an httpd handler over HTTP/2", &route.info),
+            _note: PanicNote::new("an httpd upgrade handler", &route.info),
         };
         Box::pin(async move {
             // Dropped with the future if the client resets the stream.
@@ -414,8 +381,6 @@ impl hyper::service::Service<Request<Incoming>> for Route {
             track.status = Some(parts.status);
             let bodiless = policy.bodiless;
             let body = if bodiless {
-                // hyper would send the body on HTTP/2 even for HEAD,
-                // which breaks the stream.
                 if let Some(len) = policy.len
                     && !parts.headers.contains_key(CONTENT_LENGTH)
                 {
@@ -800,32 +765,6 @@ impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
     }
 }
 
-/// Runs hyper's streams as tasks, which end when the world stops.
-#[derive(Clone)]
-struct Executor {
-    fcx: Cx,
-}
-
-impl<F> hyper::rt::Executor<F> for Executor
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    fn execute(&self, work: F) {
-        self.fcx.spawn(move |fcx| async move {
-            let mut work = pin!(work);
-            let mut stopping = pin!(fcx.cancelled());
-            poll_fn(|cx| {
-                if work.as_mut().poll(cx).is_ready() || stopping.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(());
-                }
-                Poll::Pending
-            })
-            .await;
-            Ok(())
-        });
-    }
-}
-
 /// hyper's timer, on the run's clock.
 #[derive(Clone)]
 struct CxTimer {
@@ -887,9 +826,7 @@ impl hyper::rt::Sleep for CxSleep {}
 
 #[cfg(test)]
 mod tests {
-    use super::super::{PREFACE, Router};
     use super::*;
-    use fictionet::stdlib::json::Value;
     use fictionet::sync::Mutex;
     use hyper::rt::Timer;
 
@@ -963,110 +900,6 @@ mod tests {
                     .sleep_until(later_timer.now() + Duration::from_secs(3))
                     .await;
                 assert_eq!(fcx.now().since_start(), Duration::from_secs(23));
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
-
-    struct StalledBody {
-        input: Bytes,
-    }
-
-    impl Connection for StalledBody {
-        fn poll_read(
-            &mut self,
-            _: &Cx,
-            _: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<Result<usize, ConnError>> {
-            if self.input.is_empty() {
-                return Poll::Pending;
-            }
-            let n = buf.len().min(self.input.len());
-            buf[..n].copy_from_slice(&self.input.split_to(n));
-            Poll::Ready(Ok(n))
-        }
-
-        fn poll_write(
-            &mut self,
-            _: &Cx,
-            _: &mut Context<'_>,
-            data: &[u8],
-        ) -> Poll<Result<usize, ConnError>> {
-            Poll::Ready(Ok(data.len()))
-        }
-
-        fn poll_shutdown(
-            &mut self,
-            _: &Cx,
-            _: &mut Context<'_>,
-        ) -> Poll<Result<(), ConnError>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[test]
-    fn http2_body_timeout_uses_the_fictionet_deadline() {
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            |fcx| async move {
-                let mut input = PREFACE.to_vec();
-                input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
-                // POST / over HTTP, with no END_STREAM on the headers.
-                let block = b"\x83\x86\x84\x01\x01a";
-                input.extend_from_slice(&[0, 0, block.len() as u8, 1, 4, 0, 0, 0, 1]);
-                input.extend_from_slice(block);
-                let conn = StalledBody {
-                    input: Bytes::from(input),
-                };
-                let duration = Duration::from_millis(40);
-                let opts = HttpOptions {
-                    limits: Limits {
-                        body_timeout: duration,
-                        ..Limits::default()
-                    },
-                    ..HttpOptions::default()
-                };
-                let handler = Router::new().post("/", |_, _| {
-                    panic!("a stalled body cannot reach the handler")
-                });
-                let mut served = pin!(serve(
-                    &fcx,
-                    conn,
-                    Arc::new(handler),
-                    ConnInfo::default(),
-                    &opts
-                ));
-                let log = fcx.events();
-                let wait = async {
-                    loop {
-                        if let Some(event) = log.of("http", "request").pop() {
-                            break event;
-                        }
-                        fcx.sleep(Duration::from_millis(1)).await.unwrap();
-                    }
-                };
-                let mut wait = pin!(wait);
-                let event = fcx
-                    .race(
-                        Some(fcx.now() + Duration::from_secs(2)),
-                        poll_fn(|cx| {
-                            assert!(served.as_mut().poll(cx).is_pending());
-                            wait.as_mut().poll(cx)
-                        }),
-                    )
-                    .await
-                    .unwrap();
-                let started = event.get("started").unwrap().as_f64().unwrap();
-                let elapsed = event.at.since_start().as_secs_f64() - started;
-                assert_eq!(elapsed, duration.as_secs_f64());
-                assert_eq!(event.str("answer"), Some("timeout"));
-                assert_eq!(event.u64("status"), Some(408));
-                assert_eq!(event.str("version"), Some("HTTP/2.0"));
-                assert_eq!(event.get("complete").and_then(Value::as_bool), Some(true));
-                assert_eq!(log.of("http", "request").len(), 1);
-                assert!(log.of("http", "error").is_empty());
                 Ok(())
             },
         ))

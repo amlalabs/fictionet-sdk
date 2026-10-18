@@ -3,8 +3,8 @@
 //! virtual hosting, all on [`serve`].
 //!
 //! `Http1` is a caller-driven `Service` on the `http1` decoder.
-//! `serve_connection` runs it over a live connection. HTTP/2 and hyper upgrades
-//! require the `tokio` feature. TLS comes from
+//! [`Http2`] uses the shared HTTP/2 frame layer and HPACK. Both servers run
+//! with `std` alone. `serve_connection` runs them over a live connection. TLS comes from
 //! `fictionet::stdlib::tls`. This module supplies no HTTP client.
 //!
 //! A [`Handler`] answers one request. Three kinds come ready:
@@ -48,18 +48,13 @@
 //! connection after a response, other than `101`, whose handler's
 //! `Connection` header names `close`, and drops the handler's other tokens.
 //!
-//! With `tokio`, a request that asks to switch protocols (`Connection: upgrade` with an
-//! `Upgrade` field, as a WebSocket handshake does) makes [`Http1`] hand
-//! the connection back ([`Upgrade::Handoff`](serve::Upgrade::Handoff)),
-//! and [`serve_connection`] serves the rest of it on hyper's HTTP/1, which
-//! carries out upgrades. The handler sees hyper's `OnUpgrade` in the
-//! request's extensions, so an axum `WebSocketUpgrade` handler, or one that
-//! calls `hyper::upgrade::on`, works on a [`Server`] as it does on hyper.
-//! axum runs the socket in a tokio task, so that world needs a tokio
-//! runtime. Without `tokio`, upgrade requests reach the ordinary handler.
-//! A synchronous handler can return a `101` response with an [`UpgradeHandler`]
-//! in its extensions to serve WebSocket messages on the connection. This
-//! continuation also works with `tokio`.
+//! An upgrade request reaches the native HTTP/1 handler. A synchronous handler
+//! returns `101` with an [`UpgradeHandler`] extension to receive the connection
+//! after the response is written, including unread bytes. The stdlib's
+//! [`websocket`](fictionet::stdlib::websocket) codec can serve it directly.
+//! With the opt-in `tokio` feature, tower handlers use hyper's HTTP/1 upgrade
+//! extension so axum's `WebSocketUpgrade` continues to work. Custom handlers
+//! that need that extension opt in through `Handler::hyper_upgrade`.
 //!
 //! # Dates
 //!
@@ -72,21 +67,16 @@
 //! set in 2019 never sends a date from the year it runs in. A `Date` the
 //! handler sets itself is sent as it is.
 //!
-//! HTTP/2 runs on hyper, behind the same [`Handler`] trait and the
-//! same events, with the same [`Limits`] and seeded randomness. It charges
-//! the request heads, request events and bodies it holds to the connection's
-//! [`Budget`]. A request head stays charged while its handler waits. Its
-//! event stays charged until it is recorded, including while a response
-//! streams. If hyper cannot charge the metadata, it rejects the stream
-//! before calling the handler and records `answer: budget` without a status.
-//! Transport buffers and hyper's own buffers are not charged. HTTP/2 request
-//! body and write stall timeouts use Fictionet deadlines. Hyper runs without a
-//! timer, with keep-alive pings and adaptive windows disabled. h2 retains
-//! reset streams for its default `reset_stream_duration` of one second of
-//! real time. Its reset-stream expiry reads the system clock, so late
-//! frames for a stream the world reset more than one real second earlier
-//! can behave differently between lab runs. Hyper does not let a server
-//! change that setting, and h2 exposes no clock injection for it.
+//! HTTP/2 uses the same [`Handler`], events, [`Limits`] and seeded randomness.
+//! The serve driver charges input and output storage, HPACK state, stream
+//! metadata, retained request heads and bodies, and pending responses to the
+//! connection's [`Budget`]. A head that does not fit is refused before its
+//! handler runs, with `answer: budget` and no status. A body that exceeds its
+//! allowance receives `503`. Transport storage belongs to its transport.
+//! Body deadlines, SETTINGS acknowledgment deadlines and reset-stream expiry
+//! all use the driver's world clock. Stream flow control, reset limits and
+//! bounded header assembly apply independently of the runtime. PING and GOAWAY
+//! are handled by the service; graceful shutdown drains admitted streams.
 //!
 //! ```
 //! use bytes::Bytes;
@@ -123,7 +113,7 @@
 //! connection took) and `complete`
 //! (whether it took the whole body). Over HTTP/1 a byte counts once it is
 //! written, and the event is made after the last one is; over HTTP/2 once
-//! hyper takes it for the stream. A handler adds its own fields by putting
+//! the service queues it for the stream. A handler adds its own fields by putting
 //! [`Fields`] in its response's extensions. An opt-in [`Observer`] sees the
 //! head before virtual hosting and admission, body chunks before limits
 //! discard them, and the receipt outcome. Install it with [`Http1::observe`],
@@ -143,7 +133,7 @@
 //! connection reset, budget end or cancellation. An HTTP/1.1 request without
 //! Host is answered from bytes buffered with its head; later body bytes are
 //! not observed, leaving `received: cut_off` unless already too large.
-//! Hyper observes each data frame it reads and stops reading at rejection.
+//! HTTP/2 observes each data frame it admits and stops observing at rejection.
 //! Only decoded body data is observed, not chunk framing, chunk extensions
 //! or trailers.
 //! Neither backend relaxes its limits to observe more bytes. Requests rejected
@@ -173,6 +163,8 @@ use fictionet::{Cancelled, Cx};
 mod body;
 #[path = "httpd/handlers.rs"]
 mod handlers;
+#[path = "httpd/http2.rs"]
+mod http2;
 #[path = "httpd/http1.rs"]
 mod native;
 #[path = "httpd/response.rs"]
@@ -181,9 +173,9 @@ mod response;
 mod sites;
 
 fictionet::cfg_tokio! {
-/// Live HTTP/2 and HTTP/1 Upgrade serving on hyper.
+/// The opt-in tower HTTP/1 upgrade adapter.
 #[path = "httpd/hyper.rs"]
-mod h2;
+mod upgrade;
 }
 
 pub use body::Body;
@@ -191,6 +183,7 @@ pub use handlers::{
     BadGateway, Exchange, Handler, Later, Reply, Router, Tower, UpgradeHandler, text, tower,
 };
 
+pub use http2::Http2;
 pub use native::Http1;
 pub use response::{date_header, http_date};
 pub use sites::{Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
@@ -332,11 +325,11 @@ pub struct HttpOptions {
     /// the HTTP/1 head limit allows.
     pub first_bytes: Option<Duration>,
     /// What connections are charged to ([`ServeOptions::budget`]): over
-    /// HTTP/1 what the service holds, over HTTP/2 each request's head and body,
+    /// HTTP/1 and HTTP/2 what the driver and service hold, including each request's head and body,
     /// its event metadata, and each response frame until its last slice is
     /// dropped. Heads count method, URI and header bytes, plus header slots;
     /// hidden capacities, extensions and third-party overhead are excluded.
-    /// Events use [`Event::size`](fictionet::events::Event::size). Transport and hyper buffers are excluded.
+    /// Events use [`Event::size`](fictionet::events::Event::size). Transport buffers are excluded.
     /// Response storage is charged by its original byte length; spare capacity
     /// and backing storage outside a supplied slice are not exposed by `Bytes`.
     pub budget: Option<Budget>,
@@ -345,14 +338,11 @@ pub struct HttpOptions {
     pub date: Option<SystemTime>,
 }
 
-fictionet::cfg_tokio! {
-/// What an HTTP/2 client sends first, with no TLS ("prior knowledge").
-const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-}
+use fictionet::stdlib::http2::PREFACE;
 
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
-/// otherwise. HTTP/2 and hyper upgrades require the `tokio` feature.
+/// otherwise. Both versions work with `std`; hyper upgrades require `tokio`.
 /// `info` names the connection in events.
 /// An empty half-close is silent. EOF within an HTTP/2 preface goes through
 /// HTTP/1's truncated-head handling: `http.error` with cause `protocol` and 400.
@@ -374,15 +364,14 @@ pub async fn serve_connection<C: Connection + Unpin>(
     let head_deadline = fcx.now() + opts.limits.header_timeout;
     let first_timeout = opts.first_bytes.unwrap_or(opts.limits.header_timeout);
     let h2 = if info.tls {
-        fictionet::cfg_tokio!({ info.alpn.as_deref() == Some(b"h2".as_slice()) } else { false })
+        info.alpn.as_deref() == Some(b"h2".as_slice())
     } else {
         // With HTTP/2, read enough to identify its preface. Otherwise,
         // wait for one byte to enforce the first-byte timeout.
         let preface = async {
             let mut buf = [0u8; 24];
-            while fictionet::cfg_tokio!({ first.len() < PREFACE.len() && PREFACE.starts_with(&first) } else { first.is_empty() })
-            {
-                let room = fictionet::cfg_tokio!({ PREFACE.len() - first.len() } else { 1 });
+            while first.len() < PREFACE.len() && PREFACE.starts_with(&first) {
+                let room = PREFACE.len() - first.len();
                 match conn.read(fcx, &mut buf[..room]).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => first.extend_from_slice(&buf[..n]),
@@ -405,14 +394,9 @@ pub async fn serve_connection<C: Connection + Unpin>(
                 return Ok(());
             }
         }
-        fictionet::cfg_tokio!({ first == PREFACE } else { false })
+        first == PREFACE
     };
     let conn = Prefixed::new(first, conn);
-    fictionet::cfg_tokio!({
-        if h2 {
-            return h2::serve(fcx, conn, handler, info, opts).await;
-        }
-    } else { let _ = h2; });
     let serve_opts = ServeOptions {
         idle: None,
         write_timeout: Some(opts.limits.write_timeout),
@@ -420,6 +404,18 @@ pub async fn serve_connection<C: Connection + Unpin>(
         budget: opts.budget.clone(),
         ..ServeOptions::default()
     };
+    if h2 {
+        let mut service = Http2::with(handler, opts.limits);
+        service.observe = opts.observe.clone();
+        service.date = opts
+            .date
+            .and_then(|date| date.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|date| date.as_secs());
+        return match serve::connection(fcx, conn, info, &mut service, &(), &serve_opts).await {
+            Err(serve::ServeError::Cancelled) => Err(Cancelled),
+            _ => Ok(()),
+        };
+    }
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
     service.observe = opts.observe.clone();
@@ -439,7 +435,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
             fictionet::cfg_tokio! {
                 // Hyper reads the request again and carries out its upgrade.
                 if let Some(head) = service.take_handoff() {
-                    return h2::serve_upgrade(
+                    return upgrade::serve_upgrade(
                         fcx, Prefixed::new(head, rest), handler, info, opts,
                     ).await;
                 }

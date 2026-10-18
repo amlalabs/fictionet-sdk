@@ -76,6 +76,10 @@ impl http_body::Body for BrokenBody {
 
 struct Http;
 impl httpd::Handler for Http {
+    fn hyper_upgrade(&self, _: &Request<httpd::Body>) -> bool {
+        true
+    }
+
     fn call(
         &self,
         mut request: Request<httpd::Body>,

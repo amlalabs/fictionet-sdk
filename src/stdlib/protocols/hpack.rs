@@ -406,6 +406,15 @@ impl Table {
     pub fn table_size(&self) -> usize {
         self.size
     }
+    /// Allocated dynamic-table storage, including entry slots and string capacity.
+    pub fn held(&self) -> usize {
+        self.table.capacity() * std::mem::size_of::<(Arc<[u8]>, Vec<u8>)>()
+            + self
+                .table
+                .iter()
+                .map(|(name, value)| name.len() + value.capacity())
+                .sum::<usize>()
+    }
     /// The number of retained table entries.
     pub fn table_len(&self) -> usize {
         self.table.len()
@@ -418,7 +427,7 @@ impl Table {
     /// Discards entries and the last size update after a missing or malformed block.
     /// Settings bounds remain in effect. Later references to lost entries are unknown.
     pub fn forget(&mut self) {
-        self.table.clear();
+        self.table = VecDeque::new();
         self.size = 0;
         self.unsure = true;
         self.max = None;
@@ -591,6 +600,10 @@ impl Encoder {
     /// The retained dynamic table size, including entry overhead.
     pub fn table_size(&self) -> usize {
         self.table.size
+    }
+    /// Allocated dynamic-table storage, including spare entry slots.
+    pub fn held(&self) -> usize {
+        self.table.held()
     }
     /// Applies the peer's settings limit, capped at [`MAX_TABLE`].
     /// A reduction shrinks the table and queues the required size update.

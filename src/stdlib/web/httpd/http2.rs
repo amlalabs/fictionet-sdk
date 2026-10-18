@@ -1,0 +1,1348 @@
+// Copyright (c) 2017 h2 authors
+// Portions adapted from h2 under the MIT license. Permission to use, copy,
+// modify and distribute is granted by the notice in LICENSE-h2 in this directory.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
+use bytes::Bytes;
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
+use http_body::Body as _;
+
+use fictionet::events::Fields;
+use fictionet::stdlib::codec::{Fail, Wire};
+use fictionet::stdlib::hpack;
+use fictionet::stdlib::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
+use fictionet::stdlib::serve::{self, Done, Driver, Ended, Flow, Pending, PendingDriver, Timer};
+use fictionet::sync::Mutex;
+use fictionet::time::Instant;
+use fictionet::{Cx, Error};
+
+use super::response::{
+    ResponsePolicy, Tracker, answered, error_event, error_response, request_held,
+};
+use super::{Body, Exchange, Handler, Later, Limits, Observer, Received, Reply, text};
+
+const DEADLINE: Timer = "http2 deadline";
+const RESET_LIFETIME: Duration = Duration::from_secs(1);
+const RESET_MAX: usize = 50;
+const PENDING_RESET_MAX: usize = 20;
+const ERROR_RESET_MAX: usize = 1024;
+
+/// HTTP/2 for one connection, driven by bytes and the serve driver's clock.
+/// Uses the shared frame codec and HPACK decoder, with independently scheduled
+/// responses. No runtime is required, including in a [`serve::Harness`].
+pub struct Http2 {
+    handler: Arc<dyn Handler>,
+    limits: Limits,
+    pub(super) observe: Option<Arc<dyn Observer>>,
+    pub(super) date: Option<u64>,
+    headers: wire::HeaderBlocks,
+    streams: BTreeMap<u32, Stream>,
+    send: Arc<Mutex<Outbound>>,
+    resets: VecDeque<(u32, Instant)>,
+    last_stream: u32,
+    received_settings: bool,
+    awaiting_ack: bool,
+    settings_deadline: Option<Instant>,
+    continuations: usize,
+    error_resets: usize,
+    draining: bool,
+    shutdown_ping: Option<[u8; 8]>,
+    shutdown_requested: bool,
+    goaway_last: Option<u32>,
+}
+
+struct Stream {
+    request: Option<Request<Body>>,
+    body: Vec<u8>,
+    tracker: Option<Tracker>,
+    deadline: Option<Instant>,
+    remaining: Option<u64>,
+    recv_closed: bool,
+    recv_window: i32,
+}
+
+struct Outbound {
+    window: i32,
+    initial: i32,
+    frame: usize,
+    streams: BTreeMap<u32, Window>,
+    pending_resets: usize,
+    encoder: hpack::Encoder,
+}
+
+struct Window {
+    available: i32,
+    waker: Option<Waker>,
+    accepted: bool,
+}
+
+impl Http2 {
+    /// Answers requests using the default limits.
+    pub fn new(handler: impl Handler) -> Self {
+        Self::with(Arc::new(handler), Limits::default())
+    }
+
+    /// Answers requests using the supplied handler and limits.
+    pub fn with(handler: Arc<dyn Handler>, limits: Limits) -> Self {
+        Self {
+            handler,
+            limits,
+            observe: None,
+            date: None,
+            headers: wire::HeaderBlocks::with_limits(wire::Limits {
+                header_list: limits.head.head,
+                header_block: limits.head.head,
+                ..wire::Limits::default()
+            }),
+            streams: BTreeMap::new(),
+            send: Arc::new(Mutex::new(Outbound {
+                window: 65_535,
+                initial: 65_535,
+                frame: wire::DEFAULT_FRAME_SIZE,
+                streams: BTreeMap::new(),
+                pending_resets: 0,
+                encoder: hpack::Encoder::new(0),
+            })),
+            resets: VecDeque::new(),
+            last_stream: 0,
+            received_settings: false,
+            awaiting_ack: true,
+            settings_deadline: None,
+            continuations: 0,
+            error_resets: 0,
+            draining: false,
+            shutdown_ping: None,
+            shutdown_requested: false,
+            goaway_last: None,
+        }
+    }
+
+    /// Observes request heads, body chunks and receipt outcomes.
+    pub fn observe(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observe = Some(observer);
+        self
+    }
+
+    /// Begins graceful shutdown on the next driver wake or input.
+    /// A GOAWAY and PING round trip establishes which requests were in flight;
+    /// those requests finish before the connection closes.
+    pub fn graceful_shutdown(&mut self) {
+        self.shutdown_requested = true;
+    }
+
+    fn room(driver: &Driver<'_, Inputs>, additional: usize) -> bool {
+        driver
+            .budget()
+            .as_ref()
+            .is_none_or(|b| additional <= b.limit().saturating_sub(b.used()))
+    }
+
+    fn arm(&self, driver: &mut Driver<'_, Inputs>) {
+        let deadline = self
+            .streams
+            .values()
+            .filter_map(|s| s.deadline)
+            .chain(self.resets.front().map(|(_, at)| *at))
+            .chain(self.settings_deadline)
+            .min();
+        if let Some(at) = deadline {
+            driver.set_timer(
+                DEADLINE,
+                at.since_start().saturating_sub(driver.now().since_start()),
+            );
+        } else {
+            driver.cancel_timer(DEADLINE);
+        }
+    }
+
+    fn goaway(&mut self, code: ErrorCode, last: u32, driver: &mut Driver<'_, Inputs>) {
+        let last = last.min(self.goaway_last.unwrap_or(wire::MAX_WINDOW));
+        self.goaway_last = Some(last);
+        write(
+            &wire::GoAway {
+                flags: 0,
+                last_stream: last,
+                code: code as u32,
+                debug: Vec::new(),
+            },
+            driver.reply(),
+        );
+    }
+
+    fn fail(&mut self, error: wire::Error, driver: &mut Driver<'_, Inputs>) -> Flow {
+        driver.record(error_event(driver.conn(), "protocol", error.to_string()));
+        self.goaway(error.code, self.last_stream, driver);
+        Flow::Close
+    }
+
+    fn cancel(&mut self, id: u32, driver: &mut Driver<'_, Inputs>) {
+        driver.cancel_keyed(u64::from(id));
+        self.send.lock().streams.remove(&id);
+        if let Some(mut stream) = self.streams.remove(&id)
+            && let Some(tracker) = &mut stream.tracker
+            && let Some(event) = tracker.finish(
+                Some(Fields::new().with("answer", "cut_off")),
+                None,
+                0,
+                false,
+            )
+        {
+            driver.record(event);
+        }
+    }
+
+    fn reset(
+        &mut self,
+        id: u32,
+        code: ErrorCode,
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<(), wire::Error> {
+        self.cancel(id, driver);
+        write(
+            &wire::Reset {
+                stream: id,
+                flags: 0,
+                code: code as u32,
+            },
+            driver.reply(),
+        );
+        if self.resets.len() < RESET_MAX && !self.resets.iter().any(|(s, _)| *s == id) {
+            self.resets.push_back((id, driver.now() + RESET_LIFETIME));
+        }
+        if code != ErrorCode::Cancel && code != ErrorCode::RefusedStream {
+            self.error_resets += 1;
+            if self.error_resets > ERROR_RESET_MAX {
+                return Err(problem(
+                    ErrorCode::EnhanceYourCalm,
+                    "too many local error resets",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn ignored(&self, id: u32) -> bool {
+        self.resets.iter().any(|(s, _)| *s == id)
+    }
+
+    fn dispatch(&mut self, id: u32, received: Received, driver: &mut Driver<'_, Inputs>) {
+        let stream = self.streams.get_mut(&id).expect("an admitted stream");
+        stream.deadline = None;
+        let mut request = stream.request.take().expect("request dispatched once");
+        let mut tracker = stream.tracker.take().expect("request has a tracker");
+        tracker.received(received);
+        let held = request_held(&request) + stream.body.capacity();
+        *request.body_mut() = Body::from(std::mem::take(&mut stream.body));
+        let head_only = request.method() == Method::HEAD;
+        let reply = match received {
+            Received::Complete => self.handler.call(
+                request,
+                &mut Exchange::new(driver.now(), driver.entropy(), driver.conn()),
+            ),
+            Received::TooLarge => Reply::Now(answered(
+                text(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "The request body is too large.\n",
+                ),
+                "too_large",
+            )),
+            Received::Budget => Reply::Now(answered(
+                text(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The server cannot hold this request now.\n",
+                ),
+                "budget",
+            )),
+            Received::Timeout => Reply::Now(answered(
+                text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "The request body took too long.\n",
+                ),
+                "timeout",
+            )),
+            Received::CutOff => Reply::Now(answered(
+                text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"),
+                "cut_off",
+            )),
+        };
+        let (work, response) = match reply {
+            Reply::Now(response) => (None, Some(response)),
+            Reply::Later(work) => (Some(work), None),
+        };
+        driver.defer_keyed(
+            u64::from(id),
+            Sending {
+                id,
+                send: self.send.clone(),
+                work,
+                making: None,
+                response,
+                body: None,
+                rest: Bytes::new(),
+                rest_held: 0,
+                request_held: if received == Received::Complete {
+                    held
+                } else {
+                    0
+                },
+                tracker,
+                extra: None,
+                status: None,
+                head_only,
+                date: self.date,
+                asked: driver.now(),
+                sent: 0,
+                finished: false,
+                end_sent: false,
+            },
+        );
+    }
+
+    fn headers(
+        &mut self,
+        read: wire::BlockRead,
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<(), wire::Error> {
+        let Some(block) = read.block else {
+            return Ok(());
+        };
+        let id = read.stream;
+        if id & 1 == 0 {
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "client opened an even stream",
+            ));
+        }
+        if self.ignored(id) {
+            return Ok(());
+        }
+        if let Some(stream) = self.streams.get(&id) {
+            if stream.recv_closed || !read.end || !valid_trailers(&block) {
+                return self.reset(id, ErrorCode::ProtocolError, driver);
+            }
+            if stream.remaining.is_some_and(|n| n != 0) {
+                return self.reset(id, ErrorCode::ProtocolError, driver);
+            }
+            let stream = self.streams.get_mut(&id).unwrap();
+            stream.recv_closed = true;
+            if stream.request.is_some() {
+                self.dispatch(id, Received::Complete, driver);
+            }
+            return Ok(());
+        }
+        if id <= self.last_stream {
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "headers reopened a closed stream",
+            ));
+        }
+        self.last_stream = id;
+        if self.draining || self.streams.len() >= self.limits.streams as usize {
+            return self.reset(id, ErrorCode::RefusedStream, driver);
+        }
+        let list_size: usize = block
+            .headers
+            .iter()
+            .map(|h| {
+                h.name.as_ref().map_or(0, Vec::len) + h.value.as_ref().map_or(0, Vec::len) + 32
+            })
+            .sum();
+        if block.more != 0
+            || block.headers.len() > self.limits.head.headers
+            || list_size > self.limits.head.head
+        {
+            let mut fragment = Vec::new();
+            self.send
+                .lock()
+                .encoder
+                .encode_block(&[hpack::Field::new(":status", "431")], &mut fragment)
+                .expect("static header");
+            write(
+                &wire::Headers {
+                    stream: id,
+                    flags: 5,
+                    fragment,
+                    priority: None,
+                    padding: None,
+                },
+                driver.reply(),
+            );
+            return self.reset(id, ErrorCode::RefusedStream, driver);
+        }
+        let Some(mut request) = request(block, self.limits) else {
+            return self.reset(id, ErrorCode::ProtocolError, driver);
+        };
+        let remaining = match content_length(request.headers()) {
+            Ok(n) => n,
+            Err(()) => return self.reset(id, ErrorCode::ProtocolError, driver),
+        };
+        if read.end && remaining.is_some_and(|n| n != 0) {
+            return self.reset(id, ErrorCode::ProtocolError, driver);
+        }
+        let mut tracker = Tracker::observing(&request, driver.conn(), self.observe.clone());
+        tracker.start(&request, driver.conn(), driver.now());
+        if !Self::room(
+            driver,
+            request_held(&request) + tracker.held() + std::mem::size_of::<Stream>(),
+        ) {
+            tracker.received(Received::Budget);
+            if let Some(event) =
+                tracker.finish(Some(Fields::new().with("answer", "budget")), None, 0, false)
+            {
+                driver.record(event);
+            }
+            return self.reset(id, ErrorCode::RefusedStream, driver);
+        }
+        request.extensions_mut().insert(driver.conn().clone());
+        self.streams.insert(
+            id,
+            Stream {
+                request: Some(request),
+                body: Vec::new(),
+                tracker: Some(tracker),
+                deadline: (!read.end).then_some(driver.now() + self.limits.body_timeout),
+                remaining,
+                recv_closed: read.end,
+                recv_window: 65_535,
+            },
+        );
+        let mut send = self.send.lock();
+        let initial = send.initial;
+        send.streams.insert(
+            id,
+            Window {
+                available: initial,
+                waker: None,
+                accepted: false,
+            },
+        );
+        drop(send);
+        // Acceptance runs after the current input batch so a reset burst cannot
+        // accumulate abandoned requests faster than the application drains them.
+        driver.defer_keyed(0, Accept(self.send.clone()));
+        if read.end {
+            self.dispatch(id, Received::Complete, driver);
+        }
+        Ok(())
+    }
+
+    fn data(
+        &mut self,
+        data: wire::Data,
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<(), wire::Error> {
+        let id = data.stream;
+        let size = data.data.len() + data.padding.as_ref().map_or(0, |p| p.len() + 1);
+        // Collected or discarded bytes are released before another frame is read.
+        // Padding consumes the connection window even on an ignored reset stream.
+        if size > 65_535 {
+            return Err(problem(
+                ErrorCode::FlowControlError,
+                "connection receive window exceeded",
+            ));
+        }
+        if size != 0 {
+            window_update(0, size, driver.reply());
+        }
+        if self.ignored(id) {
+            return Ok(());
+        }
+        let Some(stream) = self.streams.get(&id) else {
+            if id > self.last_stream || id & 1 == 0 {
+                return Err(problem(ErrorCode::ProtocolError, "data on an idle stream"));
+            }
+            return self.reset(id, ErrorCode::StreamClosed, driver);
+        };
+        if stream.recv_closed {
+            return self.reset(id, ErrorCode::StreamClosed, driver);
+        }
+        if size > stream.recv_window.max(0) as usize {
+            return self.reset(id, ErrorCode::FlowControlError, driver);
+        }
+        let growth = stream
+            .body
+            .len()
+            .saturating_add(data.data.len())
+            .saturating_sub(stream.body.capacity());
+        let room = Self::room(driver, growth);
+        let stream = self.streams.get_mut(&id).unwrap();
+        if let Some(remaining) = &mut stream.remaining {
+            let Some(n) = remaining.checked_sub(data.data.len() as u64) else {
+                return self.reset(id, ErrorCode::ProtocolError, driver);
+            };
+            *remaining = n;
+            if data.flags & 1 != 0 && n != 0 {
+                return self.reset(id, ErrorCode::ProtocolError, driver);
+            }
+        }
+        stream.recv_closed = data.flags & 1 != 0;
+        if size != 0 && !stream.recv_closed {
+            window_update(id, size, driver.reply());
+        }
+        if let Some(tracker) = &mut stream.tracker {
+            tracker.body(&data.data);
+            if stream.body.len().saturating_add(data.data.len()) > self.limits.body {
+                self.dispatch(id, Received::TooLarge, driver);
+            } else if !room || stream.body.try_reserve_exact(data.data.len()).is_err() {
+                self.dispatch(id, Received::Budget, driver);
+            } else {
+                stream.body.extend_from_slice(&data.data);
+                if stream.recv_closed {
+                    self.dispatch(id, Received::Complete, driver);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn frame(&mut self, frame: Frame, driver: &mut Driver<'_, Inputs>) -> Result<(), wire::Error> {
+        if !self.received_settings && !matches!(&frame, Frame::Settings(s) if s.flags & 1 == 0) {
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "first frame is not SETTINGS",
+            ));
+        }
+        if matches!(frame, Frame::Continuation(_)) {
+            self.continuations += 1;
+            let minimum = (self.limits.head.head / wire::DEFAULT_FRAME_SIZE).max(1);
+            if self.continuations > minimum.saturating_add(minimum >> 2).max(5) {
+                return Err(problem(
+                    ErrorCode::EnhanceYourCalm,
+                    "too many continuation frames",
+                ));
+            }
+        } else {
+            self.continuations = 0;
+        }
+        let headers = self.headers.read_frame(&frame)?;
+        match frame {
+            Frame::Headers(_) | Frame::Continuation(_) => self.headers(headers, driver)?,
+            Frame::Data(data) => self.data(data, driver)?,
+            Frame::Settings(settings) => {
+                if settings.flags & 1 != 0 {
+                    if !self.awaiting_ack {
+                        return Err(problem(
+                            ErrorCode::ProtocolError,
+                            "unexpected SETTINGS acknowledgment",
+                        ));
+                    }
+                    self.awaiting_ack = false;
+                    self.settings_deadline = None;
+                } else {
+                    self.received_settings = true;
+                    write(
+                        &wire::Settings {
+                            flags: 1,
+                            entries: Vec::new(),
+                        },
+                        driver.reply(),
+                    );
+                    let mut send = self.send.lock();
+                    for setting in settings.entries {
+                        match setting.id {
+                            1 => send.encoder.set_settings_limit(setting.value as usize),
+                            4 => {
+                                let initial = setting.value as i32;
+                                let delta = initial - send.initial;
+                                for window in send.streams.values_mut() {
+                                    window.available =
+                                        window.available.checked_add(delta).ok_or_else(|| {
+                                            problem(
+                                                ErrorCode::FlowControlError,
+                                                "initial window overflow",
+                                            )
+                                        })?;
+                                    if let Some(waker) = window.waker.take() {
+                                        waker.wake();
+                                    }
+                                }
+                                send.initial = initial;
+                            }
+                            5 => send.frame = setting.value as usize,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Frame::WindowUpdate(update) => {
+                let mut send = self.send.lock();
+                if update.stream == 0 {
+                    send.window = send
+                        .window
+                        .checked_add(update.increment as i32)
+                        .ok_or_else(|| {
+                            problem(ErrorCode::FlowControlError, "connection window overflow")
+                        })?;
+                    for window in send.streams.values_mut() {
+                        if let Some(waker) = window.waker.take() {
+                            waker.wake();
+                        }
+                    }
+                } else if let Some(window) = send.streams.get_mut(&update.stream) {
+                    if let Some(n) = window.available.checked_add(update.increment as i32) {
+                        window.available = n;
+                        if let Some(waker) = window.waker.take() {
+                            waker.wake();
+                        }
+                    } else {
+                        drop(send);
+                        self.reset(update.stream, ErrorCode::FlowControlError, driver)?;
+                    }
+                } else if update.stream > self.last_stream || update.stream & 1 == 0 {
+                    return Err(problem(
+                        ErrorCode::ProtocolError,
+                        "window update on idle stream",
+                    ));
+                }
+            }
+            Frame::Reset(reset) => {
+                if reset.stream > self.last_stream || reset.stream & 1 == 0 {
+                    return Err(problem(ErrorCode::ProtocolError, "reset on idle stream"));
+                }
+                let mut send = self.send.lock();
+                if send.streams.get(&reset.stream).is_some_and(|s| !s.accepted) {
+                    send.pending_resets += 1;
+                    if send.pending_resets > PENDING_RESET_MAX {
+                        return Err(problem(
+                            ErrorCode::EnhanceYourCalm,
+                            "too many pending request resets",
+                        ));
+                    }
+                }
+                drop(send);
+                self.cancel(reset.stream, driver);
+            }
+            Frame::Ping(ping) if ping.flags & 1 == 0 => {
+                write(
+                    &wire::Ping {
+                        flags: 1,
+                        opaque: ping.opaque,
+                    },
+                    driver.reply(),
+                );
+            }
+            Frame::Ping(ping) => {
+                if self.shutdown_ping == Some(ping.opaque) {
+                    self.shutdown_ping = None;
+                    self.draining = true;
+                    self.goaway(ErrorCode::NoError, self.last_stream, driver);
+                }
+            }
+            Frame::GoAway(_) => {
+                self.draining = true;
+                self.goaway(ErrorCode::NoError, self.last_stream, driver);
+            }
+            Frame::PushPromise(_) => {
+                return Err(problem(
+                    ErrorCode::ProtocolError,
+                    "client sent PUSH_PROMISE",
+                ));
+            }
+            Frame::Priority(_) | Frame::Unknown(_) => {}
+        }
+        Ok(())
+    }
+
+    fn flow(&mut self, driver: &mut Driver<'_, Inputs>) -> Flow {
+        if self.shutdown_requested && self.shutdown_ping.is_none() && !self.draining {
+            self.shutdown_requested = false;
+            let opaque = driver.random_u64().to_be_bytes();
+            self.shutdown_ping = Some(opaque);
+            self.goaway(ErrorCode::NoError, wire::MAX_WINDOW, driver);
+            write(&wire::Ping { flags: 0, opaque }, driver.reply());
+        }
+        self.arm(driver);
+        if self.draining && self.streams.is_empty() {
+            Flow::Close
+        } else {
+            Flow::Continue
+        }
+    }
+}
+
+impl serve::Service for Http2 {
+    type Decoder = Inputs;
+    type State = ();
+    type Error = Infallible;
+
+    fn decoder(&self) -> Inputs {
+        Inputs::for_server(wire::DEFAULT_FRAME_SIZE)
+    }
+
+    fn on_open(&mut self, _: &(), driver: &mut Driver<'_, Inputs>) -> Result<Flow, Infallible> {
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![
+                    wire::Setting {
+                        id: 3,
+                        value: self.limits.streams,
+                    },
+                    wire::Setting {
+                        id: 6,
+                        value: self.limits.head.head.min(u32::MAX as usize) as u32,
+                    },
+                ],
+            },
+            driver.reply(),
+        );
+        self.settings_deadline = Some(driver.now() + self.limits.header_timeout);
+        Ok(self.flow(driver))
+    }
+
+    fn on_item(
+        &mut self,
+        item: Input,
+        _: &(),
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<Flow, Infallible> {
+        let result = match item {
+            Input::Frame(frame) => self.frame(frame, driver),
+            Input::Refused { header, error, .. } => {
+                if !self.received_settings
+                    || self.headers.pending()
+                    || header.stream > self.last_stream
+                    || header.stream & 1 == 0
+                {
+                    Err(problem(
+                        ErrorCode::ProtocolError,
+                        "invalid frame on an idle stream or inside headers",
+                    ))
+                } else if self.streams.contains_key(&header.stream) {
+                    self.reset(header.stream, error.code, driver)
+                } else {
+                    Ok(())
+                }
+            }
+            Input::Preface => Ok(()),
+        };
+        if let Err(error) = result {
+            return Ok(self.fail(error, driver));
+        }
+        Ok(self.flow(driver))
+    }
+
+    fn on_timer(
+        &mut self,
+        _: Timer,
+        _: &(),
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<Flow, Infallible> {
+        let now = driver.now();
+        if self.settings_deadline.is_some_and(|at| at <= now) {
+            return Ok(self.fail(
+                problem(
+                    ErrorCode::SettingsTimeout,
+                    "SETTINGS acknowledgment timed out",
+                ),
+                driver,
+            ));
+        }
+        while self.resets.front().is_some_and(|(_, at)| *at <= now) {
+            self.resets.pop_front();
+        }
+        let expired: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.deadline.is_some_and(|at| at <= now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.dispatch(id, Received::Timeout, driver);
+        }
+        Ok(self.flow(driver))
+    }
+
+    fn on_wake(&mut self, _: &(), driver: &mut Driver<'_, Inputs>) -> Result<Flow, Infallible> {
+        Ok(self.flow(driver))
+    }
+
+    fn on_done(
+        &mut self,
+        key: u64,
+        done: Done,
+        _: &(),
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<Flow, Infallible> {
+        let id = key as u32;
+        if id == 0 {
+            return Ok(self.flow(driver));
+        }
+        if matches!(done, Done::Failed(_)) || self.streams.get(&id).is_some_and(|s| !s.recv_closed)
+        {
+            if let Err(error) = self.reset(id, ErrorCode::Cancel, driver) {
+                return Ok(self.fail(error, driver));
+            }
+        } else {
+            self.streams.remove(&id);
+            self.send.lock().streams.remove(&id);
+        }
+        Ok(self.flow(driver))
+    }
+
+    fn on_fail(
+        &mut self,
+        error: &Fail<wire::Error>,
+        _: &(),
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<(), Infallible> {
+        let error = match error {
+            Fail::Protocol(error) => *error,
+            _ => problem(ErrorCode::ProtocolError, "truncated HTTP/2 frame"),
+        };
+        self.fail(error, driver);
+        Ok(())
+    }
+
+    fn on_end(
+        &mut self,
+        end: Ended,
+        _: &(),
+        driver: &mut Driver<'_, Inputs>,
+    ) -> Result<(), Infallible> {
+        for (_, mut stream) in std::mem::take(&mut self.streams) {
+            if let Some(tracker) = &mut stream.tracker {
+                tracker.received(if end == Ended::Budget {
+                    Received::Budget
+                } else {
+                    Received::CutOff
+                });
+                if let Some(event) = tracker.finish(None, None, 0, false) {
+                    driver.record(event);
+                }
+            }
+        }
+        self.send.lock().streams.clear();
+        self.resets = VecDeque::new();
+        if end == Ended::Conn(fictionet::stdlib::ConnError::Broken) {
+            driver.record(error_event(
+                driver.conn(),
+                "transport",
+                "a TLS record did not decrypt".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn held(&self) -> usize {
+        // The live driver also holds a read scratch buffer while input is decoded.
+        wire::DEFAULT_FRAME_SIZE
+            + self.headers.allocated()
+            + self.resets.capacity() * std::mem::size_of::<(u32, Instant)>()
+            + self
+                .streams
+                .values()
+                .map(|s| {
+                    std::mem::size_of::<Stream>()
+                        + s.body.capacity()
+                        + s.request.as_ref().map_or(0, request_held)
+                        + s.tracker.as_ref().map_or(0, Tracker::held)
+                })
+                .sum::<usize>()
+            + {
+                let send = self.send.lock();
+                send.streams.len() * std::mem::size_of::<(u32, Window)>() + send.encoder.held()
+            }
+    }
+}
+
+fn problem(code: ErrorCode, reason: &'static str) -> wire::Error {
+    wire::Error { code, reason }
+}
+
+fn write<W: Wire<WriteError = wire::Error>>(frame: &W, out: &mut Vec<u8>) {
+    frame.write(out).expect("outbound frame has valid fields");
+}
+
+fn window_update(stream: u32, increment: usize, out: &mut Vec<u8>) {
+    write(
+        &wire::WindowUpdate {
+            stream,
+            flags: 0,
+            increment: increment as u32,
+        },
+        out,
+    );
+}
+
+fn content_length(headers: &http::HeaderMap) -> Result<Option<u64>, ()> {
+    let mut length = None;
+    for value in headers.get_all("content-length") {
+        let value = value.to_str().map_err(|_| ())?;
+        if value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit()) {
+            return Err(());
+        }
+        let value = value.parse().map_err(|_| ())?;
+        if length.is_some_and(|old| old != value) {
+            return Err(());
+        }
+        length = Some(value);
+    }
+    Ok(length)
+}
+
+fn valid_trailers(block: &hpack::Block) -> bool {
+    block.more == 0
+        && block.headers.iter().all(|h| {
+            h.name
+                .as_ref()
+                .is_some_and(|n| !n.starts_with(b":") && valid_name(n))
+                && h.value
+                    .as_ref()
+                    .is_some_and(|v| HeaderValue::from_bytes(v).is_ok())
+        })
+}
+
+fn valid_name(name: &[u8]) -> bool {
+    !name.iter().any(u8::is_ascii_uppercase)
+        && HeaderName::from_bytes(name).is_ok()
+        && !matches!(
+            name,
+            b"connection" | b"proxy-connection" | b"keep-alive" | b"transfer-encoding" | b"upgrade"
+        )
+}
+
+fn request(block: hpack::Block, limits: Limits) -> Option<Request<Body>> {
+    if block.more != 0 || block.headers.len() > limits.head.headers {
+        return None;
+    }
+    let mut method = None;
+    let mut scheme = None;
+    let mut authority = None;
+    let mut path = None;
+    let mut regular = false;
+    let mut headers = http::HeaderMap::new();
+    let mut list_size = 0usize;
+    for h in block.headers {
+        let (name, value) = (h.name?, h.value?);
+        list_size = list_size.checked_add(name.len() + value.len() + 32)?;
+        if list_size > limits.head.head {
+            return None;
+        }
+        if name.starts_with(b":") {
+            if regular {
+                return None;
+            }
+            let target = match name.as_slice() {
+                b":method" => &mut method,
+                b":scheme" => &mut scheme,
+                b":authority" => &mut authority,
+                b":path" => &mut path,
+                _ => return None,
+            };
+            if target.replace(String::from_utf8(value).ok()?).is_some() {
+                return None;
+            }
+        } else {
+            regular = true;
+            if !valid_name(&name) || (name == b"te" && value != b"trailers") {
+                return None;
+            }
+            headers.append(
+                HeaderName::from_bytes(&name).ok()?,
+                HeaderValue::from_bytes(&value).ok()?,
+            );
+        }
+    }
+    let method = Method::from_bytes(method?.as_bytes()).ok()?;
+    let mut uri = http::uri::Parts::default();
+    uri.authority = authority.map(|a| a.parse()).transpose().ok()?;
+    if method == Method::CONNECT {
+        if scheme.is_some() || path.is_some() || uri.authority.is_none() {
+            return None;
+        }
+    } else {
+        let scheme: http::uri::Scheme = scheme?.parse().ok()?;
+        if uri.authority.is_some() {
+            uri.scheme = Some(scheme);
+        }
+        let path = path?;
+        if path.is_empty()
+            || (!path.starts_with('/') && !(method == Method::OPTIONS && path == "*"))
+        {
+            return None;
+        }
+        uri.path_and_query = Some(path.parse().ok()?);
+    }
+    let mut request = Request::builder()
+        .method(method)
+        .uri(http::Uri::from_parts(uri).ok()?)
+        .version(Version::HTTP_2)
+        .body(Body::empty())
+        .ok()?;
+    *request.headers_mut() = headers;
+    Some(request)
+}
+
+struct Accept(Arc<Mutex<Outbound>>);
+
+impl Pending for Accept {
+    fn poll_next(
+        &mut self,
+        _: &mut PendingDriver<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Vec<u8>, Error>>> {
+        let mut send = self.0.lock();
+        for stream in send.streams.values_mut() {
+            stream.accepted = true;
+        }
+        send.pending_resets = 0;
+        Poll::Ready(None)
+    }
+}
+
+type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
+
+struct Sending {
+    id: u32,
+    send: Arc<Mutex<Outbound>>,
+    work: Option<Later>,
+    making: Option<Making>,
+    response: Option<Response<Body>>,
+    body: Option<Body>,
+    rest: Bytes,
+    rest_held: usize,
+    request_held: usize,
+    tracker: Tracker,
+    extra: Option<Fields>,
+    status: Option<StatusCode>,
+    head_only: bool,
+    date: Option<u64>,
+    asked: Instant,
+    sent: u64,
+    finished: bool,
+    end_sent: bool,
+}
+
+impl Sending {
+    fn end(&mut self, driver: &mut PendingDriver<'_>, complete: bool) {
+        if !self.finished {
+            self.finished = true;
+            if let Some(event) =
+                self.tracker
+                    .finish(self.extra.take(), self.status, self.sent, complete)
+            {
+                driver.record(event);
+            }
+        }
+    }
+
+    fn headers(&self, fields: &[hpack::Field], end: bool) -> Result<Vec<u8>, Error> {
+        let mut block = Vec::new();
+        // A zero-capacity table keeps response storage bounded while still
+        // honoring the peer's required table-size updates.
+        self.send.lock().encoder.encode_block(fields, &mut block)?;
+        let mut out = Vec::new();
+        let max = self.send.lock().frame;
+        let first = block.len().min(max);
+        wire::Headers {
+            stream: self.id,
+            flags: u8::from(end) | if first == block.len() { 4 } else { 0 },
+            fragment: block[..first].to_vec(),
+            padding: None,
+            priority: None,
+        }
+        .write(&mut out)?;
+        let rest = &block[first..];
+        for (index, fragment) in rest.chunks(max).enumerate() {
+            wire::Continuation {
+                stream: self.id,
+                flags: if (index + 1) * max >= rest.len() {
+                    4
+                } else {
+                    0
+                },
+                fragment: fragment.to_vec(),
+            }
+            .write(&mut out)?;
+        }
+        Ok(out)
+    }
+}
+
+impl Pending for Sending {
+    fn poll_next(
+        &mut self,
+        driver: &mut PendingDriver<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Vec<u8>, Error>>> {
+        if let Some(work) = self.work.take() {
+            self.making = Some(match driver.fcx() {
+                Some(fcx) => work(fcx.clone()),
+                None => Box::pin(std::future::ready(Err(Error::msg(
+                    "this answer needs a Cx: use Harness::with_fcx",
+                )))),
+            });
+        }
+        if let Some(making) = &mut self.making {
+            let response = match making.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(response)) => response,
+                Poll::Ready(Err(error)) => error_response(&error),
+            };
+            self.making = None;
+            self.response = Some(response);
+        }
+        if let Some(response) = self.response.take() {
+            self.request_held = 0;
+            let (parts, body) = response.into_parts();
+            let now = driver.fcx().map_or(self.asked, Cx::now);
+            let date = self.date.and_then(|date| {
+                HeaderValue::from_str(&super::http_date(
+                    date.saturating_add(now.since_start().as_secs()),
+                ))
+                .ok()
+            });
+            let policy =
+                ResponsePolicy::new(&parts, body.size_hint().exact(), self.head_only, date);
+            self.status = Some(parts.status);
+            self.extra = parts.extensions.get::<Fields>().cloned();
+            let mut fields = vec![hpack::Field::new(":status", parts.status.as_str())];
+            for (name, value) in &parts.headers {
+                if matches!(
+                    name.as_str(),
+                    "connection"
+                        | "proxy-connection"
+                        | "keep-alive"
+                        | "transfer-encoding"
+                        | "upgrade"
+                ) {
+                    continue;
+                }
+                fields.push(hpack::Field::new(name.as_str(), value.as_bytes()));
+            }
+            if !parts.headers.contains_key("content-length")
+                && let Some(length) = policy.len
+            {
+                fields.push(hpack::Field::new("content-length", length.to_string()));
+            }
+            if let Some(date) = policy.date {
+                fields.push(hpack::Field::new("date", date.as_bytes()));
+            }
+            self.end_sent = policy.bodiless || body.is_end_stream();
+            if !self.end_sent {
+                self.body = Some(body);
+            }
+            return Poll::Ready(Some(self.headers(&fields, self.end_sent)));
+        }
+        loop {
+            if !self.rest.is_empty() {
+                let mut send = self.send.lock();
+                let capacity = send.window.max(0) as usize;
+                let frame = send.frame.min(wire::DEFAULT_FRAME_SIZE);
+                let Some(window) = send.streams.get_mut(&self.id) else {
+                    return Poll::Ready(None);
+                };
+                let n = self
+                    .rest
+                    .len()
+                    .min(capacity)
+                    .min(window.available.max(0) as usize)
+                    .min(frame);
+                if n == 0 {
+                    window.waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                window.available -= n as i32;
+                send.window -= n as i32;
+                drop(send);
+                let data = self.rest.split_to(n).to_vec();
+                if self.rest.is_empty() {
+                    self.rest = Bytes::new();
+                    self.rest_held = 0;
+                }
+                self.sent += n as u64;
+                return Poll::Ready(Some(
+                    wire::Data {
+                        stream: self.id,
+                        flags: 0,
+                        data,
+                        padding: None,
+                    }
+                    .to_bytes()
+                    .map_err(Into::into),
+                ));
+            }
+            if self.end_sent {
+                self.end(driver, true);
+                return Poll::Ready(None);
+            }
+            let Some(body) = &mut self.body else {
+                self.end_sent = true;
+                return Poll::Ready(Some(
+                    wire::Data {
+                        stream: self.id,
+                        flags: 1,
+                        data: Vec::new(),
+                        padding: None,
+                    }
+                    .to_bytes()
+                    .map_err(Into::into),
+                ));
+            };
+            match Pin::new(body).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => self.body = None,
+                Poll::Ready(Some(Err(error))) => {
+                    self.end(driver, false);
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        self.rest_held = data.len();
+                        self.rest = data;
+                    }
+                    Err(frame) => {
+                        if let Ok(trailers) = frame.into_trailers() {
+                            let fields: Vec<_> = trailers
+                                .iter()
+                                .map(|(n, v)| hpack::Field::new(n.as_str(), v.as_bytes()))
+                                .collect();
+                            self.end_sent = true;
+                            self.body = None;
+                            return Poll::Ready(Some(self.headers(&fields, true)));
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fn cancel(&mut self, driver: &mut PendingDriver<'_>) {
+        self.end(driver, false);
+    }
+
+    fn held(&self) -> usize {
+        self.request_held
+            + self.tracker.held()
+            + self.rest_held
+            + self.body.as_ref().map_or(0, Body::full_len)
+            + self.response.as_ref().map_or(0, |r| {
+                let headers = r.headers();
+                let slots = headers.capacity() + headers.len() - headers.keys_len();
+                r.body().full_len()
+                    + slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
+                    + headers
+                        .iter()
+                        .map(|(n, v)| n.as_str().len() + v.as_bytes().len())
+                        .sum::<usize>()
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{HttpOptions, PREFACE, Router};
+    use super::*;
+    use fictionet::events::ConnInfo;
+    use fictionet::stdlib::json::Value;
+    use fictionet::stdlib::{ConnError, Connection};
+    use std::future::poll_fn;
+    use std::pin::pin;
+    struct StalledBody {
+        input: Bytes,
+    }
+
+    impl Connection for StalledBody {
+        fn poll_read(
+            &mut self,
+            _: &Cx,
+            _: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            if self.input.is_empty() {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(self.input.len());
+            buf[..n].copy_from_slice(&self.input.split_to(n));
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_write(
+            &mut self,
+            _: &Cx,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_shutdown(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn http2_body_timeout_uses_the_fictionet_deadline() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let mut input = PREFACE.to_vec();
+                input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+                // POST / over HTTP, with no END_STREAM on the headers.
+                let block = b"\x83\x86\x84\x01\x01a";
+                input.extend_from_slice(&[0, 0, block.len() as u8, 1, 4, 0, 0, 0, 1]);
+                input.extend_from_slice(block);
+                let conn = StalledBody {
+                    input: Bytes::from(input),
+                };
+                let duration = Duration::from_millis(40);
+                let opts = HttpOptions {
+                    limits: Limits {
+                        body_timeout: duration,
+                        ..Limits::default()
+                    },
+                    ..HttpOptions::default()
+                };
+                let handler = Router::new().post("/", |_, _| {
+                    panic!("a stalled body cannot reach the handler")
+                });
+                let mut served = pin!(super::super::serve_connection(
+                    &fcx,
+                    conn,
+                    ConnInfo::default(),
+                    Arc::new(handler),
+                    &opts
+                ));
+                let log = fcx.events();
+                let wait = async {
+                    loop {
+                        if let Some(event) = log.of("http", "request").pop() {
+                            break event;
+                        }
+                        fcx.sleep(Duration::from_millis(1)).await.unwrap();
+                    }
+                };
+                let mut wait = pin!(wait);
+                let event = fcx
+                    .race(
+                        Some(fcx.now() + Duration::from_secs(2)),
+                        poll_fn(|cx| {
+                            assert!(served.as_mut().poll(cx).is_pending());
+                            wait.as_mut().poll(cx)
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let started = event.get("started").unwrap().as_f64().unwrap();
+                let elapsed = event.at.since_start().as_secs_f64() - started;
+                assert_eq!(elapsed, duration.as_secs_f64());
+                assert_eq!(event.str("answer"), Some("timeout"));
+                assert_eq!(event.u64("status"), Some(408));
+                assert_eq!(event.str("version"), Some("HTTP/2.0"));
+                assert_eq!(event.get("complete").and_then(Value::as_bool), Some(true));
+                assert_eq!(log.of("http", "request").len(), 1);
+                assert!(log.of("http", "error").is_empty());
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+}

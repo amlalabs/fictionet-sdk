@@ -432,7 +432,10 @@ impl serve::Service for Http1 {
             H1::Head(head) => {
                 driver.cancel_timer(HEAD);
                 fictionet::cfg_tokio! {
-                if asks_upgrade(&head) {
+                if asks_upgrade(&head)
+                    && to_request(&head, version_of(&head), Body::empty())
+                        .is_some_and(|request| self.handler.hyper_upgrade(&request))
+                {
                     let mut bytes = Vec::new();
                     if fictionet::stdlib::codec::Wire::write(&head, &mut bytes).is_ok() {
                         self.handoff = Some(bytes);

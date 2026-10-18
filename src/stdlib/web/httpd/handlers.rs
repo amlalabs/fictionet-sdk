@@ -70,11 +70,21 @@ pub trait Handler: Send + Sync + 'static {
     /// Answers `request`. The request's extensions hold its connection's
     /// [`ConnInfo`].
     fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply;
+
+    fictionet::cfg_tokio! {
+    /// Whether upgrade requests need hyper's upgrade extension, as axum does.
+    /// Native handlers receive the connection through [`UpgradeHandler`].
+    fn hyper_upgrade(&self, _request: &Request<Body>) -> bool { false }
+    }
 }
 
 impl<H: Handler + ?Sized> Handler for Arc<H> {
     fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
         (**self).call(request, ex)
+    }
+
+    fictionet::cfg_tokio! {
+    fn hyper_upgrade(&self, request: &Request<Body>) -> bool { (**self).hyper_upgrade(request) }
     }
 }
 
@@ -281,6 +291,10 @@ where
     B::Data: Send,
     B::Error: Into<Error>,
 {
+    fictionet::cfg_tokio! {
+    fn hyper_upgrade(&self, _request: &Request<Body>) -> bool { true }
+    }
+
     fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
         let mut service = self.service.lock().clone();
         Reply::Later(Box::new(move |_fcx| {

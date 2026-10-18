@@ -352,10 +352,9 @@
 //!   - a site without `tls`: served over plain HTTP on 80. A TLS handshake
 //!     for its name on 443 is rejected with `unrecognized_name`.
 //! - **HTTP/1.0, HTTP/1.1 and HTTP/2** on every connection: HTTP/1 with
-//!   [`httpd::Http1`], HTTP/2 with hyper when `tokio` is enabled. Over TLS, the
-//!   version is agreed in the handshake (ALPN): `start` sets the ALPN list
-//!   of each config to `h2` and `http/1.1` with `tokio`, or only `http/1.1`
-//!   without it, so a browser gets HTTP/2 when available and
+//!   [`httpd::Http1`] and HTTP/2 with [`httpd::Http2`], both with `std` alone.
+//!   Over TLS, the version is agreed in the handshake (ALPN): `start` sets
+//!   each config's ALPN list to `h2` and `http/1.1`, so a browser gets HTTP/2 and
 //!   `curl` gets what it asks for. Without TLS, the version is read from the
 //!   first bytes the client sends. HTTP/2 streams run as tasks in the
 //!   connection's [region](fictionet::Cx#regions).

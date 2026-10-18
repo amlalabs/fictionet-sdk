@@ -5,10 +5,7 @@
 fn http_alpn_matches_transport_features() {
     use fictionet::stdlib::{httpd, net::PortServer};
     let server = httpd::Server::new(httpd::Router::new());
-    #[cfg(feature = "tokio")]
     assert_eq!(server.alpn(), [b"h2".to_vec(), b"http/1.1".to_vec()]);
-    #[cfg(not(feature = "tokio"))]
-    assert_eq!(server.alpn(), [b"http/1.1".to_vec()]);
 }
 
 #[test]
@@ -76,14 +73,26 @@ mod http {
         String::from_utf8(bytes).unwrap().to_lowercase()
     }
 
-    #[cfg(not(feature = "tokio"))]
     #[test]
-    fn http2_preface_gets_http1_error() {
+    fn http2_prior_knowledge_works_with_std() {
+        use fictionet::stdlib::{codec::Wire, http2};
         fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
             let mut conn = client(&fcx, httpd::Router::new()).await;
-            conn.write_all(&fcx, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-                .await?;
-            assert!(head(&fcx, &mut conn).await.starts_with("http/1.1 400"));
+            let mut input = http2::PREFACE.to_vec();
+            http2::Settings {
+                flags: 0,
+                entries: Vec::new(),
+            }
+            .write(&mut input)?;
+            conn.write_all(&fcx, &input).await?;
+            let mut bytes = [0; 9];
+            for byte in &mut bytes {
+                assert_eq!(conn.read(&fcx, std::slice::from_mut(byte)).await?, 1);
+            }
+            let frame = http2::FrameHeader::parse(&bytes)?;
+            assert_eq!(frame.kind, 4);
+            assert_eq!(frame.stream, 0);
+            assert_eq!(frame.flags, 0);
             fcx.cancel();
             Ok(())
         }))

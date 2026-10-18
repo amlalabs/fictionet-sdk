@@ -1076,8 +1076,8 @@ fn events_for_bytes_that_are_not_http() {
             http2::Frame::GoAway(http2::GoAway {
                 flags: 0,
                 last_stream: 0,
-                // h2 0.4.19 sends PROTOCOL_ERROR here; RFC 9113 §6.5 requires FRAME_SIZE_ERROR.
-                code: http2::ErrorCode::ProtocolError as u32,
+                // SETTINGS payloads must consist of complete six-byte entries.
+                code: http2::ErrorCode::FrameSizeError as u32,
                 debug: Vec::new(),
             })
         );
