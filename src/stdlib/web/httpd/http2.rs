@@ -215,7 +215,8 @@ impl Http2 {
         }
     }
 
-    /// Resets stream `id`. Too many resets for errors end the connection.
+    /// Resets stream `id` for the client's error. Too many such resets end
+    /// the connection.
     fn reset(
         &mut self,
         id: u32,
@@ -223,14 +224,12 @@ impl Http2 {
         driver: &mut Driver<'_, Inputs>,
     ) -> Result<(), wire::Error> {
         self.write_reset(id, code, driver);
-        if code != ErrorCode::NoError {
-            self.error_resets += 1;
-            if self.error_resets > ERROR_RESET_MAX {
-                return Err(problem(
-                    ErrorCode::EnhanceYourCalm,
-                    "too many local error resets",
-                ));
-            }
+        self.error_resets += 1;
+        if self.error_resets > ERROR_RESET_MAX {
+            return Err(problem(
+                ErrorCode::EnhanceYourCalm,
+                "too many local error resets",
+            ));
         }
         Ok(())
     }
@@ -840,9 +839,9 @@ impl serve::Service for Http2 {
             Done::Finished => None,
         };
         if let Some(code) = code {
-            if let Err(error) = self.reset(id, code, driver) {
-                return Ok(self.fail(error, driver));
-            }
+            // These resets are not for the client's errors, so, as in h2,
+            // they do not count toward the limit on error resets.
+            self.write_reset(id, code, driver);
         } else {
             self.streams.remove(&id);
             self.send.lock().streams.remove(&id);

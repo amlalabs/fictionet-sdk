@@ -1088,15 +1088,18 @@ fn failing_response_body_is_an_internal_stream_error() {
         }
     }
     let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Handler), ());
-    let mut input = preface();
-    input.extend(headers(1, "/", true));
-    let output = frames(&harness.push(&input).unwrap());
-    assert!(
-        output
-            .iter()
-            .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1 && r.code == 2))
-    );
-    assert!(!harness.closed());
+    harness.push(&preface()).unwrap();
+    // The failures are the server's, so they never use up the client's
+    // allowance of error resets.
+    for n in 0..1100 {
+        let output = frames(&harness.push(&headers(2 * n + 1, "/", true)).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.stream == 2 * n + 1 && r.code == 2))
+        );
+        assert!(!harness.closed());
+    }
 }
 
 #[test]
