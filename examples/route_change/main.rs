@@ -95,3 +95,6 @@ fn main() -> fictionet::Result {
         },
     ))
 }
+
+#[cfg(test)]
+mod tests;

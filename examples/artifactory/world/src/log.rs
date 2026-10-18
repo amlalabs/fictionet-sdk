@@ -16,26 +16,24 @@ use crate::events;
 use fictionet::{Cx, events::Event as Entry};
 use serde_json::{Value, json};
 use std::io::Write;
-#[path = "../../../common/log.rs"]
-mod shared;
 const FOLDED: &[&str] = &["blocked"];
 #[derive(Clone)]
 /// A handle for the world's JSON Lines log.
 pub struct Log {
-    inner: shared::Log,
+    inner: example_common::log::Log,
 }
 impl Log {
     /// Prepares the output. Call `attach` before writing.
     pub fn start(out: Box<dyn Write + Send>) -> std::io::Result<Self> {
         Ok(Self {
-            inner: shared::Log::new(out, FOLDED, transform),
+            inner: example_common::log::Log::new(out, FOLDED, transform),
         })
     }
     /// Prepares the trusted harness's shutdown request and acknowledgement.
     pub fn finalization(
         &self,
         directory: &std::path::Path,
-    ) -> std::io::Result<shared::Finalization> {
+    ) -> std::io::Result<example_common::log::Finalization> {
         self.inner.finalization(directory)
     }
     /// Attaches the output to the run's lifetime.
@@ -64,7 +62,7 @@ fn transform(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::fold_key;
+    use example_common::log::fold_key;
 
     /// The network's own counted `blocked` lines are written as they come,
     /// not counted again.
@@ -84,6 +82,6 @@ mod tests {
 
     #[test]
     fn repeated_lines_fold_into_a_count() {
-        shared::assert_repeated_lines_fold(FOLDED, transform);
+        example_common::log::assert_repeated_lines_fold(FOLDED, transform);
     }
 }

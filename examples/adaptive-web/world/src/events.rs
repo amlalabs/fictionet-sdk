@@ -18,10 +18,9 @@ use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
 use crate::backend::PAGE_FIELDS;
-use crate::log::Log;
+use example_common::log::Log;
 
-#[path = "../../../common/headers.rs"]
-mod headers;
+use example_common::headers;
 
 /// Writes the request log from `fcx`'s run's events.
 pub fn log_to(fcx: &Cx, log: Arc<Log>) {

@@ -90,16 +90,14 @@ use serde_json::{Value, json};
 /// The sources of the events [`line()`] makes lines of.
 pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 
-#[path = "../../../common/events.rs"]
-mod shared;
-use shared::{js, sandbox};
+use example_common::events::{js, sandbox};
 
 /// The log line for `e`, if it gets one.
 pub fn line(e: &Entry) -> Option<Value> {
     match (e.source, e.kind) {
         ("tls", "handshake") => Some(tls(e)),
         ("http", "request") => Some(http(e)),
-        _ => shared::line(e),
+        _ => example_common::events::line(e),
     }
 }
 
@@ -113,12 +111,12 @@ fn tls(e: &Entry) -> Value {
         "sni": sni,
     });
     let fields = line.as_object_mut().expect("an object");
-    shared::tls_outcome(e, fields);
+    example_common::events::tls_outcome(e, fields);
     line
 }
 
 fn http(e: &Entry) -> Value {
-    let (names, ua) = shared::request_headers(e);
+    let (names, ua) = example_common::events::request_headers(e);
     let answer = e.str("answer").unwrap_or("other");
     let mut line = json!({
         "type": "http",

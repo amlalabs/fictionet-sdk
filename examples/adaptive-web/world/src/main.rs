@@ -12,11 +12,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use adaptive_web_world::backend::Backend;
-use adaptive_web_world::log::Log;
-use adaptive_web_world::{
-    Addresses, Ca, GATEWAY, args, fixed_addresses, secs, serve, start_backend, watch_backend,
-    world_start,
-};
+use adaptive_web_world::{Addresses, Ca, GATEWAY, fixed_addresses, serve, world_start};
+use example_common::backend_process::{args, secs, start_backend, watch_backend};
+use example_common::log::Log;
 use serde_json::json;
 
 fn main() {

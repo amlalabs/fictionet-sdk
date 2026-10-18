@@ -98,7 +98,7 @@ fn dns(e: &Entry) -> Value {
 }
 
 /// Appends TLS outcome fields after the world-specific handshake fields.
-pub(super) fn tls_outcome(e: &Entry, fields: &mut Map<String, Value>) {
+pub fn tls_outcome(e: &Entry, fields: &mut Map<String, Value>) {
     let outcome = e.str("outcome").unwrap_or("other");
     match outcome {
         "accepted" => {
@@ -131,7 +131,7 @@ pub(super) fn tls_outcome(e: &Entry, fields: &mut Map<String, Value>) {
 }
 
 /// Distinct header names in wire order and the first valid user agent.
-pub(super) fn request_headers(e: &Entry) -> (Vec<String>, Option<String>) {
+pub fn request_headers(e: &Entry) -> (Vec<String>, Option<String>) {
     let mut names: Vec<String> = Vec::new();
     let mut ua = None;
     for pair in e.get("headers").and_then(J::as_array).unwrap_or_default() {

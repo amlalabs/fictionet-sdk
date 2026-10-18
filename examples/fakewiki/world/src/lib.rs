@@ -20,8 +20,6 @@
 
 pub mod content;
 pub mod events;
-#[path = "../../../common/log.rs"]
-pub mod log;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -36,11 +34,7 @@ use fictionet::stdlib::web;
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 use crate::content::Content;
-use crate::log::Log;
-
-#[path = "../../../common/backend_process.rs"]
-mod backend_process;
-pub use backend_process::{Args, args, secs, start_backend, watch_backend};
+use example_common::log::Log;
 
 /// Builds the network: one site per FakeWiki host at its own address, with
 /// its certificate, every request logged. `leaves` holds each host's

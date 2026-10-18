@@ -49,7 +49,7 @@ use rustls::pki_types::PrivateKeyDer;
 
 /// The addresses `example.test`, `www.example.test` and `shared.test`
 /// share.
-pub const SHARED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+const SHARED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 const SHARED6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x113, 0, 0, 0, 0, 0x10);
 
 fn main() -> Result {
@@ -57,7 +57,7 @@ fn main() -> Result {
 }
 
 /// Starts a world on the socket and writes its CA certificate.
-pub fn run(
+fn run(
     start: fn(
         &fictionet::Cx,
         Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -129,7 +129,7 @@ fn start(
 }
 
 /// The HTTPS app, shared by all four HTTPS names.
-pub fn app() -> axum::Router {
+fn app() -> axum::Router {
     let count = Arc::new(AtomicU64::new(0));
     axum::Router::new()
         .route(
@@ -153,14 +153,14 @@ pub fn app() -> axum::Router {
 }
 
 /// The plain HTTP app, shared by both HTTP names.
-pub fn plain() -> axum::Router {
+fn plain() -> axum::Router {
     axum::Router::new().fallback(|Extension(t): Extension<web::Target>| async move {
         format!("plain site {} {} {}\n", t.scheme, t.host, t.port)
     })
 }
 
 /// Resolves the world's names to sites with the given apps.
-pub fn sites(
+fn sites(
     fcx: &fictionet::Cx,
     chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,

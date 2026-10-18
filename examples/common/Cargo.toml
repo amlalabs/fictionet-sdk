@@ -1,0 +1,14 @@
+[package]
+name = "example-common"
+version = "0.0.0"
+edition = "2024"
+description = "Code the example worlds share: the JSON Lines log, the projection of network events into it, and the Python backend's startup."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+fictionet = { path = "../.." }
+serde_json = { version = "1", features = ["preserve_order"] }

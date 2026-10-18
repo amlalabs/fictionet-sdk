@@ -7,6 +7,7 @@ name = "adaptive-web-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "example-common",
  "fictionet",
  "http",
  "http-body-util",
@@ -48,6 +49,7 @@ name = "artifactory-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "example-common",
  "fictionet",
  "fictionet-test-support",
  "http",
@@ -177,6 +179,7 @@ version = "0.0.0"
 dependencies = [
  "base64",
  "bytes",
+ "example-common",
  "fictionet",
  "fictionet-test-support",
  "flate2",
@@ -532,10 +535,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-common"
+version = "0.0.0"
+dependencies = [
+ "fictionet",
+ "serde_json",
+]
+
+[[package]]
 name = "fakewiki-world"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "example-common",
  "fictionet",
  "http",
  "http-body-util",

@@ -21,10 +21,9 @@ use fictionet::events::{Event as Entry, Fields, opt};
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
-use crate::log::Log;
+use example_common::log::Log;
 
-#[path = "../../../common/headers.rs"]
-mod headers;
+use example_common::headers;
 
 /// What the handler tells the log about one response.
 #[derive(Clone, Debug)]

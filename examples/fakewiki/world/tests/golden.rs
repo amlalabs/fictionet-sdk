@@ -14,9 +14,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use example_common::backend_process::{Args, start_backend};
+use example_common::log::Log;
 use fakewiki_world::content::Content;
-use fakewiki_world::log::Log;
-use fakewiki_world::{Args, issue_leaves, serve, start_backend};
+use fakewiki_world::{issue_leaves, serve};
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::RecordType;
 use serde_json::Value;

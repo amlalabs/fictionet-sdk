@@ -21,25 +21,23 @@
 //! takes it out of every line, in any case, as `[password]`.
 
 use crate::events;
+use crate::{bank::ACCOUNT, scenario::Scenario};
 use fictionet::{Cx, events::Event as Entry};
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
-#[path = "../../../common/log.rs"]
-mod shared;
-use crate::{bank::ACCOUNT, scenario::Scenario};
 const FOLDED: &[&str] = &["blocked", "ttl_exceeded", "unreachable"];
 /// A handle for the world's JSON Lines log.
 #[derive(Clone)]
 pub struct Log {
-    inner: shared::Log,
+    inner: example_common::log::Log,
     scenario: Arc<Scenario>,
 }
 impl Log {
     /// Prepares the output. Call `attach` before writing.
     pub fn start(out: Box<dyn Write + Send>, scenario: Arc<Scenario>) -> Self {
         Self {
-            inner: shared::Log::new(out, FOLDED, transform),
+            inner: example_common::log::Log::new(out, FOLDED, transform),
             scenario,
         }
     }
@@ -47,7 +45,7 @@ impl Log {
     pub fn finalization(
         &self,
         directory: &std::path::Path,
-    ) -> std::io::Result<shared::Finalization> {
+    ) -> std::io::Result<example_common::log::Finalization> {
         self.inner.finalization(directory)
     }
     /// Attaches the output to the run's lifetime.
@@ -89,8 +87,8 @@ fn transform(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use example_common::log::fold_key;
     use serde_json::json;
-    use shared::fold_key;
 
     #[test]
     fn the_password_never_reaches_a_line() {
@@ -119,6 +117,6 @@ mod tests {
 
     #[test]
     fn repeated_lines_fold_into_a_count() {
-        shared::assert_repeated_lines_fold(FOLDED, transform);
+        example_common::log::assert_repeated_lines_fold(FOLDED, transform);
     }
 }

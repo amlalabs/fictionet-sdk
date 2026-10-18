@@ -285,7 +285,7 @@
 //! [`ServeOptions::idle`](crate::stdlib::services::serve::ServeOptions::idle)
 //! closes connections after 10 seconds without input while the service waits:
 //!
-#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/route_change.rs"), "# }\n# fn main() {}\n```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../../examples/route_change/main.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! The world has IPv4 only, so attach the sandbox with `--no-ip-addr-v6
 //! --no-gateway-v6 --no-dns-v6` in place of the three IPv6 flags (see

@@ -182,6 +182,8 @@ required-features = ["std"]
 
 [[example]]
 name = "route_change"
+path = "examples/route_change/main.rs"
+test = true
 required-features = ["std"]
 
 [[example]]

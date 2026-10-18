@@ -62,8 +62,6 @@ mod observe_tls;
 #[cfg(feature = "std")]
 mod packets;
 mod protocol_primitives;
-#[cfg(feature = "std")]
-mod recipes;
 mod resp_codec;
 mod rpc_codec;
 mod rpc_nfs_codec;

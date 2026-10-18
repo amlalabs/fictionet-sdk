@@ -11,8 +11,6 @@ use fictionet::Result;
 use fictionet::stdlib::web;
 use rustls::pki_types::PrivateKeyDer;
 
-#[allow(dead_code)]
-#[path = "../../examples/web_world.rs"]
 mod web_world;
 
 fn main() -> Result {

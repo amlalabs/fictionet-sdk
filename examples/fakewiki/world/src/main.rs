@@ -13,9 +13,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use example_common::backend_process::{args, secs, start_backend, watch_backend};
+use example_common::log::Log;
 use fakewiki_world::content::Content;
-use fakewiki_world::log::Log;
-use fakewiki_world::{GATEWAY, args, issue_leaves, secs, serve, start_backend, watch_backend};
+use fakewiki_world::{GATEWAY, issue_leaves, serve};
 use serde_json::json;
 
 fn main() {

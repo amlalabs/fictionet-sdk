@@ -4,7 +4,7 @@ use fictionet::events::Event as Entry;
 use fictionet::stdlib::protocols::json::Value as J;
 
 /// The first matching header's string value, or none if it is missing or malformed.
-pub(super) fn header<'a>(e: &'a Entry, name: &str) -> Option<&'a str> {
+pub fn header<'a>(e: &'a Entry, name: &str) -> Option<&'a str> {
     e.get("headers")
         .and_then(J::as_array)
         .unwrap_or_default()

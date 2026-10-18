@@ -34,8 +34,6 @@
 
 pub mod backend;
 pub mod events;
-#[path = "../../../common/log.rs"]
-pub mod log;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -52,14 +50,10 @@ use fictionet::stdlib::web;
 use serde_json::{Value, json};
 
 use crate::backend::Backend;
-use crate::log::Log;
+use example_common::log::Log;
 
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-
-#[path = "../../../common/backend_process.rs"]
-mod backend_process;
-pub use backend_process::{Args, args, secs, start_backend, watch_backend};
 
 /// Top-level domains that never resolve on the internet: reserved by RFC
 /// 2606 and 6761, used for mDNS, or used only inside private networks.

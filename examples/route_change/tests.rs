@@ -1,30 +1,21 @@
-//! The recipes' worlds, run against a client inside the test.
+//! The world's machines, run against a client inside the test.
 
-use fictionet_test_support::within;
-
-use std::time::Duration;
-
+use super::{MAX_CONNECTIONS, TIME_LIMIT, web_machine};
 use fictionet::prelude::*;
 use fictionet::stdlib::network::{ConnError, tcp};
-use fictionet::{Cx, block_on, lab, pair};
+use fictionet::time::Duration;
+use fictionet::{Cx, Interface, block_on, lab, pair};
+use fictionet_test_support::within;
 
-#[allow(dead_code)]
-mod route_change {
-    include!("../../examples/route_change.rs");
-
-    pub const MAX: usize = MAX_CONNECTIONS;
-    pub const LIMIT: Duration = TIME_LIMIT;
-
-    /// The bank's machine at 203.0.113.10, on `side`.
-    pub fn bank(fcx: &Cx, side: impl Interface) {
-        web_machine(
-            fcx,
-            side,
-            "203.0.113.10".parse().unwrap(),
-            "the real bank\n",
-        )
-        .unwrap();
-    }
+/// The bank's machine at 203.0.113.10, on `side`.
+fn bank(fcx: &Cx, side: impl Interface) {
+    web_machine(
+        fcx,
+        side,
+        "203.0.113.10".parse().unwrap(),
+        "the real bank\n",
+    )
+    .unwrap();
 }
 
 /// Sends `request` to the bank and reads the whole answer.
@@ -47,7 +38,7 @@ fn route_change_answers_get_with_the_body_and_head_without() {
     within(Duration::from_secs(10), || {
         block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
             let (client, server) = pair();
-            route_change::bank(&fcx, server);
+            bank(&fcx, server);
             let client = tcp::endpoint(&fcx, client, "10.0.0.2".parse()?);
             let get = ask(
                 &fcx,
@@ -87,10 +78,10 @@ fn route_change_limits_unfinished_requests() {
     within(Duration::from_secs(30), || {
         block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
             let (client, server) = pair();
-            route_change::bank(&fcx, server);
+            bank(&fcx, server);
             let client = tcp::endpoint(&fcx, client, "10.0.0.2".parse()?);
             let mut conns = Vec::new();
-            for _ in 0..route_change::MAX + 16 {
+            for _ in 0..MAX_CONNECTIONS + 16 {
                 let mut conn = client.connect(&fcx, "203.0.113.10:80".parse()?).await?;
                 conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: bank")
                     .await?;
@@ -98,24 +89,18 @@ fn route_change_limits_unfinished_requests() {
             }
             // The connections past the limit are reset without an answer.
             let started = fcx.now();
-            for conn in &mut conns[route_change::MAX..] {
+            for conn in &mut conns[MAX_CONNECTIONS..] {
                 let mut byte = [0];
                 assert_eq!(conn.read(&fcx, &mut byte).await, Err(ConnError::Reset));
             }
             // The rest close without an answer when their idle time is up.
-            for conn in &mut conns[..route_change::MAX] {
+            for conn in &mut conns[..MAX_CONNECTIONS] {
                 let mut byte = [0];
                 assert_eq!(conn.read(&fcx, &mut byte).await, Ok(0));
             }
             let waited = fcx.now().since_start() - started.since_start();
-            assert!(
-                waited >= route_change::LIMIT - Duration::from_secs(1),
-                "{waited:?}"
-            );
-            assert!(
-                waited <= route_change::LIMIT + Duration::from_secs(10),
-                "{waited:?}"
-            );
+            assert!(waited >= TIME_LIMIT - Duration::from_secs(1), "{waited:?}");
+            assert!(waited <= TIME_LIMIT + Duration::from_secs(10), "{waited:?}");
             fcx.cancel();
             Ok(())
         }))

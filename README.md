@@ -203,7 +203,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 | [`examples/lossy_sites.rs`](examples/lossy_sites.rs) | `stdlib::network::filter` drops 5% of packets each way. |
 | [`examples/bottleneck_sites.rs`](examples/bottleneck_sites.rs) | An 8 Mbit/s link using `stdlib::network::bottleneck`, with a count of queue drops. |
 | [`examples/capture_sites.rs`](examples/capture_sites.rs) | Writes sandbox packets to a pcap file that tshark and Wireshark open. |
-| [`examples/route_change.rs`](examples/route_change.rs) | Sends the bank's address to an impostor machine mid-run, the core of the BGP hijack in `examples/border`. |
+| [`examples/route_change/main.rs`](examples/route_change/main.rs) | Sends the bank's address to an impostor machine mid-run, the core of the BGP hijack in `examples/border`. |
 | [`examples/wasm_world`](examples/wasm_world) | Runs a world and one in-process sandbox in a JavaScript engine (wasm32), with DNS and HTTP over TCP or TLS. |
 | [`python/inspect_fictionet/examples/web_eval.py`](python/inspect_fictionet/examples/web_eval.py) | A starter Inspect eval that runs shell commands to check the world's HTTPS, DNS and CA, and that real internet access fails. |
 | [`examples/fakewiki`](examples/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |

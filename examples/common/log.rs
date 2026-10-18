@@ -65,9 +65,6 @@ impl Log {
     /// Latches a world-level failure unless a failure has already been recorded.
     /// [`Self::health`], [`Finalization::wait`] and [`Finalization::acknowledge`]
     /// report it, so a failed world cannot acknowledge successful finalization.
-    // Border and Artifactory include this module privately and only use its
-    // logging and finalization methods, leaving this world-level hook unused.
-    #[allow(dead_code)]
     pub fn fail(&self, reason: impl Into<String>) {
         self.0.failure.lock().get_or_insert_with(|| reason.into());
     }
@@ -389,8 +386,8 @@ impl Writer {
     }
 }
 
-/// Checks repeated-line folding with the supplied world configuration.
-#[cfg(test)]
+/// Checks repeated-line folding with the supplied world configuration. The
+/// worlds' own tests call it with their folded types and line transforms.
 pub fn assert_repeated_lines_fold(
     folded: &'static [&'static str],
     transform: fn(String) -> String,
