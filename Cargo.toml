@@ -194,6 +194,11 @@ name = "goad"
 path = "examples/goad/main.rs"
 required-features = ["std"]
 
+# The world `cargo xtask h2spec` tests.
+[[example]]
+name = "h2spec_world"
+required-features = ["tokio"]
+
 # Tests that need user namespaces, root or a tun device. They run only when
 # named: `cargo nextest run --test host`.
 [[test]]

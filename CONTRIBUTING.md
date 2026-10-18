@@ -106,6 +106,7 @@ commands. `cargo xtask --help` lists them.
 | `cargo xtask demo <name>` | Runs a demo in the VM. [demos/README.md](demos/README.md) lists them. |
 | `cargo xtask eval <border\|fakewiki\|adaptive-web\|artifactory>` | Builds a world's images and runs its Inspect eval. |
 | `cargo xtask fuzz [--check \| <target> \| <seconds>]` | Runs the fuzz targets ([fuzz/README.md](fuzz/README.md)). |
+| `cargo xtask h2spec [section]` | Runs the h2spec conformance suite against the native HTTP/2 server, over TLS and h2c. |
 | `cargo xtask scan [output directory]` | Records the scan example's dashboard. |
 
 A change to `fictionet attach` or to how a world is reached should also pass

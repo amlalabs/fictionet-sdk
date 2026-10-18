@@ -114,6 +114,7 @@ jobs:
           - test: web
           - test: ping
           - test: proxy
+          - test: h2spec
           - dockerfile: deploy/Dockerfile
             targets: attach web-world agent
           - dockerfile: tests/docker/proxy/Dockerfile
@@ -148,8 +149,11 @@ jobs:
           cargo nextest run --locked --test host attach_bin::
           cargo nextest run --locked --test host --all-features attach_bin::
       - name: Docker tests
-        if: matrix.test != '' && matrix.test != 'namespaces'
+        if: matrix.test != '' && matrix.test != 'namespaces' && matrix.test != 'h2spec'
         run: cargo xtask docker ${{ matrix.test }}
+      - name: HTTP/2 conformance
+        if: matrix.test == 'h2spec'
+        run: cargo xtask h2spec
       - name: Build images
         if: matrix.dockerfile != ''
         run: |
