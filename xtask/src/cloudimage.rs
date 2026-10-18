@@ -12,7 +12,9 @@
 //! Turning a download into a per-run overlay and cloud-init seed is the
 //! `cloudimage` demo binary; booting it is the hypervisor's job.
 
-use crate::process::Result;
+use std::path::Path;
+
+use crate::process::{Result, capture, cmd, run as execute};
 use crate::vm::{download, private_dir};
 
 /// A Cloud Hypervisor static x86-64 release binary (used in the boot probe;
@@ -33,9 +35,11 @@ pub fn run(args: &[String]) -> Result {
     match args {
         [] => {
             assets()?;
-            Ok(())
+            build()?;
+            demo()
         }
-        _ => Err("usage: cargo xtask cloudimage".into()),
+        [step] if step == "assets" => assets(),
+        _ => Err("usage: cargo xtask cloudimage [assets]".into()),
     }
 }
 
@@ -74,4 +78,39 @@ fn assets() -> Result {
     )?;
     println!("downloaded into {}", dir.display());
     Ok(())
+}
+
+fn build() -> Result {
+    execute(&mut cmd(
+        "cargo",
+        &[
+            "build",
+            "--locked",
+            "--release",
+            "-p",
+            "fictionet-demo",
+            "--bin",
+            "cloudimage",
+        ],
+    ))
+}
+
+/// Runs the demo with the downloaded paths, inheriting its output.
+fn demo() -> Result {
+    let dir = crate::root().join("demos/downloads/cloudimage");
+    let metadata: serde_json::Value = serde_json::from_str(&capture(&mut cmd(
+        "cargo",
+        &["metadata", "--locked", "--no-deps", "--format-version", "1"],
+    ))?)?;
+    let target = metadata["target_directory"]
+        .as_str()
+        .ok_or("cargo metadata gave no target directory")?;
+    let binary = Path::new(target).join("release/cloudimage");
+    execute(
+        std::process::Command::new(&binary)
+            .arg(dir.join("cloud-hypervisor"))
+            .arg(dir.join(IMAGE))
+            .arg(dir.join(VMLINUZ))
+            .arg(dir.join(INITRD)),
+    )
 }

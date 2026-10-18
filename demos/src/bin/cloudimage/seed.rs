@@ -33,6 +33,15 @@ pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
         "instance-id: iid-{0}\nlocal-hostname: {0}\n",
         provision.hostname
     );
+    // NoCloud network config: DHCP the one NIC from the world. Keyed by MAC,
+    // which the world's DHCP server leases by attachment.
+    let network_config = "version: 2\n\
+         ethernets:\n\
+         \x20 eth0:\n\
+         \x20   match:\n\
+         \x20     name: eth0\n\
+         \x20   dhcp4: true\n\
+         \x20   dhcp-identifier: mac\n";
 
     // A couple of mebibytes is ample for two small files and keeps FAT12.
     let mut cursor = Cursor::new(vec![0u8; 4 << 20]);
@@ -49,6 +58,7 @@ pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
         for (name, body) in [
             ("meta-data", meta_data.as_str()),
             ("user-data", user_data.as_str()),
+            ("network-config", network_config),
             ("vendor-data", ""),
         ] {
             let mut file = root.create_file(name).map_err(std::io::Error::other)?;
@@ -108,11 +118,20 @@ fn user_data(p: &Provision) -> String {
          \x20     [Service]\n\
          \x20     ExecStart=-/usr/sbin/sshd -i\n\
          \x20     StandardInput=socket\n\
+         \x20     StandardOutput=socket\n\
+         \x20 - path: /etc/systemd/network/05-eth0.network\n\
+         \x20   content: |\n\
+         \x20     [Match]\n\
+         \x20     Name=eth0\n\
+         \x20     [Network]\n\
+         \x20     DHCP=ipv4\n\
          runcmd:\n\
          \x20 - update-ca-certificates\n\
          \x20 - ssh-keygen -A\n\
+         \x20 - install -d -m0755 /run/sshd\n\
          \x20 - systemctl daemon-reload\n\
          \x20 - systemctl enable --now sshd-vsock.socket\n\
+         \x20 - systemctl restart systemd-networkd\n\
          {mask_wait_online}",
         hostname = p.hostname,
         user = p.user,

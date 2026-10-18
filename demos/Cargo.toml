@@ -20,6 +20,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros",
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 russh = "0.54"
+libc = "0.2"
+# The vhost-user-net backend that joins Cloud Hypervisor's guest to the
+# world. Versions track vhost-user-backend 0.18's own, so the virtio-queue,
+# vm-memory and vhost types are one instance across the crates.
+vhost = { version = "0.14", features = ["vhost-user-backend"] }
+vhost-user-backend = "0.18"
+virtio-queue = "0.14"
+vm-memory = { version = "0.16.2", features = ["backend-mmap", "backend-atomic"] }
+vmm-sys-util = "0.14"
 
 [[bin]]
 name = "cloudimage"

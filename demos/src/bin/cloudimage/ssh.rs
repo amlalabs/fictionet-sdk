@@ -18,9 +18,6 @@ use tokio::net::UnixStream;
 
 /// A per-run SSH identity.
 pub struct Identity {
-    // Held for [`Session`], the control-plane client, which a hypervisor
-    // integration drives once chosen.
-    #[allow(dead_code)]
     key: Arc<PrivateKey>,
     /// The public key as one `authorized_keys` line.
     pub authorized_key: String,
@@ -43,7 +40,6 @@ impl Identity {
 }
 
 /// What a command printed, and how it ended.
-#[allow(dead_code)]
 pub struct Output {
     pub code: i32,
     pub stdout: String,
@@ -52,12 +48,10 @@ pub struct Output {
 
 /// A connection to the guest over vsock. The control-plane client: a
 /// hypervisor integration opens it to run commands once the VMM is chosen.
-#[allow(dead_code)]
 pub struct Session {
     handle: Handle<Client>,
 }
 
-#[allow(dead_code)]
 impl Session {
     /// Connects over the CH vsock socket to the guest's port 22, retrying
     /// until sshd answers or `deadline` passes, then authenticates as
@@ -143,12 +137,13 @@ impl Session {
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
+        // Read until the channel is fully closed (`wait` returns `None`), so
+        // the exit status is captured even when it arrives after EOF.
         while let Some(msg) = channel.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
                 russh::ChannelMsg::ExtendedData { data, .. } => err.extend_from_slice(&data),
                 russh::ChannelMsg::ExitStatus { exit_status } => output.code = exit_status as i32,
-                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
                 _ => {}
             }
         }
@@ -160,7 +155,6 @@ impl Session {
 
 /// Accepts the guest's host key: the guest is this run's own, reached only
 /// over its private vsock, so there is nothing to pin.
-#[allow(dead_code)]
 struct Client;
 
 impl Handler for Client {
