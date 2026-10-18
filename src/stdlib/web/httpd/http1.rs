@@ -120,9 +120,6 @@ impl Http1 {
         received: Received,
     ) {
         if let Some(mut tracker) = self.tracker.take() {
-            let buffered = driver.unread().len();
-            let len = driver.peek_decoder().pending_body_len(buffered);
-            tracker.body(&driver.unread()[..len]);
             tracker.received(received);
             if let Some(head) = &self.head
                 && let Some(request) = to_request(head, version_of(head), Body::empty())
@@ -471,6 +468,11 @@ impl serve::Service for Http1 {
         if let Some(detail) = detail {
             driver.record(error_event(driver.conn(), "timeout", detail.into()));
         }
+        // The observer still sees the body bytes the decoder buffers.
+        if let Some(tracker) = &mut self.tracker {
+            let len = driver.peek_decoder().pending_body_len(driver.unread().len());
+            tracker.body(&driver.unread()[..len]);
+        }
         self.finish_receipt(driver, Received::Timeout);
         Ok(Flow::Close)
     }
@@ -572,6 +574,16 @@ impl serve::Service for Http1 {
         _: &(),
         driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<(), Infallible> {
+        // The client broke off inside a request head, as by a reset. A head
+        // cut off by the end of input fails the decoder and is logged there.
+        if let Ended::Conn(e) = end
+            && e != ConnError::Broken
+            && self.head.is_none()
+            && !driver.unread().is_empty()
+        {
+            let detail = format!("the connection ended inside a request head: {e}");
+            driver.record(error_event(driver.conn(), "protocol", detail));
+        }
         self.finish_receipt(
             driver,
             if end == Ended::Budget {

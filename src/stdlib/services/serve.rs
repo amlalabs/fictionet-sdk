@@ -754,8 +754,8 @@ impl<D> Driver<'_, D> {
 
     /// In [`Service::on_fail`], the bytes the decoder could not use: a
     /// message cut off by the end of input, or bytes that are not this
-    /// protocol. In [`Service::on_timer`], the bytes still buffered by the
-    /// stream decoder. Empty in every other call.
+    /// protocol. In [`Service::on_timer`] and [`Service::on_end`], the bytes
+    /// still buffered by the stream decoder. Empty in every other call.
     pub fn unread(&self) -> &[u8] {
         &self.s.unread
     }
@@ -2325,6 +2325,7 @@ where
             return Next::Closed(end);
         }
         self.state = State::Ending { end, called: true };
+        self.s.unread = self.stream.unread().to_vec();
         let result = {
             let mut driver = Driver {
                 decoder: self.stream.decoder(),
@@ -2336,6 +2337,7 @@ where
             };
             service.on_end(end, state, &mut driver)
         };
+        self.s.unread = Vec::new();
         if std::mem::take(&mut self.s.decoder_touched) {
             self.stop_item_faults("decoder");
         }
@@ -2835,7 +2837,9 @@ where
                     Some(Err(e)) => core.broken(conn_end(e)),
                     None => {}
                 }
-                if woke.gone {
+                // A reset both fails the read and wakes the gone watch. Count it
+                // once: a second end would close the connection without `on_end`.
+                if woke.gone && !matches!(woke.read, Some(Err(_))) {
                     core.broken(Ended::Conn(ConnError::Reset));
                 }
             }
