@@ -20,10 +20,22 @@ pub fn run(args: &[String]) -> Result {
     };
     let h2spec = fetch()?;
     let mut world = ChildGuard(
-        cmd("cargo", &["run", "--locked", "--example", "h2spec_world"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?,
+        cmd(
+            "cargo",
+            &[
+                "run",
+                "--locked",
+                "-p",
+                "fictionet",
+                "--features",
+                "tokio",
+                "--example",
+                "h2spec_world",
+            ],
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?,
     );
     let mut lines = BufReader::new(world.0.stdout.take().ok_or("missing world stdout")?).lines();
     let mut port = |name: &str| -> Result<String> {
