@@ -162,7 +162,7 @@ pub fn record(browser: &mut Browser, compose: &Compose) -> Result {
     browser.wait(0.5)?;
     caption(
         browser,
-        "<b>Closed groups add up</b> the links that cross their edge. Close “simulated hosts”, and its four links become one.",
+        "<b>Close a group</b> to hide its internal links. “simulated hosts” includes the router; its links to the two sandboxes stay visible.",
     )?;
     let (x, y) = center(
         browser,
@@ -172,9 +172,12 @@ pub fn record(browser: &mut Browser, compose: &Compose) -> Result {
     browser.wait(2.2)?;
     caption(
         browser,
-        "The packet view of an added-up edge <b>merges the packets</b> of every link it stands for.",
+        "<b>Open the group</b> again to see the router and its links to each simulated host.",
     )?;
-    let (x, y) = edge(browser, "document.querySelector('g.edge.merged')")?;
+    let (x, y) = center(
+        browser,
+        "[...document.querySelectorAll('g.node.group')].find(e => e.textContent.includes('simulated hosts'))?.querySelector('.toggle')",
+    )?;
     pointer.click(browser, x, y, false)?;
     browser.wait(0.6)?;
     pointer.click(browser, fx, fy, false)?;
