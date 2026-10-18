@@ -8,9 +8,11 @@
 
 #[path = "../it/common/logged.rs"]
 mod logged;
-#[path = "../it/common/poll.rs"]
+#[path = "../../../tests/common/poll.rs"]
 mod poll;
-#[path = "../it/common/temp.rs"]
+// Only `dir` is used here.
+#[allow(dead_code)]
+#[path = "../../../tests/common/temp.rs"]
 mod temp;
 
 use logged::logged;

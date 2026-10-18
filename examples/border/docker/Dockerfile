@@ -17,6 +17,7 @@ FROM rust:1.92-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY cli cli
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
@@ -27,7 +28,7 @@ COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-border-target \
     cargo build --release --locked -p border-world --bin border-world \
-    && cargo build --release --locked -p fictionet --bin fictionet \
+    && cargo build --release --locked -p fictionet-cli --bin fictionet \
     && cp target/release/border-world target/release/fictionet /usr/local/bin/
 
 FROM debian:bookworm-slim AS tools

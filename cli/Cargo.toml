@@ -1,0 +1,45 @@
+[package]
+name = "fictionet-cli"
+version.workspace = true
+edition = "2024"
+rust-version = "1.91"
+description = "Command-line tool for the Fictionet simulated internet."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/amlalabs/fictionet-sdk"
+publish = false
+
+# Its docs would land in target/doc/fictionet and replace the SDK's.
+[[bin]]
+name = "fictionet"
+path = "src/main.rs"
+doc = false
+
+[features]
+web-proxy = ["fictionet/web-proxy"]
+
+[dependencies]
+fictionet = { path = "..", default-features = false, features = ["std", "tokio", "observe"] }
+libc = "0.2.189"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["ws"] }
+bytes = "1"
+divan = "0.1.21"
+etherparse = "0.21"
+http = "1.5.0"
+http-body-util = "0.1"
+hyper = { version = "1.11.1", features = ["client"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio = { version = "1", features = ["macros"] }
+tower-service = "0.3.3"
+
+[[bench]]
+name = "services"
+harness = false
+
+# Tests that need user namespaces, root or a tun device. They run only when
+# named: `cargo nextest run --test host`.
+[[test]]
+name = "host"
+test = false

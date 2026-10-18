@@ -25,7 +25,7 @@
 //! two ends. A request the site would take is not refused here, nor an
 //! answer the client would take turned into a `502`.
 
-use crate::stdlib::http1::{Header, RequestHead, ResponseHead};
+use fictionet::stdlib::http1::{Header, RequestHead, ResponseHead};
 
 use super::Host;
 
@@ -400,7 +400,7 @@ mod tests {
                 port: 8443
             }
         );
-        assert_eq!(r.head.version, crate::stdlib::http1::Version::Http10);
+        assert_eq!(r.head.version, fictionet::stdlib::http1::Version::Http10);
         let r = parse("CONNECT [fd00::1]:443 HTTP/1.1\r\n\r\n").unwrap();
         assert_eq!(
             r.target,

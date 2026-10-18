@@ -13,8 +13,8 @@ use std::net::SocketAddrV4;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::stdlib::codec::{Fail, Stream, Wire};
-use crate::stdlib::socks::{
+use fictionet::stdlib::codec::{Fail, Stream, Wire};
+use fictionet::stdlib::socks::{
     self, Address, AuthReply, ClientMessage, ClientMessages, Command, FrameError, Method, Reply,
     ReplyCode, Selection,
 };
@@ -303,7 +303,7 @@ mod tests {
             (b"relay", b"tok:extra", false),
         ] {
             let credentials = [user, b":", password].concat();
-            let encoded = crate::stdlib::codec::base64::encode(&credentials);
+            let encoded = fictionet::stdlib::codec::base64::encode(&credentials);
             for code in [encoded.as_str(), encoded.trim_end_matches('=')] {
                 assert_eq!(
                     token().check_header(format!("Basic {code}").as_bytes()),

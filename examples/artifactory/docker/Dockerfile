@@ -12,6 +12,7 @@ RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY cli cli
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
@@ -21,7 +22,7 @@ COPY tests tests
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-artifactory-attach-target \
-    find src examples -type f -exec touch {} + \
+    find src cli examples -type f -exec touch {} + \
     && cargo build --release --locked -j 8 --bin fictionet \
     && cp target/release/fictionet /fictionet
 
@@ -34,6 +35,7 @@ FROM rust:1.92-slim-bookworm AS build-world
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY cli cli
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches

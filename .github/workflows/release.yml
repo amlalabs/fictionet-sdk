@@ -25,7 +25,7 @@ jobs:
           python3 - <<'PY'
           import os, tomllib
           with open('Cargo.toml', 'rb') as manifest:
-              version = tomllib.load(manifest)['package']['version']
+              version = tomllib.load(manifest)['workspace']['package']['version']
           assert os.environ['RELEASE_TAG'] == 'v' + version, 'tag must match Cargo.toml'
           PY
       - uses: docker/setup-qemu-action@v3

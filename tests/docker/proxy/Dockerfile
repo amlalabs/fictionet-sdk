@@ -5,6 +5,7 @@ FROM rust:1.92-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY cli cli
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
@@ -14,7 +15,7 @@ COPY tests tests
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-proxy-target \
-    find src examples tests/web_fixture -type f -exec touch {} + \
+    find src cli examples tests/web_fixture -type f -exec touch {} + \
     && cargo build --release --locked --features web-proxy --bin fictionet --example web_fixture \
     && cp target/release/fictionet target/release/examples/web_fixture /usr/local/bin/
 

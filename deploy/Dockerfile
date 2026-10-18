@@ -16,6 +16,7 @@ RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY cli cli
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
@@ -28,8 +29,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-musl-target-${TARGETARCH} \
     # Copied files may keep old times, and cargo would then take the
     # cached build for current. Touch them so it compares contents anew.
-    find src examples -type f -exec touch {} + \
-    && cargo build --release --locked --features tokio --bin fictionet --example web_world \
+    find src cli examples -type f -exec touch {} + \
+    && cargo build --release --locked --bin fictionet --example web_world \
     && mkdir /out \
     && cp target/release/fictionet target/release/examples/web_world /out/
 

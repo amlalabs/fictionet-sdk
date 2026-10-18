@@ -1,16 +1,16 @@
-const INDEX_HTML: &str = include_str!("../../../../dashboard/index.html");
-const APP_JS: &str = include_str!("../../../../dashboard/app.mjs");
-const GRAPH_JS: &str = include_str!("../../../../dashboard/graph.mjs");
-const GROUPS_JS: &str = include_str!("../../../../dashboard/groups.mjs");
-const INTERACTION_JS: &str = include_str!("../../../../dashboard/interaction.mjs");
-const LAYOUT_JS: &str = include_str!("../../../../dashboard/layout.mjs");
-const PACKETS_JS: &str = include_str!("../../../../dashboard/packets.mjs");
-const STATE_JS: &str = include_str!("../../../../dashboard/state.mjs");
-const TABLES_JS: &str = include_str!("../../../../dashboard/tables.mjs");
-const TRANSPORT_JS: &str = include_str!("../../../../dashboard/transport.mjs");
-const DOM_JS: &str = include_str!("../../../../dashboard/dom.mjs");
-const APP_CSS: &str = include_str!("../../../../dashboard/app.css");
-const ICON_SVG: &str = include_str!("../../../../dashboard/icon.svg");
+const INDEX_HTML: &str = include_str!("../../../dashboard/index.html");
+const APP_JS: &str = include_str!("../../../dashboard/app.mjs");
+const GRAPH_JS: &str = include_str!("../../../dashboard/graph.mjs");
+const GROUPS_JS: &str = include_str!("../../../dashboard/groups.mjs");
+const INTERACTION_JS: &str = include_str!("../../../dashboard/interaction.mjs");
+const LAYOUT_JS: &str = include_str!("../../../dashboard/layout.mjs");
+const PACKETS_JS: &str = include_str!("../../../dashboard/packets.mjs");
+const STATE_JS: &str = include_str!("../../../dashboard/state.mjs");
+const TABLES_JS: &str = include_str!("../../../dashboard/tables.mjs");
+const TRANSPORT_JS: &str = include_str!("../../../dashboard/transport.mjs");
+const DOM_JS: &str = include_str!("../../../dashboard/dom.mjs");
+const APP_CSS: &str = include_str!("../../../dashboard/app.css");
+const ICON_SVG: &str = include_str!("../../../dashboard/icon.svg");
 
 /// The content type and body of the embedded file served at `path`.
 pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static str)> {

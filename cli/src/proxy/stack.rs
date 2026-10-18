@@ -21,8 +21,8 @@ use fictionet::stdlib::{ConnError, ip, tcp, udp};
 use fictionet::{Cx, RecvError};
 
 use super::link::Link;
-use fictionet::relay::proxy::Host;
-use fictionet::relay::proxy::dns::{self, Lookup};
+use fictionet_cli::attach_proxy::Host;
+use fictionet_cli::attach_proxy::dns::{self, Lookup};
 
 /// How long a connection may take to open before the client is told it
 /// timed out. The stack itself would wait two minutes for a SYN that is

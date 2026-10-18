@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use crate::config::{ProxyArgs, ProxyKind};
 use crate::lifecycle;
 use crate::world::{self, Failure, Greeting, err};
-use fictionet::relay::proxy::auth::Token;
+use fictionet_cli::attach_proxy::auth::Token;
 use link::Link;
 use stack::Stack;
 
@@ -188,7 +188,7 @@ async fn busy(mut client: TcpStream, kind: ProxyKind) {
             reason = "the turned-away client is logged above; this 503 only informs a client that may be gone"
         )]
         let _ = client
-            .write_all(&fictionet::relay::proxy::http::error_response(
+            .write_all(&fictionet_cli::attach_proxy::http::error_response(
                 503,
                 "too many connections through this proxy",
             ))

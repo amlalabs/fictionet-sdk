@@ -1,5 +1,5 @@
 //! The bodies of the proxy fuzz targets: the doors' protocol side, in
-//! `fictionet::relay::proxy`.
+//! `fictionet_cli::attach_proxy`.
 
 use std::io;
 use std::pin::Pin;
@@ -8,14 +8,14 @@ use std::task::{Context, Poll};
 use arbitrary::Arbitrary;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use fictionet::attach_proxy::socks5_handshake::handshake;
-use fictionet::relay::proxy::Host;
-use fictionet::relay::proxy::auth::{Token, base64_decode};
-use fictionet::relay::proxy::dns;
-use fictionet::relay::proxy::http::{
+use fictionet::stdlib::http1::{RequestHead, ResponseHead};
+use fictionet_cli::attach_proxy::Host;
+use fictionet_cli::attach_proxy::auth::{Token, base64_decode};
+use fictionet_cli::attach_proxy::dns;
+use fictionet_cli::attach_proxy::http::{
     Target, error_response, forward_head, parse_request, rewrite_response,
 };
-use fictionet::stdlib::http1::{RequestHead, ResponseHead};
+use fictionet_cli::attach_proxy::socks5_handshake::handshake;
 
 /// The HTTP door: a request head, the token check, and the answer's head.
 pub fn http(data: &[u8]) {

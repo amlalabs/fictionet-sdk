@@ -7,7 +7,7 @@
 //! username/password method. The username is not checked: it may be
 //! anything, such as `relay` or the sandbox's name.
 
-use crate::stdlib::codec::base64::{self, Padding};
+use fictionet::stdlib::codec::base64::{self, Padding};
 
 /// The longest token: SOCKS5 carries a password in at most 255 bytes.
 pub const MAX_TOKEN: usize = 255;

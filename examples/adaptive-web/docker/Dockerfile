@@ -13,6 +13,7 @@ FROM rust:1.92-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY cli cli
 COPY docs docs
 COPY dashboard dashboard
 COPY benches benches
@@ -25,7 +26,7 @@ ARG CARGO_BUILD_JOBS=8
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-adaptive-web-target \
     cargo build --release --locked -p adaptive-web-world --bin adaptive-web-world \
-    && cargo build --release --locked -p fictionet --bin fictionet \
+    && cargo build --release --locked -p fictionet-cli --bin fictionet \
     && cp target/release/adaptive-web-world target/release/fictionet /usr/local/bin/
 
 FROM python:3.12-slim-bookworm AS world

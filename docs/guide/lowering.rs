@@ -20,7 +20,7 @@
 #![doc = include_str!("../diagrams/lowering.svg")]
 //!
 //! The function names on this page are those in the `fictionet` binary's
-//! source, under `src/bin/fictionet/`, so you can follow each step in the
+//! source, under `cli/src/`, so you can follow each step in the
 //! code.
 //!
 //! # The last hop is the same for every type

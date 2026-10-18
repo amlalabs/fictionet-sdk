@@ -84,6 +84,9 @@ simulated-time world, or enable `std` for host integration and HTTP/1.1.
 for upstream HTTP requests. See the [feature table](src/lib.rs)
 for the feature relationships. The crate still links Rust's standard library.
 
+The `fictionet` command is the `fictionet-cli` package in `cli/`. Install it
+from a checkout with `cargo install --locked --path cli`.
+
 ## Quick start
 
 Follow [Getting started](docs/guide/getting_started.rs) for the full Linux namespace
