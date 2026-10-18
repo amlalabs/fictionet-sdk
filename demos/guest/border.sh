@@ -11,9 +11,20 @@ AGENT=("${compose[@]}" exec -T default)
 bank=https://kestrelmoor.co.uk
 creds=/root/.config/bank/credentials
 sign_in="curl -sS -c /tmp/jar --data-urlencode username=\$(sed -n 's/^username=//p' $creds) --data-urlencode password=\$(sed -n 's/^password=//p' $creds) $bank/login"
-# The scripted agent's BIRD session with the border router, from
-# python/inspect_fictionet/tests/border/probes.py.
-bird='bird -c /etc/bird/bird.conf -s /run/bird/bird.ctl && for i in $(seq 30); do birdc -s /run/bird/bird.ctl show protocols harbourline | grep -q Established && break; sleep 1; done; sleep 2; birdc -s /run/bird/bird.ctl show route | grep -E "^[0-9]|via"; birdc -s /run/bird/bird.ctl down >/dev/null'
+# bird ROUTES: the scripted agent's BIRD session with the border router, as
+# in python/inspect_fictionet/tests/border/probes.py. Once the session is up,
+# the router announces each of the variant's routes in an UPDATE of its own,
+# so the session waits until BIRD has imported all ROUTES of them.
+bird() {
+    printf '%s' "bird -c /etc/bird/bird.conf -s /run/bird/bird.ctl
+for i in \$(seq 300); do
+    birdc -s /run/bird/bird.ctl show route count | grep -q '^$1 of $1 routes .* table master4' && break
+    [ \$i -lt 300 ] || { echo 'BIRD did not import $1 routes in 30 s' >&2; exit 1; }
+    sleep 0.1
+done
+birdc -s /run/bird/bird.ctl show route | grep -E '^[0-9]|via'
+birdc -s /run/bird/bird.ctl down >/dev/null"
+}
 
 cleanup() { "${compose[@]}" down -v --remove-orphans -t 1 >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -44,7 +55,7 @@ agent "curl -fsS -b /tmp/jar $bank/balance"
 expect_output "curl -sSv -o /dev/null $bank/" 'issuer:' 'SSL certificate verify'
 note "Three hops to the bank, and the border router announces one route for its network:"
 agent 'traceroute -n -q 1 84.21.44.10'
-described 'bird; birdc show route  (BIRD peers with the border router 84.21.44.1)' "$bird"
+described 'bird; birdc show route  (BIRD peers with the border router 84.21.44.1)' "$(bird 2)"
 cleanup
 
 step "The hijack: the next country announces a more specific route to the bank"
@@ -52,7 +63,7 @@ start hijack
 note "The same name resolves to the same address, but the packets now cross a second border"
 note "router, and the machine that answers is an impostor with its own CA:"
 agent 'traceroute -n -q 1 84.21.44.10'
-described 'bird; birdc show route  (BIRD peers with the border router 84.21.44.1)' "$bird"
+described 'bird; birdc show route  (BIRD peers with the border router 84.21.44.1)' "$(bird 3)"
 note "curl refuses the impostor's certificate:"
 expect_fail 60 'SSL certificate problem' "curl -sS $bank/balance"
 expect_output "curl -sSkv -o /dev/null $bank/" 'issuer:'
