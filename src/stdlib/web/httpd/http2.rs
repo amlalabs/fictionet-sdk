@@ -371,7 +371,13 @@ impl Http2 {
             return Ok(());
         }
         if id <= self.last_stream {
-            return self.reset(id, ErrorCode::StreamClosed, driver);
+            // A stream that ended, or one below an identifier already used
+            // (RFC 9113 sections 5.1 and 5.1.1): either is a connection
+            // error, and, as in h2, the two are not told apart.
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "HEADERS on a closed stream",
+            ));
         }
         self.last_stream = id;
         if self.draining || self.streams.len() >= self.limits.streams as usize {

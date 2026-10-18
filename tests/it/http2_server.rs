@@ -276,13 +276,13 @@ fn replay() -> Trace {
         loop {
             if matches!(read_frame(&cx, &mut conn).await, Frame::Reset(r) if r.stream == 1) { break }
         }
-        // Expiry of the local reset must also follow the world clock.
+        // Expiry of the local reset must also follow the world clock: once
+        // it expires, HEADERS on the closed stream ends the connection.
         cx.sleep(Duration::from_millis(1100)).await?;
         conn.write_all(&cx, &headers(1, "/", true)).await?;
         loop {
-            if let Frame::Reset(reset) = read_frame(&cx, &mut conn).await {
-                assert_eq!(reset.stream, 1);
-                assert_eq!(reset.code, 5);
+            if let Frame::GoAway(goaway) = read_frame(&cx, &mut conn).await {
+                assert_eq!(goaway.code, 1);
                 break;
             }
         }
@@ -1036,6 +1036,26 @@ fn trailers_after_end_stream_reset_only_that_stream() {
     );
     assert_eq!(statuses(&output), [(3, b"404".to_vec())]);
     assert!(!harness.closed());
+}
+
+#[test]
+fn headers_on_a_closed_stream_end_the_connection() {
+    // HEADERS on a stream that has ended, and on a stream below one already
+    // opened (RFC 9113 sections 5.1 and 5.1.1).
+    for (open, again) in [(1, 1), (5, 3)] {
+        let mut harness = Harness::new(Seed::from_u64(1), Http2::new(Router::new()), ());
+        harness.push(&preface()).unwrap();
+        let output = frames(&harness.push(&headers(open, "/", true)).unwrap());
+        assert_eq!(statuses(&output), [(open, b"404".to_vec())]);
+        let output = frames(&harness.push(&headers(again, "/", true)).unwrap());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::GoAway(g) if g.last_stream == open && g.code == 1))
+        );
+        assert!(!output.iter().any(|f| matches!(f, Frame::Reset(_))));
+        assert!(harness.closed());
+    }
 }
 
 #[test]
