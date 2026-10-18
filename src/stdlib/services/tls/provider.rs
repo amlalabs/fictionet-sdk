@@ -594,7 +594,7 @@ mod tests {
             result.push(
                 key.choose_scheme(&[rustls::SignatureScheme::RSA_PSS_SHA256])
                     .unwrap()
-                    .sign(b"copied TLS")
+                    .sign(b"seeded TLS")
                     .unwrap(),
             );
             result

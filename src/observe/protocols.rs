@@ -312,7 +312,7 @@ mod tests {
         );
         assert_eq!(packet.proto, "Modbus/TCP");
         assert_eq!(packet.layers[0].range, (0, bytes.len()));
-        let item = super::Display::from_packet(packet, "Copied frame");
+        let item = super::Display::from_packet(packet, "Modbus frame");
         assert!(super::Modbus::summary(&item).contains("transaction 7"));
         assert!(format!("{registry:?}").contains("modbus"));
         assert!(format!("{:?}", Observed::new(super::Modbus::new(true))).contains("Modbus/TCP"));
