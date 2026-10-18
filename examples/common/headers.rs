@@ -1,10 +1,10 @@
-//! Header lookup for the legacy request logs.
+//! Header lookup in HTTP request events.
 
-use fictionet::events::Event as Entry;
+use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 
 /// The first matching header's string value, or none if it is missing or malformed.
-pub fn header<'a>(e: &'a Entry, name: &str) -> Option<&'a str> {
+pub fn header<'a>(e: &'a Event, name: &str) -> Option<&'a str> {
     e.get("headers")
         .and_then(J::as_array)
         .unwrap_or_default()
@@ -26,11 +26,11 @@ mod tests {
             &Default::default(),
         )
         .unwrap();
-        let e = Entry::new("http", "request").field("headers", headers);
+        let e = Event::new("http", "request").field("headers", headers);
         assert_eq!(header(&e, "user-agent"), None);
         assert_eq!(header(&e, "referer"), Some("first"));
         assert_eq!(header(&e, "empty"), Some(""));
         assert_eq!(header(&e, "Referer"), None);
-        assert_eq!(header(&Entry::new("http", "request"), "user-agent"), None);
+        assert_eq!(header(&Event::new("http", "request"), "user-agent"), None);
     }
 }

@@ -70,7 +70,7 @@ fn ask(bank: &Bank, method: Method, target: &str, headers: &[(&str, &str)], body
 }
 
 fn ask_headers(bank: &Bank, method: Method, target: &str, headers: &HeaderMap, body: &str) -> Got {
-    let response = bank.answer(&method, target, headers, body.as_bytes());
+    let response = bank.answer(&method, target, headers, body.as_bytes(), true);
     let status = response.status();
     let page = response
         .extensions()
@@ -100,10 +100,13 @@ fn futures_body(body: http_body_util::Full<bytes::Bytes>) -> String {
 }
 
 fn lab(test: impl FnOnce(&Cx) + Send + 'static) {
-    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
-        test(&fcx);
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(Seed::from_u64(1)),
+        |fcx| async move {
+            test(&fcx);
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
@@ -771,7 +774,7 @@ fn the_password_is_found_wherever_it_is_carried() {
 
 #[test]
 fn the_status_page_is_always_the_same() {
-    let response = bank::Status::answer();
+    let response = bank::Status::answer(true);
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.extensions().get::<Page>(),
@@ -807,24 +810,28 @@ impl hyper::body::Body for Chunks {
 fn streamed(chunks: Vec<bytes::Bytes>, encoding: Option<&'static str>) -> Page {
     let result = Arc::new(std::sync::Mutex::new(None));
     let saved = result.clone();
-    fictionet::block_on(fictionet::lab(Seed::from_u64(1), move |fcx| async move {
-        let mut bank = bank(&fcx, Variant::Hijack, Task::Login, ServedBy::Impostor);
-        let mut request = http::Request::post("/login");
-        if let Some(encoding) = encoding {
-            request = request.header("content-encoding", encoding);
-        }
-        let response = tower_service::Service::call(
-            &mut bank,
-            request
-                .body(fictionet::stdlib::web::Body::new(Chunks(chunks.into())))
-                .unwrap(),
-        )
-        .await?;
-        let page = response.extensions().get::<Page>().unwrap().clone();
-        assert!(!format!("{:?}", page.fields()).contains(PASSWORD));
-        *saved.lock().unwrap() = Some(page);
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::lab(
+        fictionet::RunOptions::new(Seed::from_u64(1)),
+        move |fcx| async move {
+            let mut bank = bank(&fcx, Variant::Hijack, Task::Login, ServedBy::Impostor);
+            let mut request = http::Request::post("/login")
+                .extension(fictionet::stdlib::web::httpd::EventInterest(true));
+            if let Some(encoding) = encoding {
+                request = request.header("content-encoding", encoding);
+            }
+            let response = tower_service::Service::call(
+                &mut bank,
+                request
+                    .body(fictionet::stdlib::web::Body::new(Chunks(chunks.into())))
+                    .unwrap(),
+            )
+            .await?;
+            let page = response.extensions().get::<Page>().unwrap().clone();
+            assert!(!format!("{:?}", page.fields()).contains(PASSWORD));
+            *saved.lock().unwrap() = Some(page);
+            Ok(())
+        },
+    ))
     .unwrap();
     result.lock().unwrap().take().unwrap()
 }

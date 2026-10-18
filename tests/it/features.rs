@@ -40,7 +40,7 @@ mod http {
         web::httpd,
         world::net,
     };
-    use fictionet::{Cx, Seed};
+    use fictionet::{Cx, RunOptions, Seed};
     use std::net::{Ipv4Addr, SocketAddr};
 
     async fn client(fcx: &Cx, router: impl httpd::Handler) -> tcp::TcpConnection {
@@ -80,88 +80,91 @@ mod http {
     #[test]
     fn http2_prior_knowledge_works_with_std() {
         use fictionet::stdlib::{codec::Wire, protocols::http2};
-        fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
-            let router =
-                httpd::Router::new().get("/", |_, _| http::Response::new("hello over h2".into()));
-            let mut conn = client(&fcx, router).await;
-            let mut input = http2::PREFACE.to_vec();
-            http2::Settings {
-                flags: 0,
-                entries: Vec::new(),
-            }
-            .write(&mut input)?;
-            let mut fragment = Vec::new();
-            for (name, value) in [
-                (":method", "GET"),
-                (":scheme", "http"),
-                (":authority", "example.test"),
-                (":path", "/"),
-            ] {
-                fictionet::stdlib::protocols::hpack::Field::new(name, value)
-                    .write(&mut fragment)?;
-            }
-            http2::Headers {
-                stream: 1,
-                flags: 5,
-                fragment,
-                priority: None,
-                padding: None,
-            }
-            .write(&mut input)?;
-            conn.write_all(&fcx, &input).await?;
-            let mut blocks = http2::HeaderBlocks::with_limits(Default::default());
-            let mut body = Vec::new();
-            let mut status = None;
-            loop {
-                let mut bytes = vec![0; 9];
-                for byte in &mut bytes {
-                    assert_eq!(conn.read(&fcx, std::slice::from_mut(byte)).await?, 1);
+        fictionet::block_on(fictionet::lab(
+            RunOptions::new(Seed::from_u64(1)),
+            |fcx| async move {
+                let router = httpd::Router::new()
+                    .get("/", |_, _| http::Response::new("hello over h2".into()));
+                let mut conn = client(&fcx, router).await;
+                let mut input = http2::PREFACE.to_vec();
+                http2::Settings {
+                    flags: 0,
+                    entries: Vec::new(),
                 }
-                let header = http2::FrameHeader::parse(&bytes)?;
-                bytes.resize(9 + header.length, 0);
-                let mut at = 9;
-                while at < bytes.len() {
-                    let n = conn.read(&fcx, &mut bytes[at..]).await?;
-                    assert_ne!(n, 0);
-                    at += n;
+                .write(&mut input)?;
+                let mut fragment = Vec::new();
+                for (name, value) in [
+                    (":method", "GET"),
+                    (":scheme", "http"),
+                    (":authority", "example.test"),
+                    (":path", "/"),
+                ] {
+                    fictionet::stdlib::protocols::hpack::Field::new(name, value)
+                        .write(&mut fragment)?;
                 }
-                let frame = http2::Frame::parse(&bytes)?;
-                if let Some(block) = blocks.read_frame(&frame)?.block {
-                    status = block
-                        .headers
-                        .into_iter()
-                        .find(|h| h.name.as_deref() == Some(b":status"))
-                        .and_then(|h| h.value);
+                http2::Headers {
+                    stream: 1,
+                    flags: 5,
+                    fragment,
+                    priority: None,
+                    padding: None,
                 }
-                match frame {
-                    http2::Frame::Settings(s) if s.flags & 1 == 0 => {
-                        conn.write_all(
-                            &fcx,
-                            &http2::Settings {
-                                flags: 1,
-                                entries: Vec::new(),
-                            }
-                            .to_bytes()?,
-                        )
-                        .await?;
+                .write(&mut input)?;
+                conn.write_all(&fcx, &input).await?;
+                let mut blocks = http2::HeaderBlocks::with_limits(Default::default());
+                let mut body = Vec::new();
+                let mut status = None;
+                loop {
+                    let mut bytes = vec![0; 9];
+                    for byte in &mut bytes {
+                        assert_eq!(conn.read(&fcx, std::slice::from_mut(byte)).await?, 1);
                     }
-                    http2::Frame::Data(d) => {
-                        assert_eq!(d.stream, 1);
-                        body.extend(d.data);
-                        if d.flags & 1 != 0 {
-                            break;
+                    let header = http2::FrameHeader::parse(&bytes)?;
+                    bytes.resize(9 + header.length, 0);
+                    let mut at = 9;
+                    while at < bytes.len() {
+                        let n = conn.read(&fcx, &mut bytes[at..]).await?;
+                        assert_ne!(n, 0);
+                        at += n;
+                    }
+                    let frame = http2::Frame::parse(&bytes)?;
+                    if let Some(block) = blocks.read_frame(&frame)?.block {
+                        status = block
+                            .headers
+                            .into_iter()
+                            .find(|h| h.name.as_deref() == Some(b":status"))
+                            .and_then(|h| h.value);
+                    }
+                    match frame {
+                        http2::Frame::Settings(s) if s.flags & 1 == 0 => {
+                            conn.write_all(
+                                &fcx,
+                                &http2::Settings {
+                                    flags: 1,
+                                    entries: Vec::new(),
+                                }
+                                .to_bytes()?,
+                            )
+                            .await?;
                         }
+                        http2::Frame::Data(d) => {
+                            assert_eq!(d.stream, 1);
+                            body.extend(d.data);
+                            if d.flags & 1 != 0 {
+                                break;
+                            }
+                        }
+                        http2::Frame::Reset(r) => panic!("request reset: {r:?}"),
+                        http2::Frame::GoAway(g) => panic!("connection ended: {g:?}"),
+                        _ => {}
                     }
-                    http2::Frame::Reset(r) => panic!("request reset: {r:?}"),
-                    http2::Frame::GoAway(g) => panic!("connection ended: {g:?}"),
-                    _ => {}
                 }
-            }
-            assert_eq!(status.as_deref(), Some(b"200".as_slice()));
-            assert_eq!(body, b"hello over h2");
-            fcx.cancel();
-            Ok(())
-        }))
+                assert_eq!(status.as_deref(), Some(b"200".as_slice()));
+                assert_eq!(body, b"hello over h2");
+                fcx.cancel();
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -191,7 +194,7 @@ mod http {
             b"Content-Length: 4\r\n\r\nbody".as_slice(),
             b"Transfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n".as_slice(),
         ] {
-            fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
+            fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
                 let app = axum::Router::new().route("/", axum::routing::post(echo));
                 let mut conn = client(&fcx, Wrapped(httpd::tower(app))).await;
                 let mut input = b"POST / HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n".to_vec();
@@ -216,7 +219,7 @@ mod http {
     #[test]
     fn tower_upgrade_with_a_cut_off_body_is_answered() {
         let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
-        fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()), |fcx| async move {
+        fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()), |fcx| async move {
             let app = axum::Router::new().route("/", axum::routing::post(|| async { "reached" }));
             let mut conn = client(&fcx, httpd::tower(app)).await;
             conn.write_all(&fcx, b"POST / HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 10\r\n\r\nbody").await?;
@@ -234,7 +237,7 @@ mod http {
 
     #[test]
     fn upgrade_request_can_receive_an_ordinary_response() {
-        fictionet::block_on(fictionet::lab(Seed::from_u64(2), |fcx| async move {
+        fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(2)), |fcx| async move {
             let router = httpd::Router::new().get("/", |_, _| http::Response::new("route response".into()));
             let mut conn = client(&fcx, router).await;
             conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n").await?;
@@ -270,7 +273,7 @@ mod http {
                 Ok(serve::Flow::Continue)
             }
         }
-        fictionet::block_on(fictionet::lab(Seed::from_u64(3), |fcx| async move {
+        fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(3)), |fcx| async move {
             let router = httpd::Router::new().get("/", |_, request| {
                 let headers: Vec<_> = request.headers().iter().map(|(n, v)| (n.as_str(), v.to_str().unwrap())).collect();
                 let upgrade = websocket::check_request(&headers).unwrap();

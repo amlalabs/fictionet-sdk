@@ -120,7 +120,7 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let out = slot.clone();
     let result = fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random()),
         move |fcx| async move {
             let mut abc = fcx
                 .race(
@@ -244,7 +244,7 @@ fn resolv_conf_flag_picks_the_file_and_a_failed_write_names_it() {
 
     let written = custom.clone();
     fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random()),
         move |fcx| async move {
             let abc = attachments.get(&fcx, "good").await?;
             poll::until(Duration::from_secs(5), "sandbox resolver file", || {
@@ -295,7 +295,7 @@ const V4_ONLY: &str = "--ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
 fn hold_until(attachments: fictionet::Attachments, name: &'static str, done: std::path::PathBuf) {
     let mut attachments = attachments;
     fictionet::block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random()),
         move |fcx| async move {
             let held = attachments.get(&fcx, name).await?;
             poll::until(Duration::from_secs(10), "sandbox completion file", || {

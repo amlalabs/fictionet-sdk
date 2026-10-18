@@ -277,10 +277,6 @@ fn last_event(graph: &Graph) -> u64 {
     graph.events.as_ref().map_or(0, |events| events.last())
 }
 
-fn retained_events(graph: &Graph, after: u64, max: usize) -> Vec<Event> {
-    history_batch(graph, after, max).0
-}
-
 fn history_batch(graph: &Graph, after: u64, max: usize) -> (Vec<Event>, u64, u64) {
     graph.events.as_ref().map_or_else(
         || (Vec::new(), 0, 0),
@@ -350,21 +346,19 @@ pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
         }
         None => {
             let last = last_event(graph);
-            let events = retained_events(
+            let (events, last, dropped) = history_batch(
                 graph,
                 last.saturating_sub(SNAPSHOT_EVENTS),
                 SNAPSHOT_EVENTS as usize + 1,
             );
             view.event_seq = events.last().map_or(last, |e| e.seq);
+            view.dropped = dropped;
             events
         }
     };
     let mut events: Vec<String> = events.iter().map(event_line).collect();
-    if after.is_none() {
-        view.dropped = graph.events.as_ref().map_or(0, |history| history.dropped());
-        if view.dropped != 0 {
-            events.insert(0, loss_line(view.dropped, 0));
-        }
+    if view.dropped != 0 {
+        events.insert(0, loss_line(view.dropped, 0));
     }
     let data = Object::new()
         .secs("t", graph.since_start())
@@ -628,7 +622,7 @@ mod tests {
             .collect();
         assert_serialization_error(&events[0], 1);
         assert_eq!(events[1].get("seq").and_then(Value::as_u64), Some(2));
-        assert_eq!(events[1], retained_events(&graph, 1, 1)[0].to_json());
+        assert_eq!(events[1], history_batch(&graph, 1, 1).0[0].to_json());
         assert!(event_changes(&graph, &mut view).0.is_empty());
         assert!(!view.events_pending(&graph));
     }

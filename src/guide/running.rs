@@ -34,7 +34,7 @@
 //!     let _listening = fictionet::listen(socket, attacher)?;
 //!
 //!     // 3. The world, as one future. Nothing runs yet.
-//!     let world = fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments));
+//!     let world = fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), move |fcx| world(fcx, attachments));
 //!
 //!     // 4. Poll that future on this thread until the world ends.
 //!     fictionet::block_on(world)
@@ -63,7 +63,7 @@
 //!    [`Attachment`](crate::Attachment). Keep the returned
 //!    [`Listening`](crate::Listening) in a named variable. Dropping it
 //!    closes the socket, and `let _ = listen(...)` drops it on the spot.
-//! 3. **[`run(seed, f)`](crate::run)** returns a future and does nothing else.
+//! 3. **[`run(fictionet::RunOptions::new(seed), f)`](crate::run)** returns a future and does nothing else.
 //!    When the future is first polled, it makes the world's
 //!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every random
 //!    number drawn through `Cx` comes from `seed`;
@@ -237,7 +237,7 @@
 //! # fn main() -> Result {
 //! # let (_attacher, attachments) = fictionet::attachments();
 //! let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-//! runtime.block_on(fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments)))
+//! runtime.block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), move |fcx| world(fcx, attachments)))
 //! # }
 //! # #[cfg(not(feature = "std"))]
 //! # fn main() {}
@@ -280,7 +280,7 @@
 //! // The test plays the sandbox "agent": it holds the sandbox's end.
 //! let mut agent = attacher.attach("agent").unwrap();
 //!
-//! let test = fictionet::lab(fictionet::Seed::from_u64(1), move |fcx| async move {
+//! let test = fictionet::lab(fictionet::RunOptions::new(fictionet::Seed::from_u64(1)), move |fcx| async move {
 //!     fcx.spawn(move |fcx| world(fcx, attachments));
 //!     agent.send(Packet(vec![0x45, 0, 0, 20]));
 //!     assert_eq!(agent.recv(&fcx).await?, Packet(vec![0x45, 0, 0, 20]));
@@ -321,7 +321,7 @@
 //!
 //! # Repeatable runs
 //!
-//! [`lab(seed, f)`](crate::lab) runs a world the way `run` does, on the same
+//! [`lab(options, f)`](crate::lab) runs a world the way `run` does, on the same
 //! executor. Only what stands behind the [`Cx`](crate::Cx) changes:
 //!
 //! - **Time is a number.** It starts at zero. When every task is waiting,

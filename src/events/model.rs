@@ -312,8 +312,12 @@ impl Event {
     }
 
     /// Formats at most four KiB when emitted lazily.
-    pub fn summary(mut self, summary: impl EventSummary) -> Event {
-        let (text, truncated) = summary.into_summary(self.bounded);
+    pub fn summary(mut self, summary: impl std::fmt::Display) -> Event {
+        let (text, truncated) = if self.bounded {
+            bounded_text(summary)
+        } else {
+            (summary.to_string(), false)
+        };
         self.summary = text;
         if truncated {
             self = self.truncated();
@@ -364,7 +368,7 @@ impl Event {
         self
     }
 
-    /// Marks a repeatable fact and adds per-occurrence detail, with `count = 1`.
+    /// Marks a repeatable fact and adds per-occurrence detail.
     /// An optional [`super::Aggregate`] combines matching facts and summarizes
     /// numeric detail as ranges. Detail names must not replace identifying fields.
     /// Without that observer, every occurrence is delivered unchanged.
@@ -373,7 +377,7 @@ impl Event {
             .iter()
             .any(|(name, _)| self.fields.get(name).is_some())
         {
-            return self.fields(detail).field("count", 1u64).truncated();
+            return self.fields(detail).truncated();
         }
         let names = detail
             .iter()
@@ -384,7 +388,7 @@ impl Event {
         if detail.len() > 64 {
             self = self.truncated();
         }
-        self = self.fields(detail).field("count", 1u64);
+        self = self.fields(detail);
         self.repeat = Some(names);
         self
     }
@@ -481,8 +485,7 @@ impl Event {
 
     /// [`to_json`](Self::to_json) as one line of text, with no newline.
     /// Returns an error if the event exceeds the JSON writer's size,
-    /// depth or value-count limit. Callers must handle this `Result`;
-    /// serialization failures no longer return an empty string.
+    /// depth or value-count limit.
     pub fn to_line(&self) -> Result<String, json::Error> {
         let bytes = self.to_json().to_bytes()?;
         Ok(String::from_utf8(bytes).expect("JSON is UTF-8"))
@@ -631,49 +634,6 @@ fn bounded_value(value: &Value, depth: usize, remaining: &mut usize, bytes: &mut
                 })
         }
         _ => true,
-    }
-}
-
-/// Text that can be formatted with a bound while accepting owned summaries.
-pub trait EventSummary {
-    /// Produces summary text and whether it was shortened.
-    fn into_summary(self, bounded: bool) -> (String, bool);
-}
-
-impl EventSummary for String {
-    fn into_summary(self, bounded: bool) -> (String, bool) {
-        if bounded {
-            bounded_text(&self)
-        } else {
-            (self, false)
-        }
-    }
-}
-impl<T: std::fmt::Display + ?Sized> EventSummary for &T {
-    fn into_summary(self, bounded: bool) -> (String, bool) {
-        if bounded {
-            bounded_text(self)
-        } else {
-            (self.to_string(), false)
-        }
-    }
-}
-impl EventSummary for Cow<'_, str> {
-    fn into_summary(self, bounded: bool) -> (String, bool) {
-        if bounded {
-            bounded_text(&self)
-        } else {
-            (self.into_owned(), false)
-        }
-    }
-}
-impl EventSummary for std::fmt::Arguments<'_> {
-    fn into_summary(self, bounded: bool) -> (String, bool) {
-        if bounded {
-            bounded_text(self)
-        } else {
-            (self.to_string(), false)
-        }
     }
 }
 

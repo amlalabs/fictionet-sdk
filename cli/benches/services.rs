@@ -103,7 +103,7 @@ impl Echo {
         let listening = listen(WorldSocket::UnixSocket(path.clone()), attacher).unwrap();
         let world = std::thread::spawn(move || {
             finish(block_on(run(
-                fictionet::Seed::random(),
+                fictionet::RunOptions::new(fictionet::Seed::random()),
                 move |fcx| async move {
                     let mut agent = attachments.get(&fcx, "agent").await?;
                     loop {

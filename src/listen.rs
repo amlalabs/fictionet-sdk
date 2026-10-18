@@ -150,7 +150,7 @@ impl std::error::Error for ParseWorldSocketError {}
 /// let (attacher, attachments) = fictionet::attachments();
 /// let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 /// let _listening = fictionet::listen(socket, attacher)?;
-/// fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
+/// fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| world(fcx, attachments)))
 /// # }
 /// ```
 pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listening> {
@@ -985,22 +985,25 @@ mod tests {
         let shared = listening.shared.clone();
         let (done_tx, done_rx) = mpsc::channel();
         let world = std::thread::spawn(move || {
-            let result = block_on(run(Seed::from_u64(0), move |fcx| async move {
-                let mut agent = attachments.get(&fcx, "agent").await?;
-                let slot = shared.conns.lock().get(&2).unwrap().clone();
-                // The client does not drain the burst, so it exceeds even
-                // the raised socket buffer and needs EPOLLOUT.
-                for _ in 0..10_000 {
-                    agent.send(Packet(vec![0; 1400]));
-                }
-                assert_eq!(agent.recv(&fcx).await, Err(RecvError::Closed));
-                let out = slot.out.lock();
-                assert!(out.closed);
-                assert!(!out.want_out);
-                assert!(out.queue.is_empty());
-                assert_eq!(out.dropped, 1);
-                Ok(())
-            }));
+            let result = block_on(run(
+                fictionet::RunOptions::new(Seed::from_u64(0)),
+                move |fcx| async move {
+                    let mut agent = attachments.get(&fcx, "agent").await?;
+                    let slot = shared.conns.lock().get(&2).unwrap().clone();
+                    // The client does not drain the burst, so it exceeds even
+                    // the raised socket buffer and needs EPOLLOUT.
+                    for _ in 0..10_000 {
+                        agent.send(Packet(vec![0; 1400]));
+                    }
+                    assert_eq!(agent.recv(&fcx).await, Err(RecvError::Closed));
+                    let out = slot.out.lock();
+                    assert!(out.closed);
+                    assert!(!out.want_out);
+                    assert!(out.queue.is_empty());
+                    assert_eq!(out.dropped, 1);
+                    Ok(())
+                },
+            ));
             done_tx.send(result).unwrap();
         });
         done_rx
@@ -1038,18 +1041,21 @@ mod tests {
         assert_eq!(FAILURES.load(Ordering::SeqCst), 1);
         assert!(listening.shared.conns.lock().is_empty());
         assert!(attacher.reserve("agent").is_ok(), "name must be released");
-        block_on(run(Seed::from_u64(0), move |fcx| async move {
-            let mut next = std::pin::pin!(attachments.next(&fcx));
-            poll_fn(|cx| {
-                assert!(
-                    next.as_mut().poll(cx).is_pending(),
-                    "no attachment delivered"
-                );
-                Poll::Ready(())
-            })
-            .await;
-            Ok(())
-        }))
+        block_on(run(
+            fictionet::RunOptions::new(Seed::from_u64(0)),
+            move |fcx| async move {
+                let mut next = std::pin::pin!(attachments.next(&fcx));
+                poll_fn(|cx| {
+                    assert!(
+                        next.as_mut().poll(cx).is_pending(),
+                        "no attachment delivered"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -1072,20 +1078,23 @@ mod tests {
         let client = Client::hello(&listening.path, "agent");
         assert_eq!(client.recv(), [relay::ACCEPT]);
         let shared = listening.shared.clone();
-        block_on(run(Seed::from_u64(0), move |fcx| async move {
-            let _agent = attachments.get(&fcx, "agent").await?;
-            let slot = shared.conns.lock().get(&2).unwrap().clone();
-            let mut out = slot.out.lock();
-            slot.watch_out(&mut out, &shared, true).unwrap();
-            slot.flush(&mut out, &shared);
-            assert!(out.want_out);
-            assert!(!out.closed);
-            assert_eq!(MODS.load(Ordering::SeqCst), 3);
-            slot.watch_out(&mut out, &shared, false).unwrap();
-            assert!(!out.want_out);
-            assert_eq!(MODS.load(Ordering::SeqCst), 4);
-            Ok(())
-        }))
+        block_on(run(
+            fictionet::RunOptions::new(Seed::from_u64(0)),
+            move |fcx| async move {
+                let _agent = attachments.get(&fcx, "agent").await?;
+                let slot = shared.conns.lock().get(&2).unwrap().clone();
+                let mut out = slot.out.lock();
+                slot.watch_out(&mut out, &shared, true).unwrap();
+                slot.flush(&mut out, &shared);
+                assert!(out.want_out);
+                assert!(!out.closed);
+                assert_eq!(MODS.load(Ordering::SeqCst), 3);
+                slot.watch_out(&mut out, &shared, false).unwrap();
+                assert!(!out.want_out);
+                assert_eq!(MODS.load(Ordering::SeqCst), 4);
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 }

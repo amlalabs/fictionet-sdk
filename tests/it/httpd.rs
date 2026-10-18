@@ -1389,21 +1389,9 @@ fn http1_body_timeout_records_an_error() {
 
 #[test]
 fn observation_does_not_change_http_responses_or_protocol_budgets() {
-    struct Count(Arc<AtomicUsize>);
-    impl httpd::BodyClassifier for Count {
-        fn head(
-            &self,
-            _: &http::request::Parts,
-            _: &ConnInfo,
-            _: &mut http::Extensions,
-        ) -> Option<Fields> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
     for budget in [1024, 4096, 64 * 1024] {
         let run = |observed| {
-            let heads = Arc::new(AtomicUsize::new(0));
+            let heads = Arc::new(crate::common::http_observer::CountHeads::default());
             let memory = Arc::new(fictionet::events::Memory::default());
             let service = Http1::with(
                 Arc::new(Router::new().get("/", |_, _| {
@@ -1417,7 +1405,7 @@ fn observation_does_not_change_http_responses_or_protocol_budgets() {
                     ..Default::default()
                 },
             )
-            .observe(Arc::new(Count(heads.clone())));
+            .observe(heads.clone());
             let options = ServeOptions {
                 budget: Some(fictionet::stdlib::services::serve::Budget::new(budget)),
                 ..Default::default()
@@ -1436,10 +1424,10 @@ fn observation_does_not_change_http_responses_or_protocol_budgets() {
                     .unwrap()
             };
             if !observed {
-                assert_eq!(heads.load(Ordering::Relaxed), 0);
+                assert_eq!(heads.0.load(Ordering::Relaxed), 0);
             }
             if observed && budget == 64 * 1024 {
-                assert_eq!(heads.load(Ordering::Relaxed), 1);
+                assert_eq!(heads.0.load(Ordering::Relaxed), 1);
                 assert_eq!(memory.checked_of("http", "request").unwrap().len(), 1);
                 assert!(response.ends_with(b"hello"));
             }

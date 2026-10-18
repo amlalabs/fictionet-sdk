@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::RunOptions;
 
 // ---------------------------------------------------------------------------
 // The harness
@@ -973,18 +974,21 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
     );
 
     let ran = std::thread::spawn(move || {
-        block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            Net::new()
-                .ipv4_only()
-                .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
-                .start(&fcx, attachments)?;
-            let s = machine(&fcx, attacher.attach("agent")?, ME);
-            let mut a = s.tcp.connect(&fcx, to).await?;
-            a.write_all(&fcx, b"boom\n").await?;
-            fcx.idle().await?;
-            Ok(())
-        }))
+        block_on(lab(
+            RunOptions::new(fictionet::Seed::from_u64(1)),
+            move |fcx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                Net::new()
+                    .ipv4_only()
+                    .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
+                    .start(&fcx, attachments)?;
+                let s = machine(&fcx, attacher.attach("agent")?, ME);
+                let mut a = s.tcp.connect(&fcx, to).await?;
+                a.write_all(&fcx, b"boom\n").await?;
+                fcx.idle().await?;
+                Ok(())
+            },
+        ))
     })
     .join();
     let panic = ran.expect_err("the run should end with the panic");
@@ -1018,7 +1022,7 @@ fn a_seeded_run_repeats_its_randomness() {
     let draws = |seed: u64| {
         let (tx, rx) = mpsc::channel();
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(seed),
+            RunOptions::new(fictionet::Seed::from_u64(seed)),
             move |fcx| async move {
                 let (server, _su, client, _cu) = two_machines(&fcx);
                 serve::listen(
@@ -1212,46 +1216,50 @@ fn every_serving_wait_reports_a_cancel() {
 fn harness_service_http_and_faults_share_the_context_stream() {
     use fictionet::{Entropy, Seed, SeededEntropy};
     let seed = Seed::from_u64(42);
-    world::seeded_world(seed, Duration::from_secs(10), move |fcx| async move {
-        let oracle = SeededEntropy::new(seed);
-        assert_eq!(fcx.random_u64(), oracle.random_u64());
-        let mut dice = Harness::new(Seed::from_u64(999), Dice, ()).with_fcx(fcx.clone());
-        assert_eq!(
-            dice.open().unwrap(),
-            format!("{}\n", oracle.random_u64()).as_bytes()
-        );
+    world::seeded_world(
+        RunOptions::new(seed),
+        Duration::from_secs(10),
+        move |fcx| async move {
+            let oracle = SeededEntropy::new(seed);
+            assert_eq!(fcx.random_u64(), oracle.random_u64());
+            let mut dice = Harness::new(Seed::from_u64(999), Dice, ()).with_fcx(fcx.clone());
+            assert_eq!(
+                dice.open().unwrap(),
+                format!("{}\n", oracle.random_u64()).as_bytes()
+            );
 
-        let mut faults = fictionet::stdlib::codec::Faults::new(64, 0);
-        let plan = [Rule {
-            when: Trigger::Chance { take: 1, out_of: 2 },
-            fault: ByteFault::Corrupt {
-                offset: None,
-                xor: 1,
-            },
-        }];
-        let mut bytes = Vec::new();
-        faults.bytes(&fcx, &plan, b"abc", &mut bytes).unwrap();
-        let mut expected = b"abc".to_vec();
-        if oracle.random_below(2) == 0 {
-            expected[oracle.random_below(3) as usize] ^= 1;
-        }
-        assert_eq!(bytes, expected);
+            let mut faults = fictionet::stdlib::codec::Faults::new(64, 0);
+            let plan = [Rule {
+                when: Trigger::Chance { take: 1, out_of: 2 },
+                fault: ByteFault::Corrupt {
+                    offset: None,
+                    xor: 1,
+                },
+            }];
+            let mut bytes = Vec::new();
+            faults.bytes(&fcx, &plan, b"abc", &mut bytes).unwrap();
+            let mut expected = b"abc".to_vec();
+            if oracle.random_below(2) == 0 {
+                expected[oracle.random_below(3) as usize] ^= 1;
+            }
+            assert_eq!(bytes, expected);
 
-        let stamp = Arc::new(Mutex::new(None));
-        let seen = stamp.clone();
-        let router = Router::new().get("/", move |ex, _| {
-            *seen.lock().unwrap() = Some(ex.now());
-            http::Response::new(Bytes::from(ex.random_u64().to_le_bytes().to_vec()))
-        });
-        let mut http =
-            Harness::new(Seed::from_u64(999), Http1::new(router), ()).with_fcx(fcx.clone());
-        fcx.sleep(Duration::from_millis(1)).await?;
-        let before = fcx.now();
-        let reply = http.push(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
-        assert!(reply.ends_with(&oracle.random_u64().to_le_bytes()));
-        let stamp = stamp.lock().unwrap().unwrap();
-        assert!(stamp >= before && stamp <= fcx.now());
-        assert_eq!(fcx.random_u64(), oracle.random_u64());
-        Ok(())
-    });
+            let stamp = Arc::new(Mutex::new(None));
+            let seen = stamp.clone();
+            let router = Router::new().get("/", move |ex, _| {
+                *seen.lock().unwrap() = Some(ex.now());
+                http::Response::new(Bytes::from(ex.random_u64().to_le_bytes().to_vec()))
+            });
+            let mut http =
+                Harness::new(Seed::from_u64(999), Http1::new(router), ()).with_fcx(fcx.clone());
+            fcx.sleep(Duration::from_millis(1)).await?;
+            let before = fcx.now();
+            let reply = http.push(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
+            assert!(reply.ends_with(&oracle.random_u64().to_le_bytes()));
+            let stamp = stamp.lock().unwrap().unwrap();
+            assert!(stamp >= before && stamp <= fcx.now());
+            assert_eq!(fcx.random_u64(), oracle.random_u64());
+            Ok(())
+        },
+    );
 }

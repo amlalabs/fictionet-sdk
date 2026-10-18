@@ -16,7 +16,7 @@ use fictionet::stdlib::network::ip::{
 };
 use fictionet::stdlib::network::{ConnError, Connection, tcp, udp};
 use fictionet::stdlib::test_support::thread_cpu_time;
-use fictionet::{Cx, Interface, Packet, RecvError, pair};
+use fictionet::{Cx, Interface, Packet, RecvError, RunOptions, pair};
 
 const A: &str = "10.0.0.1";
 const B: &str = "10.0.0.2";
@@ -869,33 +869,36 @@ fn tcp_through_tokio_io() {
         .build()
         .unwrap();
     let result = rt.block_on(async {
-        run(fictionet::Seed::random(), |fcx| async move {
-            let (ea, eb) = two_tcp(&fcx, A, B);
-            let mut listener = eb.listen(80)?;
-            let server_fcx = fcx.clone();
-            let server = tokio::spawn(async move {
-                let conn = listener.accept(&server_fcx).await.unwrap();
-                let mut io = conn.into_tokio(&server_fcx);
-                let mut data = Vec::new();
-                io.read_to_end(&mut data).await.unwrap();
-                io.write_all(&data).await.unwrap();
-                io.shutdown().await.unwrap();
-            });
-            let conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
-            let client_fcx = fcx.clone();
-            let client = tokio::spawn(async move {
-                let mut io = conn.into_tokio(&client_fcx);
-                let data = pattern(1_000_000, 9);
-                io.write_all(&data).await.unwrap();
-                io.shutdown().await.unwrap();
-                let mut back = Vec::new();
-                io.read_to_end(&mut back).await.unwrap();
-                assert!(back == data);
-            });
-            server.await?;
-            client.await?;
-            Err(fictionet::Error::from(Done))
-        })
+        run(
+            RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                let (ea, eb) = two_tcp(&fcx, A, B);
+                let mut listener = eb.listen(80)?;
+                let server_fcx = fcx.clone();
+                let server = tokio::spawn(async move {
+                    let conn = listener.accept(&server_fcx).await.unwrap();
+                    let mut io = conn.into_tokio(&server_fcx);
+                    let mut data = Vec::new();
+                    io.read_to_end(&mut data).await.unwrap();
+                    io.write_all(&data).await.unwrap();
+                    io.shutdown().await.unwrap();
+                });
+                let conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+                let client_fcx = fcx.clone();
+                let client = tokio::spawn(async move {
+                    let mut io = conn.into_tokio(&client_fcx);
+                    let data = pattern(1_000_000, 9);
+                    io.write_all(&data).await.unwrap();
+                    io.shutdown().await.unwrap();
+                    let mut back = Vec::new();
+                    io.read_to_end(&mut back).await.unwrap();
+                    assert!(back == data);
+                });
+                server.await?;
+                client.await?;
+                Err(fictionet::Error::from(Done))
+            },
+        )
         .await
     });
     assert!(result.unwrap_err().downcast_ref::<Done>().is_some());

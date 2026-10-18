@@ -346,7 +346,7 @@ fn expired<I: Interface>(
     } else {
         "its hop limit ran out"
     };
-    ip::record_drop(
+    ip::emit_drop(
         fcx,
         &events::ConnInfo::default(),
         "router",
@@ -717,7 +717,7 @@ fn dropped<F>(
 ) where
     F: Fn(events::Event) -> events::Event,
 {
-    ip::record_drop(
+    ip::emit_drop(
         fcx,
         &events::ConnInfo {
             sandbox: sandbox.cloned(),
@@ -727,10 +727,7 @@ fn dropped<F>(
         packet,
         why,
         events::Fields::new,
-        |mut event| {
-            event.conn.sandbox = sandbox.cloned();
-            enrich(event)
-        },
+        enrich,
     );
 }
 
@@ -1153,7 +1150,7 @@ mod tests {
     #[test]
     fn forwarding_lowers_the_ttl() {
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let (ra, mut a) = fictionet::pair();
                 let (rb, mut b) = fictionet::pair();
@@ -1206,7 +1203,7 @@ mod tests {
         }
 
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 for _ in 0..128 {
                     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -1299,7 +1296,7 @@ mod tests {
     #[test]
     fn member_addresses_are_unicast_in_the_subnet() {
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let lan =
                     lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
@@ -1401,7 +1398,7 @@ mod tests {
     #[test]
     fn joining_a_stopped_lan_fails() {
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let kept = Arc::new(Mutex::new(None::<Lan<Box<dyn Interface>>>));
                 let k = kept.clone();

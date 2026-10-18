@@ -22,7 +22,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::protocols::dns::op::{Message, Query};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::{network::ip, web};
-use fictionet::{Cx, End, Interface, Packet, block_on, lab, run};
+use fictionet::{Cx, End, Interface, Packet, RunOptions, block_on, lab, run};
 use http::{Request, Response};
 use http_body_util::Full;
 
@@ -190,158 +190,161 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
-            let sites = web::Sites::new(|host| match host {
-                "plain.test" => Some(web::Site::new(Hello)),
-                h if h.ends_with(".wild.test") => Some(web::Site::new(Hello)),
-                _ => None,
-            })
-            .max_sites(1_000);
-            let (attacher, attachments) = fictionet::attachments();
-            sites.start(&fcx, attachments)?;
-            let mut raw = attacher.attach("agent").unwrap();
-            let other = machine(&fcx, attacher.attach("other").unwrap(), OTHER);
-            let plain = lookup(&other, &fcx, "plain.test").await;
-            let wild = lookup(&other, &fcx, "first.wild.test").await;
-            get(&other, &fcx, plain, "plain.test").await;
-            // The agent binds its address with its first packet.
-            raw.send(udp(ME, 5353, GATEWAY, 53, &query("plain.test", 1)));
-            drain(&fcx, &mut raw, Duration::from_millis(200)).await;
-            let start = rss();
-            let mut report = Vec::new();
+        let result = block_on(lab(
+            RunOptions::new(fictionet::Seed::from_u64(1)),
+            |fcx| async move {
+                let sites = web::Sites::new(|host| match host {
+                    "plain.test" => Some(web::Site::new(Hello)),
+                    h if h.ends_with(".wild.test") => Some(web::Site::new(Hello)),
+                    _ => None,
+                })
+                .max_sites(1_000);
+                let (attacher, attachments) = fictionet::attachments();
+                sites.start(&fcx, attachments)?;
+                let mut raw = attacher.attach("agent").unwrap();
+                let other = machine(&fcx, attacher.attach("other").unwrap(), OTHER);
+                let plain = lookup(&other, &fcx, "plain.test").await;
+                let wild = lookup(&other, &fcx, "first.wild.test").await;
+                get(&other, &fcx, plain, "plain.test").await;
+                // The agent binds its address with its first packet.
+                raw.send(udp(ME, 5353, GATEWAY, 53, &query("plain.test", 1)));
+                drain(&fcx, &mut raw, Duration::from_millis(200)).await;
+                let start = rss();
+                let mut report = Vec::new();
 
-            // 1. Names: 150,000 made up, past the 100,000 kept; 5,000 under
-            //    the wildcard, past the 1,000 sites this world allows.
-            for i in 0..155_000u32 {
-                let name = if i < 150_000 {
-                    format!("n{i}.made-up.test")
-                } else {
-                    format!("w{i}.wild.test")
+                // 1. Names: 150,000 made up, past the 100,000 kept; 5,000 under
+                //    the wildcard, past the 1,000 sites this world allows.
+                for i in 0..155_000u32 {
+                    let name = if i < 150_000 {
+                        format!("n{i}.made-up.test")
+                    } else {
+                        format!("w{i}.wild.test")
+                    };
+                    raw.send(udp(ME, 5353, GATEWAY, 53, &query(&name, i as u16)));
+                    if i % 256 == 255 {
+                        drain(&fcx, &mut raw, Duration::from_millis(1)).await;
+                    }
+                }
+                drain(&fcx, &mut raw, Duration::from_millis(300)).await;
+                report.push(("names", rss()));
+                get(&other, &fcx, plain, "plain.test").await;
+
+                // 2. Fragments: 20,000 first halves of 1,400 bytes that never
+                //    finish, 27 MiB in all, past the 4 MiB that may wait.
+                let data = [0xab; 1400];
+                for id in 0..20_000u16 {
+                    raw.send(ipv4(ME, plain, 17, id, 0x2000, &data));
+                    if id % 256 == 255 {
+                        drain(&fcx, &mut raw, Duration::from_millis(1)).await;
+                    }
+                }
+                drain(&fcx, &mut raw, Duration::from_millis(200)).await;
+                report.push(("fragments", rss()));
+                get(&other, &fcx, plain, "plain.test").await;
+
+                // 3. SYNs: 20,000 that are never completed, to one machine.
+                //    Every SYN-ACK is counted, from every drain.
+                let mut synacks = std::collections::BTreeSet::new();
+                let mut count = |got: Vec<Packet>| {
+                    for p in got {
+                        if let Some(t) = tcp_of(&p)
+                            && p.0[12..16] == wild.octets()
+                            && t[13] & (SYN | ACK) == SYN | ACK
+                        {
+                            synacks.insert(u16::from_be_bytes([t[2], t[3]]));
+                        }
+                    }
                 };
-                raw.send(udp(ME, 5353, GATEWAY, 53, &query(&name, i as u16)));
-                if i % 256 == 255 {
-                    drain(&fcx, &mut raw, Duration::from_millis(1)).await;
-                }
-            }
-            drain(&fcx, &mut raw, Duration::from_millis(300)).await;
-            report.push(("names", rss()));
-            get(&other, &fcx, plain, "plain.test").await;
-
-            // 2. Fragments: 20,000 first halves of 1,400 bytes that never
-            //    finish, 27 MiB in all, past the 4 MiB that may wait.
-            let data = [0xab; 1400];
-            for id in 0..20_000u16 {
-                raw.send(ipv4(ME, plain, 17, id, 0x2000, &data));
-                if id % 256 == 255 {
-                    drain(&fcx, &mut raw, Duration::from_millis(1)).await;
-                }
-            }
-            drain(&fcx, &mut raw, Duration::from_millis(200)).await;
-            report.push(("fragments", rss()));
-            get(&other, &fcx, plain, "plain.test").await;
-
-            // 3. SYNs: 20,000 that are never completed, to one machine.
-            //    Every SYN-ACK is counted, from every drain.
-            let mut synacks = std::collections::BTreeSet::new();
-            let mut count = |got: Vec<Packet>| {
-                for p in got {
-                    if let Some(t) = tcp_of(&p)
-                        && p.0[12..16] == wild.octets()
-                        && t[13] & (SYN | ACK) == SYN | ACK
-                    {
-                        synacks.insert(u16::from_be_bytes([t[2], t[3]]));
+                for port in 0..20_000u16 {
+                    raw.send(tcp_seg(ME, 20_000 + port, wild, 80, 1000, 0, SYN, &[]));
+                    if port % 256 == 255 {
+                        count(drain(&fcx, &mut raw, Duration::from_millis(1)).await);
                     }
                 }
-            };
-            for port in 0..20_000u16 {
-                raw.send(tcp_seg(ME, 20_000 + port, wild, 80, 1000, 0, SYN, &[]));
-                if port % 256 == 255 {
-                    count(drain(&fcx, &mut raw, Duration::from_millis(1)).await);
-                }
-            }
-            count(drain(&fcx, &mut raw, Duration::from_millis(300)).await);
-            report.push(("SYNs", rss()));
-            // One address has its share of the backlog: 256 waiting.
-            assert!(
-                !synacks.is_empty() && synacks.len() <= 256,
-                "{} SYN-ACKs",
-                synacks.len()
-            );
-            get(&other, &fcx, wild, "first.wild.test").await;
+                count(drain(&fcx, &mut raw, Duration::from_millis(300)).await);
+                report.push(("SYNs", rss()));
+                // One address has its share of the backlog: 256 waiting.
+                assert!(
+                    !synacks.is_empty() && synacks.len() <= 256,
+                    "{} SYN-ACKs",
+                    synacks.len()
+                );
+                get(&other, &fcx, wild, "first.wild.test").await;
 
-            // 4. HTTP connections: 1,000 complete handshakes and requests,
-            //    held open. The machine serves 256 and resets the rest. A
-            //    SYN past the sandbox's share of the backlog gets no answer,
-            //    so it is sent again, as a client would.
-            let request = b"GET / HTTP/1.1\r\nHost: plain.test\r\n\r\n";
-            let mut answered = std::collections::BTreeSet::new();
-            let mut served = std::collections::BTreeSet::new();
-            let mut reset = std::collections::BTreeSet::new();
-            for _round in 0..50 {
-                let mut sent = 0;
-                for port in 50_000..51_000u16 {
-                    if !answered.contains(&port) {
-                        raw.send(tcp_seg(ME, port, plain, 80, 1000, 0, SYN, &[]));
-                        sent += 1;
-                    }
-                }
-                if sent == 0 {
-                    break;
-                }
-                let mut pending = drain(&fcx, &mut raw, Duration::from_millis(300)).await;
-                while !pending.is_empty() {
-                    for p in std::mem::take(&mut pending) {
-                        // Only this flood's answers: SYN-ACKs from the SYN
-                        // flood's machine may still come.
-                        let Some(t) = tcp_of(&p) else { continue };
-                        let port = u16::from_be_bytes([t[2], t[3]]);
-                        if p.0[12..16] != plain.octets() || !(50_000..51_000).contains(&port) {
-                            continue;
+                // 4. HTTP connections: 1,000 complete handshakes and requests,
+                //    held open. The machine serves 256 and resets the rest. A
+                //    SYN past the sandbox's share of the backlog gets no answer,
+                //    so it is sent again, as a client would.
+                let request = b"GET / HTTP/1.1\r\nHost: plain.test\r\n\r\n";
+                let mut answered = std::collections::BTreeSet::new();
+                let mut served = std::collections::BTreeSet::new();
+                let mut reset = std::collections::BTreeSet::new();
+                for _round in 0..50 {
+                    let mut sent = 0;
+                    for port in 50_000..51_000u16 {
+                        if !answered.contains(&port) {
+                            raw.send(tcp_seg(ME, port, plain, 80, 1000, 0, SYN, &[]));
+                            sent += 1;
                         }
-                        let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
-                        let off = (t[12] >> 4) as usize * 4;
-                        if t[13] & (SYN | ACK) == SYN | ACK {
-                            if answered.insert(port) {
-                                raw.send(tcp_seg(
-                                    ME,
-                                    port,
-                                    plain,
-                                    80,
-                                    1001,
-                                    seq.wrapping_add(1),
-                                    ACK,
-                                    request,
-                                ));
+                    }
+                    if sent == 0 {
+                        break;
+                    }
+                    let mut pending = drain(&fcx, &mut raw, Duration::from_millis(300)).await;
+                    while !pending.is_empty() {
+                        for p in std::mem::take(&mut pending) {
+                            // Only this flood's answers: SYN-ACKs from the SYN
+                            // flood's machine may still come.
+                            let Some(t) = tcp_of(&p) else { continue };
+                            let port = u16::from_be_bytes([t[2], t[3]]);
+                            if p.0[12..16] != plain.octets() || !(50_000..51_000).contains(&port) {
+                                continue;
                             }
-                        } else if t[13] & 0x04 != 0 {
-                            reset.insert(port);
-                        } else if t.len() > off {
-                            served.insert(port);
+                            let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
+                            let off = (t[12] >> 4) as usize * 4;
+                            if t[13] & (SYN | ACK) == SYN | ACK {
+                                if answered.insert(port) {
+                                    raw.send(tcp_seg(
+                                        ME,
+                                        port,
+                                        plain,
+                                        80,
+                                        1001,
+                                        seq.wrapping_add(1),
+                                        ACK,
+                                        request,
+                                    ));
+                                }
+                            } else if t[13] & 0x04 != 0 {
+                                reset.insert(port);
+                            } else if t.len() > off {
+                                served.insert(port);
+                            }
                         }
+                        pending = drain(&fcx, &mut raw, Duration::from_millis(300)).await;
                     }
-                    pending = drain(&fcx, &mut raw, Duration::from_millis(300)).await;
                 }
-            }
-            report.push(("connections", rss()));
-            assert_eq!(served.len(), 256, "connections served");
-            assert_eq!(reset.len(), 1000 - 256, "connections reset");
-            get(&other, &fcx, plain, "plain.test").await;
+                report.push(("connections", rss()));
+                assert_eq!(served.len(), 256, "connections served");
+                assert_eq!(reset.len(), 1000 - 256, "connections reset");
+                get(&other, &fcx, plain, "plain.test").await;
 
-            let mut last = start;
-            for (what, at) in &report {
-                eprintln!("{what}: +{:.1} MiB", mib(at.saturating_sub(last)));
-                last = *at;
-            }
-            let grew = last.saturating_sub(start);
-            eprintln!("in all: +{:.1} MiB", mib(grew));
-            // The names turned down cost about 35 MB at most. Sites are
-            // capped at 1,000 here, each with two machines (IPv4 and IPv6) of
-            // about 11 KiB, so about 22 MiB; the other 4,000 wildcard names
-            // get SERVFAIL. Fragments and sockets are capped too. Measured:
-            // names +31 MiB, fragments +7 MiB, connections +136 MiB.
-            assert!(grew < 200 << 20, "the world grew by {:.1} MiB", mib(grew));
-            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
-        }));
+                let mut last = start;
+                for (what, at) in &report {
+                    eprintln!("{what}: +{:.1} MiB", mib(at.saturating_sub(last)));
+                    last = *at;
+                }
+                let grew = last.saturating_sub(start);
+                eprintln!("in all: +{:.1} MiB", mib(grew));
+                // The names turned down cost about 35 MB at most. Sites are
+                // capped at 1,000 here, each with two machines (IPv4 and IPv6) of
+                // about 11 KiB, so about 22 MiB; the other 4,000 wildcard names
+                // get SERVFAIL. Fragments and sockets are capped too. Measured:
+                // names +31 MiB, fragments +7 MiB, connections +136 MiB.
+                assert!(grew < 200 << 20, "the world grew by {:.1} MiB", mib(grew));
+                Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+            },
+        ));
         let _ = tx.send(result.map_err(|e| e.to_string()));
     });
     let result = rx
@@ -389,145 +392,152 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     let world_stop = stop.clone();
     let world_path = path.clone();
     std::thread::spawn(move || {
-        let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
-            let sites =
-                web::Sites::new(|host| (host == "plain.test").then(|| web::Site::new(Hello)));
-            sites.start(&fcx, attachments)?;
-            let other = machine(
-                &fcx,
-                attacher.attach("other").unwrap(),
-                Ipv4Addr::new(10, 0, 0, 100),
-            );
-            let plain = lookup(&other, &fcx, "plain.test").await;
-            // Four sandboxes, each a thread with a socket: UDP to the
-            // gateway's closed port 9, so each packet gets an ICMP answer
-            // and the links carry traffic both ways.
-            let progress: [_; 4] =
-                std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
-            let senders: Vec<_> = (0..4u8)
-                .map(|i| {
-                    let (path, stop, sent) = (world_path.clone(), world_stop.clone(), sent.clone());
-                    let attached = attached.clone();
-                    let progress = progress[usize::from(i)].clone();
-                    std::thread::spawn(move || -> io::Result<()> {
-                        let fd = unix::connect(&path)?;
-                        let hello = Hello {
-                            version: relay::VERSION,
-                            mtu: 1500,
-                            kind: "tun".into(),
-                            name: format!("s{i}"),
-                        };
-                        unix::send(fd.as_raw_fd(), &Message::Hello(hello).encode(), false)?;
-                        let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
-                        let n = unix::recv(fd.as_raw_fd(), &mut buf, false)?;
-                        if buf[..n] != [relay::ACCEPT] {
-                            return Err(io::Error::other("sender was not accepted"));
-                        }
-                        attached.send_modify(|n| *n += 1);
-                        let p = udp(Ipv4Addr::new(10, 0, 0, 2 + i), 5000, GATEWAY, 9, &[0; 100]);
-                        while !stop.load(Ordering::Relaxed) {
-                            if let Err(e) =
-                                unix::send_parts(fd.as_raw_fd(), &[&[relay::PACKET], &p.0], false)
-                            {
-                                return if stop.load(Ordering::Relaxed) {
-                                    Ok(())
-                                } else {
-                                    Err(e)
-                                };
+        let result = block_on(run(
+            RunOptions::new(fictionet::Seed::random()),
+            move |fcx| async move {
+                let sites =
+                    web::Sites::new(|host| (host == "plain.test").then(|| web::Site::new(Hello)));
+                sites.start(&fcx, attachments)?;
+                let other = machine(
+                    &fcx,
+                    attacher.attach("other").unwrap(),
+                    Ipv4Addr::new(10, 0, 0, 100),
+                );
+                let plain = lookup(&other, &fcx, "plain.test").await;
+                // Four sandboxes, each a thread with a socket: UDP to the
+                // gateway's closed port 9, so each packet gets an ICMP answer
+                // and the links carry traffic both ways.
+                let progress: [_; 4] =
+                    std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+                let senders: Vec<_> = (0..4u8)
+                    .map(|i| {
+                        let (path, stop, sent) =
+                            (world_path.clone(), world_stop.clone(), sent.clone());
+                        let attached = attached.clone();
+                        let progress = progress[usize::from(i)].clone();
+                        std::thread::spawn(move || -> io::Result<()> {
+                            let fd = unix::connect(&path)?;
+                            let hello = Hello {
+                                version: relay::VERSION,
+                                mtu: 1500,
+                                kind: "tun".into(),
+                                name: format!("s{i}"),
+                            };
+                            unix::send(fd.as_raw_fd(), &Message::Hello(hello).encode(), false)?;
+                            let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
+                            let n = unix::recv(fd.as_raw_fd(), &mut buf, false)?;
+                            if buf[..n] != [relay::ACCEPT] {
+                                return Err(io::Error::other("sender was not accepted"));
                             }
-                            sent.send_modify(|n| *n += 1);
-                            progress.fetch_add(1, Ordering::Relaxed);
-                            loop {
-                                let error = match unix::recv(fd.as_raw_fd(), &mut buf, true) {
-                                    Ok(0) => io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "flood socket closed",
-                                    ),
-                                    Ok(_) => continue,
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(e) => e,
-                                };
-                                return if stop.load(Ordering::Relaxed) {
-                                    Ok(())
-                                } else {
-                                    Err(error)
-                                };
+                            attached.send_modify(|n| *n += 1);
+                            let p =
+                                udp(Ipv4Addr::new(10, 0, 0, 2 + i), 5000, GATEWAY, 9, &[0; 100]);
+                            while !stop.load(Ordering::Relaxed) {
+                                if let Err(e) = unix::send_parts(
+                                    fd.as_raw_fd(),
+                                    &[&[relay::PACKET], &p.0],
+                                    false,
+                                ) {
+                                    return if stop.load(Ordering::Relaxed) {
+                                        Ok(())
+                                    } else {
+                                        Err(e)
+                                    };
+                                }
+                                sent.send_modify(|n| *n += 1);
+                                progress.fetch_add(1, Ordering::Relaxed);
+                                loop {
+                                    let error = match unix::recv(fd.as_raw_fd(), &mut buf, true) {
+                                        Ok(0) => io::Error::new(
+                                            io::ErrorKind::UnexpectedEof,
+                                            "flood socket closed",
+                                        ),
+                                        Ok(_) => continue,
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                        Err(e) => e,
+                                    };
+                                    return if stop.load(Ordering::Relaxed) {
+                                        Ok(())
+                                    } else {
+                                        Err(error)
+                                    };
+                                }
                             }
-                        }
-                        Ok(())
+                            Ok(())
+                        })
                     })
-                })
-                .collect();
-            senders_tx.send(senders).expect("test thread is waiting");
-            // The queues fill in the first moments. After that, the world
-            // must not keep growing.
-            let start = rss();
-            let sent_before = *world_sent.borrow();
-            let progress_before = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
-            let deadline = fcx.now() + Duration::from_secs(30);
-            fcx.race(Some(deadline), world_attached.wait_for(|n| *n == 4))
+                    .collect();
+                senders_tx.send(senders).expect("test thread is waiting");
+                // The queues fill in the first moments. After that, the world
+                // must not keep growing.
+                let start = rss();
+                let sent_before = *world_sent.borrow();
+                let progress_before = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
+                let deadline = fcx.now() + Duration::from_secs(30);
+                fcx.race(Some(deadline), world_attached.wait_for(|n| *n == 4))
+                    .await??;
+                fcx.race(
+                    Some(deadline),
+                    world_sent.wait_for(|n| *n - sent_before > 100_000),
+                )
                 .await??;
-            fcx.race(
-                Some(deadline),
-                world_sent.wait_for(|n| *n - sent_before > 100_000),
-            )
-            .await??;
-            assert_eq!(*world_attached.borrow(), 4);
-            let middle = rss();
-            let sent_middle = *world_sent.borrow();
-            let progress_middle = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
-            fcx.race(
-                Some(fcx.now() + Duration::from_secs(30)),
-                world_sent.wait_for(|n| *n - sent_middle > 100_000),
-            )
-            .await??;
-            let end = rss();
-            let progress_end = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
-            let took = timeout(
-                &fcx,
-                Duration::from_secs(10),
-                get(&other, &fcx, plain, "plain.test"),
-            )
-            .await;
-            world_stop.store(true, Ordering::Relaxed);
-            // The flood ran: the senders kept sending while memory was read.
-            let flooded = *world_sent.borrow() - sent_before;
-            assert!(flooded > 100_000, "only {flooded} packets were sent");
-            // Each link reads up to 64 packets per turn, so four symmetric
-            // senders should each contribute over 10,000 packets per window.
-            for i in 0..4 {
-                let first = progress_middle[i] - progress_before[i];
-                let second = progress_end[i] - progress_middle[i];
-                assert!(
-                    first > 10_000,
-                    "sender {i} sent only {first} packets in the first window"
+                assert_eq!(*world_attached.borrow(), 4);
+                let middle = rss();
+                let sent_middle = *world_sent.borrow();
+                let progress_middle = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
+                fcx.race(
+                    Some(fcx.now() + Duration::from_secs(30)),
+                    world_sent.wait_for(|n| *n - sent_middle > 100_000),
+                )
+                .await??;
+                let end = rss();
+                let progress_end = progress.each_ref().map(|n| n.load(Ordering::Relaxed));
+                let took = timeout(
+                    &fcx,
+                    Duration::from_secs(10),
+                    get(&other, &fcx, plain, "plain.test"),
+                )
+                .await;
+                world_stop.store(true, Ordering::Relaxed);
+                // The flood ran: the senders kept sending while memory was read.
+                let flooded = *world_sent.borrow() - sent_before;
+                assert!(flooded > 100_000, "only {flooded} packets were sent");
+                // Each link reads up to 64 packets per turn, so four symmetric
+                // senders should each contribute over 10,000 packets per window.
+                for i in 0..4 {
+                    let first = progress_middle[i] - progress_before[i];
+                    let second = progress_end[i] - progress_middle[i];
+                    assert!(
+                        first > 10_000,
+                        "sender {i} sent only {first} packets in the first window"
+                    );
+                    assert!(
+                        second > 10_000,
+                        "sender {i} sent only {second} packets in the second window"
+                    );
+                }
+                assert_eq!(*world_attached.borrow(), 4, "a sender was not attached");
+                let (first, second) = (middle.saturating_sub(start), end.saturating_sub(middle));
+                eprintln!(
+                    "four sandboxes flooding: +{:.1} MiB, then +{:.1} MiB",
+                    mib(first),
+                    mib(second)
                 );
                 assert!(
-                    second > 10_000,
-                    "sender {i} sent only {second} packets in the second window"
+                    second < 16 << 20,
+                    "the world kept growing: +{:.1} MiB, then +{:.1} MiB",
+                    mib(first),
+                    mib(second)
                 );
-            }
-            assert_eq!(*world_attached.borrow(), 4, "a sender was not attached");
-            let (first, second) = (middle.saturating_sub(start), end.saturating_sub(middle));
-            eprintln!(
-                "four sandboxes flooding: +{:.1} MiB, then +{:.1} MiB",
-                mib(first),
-                mib(second)
-            );
-            assert!(
-                second < 16 << 20,
-                "the world kept growing: +{:.1} MiB, then +{:.1} MiB",
-                mib(first),
-                mib(second)
-            );
-            assert!(
-                first + second < 64 << 20,
-                "the world grew by {:.1} MiB",
-                mib(first + second)
-            );
-            assert!(took.is_some(), "the other sandbox was not served");
-            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
-        }));
+                assert!(
+                    first + second < 64 << 20,
+                    "the world grew by {:.1} MiB",
+                    mib(first + second)
+                );
+                assert!(took.is_some(), "the other sandbox was not served");
+                Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+            },
+        ));
         let _ = tx.send(result.map_err(|e| e.to_string()));
     });
     let result = rx.recv_timeout(Duration::from_secs(60));

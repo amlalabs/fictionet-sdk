@@ -68,7 +68,7 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
 #[test]
 fn the_lab_ca_signs_leaves_a_client_trusts() {
     fictionet::block_on(fictionet::lab(
-        fictionet::Seed::from_u64(1),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
         |fcx| async move {
             let dir = tempdir("lab");
             certs::make_ca(&fcx, &dir).unwrap();
@@ -108,7 +108,7 @@ fn the_lab_ca_signs_leaves_a_client_trusts() {
 #[test]
 fn the_home_chain_goes_through_the_intermediate_to_the_root() {
     fictionet::block_on(fictionet::lab(
-        fictionet::Seed::from_u64(1),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
         |fcx| async move {
             let dir = tempdir("home");
             certs::make_pki(&fcx, &dir).unwrap();
@@ -152,7 +152,7 @@ fn the_home_chain_goes_through_the_intermediate_to_the_root() {
 #[test]
 fn the_impostor_is_not_trusted_and_names_its_rogue_root() {
     fictionet::block_on(fictionet::lab(
-        fictionet::Seed::from_u64(1),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
         |fcx| async move {
             let dir = tempdir("rogue");
             certs::make_ca(&fcx, &dir).unwrap();

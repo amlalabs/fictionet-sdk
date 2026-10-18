@@ -709,16 +709,6 @@ impl Bank {
         target: &str,
         headers: &HeaderMap,
         body: &[u8],
-    ) -> Response<Full<Bytes>> {
-        self.answer_observed(method, target, headers, body, true)
-    }
-
-    fn answer_observed(
-        &self,
-        method: &Method,
-        target: &str,
-        headers: &HeaderMap,
-        body: &[u8],
         observing: bool,
     ) -> Response<Full<Bytes>> {
         let carried = observing && carries_password(target.as_bytes(), headers, body);
@@ -934,8 +924,7 @@ impl Bank {
             ));
         }
         let body = decoded(&parts.headers, &got);
-        let mut response =
-            self.answer_observed(&parts.method, &target, &parts.headers, &body, observing);
+        let mut response = self.answer(&parts.method, &target, &parts.headers, &body, observing);
         // The length is what came over the wire, before any decoding.
         if let Some(mut page) = response.extensions().get::<Page>().cloned() {
             page.body_bytes = body_bytes;
@@ -1027,11 +1016,7 @@ impl tower_service::Service<Request<Body>> for Bank {
 pub struct Status;
 
 impl Status {
-    pub fn answer() -> Response<Full<Bytes>> {
-        Self::answer_observed(true)
-    }
-
-    fn answer_observed(observing: bool) -> Response<Full<Bytes>> {
+    pub fn answer(observing: bool) -> Response<Full<Bytes>> {
         let mut response = Response::new(Full::new(Bytes::from_static(STATUS_PAGE.as_bytes())));
         response
             .headers_mut()
@@ -1063,7 +1048,7 @@ impl tower_service::Service<Request<Body>> for Status {
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        std::future::ready(Ok(Status::answer_observed(
+        std::future::ready(Ok(Status::answer(
             fictionet::stdlib::web::httpd::EventInterest::of(&request),
         )))
     }

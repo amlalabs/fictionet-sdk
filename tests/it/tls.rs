@@ -12,7 +12,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::stdlib::services::ca::Ca;
 use fictionet::stdlib::services::tls::{self, ServerConfig};
-use fictionet::{Cx, Seed, block_on, lab};
+use fictionet::{Cx, RunOptions, Seed, block_on, lab};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
@@ -249,7 +249,7 @@ fn client_config(fcx: &Cx, ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
 #[test]
 fn handshake_with_sni_and_alpn() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[b"h2", b"http/1.1"]);
             let client_config = client_config(&fcx, &ca, &[b"h2", b"http/1.1"]);
@@ -292,7 +292,7 @@ fn handshake_with_sni_and_alpn() {
 #[test]
 fn the_world_picks_a_config_per_handshake() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let a = server_config(&fcx, &ca, "a.test", &[]);
             let b = server_config(&fcx, &ca, "b.test", &[]);
@@ -353,7 +353,7 @@ fn the_world_picks_a_config_per_handshake() {
 #[test]
 fn reject_sends_unrecognized_name() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let client_config = client_config(&fcx, &ca, &[]);
             let (server_side, client_side) = mem_pair();
@@ -385,7 +385,7 @@ fn reject_sends_unrecognized_name() {
 #[test]
 fn a_dropped_hello_closes_with_no_alert() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let client_config = client_config(&fcx, &ca, &[]);
             let (server_side, client_side) = mem_pair();
@@ -408,7 +408,7 @@ fn a_dropped_hello_closes_with_no_alert() {
 #[test]
 fn a_malformed_hello_gets_a_decode_error_alert() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (server_side, mut client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
                 assert_eq!(
@@ -439,7 +439,7 @@ fn a_malformed_hello_gets_a_decode_error_alert() {
 #[test]
 fn a_first_message_that_is_not_a_hello_is_broken() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (server_side, mut client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
                 assert_eq!(
@@ -481,78 +481,82 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
         let r = result.clone();
         let outcome = Arc::new(Mutex::new(None));
         let o = outcome.clone();
-        block_on(lab(Seed::from_u64(1), move |fcx| async move {
-            let ca = Ca::new(&fcx, "Test CA").unwrap();
-            // Valid only in 2019.
-            let (client_chain, client_key) = issue(&fcx, &ca, &["client.test"], 2019, 2020, true);
-            let (chain, key) = issue(&fcx, &ca, &["example.test"], 2000, 2100, false);
-            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-                Arc::new(roots(&ca)),
-                Arc::new(provider()),
-            )
-            .build()
-            .unwrap();
-            let config = Arc::new(
-                tls::config_builder(&fcx, start)
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1)),
+            move |fcx| async move {
+                let ca = Ca::new(&fcx, "Test CA").unwrap();
+                // Valid only in 2019.
+                let (client_chain, client_key) =
+                    issue(&fcx, &ca, &["client.test"], 2019, 2020, true);
+                let (chain, key) = issue(&fcx, &ca, &["example.test"], 2000, 2100, false);
+                let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(roots(&ca)),
+                    Arc::new(provider()),
+                )
+                .build()
+                .unwrap();
+                let config = Arc::new(
+                    tls::config_builder(&fcx, start)
+                        .with_safe_default_protocol_versions()
+                        .unwrap()
+                        .with_client_cert_verifier(verifier)
+                        .with_single_cert(chain, key)
+                        .unwrap(),
+                );
+                // The client's clock says mid-2019, so it accepts the server.
+                let client_config = Arc::new(
+                    ClientConfig::builder_with_details(
+                        Arc::new(provider()),
+                        Arc::new(FixedTime(date(2019, 6, 1))),
+                    )
                     .with_safe_default_protocol_versions()
                     .unwrap()
-                    .with_client_cert_verifier(verifier)
-                    .with_single_cert(chain, key)
+                    .with_root_certificates(roots(&ca))
+                    .with_client_auth_cert(client_chain, client_key)
                     .unwrap(),
-            );
-            // The client's clock says mid-2019, so it accepts the server.
-            let client_config = Arc::new(
-                ClientConfig::builder_with_details(
-                    Arc::new(provider()),
-                    Arc::new(FixedTime(date(2019, 6, 1))),
-                )
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots(&ca))
-                .with_client_auth_cert(client_chain, client_key)
-                .unwrap(),
-            );
+                );
 
-            let (server_side, client_side) = mem_pair();
-            let server = fcx.spawn(move |fcx| async move {
-                let hello = tls::server(&fcx, server_side).await?;
-                let finished = hello.finish(&fcx, config).await;
-                let ok = finished.is_ok();
-                if let Ok(mut conn) = finished {
-                    conn.write_all(&fcx, b"ok").await?;
-                }
-                *r.lock().unwrap() = Some(ok);
-                Ok(())
-            });
-            let client = async {
-                let mut c = Client::connect(&fcx, client_side, client_config, "example.test")
-                    .await
-                    .map_err(|e| format!("{e:?}"))?;
-                // In TLS 1.3 the client finishes first; the server's verdict
-                // arrives with the first read.
-                let mut buf = [0; 2];
-                let mut got = 0;
-                while got < 2 {
-                    got += c
-                        .read(&fcx, &mut buf[got..])
+                let (server_side, client_side) = mem_pair();
+                let server = fcx.spawn(move |fcx| async move {
+                    let hello = tls::server(&fcx, server_side).await?;
+                    let finished = hello.finish(&fcx, config).await;
+                    let ok = finished.is_ok();
+                    if let Ok(mut conn) = finished {
+                        conn.write_all(&fcx, b"ok").await?;
+                    }
+                    *r.lock().unwrap() = Some(ok);
+                    Ok(())
+                });
+                let client = async {
+                    let mut c = Client::connect(&fcx, client_side, client_config, "example.test")
                         .await
                         .map_err(|e| format!("{e:?}"))?;
-                }
-                Ok::<_, String>(())
-            };
-            let client_result = client.await;
-            server.join(&fcx).await?;
-            let server_ok = result.lock().unwrap().unwrap();
-            *o.lock().unwrap() = Some((
-                if server_ok {
-                    Ok(())
-                } else {
-                    Err(ConnError::Broken)
-                },
-                client_result,
-            ));
-            Ok(())
-        }))
+                    // In TLS 1.3 the client finishes first; the server's verdict
+                    // arrives with the first read.
+                    let mut buf = [0; 2];
+                    let mut got = 0;
+                    while got < 2 {
+                        got += c
+                            .read(&fcx, &mut buf[got..])
+                            .await
+                            .map_err(|e| format!("{e:?}"))?;
+                    }
+                    Ok::<_, String>(())
+                };
+                let client_result = client.await;
+                server.join(&fcx).await?;
+                let server_ok = result.lock().unwrap().unwrap();
+                *o.lock().unwrap() = Some((
+                    if server_ok {
+                        Ok(())
+                    } else {
+                        Err(ConnError::Broken)
+                    },
+                    client_result,
+                ));
+                Ok(())
+            },
+        ))
         .unwrap();
         outcome.lock().unwrap().take().unwrap()
     })
@@ -573,7 +577,7 @@ fn certificates_are_checked_against_the_worlds_date() {
 #[test]
 fn close_notify_both_ways() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&fcx, &ca, &[]);
@@ -634,7 +638,7 @@ fn five_megabytes_each_way() {
     const SIZE: usize = 5 * 1024 * 1024;
     within(Duration::from_secs(120), || {
         block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
+            RunOptions::new(Seed::from_u64(1)),
             |fcx| async move {
                 let ca = Ca::new(&fcx, "Test CA").unwrap();
                 let config = server_config(&fcx, &ca, "example.test", &[]);
@@ -694,7 +698,7 @@ fn five_megabytes_each_way() {
 #[test]
 fn tls12_clients_work_too() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
             // The config draws random values through Fictionet, not ring.
@@ -752,7 +756,7 @@ fn tls12_clients_work_too() {
 #[test]
 fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&fcx, &ca, &[]);
@@ -787,7 +791,7 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     .unwrap();
 
     within(Duration::from_secs(20), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (server_side, _client_side) = mem_pair();
             fcx.region(|region_fcx| async move {
                 let stopper = region_fcx.clone();
@@ -813,7 +817,7 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
 
 #[test]
 fn sandbox_client_returns_invalid_server_name() {
-    block_on(lab(Seed::from_u64(1), |fcx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
         let (_, conn) = mem_pair();
         let roots = Arc::new(RootCertStore::empty());
         let result = fictionet::stdlib::world::sandbox::TlsClient::new(

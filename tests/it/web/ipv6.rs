@@ -848,7 +848,7 @@ fn ipv6_addresses_are_bound_to_one_sandbox() {
             ["attached", "bound", "bound", "detached"],
             "{a_events:#?}"
         );
-        let at = |e: &Entry| sandbox_of(e).map(|s| (s.addr, s.addr_v6));
+        let at = |e: &Event| sandbox_of(e).map(|s| (s.addr, s.addr_v6));
         assert!(!flag(&a_events[1], "by_dhcp"));
         assert_eq!(at(&a_events[1]), Some((None, Some(ME6))));
         assert_eq!(at(&a_events[2]), Some((Some(me4), Some(ME6))));

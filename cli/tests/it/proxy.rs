@@ -195,7 +195,7 @@ impl World {
             .unwrap();
             ready_tx.send(()).unwrap();
             let _ = fictionet::block_on(fictionet::run(
-                fictionet::Seed::from_u64(1),
+                fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
                 move |fcx| async move {
                     fcx.spawn(move |fcx| async move {
                         while let Ok(mut sandbox) = attachments.next(&fcx).await {
@@ -1475,40 +1475,43 @@ mod upstream {
     async fn proxy_rejects_fallback_hosts_before_upstream_io() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        fictionet::run(Seed::from_u64(0), |fcx| async move {
-            let site = VHost::new(httpd::tower(web::proxy(&fcx)?));
-            let vhosts = VirtualHosts::new();
-            vhosts.insert("allowed.test", site.clone());
-            vhosts.set_default(site);
-            for (uri, host) in [
-                ("/", "127.0.0.1"),
-                ("/", "169.254.169.254"),
-                ("/", "unknown.test"),
-                ("http://127.0.0.1/", "allowed.test"),
-            ] {
-                let reply = route(&vhosts, request(uri, host), port);
-                let mut response = Box::pin(response(&fcx, reply));
-                let response = std::future::poll_fn(|cx| {
-                    let polled = response.as_mut().poll(cx);
-                    assert!(
-                        polled.is_ready(),
-                        "fallback rejection must not wait for I/O"
+        fictionet::run(
+            fictionet::RunOptions::new(Seed::from_u64(0)),
+            |fcx| async move {
+                let site = VHost::new(httpd::tower(web::proxy(&fcx)?));
+                let vhosts = VirtualHosts::new();
+                vhosts.insert("allowed.test", site.clone());
+                vhosts.set_default(site);
+                for (uri, host) in [
+                    ("/", "127.0.0.1"),
+                    ("/", "169.254.169.254"),
+                    ("/", "unknown.test"),
+                    ("http://127.0.0.1/", "allowed.test"),
+                ] {
+                    let reply = route(&vhosts, request(uri, host), port);
+                    let mut response = Box::pin(response(&fcx, reply));
+                    let response = std::future::poll_fn(|cx| {
+                        let polled = response.as_mut().poll(cx);
+                        assert!(
+                            polled.is_ready(),
+                            "fallback rejection must not wait for I/O"
+                        );
+                        polled
+                    })
+                    .await;
+                    assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+                    let fields = response
+                        .extensions()
+                        .get::<fictionet::events::Fields>()
+                        .unwrap();
+                    assert_eq!(
+                        fields.get("answer").and_then(|value| value.as_str()),
+                        Some("misdirected")
                     );
-                    polled
-                })
-                .await;
-                assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
-                let fields = response
-                    .extensions()
-                    .get::<fictionet::events::Fields>()
-                    .unwrap();
-                assert_eq!(
-                    fields.get("answer").and_then(|value| value.as_str()),
-                    Some("misdirected")
-                );
-            }
-            Ok(())
-        })
+                }
+                Ok(())
+            },
+        )
         .await
         .unwrap();
     }
@@ -1516,17 +1519,20 @@ mod upstream {
     #[tokio::test]
     async fn proxy_forwards_exact_hosts_even_when_the_site_is_default() {
         let (address, server) = origin().await;
-        fictionet::run(Seed::from_u64(0), |fcx| async move {
-            let site = VHost::new(httpd::tower(web::proxy(&fcx)?));
-            let vhosts = VirtualHosts::new();
-            vhosts.insert("127.0.0.1", site.clone());
-            vhosts.set_default(site);
-            let reply = route(&vhosts, request("/page?q=1", "127.0.0.1:1"), address.port());
-            let response = response(&fcx, reply).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
-            Ok(())
-        })
+        fictionet::run(
+            fictionet::RunOptions::new(Seed::from_u64(0)),
+            |fcx| async move {
+                let site = VHost::new(httpd::tower(web::proxy(&fcx)?));
+                let vhosts = VirtualHosts::new();
+                vhosts.insert("127.0.0.1", site.clone());
+                vhosts.set_default(site);
+                let reply = route(&vhosts, request("/page?q=1", "127.0.0.1:1"), address.port());
+                let response = response(&fcx, reply).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+                Ok(())
+            },
+        )
         .await
         .unwrap();
         let received = server.await.unwrap().to_ascii_lowercase();
@@ -1537,17 +1543,20 @@ mod upstream {
     #[tokio::test]
     async fn forward_accepts_fallback_hosts_at_its_fixed_origin() {
         let (address, server) = origin().await;
-        fictionet::run(Seed::from_u64(0), |fcx| async move {
-            let site = VHost::new(web::forward(&fcx, format!("http://{address}").parse()?)?);
-            let vhosts = VirtualHosts::new();
-            vhosts.insert("allowed.test", site.clone());
-            vhosts.set_default(site);
-            let reply = route(&vhosts, request("/page?q=1", "unknown.test"), 80);
-            let response = response(&fcx, reply).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
-            Ok(())
-        })
+        fictionet::run(
+            fictionet::RunOptions::new(Seed::from_u64(0)),
+            |fcx| async move {
+                let site = VHost::new(web::forward(&fcx, format!("http://{address}").parse()?)?);
+                let vhosts = VirtualHosts::new();
+                vhosts.insert("allowed.test", site.clone());
+                vhosts.set_default(site);
+                let reply = route(&vhosts, request("/page?q=1", "unknown.test"), 80);
+                let response = response(&fcx, reply).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+                Ok(())
+            },
+        )
         .await
         .unwrap();
         let received = server.await.unwrap().to_ascii_lowercase();

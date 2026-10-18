@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use fictionet::stdlib::services::tls;
-use fictionet::{Cx, Seed, block_on};
+use fictionet::{Cx, RunOptions, Seed, block_on};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::{
     ClientConfig, ClientConnection, Connection, HandshakeKind, NamedGroup, RootCertStore,
@@ -193,18 +193,21 @@ fn replay(
 ) -> Vec<Records> {
     let output = Arc::new(Mutex::new(Vec::new()));
     let result = output.clone();
-    block_on(fictionet::lab(Seed::from_u64(seed), move |cx| async move {
-        let (client, server) =
-            tls::with_context(&cx, || configs(&cx, fixture, version, group, false, false));
-        for resumed in [false, true, true] {
-            let records = tls::with_context(&cx, || {
-                exchange(client.clone(), server.clone(), group, version, resumed)
-            });
-            result.lock().unwrap().push(records);
-            cx.sleep(Duration::from_secs(1)).await?;
-        }
-        Ok(())
-    }))
+    block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(seed)),
+        move |cx| async move {
+            let (client, server) =
+                tls::with_context(&cx, || configs(&cx, fixture, version, group, false, false));
+            for resumed in [false, true, true] {
+                let records = tls::with_context(&cx, || {
+                    exchange(client.clone(), server.clone(), group, version, resumed)
+                });
+                result.lock().unwrap().push(records);
+                cx.sleep(Duration::from_secs(1)).await?;
+            }
+            Ok(())
+        },
+    ))
     .unwrap();
     Arc::try_unwrap(output).unwrap().into_inner().unwrap()
 }
@@ -261,27 +264,36 @@ matrix!(rsa_cert, RSA);
 
 #[test]
 fn real_time_stock_ring_interop() {
-    block_on(fictionet::run(Seed::from_u64(87), |cx| async move {
-        for fixture in [&P256, &P384, &ED25519, &RSA] {
-            for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
-                for group in [
-                    NamedGroup::X25519,
-                    NamedGroup::secp256r1,
-                    NamedGroup::secp384r1,
-                ] {
-                    for stock_client in [false, true] {
-                        tls::with_context(&cx, || {
-                            let (client, server) =
-                                configs(&cx, fixture, version, group, stock_client, !stock_client);
-                            exchange(client.clone(), server.clone(), group, version, false);
-                            exchange(client, server, group, version, true);
-                        });
+    block_on(fictionet::run(
+        RunOptions::new(Seed::from_u64(87)),
+        |cx| async move {
+            for fixture in [&P256, &P384, &ED25519, &RSA] {
+                for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+                    for group in [
+                        NamedGroup::X25519,
+                        NamedGroup::secp256r1,
+                        NamedGroup::secp384r1,
+                    ] {
+                        for stock_client in [false, true] {
+                            tls::with_context(&cx, || {
+                                let (client, server) = configs(
+                                    &cx,
+                                    fixture,
+                                    version,
+                                    group,
+                                    stock_client,
+                                    !stock_client,
+                                );
+                                exchange(client.clone(), server.clone(), group, version, false);
+                                exchange(client, server, group, version, true);
+                            });
+                        }
                     }
                 }
             }
-        }
-        Ok(())
-    }))
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
@@ -321,58 +333,64 @@ fn provider_preserves_ring_preferences_and_requires_context() {
 
 #[test]
 fn invalid_key_shares() {
-    block_on(fictionet::lab(Seed::from_u64(42), |cx| async move {
-        tls::with_context(&cx, || {
-            for group in tls::crypto_provider().kx_groups {
-                let len = match group.name() {
-                    NamedGroup::X25519 => 32,
-                    NamedGroup::secp256r1 => 65,
-                    NamedGroup::secp384r1 => 97,
-                    _ => unreachable!(),
-                };
-                for invalid in [vec![], vec![0; len - 1], vec![0; len], vec![0; len + 1]] {
-                    assert!(group.start().unwrap().complete(&invalid).is_err());
+    block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(42)),
+        |cx| async move {
+            tls::with_context(&cx, || {
+                for group in tls::crypto_provider().kx_groups {
+                    let len = match group.name() {
+                        NamedGroup::X25519 => 32,
+                        NamedGroup::secp256r1 => 65,
+                        NamedGroup::secp384r1 => 97,
+                        _ => unreachable!(),
+                    };
+                    for invalid in [vec![], vec![0; len - 1], vec![0; len], vec![0; len + 1]] {
+                        assert!(group.start().unwrap().complete(&invalid).is_err());
+                    }
+                    if group.name() == NamedGroup::X25519 {
+                        let mut low_order = [0; 32];
+                        low_order[0] = 1;
+                        assert!(group.start().unwrap().complete(&low_order).is_err());
+                    } else {
+                        let mut off_curve = vec![0; len];
+                        off_curve[0] = 4;
+                        assert!(group.start().unwrap().complete(&off_curve).is_err());
+                        let public = group.start().unwrap().pub_key().to_vec();
+                        let mut compressed = public[..=(len - 1) / 2].to_vec();
+                        compressed[0] = 2;
+                        assert!(group.start().unwrap().complete(&compressed).is_err());
+                    }
                 }
-                if group.name() == NamedGroup::X25519 {
-                    let mut low_order = [0; 32];
-                    low_order[0] = 1;
-                    assert!(group.start().unwrap().complete(&low_order).is_err());
-                } else {
-                    let mut off_curve = vec![0; len];
-                    off_curve[0] = 4;
-                    assert!(group.start().unwrap().complete(&off_curve).is_err());
-                    let public = group.start().unwrap().pub_key().to_vec();
-                    let mut compressed = public[..=(len - 1) / 2].to_vec();
-                    compressed[0] = 2;
-                    assert!(group.start().unwrap().complete(&compressed).is_err());
-                }
-            }
-        });
-        Ok(())
-    }))
+            });
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
 #[test]
 fn config_builder_uses_run_clock() {
-    block_on(fictionet::lab(Seed::from_u64(11), |cx| async move {
-        let config = tls::config_builder(&cx, UNIX_EPOCH + Duration::from_secs(DATE))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![P256.cert.to_vec().into()],
-                PrivateKeyDer::try_from(P256.key.to_vec()).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(config.time_provider.current_time().unwrap().as_secs(), DATE);
-        cx.sleep(Duration::from_secs(9)).await?;
-        assert_eq!(
-            config.time_provider.current_time().unwrap().as_secs(),
-            DATE + 9
-        );
-        Ok(())
-    }))
+    block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(11)),
+        |cx| async move {
+            let config = tls::config_builder(&cx, UNIX_EPOCH + Duration::from_secs(DATE))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![P256.cert.to_vec().into()],
+                    PrivateKeyDer::try_from(P256.key.to_vec()).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(config.time_provider.current_time().unwrap().as_secs(), DATE);
+            cx.sleep(Duration::from_secs(9)).await?;
+            assert_eq!(
+                config.time_provider.current_time().unwrap().as_secs(),
+                DATE + 9
+            );
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
@@ -386,36 +404,42 @@ fn nested_context_restores_on_return_and_unwind() {
         oracle.fill_random(&mut expected);
         assert_eq!(got, expected);
     }
-    block_on(fictionet::lab(Seed::from_u64(71), |outer| async move {
-        let outer_rng = Arc::new(SeededEntropy::new(Seed::from_u64(71)));
-        tls::with_context(&outer, || {
-            check(&outer_rng);
-            let nested_rng = outer_rng.clone();
-            block_on(fictionet::lab(Seed::from_u64(72), |inner| async move {
-                let inner_rng = SeededEntropy::new(Seed::from_u64(72));
-                tls::with_context(&inner, || check(&inner_rng));
-                check(&nested_rng);
-                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tls::with_context(&inner, || {
-                        check(&inner_rng);
-                        panic!("unwind context");
-                    });
-                }));
-                assert!(panic.is_err());
-                check(&nested_rng);
-                Ok(())
-            }))
-            .unwrap();
-            check(&outer_rng);
-        });
-        assert!(
-            tls::crypto_provider()
-                .secure_random
-                .fill(&mut [0; 1])
-                .is_err()
-        );
-        Ok(())
-    }))
+    block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(71)),
+        |outer| async move {
+            let outer_rng = Arc::new(SeededEntropy::new(Seed::from_u64(71)));
+            tls::with_context(&outer, || {
+                check(&outer_rng);
+                let nested_rng = outer_rng.clone();
+                block_on(fictionet::lab(
+                    RunOptions::new(Seed::from_u64(72)),
+                    |inner| async move {
+                        let inner_rng = SeededEntropy::new(Seed::from_u64(72));
+                        tls::with_context(&inner, || check(&inner_rng));
+                        check(&nested_rng);
+                        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            tls::with_context(&inner, || {
+                                check(&inner_rng);
+                                panic!("unwind context");
+                            });
+                        }));
+                        assert!(panic.is_err());
+                        check(&nested_rng);
+                        Ok(())
+                    },
+                ))
+                .unwrap();
+                check(&outer_rng);
+            });
+            assert!(
+                tls::crypto_provider()
+                    .secure_random
+                    .fill(&mut [0; 1])
+                    .is_err()
+            );
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
@@ -448,29 +472,32 @@ fn rsa_signature_schemes_and_key_encodings() {
         let public = public.clone();
         let result = Arc::new(Mutex::new(Vec::new()));
         let output = result.clone();
-        block_on(fictionet::lab(Seed::from_u64(seed), |cx| async move {
-            tls::with_context(&cx, || {
-                let key = tls::crypto_provider()
-                    .key_provider
-                    .load_private_key(der)
-                    .unwrap();
-                let offered = schemes.iter().rev().map(|(s, _)| *s).collect::<Vec<_>>();
-                assert_eq!(
-                    key.choose_scheme(&offered).unwrap().scheme(),
-                    RSA_PSS_SHA512
-                );
-                for (scheme, verifier) in schemes {
-                    let signer = key.choose_scheme(&[scheme]).unwrap();
-                    assert_eq!(signer.scheme(), scheme);
-                    let signature = signer.sign(b"signature test").unwrap();
-                    ring::signature::UnparsedPublicKey::new(verifier, public.as_bytes())
-                        .verify(b"signature test", &signature)
+        block_on(fictionet::lab(
+            RunOptions::new(Seed::from_u64(seed)),
+            |cx| async move {
+                tls::with_context(&cx, || {
+                    let key = tls::crypto_provider()
+                        .key_provider
+                        .load_private_key(der)
                         .unwrap();
-                    output.lock().unwrap().push(signature);
-                }
-            });
-            Ok(())
-        }))
+                    let offered = schemes.iter().rev().map(|(s, _)| *s).collect::<Vec<_>>();
+                    assert_eq!(
+                        key.choose_scheme(&offered).unwrap().scheme(),
+                        RSA_PSS_SHA512
+                    );
+                    for (scheme, verifier) in schemes {
+                        let signer = key.choose_scheme(&[scheme]).unwrap();
+                        assert_eq!(signer.scheme(), scheme);
+                        let signature = signer.sign(b"signature test").unwrap();
+                        ring::signature::UnparsedPublicKey::new(verifier, public.as_bytes())
+                            .verify(b"signature test", &signature)
+                            .unwrap();
+                        output.lock().unwrap().push(signature);
+                    }
+                });
+                Ok(())
+            },
+        ))
         .unwrap();
         Arc::try_unwrap(result).unwrap().into_inner().unwrap()
     };

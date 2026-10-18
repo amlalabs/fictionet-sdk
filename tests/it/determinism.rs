@@ -25,7 +25,7 @@ use fictionet::stdlib::{
     services::tls,
     web::httpd,
 };
-use fictionet::{Cx, Seed, block_on, lab};
+use fictionet::{Cx, RunOptions, Seed, block_on, lab};
 use http::{Request, Response};
 use http_body::Frame;
 use hyper_util::rt::TokioIo;
@@ -152,7 +152,7 @@ fn world(seed: Seed, trace: Arc<Mutex<Trace>>) -> impl Future<Output = fictionet
         let packets = trace.clone();
         let loss_trace = trace.clone();
         lab(
-            fictionet::RunOptions::new(seed)
+            RunOptions::new(seed)
                 .observer(output)
                 .fields(Fields::new().with("world_date", "2030-01-01")),
             move |cx| episode(cx, packets, loss_trace),
@@ -382,7 +382,7 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let replies = bodies.clone();
         block_on(lab(
-            fictionet::RunOptions::new(Seed::from_u64(seed)).observer(output),
+            RunOptions::new(Seed::from_u64(seed)).observer(output),
             move |cx| async move {
                 let date = UNIX_EPOCH + Duration::from_secs(DATE);
                 let ca = Ca::new(&cx, "Lab CA")?;
@@ -572,7 +572,7 @@ fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
         move |fcx, evidence| async move {
             *out.lock().unwrap() = Some(evidence.clone());
             let foreign = fcx.clone();
-            lab(Seed::from_u64(2), move |_fcx| async move {
+            lab(RunOptions::new(Seed::from_u64(2)), move |_fcx| async move {
                 foreign.emit("test", "record", |event| event);
                 foreign.emit("test", "foreign_emission", |event| event);
                 foreign.emit("test", "repeat", |event| event);
@@ -619,7 +619,7 @@ fn a_nested_panic_restores_the_outer_task() {
         Seed::from_u64(1),
         |fcx, evidence| async move {
             let result = std::panic::catch_unwind(|| {
-                block_on(lab(Seed::from_u64(2), |_fcx| async move {
+                block_on(lab(RunOptions::new(Seed::from_u64(2)), |_fcx| async move {
                     panic!("inner world failed");
                 }))
             });

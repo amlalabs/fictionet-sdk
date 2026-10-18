@@ -1,3 +1,4 @@
+use fictionet::RunOptions;
 use fictionet::events::Transport;
 use fictionet::observe::{Decoded, Dissector, Layer, Match, Present, Registry, Selection};
 use fictionet::stdlib::codec::{Decode, Step};
@@ -183,7 +184,7 @@ fn a_live_world_uses_the_registered_decoder_in_observe_json() {
         fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone()), attacher).unwrap();
     let world = std::thread::spawn(move || {
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            RunOptions::new(fictionet::Seed::random()),
             move |fcx| async move {
                 fcx.observe_protocols(registry());
                 let Ok(mut sandbox) = attachments.next(&fcx).await else {

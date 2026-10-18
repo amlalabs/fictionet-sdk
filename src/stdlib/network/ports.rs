@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn concrete_ports_reuse_slots_and_keep_event_priority() {
-        fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
+        fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
             let (a, mut peer) = fictionet::pair();
             let (b, _peer_b) = fictionet::pair();
             let (c, _peer_c) = fictionet::pair();

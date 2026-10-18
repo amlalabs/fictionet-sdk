@@ -3837,6 +3837,7 @@ where
             Some(wake),
             self.now,
         );
+        core.s.events.observer = self.core.s.events.observer.clone();
         core.s.bytes_in = self.core.s.bytes_in;
         if !unread.is_empty() {
             core.queue.push_back(Segment::Bytes(unread, 0));

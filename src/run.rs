@@ -22,8 +22,8 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// Configuration installed before a run starts.
 ///
-/// Passing a seed to [`run`] or [`lab`] uses no event observer. Pass options
-/// instead to install one immutable destination, shared by every region.
+/// Options select the seed and an optional observation destination, shared by
+/// every region.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -86,12 +86,6 @@ impl RunOptions {
     pub fn fields(mut self, fields: crate::events::Fields) -> Self {
         self.fields = fields;
         self
-    }
-}
-
-impl From<crate::Seed> for RunOptions {
-    fn from(seed: crate::Seed) -> Self {
-        Self::new(seed)
     }
 }
 
@@ -180,7 +174,7 @@ impl From<crate::Seed> for RunOptions {
 ///     let (attacher, attachments) = fictionet::attachments();
 ///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 ///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::run(fictionet::Seed::random(), |fcx| async move {
+///     fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
 ///         // Build the world with `fcx`, `attachments` and `db`.
 /// #       let _ = (fcx, attachments, db);
 ///         Ok(())
@@ -190,13 +184,13 @@ impl From<crate::Seed> for RunOptions {
 /// # fn main() {}
 /// ```
 #[cfg(feature = "std")]
-pub async fn run<F, Fut>(options: impl Into<RunOptions> + Send, world: F) -> Result
+pub async fn run<F, Fut>(options: RunOptions, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
     run_with(
-        RunShared::with_options(options.into(), crate::RunMode::Real),
+        RunShared::with_options(options, crate::RunMode::Real),
         world,
     )
     .await
@@ -227,16 +221,12 @@ where
 /// the lab on their first `get`, `next` or `map`, before handing out an
 /// attachment, and `get` and `next` return [`Cancelled`](crate::Cancelled).
 /// Observer sessions, `web::proxy` and `web::forward` refuse a lab too.
-pub async fn lab<F, Fut>(options: impl Into<RunOptions> + Send, world: F) -> Result
+pub async fn lab<F, Fut>(options: RunOptions, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    run_with(
-        RunShared::with_options(options.into(), crate::RunMode::Lab),
-        world,
-    )
-    .await
+    run_with(RunShared::with_options(options, crate::RunMode::Lab), world).await
 }
 
 /// Runs the world using the shared runtime services.
@@ -347,7 +337,7 @@ impl RunShared {
 
     #[cfg(all(test, feature = "std"))]
     pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Self> {
-        Self::with_options(seed.into(), mode)
+        Self::with_options(RunOptions::new(seed), mode)
     }
 
     pub(crate) fn with_options(options: RunOptions, mode: crate::RunMode) -> Arc<Self> {
@@ -393,6 +383,7 @@ impl RunShared {
         ) {
             observer.emit(
                 crate::events::Event::new("run", "start")
+                    .bounded()
                     .summary("the run started")
                     .fields(fields)
                     .field("seed", seed.to_string())

@@ -74,7 +74,7 @@ impl Buf {
 }
 
 /// Runs a test script on a runtime and ends the world when it returns.
-pub fn run<F, Fut>(options: impl Into<fictionet::RunOptions> + Send + 'static, f: F)
+pub fn run<F, Fut>(options: fictionet::RunOptions, f: F)
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,

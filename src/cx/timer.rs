@@ -123,17 +123,20 @@ mod tests {
             .await?;
             Ok(fcx.now().since_start() - start.since_start())
         }
-        block_on(crate::lab(fictionet::Seed::from_u64(0), |fcx| async move {
-            let mut timer = Timer::new(&fcx);
-            // Moved later: the old deadline does not end the wait.
-            let waited = wait(&fcx, &mut timer, ms(10), ms(120)).await?;
-            assert_eq!(waited, ms(120));
-            // Moved earlier: it fires at the new deadline, after it fired once
-            // already under the same entry.
-            let waited = wait(&fcx, &mut timer, ms(400), ms(30)).await?;
-            assert_eq!(waited, ms(30));
-            Ok(())
-        }))
+        block_on(crate::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(0)),
+            |fcx| async move {
+                let mut timer = Timer::new(&fcx);
+                // Moved later: the old deadline does not end the wait.
+                let waited = wait(&fcx, &mut timer, ms(10), ms(120)).await?;
+                assert_eq!(waited, ms(120));
+                // Moved earlier: it fires at the new deadline, after it fired once
+                // already under the same entry.
+                let waited = wait(&fcx, &mut timer, ms(400), ms(30)).await?;
+                assert_eq!(waited, ms(30));
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 }

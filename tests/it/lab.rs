@@ -5,7 +5,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use fictionet::time::{Instant, ms};
-use fictionet::{Cancelled, JoinError, RaceError, RunMode, Seed, Timer, block_on, lab};
+use fictionet::{Cancelled, JoinError, RaceError, RunMode, RunOptions, Seed, Timer, block_on, lab};
 
 #[test]
 fn idle_drains_spawned_and_woken_work_before_advancing_time() {
@@ -45,7 +45,7 @@ fn idle_drains_spawned_and_woken_work_before_advancing_time() {
 
 #[test]
 fn dropped_idle_waits_do_not_delay_the_clock() {
-    block_on(lab(Seed::from_u64(1), |cx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         let mut idle = Box::pin(cx.idle());
         poll_fn(|task| {
             assert!(idle.as_mut().poll(task).is_pending());
@@ -174,7 +174,7 @@ fn event_wait_cancellation_wins_at_the_deadline() {
 #[test]
 fn a_minute_passes_without_waiting_a_minute() {
     let real = std::time::Instant::now();
-    block_on(lab(Seed::from_u64(1), |cx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         assert_eq!(cx.mode(), RunMode::Lab);
         assert_eq!(cx.now(), Instant::ZERO);
         cx.sleep(Duration::from_secs(60)).await?;
@@ -189,17 +189,20 @@ fn a_minute_passes_without_waiting_a_minute() {
 fn deadlines_and_equal_deadlines_wake_in_order() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let out = log.clone();
-    block_on(lab(Seed::from_u64(1), move |cx| async move {
-        for (id, deadline) in [(0, 30), (1, 10), (2, 10), (3, 20), (4, 10)] {
-            let out = out.clone();
-            cx.spawn(move |cx| async move {
-                cx.sleep(ms(deadline)).await?;
-                out.lock().unwrap().push((id, cx.now().since_start()));
-                Ok(())
-            });
-        }
-        Ok(())
-    }))
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |cx| async move {
+            for (id, deadline) in [(0, 30), (1, 10), (2, 10), (3, 20), (4, 10)] {
+                let out = out.clone();
+                cx.spawn(move |cx| async move {
+                    cx.sleep(ms(deadline)).await?;
+                    out.lock().unwrap().push((id, cx.now().since_start()));
+                    Ok(())
+                });
+            }
+            Ok(())
+        },
+    ))
     .unwrap();
     assert_eq!(
         *log.lock().unwrap(),
@@ -215,7 +218,7 @@ fn deadlines_and_equal_deadlines_wake_in_order() {
 
 #[test]
 fn reset_and_drop_remove_old_deadlines() {
-    block_on(lab(Seed::from_u64(1), |cx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         let mut early = Timer::new(&cx);
         let mut late = Timer::new(&cx);
         let mut dropped = Timer::new(&cx);
@@ -240,7 +243,7 @@ fn reset_and_drop_remove_old_deadlines() {
 
 #[test]
 fn cancellation_wins_at_the_deadline_but_race_polls_work_first() {
-    block_on(lab(Seed::from_u64(1), |cx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         cx.spawn(|cx| async move {
             cx.sleep(ms(10)).await?;
             cx.cancel();
@@ -271,7 +274,7 @@ fn cancellation_wins_at_the_deadline_but_race_polls_work_first() {
         Ok(())
     }))
     .unwrap();
-    block_on(lab(Seed::from_u64(1), |cx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         let deadline = Instant::ZERO + ms(10);
         assert_eq!(
             cx.race(Some(deadline), cx.sleep_until(deadline)).await,
@@ -287,37 +290,40 @@ fn cancellation_wins_at_the_deadline_but_race_polls_work_first() {
 fn spawns_and_self_wakes_drain_before_time_advances() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let out = log.clone();
-    block_on(lab(Seed::from_u64(1), move |cx| async move {
-        let mut polls = 0;
-        poll_fn(|task| {
-            assert_eq!(cx.now(), Instant::ZERO);
-            polls += 1;
-            if polls < 100 {
-                task.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            let out = out.clone();
-            cx.spawn(move |cx| async move {
-                out.lock().unwrap().push(cx.now().since_start());
-                cx.sleep(ms(5)).await?;
-                out.lock().unwrap().push(cx.now().since_start());
-                Ok(())
-            });
-            // Spawning admitted work, without self-waking, must prevent a jump.
-            Poll::Ready(())
-        })
-        .await;
-        cx.sleep(ms(10)).await?;
-        assert_eq!(cx.now().since_start(), ms(10));
-        Ok(())
-    }))
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |cx| async move {
+            let mut polls = 0;
+            poll_fn(|task| {
+                assert_eq!(cx.now(), Instant::ZERO);
+                polls += 1;
+                if polls < 100 {
+                    task.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                let out = out.clone();
+                cx.spawn(move |cx| async move {
+                    out.lock().unwrap().push(cx.now().since_start());
+                    cx.sleep(ms(5)).await?;
+                    out.lock().unwrap().push(cx.now().since_start());
+                    Ok(())
+                });
+                // Spawning admitted work, without self-waking, must prevent a jump.
+                Poll::Ready(())
+            })
+            .await;
+            cx.sleep(ms(10)).await?;
+            assert_eq!(cx.now().since_start(), ms(10));
+            Ok(())
+        },
+    ))
     .unwrap();
     assert_eq!(*log.lock().unwrap(), [Duration::ZERO, ms(5)]);
 }
 
 #[test]
 fn a_retained_context_cannot_reopen_a_completed_region() {
-    block_on(lab(Seed::from_u64(1), |fcx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
         for outcome in ["ok", "failed", "stopped"] {
             let mut retained = None;
             let result = fcx
@@ -362,31 +368,34 @@ fn a_retained_context_cannot_reopen_a_completed_region() {
 fn an_active_cancelled_region_can_spawn_cleanup_work() {
     let cleaned = Arc::new(Mutex::new(false));
     let out = cleaned.clone();
-    block_on(lab(Seed::from_u64(1), move |fcx| async move {
-        fcx.region(|child| async move {
-            child.spawn(move |fcx| async move {
-                fcx.cancelled().await;
-                fcx.spawn(move |fcx| async move {
-                    assert!(fcx.is_cancelled());
-                    assert_eq!(fcx.sleep(ms(1)).await, Err(Cancelled));
-                    *out.lock().unwrap() = true;
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |fcx| async move {
+            fcx.region(|child| async move {
+                child.spawn(move |fcx| async move {
+                    fcx.cancelled().await;
+                    fcx.spawn(move |fcx| async move {
+                        assert!(fcx.is_cancelled());
+                        assert_eq!(fcx.sleep(ms(1)).await, Err(Cancelled));
+                        *out.lock().unwrap() = true;
+                        Ok(())
+                    });
                     Ok(())
                 });
+                child.cancel();
                 Ok(())
-            });
-            child.cancel();
+            })
+            .await?;
+            assert!(*cleaned.lock().unwrap());
             Ok(())
-        })
-        .await?;
-        assert!(*cleaned.lock().unwrap());
-        Ok(())
-    }))
+        },
+    ))
     .unwrap();
 }
 
 #[test]
 fn infinite_sleeps_are_unarmed_and_cancellable() {
-    block_on(lab(Seed::from_u64(1), |cx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         cx.spawn(|cx| async move {
             assert_eq!(cx.sleep(Duration::MAX).await, Err(Cancelled));
             assert_eq!(cx.now().since_start(), ms(1));
@@ -397,7 +406,7 @@ fn infinite_sleeps_are_unarmed_and_cancellable() {
         Ok(())
     }))
     .unwrap();
-    let error = block_on(lab(Seed::from_u64(1), |cx| async move {
+    let error = block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         cx.sleep(Duration::MAX).await?;
         Ok(())
     }))
@@ -407,14 +416,14 @@ fn infinite_sleeps_are_unarmed_and_cancellable() {
 
 #[test]
 fn overflow_waits_are_unarmed_and_virtual_time_is_bounded() {
-    let error = block_on(lab(Seed::from_u64(1), |cx| async move {
+    let error = block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         cx.sleep(ms(1)).await?;
         cx.sleep(Duration::MAX).await?;
         Ok(())
     }))
     .unwrap_err();
     assert!(error.to_string().contains("lab deadlock"));
-    let error = block_on(lab(Seed::from_u64(1), |cx| async move {
+    let error = block_on(lab(RunOptions::new(Seed::from_u64(1)), |cx| async move {
         cx.sleep(Duration::from_micros(i64::MAX as u64) + ms(1))
             .await?;
         Ok(())
@@ -425,7 +434,7 @@ fn overflow_waits_are_unarmed_and_virtual_time_is_bounded() {
 
 #[test]
 fn a_live_task_without_a_deadline_reports_deadlock() {
-    let error = block_on(lab(Seed::from_u64(1), |_| async {
+    let error = block_on(lab(RunOptions::new(Seed::from_u64(1)), |_| async {
         pending::<()>().await;
         Ok(())
     }))
@@ -444,8 +453,12 @@ async fn clock_world(cx: fictionet::Cx, duration: Duration) -> fictionet::Result
 
 #[test]
 fn two_labs_can_be_interleaved_on_one_thread() {
-    let mut a = pin!(lab(Seed::from_u64(1), |cx| clock_world(cx, ms(10))));
-    let mut b = pin!(lab(Seed::from_u64(2), |cx| clock_world(cx, ms(37))));
+    let mut a = pin!(lab(RunOptions::new(Seed::from_u64(1)), |cx| {
+        clock_world(cx, ms(10))
+    }));
+    let mut b = pin!(lab(RunOptions::new(Seed::from_u64(2)), |cx| {
+        clock_world(cx, ms(37))
+    }));
     let mut task = Context::from_waker(Waker::noop());
     let (mut done_a, mut done_b) = (false, false);
     while !done_a || !done_b {
@@ -462,7 +475,9 @@ fn two_labs_can_be_interleaved_on_one_thread() {
 
 #[test]
 fn a_lab_moves_between_host_threads() {
-    let mut world = Box::pin(lab(Seed::from_u64(1), |cx| clock_world(cx, ms(100))));
+    let mut world = Box::pin(lab(RunOptions::new(Seed::from_u64(1)), |cx| {
+        clock_world(cx, ms(100))
+    }));
     assert!(
         world
             .as_mut()
@@ -477,7 +492,7 @@ fn a_lab_moves_between_host_threads() {
 
 #[test]
 fn real_io_is_refused_before_opening_resources() {
-    block_on(lab(Seed::from_u64(1), |fcx| async move {
+    block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
         assert!(
             fcx.require_real_io()
                 .unwrap_err()
@@ -510,7 +525,7 @@ fn recorded_world() -> Vec<u8> {
     let evidence = Arc::new(fictionet::events::Memory::default());
     let out = evidence.clone();
     block_on(lab(
-        fictionet::RunOptions::new(Seed::from_u64(7)).observer(out.clone()),
+        RunOptions::new(Seed::from_u64(7)).observer(out.clone()),
         move |cx| async move {
             assert!(matches!(
                 out.checked_of("run", "start").unwrap()[0].get("wall"),
@@ -562,7 +577,7 @@ fn seeded_service_faults_repeat_at_the_same_points() {
         let points = Arc::new(Mutex::new(Vec::new()));
         let replies = points.clone();
         block_on(lab(
-            fictionet::RunOptions::new(Seed::from_u64(seed)).observer(output),
+            RunOptions::new(Seed::from_u64(seed)).observer(output),
             move |cx| async move {
                 let (a, b) = fictionet::pair();
                 let client = tcp::endpoint(&cx, a, "10.0.0.2".parse()?);

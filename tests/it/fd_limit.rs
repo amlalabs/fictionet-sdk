@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 
 use fictionet::relay::{self, Hello, Message, unix};
-use fictionet::{WorldSocket, attachments, listen};
+use fictionet::{RunOptions, WorldSocket, attachments, listen};
 
 static LIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -131,23 +131,26 @@ fn reconnects_reclaim_pending_sockets_without_world_polling() {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (mut go, mut wait) = fictionet::pair();
         let world = std::thread::spawn(move || {
-            block_on(run(Seed::from_u64(0), move |fcx| async move {
-                let mut attachments = if mapped {
-                    attachments.map(&fcx, |_, a| {
-                        assert_eq!(a.name(), "barrier", "pending agents must not be wrapped");
-                        a
-                    })
-                } else {
-                    attachments
-                };
-                for _ in 0..128 {
-                    drop(attachments.get(&fcx, "barrier").await?);
-                    ready_tx.send(()).unwrap();
-                    // Keep the stream alive without polling it during detach.
-                    wait.recv(&fcx).await?;
-                }
-                Ok(())
-            }))
+            block_on(run(
+                RunOptions::new(Seed::from_u64(0)),
+                move |fcx| async move {
+                    let mut attachments = if mapped {
+                        attachments.map(&fcx, |_, a| {
+                            assert_eq!(a.name(), "barrier", "pending agents must not be wrapped");
+                            a
+                        })
+                    } else {
+                        attachments
+                    };
+                    for _ in 0..128 {
+                        drop(attachments.get(&fcx, "barrier").await?);
+                        ready_tx.send(()).unwrap();
+                        // Keep the stream alive without polling it during detach.
+                        wait.recv(&fcx).await?;
+                    }
+                    Ok(())
+                },
+            ))
         });
         let connect = |name: &str| {
             let fd = unix::connect(&path).unwrap();

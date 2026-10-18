@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::RunOptions;
 
 // ---------------------------------------------------------------------------
 // Tests: routing, unreachable, isolation, binding
@@ -207,7 +208,7 @@ fn spoofed_and_taken_sources_are_dropped() {
 #[test]
 fn a_subnet_that_cannot_work_is_an_error() {
     let result = within(Duration::from_secs(10), || {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             for bad in [
                 "10.0.0.0/31",
                 "10.0.0.0/4",
@@ -250,12 +251,15 @@ fn the_sites_keep_running_after_the_world_returns() {
     let (attacher, attachments) = fictionet::attachments();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let r = block_on(run(fictionet::Seed::random(), move |fcx| async move {
-            web::Sites::new(|h| (h == "plain.test").then(|| web::Site::new(Plain("plain"))))
-                .start(&fcx, attachments)?;
-            let _ = tx.send(fcx.clone());
-            Ok(())
-        }));
+        let r = block_on(run(
+            RunOptions::new(fictionet::Seed::random()),
+            move |fcx| async move {
+                web::Sites::new(|h| (h == "plain.test").then(|| web::Site::new(Plain("plain"))))
+                    .start(&fcx, attachments)?;
+                let _ = tx.send(fcx.clone());
+                Ok(())
+            },
+        ));
         let _ = r;
     });
     let fcx = rx.recv().unwrap();

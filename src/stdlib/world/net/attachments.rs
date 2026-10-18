@@ -30,28 +30,6 @@ pub(super) struct Hooks {
 }
 
 impl Hooks {
-    pub(super) fn emit(
-        &self,
-        fcx: &Cx,
-        conn: &ConnInfo,
-        kind: &'static str,
-        build: impl FnOnce(Event) -> Event,
-    ) {
-        fcx.emitter(conn).emit("net", kind, build);
-    }
-
-    pub(super) fn blocked(
-        &self,
-        fcx: &Cx,
-        conn: &ConnInfo,
-        build: impl FnOnce() -> (Event, Fields),
-    ) {
-        fcx.emitter(conn).emit("net", "blocked", |_| {
-            let (event, detail) = build();
-            event.repeat(detail)
-        });
-    }
-
     pub(super) fn sandbox_at(&self, addr: IpAddr) -> Sandbox {
         if let Some(s) = self.by_addr.lock().get(&addr) {
             return s.clone();
@@ -145,17 +123,15 @@ impl Context {
             _attached: attached.clone(),
         };
         let joined = segment.add(addr, Box::new(member), Some(me.clone()));
-        hooks.emit(
-            fcx,
-            &sandbox_only(me),
+        fcx.emitter(&sandbox_only(me)).emit(
+            "net",
             if joined.is_ok() { "attached" } else { "error" },
-            |_| {
+            |event| {
                 let event = match joined {
-                    Ok(()) => Event::new("net", "attached")
-                        .bounded()
-                        .summary(format_args!("sandbox {name} joined LAN {lan} at {addr}")),
-                    Err(e) => Event::new("net", "error")
-                        .bounded()
+                    Ok(()) => {
+                        event.summary(format_args!("sandbox {name} joined LAN {lan} at {addr}"))
+                    }
+                    Err(e) => event
                         .level(Level::Notice)
                         .summary(format_args!("sandbox {name} could not join LAN {lan}: {e}"))
                         .field("error", e.to_string()),
@@ -268,9 +244,9 @@ impl Drop for Attached {
             addr: bound,
             addr_v6: bound6,
         };
-        context
-            .hooks
-            .emit(&self.fcx, &sandbox_only(sandbox), "detached", |event| {
+        self.fcx
+            .emitter(&sandbox_only(sandbox))
+            .emit("net", "detached", |event| {
                 event.summary(format_args!("sandbox {} detached", self.name))
             });
     }
@@ -320,9 +296,8 @@ pub(super) async fn filter(
         route6: None,
         reassembly: Reassembly::default(),
     };
-    context
-        .hooks
-        .emit(&fcx, &sandbox_only(f.me()), "attached", |event| {
+    fcx.emitter(&sandbox_only(f.me()))
+        .emit("net", "attached", |event| {
             event.summary(format_args!("sandbox {} attached", f.name))
         });
     // Detaches before the filter's links close.
@@ -395,18 +370,18 @@ pub fn connection_limit(
     let guard = Counted::enter(open, max);
     if guard.is_none() {
         let (src, dst) = (info.peer, info.local);
-        fcx.emitter(info).emit("net", "blocked", |_| {
+        let conn = ConnInfo {
+            sandbox: info.sandbox.clone(),
+            ..ConnInfo::default()
+        };
+        fcx.emitter(&conn).emit("net", "blocked", |_| {
             let event = blocked_event(
                 BlockedWhy::TooManyConnections,
                 Some(PROTO_TCP),
                 src.map(|a| a.ip()),
                 dst.map(|a| a.ip()),
             );
-            let conn = ConnInfo {
-                sandbox: info.sandbox.clone(),
-                ..ConnInfo::default()
-            };
-            event.conn(&conn).repeat(port_detail(dst.map(|a| a.port())))
+            event.repeat(port_detail(dst.map(|a| a.port())))
         });
     }
     guard
@@ -440,14 +415,12 @@ pub(super) fn port_detail(port: Option<u16>) -> Fields {
     Fields::new().with("dst_port", jopt(port.map(u32::from)))
 }
 
-/// The event for a blocked packet, and its detail.
-fn blocked(why: BlockedWhy, p: &[u8]) -> (Event, Fields) {
+/// The event for a blocked packet.
+fn blocked(why: BlockedWhy, p: &[u8]) -> Event {
     match Header::parse_truncated(p) {
-        Some(h) => (
-            blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst)),
-            port_detail(h.dst_port(p)),
-        ),
-        None => (blocked_event(why, None, None, None), port_detail(None)),
+        Some(h) => blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst))
+            .repeat(port_detail(h.dst_port(p))),
+        None => blocked_event(why, None, None, None).repeat(port_detail(None)),
     }
 }
 
@@ -474,9 +447,8 @@ impl Filter {
     }
 
     fn block(&self, fcx: &Cx, why: BlockedWhy, packet: &[u8]) {
-        self.context
-            .hooks
-            .blocked(fcx, &sandbox_only(self.me()), || blocked(why, packet));
+        fcx.emitter(&sandbox_only(self.me()))
+            .emit("net", "blocked", |_| blocked(why, packet));
     }
 
     fn bound_now(&mut self, fcx: &Cx, addr: IpAddr, by_dhcp: bool) {
@@ -500,9 +472,8 @@ impl Filter {
             by_addr.insert(a, sandbox.clone());
         }
         drop(by_addr);
-        self.context
-            .hooks
-            .emit(fcx, &sandbox_only(sandbox), "bound", |event| {
+        fcx.emitter(&sandbox_only(sandbox))
+            .emit("net", "bound", |event| {
                 event
                     .summary(format_args!("sandbox {} bound {addr}", self.name))
                     .field("by_dhcp", by_dhcp)

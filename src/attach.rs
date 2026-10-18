@@ -199,7 +199,7 @@ impl Interface for Attachment {
 /// # fn main() -> Result {
 /// let (attacher, attachments) = fictionet::attachments();
 /// let agent = attacher.attach("agent")?; // the test holds the sandbox's end
-/// let world = fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments));
+/// let world = fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| world(fcx, attachments));
 /// // send packets on `agent` and check what comes back while `world` runs
 /// # drop(agent);
 /// # fictionet::block_on(world)
@@ -713,7 +713,7 @@ mod tests {
     fn detach_cleanup_follows_chained_maps_without_polling() {
         let (attacher, attachments) = attachments();
         crate::block_on(crate::lab(
-            crate::Seed::from_u64(0),
+            fictionet::RunOptions::new(crate::Seed::from_u64(0)),
             move |fcx| async move {
                 let wrap = |_: &Cx, a: Attachment| {
                     assert_eq!(a.name(), "barrier", "detached agents must not be wrapped");
@@ -742,7 +742,7 @@ mod tests {
         let sandbox = attacher.attach("agent").unwrap();
         attacher.mark_listener().unwrap();
         let error = crate::block_on(crate::lab(
-            crate::Seed::from_u64(0),
+            fictionet::RunOptions::new(crate::Seed::from_u64(0)),
             move |fcx| async move {
                 assert!(matches!(
                     attachments.get(&fcx, "agent").await,
@@ -767,7 +767,7 @@ mod tests {
         let (attacher, mut attachments) = attachments();
         attacher.mark_listener().unwrap();
         let error = crate::block_on(crate::lab(
-            crate::Seed::from_u64(0),
+            fictionet::RunOptions::new(crate::Seed::from_u64(0)),
             move |fcx| async move {
                 assert!(matches!(attachments.next(&fcx).await, Err(Cancelled)));
                 assert_eq!(fcx.now(), crate::time::Instant::ZERO);
@@ -787,7 +787,7 @@ mod tests {
         let sandbox = attacher.attach("agent").unwrap();
         attacher.mark_listener().unwrap();
         let error = crate::block_on(crate::lab(
-            crate::Seed::from_u64(0),
+            fictionet::RunOptions::new(crate::Seed::from_u64(0)),
             move |fcx| async move {
                 let mut mapped = attachments.map(&fcx, |_, _| -> End {
                     panic!("a refused attachment must not be wrapped")

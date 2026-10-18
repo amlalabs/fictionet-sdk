@@ -254,21 +254,24 @@ mod tests {
 
     #[test]
     fn a_limited_cable_drops_what_does_not_fit_and_frees_what_is_read() {
-        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
-            // Room for exactly ten 36-byte packets.
-            let (mut a, mut b) = pair_with_limit(10 * (36 + PACKET_COST));
-            for i in 0..20u8 {
-                a.send(Packet(vec![i; 36]));
-            }
-            for i in 0..10u8 {
-                assert_eq!(b.recv(&fcx).await?, Packet(vec![i; 36]));
-            }
-            // The ten past the limit were dropped; reading made room again.
-            a.send(Packet(vec![99; 36]));
-            assert_eq!(b.recv(&fcx).await?, Packet(vec![99; 36]));
-            assert_eq!(b.cable.dirs[b.side].lock().queue.bytes(), 0);
-            Err::<(), crate::Error>(crate::Error::msg("done"))
-        }));
+        let result = block_on(run(
+            fictionet::RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                // Room for exactly ten 36-byte packets.
+                let (mut a, mut b) = pair_with_limit(10 * (36 + PACKET_COST));
+                for i in 0..20u8 {
+                    a.send(Packet(vec![i; 36]));
+                }
+                for i in 0..10u8 {
+                    assert_eq!(b.recv(&fcx).await?, Packet(vec![i; 36]));
+                }
+                // The ten past the limit were dropped; reading made room again.
+                a.send(Packet(vec![99; 36]));
+                assert_eq!(b.recv(&fcx).await?, Packet(vec![99; 36]));
+                assert_eq!(b.cable.dirs[b.side].lock().queue.bytes(), 0);
+                Err::<(), crate::Error>(crate::Error::msg("done"))
+            },
+        ));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
 }

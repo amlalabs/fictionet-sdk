@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use fictionet::prelude::*;
 use fictionet::relay::{self, Hello, Message, unix};
-use fictionet::{Interface, RecvError, attachments, block_on, listen, pair, run};
+use fictionet::{Interface, RecvError, RunOptions, attachments, block_on, listen, pair, run};
 
 fn connect(path: &str, name: &str) -> OwnedFd {
     let fd = unix::connect(path).unwrap();
@@ -73,30 +73,33 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
     let world = std::thread::Builder::new()
         .name("world".into())
         .spawn(move || {
-            block_on(run(fictionet::Seed::random(), move |fcx| async move {
-                // A long timer stays pending the whole time.
-                fcx.spawn(|fcx| async move {
-                    fcx.sleep(Duration::from_secs(3600)).await?;
-                    Ok(())
-                });
-                for _ in 0..CLIENTS {
-                    let mut a = attachments.next(&fcx).await?;
-                    fcx.spawn(move |fcx| async move {
-                        loop {
-                            match a.recv(&fcx).await {
-                                Ok(p) => a.send(p),
-                                Err(RecvError::Closed) => return Ok(()),
-                                Err(e) => return Err(e.into()),
-                            }
-                        }
+            block_on(run(
+                RunOptions::new(fictionet::Seed::random()),
+                move |fcx| async move {
+                    // A long timer stays pending the whole time.
+                    fcx.spawn(|fcx| async move {
+                        fcx.sleep(Duration::from_secs(3600)).await?;
+                        Ok(())
                     });
-                }
-                ready_tx.send(()).unwrap();
-                // Wait for the test to say stop, then fail the region to
-                // cancel the timer.
-                let _ = stopped.recv(&fcx).await;
-                Err(fictionet::Error::msg("stop"))
-            }))
+                    for _ in 0..CLIENTS {
+                        let mut a = attachments.next(&fcx).await?;
+                        fcx.spawn(move |fcx| async move {
+                            loop {
+                                match a.recv(&fcx).await {
+                                    Ok(p) => a.send(p),
+                                    Err(RecvError::Closed) => return Ok(()),
+                                    Err(e) => return Err(e.into()),
+                                }
+                            }
+                        });
+                    }
+                    ready_tx.send(()).unwrap();
+                    // Wait for the test to say stop, then fail the region to
+                    // cancel the timer.
+                    let _ = stopped.recv(&fcx).await;
+                    Err(fictionet::Error::msg("stop"))
+                },
+            ))
             .map_err(|e| e.to_string())
         })
         .unwrap();

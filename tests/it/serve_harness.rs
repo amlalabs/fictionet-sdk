@@ -83,3 +83,44 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
     assert_eq!(h.service().unread, bad);
     assert_eq!(h.end_reason(), Some(Ended::Failed));
 }
+
+#[test]
+fn resuming_an_upgrade_keeps_the_observer_and_sequence() {
+    use fictionet::events::{ConnInfo, Memory};
+    use fictionet::stdlib::codec::{Ending, LineError, Lines};
+    use fictionet::stdlib::services::serve::Upgrade;
+    use std::sync::Arc;
+
+    struct Switch;
+    service_fixture! {
+        Switch => (Lines, (), LineError);
+        decoder(self) { Lines::new(64, Ending::LfOrCrlf) }
+        on_item(self, item: Result<Vec<u8>, LineError>; _, driver) -> Flow {
+            let line = item?;
+            driver.emit("test", "line", |event| event.field("bytes", line.len() as u64));
+            Ok(if line == b"tls" { Flow::Upgrade(Upgrade::Tls) } else { Flow::Continue })
+        }
+    }
+    let evidence = Arc::new(Memory::default());
+    let mut harness =
+        Harness::new(fictionet::Seed::from_u64(1), Switch, ()).observer(evidence.clone());
+    assert!(matches!(
+        harness.push(b"tls\n"),
+        Err(HarnessError::Upgraded(Upgrade::Tls))
+    ));
+    harness
+        .resume(ConnInfo {
+            tls: true,
+            ..ConnInfo::default()
+        })
+        .unwrap();
+    harness.push(b"hello\n").unwrap();
+    let events = evidence.checked_of("test", "line").unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| (e.seq, e.conn.tls, e.u64("bytes")))
+            .collect::<Vec<_>>(),
+        [(1, false, Some(3)), (2, true, Some(5))]
+    );
+}

@@ -423,7 +423,7 @@ mod tests {
                 .build()
                 .unwrap();
             let _ = rt.block_on(fictionet::run(
-                fictionet::Seed::random(),
+                fictionet::RunOptions::new(fictionet::Seed::random()),
                 move |fcx| async move {
                     let (ca, leaf) = fictionet_test_support::certs::issue(
                         &fcx,

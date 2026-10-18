@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::sync::{Arc, Weak};
+use std::task::{Poll, Waker};
 
 use crate::sync::Mutex;
 
@@ -53,11 +55,11 @@ pub struct Memory {
 
 #[derive(Default)]
 struct State {
-    events: VecDeque<Event>,
+    events: VecDeque<Arc<Event>>,
     bytes: usize,
     last: u64,
     dropped: u64,
-    waiters: [Option<std::task::Waker>; 32],
+    waiters: Vec<Weak<Mutex<Option<Waker>>>>,
 }
 
 impl Default for Memory {
@@ -92,7 +94,12 @@ impl Memory {
                 dropped: state.dropped,
             });
         }
-        Ok(state.events.iter().filter(|e| pick(e)).cloned().collect())
+        Ok(state
+            .events
+            .iter()
+            .filter(|e| pick(e))
+            .map(|e| (**e).clone())
+            .collect())
     }
 
     /// Waits for matching complete evidence, bounded by the run's clock.
@@ -105,27 +112,19 @@ impl Memory {
         limit: std::time::Duration,
         mut pick: impl FnMut(&Event) -> bool,
     ) -> crate::Result<Vec<Event>> {
-        use std::task::{Poll, Waker};
-        struct Wait<'a>(&'a Memory, usize);
-        impl Drop for Wait<'_> {
-            fn drop(&mut self) {
-                self.0.state.lock().waiters[self.1] = None;
-            }
-        }
         if cx.is_cancelled() {
             return Err(crate::Cancelled.into());
         }
-        let slot = {
+        // The future owns its registration; dropping it releases the waker.
+        let wake = Arc::new(Mutex::new(None));
+        {
             let mut state = self.state.lock();
-            let slot = state
-                .waiters
-                .iter()
-                .position(Option::is_none)
-                .ok_or_else(|| crate::Error::msg("too many evidence waits"))?;
-            state.waiters[slot] = Some(Waker::noop().clone());
-            slot
-        };
-        let _wait = Wait(self, slot);
+            state.waiters.retain(|wait| wait.strong_count() != 0);
+            if state.waiters.len() == 32 {
+                return Err(crate::Error::msg("too many evidence waits"));
+            }
+            state.waiters.push(Arc::downgrade(&wake));
+        }
         let deadline =
             crate::time::Instant::from_since_start(cx.now().since_start().saturating_add(limit));
         let mut timer = crate::Timer::new(cx);
@@ -133,16 +132,17 @@ impl Memory {
             if cx.is_cancelled() {
                 return Poll::Ready(Err(crate::Cancelled.into()));
             }
-            let (events, last) = {
-                let mut state = self.state.lock();
-                state.waiters[slot] = Some(task.waker().clone());
+            let previous = wake.lock().replace(task.waker().clone());
+            drop(previous);
+            let events = {
+                let state = self.state.lock();
                 if state.dropped != 0 {
                     return Poll::Ready(Err(Incomplete {
                         dropped: state.dropped,
                     }
                     .into()));
                 }
-                (state.events.iter().cloned().collect::<Vec<_>>(), state.last)
+                state.events.iter().cloned().collect::<Vec<_>>()
             };
             let matches: Vec<_> = events.into_iter().filter(|event| pick(event)).collect();
             if cx.is_cancelled() {
@@ -153,10 +153,7 @@ impl Memory {
                 return Poll::Ready(Err(Incomplete { dropped }.into()));
             }
             if matches.len() >= count || cx.now() >= deadline {
-                return Poll::Ready(Ok(matches));
-            }
-            if self.last() != last {
-                task.waker().wake_by_ref();
+                return Poll::Ready(Ok(matches.iter().map(|event| (**event).clone()).collect()));
             }
             match timer.poll_until(task, deadline) {
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
@@ -170,17 +167,9 @@ impl Memory {
 
     /// Reads a bounded display batch. This does not certify completeness.
     pub fn after(&self, after: u64, max: usize) -> Vec<Event> {
-        self.state
-            .lock()
-            .events
-            .iter()
-            .filter(|e| e.seq > after)
-            .take(max.min(self.limits.events))
-            .cloned()
-            .collect()
+        self.display_batch(after, max).0
     }
 
-    #[cfg(feature = "observe")]
     pub(crate) fn display_batch(&self, after: u64, max: usize) -> (Vec<Event>, u64, u64) {
         let state = self.state.lock();
         (
@@ -188,8 +177,8 @@ impl Memory {
                 .events
                 .iter()
                 .filter(|e| e.seq > after)
-                .take(max.min(self.limits.events))
-                .cloned()
+                .take(max)
+                .map(|e| (**e).clone())
                 .collect(),
             state.last,
             state.dropped,
@@ -217,8 +206,13 @@ impl Observer for Memory {
     fn lost(&self, count: u64) {
         let mut state = self.state.lock();
         state.dropped = state.dropped.saturating_add(count);
-        for waker in state.waiters.iter().flatten() {
-            waker.wake_by_ref();
+        let waiters: Vec<_> = state.waiters.iter().filter_map(Weak::upgrade).collect();
+        drop(state);
+        for wait in waiters {
+            let waker = wait.lock().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
 
@@ -231,27 +225,33 @@ impl Observer for Memory {
         let size = event.size();
         let mut state = self.state.lock();
         state.last = stamp.seq;
-        for waker in state.waiters.iter().flatten() {
-            waker.wake_by_ref();
-        }
         if self.limits.events == 0 || size > self.limits.bytes {
-            state.dropped += 1;
-            return;
+            state.dropped = state.dropped.saturating_add(1);
+        } else {
+            while state.events.len() >= self.limits.events || state.bytes > self.limits.bytes - size
+            {
+                let oldest = state
+                    .events
+                    .pop_front()
+                    .expect("retained event exceeds bounds");
+                state.bytes -= oldest.size();
+                state.dropped = state.dropped.saturating_add(1);
+            }
+            let mut event = event.clone();
+            event.seq = stamp.seq;
+            event.at = stamp.at;
+            // Cloning strings can shrink their capacity; charge the retained copy.
+            state.bytes += event.size();
+            state.events.push_back(Arc::new(event));
         }
-        while state.events.len() >= self.limits.events || state.bytes > self.limits.bytes - size {
-            let oldest = state
-                .events
-                .pop_front()
-                .expect("retained event exceeds bounds");
-            state.bytes -= oldest.size();
-            state.dropped += 1;
+        let waiters: Vec<_> = state.waiters.iter().filter_map(Weak::upgrade).collect();
+        drop(state);
+        for wait in waiters {
+            let waker = wait.lock().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
-        let mut event = event.clone();
-        event.seq = stamp.seq;
-        event.at = stamp.at;
-        // Cloning strings can shrink their capacity; charge the retained copy.
-        state.bytes += event.size();
-        state.events.push_back(event);
     }
 }
 
@@ -297,6 +297,55 @@ mod tests {
                     1
                 );
                 assert_eq!(cx.now(), crate::time::Instant::ZERO);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn waking_a_reader_can_inspect_memory() {
+        struct Reader(Arc<Memory>, Arc<std::sync::atomic::AtomicUsize>);
+        impl std::task::Wake for Reader {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                let _ = self.0.after(0, 1);
+                self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        block_on(lab(
+            fictionet::RunOptions::new(Seed::from_u64(1)),
+            |cx| async move {
+                let memory = Arc::new(Memory::default());
+                let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let waker = Waker::from(Arc::new(Reader(memory.clone(), wakes.clone())));
+                let mut wait = Box::pin(memory.wait(&cx, 2, ms(100), |_| true));
+                assert!(
+                    wait.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                memory.observe(
+                    Stamp {
+                        seq: 1,
+                        at: crate::time::Instant::ZERO,
+                    },
+                    Observation::Event(&Event::new("test", "ready")),
+                );
+                assert!(
+                    wait.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                memory.lost(1);
+                assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 2);
+                assert!(
+                    wait.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_ready()
+                );
                 Ok(())
             },
         ))

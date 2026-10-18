@@ -15,7 +15,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::network::route::{Prefix, lan, router};
 use fictionet::stdlib::network::{bottleneck, delay, icmp, ip, udp};
 use fictionet::time::ms;
-use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, lab, pair};
+use fictionet::{Cx, End, Interface, Packet, RecvError, RunOptions, block_on, lab, pair};
 
 #[test]
 fn packet_drop_events_keep_packet_fields_and_repeat_details() {
@@ -59,7 +59,7 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
                 udp(443, 12),
             ];
             for (i, packet) in packets.iter().enumerate() {
-                ip::record_drop(
+                ip::emit_drop(
                     &fcx,
                     &conn,
                     "test",
@@ -82,27 +82,27 @@ fn packet_drop_events_keep_packet_fields_and_repeat_details() {
     let expected = [
         (
             "10.0.0.2 → 10.0.0.1: blocked",
-            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":24,"dst_port":53,"waiting":0,"count":1}"#,
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":24,"dst_port":53,"waiting":0}"#,
         ),
         (
             "2001:db8::2 → 2001:db8::1: blocked",
-            r#"{"src":"2001:db8::2","dst":"2001:db8::1","protocol":6,"why":"blocked","owner":"edge","len":44,"dst_port":443,"waiting":1,"count":1}"#,
+            r#"{"src":"2001:db8::2","dst":"2001:db8::1","protocol":6,"why":"blocked","owner":"edge","len":44,"dst_port":443,"waiting":1}"#,
         ),
         (
             "10.0.0.2 → 10.0.0.1: blocked",
-            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":1,"why":"blocked","owner":"edge","len":24,"dst_port":null,"waiting":2,"count":1}"#,
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":1,"why":"blocked","owner":"edge","len":24,"dst_port":null,"waiting":2}"#,
         ),
         (
             "? → ?: blocked",
-            r#"{"src":null,"dst":null,"protocol":null,"why":"blocked","owner":"edge","len":1,"dst_port":null,"waiting":3,"count":1}"#,
+            r#"{"src":null,"dst":null,"protocol":null,"why":"blocked","owner":"edge","len":1,"dst_port":null,"waiting":3}"#,
         ),
         (
             "10.0.0.2 → 10.0.0.1: blocked",
-            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":30,"dst_port":80,"waiting":4,"count":1}"#,
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":30,"dst_port":80,"waiting":4}"#,
         ),
         (
             "10.0.0.2 → 10.0.0.1: blocked",
-            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":32,"dst_port":443,"waiting":5,"count":1}"#,
+            r#"{"src":"10.0.0.2","dst":"10.0.0.1","protocol":17,"why":"blocked","owner":"edge","len":32,"dst_port":443,"waiting":5}"#,
         ),
     ];
     for (i, (event, (summary, fields))) in events.iter().zip(expected).enumerate() {
@@ -134,7 +134,7 @@ where
     Fut: std::future::Future<Output = fictionet::Result> + Send + 'static,
 {
     within(Duration::from_secs(10), move || {
-        block_on(lab(fictionet::Seed::from_u64(1), f))
+        block_on(lab(RunOptions::new(fictionet::Seed::from_u64(1)), f))
     })
     .unwrap();
 }
@@ -1651,36 +1651,39 @@ fn every_task_stops_when_its_region_is_cancelled() {
     // The world fails while every kind of task is running with its cables
     // still open. The run then ends with the error instead of waiting.
     let result = within(Duration::from_secs(5), || {
-        block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
-            let mut keep = Vec::new();
-            let (a, b) = pair();
-            keep.push(a);
-            keep.push(delay(&fcx, ms(10), b));
-            let (a, b) = pair();
-            keep.push(a);
-            keep.push(bottleneck(&fcx, 1000, 10, b));
-            let (a, b) = pair();
-            keep.push(a);
-            let (x, y, z) = ip::split_versions(&fcx, b);
-            keep.extend([x, y, z]);
-            let (a, b) = pair();
-            keep.push(a);
-            let (w, x, y, z) = ip::split_protocols(&fcx, b);
-            keep.extend([w, x, y, z]);
-            let (a, b) = pair();
-            keep.push(a);
-            let r = router(
-                &fcx,
-                vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)],
-            );
-            let (a, b) = pair();
-            keep.push(a);
-            let l = lan::<Box<dyn Interface>, _>(&fcx, "10.0.0.0/24".parse()?, |event| event);
-            l.add("10.0.0.2".parse()?, Box::new(b), None)?;
-            fcx.idle().await?;
-            let _keep = (keep, r, l);
-            Err(fictionet::Error::msg("stop"))
-        }))
+        block_on(lab(
+            RunOptions::new(fictionet::Seed::from_u64(1)),
+            |fcx| async move {
+                let mut keep = Vec::new();
+                let (a, b) = pair();
+                keep.push(a);
+                keep.push(delay(&fcx, ms(10), b));
+                let (a, b) = pair();
+                keep.push(a);
+                keep.push(bottleneck(&fcx, 1000, 10, b));
+                let (a, b) = pair();
+                keep.push(a);
+                let (x, y, z) = ip::split_versions(&fcx, b);
+                keep.extend([x, y, z]);
+                let (a, b) = pair();
+                keep.push(a);
+                let (w, x, y, z) = ip::split_protocols(&fcx, b);
+                keep.extend([w, x, y, z]);
+                let (a, b) = pair();
+                keep.push(a);
+                let r = router(
+                    &fcx,
+                    vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)],
+                );
+                let (a, b) = pair();
+                keep.push(a);
+                let l = lan::<Box<dyn Interface>, _>(&fcx, "10.0.0.0/24".parse()?, |event| event);
+                l.add("10.0.0.2".parse()?, Box::new(b), None)?;
+                fcx.idle().await?;
+                let _keep = (keep, r, l);
+                Err(fictionet::Error::msg("stop"))
+            },
+        ))
     });
     assert_eq!(result.unwrap_err().to_string(), "stop");
 }
@@ -1718,7 +1721,7 @@ fn lan_drop_identity_comes_from_ingress_registration() {
             for event in &drops {
                 assert_eq!(event.conn.sandbox.as_ref(), Some(&identity));
                 assert_eq!(event.str("lan"), Some("test"));
-                assert_eq!(event.u64("count"), Some(1));
+                assert!(event.get("count").is_none());
             }
             assert_eq!(drops[0].str("src"), Some("10.0.0.3"));
             assert_eq!(drops[1].str("why"), Some("not an IP packet"));

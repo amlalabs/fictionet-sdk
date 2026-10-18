@@ -18,7 +18,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore};
 #[test]
 fn config_keeps_its_logger_unless_observed() {
     fictionet::block_on(fictionet::lab(
-        fictionet::Seed::from_u64(7),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
         |fcx| async move {
             let config = Arc::new(
                 ServerConfig::builder_with_provider(Arc::new(tls::crypto_provider()))

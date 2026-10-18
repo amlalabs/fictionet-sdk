@@ -14,7 +14,7 @@
 //! and flushed early if full.
 
 use crate::events;
-use fictionet::{Cx, events::Event as Entry};
+use fictionet::{Cx, events::Event};
 use serde_json::{Value, json};
 use std::io::Write;
 const FOLDED: &[&str] = &["blocked"];
@@ -46,7 +46,7 @@ impl Log {
         self.inner.finish()
     }
     /// Converts a network event to a log line when it is relevant.
-    pub fn entry(&self, entry: &Entry) {
+    pub fn entry(&self, entry: &Event) {
         if let Some(line) = events::line(entry) {
             self.line(line);
         }
@@ -63,6 +63,12 @@ impl fictionet::events::Observer for Log {
         _: &fictionet::events::ConnInfo,
     ) -> bool {
         events::LOGGED.contains(&metadata.source)
+    }
+    fn lost(&self, count: u64) {
+        if count != 0 {
+            self.inner
+                .fail(format!("{count} events lost before log delivery"));
+        }
     }
     fn observe(
         &self,
@@ -87,6 +93,16 @@ fn transform(text: String) -> String {
 mod tests {
     use super::*;
     use example_common::log::fold_key;
+
+    #[test]
+    fn producer_loss_prevents_successful_finalization() {
+        let log = Log::start(Box::new(std::io::sink())).unwrap();
+        fictionet::events::Observer::lost(&log, 3);
+        assert_eq!(
+            log.finish().unwrap_err().to_string(),
+            "3 events lost before log delivery"
+        );
+    }
 
     /// The observer's counted `blocked` lines are written as they come,
     /// not counted again.

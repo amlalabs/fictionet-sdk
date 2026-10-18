@@ -3,6 +3,7 @@ use super::dns_dhcp::{dhcp_ask, dhcp_msg, read_exact};
 use super::http_serving::read_all;
 use super::sites::raw_dns;
 use super::*;
+use fictionet::RunOptions;
 
 // ---------------------------------------------------------------------------
 // Tests: events
@@ -44,7 +45,7 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     run_world::seeded_world(
-        fictionet::RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()),
+        RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()),
         Duration::from_secs(60),
         move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
@@ -58,7 +59,7 @@ where
 }
 
 /// The events after the log's mark that `pick` keeps.
-pub(super) fn picked<T>(log: &Log, pick: impl FnMut(&Entry) -> Option<T>) -> Vec<T> {
+pub(super) fn picked<T>(log: &Log, pick: impl FnMut(&Event) -> Option<T>) -> Vec<T> {
     log.events
         .checked_all()
         .unwrap()
@@ -74,7 +75,7 @@ pub(super) async fn wait_for<T>(
     fcx: &Cx,
     log: &Log,
     n: usize,
-    mut pick: impl FnMut(&Entry) -> Option<T>,
+    mut pick: impl FnMut(&Event) -> Option<T>,
 ) -> Vec<T> {
     let from = log.from.load(Ordering::SeqCst);
     let got = log
@@ -98,7 +99,7 @@ fn is(s: &Sandbox, name: &str, addr: Option<Ipv4Addr>) -> bool {
 }
 
 /// The sandbox an event names.
-pub(super) fn sandbox_of(e: &Entry) -> Option<&Sandbox> {
+pub(super) fn sandbox_of(e: &Event) -> Option<&Sandbox> {
     e.conn.sandbox.as_ref()
 }
 
@@ -106,42 +107,42 @@ pub(super) fn sandbox_of(e: &Entry) -> Option<&Sandbox> {
 pub(super) fn seen(
     source: &'static str,
     kind: &'static str,
-) -> impl FnMut(&Entry) -> Option<Entry> {
+) -> impl FnMut(&Event) -> Option<Event> {
     move |e| e.is(source, kind).then(|| e.clone())
 }
 
-pub(super) fn dns_seen(e: &Entry) -> Option<Entry> {
+pub(super) fn dns_seen(e: &Event) -> Option<Event> {
     seen("dns", "query")(e)
 }
 
-pub(super) fn tls_seen(e: &Entry) -> Option<Entry> {
+pub(super) fn tls_seen(e: &Event) -> Option<Event> {
     seen("tls", "handshake")(e)
 }
 
-pub(super) fn http_seen(e: &Entry) -> Option<Entry> {
+pub(super) fn http_seen(e: &Event) -> Option<Event> {
     seen("http", "request")(e)
 }
 
-fn error_seen(e: &Entry) -> Option<Entry> {
+fn error_seen(e: &Event) -> Option<Event> {
     seen("http", "error")(e)
 }
 
-pub(super) fn blocked_seen(e: &Entry) -> Option<Entry> {
+pub(super) fn blocked_seen(e: &Event) -> Option<Event> {
     seen("net", "blocked")(e)
 }
 
 /// The field `name` as an address.
-pub(super) fn addr(e: &Entry, name: &str) -> Option<IpAddr> {
+pub(super) fn addr(e: &Event, name: &str) -> Option<IpAddr> {
     e.str(name)?.parse().ok()
 }
 
 /// Whether the field `name` is true.
-pub(super) fn flag(e: &Entry, name: &str) -> bool {
+pub(super) fn flag(e: &Event, name: &str) -> bool {
     e.get(name).and_then(|v| v.as_bool()) == Some(true)
 }
 
 /// The address and port an event's connection arrived on.
-pub(super) fn local(e: &Entry) -> SocketAddr {
+pub(super) fn local(e: &Event) -> SocketAddr {
     e.conn
         .local
         .expect("a connection's event names its address")
@@ -149,7 +150,7 @@ pub(super) fn local(e: &Entry) -> SocketAddr {
 
 /// A DNS event's answer, as `addr 192.0.2.1`, `nodata`, `nxdomain`,
 /// `error 1` or `none`.
-pub(super) fn answer(e: &Entry) -> String {
+pub(super) fn answer(e: &Event) -> String {
     match e.str("answer") {
         Some("addr") => format!("addr {}", e.str("addr").unwrap_or_default()),
         Some("error") => format!("error {}", e.u64("rcode").unwrap_or_default()),
@@ -160,7 +161,7 @@ pub(super) fn answer(e: &Entry) -> String {
 
 /// A TLS event's outcome, with its `alpn`, `alert_code` or nothing after a
 /// space: `accepted h2`, `alert 48`, `rejected`.
-pub(super) fn outcome(e: &Entry) -> String {
+pub(super) fn outcome(e: &Event) -> String {
     match e.str("outcome") {
         Some("accepted") => format!("accepted {}", e.str("alpn").unwrap_or("-")),
         Some("alert") => format!("alert {}", e.u64("alert_code").unwrap_or_default()),
@@ -170,7 +171,7 @@ pub(super) fn outcome(e: &Entry) -> String {
 }
 
 /// How many fields a handler added to an HTTP event.
-fn extra(e: &Entry) -> usize {
+fn extra(e: &Event) -> usize {
     let standard = [
         "scheme", "sni", "host", "method", "uri", "path", "query", "version", "headers", "started",
         "answer", "received", "status", "sent", "complete",
@@ -192,7 +193,7 @@ type BlockedRow<'a> = (
     Option<u64>,
 );
 
-fn blocked_row(e: &Entry) -> BlockedRow<'_> {
+fn blocked_row(e: &Event) -> BlockedRow<'_> {
     (
         e.str("why").unwrap_or_default(),
         sandbox_of(e).and_then(|s| s.addr),
@@ -248,7 +249,7 @@ fn events_attach_bind_and_detach() {
         let a_events = of("a");
         let kinds: Vec<_> = a_events.iter().map(|e| e.kind).collect();
         assert_eq!(kinds, ["attached", "bound", "detached"], "{a_events:#?}");
-        let sandbox = |e: &Entry| sandbox_of(e).unwrap().clone();
+        let sandbox = |e: &Event| sandbox_of(e).unwrap().clone();
         assert!(is(&sandbox(&a_events[0]), "a", None) && sandbox(&a_events[0]).id == 1);
         assert!(is(&sandbox(&a_events[1]), "a", Some(me)) && !flag(&a_events[1], "by_dhcp"));
         assert!(is(&sandbox(&a_events[2]), "a", Some(me)) && sandbox(&a_events[2]).id == 1);
@@ -948,52 +949,57 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = dropped.clone();
     let result = within(Duration::from_secs(30), move || {
-        block_on(lab(Seed::from_u64(1), move |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (seen, set) = (started.clone(), flag.clone());
-            let app = axum::Router::new().route(
-                "/hang",
-                axum::routing::get(move || {
-                    let (seen, set) = (seen.clone(), set.clone());
-                    async move {
-                        let _guard = SetOnDrop(set);
-                        seen.store(true, Ordering::SeqCst);
-                        std::future::pending::<()>().await;
-                        "never"
-                    }
-                }),
-            );
-            web::Sites::new(move |host| (host == "hang.test").then(|| web::Site::new(app.clone())))
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1)),
+            move |fcx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (seen, set) = (started.clone(), flag.clone());
+                let app = axum::Router::new().route(
+                    "/hang",
+                    axum::routing::get(move || {
+                        let (seen, set) = (seen.clone(), set.clone());
+                        async move {
+                            let _guard = SetOnDrop(set);
+                            seen.store(true, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                            "never"
+                        }
+                    }),
+                );
+                web::Sites::new(move |host| {
+                    (host == "hang.test").then(|| web::Site::new(app.clone()))
+                })
                 .start(&fcx, attachments)?;
 
-            let me = Ipv4Addr::new(10, 0, 0, 2);
-            let mut raw = attacher.attach("a").unwrap();
-            let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "hang.test", 1)
-                .await
-                .unwrap();
-            let to = SocketAddr::new(addrs[0].into(), 80);
-            let (seq, ack) = raw_connect(
-                &fcx,
-                &mut raw,
-                me,
-                to,
-                30_000,
-                b"GET /hang HTTP/1.1\r\nHost: hang.test\r\n\r\n",
-            )
-            .await;
-            fcx.idle().await?;
-            assert!(started.load(Ordering::SeqCst), "the handler started");
-            assert!(!flag.load(Ordering::SeqCst));
-            raw.send(tcp_seg(me, 30_000, addrs[0], 80, seq, ack, RST, &[]));
-            fcx.idle().await?;
-            // Checked here: stopping the world would drop the handler too.
-            assert!(
-                flag.load(Ordering::SeqCst),
-                "the handler was dropped after the reset"
-            );
-            Err(fictionet::Error::from(Done))
-        }))
+                let me = Ipv4Addr::new(10, 0, 0, 2);
+                let mut raw = attacher.attach("a").unwrap();
+                let (_, addrs) = raw_dns(&fcx, &mut raw, me, GATEWAY, "hang.test", 1)
+                    .await
+                    .unwrap();
+                let to = SocketAddr::new(addrs[0].into(), 80);
+                let (seq, ack) = raw_connect(
+                    &fcx,
+                    &mut raw,
+                    me,
+                    to,
+                    30_000,
+                    b"GET /hang HTTP/1.1\r\nHost: hang.test\r\n\r\n",
+                )
+                .await;
+                fcx.idle().await?;
+                assert!(started.load(Ordering::SeqCst), "the handler started");
+                assert!(!flag.load(Ordering::SeqCst));
+                raw.send(tcp_seg(me, 30_000, addrs[0], 80, seq, ack, RST, &[]));
+                fcx.idle().await?;
+                // Checked here: stopping the world would drop the handler too.
+                assert!(
+                    flag.load(Ordering::SeqCst),
+                    "the handler was dropped after the reset"
+                );
+                Err(fictionet::Error::from(Done))
+            },
+        ))
     });
     assert!(
         matches!(&result, Err(e) if e.downcast_ref::<Done>().is_some()),
@@ -1206,7 +1212,7 @@ fn events_for_clients_that_send_nothing() {
 }
 
 /// Waits up to 10 s for the first event `pick` keeps.
-async fn wait_for_long<T>(fcx: &Cx, log: &Log, mut pick: impl FnMut(&Entry) -> Option<T>) -> T {
+async fn wait_for_long<T>(fcx: &Cx, log: &Log, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
     let from = log.from.load(Ordering::SeqCst);
     let got = log
         .events
@@ -1430,14 +1436,7 @@ fn events_for_blocked_packets() {
                 ),
             ]
         );
-        let counts: Vec<_> = got.iter().map(|b| b.u64("count")).collect();
-        assert_eq!(
-            counts,
-            [Some(1); 11]
-                .into_iter()
-                .chain([Some(1)])
-                .collect::<Vec<_>>()
-        );
+        assert!(got.iter().all(|event| event.get("count").is_none()));
         assert!(
             got.iter()
                 .all(|b| sandbox_of(b).is_some_and(|s| &*s.name == "a" && s.id == 1))
@@ -1459,12 +1458,9 @@ fn events_for_blocked_packets() {
         .await;
         assert_eq!(open, 300);
         let got = wait_for(&fcx, &log, 44, blocked_seen).await;
-        assert_eq!(
-            (got[0].u64("count"), got[0].u64("dst_port")),
-            (Some(1), Some(443))
-        );
+        assert_eq!(got[0].u64("dst_port"), Some(443));
         assert_eq!(got.len(), 44);
-        assert!(got.iter().all(|event| event.u64("count") == Some(1)));
+        assert!(got.iter().all(|event| event.get("count").is_none()));
         assert!(got.iter().all(
             |b| b.str("why") == Some("TooManyConnections") && addr(b, "dst") == v4(SECURE_ADDR)
         ));
@@ -1537,7 +1533,7 @@ fn a_port_scan_fits_an_explicit_evidence_budget() {
     );
     // The run is over: complete evidence can be serialized outside it.
     let events = kept.lock().unwrap().take().unwrap();
-    fn from(e: &Entry, name: &str) -> bool {
+    fn from(e: &Event, name: &str) -> bool {
         sandbox_of(e).is_some_and(|s| &*s.name == name)
     }
     let all = events.checked_all().unwrap();
@@ -1557,10 +1553,7 @@ fn a_port_scan_fits_an_explicit_evidence_budget() {
         .iter()
         .filter(|e| e.is("net", "blocked") && from(e, "b"))
         .collect();
-    assert_eq!(
-        blocked.iter().map(|e| e.u64("count").unwrap()).sum::<u64>(),
-        u64::from(SCAN)
-    );
+    assert!(blocked.iter().all(|event| event.get("count").is_none()));
     assert_eq!(blocked.len(), usize::from(SCAN));
     std::fs::write(&path, crate::common::evidence_bytes(&events)).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();

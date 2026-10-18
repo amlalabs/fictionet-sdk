@@ -168,41 +168,44 @@ mod tests {
                 .await
                 .unwrap();
         });
-        fictionet::run(fictionet::Seed::from_u64(1), move |fcx| async move {
-            let vhosts = VirtualHosts::new();
-            vhosts.insert(
-                "en.wikipedia.org",
-                VHost::new(httpd::tower(Content::new(&fcx, address.port())?)),
-            );
-            let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
-            let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
-            let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
-            let request = Request::builder()
-                .uri("https://en.wikipedia.org/wiki/redirect")
-                .extension(httpd::EventInterest(true))
-                .body(Body::empty())?;
-            let httpd::Reply::Later(work) = vhosts.call(request, &mut ex) else {
-                panic!("the content handler dispatches to the backend");
-            };
-            let response = work(fcx.clone()).await?;
-            assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
-            assert_eq!(
-                response.headers()[LOCATION].as_bytes(),
-                b"/caf\xc3\xa9/\xff"
-            );
-            let fields = response.extensions().get::<Fields>().unwrap();
-            assert_eq!(
-                fields.get("kind").and_then(|v| v.as_str()),
-                Some("redirect")
-            );
-            assert_eq!(
-                fields.get("location").and_then(|v| v.as_str()),
-                Some("/café/\u{fffd}")
-            );
-            assert_eq!(response.into_body().collect().await?.to_bytes(), "Moved");
-            server.await.unwrap();
-            Ok(())
-        })
+        fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            move |fcx| async move {
+                let vhosts = VirtualHosts::new();
+                vhosts.insert(
+                    "en.wikipedia.org",
+                    VHost::new(httpd::tower(Content::new(&fcx, address.port())?)),
+                );
+                let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
+                let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+                let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
+                let request = Request::builder()
+                    .uri("https://en.wikipedia.org/wiki/redirect")
+                    .extension(httpd::EventInterest(true))
+                    .body(Body::empty())?;
+                let httpd::Reply::Later(work) = vhosts.call(request, &mut ex) else {
+                    panic!("the content handler dispatches to the backend");
+                };
+                let response = work(fcx.clone()).await?;
+                assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+                assert_eq!(
+                    response.headers()[LOCATION].as_bytes(),
+                    b"/caf\xc3\xa9/\xff"
+                );
+                let fields = response.extensions().get::<Fields>().unwrap();
+                assert_eq!(
+                    fields.get("kind").and_then(|v| v.as_str()),
+                    Some("redirect")
+                );
+                assert_eq!(
+                    fields.get("location").and_then(|v| v.as_str()),
+                    Some("/café/\u{fffd}")
+                );
+                assert_eq!(response.into_body().collect().await?.to_bytes(), "Moved");
+                server.await.unwrap();
+                Ok(())
+            },
+        )
         .await
         .unwrap();
     }
@@ -210,7 +213,7 @@ mod tests {
     #[test]
     fn construction_refuses_a_lab() {
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             |fcx| async move {
                 let error = super::Content::new(&fcx, 8080).err().unwrap();
                 assert_eq!(error.to_string(), "real I/O is unavailable in a lab run");

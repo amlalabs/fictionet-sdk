@@ -68,3 +68,19 @@ impl BodyClassifier for Exposure {
         )
     }
 }
+
+/// Counts classifier calls without adding event fields.
+#[derive(Default)]
+pub struct CountHeads(pub std::sync::atomic::AtomicUsize);
+
+impl BodyClassifier for CountHeads {
+    fn head(
+        &self,
+        _: &http::request::Parts,
+        _: &ConnInfo,
+        _: &mut http::Extensions,
+    ) -> Option<Fields> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+}

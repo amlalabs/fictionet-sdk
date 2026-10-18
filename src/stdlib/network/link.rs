@@ -285,7 +285,7 @@ where
                             queues[i].packets.push_back((leaves, packet));
                         } else {
                             let waiting = queues[i].packets.len();
-                            fictionet::stdlib::network::ip::record_drop(
+                            fictionet::stdlib::network::ip::emit_drop(
                                 &fcx,
                                 &fictionet::events::ConnInfo::default(),
                                 name,
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn a_delay_drops_what_does_not_fit() {
         block_on(fictionet::lab(
-            fictionet::Seed::from_u64(0),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(0)),
             |fcx| async move {
                 let (mut sandbox, inner) = pair();
                 let mut far = delay(&fcx, Duration::from_secs(1), inner);
@@ -408,7 +408,7 @@ mod tests {
                 assert_eq!(drain(&fcx, &mut far).await, 0);
                 let drops = evidence.checked_of("bottleneck", "drop").unwrap();
                 assert_eq!(drops.len(), 1);
-                assert_eq!(drops[0].u64("count"), Some(1));
+                assert!(drops[0].get("count").is_none());
                 Ok(())
             },
         ))
@@ -433,7 +433,7 @@ mod tests {
             fn observe(&self, stamp: Stamp, item: Observation<'_>) {
                 let Observation::Event(event) = item;
                 if event.is("bottleneck", "drop") {
-                    assert_eq!(event.u64("count"), Some(1));
+                    assert!(event.get("count").is_none());
                     assert_eq!(event.str("why"), Some("the queue was full"));
                     self.drops.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn an_unread_bottleneck_output_stops_growing() {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
             let (mut sandbox, inner) = pair();
             let mut far = bottleneck(&fcx, u64::MAX, 64, inner);
             flood(&fcx, &mut sandbox, FIT + 500).await?;

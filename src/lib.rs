@@ -148,7 +148,7 @@
 //!     let (attacher, attachments) = fictionet::attachments();
 //!     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 //!     let _listening = fictionet::listen(socket, attacher)?;
-//!     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
+//!     fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| world(fcx, attachments)))
 //! }
 //! # #[cfg(not(feature = "std"))]
 //! # fn main() {}

@@ -64,7 +64,7 @@
 //!   a protocol chooses its own checksum coverage.
 //! - [`packet`] and [`packet_with`] put an IP header in front of a payload.
 //!   [`hop`] lowers the TTL as a router does.
-//! - [`record_drop`] emits a dropped-packet fact to interested observers, with
+//! - [`emit_drop`] emits a dropped-packet fact to interested observers, with
 //!   its addresses, protocol and reason.
 //!
 //! ```
@@ -809,7 +809,7 @@ pub mod protocol {
 /// Emits that `source` dropped `packet`, with its addresses, protocol and detail.
 /// Interest is checked with `conn` before parsing or invoking either closure.
 /// `enrich` may add attribution discovered from the parsed fields.
-pub fn record_drop<F>(
+pub fn emit_drop<F>(
     fcx: &Cx,
     conn: &events::ConnInfo,
     source: &'static str,
@@ -1860,7 +1860,7 @@ mod tests {
     #[test]
     fn an_interface_never_read_holds_at_most_its_queue() {
         let result = fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let (mut raw, side) = fictionet::pair();
                 let (_tcp, _udp, _icmp, other) = split_protocols(&fcx, side);

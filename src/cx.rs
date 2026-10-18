@@ -438,7 +438,7 @@ impl Cx {
     /// [`Cancelled`] if this context's region is cancelled.
     ///
     /// ```
-    /// # fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |cx| async move {
+    /// # fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(fictionet::Seed::from_u64(1)), |cx| async move {
     /// let start = cx.now();
     /// cx.idle().await?;
     /// assert_eq!(cx.now(), start);
@@ -488,7 +488,7 @@ impl Cx {
     /// ```
     /// # #[cfg(feature = "std")]
     /// # {
-    /// # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
+    /// # fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
     /// use fictionet::RaceError;
     /// let late = fcx.race(Some(fcx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
     /// assert_eq!(late, Err(RaceError::Deadline));

@@ -61,7 +61,7 @@ fn main() {
             .ok_or_else(|| fictionet::Error::msg("make-ca needs a directory"))
             .and_then(|d| {
                 fictionet::block_on(fictionet::lab(
-                    fictionet::Seed::random(),
+                    fictionet::RunOptions::new(fictionet::Seed::random()),
                     move |fcx| async move { certs::make_ca(&fcx, Path::new(&d)) },
                 ))
             }),
@@ -70,7 +70,7 @@ fn main() {
             .ok_or_else(|| fictionet::Error::msg("make-pki needs a directory"))
             .and_then(|d| {
                 fictionet::block_on(fictionet::lab(
-                    fictionet::Seed::random(),
+                    fictionet::RunOptions::new(fictionet::Seed::random()),
                     move |fcx| async move { certs::make_pki(&fcx, Path::new(&d)) },
                 ))
             }),

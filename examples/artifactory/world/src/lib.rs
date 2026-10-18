@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn each_leaf_names_only_its_site() {
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             |fcx| async move {
                 let identity = Identity::new(&fcx).unwrap();
                 for (i, (leaf, _)) in identity.leaves.iter().enumerate() {

@@ -45,7 +45,7 @@ fn main() -> fictionet::Result {
         .enable_all()
         .build()?;
     runtime.block_on(fictionet::run(
-        fictionet::Seed::random(),
+        fictionet::RunOptions::new(fictionet::Seed::random()),
         move |fcx| async move {
             let ca = Ca::new(&fcx, "h2spec CA")?;
             let leaf = ca.issue(

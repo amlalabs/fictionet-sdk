@@ -57,20 +57,6 @@ impl Aggregate {
         }
     }
 
-    fn flush(&self, state: &mut State) {
-        state.pending.sort_unstable_by_key(|p| p.event.seq);
-        for mut pending in state.pending.drain(..) {
-            if pending.count > 1 {
-                pending.event.fields.set("count", pending.count);
-                pending.event.fields.set("first_seq", pending.first);
-                pending.event.fields.set("last_seq", pending.event.seq);
-            }
-            self.deliver(&pending.event);
-        }
-        state.bytes = 0;
-        state.start = None;
-    }
-
     fn deliver(&self, event: &Event) {
         self.next.observe(
             Stamp {
@@ -93,56 +79,15 @@ impl Observer for Aggregate {
         if state.ended {
             return;
         }
-        if event.repeat.is_none()
-            || state
-                .start
-                .is_some_and(|start| stamp.at >= start + self.window)
-        {
-            self.flush(&mut state);
+        let mut ready = Vec::new();
+        let forward = state.stage(stamp, event, self.window, self.limits, &mut ready);
+        drop(state);
+        for event in ready {
+            self.deliver(&event);
         }
-        if event.repeat.is_none() || self.window.is_zero() {
+        if forward {
             self.next.observe(stamp, observation);
-            return;
         }
-        if let Some(pending) = state.pending.iter_mut().find(|p| matches(&p.event, event)) {
-            for name in event.repeat.as_ref().unwrap() {
-                if let Some(n) = event.u64(name) {
-                    let old = pending.event.get(name).unwrap();
-                    let (low, high) = range(old).unwrap();
-                    pending.event.fields.set(
-                        name,
-                        Value::Array(vec![low.min(n).into(), high.max(n).into()]),
-                    );
-                }
-            }
-            pending.count += 1;
-            pending.event.seq = stamp.seq;
-            pending.event.at = stamp.at;
-            return;
-        }
-        // Reserve space for numeric ranges and summary fields before copying.
-        let size = event
-            .size()
-            .saturating_add(event.repeat.as_ref().unwrap().len().saturating_mul(256) + 1024);
-        if state.pending.len() >= self.limits.events
-            || size > self.limits.bytes.saturating_sub(state.bytes)
-        {
-            self.flush(&mut state);
-        }
-        if self.limits.events == 0 || size > self.limits.bytes {
-            self.next.observe(stamp, observation);
-            return;
-        }
-        state.start.get_or_insert(stamp.at);
-        let mut event = event.clone();
-        event.seq = stamp.seq;
-        event.at = stamp.at;
-        state.pending.push(Pending {
-            event,
-            first: stamp.seq,
-            count: 1,
-        });
-        state.bytes += size;
     }
 
     fn lost(&self, count: u64) {
@@ -153,9 +98,89 @@ impl Observer for Aggregate {
         let mut state = self.state.lock();
         if !state.ended {
             state.ended = true;
-            self.flush(&mut state);
+            let mut ready = Vec::new();
+            state.flush(&mut ready);
+            drop(state);
+            for event in ready {
+                self.deliver(&event);
+            }
             self.next.end(at);
         }
+    }
+}
+
+impl State {
+    fn flush(&mut self, ready: &mut Vec<Event>) {
+        self.pending.sort_unstable_by_key(|p| p.event.seq);
+        ready.extend(self.pending.drain(..).map(|mut pending| {
+            if pending.count > 1 {
+                pending.event.fields.set("count", pending.count);
+                pending.event.fields.set("first_seq", pending.first);
+                pending.event.fields.set("last_seq", pending.event.seq);
+            }
+            pending.event
+        }));
+        self.bytes = 0;
+        self.start = None;
+    }
+
+    fn stage(
+        &mut self,
+        stamp: Stamp,
+        event: &Event,
+        window: Duration,
+        limits: Limits,
+        ready: &mut Vec<Event>,
+    ) -> bool {
+        if event.repeat.is_none()
+            || self.start.is_some_and(|start| {
+                stamp.at.since_start().saturating_sub(start.since_start()) >= window
+            })
+        {
+            self.flush(ready);
+        }
+        if event.repeat.is_none() || window.is_zero() {
+            return true;
+        }
+        if let Some(pending) = self.pending.iter_mut().find(|p| matches(&p.event, event)) {
+            for name in event.repeat.as_ref().unwrap() {
+                if let Some(n) = event.u64(name)
+                    && let Some((low, high)) = pending.event.get(name).and_then(range)
+                {
+                    pending.event.fields.set(
+                        name,
+                        Value::Array(vec![low.min(n).into(), high.max(n).into()]),
+                    );
+                }
+            }
+            pending.count += 1;
+            pending.event.seq = stamp.seq;
+            pending.event.at = stamp.at;
+            return false;
+        }
+        // Reserve space for numeric ranges and summary fields before copying.
+        let size = event
+            .size()
+            .saturating_add(event.repeat.as_ref().unwrap().len().saturating_mul(256))
+            .saturating_add((event.fields.len() + 3) * std::mem::size_of::<(&str, Value)>())
+            .saturating_add(1024);
+        if self.pending.len() >= limits.events || size > limits.bytes.saturating_sub(self.bytes) {
+            self.flush(ready);
+        }
+        if limits.events == 0 || size > limits.bytes {
+            return true;
+        }
+        self.start.get_or_insert(stamp.at);
+        let mut event = event.clone();
+        event.seq = stamp.seq;
+        event.at = stamp.at;
+        self.pending.push(Pending {
+            event,
+            first: stamp.seq,
+            count: 1,
+        });
+        self.bytes += size;
+        false
     }
 }
 
@@ -332,7 +357,57 @@ mod tests {
         aggregate.end(Instant::ZERO);
         let events = memory.checked_all().unwrap();
         assert_eq!(events.len(), 3);
-        assert!(events.iter().all(|e| e.u64("count") == Some(1)));
+        assert!(events.iter().all(|e| e.get("count").is_none()));
+    }
+
+    #[test]
+    fn summary_fields_fit_the_byte_budget() {
+        let mut event = Event::new("test", "repeat");
+        for name in "a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff"
+            .split_whitespace()
+        {
+            event = event.field(name, true);
+        }
+        let event = event.repeat(Fields::new());
+        let bytes = event.size() + 1024;
+        let memory = Arc::new(Memory::default());
+        let aggregate = Aggregate::with_limits(
+            memory.clone(),
+            Duration::from_secs(1),
+            Limits::new(10, bytes),
+        );
+        for seq in 1..=2 {
+            aggregate.observe(
+                Stamp {
+                    seq,
+                    at: Instant::ZERO,
+                },
+                Observation::Event(&event),
+            );
+        }
+        aggregate.end(Instant::ZERO);
+        let events = memory.checked_all().unwrap();
+        assert!(events.iter().all(|event| event.size() <= bytes));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.u64("count").unwrap_or(1))
+                .sum::<u64>(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_unbounded_window_does_not_overflow_run_time() {
+        let memory = Arc::new(Memory::default());
+        let aggregate = Aggregate::with_limits(memory.clone(), Duration::MAX, Limits::default());
+        send(&aggregate, 1, 1, 7);
+        send(&aggregate, 2, 2, 7);
+        assert!(memory.checked_all().unwrap().is_empty());
+        aggregate.end(Instant::ZERO + Duration::from_secs(2));
+        let events = memory.checked_all().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].u64("count"), Some(2));
     }
 
     #[test]

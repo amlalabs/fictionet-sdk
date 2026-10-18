@@ -1,6 +1,6 @@
 //! Shared network event projection.
 
-use fictionet::events::Event as Entry;
+use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
@@ -22,15 +22,15 @@ pub fn js(v: Option<&J>) -> Value {
     }
 }
 
-pub fn sandbox(e: &Entry) -> Value {
+pub fn sandbox(e: &Event) -> Value {
     match &e.conn.sandbox {
         Some(s) => json!({"id": s.id, "name": &*s.name, "addr": s.addr.map(|a| a.to_string())}),
         None => json!({"id": 0, "name": "", "addr": null}),
     }
 }
 
-/// The log line for `entry`, if it gets one.
-pub fn line(e: &Entry) -> Option<Value> {
+/// The log line for the event, if it gets one.
+pub fn line(e: &Event) -> Option<Value> {
     let f = |name: &str| js(e.get(name));
     let conn = e.conn.id.unwrap_or(0);
     let local = e.conn.local.map(|a| a.to_string()).unwrap_or_default();
@@ -51,21 +51,16 @@ pub fn line(e: &Entry) -> Option<Value> {
         })),
         // An installed aggregator counts repeated network facts and retains
         // the lowest and highest port.
-        ("net", "blocked")
-            if e.u64("count").is_some_and(|n| n > 1)
-                || matches!(e.get("dst_port"), Some(J::Array(_))) =>
-        {
-            Some(json!({
-                "type": "blocked",
-                "sandbox": sandbox(e),
-                "why": f("why"),
-                "protocol": f("protocol"),
-                "src": f("src"),
-                "dst": f("dst"),
-                "count": f("count"),
-                "ports": f("dst_port"),
-            }))
-        }
+        ("net", "blocked") if e.u64("count").is_some_and(|n| n > 1) => Some(json!({
+            "type": "blocked",
+            "sandbox": sandbox(e),
+            "why": f("why"),
+            "protocol": f("protocol"),
+            "src": f("src"),
+            "dst": f("dst"),
+            "count": f("count"),
+            "ports": f("dst_port"),
+        })),
         ("net", "blocked") => Some(json!({
             "type": "blocked",
             "sandbox": sandbox(e),
@@ -79,7 +74,7 @@ pub fn line(e: &Entry) -> Option<Value> {
     }
 }
 
-fn dns(e: &Entry) -> Value {
+fn dns(e: &Event) -> Value {
     let answer = match e.str("answer") {
         Some("addr") => e.str("addr").unwrap_or_default().to_owned(),
         Some("nodata") => "nodata".into(),
@@ -98,7 +93,7 @@ fn dns(e: &Entry) -> Value {
 }
 
 /// Appends TLS outcome fields after the world-specific handshake fields.
-pub fn tls_outcome(e: &Entry, fields: &mut Map<String, Value>) {
+pub fn tls_outcome(e: &Event, fields: &mut Map<String, Value>) {
     let outcome = e.str("outcome").unwrap_or("other");
     match outcome {
         "accepted" => {
@@ -131,7 +126,7 @@ pub fn tls_outcome(e: &Entry, fields: &mut Map<String, Value>) {
 }
 
 /// Distinct header names in wire order and the first valid user agent.
-pub fn request_headers(e: &Entry) -> (Vec<String>, Option<String>) {
+pub fn request_headers(e: &Event) -> (Vec<String>, Option<String>) {
     let mut names: Vec<String> = Vec::new();
     let mut ua = None;
     for pair in e.get("headers").and_then(J::as_array).unwrap_or_default() {
@@ -176,7 +171,7 @@ mod tests {
             ("cancelled", r#"{"identity":"bank","outcome":"cancelled"}"#),
             ("unknown", r#"{"identity":"bank","outcome":"other"}"#),
         ] {
-            let e = Entry::new("tls", "handshake")
+            let e = Event::new("tls", "handshake")
                 .field("outcome", outcome)
                 .field("alpn", "h2")
                 .field("alert", "bad certificate")
@@ -185,7 +180,7 @@ mod tests {
             tls_outcome(&e, line.as_object_mut().unwrap());
             assert_eq!(line.to_string(), expected);
         }
-        let e = Entry::new("tls", "handshake")
+        let e = Event::new("tls", "handshake")
             .field("outcome", "failed")
             .field("detail", "é".repeat(201));
         let mut fields = Map::new();
@@ -194,7 +189,7 @@ mod tests {
         assert_eq!(fields["outcome"], "failed");
 
         let mut fields = Map::new();
-        tls_outcome(&Entry::new("tls", "handshake"), &mut fields);
+        tls_outcome(&Event::new("tls", "handshake"), &mut fields);
         assert_eq!(Value::Object(fields), json!({"outcome": "other"}));
     }
 
@@ -207,7 +202,7 @@ mod tests {
             &Default::default(),
         )
         .unwrap();
-        let e = Entry::new("http", "request").field("headers", headers);
+        let e = Event::new("http", "request").field("headers", headers);
         assert_eq!(
             request_headers(&e),
             (
@@ -216,7 +211,7 @@ mod tests {
             )
         );
         assert_eq!(
-            request_headers(&Entry::new("http", "request")),
+            request_headers(&Event::new("http", "request")),
             (vec![], None)
         );
     }

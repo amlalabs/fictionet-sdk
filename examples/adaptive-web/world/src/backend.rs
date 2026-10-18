@@ -262,7 +262,7 @@ mod tests {
             .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let result = rt.block_on(fictionet::run(
-            fictionet::Seed::from_u64(1),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             move |fcx| async move {
                 let hosts = VirtualHosts::new();
                 hosts.insert(
@@ -273,6 +273,7 @@ mod tests {
                 let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
                 let mut ex = httpd::Exchange::new(fcx.now(), &entropy, &conn);
                 let request = Request::builder()
+                    .extension(httpd::EventInterest(true))
                     .uri("http://example.com/")
                     .body(Body::empty())?;
                 let httpd::Reply::Later(work) = hosts.call(request, &mut ex) else {
@@ -359,7 +360,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(fictionet::run(
-            fictionet::Seed::from_u64(1),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             move |fcx| async move {
                 let hosts = VirtualHosts::new();
                 hosts.insert(
@@ -370,6 +371,7 @@ mod tests {
                 let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
                 let mut ex = httpd::Exchange::new(fcx.now(), &entropy, &conn);
                 let request = Request::builder()
+                    .extension(httpd::EventInterest(true))
                     .uri("http://example.com/")
                     .body(Body::empty())?;
                 let httpd::Reply::Later(work) = hosts.call(request, &mut ex) else {
@@ -392,7 +394,7 @@ mod tests {
     #[test]
     fn construction_refuses_a_lab() {
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             |fcx| async move {
                 let error = super::Backend::new(&fcx, 8080).err().unwrap();
                 assert_eq!(error.to_string(), "real I/O is unavailable in a lab run");

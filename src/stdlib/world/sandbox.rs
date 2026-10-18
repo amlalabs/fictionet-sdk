@@ -447,7 +447,7 @@ mod tests {
         let result = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
         let out = result.clone();
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(7),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
             move |fcx| async move {
                 let conn = Writes {
                     bytes: Vec::new(),

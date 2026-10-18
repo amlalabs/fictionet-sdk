@@ -1,5 +1,6 @@
 use super::events::{http_seen, local, raw_http, wait_for, world_events};
 use super::*;
+use fictionet::RunOptions;
 
 // Checks the Date response for both HTTP versions.
 async fn assert_date_responses(fcx: &Cx, m: &Machine, addr: Ipv4Addr, date: Option<SystemTime>) {
@@ -112,28 +113,31 @@ fn dates_come_from_the_world() {
     let june_2019 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_559_347_200);
     for date in [Some(june_2019), None] {
         let result = within(Duration::from_secs(60), move || {
-            block_on(lab(Seed::from_u64(1), move |fcx| async move {
-                let (attacher, attachments) = fictionet::attachments();
-                let site = axum::Router::new()
-                    .route(
-                        "/own",
-                        axum::routing::get(|| async {
-                            ([("date", "Mon, 01 Jan 2001 00:00:00 GMT")], "own")
-                        }),
-                    )
-                    .fallback(|| async { "hello" });
-                let mut sites = web::Sites::new(move |name: &str| {
-                    (name == "dated.test").then(|| web::Site::new(site.clone()))
-                });
-                if let Some(date) = date {
-                    sites = sites.date(date);
-                }
-                sites.start(&fcx, attachments)?;
-                let m = default_machine(&fcx, &attacher);
-                let addr = lookup(&fcx, &m, "dated.test").await;
-                assert_date_responses(&fcx, &m, addr, date).await;
-                Err(fictionet::Error::from(Done))
-            }))
+            block_on(lab(
+                RunOptions::new(Seed::from_u64(1)),
+                move |fcx| async move {
+                    let (attacher, attachments) = fictionet::attachments();
+                    let site = axum::Router::new()
+                        .route(
+                            "/own",
+                            axum::routing::get(|| async {
+                                ([("date", "Mon, 01 Jan 2001 00:00:00 GMT")], "own")
+                            }),
+                        )
+                        .fallback(|| async { "hello" });
+                    let mut sites = web::Sites::new(move |name: &str| {
+                        (name == "dated.test").then(|| web::Site::new(site.clone()))
+                    });
+                    if let Some(date) = date {
+                        sites = sites.date(date);
+                    }
+                    sites.start(&fcx, attachments)?;
+                    let m = default_machine(&fcx, &attacher);
+                    let addr = lookup(&fcx, &m, "dated.test").await;
+                    assert_date_responses(&fcx, &m, addr, date).await;
+                    Err(fictionet::Error::from(Done))
+                },
+            ))
         });
         assert!(result.is_err_and(|e| e.downcast_ref::<Done>().is_some()));
     }
@@ -350,48 +354,51 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
         conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close, x-private\r\nConnection: x-other\r\nX-Private: secret\r\nX-Other: secret\r\nUpgrade: websocket\r\nX-Public: kept\r\n\r\nworld").await.unwrap();
         String::from_utf8(received).unwrap()
     });
-    run(fictionet::Seed::from_u64(1), move |fcx| async move {
-        let vhosts = VirtualHosts::new();
-        vhosts.insert("127.0.0.1", VHost::new(httpd::tower(web::proxy(&fcx)?)));
-        let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
-        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
-        let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
-        let reply = vhosts.call(
-            Request::builder()
-                .method("POST")
-                .uri("https://127.0.0.1:443/path?q=1")
-                .version(http::Version::HTTP_2)
-                .header("host", "different.test")
-                .header("connection", "x-private")
-                .header("connection", "x-other, upgrade")
-                .header("x-private", "secret")
-                .header("x-other", "secret")
-                .header("upgrade", "websocket")
-                .header("proxy-authorization", "Basic secret")
-                .header("x-public", "kept")
-                .body(web::Body::from("hello"))
-                .unwrap(),
-            &mut ex,
-        );
-        let httpd::Reply::Later(work) = reply else {
-            panic!("the proxy dispatches upstream");
-        };
-        let response = work(fcx.clone()).await?;
-        assert_eq!(response.status(), 201);
-        assert_eq!(response.headers()["x-public"], "kept");
-        for name in ["connection", "x-private", "x-other", "upgrade"] {
-            assert!(!response.headers().contains_key(name));
-        }
-        assert_eq!(response.into_body().collect().await?.to_bytes(), "world");
-        let request = server.await.unwrap().to_ascii_lowercase();
-        assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
-        assert!(request.contains(&format!("host: {address}\r\n")));
-        assert!(request.contains("x-public: kept\r\n"));
-        for name in ["x-private", "x-other", "upgrade", "proxy-authorization"] {
-            assert!(!request.contains(name));
-        }
-        Ok(())
-    })
+    run(
+        RunOptions::new(fictionet::Seed::from_u64(1)),
+        move |fcx| async move {
+            let vhosts = VirtualHosts::new();
+            vhosts.insert("127.0.0.1", VHost::new(httpd::tower(web::proxy(&fcx)?)));
+            let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
+            let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+            let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
+            let reply = vhosts.call(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://127.0.0.1:443/path?q=1")
+                    .version(http::Version::HTTP_2)
+                    .header("host", "different.test")
+                    .header("connection", "x-private")
+                    .header("connection", "x-other, upgrade")
+                    .header("x-private", "secret")
+                    .header("x-other", "secret")
+                    .header("upgrade", "websocket")
+                    .header("proxy-authorization", "Basic secret")
+                    .header("x-public", "kept")
+                    .body(web::Body::from("hello"))
+                    .unwrap(),
+                &mut ex,
+            );
+            let httpd::Reply::Later(work) = reply else {
+                panic!("the proxy dispatches upstream");
+            };
+            let response = work(fcx.clone()).await?;
+            assert_eq!(response.status(), 201);
+            assert_eq!(response.headers()["x-public"], "kept");
+            for name in ["connection", "x-private", "x-other", "upgrade"] {
+                assert!(!response.headers().contains_key(name));
+            }
+            assert_eq!(response.into_body().collect().await?.to_bytes(), "world");
+            let request = server.await.unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
+            assert!(request.contains(&format!("host: {address}\r\n")));
+            assert!(request.contains("x-public: kept\r\n"));
+            for name in ["x-private", "x-other", "upgrade", "proxy-authorization"] {
+                assert!(!request.contains(name));
+            }
+            Ok(())
+        },
+    )
     .await
     .unwrap();
 }
@@ -401,21 +408,24 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
 async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run(fictionet::Seed::random(), |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            let upstream = web::proxy(&fcx)?;
-            web::Sites::new(move |h| {
-                (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
-            })
-            .start(&fcx, attachments)?;
-            let m = default_machine(&fcx, &attacher);
-            let addr = lookup(&fcx, &m, "nowhere.invalid").await;
-            let mut client = plain_client(&fcx, &m, addr, false).await;
-            let got = client.get("http", "nowhere.invalid", "/").await;
-            assert_eq!(got.status, StatusCode::BAD_GATEWAY, "{}", got.body);
-            assert!(got.body.contains("nowhere.invalid"), "{}", got.body);
-            Err(fictionet::Error::from(Done))
-        }),
+        run(
+            RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                let upstream = web::proxy(&fcx)?;
+                web::Sites::new(move |h| {
+                    (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
+                })
+                .start(&fcx, attachments)?;
+                let m = default_machine(&fcx, &attacher);
+                let addr = lookup(&fcx, &m, "nowhere.invalid").await;
+                let mut client = plain_client(&fcx, &m, addr, false).await;
+                let got = client.get("http", "nowhere.invalid", "/").await;
+                assert_eq!(got.status, StatusCode::BAD_GATEWAY, "{}", got.body);
+                assert!(got.body.contains("nowhere.invalid"), "{}", got.body);
+                Err(fictionet::Error::from(Done))
+            },
+        ),
     )
     .await
     .expect("timed out");
@@ -490,7 +500,7 @@ async fn the_proxy_refuses_hosts_routed_by_default_host() {
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         run(
-            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
             move |fcx| async move {
                 let log = super::events::Log::new(evidence);
                 let (attacher, attachments) = fictionet::attachments();
@@ -636,24 +646,27 @@ async fn websocket_echo<C: Connection>(
 async fn websockets_work_through_sites() {
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run(fictionet::Seed::random(), |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket())))
-                .start(&fcx, attachments)?;
-            let m = default_machine(&fcx, &attacher);
-            let addr = lookup(&fcx, &m, "ws.test").await;
-            let mut conn = m
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), 80))
-                .await
-                .unwrap();
-            let reply = websocket_echo(&fcx, &mut conn, "ws.test", "hello").await;
-            assert_eq!(
-                reply,
-                fictionet::stdlib::protocols::websocket::Message::Text("echo: hello".into())
-            );
-            Err(fictionet::Error::from(Done))
-        }),
+        run(
+            RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket())))
+                    .start(&fcx, attachments)?;
+                let m = default_machine(&fcx, &attacher);
+                let addr = lookup(&fcx, &m, "ws.test").await;
+                let mut conn = m
+                    .tcp
+                    .connect(&fcx, SocketAddr::new(addr.into(), 80))
+                    .await
+                    .unwrap();
+                let reply = websocket_echo(&fcx, &mut conn, "ws.test", "hello").await;
+                assert_eq!(
+                    reply,
+                    fictionet::stdlib::protocols::websocket::Message::Text("echo: hello".into())
+                );
+                Err(fictionet::Error::from(Done))
+            },
+        ),
     )
     .await
     .expect("timed out");
@@ -1011,29 +1024,32 @@ fn eager_sites_send_the_world_date_without_a_lookup() {
     let june_2019 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_559_347_200);
     for date in [Some(june_2019), None] {
         let result = within(Duration::from_secs(60), move || {
-            block_on(lab(Seed::from_u64(1), move |fcx| async move {
-                let (attacher, attachments) = fictionet::attachments();
-                let site = axum::Router::new()
-                    .route(
-                        "/own",
-                        axum::routing::get(|| async {
-                            ([("date", "Mon, 01 Jan 2001 00:00:00 GMT")], "own")
-                        }),
-                    )
-                    .fallback(|| async { "hello" });
-                let mut site = web::Site::new(site);
-                if let Some(date) = date {
-                    site = site.date(date);
-                }
-                let addr = Ipv4Addr::new(203, 0, 113, 10);
-                web::Sites::new(|_| None)
-                    .into_net()
-                    .add_host(site.at(addr).into_host("dated.test"))
-                    .start(&fcx, attachments)?;
-                let m = default_machine(&fcx, &attacher);
-                assert_date_responses(&fcx, &m, addr, date).await;
-                Err(fictionet::Error::from(Done))
-            }))
+            block_on(lab(
+                RunOptions::new(Seed::from_u64(1)),
+                move |fcx| async move {
+                    let (attacher, attachments) = fictionet::attachments();
+                    let site = axum::Router::new()
+                        .route(
+                            "/own",
+                            axum::routing::get(|| async {
+                                ([("date", "Mon, 01 Jan 2001 00:00:00 GMT")], "own")
+                            }),
+                        )
+                        .fallback(|| async { "hello" });
+                    let mut site = web::Site::new(site);
+                    if let Some(date) = date {
+                        site = site.date(date);
+                    }
+                    let addr = Ipv4Addr::new(203, 0, 113, 10);
+                    web::Sites::new(|_| None)
+                        .into_net()
+                        .add_host(site.at(addr).into_host("dated.test"))
+                        .start(&fcx, attachments)?;
+                    let m = default_machine(&fcx, &attacher);
+                    assert_date_responses(&fcx, &m, addr, date).await;
+                    Err(fictionet::Error::from(Done))
+                },
+            ))
         });
         assert!(result.is_err_and(|e| e.downcast_ref::<Done>().is_some()));
     }

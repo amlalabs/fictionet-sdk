@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn lab_refuses_the_observer_reaper() {
         crate::block_on(crate::lab(
-            crate::Seed::from_u64(0),
+            fictionet::RunOptions::new(crate::Seed::from_u64(0)),
             move |fcx| async move {
                 assert!(
                     WatchSet::reap_later(fcx.graph())

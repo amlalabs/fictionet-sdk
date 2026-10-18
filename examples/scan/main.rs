@@ -487,7 +487,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let result = fictionet::block_on(fictionet::run(
-                fictionet::Seed::random(),
+                fictionet::RunOptions::new(fictionet::Seed::random()),
                 move |fcx| async move {
                     let (attacher, attachments) = fictionet::attachments();
                     fcx.spawn(move |fcx| super::world(fcx, attachments));

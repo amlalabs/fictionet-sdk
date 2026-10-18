@@ -2093,7 +2093,7 @@ mod tests {
 
     #[test]
     fn orphan_waits_for_reset_when_output_is_full() {
-        block_on(run(Seed::random(), |fcx| async move {
+        block_on(run(fictionet::RunOptions::new(Seed::random()), |fcx| async move {
             let (_raw, side) = pair();
             let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
             let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
@@ -2167,7 +2167,7 @@ mod tests {
 
     #[test]
     fn time_wait_survives_full_output_and_expires_after_retransmission() {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (_raw, side) = pair();
             let local: SocketAddr = "10.0.0.1:80".parse()?;
             let peer: SocketAddr = "10.0.0.2:1234".parse()?;
@@ -2240,7 +2240,7 @@ mod tests {
 
     #[test]
     fn time_wait_overflow_evicts_the_oldest_dropped_connections() {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (_raw, side) = pair();
             let local: SocketAddr = "10.0.0.1:80".parse()?;
             let peer: IpAddr = "10.0.0.2".parse()?;
@@ -2304,7 +2304,7 @@ mod tests {
     #[test]
     fn local_reset_wakes_watches_before_rst_egress() {
         for reset in 0..3 {
-            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), move |fcx| async move {
                 let (a, b) = pair();
                 let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
                 let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
@@ -2372,7 +2372,7 @@ mod tests {
 
     #[test]
     fn stop_wakes_watches_with_retained_connection() {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
@@ -2407,7 +2407,7 @@ mod tests {
 
     #[test]
     fn stop_wakes_listeners_in_port_order() {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let log = Arc::new(Mutex::new(Vec::new()));
@@ -2432,7 +2432,7 @@ mod tests {
 
     #[test]
     fn abort_peer_wakes_connections_in_socket_order() {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let log = Arc::new(Mutex::new(Vec::new()));
@@ -2460,7 +2460,7 @@ mod tests {
 
     #[test]
     fn compaction_keeps_socket_id_scan_order() {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let mut st = ep.shared.state.lock();
@@ -2535,7 +2535,7 @@ mod tests {
     fn icmp_requires_the_current_syn_and_a_valid_quote() {
         use fictionet::stdlib::network::{icmp, ip};
 
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (_raw, side) = pair();
             let local: SocketAddr = "10.0.0.1:49152".parse().unwrap();
             let peer: SocketAddr = "10.0.0.2:80".parse().unwrap();
@@ -2659,7 +2659,7 @@ mod tests {
         ] {
             let local: SocketAddr = local.parse().unwrap();
             let peer: SocketAddr = peer.parse().unwrap();
-            block_on(lab(Seed::from_u64(1), |fcx| async move {
+            block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
                 let (_raw, side) = pair();
                 let ep = endpoint_with(&fcx, side, local.ip(), Options::default().buffer(MIN_BUFFER));
                 let now = smol_now(&fcx);
@@ -2748,7 +2748,7 @@ mod tests {
 
     #[test]
     fn simultaneous_open_records_the_accepted_syn_origin() {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
+        block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (_raw, side) = pair();
             let local: SocketAddr = "10.0.0.1:1234".parse()?;
             let peer: SocketAddr = "10.0.0.2:80".parse()?;
@@ -2819,7 +2819,7 @@ mod tests {
     #[test]
     fn client_advertised_window_uses_negotiated_scale() {
         for scaled in [false, true] {
-            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), move |fcx| async move {
                 let (_raw, side) = pair();
                 let local: SocketAddr = "10.0.0.1:1234".parse()?;
                 let peer: SocketAddr = "10.0.0.2:80".parse()?;
@@ -2863,7 +2863,7 @@ mod tests {
     #[test]
     fn legitimate_rounded_window_recovery() {
         for irs in [7u32, u32::MAX - BUFFER as u32 / 2] {
-            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), move |fcx| async move {
                 let (_raw, side) = pair();
                 let local: SocketAddr = "10.0.0.1:80".parse()?;
                 let peer: SocketAddr = "10.0.0.2:1234".parse()?;
@@ -2966,7 +2966,7 @@ mod tests {
 
     fn ack_repair_window_boundary(irs: u32) {
         for reopened in [false, true] {
-            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), move |fcx| async move {
                 let (_raw, side) = pair();
                 let local: SocketAddr = "10.0.0.1:80".parse()?;
                 let peer: SocketAddr = "10.0.0.2:1234".parse()?;
@@ -3170,7 +3170,7 @@ mod tests {
         ] {
             let local: SocketAddr = local.parse().unwrap();
             let peer: SocketAddr = peer.parse().unwrap();
-            let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            let result = block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), move |fcx| async move {
                 let (side, _raw) = pair();
                 let server = endpoint_with(&fcx, side, local.ip(), Options::default());
                 let mut listener = server.listen(local.port())?;
@@ -3269,7 +3269,7 @@ mod tests {
     }
 
     fn window_reopens(drop_handle: bool, data: &'static [u8]) {
-        let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        let result = block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), move |fcx| async move {
             let (side, _raw) = pair();
             let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
             let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
@@ -3372,7 +3372,7 @@ mod tests {
             ),
             (1, MAX_BACKLOG)
         );
-        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
+        let result = block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint_with(
                 &fcx,
@@ -3411,7 +3411,7 @@ mod tests {
     /// at most one spare listening socket, not one per SYN.
     #[test]
     fn a_burst_of_reset_handshakes_leaves_no_pool_of_sockets() {
-        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
+        let result = block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let _listener = server.listen(80)?;
@@ -3458,7 +3458,7 @@ mod tests {
     /// working.
     #[test]
     fn the_socket_set_shrinks_after_a_crowd_leaves() {
-        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let result = block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
@@ -3514,7 +3514,7 @@ mod tests {
     /// a minute, not the two minutes of an open one.
     #[test]
     fn a_dropped_connection_waits_a_minute_at_most() {
-        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
+        let result = block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
@@ -3546,7 +3546,7 @@ mod tests {
         assert_eq!(Options::default().buffer(1).buffer, MIN_BUFFER);
         assert_eq!(Options::default().buffer(usize::MAX).buffer, MAX_BUFFER);
         for size in [MIN_BUFFER, 1 << 20] {
-            let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            let result = block_on(run(fictionet::RunOptions::new(fictionet::Seed::random()), move |fcx| async move {
                 let (a, b) = pair();
                 let options = Options::default().buffer(size);
                 let server = endpoint_with(&fcx, a, "10.0.0.1".parse().unwrap(), options);
@@ -3583,7 +3583,7 @@ mod tests {
 
     #[test]
     fn quiet_connections_give_their_buffer_pages_back() {
-        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let result = block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
@@ -3665,7 +3665,7 @@ mod tests {
 
     #[test]
     fn retransmitted_syn_reuses_the_existing_socket() {
-        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let result = block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let _listener = server.listen(80)?;
@@ -3694,7 +3694,7 @@ mod tests {
 
     #[test]
     fn out_of_window_rst_keeps_the_connection_open() {
-        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let result = block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let mut listener = server.listen(80)?;
@@ -3720,7 +3720,7 @@ mod tests {
     }
     #[test]
     fn rejected_fin_does_not_mark_the_receive_side_closed() {
-        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let result = block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint(&fcx, side, "10.0.0.1".parse()?);
             let mut listener = server.listen(80)?;

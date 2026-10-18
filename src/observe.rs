@@ -735,19 +735,22 @@ mod tests {
     /// `filter` shows as `filter`, at the line that called it.
     #[test]
     fn filter_reports_its_caller() {
-        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
-            let (a, _b) = crate::pair();
-            let line = line!() + 1;
-            let _f = crate::stdlib::network::filter(&fcx, a, |_, _, _| true);
-            let tasks: Vec<_> = fcx.graph().state().tasks.values().cloned().collect();
-            assert!(
-                tasks
-                    .iter()
-                    .any(|t| t.name == "filter" && t.file == file!() && t.line == line),
-                "{tasks:?}"
-            );
-            Ok(())
-        }))
+        crate::block_on(crate::run(
+            fictionet::RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                let (a, _b) = crate::pair();
+                let line = line!() + 1;
+                let _f = crate::stdlib::network::filter(&fcx, a, |_, _, _| true);
+                let tasks: Vec<_> = fcx.graph().state().tasks.values().cloned().collect();
+                assert!(
+                    tasks
+                        .iter()
+                        .any(|t| t.name == "filter" && t.file == file!() && t.line == line),
+                    "{tasks:?}"
+                );
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 

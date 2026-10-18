@@ -2,6 +2,7 @@
 //! with one sandbox, and an observer asking for the graph, following its
 //! changes and custom events, and watching a link's packets.
 
+use fictionet::RunOptions;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -294,7 +295,7 @@ fn start_world(path: &str) -> fictionet::Listening {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random())
+            RunOptions::new(fictionet::Seed::random())
                 .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
             move |fcx| async move {
                 fcx.spawn(move |fcx| async move {
@@ -655,7 +656,7 @@ fn watch_capacity_errors_preserve_shared_streams_and_cancel_frees_admission() {
     )
     .unwrap();
     let mut world = std::pin::pin!(fictionet::run(
-        fictionet::Seed::from_u64(1),
+        RunOptions::new(fictionet::Seed::from_u64(1)),
         move |fcx| async move {
             fcx.set_observe_watch_limit(1);
             let mut links = Vec::new();

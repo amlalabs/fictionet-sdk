@@ -711,38 +711,44 @@ mod tests {
     fn link_owners_and_creators_stay_in_their_run() {
         use crate::Interface;
         use crate::prelude::*;
-        crate::block_on(crate::lab(crate::Seed::from_u64(1), |fcx| async move {
-            let (mut a, mut b) = crate::pair();
-            a.send(Packet(vec![1]));
-            b.recv(&fcx).await?;
-            assert_eq!(fcx.graph().state().links[&b.meter().id].owners, [0, 1]);
-            #[cfg(feature = "observe")]
-            assert_eq!(fcx.graph().state().links[&b.meter().id].creator, 1);
-
-            let foreign = fcx;
-            crate::lab(crate::Seed::from_u64(2), move |fcx| async move {
-                a.send(Packet(vec![2]));
+        crate::block_on(crate::lab(
+            fictionet::RunOptions::new(crate::Seed::from_u64(1)),
+            |fcx| async move {
+                let (mut a, mut b) = crate::pair();
+                a.send(Packet(vec![1]));
                 b.recv(&fcx).await?;
-                // Both roots are task 1, but this end must be seen anew.
                 assert_eq!(fcx.graph().state().links[&b.meter().id].owners, [0, 1]);
                 #[cfg(feature = "observe")]
-                assert_eq!(fcx.graph().state().links[&b.meter().id].creator, 0);
+                assert_eq!(fcx.graph().state().links[&b.meter().id].creator, 1);
 
-                let (mut c, mut d) = crate::pair();
-                c.send(Packet(vec![3]));
-                d.recv(&foreign).await?;
-                assert!(!foreign.graph().state().links.contains_key(&d.meter().id));
-                // Labeling also creates a graph entry, without ownership.
-                foreign.graph().label(d.meter(), "foreign".into());
-                let graph = foreign.graph().state();
-                let link = &graph.links[&d.meter().id];
-                assert_eq!(link.owners, [0, 0]);
-                #[cfg(feature = "observe")]
-                assert_eq!(link.creator, 0);
-                Ok(())
-            })
-            .await
-        }))
+                let foreign = fcx;
+                crate::lab(
+                    fictionet::RunOptions::new(crate::Seed::from_u64(2)),
+                    move |fcx| async move {
+                        a.send(Packet(vec![2]));
+                        b.recv(&fcx).await?;
+                        // Both roots are task 1, but this end must be seen anew.
+                        assert_eq!(fcx.graph().state().links[&b.meter().id].owners, [0, 1]);
+                        #[cfg(feature = "observe")]
+                        assert_eq!(fcx.graph().state().links[&b.meter().id].creator, 0);
+
+                        let (mut c, mut d) = crate::pair();
+                        c.send(Packet(vec![3]));
+                        d.recv(&foreign).await?;
+                        assert!(!foreign.graph().state().links.contains_key(&d.meter().id));
+                        // Labeling also creates a graph entry, without ownership.
+                        foreign.graph().label(d.meter(), "foreign".into());
+                        let graph = foreign.graph().state();
+                        let link = &graph.links[&d.meter().id];
+                        assert_eq!(link.owners, [0, 0]);
+                        #[cfg(feature = "observe")]
+                        assert_eq!(link.creator, 0);
+                        Ok(())
+                    },
+                )
+                .await
+            },
+        ))
         .unwrap();
     }
 
@@ -762,38 +768,44 @@ mod tests {
     fn pairs_count_their_packets() {
         use crate::Interface;
         use crate::prelude::*;
-        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
-            let (mut a, mut b) = crate::pair();
-            a.send(Packet(vec![0; 40]));
-            b.recv(&fcx).await?;
-            assert_eq!(a.meter().totals(), [1, 40, 0, 0]);
-            Ok(())
-        }))
+        crate::block_on(crate::run(
+            fictionet::RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                let (mut a, mut b) = crate::pair();
+                a.send(Packet(vec![0; 40]));
+                b.recv(&fcx).await?;
+                assert_eq!(a.meter().totals(), [1, 40, 0, 0]);
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
     #[test]
     fn graph_and_sampling_windows_use_lab_time() {
-        crate::block_on(crate::lab(crate::Seed::from_u64(0), |fcx| async move {
-            let meter = Meter::new();
-            let guard = meter.watch(&fcx.graph().environment);
-            for _ in 0..66 {
-                meter.sent(0, &Packet(vec![1]));
-            }
-            let (missed, before) = guard.tap.since(0, 100);
-            assert_eq!(missed, 0);
-            assert_eq!(before.len(), 65);
-            assert!(before.iter().all(|copy| copy.at == Instant::ZERO));
-            fcx.sleep(WINDOW).await?;
-            assert_eq!(fcx.graph().since_start(), WINDOW);
-            meter.sent(0, &Packet(vec![2]));
-            let (missed, after) = guard.tap.since(65, 100);
-            assert_eq!(missed, 0);
-            assert_eq!(after.len(), 1);
-            assert_eq!(after[0].at.since_start(), WINDOW);
-            assert_eq!(after[0].skipped, 1);
-            Ok(())
-        }))
+        crate::block_on(crate::lab(
+            fictionet::RunOptions::new(crate::Seed::from_u64(0)),
+            |fcx| async move {
+                let meter = Meter::new();
+                let guard = meter.watch(&fcx.graph().environment);
+                for _ in 0..66 {
+                    meter.sent(0, &Packet(vec![1]));
+                }
+                let (missed, before) = guard.tap.since(0, 100);
+                assert_eq!(missed, 0);
+                assert_eq!(before.len(), 65);
+                assert!(before.iter().all(|copy| copy.at == Instant::ZERO));
+                fcx.sleep(WINDOW).await?;
+                assert_eq!(fcx.graph().since_start(), WINDOW);
+                meter.sent(0, &Packet(vec![2]));
+                let (missed, after) = guard.tap.since(65, 100);
+                assert_eq!(missed, 0);
+                assert_eq!(after.len(), 1);
+                assert_eq!(after[0].at.since_start(), WINDOW);
+                assert_eq!(after[0].skipped, 1);
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 

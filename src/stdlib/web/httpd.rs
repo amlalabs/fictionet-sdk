@@ -221,12 +221,12 @@ pub struct EventInterest(pub bool);
 
 impl EventInterest {
     /// Checks the interest supplied by the HTTP server. Direct handler callers
-    /// without this extension retain response metadata, as before.
+    /// opt in by inserting this extension.
     pub fn of<B>(request: &http::Request<B>) -> bool {
         request
             .extensions()
             .get::<Self>()
-            .is_none_or(|interest| interest.0)
+            .is_some_and(|interest| interest.0)
     }
 }
 

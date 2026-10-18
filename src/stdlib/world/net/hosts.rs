@@ -491,6 +491,7 @@ impl LookupContext<'_> {
         let Some(resolver) = &self.resolver else {
             return Lookup::NoHost;
         };
+        let mut failure = None;
         let known = match resolver(name) {
             Some(_) if world.resolved >= world.max_hosts => return Lookup::Full,
             Some(mut host) => {
@@ -501,13 +502,7 @@ impl LookupContext<'_> {
                 match self.installation.place(&mut world, host) {
                     Ok(p) => Known::Host(p),
                     Err(e) => {
-                        self.installation.fcx.emit("net", "error", |event| {
-                            event
-                                .level(Level::Notice)
-                                .summary(format_args!("host {label} for {name}: {e}"))
-                                .field("name", name)
-                                .field("error", e)
-                        });
+                        failure = Some((label, e));
                         Known::NoHost
                     }
                 }
@@ -515,6 +510,16 @@ impl LookupContext<'_> {
             None => Known::NoHost,
         };
         world.remember(name, known);
+        drop(world);
+        if let Some((label, error)) = failure {
+            self.installation.fcx.emit("net", "error", |event| {
+                event
+                    .level(Level::Notice)
+                    .summary(format_args!("host {label} for {name}: {error}"))
+                    .field("name", name)
+                    .field("error", error)
+            });
+        }
         match known {
             Known::Host(p) => Lookup::Host(p),
             Known::NoHost => Lookup::NoHost,
@@ -1158,17 +1163,16 @@ pub(super) fn host_prefix(addr: IpAddr) -> Prefix {
 /// limit.
 pub(super) fn too_many(fcx: &Cx, hooks: &Hooks, conn: &tcp::TcpConnection) {
     let (peer, local) = (conn.peer_addr(), conn.local_addr());
-    hooks.blocked(fcx, &sandbox_only(hooks.sandbox_at(peer.ip())), || {
-        (
+    fcx.emitter(&sandbox_only(hooks.sandbox_at(peer.ip())))
+        .emit("net", "blocked", |_| {
             blocked_event(
                 BlockedWhy::TooManyConnections,
                 Some(PROTO_TCP),
                 Some(peer.ip()),
                 Some(local.ip()),
-            ),
-            port_detail(Some(local.port())),
-        )
-    });
+            )
+            .repeat(port_detail(Some(local.port())))
+        });
 }
 
 /// Accepts connections on one port of a machine. Each is served in its own
@@ -1313,7 +1317,7 @@ mod tests {
             }
         }
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let log = Arc::new(Mutex::new(Vec::new()));
                 let mut net = Net::new().ipv4_only();

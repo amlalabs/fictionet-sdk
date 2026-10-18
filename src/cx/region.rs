@@ -271,26 +271,29 @@ mod tests {
 
     #[test]
     fn cancelling_a_child_wakes_a_parent_task_waiting_on_it() {
-        block_on(crate::lab(crate::Seed::from_u64(0), |fcx| async move {
-            fcx.region(|child| async move {
-                child.spawn(|task| async move {
-                    task.sleep(ms(1)).await?;
-                    task.cancel();
+        block_on(crate::lab(
+            fictionet::RunOptions::new(crate::Seed::from_u64(0)),
+            |fcx| async move {
+                fcx.region(|child| async move {
+                    child.spawn(|task| async move {
+                        task.sleep(ms(1)).await?;
+                        task.cancel();
+                        Ok(())
+                    });
+                    // The region's owner is polled in the parent's task.
+                    poll_fn(|_| {
+                        if child.is_cancelled() {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
                     Ok(())
-                });
-                // The region's owner is polled in the parent's task.
-                poll_fn(|_| {
-                    if child.is_cancelled() {
-                        Poll::Ready(())
-                    } else {
-                        Poll::Pending
-                    }
                 })
-                .await;
-                Ok(())
-            })
-            .await
-        }))
+                .await
+            },
+        ))
         .unwrap();
     }
 
@@ -298,40 +301,43 @@ mod tests {
     fn a_nested_region_waits_for_its_work_and_keeps_its_error() {
         let ended = Arc::new(AtomicUsize::new(0));
         let e = ended.clone();
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
-            // Ok: waits for the region's work.
-            let e1 = e.clone();
-            fcx.region(|fcx| async move {
-                fcx.spawn(move |fcx| async move {
-                    fcx.sleep(ms(20)).await?;
-                    e1.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                });
-                Ok(())
-            })
-            .await?;
-            assert_eq!(e.load(Ordering::SeqCst), 1);
-
-            // A task's error cancels the nested region only, and comes back
-            // from `region` instead of failing the run.
-            let e2 = e.clone();
-            let res = fcx
-                .region(|fcx| async move {
+        block_on(run(
+            fictionet::RunOptions::new(fictionet::Seed::random()),
+            move |fcx| async move {
+                // Ok: waits for the region's work.
+                let e1 = e.clone();
+                fcx.region(|fcx| async move {
                     fcx.spawn(move |fcx| async move {
-                        let r = fcx.sleep(std::time::Duration::from_secs(60)).await;
-                        assert_eq!(r, Err(Cancelled));
-                        e2.fetch_add(1, Ordering::SeqCst);
+                        fcx.sleep(ms(20)).await?;
+                        e1.fetch_add(1, Ordering::SeqCst);
                         Ok(())
                     });
-                    fcx.spawn(|_fcx| async { Err(crate::Error::msg("conn failed")) });
                     Ok(())
                 })
-                .await;
-            assert_eq!(res.unwrap_err().to_string(), "conn failed");
-            assert!(!fcx.is_cancelled());
-            assert_eq!(e.load(Ordering::SeqCst), 2);
-            Ok(())
-        }))
+                .await?;
+                assert_eq!(e.load(Ordering::SeqCst), 1);
+
+                // A task's error cancels the nested region only, and comes back
+                // from `region` instead of failing the run.
+                let e2 = e.clone();
+                let res = fcx
+                    .region(|fcx| async move {
+                        fcx.spawn(move |fcx| async move {
+                            let r = fcx.sleep(std::time::Duration::from_secs(60)).await;
+                            assert_eq!(r, Err(Cancelled));
+                            e2.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        });
+                        fcx.spawn(|_fcx| async { Err(crate::Error::msg("conn failed")) });
+                        Ok(())
+                    })
+                    .await;
+                assert_eq!(res.unwrap_err().to_string(), "conn failed");
+                assert!(!fcx.is_cancelled());
+                assert_eq!(e.load(Ordering::SeqCst), 2);
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -341,35 +347,38 @@ mod tests {
     fn dropping_a_region_cancels_its_work() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let out = block_on(run(fictionet::Seed::random(), |fcx| async move {
-                let started = Arc::new(AtomicUsize::new(0));
-                let s = started.clone();
-                let mut region = std::pin::pin!(fcx.region(|fcx| async move {
-                    fcx.spawn(move |fcx| async move {
-                        s.fetch_add(1, Ordering::SeqCst);
+            let out = block_on(run(
+                fictionet::RunOptions::new(fictionet::Seed::random()),
+                |fcx| async move {
+                    let started = Arc::new(AtomicUsize::new(0));
+                    let s = started.clone();
+                    let mut region = std::pin::pin!(fcx.region(|fcx| async move {
+                        fcx.spawn(move |fcx| async move {
+                            s.fetch_add(1, Ordering::SeqCst);
+                            fcx.sleep(std::time::Duration::from_secs(60)).await?;
+                            Ok(())
+                        });
                         fcx.sleep(std::time::Duration::from_secs(60)).await?;
                         Ok(())
-                    });
-                    fcx.sleep(std::time::Duration::from_secs(60)).await?;
+                    }));
+                    // Poll the region until its task has started, then give up
+                    // on it, as a timeout would.
+                    poll_fn(|cx| {
+                        assert!(
+                            region.as_mut().poll(cx).is_pending(),
+                            "the region sleeps for 60 s"
+                        );
+                        if started.load(Ordering::SeqCst) == 1 {
+                            Poll::Ready(())
+                        } else {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
                     Ok(())
-                }));
-                // Poll the region until its task has started, then give up
-                // on it, as a timeout would.
-                poll_fn(|cx| {
-                    assert!(
-                        region.as_mut().poll(cx).is_pending(),
-                        "the region sleeps for 60 s"
-                    );
-                    if started.load(Ordering::SeqCst) == 1 {
-                        Poll::Ready(())
-                    } else {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                })
-                .await;
-                Ok(())
-            }));
+                },
+            ));
             #[expect(
                 clippy::let_underscore_must_use,
                 reason = "the receiver is gone only once recv_timeout below has failed the test"
@@ -395,29 +404,32 @@ mod tests {
                 self.0.cancel();
             }
         }
-        let res = block_on(run(fictionet::Seed::random(), |fcx| async move {
-            use crate::Interface;
-            let (inside, outside) = crate::pair();
-            let watcher = Arc::new(Mutex::new(Some(outside)));
-            let w = watcher.clone();
-            let res = fcx
-                .region(move |fcx| {
-                    let wake = Waker::from(Arc::new(CancelOnWake(fcx.clone())));
-                    let mut outside = w.lock();
-                    let polled = outside
-                        .as_mut()
-                        .unwrap()
-                        .poll_recv(&fcx, &mut Context::from_waker(&wake));
-                    assert!(polled.is_pending());
-                    poll_fn(move |_| {
-                        let _held = &inside;
-                        Poll::Ready(Err(crate::Error::msg("failed holding a link")))
+        let res = block_on(run(
+            fictionet::RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                use crate::Interface;
+                let (inside, outside) = crate::pair();
+                let watcher = Arc::new(Mutex::new(Some(outside)));
+                let w = watcher.clone();
+                let res = fcx
+                    .region(move |fcx| {
+                        let wake = Waker::from(Arc::new(CancelOnWake(fcx.clone())));
+                        let mut outside = w.lock();
+                        let polled = outside
+                            .as_mut()
+                            .unwrap()
+                            .poll_recv(&fcx, &mut Context::from_waker(&wake));
+                        assert!(polled.is_pending());
+                        poll_fn(move |_| {
+                            let _held = &inside;
+                            Poll::Ready(Err(crate::Error::msg("failed holding a link")))
+                        })
                     })
-                })
-                .await;
-            drop(watcher);
-            res
-        }));
+                    .await;
+                drop(watcher);
+                res
+            },
+        ));
         assert_eq!(res.unwrap_err().to_string(), "failed holding a link");
     }
 
@@ -426,26 +438,29 @@ mod tests {
     /// nothing, is not cancelled, and its joiner hears `Cancelled`.
     #[test]
     fn a_task_that_ends_with_a_cancel_does_not_fail_its_region() {
-        let res = block_on(run(fictionet::Seed::random(), |fcx| async move {
-            let mut stopped = None;
-            fcx.region(|inner| {
-                stopped = Some(inner.clone());
-                inner.cancel();
-                async { Ok(()) }
-            })
-            .await?;
-            let stopped = stopped.unwrap();
-            let task = fcx.spawn(move |_fcx| async move {
-                // A wrapper's `Cancelled` variant counts too.
-                let (mut a, _b) = crate::pair();
-                use crate::InterfaceExt;
-                a.recv(&stopped).await?;
+        let res = block_on(run(
+            fictionet::RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                let mut stopped = None;
+                fcx.region(|inner| {
+                    stopped = Some(inner.clone());
+                    inner.cancel();
+                    async { Ok(()) }
+                })
+                .await?;
+                let stopped = stopped.unwrap();
+                let task = fcx.spawn(move |_fcx| async move {
+                    // A wrapper's `Cancelled` variant counts too.
+                    let (mut a, _b) = crate::pair();
+                    use crate::InterfaceExt;
+                    a.recv(&stopped).await?;
+                    Ok(())
+                });
+                assert!(matches!(task.join(&fcx).await, Err(JoinError::Cancelled)));
+                assert!(!fcx.is_cancelled());
                 Ok(())
-            });
-            assert!(matches!(task.join(&fcx).await, Err(JoinError::Cancelled)));
-            assert!(!fcx.is_cancelled());
-            Ok(())
-        }));
+            },
+        ));
         assert!(res.is_ok(), "{res:?}");
     }
 
@@ -454,53 +469,59 @@ mod tests {
     /// work used to say so.
     #[test]
     fn a_region_says_whether_it_was_stopped_or_cut_short() {
-        let res = block_on(run(fictionet::Seed::random(), |fcx| async move {
-            let stopped = fcx
-                .region(|inner| async move {
-                    inner.cancel();
-                    inner.sleep(std::time::Duration::from_secs(60)).await?;
-                    Ok(())
-                })
-                .await;
-            assert!(stopped.is_ok(), "{stopped:?}");
-            let outer = fcx.clone();
-            let cut = fcx
-                .region(|inner| async move {
-                    let (mut a, _b) = crate::pair();
-                    use crate::InterfaceExt;
-                    outer.spawn(move |fcx| async move {
-                        fcx.sleep(ms(10)).await?;
-                        fcx.cancel();
+        let res = block_on(run(
+            fictionet::RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                let stopped = fcx
+                    .region(|inner| async move {
+                        inner.cancel();
+                        inner.sleep(std::time::Duration::from_secs(60)).await?;
                         Ok(())
-                    });
-                    a.recv(&inner).await?;
-                    Ok(())
-                })
-                .await;
-            let e = cut.unwrap_err();
-            assert!(e.is::<Cancelled>(), "{e:?}");
-            Ok(())
-        }));
+                    })
+                    .await;
+                assert!(stopped.is_ok(), "{stopped:?}");
+                let outer = fcx.clone();
+                let cut = fcx
+                    .region(|inner| async move {
+                        let (mut a, _b) = crate::pair();
+                        use crate::InterfaceExt;
+                        outer.spawn(move |fcx| async move {
+                            fcx.sleep(ms(10)).await?;
+                            fcx.cancel();
+                            Ok(())
+                        });
+                        a.recv(&inner).await?;
+                        Ok(())
+                    })
+                    .await;
+                let e = cut.unwrap_err();
+                assert!(e.is::<Cancelled>(), "{e:?}");
+                Ok(())
+            },
+        ));
         assert!(res.is_ok(), "{res:?}");
     }
 
     #[test]
     fn cancelling_a_region_cancels_regions_inside_it() {
-        let res = block_on(run(fictionet::Seed::random(), |fcx| async move {
-            fcx.spawn(|fcx| async move {
-                let inner = fcx
-                    .region(|fcx| async move {
-                        fcx.sleep(std::time::Duration::from_secs(60))
-                            .await
-                            .map_err(Into::into)
-                    })
-                    .await;
-                assert!(inner.unwrap_err().is::<Cancelled>());
-                Ok(())
-            });
-            fcx.sleep(ms(10)).await?;
-            Err(crate::Error::msg("outer"))
-        }));
+        let res = block_on(run(
+            fictionet::RunOptions::new(fictionet::Seed::random()),
+            |fcx| async move {
+                fcx.spawn(|fcx| async move {
+                    let inner = fcx
+                        .region(|fcx| async move {
+                            fcx.sleep(std::time::Duration::from_secs(60))
+                                .await
+                                .map_err(Into::into)
+                        })
+                        .await;
+                    assert!(inner.unwrap_err().is::<Cancelled>());
+                    Ok(())
+                });
+                fcx.sleep(ms(10)).await?;
+                Err(crate::Error::msg("outer"))
+            },
+        ));
         assert_eq!(res.unwrap_err().to_string(), "outer");
     }
 }

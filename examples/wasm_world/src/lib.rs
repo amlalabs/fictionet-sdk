@@ -66,77 +66,80 @@ pub struct Fetched {
 pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
     let fetched = Arc::new(Mutex::new(None));
     let out = fetched.clone();
-    let ended = run(fictionet::Seed::random(), move |fcx| async move {
-        let certs = certs(&fcx)?;
-        // The world's date: certificates are checked against it.
-        let date = std::time::Duration::from_secs(1_767_225_600); // 2026-01-01
-        let server = Arc::new(
-            tls::config_builder(&fcx, std::time::UNIX_EPOCH + date)
+    let ended = run(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        move |fcx| async move {
+            let certs = certs(&fcx)?;
+            // The world's date: certificates are checked against it.
+            let date = std::time::Duration::from_secs(1_767_225_600); // 2026-01-01
+            let server = Arc::new(
+                tls::config_builder(&fcx, std::time::UNIX_EPOCH + date)
+                    .with_safe_default_protocol_versions()?
+                    .with_no_client_auth()
+                    .with_single_cert(certs.chain, certs.key)?,
+            );
+            let (attacher, attachments) = fictionet::attachments();
+            let sites = web::Sites::new(move |host| match host {
+                // TLS on port 443, and the same site without it on port 80
+                // (rather than a redirect to https).
+                NAME => Some(
+                    web::Site::new(Hello)
+                        .at(SITE)
+                        .tls(server.clone())
+                        .plain_http(),
+                ),
+                _ => None,
+            });
+            sites.start(&fcx, attachments)?;
+
+            // The sandbox: an IP stack of its own on the `End` returned by `Attacher::attach`.
+            let cable = attacher.attach("agent")?;
+            let (tcp_packets, udp_packets, _icmp, _other) = ip::split_protocols(&fcx, cable);
+            let tcp = tcp::endpoint(&fcx, tcp_packets, SANDBOX.into());
+            let udp = udp::endpoint(&fcx, udp_packets, SANDBOX.into());
+
+            let address = lookup(&fcx, &udp, NAME).await?;
+            let response = if https {
+                let conn = tcp
+                    .connect(&fcx, SocketAddr::new(address.into(), 443))
+                    .await?;
+                let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
                 .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(certs.chain, certs.key)?,
-        );
-        let (attacher, attachments) = fictionet::attachments();
-        let sites = web::Sites::new(move |host| match host {
-            // TLS on port 443, and the same site without it on port 80
-            // (rather than a redirect to https).
-            NAME => Some(
-                web::Site::new(Hello)
-                    .at(SITE)
-                    .tls(server.clone())
-                    .plain_http(),
-            ),
-            _ => None,
-        });
-        sites.start(&fcx, attachments)?;
-
-        // The sandbox: an IP stack of its own on the `End` returned by `Attacher::attach`.
-        let cable = attacher.attach("agent")?;
-        let (tcp_packets, udp_packets, _icmp, _other) = ip::split_protocols(&fcx, cable);
-        let tcp = tcp::endpoint(&fcx, tcp_packets, SANDBOX.into());
-        let udp = udp::endpoint(&fcx, udp_packets, SANDBOX.into());
-
-        let address = lookup(&fcx, &udp, NAME).await?;
-        let response = if https {
-            let conn = tcp
-                .connect(&fcx, SocketAddr::new(address.into(), 443))
-                .await?;
-            let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(certs.roots)
-            .with_no_client_auth();
-            client.alpn_protocols = vec![if version == Version::HTTP_2 {
-                b"h2".to_vec()
+                .with_root_certificates(certs.roots)
+                .with_no_client_auth();
+                client.alpn_protocols = vec![if version == Version::HTTP_2 {
+                    b"h2".to_vec()
+                } else {
+                    b"http/1.1".to_vec()
+                }];
+                let session = tls::with_context(&fcx, || {
+                    rustls::ClientConnection::new(Arc::new(client), NAME.try_into().unwrap())
+                })?;
+                let mut conn = TlsClient::with(conn, session);
+                conn.handshake(&fcx).await?;
+                get(&fcx, conn, "https", version, "/from-the-browser").await?
             } else {
-                b"http/1.1".to_vec()
-            }];
-            let session = tls::with_context(&fcx, || {
-                rustls::ClientConnection::new(Arc::new(client), NAME.try_into().unwrap())
-            })?;
-            let mut conn = TlsClient::with(conn, session);
-            conn.handshake(&fcx).await?;
-            get(&fcx, conn, "https", version, "/from-the-browser").await?
-        } else {
-            let conn = tcp
-                .connect(&fcx, SocketAddr::new(address.into(), 80))
-                .await?;
-            get(&fcx, conn, "http", version, "/from-the-browser").await?
-        };
-        let status = response.status().as_u16();
-        let version = response.version();
-        let body = response.into_body().collect().await?.to_bytes();
-        let body = String::from_utf8(body.to_vec())?;
-        *out.lock().unwrap() = Some(Fetched {
-            address,
-            status,
-            version,
-            body,
-        });
-        // Ending with an error cancels the sites, which would serve forever.
-        Err(fictionet::Error::from(Done))
-    })
+                let conn = tcp
+                    .connect(&fcx, SocketAddr::new(address.into(), 80))
+                    .await?;
+                get(&fcx, conn, "http", version, "/from-the-browser").await?
+            };
+            let status = response.status().as_u16();
+            let version = response.version();
+            let body = response.into_body().collect().await?.to_bytes();
+            let body = String::from_utf8(body.to_vec())?;
+            *out.lock().unwrap() = Some(Fetched {
+                address,
+                status,
+                version,
+                body,
+            });
+            // Ending with an error cancels the sites, which would serve forever.
+            Err(fictionet::Error::from(Done))
+        },
+    )
     .await;
     match ended {
         Err(e) if e.downcast_ref::<Done>().is_some() => {}

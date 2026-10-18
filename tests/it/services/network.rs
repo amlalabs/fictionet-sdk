@@ -909,7 +909,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             drops[1].conn.sandbox.as_ref().map(|s| &*s.name),
             Some("ws01")
         );
-        assert_eq!(drops[1].u64("count"), Some(1));
+        assert!(drops[1].get("count").is_none());
         assert_eq!(drops[1].str("why"), Some("no member at that address"));
         // The VM is named in events like any sandbox.
         let joined = kept.checked_of("net", "attached").unwrap();
@@ -1202,4 +1202,35 @@ fn udp_ephemeral_ports_skip_bound_ports_and_reuse_released_ports() {
         assert_eq!(endpoint.bind(0)?.local_addr().port(), 49152);
         Ok(())
     });
+}
+
+#[test]
+fn refused_connections_share_a_bounded_aggregate() {
+    use fictionet::events::{Aggregate, ConnInfo, Limits, Memory};
+    use fictionet::stdlib::world::net;
+    use std::sync::atomic::AtomicUsize;
+
+    let evidence = Arc::new(Memory::new(Limits::new(4, 8192)));
+    let observer = Arc::new(Aggregate::new(evidence.clone()));
+    block_on(lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(observer),
+        |fcx| async move {
+            let open = Arc::new(AtomicUsize::new(0));
+            for port in 1000..2000 {
+                let conn = ConnInfo::new(
+                    u64::from(port),
+                    "10.0.0.1:443".parse()?,
+                    SocketAddr::from(([10, 0, 0, 2], port)),
+                );
+                assert!(net::connection_limit(&fcx, &conn, &open, 0).is_none());
+            }
+            Ok(())
+        },
+    ))
+    .unwrap();
+    let blocked = evidence.checked_of("net", "blocked").unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].u64("count"), Some(1000));
+    assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
+    assert!(blocked[0].conn.id.is_none());
 }

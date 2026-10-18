@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn failed_hosts_reuse_automatic_addresses_even_without_negative_caching() {
-        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |fcx| async move {
+        fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(fictionet::Seed::from_u64(1)), |fcx| async move {
             let shared = Arc::new(Shared {
                 fcx: fcx.clone(),
                 resolver: Some(Arc::new(|name| Some(match name {
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn failed_hosts_remember_an_exhausted_automatic_range() {
-        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |fcx| async move {
+        fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(fictionet::Seed::from_u64(1)), |fcx| async move {
             let shared = Arc::new(Shared {
                 fcx: fcx.clone(),
                 resolver: Some(Arc::new(|name| Some(Host::new(name)))),

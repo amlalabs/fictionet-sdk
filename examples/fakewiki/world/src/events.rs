@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use fictionet::events::{Event as Entry, Fields, opt};
+use fictionet::events::{Event, Fields, opt};
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
@@ -67,6 +67,12 @@ impl fictionet::events::Observer for LogObserver {
     ) -> bool {
         matches!(metadata.source, "net" | "dns" | "tls" | "http")
     }
+    fn lost(&self, count: u64) {
+        if count != 0 {
+            self.log
+                .fail(format!("{count} events lost before log delivery"));
+        }
+    }
     fn observe(
         &self,
         _: fictionet::events::Stamp,
@@ -80,12 +86,12 @@ impl fictionet::events::Observer for LogObserver {
     }
 }
 
-fn text(e: &Entry, name: &str) -> Option<String> {
+fn text(e: &Event, name: &str) -> Option<String> {
     e.str(name).map(str::to_owned)
 }
 
 /// The log line for `entry`, if main.py logged such a thing.
-fn line(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Option<Value> {
+fn line(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
     match (e.source, e.kind) {
         ("net", "attached") => {
@@ -105,7 +111,7 @@ fn line(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Option<Value> {
 
 /// A DNS query, as main.py's `dns_answer` logged it, or a `dns_error` for
 /// one that could not be read.
-fn dns(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
+fn dns(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Value {
     let (Some(name), Some(qtype)) = (text(e, "name"), e.u64("qtype")) else {
         let error = match e.str("answer") {
             Some("none") | None => "not a DNS query".to_owned(),
@@ -129,7 +135,7 @@ fn dns(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
 
 /// A TLS handshake that did not finish: `tls_reject` when the world refused
 /// the name, `tls_error` when the client gave up or broke the protocol.
-fn tls(e: &Entry) -> Option<Value> {
+fn tls(e: &Event) -> Option<Value> {
     let sni = text(e, "sni");
     let error = match e.str("outcome")? {
         "accepted" => return None,
@@ -154,7 +160,7 @@ fn tls(e: &Entry) -> Option<Value> {
 
 /// An HTTP request, as main.py's handler logged it: the request, then
 /// what the world made of it.
-fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
+fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Value {
     let host = text(e, "host").unwrap_or_default();
     let path = match e.str("query") {
         Some(q) => format!("{}?{q}", e.str("path").unwrap_or("/")),
@@ -237,7 +243,7 @@ mod tests {
     #[test]
     fn delivery_facts_are_separate_from_page_length() {
         for (method, sent, complete) in [("HEAD", 0_u64, true), ("GET", 20, false)] {
-            let event = Entry::new("http", "request")
+            let event = Event::new("http", "request")
                 .field("answer", "handler")
                 .field("kind", "wiki_article")
                 .field("method", method)
@@ -255,7 +261,7 @@ mod tests {
 
     #[test]
     fn missing_delivery_facts_stay_unknown() {
-        let event = Entry::new("http", "request").field("bytes", 100_u64);
+        let event = Event::new("http", "request").field("bytes", 100_u64);
         let line = http(&HashMap::new(), &event);
         assert!(line["sent"].is_null());
         assert!(line["complete"].is_null());

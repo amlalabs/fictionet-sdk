@@ -78,10 +78,13 @@ mod tests {
 
     #[test]
     fn no_recorder_without_an_observer() {
-        block_on(lab(Seed::from_u64(7), |fcx| async move {
-            assert!(fcx.tls_key_log().is_none());
-            Ok(())
-        }))
+        block_on(lab(
+            fictionet::RunOptions::new(Seed::from_u64(7)),
+            |fcx| async move {
+                assert!(fcx.tls_key_log().is_none());
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -94,29 +97,32 @@ mod tests {
 
         let kept = Arc::new(Mutex::new(None));
         let keep = kept.clone();
-        block_on(lab(Seed::from_u64(7), move |fcx| async move {
-            let graph = fcx.graph();
-            graph.viewers.store(1, Ordering::Relaxed);
-            let recorder = fcx.tls_key_log().unwrap();
-            graph.viewers.store(0, Ordering::Relaxed);
-            assert!(fcx.tls_key_log().is_none());
-            recorder.log("CLIENT_RANDOM", &[0, 255, 7], &[128, 0, 42]);
-            {
-                let s = graph.keys.state();
-                assert_eq!(s.keys_added, 1);
-                assert_eq!(s.keys.len(), 1);
-                assert_eq!(s.keys[0].label, "CLIENT_RANDOM");
-                assert_eq!(s.keys[0].client_random, [0, 255, 7]);
-                assert_eq!(s.keys[0].secret, [128, 0, 42]);
-            }
-            *keep.lock() = Some((
-                recorder,
-                Arc::downgrade(&fcx.run),
-                Arc::downgrade(graph),
-                Arc::downgrade(&graph.keys),
-            ));
-            Ok(())
-        }))
+        block_on(lab(
+            fictionet::RunOptions::new(Seed::from_u64(7)),
+            move |fcx| async move {
+                let graph = fcx.graph();
+                graph.viewers.store(1, Ordering::Relaxed);
+                let recorder = fcx.tls_key_log().unwrap();
+                graph.viewers.store(0, Ordering::Relaxed);
+                assert!(fcx.tls_key_log().is_none());
+                recorder.log("CLIENT_RANDOM", &[0, 255, 7], &[128, 0, 42]);
+                {
+                    let s = graph.keys.state();
+                    assert_eq!(s.keys_added, 1);
+                    assert_eq!(s.keys.len(), 1);
+                    assert_eq!(s.keys[0].label, "CLIENT_RANDOM");
+                    assert_eq!(s.keys[0].client_random, [0, 255, 7]);
+                    assert_eq!(s.keys[0].secret, [128, 0, 42]);
+                }
+                *keep.lock() = Some((
+                    recorder,
+                    Arc::downgrade(&fcx.run),
+                    Arc::downgrade(graph),
+                    Arc::downgrade(&graph.keys),
+                ));
+                Ok(())
+            },
+        ))
         .unwrap();
         let (recorder, run, graph, keys) = kept.lock().take().unwrap();
         assert!(run.upgrade().is_none());

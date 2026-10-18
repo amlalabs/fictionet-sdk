@@ -216,7 +216,7 @@
 //! #         });
 //! #     }
 //! # });
-//! fictionet::run(fictionet::Seed::random(), |fcx| async move {
+//! fictionet::run(fictionet::RunOptions::new(fictionet::Seed::random()), |fcx| async move {
 //! #     let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
 //! #     let ca = Ca::new(&fcx, "World CA")?;
 //! #     let leaf = ca.issue(&fcx, &["gmail.googleapis.com"], Validity {

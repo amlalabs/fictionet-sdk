@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use fictionet::relay::observer::{Client, Value};
 use fictionet::stdlib::network::{Connection, ConnectionExt, tcp};
 use fictionet::stdlib::services::tls::{self, ServerConfig};
-use fictionet::{Cx, Interface, InterfaceExt, Result};
+use fictionet::{Cx, Interface, InterfaceExt, Result, RunOptions};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
@@ -95,7 +95,7 @@ fn an_observer_sees_http_inside_tls() {
     let (response_tx, fetched) = std::sync::mpsc::channel();
     let world = std::thread::spawn(move || {
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            RunOptions::new(fictionet::Seed::random()),
             move |fcx| async move {
                 // Taking attachments is what lets the world socket find this run.
                 fcx.spawn(move |fcx| async move {

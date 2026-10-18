@@ -22,7 +22,7 @@
 
 use crate::events;
 use crate::{bank::ACCOUNT, scenario::Scenario};
-use fictionet::{Cx, events::Event as Entry};
+use fictionet::{Cx, events::Event};
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
@@ -57,7 +57,7 @@ impl Log {
         self.inner.finish()
     }
     /// Converts a network event to a log line when it is relevant.
-    pub fn entry(&self, entry: &Entry) {
+    pub fn entry(&self, entry: &Event) {
         if let Some(line) = events::line(&self.scenario, entry) {
             self.line(line);
         }
@@ -74,6 +74,12 @@ impl fictionet::events::Observer for Log {
         _: &fictionet::events::ConnInfo,
     ) -> bool {
         events::LOGGED.contains(&metadata.source)
+    }
+    fn lost(&self, count: u64) {
+        if count != 0 {
+            self.inner
+                .fail(format!("{count} events lost before log delivery"));
+        }
     }
     fn observe(
         &self,

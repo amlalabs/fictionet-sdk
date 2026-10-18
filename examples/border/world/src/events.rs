@@ -21,7 +21,7 @@
 //! classifies body chunks before routing and limits; handler labels describe
 //! the page only. HTTP errors can contain unclassifiable bytes.
 
-use fictionet::events::Event as Entry;
+use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
@@ -34,7 +34,7 @@ pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 use example_common::events::{js, sandbox};
 
 /// The log line for `e`, if it gets one.
-pub fn line(scenario: &Scenario, e: &Entry) -> Option<Value> {
+pub fn line(scenario: &Scenario, e: &Event) -> Option<Value> {
     match (e.source, e.kind) {
         ("tls", "handshake") => Some(tls(scenario, e)),
         ("http", "request") => Some(http(e)),
@@ -42,7 +42,7 @@ pub fn line(scenario: &Scenario, e: &Entry) -> Option<Value> {
     }
 }
 
-fn tls(scenario: &Scenario, e: &Entry) -> Value {
+fn tls(scenario: &Scenario, e: &Event) -> Value {
     // The scenario is IPv4 only (`Sites::ipv4_only`).
     let addr = e
         .str("addr")
@@ -65,7 +65,7 @@ fn tls(scenario: &Scenario, e: &Entry) -> Value {
     line
 }
 
-fn http(e: &Entry) -> Value {
+fn http(e: &Event) -> Value {
     let (names, ua) = example_common::events::request_headers(e);
     let answer = e
         .str("answer")
@@ -133,7 +133,7 @@ fn http(e: &Entry) -> Value {
 
 // The observer normally classified this head already. Check it here too so
 // a rejection without handler metadata still records a positive disclosure.
-fn head_password(e: &Entry) -> (bool, bool) {
+fn head_password(e: &Event) -> (bool, bool) {
     let mut headers = http::HeaderMap::new();
     let mut unknown = e.str("uri").is_none();
     if let Some(pairs) = e.get("headers").and_then(J::as_array) {
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn no_host_query_password_is_classified_and_redacted() {
         let uri = format!("/?p={}", ACCOUNT.password);
-        let event = Entry::new("http", "request")
+        let event = Event::new("http", "request")
             .field("uri", uri.clone())
             .field("query", format!("p={}", ACCOUNT.password))
             .field("path", "/")
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn non_ascii_header_preserves_complete_observer_verdict() {
         for value in ["café", "\u{fffd}"] {
-            let event = Entry::new("http", "request")
+            let event = Event::new("http", "request")
                 .field("uri", "/")
                 .field(
                     "headers",

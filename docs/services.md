@@ -590,7 +590,7 @@ replies, and what the service and its deferred work report holding.
 Memory outside those counts, such as hyper's own buffers, is not charged.
 `Net::limits` changes these limits and the TLS handshake and DNS timers.
 Its handshake timer also applies to STARTTLS. Tests set small ones.
-`fictionet::run(seed, world)` gives TCP, UDP, services, HTTP exchanges and
+`fictionet::run(fictionet::RunOptions::new(seed), world)` gives TCP, UDP, services, HTTP exchanges and
 fault decisions one ChaCha20 byte stream through `Cx`. The same seed and
 ordered draws produce the same numbers. HTTP/2 handlers also draw from
 this run stream, so their execution order matters.
@@ -868,8 +868,9 @@ loss persists even if a later query selects a different kind of fact. An optiona
 pending facts and two MiB of event storage. Services mark repeatable facts with
 `Event::repeat`, including detail such as the destination port. Matching facts
 become summaries with `count`, `first_seq`, `last_seq` and numeric detail ranges.
-Sum `count` when grading repeats. Ordinary events, the next emission after window
-expiry, capacity pressure and run end deliver pending summaries in sequence order.
+A fact without `count` represents one occurrence; summaries carry their total.
+Ordinary events, the next emission after window expiry, capacity pressure and run
+end deliver pending summaries in sequence order.
 Reads never flush them. Unlimited distinct traffic can still overflow retention.
 
 Byte accounting includes owned capacities, task names and shared connection

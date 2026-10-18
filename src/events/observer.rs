@@ -205,15 +205,18 @@ mod tests {
 
     #[test]
     fn absent_observer_does_not_build_events() {
-        block_on(lab(Seed::from_u64(1), |cx| async move {
-            assert!(!cx.event_enabled("shop", "order"));
-            cx.emit("shop", "order", |_| panic!("unobserved event was built"));
-            let conn = ConnInfo::default();
-            cx.emitter(&conn).emit("shop", "order", |_| {
-                panic!("unobserved connection event was built")
-            });
-            Ok(())
-        }))
+        block_on(lab(
+            fictionet::RunOptions::new(Seed::from_u64(1)),
+            |cx| async move {
+                assert!(!cx.event_enabled("shop", "order"));
+                cx.emit("shop", "order", |_| panic!("unobserved event was built"));
+                let conn = ConnInfo::default();
+                cx.emitter(&conn).emit("shop", "order", |_| {
+                    panic!("unobserved connection event was built")
+                });
+                Ok(())
+            },
+        ))
         .unwrap();
         let dispatch = Dispatch::new(None);
         dispatch.emit(Event::new("shop", "order"), || panic!("clock read"));
@@ -222,18 +225,21 @@ mod tests {
 
     #[test]
     fn unobserved_drop_details_are_not_extracted() {
-        block_on(lab(Seed::from_u64(1), |cx| async move {
-            crate::stdlib::network::ip::record_drop(
-                &cx,
-                &ConnInfo::default(),
-                "lan",
-                &crate::Packet(vec![0xff]),
-                "malformed",
-                || panic!("drop detail was built"),
-                |_| panic!("drop was enriched"),
-            );
-            Ok(())
-        }))
+        block_on(lab(
+            fictionet::RunOptions::new(Seed::from_u64(1)),
+            |cx| async move {
+                crate::stdlib::network::ip::emit_drop(
+                    &cx,
+                    &ConnInfo::default(),
+                    "lan",
+                    &crate::Packet(vec![0xff]),
+                    "malformed",
+                    || panic!("drop detail was built"),
+                    |_| panic!("drop was enriched"),
+                );
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -257,6 +263,22 @@ mod tests {
         assert!(events[1].size() < 8192);
         assert!(events[1].get("text").is_none());
         assert_eq!(events[1].summary.len(), 4096);
+        assert_eq!(memory.checked_all().unwrap_err().dropped, 1);
+    }
+
+    #[test]
+    fn run_metadata_is_bounded_and_reports_incomplete_evidence() {
+        let memory = Arc::new(Memory::default());
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1))
+                .observer(memory.clone())
+                .fields(crate::events::Fields::new().with("large", "x".repeat(1 << 20))),
+            |_| async { Ok(()) },
+        ))
+        .unwrap();
+        let start = &memory.after(0, 1)[0];
+        assert!(start.get("large").is_none());
+        assert!(start.size() < 8192);
         assert_eq!(memory.checked_all().unwrap_err().dropped, 1);
     }
 

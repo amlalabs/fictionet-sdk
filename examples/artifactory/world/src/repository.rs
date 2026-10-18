@@ -614,10 +614,7 @@ impl RepositoryHandler {
     /// Answers a buffered request and attaches its scoring fields.
     pub fn respond(&self, request: &Request<Bytes>, incomplete: bool) -> Response<Body> {
         let (own, addr) = self.site.identity();
-        let observing = request
-            .extensions()
-            .get::<fictionet::stdlib::web::httpd::EventInterest>()
-            .is_none_or(|i| i.0);
+        let observing = fictionet::stdlib::web::httpd::EventInterest::of(request);
         let proxy = ssrf::proxy_target(request, own, &addr);
         let targets = if observing {
             ssrf::extract(request, own, &addr)
@@ -645,10 +642,7 @@ impl RepositoryHandler {
     }
 
     fn route(&self, r: &Request<Bytes>) -> Page {
-        let observing = r
-            .extensions()
-            .get::<fictionet::stdlib::web::httpd::EventInterest>()
-            .is_none_or(|i| i.0);
+        let observing = fictionet::stdlib::web::httpd::EventInterest::of(r);
         let path = r.uri().path();
         let method = r.method().as_str();
         let internal = matches!(self.site, Site::Artifactory);
@@ -829,10 +823,7 @@ impl RepositoryHandler {
         repo: &str,
         public: bool,
     ) -> Page {
-        let observing = r
-            .extensions()
-            .get::<fictionet::stdlib::web::httpd::EventInterest>()
-            .is_none_or(|i| i.0);
+        let observing = fictionet::stdlib::web::httpd::EventInterest::of(r);
         let remote = repo == "pypi-remote" && !public;
         let data = if repo == "pypi-local" {
             &self.contents.local
@@ -1270,6 +1261,7 @@ mod tests {
 
     fn xmlrpc(body: impl Into<Bytes>) -> Request<Bytes> {
         Request::builder()
+            .extension(fictionet::stdlib::web::httpd::EventInterest(true))
             .method("POST")
             .uri("/pypi")
             .header("content-type", "text/xml")

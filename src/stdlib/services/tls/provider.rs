@@ -547,15 +547,18 @@ mod tests {
         use rustls::crypto::SecureRandom;
         let mut byte = [0; 1];
         assert!(super::CxRandom.fill(&mut byte).is_err());
-        fictionet::block_on(fictionet::lab(Seed::from_u64(42), |fcx| async move {
-            let oracle = SeededEntropy::new(Seed::from_u64(42));
-            let mut expected = [0; 1];
-            oracle.fill_random(&mut expected);
-            super::with_context(&fcx, || super::CxRandom.fill(&mut byte)).unwrap();
-            assert_eq!(byte, expected);
-            assert_eq!(fcx.random_u64(), oracle.random_u64());
-            Ok(())
-        }))
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(Seed::from_u64(42)),
+            |fcx| async move {
+                let oracle = SeededEntropy::new(Seed::from_u64(42));
+                let mut expected = [0; 1];
+                oracle.fill_random(&mut expected);
+                super::with_context(&fcx, || super::CxRandom.fill(&mut byte)).unwrap();
+                assert_eq!(byte, expected);
+                assert_eq!(fcx.random_u64(), oracle.random_u64());
+                Ok(())
+            },
+        ))
         .unwrap();
         assert!(super::CxRandom.fill(&mut byte).is_err());
     }
@@ -603,11 +606,14 @@ mod tests {
         let exercise = |seed| {
             let result = Arc::new(Mutex::new(Vec::new()));
             let output = result.clone();
-            block_on(lab(Seed::from_u64(seed), move |cx| async move {
-                *output.lock().unwrap() =
-                    super::with_context(&cx, || draw(super::crypto_provider()));
-                Ok(())
-            }))
+            block_on(lab(
+                fictionet::RunOptions::new(Seed::from_u64(seed)),
+                move |cx| async move {
+                    *output.lock().unwrap() =
+                        super::with_context(&cx, || draw(super::crypto_provider()));
+                    Ok(())
+                },
+            ))
             .unwrap();
             Arc::try_unwrap(result).unwrap().into_inner().unwrap()
         };

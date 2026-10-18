@@ -1,3 +1,4 @@
+use fictionet::RunOptions;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -121,7 +122,7 @@ service_fixture! {
 #[test]
 fn finishing_a_connection_cancels_and_joins_its_spawned_work() {
     fictionet::block_on(fictionet::lab(
-        fictionet::Seed::from_u64(2),
+        RunOptions::new(fictionet::Seed::from_u64(2)),
         |fcx| async move {
             let (a, b) = fictionet::pair();
             let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
@@ -263,7 +264,7 @@ fn service_error_stays_primary_when_background_work_fails() {
 fn background_failure(fail: bool) {
     let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
     fictionet::block_on(fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(3)).observer(evidence.clone()),
+        RunOptions::new(fictionet::Seed::from_u64(3)).observer(evidence.clone()),
         |fcx| async move {
             let mut service = TerminalSvc {
                 background: true,
@@ -327,7 +328,7 @@ fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Opt
     use std::future::{Future, poll_fn};
     let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
     fictionet::block_on(fictionet::lab(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(4)).observer(evidence.clone()),
+        RunOptions::new(fictionet::Seed::from_u64(4)).observer(evidence.clone()),
         |fcx| async move {
             let polled = Arc::new(std::sync::Mutex::new(None));
             let mut service = TerminalSvc {

@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn lan_dns_endpoints_start_in_name_order() {
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let subnet = Subnet::new("198.18.0.0/16".parse().unwrap()).unwrap();
                 let router = route::router::<Box<dyn Interface>>(&fcx, Vec::new());

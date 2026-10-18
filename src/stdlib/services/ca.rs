@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn p384_ca_signs_a_trusted_p256_leaf() {
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(19),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(19)),
             |fcx| async move {
                 let validity = x509::Validity {
                     not_before: x509::Time::from_unix(1_700_000_000)?,
@@ -387,7 +387,7 @@ mod tests {
             let bytes = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
             let output = bytes.clone();
             fictionet::block_on(fictionet::lab(
-                fictionet::Seed::from_u64(17),
+                fictionet::RunOptions::new(fictionet::Seed::from_u64(17)),
                 move |fcx| async move {
                     let ca = Ca::new(&fcx, "Test CA")?;
                     let key = ca.key_pem();

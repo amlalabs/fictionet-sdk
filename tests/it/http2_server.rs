@@ -15,7 +15,7 @@ use fictionet::stdlib::{
     services::tls,
     world::{net, sandbox},
 };
-use fictionet::{Cx, Seed};
+use fictionet::{Cx, RunOptions, Seed};
 
 const SITE: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const DATE: u64 = 1_893_456_000;
@@ -234,7 +234,7 @@ fn replay() -> Trace {
     let packets = trace.clone();
     let log = Arc::new(fictionet::events::Memory::default());
     let writer = log.clone();
-    fictionet::block_on(fictionet::lab(fictionet::RunOptions::new(Seed::from_u64(71)).observer(writer.clone()), move |cx| async move {
+    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(71)).observer(writer.clone()), move |cx| async move {
         let evidence = writer;
         let cert = rustls::pki_types::CertificateDer::from(include_bytes!("fixtures/tls/ed25519.cert.der").to_vec());
         let key = rustls::pki_types::PrivateKeyDer::try_from(include_bytes!("fixtures/tls/ed25519.key.der").to_vec()).unwrap();
@@ -374,7 +374,7 @@ mod clients {
                     .enable_all()
                     .build()
                     .unwrap();
-                runtime.block_on(fictionet::run(fictionet::RunOptions::new(Seed::from_u64(20)).observer(observed.clone()), move |cx| async move {
+                runtime.block_on(fictionet::run(RunOptions::new(Seed::from_u64(20)).observer(observed.clone()), move |cx| async move {
                     let (ca, leaf) = fictionet_test_support::certs::issue(&cx, "HTTP test CA", &["localhost"])?;
                     std::fs::write(ca_path, ca.cert_pem())?;
                     let config = Arc::new(tls::config_builder(&cx, std::time::SystemTime::now()).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(leaf.chain, leaf.key)?);
@@ -1364,60 +1364,51 @@ fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
 
 #[test]
 fn deferred_response_budget_refusal_preserves_other_streams() {
-    fictionet::block_on(fictionet::lab(Seed::from_u64(1), |cx| async move {
-        let router = Router::new()
-            .post("/small", |_, _| {
-                http::Response::new(Bytes::from_static(b"ok"))
-            })
-            .route_async(Some(http::Method::POST), "/large", |_, _| async {
-                http::Response::new(Bytes::from(vec![b'x'; 200_000]))
-            });
-        let mut harness = Harness::with_options(
-            Seed::from_u64(1),
-            Http2::new(router),
-            (),
-            fictionet::stdlib::services::serve::ServeOptions::default()
-                .budget(fictionet::stdlib::services::serve::Budget::new(128 << 10)),
-        )
-        .with_fcx(cx.clone());
-        let mut input = preface();
-        input.extend(headers(1, "/small", true));
-        input.extend(headers(3, "/large", true));
-        let output = frames(&harness.push(&input).unwrap());
-        assert_eq!(
-            statuses(&output),
-            [(1, b"200".to_vec()), (3, b"503".to_vec())]
-        );
-        assert!(!harness.closed());
-        cx.cancel();
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(1)),
+        |cx| async move {
+            let router = Router::new()
+                .post("/small", |_, _| {
+                    http::Response::new(Bytes::from_static(b"ok"))
+                })
+                .route_async(Some(http::Method::POST), "/large", |_, _| async {
+                    http::Response::new(Bytes::from(vec![b'x'; 200_000]))
+                });
+            let mut harness = Harness::with_options(
+                Seed::from_u64(1),
+                Http2::new(router),
+                (),
+                fictionet::stdlib::services::serve::ServeOptions::default()
+                    .budget(fictionet::stdlib::services::serve::Budget::new(128 << 10)),
+            )
+            .with_fcx(cx.clone());
+            let mut input = preface();
+            input.extend(headers(1, "/small", true));
+            input.extend(headers(3, "/large", true));
+            let output = frames(&harness.push(&input).unwrap());
+            assert_eq!(
+                statuses(&output),
+                [(1, b"200".to_vec()), (3, b"503".to_vec())]
+            );
+            assert!(!harness.closed());
+            cx.cancel();
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
 #[test]
 fn observation_does_not_change_http2_streams() {
-    struct Count(Arc<std::sync::atomic::AtomicUsize>);
-    impl httpd::BodyClassifier for Count {
-        fn head(
-            &self,
-            _: &http::request::Parts,
-            _: &fictionet::events::ConnInfo,
-            _: &mut http::Extensions,
-        ) -> Option<Fields> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            None
-        }
-    }
     let run = |observed| {
-        let heads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heads = Arc::new(crate::common::http_observer::CountHeads::default());
         let memory = Arc::new(fictionet::events::Memory::default());
         let router = Router::new().post("/", |_, _| {
             http::Response::new(Bytes::from_static(b"hello"))
         });
         let mut harness = Harness::new(
             Seed::from_u64(1),
-            Http2::new(router).observe(Arc::new(Count(heads.clone()))),
+            Http2::new(router).observe(heads.clone()),
             (),
         );
         if observed {
@@ -1429,7 +1420,7 @@ fn observation_does_not_change_http2_streams() {
         }
         let output = harness.push(&input).unwrap();
         assert_eq!(
-            heads.load(std::sync::atomic::Ordering::Relaxed),
+            heads.0.load(std::sync::atomic::Ordering::Relaxed),
             if observed { 3 } else { 0 }
         );
         assert_eq!(

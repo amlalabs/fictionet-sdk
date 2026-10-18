@@ -403,28 +403,31 @@ fn a_linux_client_through_tun() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
     let l = log.clone();
-    let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
-        let [t4, u4, t6, u6] = demux(&fcx, tun);
-        let tcp4 = tcp::endpoint(&fcx, t4, "10.9.0.2".parse()?);
-        let udp4 = udp::endpoint(&fcx, u4, "10.9.0.2".parse()?);
-        let tcp6 = tcp::endpoint(&fcx, t6, "fd09::2".parse()?);
-        let udp6 = udp::endpoint(&fcx, u6, "fd09::2".parse()?);
-        serve(&fcx, &tcp4)?;
-        serve(&fcx, &tcp6)?;
-        udp_echo(&fcx, &udp4)?;
-        udp_echo(&fcx, &udp6)?;
-        let checks = std::thread::spawn(move || {
-            client(&l);
-            let _ = done_tx.send(());
-        });
-        if done_rx.await.is_err() {
-            for line in RING.lock().unwrap().iter() {
-                eprintln!("{line}");
+    let result = block_on(run(
+        fictionet::RunOptions::new(fictionet::Seed::random()),
+        move |fcx| async move {
+            let [t4, u4, t6, u6] = demux(&fcx, tun);
+            let tcp4 = tcp::endpoint(&fcx, t4, "10.9.0.2".parse()?);
+            let udp4 = udp::endpoint(&fcx, u4, "10.9.0.2".parse()?);
+            let tcp6 = tcp::endpoint(&fcx, t6, "fd09::2".parse()?);
+            let udp6 = udp::endpoint(&fcx, u6, "fd09::2".parse()?);
+            serve(&fcx, &tcp4)?;
+            serve(&fcx, &tcp6)?;
+            udp_echo(&fcx, &udp4)?;
+            udp_echo(&fcx, &udp6)?;
+            let checks = std::thread::spawn(move || {
+                client(&l);
+                let _ = done_tx.send(());
+            });
+            if done_rx.await.is_err() {
+                for line in RING.lock().unwrap().iter() {
+                    eprintln!("{line}");
+                }
+                std::panic::resume_unwind(checks.join().unwrap_err());
             }
-            std::panic::resume_unwind(checks.join().unwrap_err());
-        }
-        checks.join().unwrap();
-        Err(fictionet::Error::from(Done))
-    }));
+            checks.join().unwrap();
+            Err(fictionet::Error::from(Done))
+        },
+    ));
     ended_with_done(result).unwrap();
 }

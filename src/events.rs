@@ -60,7 +60,7 @@
 //! sequence references and numeric detail ranges. Reads cannot close windows.
 //! Ordinary events, window expiry on the next emission, capacity pressure and
 //! run end deliver pending summaries in sequence order. Without aggregation,
-//! an observer receives each fact with `count = 1`.
+//! an observer receives each fact without summary fields.
 //!
 //! Aggregation bounds pending facts; retention and exporter queues have their
 //! own bounds. Unlimited distinct traffic can still exhaust finite history.
@@ -80,9 +80,7 @@ pub use aggregate::Aggregate;
 pub use jsonl::Jsonl;
 pub use memory::{Incomplete, Limits, Memory};
 pub(crate) use model::Origin;
-pub use model::{
-    ConnInfo, Event, EventSummary, EventValue, Fields, Level, Sandbox, Transport, float, opt,
-};
+pub use model::{ConnInfo, Event, EventValue, Fields, Level, Sandbox, Transport, float, opt};
 pub use observer::{Dispatch, Emitter, Fanout, Metadata, Observation, Observer, Stamp};
 
 /// Default number of events retained by [`Memory`].

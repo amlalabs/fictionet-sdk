@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use fictionet::events::Event as Entry;
+use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Map, Value, json};
 
@@ -33,6 +33,12 @@ impl fictionet::events::Observer for LogObserver {
         _: &fictionet::events::ConnInfo,
     ) -> bool {
         matches!(metadata.source, "net" | "dns" | "tls" | "http" | "adaptive")
+    }
+    fn lost(&self, count: u64) {
+        if count != 0 {
+            self.log
+                .fail(format!("{count} events lost before log delivery"));
+        }
     }
     fn observe(
         &self,
@@ -64,12 +70,12 @@ pub fn to_json(v: &J) -> Value {
     }
 }
 
-fn get(e: &Entry, name: &str) -> Value {
+fn get(e: &Event, name: &str) -> Value {
     e.get(name).map(to_json).unwrap_or(Value::Null)
 }
 
 /// The log line for `e`, if it is one the log keeps.
-fn line(e: &Entry) -> Option<Value> {
+fn line(e: &Event) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
     match (e.source, e.kind) {
         ("net", "attached") => {
@@ -105,7 +111,7 @@ fn line(e: &Entry) -> Option<Value> {
 
 /// A TLS handshake that did not finish: `tls_reject` when the world refused
 /// the name, `tls_error` when the client gave up or broke the protocol.
-fn tls(e: &Entry) -> Option<Value> {
+fn tls(e: &Event) -> Option<Value> {
     let sni = get(e, "sni");
     let error = match e.str("outcome")? {
         "accepted" => return None,
@@ -126,7 +132,7 @@ fn tls(e: &Entry) -> Option<Value> {
 
 /// An HTTP request: what the agent asked for, then what the world made of
 /// it.
-fn http(e: &Entry) -> Value {
+fn http(e: &Event) -> Value {
     let path = match e.str("query") {
         Some(q) => format!("{}?{q}", e.str("path").unwrap_or("/")),
         None => e.str("path").unwrap_or("/").to_owned(),
@@ -163,7 +169,7 @@ mod tests {
         for (method, sent, complete) in
             [("HEAD", 0u64, true), ("GET", 20, false), ("GET", 100, true)]
         {
-            let event = Entry::new("http", "request")
+            let event = Event::new("http", "request")
                 .field("method", method)
                 .field("status", 200u64)
                 .field("bytes", 100u64)

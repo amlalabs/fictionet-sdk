@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn response_frames_keep_the_charge_after_the_body_is_dropped() {
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(0),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(0)),
             |fcx| async move {
                 let budget = Budget::new(3 * PIECE);
                 let info = Arc::new(ConnInfo::default());
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn hyper_deadlines_use_the_clock_at_creation() {
         fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(0),
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(0)),
             |fcx| async move {
                 let timer = CxTimer::new(fcx.clone());
                 let origin = timer.now();
@@ -947,7 +947,7 @@ mod tests {
     #[test]
     fn a_cancelled_sleep_never_fires() {
         fictionet::block_on(fictionet::run(
-            fictionet::Seed::random(),
+            fictionet::RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let slot: Arc<Mutex<Option<Cx>>> = Arc::default();
                 let s = slot.clone();

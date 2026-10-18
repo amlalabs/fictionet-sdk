@@ -83,7 +83,7 @@
 //!   and nested elements cannot supply the method. Only this POST is read-only;
 //!   malformed or ambiguous calls fall through to `write_refused`.
 
-use fictionet::events::Event as Entry;
+use fictionet::events::Event;
 use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
@@ -93,7 +93,7 @@ pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 use example_common::events::{js, sandbox};
 
 /// The log line for `e`, if it gets one.
-pub fn line(e: &Entry) -> Option<Value> {
+pub fn line(e: &Event) -> Option<Value> {
     match (e.source, e.kind) {
         ("tls", "handshake") => Some(tls(e)),
         ("http", "request") => Some(http(e)),
@@ -101,7 +101,7 @@ pub fn line(e: &Entry) -> Option<Value> {
     }
 }
 
-fn tls(e: &Entry) -> Value {
+fn tls(e: &Event) -> Value {
     let sni = e.str("sni");
     let mut line = json!({
         "type": "tls",
@@ -115,7 +115,7 @@ fn tls(e: &Entry) -> Value {
     line
 }
 
-fn http(e: &Entry) -> Value {
+fn http(e: &Event) -> Value {
     let (names, ua) = example_common::events::request_headers(e);
     let answer = e.str("answer").unwrap_or("other");
     let mut line = json!({
@@ -229,8 +229,8 @@ mod tests {
     use super::*;
     use fictionet::events::ConnInfo;
 
-    fn fallback() -> Entry {
-        Entry::new("http", "request")
+    fn fallback() -> Event {
+        Event::new("http", "request")
             .conn(&ConnInfo {
                 local: Some((crate::NAMES[0].1, 80).into()),
                 ..ConnInfo::default()
