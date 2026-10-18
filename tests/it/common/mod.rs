@@ -6,6 +6,7 @@ mod service_fixture;
 
 pub mod alloc;
 #[cfg(feature = "std")]
+#[path = "../../common/certs.rs"]
 pub mod certs;
 #[cfg(feature = "std")]
 pub mod done;
@@ -17,15 +18,15 @@ pub mod http_observer;
 pub mod hyper_io;
 #[cfg(all(feature = "std", feature = "tokio"))]
 pub mod io;
-#[cfg(feature = "std")]
-pub mod logged;
 #[cfg(all(feature = "std", feature = "tokio"))]
 pub mod pattern;
 #[cfg(feature = "std")]
+#[path = "../../common/poll.rs"]
 pub mod poll;
 #[cfg(all(feature = "std", feature = "tokio"))]
 pub mod rustls_client;
 #[cfg(feature = "std")]
+#[path = "../../common/temp.rs"]
 pub mod temp;
 #[cfg(feature = "std")]
 pub mod threads;
@@ -35,19 +36,10 @@ pub mod timeout;
 pub mod world;
 
 #[cfg(feature = "std")]
-use std::sync::mpsc;
+#[path = "../../common/within.rs"]
+mod within;
 #[cfg(feature = "std")]
-use std::time::Duration;
-
-/// Runs a function on a thread and fails if it exceeds the limit.
-#[cfg(feature = "std")]
-pub fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(limit).expect("timed out")
-}
+pub use within::within;
 
 /// Runs the test `name` alone in a child process of this binary, and fails
 /// if it fails there. Returns true here, where the test then returns, and

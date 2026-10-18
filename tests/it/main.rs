@@ -5,8 +5,6 @@
 mod common;
 
 mod asn1_codec;
-#[cfg(feature = "std")]
-mod attach_bin;
 mod bodies_codec;
 mod cme_unknown_enum;
 mod codec_tools;
@@ -55,8 +53,6 @@ mod media_codec;
 mod messaging_codec;
 #[cfg(all(feature = "std", feature = "tokio", feature = "observe"))]
 mod observe;
-#[cfg(all(feature = "std", feature = "tokio", feature = "observe"))]
-mod observe_bin;
 #[cfg(all(feature = "tokio", feature = "observe"))]
 mod observe_http2;
 #[cfg(all(feature = "std", feature = "observe"))]
@@ -66,8 +62,6 @@ mod observe_tls;
 #[cfg(feature = "std")]
 mod packets;
 mod protocol_primitives;
-#[cfg(all(feature = "std", feature = "tokio"))]
-mod proxy;
 #[cfg(feature = "std")]
 mod recipes;
 mod resp_codec;
@@ -89,8 +83,6 @@ mod sse_codec;
 mod streams_codec;
 #[cfg(feature = "std")]
 mod stress;
-#[cfg(feature = "std")]
-mod tap_bin;
 mod tcp_reassembly;
 #[cfg(all(feature = "std", feature = "tokio"))]
 mod tcpudp;

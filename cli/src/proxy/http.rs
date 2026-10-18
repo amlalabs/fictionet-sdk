@@ -1,18 +1,18 @@
 //! The HTTP door, `--type http_proxy`, served over a client's TCP
 //! connection. What it reads and answers is in
-//! [`fictionet::relay::proxy::http`].
+//! [`fictionet_cli::attach_proxy::http`].
 
 use std::io;
 use std::time::{Duration, Instant};
 
-use fictionet::relay::proxy::auth::Token;
-use fictionet::relay::proxy::http::{
-    Answer, MAX_HEAD, Reject, Request, Target, error_response, forward_head, parse_request,
-    rewrite_response,
-};
 use fictionet::stdlib::http1::header_line_ok;
 use fictionet::stdlib::tcp::TcpConnection;
 use fictionet::tokio::{Compat, ConnectionTokioExt};
+use fictionet_cli::attach_proxy::auth::Token;
+use fictionet_cli::attach_proxy::http::{
+    Answer, MAX_HEAD, Reject, Request, Target, error_response, forward_head, parse_request,
+    rewrite_response,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 

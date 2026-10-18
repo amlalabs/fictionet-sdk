@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fictionet::relay::observer::Client;
-use fictionet::relay::proxy::auth::Token;
+use fictionet_cli::attach_proxy::auth::Token;
 
 use crate::args::take_world;
 use crate::config::world_path;

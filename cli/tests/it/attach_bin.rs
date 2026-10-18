@@ -92,7 +92,6 @@ fn ready_exits_0_only_when_the_file_exists() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(feature = "tokio")]
 #[test]
 fn a_failed_ready_file_write_does_not_leave_a_successful_probe() {
     use std::os::unix::process::CommandExt;

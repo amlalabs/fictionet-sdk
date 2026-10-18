@@ -7,8 +7,8 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use crate::stdlib::dns::op::{Message, MessageType, Query, ResponseCode};
-use crate::stdlib::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::dns::op::{Message, MessageType, Query, ResponseCode};
+use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 
 /// Answers are kept at most this long, whatever their TTL.
 pub const MAX_TTL: u32 = 60;
@@ -120,8 +120,8 @@ pub fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::dns::rr::Record;
-    use crate::stdlib::dns::rr::rdata::{A, CNAME};
+    use fictionet::stdlib::dns::rr::Record;
+    use fictionet::stdlib::dns::rr::rdata::{A, CNAME};
 
     const SERVER: &str = "10.0.0.1:53";
 

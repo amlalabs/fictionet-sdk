@@ -27,7 +27,7 @@ stdlib module. Others cover generated code, packet handling and the relay:
 - [`stack`](fuzz_targets/stack.rs) feeds IPv4 and IPv6 packets to TCP, UDP and ICMP endpoints.
 
 The proxy targets call the doors' protocol side in
-`fictionet::relay::proxy`, the same code the `fictionet` binary runs over
+`fictionet_cli::attach_proxy`, the same code the `fictionet` binary runs over
 its connections. Code that the targets need from inside the SDK is in
 `fictionet::fuzzing`, which exists only when `cargo fuzz` builds with
 `--cfg fuzzing`.

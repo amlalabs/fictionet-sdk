@@ -596,6 +596,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-cli"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "divan",
+ "etherparse",
+ "fictionet",
+ "http",
+ "http-body-util",
+ "hyper",
+ "libc",
+ "rustls",
+ "tokio",
+ "tower-service",
+]
+
+[[package]]
 name = "fictionet-codegen"
 version = "0.1.0"
 dependencies = [

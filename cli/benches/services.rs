@@ -1,5 +1,6 @@
+#[path = "../../benches/common/mod.rs"]
 mod common;
-#[path = "common/http.rs"]
+#[path = "../../benches/common/http.rs"]
 mod http_world;
 
 use bytes::Bytes;

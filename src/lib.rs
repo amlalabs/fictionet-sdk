@@ -277,7 +277,7 @@
 //! | Feature | What it gates | Implies | Default |
 //! |---|---|---|---|
 //! | `std` | Real clocks, OS entropy, world sockets, event files, timer threads, relay, and the HTTP stack | — | Yes |
-//! | `tokio` | Tokio adapters, HTTP/2, hyper upgrades, and proxy attach types | `std` | Yes |
+//! | `tokio` | Tokio adapters, HTTP/2, and hyper upgrades | `std` | Yes |
 //! | `observe` | Observer sessions, TLS key capture, and built-in protocol presenters | `std` | Yes |
 //! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `tokio` | No |
 //!
@@ -299,9 +299,8 @@
 //! target). The page plays the sandboxes through [`Attacher::attach`],
 //! whose [`End`] carries raw IP packets.
 //!
-//! What needs an operating system is left out of that build: [`listen`]
-//! and [`WorldSocket`], the `fictionet` command, observer sessions, and
-//! proxy attach types. The clocks come from `performance.now()` and
+//! What needs an operating system is left out of that build: [`listen`],
+//! [`WorldSocket`] and observer sessions. The clocks come from `performance.now()` and
 //! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
 //! from `setTimeout`. In a page, hand [`run`] to the event loop with
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
@@ -330,9 +329,6 @@
 extern crate self as fictionet;
 
 mod attach;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-#[doc(hidden)]
-pub mod attach_proxy;
 #[path = "../docs/guide/attaching.rs"]
 pub mod attaching;
 mod block_on;

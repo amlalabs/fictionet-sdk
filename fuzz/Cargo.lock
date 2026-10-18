@@ -352,12 +352,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-cli"
+version = "0.1.0"
+dependencies = [
+ "fictionet",
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "fictionet-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "bytes",
  "fictionet",
+ "fictionet-cli",
  "http",
  "http-body-util",
  "libfuzzer-sys",

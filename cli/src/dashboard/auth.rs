@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use fictionet::relay::proxy::auth::Token;
+use fictionet_cli::attach_proxy::auth::Token;
 
 use super::http::Request;
 
