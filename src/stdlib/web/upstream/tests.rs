@@ -352,7 +352,7 @@ fn connection_close_responses_are_not_reused() {
 }
 
 #[test]
-fn a_pooled_connection_the_server_closed_is_replaced() {
+fn a_pooled_connection_the_server_closed_is_replaced_for_idempotent_requests() {
     for tls in [false, true] {
         run(async move |fcx| {
             let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -387,15 +387,25 @@ fn a_pooled_connection_the_server_closed_is_replaced() {
                 second.flush().unwrap();
                 read_head(&mut *second);
                 drop(second);
-                // That request comes again, body and all.
+                // That request is idempotent, so it comes again, body and all.
                 let mut third = open();
                 let head = read_head(&mut *third).to_ascii_lowercase();
-                assert!(head.starts_with("post "), "{head}");
+                assert!(head.starts_with("put "), "{head}");
                 let mut body = [0; 5];
                 third.read_exact(&mut body).unwrap();
                 assert_eq!(&body, b"again");
                 third.write_all(OK).unwrap();
                 third.flush().unwrap();
+                // A POST left unanswered may have been acted on, so it does
+                // not come again: the next connection carries the GET after it.
+                let head = read_head(&mut *third).to_ascii_lowercase();
+                assert!(head.starts_with("post "), "{head}");
+                drop(third);
+                let mut fourth = open();
+                let head = read_head(&mut *fourth).to_ascii_lowercase();
+                assert!(head.starts_with("get "), "{head}");
+                fourth.write_all(OK).unwrap();
+                fourth.flush().unwrap();
             });
             let mut forward = forward(Arc::new(client), tls, address);
             let response = forward.call(request()).await?;
@@ -403,13 +413,19 @@ fn a_pooled_connection_the_server_closed_is_replaced() {
             idle_closed.recv()?;
             for request in [request(), {
                 let mut again = request();
-                *again.method_mut() = Method::POST;
+                *again.method_mut() = Method::PUT;
                 *again.body_mut() = Body::from("again");
                 again
             }] {
                 let response = forward.call(request).await?;
                 assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
             }
+            let mut once = request();
+            *once.method_mut() = Method::POST;
+            *once.body_mut() = Body::from("once");
+            assert!(forward.call(once).await.is_err());
+            let response = forward.call(request()).await?;
+            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
             server.join().unwrap();
             Ok(())
         });

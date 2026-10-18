@@ -275,7 +275,7 @@ impl Client {
         signal: &Arc<Signal>,
     ) -> Result<(), Error> {
         let (conn, replay) = match self.pooled(&job.origin) {
-            Some(conn) => (conn, true),
+            Some(conn) => (conn, idempotent(&job.method)),
             None => (self.connect(&job, signal)?, false),
         };
         Exchange {
@@ -347,6 +347,17 @@ impl Drop for Permit {
     }
 }
 
+/// Whether sending a request twice has the effect of sending it once
+/// (RFC 9110 section 9.2.2). Only these go again when a pooled
+/// connection closes unanswered: the upstream may have acted on the first
+/// copy.
+fn idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
 /// Whether a request with this method carries content, so that an empty
 /// body still says `Content-Length: 0`.
 fn expects_content(method: &Method) -> bool {
@@ -373,8 +384,9 @@ struct Exchange<'a> {
     job: Job,
     signal: &'a Arc<Signal>,
     conn: Connection,
-    /// The connection came from the pool and nothing of the response has
-    /// come back, so `out` still holds every byte written to it.
+    /// The connection came from the pool, the method is idempotent, and
+    /// nothing of the response has come back, so `out` still holds every
+    /// byte written to it.
     replay: bool,
     /// Bytes for the socket. The first `written` of them went out.
     out: Vec<u8>,
@@ -565,9 +577,9 @@ impl Exchange<'_> {
         Ok(true)
     }
 
-    /// Sends the request again on a new connection. A server may close an
-    /// idle connection just as a request goes out on it, and then none of
-    /// the request was answered, so it goes again, as browsers do.
+    /// Sends an idempotent request again on a new connection. A server may
+    /// close an idle connection just as a request goes out on it, and then
+    /// none of the request was answered.
     fn retry(&mut self) -> Result<(), Error> {
         self.conn = self.client.connect(&self.job, self.signal)?;
         self.replay = false;
