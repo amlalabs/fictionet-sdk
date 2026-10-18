@@ -13,6 +13,7 @@ use fictionet::stdlib::{protocols::x509, services::tls};
 use fictionet::{Cx, Error};
 use p256::ecdsa::signature::Signer;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+use rsa::pkcs1::EncodeRsaPublicKey;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use x509::{ExtensionValue, oid};
 
@@ -23,6 +24,11 @@ pub enum Curve {
     P256,
     /// P-384 keys with ECDSA-SHA384 signatures.
     P384,
+    /// RSA 2048-bit keys with RSASSA-PKCS1-v1_5 SHA-256 signatures. Not a
+    /// curve; kept here so one enum chooses every key a CA can hold. A world
+    /// reaches for it only to match a certificate that is RSA, such as a
+    /// look-alike enterprise CA, since EC keys are smaller and faster.
+    Rsa2048,
 }
 
 /// A certificate authority and its signing key.
@@ -48,7 +54,34 @@ fn id(bytes: &[u8]) -> Oid {
 enum Key {
     P256(p256::ecdsa::SigningKey),
     P384(p384::ecdsa::SigningKey),
+    Rsa(Box<rsa::RsaPrivateKey>),
 }
+
+/// A deterministic random source for RSA key generation, so a seeded run
+/// makes the same key every time, as the EC paths do with `fill_random`.
+struct SeededRng<'a>(&'a Cx);
+
+impl rsa::rand_core::RngCore for SeededRng<'_> {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.0.fill_random(dest);
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rsa::rand_core::CryptoRng for SeededRng<'_> {}
 
 impl Key {
     fn new(fcx: &Cx, curve: Curve) -> Self {
@@ -68,50 +101,101 @@ impl Key {
                         return Self::P384(key);
                     }
                 }
+                Curve::Rsa2048 => {
+                    let key = rsa::RsaPrivateKey::new(&mut SeededRng(fcx), 2048)
+                        .expect("RSA 2048 key generation");
+                    return Self::Rsa(Box::new(key));
+                }
             }
         }
     }
 
     fn algorithm(&self) -> x509::AlgorithmIdentifier {
-        x509::AlgorithmIdentifier {
-            oid: id(match self {
-                Self::P256(_) => oid::ECDSA_WITH_SHA256,
-                Self::P384(_) => oid::ECDSA_WITH_SHA384,
-            }),
-            parameters: None,
-        }
-    }
-
-    fn public_key(&self) -> Vec<u8> {
         match self {
-            Self::P256(key) => key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec(),
-            Self::P384(key) => key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec(),
+            Self::P256(_) => x509::AlgorithmIdentifier {
+                oid: id(oid::ECDSA_WITH_SHA256),
+                parameters: None,
+            },
+            Self::P384(_) => x509::AlgorithmIdentifier {
+                oid: id(oid::ECDSA_WITH_SHA384),
+                parameters: None,
+            },
+            // RFC 4055 section 5: RSA signature parameters are NULL.
+            Self::Rsa(_) => x509::AlgorithmIdentifier {
+                oid: id(oid::SHA256_WITH_RSA),
+                parameters: Some(vec![0x05, 0x00]),
+            },
         }
     }
 
-    fn parameters(&self) -> Vec<u8> {
-        let mut writer = Writer::new();
-        writer.oid(&id(match self {
-            Self::P256(_) => oid::PRIME256V1,
-            Self::P384(_) => oid::SECP384R1,
-        }));
-        writer.finish().expect("a certificate curve identifier")
+    /// The subject public key info: the algorithm with its parameters, and
+    /// the key in that algorithm's own encoding.
+    fn public_key_info(&self) -> x509::PublicKeyInfo {
+        let (algorithm, key) = match self {
+            Self::P256(k) => (
+                x509::AlgorithmIdentifier {
+                    oid: id(oid::EC_PUBLIC_KEY),
+                    parameters: Some(curve_parameters(oid::PRIME256V1)),
+                },
+                k.verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            Self::P384(k) => (
+                x509::AlgorithmIdentifier {
+                    oid: id(oid::EC_PUBLIC_KEY),
+                    parameters: Some(curve_parameters(oid::SECP384R1)),
+                },
+                k.verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            // RFC 4055 section 1.2: the algorithm is rsaEncryption with NULL
+            // parameters, and the key is the DER of RSAPublicKey.
+            Self::Rsa(k) => (
+                x509::AlgorithmIdentifier {
+                    oid: id(oid::RSA_ENCRYPTION),
+                    parameters: Some(vec![0x05, 0x00]),
+                },
+                k.to_public_key()
+                    .to_pkcs1_der()
+                    .expect("an RSA public key encodes")
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        };
+        x509::PublicKeyInfo {
+            algorithm,
+            key: BitString::new(key, 0).expect("a public key is whole bytes"),
+        }
     }
 
-    fn der(&self) -> Result<p256::pkcs8::SecretDocument, Error> {
+    /// The subject public key identifier, computed the usual way: the SHA-1
+    /// of the subject public key bit string's bytes (RFC 5280 section
+    /// 4.2.1.2, method 1).
+    fn key_identifier(&self) -> Vec<u8> {
+        let spki = self.public_key_info();
+        ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, spki.key.bytes())
+            .as_ref()
+            .to_vec()
+    }
+
+    fn der(&self) -> Result<rsa::pkcs8::SecretDocument, Error> {
         Ok(match self {
             Self::P256(key) => key.to_pkcs8_der()?,
             Self::P384(key) => key.to_pkcs8_der()?,
+            Self::Rsa(key) => rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(key.as_ref())?,
         })
     }
+}
+
+/// The DER of a named-curve parameter: the curve's object identifier.
+fn curve_parameters(curve: &[u8]) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.oid(&id(curve));
+    writer.finish().expect("a certificate curve identifier")
 }
 
 fn subject(cn: &str) -> x509::Name {
@@ -137,13 +221,7 @@ fn tbs(fcx: &Cx, key: &Key, name: x509::Name, validity: x509::Validity) -> x509:
         issuer: name.clone(),
         validity,
         subject: name,
-        public_key: x509::PublicKeyInfo {
-            algorithm: x509::AlgorithmIdentifier {
-                oid: id(oid::EC_PUBLIC_KEY),
-                parameters: Some(key.parameters()),
-            },
-            key: BitString::new(key.public_key(), 0).unwrap(),
-        },
+        public_key: key.public_key_info(),
         issuer_unique_id: None,
         subject_unique_id: None,
         extensions: Vec::new(),
@@ -161,12 +239,63 @@ fn sign(key: &Key, tbs: x509::TbsCertificate) -> Result<x509::Certificate, Error
             let signature: p384::ecdsa::Signature = key.sign(&bytes);
             signature.to_der().as_bytes().to_vec()
         }
+        Key::Rsa(key) => {
+            // RSASSA-PKCS1-v1_5 over the SHA-256 of the signed bytes.
+            let hash = ring::digest::digest(&ring::digest::SHA256, &bytes);
+            key.sign(rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(), hash.as_ref())?
+        }
     };
     Ok(x509::Certificate::assemble(
         &bytes,
         key.algorithm(),
         BitString::new(signature, 0)?,
     )?)
+}
+
+/// A key that signs certificates, the primitive under [`Ca`]. A world
+/// reaches for it only when it must build a certificate chain field by
+/// field, such as a look-alike enterprise CA whose exact subject names,
+/// extensions and criticality a sandboxed client should recognize. For an
+/// ordinary simulated site, [`Ca`] is simpler.
+///
+/// Keys and signatures are deterministic in `fcx`'s seed, so a seeded run
+/// makes the same chain every time.
+pub struct SigningKey(Key);
+
+impl SigningKey {
+    /// Generates a key of `curve` from `fcx`'s randomness.
+    pub fn generate(fcx: &Cx, curve: Curve) -> SigningKey {
+        SigningKey(Key::new(fcx, curve))
+    }
+
+    /// The signature algorithm this key signs with, for a certificate's
+    /// `signature` field (which must match, or signing fails).
+    pub fn algorithm(&self) -> x509::AlgorithmIdentifier {
+        self.0.algorithm()
+    }
+
+    /// The subject public key info to put in a certificate this key is for.
+    pub fn public_key_info(&self) -> x509::PublicKeyInfo {
+        self.0.public_key_info()
+    }
+
+    /// The subject (and, from the issuer's key, authority) key identifier:
+    /// the SHA-1 of the subject public key, as issuers compute it.
+    pub fn key_identifier(&self) -> Vec<u8> {
+        self.0.key_identifier()
+    }
+
+    /// Signs `tbs` with this key and assembles the certificate. The caller
+    /// sets every field, including `tbs.signature`, which must be
+    /// [`algorithm`](Self::algorithm). No extension is added or changed.
+    pub fn sign(&self, tbs: x509::TbsCertificate) -> Result<x509::Certificate, Error> {
+        sign(&self.0, tbs)
+    }
+
+    /// The private key as PKCS#8 DER, for a server configuration.
+    pub fn private_key_der(&self) -> Result<PrivatePkcs8KeyDer<'static>, Error> {
+        Ok(PrivatePkcs8KeyDer::from(self.0.der()?.as_bytes().to_vec()))
+    }
 }
 
 impl Ca {
@@ -218,8 +347,8 @@ impl Ca {
             .tbs
             .get::<x509::BasicConstraints>()?
             .is_some_and(|c| c.ca)
-            || certificate.tbs.public_key.key != BitString::new(key.public_key(), 0)?
-            || certificate.tbs.public_key.algorithm.parameters != Some(key.parameters())
+            || certificate.tbs.public_key.key != key.public_key_info().key
+            || certificate.tbs.public_key.algorithm != key.public_key_info().algorithm
         {
             return Err(Error::msg("CA certificate and key do not match"));
         }
