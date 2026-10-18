@@ -45,6 +45,7 @@ note "container's versions come from the real nginx and OpenSSH. The light versi
 note "about 40 s, and --max-rate only slows the scan down, so it is easy to follow in the dashboard."
 expect_output 'nmap -sS -sV --version-light -n -p 1-1024 --max-rate 300 10.0.0.0/24' \
     '^Nmap scan report for 10\.0\.0\.50' '^22/tcp +open +ssh +OpenSSH' '^80/tcp +open +http +nginx' \
+    '^80/tcp +open +http +Apache httpd' '^631/tcp +open +ipp +CUPS' \
     '^Nmap scan report' '^[0-9]+/tcp' '^Not shown' '5 hosts up'
 
 if [[ -z $seconds && -t 0 ]]; then
