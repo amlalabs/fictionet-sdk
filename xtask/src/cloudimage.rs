@@ -31,6 +31,13 @@ const VMLINUZ_SHA256: &str = "41ba36d860aa0b0cd995f4ca8856d80249b244577e704929b5
 const INITRD: &str = "ubuntu-24.04-server-cloudimg-amd64-initrd-generic";
 const INITRD_SHA256: &str = "bf276ffc12872256080890698b42db0dc9c5a469c896d8b59af6bc4e723cd186";
 
+/// noVNC, the desktop viewer the demo embeds. The npm registry's tarball is
+/// immutable and content-addressed, so this pin is stable (GitHub's
+/// auto-generated source archives are not). Unpacked into `novnc/`, its files
+/// become a table the demo's `build.rs` embeds.
+const NOVNC_URL: &str = "https://registry.npmjs.org/@novnc/novnc/-/novnc-1.7.0.tgz";
+const NOVNC_SHA256: &str = "32689f18d6abe96bc6530828a6bd0b9ae33bda07c083a6575ed255b5a8f2e903";
+
 pub fn run(args: &[String]) -> Result {
     match args {
         [] => {
@@ -76,8 +83,28 @@ fn assets() -> Result {
         "sha256sum",
         INITRD_SHA256,
     )?;
+    novnc(&dir)?;
     println!("downloaded into {}", dir.display());
     Ok(())
+}
+
+/// Fetches noVNC's npm tarball and unpacks it into `novnc/` (its one
+/// `package/` level stripped), so `build.rs` can embed the files. Idempotent:
+/// the unpack is skipped once `core/rfb.js` is in place.
+fn novnc(dir: &Path) -> Result {
+    let tree = dir.join("novnc");
+    if tree.join("core/rfb.js").is_file() {
+        return Ok(());
+    }
+    let tarball = dir.join("novnc-1.7.0.tgz");
+    download(NOVNC_URL, &tarball, "sha256sum", NOVNC_SHA256)?;
+    std::fs::create_dir_all(&tree)?;
+    execute(
+        cmd("tar", &["xzf"])
+            .arg(&tarball)
+            .args(["--strip-components=1", "-C"])
+            .arg(&tree),
+    )
 }
 
 fn build() -> Result {

@@ -5,6 +5,8 @@
 //! sandbox.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use example_common::web_world::{SHARED, app};
@@ -39,9 +41,17 @@ pub struct World {
     /// The CA root in PEM, for the guest's trust store.
     pub ca_pem: String,
     fcx: Cx,
+    /// Set once the world answers an `http.request` for the site, which is
+    /// Firefox's GET (nothing else fetches it over HTTP).
+    firefox_loaded: Arc<AtomicBool>,
 }
 
 impl World {
+    /// Whether Firefox has loaded the site, seen in the world's events.
+    pub fn firefox_loaded(&self) -> bool {
+        self.firefox_loaded.load(Ordering::SeqCst)
+    }
+
     /// Cancels the world and its bridge.
     pub fn shutdown(self) {
         self.fcx.cancel();
@@ -62,8 +72,10 @@ pub async fn start(config: Config) -> Result<World> {
     let now_unix = config.now_unix;
     let site = config.site.clone();
     let now_sys = SystemTime::UNIX_EPOCH + Duration::from_secs(now_unix as u64);
+    let firefox_loaded = Arc::new(AtomicBool::new(false));
 
     let (ready, world_ready) = oneshot::channel();
+    let loaded = firefox_loaded.clone();
     tokio::spawn(fictionet::run(Seed::random(), move |fcx| async move {
         let z = zscaler(&fcx, DEFAULT_CLOUD, now_unix)?;
         let www = format!("www.{site}");
@@ -73,6 +85,16 @@ pub async fn start(config: Config) -> Result<World> {
         if ready.send((z.root_pem().to_string(), fcx.clone())).is_err() {
             return Ok(());
         }
+        // Firefox's GET of the site, seen in the world's http.request events.
+        let site_name = site.clone();
+        fcx.events().subscribe(move |e| {
+            if e.source == "http"
+                && e.kind == "request"
+                && e.str("host") == Some(site_name.as_str())
+            {
+                loaded.store(true, Ordering::SeqCst);
+            }
+        });
         // The apt mirror: the world forwards these names to the real servers
         // over the host's network, so the guest installs the desktop at
         // boot. apt's signatures verify everything.
@@ -96,7 +118,11 @@ pub async fn start(config: Config) -> Result<World> {
         .map_err(|_| fictionet::Error::msg("the world stopped before it was ready"))?;
 
     tokio::spawn(bridge(to_world_rx, rx, sandbox, fcx.clone()));
-    Ok(World { ca_pem, fcx })
+    Ok(World {
+        ca_pem,
+        fcx,
+        firefox_loaded,
+    })
 }
 
 /// Moves frames between the guest (through the backend) and the world,

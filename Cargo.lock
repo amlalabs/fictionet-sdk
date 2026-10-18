@@ -1084,13 +1084,16 @@ dependencies = [
 name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "example-common",
  "fatfs",
  "fictionet",
  "fictionet-microvm",
+ "flate2",
  "libc",
  "russh",
  "rustls",
+ "serde_json",
  "tokio",
  "vhost",
  "vhost-user-backend",
