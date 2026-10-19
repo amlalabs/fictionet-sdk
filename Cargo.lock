@@ -2392,6 +2392,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scan-world"
+version = "0.0.0"
+dependencies = [
+ "fictionet",
+ "http",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "scrypt"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

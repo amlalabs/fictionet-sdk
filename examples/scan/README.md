@@ -1,19 +1,20 @@
-# nmap finds a five-host range. One host is a real container.
+# nmap finds a five-host range. One host is a real server.
 
 This example is a small office subnet for a port scanner. The agent runs
 `nmap` in its sandbox and scans `10.0.0.0/24`. It finds five hosts. Four
 are simulated machines that the world builds from Fictionet's stdlib. The
-fifth is a real container running nginx and OpenSSH, attached to the world
-as a sandbox of its own and routed into the same subnet. From the
+fifth is a real server, attached to the world as a sandbox of its own and
+routed into the same subnet. Compose runs it as a container with nginx
+and OpenSSH. An in-process demo can attach a VM at the same address. From the
 scanner's side there is no difference between them: every host answers
 pings, every closed port answers a SYN with a RST, and every open port
 answers nmap's service probes.
 
 ## What is in the world
 
-`main.rs` builds the network with `net::Net`. The simulated machines are
+`world/src/lib.rs` builds the network with `net::Net`. The simulated machines are
 `Host`s on the office subnet, the scanner is a sandbox in the `Net`'s own
-subnet, and the container is wired in with `Net::route` as a trusted host
+subnet, and the server is wired in with `Net::route` as a trusted host
 at its fixed address, so the scanner can reach it:
 
 | Address | Host | Open TCP ports |
@@ -22,7 +23,7 @@ at its fixed address, so the scanner can reach it:
 | 10.0.0.11 | `mail`, simulated | 25 (Postfix), 110 (Dovecot POP3), 143 (Dovecot IMAP) |
 | 10.0.0.12 | `files`, simulated | 21 (vsftpd), 22 (OpenSSH banner) |
 | 10.0.0.13 | `printer`, simulated | 80 (HTTP, lighttpd), 631 (HTTP, CUPS) |
-| 10.0.0.50 | `container`, a real container | 22 (OpenSSH), 80 (nginx) |
+| 10.0.0.50 | `server`, a real server | 22 (OpenSSH), 80 (nginx) |
 | 10.0.9.2 | `scanner`, the agent | |
 
 Each simulated machine is a `Host` with a small `Service` on each open
@@ -39,20 +40,72 @@ The scanner sits in a subnet of its own, `10.0.9.0/24`. Scanning
 sixth host.
 
 The world puts its parts in groups with `Cx::group` (see "Groups" in the
-`fictionet::Cx` docs), so the dashboard draws "scanner", "real container" and
+`fictionet::Cx` docs), so the dashboard draws "scanner", "real server" and
 "simulated hosts", with one group per machine inside the last. Each
-sandbox goes through a 1 or 2 ms `delay` started in its own group: the
-delay is the task that reads the sandbox, so the sandbox is drawn in that
-group too.
+sandbox goes through a 1 or 2 ms `delay` started in its own group. The
+scanner also has a passive probe tap in that group. The tasks that read the
+sandboxes belong to these groups, so the sandboxes are drawn there too.
+
+## Crate layout
+
+`world/` is the `scan-world` crate. `world/src/lib.rs` exposes `office()`,
+`start()` and `world()`. `world/src/main.rs` runs the world on a socket:
+
+```text
+cargo run -p scan-world -- /run/fictionet/world.sock
+```
+
+Integration tests live in `world/tests/`. Run all tests with `cargo test -p scan-world`.
+The golden report is in `world/tests/golden.txt`.
+
+## Attaching a real server
+
+The attachment is named `server`, whether it comes from the Compose container
+or a VM. A server VM uses a card made with
+`Link::new(Family::Serve(SERVER_LEASE), Family::Off, mtu)`. Bridge its Ethernet
+frames through that card to the `SERVER` attachment. `SERVER_LEASE` gives it
+10.0.0.50/24, gateway 10.0.0.1 and DNS 10.0.9.1.
+
+The scanner attaches as `scanner`. A scanner VM's card uses `Family::FromWorld`.
+The world's DHCP leases it an address in `SCANNER_SUBNET` (10.0.9.0/24).
+An integrator can add hosts with `.host(...)` or `.resolve(...)`, and trusted
+routes with `.route(...)`, to `office()` before calling `start()`. This lets a
+server reach an apt mirror and lets an admin jump host reach the server.
+Other attachment names pass through unchanged.
+
+## Port facts
+
+The scanner's tap watches IPv4 packets and passes them through unchanged.
+A probe is an office-bound TCP SYN with ACK, RST and FIN clear, or a UDP
+packet. A matching TCP SYN-ACK or UDP reply means `open`. A matching TCP
+RST-ACK or ICMP port-unreachable means `closed`. Other ICMP destination
+unreachable codes mean `unreachable`. Each reply must match the latest
+probe's source port and, for TCP, its sequence number. Traffic outside the
+office, stale replies and noninitial fragments do not update the map.
+
+A row starts `unanswered`. Repeated probes keep the last answered state.
+`scan.port` facts report new rows and state changes, with the previous state,
+probe count, first and last probe times, and revision. A new row's previous
+state is null. Times are whole milliseconds since the run began.
+
+`start()` returns a shared `Ports` handle. `snapshot()` returns the office
+labels and sorted rows. `changes_since(revision)` returns the latest version
+of each row changed since that revision. Every tracked probe and state change
+advances the map revision. Both projections include the last change time and the
+untracked count. Their `MAX_JSON_BYTES` constants bound compact JSON output.
+
+The map holds at most 16,384 rows and never evicts them. Further probes for
+new keys increment `untracked`; existing rows still update. The first such
+probe emits one `scan.full` fact with `max_rows`.
 
 ## Running it
 
 `compose.yaml` runs the world, the two sandboxes and the dashboard:
 
-- `world` runs `main.rs`, with no network at all. Its only door is the
+- `world` runs `scan-world`, with no network at all. Its only door is the
   world socket on a shared volume.
-- `container-attach` runs `fictionet attach --type tun` for the real
-  container, at 10.0.0.50. The `container` service (nginx and OpenSSH on
+- `container-attach` runs `fictionet attach --name server --type tun` for the
+  real container, at 10.0.0.50. The `container` service (nginx and OpenSSH on
   Alpine) joins its network namespace, so its only interface is `tun0`.
 - `scanner-attach` does the same for the agent, at 10.0.9.2, and the
   `scanner` service, with nmap, joins it. nmap needs `NET_RAW` to send SYN
@@ -148,8 +201,8 @@ Open http://127.0.0.1:7880/ while the scan runs to watch it. The scanner's
 link lights up, and packets fan out from the router to the five hosts.
 Double-click a host's group to open it, click the scanner's link to see
 the SYNs go out and the RSTs come back, and drag any box to move it.
-Closing "simulated hosts" draws its four links as one line, and that
-line's packet list merges all four.
+Closing "simulated hosts" hides the router and its internal links.
+The links to the two sandboxes stay visible.
 
 Stop it all and remove its volume with `docker compose down -v`.
 
@@ -168,12 +221,12 @@ Set `KEEP=1` to retain the stack; the command prints its private token file's pa
 
 The Rust command drives Chromium and records its screen. It
 puts a terminal panel beside the dashboard with nmap's real output, runs
-host discovery and then the port scan, and uses the dashboard while the
-scan runs: it opens a group, opens the scanner's link and a RST in it,
-closes a group and opens its merged packet list, and drags a box and a
-group. The output folder gets `dashboard.webm` as recorded,
-`dashboard.mp4` (H.264), a smaller `dashboard.gif`, and `nmap.txt` with
-the two scans' output. The recording is about 67 seconds long.
+host discovery and then the port scan with `--max-rate 200`. During the scan,
+it opens a group, opens the scanner's link and a RST in it, closes and reopens
+a group, and drags a box and the server's group. The output folder gets
+`dashboard.webm` as recorded, `dashboard.mp4` (H.264), a smaller
+`dashboard.gif`, and `nmap.txt` with the two scans' output. The recording is
+about 75 seconds long.
 
 The recorder saves the scanner output before checking its exit status.
 It stops if either scan fails or does not find all five expected hosts.

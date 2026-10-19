@@ -195,7 +195,7 @@ pub fn record(browser: &mut Browser, compose: &Compose) -> Result {
     browser.wait(0.8)?;
     let (x, y) = center(
         browser,
-        "[...document.querySelectorAll('g.frame .fhead')].find(e => e.textContent.includes('real container'))",
+        "[...document.querySelectorAll('g.frame .fhead')].find(e => e.textContent.includes('real server'))",
     )?;
     pointer.drag(browser, x - 40.0, y, -10.0, -50.0)?;
     pointer.move_to(browser, x + 120.0, y + 260.0, 500)?;
