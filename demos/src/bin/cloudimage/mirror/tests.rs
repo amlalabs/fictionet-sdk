@@ -96,16 +96,27 @@ fn request(path: &str) -> Request<Body> {
 }
 
 // Exercise the real routing boundary that supplies the cache's origin key.
-async fn send(fcx: &Cx, cache: &Cache<web::Forward>, request: Request<Body>) -> Answer {
+async fn send<S>(fcx: &Cx, cache: &Cache<S>, request: Request<Body>) -> Answer
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = Error>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+{
     send_on(fcx, cache, request, false).await
 }
 
-async fn send_on(
-    fcx: &Cx,
-    cache: &Cache<web::Forward>,
-    request: Request<Body>,
-    tls: bool,
-) -> Answer {
+async fn send_on<S>(fcx: &Cx, cache: &Cache<S>, request: Request<Body>, tls: bool) -> Answer
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = Error>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+{
     let hosts = VirtualHosts::new();
     let mut host = VHost::new(httpd::tower(cache.clone()));
     host.https = tls;
@@ -160,6 +171,7 @@ async fn miss_then_hit_survives_a_new_run() {
         );
         assert_eq!(upstream.count(), 1);
         assert_eq!(cache.state.stats.saved.load(Ordering::Relaxed), 7);
+        drop(cache);
         let cache = upstream.cache(&fcx, dir.path());
         assert_eq!(
             bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
@@ -171,54 +183,54 @@ async fn miss_then_hit_survives_a_new_run() {
 }
 
 #[tokio::test]
-async fn index_revalidates_once_per_run_and_replaces_on_change() {
+async fn mutable_indexes_keep_origin_validators_and_changes() {
     run(|fcx| async move {
         let dir = crate::RunDir::new().unwrap();
         let upstream = Upstream::new().await;
-        upstream.push(reply("200 OK", "ETag: \"first\"\r\n", b"first"));
         let cache = upstream.cache(&fcx, dir.path());
-        assert_eq!(
-            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
-            "first"
-        );
-        upstream.push(reply("304 Not Modified", "", b""));
-        let cache = upstream.cache(&fcx, dir.path());
-        assert_eq!(
-            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
-            "first"
-        );
-        assert_eq!(
-            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
-            "first"
-        );
-        assert_eq!(upstream.count(), 2);
-        assert!(upstream.requests.lock().unwrap()[1].contains("if-none-match: \"first\""));
-        upstream.push(reply(
-            "200 OK",
-            "Last-Modified: Wed, 01 Jul 2026 12:00:00 GMT\r\n",
-            b"second",
-        ));
-        let cache = upstream.cache(&fcx, dir.path());
-        assert_eq!(
-            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
-            "second"
-        );
-        upstream.push(reply("304 Not Modified", "", b""));
-        let cache = upstream.cache(&fcx, dir.path());
-        assert_eq!(
-            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
-            "second"
-        );
-        assert!(
-            upstream.requests.lock().unwrap()[3]
-                .contains("if-modified-since: Wed, 01 Jul 2026 12:00:00 GMT")
-        );
+        for path in [INDEX, "/ubuntu/dists/noble/main/binary-amd64/Packages.xz"] {
+            for body in [b"first".as_slice(), b"second"] {
+                upstream.push(reply("200 OK", "ETag: \"current\"\r\n", body));
+                assert_eq!(
+                    bytes(send(&fcx, &cache, request(path)).await.unwrap()).await,
+                    body
+                );
+            }
+            for (name, value) in [
+                (header::IF_NONE_MATCH, "\"current\""),
+                (header::IF_MODIFIED_SINCE, "Wed, 01 Jul 2026 12:00:00 GMT"),
+            ] {
+                upstream.push(reply(
+                    "304 Not Modified",
+                    "ETag: \"updated\"\r\nCache-Control: no-cache\r\n",
+                    b"",
+                ));
+                let mut req = request(path);
+                req.headers_mut()
+                    .insert(name.clone(), value.parse().unwrap());
+                let response = send(&fcx, &cache, req).await.unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+                assert_eq!(response.headers()[header::ETAG], "\"updated\"");
+                assert!(bytes(response).await.is_empty());
+                assert!(
+                    upstream
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .contains(&format!("{name}: {value}"))
+                );
+            }
+        }
+        assert_eq!(upstream.count(), 8);
+        assert!(!dir.path().join("mirror.test").exists());
     })
     .await;
 }
 
 #[tokio::test]
-async fn offline_index_fallback() {
+async fn offline_indexes_report_failure_instead_of_stale_success() {
     run(|fcx| async move {
         let dir = crate::RunDir::new().unwrap();
         let mut upstream = Upstream::new().await;
@@ -227,15 +239,13 @@ async fn offline_index_fallback() {
             bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
             "package"
         );
-        let cache = upstream.cache(&fcx, dir.path());
+        upstream.push(reply("503 Service Unavailable", "", b"offline"));
+        let response = send(&fcx, &cache, request(INDEX)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(bytes(response).await, "offline");
         upstream.task.abort();
-        // Joining the stopped listener makes connection refusal deterministic.
         let _ = (&mut upstream.task).await;
-        assert_eq!(
-            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
-            "package"
-        );
-        assert_eq!(cache.state.stats.offline.load(Ordering::Relaxed), 1);
+        assert!(send(&fcx, &cache, request(INDEX)).await.is_err());
     })
     .await;
 }
@@ -249,7 +259,15 @@ async fn partial_body_is_never_published() {
             b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort".to_vec(),
         );
         let cache = upstream.cache(&fcx, dir.path());
-        assert!(send(&fcx, &cache, request(PACKAGE)).await.is_err());
+        assert!(
+            send(&fcx, &cache, request(PACKAGE))
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .is_err()
+        );
         let path = dir.path().join("mirror.test/http-80").join(&PACKAGE[1..]);
         assert!(!path.exists());
         assert_eq!(
@@ -271,7 +289,7 @@ async fn concurrent_misses_share_one_fetch() {
         let dir = crate::RunDir::new().unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
-        for path in [PACKAGE, INDEX] {
+        for path in [PACKAGE] {
             let mut pending = Vec::new();
             for _ in 0..8 {
                 pending.push(Box::pin(send(&fcx, &cache, request(path))));
@@ -288,7 +306,7 @@ async fn concurrent_misses_share_one_fetch() {
                 assert_eq!(bytes(future.await.unwrap()).await, "package");
             }
         }
-        assert_eq!(upstream.count(), 2);
+        assert_eq!(upstream.count(), 1);
     })
     .await;
 }
@@ -399,39 +417,42 @@ async fn tls_origin_and_hosts_have_separate_entries() {
 
 #[test]
 fn repository_policy_and_path_limits() {
-    assert_eq!(policy(PACKAGE), Some(Policy::Immutable));
-    assert_eq!(
-        policy("/apt/pool/firefox_1%3a2.deb"),
-        Some(Policy::Immutable)
-    );
-    assert_eq!(
-        policy("/ubuntu/dists/noble/main/by-hash/SHA256/abc"),
-        Some(Policy::Immutable)
-    );
-    for name in [
-        "InRelease",
-        "Release",
-        "Release.gpg",
-        "main/binary-amd64/Packages.xz",
-        "main/i18n/Translation-en.gz",
-        "Contents-amd64.gz",
-    ] {
-        assert_eq!(
-            policy(&format!("/ubuntu/dists/noble/{name}")),
-            Some(Policy::Index)
-        );
-    }
+    assert!(immutable(PACKAGE));
+    assert!(immutable("/apt/pool/firefox_1%3a2.deb"));
+    assert!(immutable(&format!(
+        "/ubuntu/dists/noble/main/by-hash/SHA256/{}",
+        "a".repeat(64)
+    )));
+    assert!(immutable(&format!(
+        "/ubuntu/dists/noble/main/by-hash/SHA512/{}",
+        "A".repeat(128)
+    )));
     for path in [
+        INDEX,
+        "/ubuntu/dists/noble/Packages.xz",
         "/key.asc",
         "/pool/a.txt",
         "/pool/../escape.deb",
         "/pool//a.deb",
         "/pool/./a.deb",
         "/pool/a\\b.deb",
+        "/pool/%2e%2e/a.deb",
+        "/pool/a%2fb.deb",
+        "/pool/a%5Cb.deb",
+        "/pool/a%00.deb",
+        "/pool/a%253a.deb",
+        "/pool/é.deb",
+        "/pool/..\0.deb",
+        "/pool/a%0d%0a.deb",
+        "/ubuntu/dists/noble/by-hash/SHA256/not-a-hash",
+        "/by-hash/anything",
+        "/ubuntu/dists/pool/index.deb",
     ] {
-        assert_eq!(policy(path), None);
+        assert!(!immutable(path), "{path}");
     }
-    assert_eq!(policy(&format!("/pool/{}.deb", "a".repeat(250))), None);
+    assert!(!immutable(&format!("/pool/{}.deb", "a".repeat(250))));
+    assert!(!immutable(&format!("/pool/{}a.deb", "a/".repeat(33))));
+    assert!(!immutable(&format!("/pool/{}a.deb", "a".repeat(2048))));
 }
 
 #[tokio::test]
@@ -439,9 +460,10 @@ async fn by_hash_is_immutable_and_damaged_entries_are_refetched() {
     run(|fcx| async move {
         let dir = crate::RunDir::new().unwrap();
         let upstream = Upstream::new().await;
-        let path = "/ubuntu/dists/noble/main/by-hash/SHA256/abcdef";
+        let path = &format!("/ubuntu/dists/noble/main/by-hash/SHA256/{}", "a".repeat(64));
         let cache = upstream.cache(&fcx, dir.path());
         bytes(send(&fcx, &cache, request(path)).await.unwrap()).await;
+        drop(cache);
         let cache = upstream.cache(&fcx, dir.path());
         bytes(send(&fcx, &cache, request(path)).await.unwrap()).await;
         assert_eq!(upstream.count(), 1);
@@ -529,7 +551,7 @@ async fn changed_if_range_is_forwarded() {
 }
 
 #[tokio::test]
-async fn interrupted_index_replacement_preserves_the_complete_entry() {
+async fn interrupted_mutable_index_is_not_hidden_by_cached_bytes() {
     run(|fcx| async move {
         let dir = crate::RunDir::new().unwrap();
         let upstream = Upstream::new().await;
@@ -538,25 +560,194 @@ async fn interrupted_index_replacement_preserves_the_complete_entry() {
             bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
             "package"
         );
-        let cache = upstream.cache(&fcx, dir.path());
         upstream.push(
             b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort".to_vec(),
         );
+        assert!(
+            send(&fcx, &cache, request(INDEX))
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .is_err()
+        );
+        assert_eq!(upstream.count(), 2);
+        assert!(!dir.path().join("mirror.test").exists());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn immutable_conditions_obey_precedence_and_weak_comparison() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let upstream = Upstream::new().await;
+        upstream.push(reply(
+            "200 OK",
+            "ETag: \"current\"\r\nLast-Modified: Wed, 01 Jul 2026 12:00:00 GMT\r\n",
+            b"package",
+        ));
+        let cache = upstream.cache(&fcx, dir.path());
         assert_eq!(
-            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
             "package"
         );
-        let path = dir.path().join("mirror.test/http-80").join(&INDEX[1..]);
-        let entry = Entry::open(&path).await.unwrap();
+        for (tag, status) in [
+            ("W/\"current\"", StatusCode::NOT_MODIFIED),
+            ("\"old\"", StatusCode::OK),
+            ("*", StatusCode::NOT_MODIFIED),
+        ] {
+            let mut req = request(PACKAGE);
+            req.headers_mut()
+                .insert(header::IF_NONE_MATCH, tag.parse().unwrap());
+            req.headers_mut().insert(
+                header::IF_MODIFIED_SINCE,
+                "Wed, 01 Jul 2026 12:00:00 GMT".parse().unwrap(),
+            );
+            let response = send(&fcx, &cache, req).await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                bytes(response).await.len(),
+                if status == StatusCode::OK { 7 } else { 0 }
+            );
+        }
+        assert_eq!(upstream.count(), 1);
+    })
+    .await;
+}
+
+#[derive(Clone)]
+struct Scripted {
+    replies: Arc<Mutex<VecDeque<Response<Body>>>>,
+    requests: Arc<Mutex<Vec<Request<Body>>>>,
+}
+impl Scripted {
+    fn new(replies: Vec<Response<Body>>) -> Self {
+        Self {
+            replies: Arc::new(Mutex::new(replies.into())),
+            requests: Arc::default(),
+        }
+    }
+}
+impl Service<Request<Body>> for Scripted {
+    type Response = Response<Body>;
+    type Error = Error;
+    type Future = std::future::Ready<Answer>;
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        self.requests.lock().unwrap().push(request);
+        std::future::ready(Ok(self
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected upstream request")))
+    }
+}
+
+struct ControlledBody(mpsc::Receiver<Result<Frame<Bytes>, Error>>);
+impl http_body::Body for ControlledBody {
+    type Data = Bytes;
+    type Error = Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+fn complete(body: &'static str) -> Response<Body> {
+    Response::builder()
+        .header(header::CONTENT_LENGTH, body.len())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cold_response_streams_before_completion_and_waiters_retry_failure() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let source = Scripted::new(vec![
+            Response::builder()
+                .header(header::CONTENT_LENGTH, 7)
+                .body(Body::new(ControlledBody(rx)))
+                .unwrap(),
+            complete("package"),
+        ]);
+        let cache = Cache::new(source.clone(), dir.path().to_owned());
+        let path = dir.path().join("mirror.test/http-80").join(&PACKAGE[1..]);
+        let mut first = send(&fcx, &cache, request(PACKAGE))
+            .await
+            .unwrap()
+            .into_body();
+        tx.send(Ok(Frame::data(Bytes::from_static(b"pac"))))
+            .await
+            .unwrap();
         assert_eq!(
-            bytes(
-                entry
-                    .response(&HeaderMap::new(), None)
-                    .await
-                    .unwrap()
-                    .unwrap()
-            )
-            .await,
+            first.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "pac"
+        );
+        assert!(!path.exists());
+        let mut waiter = Box::pin(send(&fcx, &cache, request(PACKAGE)));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tx.send(Err(Error::msg("upstream interrupted")))
+            .await
+            .unwrap();
+        assert!(first.collect().await.is_err());
+        assert_eq!(bytes(waiter.await.unwrap()).await, "package");
+        assert_eq!(source.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(source.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancelled_download_releases_its_key_and_never_publishes() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let source = Scripted::new(vec![
+            Response::builder()
+                .header(header::CONTENT_LENGTH, 7)
+                .body(Body::new(ControlledBody(rx)))
+                .unwrap(),
+            complete("package"),
+        ]);
+        let cache = Cache::new(source, dir.path().to_owned());
+        let mut body = send(&fcx, &cache, request(PACKAGE))
+            .await
+            .unwrap()
+            .into_body();
+        tx.send(Ok(Frame::data(Bytes::from_static(b"pac"))))
+            .await
+            .unwrap();
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "pac"
+        );
+        drop(body);
+        tx.closed().await;
+        let path = dir.path().join("mirror.test/http-80").join(&PACKAGE[1..]);
+        assert!(!path.exists());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
             "package"
         );
         assert_eq!(
@@ -568,48 +759,605 @@ async fn interrupted_index_replacement_preserves_the_complete_entry() {
 }
 
 #[tokio::test]
-async fn guest_conditions_do_not_prevent_index_population_or_offline_use() {
+async fn all_traffic_and_key_waiters_share_bounded_admission() {
     run(|fcx| async move {
         let dir = crate::RunDir::new().unwrap();
-        let mut upstream = Upstream::new().await;
-        upstream.push(reply(
-            "200 OK",
-            "ETag: \"current\"\r\nLast-Modified: Wed, 01 Jul 2026 12:00:00 GMT\r\n",
-            b"index",
-        ));
+        let source = Scripted::new(vec![complete("package")]);
+        let mut cache = Cache::new(source.clone(), dir.path().to_owned());
+        // Unpolled futures consume admission too, so they cannot accumulate
+        // unbounded key locks or upstream requests.
+        let pending: Vec<_> = (0..SLOTS).map(|_| cache.call(request(PACKAGE))).collect();
+        for path in [PACKAGE, INDEX, "/arbitrary?query=1"] {
+            let response = cache.call(request(path)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(bytes(response).await, "apt mirror busy\n");
+        }
+        assert!(source.requests.lock().unwrap().is_empty());
+        drop(pending);
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(source.requests.lock().unwrap().len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn hostile_fill_headers_cannot_select_or_frame_the_stored_object() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
-        let mut req = request(INDEX);
-        req.headers_mut().insert(
-            header::IF_MODIFIED_SINCE,
-            "Wed, 01 Jul 2026 12:00:00 GMT".parse().unwrap(),
-        );
+        let mut req = request(PACKAGE);
+        for (name, value) in [
+            ("accept-language", "evil"),
+            ("x-rewrite-url", "/private"),
+            ("x-forwarded-host", "evil.test"),
+            ("connection", "accept-encoding"),
+            ("accept-encoding", "gzip"),
+            ("content-length", "999"),
+            ("transfer-encoding", "chunked"),
+            ("expect", "100-continue"),
+        ] {
+            req.headers_mut().insert(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
         assert_eq!(
-            send(&fcx, &cache, req).await.unwrap().status(),
-            StatusCode::NOT_MODIFIED
+            bytes(send(&fcx, &cache, req).await.unwrap()).await,
+            "package"
         );
+        let wire = upstream.requests.lock().unwrap()[0].clone();
+        assert!(wire.contains("accept-encoding: identity\r\n"));
+        for text in [
+            "evil",
+            "private",
+            "gzip",
+            "999",
+            "chunked",
+            "100-continue",
+            "connection:",
+        ] {
+            assert!(!wire.contains(text), "{wire}");
+        }
         assert_eq!(
-            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
-            "index"
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
         );
         assert_eq!(upstream.count(), 1);
-        assert!(!upstream.requests.lock().unwrap()[0].contains("if-modified-since"));
-        for (tag, status) in [
-            ("W/\"current\"", StatusCode::NOT_MODIFIED),
-            ("\"old\"", StatusCode::OK),
-            ("*", StatusCode::NOT_MODIFIED),
-        ] {
-            let mut req = request(INDEX);
-            req.headers_mut()
-                .insert(header::IF_NONE_MATCH, tag.parse().unwrap());
-            assert_eq!(send(&fcx, &cache, req).await.unwrap().status(), status);
-        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn head_queries_bodies_and_cache_directives_do_not_populate_or_poison() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
-        upstream.task.abort();
-        let _ = (&mut upstream.task).await;
-        let mut req = request(INDEX);
-        req.headers_mut()
-            .insert(header::IF_NONE_MATCH, "\"older\"".parse().unwrap());
-        assert_eq!(bytes(send(&fcx, &cache, req).await.unwrap()).await, "index");
+        let mut req = request(PACKAGE);
+        *req.method_mut() = Method::HEAD;
+        let response = send(&fcx, &cache, req).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
+        assert!(bytes(response).await.is_empty());
+        for path in [format!("{PACKAGE}?variant=1"), PACKAGE.to_owned()] {
+            let mut req = request(&path);
+            if path == PACKAGE {
+                *req.method_mut() = Method::POST;
+            }
+            assert_eq!(
+                bytes(send(&fcx, &cache, req).await.unwrap()).await,
+                "package"
+            );
+        }
+        assert!(!dir.path().join("mirror.test").exists());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        for (name, value) in [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ] {
+            upstream.push(reply("200 OK", "", b"fresh"));
+            let mut req = request(PACKAGE);
+            req.headers_mut().insert(name, value.parse().unwrap());
+            assert_eq!(bytes(send(&fcx, &cache, req).await.unwrap()).await, "fresh");
+        }
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(upstream.count(), 7);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn no_cache_private_variants_and_chunked_responses_are_never_retained() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let upstream = Upstream::new().await;
+        let cache = upstream.cache(&fcx, dir.path());
+        for extra in ["Cache-Control: no-cache\r\n", "Cache-Control: private=\"ETag\"\r\n", "Vary: *\r\n",
+            "Vary: Accept-Encoding, Cookie\r\n", "Content-Encoding: identity\r\nContent-Encoding: gzip\r\n"] {
+            upstream.push(reply("200 OK", extra, b"variant"));
+            assert_eq!(bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await, "variant");
+        }
+        upstream.push(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n".to_vec());
+        assert_eq!(bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await, "abc");
+        assert!(!dir.path().join("mirror.test").exists());
+        assert_eq!(upstream.count(), 6);
+    }).await;
+}
+
+#[tokio::test]
+async fn cache_age_survives_restart_and_origin_expiry_is_respected() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let upstream = Upstream::new().await;
+        let date = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(300));
+        upstream.push(reply(
+            "200 OK",
+            &format!("Date: {date}\r\nAge: 500\r\nCache-Control: max-age=1000\r\n"),
+            b"package",
+        ));
+        let cache = upstream.cache(&fcx, dir.path());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        drop(cache);
+        let path = dir.path().join("mirror.test/http-80").join(&PACKAGE[1..]);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(100))
+            .unwrap();
+        let cache = upstream.cache(&fcx, dir.path());
+        let response = send(&fcx, &cache, request(PACKAGE)).await.unwrap();
+        assert_eq!(response.headers()[header::DATE], date);
+        assert!(header_age(response.headers()) >= 600);
+        assert_eq!(bytes(response).await, "package");
+        assert_eq!(upstream.count(), 1);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(1001))
+            .unwrap();
+        upstream.push(reply("200 OK", "Cache-Control: max-age=0\r\n", b"changed"));
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "changed"
+        );
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(upstream.count(), 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn symlinks_and_hardlinks_disable_cache_without_touching_the_target() {
+    run(|fcx| async move {
+        for location in ["root", "host", "file", "hardlink"] {
+            let dir = crate::RunDir::new().unwrap();
+            let outside = crate::RunDir::new().unwrap();
+            let sentinel = outside.path().join("sentinel");
+            std::fs::write(&sentinel, "do not touch").unwrap();
+            let root = dir.path().join("cache");
+            if location == "root" {
+                std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+            } else {
+                std::fs::create_dir(&root).unwrap();
+                if location == "host" {
+                    std::os::unix::fs::symlink(outside.path(), root.join("mirror.test")).unwrap();
+                } else {
+                    let path = root.join("mirror.test/http-80").join(&PACKAGE[1..]);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    if location == "file" {
+                        std::os::unix::fs::symlink(&sentinel, path).unwrap();
+                    } else {
+                        std::fs::hard_link(&sentinel, path).unwrap();
+                    }
+                }
+            }
+            let source = Scripted::new(vec![complete("package"), complete("fresh")]);
+            let cache = Cache::new(source, root);
+            assert_eq!(
+                bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+                "package"
+            );
+            assert_eq!(
+                bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+                "fresh"
+            );
+            assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "do not touch");
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disk_budget_includes_old_files_and_limits_new_admission() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let file = std::fs::File::create(dir.path().join("old")).unwrap();
+        file.set_len(MAX_TOTAL - 8192).unwrap();
+        let source = Scripted::new(vec![complete("package"), complete("fresh")]);
+        let cache = Cache::new(source, dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "fresh"
+        );
+        assert!(!dir.path().join("mirror.test").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reservations_bound_concurrent_files_and_release_failed_downloads() {
+    let dir = crate::RunDir::new().unwrap();
+    let disk = Arc::new(Disk::open(dir.path().to_owned()).unwrap());
+    let mut pending = Vec::new();
+    for i in 0..7 {
+        pending.push(
+            disk.reserve(Path::new(&format!("pool/{i}.deb")), MAX_FILE)
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert!(
+        disk.reserve(Path::new("pool/full.deb"), MAX_FILE)
+            .unwrap()
+            .is_none()
+    );
+    drop(pending);
+    assert!(
+        disk.reserve(Path::new("pool/available.deb"), MAX_FILE)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn second_owner_bypasses_and_restart_removes_crash_debris() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let source = Scripted::new(vec![complete("package"), complete("other process")]);
+        let owner = Cache::new(source.clone(), dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &owner, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        let second = Cache::new(source.clone(), dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &second, request(PACKAGE)).await.unwrap()).await,
+            "other process"
+        );
+        drop(second);
+        drop(owner);
+        let debris = dir.path().join(".download-interrupted");
+        std::fs::write(&debris, b"partial").unwrap();
+        let restarted = Cache::new(source.clone(), dir.path().to_owned());
+        assert!(!debris.exists());
+        assert_eq!(
+            bytes(send(&fcx, &restarted, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(source.requests.lock().unwrap().len(), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn temp_collision_never_removes_another_download() {
+    let dir = crate::RunDir::new().unwrap();
+    let path = dir.path().join(".download-collision");
+    std::fs::write(&path, "existing download").unwrap();
+    assert!(Temporary::create(path.clone()).is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "existing download");
+}
+
+#[tokio::test]
+async fn slow_body_deadline_releases_resources_even_without_a_reader() {
+    let slots = Arc::new(Semaphore::new(1));
+    let (tx, rx) = mpsc::channel(1);
+    let body = stream(
+        Body::new(ControlledBody(rx)),
+        slots.clone().try_acquire_owned().unwrap(),
+        tokio::time::Instant::now(),
+    );
+    tx.closed().await;
+    assert!(slots.try_acquire().is_ok());
+    assert!(body.collect().await.is_err());
+}
+
+#[tokio::test]
+async fn filesystem_entry_limit_bounds_tiny_files_and_directories() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        for i in 1..MAX_NODES {
+            std::fs::File::create(dir.path().join(format!("old-{i}"))).unwrap();
+        }
+        let source = Scripted::new(vec![complete("package"), complete("fresh")]);
+        let cache = Cache::new(source, dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "fresh"
+        );
+        assert!(!dir.path().join("mirror.test").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count() as u64,
+            MAX_NODES
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn oversized_files_and_header_blocks_stream_without_storage() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let mut large = complete("large");
+        large
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, (MAX_FILE + 1).into());
+        let mut headers = complete("headers");
+        headers
+            .headers_mut()
+            .insert("x-large", "a".repeat(MAX_HEAD).parse().unwrap());
+        let source = Scripted::new(vec![large, headers, complete("package")]);
+        let cache = Cache::new(source, dir.path().to_owned());
+        let response = send(&fcx, &cache, request(PACKAGE)).await.unwrap();
+        assert_eq!(length(response.headers()), Some(MAX_FILE + 1));
+        // The synthetic source ends early; admission must not start a disk write.
+        assert_eq!(bytes(response).await, "large");
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "headers"
+        );
+        assert!(!dir.path().join("mirror.test").exists());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn failed_replacement_preserves_complete_bytes_and_does_not_serve_them_stale() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let mut old = complete("old package");
+        old.headers_mut()
+            .insert(header::CACHE_CONTROL, "max-age=0".parse().unwrap());
+        let mut short = complete("short");
+        short
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, 100.into());
+        let source = Scripted::new(vec![old, short, complete("new package")]);
+        let cache = Cache::new(source, dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "old package"
+        );
+        let path = dir.path().join("mirror.test/http-80").join(&PACKAGE[1..]);
+        let original = std::fs::read(&path).unwrap();
+        assert!(
+            send(&fcx, &cache, request(PACKAGE))
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "new package"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disk_write_failure_does_not_replace_a_valid_upstream_response() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let path = dir.path().join("mirror.test/http-80").join(&PACKAGE[1..]);
+        std::fs::create_dir_all(&path).unwrap();
+        let source = Scripted::new(vec![complete("package"), complete("fresh")]);
+        let cache = Cache::new(source, dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "fresh"
+        );
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn admission_covers_response_bodies_after_headers_are_returned() {
+    let dir = crate::RunDir::new().unwrap();
+    let mut senders = Vec::new();
+    let mut responses = Vec::new();
+    for _ in 0..SLOTS {
+        let (tx, rx) = mpsc::channel(1);
+        senders.push(tx);
+        responses.push(Response::new(Body::new(ControlledBody(rx))));
+    }
+    responses.push(complete("available"));
+    let source = Scripted::new(responses);
+    let mut cache = Cache::new(source.clone(), dir.path().to_owned());
+    let mut held = Vec::new();
+    for _ in 0..SLOTS {
+        held.push(cache.call(request("/bypass")).await.unwrap());
+    }
+    assert_eq!(
+        cache.call(request("/bypass")).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(source.requests.lock().unwrap().len(), SLOTS);
+    drop(held.pop());
+    senders.last().unwrap().closed().await;
+    assert_eq!(
+        bytes(cache.call(request("/bypass")).await.unwrap()).await,
+        "available"
+    );
+    assert_eq!(source.requests.lock().unwrap().len(), SLOTS + 1);
+}
+
+#[tokio::test]
+async fn ambiguous_upstream_framing_is_rejected_without_a_cache_entry() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let upstream = Upstream::new().await;
+        let cache = upstream.cache(&fcx, dir.path());
+        for headers in [
+            "Content-Length: 3\r\nContent-Length: 4\r\n",
+            "Transfer-Encoding: chunked\r\nContent-Length: 3\r\n",
+        ] {
+            upstream.push(
+                format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{headers}\r\nabc").into_bytes(),
+            );
+            assert!(send(&fcx, &cache, request(PACKAGE)).await.is_err());
+        }
+        assert!(!dir.path().join("mirror.test").exists());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn request_bodies_are_forwarded_without_populating_the_cache() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let source = Scripted::new(vec![complete("body response"), complete("package")]);
+        let cache = Cache::new(source.clone(), dir.path().to_owned());
+        let mut req = request(PACKAGE);
+        *req.body_mut() = Body::from("guest body");
+        assert_eq!(
+            bytes(send(&fcx, &cache, req).await.unwrap()).await,
+            "body response"
+        );
+        assert!(!dir.path().join("mirror.test").exists());
+        assert_eq!(
+            source.requests.lock().unwrap()[0].body().bytes().unwrap(),
+            "guest body"
+        );
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(source.requests.lock().unwrap().len(), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cached_readers_keep_directory_ownership_until_their_files_close() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let payload = Bytes::from(vec![b'p'; 8 * CHUNK]);
+        let source = Scripted::new(vec![
+            Response::builder()
+                .header(header::CONTENT_LENGTH, payload.len())
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+            complete("other owner"),
+        ]);
+        let cache = Cache::new(source.clone(), dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            payload
+        );
+        let held = send(&fcx, &cache, request(PACKAGE)).await.unwrap();
+        drop(cache);
+        let contender = Cache::new(source.clone(), dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &contender, request(PACKAGE)).await.unwrap()).await,
+            "other owner"
+        );
+        assert_eq!(bytes(held).await, payload);
+        drop(contender);
+        let cache = Cache::new(source.clone(), dir.path().to_owned());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            payload
+        );
+        assert_eq!(source.requests.lock().unwrap().len(), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn stalled_storage_is_abandoned_without_stalling_the_guest() {
+    run(|_| async move {
+        let payload = Bytes::from(vec![b'p'; CHUNK * 4]);
+        let expected = payload.clone();
+        let (write, mut disk) = mpsc::channel(1);
+        let writer = CacheWriter {
+            write,
+            task: tokio::spawn(std::future::pending()),
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            tee(
+                Body::from(payload.clone()),
+                &tx,
+                Some(writer),
+                payload.len() as u64,
+                Arc::default(),
+            )
+            .await
+        });
+        assert_eq!(
+            ControlledBody(rx).collect().await.unwrap().to_bytes(),
+            expected
+        );
+        task.await.unwrap().unwrap();
+        assert_eq!(disk.try_recv().unwrap().unwrap(), expected.slice(..CHUNK));
+        assert!(matches!(
+            disk.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
     })
     .await;
 }
