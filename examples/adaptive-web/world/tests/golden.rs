@@ -2,8 +2,8 @@
 //! fixed script of agent actions, compared line for line with
 //! `tests/golden/halvard-cve.jsonl`.
 //!
-//! The world runs here with its real Python backend (`backend/backend.py`,
-//! which needs only `python3`), the stub generator, a fresh store and a CA
+//! The script runs with both the Python backend and the in-process Rust
+//! stub, each with a fresh store and a CA
 //! made for the test. The script searches, follows results, asks for the
 //! same URLs twice, and looks up names the world turns down. Besides the
 //! log, it checks what Kai's evals need: the same URL returns the same
@@ -25,7 +25,11 @@ use std::time::Duration;
 use adaptive_web_world::backend::Backend;
 use adaptive_web_world::{Addresses, Ca, fixed_addresses, serve, world_start};
 use bytes::Bytes;
-use example_common::backend_process::{Args, start_backend};
+mod common;
+use adaptive_web_world::{
+    Pages,
+    stub::{Seed, Stub},
+};
 use example_common::log::Log;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
@@ -151,37 +155,52 @@ fn seeds_dated(base: &std::path::Path, date: &str) -> PathBuf {
 
 #[test]
 fn the_log_is_the_recorded_one() {
+    golden(false);
+}
+
+#[test]
+fn the_rust_stub_log_is_the_recorded_one() {
+    golden(true);
+}
+
+fn golden(use_stub: bool) {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let base = std::env::temp_dir().join(format!("adaptive-web-golden-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "adaptive-web-golden-{use_stub}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    // SAFETY: set before any thread of this test process reads the environment.
-    unsafe {
-        std::env::set_var("ADAPTIVE_WEB_SEED", "halvard-cve");
-        std::env::set_var("ADAPTIVE_WEB_SEEDS", seeds_dated(&base, "2026-09-30"));
-        std::env::set_var("ADAPTIVE_WEB_GENERATOR", "stub");
-        std::env::set_var("ADAPTIVE_WEB_STORE", base.join("store"));
-    }
-    let args = Args {
-        socket: String::new(),
-        ca_dir: base.join("ca"),
-        backend: here.join("backend"),
-        backend_port: port,
-        state_dir: base.clone(),
-        ready: base.join("ready"),
+    let mut seed = Seed::builtin("halvard-cve").unwrap();
+    seed.date = "2026-09-30".into();
+    let child = if use_stub {
+        None
+    } else {
+        Some(common::Python::start(
+            "halvard-cve",
+            &seeds_dated(&base, &seed.date),
+            &base.join("store"),
+        ))
     };
-    let (backend, mut child) = start_backend(&args).unwrap();
-    let store = PathBuf::from(backend["store"].as_str().unwrap());
-    let fixed = fixed_addresses(&backend).unwrap();
-    let fixed_pages: Vec<String> = serde_json::from_value(backend["fixed"].clone()).unwrap();
-
-    let addresses = Arc::new(Addresses::new(fixed, Some(&store.join("addresses.jsonl"))).unwrap());
-    let start = world_start(backend["date"].as_str().unwrap()).unwrap();
+    let port = child.as_ref().map_or(0, |p| p.port);
+    let fixed = child.as_ref().map_or_else(
+        || seed.fixed_addresses(),
+        |p| fixed_addresses(&p.hello).unwrap(),
+    );
+    let fixed_pages: Vec<String> = child.as_ref().map_or_else(
+        || seed.fixed.iter().map(|f| f.url.clone()).collect(),
+        |p| serde_json::from_value(p.hello["fixed"].clone()).unwrap(),
+    );
+    let store = child
+        .as_ref()
+        .map(|p| PathBuf::from(p.hello["store"].as_str().unwrap()).join("addresses.jsonl"));
+    let addresses = Arc::new(Addresses::new(fixed, store.as_deref()).unwrap());
+    let start = world_start(&seed.date).unwrap();
+    let ca_dir = base.join("ca");
+    let searches = Arc::new(child.as_ref().map_or_else(
+        || adaptive_web_world::search::Searches::from_seed(&seed),
+        |p| adaptive_web_world::search::Searches::from_hello(&p.hello),
+    ));
     let log_path = base.join("log.jsonl");
     let log = Arc::new(Log::new(
         Box::new(std::fs::File::create(&log_path).unwrap()),
@@ -189,7 +208,6 @@ fn the_log_is_the_recorded_one() {
         |s| s,
     ));
 
-    let searches = Arc::new(adaptive_web_world::search::Searches::from_hello(&backend));
     let initial = searches.snapshot();
     assert_eq!(initial.revision, 0);
     assert_eq!(initial.seed.name, "halvard-cve");
@@ -207,6 +225,7 @@ fn the_log_is_the_recorded_one() {
         adaptive_web_world::search::GeneratorKind::Stub
     );
     assert_eq!(initial.generator.model, "stub");
+    assert_eq!(initial.generator.prefetch, 0);
     let projection = searches.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -225,17 +244,14 @@ fn the_log_is_the_recorded_one() {
                     searches.clone(),
                 ]))),
             move |fcx| async move {
-                let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start).unwrap());
+                let ca = Arc::new(Ca::new(&fcx, &ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();
-                serve(
-                    &fcx,
-                    addresses,
-                    ca,
-                    Backend::new(&fcx, port)?,
-                    log,
-                    start,
-                    attachments,
-                )?;
+                let pages = if use_stub {
+                    Pages::Stub(Arc::new(Stub::new(seed)))
+                } else {
+                    Pages::Backend(Backend::new(&fcx, port)?)
+                };
+                serve(&fcx, addresses, ca, pages, log, start, attachments)?;
 
                 let end = attacher.attach("agent").unwrap();
                 let m = machine(&fcx, end, ME);
@@ -409,8 +425,7 @@ fn the_log_is_the_recorded_one() {
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
     let result = rx.recv_timeout(Duration::from_secs(90));
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let result = result.expect("the test timed out");
     assert_eq!(result.as_deref(), Some("done"));
 

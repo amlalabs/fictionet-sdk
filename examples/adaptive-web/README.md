@@ -275,6 +275,12 @@ Three containers, as in FakeWiki:
   interface is `tun0`. It has no extra capabilities, and it sees neither
   the world socket nor the world's files and processes.
 
+**In one executable.** The world library also has an in-process Rust stub
+(`world/src/stub/`) that serves the same bytes and metadata as the Python
+stub. A demo can run the whole world inside one Rust program, with the
+seeds embedded and no Python or page files on the host. It keeps pages in
+memory for the run. Evals and model generation use the Python backend.
+
 What one new page is made from:
 
 1. the seed: its date, scenario, facts, cast, and what it says about the
@@ -611,12 +617,17 @@ or `missing` cache states fail the inventory check.
 ## Tests
 
 * `cargo test --locked --manifest-path examples/adaptive-web/world/Cargo.toml` runs the world end to end
-  with the stub generator and compares its log with the recorded one
-  (`tests/golden/`). It also checks that every result resolves to a page
-  with its title, that URLs return the same bytes, and that responses and
-  certificates are dated from the seed's day.
-  It also checks that missing or malformed backend metadata returns 502
-  and records `meta_error`.
+  with the Python stub and with the Rust stub, and compares both logs with
+  the same recorded one (`tests/golden/`). It also checks that every result
+  resolves to a page with its title, that URLs return the same bytes, and
+  that responses and certificates are dated from the seed's day.
+  `tests/parity.rs` sends the same requests to a fresh Python stub and the
+  Rust stub for each seed and compares status, headers, bodies and
+  metadata, including the generation budget. `tests/lab.rs` runs the Rust
+  stub world twice in a lab run, with no real I/O, and checks that the
+  events and the search projection are the same. Other tests check that
+  missing or malformed backend metadata returns 502 and records
+  `meta_error`, and each reason a search can fail.
 * `uv run --project python/inspect_fictionet --locked pytest python/inspect_fictionet/tests/adaptive_web`
   checks citation identity, complete delivery, checked preflights and probe
   diagnostics, request multiplicity and cache sequences. It needs no Docker.
@@ -638,10 +649,15 @@ examples/adaptive-web/
   seeds/                    # the seeds, and fixed/ pages they serve
   world/                    # the world: its own Cargo package
     src/lib.rs              # names, addresses, dates, certificates, Sites
-    src/backend.rs          # the handler: asks backend.py, moves its meta into the event
+    src/backend.rs          # shared handler for Python and Rust page sources
+    src/stub/               # embedded seeds, in-memory store, generator, layouts, text helpers
+    src/route.rs            # search routing and query keys
+    src/search.rs           # bounded search and page projection
     src/events.rs           # the log, written from the network's events
     src/main.rs             # start-up, state.json, the ready file
-    tests/golden.rs         # the log for a scripted agent, against tests/golden/
+    tests/golden.rs         # both sources against tests/golden/ and projection assertions
+    tests/parity.rs         # byte and metadata parity with the Python stub
+    tests/lab.rs            # Rust-only world and budget failures without real I/O
     backend/backend.py      # the HTTP server on 127.0.0.1
     backend/adaptive/       # seed, llm, prompts, generate, stub, world, store, render, tells, ca
     backend/tests/          # the backend's tests

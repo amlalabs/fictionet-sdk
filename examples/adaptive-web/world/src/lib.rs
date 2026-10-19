@@ -22,8 +22,9 @@
 //! - **Dates** ([`world_start`]): the world's clock starts on the seed's
 //!   date, so every response's `Date` header is in the scenario, and each
 //!   certificate was issued shortly before it.
-//! - **Pages** ([`backend`]): every site forwards to the Python backend
-//!   on 127.0.0.1, which makes, stores and serves the pages. Fixed responses
+//! - **Pages** ([`backend`]): sites use either the Python backend on
+//!   127.0.0.1 or the in-process [`stub`]. Python serves evals and model
+//!   generation; the Rust stub serves demos without host I/O. Fixed responses
 //!   retain their bytes and metadata on first use. Replay needs no fixed
 //!   source files and returns 404 for pages absent from the store. Stores
 //!   check the seed and generator identity; incompatible or legacy stores
@@ -36,6 +37,7 @@ pub mod backend;
 pub mod events;
 pub mod route;
 pub mod search;
+pub mod stub;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -50,7 +52,9 @@ use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use serde_json::{Value, json};
 
+#[cfg(test)]
 use crate::backend::Backend;
+pub use crate::backend::Pages;
 use example_common::log::Log;
 
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
@@ -305,10 +309,18 @@ pub struct Ca {
 impl Ca {
     /// Makes a seeded CA and writes its public certificate for the agent.
     pub fn new(fcx: &Cx, dir: &Path, start: SystemTime) -> fictionet::Result<Ca> {
-        let issuer = fictionet::stdlib::services::ca::Ca::new(fcx, "Internet Security Root CA")?;
+        let ca = Self::in_memory(fcx, start)?;
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("ca.pem"), issuer.cert_pem())?;
-        Ok(Ca { issuer, start })
+        std::fs::write(dir.join("ca.pem"), ca.issuer.cert_pem())?;
+        Ok(ca)
+    }
+
+    /// Makes a seeded CA without writing files, for an in-process world.
+    pub fn in_memory(fcx: &Cx, start: SystemTime) -> fictionet::Result<Ca> {
+        Ok(Ca {
+            issuer: fictionet::stdlib::services::ca::Ca::new(fcx, "Internet Security Root CA")?,
+            start,
+        })
     }
 
     /// A certificate for `host`: the host as CN and SAN, for server auth,
@@ -351,18 +363,19 @@ impl Ca {
 
 /// Builds the network: a site for every name [`admit`] lets in, at its
 /// address from `addresses`, with a certificate from `ca` made at its first
-/// handshake, every request answered by `backend` and logged, and every
+/// handshake, every request answered by `pages` and logged, and every
 /// response dated from `start`, the world's date at the start of the run.
 /// Returns at once; the network runs in `fcx`'s region.
 pub fn serve(
     fcx: &Cx,
     addresses: Arc<Addresses>,
     ca: Arc<Ca>,
-    backend: Backend,
+    pages: impl Into<Pages>,
     log: Arc<Log>,
     start: SystemTime,
     attachments: fictionet::Attachments,
 ) -> fictionet::Result {
+    let handler = pages.into().handler(fcx);
     log.attach(fcx);
     let names = addresses.fixed.clone();
     let world = fcx.clone();
@@ -405,7 +418,7 @@ pub fn serve(
         let (ca, name) = (ca.clone(), host.to_owned());
         let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
         Some(
-            web::Site::new(backend.clone())
+            web::Site::new(handler.clone())
                 .date(start)
                 .at(addr)
                 .tls_with(move |fcx| {

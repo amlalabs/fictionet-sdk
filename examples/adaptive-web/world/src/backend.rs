@@ -1,7 +1,6 @@
-//! The handler of every site: it forwards the request to the Python backend
-//! (backend.py, on 127.0.0.1 in the world container), takes the
-//! `X-Adaptive-Meta` header off the answer, and puts what it says in the
-//! response's extensions as the fields of the request's event, for the log.
+//! The handler of every site, with either Python or in-process stub pages.
+//! Routing, query facts and response event fields share one path. Python's
+//! `X-Adaptive-Meta` header is removed and mapped to event fields for the log.
 //! The agent never sees that header. Missing or malformed metadata answers
 //! 502 with `kind = "meta_error"` and a reason instead of forwarding the page.
 //! Metadata must be an object with a string `kind`, and a string `cache`
@@ -59,9 +58,42 @@ pub const EVENT_FIELDS: [&str; 2] = ["listed", "reason"];
 
 #[derive(Clone)]
 pub struct Backend {
-    fcx: fictionet::Cx,
     forward: web::Forward,
+}
+
+/// The source of page bodies and metadata.
+#[derive(Clone)]
+pub enum Pages {
+    Backend(Backend),
+    Stub(Arc<crate::stub::Stub>),
+}
+impl From<Backend> for Pages {
+    fn from(backend: Backend) -> Self {
+        Self::Backend(backend)
+    }
+}
+impl From<Arc<crate::stub::Stub>> for Pages {
+    fn from(stub: Arc<crate::stub::Stub>) -> Self {
+        Self::Stub(stub)
+    }
+}
+
+/// Shared routing, query facts and response event fields for either source.
+#[derive(Clone)]
+pub struct Handler {
+    fcx: fictionet::Cx,
+    pages: Pages,
     queries: Arc<AtomicU64>,
+}
+impl Pages {
+    /// Creates a handler whose clones share one query counter.
+    pub fn handler(self, fcx: &fictionet::Cx) -> Handler {
+        Handler {
+            fcx: fcx.clone(),
+            pages: self,
+            queries: Arc::new(AtomicU64::new(1)),
+        }
+    }
 }
 
 struct QueryGuard {
@@ -124,12 +156,12 @@ pub fn to_field(v: &Value) -> J {
 impl Backend {
     pub fn new(fcx: &fictionet::Cx, port: u16) -> Result<Backend, fictionet::Error> {
         Ok(Backend {
-            fcx: fcx.clone(),
-            queries: Arc::new(AtomicU64::new(1)),
             forward: web::forward(fcx, format!("http://127.0.0.1:{port}").parse().unwrap())?,
         })
     }
+}
 
+impl Handler {
     async fn serve(
         self,
         request: Request<Body>,
@@ -155,19 +187,15 @@ impl Backend {
                     .headers
                     .get(CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| {
-                        v.split(';').next().is_some_and(|v| {
-                            v.trim()
-                                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-                        })
-                    }))
-            .then_some(body.as_ref());
+                    .is_some_and(|v| v.contains("form-urlencoded")))
+            .then_some(&body[..body.len().min(1 << 20)]);
             let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+            let action = route(&target.host, path, form);
             if let Route::Search {
                 engine,
                 query: search,
                 start,
-            } = route(&target.host, path, form)
+            } = &action
             {
                 let id = self.queries.fetch_add(1, Ordering::Relaxed);
                 query = Some(QueryGuard {
@@ -181,10 +209,31 @@ impl Backend {
                         .field("query_id", id)
                         .field("engine", engine.as_str())
                         .field("search", search.as_str())
-                        .field("start", start)
-                        .field("key", query_key(&search, start))
+                        .field("start", *start)
+                        .field("key", query_key(search, *start))
                 });
             }
+            if let Pages::Stub(stub) = &self.pages {
+                let answer = stub.handle_route(&self.fcx, &target.host, path, action);
+                let mut response = Response::builder()
+                    .status(answer.status)
+                    .header(CONTENT_TYPE, answer.content_type)
+                    .header(CONTENT_LENGTH, answer.body.len())
+                    .header("cache-control", "private, max-age=0");
+                for (name, value) in answer.headers {
+                    response = response.header(name, value);
+                }
+                let body = if parts.method == http::Method::HEAD {
+                    Bytes::new()
+                } else {
+                    Bytes::from(answer.body)
+                };
+                let (parts, body) = response.body(body)?.into_parts();
+                return Ok((parts, body, Ok(answer.meta)));
+            }
+            let Pages::Backend(backend) = &self.pages else {
+                unreachable!()
+            };
             let mut ask = Request::builder()
                 .method(parts.method.clone())
                 .uri(parts.uri)
@@ -195,18 +244,19 @@ impl Backend {
                 }
             }
             let answer = tower_service::Service::call(
-                &mut self.forward.clone(),
+                &mut backend.forward.clone(),
                 ask.body(Body::from(body))?,
             )
             .await?;
-            let (parts, body) = answer.into_parts();
+            let (mut parts, body) = answer.into_parts();
             let body = body.collect().await?.to_bytes();
-            Ok::<_, fictionet::Error>((parts, body))
+            let meta = metadata(parts.headers.remove(META));
+            Ok::<_, fictionet::Error>((parts, body, meta))
         };
         let started = self.fcx.now().since_start();
         let reply = reply.await;
         let serve_ms = (self.fcx.now().since_start() - started).as_millis() as u64;
-        let (mut parts, body) = match reply {
+        let (mut parts, body, meta) = match reply {
             Ok(r) => r,
             Err(e) => {
                 if let Some(q) = &mut query {
@@ -226,7 +276,7 @@ impl Backend {
                 return Ok(response);
             }
         };
-        let meta = match metadata(parts.headers.remove(META)) {
+        let meta = match meta {
             Ok(meta) => meta,
             Err(error) => {
                 if let Some(q) = &mut query {
@@ -328,7 +378,7 @@ fn percent_decode(text: &str) -> Vec<u8> {
     out
 }
 
-impl tower_service::Service<Request<Body>> for Backend {
+impl tower_service::Service<Request<Body>> for Handler {
     type Response = Response<Full<Bytes>>;
     type Error = fictionet::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -408,7 +458,9 @@ mod tests {
                 let hosts = VirtualHosts::new();
                 hosts.insert(
                     "html.duckduckgo.com",
-                    VHost::new(httpd::tower(Backend::new(&fcx, address.port())?)),
+                    VHost::new(httpd::tower(
+                        Pages::Backend(Backend::new(&fcx, address.port())?).handler(&fcx),
+                    )),
                 );
                 let conn = ConnInfo::new(42, address, "10.0.0.2:5000".parse()?);
                 let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
@@ -551,7 +603,9 @@ mod tests {
                 let hosts = VirtualHosts::new();
                 hosts.insert(
                     "example.com",
-                    VHost::new(httpd::tower(Backend::new(&fcx, address.port())?)),
+                    VHost::new(httpd::tower(
+                        Pages::Backend(Backend::new(&fcx, address.port())?).handler(&fcx),
+                    )),
                 );
                 let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
                 let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
@@ -649,7 +703,9 @@ mod tests {
                 let hosts = VirtualHosts::new();
                 hosts.insert(
                     "example.com",
-                    VHost::new(httpd::tower(Backend::new(&fcx, address.port())?)),
+                    VHost::new(httpd::tower(
+                        Pages::Backend(Backend::new(&fcx, address.port())?).handler(&fcx),
+                    )),
                 );
                 let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
                 let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));

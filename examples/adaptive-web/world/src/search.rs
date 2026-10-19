@@ -386,6 +386,23 @@ impl Searches {
             ..Snapshot::default()
         }))
     }
+    /// Builds the initial card for an in-process Rust stub.
+    pub fn from_seed(seed: &crate::stub::Seed) -> Self {
+        Self::new(
+            SeedCard {
+                name: seed.name.clone(),
+                date: seed.date.clone(),
+                question: seed.question.clone(),
+                facts: seed.facts.clone(),
+                sites: seed.sites.iter().map(|s| s.host.clone()).collect(),
+            },
+            Generator {
+                kind: GeneratorKind::Stub,
+                model: "stub".into(),
+                prefetch: 0,
+            },
+        )
+    }
     /// Builds the initial card from the Python backend's hello line.
     pub fn from_hello(hello: &serde_json::Value) -> Self {
         let string = |key: &str| hello[key].as_str().unwrap_or_default().to_owned();
