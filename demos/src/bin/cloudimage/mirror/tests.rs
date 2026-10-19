@@ -513,6 +513,16 @@ async fn uncacheable_representations_and_requests_pass_through() {
             bytes(send(&fcx, &cache, req).await.unwrap()).await;
         }
         assert_eq!(upstream.count(), 9);
+        assert_eq!(
+            *cache.state.stats.bypassed.lock().unwrap(),
+            BTreeMap::from([
+                ("response variant", 3),
+                ("response directive", 1),
+                ("response framing", 1),
+                ("credentials", 2),
+                ("conditional or range", 2),
+            ])
+        );
         assert!(!dir.path().join("mirror.test").exists());
         bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await;
         bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await;
@@ -773,6 +783,7 @@ async fn all_traffic_and_key_waiters_share_bounded_admission() {
             assert_eq!(bytes(response).await, "apt mirror busy\n");
         }
         assert!(source.requests.lock().unwrap().is_empty());
+        assert_eq!(cache.state.stats.bypassed.lock().unwrap()["admission"], 3);
         drop(pending);
         assert_eq!(
             bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
@@ -832,7 +843,7 @@ async fn hostile_fill_headers_cannot_select_or_frame_the_stored_object() {
 }
 
 #[tokio::test]
-async fn head_queries_bodies_and_cache_directives_do_not_populate_or_poison() {
+async fn head_queries_and_storage_directives_do_not_populate_or_poison() {
     run(|fcx| async move {
         let dir = crate::RunDir::new().unwrap();
         let upstream = Upstream::new().await;
@@ -858,9 +869,9 @@ async fn head_queries_bodies_and_cache_directives_do_not_populate_or_poison() {
             "package"
         );
         for (name, value) in [
-            (header::CACHE_CONTROL, "no-cache"),
             (header::CACHE_CONTROL, "no-store"),
-            (header::PRAGMA, "no-cache"),
+            (header::CACHE_CONTROL, "no-cache, no-store"),
+            (header::PRAGMA, "unknown"),
         ] {
             upstream.push(reply("200 OK", "", b"fresh"));
             let mut req = request(PACKAGE);
@@ -872,6 +883,10 @@ async fn head_queries_bodies_and_cache_directives_do_not_populate_or_poison() {
             "package"
         );
         assert_eq!(upstream.count(), 7);
+        assert_eq!(
+            *cache.state.stats.bypassed.lock().unwrap(),
+            BTreeMap::from([("query or method", 3), ("request directive", 3)])
+        );
     })
     .await;
 }
@@ -1004,6 +1019,7 @@ async fn disk_budget_includes_old_files_and_limits_new_admission() {
         );
         assert!(!dir.path().join("mirror.test").exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        assert_eq!(cache.state.stats.bypassed.lock().unwrap()["full cache"], 2);
     })
     .await;
 }
@@ -1048,6 +1064,7 @@ async fn second_owner_bypasses_and_restart_removes_crash_debris() {
             bytes(send(&fcx, &second, request(PACKAGE)).await.unwrap()).await,
             "other process"
         );
+        assert_eq!(second.state.stats.bypassed.lock().unwrap()["disabled"], 1);
         drop(second);
         drop(owner);
         let debris = dir.path().join(".download-interrupted");
@@ -1077,9 +1094,11 @@ async fn slow_body_deadline_releases_resources_even_without_a_reader() {
     let slots = Arc::new(Semaphore::new(1));
     let (tx, rx) = mpsc::channel(1);
     let body = stream(
-        Body::new(ControlledBody(rx)),
+        Source::Upstream(Body::new(ControlledBody(rx))),
         slots.clone().try_acquire_owned().unwrap(),
         tokio::time::Instant::now(),
+        None,
+        Arc::default(),
     );
     tx.closed().await;
     assert!(slots.try_acquire().is_ok());
@@ -1200,6 +1219,7 @@ async fn disk_write_failure_does_not_replace_a_valid_upstream_response() {
             bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
             "fresh"
         );
+        assert_eq!(cache.state.stats.bypassed.lock().unwrap()["storage"], 2);
         assert!(path.is_dir());
         assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
     })
@@ -1340,10 +1360,10 @@ async fn stalled_storage_is_abandoned_without_stalling_the_guest() {
         let (tx, rx) = mpsc::channel(1);
         let task = tokio::spawn(async move {
             tee(
-                Body::from(payload.clone()),
+                Source::Upstream(Body::from(payload.clone())),
                 &tx,
                 Some(writer),
-                payload.len() as u64,
+                Some(payload.len() as u64),
                 Arc::default(),
             )
             .await
@@ -1358,6 +1378,90 @@ async fn stalled_storage_is_abandoned_without_stalling_the_guest() {
             disk.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn immutable_request_freshness_preferences_allow_fills_and_hits() {
+    run(|fcx| async move {
+        let hash = format!("/ubuntu/dists/noble/main/by-hash/SHA256/{}", "a".repeat(64));
+        for path in [PACKAGE, hash.as_str()] {
+            for directives in [
+                vec![(header::CACHE_CONTROL, "max-age=0")],
+                vec![(header::CACHE_CONTROL, "max-age=86400")],
+                vec![(header::CACHE_CONTROL, "no-cache")],
+                vec![(header::PRAGMA, "no-cache")],
+                vec![
+                    (header::CACHE_CONTROL, "no-cache"),
+                    (header::PRAGMA, "no-cache"),
+                ],
+                vec![
+                    (header::CACHE_CONTROL, "max-age=0"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+            ] {
+                let dir = crate::RunDir::new().unwrap();
+                let source = Scripted::new(vec![complete("package")]);
+                let cache = Cache::new(source.clone(), dir.path().to_owned());
+                for _ in 0..2 {
+                    let mut req = request(path);
+                    req.headers_mut()
+                        .insert(header::ACCEPT, "text/*".parse().unwrap());
+                    req.headers_mut()
+                        .insert(header::USER_AGENT, "Debian APT-HTTP/1.3".parse().unwrap());
+                    for (name, value) in &directives {
+                        req.headers_mut().append(name, value.parse().unwrap());
+                    }
+                    assert_eq!(
+                        bytes(send(&fcx, &cache, req).await.unwrap()).await,
+                        "package"
+                    );
+                }
+                assert_eq!(cache.state.stats.hits.load(Ordering::Relaxed), 1);
+                assert_eq!(cache.state.stats.misses.load(Ordering::Relaxed), 1);
+                assert!(cache.state.stats.bypassed.lock().unwrap().is_empty());
+                let requests = source.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].headers().len(), 2);
+                assert_eq!(requests[0].headers()[header::ACCEPT_ENCODING], "identity");
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mutable_request_directives_are_forwarded_and_counted() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let source = Scripted::new(vec![
+            complete("first"),
+            complete("second"),
+            complete("third"),
+        ]);
+        let cache = Cache::new(source.clone(), dir.path().to_owned());
+        for (name, value, expected) in [
+            (header::CACHE_CONTROL, "max-age=0", "first"),
+            (header::CACHE_CONTROL, "no-cache", "second"),
+            (header::PRAGMA, "no-cache", "third"),
+        ] {
+            let mut req = request(INDEX);
+            req.headers_mut().insert(&name, value.parse().unwrap());
+            assert_eq!(
+                bytes(send(&fcx, &cache, req).await.unwrap()).await,
+                expected
+            );
+            assert_eq!(
+                source.requests.lock().unwrap().last().unwrap().headers()[name],
+                value
+            );
+        }
+        assert_eq!(
+            *cache.state.stats.bypassed.lock().unwrap(),
+            BTreeMap::from([("not immutable", 3)])
+        );
+        assert!(!dir.path().join("mirror.test").exists());
     })
     .await;
 }

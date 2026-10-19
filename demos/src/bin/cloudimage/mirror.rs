@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
@@ -20,10 +20,10 @@ use fictionet::stdlib::web::{
 };
 use fictionet::{Cx, Error};
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
-use http_body::{Frame, SizeHint};
+use http_body::Frame;
 use http_body_util::BodyExt;
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tower_service::Service;
 
@@ -56,26 +56,33 @@ struct Stats {
     misses: AtomicU64,
     saved: AtomicU64,
     fetched: AtomicU64,
-    bypassed: AtomicU64,
+    bypassed: Mutex<BTreeMap<&'static str, u64>>,
 }
 
 struct State {
     disk: Option<Arc<Disk>>,
-    keys: Mutex<BTreeMap<PathBuf, Weak<AsyncMutex<()>>>>,
+    keys: Mutex<BTreeMap<PathBuf, Arc<AsyncMutex<()>>>>,
     slots: Arc<Semaphore>,
     stats: Arc<Stats>,
+}
+
+impl Stats {
+    fn bypass(&self, reason: &'static str) {
+        *self.bypassed.lock().unwrap().entry(reason).or_default() += 1;
+    }
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         let s = &self.stats;
+        let reasons = s.bypassed.lock().unwrap();
         println!(
-            "apt cache: {} hits, {} misses, {} bytes saved, {} bytes fetched, {} bypassed",
+            "apt cache: {} hits, {} misses, {} bytes saved, {} bytes fetched, {} bypassed {reasons:?}",
             s.hits.load(Ordering::Relaxed),
             s.misses.load(Ordering::Relaxed),
             s.saved.load(Ordering::Relaxed),
             s.fetched.load(Ordering::Relaxed),
-            s.bypassed.load(Ordering::Relaxed)
+            reasons.values().sum::<u64>()
         );
     }
 }
@@ -138,8 +145,8 @@ fn immutable(path: &str) -> bool {
     parts.contains(&"pool") && !parts.contains(&"dists") && path.ends_with(".deb")
 }
 
-fn key(request: &Request<Body>) -> Option<PathBuf> {
-    let target = request.extensions().get::<Target>()?;
+fn key(request: &Request<Body>) -> Result<PathBuf, &'static str> {
+    let target = request.extensions().get::<Target>().ok_or("target")?;
     if target.routing != Routing::Exact
         || target.host.is_empty()
         || target.host.len() > 253
@@ -148,29 +155,51 @@ fn key(request: &Request<Body>) -> Option<PathBuf> {
                 || p.len() > 63
                 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
-        || request.method() != Method::GET
-        || request.uri().query().is_some()
-        || request.body().bytes().is_none_or(|b| !b.is_empty())
-        || [
-            header::AUTHORIZATION,
-            header::COOKIE,
-            header::IF_MATCH,
-            header::IF_UNMODIFIED_SINCE,
-            header::CACHE_CONTROL,
-            header::PRAGMA,
-        ]
-        .iter()
-        .any(|h| request.headers().contains_key(h))
-        || !supported_conditions(request.headers())
-        || !immutable(request.uri().path())
     {
-        return None;
+        return Err("target");
     }
-    Some(
-        Path::new(&target.host)
-            .join(format!("{}-{}", target.scheme, target.port))
-            .join(&request.uri().path()[1..]),
-    )
+    if request.method() != Method::GET || request.uri().query().is_some() {
+        return Err("query or method");
+    }
+    if request.body().bytes().is_none_or(|b| !b.is_empty()) {
+        return Err("request body");
+    }
+    if !immutable(request.uri().path()) {
+        return Err("not immutable");
+    }
+    let headers = request.headers();
+    if headers.contains_key(header::AUTHORIZATION) || headers.contains_key(header::COOKIE) {
+        return Err("credentials");
+    }
+    if headers.contains_key(header::IF_MATCH)
+        || headers.contains_key(header::IF_UNMODIFIED_SINCE)
+        || !supported_conditions(headers)
+    {
+        return Err("conditional or range");
+    }
+    // Request freshness directives are advisory under RFC 9111 section 5.2.1.
+    // Immutable names need no refresh; Pragma carries the same preference.
+    for name in [header::CACHE_CONTROL, header::PRAGMA] {
+        for value in headers.get_all(&name) {
+            for directive in value.to_str().map_err(|_| "request directive")?.split(',') {
+                let directive = directive.trim();
+                if directive.eq_ignore_ascii_case("no-cache") {
+                    continue;
+                }
+                if name == header::CACHE_CONTROL
+                    && let Some((key, value)) = directive.split_once('=')
+                    && key.trim().eq_ignore_ascii_case("max-age")
+                    && value.trim().parse::<u64>().is_ok()
+                {
+                    continue;
+                }
+                return Err("request directive");
+            }
+        }
+    }
+    Ok(Path::new(&target.host)
+        .join(format!("{}-{}", target.scheme, target.port))
+        .join(&request.uri().path()[1..]))
 }
 
 impl<S> Service<Request<Body>> for Cache<S>
@@ -192,18 +221,18 @@ where
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let cache = self.clone();
-        // Admission precedes both per-key waits and bypasses. A permit stays
-        // with the response until EOF, cancellation or the absolute deadline.
+        // Admit before per-key waits; hold through EOF, cancellation or deadline.
         let permit = self.state.slots.clone().try_acquire_owned();
         Box::pin(async move {
             let Ok(permit) = permit else {
+                cache.state.stats.bypass("admission");
                 return Ok(web::httpd::text(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "apt mirror busy\n",
                 ));
             };
             let deadline = tokio::time::Instant::now() + DEADLINE;
-            let response = tokio::time::timeout_at(deadline, cache.serve(request))
+            let (response, fill) = tokio::time::timeout_at(deadline, cache.serve(request))
                 .await
                 .map_err(|_| {
                     Error::from(web::httpd::BadGateway("apt mirror timed out".into()))
@@ -211,7 +240,13 @@ where
             let (parts, body) = response.into_parts();
             Ok(Response::from_parts(
                 parts,
-                Body::new(stream(body, permit, deadline)),
+                Body::new(stream(
+                    body,
+                    permit,
+                    deadline,
+                    fill,
+                    cache.state.stats.clone(),
+                )),
             ))
         })
     }
@@ -232,39 +267,40 @@ where
         upstream.call(request).await
     }
 
-    async fn bypass(&self, request: Request<Body>) -> Answer {
-        self.state.stats.bypassed.fetch_add(1, Ordering::Relaxed);
-        self.forward(request).await
+    async fn bypass(
+        &self,
+        request: Request<Body>,
+        reason: &'static str,
+    ) -> Result<(Response<Source>, Option<Fill>), Error> {
+        self.state.stats.bypass(reason);
+        Ok((self.forward(request).await?.map(Source::Upstream), None))
     }
 
-    async fn serve(&self, mut request: Request<Body>) -> Answer {
-        let Some((key, disk)) = key(&request).zip(self.state.disk.clone()) else {
-            return self.bypass(request).await;
+    async fn serve(
+        &self,
+        mut request: Request<Body>,
+    ) -> Result<(Response<Source>, Option<Fill>), Error> {
+        let key = match key(&request) {
+            Ok(key) => key,
+            Err(reason) => return self.bypass(request, reason).await,
+        };
+        let Some(disk) = self.state.disk.clone() else {
+            return self.bypass(request, "disabled").await;
         };
         let lock = {
             let mut keys = self.state.keys.lock().unwrap();
-            keys.retain(|_, lock| lock.strong_count() != 0);
-            match keys.get(&key).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(AsyncMutex::new(()));
-                    keys.insert(key.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
+            keys.retain(|_, lock| Arc::strong_count(lock) > 1);
+            keys.entry(key.clone()).or_default().clone()
         };
         let guard = lock.lock_owned().await;
         let path = disk.root.join(&key);
         match Entry::open(&path).await {
             Ok(entry) => {
-                if let Some(response) = entry
-                    .response(request.headers(), self.state.stats.clone(), disk.clone())
-                    .await?
-                {
+                if let Some(response) = entry.response(request.headers(), disk.clone()).await? {
                     self.state.stats.hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(response);
+                    return Ok((response, None));
                 }
-                return self.bypass(request).await;
+                return self.bypass(request, "conditional or range").await;
             }
             Err(error) => {
                 if path.exists() {
@@ -276,10 +312,9 @@ where
             || request.headers().contains_key(header::IF_NONE_MATCH)
             || request.headers().contains_key(header::IF_MODIFIED_SINCE)
         {
-            return self.bypass(request).await;
+            return self.bypass(request, "conditional or range").await;
         }
-        // A cache fill is an origin GET, independent of guest negotiation,
-        // forwarding headers, framing headers, or connection nominations.
+        // Fill with a canonical origin GET, independent of guest headers.
         let host = request.headers().get(header::HOST).cloned();
         request.headers_mut().clear();
         if let Some(host) = host {
@@ -290,13 +325,16 @@ where
             .insert(header::ACCEPT_ENCODING, "identity".parse()?);
         self.state.stats.misses.fetch_add(1, Ordering::Relaxed);
         let requested = SystemTime::now();
-        let response = self.forward(request).await?;
-        if !cacheable(&response) {
-            return Ok(response);
-        }
+        let response = self.forward(request).await?.map(Source::Upstream);
+        let expected = match cacheable(response.status(), response.headers()) {
+            Ok(expected) => expected,
+            Err(reason) => {
+                self.state.stats.bypass(reason);
+                return Ok((response, None));
+            }
+        };
         let (mut parts, body) = response.into_parts();
-        // Date plus corrected Age at receipt, and the file's modification time,
-        // suffice to account for residence time across demo runs.
+        // Persist receipt age and time to account for residence across runs.
         let now = SystemTime::now();
         let delay = now
             .duration_since(requested)
@@ -318,44 +356,37 @@ where
                 .map(|(k, v)| (k.as_str(), v.as_bytes()))
                 .collect::<Vec<_>>(),
         )?;
-        let expected = length(&parts.headers).unwrap();
-        let reservation = if head.len() <= MAX_HEAD {
-            disk.reserve(&key, expected + head.len() as u64 + 4)
+        let reservation = if head.len() > MAX_HEAD {
+            Err("header budget")
         } else {
-            Ok(None)
+            disk.reserve(&key, expected + head.len() as u64 + 4)
+                .map_err(|error| {
+                    eprintln!("apt cache write: {error}");
+                    "storage"
+                })
+                .and_then(|r| r.ok_or("full cache"))
         };
         let mut reservation = match reservation {
-            Ok(Some(reservation)) => reservation,
-            Ok(None) => return Ok(Response::from_parts(parts, body)),
-            Err(error) => {
-                eprintln!("apt cache write disabled for {}: {error}", path.display());
-                return Ok(Response::from_parts(parts, body));
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                self.state.stats.bypass(reason);
+                return Ok((Response::from_parts(parts, body), None));
             }
         };
         reservation._key = Some(guard);
-        let (tx, rx) = mpsc::channel(2);
-        let stats = self.state.stats.clone();
-        let task = tokio::spawn(async move {
-            let work = download(body, &tx, reservation, head, expected, stats, now);
-            tokio::select! {
-                _ = tx.closed() => Ok(()),
-                result = tokio::time::timeout(DEADLINE, work) => result.unwrap_or_else(|_| Err(Error::msg("apt download timed out"))),
-            }
-        });
-        Ok(Response::from_parts(
-            parts,
-            Body::new(DownloadBody {
-                rx,
-                task,
-                done: false,
+        Ok((
+            Response::from_parts(parts, body),
+            Some(Fill {
+                reservation,
+                head,
+                expected,
+                received_at: now,
             }),
         ))
     }
 }
 
-// The host is trusted. Validate the whole existing tree before using it and
-// hold its lock throughout this cache's lifetime. Never follow symlinks or
-// share writable files with another owner. No guest input names the lock.
+// Validate the trusted host's tree and hold exclusive ownership while in use.
 struct Disk {
     root: PathBuf,
     _lock: std::fs::File,
@@ -419,17 +450,13 @@ impl Disk {
                 Err(e) => return Err(e.into()),
             }
         }
-        if budget.0 + charge > MAX_TOTAL {
-            return Ok(None);
-        }
         match path.symlink_metadata() {
             Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => {}
             Ok(_) => return Err(Error::msg("invalid apt cache destination")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        // Keep replacement charges until reopening the directory: another
-        // response can still hold the old inode after the atomic rename.
+        // Old inodes may still have readers; retain replacement charges.
         budget.0 += charge;
         budget.1 += 1;
         Ok(Some(Reservation {
@@ -499,45 +526,63 @@ impl Drop for Reservation {
     }
 }
 
-async fn download(
-    body: Body,
-    tx: &mpsc::Sender<Result<Frame<Bytes>, Error>>,
+enum Source {
+    Upstream(Body),
+    File(tokio::io::Take<File>, Arc<Disk>),
+}
+
+impl Source {
+    async fn frame(&mut self) -> Result<Option<Frame<Bytes>>, Error> {
+        match self {
+            Self::Upstream(body) => body.frame().await.transpose(),
+            Self::File(file, _disk) => {
+                if file.limit() == 0 {
+                    return Ok(None);
+                }
+                let mut bytes = vec![0; file.limit().min(CHUNK as u64) as usize];
+                file.read_exact(&mut bytes).await?;
+                Ok(Some(Frame::data(bytes.into())))
+            }
+        }
+    }
+}
+
+struct Fill {
     reservation: Reservation,
     head: Vec<u8>,
     expected: u64,
-    stats: Arc<Stats>,
     received_at: SystemTime,
-) -> Result<(), Error> {
-    let (write, incoming) = mpsc::channel(32);
-    let task = tokio::spawn(async move {
-        if let Err(error) = persist(incoming, reservation, head, received_at).await {
-            eprintln!("apt cache write: {error}");
-        }
-    });
-    tee(body, tx, Some(CacheWriter { write, task }), expected, stats).await
 }
 
 async fn tee(
-    mut body: Body,
+    mut body: Source,
     tx: &mpsc::Sender<Result<Frame<Bytes>, Error>>,
     mut writer: Option<CacheWriter>,
-    expected: u64,
+    expected: Option<u64>,
     stats: Arc<Stats>,
 ) -> Result<(), Error> {
+    let cached = matches!(body, Source::File(_, _));
     let result = async {
         let mut received = 0;
-        while let Some(frame) = body.frame().await {
-            let frame = frame?;
-            let Ok(data) = frame.into_data() else {
-                return Err(Error::msg("unexpected apt response trailers"));
+        while let Some(frame) = body.frame().await? {
+            let data = match frame.into_data() {
+                Ok(data) => data,
+                Err(frame) if expected.is_none() => {
+                    tx.send(Ok(frame))
+                        .await
+                        .map_err(|_| Error::msg("apt client disconnected"))?;
+                    continue;
+                }
+                Err(_) => return Err(Error::msg("unexpected apt response trailers")),
             };
             received += data.len() as u64;
-            if received > expected {
+            if expected.is_some_and(|n| received > n) {
                 return Err(Error::msg("apt response exceeds Content-Length"));
             }
-            stats
-                .fetched
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            if cached || expected.is_some() {
+                let counter = if cached { &stats.saved } else { &stats.fetched };
+                counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
             for chunk in data.chunks(CHUNK) {
                 let chunk = Bytes::copy_from_slice(chunk);
                 tx.send(Ok(Frame::data(chunk.clone())))
@@ -548,11 +593,12 @@ async fn tee(
                     .as_ref()
                     .is_some_and(|w| w.write.try_send(Some(chunk)).is_err())
                 {
+                    stats.bypass("storage");
                     writer = None;
                 }
             }
         }
-        if received != expected {
+        if expected.is_some_and(|n| received != n) {
             return Err(Error::msg("apt response does not match Content-Length"));
         }
         Ok::<_, Error>(())
@@ -560,14 +606,16 @@ async fn tee(
     .await;
     if let Some(mut writer) = writer {
         if result.is_err() || writer.write.try_send(None).is_err() {
+            stats.bypass(if result.is_err() {
+                "invalid body"
+            } else {
+                "storage"
+            });
             writer.task.abort();
-        }
-        // Guest bytes are already streaming; keep the key locked until commit
-        // or cleanup, and preserve upstream errors when abandoning a write.
-        if let Err(error) = (&mut writer.task).await
-            && !error.is_cancelled()
-        {
-            return Err(error.into());
+            let _ = (&mut writer.task).await;
+        } else if let Err(error) = (&mut writer.task).await? {
+            stats.bypass("storage");
+            eprintln!("apt cache write: {error}");
         }
     }
     result
@@ -575,7 +623,7 @@ async fn tee(
 
 struct CacheWriter {
     write: mpsc::Sender<Option<Bytes>>,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Result<(), Error>>,
 }
 impl Drop for CacheWriter {
     fn drop(&mut self) {
@@ -617,28 +665,37 @@ async fn persist(
 }
 
 fn stream(
-    body: Body,
+    body: Source,
     permit: OwnedSemaphorePermit,
     deadline: tokio::time::Instant,
+    fill: Option<Fill>,
+    stats: Arc<Stats>,
 ) -> DownloadBody {
     let (tx, rx) = mpsc::channel(2);
     let task = tokio::spawn(async move {
         let _permit = permit;
-        tokio::time::timeout_at(deadline, relay(body, &tx))
-            .await
-            .unwrap_or_else(|_| Err(Error::msg("apt response timed out")))
+        let expected = fill.as_ref().map(|f| f.expected);
+        let writer = fill.map(|f| {
+            let (write, incoming) = mpsc::channel(32);
+            let task = tokio::spawn(persist(incoming, f.reservation, f.head, f.received_at));
+            CacheWriter { write, task }
+        });
+        let result = tokio::select! {
+            _ = tx.closed() => Ok(()),
+            result = tokio::time::timeout_at(deadline, tee(body, &tx, writer, expected, stats)) =>
+                result.unwrap_or_else(|_| Err(Error::msg("apt response timed out"))),
+        };
+        drop(_permit);
+        if let Err(error) = result {
+            let _ = tx.send(Err(error)).await;
+        }
     });
-    DownloadBody {
-        rx,
-        task,
-        done: false,
-    }
+    DownloadBody { rx, task }
 }
 
 struct DownloadBody {
     rx: mpsc::Receiver<Result<Frame<Bytes>, Error>>,
-    done: bool,
-    task: tokio::task::JoinHandle<Result<(), Error>>,
+    task: tokio::task::JoinHandle<()>,
 }
 impl Drop for DownloadBody {
     fn drop(&mut self) {
@@ -652,50 +709,7 @@ impl http_body::Body for DownloadBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
-        if self.done {
-            return Poll::Ready(None);
-        }
-        match std::task::ready!(self.rx.poll_recv(cx)) {
-            Some(frame) => Poll::Ready(Some(frame)),
-            None => {
-                let result = std::task::ready!(Pin::new(&mut self.task).poll(cx));
-                self.done = true;
-                Poll::Ready(match result {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(Err(error)),
-                    Err(error) => Some(Err(error.into())),
-                })
-            }
-        }
-    }
-}
-
-async fn relay(
-    mut body: Body,
-    tx: &mpsc::Sender<Result<Frame<Bytes>, Error>>,
-) -> Result<(), Error> {
-    loop {
-        let frame = tokio::select! {
-            _ = tx.closed() => return Ok(()),
-            frame = body.frame() => frame,
-        };
-        let Some(frame) = frame else {
-            return Ok(());
-        };
-        let frame = frame?;
-        match frame.into_data() {
-            Ok(data) => {
-                for chunk in data.chunks(CHUNK) {
-                    tx.send(Ok(Frame::data(Bytes::copy_from_slice(chunk))))
-                        .await
-                        .map_err(|_| Error::msg("apt client disconnected"))?;
-                }
-            }
-            Err(frame) => tx
-                .send(Ok(frame))
-                .await
-                .map_err(|_| Error::msg("apt client disconnected"))?,
-        }
+        self.rx.poll_recv(cx)
     }
 }
 
@@ -779,10 +793,14 @@ fn fresh(headers: &HeaderMap, age: u64) -> bool {
 
 fn supported_conditions(headers: &HeaderMap) -> bool {
     // Unusual entity tags containing commas can be evaluated by the origin.
-    headers.get_all(header::RANGE).iter().count() <= 1
-        && headers.get_all(header::IF_RANGE).iter().count() <= 1
-        && headers.get_all(header::IF_MODIFIED_SINCE).iter().count() <= 1
-        && headers.get_all(header::IF_NONE_MATCH).iter().count() <= 1
+    [
+        header::RANGE,
+        header::IF_RANGE,
+        header::IF_MODIFIED_SINCE,
+        header::IF_NONE_MATCH,
+    ]
+    .iter()
+    .all(|h| headers.get_all(h).iter().count() <= 1)
         && headers.get(header::IF_NONE_MATCH).is_none_or(|v| {
             v.to_str().is_ok_and(|s| {
                 s == "*"
@@ -825,44 +843,55 @@ fn not_modified(request: &HeaderMap, stored: &HeaderMap) -> bool {
     }
 }
 
-fn cacheable(response: &Response<Body>) -> bool {
-    response.status() == StatusCode::OK
-        && length(response.headers()).is_some_and(|n| n <= MAX_FILE)
-        && !response.headers().contains_key(header::TRANSFER_ENCODING)
-        && !response.headers().contains_key(header::TRAILER)
-        && !response.headers().contains_key(header::CONTENT_RANGE)
-        && !response.headers().contains_key(header::SET_COOKIE)
-        && response.headers().get_all(header::VARY).iter().all(|v| {
+fn cacheable(status: StatusCode, headers: &HeaderMap) -> Result<u64, &'static str> {
+    if status != StatusCode::OK {
+        return Err("response status");
+    }
+    let len = length(headers).ok_or("response framing")?;
+    if len > MAX_FILE {
+        return Err("file budget");
+    }
+    if [
+        header::TRANSFER_ENCODING,
+        header::TRAILER,
+        header::CONTENT_RANGE,
+    ]
+    .iter()
+    .any(|h| headers.contains_key(h))
+    {
+        return Err("response framing");
+    }
+    if headers.contains_key(header::SET_COOKIE)
+        || !headers.get_all(header::VARY).iter().all(|v| {
             v.to_str().is_ok_and(|v| {
                 v.split(',')
                     .all(|s| s.trim().eq_ignore_ascii_case("accept-encoding"))
             })
         })
-        && response
-            .headers()
+        || !headers
             .get_all(header::CONTENT_ENCODING)
             .iter()
             .all(|v| v == "identity")
-        && response
-            .headers()
-            .get_all(header::CACHE_CONTROL)
-            .iter()
-            .all(|v| {
-                v.to_str().is_ok_and(|v| {
-                    !v.split(',').any(|s| {
-                        matches!(
-                            s.trim()
-                                .split('=')
-                                .next()
-                                .unwrap_or("")
-                                .trim()
-                                .to_ascii_lowercase()
-                                .as_str(),
-                            "no-store" | "private" | "no-cache"
-                        )
-                    })
-                })
-            })
+    {
+        return Err("response variant");
+    }
+    for value in headers.get_all(header::CACHE_CONTROL) {
+        for directive in value.to_str().map_err(|_| "response directive")?.split(',') {
+            if matches!(
+                directive
+                    .split('=')
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "no-store" | "private" | "no-cache"
+            ) {
+                return Err("response directive");
+            }
+        }
+    }
+    Ok(len)
 }
 
 struct Temporary(PathBuf);
@@ -920,17 +949,10 @@ impl Entry {
                 value.try_into()?,
             );
         }
-        let len = length(&headers)
-            .filter(|n| *n <= MAX_FILE)
-            .ok_or_else(|| Error::msg("invalid apt cache length"))?;
+        let len = cacheable(StatusCode::OK, &headers).map_err(Error::msg)?;
         let offset = 4 + size as u64;
-        if file.metadata().await?.len() != offset + len {
+        if metadata.len() != offset + len {
             return Err(Error::msg("incomplete apt cache entry"));
-        }
-        let mut response = Response::new(Body::empty());
-        *response.headers_mut() = headers.clone();
-        if !cacheable(&response) {
-            return Err(Error::msg("uncacheable stored apt response"));
         }
         let now = SystemTime::now();
         let residence = now
@@ -953,11 +975,10 @@ impl Entry {
     async fn response(
         mut self,
         request: &HeaderMap,
-        stats: Arc<Stats>,
         disk: Arc<Disk>,
-    ) -> Result<Option<Response<Body>>, Error> {
+    ) -> Result<Option<Response<Source>>, Error> {
         if not_modified(request, &self.headers) {
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(Source::Upstream(Body::empty()));
             *response.status_mut() = StatusCode::NOT_MODIFIED;
             *response.headers_mut() = self.headers;
             return Ok(Some(response));
@@ -987,12 +1008,7 @@ impl Entry {
         self.file.seek(SeekFrom::Start(self.offset + start)).await?;
         self.headers.insert(header::CONTENT_LENGTH, len.into());
         self.headers.insert(header::ACCEPT_RANGES, "bytes".parse()?);
-        let mut response = Response::new(Body::new(FileBody {
-            file: self.file,
-            remaining: len,
-            stats,
-            _disk: disk,
-        }));
+        let mut response = Response::new(Source::File(self.file.take(len), disk));
         *response.status_mut() = status;
         *response.headers_mut() = self.headers;
         Ok(Some(response))
@@ -1019,53 +1035,6 @@ fn byte_range(value: &str, len: u64) -> Option<(u64, u64)> {
         end.parse::<u64>().ok()?.min(len - 1)
     };
     (start <= end).then(|| (start, end - start + 1))
-}
-
-struct FileBody {
-    file: File,
-    remaining: u64,
-    stats: Arc<Stats>,
-    _disk: Arc<Disk>,
-}
-
-impl http_body::Body for FileBody {
-    type Data = Bytes;
-    type Error = Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
-        let this = self.get_mut();
-        if this.remaining == 0 {
-            return Poll::Ready(None);
-        }
-        let mut bytes = vec![0; this.remaining.min(CHUNK as u64) as usize];
-        let mut buf = ReadBuf::new(&mut bytes);
-        let read = std::task::ready!(Pin::new(&mut this.file).poll_read(cx, &mut buf));
-        if let Err(error) = read {
-            this.remaining = 0;
-            return Poll::Ready(Some(Err(error.into())));
-        }
-        let n = buf.filled().len();
-        if n == 0 {
-            this.remaining = 0;
-            return Poll::Ready(Some(Err(
-                io::Error::from(io::ErrorKind::UnexpectedEof).into()
-            )));
-        }
-        bytes.truncate(n);
-        this.remaining -= n as u64;
-        this.stats.saved.fetch_add(n as u64, Ordering::Relaxed);
-        Poll::Ready(Some(Ok(Frame::data(bytes.into()))))
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.remaining)
-    }
-    fn is_end_stream(&self) -> bool {
-        self.remaining == 0
-    }
 }
 
 #[cfg(test)]
