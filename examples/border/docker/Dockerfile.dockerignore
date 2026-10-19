@@ -8,6 +8,7 @@
 !benches
 !codegen
 !xtask
+!smoltcp
 !demos
 !tests
 !examples

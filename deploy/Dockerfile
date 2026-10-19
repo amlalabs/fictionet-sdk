@@ -22,6 +22,7 @@ COPY dashboard dashboard
 COPY benches benches
 COPY codegen codegen
 COPY xtask xtask
+COPY smoltcp smoltcp
 COPY demos demos
 COPY tests tests
 COPY examples examples
