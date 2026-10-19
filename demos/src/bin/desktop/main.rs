@@ -1,44 +1,18 @@
-//! Boots Ubuntu 24.04's official cloud image unmodified in Cloud
-//! Hypervisor, provisions it through cloud-init from a Fictionet world, and
-//! reaches it the way an admin would, with no guest agent: SSH from a jump
-//! host across the world's network, and VNC tunneled through that session.
-//!
-//! `cargo xtask cloudimage` downloads the pinned image, kernel, initrd and
-//! Cloud Hypervisor binary and runs this with their paths. The per-run
-//! overlay ([`disk`]) and cloud-init seed ([`seed`]) are written in Rust;
-//! the world ([`world`]) joins the guest to the network through the
-//! vhost-user backend ([`net`]), and its jump host carries the SSH session
-//! ([`ssh`]) that the desktop viewer ([`page`]) tunnels VNC through.
-//!
-//! An optional fifth argument names a Unix observation socket. The world
-//! serves its collector there with `fictionet_observe::serve`. For a path
-//! of `/run/fictionet/observation.sock`, watch from another terminal:
-//!
-//! ```sh
-//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
-//! ```
-//!
-//! See `fictionet_observe` for browser access and capture limits.
+//! The desktop gate on the shared microVM kit.
+//! Run with `cargo xtask demo desktop`.
 
-mod ch;
-mod disk;
-mod mirror;
-mod net;
+mod guest;
 mod page;
-mod seed;
-mod shot;
-mod ssh;
-mod viewer;
 mod world;
 
+use fictionet_demo::kit::{self, Kit, b64_decode, rfb, shot, ssh};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-/// The overlay's virtual size: well above the image, so growpart has room.
-const DISK_SIZE: u64 = 10 << 30;
 const HOSTNAME: &str = "workstation";
 const USER: &str = "analyst";
 /// The world's HTTPS site the guest fetches with the Zscaler chain.
@@ -52,15 +26,15 @@ fn boxed<E: std::fmt::Display>(error: E) -> Error {
 
 fn main() -> ExitCode {
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let [ch_bin, image, vmlinuz, initrd, rest @ ..] = args.as_slice() else {
+    let [downloads, rest @ ..] = args.as_slice() else {
         eprintln!(
-            "usage: cloudimage <cloud-hypervisor> <image.img> <vmlinuz> <initrd> [observation-socket]\n\
-             run it with `cargo xtask cloudimage` first to fetch the pinned files"
+            "usage: desktop <downloads-directory> [observation-socket]\n\
+             run it with `cargo xtask demo desktop` first to fetch the pinned files"
         );
         return ExitCode::FAILURE;
     };
     if rest.len() > 1 {
-        eprintln!("cloudimage: too many arguments");
+        eprintln!("desktop: too many arguments");
         return ExitCode::FAILURE;
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -69,96 +43,39 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("cloudimage: {e}");
+            eprintln!("desktop: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(gate(ch_bin, image, vmlinuz, initrd, rest.first().cloned())) {
+    match runtime.block_on(gate(downloads, rest.first().cloned())) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("cloudimage: {error}");
+            eprintln!("desktop: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// A private run directory, removed when dropped.
-struct RunDir(PathBuf);
-
-impl RunDir {
-    fn new() -> std::io::Result<RunDir> {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut bytes = [0u8; 8];
-        getrandom(&mut bytes);
-        let path = std::env::temp_dir().join(format!("cloudimage-{}", u64::from_ne_bytes(bytes)));
-        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(RunDir(path))
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for RunDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn getrandom(dest: &mut [u8]) {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(dest))
-        .expect("read /dev/urandom");
-}
-
-async fn gate(
-    ch_bin: &Path,
-    image: &Path,
-    vmlinuz: &Path,
-    initrd: &Path,
-    observation: Option<PathBuf>,
-) -> Result<(), Error> {
+async fn gate(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error> {
     let total = Instant::now();
-    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    let dir = RunDir::new()?;
-
-    // This run's ssh identity.
-    let identity = ssh::Identity::generate()?;
-
-    // Start the world: it mints the Zscaler chain, hands out DHCP, serves
-    // the HTTPS site, and gives us the CA root for the seed. The guest's
-    // frames reach it through the vhost-user backend on this socket.
-    let net_socket = dir.path().join("net.sock");
-    let world = world::start(world::Config {
-        now_unix,
-        observation,
-        site: SITE.to_string(),
-        net_socket: net_socket.clone(),
-    })
-    .await
-    .map_err(boxed)?;
-
-    // The cloud-init seed, carrying the world's CA.
-    let seed_bytes = seed::build(&seed::Provision {
-        hostname: HOSTNAME,
-        user: USER,
-        authorized_key: &identity.authorized_key,
-        ca_pem: &world.ca_pem,
-        site: SITE,
-    })?;
-    let seed_path = dir.path().join("seed.img");
-    std::fs::write(&seed_path, &seed_bytes)?;
-
-    // The per-run overlay over the untouched download.
-    let overlay = dir.path().join("overlay.qcow2");
-    disk::write_overlay(&overlay, &std::fs::canonicalize(image)?, DISK_SIZE)?;
-
+    let loaded = Arc::new(AtomicBool::new(false));
+    let dashboard =
+        fictionet_observe::DashboardObserver::new(fictionet_observe::DashboardOptions::demo());
+    let _observation = observation
+        .as_ref()
+        .map(|p| fictionet_observe::serve(dashboard.handle(), p))
+        .transpose()
+        .map_err(boxed)?;
+    let kit = Kit::new("desktop")
+        .guest(guest::workstation(HOSTNAME, USER, SITE))
+        .observer(dashboard.observer())
+        .observer(Arc::new(world::SiteLoaded {
+            host: SITE.into(),
+            loaded: loaded.clone(),
+        }))
+        .world(|fcx, world| world::start(fcx, world, SITE.into()));
     // Screenshots survive the run (the run dir does not).
-    let shots = image
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("shots");
+    let shots = downloads.join("shots");
     std::fs::create_dir_all(&shots)?;
 
     // The desktop viewer, bound before boot so a port already in use fails
@@ -169,31 +86,20 @@ async fn gate(
     let page_url = page.url();
     let page_port = page.port();
 
-    // Boot.
-    let boot = Instant::now();
-    let vm = ch::Vm::start(
-        &ch::Config {
-            cloud_hypervisor: ch_bin,
-            vmlinuz,
-            initrd,
-            cmdline: "root=LABEL=cloudimg-rootfs ro console=ttyS0,115200n8 net.ifnames=0",
-            overlay: &overlay,
-            seed: &seed_path,
-            vcpus: 4,
-            memory_mib: 4096,
-            manufacturer: "LENOVO",
-            product: "20UES000-WS",
-            uuid: &random_uuid(),
-            net_socket: &net_socket,
-            mac: world::GUEST_MAC,
-        },
-        dir.path(),
-    )?;
-
-    // Serve the viewer for the rest of the run; dropped when the gate returns.
     let tunnel = page::Tunnel::default();
     let viewer = tokio::spawn(page.serve(tunnel.clone()));
     println!("desktop viewer: {page_url}");
+    let run = match kit.boot(downloads).await {
+        Ok(run) => run,
+        Err(error) => {
+            viewer.abort();
+            let _ = viewer.await;
+            return Err(error.into());
+        }
+    };
+    let boot = run.boot_started();
+    let workstation = run.guest(HOSTNAME);
+    let vm = workstation.vm();
 
     // Show where Cloud Hypervisor runs from: a memfd when the binary is
     // embedded (nothing on disk), the downloaded path otherwise.
@@ -204,38 +110,20 @@ async fn gate(
         println!("Cloud Hypervisor (pid {pid}) runs from {}\n", exe.display());
     }
 
-    // The admin's SSH session, from the jump host to the guest's sshd. The
-    // viewer tunnels through it once it is up.
-    let result = match admin_session(&vm, &world, &identity).await {
-        Ok(session) => {
-            let ssh_ready_ms = boot.elapsed().as_millis();
-            println!(
-                "ssh from the jump host ({}) is up after {ssh_ready_ms} ms; waiting for the desktop install\n",
-                world::JUMP_ADDR
-            );
-            let session = Arc::new(session);
-            let _ = tunnel.set(session.clone());
-            run_checks(&vm, &session, &world, boot, &shots, &page_url, page_port)
-                .await
-                .map(|checks| (ssh_ready_ms, checks))
-        }
-        Err(error) => Err(error),
-    };
+    let ssh_ready_ms = workstation.ssh_ready().as_millis();
+    println!(
+        "ssh from the jump host ({}) is up after {ssh_ready_ms} ms; waiting for the desktop \
+            install\n",
+        kit::jump::JUMP_ADDR
+    );
+    let _ = tunnel.set(workstation.ssh().clone());
+    let result = run_checks(workstation, &loaded, boot, &shots, &page_url, page_port)
+        .await
+        .map(|checks| (ssh_ready_ms, checks));
     viewer.abort();
-
-    // ACPI poweroff over the session, then a bounded kill as backup. The
-    // guest may go before it answers, so the command is not waited on long.
-    if let Some(session) = tunnel.get() {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(10),
-            session.run("sudo systemctl poweroff"),
-        )
-        .await;
-    }
-    let stop = vm.stop(Duration::from_secs(60)).await;
-    world.shutdown();
-    let run_dir = dir.path().to_path_buf();
-    drop(dir);
+    let _ = viewer.await;
+    let run_dir = run.path().to_path_buf();
+    let stop = run.shutdown().await;
 
     println!("\n=== shutdown ===");
     let mut failures = Vec::new();
@@ -279,25 +167,6 @@ fn check(failures: &mut Vec<String>, what: &str, ok: bool) {
     }
 }
 
-/// Connects the admin's SSH session: from the jump host, through the world,
-/// to the guest's sshd on the address it leased.
-async fn admin_session(
-    vm: &ch::Vm,
-    world: &world::World,
-    identity: &ssh::Identity,
-) -> Result<ssh::Session, Error> {
-    let dial = || world.connect_guest(22, Duration::from_secs(10));
-    match ssh::Session::connect(dial, identity, USER, Duration::from_secs(300)).await {
-        Ok(session) => Ok(session),
-        Err(error) => Err(format!(
-            "{error}\n--- cloud-hypervisor stderr ---\n{}\n--- guest console tail ---\n{}",
-            vm.ch_stderr_tail(),
-            vm.console_tail()
-        )
-        .into()),
-    }
-}
-
 struct Checks {
     desktop_ready_ms: u128,
     /// The guest's own measure of the coding agents' install: bytes
@@ -308,14 +177,15 @@ struct Checks {
 }
 
 async fn run_checks(
-    vm: &ch::Vm,
-    session: &ssh::Session,
-    world: &world::World,
+    workstation: &kit::GuestHandle,
+    loaded: &AtomicBool,
     boot: Instant,
     shots: &Path,
     page_url: &str,
     page_port: u16,
 ) -> Result<Checks, Error> {
+    let vm = workstation.vm();
+    let session = workstation.ssh();
     // Every required check that failed; the gate fails at the end if any did.
     let mut failures: Vec<String> = Vec::new();
 
@@ -344,7 +214,8 @@ async fn run_checks(
         "pgrep -af firefox | head -1 || echo 'no firefox'",
         "ls /etc/ssl/certs | grep -i zscaler || echo 'no zscaler cert'",
         // How much the guest pulled from the world's mirror at boot.
-        "echo \"packages downloaded: $(du -shc /var/cache/apt/archives/*.deb 2>/dev/null | tail -1 | cut -f1) in $(ls /var/cache/apt/archives/*.deb 2>/dev/null | wc -l) files\"",
+        "echo \"packages downloaded: $(du -shc /var/cache/apt/archives/*.deb 2>/dev/null | tail \
+            -1 | cut -f1) in $(ls /var/cache/apt/archives/*.deb 2>/dev/null | wc -l) files\"",
         // Every socket the guest listens on, and from where.
         "sudo ss -tulnpH",
     ] {
@@ -352,7 +223,7 @@ async fn run_checks(
     }
 
     // Required: the guest's address is the one the world leased it by DHCP.
-    let lease = world.guest_addr();
+    let lease = workstation.addr();
     let addr = guest_cmd(session, "ip -4 -o addr show dev eth0").await?;
     check(
         &mut failures,
@@ -387,9 +258,12 @@ async fn run_checks(
         &mut failures,
         &format!(
             "ss shows the SSH session coming from the jump host ({})",
-            world::JUMP_ADDR
+            kit::jump::JUMP_ADDR
         ),
-        !peers.is_empty() && peers.iter().all(|p| *p == Some(world::JUMP_ADDR.into())),
+        !peers.is_empty()
+            && peers
+                .iter()
+                .all(|p| *p == Some(kit::jump::JUMP_ADDR.into())),
     );
 
     // Required: Ubuntu's sshd and the desktop are running, and Xvnc listens
@@ -434,7 +308,8 @@ async fn run_checks(
     );
     let session_env = guest_cmd(
         session,
-        "sudo cat /proc/$(pgrep -xo xfce4-session || echo 1)/environ 2>/dev/null | tr '\\0' '\\n' | grep -iE 'SSL_CERT|REQUESTS_CA|NODE_USE' || echo 'no session trust env'",
+        "sudo cat /proc/$(pgrep -xo xfce4-session || echo 1)/environ 2>/dev/null | tr '\\0' \
+            '\\n' | grep -iE 'SSL_CERT|REQUESTS_CA|NODE_USE' || echo 'no session trust env'",
     )
     .await?;
     check(
@@ -457,7 +332,8 @@ async fn run_checks(
     );
     let firefox = guest_cmd(
         session,
-        "firefox --version 2>/dev/null; test -x /usr/lib/firefox/firefox && echo 'Mozilla firefox (not snap)'",
+        "firefox --version 2>/dev/null; test -x /usr/lib/firefox/firefox && echo 'Mozilla \
+            firefox (not snap)'",
     )
     .await?;
     check(
@@ -469,15 +345,15 @@ async fn run_checks(
     // Required: Firefox loaded the site, seen as the world's http.request
     // event with Firefox's User-Agent.
     let firefox_deadline = Instant::now() + Duration::from_secs(90);
-    while !world.firefox_loaded() && Instant::now() < firefox_deadline {
+    while !loaded.load(Ordering::SeqCst) && Instant::now() < firefox_deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     check(
         &mut failures,
         "Firefox loaded the site (the world's http.request event)",
-        world.firefox_loaded(),
+        loaded.load(Ordering::SeqCst),
     );
-    if world.firefox_loaded() {
+    if loaded.load(Ordering::SeqCst) {
         // A moment for Firefox to finish painting the page and its padlock.
         tokio::time::sleep(Duration::from_secs(6)).await;
     } else {
@@ -495,7 +371,10 @@ async fn run_checks(
     // A screenshot of the guest's own screen, over ssh, decoded on the host.
     let mut screenshots = Vec::new();
     let shot = session
-        .run("sudo -u analyst env DISPLAY=:1 scrot -o /tmp/guest.png 2>/dev/null && base64 -w0 /tmp/guest.png")
+        .run(
+            "sudo -u analyst env DISPLAY=:1 scrot -o /tmp/guest.png 2>/dev/null && base64 -w0 \
+            /tmp/guest.png",
+        )
         .await?;
     let guest_png = save_png(&shot.stdout, &shots.join("guest-desktop.png"));
     check(
@@ -512,7 +391,7 @@ async fn run_checks(
     let viewer_png = shots.join("viewer-desktop.png");
     let capture = tokio::time::timeout(
         Duration::from_secs(30),
-        viewer::capture(page_port, &viewer_png),
+        rfb::capture_page(page_port, &viewer_png),
     )
     .await
     .unwrap_or_else(|_| Err(std::io::Error::other("timed out")));
@@ -557,17 +436,17 @@ async fn run_checks(
     let claude = guest_cmd(session, "claude --version").await?;
     check(
         &mut failures,
-        &format!("claude --version is Claude Code {}", seed::CLAUDE_VERSION),
+        &format!("claude --version is Claude Code {}", guest::CLAUDE_VERSION),
         claude.code == 0
             && claude
                 .stdout
-                .contains(&format!("{} (Claude Code)", seed::CLAUDE_VERSION)),
+                .contains(&format!("{} (Claude Code)", guest::CLAUDE_VERSION)),
     );
     let codex = guest_cmd(session, "codex --version").await?;
     check(
         &mut failures,
-        &format!("codex --version is codex-cli {}", seed::CODEX_VERSION),
-        codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", seed::CODEX_VERSION),
+        &format!("codex --version is codex-cli {}", guest::CODEX_VERSION),
+        codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", guest::CODEX_VERSION),
     );
 
     // Required: each agent's own HTTP client trusts the world's CA through
@@ -589,7 +468,8 @@ async fn run_checks(
         session,
         &format!(
             "timeout 60 codex -c model_provider=site \
-             -c 'model_providers.site={{name=\"site\",base_url=\"https://{SITE}\",requires_openai_auth=false}}' \
+             -c 'model_providers.site={{name=\"site\",base_url=\"https://{SITE}\
+                 \",requires_openai_auth=false}}' \
              doctor --no-color --ascii 2>&1 | grep -iE 'inference URL|TLS|certificate|sandbox'"
         ),
     )
@@ -603,7 +483,8 @@ async fn run_checks(
     );
     let agents = guest_cmd(
         session,
-        "sudo grep -h '^coding agents:' /var/log/cloud-init-output.log || echo 'coding agents: not installed'",
+        "sudo grep -h '^coding agents:' /var/log/cloud-init-output.log || echo 'coding agents: \
+            not installed'",
     )
     .await?;
     let agents_install = agents
@@ -613,7 +494,7 @@ async fn run_checks(
         .trim()
         .to_string();
 
-    let peak_rss_mib = vm_peak_rss_mib(vm).unwrap_or(0);
+    let peak_rss_mib = vm.peak_rss_mib().unwrap_or(0);
     if !failures.is_empty() {
         return Err(format!("the gate's required checks failed: {}", failures.join("; ")).into());
     }
@@ -660,71 +541,4 @@ fn save_png(b64: &str, path: &Path) -> Option<String> {
     }
     std::fs::write(path, &bytes).ok()?;
     Some(path.display().to_string())
-}
-
-/// Decodes standard base64 (ignoring whitespace).
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::new();
-    let mut acc = 0u32;
-    let mut bits = 0;
-    for &c in s.as_bytes() {
-        if c == b'=' || c.is_ascii_whitespace() {
-            continue;
-        }
-        let v = val(c)? as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
-/// The VM child's peak resident memory, in MiB.
-fn vm_peak_rss_mib(vm: &ch::Vm) -> Option<u64> {
-    let pid = vm.pid()?;
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("VmHWM:"))
-        .and_then(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())
-        .map(|kb| kb >> 10)
-}
-
-fn random_uuid() -> String {
-    let mut b = [0u8; 16];
-    getrandom(&mut b);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0],
-        b[1],
-        b[2],
-        b[3],
-        b[4],
-        b[5],
-        b[6],
-        b[7],
-        b[8],
-        b[9],
-        b[10],
-        b[11],
-        b[12],
-        b[13],
-        b[14],
-        b[15]
-    )
 }

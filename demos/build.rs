@@ -1,9 +1,9 @@
-//! Embeds the files `cargo xtask cloudimage` downloads to
+//! Embeds the files `cargo xtask demo assets` downloads to
 //! `downloads/cloudimage` when they are there, so a workspace build without
 //! them still compiles. noVNC's files become a table in `OUT_DIR/novnc.rs`,
 //! empty without them.
 //! Cloud Hypervisor's static binary becomes `OUT_DIR/ch_bin.rs`, `None`
-//! without it, so the cloud-image demo can run it from memory with nothing
+//! without it, so the shared kit can run it from memory with nothing
 //! written to disk.
 
 use std::fmt::Write;
@@ -46,7 +46,7 @@ fn main() {
              pub static CH_BIN: Option<&[u8]> = Some(include_bytes!({ch:?}));\n"
         )
     } else {
-        "/// Set once `cargo xtask cloudimage` has downloaded the binary.\n\
+        "/// Set once `cargo xtask demo assets` has downloaded the binary.\n\
          pub static CH_BIN: Option<&[u8]> = None;\n"
             .to_string()
     };

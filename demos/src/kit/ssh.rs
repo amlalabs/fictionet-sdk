@@ -42,8 +42,11 @@ impl Identity {
 
 /// What a command printed, and how it ended.
 pub struct Output {
+    /// The remote exit status, or minus one if none was reported.
     pub code: i32,
+    /// The command standard output.
     pub stdout: String,
+    /// The command standard error.
     pub stderr: String,
 }
 
@@ -130,6 +133,26 @@ impl Session {
         Ok(channel.into_stream())
     }
 
+    /// Opens a shell with a PTY on this authenticated session.
+    pub async fn pty(&self, term: &str, cols: u32, rows: u32) -> io::Result<Pty> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(io::Error::other)?;
+        channel
+            .request_pty(true, term, cols, rows, 0, 0, &[])
+            .await
+            .map_err(io::Error::other)?;
+        request_accepted(&mut channel).await?;
+        channel
+            .request_shell(true)
+            .await
+            .map_err(io::Error::other)?;
+        request_accepted(&mut channel).await?;
+        Ok(Pty { channel })
+    }
+
     /// Runs `command` and returns what it printed and its exit code.
     pub async fn run(&self, command: &str) -> io::Result<Output> {
         let mut channel = self
@@ -191,10 +214,7 @@ impl russh::keys::ssh_key::rand_core::RngCore for OsRng {
         u64::from_ne_bytes(b)
     }
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        use std::io::Read;
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(dest))
-            .expect("read /dev/urandom");
+        super::getrandom(dest);
     }
     fn try_fill_bytes(
         &mut self,
@@ -206,3 +226,51 @@ impl russh::keys::ssh_key::rand_core::RngCore for OsRng {
 }
 
 impl russh::keys::ssh_key::rand_core::CryptoRng for OsRng {}
+
+/// A shell channel whose reads apply backpressure through russh's bounded channel and window.
+pub struct Pty {
+    channel: russh::Channel<Msg>,
+}
+
+impl Pty {
+    /// Sends input to the shell.
+    pub async fn write(&self, input: &[u8]) -> io::Result<()> {
+        self.channel.data(input).await.map_err(io::Error::other)
+    }
+    /// Returns one output chunk, or None when the shell closes.
+    /// Reading applies backpressure through russh's bounded channel and window.
+    pub async fn read(&mut self) -> io::Result<Option<Vec<u8>>> {
+        while let Some(message) = self.channel.wait().await {
+            match message {
+                russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. } => {
+                    return Ok(Some(data.to_vec()));
+                }
+                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => return Ok(None),
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+    /// Changes the terminal size in columns and rows.
+    pub async fn resize(&self, cols: u32, rows: u32) -> io::Result<()> {
+        self.channel
+            .window_change(cols, rows, 0, 0)
+            .await
+            .map_err(io::Error::other)
+    }
+    /// Sends EOF and closes the shell channel.
+    pub async fn close(&self) -> io::Result<()> {
+        self.channel.eof().await.map_err(io::Error::other)?;
+        self.channel.close().await.map_err(io::Error::other)
+    }
+}
+
+async fn request_accepted(channel: &mut russh::Channel<Msg>) -> io::Result<()> {
+    match channel.wait().await {
+        Some(russh::ChannelMsg::Success) => Ok(()),
+        _ => Err(io::Error::other("the guest refused the shell or PTY")),
+    }
+}
+
+#[cfg(test)]
+mod tests;

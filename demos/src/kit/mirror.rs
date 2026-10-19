@@ -41,6 +41,7 @@ const SLOTS: usize = 16;
 
 type Answer = Result<Response<Body>, Error>;
 
+/// Opens the shared host cache and its upstream web proxy.
 pub fn new(fcx: &Cx) -> Result<Cache<web::Proxy>, Error> {
     Ok(Cache::new(
         web::proxy(fcx)?,
@@ -49,6 +50,7 @@ pub fn new(fcx: &Cx) -> Result<Cache<web::Proxy>, Error> {
 }
 
 #[derive(Clone)]
+/// A web service that caches eligible upstream package downloads.
 pub struct Cache<S> {
     upstream: S,
     state: Arc<State>,
@@ -81,7 +83,8 @@ impl Drop for State {
         let s = &self.stats;
         let reasons = s.bypassed.lock().unwrap();
         println!(
-            "apt cache: {} hits, {} misses, {} bytes saved, {} bytes fetched, {} bypassed {reasons:?}",
+            "apt cache: {} hits, {} misses, {} bytes saved, {} bytes fetched, {} bypassed \
+                {reasons:?}",
             s.hits.load(Ordering::Relaxed),
             s.misses.load(Ordering::Relaxed),
             s.saved.load(Ordering::Relaxed),
@@ -735,7 +738,7 @@ async fn persist(
     received_at: SystemTime,
 ) -> Result<(), Error> {
     let mut random = [0; 8];
-    crate::getrandom(&mut random);
+    crate::kit::getrandom(&mut random);
     let path = reservation
         .path
         .parent()

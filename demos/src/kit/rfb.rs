@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use fictionet::stdlib::codec::{Side, Stream, Wire};
 use fictionet::stdlib::protocols::websocket::{self, Message, Messages};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// What a capture found.
@@ -20,7 +20,9 @@ pub struct Capture {
     /// The RFB ProtocolVersion the guest's server opened with, e.g.
     /// `RFB 003.008`.
     pub banner: String,
+    /// The captured screen width in pixels.
     pub width: u16,
+    /// The captured screen height in pixels.
     pub height: u16,
     /// How many colors the screen shows, counted up to 256: one for a blank
     /// screen, many for a desktop.
@@ -31,8 +33,24 @@ pub struct Capture {
 
 /// Connects through the page, captures the guest's screen over RFB, and writes
 /// it to `out` as a PNG.
-pub async fn capture(port: u16, out: &Path) -> io::Result<Capture> {
-    let mut conn = WsConn::connect(port).await?;
+pub async fn capture_page(port: u16, out: &Path) -> io::Result<Capture> {
+    let (stream, bridge) = WsConn::connect(port).await?.into_stream();
+    let result = capture(stream, out).await;
+    if result.is_err() {
+        bridge.await.map_err(io::Error::other)??;
+    } else {
+        bridge.abort();
+        let _ = bridge.await;
+    }
+    result
+}
+
+/// Captures RFB from an SSH forward or any other byte stream.
+pub async fn capture<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    out: &Path,
+) -> io::Result<Capture> {
+    let mut conn = ByteStream(stream);
 
     // RFB 3.8 handshake (RFC 6143). The server opens with its version.
     let banner_bytes = conn.read_exact(12).await?;
@@ -180,7 +198,7 @@ impl WsConn {
     async fn connect(port: u16) -> io::Result<WsConn> {
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
         let mut nonce = [0u8; 16];
-        crate::getrandom(&mut nonce);
+        crate::kit::getrandom(&mut nonce);
         let headers = websocket::request_headers(&format!("127.0.0.1:{port}"), nonce, &["binary"])
             .map_err(io::Error::other)?;
         let mut request = String::from("GET /websockify HTTP/1.1\r\n");
@@ -239,28 +257,60 @@ impl WsConn {
         Ok(())
     }
 
-    /// Reads exactly `n` RFB bytes, pulling more WebSocket frames as needed.
-    async fn read_exact(&mut self, n: usize) -> io::Result<Vec<u8>> {
-        while self.rx.len() < n {
-            let read = self.stream.read(self.messages.spare()).await?;
-            if read == 0 {
-                return Err(io::Error::other("the viewer stream ended mid-message"));
-            }
-            self.messages.commit(read);
-            self.drain_messages()?;
-        }
-        Ok(self.rx.drain(..n).collect())
+    fn into_stream(
+        self,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let (client, bridge) = tokio::io::duplex(64 << 10);
+        let task = tokio::spawn(self.bridge(bridge));
+        (client, task)
     }
 
-    /// Sends RFB bytes as one masked binary WebSocket message.
+    async fn bridge(mut self, mut stream: tokio::io::DuplexStream) -> io::Result<()> {
+        let mut input = [0u8; 16 << 10];
+        loop {
+            if !self.rx.is_empty() {
+                stream.write_all(&self.rx).await?;
+                self.rx.clear();
+            }
+            tokio::select! {
+                read = self.stream.read(self.messages.spare()) => {
+                    let n = read?;
+                    if n == 0 {
+                        return Err(io::Error::other("the viewer's WebSocket closed"));
+                    }
+                    self.messages.commit(n);
+                    self.drain_messages()?;
+                }
+                read = stream.read(&mut input) => {
+                    let n = read?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    let mut mask = [0u8; 4];
+                    super::getrandom(&mut mask);
+                    let frame = Message::Binary(input[..n].to_vec())
+                        .to_frame(Some(mask))
+                        .map_err(io::Error::other)?;
+                    let wire = Wire::to_bytes(&frame).map_err(io::Error::other)?;
+                    self.stream.write_all(&wire).await?;
+                }
+            }
+        }
+    }
+}
+
+struct ByteStream<S>(S);
+impl<S: AsyncRead + AsyncWrite + Unpin> ByteStream<S> {
+    async fn read_exact(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        let mut bytes = vec![0; n];
+        self.0.read_exact(&mut bytes).await?;
+        Ok(bytes)
+    }
     async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut mask = [0u8; 4];
-        crate::getrandom(&mut mask);
-        let frame = Message::Binary(bytes.to_vec())
-            .to_frame(Some(mask))
-            .map_err(io::Error::other)?;
-        let wire = Wire::to_bytes(&frame).map_err(io::Error::other)?;
-        self.stream.write_all(&wire).await
+        self.0.write_all(bytes).await
     }
 }
 
@@ -299,4 +349,76 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     crc.update(kind);
     crc.update(data);
     out.extend_from_slice(&crc.finalize().to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn page_capture_reports_websocket_failure() {
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+                .await
+                .unwrap();
+            stream.write_all(b"\x82\x0cRFB 003.008\n").await.unwrap();
+            let mut banner = [0; 18];
+            stream.read_exact(&mut banner).await.unwrap();
+            stream.write_all(b"\x88\x00").await.unwrap();
+        });
+        let error = capture_page(port, &dir.path().join("screen.png"))
+            .await
+            .err()
+            .unwrap();
+        peer.await.unwrap();
+        assert_eq!(error.to_string(), "the viewer closed the stream");
+    }
+
+    #[tokio::test]
+    async fn captures_a_byte_stream_as_png() {
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
+        let out = dir.path().join("screen.png");
+        let (client, mut server) = tokio::io::duplex(64);
+        let peer = tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut banner = [0; 12];
+            server.read_exact(&mut banner).await.unwrap();
+            assert_eq!(&banner, b"RFB 003.008\n");
+            server.write_all(&[1, 1]).await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), 1);
+            server.write_all(&[0; 4]).await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), 1);
+            let mut init = [0; 24];
+            init[..4].copy_from_slice(&[0, 2, 0, 1]);
+            server.write_all(&init).await.unwrap();
+            let mut request = [0; 38];
+            server.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[0], 0);
+            assert_eq!(request[20], 2);
+            assert_eq!(request[28], 3);
+            server
+                .write_all(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            server
+                .write_all(&[0, 0, 255, 0, 0, 255, 0, 0])
+                .await
+                .unwrap();
+        });
+        let result = capture(client, &out).await.unwrap();
+        peer.await.unwrap();
+        assert_eq!((result.width, result.height, result.colors), (2, 1, 2));
+        assert_eq!(&std::fs::read(out).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+    }
 }

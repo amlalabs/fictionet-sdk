@@ -159,7 +159,7 @@ async fn run<F: Future<Output = ()> + Send + 'static>(f: impl FnOnce(Cx) -> F + 
 #[tokio::test]
 async fn miss_then_hit_survives_a_new_run() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         assert_eq!(
@@ -186,7 +186,7 @@ async fn miss_then_hit_survives_a_new_run() {
 #[tokio::test]
 async fn mutable_indexes_keep_origin_validators_and_changes() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         for path in [INDEX, "/ubuntu/dists/noble/main/binary-amd64/Packages.xz"] {
@@ -233,7 +233,7 @@ async fn mutable_indexes_keep_origin_validators_and_changes() {
 #[tokio::test]
 async fn offline_indexes_report_failure_instead_of_stale_success() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let mut upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         assert_eq!(
@@ -254,7 +254,7 @@ async fn offline_indexes_report_failure_instead_of_stale_success() {
 #[tokio::test]
 async fn partial_body_is_never_published() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         upstream.push(
             b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort".to_vec(),
@@ -287,7 +287,7 @@ async fn partial_body_is_never_published() {
 #[tokio::test]
 async fn concurrent_misses_share_one_fetch() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         for path in [PACKAGE] {
@@ -315,7 +315,7 @@ async fn concurrent_misses_share_one_fetch() {
 #[tokio::test]
 async fn ranges_use_complete_entries_and_other_ranges_pass_through() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         upstream.push(reply(
             "206 Partial Content",
@@ -362,7 +362,7 @@ async fn ranges_use_complete_entries_and_other_ranges_pass_through() {
 #[tokio::test]
 async fn errors_and_unknown_paths_are_not_cached() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         for status in ["404 Not Found", "503 Service Unavailable", "302 Found"] {
@@ -395,7 +395,7 @@ async fn errors_and_unknown_paths_are_not_cached() {
 #[tokio::test]
 async fn tls_origin_and_hosts_have_separate_entries() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         for tls in [false, true] {
@@ -494,7 +494,7 @@ fn release_files_are_immutable_inside_version_directories() {
 #[tokio::test]
 async fn a_client_that_stops_at_content_length_still_leaves_the_file() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         let mut body = send(&fcx, &cache, request(PACKAGE))
@@ -521,7 +521,7 @@ async fn a_client_that_stops_at_content_length_still_leaves_the_file() {
 #[tokio::test]
 async fn release_files_are_passed_on_and_stored_without_cookies() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         let release = |path: &str| {
@@ -554,7 +554,7 @@ async fn release_files_are_passed_on_and_stored_without_cookies() {
 #[tokio::test]
 async fn by_hash_is_immutable_and_damaged_entries_are_refetched() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let path = &format!("/ubuntu/dists/noble/main/by-hash/SHA256/{}", "a".repeat(64));
         let cache = upstream.cache(&fcx, dir.path());
@@ -578,7 +578,7 @@ async fn by_hash_is_immutable_and_damaged_entries_are_refetched() {
 #[tokio::test]
 async fn uncacheable_representations_and_requests_pass_through() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         for extra in [
@@ -631,7 +631,7 @@ async fn uncacheable_representations_and_requests_pass_through() {
 #[tokio::test]
 async fn changed_if_range_is_forwarded() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         upstream.push(reply("200 OK", "ETag: \"current\"\r\n", b"package"));
@@ -659,7 +659,7 @@ async fn changed_if_range_is_forwarded() {
 #[tokio::test]
 async fn interrupted_mutable_index_is_not_hidden_by_cached_bytes() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         assert_eq!(
@@ -687,7 +687,7 @@ async fn interrupted_mutable_index_is_not_hidden_by_cached_bytes() {
 #[tokio::test]
 async fn immutable_conditions_obey_precedence_and_weak_comparison() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         upstream.push(reply(
             "200 OK",
@@ -776,7 +776,7 @@ fn complete(body: &'static str) -> Response<Body> {
 #[tokio::test]
 async fn cold_response_streams_before_completion_and_waiters_retry_failure() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let (tx, rx) = mpsc::channel(1);
         let source = Scripted::new(vec![
             Response::builder()
@@ -827,7 +827,7 @@ async fn cold_response_streams_before_completion_and_waiters_retry_failure() {
 #[tokio::test]
 async fn cancelled_download_releases_its_key_and_never_publishes() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let (tx, rx) = mpsc::channel(1);
         let source = Scripted::new(vec![
             Response::builder()
@@ -867,7 +867,7 @@ async fn cancelled_download_releases_its_key_and_never_publishes() {
 #[tokio::test]
 async fn all_traffic_and_key_waiters_share_bounded_admission() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let source = Scripted::new(vec![complete("package")]);
         let mut cache = Cache::new(source.clone(), dir.path().to_owned());
         // Unpolled futures consume admission too, so they cannot accumulate
@@ -893,7 +893,7 @@ async fn all_traffic_and_key_waiters_share_bounded_admission() {
 #[tokio::test]
 async fn hostile_fill_headers_cannot_select_or_frame_the_stored_object() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         let mut req = request(PACKAGE);
@@ -941,7 +941,7 @@ async fn hostile_fill_headers_cannot_select_or_frame_the_stored_object() {
 #[tokio::test]
 async fn head_queries_and_storage_directives_do_not_populate_or_poison() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         let mut req = request(PACKAGE);
@@ -990,25 +990,41 @@ async fn head_queries_and_storage_directives_do_not_populate_or_poison() {
 #[tokio::test]
 async fn no_cache_private_variants_and_chunked_responses_are_never_retained() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
-        for extra in ["Cache-Control: no-cache\r\n", "Cache-Control: private=\"ETag\"\r\n", "Vary: *\r\n",
-            "Vary: Accept-Encoding, Cookie\r\n", "Content-Encoding: identity\r\nContent-Encoding: gzip\r\n"] {
+        for extra in [
+            "Cache-Control: no-cache\r\n",
+            "Cache-Control: private=\"ETag\"\r\n",
+            "Vary: *\r\n",
+            "Vary: Accept-Encoding, Cookie\r\n",
+            "Content-Encoding: identity\r\nContent-Encoding: gzip\r\n",
+        ] {
             upstream.push(reply("200 OK", extra, b"variant"));
-            assert_eq!(bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await, "variant");
+            assert_eq!(
+                bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+                "variant"
+            );
         }
-        upstream.push(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n".to_vec());
-        assert_eq!(bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await, "abc");
+        upstream.push(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+              Connection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+                .to_vec(),
+        );
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "abc"
+        );
         assert!(!dir.path().join("mirror.test").exists());
         assert_eq!(upstream.count(), 6);
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn cache_age_survives_restart_and_origin_expiry_is_respected() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let date = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(300));
         upstream.push(reply(
@@ -1059,8 +1075,8 @@ async fn cache_age_survives_restart_and_origin_expiry_is_respected() {
 async fn symlinks_and_hardlinks_disable_cache_without_touching_the_target() {
     run(|fcx| async move {
         for location in ["root", "host", "file", "hardlink"] {
-            let dir = crate::RunDir::new().unwrap();
-            let outside = crate::RunDir::new().unwrap();
+            let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
+            let outside = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
             let sentinel = outside.path().join("sentinel");
             std::fs::write(&sentinel, "do not touch").unwrap();
             let root = dir.path().join("cache");
@@ -1100,7 +1116,7 @@ async fn symlinks_and_hardlinks_disable_cache_without_touching_the_target() {
 #[tokio::test]
 async fn disk_budget_includes_old_files_and_limits_new_admission() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let file = std::fs::File::create(dir.path().join("old")).unwrap();
         file.set_len(MAX_TOTAL - 8192).unwrap();
         let source = Scripted::new(vec![complete("package"), complete("fresh")]);
@@ -1122,7 +1138,7 @@ async fn disk_budget_includes_old_files_and_limits_new_admission() {
 
 #[tokio::test]
 async fn reservations_bound_concurrent_files_and_release_failed_downloads() {
-    let dir = crate::RunDir::new().unwrap();
+    let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
     let disk = Arc::new(Disk::open(dir.path().to_owned()).unwrap());
     let mut pending = Vec::new();
     for i in 0..7 {
@@ -1148,7 +1164,7 @@ async fn reservations_bound_concurrent_files_and_release_failed_downloads() {
 #[tokio::test]
 async fn second_owner_bypasses_and_restart_removes_crash_debris() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let source = Scripted::new(vec![complete("package"), complete("other process")]);
         let owner = Cache::new(source.clone(), dir.path().to_owned());
         assert_eq!(
@@ -1178,7 +1194,7 @@ async fn second_owner_bypasses_and_restart_removes_crash_debris() {
 
 #[tokio::test]
 async fn temp_collision_never_removes_another_download() {
-    let dir = crate::RunDir::new().unwrap();
+    let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
     let path = dir.path().join(".download-collision");
     std::fs::write(&path, "existing download").unwrap();
     assert!(Temporary::create(path.clone()).is_err());
@@ -1204,7 +1220,7 @@ async fn slow_body_deadline_releases_resources_even_without_a_reader() {
 #[tokio::test]
 async fn filesystem_entry_limit_bounds_tiny_files_and_directories() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         for i in 1..MAX_NODES {
             std::fs::File::create(dir.path().join(format!("old-{i}"))).unwrap();
         }
@@ -1230,7 +1246,7 @@ async fn filesystem_entry_limit_bounds_tiny_files_and_directories() {
 #[tokio::test]
 async fn oversized_files_and_header_blocks_stream_without_storage() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let mut large = complete("large");
         large
             .headers_mut()
@@ -1261,7 +1277,7 @@ async fn oversized_files_and_header_blocks_stream_without_storage() {
 #[tokio::test]
 async fn failed_replacement_preserves_complete_bytes_and_does_not_serve_them_stale() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let mut old = complete("old package");
         old.headers_mut()
             .insert(header::CACHE_CONTROL, "max-age=0".parse().unwrap());
@@ -1302,7 +1318,7 @@ async fn failed_replacement_preserves_complete_bytes_and_does_not_serve_them_sta
 #[tokio::test]
 async fn disk_write_failure_does_not_replace_a_valid_upstream_response() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let path = dir.path().join("mirror.test/http-80").join(&PACKAGE[1..]);
         std::fs::create_dir_all(&path).unwrap();
         let source = Scripted::new(vec![complete("package"), complete("fresh")]);
@@ -1324,7 +1340,7 @@ async fn disk_write_failure_does_not_replace_a_valid_upstream_response() {
 
 #[tokio::test]
 async fn admission_covers_response_bodies_after_headers_are_returned() {
-    let dir = crate::RunDir::new().unwrap();
+    let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
     let mut senders = Vec::new();
     let mut responses = Vec::new();
     for _ in 0..SLOTS {
@@ -1356,7 +1372,7 @@ async fn admission_covers_response_bodies_after_headers_are_returned() {
 #[tokio::test]
 async fn ambiguous_upstream_framing_is_rejected_without_a_cache_entry() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
         for headers in [
@@ -1380,7 +1396,7 @@ async fn ambiguous_upstream_framing_is_rejected_without_a_cache_entry() {
 #[tokio::test]
 async fn request_bodies_are_forwarded_without_populating_the_cache() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let source = Scripted::new(vec![complete("body response"), complete("package")]);
         let cache = Cache::new(source.clone(), dir.path().to_owned());
         let mut req = request(PACKAGE);
@@ -1410,7 +1426,7 @@ async fn request_bodies_are_forwarded_without_populating_the_cache() {
 #[tokio::test]
 async fn cached_readers_keep_directory_ownership_until_their_files_close() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let payload = Bytes::from(vec![b'p'; 8 * CHUNK]);
         let source = Scripted::new(vec![
             Response::builder()
@@ -1527,7 +1543,7 @@ async fn immutable_request_freshness_preferences_allow_fills_and_hits() {
                     (header::CACHE_CONTROL, "no-cache"),
                 ],
             ] {
-                let dir = crate::RunDir::new().unwrap();
+                let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
                 let source = Scripted::new(vec![complete("package")]);
                 let cache = Cache::new(source.clone(), dir.path().to_owned());
                 for _ in 0..2 {
@@ -1560,7 +1576,7 @@ async fn immutable_request_freshness_preferences_allow_fills_and_hits() {
 #[tokio::test]
 async fn mutable_request_directives_are_forwarded_and_counted() {
     run(|fcx| async move {
-        let dir = crate::RunDir::new().unwrap();
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let source = Scripted::new(vec![
             complete("first"),
             complete("second"),

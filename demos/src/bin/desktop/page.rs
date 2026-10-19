@@ -22,7 +22,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
-use crate::ssh;
+use fictionet_demo::kit::ssh;
 
 include!(concat!(env!("OUT_DIR"), "/novnc.rs"));
 

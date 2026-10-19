@@ -4,6 +4,8 @@
 //! vhost-user backend. The guest has no vsock or other side channel: the
 //! host reaches it over that card, through the world.
 
+pub mod disk;
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -13,22 +15,32 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 // `pub static CH_BIN: Option<&[u8]>`: Cloud Hypervisor's static binary when
-// `cargo xtask cloudimage` has downloaded it (see build.rs), else `None`.
+// `cargo xtask demo assets` has downloaded it (see build.rs), else `None`.
 include!(concat!(env!("OUT_DIR"), "/ch_bin.rs"));
 
 /// How to boot one VM.
 pub struct Config<'a> {
+    /// The downloaded executable used when no embedded binary is available.
     pub cloud_hypervisor: &'a Path,
+    /// The unmodified Ubuntu kernel.
     pub vmlinuz: &'a Path,
+    /// The unmodified Ubuntu initial ramdisk.
     pub initrd: &'a Path,
+    /// The guest kernel command line.
     pub cmdline: &'a str,
+    /// The writable disk backed by the unmodified cloud image.
     pub overlay: &'a Path,
+    /// The read-only NoCloud seed image.
     pub seed: &'a Path,
+    /// The number of virtual CPUs.
     pub vcpus: u8,
+    /// The memory size in MiB.
     pub memory_mib: u32,
     /// Neutral DMI strings, so `dmidecode` does not read "Cloud Hypervisor".
     pub manufacturer: &'a str,
+    /// The guest-visible DMI product name.
     pub product: &'a str,
+    /// The guest-visible DMI UUID.
     pub uuid: &'a str,
     /// The vhost-user-net backend socket.
     pub net_socket: &'a Path,
@@ -125,6 +137,17 @@ impl Vm {
             stderr_log,
             _ch_memfd: ch_memfd,
         })
+    }
+
+    /// The VM child's peak resident memory, in MiB.
+    pub fn peak_rss_mib(&self) -> Option<u64> {
+        let pid = self.pid()?;
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())
+            .map(|kb| kb >> 10)
     }
 
     /// The last lines Cloud Hypervisor wrote to its stderr, for an error.

@@ -12,7 +12,7 @@
 //!   wakes the backend through an eventfd; the backend prepends a zero
 //!   header and writes it into a guest receive buffer.
 //!
-//! The world task ([`crate::world`]) owns the Ethernet lowering; this is
+//! The world task ([`crate::kit::bridge`]) owns the Ethernet lowering; this is
 //! only the virtqueue plumbing.
 
 use std::collections::VecDeque;
@@ -57,6 +57,7 @@ pub struct RxQueue {
 }
 
 impl RxQueue {
+    /// Creates an empty receive queue and its notification event.
     pub fn new() -> std::io::Result<RxQueue> {
         Ok(RxQueue {
             frames: Arc::new(Mutex::new(VecDeque::new())),
@@ -247,9 +248,10 @@ pub fn start(
     mac: [u8; 6],
     to_world: UnboundedSender<Vec<u8>>,
     rx: RxQueue,
-) -> std::io::Result<thread::JoinHandle<()>> {
+) -> std::io::Result<Backend> {
     let mem: Mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
     let exit = EventFd::new(EFD_NONBLOCK)?;
+    let stop = exit.try_clone()?;
     let backend = Arc::new(RwLock::new(NetBackend {
         mem: None,
         event_idx: false,
@@ -266,12 +268,42 @@ pub fn start(
             .register_listener(rx.notify.as_raw_fd(), EventSet::IN, RX_NOTIFY as u64)
             .map_err(|e| std::io::Error::other(format!("register rx listener: {e}")))?;
     }
+    let listener = vhost::vhost_user::Listener::new(socket, true).map_err(std::io::Error::other)?;
     let socket = socket.to_path_buf();
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("fictionet-net".to_string())
         .spawn(move || {
-            if let Err(error) = daemon.serve(&socket) {
-                eprintln!("vhost-user-net backend stopped: {error}");
+            let result = daemon.start(listener).and_then(|()| daemon.wait());
+            match result {
+                Ok(())
+                | Err(vhost_user_backend::Error::HandleRequest(
+                    vhost::vhost_user::Error::Disconnected
+                    | vhost::vhost_user::Error::PartialMessage,
+                )) => {}
+                Err(error) => eprintln!("vhost-user-net backend stopped: {error}"),
             }
-        })
+        })?;
+    Ok(Backend {
+        socket,
+        thread: Some(thread),
+        stop,
+    })
+}
+
+/// Owns the listener and joins its worker when the VM disconnects.
+pub struct Backend {
+    socket: std::path::PathBuf,
+    thread: Option<thread::JoinHandle<()>>,
+    stop: EventFd,
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        // Wake accept when boot failed before the VMM connected.
+        let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+        let _ = self.stop.write(1);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }

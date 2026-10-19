@@ -135,7 +135,7 @@ commands. `cargo xtask --help` lists them.
 | `cargo xtask docker <ping\|tcpudp\|proxy\|web>` | Runs a Docker Compose test of `fictionet attach`. |
 | `cargo xtask k8s [tun\|proxy]` | Runs the Helm chart on kind. |
 | `cargo xtask vm ...` | Boots the development VM and runs test suites in it ([vm/README.md](vm/README.md)). |
-| `cargo xtask demo <name>` | Runs a demo in the VM. [demos/README.md](demos/README.md) lists them. |
+| `cargo xtask demo [name \| assets]` | Runs an in-process demo on this machine, or a script from `demos/guest/` in the VM. [demos/README.md](demos/README.md) lists them. |
 | `cargo xtask eval <border\|fakewiki\|adaptive-web\|artifactory>` | Builds a world's images and runs its Inspect eval. |
 | `cargo xtask copy-check` | Copies `src/stdlib` and the companion's conversation, HTTP/2, protocol and TLS capture adapters into a separate crate. Builds with no SDK features and all SDK features, each with and without `decode`. |
 | `cargo xtask fuzz [--check \| <target> \| <seconds>]` | Runs the fuzz targets ([fuzz/README.md](fuzz/README.md)). |

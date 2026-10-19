@@ -1,15 +1,4 @@
-//! `cargo xtask cloudimage`: downloads the pinned files for booting Ubuntu
-//! 24.04's official cloud image unmodified.
-//!
-//! Everything downloads into `demos/downloads/cloudimage` (git ignores it),
-//! each file pinned by the sha256 Canonical signs in its `SHA256SUMS`: the
-//! image, its matching kernel and initrd. The image is never modified; the
-//! kernel and initrd boot it directly, so nothing is extracted or rebuilt.
-//! Cloud Hypervisor's static binary is pinned too; the demo embeds it and
-//! runs it from memory.
-//!
-//! Turning a download into a per-run overlay and cloud-init seed, and
-//! booting it, is the `cloudimage` demo binary's job.
+//! Downloads, builds, and launches the in-process demos.
 
 use std::path::Path;
 
@@ -17,7 +6,8 @@ use crate::process::{Result, capture, cmd, run as execute};
 use crate::vm::{download, private_dir};
 
 /// Cloud Hypervisor's static x86-64 release binary, which the demo embeds.
-const CH_URL: &str = "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/cloud-hypervisor-static";
+const CH_URL: &str = "https://github.com/cloud-hypervisor/cloud-hypervisor/\
+    releases/download/v54.0/cloud-hypervisor-static";
 const CH_SHA256: &str = "4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b";
 
 /// The cloud image release serial every Ubuntu file is taken from.
@@ -36,22 +26,10 @@ const INITRD_SHA256: &str = "bf276ffc12872256080890698b42db0dc9c5a469c896d8b59af
 const NOVNC_URL: &str = "https://registry.npmjs.org/@novnc/novnc/-/novnc-1.7.0.tgz";
 const NOVNC_SHA256: &str = "32689f18d6abe96bc6530828a6bd0b9ae33bda07c083a6575ed255b5a8f2e903";
 
-pub fn run(args: &[String]) -> Result {
-    match args {
-        [] => {
-            assets()?;
-            build()?;
-            demo()
-        }
-        [step] if step == "assets" => assets(),
-        _ => Err("usage: cargo xtask cloudimage [assets]".into()),
-    }
-}
-
 /// The downloaded files the demo boots from.
 /// Downloads every pinned file into the gitignored downloads folder,
 /// verified by sha256.
-fn assets() -> Result {
+pub fn assets() -> Result {
     let dir = crate::root().join("demos/downloads/cloudimage");
     private_dir(&dir)?;
     let cloud_hypervisor = dir.join("cloud-hypervisor");
@@ -105,7 +83,7 @@ fn novnc(dir: &Path) -> Result {
     )
 }
 
-fn build() -> Result {
+pub fn build(name: &str) -> Result {
     execute(&mut cmd(
         "cargo",
         &[
@@ -115,13 +93,13 @@ fn build() -> Result {
             "-p",
             "fictionet-demo",
             "--bin",
-            "cloudimage",
+            name,
         ],
     ))
 }
 
 /// Runs the demo with the downloaded paths, inheriting its output.
-fn demo() -> Result {
+pub fn launch(name: &str) -> Result {
     let dir = crate::root().join("demos/downloads/cloudimage");
     let metadata: serde_json::Value = serde_json::from_str(&capture(&mut cmd(
         "cargo",
@@ -130,12 +108,6 @@ fn demo() -> Result {
     let target = metadata["target_directory"]
         .as_str()
         .ok_or("cargo metadata gave no target directory")?;
-    let binary = Path::new(target).join("release/cloudimage");
-    execute(
-        std::process::Command::new(&binary)
-            .arg(dir.join("cloud-hypervisor"))
-            .arg(dir.join(IMAGE))
-            .arg(dir.join(VMLINUZ))
-            .arg(dir.join(INITRD)),
-    )
+    let binary = Path::new(target).join("release").join(name);
+    execute(std::process::Command::new(&binary).arg(dir))
 }

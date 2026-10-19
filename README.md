@@ -75,6 +75,10 @@ needs root or Docker on your machine. The first run takes a few minutes; after
 that a demo starts in seconds. [demos/README.md](demos/README.md) lists every
 demo, what each one needs and shows, and how to make a demo of your own.
 
+`cargo xtask demo desktop` runs one executable on your machine, booting Ubuntu's
+unmodified cloud image in Cloud Hypervisor with the world in the same process.
+It needs KVM.
+
 ## Install
 
 Add `fictionet` to your Cargo dependencies. The default feature is

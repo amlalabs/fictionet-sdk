@@ -6,7 +6,34 @@ Every demo is one command:
 $ cargo xtask demo <name>
 ```
 
-It boots the Fictionet VM if it is not running ([vm/README.md](../vm/README.md)),
+`cargo xtask demo` lists in-process binaries and the scripts in `demos/guest/`.
+`cargo xtask demo assets` downloads the pinned Ubuntu image, kernel, initrd,
+Cloud Hypervisor and noVNC into `downloads/cloudimage/` without booting.
+
+## Desktop
+
+`cargo xtask demo desktop` downloads the pinned files, builds the `desktop`
+binary in release mode and runs it on your machine. It needs KVM. It needs no
+QEMU, Docker or root. The world runs in the same process. The guest is
+Ubuntu's official 24.04 cloud image, never modified: each run writes its own
+qcow2 overlay and cloud-init seed. Cloud Hypervisor runs from a copy embedded
+in the binary.
+
+At boot the guest installs Xfce, Mozilla's Firefox, Xvnc and two pinned coding
+agents, Claude Code and Codex, through the world's mirror. The demo reaches the
+guest over SSH from the world's jump host, and serves a noVNC page of its
+screen while it runs. It prints each check, powers the guest off, checks that
+no Cloud Hypervisor process or run directory is left, and ends with `every
+required check passed`. Screenshots go to `downloads/cloudimage/shots/`.
+
+The binary takes the downloads directory and, optionally, a Unix socket path.
+With the path, `fictionet observe --observation unix:PATH watch` follows the
+run from another terminal.
+
+## VM scripts
+
+The other demos are scripts in `demos/guest/` that run in the Fictionet VM.
+The command boots the VM if it is not running ([vm/README.md](../vm/README.md)),
 builds Fictionet inside it, runs the demo, and cleans up. Each step says in plain
 words what happens next, then shows the commands and their real output. Nothing
 needs root or Docker on your machine: QEMU, KVM and
@@ -78,6 +105,24 @@ and capture limits. The dashboard and `fictionet observe` use the observation
 socket served by `fictionet_observe::serve`; attachments use the world socket.
 
 ## Making a demo of your own
+
+The shared `fictionet_demo::kit` boots one or more Ubuntu cloud guests with
+Cloud Hypervisor and a world in the same process. A binary in
+`src/bin/<name>/main.rs` declares its guests and the world startup function:
+
+```rust
+let kit = Kit::new("office")
+    .guest(Guest::ubuntu("workstation", "analyst").packages(&["curl"]))
+    .world(start_world);
+let run = kit.boot(downloads).await?;
+run.shutdown().await?;
+```
+
+The guest image is never modified; each run gets its own overlay and seed.
+See the [kit API](src/kit/mod.rs) and the desktop's
+[guest](src/bin/desktop/guest.rs) and [world](src/bin/desktop/world.rs) definitions.
+
+### Adding a VM script
 
 Start from [`examples/scan`](../examples/scan), the smallest Docker example with
 an agent container: the world in one file, a Dockerfile with one stage per

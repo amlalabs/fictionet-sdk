@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 const PAINT: Duration = Duration::from_secs(8);
 /// How long to wait for any one DevTools reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long Chromium may take to close before it is killed.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Screenshots `url` to `out` with Chromium. Best effort: a missing or failing
 /// Chromium returns `None` and never blocks the caller for long.
@@ -26,11 +28,8 @@ pub fn capture(url: &str, out: &Path) -> Option<String> {
         .unwrap_or_else(|| PathBuf::from("/usr/bin/chromium"));
     let _ = std::fs::remove_file(out);
 
-    let mut seed = [0u8; 8];
-    crate::getrandom(&mut seed);
-    let profile =
-        std::env::temp_dir().join(format!("cloudimage-chrome-{}", u64::from_ne_bytes(seed)));
-    let _ = std::fs::create_dir_all(&profile);
+    let profile_dir = super::util::RunDir::new(&std::env::temp_dir(), "chrome").ok()?;
+    let profile = profile_dir.path();
     let stderr_log = profile.join("chromium.stderr");
     let stderr = std::fs::File::create(&stderr_log).ok();
 
@@ -128,7 +127,7 @@ pub fn capture(url: &str, out: &Path) -> Option<String> {
             "\"format\":\"png\"",
         )?;
         let data = field(&shot, "data")?;
-        let bytes = crate::b64_decode(&data)?;
+        let bytes = crate::kit::b64_decode(&data)?;
         if bytes.len() < 8 || &bytes[1..4] != b"PNG" {
             return None;
         }
@@ -136,6 +135,14 @@ pub fn capture(url: &str, out: &Path) -> Option<String> {
         Some(out.display().to_string())
     })();
 
+    // Close the browser over the pipe, so it stops its helper processes and
+    // they write nothing to the profile after it is removed. Killing only
+    // the browser leaves its network service writing there as it exits.
+    let _ = write_all(&to_write, b"{\"id\":6,\"method\":\"Browser.close\"}");
+    let closing = Instant::now() + CLOSE_TIMEOUT;
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < closing {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let _ = child.kill();
     let _ = child.wait();
     if result.is_none()
@@ -149,7 +156,6 @@ pub fn capture(url: &str, out: &Path) -> Option<String> {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&profile);
     result
 }
 
