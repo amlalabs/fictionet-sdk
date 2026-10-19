@@ -9,6 +9,8 @@ export class Element extends EventTarget {
     this.children = [];
     this.dataset = {};
     this.hidden = false;
+    // A real button or input starts enabled.
+    this.disabled = false;
     this.value = '';
     this.scrollHeight = this.scrollTop = this.clientHeight = 0;
     const classes = new Set();

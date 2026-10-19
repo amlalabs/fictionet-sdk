@@ -83,7 +83,7 @@ test('screen stays unavailable while booting, watches by default and follows the
   assert.equal(claim.hidden, true, 'take over waits for the screen to connect');
   rfb.dispatchEvent(new Event('connect'));
   assert.equal(claim.hidden, false);
-  assert.notEqual(claim.disabled, true);
+  assert.equal(claim.disabled, false);
   claim.click();
   await settle();
   assert.deepEqual(h.requests.at(-1), { method: 'POST', path: '/api/lease', body: { host: 'alpha', session: 'ours', take: true } });

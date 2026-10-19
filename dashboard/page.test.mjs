@@ -217,9 +217,13 @@ test('the page holds at most three long-lived streams across every panel, and no
     watch.emit('counters', { t: 2, edges: {} });
     await settle();
   }
-  // The keyboard moves focus along the tabs; Enter opens one.
+  // The keyboard moves focus along the tabs without opening them; Enter opens one.
+  tabs[0].click();
+  await settle();
   const right = new Event('keydown'); right.key = 'ArrowRight'; tabs[0].dispatchEvent(right);
   assert.equal(h.document.activeElement, tabs[1]);
+  assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
+  assert.equal(tabs[1].getAttribute('aria-selected'), 'false');
   const enter = new Event('keydown'); enter.key = 'Enter'; tabs[1].dispatchEvent(enter);
   assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
   assert.ok(h.budget.most <= 3, `the page held ${h.budget.most} streams at once`);
