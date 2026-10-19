@@ -51,7 +51,7 @@ impl Display for ConnectError {
 
 impl core::error::Error for ConnectError {}
 
-/// Error returned by [`Socket::send`]
+/// Error returned by [`Socket::send_slice`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SendError {
     InvalidState,
@@ -520,11 +520,7 @@ const MIN_REMOTE_MSS: usize = 48;
 
 impl<'a> Socket<'a> {
     /// Create a socket using the given buffers.
-    pub fn new<T>(rx_buffer: T, tx_buffer: T) -> Socket<'a>
-    where
-        T: Into<SocketBuffer<'a>>,
-    {
-        let (rx_buffer, tx_buffer) = (rx_buffer.into(), tx_buffer.into());
+    pub fn new(rx_buffer: SocketBuffer<'a>, tx_buffer: SocketBuffer<'a>) -> Socket<'a> {
         let rx_capacity = rx_buffer.capacity();
 
         if rx_capacity > (1 << 30) {
@@ -626,20 +622,6 @@ impl<'a> Socket<'a> {
         self.timeout
     }
 
-    /// Return the ACK delay duration.
-    ///
-    /// See also the [set_ack_delay](#method.set_ack_delay) method.
-    pub fn ack_delay(&self) -> Option<Duration> {
-        self.ack_delay
-    }
-
-    /// Return whether Nagle's Algorithm is enabled.
-    ///
-    /// See also the [set_nagle_enabled](#method.set_nagle_enabled) method.
-    pub fn nagle_enabled(&self) -> bool {
-        self.nagle
-    }
-
     /// Return the current window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
@@ -713,13 +695,6 @@ impl<'a> Socket<'a> {
     /// has ACK delay enabled.
     pub fn set_nagle_enabled(&mut self, enabled: bool) {
         self.nagle = enabled
-    }
-
-    /// Return the keep-alive interval.
-    ///
-    /// See also the [set_keep_alive](#method.set_keep_alive) method.
-    pub fn keep_alive(&self) -> Option<Duration> {
-        self.keep_alive
     }
 
     /// Set the keep-alive interval.
@@ -843,14 +818,7 @@ impl<'a> Socket<'a> {
         }
 
         if self.is_open() {
-            // If we were already listening to same endpoint there is nothing to do; exit early.
-            //
-            // In the past listening on an socket that was already listening was an error,
-            // however this makes writing an acceptor loop with multiple sockets impossible.
-            // Without this early exit, if you tried to listen on a socket that's already listening you'll
-            // immediately get an error. The only way around this is to abort the socket first
-            // before listening again, but this means that incoming connections can actually
-            // get aborted between the abort() and the next listen().
+            // Listening again on the same endpoint preserves pending connections.
             if matches!(self.state, State::Listen) && self.listen_endpoint == local_endpoint {
                 return Ok(());
             } else {
@@ -1010,33 +978,11 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// Return whether a connection is active.
-    ///
-    /// This function returns true if the socket is actively exchanging packets with
-    /// a remote endpoint. Note that this does not mean that it is possible to send or receive
-    /// data through the socket; for that, use [can_send](#method.can_send) or
-    /// [can_recv](#method.can_recv).
-    ///
-    /// If a connection is established, [abort](#method.close) will send a reset to
-    /// the remote endpoint.
-    ///
-    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`, `TIME-WAIT`,
-    /// or `LISTEN` state.
-    #[inline]
-    pub fn is_active(&self) -> bool {
-        match self.state {
-            State::Closed => false,
-            State::TimeWait => false,
-            State::Listen => false,
-            _ => true,
-        }
-    }
-
     /// Return whether the transmit half of the full-duplex connection is open.
     ///
     /// This function returns true if it's possible to send data and have it arrive
     /// to the remote endpoint. However, it does not make any guarantees about the state
-    /// of the transmit buffer, and even if it returns true, [send](#method.send) may
+    /// of the transmit buffer, and even if it returns true, [send_slice](#method.send_slice) may
     /// not be able to enqueue any octets.
     ///
     /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED` or
@@ -1133,24 +1079,10 @@ impl<'a> Socket<'a> {
         Ok(result)
     }
 
-    /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
-    /// and enqueue the amount of elements returned by `f`.
-    ///
-    /// This function returns `Err(Error::Illegal)` if the transmit half of
-    /// the connection is not open; see [may_send](#method.may_send).
-    pub fn send<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
-    where
-        F: FnOnce(&'b mut [u8]) -> (usize, R),
-    {
-        self.send_impl(|tx_buffer| tx_buffer.enqueue_many_with(f))
-    }
-
     /// Enqueue a sequence of octets to be sent, and fill it from a slice.
     ///
     /// This function returns the amount of octets actually enqueued, which is limited
     /// by the amount of free space in the transmit buffer; down to zero.
-    ///
-    /// See also [send](#method.send).
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
         self.send_impl(|tx_buffer| {
             let size = tx_buffer.enqueue_slice(data);
@@ -1211,17 +1143,6 @@ impl<'a> Socket<'a> {
             let size = rx_buffer.dequeue_slice(data);
             (size, size)
         })
-    }
-
-    /// Peek at a sequence of received octets without removing them from
-    /// the receive buffer, and return a pointer to it.
-    ///
-    /// This function otherwise behaves identically to [recv](#method.recv).
-    pub fn peek(&mut self, size: usize) -> Result<&[u8], RecvError> {
-        self.recv_error_check()?;
-
-        let buffer = self.rx_buffer.get_allocated(0, size);
-        Ok(buffer)
     }
 
     /// Peek at a sequence of received octets without removing them from

@@ -5,14 +5,9 @@ use core::fmt;
 
 use super::{Error, Result};
 
-pub use super::IpProtocol as Protocol;
+use super::IpProtocol as Protocol;
 
-/// Minimum MTU required of all links supporting IPv6. See [RFC 8200 § 5].
-///
-/// [RFC 8200 § 5]: https://tools.ietf.org/html/rfc8200#section-5
-pub const MIN_MTU: usize = 1280;
-
-/// Size of IPv6 adderess in octets.
+/// Size of an IPv6 address in octets.
 ///
 /// [RFC 8200 § 2]: https://www.rfc-editor.org/rfc/rfc4291#section-2
 pub const ADDR_SIZE: usize = 16;
@@ -34,7 +29,7 @@ pub(crate) trait AddressExt {
     fn mask(&self, mask: u8) -> [u8; ADDR_SIZE];
 
     /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
-    /// where `prefix_len` is the number of leading zeroes. Return `None` otherwise.
+    /// where `prefix_len` is the number of leading ones. Return `None` otherwise.
     fn prefix_len(&self) -> Option<u8>;
 }
 
@@ -92,20 +87,6 @@ pub struct Cidr {
 }
 
 impl Cidr {
-    /// The [solicited node prefix].
-    ///
-    /// [solicited node prefix]: https://tools.ietf.org/html/rfc4291#section-2.7.1
-    pub const SOLICITED_NODE_PREFIX: Cidr = Cidr {
-        address: Address::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0),
-        prefix_len: 104,
-    };
-
-    /// The link-local address prefix.
-    pub const LINK_LOCAL_PREFIX: Cidr = Cidr {
-        address: Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
-        prefix_len: 10,
-    };
-
     /// Create an IPv6 CIDR block from the given address and prefix length.
     ///
     /// # Panics
@@ -123,15 +104,9 @@ impl Cidr {
         self.address
     }
 
-    /// Return the prefix length of this IPv6 CIDR block.
-    pub const fn prefix_len(&self) -> u8 {
-        self.prefix_len
-    }
-
     /// Query whether the subnetwork described by this IPv6 CIDR block contains
     /// the given address.
     pub fn contains_addr(&self, addr: &Address) -> bool {
-        // right shift by 128 is not legal
         if self.prefix_len == 0 {
             return true;
         }
@@ -159,48 +134,13 @@ pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
 }
 
-// Ranges and constants describing the IPv6 header
-//
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |Version| Traffic Class |           Flow Label                  |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |         Payload Length        |  Next Header  |   Hop Limit   |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                                                               |
-// +                                                               +
-// |                                                               |
-// +                         Source Address                        +
-// |                                                               |
-// +                                                               +
-// |                                                               |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                                                               |
-// +                                                               +
-// |                                                               |
-// +                      Destination Address                      +
-// |                                                               |
-// +                                                               +
-// |                                                               |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-//
-// See https://tools.ietf.org/html/rfc2460#section-3 for details.
 mod field {
     use crate::wire::field::*;
-    // 4-bit version number, 8-bit traffic class, and the
-    // 20-bit flow label.
     pub const VER_TC_FLOW: Field = 0..4;
-    // 16-bit value representing the length of the payload.
-    // Note: Options are included in this length.
     pub const LENGTH: Field = 4..6;
-    // 8-bit value identifying the type of header following this
-    // one. Note: The same numbers are used in IPv4.
     pub const NXT_HDR: usize = 6;
-    // 8-bit value decremented by each node that forwards this
-    // packet. The packet is discarded when the value is 0.
     pub const HOP_LIMIT: usize = 7;
-    // IPv6 address of the source node.
     pub const SRC_ADDR: Field = 8..24;
-    // IPv6 address of the destination node.
     pub const DST_ADDR: Field = 24..40;
 }
 
@@ -250,8 +190,6 @@ impl<T: AsRef<[u8]>> Packet<T> {
     /// Return the header length.
     #[inline]
     pub const fn header_len(&self) -> usize {
-        // This is not a strictly necessary function, but it makes
-        // code more readable.
         field::DST_ADDR.end
     }
 
@@ -333,8 +271,6 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     #[inline]
     pub fn set_version(&mut self, value: u8) {
         let data = self.buffer.as_mut();
-        // Make sure to retain the lower order bits which contain
-        // the higher order bits of the traffic class
         data[0] = (data[0] & 0x0f) | ((value & 0x0f) << 4);
     }
 
@@ -342,11 +278,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     #[inline]
     pub fn set_traffic_class(&mut self, value: u8) {
         let data = self.buffer.as_mut();
-        // Put the higher order 4-bits of value in the lower order
-        // 4-bits of the first byte
         data[0] = (data[0] & 0xf0) | ((value & 0xf0) >> 4);
-        // Put the lower order 4-bits of value in the higher order
-        // 4-bits of the second byte
         data[1] = (data[1] & 0x0f) | ((value & 0x0f) << 4);
     }
 
@@ -354,7 +286,6 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     #[inline]
     pub fn set_flow_label(&mut self, value: u32) {
         let data = self.buffer.as_mut();
-        // Retain the lower order 4-bits of the traffic class
         let raw = (((data[1] & 0xf0) as u32) << 16) | (value & 0x0fffff);
         NetworkEndian::write_u24(&mut data[1..4], raw);
     }
@@ -421,7 +352,6 @@ pub struct Repr {
 impl Repr {
     /// Parse an Internet Protocol version 6 packet and return a high-level representation.
     pub fn parse<T: AsRef<[u8]> + ?Sized>(packet: &Packet<&T>) -> Result<Repr> {
-        // Ensure basic accessors will work
         packet.check_len()?;
         if packet.version() != 6 {
             return Err(Error);
@@ -437,14 +367,11 @@ impl Repr {
 
     /// Return the length of a header that will be emitted from this high-level representation.
     pub const fn buffer_len(&self) -> usize {
-        // This function is not strictly necessary, but it can make client code more readable.
         field::DST_ADDR.end
     }
 
     /// Emit a high-level representation into an Internet Protocol version 6 packet.
     pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, packet: &mut Packet<T>) {
-        // Make no assumptions about the original state of the packet buffer.
-        // Make sure to set every byte.
         packet.set_version(6);
         packet.set_traffic_class(0);
         packet.set_flow_label(0);

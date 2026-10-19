@@ -26,14 +26,12 @@ pub trait Device {
     ///
     /// The transmit token allows an immediate TCP reply.
     ///
-    /// The timestamp must be a number of milliseconds, monotonically increasing since an
-    /// arbitrary moment in time, such as system startup.
+    /// The timestamp uses the simulation clock and must increase monotonically.
     fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)>;
 
     /// Construct a transmit token.
     ///
-    /// The timestamp must be a number of milliseconds, monotonically increasing since an
-    /// arbitrary moment in time, such as system startup.
+    /// The timestamp uses the simulation clock and must increase monotonically.
     fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>>;
 
     /// Get a description of device capabilities.

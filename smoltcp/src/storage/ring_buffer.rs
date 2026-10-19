@@ -293,12 +293,6 @@ impl<'a> RingBuffer<'a> {
     }
 }
 
-impl<'a> From<ManagedSlice<'a, u8>> for RingBuffer<'a> {
-    fn from(slice: ManagedSlice<'a, u8>) -> RingBuffer<'a> {
-        RingBuffer::new(slice)
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;

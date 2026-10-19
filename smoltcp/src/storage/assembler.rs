@@ -75,9 +75,7 @@ impl Contig {
     }
 }
 
-/// A buffer (re)assembler.
-///
-/// Currently, up to a hardcoded limit of 4 or 32 holes can be tracked in the buffer.
+/// Tracks up to four disjoint byte ranges.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Assembler {
     contigs: [Contig; ASSEMBLER_MAX_SEGMENT_COUNT],
@@ -110,18 +108,8 @@ impl Assembler {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.contigs.fill(Contig::empty());
-    }
-
     fn front(&self) -> Contig {
         self.contigs[0]
-    }
-
-    /// Return length of the front contiguous range without removing it from the assembler
-    pub fn peek_front(&self) -> usize {
-        let front = self.front();
-        if front.has_hole() { 0 } else { front.data_size }
     }
 
     fn back(&self) -> Contig {
@@ -144,7 +132,6 @@ impl Assembler {
             self.contigs[i] = self.contigs[i + 1];
         }
 
-        // Removing the last one.
         self.contigs[self.contigs.len() - 1] = Contig::empty();
     }
 
@@ -174,12 +161,11 @@ impl Assembler {
         // Find index of the contig containing the start of the range.
         loop {
             if i == self.contigs.len() {
-                // The new range is after all the previous ranges, but there/s no space to add it.
+                // The new range is after all the previous ranges, but there is no space to add it.
                 return Err(TooManyHolesError);
             }
             let contig = &mut self.contigs[i];
             if !contig.has_data() {
-                // The new range is after all the previous ranges. Add it.
                 *contig = Contig::hole_and_data(offset, size);
                 return Ok(());
             }
@@ -210,7 +196,6 @@ impl Assembler {
             contig.shrink_hole_to(offset);
         }
 
-        // coalesce contigs to the right.
         let mut j = i + 1;
         while j < self.contigs.len()
             && self.contigs[j].has_data()
@@ -286,7 +271,7 @@ impl Assembler {
 
     /// Iterate over all of the contiguous data ranges.
     ///
-    /// Returns `(offset, size)` tuples for each contiguous data range, where
+    /// Returns `(start, end)` tuples for each contiguous data range, where
     /// offset is relative to the start of the assembler.
     ///
     ///    Data        Hole        Data
@@ -437,7 +422,6 @@ mod test {
         for c in 1..=ASSEMBLER_MAX_SEGMENT_COUNT {
             assert_eq!(assr.add(c * 10, 3), Ok(()));
         }
-        // Maximum of allowed holes is reached
         let assr_before = assr.clone();
         assert_eq!(assr.add(1, 3), Err(TooManyHolesError));
         assert_eq!(assr_before, assr);
@@ -617,7 +601,6 @@ mod test {
         for c in 1..=ASSEMBLER_MAX_SEGMENT_COUNT {
             assert_eq!(assr.add(c * 10, 3), Ok(()));
         }
-        // Maximum of allowed holes is reached
         let assr_before = assr.clone();
         assert_eq!(assr.add_then_remove_front(1, 3), Err(TooManyHolesError));
         assert_eq!(assr_before, assr);
@@ -645,7 +628,6 @@ mod test {
 
         for max_size in [2, 5, 10, 100] {
             for _ in 0..300 {
-                //println!("===");
                 let mut assr = Assembler::new();
                 let mut map = [false; MAX_INDEX];
 
@@ -653,11 +635,8 @@ mod test {
                     let offset = rand::thread_rng().gen_range(0..MAX_INDEX - max_size - 1);
                     let size = rand::thread_rng().gen_range(1..=max_size);
 
-                    //println!("add {}..{} {}", offset, offset + size, size);
-                    // Real impl
                     let res = assr.add(offset, size);
 
-                    // Bitmap impl
                     let mut map2 = map;
                     map2[offset..][..size].fill(true);
 
@@ -677,7 +656,6 @@ mod test {
                         }
                     }
 
-                    // Compare.
                     let wanted_res = if contigs.len() > ASSEMBLER_MAX_SEGMENT_COUNT {
                         Err(TooManyHolesError)
                     } else {

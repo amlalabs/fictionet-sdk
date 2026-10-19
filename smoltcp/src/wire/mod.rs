@@ -17,17 +17,17 @@ use core::fmt;
 pub use self::ip::{
     Address as IpAddress, Cidr as IpCidr, Endpoint as IpEndpoint,
     ListenEndpoint as IpListenEndpoint, Protocol as IpProtocol, Repr as IpRepr,
-    Version as IpVersion, checksum,
+    Version as IpVersion,
 };
 pub(crate) use self::ipv4::AddressExt as Ipv4AddressExt;
 pub use self::ipv4::{
-    Address as Ipv4Address, Cidr as Ipv4Cidr, HEADER_LEN as IPV4_HEADER_LEN,
-    MIN_MTU as IPV4_MIN_MTU, Packet as Ipv4Packet, Repr as Ipv4Repr,
+    Address as Ipv4Address, Cidr as Ipv4Cidr, HEADER_LEN as IPV4_HEADER_LEN, Packet as Ipv4Packet,
+    Repr as Ipv4Repr,
 };
 pub(crate) use self::ipv6::AddressExt as Ipv6AddressExt;
 pub use self::ipv6::{
-    Address as Ipv6Address, Cidr as Ipv6Cidr, HEADER_LEN as IPV6_HEADER_LEN,
-    MIN_MTU as IPV6_MIN_MTU, Packet as Ipv6Packet, Repr as Ipv6Repr,
+    Address as Ipv6Address, Cidr as Ipv6Cidr, HEADER_LEN as IPV6_HEADER_LEN, Packet as Ipv6Packet,
+    Repr as Ipv6Repr,
 };
 pub use self::tcp::{
     Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, Repr as TcpRepr,

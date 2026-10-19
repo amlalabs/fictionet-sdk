@@ -1,14 +1,4 @@
-/*! Time structures.
-
-The `time` module contains structures used to represent both
-absolute and relative time.
-
- - [Instant] is used to represent absolute time.
- - [Duration] is used to represent relative time.
-
-[Instant]: struct.Instant.html
-[Duration]: struct.Duration.html
-*/
+//! Simulation instants and durations in microseconds.
 
 use core::{fmt, ops};
 
@@ -61,26 +51,10 @@ impl Instant {
         }
     }
 
-    /// Create a new `Instant` from the current [std::time::SystemTime].
-    ///
-    /// See [std::time::SystemTime::now]
-    ///
-    /// [std::time::SystemTime]: https://doc.rust-lang.org/std/time/struct.SystemTime.html
-    /// [std::time::SystemTime::now]: https://doc.rust-lang.org/std/time/struct.SystemTime.html#method.now
-    pub fn now() -> Instant {
-        Self::from(::std::time::SystemTime::now())
-    }
-
     /// The fractional number of milliseconds that have passed
     /// since the beginning of time.
     pub const fn millis(&self) -> i64 {
         self.micros % 1000000 / 1000
-    }
-
-    /// The fractional number of microseconds that have passed
-    /// since the beginning of time.
-    pub const fn micros(&self) -> i64 {
-        self.micros % 1000000
     }
 
     /// The number of whole seconds that have passed since the
@@ -94,8 +68,7 @@ impl Instant {
     pub const fn total_millis(&self) -> i64 {
         self.micros / 1000
     }
-    /// The total number of milliseconds that have passed since
-    /// the beginning of time.
+    /// The total number of microseconds since the clock origin.
     pub const fn total_micros(&self) -> i64 {
         self.micros
     }
@@ -140,23 +113,11 @@ impl ops::Add<Duration> for Instant {
     }
 }
 
-impl ops::AddAssign<Duration> for Instant {
-    fn add_assign(&mut self, rhs: Duration) {
-        self.micros += rhs.total_micros() as i64;
-    }
-}
-
 impl ops::Sub<Duration> for Instant {
     type Output = Instant;
 
     fn sub(self, rhs: Duration) -> Instant {
         Instant::from_micros(self.micros - rhs.total_micros() as i64)
-    }
-}
-
-impl ops::SubAssign<Duration> for Instant {
-    fn sub_assign(&mut self, rhs: Duration) {
-        self.micros -= rhs.total_micros() as i64;
     }
 }
 
@@ -175,9 +136,6 @@ pub struct Duration {
 }
 
 impl Duration {
-    pub const ZERO: Duration = Duration::from_micros(0);
-    /// The longest possible duration we can encode.
-    pub const MAX: Duration = Duration::from_micros(u64::MAX);
     /// Create a new `Duration` from a number of microseconds.
     pub const fn from_micros(micros: u64) -> Duration {
         Duration { micros }
@@ -200,11 +158,6 @@ impl Duration {
     /// The fractional number of milliseconds in this `Duration`.
     pub const fn millis(&self) -> u64 {
         self.micros / 1000 % 1000
-    }
-
-    /// The fractional number of milliseconds in this `Duration`.
-    pub const fn micros(&self) -> u64 {
-        self.micros % 1000000
     }
 
     /// The number of whole seconds in this `Duration`.
@@ -292,34 +245,6 @@ impl ops::DivAssign<u32> for Duration {
     }
 }
 
-impl ops::Shl<u32> for Duration {
-    type Output = Duration;
-
-    fn shl(self, rhs: u32) -> Duration {
-        Duration::from_micros(self.micros << rhs)
-    }
-}
-
-impl ops::ShlAssign<u32> for Duration {
-    fn shl_assign(&mut self, rhs: u32) {
-        self.micros <<= rhs;
-    }
-}
-
-impl ops::Shr<u32> for Duration {
-    type Output = Duration;
-
-    fn shr(self, rhs: u32) -> Duration {
-        Duration::from_micros(self.micros >> rhs)
-    }
-}
-
-impl ops::ShrAssign<u32> for Duration {
-    fn shr_assign(&mut self, rhs: u32) {
-        self.micros >>= rhs;
-    }
-}
-
 impl From<::core::time::Duration> for Duration {
     fn from(other: ::core::time::Duration) -> Duration {
         Duration::from_micros(other.as_secs() * 1000000 + other.subsec_micros() as u64)
@@ -346,12 +271,10 @@ mod test {
 
     #[test]
     fn test_instant_ops() {
-        // std::ops::Add
         assert_eq!(
             Instant::from_millis(4) + Duration::from_millis(6),
             Instant::from_millis(10)
         );
-        // std::ops::Sub
         assert_eq!(
             Instant::from_millis(7) - Duration::from_millis(5),
             Instant::from_millis(2)
@@ -405,19 +328,15 @@ mod test {
 
     #[test]
     fn test_duration_ops() {
-        // std::ops::Add
         assert_eq!(
             Duration::from_millis(40) + Duration::from_millis(2),
             Duration::from_millis(42)
         );
-        // std::ops::Sub
         assert_eq!(
             Duration::from_millis(555) - Duration::from_millis(42),
             Duration::from_millis(513)
         );
-        // std::ops::Mul
         assert_eq!(Duration::from_millis(13) * 22, Duration::from_millis(286));
-        // std::ops::Div
         assert_eq!(Duration::from_millis(53) / 4, Duration::from_micros(13250));
     }
 

@@ -36,7 +36,6 @@ impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Version::Ipv4 => write!(f, "IPv4"),
-
             Version::Ipv6 => write!(f, "IPv6"),
         }
     }
@@ -114,7 +113,6 @@ impl Address {
     pub const fn version(&self) -> Version {
         match self {
             Address::Ipv4(_) => Version::Ipv4,
-
             Address::Ipv6(_) => Version::Ipv6,
         }
     }
@@ -123,26 +121,7 @@ impl Address {
     pub fn is_unicast(&self) -> bool {
         match self {
             Address::Ipv4(addr) => addr.x_is_unicast(),
-
             Address::Ipv6(addr) => addr.x_is_unicast(),
-        }
-    }
-
-    /// Query whether the address is a valid multicast address.
-    pub const fn is_multicast(&self) -> bool {
-        match self {
-            Address::Ipv4(addr) => addr.is_multicast(),
-
-            Address::Ipv6(addr) => addr.is_multicast(),
-        }
-    }
-
-    /// Query whether the address is the broadcast address.
-    pub fn is_broadcast(&self) -> bool {
-        match self {
-            Address::Ipv4(addr) => addr.is_broadcast(),
-
-            Address::Ipv6(_) => false,
         }
     }
 
@@ -150,17 +129,15 @@ impl Address {
     pub fn is_unspecified(&self) -> bool {
         match self {
             Address::Ipv4(addr) => addr.is_unspecified(),
-
             Address::Ipv6(addr) => addr.is_unspecified(),
         }
     }
 
     /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
-    /// where `prefix_len` is the number of leading zeroes. Return `None` otherwise.
+    /// where `prefix_len` is the number of leading ones. Return `None` otherwise.
     pub fn prefix_len(&self) -> Option<u8> {
         match self {
             Address::Ipv4(addr) => addr.prefix_len(),
-
             Address::Ipv6(addr) => addr.prefix_len(),
         }
     }
@@ -179,7 +156,6 @@ impl From<Address> for ::core::net::IpAddr {
     fn from(x: Address) -> ::core::net::IpAddr {
         match x {
             Address::Ipv4(ipv4) => ::core::net::IpAddr::V4(ipv4),
-
             Address::Ipv6(ipv6) => ::core::net::IpAddr::V6(ipv6),
         }
     }
@@ -201,7 +177,6 @@ impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Address::Ipv4(addr) => write!(f, "{addr}"),
-
             Address::Ipv6(addr) => write!(f, "{addr}"),
         }
     }
@@ -224,7 +199,6 @@ impl Cidr {
     pub const fn new(addr: Address, prefix_len: u8) -> Cidr {
         match addr {
             Address::Ipv4(addr) => Cidr::Ipv4(Ipv4Cidr::new(addr, prefix_len)),
-
             Address::Ipv6(addr) => Cidr::Ipv6(Ipv6Cidr::new(addr, prefix_len)),
         }
     }
@@ -233,52 +207,8 @@ impl Cidr {
     pub const fn address(&self) -> Address {
         match *self {
             Cidr::Ipv4(cidr) => Address::Ipv4(cidr.address()),
-
             Cidr::Ipv6(cidr) => Address::Ipv6(cidr.address()),
         }
-    }
-
-    /// Return the prefix length of this CIDR block.
-    pub const fn prefix_len(&self) -> u8 {
-        match *self {
-            Cidr::Ipv4(cidr) => cidr.prefix_len(),
-
-            Cidr::Ipv6(cidr) => cidr.prefix_len(),
-        }
-    }
-
-    /// Query whether the subnetwork described by this CIDR block contains
-    /// the given address.
-    pub fn contains_addr(&self, addr: &Address) -> bool {
-        match (self, addr) {
-            (Cidr::Ipv4(cidr), Address::Ipv4(addr)) => cidr.contains_addr(addr),
-
-            (Cidr::Ipv6(cidr), Address::Ipv6(addr)) => cidr.contains_addr(addr),
-            _ => false,
-        }
-    }
-
-    /// Query whether the subnetwork described by this CIDR block contains
-    /// the subnetwork described by the given CIDR block.
-    pub fn contains_subnet(&self, subnet: &Cidr) -> bool {
-        match (self, subnet) {
-            (Cidr::Ipv4(cidr), Cidr::Ipv4(other)) => cidr.contains_subnet(other),
-
-            (Cidr::Ipv6(cidr), Cidr::Ipv6(other)) => cidr.contains_subnet(other),
-            _ => false,
-        }
-    }
-}
-
-impl From<Ipv4Cidr> for Cidr {
-    fn from(addr: Ipv4Cidr) -> Self {
-        Cidr::Ipv4(addr)
-    }
-}
-
-impl From<Ipv6Cidr> for Cidr {
-    fn from(addr: Ipv6Cidr) -> Self {
-        Cidr::Ipv6(addr)
     }
 }
 
@@ -286,7 +216,6 @@ impl fmt::Display for Cidr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Cidr::Ipv4(cidr) => write!(f, "{cidr}"),
-
             Cidr::Ipv6(cidr) => write!(f, "{cidr}"),
         }
     }
@@ -315,24 +244,6 @@ impl From<::core::net::SocketAddr> for Endpoint {
     fn from(x: ::core::net::SocketAddr) -> Endpoint {
         Endpoint {
             addr: x.ip().into(),
-            port: x.port(),
-        }
-    }
-}
-
-impl From<::core::net::SocketAddrV4> for Endpoint {
-    fn from(x: ::core::net::SocketAddrV4) -> Endpoint {
-        Endpoint {
-            addr: (*x.ip()).into(),
-            port: x.port(),
-        }
-    }
-}
-
-impl From<::core::net::SocketAddrV6> for Endpoint {
-    fn from(x: ::core::net::SocketAddrV6) -> Endpoint {
-        Endpoint {
-            addr: (*x.ip()).into(),
             port: x.port(),
         }
     }
@@ -371,35 +282,10 @@ pub struct ListenEndpoint {
     pub port: u16,
 }
 
-impl ListenEndpoint {
-    /// Query whether the endpoint has a specified address and port.
-    pub const fn is_specified(&self) -> bool {
-        self.addr.is_some() && self.port != 0
-    }
-}
-
 impl From<::core::net::SocketAddr> for ListenEndpoint {
     fn from(x: ::core::net::SocketAddr) -> ListenEndpoint {
         ListenEndpoint {
             addr: Some(x.ip().into()),
-            port: x.port(),
-        }
-    }
-}
-
-impl From<::core::net::SocketAddrV4> for ListenEndpoint {
-    fn from(x: ::core::net::SocketAddrV4) -> ListenEndpoint {
-        ListenEndpoint {
-            addr: Some((*x.ip()).into()),
-            port: x.port(),
-        }
-    }
-}
-
-impl From<::core::net::SocketAddrV6> for ListenEndpoint {
-    fn from(x: ::core::net::SocketAddrV6) -> ListenEndpoint {
-        ListenEndpoint {
-            addr: Some((*x.ip()).into()),
             port: x.port(),
         }
     }
@@ -495,20 +381,10 @@ impl Repr {
         }
     }
 
-    /// Return the protocol version.
-    pub const fn version(&self) -> Version {
-        match *self {
-            Repr::Ipv4(_) => Version::Ipv4,
-
-            Repr::Ipv6(_) => Version::Ipv6,
-        }
-    }
-
     /// Return the source address.
     pub const fn src_addr(&self) -> Address {
         match *self {
             Repr::Ipv4(repr) => Address::Ipv4(repr.src_addr),
-
             Repr::Ipv6(repr) => Address::Ipv6(repr.src_addr),
         }
     }
@@ -517,7 +393,6 @@ impl Repr {
     pub const fn dst_addr(&self) -> Address {
         match *self {
             Repr::Ipv4(repr) => Address::Ipv4(repr.dst_addr),
-
             Repr::Ipv6(repr) => Address::Ipv6(repr.dst_addr),
         }
     }
@@ -526,7 +401,6 @@ impl Repr {
     pub const fn next_header(&self) -> Protocol {
         match *self {
             Repr::Ipv4(repr) => repr.next_header,
-
             Repr::Ipv6(repr) => repr.next_header,
         }
     }
@@ -535,7 +409,6 @@ impl Repr {
     pub const fn payload_len(&self) -> usize {
         match *self {
             Repr::Ipv4(repr) => repr.payload_len,
-
             Repr::Ipv6(repr) => repr.payload_len,
         }
     }
@@ -544,7 +417,6 @@ impl Repr {
     pub fn set_payload_len(&mut self, length: usize) {
         match self {
             Repr::Ipv4(Ipv4Repr { payload_len, .. }) => *payload_len = length,
-
             Repr::Ipv6(Ipv6Repr { payload_len, .. }) => *payload_len = length,
         }
     }
@@ -553,7 +425,6 @@ impl Repr {
     pub const fn hop_limit(&self) -> u8 {
         match *self {
             Repr::Ipv4(Ipv4Repr { hop_limit, .. }) => hop_limit,
-
             Repr::Ipv6(Ipv6Repr { hop_limit, .. }) => hop_limit,
         }
     }
@@ -562,7 +433,6 @@ impl Repr {
     pub const fn header_len(&self) -> usize {
         match *self {
             Repr::Ipv4(repr) => repr.buffer_len(),
-
             Repr::Ipv6(repr) => repr.buffer_len(),
         }
     }
@@ -571,7 +441,6 @@ impl Repr {
     pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, buffer: T) {
         match *self {
             Repr::Ipv4(repr) => repr.emit(&mut Ipv4Packet::new_unchecked(buffer)),
-
             Repr::Ipv6(repr) => repr.emit(&mut Ipv6Packet::new_unchecked(buffer)),
         }
     }
@@ -585,7 +454,7 @@ impl Repr {
     }
 }
 
-pub mod checksum {
+pub(crate) mod checksum {
     use byteorder::{ByteOrder, NetworkEndian};
 
     use super::*;

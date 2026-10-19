@@ -4,21 +4,7 @@ use core::fmt;
 use super::{Error, Result};
 use crate::wire::ip::checksum;
 
-pub use super::IpProtocol as Protocol;
-
-/// Minimum MTU required of all links supporting IPv4. See [RFC 791 § 3.1].
-///
-/// [RFC 791 § 3.1]: https://tools.ietf.org/html/rfc791#section-3.1
-// RFC 791 states the following:
-//
-// > Every internet module must be able to forward a datagram of 68
-// > octets without further fragmentation... Every internet destination
-// > must be able to receive a datagram of 576 octets either in one piece
-// > or in fragments to be reassembled.
-//
-// As a result, we can assume that every host we send packets to can
-// accept a packet of the following size.
-pub const MIN_MTU: usize = 576;
+use super::IpProtocol as Protocol;
 
 /// Minimum IHL length 5x32 bit words or 20 bytes
 /// [RFC 791 § 3.1]: https://tools.ietf.org/html/rfc791#section-3.1
@@ -33,7 +19,7 @@ pub(crate) trait AddressExt {
     fn x_is_unicast(&self) -> bool;
 
     /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
-    /// where `prefix_len` is the number of leading zeroes. Return `None` otherwise.
+    /// where `prefix_len` is the number of leading ones. Return `None` otherwise.
     fn prefix_len(&self) -> Option<u8>;
 }
 
@@ -51,14 +37,12 @@ impl AddressExt for Address {
             for _ in 0..8 {
                 let one = byte & mask != 0;
                 if ones {
-                    // Expect 1s until first 0
                     if one {
                         prefix_len += 1;
                     } else {
                         ones = false;
                     }
                 } else if one {
-                    // 1 where 0 was expected
                     return None;
                 }
                 mask >>= 1;
@@ -105,11 +89,6 @@ impl Cidr {
     /// Return the address of this IPv4 CIDR block.
     pub const fn address(&self) -> Address {
         self.address
-    }
-
-    /// Return the prefix length of this IPv4 CIDR block.
-    pub const fn prefix_len(&self) -> u8 {
-        self.prefix_len
     }
 
     /// Return the network mask of this IPv4 CIDR.

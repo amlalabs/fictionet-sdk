@@ -291,49 +291,6 @@ impl<T: AsRef<[u8]>> Packet<T> {
         NetworkEndian::read_u16(&data[field::URGENT])
     }
 
-    /// Return the length of the segment, in terms of sequence space.
-    pub fn segment_len(&self) -> usize {
-        let data = self.buffer.as_ref();
-        let mut length = data.len() - self.header_len() as usize;
-        if self.syn() {
-            length += 1
-        }
-        if self.fin() {
-            length += 1
-        }
-        length
-    }
-
-    /// Returns whether the selective acknowledgement SYN flag is set or not.
-    pub fn selective_ack_permitted(&self) -> Result<bool> {
-        let data = self.buffer.as_ref();
-        let mut options = &data[field::OPTIONS(self.header_len())];
-        while !options.is_empty() {
-            let (next_options, option) = TcpOption::parse(options)?;
-            if option == TcpOption::SackPermitted {
-                return Ok(true);
-            }
-            options = next_options;
-        }
-        Ok(false)
-    }
-
-    /// Return the selective acknowledgement ranges, if any. If there are none in the packet, an
-    /// array of ``None`` values will be returned.
-    ///
-    pub fn selective_ack_ranges(&self) -> Result<[Option<(u32, u32)>; 3]> {
-        let data = self.buffer.as_ref();
-        let mut options = &data[field::OPTIONS(self.header_len())];
-        while !options.is_empty() {
-            let (next_options, option) = TcpOption::parse(options)?;
-            if let TcpOption::SackRange(slice) = option {
-                return Ok(slice);
-            }
-            options = next_options;
-        }
-        Ok([None, None, None])
-    }
-
     /// Parse and summarize all TCP options in a single pass.
     pub fn options_summary(&self) -> Result<TcpOptionSummary> {
         let data = self.buffer.as_ref();
@@ -673,22 +630,9 @@ impl<'a> TcpOption<'a> {
                         if n < 10 || (n - 2) % 8 != 0 {
                             return Err(Error);
                         }
-                        if n > 26 {
-                            // It's possible for a remote to send 4 SACK blocks, but extremely rare.
-                            // Better to "lose" that 4th block and save the extra RAM and CPU
-                            // cycles in the vastly more common case.
-                            //
-                            // RFC 2018: SACK option that specifies n blocks will have a length of
-                            // 8*n+2 bytes, so the 40 bytes available for TCP options can specify a
-                            // maximum of 4 blocks.  It is expected that SACK will often be used in
-                            // conjunction with the Timestamp option used for RTTM [...] thus a
-                            // maximum of 3 SACK blocks will be allowed in this case.
-                        }
+                        // Keep up to three SACK blocks; RFC 2018 permits four without timestamps.
                         let mut sack_ranges: [Option<(u32, u32)>; 3] = [None; 3];
 
-                        // RFC 2018: Each contiguous block of data queued at the data receiver is
-                        // defined in the SACK option by two 32-bit unsigned integers in network
-                        // byte order[...]
                         sack_ranges.iter_mut().enumerate().for_each(|(i, nmut)| {
                             let left = i * 8;
                             *nmut = if left < data.len() {
@@ -897,10 +841,7 @@ impl<'a> Repr<'a> {
             true => Some(packet.ack_number()),
             false => None,
         };
-        // The PSH flag is ignored.
-        // The URG flag and the urgent field is ignored. This behavior is standards-compliant,
-        // however, most deployed systems (e.g. Linux) are *not* standards-compliant, and would
-        // cut the byte at the urgent pointer from the stream.
+        // Urgent data stays in the byte stream.
 
         let mut max_seg_size = None;
         let mut window_scale = None;
@@ -915,11 +856,8 @@ impl<'a> Repr<'a> {
                 TcpOption::NoOperation => (),
                 TcpOption::MaxSegmentSize(value) => max_seg_size = Some(value),
                 TcpOption::WindowScale(value) => {
-                    // RFC 1323: Thus, the shift count must be limited to 14 (which allows windows
-                    // of 2**30 = 1 Gigabyte). If a Window Scale option is received with a shift.cnt
-                    // value exceeding 14, the TCP should log the error but use 14 instead of the
-                    // specified value.
-                    window_scale = if value > 14 { Some(14) } else { Some(value) };
+                    // RFC 7323 limits the window scale to 14.
+                    window_scale = Some(value.min(14));
                 }
                 TcpOption::SackPermitted => sack_permitted = true,
                 TcpOption::SackRange(slice) => sack_ranges = slice,
