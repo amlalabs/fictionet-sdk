@@ -54,6 +54,11 @@ pub fn capture(url: &str, out: &Path) -> Option<String> {
             "--disable-background-networking",
             "--disable-component-update",
             "--disable-sync",
+            // A throwaway profile needs no OS keyring. Without these, Chromium
+            // asks the desktop's keyring for its cookie key, which pops up an
+            // unlock prompt and stalls its network service until answered.
+            "--password-store=basic",
+            "--use-mock-keychain",
             "--hide-scrollbars",
             "--window-size=1280,900",
             "--remote-debugging-pipe",
