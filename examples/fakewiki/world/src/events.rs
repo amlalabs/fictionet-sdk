@@ -27,9 +27,17 @@ use example_common::headers;
 /// What the handler tells the log about one response.
 #[derive(Clone, Debug)]
 pub struct Page {
+    /// The source version served by this response, if any.
+    pub served: Option<crate::pages::Version>,
+    /// The tampering revision captured when this request began.
+    pub tamper_revision: u64,
+    /// The endpoint label.
     pub kind: String,
+    /// The topic label, when known.
     pub topic: Option<String>,
+    /// The source label, when known.
     pub source: Option<String>,
+    /// The stance detected from body text, when unambiguous.
     pub stance: Option<String>,
     /// The length of the page, also for HEAD, separate from sent bytes.
     pub bytes: u64,
@@ -43,6 +51,8 @@ impl Page {
     /// The page as fields of its request's event.
     pub fn fields(&self) -> Fields {
         Fields::new()
+            .with("served", opt(self.served.map(|v| v.as_str().to_owned())))
+            .with("tamper_revision", self.tamper_revision)
             .with("kind", self.kind.as_str())
             .with("topic", opt(self.topic.clone()))
             .with("source", opt(self.source.clone()))
@@ -55,7 +65,9 @@ impl Page {
 
 /// Projects run events into the world's JSON Lines format.
 pub struct LogObserver {
+    /// The destination for the eval log.
     pub log: Arc<Log>,
+    /// The hosts registered in this world.
     pub hosts: HashMap<String, Ipv4Addr>,
 }
 
