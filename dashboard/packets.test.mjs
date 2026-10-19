@@ -471,11 +471,29 @@ test('packets keep the reading position and offer a jump to new rows', (t) => {
   h.flush();
   assert.equal($('plist').scrollTop, 40);
   assert.equal($('jump-packets').hidden, false);
-  assert.equal($('jump-packets').textContent, '1 new');
+  assert.equal($('jump-packets').textContent, '↓ 1 new');
   $('jump-packets').click();
   assert.equal($('plist').scrollTop, 1000);
   assert.equal($('jump-packets').hidden, true);
   h.view.dispose();
   assert.equal($('jump-packets').listenerCount, 0);
   assert.equal($('plist').listenerCount, 0);
+});
+
+test('an address pair shows its packets in both directions and nothing else', (t) => {
+  const h = setup(t);
+  h.send(1, { skipped: 0, src: '10.0.0.2:5000', dst: '10.0.0.1:53' });
+  h.send(2, { skipped: 0, src: '10.0.0.1:53', dst: '10.0.0.2:5000' });
+  h.send(3, { skipped: 0, src: '10.0.0.2:5001', dst: '10.0.0.1:53' });
+  h.flush();
+  h.view.setPair(['10.0.0.1:53', '10.0.0.2:5000']);
+  assert.deepEqual(h.rows().map((row) => row.hidden), [false, false, true]);
+  // The text filter narrows the pair further; it never widens it.
+  $('pfilter').value = 'packet 2';
+  $('pfilter').dispatchEvent(new Event('input'));
+  assert.deepEqual(h.rows().map((row) => row.hidden), [true, false, true]);
+  $('pfilter').value = '';
+  $('pfilter').dispatchEvent(new Event('input'));
+  h.view.setPair(null);
+  assert.deepEqual(h.rows().map((row) => row.hidden), [false, false, false]);
 });

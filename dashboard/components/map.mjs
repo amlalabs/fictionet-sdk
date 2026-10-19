@@ -135,7 +135,7 @@ export function mount(root, services, options = {}) {
     if (ev.key === 'Escape' && active === root.ownerDocument.body) select(null);
   });
   options.onReady?.({ getEdge: (id) => view.dedges.get(id), ends, nodeLabel, fmtCount, fit: () => { if (!state.userMoved) fit(); } });
-  const stop = services.transport.connect({ ...graph, setStatus });
+  const stop = services.connect({ ...graph, setStatus });
   renderSide();
   animation = requestAnimationFrame(frame);
   return () => {
@@ -150,10 +150,16 @@ export function mount(root, services, options = {}) {
 }
 
 function structure(root, el) {
-  const tools = el('div', { class: 'map-tools' }, root);
-  el('input', { id: 'search', type: 'search', placeholder: 'Find a task, host or route', 'aria-label': 'Find a task, host or route' }, tools);
-  el('button', { id: 'fit', type: 'button', text: 'Fit' }, tools);
-  el('button', { id: 'reset', type: 'button', text: 'Reset' }, tools);
+  const tools = el('div', { class: 'panel-tools' }, root);
+  el('input', { id: 'search', class: 'text-field', type: 'search', placeholder: 'Find a task, host or route', 'aria-label': 'Find a task, host or route', autocomplete: 'off' }, tools);
+  // The CLI dashboard's icons for these two buttons.
+  const icon = (id, label, path) => {
+    const button = el('button', { id, class: 'icon-button', type: 'button', 'aria-label': label, title: label }, tools);
+    const svg = el('svg:svg', { viewBox: '0 0 16 16', 'aria-hidden': 'true' }, button);
+    el('svg:path', { d: path, fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, svg);
+  };
+  icon('fit', 'Fit the map to the panel', 'M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4');
+  icon('reset', 'Lay the map out again', 'M3.5 8a4.5 4.5 0 1 0 1.4-3.3M3.2 2.4v2.6h2.6');
   const stats = el('div', { hidden: '' }, root);
   for (const id of ['stat-sandboxes', 'stat-tasks', 'stat-links', 'stat-rate']) el('span', { id }, stats);
   const main = el('div', { class: 'main' }, root);

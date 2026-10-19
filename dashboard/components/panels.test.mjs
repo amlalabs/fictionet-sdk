@@ -52,7 +52,10 @@ test('control sends the linked revision once and shows replies, rejections and t
   const dispose = control(h.root, h.services, { state: '/api/state/traffic', command: '/api/command/traffic', actions: [{ label: '<Pause>', command: { running: false } }] });
   const button = h.root.querySelector('button');
   assert.equal(button.disabled, true);
-  h.publish({ revision: 7, value: { running: true } });
+  h.publish({ revision: 7, value: { running: true, last_change: 'boot' } });
+  // The linked state is a key and value list, as text.
+  assert.deepEqual(h.root.querySelectorAll('dt').map((dt) => dt.textContent), ['Running', 'Last change']);
+  assert.deepEqual(h.root.querySelectorAll('dd').map((dd) => dd.textContent), ['true', 'boot']);
   button.click(); button.click();
   assert.equal(h.requests.length, 1);
   assert.equal(h.requests[0].body.command.expected_revision, 7);
@@ -60,19 +63,23 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.match(h.requests[0].body.request_id, /^[0-9a-f-]{36}$/);
   h.requests[0].resolve({ status: 'applied', reply: '<done>' });
   await settle();
-  assert.match(h.root.textContent, /Applied.*<done>/);
+  assert.match(h.root.textContent, /<Pause>: applied.*<done>/);
   h.publish({ revision: 8, value: { running: false } });
   button.click();
   assert.equal(h.requests[1].body.command.expected_revision, 8);
   assert.notEqual(h.requests[0].body.request_id, h.requests[1].body.request_id);
   h.requests[1].reject({ body: { rejection: { reason: 'stale_revision', current: 9 } } });
   await settle();
-  assert.match(h.root.textContent, /Rejected.*stale_revision/);
+  assert.match(h.root.textContent, /Not applied: the state changed \(now revision 9\)\. Check it and try again\./);
   button.click();
   h.requests[2].reject({ body: { status: 'timeout' } });
   await settle();
   assert.match(h.root.textContent, /may still apply/);
   assert.equal(h.requests.length, 3);
+  button.click();
+  h.requests[3].resolve({ status: 'applied', reply: null });
+  await settle();
+  assert.match(h.root.querySelector('.control-reply').textContent, /^<Pause>: applied$/);
   dispose();
   assert.equal(button.listenerCount, 0);
   assert.equal(h.subscriptions.size, 0);
@@ -85,7 +92,7 @@ test('event table advances the server cursor and cancels pending reads and timer
   h.requests[0].resolve({ rows: [{ summary: '<world>' }], next: 11, dropped: 3 });
   await settle();
   assert.match(h.root.textContent, /<world>/);
-  assert.match(h.root.textContent, /3 events lost/);
+  assert.match(h.root.textContent, /3 events were lost/);
   const next = [...h.timers.values()][0]; h.timers.clear(); next();
   assert.deepEqual(h.requests[1].params, { after: 11 });
   dispose();

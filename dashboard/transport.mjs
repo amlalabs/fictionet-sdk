@@ -53,17 +53,14 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
   function endpoint(path, method) {
     if (method === 'POST' && ['/api/bootstrap', '/api/ticket', '/api/lease'].includes(path)) return path;
     if (method === 'DELETE' && path === '/api/lease') return path;
-    if (method === 'GET' && (path === '/api/page' || observation.some((op) => path === `/api/${op}`))) return path;
+    if (method === 'GET' && (path === '/api/page' || path === '/api/states/stream' || observation.some((op) => path === `/api/${op}`))) return path;
     const parts = path.split('/');
     if (parts[0] !== '' || parts[1] !== 'api' || !segment(parts[3])) throw new Error('Invalid page endpoint');
     if (parts.length === 4 && (
       (method === 'GET' && ['state', 'event-table'].includes(parts[2])) ||
       (method === 'POST' && parts[2] === 'command')
     )) return path;
-    if (method === 'GET' && parts.length === 5 && (
-      (parts[2] === 'state' && parts[4] === 'stream') ||
-      (parts[2] === 'host' && parts[4] === 'links')
-    )) return path;
+    if (method === 'GET' && parts.length === 5 && parts[2] === 'host' && parts[4] === 'links') return path;
     throw new Error('Invalid page endpoint');
   }
 
@@ -281,9 +278,14 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
   const post = (path, body, signal) => json('POST', path, {}, body, signal);
   const remove = (path, body, signal) => json('DELETE', path, {}, body, signal);
 
-  function stateStream(id, after) {
-    if (!segment(id)) throw new Error('Invalid state id');
-    return stream(`/api/state/${id}/stream`, after === undefined ? {} : { after });
+  // One stream carries every state topic a page shows: `topics` maps each
+  // topic id to the revision already held, or undefined for a snapshot.
+  function stateStream(topics) {
+    const entries = Object.entries(topics);
+    const valid = ([id, after]) => segment(id) && (after === undefined || (Number.isSafeInteger(after) && after >= 0));
+    if (!entries.length || entries.length > 64 || !entries.every(valid)) throw new Error('Invalid state topics');
+    const cursors = entries.filter(([, after]) => after !== undefined).map(([id, after]) => `${id}:${after}`);
+    return stream('/api/states/stream', { topics: entries.map(([id]) => id).join(','), ...(cursors.length ? { after: cursors.join(',') } : {}) });
   }
 
   async function socket(capability, host, signal) {

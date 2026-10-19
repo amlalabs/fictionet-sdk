@@ -7,7 +7,8 @@ use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
+use tokio::task::JoinSet;
 
 use super::{http, observation};
 
@@ -246,27 +247,51 @@ impl Topic {
             .collect();
         (state.revision, values)
     }
+}
 
-    pub async fn stream(&self, conn: &mut TcpStream, mut after: Option<u64>) -> io::Result<()> {
-        let mut changed = self.0.changed.subscribe();
-        let mut too_large_shown = false;
-        http::headers(conn, 200, "text/event-stream", "").await?;
-        loop {
-            changed.borrow_and_update();
-            if !too_large_shown && self.0.state.lock().status.too_large {
-                after = None;
-                too_large_shown = true;
+/// Most topics one stream may carry.
+pub(super) const MAX_STREAM_TOPICS: usize = 64;
+
+/// Streams several topics on one connection, so a page needs one connection
+/// for all of its state. Each topic first gets its snapshot, or the deltas
+/// after its cursor, then every change. Every event names its topic.
+pub(super) async fn stream(
+    conn: &mut TcpStream,
+    topics: &[(&str, &Topic, Option<u64>)],
+) -> io::Result<()> {
+    // Subscribe before the first read, so no change in between is lost. A
+    // notification that arrives while events are written is kept as a permit.
+    let changed = Arc::new(Notify::new());
+    let mut watchers = JoinSet::new();
+    for (_, topic, _) in topics {
+        let mut receiver = topic.0.changed.subscribe();
+        let changed = changed.clone();
+        watchers.spawn(async move {
+            while receiver.changed().await.is_ok() {
+                changed.notify_one();
             }
-            let (revision, values) = self.since(after);
-            after = Some(revision);
+        });
+    }
+    let mut cursors: Vec<Option<u64>> = topics.iter().map(|(_, _, after)| *after).collect();
+    let mut too_large_shown = vec![false; topics.len()];
+    http::headers(conn, 200, "text/event-stream", "").await?;
+    loop {
+        for (i, (id, topic, _)) in topics.iter().enumerate() {
+            if !too_large_shown[i] && topic.0.state.lock().status.too_large {
+                cursors[i] = None;
+                too_large_shown[i] = true;
+            }
+            let (revision, values) = topic.since(cursors[i]);
+            cursors[i] = Some(revision);
             for (name, data) in values {
-                observation::event(conn, name, &data).await?;
+                let id = serde_json::to_string(id).map_err(io::Error::other)?;
+                observation::event(conn, name, &format!("{{\"topic\":{id},{}", &data[1..])).await?;
             }
-            tokio::select! {
-                result = changed.changed() => { if result.is_err() { return Ok(()); } }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    http::write(conn, b": ping\n\n").await?;
-                }
+        }
+        tokio::select! {
+            () = changed.notified() => {}
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                http::write(conn, b": ping\n\n").await?;
             }
         }
     }

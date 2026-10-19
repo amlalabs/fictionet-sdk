@@ -54,6 +54,10 @@ pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static str)> {
             "text/css; charset=utf-8",
             include_str!("../../../dashboard/tokens.css"),
         )),
+        "/components.css" => Some((
+            "text/css; charset=utf-8",
+            include_str!("../../../dashboard/components.css"),
+        )),
         "/app.css" => Some(("text/css; charset=utf-8", APP_CSS)),
         "/icon.svg" => Some(("image/svg+xml", ICON_SVG)),
         _ => None,
@@ -63,6 +67,39 @@ pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::lookup;
+
+    #[test]
+    fn stylesheets_and_their_imports_are_served() {
+        let (_, html) = lookup("/").unwrap();
+        let mut pending: Vec<String> = Vec::new();
+        for link in html.split("<link ").skip(1) {
+            let tag = link.split_once('>').unwrap().0;
+            if tag.contains("rel=\"stylesheet\"") {
+                let href = tag
+                    .split_once("href=\"")
+                    .unwrap()
+                    .1
+                    .split('"')
+                    .next()
+                    .unwrap();
+                pending.push(format!("/{}", href.trim_start_matches("./")));
+            }
+        }
+        assert!(!pending.is_empty(), "index.html links no stylesheet");
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(path) = pending.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let (kind, css) = lookup(&path).unwrap_or_else(|| panic!("{path} is not served"));
+            assert!(kind.starts_with("text/css"), "{path} is served as {kind}");
+            for import in css.split("@import url(\"").skip(1) {
+                let name = import.split('"').next().unwrap();
+                pending.push(format!("/{}", name.trim_start_matches("./")));
+            }
+        }
+        assert!(seen.contains("/components.css") && seen.contains("/tokens.css"));
+    }
 
     #[test]
     fn module_imports_are_served() {

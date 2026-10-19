@@ -24,7 +24,7 @@ function fixture() {
   }
   class RFB extends Element {
     constructor(display, socket) { super('rfb'); this.socket = socket; rfbs.push(this); }
-    disconnect() { this.disposed = true; }
+    disconnect() { this.disposed = true; this.disconnects = (this.disconnects || 0) + 1; }
   }
   class Terminal {
     constructor(options) { this.options = options; this.writes = []; this.inputs = new Set(); this.cols = 80; this.rows = 24; terminals.push(this); }
@@ -77,10 +77,13 @@ test('screen stays unavailable while booting, watches by default and follows the
   assert.equal(rfb.viewOnly, true);
   assert.equal(rfb.scaleViewport, true);
   assert.equal(rfb.resizeSession, false);
-  assert.equal(rfb.background, 'var(--sunken)');
-  rfb.dispatchEvent(new Event('connect'));
+  // The letterbox is the panel's own surface.
+  assert.equal(rfb.background, 'transparent');
   const claim = h.root.querySelector('button');
-  assert.equal(claim.disabled, false);
+  assert.equal(claim.hidden, true, 'take over waits for the screen to connect');
+  rfb.dispatchEvent(new Event('connect'));
+  assert.equal(claim.hidden, false);
+  assert.notEqual(claim.disabled, true);
   claim.click();
   await settle();
   assert.deepEqual(h.requests.at(-1), { method: 'POST', path: '/api/lease', body: { host: 'alpha', session: 'ours', take: true } });
@@ -92,6 +95,11 @@ test('screen stays unavailable while booting, watches by default and follows the
   h.lease('another');
   assert.equal(rfb.viewOnly, true);
   assert.equal(ownership.at(-1), 'Another viewer has control');
+  assert.match(h.root.textContent, /Another viewer took control/);
+  const notice = [...h.timers.values()].find((timer) => timer.delay === 4000);
+  assert.ok(notice, 'the lost-control notice clears itself');
+  notice.callback();
+  assert.match(h.root.textContent, /Another viewer has control/);
   h.lease('ours');
   claim.click();
   await settle();
@@ -127,6 +135,22 @@ test('screen reconnects with backoff and disposal cancels a scheduled reconnect'
   assert.ok(h.rfbs.every((rfb) => rfb.disposed && !rfb.listenerCount));
   assert.ok(h.sockets.every((socket) => !socket.listenerCount));
   assert.equal(reconnect.listenerCount, 0);
+});
+
+test('a screen noVNC already disconnected is not disconnected again', async () => {
+  const h = fixture();
+  h.publish({ screen: true });
+  const dispose = screen(h.root, h.services, h.screenOptions);
+  await settle();
+  const rfb = h.rfbs[0];
+  rfb.dispatchEvent(new Event('connect'));
+  rfb.dispatchEvent(new Event('disconnect'));
+  assert.equal(rfb.disconnects, undefined);
+  assert.match(h.root.textContent, /Connection lost\. Reconnecting in 4 s/);
+  assert.equal(h.root.querySelector('button').hidden, true, 'no take over while disconnected');
+  dispose();
+  assert.equal(rfb.disconnects, undefined);
+  assert.equal(h.timers.size, 0);
 });
 
 test('terminal acknowledges only consumed output and releases its socket, addon and observer', async () => {
@@ -176,9 +200,12 @@ test('terminal waits for SSH, reports a disconnect and reconnects only on reques
   h.publish({ terminal: true });
   await settle();
   h.sockets[0].close();
-  assert.match(h.root.textContent, /Disconnected\. Reconnect/);
+  assert.match(h.root.textContent, /Disconnected\./);
+  const reconnect = h.root.querySelector('button');
+  assert.equal(reconnect.textContent, 'Reconnect');
+  assert.equal(reconnect.hidden, false);
   assert.equal(h.timers.size, 0);
-  h.root.querySelector('button').click();
+  reconnect.click();
   await settle();
   assert.equal(h.sockets.length, 2);
   h.publish({ state: 'stopped', terminal: false });

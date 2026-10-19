@@ -28,24 +28,33 @@ export function render(root, rows, columns, options = {}) {
   const previous = new Set([...root.querySelectorAll('tbody tr')].map((row) => row.textContent));
   const table = el('table', { class: 'data-table' });
   const head = el('tr', {}, el('thead', {}, table));
-  for (const column of columns) el('th', { text: column.label, scope: 'col' }, head);
+  // Every column but the last takes the width of its content; the last
+  // takes the rest. Numbers align right, headers with them.
+  const kind = (column, i) => [
+    ['number', 'bytes', 'time'].includes(column.format) ? 'numeric' : '',
+    i < columns.length - 1 ? 'fit' : '',
+  ].filter(Boolean).join(' ');
+  columns.forEach((column, i) => el('th', { text: column.label, scope: 'col', class: kind(column, i) }, head));
   const body = el('tbody', {}, table);
   for (const row of rows) {
     const tr = el('tr', {}, body);
     if (options.moment?.(row)) tr.classList.add('moment');
-    for (const column of columns) {
-      el('td', { text: cell(pointer(row, column.pointer), column.format), class: ['number', 'bytes', 'time'].includes(column.format) ? 'numeric' : '' }, tr);
-    }
+    columns.forEach((column, i) => {
+      const text = cell(pointer(row, column.pointer), column.format);
+      const td = el('td', { class: kind(column, i) }, tr);
+      if (column.format === 'status' && text !== '—') el('span', { class: 'pill', text }, td);
+      else td.textContent = text;
+    });
     if (!previous.has(tr.textContent)) tr.classList.add('new-row');
   }
-  if (!rows.length) el('td', { colspan: Math.max(1, columns.length), text: 'No rows yet. They appear here as the world runs.' }, el('tr', {}, body));
+  if (!rows.length) el('td', { colspan: Math.max(1, columns.length), class: 'empty-cell', text: 'No rows yet. They appear here as the world runs.' }, el('tr', {}, body));
   root.replaceChildren(table);
   root.scrollTop = top;
 }
 
 export function mount(root, services, options) {
   const { el } = scoped(root);
-  const status = el('p', { role: 'status', text: 'Loading…' }, root);
+  const status = el('p', { class: 'loss-note', role: 'status', text: 'Loading…' }, root);
   const body = el('div', { class: 'table-scroll' }, root);
   const stop = services.state(options.state, (snapshot) => {
     const value = snapshot.value;

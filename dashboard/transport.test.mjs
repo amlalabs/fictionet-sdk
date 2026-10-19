@@ -430,20 +430,24 @@ test('page paths reject foreign origins, traversal, encoded segments and wrong m
   ]) await assert.rejects(h.get(path));
   await assert.rejects(h.post('/api/page', {}));
   await assert.rejects(h.delete('/api/command/traffic', {}));
-  for (const id of ['../leases', '%2f', '', undefined, 123]) assert.throws(() => h.stateStream(id));
+  for (const id of ['../leases', '%2f', '', 'a,b', 'a:1']) assert.throws(() => h.stateStream({ [id]: undefined }));
+  for (const after of [-1, 1.5, '3', null]) assert.throws(() => h.stateStream({ leases: after }));
+  assert.throws(() => h.stateStream({}));
+  assert.throws(() => h.stateStream(Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`t${i}`, undefined]))));
+  await assert.rejects(h.get('/api/state/leases/stream'));
   for (const [capability, host] of [['screen/alpha', 'alpha'], ['screen', '../alpha'], ['terminal', ''], ['screen', undefined]]) {
     await assert.rejects(h.socket(capability, host));
   }
   assert.equal(h.requests.length, 0);
 });
 
-test('state streams share the SSE reader, send revisions and close with the transport', async (t) => {
+test('one state stream carries every topic, sends revisions and closes with the transport', async (t) => {
   const h = transport(t), seen = [];
-  const stream = h.stateStream('leases', 4);
+  const stream = h.stateStream({ leases: 4, 'host-alpha': undefined });
   stream.addEventListener('snapshot', (event) => seen.push(JSON.parse(event.data)));
   stream.addEventListener('delta', (event) => seen.push(JSON.parse(event.data)));
   await settle();
-  assert.equal(h.requests[0].url, 'http://127.0.0.1:7878/api/state/leases/stream?after=4');
+  assert.equal(h.requests[0].url, 'http://127.0.0.1:7878/api/states/stream?topics=leases%2Chost-alpha&after=leases%3A4');
   assert.equal(h.requests[0].headers.Authorization, 'Bearer secret');
   h.sources[0].emit('snapshot', { revision: 5, value: { alpha: { holder: null } } });
   h.sources[0].emit('delta', { revision: 6, delta: {} });

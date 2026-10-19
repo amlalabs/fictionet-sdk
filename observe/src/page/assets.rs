@@ -23,7 +23,8 @@ pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static [u8])> {
         }
         "/components/control.mjs" => include_bytes!("../../../dashboard/components/control.mjs"),
         "/components/custom.mjs" => include_bytes!("../../../dashboard/components/custom.mjs"),
-        "/app.css" => include_bytes!("../../../dashboard/app.css"),
+        "/components.css" => include_bytes!("../../../dashboard/components.css"),
+        "/streams.mjs" => include_bytes!("../../../dashboard/streams.mjs"),
         "/page.mjs" => include_bytes!("../../../dashboard/page.mjs"),
         "/theme.mjs" => include_bytes!("../../../dashboard/theme.mjs"),
         "/selection.mjs" => include_bytes!("../../../dashboard/selection.mjs"),
@@ -64,9 +65,16 @@ fn escape(text: &str) -> String {
 }
 
 pub(super) fn licenses() -> String {
-    let mut html = String::from(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Library licenses</title><link rel=\"icon\" href=\"/icon.svg\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/tokens.css\"><link rel=\"stylesheet\" href=\"/page.css\"><body class=\"licenses\"><main><p><a href=\"/\">Back to the demo</a></p><h1>Library licenses</h1>",
-    );
+    let mut html = String::from(concat!(
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+        "<title>Library licenses</title>",
+        "<link rel=\"icon\" href=\"/icon.svg\" type=\"image/svg+xml\">",
+        "<link rel=\"stylesheet\" href=\"/tokens.css\">",
+        "<link rel=\"stylesheet\" href=\"/page.css\">",
+        "<body class=\"licenses\"><main><p><a href=\"/\">Back to the demo</a></p>",
+        "<h1>Library licenses</h1>",
+    ));
     for (path, bytes) in VENDOR {
         let Some((library, name)) = path.split_once('/') else {
             continue;
@@ -88,7 +96,10 @@ pub(super) fn licenses() -> String {
         .expect("a String");
     }
     if VENDOR.is_empty() {
-        html.push_str("<p>No browser libraries in this build. Run <code>cargo xtask demo assets</code>, then rebuild.</p>");
+        html.push_str(concat!(
+            "<p>No browser libraries in this build. ",
+            "Run <code>cargo xtask demo assets</code>, then rebuild.</p>",
+        ));
     }
     html.push_str("<p><a href=\"/\">Back to the demo</a></p></main></body></html>");
     html
@@ -115,6 +126,41 @@ mod tests {
             }
         }
         format!("/{}", parts.join("/"))
+    }
+
+    #[test]
+    fn stylesheets_and_their_imports_are_served() {
+        let mut pending: Vec<String> = Vec::new();
+        for page in [HTML, &licenses()] {
+            for link in page.split("<link ").skip(1) {
+                let tag = link.split_once('>').unwrap().0;
+                if tag.contains("rel=\"stylesheet\"") {
+                    let href = tag
+                        .split_once("href=\"")
+                        .unwrap()
+                        .1
+                        .split('"')
+                        .next()
+                        .unwrap();
+                    pending.push(href.to_owned());
+                }
+            }
+        }
+        assert!(!pending.is_empty(), "the page links no stylesheet");
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(path) = pending.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let (kind, bytes) = lookup(&path).unwrap_or_else(|| panic!("{path} is not served"));
+            assert!(kind.starts_with("text/css"), "{path} is served as {kind}");
+            let css = std::str::from_utf8(bytes).unwrap();
+            for import in css.split("@import url(\"").skip(1) {
+                let name = import.split('"').next().unwrap();
+                pending.push(resolve(&path, name));
+            }
+        }
+        assert!(seen.contains("/components.css") && seen.contains("/tokens.css"));
     }
 
     fn imports(source: &str) -> Vec<&str> {

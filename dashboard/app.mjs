@@ -14,6 +14,7 @@ const setStatus = (kind, text) => {
 };
 const transport = createTransport({ setStatus, onLogout: () => packets?.close() });
 const services = { transport, setStatus, selection: createSelection(),
+  connect: (graph) => transport.connect(graph),
   openPackets: (id) => packets.open(id), openLinks: (...args) => packets.openLinks(...args),
 };
 let map;

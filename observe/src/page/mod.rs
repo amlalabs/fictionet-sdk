@@ -79,14 +79,24 @@
 //! Delta count is bounded by `StateLimits.deltas`, total delta payload bytes
 //! by `StateLimits.max_bytes`, and each snapshot by that same byte bound.
 //!
-//! `GET /api/state/<id>/stream?after=N` is SSE. Without `after`, or when
-//! continuity from N is unavailable, it sends `snapshot` with the GET shape.
-//! Otherwise it sends `delta` events with
-//! `{revision,at,delta,status:{too_large}}` in revision order. No event is
-//! needed when N is current. A future N also receives a snapshot. A publish
-//! without a delta breaks continuity. Status changes wake subscribers even
-//! when the revision has not changed. Delta semantics are author-defined;
-//! readers unable to apply a delta can fetch the replacement snapshot.
+//! `GET /api/states/stream?topics=a,b&after=a:3,b:7` is one SSE stream for
+//! up to 64 topics. A browser allows six HTTP/1.1 connections to one origin,
+//! so a page streams all of its state on one connection. `topics` lists topic
+//! ids; `after` is optional and gives a revision per listed topic. An unknown
+//! topic returns 404 naming it; a malformed or repeated list returns 400.
+//! Each event's data starts with `topic`. Without a cursor, or when
+//! continuity from it is unavailable, a topic gets `snapshot` with the GET
+//! shape plus `topic`. Otherwise it gets `delta` events with
+//! `{topic,revision,at,delta,status:{too_large}}` in revision order. No event
+//! is needed when the cursor is current. A future cursor also receives a
+//! snapshot. A publish without a delta breaks continuity. Status changes wake
+//! subscribers even when the revision has not changed. Delta semantics are
+//! author-defined; readers unable to apply a delta can fetch the replacement
+//! snapshot.
+//!
+//! A page holds at most three long-lived streams: `watch`, the state stream
+//! and `packets`. Everything else is a short request. The browser components
+//! share one of each.
 //!
 //! # Commands
 //!
@@ -310,8 +320,8 @@
 //! Invalid sessions return 400. Closing the holding WebSocket also releases
 //! the lease. These mutations require bearer and Origin headers.
 //!
-//! `GET /api/state/leases` and `/api/state/leases/stream?after=N` use the
-//! regular state snapshot and SSE shapes. Value is a map
+//! `leases` is a built-in state topic: `GET /api/state/leases` and the state
+//! stream with `topics=leases` use the regular shapes. Value is a map
 //! `{"alpha":{"holder":null},"beta":{"holder":"session id"}}`.
 //! This built-in topic publishes replacement snapshots, with at measured on
 //! the injected server clock. Compare holder to the ticket's session ID to
@@ -704,32 +714,22 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
             )
             .await
         }
-        ("GET", path) if path.starts_with("/api/state/") => {
-            let path = &path[11..];
-            let (id, stream) = path
-                .strip_suffix("/stream")
-                .map_or((path, false), |id| (id, true));
-            let Some((_, topic)) = shared.page.topics.iter().find(|(name, _)| name == id) else {
-                return http::error(conn, 404, "no such state topic").await;
-            };
-            if !stream {
-                return http::respond(conn, 200, "application/json", topic.snapshot().as_bytes())
-                    .await;
-            }
-            let after = match req.query.as_slice() {
-                [] => None,
-                [(key, value)] if key == "after" => match value.parse() {
-                    Ok(revision) => Some(revision),
-                    Err(_) => {
-                        return http::error(conn, 400, "after must be an unsigned revision").await;
-                    }
-                },
-                _ => return http::error(conn, 400, "state streams accept only after").await,
+        ("GET", "/api/states/stream") => {
+            let topics = match state_stream_topics(&shared.page.topics, &req.query) {
+                Ok(topics) => topics,
+                Err((status, error)) => return http::error(conn, status, &error).await,
             };
             let Ok(_permit) = shared.streams.try_acquire() else {
                 return http::error(conn, 503, "too many streams").await;
             };
-            topic.stream(conn, after).await
+            state::stream(conn, &topics).await
+        }
+        ("GET", path) if path.starts_with("/api/state/") => {
+            let id = &path[11..];
+            let Some((_, topic)) = shared.page.topics.iter().find(|(name, _)| name == id) else {
+                return http::error(conn, 404, "no such state topic").await;
+            };
+            http::respond(conn, 200, "application/json", topic.snapshot().as_bytes()).await
         }
         ("POST", path) if path.starts_with("/api/command/") => {
             let Some((id, port)) = shared
@@ -758,6 +758,67 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
         }
         _ => http::error(conn, 404, "no such route").await,
     }
+}
+
+type StreamTopics<'a> = Vec<(&'a str, &'a state::Topic, Option<u64>)>;
+
+/// Reads `topics=a,b&after=a:3` into the topics a state stream carries.
+fn state_stream_topics<'a>(
+    declared: &'a [(String, state::Topic)],
+    query: &[(String, String)],
+) -> Result<StreamTopics<'a>, (u16, String)> {
+    let bad = |error: &str| Err((400, error.to_owned()));
+    let (mut names, mut after) = (None, None);
+    for (key, value) in query {
+        let slot = match key.as_str() {
+            "topics" => &mut names,
+            "after" => &mut after,
+            _ => return bad("state streams accept only topics and after"),
+        };
+        if slot.replace(value.as_str()).is_some() {
+            return Err((400, format!("{key} appears more than once")));
+        }
+    }
+    let Some(names) = names else {
+        return bad("name the topics, as topics=a,b");
+    };
+    if names.split(',').count() > state::MAX_STREAM_TOPICS {
+        return Err((
+            400,
+            format!(
+                "a stream carries at most {} topics",
+                state::MAX_STREAM_TOPICS
+            ),
+        ));
+    }
+    let mut topics: StreamTopics<'a> = Vec::new();
+    for name in names.split(',') {
+        if name.is_empty() {
+            return bad("topics is a comma-separated list of topic ids");
+        }
+        if topics.iter().any(|(id, _, _)| *id == name) {
+            return Err((400, format!("topic {name:?} appears more than once")));
+        }
+        let Some((id, topic)) = declared.iter().find(|(id, _)| id == name) else {
+            return Err((404, format!("no such state topic: {name:?}")));
+        };
+        topics.push((id, topic, None));
+    }
+    for cursor in after.into_iter().flat_map(|after| after.split(',')) {
+        let Some((name, revision)) = cursor.split_once(':') else {
+            return bad("after is a list of topic:revision");
+        };
+        let Some(entry) = topics.iter_mut().find(|(id, _, _)| *id == name) else {
+            return Err((400, format!("after names {name:?}, which is not in topics")));
+        };
+        let Ok(revision) = revision.parse() else {
+            return bad("after must give unsigned revisions");
+        };
+        if entry.2.replace(revision).is_some() {
+            return Err((400, format!("after names {name:?} more than once")));
+        }
+    }
+    Ok(topics)
 }
 
 #[cfg(test)]

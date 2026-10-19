@@ -2,7 +2,11 @@
 // The caller passes DOM helpers, graph links, labels and orientation, and a fit callback.
 import { listen } from './dom.mjs';
 
-export function createPackets({ $, el, packetStream, packet, download, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000 }) {
+export function createPackets({
+  $, el, packetStream, packet, download, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000,
+  placeholder = (many) => (many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.'),
+  pcapLabel = 'Capture for Wireshark',
+}) {
   // ---------------------------------------------------------------------------
   // The packet drawer
 
@@ -62,12 +66,12 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
     $('dir-a').textContent = `${fromName} → ${toName}`;
     $('dir-b').textContent = `${toName} → ${fromName}`;
     const list = members.map((m) => m.e.id).join(',');
-    $('pcap-label').textContent = 'Capture for Wireshark';
+    $('pcap-label').textContent = pcapLabel;
     $('pause').textContent = 'Pause';
     $('sampled').hidden = true;
     $('sampled').textContent = '';
     prows.replaceChildren();
-    clearDetail(many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.');
+    clearDetail(placeholder(many));
     const flips = new Map(members.map((m) => [m.e.id, m.flip]));
     const onStream = (...args) => streamCleanup.push(listen(source, ...args));
     const source = packetStream(list, () => {
@@ -164,7 +168,7 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
     const current = packets;
     try {
       await download('pcap', current.list);
-      if (packets === current) $('pcap-label').textContent = 'Capture for Wireshark';
+      if (packets === current) $('pcap-label').textContent = pcapLabel;
     } catch {
       if (packets === current) $('pcap-label').textContent = 'Download failed. Try again.';
     }
@@ -182,9 +186,20 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
     for (const tr of prows.children) filterRow(tr);
   });
 
+  // An address pair, `[a, b]`, matched in either direction: what an event
+  // names as its local and peer ends. Null shows every row.
+  let pair = null;
   function filterRow(tr) {
     const q = $('pfilter').value.trim().toLowerCase();
-    tr.hidden = !!q && (tr.classList.contains('gap') || !(tr.dataset.text || '').includes(q));
+    const gap = tr.classList.contains('gap');
+    const text = !q || (!gap && (tr.dataset.text || '').includes(q));
+    const { src, dst } = tr.dataset;
+    const ends = !pair || (!gap && ((src === pair[0] && dst === pair[1]) || (src === pair[1] && dst === pair[0])));
+    tr.hidden = !(text && ends);
+  }
+  function setPair(next) {
+    pair = next ? [String(next[0]), String(next[1])] : null;
+    for (const tr of prows.children) filterRow(tr);
   }
 
   function addGap(text, parent = prows) {
@@ -236,7 +251,7 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
     prows.appendChild(frag);
     trimRows();
     if (nearBottom) { plist.scrollTop = plist.scrollHeight; clearUnread(); }
-    else if (jump) { unread += batch.length; jump.textContent = `${unread} new`; jump.hidden = false; }
+    else if (jump) { unread += batch.length; jump.textContent = `↓ ${unread} new`; jump.hidden = false; }
   }
 
   function addPacket(p, parent) {
@@ -260,6 +275,8 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
     tr.title = p.skipped > 0 ? `${p.info}\n(${p.skipped} packet${p.skipped === 1 ? '' : 's'} before this one not copied)` : p.info;
     if (p.evicted > 0) tr.title += `\n(${p.evicted} captured ${p.evicted === 1 ? 'copy' : 'copies'} before this one evicted before decoding)`;
     tr.dataset.text = `${p.src} ${p.dst} ${p.proto} ${p.info}`.toLowerCase();
+    tr.dataset.src = p.src;
+    tr.dataset.dst = p.dst;
     filterRow(tr);
     tr.classList.add('new-row');
     tr.addEventListener('click', () => showPacket(p, tr));
@@ -275,6 +292,7 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
     const current = () => packets === history && selection === generation && !drawer.hidden;
     for (const r of prows.querySelectorAll('tr.on')) r.classList.remove('on');
     tr.classList.add('on');
+    drawer.classList.add('has-packet');
     clearDetail('Loading packet…');
     try {
       const res = await packet(p, request.signal);
@@ -295,6 +313,7 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
   }
 
   function invalidateSelection() {
+    drawer.classList.remove('has-packet');
     selection++;
     detailRequest?.abort();
     detailRequest = null;
@@ -453,5 +472,5 @@ export function createPackets({ $, el, packetStream, packet, download, getEdge, 
     cleanup.splice(0).forEach((remove) => remove());
     prows.replaceChildren();
     clearDetail('Select a packet to see its layers.');
-  }, open: openPackets, openLinks, close: closePackets, flush: flushPackets };
+  }, open: openPackets, openLinks, close: closePackets, flush: flushPackets, setPair };
 }

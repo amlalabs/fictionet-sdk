@@ -1,6 +1,11 @@
+// The demo page: a host bar, a workspace of consoles beside a tabbed
+// inspector, built from the page description the server gives at /api/page.
+// Components share one watch stream and one state stream (see streams.mjs).
 import { createTransport } from './transport.mjs';
 import { createSelection } from './selection.mjs';
 import { createTheme } from './theme.mjs';
+import { createStateHub, createWatchHub } from './streams.mjs';
+import { watchState } from './state.mjs';
 import * as format from './format.mjs';
 import { scoped, listen } from './dom.mjs';
 import { mount as screen } from './components/screen.mjs';
@@ -13,64 +18,52 @@ import { mount as eventTable } from './components/event-table.mjs';
 import { mount as control } from './components/control.mjs';
 import { mount as custom } from './components/custom.mjs';
 
-export function createServices(transport, theme) {
-  const topics = new Map();
-  const selection = createSelection();
-  const moments = new Set();
-  const momentListeners = new Set();
+const SIGNED_OUT = 'Open the URL the demo printed in its terminal. A URL signs in one tab. Restart the demo for a new one.';
+
+// A value components can read and follow.
+function store(value) {
+  const listeners = new Set();
   return {
-    transport, selection, theme, format,
-    moment(element) { element.classList.add('moment'); },
-    isMoment: (event) => moments.has(event.seq),
-    onMoment(callback) { momentListeners.add(callback); return () => momentListeners.delete(callback); },
-    markMoment(event) { moments.add(event.seq); if (moments.size > 1000) moments.delete(moments.values().next().value); momentListeners.forEach((callback) => callback()); },
-    state(path, onSnapshot, onError = () => {}) {
-      if (!/^\/api\/state\/[A-Za-z0-9_-]{1,128}$/.test(path)) throw new Error('Invalid state path');
-      let topic = topics.get(path);
-      if (!topic) {
-        const source = transport.stateStream(path.slice('/api/state/'.length));
-        const controller = new AbortController();
-        topic = { listeners: new Set(), latest: null, source, controller, refreshing: false, dirty: false };
-        const deliver = (snapshot) => {
-          if (controller.signal.aborted || snapshot.revision < (topic.latest?.revision || 0)) return;
-          topic.latest = snapshot;
-          topic.listeners.forEach((listener) => listener.onSnapshot(snapshot));
-        };
-        const fail = (error) => { if (!controller.signal.aborted) topic.listeners.forEach((listener) => listener.onError(error)); };
-        const refresh = async () => {
-          topic.dirty = true;
-          if (topic.refreshing) return;
-          topic.refreshing = true;
-          try {
-            while (topic.dirty && !controller.signal.aborted) {
-              topic.dirty = false;
-              deliver(await transport.get(path, {}, controller.signal));
-            }
-          } catch (error) { fail(error); }
-          finally { topic.refreshing = false; }
-        };
-        const offSnapshot = listen(source, 'snapshot', (event) => deliver(JSON.parse(event.data)));
-        const offDelta = listen(source, 'delta', refresh);
-        const onError = (event) => fail(new Error(JSON.parse(event.data).error));
-        const offError = listen(source, 'error', onError);
-        const offRefusal = listen(source, 'world_error', onError);
-        topic.stop = () => { controller.abort(); offSnapshot(); offDelta(); offError(); offRefusal(); source.close(); };
-        topics.set(path, topic);
-      }
-      const listener = { onSnapshot, onError };
-      topic.listeners.add(listener);
-      if (topic.latest) onSnapshot(topic.latest);
-      return () => {
-        topic.listeners.delete(listener);
-        if (!topic.listeners.size) { topic.stop(); topics.delete(path); }
-      };
-    },
-    dispose() { topics.forEach((topic) => topic.stop()); topics.clear(); momentListeners.clear(); },
+    get: () => value,
+    set(next) { value = next; listeners.forEach((listener) => listener(value)); },
+    subscribe(listener) { listeners.add(listener); listener(value); return () => listeners.delete(listener); },
   };
 }
 
+export function createServices(transport, theme) {
+  const states = createStateHub(transport);
+  const watches = createWatchHub(transport);
+  const selection = createSelection();
+  const moments = new Set();
+  const momentListeners = new Set();
+  const clock = { t: 0, at: performance.now(), ended: true };
+  return {
+    transport, selection, theme, format, clock,
+    packetPair: store(null),
+    watch: () => watches.subscribe(),
+    connect: (graph) => watchState(watches.subscribe(), graph),
+    state(path, onSnapshot, onError) {
+      if (!/^\/api\/state\/[A-Za-z0-9_-]{1,128}$/.test(path)) throw new Error('Invalid state path');
+      return states.subscribe(path.slice('/api/state/'.length), onSnapshot, onError);
+    },
+    runTime: () => clock.t + (clock.ended ? 0 : (performance.now() - clock.at) / 1000),
+    moment(element) { element.classList.add('moment'); },
+    isMoment: (event) => moments.has(event.seq),
+    onMoment(callback) { momentListeners.add(callback); return () => momentListeners.delete(callback); },
+    markMoment(event) {
+      moments.add(event.seq);
+      if (moments.size > 1000) moments.delete(moments.values().next().value);
+      momentListeners.forEach((callback) => callback());
+    },
+    dispose() { states.dispose(); watches.dispose(); momentListeners.clear(); },
+  };
+}
+
+// The workspace's share of the width until the viewer drags the divider.
+const DEFAULT_SPLIT = 58;
+
 export function divider(element, workspace, title) {
-  let percent = 62;
+  let percent = DEFAULT_SPLIT;
   const key = `fictionet-divider:${title}`;
   try { const saved = Number(localStorage.getItem(key)); if (saved >= 25 && saved <= 80) percent = saved; } catch { /* The position still lasts for this page. */ }
   function apply(value, save = true) {
@@ -86,7 +79,7 @@ export function divider(element, workspace, title) {
     listen(element, 'pointerup', () => { dragging = false; }),
     listen(element, 'pointercancel', () => { dragging = false; }),
     listen(element, 'lostpointercapture', () => { dragging = false; }),
-    listen(element, 'dblclick', () => apply(62)),
+    listen(element, 'dblclick', () => apply(DEFAULT_SPLIT)),
     listen(element, 'keydown', (event) => {
       const value = { ArrowLeft: percent - 2, ArrowRight: percent + 2, Home: 25, End: 80 }[event.key];
       if (value !== undefined) { event.preventDefault(); apply(value); }
@@ -96,112 +89,177 @@ export function divider(element, workspace, title) {
   return () => cleanup.forEach((remove) => remove());
 }
 
+// Small inline icons, drawn with the current text color.
+const ICONS = {
+  screen: 'M2.5 3.5h11v7h-11zM6 13.5h4M8 10.5v3',
+  terminal: 'M2.5 3.5h11v9h-11zM5 7l2 1.5L5 10M8.5 10.5h2.5',
+  pin: 'M6 2.5h4M7 2.5v4L5 9h6L9 6.5v-4M8 9v4.5',
+};
+function icon(el, parent, name, label) {
+  const svg = el('svg:svg', { viewBox: '0 0 16 16', class: `icon icon-${name}`, ...(label ? { role: 'img', 'aria-label': label } : { 'aria-hidden': 'true' }) }, parent);
+  if (label) el('svg:title', { text: label }, svg);
+  el('svg:path', { d: ICONS[name], fill: 'none', stroke: 'currentColor', 'stroke-width': '1.4', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, svg);
+  return svg;
+}
+
+const READINESS = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', stopped: 'Stopped' };
+const ORDER = ['packets', 'events', 'map'];
+
 export async function mount(root, transport, theme) {
   const { $, el } = scoped(root);
+  const document = root.ownerDocument;
   const cleanup = [];
   const services = createServices(transport, theme);
-  services.setStatus = (_, text) => { $('page-status').textContent = text; };
   const controller = new AbortController();
   const tiles = new Map(), chips = new Map(), pinned = new Set(), modes = new Map();
   let stopPanel = () => {}, stopWorkspace = () => {}, selectedTab, disposed = false, workspaceMounted = false;
-  let clockTimer, momentTimer, watch;
+  let clockTimer, momentTimer, watch, page;
   const stop = () => {
     if (disposed) return;
     disposed = true;
     controller.abort();
-    clearInterval(clockTimer); clearTimeout(momentTimer);
+    clearInterval(clockTimer);
+    clearTimeout(momentTimer);
     watch?.close();
-    stopPanel(); stopWorkspace(); tiles.forEach((tile) => tile.dispose());
+    stopPanel();
+    stopWorkspace();
+    tiles.forEach((tile) => tile.dispose());
     cleanup.forEach((remove) => remove());
-    services.dispose(); transport.close(); theme.dispose();
+    services.dispose();
+    transport.close();
+    theme.dispose();
   };
-  cleanup.push(listen(window, 'pagehide', stop, { once: true }));
-  let page;
-  try { page = await transport.get('/api/page', {}, controller.signal); }
-  catch (error) {
-    if (!$('page-status').textContent.startsWith('Not signed in.')) $('page-status').textContent = `Could not open the demo: ${error.message}. Reload to retry.`;
-    $('workspace').textContent = $('page-status').textContent;
-    $('inspector-content').textContent = 'Open a demo URL to view its panels.';
+  cleanup.push(listen(globalThis.window, 'pagehide', stop, { once: true }));
+
+  const notice = (title, text, action) => showNotice(root, title, text, action);
+  cleanup.push(listen($('notice-action'), 'click', () => globalThis.location?.reload()));
+
+  try {
+    page = await transport.get('/api/page', {}, controller.signal);
+  } catch (error) {
+    if (!disposed && root.dataset.state !== 'notice') {
+      if (error.status === 401 || error.status === 403 || /authorization|closed/i.test(error.message)) notice('Not signed in', SIGNED_OUT);
+      else notice('Could not open the demo', `${error.message}.`, true);
+    }
     return stop;
   }
   if (disposed) return stop;
+  root.dataset.state = 'ready';
   services.hosts = page.hosts;
-  document.title = page.title;
+  document.title = `${page.title} · Fictionet`;
   $('page-title').textContent = page.title;
-  $('page-status').textContent = 'Waiting for the world';
   cleanup.push(divider($('divider'), $('workbench'), page.title));
-  const readiness = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', stopped: 'Stopped' };
+
+  // The host bar.
   const selectHost = (host) => services.selection.set({ host, node: null, links: [], event: null, connection: null, request: null });
-  const all = el('button', { type: 'button', class: 'host-chip', text: 'All hosts', 'aria-pressed': 'true' }, $('host-bar'));
+  const bar = $('host-bar');
+  bar.replaceChildren();
+  const all = el('button', { type: 'button', class: 'host-chip all', 'aria-pressed': 'true', text: 'All hosts' }, bar);
   cleanup.push(listen(all, 'click', () => selectHost(null)));
+  const customWorkspace = page.panels.find((panel) => panel.area === 'workspace' && panel.kind === 'custom');
   for (const host of page.hosts) {
-    const group = el('div', { class: 'host-group' }, $('host-bar'));
+    const group = el('div', { class: 'host-group' }, bar);
     const chip = el('button', { type: 'button', class: 'host-chip', 'aria-pressed': 'false' }, group);
-    const dot = el('span', { class: 'readiness', 'aria-hidden': 'true' }, chip);
-    const ready = el('span', { text: 'Booting' }, chip);
+    const dot = el('i', { class: 'readiness', 'data-state': 'booting', 'aria-hidden': 'true' }, chip);
     el('b', { text: host.name }, chip);
-    const addresses = el('span', { class: 'mono host-addresses' }, chip);
-    const consoles = el('span', { class: 'host-consoles' }, chip);
-    const owner = el('span', { class: 'host-owner', text: 'Watching' }, chip);
-    const pin = el('button', { type: 'button', class: 'pin', text: 'Pin', 'aria-label': `Pin ${host.name}`, 'aria-pressed': 'false' }, group);
-    pin.hidden = page.panels.some((panel) => panel.area === 'workspace' && panel.kind === 'custom');
+    const addresses = el('span', { class: 'host-addresses' }, chip);
+    const ready = el('span', { class: 'pill', text: 'Booting' }, chip);
+    const marks = el('span', { class: 'console-marks' }, chip);
+    const owner = el('span', { class: 'host-owner' }, chip);
+    const pin = el('button', { type: 'button', class: 'pin', 'aria-label': `Pin ${host.name} to the workspace`, title: 'Pin to the workspace', 'aria-pressed': 'false' }, group);
+    icon(el, pin, 'pin');
+    pin.hidden = Boolean(customWorkspace);
     chips.set(host.name, { chip, pin, owner });
     cleanup.push(listen(chip, 'click', () => selectHost(host.name)));
     cleanup.push(listen(pin, 'click', () => {
       if (pinned.has(host.name)) pinned.delete(host.name); else pinned.add(host.name);
       pin.setAttribute('aria-pressed', String(pinned.has(host.name)));
-      pin.textContent = pinned.has(host.name) ? 'Unpin' : 'Pin';
+      pin.setAttribute('aria-label', `${pinned.has(host.name) ? 'Unpin' : 'Pin'} ${host.name} ${pinned.has(host.name) ? 'from' : 'to'} the workspace`);
       renderWorkspace();
     }));
     cleanup.push(services.state(host.status, ({ value }) => {
-      ready.textContent = readiness[value?.state] || 'Booting';
-      dot.dataset.state = value?.state || 'booting';
+      const state = value?.state || 'booting';
+      ready.textContent = READINESS[state] || 'Booting';
+      dot.dataset.state = state;
       addresses.textContent = (value?.addresses || []).join(' · ');
-      consoles.textContent = `${value?.screen ? 'Screen' : 'No screen'} · ${value?.terminal ? 'Terminal' : 'No terminal'}`;
+      marks.replaceChildren();
+      if (host.screen) icon(el, marks, 'screen', value?.screen ? 'Screen available' : 'No screen yet').classList.toggle('off', !value?.screen);
+      if (host.terminal) icon(el, marks, 'terminal', value?.terminal ? 'Terminal available' : 'No terminal yet').classList.toggle('off', !value?.terminal);
     }, (error) => { ready.textContent = `Status unavailable: ${error.message}`; }));
   }
-  cleanup.push(services.state('/api/state/leases', ({ value }) => {
-    for (const [name, { owner }] of chips) owner.textContent = value?.[name]?.holder ? 'Another viewer has control' : 'Watching';
-  }, () => { for (const { owner } of chips.values()) owner.textContent = 'Input status unavailable'; }));
-  const workspacePanel = page.panels.find((panel) => panel.area === 'workspace' && panel.kind === 'custom');
-  const panels = page.panels.filter((panel) => panel.area === 'inspector');
-  const order = ['packets', 'events', 'map'];
-  panels.sort((a, b) => (order.indexOf(a.kind) < 0 ? 3 : order.indexOf(a.kind)) - (order.indexOf(b.kind) < 0 ? 3 : order.indexOf(b.kind)));
-  cleanup.push(listen(document, 'visibilitychange', () => {
-    if (document.hidden) { stopPanel(); stopPanel = () => {}; stopWorkspace(); stopWorkspace = () => {}; tiles.forEach((tile) => { tile.dispose(); tile.root.remove(); }); tiles.clear(); }
-    else { renderWorkspace(); if (selectedTab) activate(selectedTab); }
+  const ownership = (name, text) => {
+    const entry = chips.get(name);
+    if (!entry) return;
+    entry.owner.textContent = text === 'Watching' ? '' : text;
+    entry.owner.dataset.owner = text === 'You have control' ? 'mine' : text === 'Watching' ? 'none' : 'other';
+  };
+  // Every viewer sees who holds each host's input, whether or not it shows
+  // the screen. `sessions` holds this tab's connected screen per host.
+  const sessions = new Map();
+  let leases = {};
+  const owners = () => {
+    for (const name of chips.keys()) {
+      const holder = leases?.[name]?.holder;
+      ownership(name, !holder ? 'Watching' : holder === sessions.get(name) ? 'You have control' : 'Another viewer has control');
+    }
+  };
+  cleanup.push(services.state('/api/state/leases', ({ value }) => { leases = value || {}; owners(); }, () => {
+    for (const name of chips.keys()) ownership(name, 'Input status unavailable');
   }));
+
+  // The inspector.
+  const panels = page.panels.filter((panel) => panel.area === 'inspector');
+  panels.sort((a, b) => (ORDER.indexOf(a.kind) < 0 ? 3 : ORDER.indexOf(a.kind)) - (ORDER.indexOf(b.kind) < 0 ? 3 : ORDER.indexOf(b.kind)));
   const tabs = [];
-  const hostStatus = (options) => ({ ...options, status: page.hosts.find((host) => host.name === options.host)?.status, onOwnership: (text) => { const chip = chips.get(options.host); if (chip) chip.owner.textContent = text; } });
-  function panel(root, options) {
+  const consoleOptions = (options, controls) => ({
+    ...options, controls,
+    status: page.hosts.find((host) => host.name === options.host)?.status,
+    onSession: (session) => {
+      if (session) sessions.set(options.host, session); else sessions.delete(options.host);
+      owners();
+    },
+  });
+  function panel(content, options, controls) {
     try {
       switch (options.kind) {
-        case 'screen': return screen(root, services, hostStatus(options));
-        case 'terminal': return terminal(root, services, hostStatus(options));
-        case 'packets': return packets(root, services, options);
-        case 'events': return events(root, services, options);
-        case 'map': return map(root, services, options);
-        case 'table': return table(root, services, options);
-        case 'event_table': return eventTable(root, services, options);
-        case 'control': return control(root, services, options);
-        case 'custom': return custom(root, services, options);
-        default: el('p', { text: 'This panel is unavailable. Rebuild the demo.' }, root); return () => {};
+        case 'screen': return screen(content, services, consoleOptions(options, controls));
+        case 'terminal': return terminal(content, services, consoleOptions(options, controls));
+        case 'packets': return packets(content, services, options);
+        case 'events': return events(content, services, options);
+        case 'map': return map(content, services, options);
+        case 'table': return table(content, services, options);
+        case 'event_table': return eventTable(content, services, options);
+        case 'control': return control(content, services, options);
+        case 'custom': return custom(content, services, options);
+        default: el('p', { class: 'empty-note', text: 'This panel is unavailable. Rebuild the demo.' }, content); return () => {};
       }
-    } catch (error) { root.replaceChildren(el('p', { text: `Could not open ${options.title}: ${error.message}` })); return () => {}; }
+    } catch (error) {
+      content.replaceChildren(el('p', { class: 'empty-note', text: `Could not open ${options.title}: ${error.message}` }));
+      return () => {};
+    }
   }
-  function activate(item) {
+  function activate(item, focus = false) {
     stopPanel();
     selectedTab = item;
-    for (const entry of tabs) { entry.button.setAttribute('aria-selected', String(entry === item)); entry.button.tabIndex = entry === item ? 0 : -1; }
+    for (const entry of tabs) {
+      entry.button.setAttribute('aria-selected', String(entry === item));
+      entry.button.tabIndex = entry === item ? 0 : -1;
+    }
+    item.button.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    if (focus) item.button.focus();
     const content = $('inspector-content');
     content.replaceChildren();
+    content.dataset.kind = item.options.kind;
     content.setAttribute('aria-labelledby', item.button.id);
     stopPanel = panel(content, item.options);
   }
+  const tabList = $('tabs');
+  tabList.replaceChildren();
   for (const options of panels) {
-    const button = el('button', { id: `tab-${options.id}`, type: 'button', role: 'tab', 'aria-controls': 'inspector-content', 'aria-selected': 'false', text: options.title }, $('tabs'));
+    const button = el('button', { id: `tab-${options.id}`, type: 'button', role: 'tab', 'aria-controls': 'inspector-content', 'aria-selected': 'false', text: options.title }, tabList);
     button.tabIndex = -1;
-    const item = { button, options }; tabs.push(item);
+    const item = { button, options };
+    tabs.push(item);
     cleanup.push(listen(button, 'click', () => activate(item)));
     cleanup.push(listen(button, 'keydown', (event) => {
       let index = tabs.indexOf(item);
@@ -214,74 +272,143 @@ export async function mount(root, transport, theme) {
       event.preventDefault();
       tabs.forEach((entry, i) => { entry.button.tabIndex = i === index ? 0 : -1; });
       tabs[index].button.focus();
+      tabs[index].button.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
     }));
   }
+  // The tab strip fades at an edge that has more tabs past it.
+  const strip = tabList.parentElement;
+  const edges = () => {
+    strip.dataset.left = String(tabList.scrollLeft > 1);
+    strip.dataset.right = String(tabList.scrollLeft + tabList.clientWidth < tabList.scrollWidth - 1);
+  };
+  cleanup.push(listen(tabList, 'scroll', edges));
+  if (globalThis.ResizeObserver) {
+    const observer = new ResizeObserver(edges);
+    observer.observe(tabList);
+    cleanup.push(() => observer.disconnect());
+  }
+  const tabOf = (kind) => tabs.find((tab) => tab.options.kind === kind);
   services.openPackets = (id) => {
     services.selection.set({ links: [id] });
-    const item = tabs.find((tab) => tab.options.kind === 'packets'); if (item) activate(item);
+    const item = tabOf('packets'); if (item) activate(item);
   };
   services.openLinks = (_from, _to, members) => {
     services.selection.set({ links: members.map(({ e }) => e.id) });
-    const item = tabs.find((tab) => tab.options.kind === 'packets'); if (item) activate(item);
+    const item = tabOf('packets'); if (item) activate(item);
   };
+  services.showPackets = (pair) => {
+    services.packetPair.set(pair);
+    const item = tabOf('packets'); if (item) activate(item);
+  };
+
+  // The workspace: the pinned hosts, or the selected one, each in a tile.
   function renderWorkspace() {
     if (!page || document.hidden) return;
     const workspace = $('workspace');
-    if (workspacePanel) {
+    if (customWorkspace) {
       if (workspaceMounted) return;
       workspace.replaceChildren();
       const content = el('section', { class: 'custom-workspace' }, workspace);
-      const off = panel(content, workspacePanel);
+      const off = panel(content, customWorkspace);
       workspaceMounted = true;
       stopWorkspace = () => { off(); workspaceMounted = false; };
       return;
     }
     const names = pinned.size ? [...pinned] : [services.selection.get().host || page.hosts[0]?.name].filter(Boolean);
-    for (const [name, tile] of tiles) if (!names.includes(name) || tile.mode !== (modes.get(name) || 'screen')) { tile.dispose(); tile.root.remove(); tiles.delete(name); }
-    if (!names.length) { workspace.textContent = 'No hosts declared. Add a host to this demo.'; return; }
+    for (const [name, tile] of tiles) {
+      if (!names.includes(name) || tile.mode !== modes.get(name)) { tile.dispose(); tile.root.remove(); tiles.delete(name); }
+    }
+    if (!names.length) {
+      workspace.replaceChildren(el('div', { class: 'notice' }, null));
+      const card = el('div', { class: 'card' }, workspace.firstChild);
+      el('h2', { text: 'No hosts' }, card);
+      el('p', { text: 'This demo declares no hosts. Its panels are in the inspector.' }, card);
+      return;
+    }
     if (!tiles.size) workspace.replaceChildren();
     for (const name of names) {
+      const host = page.hosts.find((item) => item.name === name);
+      const offered = ['screen', 'terminal'].filter((kind) => host[kind]);
+      if (!modes.has(name) || !offered.includes(modes.get(name))) modes.set(name, offered[0] || 'screen');
       if (tiles.has(name)) continue;
-      const host = page.hosts.find((host) => host.name === name);
+      const mode = modes.get(name);
       const tile = el('section', { class: 'workspace-tile', 'aria-label': name }, workspace);
       const header = el('header', {}, tile);
       el('h2', { text: name }, header);
-      const toggle = el('button', { type: 'button' }, header);
-      const mode = modes.get(name) || 'screen';
-      toggle.textContent = mode === 'screen' ? 'Terminal' : 'Screen';
+      const removers = [];
+      if (offered.length > 1) {
+        const group = el('div', { class: 'segmented', role: 'group', 'aria-label': `${name} console` }, header);
+        for (const kind of offered) {
+          const button = el('button', { type: 'button', 'aria-pressed': String(kind === mode), text: kind === 'screen' ? 'Screen' : 'Terminal' }, group);
+          removers.push(listen(button, 'click', () => { if (modes.get(name) !== kind) { modes.set(name, kind); renderWorkspace(); } }));
+        }
+      }
+      el('span', { class: 'grow' }, header);
+      const controls = el('div', { class: 'tile-controls' }, header);
       const content = el('div', { class: 'tile-console' }, tile);
-      const change = listen(toggle, 'click', () => { modes.set(name, mode === 'screen' ? 'terminal' : 'screen'); renderWorkspace(); });
-      const offered = host[mode];
-      const off = offered ? panel(content, { kind: mode, host: name, title: name }) : () => {};
-      if (!offered) content.textContent = `${name} does not offer a ${mode}.`;
-      tiles.set(name, { root: tile, mode, dispose() { change(); off(); } });
+      let off = () => {};
+      if (offered.includes(mode)) {
+        const options = page.panels.find((item) => item.kind === mode && item.host === name) || { kind: mode, host: name, title: name };
+        off = panel(content, options, controls);
+      } else {
+        const card = el('div', { class: 'console-card' }, el('div', { class: 'console-stage' }, content));
+        el('p', { text: `${name} offers no screen or terminal.` }, card);
+      }
+      tiles.set(name, { root: tile, mode, dispose() { removers.forEach((remove) => remove()); off(); } });
     }
     workspace.dataset.tiles = String(names.length);
   }
+
   cleanup.push(listen($('clear-scope'), 'click', () => selectHost(null)));
   cleanup.push(services.selection.subscribe(({ host }) => {
     all.setAttribute('aria-pressed', String(!host));
     for (const [name, { chip }] of chips) chip.setAttribute('aria-pressed', String(name === host));
-    $('scope-text').textContent = host ? `Host: ${host}` : 'All hosts';
+    $('scope-text').textContent = host ? `Showing ${host}` : 'Showing all hosts';
     $('clear-scope').hidden = !host;
     renderWorkspace();
   }));
-  if (tabs.length) activate(tabs[0]); else $('inspector-content').textContent = 'No inspector panels declared.';
-  let run = { t: 0, at: performance.now(), ended: true };
-  watch = transport.watch();
-  const on = (name, callback) => cleanup.push(listen(watch, name, (event) => callback(JSON.parse(event.data))));
-  on('snapshot', (value) => { run = { t: value.t, at: performance.now(), ended: value.ended }; $('page-status').textContent = value.ended ? 'Stopped' : 'Running'; });
-  on('counters', (value) => { run.t = value.t; run.at = performance.now(); });
-  on('ended', (value) => { run = { t: value.t, at: performance.now(), ended: true }; $('page-status').textContent = 'Stopped'; });
-  on('end', () => { run.t += run.ended ? 0 : (performance.now() - run.at) / 1000; run.ended = true; $('page-status').textContent = 'Stopped'; });
-  on('error', () => { $('page-status').textContent = 'Connection lost. Reconnecting.'; });
-  on('world_error', ({ error }) => { $('page-status').textContent = error; });
-  const clock = () => { $('run-clock').textContent = format.fmtDuration(run.t + (run.ended ? 0 : (performance.now() - run.at) / 1000)); };
-  clock(); clockTimer = setInterval(clock, 1000);
-  const seen = new Set(), cursors = new Map(); let latest = -1, bannerEvent;
-  cleanup.push(listen($('moment-banner'), 'click', () => { if (bannerEvent) services.selection.set({ host: page.hosts.find((host) => host.sandbox === bannerEvent.sandbox?.name)?.name || null, event: bannerEvent, node: bannerEvent.node || null, connection: bannerEvent.conn ?? null, request: bannerEvent.fields?.request_id ?? null, links: [] }); }));
+  cleanup.push(listen(document, 'visibilitychange', () => {
+    if (document.hidden) {
+      stopPanel(); stopPanel = () => {};
+      stopWorkspace(); stopWorkspace = () => {};
+      tiles.forEach((tile) => { tile.dispose(); tile.root.remove(); });
+      tiles.clear();
+    } else {
+      renderWorkspace();
+      if (selectedTab) activate(selectedTab);
+    }
+  }));
+  if (tabs.length) activate(tabs[0]);
+  else $('inspector-content').replaceChildren(el('p', { class: 'empty-note', text: 'This demo declares no inspector panels.' }));
+
+  // The run status and clock, from the shared watch.
+  const clock = services.clock;
+  const status = (state, text) => { $('run-status').dataset.state = state; $('page-status').textContent = text; };
+  watch = services.watch();
+  const on = (name, callback) => cleanup.push(listen(watch, name, (event) => callback(event.data ? JSON.parse(event.data) : null)));
+  on('waiting', () => status('connecting', 'Waiting for the world'));
+  on('snapshot', (value) => { Object.assign(clock, { t: value.t, at: performance.now(), ended: value.ended }); status(value.ended ? 'stopped' : 'running', value.ended ? 'Stopped' : 'Running'); });
+  on('counters', (value) => { clock.t = value.t; clock.at = performance.now(); });
+  on('ended', (value) => { Object.assign(clock, { t: value.t, at: performance.now(), ended: true }); status('stopped', 'Stopped'); });
+  on('end', () => { clock.t = services.runTime(); clock.ended = true; status('stopped', 'Stopped'); });
+  on('error', () => { if (!clock.ended) status('connecting', 'Reconnecting'); });
+  on('open', () => { if ($('run-status').dataset.state === 'connecting' && !clock.ended) status('running', 'Running'); });
+  on('world_error', (value) => status('stopped', value.error));
+  const tick = () => { $('run-clock').textContent = format.fmtDuration(services.runTime()); };
+  tick();
+  clockTimer = setInterval(tick, 1000);
+
+  // Story moments: the newest one the world marked is the banner.
+  const seen = new Set(), cursors = new Map();
+  let latest = -1, bannerEvent;
+  cleanup.push(listen($('moment-banner'), 'click', () => {
+    if (!bannerEvent) return;
+    const host = page.hosts.find((item) => item.sandbox === bannerEvent.sandbox?.name)?.name || null;
+    services.selection.set({ host, event: bannerEvent, node: bannerEvent.node || null, connection: bannerEvent.conn ?? null, request: bannerEvent.fields?.request_id ?? null, links: [] });
+    const item = tabOf('events'); if (item) activate(item);
+  }));
   async function readMoments() {
-    for (const moment of page.moments) {
+    for (const moment of page.moments || []) {
       if (disposed) return;
       try {
         const reply = await transport.get(moment.events, { after: cursors.get(moment.id) || 0 }, controller.signal);
@@ -293,26 +420,39 @@ export async function mount(root, transport, theme) {
         if (!event || seen.has(moment.id)) continue;
         seen.add(moment.id);
         if (event.at >= latest) {
-          latest = event.at; bannerEvent = event;
-          $('moment-banner').textContent = `${moment.title} · ${format.fmtDuration(event.at)}`;
+          latest = event.at;
+          bannerEvent = event;
+          $('moment-title').textContent = moment.title;
+          $('moment-time').textContent = `at ${format.fmtDuration(event.at)}`;
           $('moment-banner').hidden = false;
         }
-      } catch (error) { if (!disposed) $('moment-status').textContent = `Could not read moments: ${error.message}`; }
+      } catch (error) {
+        if (!disposed) $('moment-status').textContent = `Could not read moments: ${error.message}`;
+      }
     }
-    if (!disposed) momentTimer = setTimeout(readMoments, 1000);
+    if (!disposed && page.moments?.length) momentTimer = setTimeout(readMoments, document.hidden ? 5000 : 1000);
   }
   void readMoments();
   return stop;
 }
 
-if (typeof document !== 'undefined') {
-  const theme = createTheme(document.querySelector('#theme'));
+// One centered card in place of the hosts and panels: not signed in, or the
+// page description could not be read.
+function showNotice(root, title, text, action = false) {
+  const { $ } = scoped(root);
+  root.dataset.state = 'notice';
+  $('notice').hidden = false;
+  $('notice-title').textContent = title;
+  $('notice-text').textContent = text;
+  $('notice-action').hidden = !action;
+  $('host-bar').replaceChildren();
+  $('run-status').hidden = true;
+}
+
+if (typeof document !== 'undefined' && document.querySelector?.('#demo')) {
   const root = document.querySelector('#demo');
-  if (root) {
-    const status = root.querySelector('#page-status');
-    const transport = createTransport({ setStatus: (_, text) => { status.textContent = text; } }, {
-      signedOutMessage: 'Not signed in. Open the URL the demo printed. A URL works in one tab; restart the demo for a new one.',
-    });
-    void mount(root, transport, theme);
-  }
+  const transport = createTransport({
+    setStatus: (kind, text) => { if (kind === 'ended' && text?.startsWith('Not signed in')) showNotice(root, 'Not signed in', SIGNED_OUT); },
+  }, { signedOutMessage: `Not signed in. ${SIGNED_OUT}` });
+  void mount(root, transport, createTheme(root.querySelector('#theme')));
 }

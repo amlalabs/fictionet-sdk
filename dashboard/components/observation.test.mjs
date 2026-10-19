@@ -28,11 +28,11 @@ function fixture(t) {
     close() { this.closed = true; }
   }
   const selection = createSelection();
+  const watch = () => { const source = new Source(); watches.push(source); return source; };
   const services = {
     selection, reducedMotion: { matches: true }, hosts: [{ name: 'alpha', sandbox: 'guest' }],
+    watch, connect: (graph) => watchState(watch(), graph),
     transport: {
-      connect(graph) { return watchState(this.watch(), graph); },
-      watch() { const source = new Source(); watches.push(source); return source; },
       packetStream(list) { const source = new Source(); source.links = list; streams.push(source); return source; },
       async get(path, params, signal) { requests.push({ path, signal }); return { links: ['e2'] }; },
     },
@@ -95,12 +95,34 @@ test('events filters text, preserves loss and selects only explicit flow identit
   assert.match(h.root.textContent, /4 lost/);
   assert.match(h.root.textContent, /<script>hello<\/script>/);
   assert.equal(h.root.querySelector('script'), null);
-  h.root.querySelector('button.text').click();
+  h.root.querySelector('button.event-line').click();
   assert.equal(h.selection.get().connection, 12);
   assert.deepEqual(h.selection.get().links, []);
   const input = h.root.querySelector('input');
   input.value = 'missing'; input.dispatchEvent(new Event('input'));
   assert.doesNotMatch(h.root.querySelector('.event-list').textContent, /hello/);
+  dispose();
+  h.clean();
+});
+
+test('a selected event shows its fields and offers only an approximate packet match', (t) => {
+  const h = fixture(t);
+  const pairs = [];
+  h.services.packetPair = { set() {} };
+  h.services.showPackets = (pair) => pairs.push(pair);
+  const dispose = events(h.root, h.services);
+  const event = { seq: 2, at: 3, sandbox: { name: 'guest' }, source: 'dns', kind: 'query', summary: 'example.test', fields: { name: 'example.test' }, local: '10.0.0.1:53', peer: '10.0.0.2:5000', transport: 'udp', tls: false, conn: null };
+  h.watches[0].emit('snapshot', { ...h.snapshot, events: [event] });
+  assert.equal(h.root.querySelector('.event-detail'), null);
+  h.root.querySelector('button.event-line').click();
+  assert.equal(h.selection.get().host, 'alpha');
+  assert.match(h.root.querySelector('.event-detail').textContent, /10\.0\.0\.2:5000/);
+  assert.match(h.root.textContent, /Approximate: matched by address and port, not by connection\./);
+  h.root.querySelectorAll('button').find((button) => button.textContent === 'Show matching packets').click();
+  assert.deepEqual(pairs, [{ local: '10.0.0.1:53', peer: '10.0.0.2:5000' }]);
+  h.root.querySelector('button.event-line').click();
+  assert.equal(h.root.querySelector('.event-detail'), null);
+  assert.equal(h.selection.get().event, null);
   dispose();
   h.clean();
 });

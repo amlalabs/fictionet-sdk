@@ -1,37 +1,68 @@
 // mount(root, services, options) -> dispose; shared services are described in README.md.
+// A host's screen through noVNC, watching by default. "Take over" asks for the
+// host's input lease; the lease topic says who holds it, for every viewer.
+// options.controls, when given, is where the take over button and the owner
+// go (a tile header); otherwise they sit above the screen. options.onSession
+// hears this tab's screen session while it is connected, and null after.
 export function mount(root, services, options) {
   const document = root.ownerDocument;
   const { setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout } = services;
-  const make = (tag, text) => { const node = document.createElement(tag); if (text) node.textContent = text; return node; };
-  const controls = make('div'), claim = make('button', 'Take over'), owner = make('span', 'Watching');
-  const message = make('p', 'Loading screen…'), reconnect = make('button', 'Reconnect now'), display = make('div');
-  controls.className = 'console-controls';
-  display.className = 'screen-display';
-  root.classList.add('console-panel');
+  const make = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text) node.textContent = text;
+    return node;
+  };
+  const controls = options.controls || make('div', 'console-controls');
+  const owner = make('span', 'console-owner'), claim = make('button', 'button', 'Take over');
+  const stage = make('div', 'console-stage'), display = make('div', 'screen-display');
+  const card = make('div', 'console-card'), message = make('p', '', 'Loading the screen…');
+  const reconnect = make('button', 'button', 'Reconnect now');
+  claim.type = reconnect.type = 'button';
   message.setAttribute('role', 'status');
-  claim.disabled = true;
+  claim.hidden = true;
   reconnect.hidden = true;
-  controls.append(claim, owner);
-  root.append(controls, message, reconnect, display);
-  let disposed = false, available = false, missing = false, RFB, active, timer, attempt = 0, generation = 0;
-  let holder = null;
+  card.append(message, reconnect);
+  stage.append(display, card);
+  controls.append(owner, claim);
+  root.classList.add('console-panel');
+  if (!options.controls) root.append(controls);
+  root.append(stage);
+  let disposed = false, available = false, missing = false, RFB, active, timer, notice, attempt = 0, generation = 0;
+  let holder = null, mine = false;
 
+  function show(text, retry = false) {
+    message.textContent = text;
+    card.hidden = false;
+    reconnect.hidden = !retry;
+  }
   function ownership() {
-    const mine = Boolean(active?.session && holder === active.session);
+    const was = mine;
+    mine = Boolean(active?.session && holder === active.session);
     if (active?.rfb) active.rfb.viewOnly = !mine;
+    claim.hidden = !active?.connected;
     claim.textContent = mine ? 'Release' : 'Take over';
-    claim.disabled = !active?.connected;
-    owner.textContent = mine ? 'You have control' : holder ? 'Another viewer has control' : 'Watching';
-    options.onOwnership?.(owner.textContent);
+    const text = mine ? 'You have control' : holder ? 'Another viewer has control' : 'Watching';
+    owner.textContent = text === 'Watching' ? '' : text;
+    owner.dataset.owner = mine ? 'mine' : holder ? 'other' : 'none';
+    options.onOwnership?.(text);
+    if (was && !mine && holder && active?.connected) {
+      // Input is already off: the lease topic moved to another viewer.
+      owner.textContent = 'Another viewer took control';
+      clearTimeout(notice);
+      notice = setTimeout(ownership, 4000);
+    }
   }
   function stop() {
     generation++;
     clearTimeout(timer);
     const old = active;
     active = null;
+    if (old?.connected) options.onSession?.(null);
     old?.cleanup?.();
     old?.controller.abort();
-    old?.rfb?.disconnect();
+    // noVNC logs an error when an RFB that already disconnected is told to.
+    if (old?.rfb && !old.disconnected) old.rfb.disconnect();
     old?.socket?.close();
     display.replaceChildren();
     ownership();
@@ -40,42 +71,42 @@ export function mount(root, services, options) {
     stop();
     if (disposed || !available || missing) return;
     const seconds = Math.min(30, 4 * 2 ** attempt++);
-    message.hidden = false;
-    message.textContent = `${reason || 'Connection lost.'} Reconnecting in ${seconds} s`;
-    reconnect.hidden = false;
+    show(`${reason ? `${reason}. ` : 'Connection lost. '}Reconnecting in ${seconds} s`, true);
     timer = setTimeout(connect, seconds * 1000);
   }
   async function connect() {
     if (disposed || !available || !RFB) return;
     stop();
     const current = generation, controller = new AbortController();
-    active = { controller };
-    message.hidden = false;
-    message.textContent = 'Connecting screen…';
-    reconnect.hidden = true;
+    const entry = active = { controller };
+    show('Connecting to the screen…');
     try {
       const { socket, session } = await services.transport.socket('screen', options.host, controller.signal);
       if (disposed || current !== generation) { socket.close(); return; }
-      active.socket = socket;
-      active.session = session;
-      const rfb = active.rfb = new RFB(display, socket);
+      entry.socket = socket;
+      entry.session = session;
+      const rfb = entry.rfb = new RFB(display, socket);
       rfb.scaleViewport = true;
       rfb.resizeSession = false;
-      rfb.background = 'var(--sunken)';
+      rfb.background = 'transparent';
       rfb.viewOnly = true;
       const connected = () => {
         if (current !== generation) return;
-        active.connected = true;
+        entry.connected = true;
         attempt = 0;
-        message.hidden = true;
+        card.hidden = true;
+        options.onSession?.(entry.session);
         ownership();
       };
-      const disconnected = () => { if (current === generation) lost(); };
+      const disconnected = () => {
+        entry.disconnected = true;
+        if (current === generation) lost();
+      };
       const closed = (event) => { if (current === generation) lost(event.reason); };
       rfb.addEventListener('connect', connected);
       rfb.addEventListener('disconnect', disconnected);
       socket.addEventListener('close', closed);
-      active.cleanup = () => {
+      entry.cleanup = () => {
         rfb.removeEventListener('connect', connected);
         rfb.removeEventListener('disconnect', disconnected);
         socket.removeEventListener('close', closed);
@@ -90,19 +121,18 @@ export function mount(root, services, options) {
     if (!current?.connected) return;
     claim.disabled = true;
     try {
-      const mine = holder === current.session;
-      const reply = await services.transport[mine ? 'delete' : 'post']('/api/lease', {
-        host: options.host, session: current.session, ...(mine ? {} : { take: true }),
+      const release = holder === current.session;
+      const reply = await services.transport[release ? 'delete' : 'post']('/api/lease', {
+        host: options.host, session: current.session, ...(release ? {} : { take: true }),
       }, current.controller.signal);
-      // The state stream owns input permission, including a takeover during this reply.
+      // The lease topic owns input permission, including a takeover during this reply.
       if (active !== current) return;
       if (reply.holder !== current.session) current.rfb.viewOnly = true;
     } catch (error) {
       if (active !== current) return;
-      message.hidden = false;
-      message.textContent = `Input control unavailable: ${error.message}`;
+      owner.textContent = `Input control unavailable: ${error.message}`;
     } finally {
-      if (active === current) claim.disabled = false;
+      claim.disabled = false;
     }
   }
   claim.addEventListener('click', takeover);
@@ -113,26 +143,20 @@ export function mount(root, services, options) {
   }, (error) => {
     holder = null;
     ownership();
-    message.hidden = false;
-    message.textContent = `Input control unavailable: ${error.message}`;
+    owner.textContent = `Input control unavailable: ${error.message}`;
   });
   const offStatus = services.state(options.status || `/api/state/host-${options.host}`, (snapshot) => {
     const wasAvailable = available;
     available = Boolean(snapshot.value?.screen);
     if (!available) {
       stop();
-      if (!missing) {
-        message.hidden = false;
-        message.textContent = `${options.host} is ${snapshot.value?.state === 'stopped' ? 'stopped' : 'booting'}. The screen opens when its desktop is up.`;
-      }
-      reconnect.hidden = true;
+      const state = snapshot.value?.state;
+      if (!missing) show(state === 'stopped' ? `${options.host} has stopped.` : `${options.host} is booting. The screen opens when its desktop is up.`);
     } else if (!wasAvailable) void connect();
   }, (error) => {
     available = false;
     stop();
-    message.hidden = false;
-    reconnect.hidden = true;
-    message.textContent = `Screen status unavailable: ${error.message}. Reload the demo to retry.`;
+    show(`Screen status unavailable: ${error.message}. Reload the demo to retry.`);
   });
   const load = options.load || (() => import('/vendor/novnc/core/rfb.js'));
   void load().then((module) => {
@@ -142,16 +166,18 @@ export function mount(root, services, options) {
   }).catch(() => {
     if (disposed) return;
     missing = true;
-    message.textContent = 'noVNC is not in this build. Run `cargo xtask demo assets`, then rebuild.';
+    show('noVNC is not in this build. Run `cargo xtask demo assets`, then rebuild.');
   });
   return () => {
     if (disposed) return;
     disposed = true;
     offLease();
     offStatus();
+    clearTimeout(notice);
     stop();
     claim.removeEventListener('click', takeover);
     reconnect.removeEventListener('click', connect);
+    controls.replaceChildren();
     root.replaceChildren();
     root.classList.remove('console-panel');
   };

@@ -408,15 +408,13 @@ async fn state_routes_serve_snapshots_deltas_and_persistent_status() {
     assert_eq!(snapshot.value, Some(vec![1, 2]));
     assert_eq!(snapshot.revision, 2);
     assert_eq!(snapshot.at, 2.0);
-    assert!(
-        first_event(&server, "/api/state/numbers/stream?after=1")
-            .await
-            .contains("event: delta\n")
-    );
+    let delta = first_event(&server, "/api/states/stream?topics=numbers&after=numbers:1").await;
+    assert!(delta.contains("event: delta\n"));
+    assert!(delta.contains("data: {\"topic\":\"numbers\",\"revision\":2,"));
     topic.publish_with_delta(at, &vec![1, 2, 3], &3).unwrap();
     topic.publish_with_delta(at, &vec![1, 2, 3, 4], &4).unwrap();
     assert!(
-        first_event(&server, "/api/state/numbers/stream?after=1")
+        first_event(&server, "/api/states/stream?topics=numbers&after=numbers:1")
             .await
             .contains("event: snapshot\n")
     );
@@ -425,6 +423,126 @@ async fn state_routes_serve_snapshots_deltas_and_persistent_status() {
     assert!(response.contains("\"too_large\":true"));
     assert!(response.contains("\"revision\":4"));
     assert!(response.contains("\"value\":[1,2,3,4]"));
+}
+
+/// Reads whole SSE events from a stream, skipping the response head and
+/// heartbeat comments, until `count` more events have arrived.
+async fn next_events(conn: &mut TcpStream, wire: &mut Vec<u8>, count: usize) -> Vec<String> {
+    let mut events = Vec::new();
+    loop {
+        let text = String::from_utf8(wire.clone()).unwrap();
+        let body = text.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+        let blocks: Vec<&str> = body.split("\n\n").collect();
+        // The last block is incomplete until its blank line arrives.
+        let complete: Vec<String> = blocks[..blocks.len() - 1]
+            .iter()
+            .filter(|block| block.starts_with("event: "))
+            .map(|block| block.to_string())
+            .collect();
+        if complete.len() >= events.len() + count {
+            let consumed = body.rfind("\n\n").unwrap() + 2;
+            let head = text.len() - body.len();
+            wire.drain(head..head + consumed);
+            events.extend(complete);
+            return events;
+        }
+        let mut chunk = [0; 1024];
+        let n = conn.read(&mut chunk).await.unwrap();
+        assert_ne!(n, 0, "the stream closed");
+        wire.extend_from_slice(&chunk[..n]);
+    }
+}
+
+#[tokio::test]
+async fn one_state_stream_carries_several_topics_and_rejects_bad_lists() {
+    let first = StateTopic::new(StateLimits::default());
+    let second = StateTopic::new(StateLimits::default());
+    let at = fictionet::time::Instant::from_since_start(std::time::Duration::from_secs(2));
+    first.publish(at, &vec![1]).unwrap();
+    second.publish(at, &vec![2]).unwrap();
+    second.publish(at, &vec![2, 3]).unwrap();
+    let server = Page::new(
+        "State",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .table("First", first.clone(), vec![Column::new("Number", "")])
+    .table("Second", second.clone(), vec![Column::new("Number", "")])
+    .bind_loopback(0)
+    .await
+    .unwrap();
+    let mut conn = TcpStream::connect(address(&server)).await.unwrap();
+    conn.write_all(
+        format!(
+            concat!(
+                "GET /api/states/stream?topics=first,second&after=second:2 HTTP/1.1\r\n",
+                "Host: {}\r\n{}\r\n",
+            ),
+            address(&server),
+            bearer(&server)
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut wire = Vec::new();
+    // The second topic's cursor is current, so only the first gets a snapshot.
+    let opening = next_events(&mut conn, &mut wire, 1).await;
+    assert_eq!(opening.len(), 1);
+    assert!(
+        opening[0].starts_with("event: snapshot\n"),
+        "{}",
+        opening[0]
+    );
+    assert!(opening[0].contains("data: {\"topic\":\"first\",\"revision\":1,"));
+    second.publish_with_delta(at, &vec![2, 3, 4], &4).unwrap();
+    let delta = next_events(&mut conn, &mut wire, 1).await;
+    assert_eq!(delta.len(), 1);
+    assert!(delta[0].starts_with("event: delta\n"), "{}", delta[0]);
+    assert!(delta[0].contains("{\"topic\":\"second\",\"revision\":3,"));
+    assert!(delta[0].contains("\"delta\":4"));
+    first.publish(at, &vec![5]).unwrap();
+    let snapshot = next_events(&mut conn, &mut wire, 1).await;
+    assert!(snapshot[0].contains("{\"topic\":\"first\",\"revision\":2,"));
+    assert!(snapshot[0].contains("\"value\":[5]"));
+    drop(conn);
+
+    let many = vec!["first"; 65].join(",");
+    for (query, code) in [
+        ("", 400),
+        ("topics=", 400),
+        ("topics=first,,second", 400),
+        ("topics=first,first", 400),
+        ("topics=missing", 404),
+        ("topics=first&topics=second", 400),
+        ("topics=first&after=second:1", 400),
+        ("topics=first&after=first:x", 400),
+        ("topics=first&after=first", 400),
+        ("topics=first&after=first:1,first:2", 400),
+        ("topics=first&other=1", 400),
+        (&format!("topics={many}"), 400),
+    ] {
+        let response = request(
+            &server,
+            "GET",
+            &format!("/api/states/stream?{query}"),
+            &bearer(&server),
+            "",
+        )
+        .await;
+        status(&response, code);
+    }
+    // There is one way to stream state.
+    status(
+        &request(
+            &server,
+            "GET",
+            "/api/state/first/stream",
+            &bearer(&server),
+            "",
+        )
+        .await,
+        404,
+    );
 }
 
 #[derive(Deserialize)]
@@ -1247,7 +1365,7 @@ async fn screen_input_follows_the_live_lease_and_disconnect_releases_it() {
     let state = request(&server, "GET", "/api/state/leases", &bearer(&server), "").await;
     assert_eq!(json_body(&state)["value"]["host"]["holder"], b["session"]);
     assert!(
-        first_event(&server, "/api/state/leases/stream")
+        first_event(&server, "/api/states/stream?topics=leases")
             .await
             .contains(b["session"].as_str().unwrap())
     );

@@ -1,16 +1,19 @@
 // mount(root, services, options) returns dispose. Services provide transport and selection.
+// World events the page declared, filtered on the server, as a table. New rows
+// arrive at the bottom; reading further up holds the view still.
 import { scoped, listen } from '../dom.mjs';
 import { render } from './table.mjs';
 
 export function mount(root, services, options) {
   const { el } = scoped(root);
-  const status = el('p', { role: 'status', text: 'Loading…' }, root);
-  const jump = el('button', { type: 'button', hidden: '' }, root);
-  const body = el('div', { class: 'table-scroll' }, root);
+  const status = el('p', { class: 'loss-note', role: 'status', text: 'Loading…' }, root);
+  const wrap = el('div', { class: 'list-wrap' }, root);
+  const body = el('div', { class: 'table-scroll' }, wrap);
+  const jump = el('button', { class: 'jump', type: 'button', hidden: '' }, wrap);
   const controller = new AbortController();
   const schedule = services.setTimeout || setTimeout;
   const cancel = services.clearTimeout || clearTimeout;
-  let timer, after = 0, rows = [], pending = 0, paused = false;
+  let timer, after = 0, rows = [], pending = 0, paused = false, dropped = 0;
   function draw() {
     render(body, rows, options.columns);
     pending = 0;
@@ -22,11 +25,15 @@ export function mount(root, services, options) {
       if (controller.signal.aborted) return;
       after = reply.next;
       rows = [...rows, ...reply.rows].slice(-1000);
-      status.textContent = reply.dropped ? `${reply.dropped} events lost from history.` : '';
-      if (paused && reply.rows.length) { pending += reply.rows.length; jump.textContent = `${pending} new`; jump.hidden = false; }
+      dropped = reply.dropped || dropped;
+      status.textContent = dropped ? `${dropped} events were lost from the history before this table read them.` : '';
+      status.hidden = !status.textContent;
+      if (paused && reply.rows.length) { pending += reply.rows.length; jump.textContent = `↓ ${pending} new`; jump.hidden = false; }
       else if (!paused) { draw(); body.scrollTop = body.scrollHeight; }
     } catch (error) {
-      if (!controller.signal.aborted) status.textContent = `Could not load events: ${error.message}`;
+      if (controller.signal.aborted) return;
+      status.textContent = `Could not load events: ${error.message}`;
+      status.hidden = false;
     } finally {
       if (!controller.signal.aborted) timer = schedule(read, 1000);
     }

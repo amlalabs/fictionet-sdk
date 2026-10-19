@@ -1,23 +1,37 @@
 // mount(root, services, options) -> dispose; shared services are described in README.md.
+// A shell on the host through xterm.js. Output is acknowledged after xterm
+// has written it, so the page server stops reading when the browser lags.
 export function mount(root, services, options) {
   const document = root.ownerDocument;
-  const message = document.createElement('p'), reconnect = document.createElement('button');
-  const display = document.createElement('div'), css = document.createElement('link');
+  const make = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text) node.textContent = text;
+    return node;
+  };
+  const stage = make('div', 'console-stage'), display = make('div', 'terminal-display');
+  const card = make('div', 'console-card'), message = make('p', '', 'Loading the terminal…');
+  const reconnect = make('button', 'button', 'Reconnect'), css = make('link');
   css.rel = 'stylesheet';
   css.href = '/vendor/xterm/css/xterm.css';
-  display.className = 'terminal-display';
-  root.classList.add('console-panel');
-  message.textContent = 'Loading terminal…';
-  message.setAttribute('role', 'status');
-  reconnect.textContent = 'Reconnect';
+  reconnect.type = 'button';
   reconnect.hidden = true;
-  root.append(css, message, reconnect, display);
+  message.setAttribute('role', 'status');
+  card.append(message, reconnect);
+  stage.append(display, card);
+  root.classList.add('console-panel');
+  root.append(css, stage);
   let disposed = false, available = false, missing = false, constructors, active, generation = 0;
   const ResizeObserver = options.ResizeObserver || globalThis.ResizeObserver;
   const theme = () => {
     const style = (options.getComputedStyle || globalThis.getComputedStyle)(display);
     return { background: style.backgroundColor, foreground: style.color, cursor: style.color };
   };
+  function show(text, retry = false) {
+    message.textContent = text;
+    card.hidden = false;
+    reconnect.hidden = !retry;
+  }
   function stop() {
     generation++;
     const old = active;
@@ -32,24 +46,21 @@ export function mount(root, services, options) {
   function disconnected(reason) {
     stop();
     if (disposed || !available) return;
-    message.hidden = false;
-    message.textContent = reason ? `Disconnected. ${reason}` : 'Disconnected. Reconnect';
-    reconnect.hidden = false;
+    show(reason ? `Disconnected: ${reason}.` : 'Disconnected.', true);
   }
   async function connect() {
     if (disposed || !available || !constructors) return;
     stop();
     const current = generation, controller = new AbortController();
     const entry = active = { controller };
-    message.hidden = false;
-    message.textContent = 'Connecting terminal…';
-    reconnect.hidden = true;
+    show('Connecting to the terminal…');
     try {
       const { socket } = await services.transport.socket('terminal', options.host, controller.signal);
       if (disposed || generation !== current) { socket.close(); return; }
       entry.socket = socket;
       const [{ Terminal }, { FitAddon }] = constructors;
-      const terminal = entry.terminal = new Terminal({ scrollback: 5000, theme: theme(), allowProposedApi: false });
+      const font = (options.getComputedStyle || globalThis.getComputedStyle)(display).fontFamily;
+      const terminal = entry.terminal = new Terminal({ scrollback: 5000, theme: theme(), allowProposedApi: false, fontSize: 13, ...(font ? { fontFamily: font } : {}) });
       const fit = new FitAddon();
       terminal.loadAddon(fit);
       terminal.open(display);
@@ -59,7 +70,7 @@ export function mount(root, services, options) {
         fit.fit();
         send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }));
       };
-      const opened = () => { message.hidden = true; resize(); };
+      const opened = () => { card.hidden = true; resize(); };
       const received = (event) => {
         if (active !== entry || !(event.data instanceof ArrayBuffer)) return;
         const bytes = new Uint8Array(event.data);
@@ -94,22 +105,17 @@ export function mount(root, services, options) {
     available = Boolean(snapshot.value?.terminal);
     if (!available) {
       stop();
-      if (!missing) {
-        message.hidden = false;
-        message.textContent = `${options.host} is ${snapshot.value?.state === 'stopped' ? 'stopped' : 'booting'}. The terminal opens when SSH is up.`;
-      }
-      reconnect.hidden = true;
+      const state = snapshot.value?.state;
+      if (!missing) show(state === 'stopped' ? `${options.host} has stopped.` : `${options.host} is booting. The terminal opens when SSH is up.`);
     } else if (!wasAvailable) void connect();
   }, (error) => {
     available = false;
     stop();
-    message.hidden = false;
-    reconnect.hidden = true;
-    message.textContent = `Terminal status unavailable: ${error.message}. Reload the demo to retry.`;
+    show(`Terminal status unavailable: ${error.message}. Reload the demo to retry.`);
   });
   const load = options.load || (() => Promise.all([
     import('/vendor/xterm/lib/xterm.mjs').catch(() => { throw new Error('xterm.js'); }),
-    import('/vendor/addon-fit/lib/addon-fit.mjs').catch(() => { throw new Error('The xterm fit addon'); }),
+    import('/vendor/addon-fit/lib/addon-fit.mjs').catch(() => { throw new Error('The xterm.js fit addon'); }),
   ]));
   void load().then((modules) => {
     if (disposed) return;
@@ -118,7 +124,7 @@ export function mount(root, services, options) {
   }).catch((error) => {
     if (disposed) return;
     missing = true;
-    message.textContent = `${error.message} is not in this build. Run \`cargo xtask demo assets\`, then rebuild.`;
+    show(`${error.message} is not in this build. Run \`cargo xtask demo assets\`, then rebuild.`);
   });
   return () => {
     if (disposed) return;
