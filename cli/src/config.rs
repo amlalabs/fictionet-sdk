@@ -1,6 +1,7 @@
 //! The settings each attach type runs with, which `args` reads from the
 //! flags, and the values the commands share: world and observation socket
-//! paths, and an IPv4 netmask.
+//! paths, and an IPv4 netmask. The observation socket serves the companion's
+//! request protocol; the world socket carries sandbox attachments.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;

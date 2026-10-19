@@ -5,12 +5,21 @@
 //! packets unchanged. The default addresses are the upstream GOAD topology.
 //!
 //! ```text
-//! cargo run --example goad -- /run/fictionet/goad.sock 192.168.56 [observation.sock]
+//! cargo run --example goad -- /run/fictionet/goad.sock 192.168.56 /run/fictionet/observation.sock
 //! ```
 //!
 //! Attach members by these names: `provisioner`, `attacker`, `dc01`, `dc02`,
 //! `dc03`, `srv02`, `srv03` and `ws01`. GOAD-Light uses the attacker and the
 //! `dc01`, `dc02` and `srv02` members. See `examples/goad/README.md`.
+//!
+//! The optional third argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};

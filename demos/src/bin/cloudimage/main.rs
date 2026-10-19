@@ -9,6 +9,16 @@
 //! the world ([`world`]) joins the guest to the network through the
 //! vhost-user backend ([`net`]), and its jump host carries the SSH session
 //! ([`ssh`]) that the desktop viewer ([`page`]) tunnels VNC through.
+//!
+//! An optional fifth argument names a Unix observation socket. The world
+//! serves its collector there with `fictionet_observe::serve`. For a path
+//! of `/run/fictionet/observation.sock`, watch from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! See `fictionet_observe` for browser access and capture limits.
 
 mod ch;
 mod disk;

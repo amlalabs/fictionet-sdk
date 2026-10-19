@@ -1,10 +1,11 @@
-//! `fictionet dashboard`: serves the dashboard app, and carries its API
-//! calls to the world as an observer.
+//! `fictionet dashboard` serves the app and forwards its API calls to the
+//! socket a world serves with `fictionet_observe::serve`. The world's
+//! `DashboardObserver` owns collection and retention.
 //!
 //! The app is the static files in the repository's `dashboard/` folder,
 //! built into this binary. Every `GET /api/<op>?<key>=<value>...` becomes
-//! one observe request, `{"op":"<op>","<key>":<value>,...}`, on a new
-//! observer session. Streams (`watch`, `packets`) come back as server-sent
+//! one observation request, `{"op":"<op>","<key>":<value>,...}`, on a
+//! client session. Streams (`watch`, `packets`) come back as server-sent
 //! events, binary values as downloads, and the rest as JSON. So the app
 //! uses the observe API and nothing else.
 //!
@@ -41,15 +42,14 @@ use http::{host_allowed, parse_request, read_head, same_site};
 pub(crate) const USAGE: &str = "\
 usage: fictionet dashboard --observation unix:<path> --token-file <path> [--listen <address:port>]
 
-Serves the dashboard, a live view of the world on <path>, at
-http://127.0.0.1:7878/ (or --listen). It connects to the observation socket as an
-observer; start the world with an observation socket explicitly.
-
-The dashboard shows everything the world carries, decrypted TLS included.
+Serves the dashboard at http://127.0.0.1:7878/ (or --listen).
+--observation names the Unix socket a world serves with fictionet_observe::serve.
+The world's DashboardObserver supplies topology, events and captured packets.
+TLS 1.3 decryption needs keys from instrumented endpoints and a usable capture.
 The token file is required. Open /#token=<URL-encoded-token> once to sign in.
 The page removes the fragment and stores the token for this origin and tab.
 API calls, streams and downloads send Authorization: Bearer <token>.
-Cookies do not authenticate; the app shell expires the old login cookie.
+Cookies do not authenticate.
 Log out or close the tab to clear the stored token.
 Restart the dashboard to use the bootstrap URL again. Keep the token outside
 the sandbox. Use loopback or a trusted TLS tunnel; HTTP carries the token
@@ -197,7 +197,7 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
         );
     }
     if let Some((kind, body)) = assets::lookup(req.path.as_str()) {
-        // Remove the old port-wide credential when an existing browser upgrades.
+        // Clear the credential cookie so other ports do not receive it.
         let extra = if matches!(req.path.as_str(), "/" | "/index.html") {
             "Set-Cookie: fictionet_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n"
         } else {

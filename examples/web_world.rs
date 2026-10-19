@@ -1,7 +1,7 @@
 //! A small world of websites, written with `web::Sites`.
 //!
 //! ```text
-//! cargo run --example web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem [observation.sock]
+//! cargo run --example web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
 //! ```
 //!
 //! It makes a certificate authority for the world when it starts and
@@ -28,10 +28,15 @@
 //!   with NODATA.
 //! - every other name: NXDOMAIN.
 //!
-//! The sites record every DNS query, TLS handshake and HTTP request as an
-//! event (`dns.query`, `tls.handshake`, `http.request`). Watch them, and the
-//! whole world, with `fictionet dashboard --observation unix:<socket> --token-file <path>`: see
-//! [`fictionet_observe`].
+//! The sites emit `dns.query`, `tls.handshake` and `http.request` events.
+//! The optional third path installs a collector and serves its handle.
+//! Watch it from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see [`fictionet_observe`].
 //!
 //! The sites themselves are in `example_common::web_world`, which the web
 //! test's fixture in `tests/web_fixture` shares to add bulk transfers and a

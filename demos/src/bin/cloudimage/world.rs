@@ -7,6 +7,11 @@
 //! The world also holds the admin's jump host, the machine the demo reaches
 //! the guest from: its SSH session, and the VNC that session carries, cross
 //! the world's network to the address the guest leased, as an admin's would.
+//!
+//! A `DashboardObserver` collects alongside the demo's event observers.
+//! `Config::observation` serves its handle on a private Unix socket with
+//! `fictionet_observe::serve`. Connect with
+//! `fictionet observe --observation unix:PATH watch`.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -44,7 +49,8 @@ const JUMP: &str = "jump";
 
 /// How to start the world.
 pub struct Config {
-    /// An optional Unix observation socket.
+    /// The optional fifth command argument: a Unix socket for the collector.
+    /// `fictionet observe --observation unix:PATH watch` follows its output.
     pub observation: Option<PathBuf>,
     /// The run's wall-clock time, for certificate validity and the `Date`
     /// header.

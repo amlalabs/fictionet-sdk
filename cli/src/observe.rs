@@ -12,24 +12,27 @@ use crate::config::{connect_observation, observation_path};
 pub(crate) const USAGE: &str = "\
 usage: fictionet observe --observation unix:<path> [<request>]
 
-Connects to an observation socket as an observer, sends one request, and writes
-each JSON reply followed by a newline. Streams (watch, packets) run
-until the world ends them or you stop the command. Binary values (pcap,
-keylog) are written to stdout as they are.
+--observation names the Unix socket a world serves with fictionet_observe::serve.
+Sends one request and writes each JSON reply followed by a newline. Streams
+(watch, packets) run until the world ends them or you stop the command.
+Binary values (pcap, keylog) are written to stdout as they are.
 
 Requests:
-  world                   the world's API version and whether it runs
-  graph                   the tasks, sandboxes and links, with counters (the default)
+  world                   the observation API version and whether the world runs
+  graph                   tasks, groups, hosts, sandboxes, links and loss status (default)
   watch [<after>]         the graph, then every change, as JSON lines; with <after>,
-                          first every event the world kept after that number
+                          first every event the collector kept after that number
   counters                packets and bytes on every link
-  events [<after>]        the events the world kept after that number (from 0), up to 1000
+  events [<after>]        the events the collector kept after that number (from 0), up to 1000
   link <link>             one link, such as e12
-  packets <link>          a link's packets as they cross it, decoded
-  packet <link> <seq>     one packet's layers and bytes (while the link is watched)
-  pcap <link>             a pcapng capture of the link (while it is watched)
-  keylog                  the world's TLS keys, as an SSLKEYLOGFILE
+  packets <link>          a link's retained packets, then captured packets, decoded
+  packet <link> <seq>     one retained packet's layers and bytes
+  pcap <link>             a pcapng export of the link's retained capture
+  keylog                  retained TLS keys, as an SSLKEYLOGFILE
   '{\"op\":...}'            any request, as JSON
+
+Start packets <link> before requesting packet details or pcap. Those requests
+need the link's decoded capture to remain in memory. Retention is bounded.
 
 Exit status: 0 when the reply ended, including a watch closed between values
 after its world ended, 1 if the world sent an error, could not be reached,

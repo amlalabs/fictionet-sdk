@@ -9,10 +9,23 @@ The `fictionet` command is the `fictionet-cli` package in `cli/`, and Cargo
 builds it with the SDK from the top directory. Install it from a checkout with
 `cargo install --locked --path cli`.
 
-The `fictionet-observe` crate in `observe/` owns bounded collectors. Its base
-builds without default features, including on wasm. `native` adds the JSONL
-worker, `decode` reserves packet presentation, and `tracing` adds the explicit
-dispatch bridge. Run its tests with `--all-features` as well as its base checks.
+The [`fictionet-observe`](observe/README.md) crate owns consumption. Its base
+has `Memory`, `Aggregate` and `Collector`, with bounded topology, packet copies,
+TLS keys and loss totals. It is sans-I/O and builds for wasm. `decode` adds
+packet decoders, protocol presenters, pcapng, `DashboardObserver` and request
+sessions. `native` enables `decode` and adds JSONL workers on native targets,
+plus the observation endpoint and client on Unix. `tracing` uses an explicit
+dispatch supplied by the integrator.
+
+Check the companion's base and all features, and its base wasm build:
+
+```console
+$ cargo clippy --locked --all-targets -p fictionet-observe --no-default-features -- -D warnings
+$ cargo clippy --locked --all-targets -p fictionet-observe --all-features -- -D warnings
+$ cargo check --locked --lib -p fictionet-observe --no-default-features --target wasm32-unknown-unknown
+```
+
+The workspace `--all-features` checks below include its tests and docs.
 
 CI runs these commands with four sets of flags:
 
@@ -101,7 +114,11 @@ $ cargo bench --locked --bench network -- --list
 
 `network` covers TCP throughput, routed paths, idle connections, delayed links,
 scheduling and unread-link memory. `services` covers relay traffic, HTTPS sites
-and proxy DNS caching. `runtime` covers timers, event emission and observation.
+and proxy DNS caching. `runtime::logging` compares event handling with and
+without a JSONL writer. `runtime::observe::links` compares no collector,
+topology collection and packet capture; `runtime::observe::graph` uses 1,000
+sites. `network::sched::packet_round_trips` compares no observer, event-only
+interest and packet interest. `runtime::timers` covers timers.
 `decoders` feeds TPKT/COTP, HTTP/1 requests and ITCH add orders in 16 KiB
 chunks. Divan reports timings, rates and allocation counts; no benchmark has a
 pass or fail threshold. Compare two commits on the same machine. CI compiles
@@ -120,7 +137,7 @@ commands. `cargo xtask --help` lists them.
 | `cargo xtask vm ...` | Boots the development VM and runs test suites in it ([vm/README.md](vm/README.md)). |
 | `cargo xtask demo <name>` | Runs a demo in the VM. [demos/README.md](demos/README.md) lists them. |
 | `cargo xtask eval <border\|fakewiki\|adaptive-web\|artifactory>` | Builds a world's images and runs its Inspect eval. |
-| `cargo xtask copy-check` | Copies the stdlib and the capture adapters into a crate of their own and builds it, with no SDK features and with all of them. |
+| `cargo xtask copy-check` | Copies `src/stdlib` and the companion's conversation, HTTP/2, protocol and TLS capture adapters into a separate crate. Builds with no SDK features and all SDK features, each with and without `decode`. |
 | `cargo xtask fuzz [--check \| <target> \| <seconds>]` | Runs the fuzz targets ([fuzz/README.md](fuzz/README.md)). |
 | `cargo xtask h2spec [section]` | Runs the h2spec conformance suite against the native HTTP/2 server, over TLS and h2c. |
 | `cargo xtask scan [output directory]` | Records the scan example's dashboard. |

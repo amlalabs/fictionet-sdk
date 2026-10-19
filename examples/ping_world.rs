@@ -2,7 +2,7 @@
 //! sandbox, at any address, and drops every other packet.
 //!
 //! ```text
-//! cargo run --example ping_world -- /run/fictionet/world.sock [observation.sock]
+//! cargo run --example ping_world -- /run/fictionet/world.sock /run/fictionet/observation.sock
 //! ```
 //!
 //! Each sandbox's interface is split by protocol with
@@ -13,6 +13,15 @@
 //!
 //! It prints `attached <name>` and `detached <name>` lines, which the
 //! Docker test in `tests/docker/ping` reads.
+//!
+//! The optional second argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

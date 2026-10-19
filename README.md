@@ -57,11 +57,11 @@ HTTP has a ready server, `Net` serves DNS and DHCP, and TLS is built in.
 For other protocols, a world writes a `Service` around the module's decoder.
 The crate is not on crates.io, so build it from this repository.
 
-A world's time and randomness come from one place, and its randomness from a
-seed. With real sandboxes it runs on real time. In a test it can run on
-simulated time instead. In a closed world, the same seed, inputs and observer
-configuration give the same observed events and packets; see the HTTP/2 clock exception
-([running a world](src/guide/running.rs)).
+A run supplies the world's clock and seeded randomness. With real sandboxes
+it uses real time. Tests can use simulated time. The same seed and ordered
+inputs, interests and limits in a lab give the same observations and stamps.
+External I/O and opt-in axum upgrades have separate timing limits; see
+[Repeatable runs](src/guide/running.rs).
 
 ## Try it
 
@@ -152,15 +152,21 @@ services on its ports. A service is the server side of one protocol for one
 connection, written with no I/O: it gets decoded items and appends reply bytes,
 and one driver runs it over any connection. HTTP is a service
 (`stdlib::web::httpd`), and `web::Sites` is a preset on `Net` for websites. Every
-service emits structured events (`fictionet::events`). The integrator installs
-observers through `RunOptions`: none, bounded `fictionet_observe::Memory`, native `fictionet_observe::Jsonl`, an
-`fictionet_observe::Aggregate` around retention, the dashboard's retention, or a custom observer.
-With no observer, the interest check skips event construction and recording. Graders check
-retention completeness before using evidence.
-[docs/services.md](docs/services.md) builds a small world this way, step by
-step.
+service emits structured events. Core produces four streams through
+[`fictionet::events`](src/events.rs): events, packets, TLS keys and topology.
+The integrator installs one observer through `RunOptions` before the run.
+`Fanout` combines observers. With no observer, core skips observation work.
 
-Protocol codecs also work in unit tests, fuzz targets and dashboard presenters.
+The companion crate owns consumption and retention: `Memory` for grading,
+`Aggregate` to combine repeats, `Jsonl` for files, and `DashboardObserver` for
+watching a world. Graders check that retained events are complete. Serve the
+dashboard handle with `fictionet_observe::serve` on a private observation
+socket. Both `fictionet dashboard` and `fictionet observe` connect through
+`--observation unix:PATH`. See [Fictionet Observe](observe/README.md) for setup
+and limits, and [services](docs/services.md) for a small world.
+
+Protocol codecs also work in unit tests and fuzz targets. The companion's
+`decode` feature supplies presenters that use those codecs for captured traffic.
 The [stdlib docs](src/stdlib/mod.rs) list the modules and describe their uses.
 To change a protocol, see
 [the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
@@ -199,7 +205,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 | Example | What it is |
 |---|---|
 | [`examples/ping_world.rs`](examples/ping_world.rs) | The smallest world: it answers every ping and drops everything else. |
-| [`examples/custom_protocol`](examples/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom dashboard presenter. Runs without network or root. |
+| [`examples/custom_protocol`](examples/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom presenter installed in its in-process collector. Runs without network or root; it serves no observation socket. |
 | [`examples/web_world.rs`](examples/web_world.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The getting-started tutorial runs it. |
 | [`examples/delayed_sites.rs`](examples/delayed_sites.rs) | Each site is 200 ms away, using `stdlib::network::delay` and `Attachments::map`. |
 | [`examples/lossy_sites.rs`](examples/lossy_sites.rs) | `stdlib::network::filter` drops 5% of packets each way. |
@@ -222,7 +228,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 The crate docs are the guide. Build them with:
 
 ```console
-$ cargo doc --no-deps --open
+$ cargo doc --no-deps -p fictionet -p fictionet-observe --all-features --open
 ```
 
 Start at the crate root, which explains the main ideas, then read in this order:
@@ -243,8 +249,8 @@ Start at the crate root, which explains the main ideas, then read in this order:
    websites.
 6. [`recipes`](src/guide/recipes.rs): a delayed website, a slow or lossy link, a packet
    capture, and a route that changes mid-run.
-7. [`fictionet-observe`](observe/README.md): watching a running world, in the dashboard or
-   from a shell.
+7. [Fictionet Observe](observe/README.md): collection, grading, files, and watching
+   a world from the dashboard or a shell. [Events](src/events.rs) covers production.
 8. [`proto`](src/guide/proto.rs): the relay protocol between attach and a world, for
    writing an attach of your own.
 9. [`roadmap`](src/guide/roadmap.rs): what is planned.

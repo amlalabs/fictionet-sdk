@@ -1,6 +1,18 @@
 //! The sites and startup of the quick-start world, `examples/web_world.rs`.
 //! The web test's fixture, `tests/web_fixture`, serves the same world with
 //! routes of its own added.
+//!
+//! `run` takes the attachment socket, CA output and optional observation
+//! socket after the executable name. The third path installs a collector
+//! and serves its handle with `fictionet_observe::serve`:
+//!
+//! ```sh
+//! cargo run --example web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observation.sock
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! Run the watch command in another terminal. See `fictionet_observe` for
+//! browser access and capture limits.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;

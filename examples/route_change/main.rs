@@ -1,8 +1,19 @@
-// A route that changes mid-run: after a delay, the bank's address leads
-// to an impostor machine instead of the bank. This is the core of a BGP
-// hijack, which examples/border plays out in full.
-//
-//     cargo run --example route_change -- /run/fictionet/world.sock 20 [observation.sock]
+//! A route that changes mid-run: after a delay, the bank's address leads
+//! to an impostor machine instead of the bank. This is the core of a BGP
+//! hijack, which examples/border plays out in full.
+//!
+//! ```text
+//! cargo run --example route_change -- /run/fictionet/world.sock 20 /run/fictionet/observation.sock
+//! ```
+//!
+//! The optional third argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use std::net::IpAddr;
 use std::sync::Arc;

@@ -41,7 +41,8 @@ usage: fictionet attach --world unix:<path> --name <name> --type tun|tap|http_pr
        fictionet dashboard --observation unix:<path> --token-file <path> [--listen <address:port>]
 
 Run `fictionet attach --help` for the flags, and `fictionet observe --help`
-for the requests an observer can make.
+for observation requests. --observation names the Unix socket a world serves
+with fictionet_observe::serve. Run `fictionet dashboard --help` for browser access.
 `fictionet ready <path>` exits 0 if <path> exists, and 1 if not. Use it as
 a probe on attach's --ready-file, in an image with no shell.
 `fictionet wait-blocked` exits 0 once the addresses stop answering, such as

@@ -2,7 +2,7 @@
 //! one real container, on a [`Net`].
 //!
 //! ```text
-//! cargo run --example scan -- /run/fictionet/world.sock [observation.sock]
+//! cargo run --example scan -- /run/fictionet/world.sock /run/fictionet/observation.sock
 //! ```
 //!
 //! The world waits for two sandboxes:
@@ -22,6 +22,15 @@
 //! The dashboard shows the network as one group, "simulated hosts", with one group
 //! per machine inside it, and the two sandboxes in groups of their own.
 //! `examples/scan/README.md` runs it all under Docker Compose with nmap.
+//!
+//! The optional second argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use std::convert::Infallible;
 use std::net::Ipv4Addr;

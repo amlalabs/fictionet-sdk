@@ -1,9 +1,20 @@
-// The packets between the sandboxes and `web::Sites`, written to a pcap
-// file that tshark and Wireshark open. The world prints a line when a
-// packet could not be written. Controlled shutdown drains the writer; an
-// abrupt exit can truncate the pcap.
-//
-//     cargo run --example capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap [observation.sock]
+//! The packets between the sandboxes and `web::Sites`, written to a pcap
+//! file that tshark and Wireshark open. The world prints a line when a
+//! packet could not be written. Controlled shutdown drains the writer; an
+//! abrupt exit can truncate the pcap.
+//!
+//! ```text
+//! cargo run --example capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap /run/fictionet/observation.sock
+//! ```
+//!
+//! The optional third argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use std::io::Write;
 use std::sync::Arc;

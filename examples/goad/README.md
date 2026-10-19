@@ -40,10 +40,10 @@ Windows sends LLMNR over IPv4 as well, and NBNS and DNS are IPv4 here, so
 name resolution between the guests still works. Attacks that need IPv6 on
 the segment, such as DHCPv6 spoofing with mitm6, are outside this lab.
 
-Fictionet is the only data path between members, so the dashboard and observers
-see the real packets, and link controls such as delay, loss and capture can be
-inserted later. A packet for an address with no member, or for another subnet,
-is dropped, and the LAN records each drop with its reason in the run's events.
+Fictionet is the only data path between members. An installed observer can
+capture those packets within its limits. Link controls can add delay or loss.
+A packet for an address with no member, or for another subnet, is dropped.
+The LAN emits each drop with its reason to interested observers.
 This world adds no gateway, so the lab has no route to the host or the internet. A world that wants one gives the LAN a
 gateway with `Lan::gateway` and puts a `route::router` behind it.
 
@@ -144,8 +144,16 @@ $ sudo ip netns exec goad-attacker nmap -Pn -sV \
     -p 53,88,135,389,445,636,1433,3268,3389,5985 192.168.56.10-23
 ```
 
-The optional third argument opens an observation socket. Run the dashboard
-against that socket to watch the real exchange:
+The optional third argument installs a `DashboardObserver` and opens a Unix
+socket with `fictionet_observe::serve`. Run the dashboard against that socket
+to watch captured traffic. See [Fictionet Observe](../../observe/README.md)
+for capture limits. Guest TLS needs keys from instrumented endpoints to decrypt.
+
+```console
+$ target/release/fictionet observe --observation unix:/run/user/$(id -u)/fictionet-goad/observation.sock watch
+```
+
+For browser access:
 
 ```console
 $ (umask 077; openssl rand -hex 32 > /tmp/goad-dashboard-token)

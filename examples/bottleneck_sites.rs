@@ -1,7 +1,18 @@
-// A sandbox on a slow link: `stdlib::network::bottleneck` in front of `web::Sites`,
-// with a count of the packets its queues drop.
-//
-//     cargo run --example bottleneck_sites -- /run/fictionet/world.sock [observation.sock]
+//! A sandbox on a slow link: `stdlib::network::bottleneck` in front of `web::Sites`,
+//! with a count of the packets its queues drop.
+//!
+//! ```text
+//! cargo run --example bottleneck_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
+//! ```
+//!
+//! The optional second argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -4,12 +4,13 @@ This guide builds a small world step by step: a service, a test for it,
 a network of hosts that serve it, and a log a grader reads. Every piece is
 a public module of `fictionet::stdlib`, so each file can be copied into a world's crate and
 changed there. Each piece emits structured facts through `fictionet::events`
-to optional observers installed by the integrator.
+to the run's installed observer. The [companion](../observe/README.md) owns
+collection and retention.
 
 | Module | What it gives |
 |---|---|
 | `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests, transcripts and fault plans |
-| `fictionet::events` | Not in the stdlib: lazy structured events and optional observers (`fictionet_observe::Memory`, `fictionet_observe::Jsonl`, `fictionet_observe::Aggregate`, dashboard retention, or custom observers); no observer means no recording work |
+| `fictionet::events` | Core's four observation streams and observer contract. The companion owns retention; no observer means no observation work. |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Router`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
@@ -451,13 +452,13 @@ reply.
 ```rust
 use fictionet::stdlib::services::serve::Harness;
 
-let evidence = std::sync::Arc::new(fictionet_observe::Memory::default());
+let grader = std::sync::Arc::new(fictionet_observe::Memory::default());
 let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt, "hunter2".to_owned())
-    .observer(evidence.clone());
+    .observer(grader.clone());
 assert_eq!(h.open()?, b"password: ");
 assert_eq!(h.push(b"hunter2\n")?, b"welcome\n");
 assert!(h.closed());
-assert_eq!(evidence.checked_all()?[0].kind, "login");
+assert_eq!(grader.checked_all()?[0].kind, "login");
 ```
 
 The harness runs the same state machine as the driver: `advance` moves
@@ -576,8 +577,9 @@ TLS ownership and reproducibility are split across these files:
 - [`tls/output.rs`](../src/stdlib/services/tls/output.rs) drains ciphertext for both
   the server and the simulated client.
 
-The [repeatable-run contract](guide/running.rs) also describes external I/O
-and the HTTP/2 host-clock exception.
+[Repeatable runs](../src/guide/running.rs) describes external I/O and clock
+limits. Native HTTP/2 reset expiry follows the run's clock. Only opt-in axum
+upgrades use hyper's own time.
 
 Each peer address may hold 256 connections at once across all machines
 and gateway DNS listeners in the network. Bytes held by the service layer

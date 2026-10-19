@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The dashboard demo, run inside the VM by cargo xtask demo dashboard. The web world
 # and its sandbox from cargo xtask demo web, with `fictionet dashboard` showing them
-# live in your browser, and `fictionet observe` reading the same API from
-# a shell.
+# live in your browser. `fictionet observe` reads the same API from a shell.
+# Both commands connect to the world's private observation socket.
 # needs: sdk
 . "$(dirname "$0")/lib.sh"
 . "$(dirname "$0")/web_setup.sh"
@@ -24,7 +24,8 @@ start_web /run/fictionet/observation.sock
 attach_web
 
 step "Start the dashboard"
-note "fictionet dashboard connects to the observation socket passed to web_world."
+note "web_world serves its collector on the third path with fictionet_observe::serve."
+note "fictionet dashboard connects through --observation unix:/run/fictionet/observation.sock."
 note "In the VM it listens on port 7878, which cargo xtask vm forwards to"
 note "127.0.0.1:$host_port on your machine, and nowhere else."
 umask 077
@@ -61,9 +62,9 @@ fi
 step "The same API from a shell: fictionet observe"
 vm "fictionet observe --observation unix:/run/fictionet/observation.sock world"
 vm "fictionet observe --observation unix:/run/fictionet/observation.sock graph | jq -c '{tasks: [.nodes[] | select(.kind != \"sandbox\")] | length, sandboxes: [.nodes[] | select(.kind == \"sandbox\") | .name], links: (.edges | length)}'"
-note "The world keeps a log of events, such as web_world's dns.query and http.request, whether"
-note "or not anyone watches. The watch request replays every event the world kept from the start,"
-note "then follows new events as they happen. Here are the first four:"
+note "web_world installs a collector that retains events before clients connect."
+note "watch 0 replays its retained events, then follows events as they arrive."
+note "Retention is bounded. Here are the first four:"
 vm "s=0
 timeout 4 fictionet observe --observation unix:/run/fictionet/observation.sock watch 0 >/run/watch.jsonl || s=\$?
 [[ \$s -eq 0 || \$s -eq 124 ]] || exit \"\$s\"

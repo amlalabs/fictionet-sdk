@@ -1,7 +1,18 @@
-// A website 200 ms away from every sandbox: `stdlib::network::delay` in front of
-// `web::Sites`, with `Attachments::map`.
-//
-//     cargo run --example delayed_sites -- /run/fictionet/world.sock [observation.sock]
+//! A website 200 ms away from every sandbox: `stdlib::network::delay` in front of
+//! `web::Sites`, with `Attachments::map`.
+//!
+//! ```text
+//! cargo run --example delayed_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
+//! ```
+//!
+//! The optional second argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use fictionet::stdlib::{self, web};
 use fictionet::time::ms;

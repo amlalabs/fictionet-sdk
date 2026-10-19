@@ -1,7 +1,18 @@
-// A lossy link: `stdlib::network::filter` in front of `web::Sites` drops 5% of the
-// packets in each direction, at random.
-//
-//     cargo run --example lossy_sites -- /run/fictionet/world.sock [observation.sock]
+//! A lossy link: `stdlib::network::filter` in front of `web::Sites` drops 5% of the
+//! packets in each direction, at random.
+//!
+//! ```text
+//! cargo run --example lossy_sites -- /run/fictionet/world.sock /run/fictionet/observation.sock
+//! ```
+//!
+//! The optional second argument opens a Unix observation socket. Watch it
+//! from another terminal:
+//!
+//! ```sh
+//! fictionet observe --observation unix:/run/fictionet/observation.sock watch
+//! ```
+//!
+//! For browser access and capture limits, see `fictionet_observe`.
 
 use fictionet::stdlib::{self, web};
 
