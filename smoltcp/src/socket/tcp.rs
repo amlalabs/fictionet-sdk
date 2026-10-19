@@ -182,9 +182,9 @@ impl RttEstimator {
     fn sample(&mut self, new_rtt: u32) {
         if self.have_measurement {
             // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
-            let diff = (self.srtt as i32 - new_rtt as i32).unsigned_abs();
-            self.rttvar = (self.rttvar * 3 + diff).div_ceil(4);
-            self.srtt = (self.srtt * 7 + new_rtt).div_ceil(8);
+            let diff = self.srtt.abs_diff(new_rtt) as u64;
+            self.rttvar = (self.rttvar as u64 * 3 + diff).div_ceil(4) as u32;
+            self.srtt = (self.srtt as u64 * 7 + new_rtt as u64).div_ceil(8) as u32;
         } else {
             // RFC 6298 (2.2) When the first RTT measurement R is made, the host MUST set (...)
             self.have_measurement = true;
@@ -193,8 +193,9 @@ impl RttEstimator {
         }
 
         // RFC 6298 (2.2), (2.3)
-        let margin = RTTE_MIN_MARGIN.max(self.rttvar * RTTE_K);
-        self.rto = (self.srtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
+        let margin = (RTTE_MIN_MARGIN as u64).max(self.rttvar as u64 * RTTE_K as u64);
+        self.rto =
+            (self.srtt as u64 + margin).clamp(RTTE_MIN_RTO as u64, RTTE_MAX_RTO as u64) as u32;
 
         self.rto_count = 0;
     }
@@ -216,7 +217,9 @@ impl RttEstimator {
         if let Some((sent_timestamp, sent_seq)) = self.timestamp
             && seq >= sent_seq
         {
-            self.sample((timestamp - sent_timestamp).total_millis() as u32);
+            self.sample(
+                u32::try_from((timestamp - sent_timestamp).total_millis()).unwrap_or(u32::MAX),
+            );
             self.timestamp = None;
         }
     }
@@ -451,6 +454,8 @@ pub struct Socket<'a> {
     remote_last_ack: Option<TcpSeqNumber>,
     /// The last window length sent.
     remote_last_win: u16,
+    /// The furthest receive window edge.
+    remote_win_end: Option<TcpSeqNumber>,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -549,6 +554,7 @@ impl<'a> Socket<'a> {
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win: 0,
+            remote_win_end: None,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
@@ -645,23 +651,33 @@ impl<'a> Socket<'a> {
         u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
-    /// Return the last window field value, including scaling according to RFC 1323.
-    ///
-    /// Used in internal calculations as well as packet generation.
-    ///
-    /// Unlike `remote_last_win`, we take into account new packets received (but not acknowledged)
-    /// since the last window update and adjust the window length accordingly. This ensures a fair
-    /// comparison between the last window length and the new window length we're going to
-    /// advertise.
+    /// Return the scaled window remaining to the furthest advertised edge.
+    /// Received data consumes this window even before it is acknowledged.
     #[inline]
     fn last_scaled_window(&self) -> Option<u16> {
-        let last_ack = self.remote_last_ack?;
+        let window_end = self.remote_win_end?;
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
-
-        let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        let last_win_adjusted = window_end.max(next_ack) - next_ack;
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
+    }
+
+    fn receive_window_end(&self) -> TcpSeqNumber {
+        let start = self.remote_seq_no + self.rx_buffer.len();
+        self.remote_win_end
+            .unwrap_or(start)
+            .min(self.remote_seq_no + self.rx_buffer.capacity())
+            .max(start)
+    }
+
+    fn remember_window(&mut self, ack: Option<TcpSeqNumber>, window: u16) {
+        self.remote_last_ack = ack;
+        self.remote_last_win = window;
+        if let Some(ack) = ack {
+            let end = (ack + ((window as usize) << self.remote_win_shift))
+                .min(self.remote_seq_no + self.rx_buffer.capacity());
+            self.remote_win_end = Some(self.remote_win_end.map_or(end, |old| old.max(end)));
+        }
     }
 
     /// Set the timeout duration.
@@ -799,6 +815,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        self.remote_win_end = None;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -1213,6 +1230,7 @@ impl<'a> Socket<'a> {
     ///
     /// This function otherwise behaves identically to [recv_slice](#method.recv_slice).
     pub fn peek_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
+        self.recv_error_check()?;
         Ok(self.rx_buffer.read_allocated(0, data))
     }
 
@@ -1308,13 +1326,12 @@ impl<'a> Socket<'a> {
         // to be received.
         reply_repr.seq_number = self.remote_last_seq;
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
-        self.remote_last_ack = reply_repr.ack_number;
 
         // From RFC 1323:
         // The window field [...] of every outgoing segment, with the exception of SYN
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
-        self.remote_last_win = reply_repr.window_len;
+        self.remember_window(reply_repr.ack_number, reply_repr.window_len);
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -1404,6 +1421,36 @@ impl<'a> Socket<'a> {
         }
     }
 
+    fn segment_in_window(
+        repr: &TcpRepr,
+        window_start: TcpSeqNumber,
+        window_end: TcpSeqNumber,
+    ) -> bool {
+        let segment_start = repr.seq_number;
+        let segment_end =
+            segment_start + repr.payload.len() + usize::from(repr.control == TcpControl::Fin);
+        match (segment_start == segment_end, window_start == window_end) {
+            (true, _) if segment_end == window_start - 1 => false,
+            (true, true) => window_start == segment_start,
+            (true, false) => {
+                // A peer that filled the window sends its next ACK at the right edge.
+                window_start <= segment_start
+                    && (segment_start < window_end
+                        || (segment_start == window_end
+                            && repr.control.quash_psh() == TcpControl::None))
+            }
+            (false, true) => {
+                repr.payload.is_empty()
+                    && repr.control == TcpControl::Fin
+                    && segment_start == window_start
+            }
+            (false, false) => {
+                (window_start <= segment_start && segment_start < window_end)
+                    || (window_start < segment_end && segment_end <= window_end)
+            }
+        }
+    }
+
     pub(crate) fn process(
         &mut self,
         cx: &mut Context,
@@ -1482,31 +1529,15 @@ impl<'a> Socket<'a> {
             (_, _, Some(ack_number)) => {
                 let unacknowledged = self.tx_buffer.len() + control_len;
 
-                // Acceptable ACK range (both inclusive)
-                let mut ack_min = self.local_seq_no;
                 let ack_max = self.local_seq_no + unacknowledged;
-
-                // If we have sent a SYN, it MUST be acknowledged.
-                if sent_syn {
-                    ack_min += 1;
-                }
-
-                if ack_number < ack_min {
-                    return None;
-                }
-
-                if ack_number > ack_max {
+                if ack_number >= self.local_seq_no && ack_number > ack_max {
                     return self.challenge_ack_reply(cx, ip_repr, repr);
                 }
             }
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
-        } else {
-            window_start
-        };
+        let window_end = self.receive_window_end();
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -1514,22 +1545,7 @@ impl<'a> Socket<'a> {
             // In LISTEN and SYN-SENT states, we have not yet synchronized with the remote end.
             State::Listen | State::SynSent => (&[][..], 0),
             _ => {
-                // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
-                let segment_in_window =
-                    match (segment_start == segment_end, window_start == window_end) {
-                        (true, _) if segment_end == window_start - 1 => false,
-                        (true, true) => window_start == segment_start,
-                        (true, false) => {
-                            window_start <= segment_start && segment_start < window_end
-                        }
-                        (false, true) => false,
-                        (false, false) => {
-                            (window_start <= segment_start && segment_start < window_end)
-                                || (window_start < segment_end && segment_end <= window_end)
-                        }
-                    };
-
-                if segment_in_window {
+                if Self::segment_in_window(repr, window_start, window_end) {
                     let overlap_start = window_start.max(segment_start);
                     let overlap_end = window_end.min(segment_end);
 
@@ -1623,9 +1639,9 @@ impl<'a> Socket<'a> {
         let mut control = repr.control;
         control = control.quash_psh();
 
-        // If a FIN is received at the end of the current segment, but
-        // we have a hole in the assembler before the current segment, disregard this FIN.
-        if control == TcpControl::Fin && window_start < segment_start {
+        // Ignore a FIN past a gap or outside the receive window.
+        if control == TcpControl::Fin && (window_start < segment_start || segment_end > window_end)
+        {
             control = TcpControl::None;
         }
 
@@ -1640,6 +1656,7 @@ impl<'a> Socket<'a> {
             // reason is TCP simultaneous open).
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 self.tuple = None;
+                self.remote_win_end = None;
                 self.set_state(State::Listen);
                 return None;
             }
@@ -1716,6 +1733,11 @@ impl<'a> Socket<'a> {
                 if self.remote_win_scale.is_none() {
                     self.remote_win_shift = 0;
                 }
+                self.remote_win_end = Some(
+                    self.remote_seq_no
+                        + ((self.remote_last_win as usize) << self.remote_win_shift)
+                            .min(self.rx_buffer.capacity()),
+                );
                 // Remote doesn't support timestamping, don't do it.
                 if repr.timestamp.is_none() {
                     self.tsval_generator = None;
@@ -1806,7 +1828,12 @@ impl<'a> Socket<'a> {
             TcpControl::Syn => 0,
             _ => self.remote_win_scale.unwrap_or(0),
         };
-        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
+        let old_ack = repr.ack_number.is_some_and(|ack| ack < self.local_seq_no);
+        let new_remote_win_len = if old_ack {
+            self.remote_win_len
+        } else {
+            (repr.window_len as usize) << (scale as usize)
+        };
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
 
@@ -1824,7 +1851,7 @@ impl<'a> Socket<'a> {
             self.tx_waker.wake();
         }
 
-        if let Some(ack_number) = repr.ack_number {
+        if let Some(ack_number) = repr.ack_number.filter(|_| !old_ack) {
             // TODO: When flow control is implemented,
             // refractor the following block within that implementation
 
@@ -1926,17 +1953,15 @@ impl<'a> Socket<'a> {
             .assembler
             .add_then_remove_front(payload_offset, payload_len)
         else {
-            return None;
+            return Some(self.ack_reply(ip_repr, repr));
         };
 
         // Place payload octets into the buffer.
-
         let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
         debug_assert!(len_written == payload_len);
 
         if contig_len != 0 {
             // Enqueue the contiguous data octets in front of the buffer.
-
             self.rx_buffer.enqueue_unallocated(contig_len);
 
             // There's new data in rx_buffer, notify waiting task if any.
@@ -2395,15 +2420,15 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = self
             .remote_last_seq
             .max(repr.seq_number + repr.segment_len());
-        self.remote_last_ack = repr.ack_number;
-        self.remote_last_win = repr.window_len;
+        let segment_len = repr.segment_len();
+        let segment_end = repr.seq_number + segment_len;
+        self.remember_window(repr.ack_number, repr.window_len);
 
-        if repr.segment_len() > 0 {
-            self.rtte
-                .on_send(cx.now(), repr.seq_number + repr.segment_len());
+        if segment_len > 0 {
+            self.rtte.on_send(cx.now(), segment_end);
         }
 
-        if repr.segment_len() > 0 && !self.timer.is_retransmit() {
+        if segment_len > 0 && !self.timer.is_retransmit() {
             // RFC 6298 (5.1) Every time a packet containing data is sent (including a
             // retransmission), if the timer is not running, start it running
             // so that it will expire after RTO seconds.
@@ -2766,6 +2791,8 @@ mod test {
         s.remote_last_seq = LOCAL_SEQ + 1;
         s.remote_last_ack = Some(REMOTE_SEQ + 1);
         s.remote_last_win = s.scaled_window();
+        s.remote_win_end =
+            Some(REMOTE_SEQ + 1 + ((s.remote_last_win as usize) << s.remote_win_shift));
         s
     }
 
@@ -4182,6 +4209,7 @@ mod test {
         s.remote_has_sack = true;
         s.remote_seq_no = TcpSeqNumber(-4);
         s.remote_last_ack = Some(TcpSeqNumber(-4));
+        s.remote_win_end = Some(TcpSeqNumber(-4) + 64);
 
         // Send an out-of-order segment 10 bytes past the expected sequence,
         // creating a 10-byte hole at the front of the assembler.
@@ -4209,14 +4237,9 @@ mod test {
 
     #[test]
     fn test_established_sliding_window_recv() {
-        let mut s = socket_established();
-        // Update our scaling parameters for a TCP with a scaled buffer.
+        let mut s = socket_established_with_buffer_sizes(64, 262143);
         assert_eq!(s.rx_buffer.len(), 0);
-        s.rx_buffer = SocketBuffer::new(vec![0; 262143]);
-        s.assembler = Assembler::new();
         s.remote_win_scale = Some(0);
-        s.remote_last_win = 65535;
-        s.remote_win_shift = 2;
 
         // Create a TCP segment that will mostly fill an IP frame.
         let mut segment: Vec<u8> = Vec::with_capacity(1400);
@@ -7392,9 +7415,7 @@ mod test {
 
     #[test]
     fn test_zero_window_ack_on_window_growth() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
-        s.assembler = Assembler::new();
+        let mut s = socket_established_with_buffer_sizes(64, 6);
         send!(
             s,
             TcpRepr {
@@ -7528,9 +7549,7 @@ mod test {
 
     #[test]
     fn test_announce_window_after_read() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
-        s.assembler = Assembler::new();
+        let mut s = socket_established_with_buffer_sizes(64, 6);
         send!(
             s,
             TcpRepr {
@@ -9210,5 +9229,637 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    fn scaled_handshake(active: bool) -> TestSocket {
+        let mut s = socket_with_buffer_sizes(64, 256 * 1024);
+        if active {
+            s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: None,
+                    window_len: 65535,
+                    window_scale: Some(3),
+                    max_seg_size: Some(BASE_MSS),
+                    sack_permitted: true,
+                    ..RECV_TEMPL
+                }]
+            );
+        } else {
+            s.listen(LOCAL_END).unwrap();
+        }
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: active.then_some(LOCAL_SEQ + 1),
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        if !active {
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    window_len: 65535,
+                    window_scale: Some(3),
+                    max_seg_size: Some(BASE_MSS),
+                    ..RECV_TEMPL
+                }]
+            );
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    ..SEND_TEMPL
+                }
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn test_listen_scaled_handshake_no_window_update() {
+        let mut s = scaled_handshake(false);
+        assert_eq!(s.state, State::Established);
+        recv_nothing!(s);
+    }
+
+    #[test]
+    fn test_connect_scaled_handshake_no_window_update() {
+        let mut s = scaled_handshake(true);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 32768,
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.state, State::Established);
+        recv_nothing!(s);
+    }
+
+    #[test]
+    fn test_scaled_handshake_reopens_window_after_read() {
+        for active in [false, true] {
+            let mut s = scaled_handshake(active);
+            let capacity = s.rx_buffer.capacity();
+            let data = vec![42; capacity];
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &data,
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + capacity),
+                    window_len: 0,
+                    ..RECV_TEMPL
+                }]
+            );
+            let mut bytes = vec![0; capacity];
+            assert_eq!(s.recv_slice(&mut bytes), Ok(capacity));
+            assert_eq!(bytes, data);
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + capacity),
+                    window_len: 32768,
+                    ..RECV_TEMPL
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn test_listen_scaled_handshake_keeps_payload_within_buffer() {
+        let mut s = scaled_handshake(false);
+        let capacity = s.rx_buffer.capacity();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + capacity - 4,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abcdefghij",
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 32768,
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &vec![42; capacity - 4],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + capacity),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        let mut bytes = vec![0; capacity];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(capacity));
+        assert!(bytes[..capacity - 4].iter().all(|b| *b == 42));
+        assert_eq!(&bytes[capacity - 4..], b"abcd");
+        assert_eq!(s.recv_slice(&mut [0; 1]), Ok(0));
+    }
+
+    fn syn_window_rejects_excess(active: bool, offset: usize) {
+        let mut s = scaled_handshake(active);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + offset,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"0123456789",
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 32768,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.recv_slice(&mut [0; 10]), Ok(0));
+    }
+
+    #[test]
+    fn test_listen_syn_window_crossing_buffer_end() {
+        syn_window_rejects_excess(false, 256 * 1024 - 4);
+    }
+
+    #[test]
+    fn test_listen_syn_window_past_buffer_end() {
+        syn_window_rejects_excess(false, 256 * 1024 + 4);
+    }
+
+    #[test]
+    fn test_connect_syn_window_crossing_buffer_end() {
+        syn_window_rejects_excess(true, 256 * 1024 - 4);
+    }
+
+    #[test]
+    fn test_connect_syn_window_past_buffer_end() {
+        syn_window_rejects_excess(true, 256 * 1024 + 4);
+    }
+
+    #[test]
+    fn test_fin_at_receive_window_edge() {
+        for len in [64, 65] {
+            let mut s = socket_established();
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &vec![42; len],
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.last_scaled_window(), Some(0));
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 65 + usize::from(len == 64)),
+                    window_len: 0,
+                    ..RECV_TEMPL
+                }]
+            );
+            let mut bytes = [0; 64];
+            assert_eq!(s.recv_slice(&mut bytes), Ok(64));
+            assert_eq!(bytes, [42; 64]);
+            if len == 64 {
+                assert_eq!(s.recv_slice(&mut bytes), Err(RecvError::Finished));
+                recv_nothing!(s);
+                continue;
+            }
+            assert_eq!(s.recv_slice(&mut bytes), Ok(0));
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 65),
+                    ..RECV_TEMPL
+                }]
+            );
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: REMOTE_SEQ + 65,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 66),
+                    ..RECV_TEMPL
+                }]
+            );
+            assert_eq!(s.recv_slice(&mut bytes), Err(RecvError::Finished));
+        }
+    }
+
+    #[test]
+    fn test_scaled_window_keeps_bytes_from_furthest_advertised_edge() {
+        let mut s = socket_established_with_buffer_sizes(64, 256 * 1024);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"x",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(s, time 20, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 2),
+            window_len: 32767,
+            ..RECV_TEMPL
+        }]);
+        send!(s, time 30, TcpRepr {
+            seq_number: REMOTE_SEQ + 2,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"y",
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.last_scaled_window(), Some(32767));
+    }
+
+    #[test]
+    fn test_fill_furthest_advertised_window_acknowledges_and_reads_all_data() {
+        let capacity = 256 * 1024;
+        let mut s = socket_established_with_buffer_sizes(64, capacity);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"x",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(s, time 20, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 2),
+            window_len: 32767,
+            ..RECV_TEMPL
+        }]);
+        let data = vec![7; capacity - 1];
+        send!(s, time 30, TcpRepr {
+            seq_number: REMOTE_SEQ + 2,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &data,
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.recv_queue(), capacity);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+        recv!(s, time 30, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + capacity),
+            window_len: 0,
+            ..RECV_TEMPL
+        }]);
+        let mut bytes = vec![0; capacity];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(capacity));
+        assert_eq!(bytes[0], b'x');
+        assert_eq!(&bytes[1..], data.as_slice());
+        assert_eq!(s.recv_slice(&mut [0; 1]), Ok(0));
+    }
+
+    #[test]
+    fn test_rounded_window_accepts_previous_edge() {
+        let mut s = socket_established_with_buffer_sizes(64, 256 * 1024);
+        s.send_slice(b"abc").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 32768,
+                payload: b"abc",
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"x",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 4,
+                ack_number: Some(REMOTE_SEQ + 2),
+                window_len: 32767,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 256 * 1024,
+                ack_number: Some(LOCAL_SEQ + 4),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.send_queue(), 0);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 256 * 1024,
+                ack_number: Some(LOCAL_SEQ + 4),
+                payload: b"z",
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 4,
+                ack_number: Some(REMOTE_SEQ + 2),
+                window_len: 32767,
+                ..RECV_TEMPL
+            })
+        );
+        for offset in (1..256 * 1024 - 1).step_by(4096) {
+            let end = (offset + 4096).min(256 * 1024 - 1);
+            let reply = send(
+                &mut s,
+                Instant::ZERO,
+                &TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 4),
+                    payload: &vec![42; end - offset],
+                    ..SEND_TEMPL
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                reply.ack_number,
+                Some(REMOTE_SEQ + 1 + end + usize::from(end == 256 * 1024 - 1))
+            );
+        }
+        let mut bytes = vec![0; 256 * 1024];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(bytes.len()));
+        assert_eq!(bytes[0], b'x');
+        assert!(bytes[1..bytes.len() - 1].iter().all(|b| *b == 42));
+        assert_eq!(bytes[bytes.len() - 1], b'z');
+    }
+
+    #[test]
+    fn test_old_ack_keeps_payload_and_fin() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"abcdef",
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 4),
+                ..SEND_TEMPL
+            }
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"xyz",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 7,
+                ack_number: Some(REMOTE_SEQ + 5),
+                window_len: 61,
+                ..RECV_TEMPL
+            }]
+        );
+        let mut bytes = [0; 3];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(3));
+        assert_eq!(&bytes, b"xyz");
+        assert_eq!(s.recv_slice(&mut bytes), Err(RecvError::Finished));
+        assert_eq!(s.send_queue(), 3);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 5,
+                ack_number: Some(LOCAL_SEQ + 7),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.send_queue(), 0);
+    }
+
+    #[test]
+    fn test_full_assembler_sends_duplicate_ack() {
+        let mut s = socket_established();
+        for offset in [1, 3, 5, 7, 9] {
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: b"x",
+                    ..SEND_TEMPL
+                },
+                Some(TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    ..RECV_TEMPL
+                })
+            );
+        }
+        assert_eq!(s.recv_slice(&mut [0; 10]), Ok(0));
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abcdefghij",
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 11),
+                window_len: 54,
+                ..RECV_TEMPL
+            })
+        );
+        let mut bytes = [0; 10];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(10));
+        assert_eq!(&bytes, b"abcdefghij");
+    }
+
+    #[test]
+    fn test_long_round_trip_samples() {
+        let mut s = socket_established();
+        for (n, now) in [0, 700_000_000, 2_900_000_000i64].into_iter().enumerate() {
+            s.send_slice(b"x").unwrap();
+            recv!(s, time now, [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + n,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"x",
+                ..RECV_TEMPL
+            }]);
+            send!(s, time now + 700_000_000, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 2 + n),
+                ..SEND_TEMPL
+            });
+        }
+    }
+
+    #[test]
+    fn test_round_trip_variance_overflow() {
+        let mut s = socket_established();
+        let mut now = 0;
+        for (n, delay) in [700_000_000, 2_200_000_000i64].into_iter().enumerate() {
+            s.send_slice(b"x").unwrap();
+            recv!(s, time now, [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + n,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"x",
+                ..RECV_TEMPL
+            }]);
+            send!(s, time now + delay, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 2 + n),
+                ..SEND_TEMPL
+            });
+            now += delay;
+        }
+    }
+
+    #[test]
+    fn test_round_trip_margin_overflow() {
+        let mut s = socket_established();
+        s.send_slice(b"x").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"x",
+                ..RECV_TEMPL
+            }]
+        );
+        send!(s, time 2_200_000_000i64, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 2),
+            ..SEND_TEMPL
+        });
+    }
+
+    #[test]
+    fn test_retransmitted_payload_with_new_fin() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abc",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 4),
+                window_len: 61,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abc",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 5),
+                window_len: 61,
+                ..RECV_TEMPL
+            }]
+        );
+        let mut bytes = [0; 3];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(3));
+        assert_eq!(&bytes, b"abc");
+        assert_eq!(s.recv_slice(&mut bytes), Err(RecvError::Finished));
+    }
+
+    #[test]
+    fn test_peek_slice_closed() {
+        let mut s = socket();
+        assert_eq!(s.peek_slice(&mut [0; 1]), Err(RecvError::InvalidState));
+    }
+
+    #[test]
+    fn test_peek_slice_finished() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.peek_slice(&mut [0; 1]), Err(RecvError::Finished));
     }
 }
