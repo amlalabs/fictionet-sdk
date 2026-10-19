@@ -80,6 +80,18 @@ fn get(e: &Event, name: &str) -> Value {
 fn line(e: &Event) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
     match (e.source, e.kind) {
+        ("adaptive", "query") => Some(json!({"type": "query", "id": get(e, "query_id"),
+            "engine": get(e, "engine"), "search": get(e, "search"), "start": get(e, "start")})),
+        ("adaptive", "query_failed") => {
+            let mut line =
+                json!({"type": "query_failed", "id": get(e, "query_id"), "why": get(e, "why")});
+            for name in ["error", "serve_ms"] {
+                if let Some(value) = e.get(name) {
+                    line[name] = to_json(value);
+                }
+            }
+            Some(line)
+        }
         ("net", "attached") => {
             println!("attached {}", name.as_deref().unwrap_or(""));
             None
@@ -165,6 +177,65 @@ fn http(e: &Event) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_lines_and_http_context() {
+        use fictionet::events::{Fanout, Memory, Observation, Observer, Stamp};
+        let query = Event::new("adaptive", "query")
+            .field("query_id", 3u64)
+            .field("engine", "google")
+            .field("search", "a")
+            .field("start", 10u64);
+        assert_eq!(
+            line(&query),
+            Some(json!({"type":"query","id":3,"engine":"google","search":"a","start":10}))
+        );
+        for why in [
+            "backend_error",
+            "meta_error",
+            "error",
+            "budget",
+            "abandoned",
+        ] {
+            let failed = Event::new("adaptive", "query_failed")
+                .field("query_id", 3u64)
+                .field("why", why);
+            assert_eq!(
+                line(&failed),
+                Some(json!({"type":"query_failed","id":3,"why":why}))
+            );
+            let failed = failed.field("error", "stopped").field("serve_ms", 7u64);
+            assert_eq!(
+                line(&failed),
+                Some(
+                    json!({"type":"query_failed","id":3,"why":why,"error":"stopped","serve_ms":7})
+                )
+            );
+        }
+        let memory = Arc::new(Memory::default());
+        let observer = Fanout::new(vec![memory.clone()]);
+        let event = Event::new("http", "request")
+            .field("path", "/search")
+            .field("query", "q=a")
+            .field("query_id", 3u64)
+            .field("listed", J::Array(vec![]))
+            .field("reason", "direct");
+        let stamp = Stamp {
+            seq: 1,
+            at: fictionet::time::Instant::ZERO,
+        };
+        observer.observe(stamp, Observation::Event(&event));
+        let events = memory.checked_of("http", "request").unwrap();
+        assert_eq!(events[0].u64("query_id"), Some(3));
+        assert_eq!(events[0].str("query"), Some("q=a"));
+        assert_eq!(events[0].fields, event.fields);
+        assert_eq!(line(&events[0]), line(&event));
+        let http = line(&events[0]).unwrap();
+        assert_eq!(http["path"], "/search?q=a");
+        for name in ["query", "query_id", "listed", "reason"] {
+            assert!(http.get(name).is_none());
+        }
+    }
 
     #[test]
     fn producer_loss_prevents_successful_finalization() {

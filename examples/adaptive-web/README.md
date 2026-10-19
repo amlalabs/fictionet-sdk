@@ -231,10 +231,14 @@ Three containers, as in FakeWiki:
     never cost a model call.
   * **The log.** `/var/lib/fictionet/log.jsonl` is written from the run's
     events: one line per DNS query, naming decision, certificate, failed
-    handshake and HTTP request. The backend sends what it knows about each
+    handshake and HTTP request. A `query` line records each search before
+    forwarding: `id`, `engine`, `search` and `start`. A `query_failed` line
+    records its `id` and `why` (`backend_error`, `meta_error`, `error`,
+    `budget` or `abandoned`), plus `error` and `serve_ms` when available.
+    The backend sends what it knows about each
     response in an `X-Adaptive-Meta` header, which the handler takes off and
     puts in the request's event: `kind`, `cache` (`generated`, `prefetched`,
-    `cached`, `fixed`, `missing`), `gen_ms`, `serve_ms`, `cost`, `model`,
+    `cached`, `fixed`, `missing`, `budget`), `gen_ms`, `serve_ms`, `cost`, `model`,
     the page's `title` and stated `claims`, and any `unsupported_snippets`,
     `unchecked_snippets` and `tells`. `gen_ms` includes failed HTTP attempts,
     backoff and parse re-asks for that generation, through the final answer
@@ -250,6 +254,22 @@ Three containers, as in FakeWiki:
     evidence requires a complete GET or POST with status 200 and matching
     `sent` and `bytes`. It preserves scheme, query and trailing slash;
     redirects count only when their destination was fetched completely.
+    Events also carry `listed` (rank, URL and title of each result, in
+    display order) and `reason` (the first search or link a page was made
+    from, `direct`, or `fixed`). The log leaves both out. A search's id is
+    `query_id` in the `adaptive.query`, `adaptive.query_failed` and
+    answering `http.request` events, and `id` in the log.
+  * **For a live page.** `Searches` (`world/src/search.rs`) is an observer
+    that turns these events into one serde snapshot with a revision and the
+    run time of its last change: the seed card and generator, each search
+    and its outcome, the result lists, each page with the world's reason
+    for it, how it was made (`stubbed`, `written_live`, `stored`, `fixed`,
+    `missing`, `not_made`) and its latency, the sites with the reason for
+    their address, and the refused names. Named limits keep the most recent
+    128 searches, 24 result lists and 128 pages, the first 128 sites and
+    the last 64 refused names, and cut strings at 256 bytes. `omitted`
+    counts what was dropped. The snapshot stays under 3,934,927 bytes of
+    JSON.
 * **`attach`** runs `fictionet attach --type tun` with IPv6 off.
 * **`default`, the agent**, shares attach's network namespace. Its only
   interface is `tun0`. It has no extra capabilities, and it sees neither

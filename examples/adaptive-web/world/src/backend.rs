@@ -10,10 +10,15 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::task::{Context, Poll};
 
+use crate::route::{Route, query_key, route};
 use bytes::Bytes;
-use fictionet::events::{Fields, float};
+use fictionet::events::{ConnInfo, Fields, float};
 use fictionet::stdlib::protocols::json::Value as J;
 use fictionet::stdlib::web::{self, Body};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, REFERER, USER_AGENT};
@@ -24,9 +29,8 @@ use serde_json::Value;
 /// The header backend.py adds for the log.
 const META: &str = "x-adaptive-meta";
 
-/// The fields the log takes from the backend's meta, by name. None of them
-/// is a name `http.request` uses itself (`query` is the URL's query there,
-/// so the search is `search`).
+/// Backend fields retained in HTTP log lines. None is a name `http.request`
+/// uses itself. There, `query` is the URL query, so search text is `search`.
 pub const PAGE_FIELDS: [&str; 19] = [
     "kind",
     "cache",
@@ -49,10 +53,51 @@ pub const PAGE_FIELDS: [&str; 19] = [
     "bytes",
 ];
 
+/// Backend fields for the projection, kept out of HTTP log lines.
+/// These names and the handler's `query_id` are not used by `http.request` itself.
+pub const EVENT_FIELDS: [&str; 2] = ["listed", "reason"];
+
 #[derive(Clone)]
 pub struct Backend {
     fcx: fictionet::Cx,
     forward: web::Forward,
+    queries: Arc<AtomicU64>,
+}
+
+struct QueryGuard {
+    fcx: fictionet::Cx,
+    conn: ConnInfo,
+    id: u64,
+    finished: bool,
+}
+
+impl QueryGuard {
+    fn fail(&mut self, why: &str, error: Option<&str>, serve_ms: Option<u64>) {
+        self.finished = true;
+        self.fcx
+            .emitter(&self.conn)
+            .emit("adaptive", "query_failed", |e| {
+                let mut e = e
+                    .summary(format_args!("query {}: {why}", self.id))
+                    .field("query_id", self.id)
+                    .field("why", why);
+                if let Some(error) = error {
+                    e = e.field("error", error);
+                }
+                if let Some(ms) = serve_ms {
+                    e = e.field("serve_ms", ms);
+                }
+                e
+            });
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.fail("abandoned", None, None);
+        }
+    }
 }
 
 /// A JSON value from the backend as an event field's value.
@@ -80,6 +125,7 @@ impl Backend {
     pub fn new(fcx: &fictionet::Cx, port: u16) -> Result<Backend, fictionet::Error> {
         Ok(Backend {
             fcx: fcx.clone(),
+            queries: Arc::new(AtomicU64::new(1)),
             forward: web::forward(fcx, format!("http://127.0.0.1:{port}").parse().unwrap())?,
         })
     }
@@ -94,9 +140,51 @@ impl Backend {
             .get::<web::Target>()
             .cloned()
             .ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
+        let conn = request
+            .extensions()
+            .get::<ConnInfo>()
+            .cloned()
+            .unwrap_or_default();
         let (parts, body) = request.into_parts();
+        let mut query = None;
+
         let reply = async {
             let body = body.collect().await?.to_bytes();
+            let form = (parts.method == http::Method::POST
+                && parts
+                    .headers
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| {
+                        v.split(';').next().is_some_and(|v| {
+                            v.trim()
+                                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+                        })
+                    }))
+            .then_some(body.as_ref());
+            let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+            if let Route::Search {
+                engine,
+                query: search,
+                start,
+            } = route(&target.host, path, form)
+            {
+                let id = self.queries.fetch_add(1, Ordering::Relaxed);
+                query = Some(QueryGuard {
+                    fcx: self.fcx.clone(),
+                    conn: conn.clone(),
+                    id,
+                    finished: false,
+                });
+                self.fcx.emitter(&conn).emit("adaptive", "query", |e| {
+                    e.summary(format_args!("{} search: {search}", engine.as_str()))
+                        .field("query_id", id)
+                        .field("engine", engine.as_str())
+                        .field("search", search.as_str())
+                        .field("start", start)
+                        .field("key", query_key(&search, start))
+                });
+            }
             let mut ask = Request::builder()
                 .method(parts.method.clone())
                 .uri(parts.uri)
@@ -121,6 +209,9 @@ impl Backend {
         let (mut parts, body) = match reply {
             Ok(r) => r,
             Err(e) => {
+                if let Some(q) = &mut query {
+                    q.fail("backend_error", Some(&e.to_string()), Some(serve_ms));
+                }
                 let mut response = Response::new(Full::new(Bytes::from_static(
                     b"The site failed to answer.\n",
                 )));
@@ -138,6 +229,9 @@ impl Backend {
         let meta = match metadata(parts.headers.remove(META)) {
             Ok(meta) => meta,
             Err(error) => {
+                if let Some(q) = &mut query {
+                    q.fail("meta_error", Some(error), Some(serve_ms));
+                }
                 let mut response = Response::new(Full::new(Bytes::from_static(
                     b"The site returned invalid metadata.\n",
                 )));
@@ -153,12 +247,33 @@ impl Backend {
             }
         };
 
+        if let Some(q) = &mut query {
+            let why = if meta["kind"] == "error" {
+                Some("error")
+            } else if meta["cache"] == "budget" {
+                Some("budget")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                q.fail(
+                    why,
+                    meta["error"].as_str(),
+                    meta["serve_ms"].as_u64().or(Some(serve_ms)),
+                );
+            } else {
+                q.finished = true;
+            }
+        }
         if observing {
             let mut fields = Fields::new();
-            for name in PAGE_FIELDS {
+            for name in PAGE_FIELDS.into_iter().chain(EVENT_FIELDS) {
                 if let Some(v) = meta.get(name) {
                     fields.set(name, to_field(v));
                 }
+            }
+            if let Some(q) = &query {
+                fields.set("query_id", q.id);
             }
             // The length of the page, also for HEAD.
             let bytes = parts
@@ -233,6 +348,175 @@ mod tests {
     use fictionet::stdlib::web::httpd::{self, Handler, VHost, VirtualHosts};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    enum Answer {
+        Success,
+        Transport,
+        Metadata,
+        Error,
+        Budget,
+        Abandoned,
+    }
+
+    fn query_outcome(answer: Answer) -> (Arc<fictionet::events::Memory>, Option<Fields>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let abandoned = matches!(answer, Answer::Abandoned);
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = conn.read(&mut buf).unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            accepted_tx.send(()).unwrap();
+            if abandoned {
+                release_rx.recv().unwrap();
+                return;
+            }
+            let (status, meta) = match answer {
+                Answer::Success => (
+                    200,
+                    r#"{"kind":"search","cache":"generated","listed":[{"rank":1,"url":"https://a.com/","title":"A"}],"reason":{"via":"direct"}}"#,
+                ),
+                Answer::Transport => return,
+                Answer::Metadata => (200, "invalid"),
+                Answer::Error => (
+                    503,
+                    r#"{"kind":"error","error":"generation failed","serve_ms":7}"#,
+                ),
+                Answer::Budget => (503, r#"{"kind":"search","cache":"budget","serve_ms":8}"#),
+                Answer::Abandoned => unreachable!(),
+            };
+            write!(conn, "HTTP/1.1 {status} OK\r\nContent-Length: 4\r\nConnection: close\r\nX-Adaptive-Meta: {meta}\r\n\r\npage").unwrap();
+        });
+        let events = Arc::new(fictionet::events::Memory::default());
+        let observed = events.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (fields_tx, fields_rx) = std::sync::mpsc::channel();
+        rt.block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(observed),
+            move |fcx| async move {
+                let hosts = VirtualHosts::new();
+                hosts.insert(
+                    "html.duckduckgo.com",
+                    VHost::new(httpd::tower(Backend::new(&fcx, address.port())?)),
+                );
+                let conn = ConnInfo::new(42, address, "10.0.0.2:5000".parse()?);
+                let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+                let mut ex = httpd::Exchange::new(fcx.now(), &entropy, &conn);
+                let request = Request::builder()
+                    .extension(httpd::EventInterest(true))
+                    .extension(conn.clone())
+                    .method("POST")
+                    .header(
+                        CONTENT_TYPE,
+                        "application/x-www-form-urlencoded; charset=utf-8",
+                    )
+                    .uri("http://html.duckduckgo.com/html/?q=url")
+                    .body(Body::from(Bytes::from_static(b"q=+Form+search+&s=20")))?;
+                let httpd::Reply::Later(work) = hosts.call(request, &mut ex) else {
+                    panic!("backend request required");
+                };
+                let mut future = work(fcx);
+                if abandoned {
+                    tokio::select! {
+                        result = &mut future => panic!("backend unexpectedly answered: {result:?}"),
+                        result = accepted_rx => result.unwrap(),
+                    }
+                    drop(future);
+                    release_tx.send(()).unwrap();
+                    fields_tx.send(None).unwrap();
+                    Ok(())
+                } else {
+                    // Keep the receiver until the server reports acceptance.
+                    let response = future.await?;
+                    accepted_rx.await.unwrap();
+                    fields_tx
+                        .send(response.extensions().get::<Fields>().cloned())
+                        .unwrap();
+                    Ok(())
+                }
+            },
+        ))
+        .unwrap();
+        server.join().unwrap();
+        let queries = events.checked_of("adaptive", "query").unwrap();
+        assert_eq!(queries.len(), 1);
+        let q = &queries[0];
+        assert_eq!(q.u64("query_id"), Some(1));
+        assert_eq!(q.str("engine"), Some("duckduckgo"));
+        assert_eq!(q.str("search"), Some("Form search"));
+        assert_eq!(q.u64("start"), Some(20));
+        assert_eq!(q.str("key"), Some("form search (from 20)"));
+        assert_eq!(q.conn.id, Some(42));
+        assert_eq!(q.conn.peer.unwrap().ip().to_string(), "10.0.0.2");
+        (events, fields_rx.recv().unwrap())
+    }
+
+    fn query_failure(answer: Answer, why: &str) {
+        let (events, _) = query_outcome(answer);
+        let failed = events.checked_of("adaptive", "query_failed").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].u64("query_id"), Some(1));
+        assert_eq!(failed[0].str("why"), Some(why));
+        assert_eq!(failed[0].conn.id, Some(42));
+        if why != "abandoned" {
+            assert!(failed[0].u64("serve_ms").is_some());
+        }
+        if matches!(why, "backend_error" | "meta_error" | "error") {
+            assert!(!failed[0].str("error").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn query_success() {
+        let (events, fields) = query_outcome(Answer::Success);
+        assert!(
+            events
+                .checked_of("adaptive", "query_failed")
+                .unwrap()
+                .is_empty()
+        );
+        let fields = fields.unwrap();
+        assert_eq!(fields.get("query_id").and_then(J::as_u64), Some(1));
+        assert_eq!(
+            fields.get("listed").map(crate::events::to_json),
+            Some(serde_json::json!([{"rank":1,"url":"https://a.com/","title":"A"}]))
+        );
+        assert_eq!(
+            fields.get("reason").map(crate::events::to_json),
+            Some(serde_json::json!({"via":"direct"}))
+        );
+    }
+    #[test]
+    fn query_transport_failure() {
+        query_failure(Answer::Transport, "backend_error");
+    }
+    #[test]
+    fn query_metadata_failure() {
+        query_failure(Answer::Metadata, "meta_error");
+    }
+    #[test]
+    fn query_generation_failure() {
+        query_failure(Answer::Error, "error");
+    }
+    #[test]
+    fn query_budget_failure() {
+        query_failure(Answer::Budget, "budget");
+    }
+    #[test]
+    fn query_abandoned() {
+        query_failure(Answer::Abandoned, "abandoned");
+    }
 
     fn backend_response(meta: Option<&[u8]>) -> Response<Bytes> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

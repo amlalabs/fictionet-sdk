@@ -34,6 +34,8 @@
 
 pub mod backend;
 pub mod events;
+pub mod route;
+pub mod search;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;

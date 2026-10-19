@@ -1,0 +1,307 @@
+//! Request routing shared with the Python world.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+/// A supported search engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Engine {
+    /// Google search.
+    Google,
+    /// DuckDuckGo search.
+    #[serde(rename = "duckduckgo")]
+    DuckDuckGo,
+    /// Bing search.
+    Bing,
+}
+
+impl Engine {
+    /// Returns the backend's engine name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Bing => "bing",
+        }
+    }
+}
+
+/// The action requested from the world.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Route {
+    /// Redirect to another URL.
+    Redirect { location: String, status: u16 },
+    /// Show an engine's home page.
+    SearchHome { engine: Engine },
+    /// Show results for a search.
+    Search {
+        engine: Engine,
+        /// Search text with surrounding whitespace removed.
+        query: String,
+        /// Result offset, starting at zero.
+        start: u64,
+    },
+    /// Fetch a page or asset.
+    Page,
+}
+
+fn whitespace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// Normalizes search text and adds offsets of ten or more to the shared key.
+pub fn query_key(query: &str, start: u64) -> String {
+    let mut key = query
+        .to_lowercase()
+        .split(whitespace)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if start >= 10 {
+        key.push_str(&format!(" (from {start})"));
+    }
+    key
+}
+
+// Python accepts decimal Unicode digits and underscores between digits.
+fn digit(c: char) -> Option<u64> {
+    if c.is_ascii_digit() {
+        return Some(u64::from(c as u32 - '0' as u32));
+    }
+    static DECIMAL: OnceLock<regex::Regex> = OnceLock::new();
+    let decimal = DECIMAL.get_or_init(|| regex::Regex::new(r"^\p{Nd}$").unwrap());
+    if !decimal.is_match(c.encode_utf8(&mut [0; 4])) {
+        return None;
+    }
+    let mut first = c as u32;
+    while let Some(prev) = char::from_u32(first - 1) {
+        if !decimal.is_match(prev.encode_utf8(&mut [0; 4])) {
+            break;
+        }
+        first -= 1;
+    }
+    Some(u64::from((c as u32 - first) % 10))
+}
+
+/// Offsets beyond the representation saturate at the largest offset.
+fn number(text: &str) -> u64 {
+    // Python int excludes the four extra string whitespace characters.
+    let text = text.trim_matches(char::is_whitespace);
+    let text = text.strip_prefix('+').unwrap_or(text);
+    let mut value = 0u64;
+    let mut previous_digit = false;
+    for c in text.chars() {
+        if c == '_' && previous_digit {
+            previous_digit = false;
+            continue;
+        }
+        let Some(digit) = digit(c) else {
+            return 0;
+        };
+        value = value.saturating_mul(10).saturating_add(digit);
+        previous_digit = true;
+    }
+    if previous_digit { value } else { 0 }
+}
+
+/// Routes a host and request target like the Python backend.
+/// Pass form bytes only for a form URL encoded POST.
+pub fn route(host: &str, target: &str, form: Option<&[u8]>) -> Route {
+    let host = host.to_lowercase();
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let parse = |bytes: &[u8], blanks: bool| {
+        let mut args = BTreeMap::new();
+        for (name, value) in form_urlencoded::parse(bytes) {
+            if blanks || !value.is_empty() {
+                args.entry(name.into_owned())
+                    .or_insert_with(|| value.into_owned());
+            }
+        }
+        args
+    };
+    let mut args = parse(query.as_bytes(), true);
+    if let Some(body) = form {
+        args.extend(parse(String::from_utf8_lossy(body).as_bytes(), false));
+    }
+    let arg = |name: &str| args.get(name).map(String::as_str).unwrap_or("");
+    let q = arg("q").trim_matches(whitespace);
+    let search = |engine, start| Route::Search {
+        engine,
+        query: q.to_owned(),
+        start,
+    };
+    let redirect = |location, status| Route::Redirect { location, status };
+    if matches!(host.as_str(), "google.com" | "bing.com") {
+        return redirect(format!("https://www.{host}{target}"), 301);
+    }
+    if host == "www.google.com" {
+        if path == "/search" && !q.is_empty() {
+            return search(Engine::Google, number(arg("start")));
+        }
+        if path == "/url" && arg("q").starts_with("http") {
+            return redirect(arg("q").into(), 302);
+        }
+        if matches!(path, "/" | "/webhp") {
+            return Route::SearchHome {
+                engine: Engine::Google,
+            };
+        }
+    }
+    if matches!(
+        host.as_str(),
+        "html.duckduckgo.com" | "duckduckgo.com" | "lite.duckduckgo.com"
+    ) {
+        if path == "/l/" && arg("uddg").starts_with("http") {
+            return redirect(arg("uddg").into(), 302);
+        }
+        if matches!(path, "/html" | "/html/" | "/lite" | "/lite/" | "/") {
+            return if q.is_empty() {
+                Route::SearchHome {
+                    engine: Engine::DuckDuckGo,
+                }
+            } else {
+                search(Engine::DuckDuckGo, number(arg("s")))
+            };
+        }
+    }
+    if host == "www.bing.com" && path == "/search" && !q.is_empty() {
+        return search(Engine::Bing, number(arg("first")).saturating_sub(1));
+    }
+    Route::Page
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn routing_branches() {
+        for host in ["GOOGLE.COM", "bing.com"] {
+            assert_eq!(
+                route(host, "/search?q=x", None),
+                Route::Redirect {
+                    location: format!("https://www.{}/search?q=x", host.to_lowercase()),
+                    status: 301
+                }
+            );
+        }
+        for path in ["/", "/webhp"] {
+            assert_eq!(
+                route("www.google.com", path, None),
+                Route::SearchHome {
+                    engine: Engine::Google
+                }
+            );
+        }
+        for host in [
+            "html.duckduckgo.com",
+            "duckduckgo.com",
+            "lite.duckduckgo.com",
+        ] {
+            for path in ["/html", "/html/", "/lite", "/lite/", "/"] {
+                assert_eq!(
+                    route(host, path, None),
+                    Route::SearchHome {
+                        engine: Engine::DuckDuckGo
+                    }
+                );
+                assert_eq!(
+                    route(host, &format!("{path}?q=x&s=30"), None),
+                    Route::Search {
+                        engine: Engine::DuckDuckGo,
+                        query: "x".into(),
+                        start: 30
+                    }
+                );
+            }
+            assert_eq!(
+                route(host, "/l/?uddg=https%3A%2F%2Fa.com", None),
+                Route::Redirect {
+                    location: "https://a.com".into(),
+                    status: 302
+                }
+            );
+            assert_eq!(route(host, "/l/?uddg=ftp://a.com", None), Route::Page);
+        }
+        assert_eq!(
+            route("www.google.com", "/url?q=httpwhatever", None),
+            Route::Redirect {
+                location: "httpwhatever".into(),
+                status: 302
+            }
+        );
+        for (host, target) in [
+            ("www.google.com", "/url?q=+https://a.com"),
+            ("www.google.com", "/search?q="),
+            ("www.bing.com", "/"),
+            ("www.bing.com", "/search"),
+            ("else.com", "/search?q=x"),
+            ("else.com", "/x.css"),
+        ] {
+            assert_eq!(route(host, target, None), Route::Page);
+        }
+    }
+    #[test]
+    fn forms_offsets_and_normalization() {
+        assert_eq!(
+            route(
+                "html.duckduckgo.com",
+                "/html/?q=url&s=2",
+                Some(b"q=&q=+Form+&q=last&s=20")
+            ),
+            Route::Search {
+                engine: Engine::DuckDuckGo,
+                query: "Form".into(),
+                start: 20
+            }
+        );
+        assert_eq!(
+            route("www.google.com", "/search?q=&q=second", Some(b"q=")),
+            Route::Page
+        );
+        for (offset, want) in [
+            ("-4", 0),
+            ("bad", 0),
+            ("1__0", 0),
+            ("10_", 0),
+            ("%2B1_0", 10),
+            ("+20+", 20),
+            ("١٢", 12),
+            ("%1C10", 0),
+        ] {
+            assert_eq!(
+                route(
+                    "www.google.com",
+                    &format!("/search?q=%1CHi%1F&start={offset}"),
+                    None
+                ),
+                Route::Search {
+                    engine: Engine::Google,
+                    query: "Hi".into(),
+                    start: want
+                }
+            );
+        }
+        for (first, start) in [("", 0), ("0", 0), ("1", 0), ("11", 10), ("21", 20)] {
+            assert_eq!(
+                route(
+                    "www.bing.com",
+                    &format!("/search?q=a%3Fb&first={first}"),
+                    None
+                ),
+                Route::Search {
+                    engine: Engine::Bing,
+                    query: "a?b".into(),
+                    start
+                }
+            );
+        }
+        assert_eq!(
+            query_key("\u{1c}HI\u{1d}\u{2003}There\u{1f}", 9),
+            "hi there"
+        );
+        assert_eq!(query_key("Hi", 10), "hi (from 10)");
+    }
+}

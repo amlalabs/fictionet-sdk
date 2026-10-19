@@ -178,6 +178,7 @@ fn the_log_is_the_recorded_one() {
     let (backend, mut child) = start_backend(&args).unwrap();
     let store = PathBuf::from(backend["store"].as_str().unwrap());
     let fixed = fixed_addresses(&backend).unwrap();
+    let fixed_pages: Vec<String> = serde_json::from_value(backend["fixed"].clone()).unwrap();
 
     let addresses = Arc::new(Addresses::new(fixed, Some(&store.join("addresses.jsonl"))).unwrap());
     let start = world_start(backend["date"].as_str().unwrap()).unwrap();
@@ -188,6 +189,25 @@ fn the_log_is_the_recorded_one() {
         |s| s,
     ));
 
+    let searches = Arc::new(adaptive_web_world::search::Searches::from_hello(&backend));
+    let initial = searches.snapshot();
+    assert_eq!(initial.revision, 0);
+    assert_eq!(initial.seed.name, "halvard-cve");
+    assert_eq!(initial.seed.date, "2026-09-30");
+    assert!(!initial.seed.facts.is_empty());
+    assert!(
+        initial
+            .seed
+            .sites
+            .iter()
+            .any(|h| h == "www.halvardsystems.com")
+    );
+    assert_eq!(
+        initial.generator.kind,
+        adaptive_web_world::search::GeneratorKind::Stub
+    );
+    assert_eq!(initial.generator.model, "stub");
+    let projection = searches.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -200,9 +220,10 @@ fn the_log_is_the_recorded_one() {
             fictionet::RunOptions::new(fictionet::Seed::random())
                 .aggregate_events()
                 .event_history(Arc::new(fictionet::events::Memory::default()))
-                .observer(Arc::new(adaptive_web_world::events::LogObserver {
-                    log: log.clone(),
-                })),
+                .observer(Arc::new(fictionet::events::Fanout::new(vec![
+                    Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() }),
+                    searches.clone(),
+                ]))),
             move |fcx| async move {
                 let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();
@@ -247,11 +268,54 @@ fn the_log_is_the_recorded_one() {
                     .unwrap();
                 let (_, date, _) = request(&fcx, conn, "www.google.com", "/").await;
                 assert!(date.contains("30 Sep 2026"), "Date: {date}");
-                for (url, title) in &found {
+                for (rank, (url, title)) in found.iter().enumerate() {
                     let (host, path) = split_url(url);
                     let (status, first) = fetch(&fcx, &m, &host, &path).await;
                     assert_eq!(status, 200, "{url}");
+                    let snapshot = projection.snapshot();
+                    let row = snapshot.pages.iter().find(|p| p.url == *url).unwrap();
+                    assert_eq!(
+                        row.made,
+                        if fixed_pages.contains(url) {
+                            adaptive_web_world::search::Made::Fixed
+                        } else {
+                            adaptive_web_world::search::Made::Stubbed
+                        }
+                    );
+                    assert_eq!(
+                        row.reason,
+                        if fixed_pages.contains(url) {
+                            adaptive_web_world::search::Reason::Fixed
+                        } else {
+                            adaptive_web_world::search::Reason::Search {
+                                query: "halvard gateway vulnerability".into(),
+                                rank: rank as u64 + 1,
+                            }
+                        }
+                    );
+                    assert_eq!(row.latest, row.made);
+                    let first_made = row.made;
                     let (_, again) = fetch(&fcx, &m, &host, &path).await;
+                    let snapshot = projection.snapshot();
+                    let row = snapshot.pages.iter().find(|p| p.url == *url).unwrap();
+                    assert_eq!(row.made, first_made);
+                    assert_eq!(
+                        row.latest,
+                        if fixed_pages.contains(url) {
+                            adaptive_web_world::search::Made::Fixed
+                        } else {
+                            adaptive_web_world::search::Made::Stored
+                        }
+                    );
+                    assert_eq!(
+                        row.cache,
+                        if fixed_pages.contains(url) {
+                            adaptive_web_world::search::Cache::Fixed
+                        } else {
+                            adaptive_web_world::search::Cache::Generated
+                        }
+                    );
+                    assert_eq!(row.fetches, 2);
                     assert_eq!(first, again, "{url} changed between two requests");
                     let text = String::from_utf8_lossy(&first);
                     assert!(
@@ -281,6 +345,63 @@ fn the_log_is_the_recorded_one() {
                     .unwrap();
                 assert_eq!(get(&fcx, conn, "totally-new-site.io", "/").await.0, 301);
                 let _ = fcx.sleep(Duration::from_millis(500)).await;
+                let snapshot = projection.snapshot();
+                assert_eq!(snapshot.queries.len(), 2);
+                assert!(
+                    snapshot
+                        .queries
+                        .iter()
+                        .all(|q| q.outcome == adaptive_web_world::search::Outcome::Served)
+                );
+                assert_eq!(snapshot.queries[0].key, snapshot.queries[1].key);
+                assert_eq!(snapshot.queries[0].sandbox.as_deref(), Some("agent"));
+                assert_eq!(snapshot.queries[0].peer.as_deref(), Some("10.0.0.2"));
+                assert_eq!(snapshot.results.len(), 1);
+                assert_eq!(snapshot.results[0].listed.len(), 10);
+                assert_eq!(snapshot.results[0].query_id, snapshot.queries[0].id);
+                for (rank, listed) in snapshot.results[0].listed.iter().enumerate() {
+                    assert_eq!(listed.rank, rank as u64 + 1);
+                    assert_eq!(listed.url, found[rank].0);
+                    let rendered = listed
+                        .title
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;")
+                        .replace('\'', "&#x27;");
+                    assert_eq!(rendered, found[rank].1);
+                }
+                assert_eq!(
+                    snapshot
+                        .pages
+                        .iter()
+                        .find(|p| p.host == "totally-new-site.io")
+                        .unwrap()
+                        .reason,
+                    adaptive_web_world::search::Reason::Direct
+                );
+                assert!(snapshot.refused.iter().any(|r| r.name == "printer.local"));
+                assert!(snapshot.refused.iter().any(|r| r.name == "rw-desktop"));
+                for site in &snapshot.sites {
+                    let expected = if [
+                        "www.google.com",
+                        "google.com",
+                        "html.duckduckgo.com",
+                        "duckduckgo.com",
+                        "lite.duckduckgo.com",
+                        "www.bing.com",
+                        "bing.com",
+                    ]
+                    .contains(&site.host.as_str())
+                    {
+                        adaptive_web_world::search::SiteReason::SearchEngine
+                    } else if site.host == "www.halvardsystems.com" {
+                        adaptive_web_world::search::SiteReason::Seed
+                    } else {
+                        adaptive_web_world::search::SiteReason::Pool
+                    };
+                    assert_eq!(site.reason, expected, "{}", site.host);
+                }
                 Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
             },
         ));
