@@ -264,6 +264,15 @@ pub enum Made {
     /// The cache value was unrecognized.
     Unknown,
 }
+impl Made {
+    /// Whether a page was served.
+    fn supplied(self) -> bool {
+        matches!(
+            self,
+            Self::Stubbed | Self::WrittenLive | Self::Stored | Self::Fixed
+        )
+    }
+}
 fn made(cache: Cache, model: &str) -> Made {
     match cache {
         Cache::Generated | Cache::Prefetched if model == "stub" => Made::Stubbed,
@@ -275,7 +284,9 @@ fn made(cache: Cache, model: &str) -> Made {
         Cache::Unknown => Made::Unknown,
     }
 }
-/// A fetched page with its first metadata and latest delivery state.
+/// A fetched page: what its first served fetch said, and its latest delivery
+/// state. Until a fetch serves the page (a 404 with generation off, or a
+/// refusal over the budget), the first fetch stands in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page {
     pub url: String,
@@ -285,21 +296,22 @@ pub struct Page {
     pub fetches: u64,
     /// HTTP status of the latest fetch.
     pub status: u64,
-    /// Title from the first fetch.
+    /// Title from the first served fetch.
     pub title: String,
-    /// Model from the first fetch.
+    /// Model from the first served fetch.
     pub model: String,
-    /// Cache value from the first fetch.
+    /// Cache value from the first served fetch.
     pub cache: Cache,
-    /// Serving time of the first fetch, in milliseconds.
+    /// Serving time of the first served fetch, in milliseconds.
     pub serve_ms: Option<u64>,
-    /// Generation time of the first fetch, in milliseconds.
+    /// Generation time of the first served fetch, in milliseconds.
     pub gen_ms: Option<u64>,
     /// Serving time of the latest fetch, in milliseconds.
     pub latest_serve_ms: Option<u64>,
-    /// Creation reason from the first fetch.
+    /// Creation reason from the first served fetch.
     pub reason: Reason,
-    /// How the first fetch supplied the page. This does not change.
+    /// How the first served fetch supplied the page. Later fetches do not
+    /// change it.
     pub made: Made,
     /// How the latest fetch supplied the page.
     pub latest: Made,
@@ -599,8 +611,15 @@ impl Snapshot {
                         && let Some(fictionet::stdlib::protocols::json::Value::Array(items)) =
                             e.get("listed")
                     {
-                        if let Some(index) = self.results.iter().position(|r| r.key == q.key) {
-                            let list = self.results.remove(index);
+                        // A list made for this answer replaces one shown
+                        // while generation was off.
+                        let made = matches!(q.cache, Some(Cache::Generated | Cache::Prefetched));
+                        let shown = self
+                            .results
+                            .iter()
+                            .position(|r| r.key == q.key)
+                            .map(|index| self.results.remove(index));
+                        if let Some(list) = shown.filter(|_| !made) {
                             self.results.push(list);
                         } else {
                             let listed = items
@@ -648,37 +667,45 @@ impl Snapshot {
                     ));
                     let cache = parse(e, "cache").unwrap_or_default();
                     let made = made(cache, e.str("model").unwrap_or_default());
-                    if let Some(index) = self.pages.iter().position(|p| p.url == url) {
-                        let mut page = self.pages.remove(index);
+                    let mut reason: Reason = parse(e, "reason").unwrap_or_default();
+                    reason.bound();
+                    let fetched = Page {
+                        url,
+                        host: bounded(host_name),
+                        at_ms: ms,
+                        fetches: 1,
+                        status: e.u64("status").unwrap_or(0),
+                        title: text(e, "title"),
+                        model: text(e, "model"),
+                        cache,
+                        serve_ms: e.u64("serve_ms"),
+                        gen_ms: e.u64("gen_ms"),
+                        latest_serve_ms: e.u64("serve_ms"),
+                        reason,
+                        made,
+                        latest: made,
+                    };
+                    if let Some(index) = self.pages.iter().position(|p| p.url == fetched.url) {
+                        let old = self.pages.remove(index);
+                        let mut page = if !old.made.supplied() && made.supplied() {
+                            // The fetch that made the page says why and how.
+                            Page {
+                                at_ms: old.at_ms,
+                                fetches: old.fetches,
+                                ..fetched
+                            }
+                        } else {
+                            Page {
+                                status: fetched.status,
+                                latest_serve_ms: fetched.latest_serve_ms,
+                                latest: made,
+                                ..old
+                            }
+                        };
                         page.fetches = page.fetches.saturating_add(1);
-                        page.status = e.u64("status").unwrap_or(0);
-                        page.latest_serve_ms = e.u64("serve_ms");
-                        page.latest = made;
                         self.pages.push(page);
                     } else {
-                        let mut reason: Reason = parse(e, "reason").unwrap_or_default();
-                        reason.bound();
-                        recent(
-                            &mut self.pages,
-                            Page {
-                                url,
-                                host: bounded(host_name),
-                                at_ms: ms,
-                                fetches: 1,
-                                status: e.u64("status").unwrap_or(0),
-                                title: text(e, "title"),
-                                model: text(e, "model"),
-                                cache,
-                                serve_ms: e.u64("serve_ms"),
-                                gen_ms: e.u64("gen_ms"),
-                                latest_serve_ms: e.u64("serve_ms"),
-                                reason,
-                                made,
-                                latest: made,
-                            },
-                            MAX_PAGES,
-                            &mut self.omitted.pages,
-                        );
+                        recent(&mut self.pages, fetched, MAX_PAGES, &mut self.omitted.pages);
                     }
                     changed = true;
                 }

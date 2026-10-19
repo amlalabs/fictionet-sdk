@@ -149,6 +149,33 @@ fn query_lifecycle_and_shared_results() {
     assert!(!s.enabled(Interest::Topology(TopologyKind::Link)));
 }
 #[test]
+fn a_list_made_later_replaces_the_empty_one() {
+    let s = searches();
+    feed(&s, 1, query(1, "google", "a"));
+    let empty = answer(1, true)
+        .field("cache", "missing")
+        .field("results", 0u64)
+        .field("listed", to_field(&json!([])));
+    feed(&s, 2, empty);
+    let off = s.snapshot();
+    assert_eq!(off.queries[0].results, Some(0));
+    assert_eq!(off.results.len(), 1);
+    assert!(off.results[0].listed.is_empty());
+    assert_eq!(off.results[0].cache, Cache::Missing);
+
+    feed(&s, 3, query(2, "bing", "a"));
+    feed(&s, 4, answer(2, true));
+    let on = s.snapshot();
+    assert_eq!(on.results.len(), 1);
+    assert_eq!(on.results[0].query_id, 2);
+    assert_eq!(on.results[0].cache, Cache::Generated);
+    assert_eq!(on.results[0].listed[0].url, "https://a.com/");
+
+    feed(&s, 5, query(3, "google", "a"));
+    feed(&s, 6, answer(3, true).field("cache", "cached"));
+    assert_eq!(s.snapshot().results, on.results);
+}
+#[test]
 fn failed_queries() {
     let s = searches();
     for (id, why, expected) in [
@@ -258,6 +285,50 @@ fn page_creation_and_fetches() {
         (p.at_ms, p.fetches, p.serve_ms, p.latest_serve_ms, p.gen_ms),
         (10, 2, Some(20), Some(3), Some(15))
     );
+}
+#[test]
+fn a_page_made_after_a_404_takes_its_reason_from_the_fetch_that_made_it() {
+    let s = searches();
+    for (seq, cache) in [(1, "missing"), (2, "budget")] {
+        feed(
+            &s,
+            seq,
+            page("/later", cache, "", json!(null)).field("status", 404u64),
+        );
+    }
+    let missing = s.snapshot();
+    assert_eq!(missing.pages[0].made, Made::Missing);
+    assert_eq!(missing.pages[0].latest, Made::NotMade);
+    assert_eq!(missing.pages[0].reason, Reason::Unknown);
+
+    feed(
+        &s,
+        3,
+        page("/later", "generated", "stub", json!({"via":"direct"})).field("serve_ms", 5u64),
+    );
+    let made = s.snapshot();
+    let p = &made.pages[0];
+    assert_eq!((p.made, p.latest), (Made::Stubbed, Made::Stubbed));
+    assert_eq!(p.reason, Reason::Direct);
+    assert_eq!(p.cache, Cache::Generated);
+    assert_eq!((p.title.as_str(), p.model.as_str()), ("Title", "stub"));
+    assert_eq!((p.serve_ms, p.gen_ms), (Some(5), Some(15)));
+    assert_eq!((p.at_ms, p.fetches, p.status), (10, 3, 200));
+
+    feed(
+        &s,
+        4,
+        page(
+            "/later",
+            "cached",
+            "stub",
+            json!({"via":"link","from":"https://b.com/"}),
+        ),
+    );
+    let p = s.snapshot().pages[0].clone();
+    assert_eq!((p.made, p.latest), (Made::Stubbed, Made::Stored));
+    assert_eq!(p.reason, Reason::Direct);
+    assert_eq!(p.fetches, 4);
 }
 #[test]
 fn sites_refusals_and_eviction() {
