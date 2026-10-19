@@ -609,6 +609,9 @@ button.link:hover {
 }
 
 /* The packet drawer. */
+.packet-info-protocol {
+  display: none;
+}
 .drawer-head .grow {
   flex: 1;
 }
@@ -959,8 +962,17 @@ button.link:hover {
 .egress-groups .table-scroll { flex: none; }
 .egress-lookups summary { cursor: pointer; margin-bottom: 8px; }
 
-.egress-groups .data-table { width: max-content; min-width: 100%; }
-.egress-groups .data-table th, .egress-groups .data-table td { padding: 8px; }
-.egress-groups .data-table .numeric { white-space: nowrap; }
-.egress-destination { min-width: 192px; white-space: nowrap; }
-.egress-answer { min-width: 192px; max-width: 256px; }
+.egress-groups .data-table { width: 100%; table-layout: auto; }
+.egress-groups .data-table th, .egress-groups .data-table td { padding: 8px; overflow-wrap: anywhere; white-space: normal; }
+.egress-groups th:nth-child(1) { width: 34%; }
+.egress-groups th:nth-child(2) { width: 26%; }
+.egress-groups th:nth-child(3) { width: 25%; }
+.egress-groups th:nth-child(4) { width: 15%; }
+.egress-destination .pill { margin: 0 4px 4px 0; }
+.egress-name { display: inline; }
+.egress-summary > p:first-child { display: flex; gap: 8px; align-items: center; font-weight: 600; }
+.egress-summary svg { display: block; }
+.egress-origin { display: flex; justify-content: space-between; gap: 16px; margin: 8px 0; }
+.egress-address { overflow-wrap: normal; }
+.egress-address > span { white-space: nowrap; }
+.egress-origin .egress-muted { flex: none; }

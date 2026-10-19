@@ -119,6 +119,8 @@ test('events filters text, preserves loss and selects only explicit flow identit
   assert.equal(h.selection.get().connection, 12);
   assert.deepEqual(h.selection.get().links, []);
   const input = h.root.querySelector('input');
+  input.value = 'http.request'; input.dispatchEvent(new Event('input'));
+  assert.match(h.root.querySelector('.event-list').textContent, /hello/);
   input.value = 'missing'; input.dispatchEvent(new Event('input'));
   assert.doesNotMatch(h.root.querySelector('.event-list').textContent, /hello/);
   dispose();
@@ -141,6 +143,51 @@ test('incoming events preserve a label being typed', (t) => {
   assert.equal(h.root.querySelector('.label-action').querySelector('form').hidden, false);
   assert.equal(h.root.querySelector('.jump').hidden, false);
   assert.match(h.root.querySelector('.jump').textContent, /1 new/);
+  assert.equal(h.root.querySelector('.panel-tools').children[1], h.root.querySelector('.jump'));
+  dispose();
+  h.clean();
+});
+
+test('events offers new rows beside the filter and jumps to the newest event', (t) => {
+  const h = fixture(t);
+  const dispose = events(h.root, h.services);
+  const event = { seq: 1, at: 2, source: 'http', kind: 'request', summary: 'first', fields: {} };
+  h.watches[0].emit('snapshot', { ...h.snapshot, events: [event] });
+  const list = h.root.querySelector('.event-list'), jump = h.root.querySelector('.jump');
+  list.scrollTop = 80;
+  list.dispatchEvent(new Event('scroll'));
+  h.watches[0].emit('event', { ...event, seq: 2, summary: 'second' });
+  assert.equal(list.scrollTop, 80);
+  assert.doesNotMatch(list.textContent, /second/);
+  assert.equal(h.root.querySelector('.panel-tools').children[1], jump);
+  assert.equal(jump.textContent, '↑ 1 new');
+  assert.equal(jump.hidden, false);
+  jump.click();
+  assert.equal(list.scrollTop, 0);
+  assert.match(list.children[0].textContent, /second/);
+  assert.equal(jump.hidden, true);
+  dispose();
+  h.clean();
+});
+
+test('packets offers new rows before Pause and jumps to the latest packets', (t) => {
+  const h = fixture(t);
+  const dispose = packets(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e1', a: 's1', b: 't1' }], counters: { e1: [0, 0, 0, 0] } });
+  const list = h.root.querySelector('#plist'), jump = h.root.querySelector('#jump-packets');
+  const controls = h.root.querySelector('.drawer-head').children;
+  assert.equal(controls[controls.indexOf(jump) + 1], h.root.querySelector('#pause'));
+  list.scrollHeight = 1000;
+  list.clientHeight = 100;
+  list.scrollTop = 40;
+  h.streams[0].emit('packet', { seq: 1, t: 1, side: 0, len: 28, skipped: 0, evicted: 0, src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', info: 'Echo', tags: [] });
+  h.frame();
+  assert.equal(list.scrollTop, 40);
+  assert.equal(jump.hidden, false);
+  assert.equal(jump.textContent, '↓ 1 new');
+  jump.click();
+  assert.equal(list.scrollTop, 1000);
+  assert.equal(jump.hidden, true);
   dispose();
   h.clean();
 });
@@ -212,5 +259,56 @@ test('the map keeps its own selection instead of applying it back to itself', (t
   assert.match(h.root.querySelector('#side').textContent, /A link between/);
   assert.doesNotMatch(h.root.querySelector('#side').textContent, /This world/);
   dispose();
+  h.clean();
+});
+
+test('event and connection labels come from state and stay after the summary', (t) => {
+  const h = fixture(t);
+  let update, stopped = false;
+  h.services.labelState = '/api/state/labels';
+  h.services.labelCommand = '/api/command/labels';
+  h.services.state = (path, callback) => { assert.equal(path, '/api/state/labels'); update = callback; return () => { stopped = true; }; };
+  const dispose = events(h.root, h.services);
+  const event = { seq: 7, at: 1.2, source: 'dns', kind: 'query', summary: 'example.test', conn: 4, fields: {} };
+  h.watches[0].emit('snapshot', { ...h.snapshot, events: [event, { ...event, seq: 8, conn: 5 }] });
+  update({ value: [{ text: 'download', target: { kind: 'event', seq: 7 } }, { text: 'lookup', target: { kind: 'connection', id: 4 } }] });
+  const lines = h.root.querySelectorAll('.event-line');
+  assert.equal(lines[0].querySelector('.label-chip'), null);
+  assert.equal(lines[1].querySelector('.text').textContent, 'example.testdownloadlookup');
+  lines[1].click();
+  assert.ok(h.root.querySelector('.event-detail-head').querySelector('.label-action'));
+  h.selection.set({ event: null, connection: 5 });
+  assert.equal(h.root.querySelectorAll('.event-line').length, 1);
+  assert.equal(h.root.querySelector('.event-line').querySelector('.label-chip'), null);
+  update({ value: [] });
+  h.selection.set({ event: null, connection: null });
+  assert.equal(h.root.querySelectorAll('.event-line').length, 2);
+  assert.equal(h.root.querySelector('.label-chip'), null);
+  dispose();
+  assert.equal(stopped, true);
+  h.clean();
+});
+
+test('selected startup links acquire their host name without changing the selection', async (t) => {
+  const h = fixture(t);
+  h.selection.set({ links: ['e2'] });
+  const dispose = packets(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
+  await settle();
+  assert.deepEqual(h.selection.get().links, ['e2']);
+  assert.equal(h.streams.at(-1).links, 'e2');
+  assert.ok(h.streams.slice(0, -1).every((stream) => stream.closed));
+  let update;
+  h.services.transport.packet = async () => ({ ok: true, json: async () => ({ seq: 4, len: 28, t: 1, layers: [], buffers: [{ name: 'packet', hex: '4142' }] }) });
+  dispose();
+  const stop = packets(h.root, h.services, { onReady(view) { update = view; } });
+  h.watches.at(-1).emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
+  await settle();
+  h.streams.at(-1).emit('packet', { seq: 4, link: 'e2', side: 0, t: 1, tags: [], src: 'a', dst: 'b', proto: 'ICMP', len: 28, info: 'Echo request' });
+  update.flush();
+  h.root.querySelector('#prows').querySelector('tr').click();
+  await settle();
+  assert.match(h.root.querySelector('.packet-detail-head').textContent, /Packet 4 · alpha's link, packet 4/);
+  stop();
   h.clean();
 });

@@ -1,11 +1,12 @@
 // The packet drawer: its stream, queue, selection, detail and hex view.
 // The caller passes DOM helpers, graph links, labels and orientation, and a fit callback.
+import { labelChips, flowMatches } from './components/labels.mjs';
 import { listen } from './dom.mjs';
 
 export function createPackets({
   $, el, packetStream, packet, download, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000,
   placeholder = (many) => (many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.'),
-  pcapLabel = 'Capture for Wireshark', onSelect = () => {},
+  pcapLabel = 'Capture for Wireshark', onDetail = () => {},
 }) {
   // ---------------------------------------------------------------------------
   // The packet drawer
@@ -21,7 +22,7 @@ export function createPackets({
   // What the drawer watches: { links: [{ id, flip }], source, paused, held,
   // queue, lastTime, skipped, evicted, missed, rows }. A packet's side is turned to the drawn edge's:
   // 0 from its first end, 1 from its second.
-  let packets = null;
+  let packets = null, labels = [];
   let unread = 0;
   const jump = $('jump-packets');
   const clearUnread = () => { unread = 0; if (jump) jump.hidden = true; };
@@ -63,6 +64,8 @@ export function createPackets({
     const many = members.length > 1;
     const count = total > members.length ? `  (the busiest ${members.length} of ${total} links)` : many ? `  (${members.length} links)` : '';
     $('drawer-title').textContent = `${fromName} ↔ ${toName}${label ? `  ${label}` : ''}${count}`;
+    $('drawer-title').title = $('drawer-title').textContent;
+    $('drawer-title').setAttribute('aria-label', $('drawer-title').textContent);
     $('dir-a').textContent = `${fromName} → ${toName}`;
     $('dir-b').textContent = `${toName} → ${fromName}`;
     const list = members.map((m) => m.e.id).join(',');
@@ -72,6 +75,9 @@ export function createPackets({
     $('sampled').textContent = '';
     prows.replaceChildren();
     clearDetail(placeholder(many));
+    const hosts = new Map(members.filter((m) => m.host).map((m) => [m.e.id, m.host]));
+    const showHost = new Set(hosts.values()).size > 1;
+    drawer.classList.toggle('merged-hosts', showHost);
     const flips = new Map(members.map((m) => [m.e.id, m.flip]));
     const onStream = (...args) => streamCleanup.push(listen(source, ...args));
     const source = packetStream(list, () => {
@@ -86,7 +92,7 @@ export function createPackets({
       $('sampled').textContent = '';
       clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
     });
-    packets = { list, flips, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
+    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
     onStream('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
@@ -139,6 +145,7 @@ export function createPackets({
       if (JSON.parse(ev.data).reason === 'the world closed') addGap('The world closed.');
       else if (!packets.failed) addGap(many ? 'Every one of these links has closed.' : 'The link closed: both of its ends are gone.');
     });
+    fitColumns();
     fit();
   }
 
@@ -249,9 +256,17 @@ export function createPackets({
       else addPacket(p, frag);
     }
     prows.appendChild(frag);
+    fitColumns();
     trimRows();
     if (nearBottom) { plist.scrollTop = plist.scrollHeight; clearUnread(); }
     else if (jump) { unread += batch.length; jump.textContent = `↓ ${unread} new`; jump.hidden = false; }
+  }
+
+  function fitColumns() {
+    if (!packets || !drawer.classList.contains('packet-panel')) return;
+    for (const [field, width] of Object.entries(packets.widths)) {
+      drawer.style.setProperty(`--packet-${field}`, `calc(${width}ch + 16px)`);
+    }
   }
 
   function addPacket(p, parent) {
@@ -259,18 +274,31 @@ export function createPackets({
       packets.skipped += p.skipped;
       showCounts();
     }
+    for (const field of ['src', 'dst', 'proto']) packets.widths[field] = Math.max(packets.widths[field], p[field].length);
+    const time = p.t.toFixed(4);
+    packets.widths.time = Math.max(packets.widths.time, time.length);
     packets.rows++;
     // One link numbers its own packets; merged links are numbered here.
     const no = packets.many ? packets.rows : p.seq;
     const tr = el('tr', { class: `${p.side === 1 ? 'back' : ''} ${p.skipped > 0 || p.evicted > 0 ? 'after-gap' : ''} ${p.tags.join(' ')}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
-    const cells = [no, p.t.toFixed(4), '', p.src, p.dst, p.proto, p.len, p.info];
+    p.no = no;
+    const cells = [no, time, '', p.src, p.dst, p.proto, p.len, p.info];
     cells.forEach((c, i) => {
-      const td = el('td', { text: String(c) }, tr);
+      const td = el('td', i === 7 ? {} : { text: String(c) }, tr);
       if (i === 2) {
         td.className = 'dir';
         el('i', {}, td);
       }
       if (i === 5) td.className = 'proto';
+      td.classList.add(['c-no', 'c-time', 'c-dir', 'c-src', 'c-dst', 'c-proto', 'c-len', 'c-info'][i]);
+      if (i === 2 && packets.showHost) el('td', { class: 'c-host mono', text: packets.hosts.get(p.link) || '—' }, tr);
+      if (i === 7) {
+        const info = el('div', { class: 'packet-info' }, td);
+        const text = el('span', { class: 'packet-info-text' }, info);
+        el('span', { class: 'packet-info-protocol', text: `${p.proto} ` }, text);
+        text.append(String(c));
+        labelChips(info, labels.filter((label) => flowMatches(label.target, p)));
+      }
     });
     tr.title = p.skipped > 0 ? `${p.info}\n(${p.skipped} packet${p.skipped === 1 ? '' : 's'} before this one not copied)` : p.info;
     if (p.evicted > 0) tr.title += `\n(${p.evicted} captured ${p.evicted === 1 ? 'copy' : 'copies'} before this one evicted before decoding)`;
@@ -285,7 +313,6 @@ export function createPackets({
   async function showPacket(p, tr) {
     if (!packets) return;
     invalidateSelection();
-    onSelect(p);
     const generation = selection;
     const history = packets;
     const request = new AbortController();
@@ -305,7 +332,7 @@ export function createPackets({
       const d = await res.json();
       if (!current()) return;
       d.side = p.side;
-      renderDetail(d);
+      renderDetail(d, p);
     } catch {
       if (current()) clearDetail('Could not load this packet. Select it again to retry.');
     } finally {
@@ -313,8 +340,17 @@ export function createPackets({
     }
   }
 
+  function setLabels(value) {
+    labels = value;
+    for (const row of prows.querySelectorAll('tr')) {
+      const info = row.querySelector('.packet-info');
+      if (!info) continue;
+      for (const chip of info.querySelectorAll('.label-chip')) chip.remove();
+      labelChips(info, labels.filter((label) => flowMatches(label.target, { link: row.dataset.link, src: row.dataset.src, dst: row.dataset.dst })));
+    }
+  }
+
   function invalidateSelection() {
-    onSelect(null);
     drawer.classList.remove('has-packet');
     selection++;
     detailRequest?.abort();
@@ -334,13 +370,15 @@ export function createPackets({
     $('hex-dump').replaceChildren();
   }
 
-  function renderDetail(d) {
+  function renderDetail(d, p) {
     const tree = $('tree');
     tree.replaceChildren();
-    const head = el('details', { open: '' }, tree);
-    const sum = el('summary', {}, head);
-    el('b', { text: `Packet ${d.seq}` }, sum);
-    el('span', { text: `, ${d.len} bytes at ${d.t.toFixed(6)}s, ${d.side === 0 ? $('dir-a').textContent : $('dir-b').textContent}` }, sum);
+    const host = packets.hosts.get(p.link);
+    const head = el('div', { class: 'packet-detail-head' }, tree);
+    const title = el('div', {}, head);
+    el('b', { text: `Packet ${p.no}` }, title);
+    el('span', { text: host ? ` · ${host}'s link, packet ${p.seq} · ${d.len} bytes at ${d.t.toFixed(6)} s` : `, ${d.len} bytes at ${d.t.toFixed(6)}s, ${d.side === 0 ? $('dir-a').textContent : $('dir-b').textContent}` }, title);
+    onDetail(p, head);
     // The layers below the application start closed, as in Wireshark, unless
     // they are all there is.
     const low = /^(Internet Protocol|Transmission Control|User Datagram)/;
@@ -474,5 +512,5 @@ export function createPackets({
     cleanup.splice(0).forEach((remove) => remove());
     prows.replaceChildren();
     clearDetail('Select a packet to see its layers.');
-  }, open: openPackets, openLinks, close: closePackets, flush: flushPackets, setPair };
+  }, open: openPackets, openLinks, close: closePackets, flush: flushPackets, setPair, setLabels };
 }

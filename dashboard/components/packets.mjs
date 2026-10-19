@@ -13,11 +13,9 @@ export const APPROXIMATE = 'Approximate: matched by address and port, not by con
 export function mount(root, services, options = {}) {
   const { $, el } = scoped(root);
   if (!$('drawer')) structure(root, el);
-  const labels = el('div', {}, $('drawer'));
   const view = createPackets({
-    onSelect(packet) {
-      labels.replaceChildren();
-      if (packet) labelAction(labels, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
+    onDetail(packet, header) {
+      labelAction(header, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
     },
     $, el, ...services.transport, fmtCount, fit() {}, ...options,
     placeholder: options.placeholder || (() => 'Select a packet to see its layers.'),
@@ -38,13 +36,15 @@ export function mount(root, services, options = {}) {
   animation = requestAnimationFrame(frame);
   const cleanup = [];
   let watch, request, generation = 0, current = '';
-  let nodes = new Map(), edges = new Map();
+  let nodes = new Map(), edges = new Map(), owners = new Map();
   let selected = services.selection?.get() || { host: null, links: [] };
 
   function empty(text) {
     view.close();
     $('drawer').hidden = false;
     $('drawer-title').textContent = 'Packets';
+    $('drawer-title').title = 'Packets';
+    $('drawer-title').setAttribute('aria-label', 'Packets');
     $('prows').replaceChildren();
     el('td', { colspan: 8, text }, el('tr', { class: 'gap' }, $('prows')));
   }
@@ -52,21 +52,25 @@ export function mount(root, services, options = {}) {
     const members = links.map((id) => edges.get(id) || { id, c: [0, 0, 0, 0] })
       .sort((a, b) => (b.c?.[0] || 0) + (b.c?.[2] || 0) - (a.c?.[0] || 0) - (a.c?.[2] || 0));
     const kept = members.slice(0, 32);
-    const key = `${label}:${kept.map((edge) => edge.id).join(',')}`;
+    const membersWithHosts = kept.map((e) => {
+      const node = [nodes.get(e.a), nodes.get(e.b)].find((node) => node?.kind === 'sandbox');
+      return { e, flip: nodes.get(e.b)?.kind === 'sandbox', host: services.hosts?.find((host) => host.sandbox === node?.name)?.name || node?.name || owners.get(e.id) };
+    });
+    const key = `${label}:${membersWithHosts.map(({ e, host, flip }) => `${e.id}:${host}:${flip}`).join(',')}`;
     if (current === key) return;
     current = key;
     if (!kept.length) {
       empty(label === 'All hosts' ? 'No packets yet. They appear here as the world sends them.' : `${label} has no links yet. Its packets appear here once its network is up.`);
       return;
     }
-    view.openLinks(label, 'network', kept.map((e) => ({ e, flip: nodes.get(e.b)?.kind === 'sandbox' })), '', members.length);
+    view.openLinks(label, 'network', membersWithHosts, '', members.length);
   }
   async function scope() {
     const attempt = ++generation;
     request?.abort();
-    if (selected.links.length) return show(selected.links, selected.host || 'Selected links');
+    if (selected.links.length) show(selected.links, selected.host || 'Selected links');
     const live = [...edges.values()].filter((e) => nodes.get(e.a)?.kind === 'sandbox' || nodes.get(e.b)?.kind === 'sandbox').map((e) => e.id);
-    if (!selected.host) {
+    if (!selected.host && !selected.links.length) {
       show(live, 'All hosts');
     }
     const hosts = selected.host ? [selected.host] : (services.hosts || []).map((host) => host.name);
@@ -74,7 +78,10 @@ export function mount(root, services, options = {}) {
     request = new AbortController();
     try {
       const values = await Promise.all(hosts.map((host) => services.transport.get(`/api/host/${host}/links`, {}, request.signal)));
-      if (attempt === generation) show([...new Set([...(selected.host ? [] : live), ...values.flatMap((value) => value.links)])], selected.host || 'All hosts');
+      if (attempt !== generation) return;
+      values.forEach((value, index) => value.links.forEach((link) => owners.set(link, hosts[index])));
+      if (selected.links.length) show(selected.links, selected.host || 'Selected links');
+      else show([...new Set([...(selected.host ? [] : live), ...values.flatMap((value) => value.links)])], selected.host || 'All hosts');
     } catch (error) {
       if (attempt !== generation || request.signal.aborted) return;
       current = '';
@@ -82,6 +89,7 @@ export function mount(root, services, options = {}) {
     }
   }
 
+  if (services.labelState) cleanup.push(services.state(services.labelState, (value) => view.setLabels(value.value || [])));
   if (!options.drawer) {
     $('close-drawer').hidden = true;
     $('grip').hidden = true;
@@ -132,6 +140,7 @@ function structure(root, el) {
   const head = el('div', { class: 'drawer-head' }, drawer);
   el('h2', { id: 'drawer-title', text: 'Packets' }, head);
   el('input', { id: 'pfilter', type: 'search', placeholder: 'Filter packets', 'aria-label': 'Filter packets', autocomplete: 'off' }, head);
+  el('button', { id: 'jump-packets', class: 'jump', type: 'button', hidden: '' }, head);
   el('button', { id: 'pause', class: 'button', type: 'button', text: 'Pause' }, head);
   const pcap = el('button', { id: 'pcap', class: 'button', type: 'button', title: 'Download these packets as pcapng, for Wireshark' }, head);
   const svg = el('svg:svg', { viewBox: '0 0 16 16', 'aria-hidden': 'true' }, pcap);
@@ -149,14 +158,13 @@ function structure(root, el) {
   const scroller = el('div', { id: 'plist', class: 'plist' }, list);
   const table = el('table', {}, scroller);
   const cols = el('colgroup', {}, table);
-  for (const name of ['c-no', 'c-time', 'c-dir', 'c-addr', 'c-addr', 'c-proto', 'c-len', 'c-info']) el('col', { class: name }, cols);
+  for (const name of ['c-no', 'c-time', 'c-dir', 'c-host', 'c-src', 'c-dst', 'c-proto', 'c-len', 'c-info']) el('col', { class: name }, cols);
   const row = el('tr', {}, el('thead', {}, table));
-  for (const text of ['No.', 'Time', '', 'Source', 'Destination', 'Protocol', 'Length', 'Info']) {
-    const th = el('th', { text, scope: 'col' }, row);
+  for (const [index, text] of ['No.', 'Time', '', 'Host', 'Source', 'Destination', 'Protocol', 'Length', 'Info'].entries()) {
+    const th = el('th', { text, scope: 'col', class: ['c-no', 'c-time', 'c-dir', 'c-host', 'c-src', 'c-dst', 'c-proto', 'c-len', 'c-info'][index] }, row);
     if (!text) th.setAttribute('aria-label', 'Direction');
   }
   el('tbody', { id: 'prows' }, table);
-  el('button', { id: 'jump-packets', class: 'jump', type: 'button', hidden: '' }, list);
   el('p', { id: 'plist-empty', class: 'list-empty', role: 'status', hidden: '', text: 'No packets yet. They appear here as the world sends them.' }, list);
   const detail = el('div', { class: 'detail' }, body);
   el('div', { id: 'tree', class: 'tree' }, detail);

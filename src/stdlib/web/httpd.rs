@@ -258,8 +258,13 @@ impl RequestFields {
     /// server is not observing this request. Build fields only when interested.
     pub fn record<B>(request: &http::Request<B>, fields: Fields) {
         if let Some(store) = request.extensions().get::<Self>() {
-            store.extend(fields, false);
+            store.record_fields(fields);
         }
+    }
+
+    /// Records handler fields directly on this request's store.
+    pub fn record_fields(&self, fields: Fields) {
+        self.extend(fields, false);
     }
 
     fn extend(&self, mut fields: Fields, service: bool) {

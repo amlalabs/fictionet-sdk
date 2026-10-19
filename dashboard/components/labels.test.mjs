@@ -33,9 +33,9 @@ test('typed labels, removal and scoped downloads use real authenticated transpor
   await settle();
   source.enqueue(new TextEncoder().encode(`event: snapshot\ndata: ${JSON.stringify({ topic: 'labels', revision: 1, value: [{ id: 3, text: '<download>', target: { kind: 'event', seq: 7 }, at: 2 }] })}\n\n`));
   await settle();
-  assert.match(root.textContent, /<download>Event 72 sRemove/);
+  assert.match(root.textContent, /<download>Event 72.0s/);
   assert.equal(root.querySelector('download'), null);
-  const remove = root.querySelectorAll('button').find((button) => button.textContent === 'Remove');
+  const remove = root.querySelectorAll('button').find((button) => button.getAttribute('aria-label') === 'Remove label <download>');
   remove.click(); await settle();
   assert.deepEqual(JSON.parse(requests.at(-1).options.body).command, { action: 'remove', id: 3 });
   for (const target of [{ kind: 'event', seq: 7 }, { kind: 'connection', id: 2, local: '192.0.2.1:80', peer: '10.0.2.15:40000' }, { kind: 'flow', link: 'e1', a: '192.0.2.1:80', b: '10.0.2.15:40000' }]) {
@@ -62,4 +62,69 @@ test('typed labels, removal and scoped downloads use real authenticated transpor
   assert.equal(downloads.length, 2);
   assert.equal(downloads[0].name, 'fictionet-events.jsonl');
   assert.ok(downloads.every((item) => item.href.startsWith('blob:') && !item.href.includes('secret')));
+});
+
+test('label editors cancel with Escape or Cancel and close after saving', async () => {
+  const document = createDocument(), root = document.createElement('section');
+  const commands = [];
+  labelAction(root, { labelCommand: '/api/command/labels', transport: { post: async (_, value) => { commands.push(value.command); return { status: 'applied' }; } } }, { kind: 'event', seq: 7 });
+  const open = root.querySelector('button'), form = root.querySelector('form');
+  open.click();
+  assert.equal(open.hidden, true);
+  assert.equal(form.hidden, false);
+  const escape = new Event('keydown', { cancelable: true });
+  Object.defineProperty(escape, 'key', { value: 'Escape' });
+  form.dispatchEvent(escape);
+  assert.equal(form.hidden, true);
+  assert.equal(open.hidden, false);
+  assert.equal(commands.length, 0);
+  open.click();
+  root.querySelectorAll('button').find((button) => button.textContent === 'Cancel').click();
+  assert.equal(form.hidden, true);
+  open.click();
+  root.querySelector('input').value = 'download';
+  form.dispatchEvent(new Event('submit', { cancelable: true }));
+  await settle();
+  assert.deepEqual(commands, [{ action: 'add', target: { kind: 'event', seq: 7 }, text: 'download' }]);
+  assert.equal(form.hidden, true);
+  assert.equal(open.hidden, false);
+});
+
+test('label targets describe and select retained events, connections and host links', () => {
+  const document = createDocument(), root = document.createElement('section');
+  const watch = new EventTarget(); watch.close = () => {};
+  const services = createServices({});
+  const opened = [], pairs = [];
+  services.watch = () => watch;
+  services.showPanel = (kind) => opened.push(kind);
+  services.showPackets = (pair) => pairs.push(pair);
+  services.hosts = [{ name: 'beta', sandbox: 'west' }];
+  services.state = (_, callback) => {
+    callback({ value: [
+      { id: 1, text: 'lookup', target: { kind: 'event', seq: 7 }, at: 1.2 },
+      { id: 2, text: 'flow', target: { kind: 'flow', link: 'e2', a: '10.0.0.2', b: '10.0.0.3' }, at: 1.3 },
+      { id: 3, text: 'connection', target: { kind: 'connection', id: 4, local: '10.0.0.2:53', peer: '10.0.0.3:99' }, at: 1.4 },
+    ] }); return () => {};
+  };
+  const dispose = mount(root, services, { state: '/api/state/labels' });
+  const event = { seq: 7, source: 'dns', kind: 'query', summary: 'example.test', conn: 4 };
+  const snapshot = new Event('snapshot');
+  snapshot.data = JSON.stringify({ events: [event], nodes: [{ id: 'n2', kind: 'sandbox', name: 'west' }], edges: [{ id: 'e2', a: 'n2', b: 'n3' }] });
+  watch.dispatchEvent(snapshot);
+  const targets = root.querySelectorAll('.label-target');
+  assert.deepEqual(targets.map((button) => button.textContent), ['Event 7 · dns.query example.test', "beta's link · 10.0.0.2 ↔ 10.0.0.3", '10.0.0.2:53 ↔ 10.0.0.3:99']);
+  targets[0].click();
+  assert.deepEqual(services.selection.get().event, event);
+  assert.deepEqual(opened, ['events']);
+  targets[1].click();
+  assert.deepEqual(services.selection.get().links, ['e2']);
+  assert.deepEqual(pairs, [{ local: '10.0.0.2', peer: '10.0.0.3' }]);
+  targets[2].click();
+  assert.equal(services.selection.get().connection, 4);
+  assert.equal(services.selection.get().event, null);
+  assert.deepEqual(opened, ['events', 'events']);
+  assert.equal(root.querySelectorAll('td.numeric')[0].textContent, '1.2s');
+  assert.equal(root.querySelector('.label-remove').getAttribute('aria-label'), 'Remove label lookup');
+  assert.ok(root.querySelector('.label-remove').querySelector('svg'));
+  dispose(); services.dispose();
 });

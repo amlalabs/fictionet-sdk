@@ -1,18 +1,29 @@
 // Guest destinations projected by the observer, including startup traffic.
-import { scoped } from '../dom.mjs';
-import { cell, render } from './table.mjs';
+import { scoped, icon } from '../dom.mjs';
+import { render } from './table.mjs';
 
 const groups = [
   ['forwarded', 'Forwarded to the real internet'], ['served', 'Served by the world'],
   ['refused', 'Refused'], ['no_route', 'No route'],
 ];
+const plural = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 const attempts = (row) => (row.requests || 0) + (row.packets || 0) || row.connections || 0;
 
 export function mount(root, services) {
   const { el } = scoped(root), document = root.ownerDocument;
+  function renderOrigin(parent, value) {
+    const parts = value.match(/^(https?:\/\/)(.*)$/);
+    if (!parts) { parent.append(value); return; }
+    const address = el('span', { class: 'egress-address' }, parent);
+    el('span', { text: parts[1] }, address);
+    el('wbr', {}, address);
+    el('span', { text: parts[2] }, address);
+  }
   const summary = el('div', { class: 'egress-summary', role: 'status' }, root);
   const status = el('p', { text: 'Loading destinations…' }, summary);
+  const forwarded = el('div', { class: 'egress-origins' }, summary);
   const stayed = el('p', {}, summary);
+  const counts = el('p', { class: 'egress-counts' }, summary);
   const pending = el('p', { class: 'egress-muted' }, summary);
   const body = el('div', { class: 'egress-groups' }, root);
   const details = el('details', { class: 'egress-lookups' }, root);
@@ -20,7 +31,7 @@ export function mount(root, services) {
   const lookups = el('div', { class: 'table-scroll' }, details);
   const controller = new AbortController();
   const schedule = services.setTimeout || setTimeout, cancel = services.clearTimeout || clearTimeout;
-  let timer, snapshot, selected, failed = false;
+  let timer, snapshot, containment, containmentFailed = false, selected, failed = false;
   function draw() {
     if (!snapshot) return;
     const sandbox = services.hosts?.find((host) => host.name === selected)?.sandbox || selected;
@@ -29,22 +40,32 @@ export function mount(root, services) {
     const origins = new Map();
     for (const row of rows.filter((row) => row.outcome === 'forwarded')) origins.set(row.by, (origins.get(row.by) || 0) + row.requests);
     status.replaceChildren();
+    const escaped = containment?.value?.probes?.some((probe) => (!sandbox || probe.guest === sandbox) && probe.outcome === 'not_contained');
     const incomplete = snapshot.dropped || snapshot.lost;
-    el('span', { class: incomplete ? 'egress-warning' : 'egress-complete', text: incomplete ? '△ ' : '✓ ' }, status);
-    if (incomplete) status.append(`This list may be incomplete: ${snapshot.dropped} attempts not kept, ${snapshot.lost} observations lost.`);
-    else if (!origins.size) status.append('Nothing left the box.');
-    else {
-      status.append('Left the box: ');
-      [...origins].forEach(([origin, count], i) => {
-        if (i) status.append(', ');
-        el('span', { class: 'mono', text: origin }, status);
-        status.append(` (${count} requests)`);
-      });
+    const unchecked = services.containmentState && (!containment || containmentFailed || containment.status?.too_large);
+    const mark = el('span', { class: incomplete || escaped || unchecked ? 'egress-warning' : 'egress-complete' }, status);
+    icon(mark, incomplete || escaped || unchecked ? 'warning' : 'check');
+    status.append('Left the box');
+    forwarded.replaceChildren();
+    for (const [origin, count] of origins) {
+      const line = el('div', { class: 'egress-origin' }, forwarded);
+      const address = el('span', { class: 'mono' }, line);
+      renderOrigin(address, origin);
+      el('span', { class: 'egress-muted', text: plural(count, 'request') }, line);
     }
+    if (!origins.size) el('p', { text: 'No forwarded origins observed.' }, forwarded);
     const count = (outcome) => rows.filter((row) => row.outcome === outcome).reduce((n, row) => n + attempts(row), 0);
-    stayed.textContent = `${incomplete ? 'Observed in the world' : 'Everything else stayed in the world'}: ${count('served')} served, ${count('refused')} refused, ${count('no_route')} with no route.`;
+    stayed.replaceChildren();
+    if (escaped) {
+      stayed.append('The containment check found a way out that the world does not record. ');
+      const button = el('button', { class: 'text-button', type: 'button', text: 'Open Containment' }, stayed);
+      button.addEventListener('click', () => services.showPanel?.('containment'));
+      stayed.append(' ');
+    } else if (unchecked) stayed.append('Containment results are unavailable or incomplete. ');
+    if (incomplete) stayed.append(`This list may be incomplete: ${snapshot.dropped} attempts not kept, ${snapshot.lost} observations lost. `);
+    counts.textContent = `${incomplete || escaped || unchecked ? 'Observed in the world' : 'Everything else stayed in the world'}: ${count('served')} served, ${count('refused')} refused, ${count('no_route')} with no route.`;
     const open = (snapshot.pending || []).filter(visible).length;
-    pending.textContent = open ? `${open} connections open, outcome not known yet` : '';
+    pending.textContent = open ? `${plural(open, 'connection')} open, outcome not known yet` : '';
     const scroll = root.scrollTop;
     body.replaceChildren();
     for (const [outcome, title] of groups) {
@@ -53,20 +74,21 @@ export function mount(root, services) {
       el('h3', { text: `${title} (${count(outcome)})` }, body);
       const table = el('table', { class: 'data-table' }, el('div', { class: 'table-scroll' }, body));
       const head = el('tr', {}, el('thead', {}, table));
-      const columns = [...(!sandbox ? ['Guest'] : []), 'Destination', 'Transport', 'Answered by', 'Connections', 'Requests', 'Packets', 'First', 'Last'];
-      columns.forEach((label) => el('th', { scope: 'col', text: label, class: ['Connections', 'Requests', 'Packets', 'First', 'Last'].includes(label) ? 'numeric' : '' }, head));
+      const columns = ['Destination', 'Answered by', 'Attempts', 'When'];
+      columns.forEach((label) => el('th', { scope: 'col', text: label }, head));
       const tbody = el('tbody', {}, table);
       for (const row of group) {
         const tr = el('tr', {}, tbody);
-        if (!sandbox) el('td', { text: row.sandbox }, tr);
         const destination = el('td', { class: 'egress-destination' }, tr);
+        if (!sandbox) el('span', { class: 'pill', text: services.hosts?.find((host) => host.sandbox === row.sandbox)?.name || row.sandbox }, destination);
         if (row.name) el('div', { class: 'egress-name', text: row.name }, destination);
-        el('div', { class: 'mono egress-muted', text: row.address }, destination);
-        el('td', { text: row.transport }, tr);
-        const by = el('td', { class: 'egress-answer', text: row.by === 'host package cache' ? 'the host package cache' : row.by }, tr);
+        el('div', { class: 'mono egress-muted', text: `${row.address} ${row.transport}` }, destination);
+        const by = el('td', { class: 'egress-answer' }, tr);
+        renderOrigin(by, row.by === 'host package cache' ? 'the host package cache' : row.by);
         if (row.unanswered) el('div', { class: 'egress-muted', text: `${row.unanswered} ended without an answer` }, by);
-        for (const key of ['connections', 'requests', 'packets']) el('td', { class: 'numeric', text: row[key] ? cell(row[key], 'number') : '—' }, tr);
-        for (const key of ['first', 'last']) el('td', { class: 'numeric', text: `${Number(row[key].toFixed(3))} s` }, tr);
+        el('td', { text: [['requests', 'request'], ['connections', 'connection'], ['packets', 'packet']].filter(([key]) => row[key]).map(([key, noun]) => plural(row[key], noun)).join(' · ') || '—' }, tr);
+        const time = (value) => `${Number(value.toFixed(3))} s`;
+        el('td', { text: time(row.first) === time(row.last) ? time(row.first) : `${time(row.first)} – ${time(row.last)}` }, tr);
       }
     }
     const queries = snapshot.lookups.filter(visible);
@@ -101,7 +123,8 @@ export function mount(root, services) {
       if (!controller.signal.aborted) queue();
     }
   }
+  const stopContainment = services.containmentState ? services.state(services.containmentState, (value) => { containment = value; containmentFailed = false; draw(); }, () => { containmentFailed = true; draw(); }) : () => {};
   document.addEventListener('visibilitychange', queue);
   void read();
-  return () => { controller.abort(); cancel(timer); document.removeEventListener('visibilitychange', queue); stop(); root.replaceChildren(); };
+  return () => { controller.abort(); cancel(timer); document.removeEventListener('visibilitychange', queue); stop(); stopContainment(); root.replaceChildren(); };
 }

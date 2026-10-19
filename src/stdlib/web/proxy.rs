@@ -184,21 +184,15 @@ async fn dispatch(
             .unwrap_or("/"),
     )?;
     parts.version = http::Version::HTTP_11;
-    let fields = parts.extensions.get::<httpd::RequestFields>().cloned();
-    parts.extensions = http::Extensions::new();
+    if let Some(fields) = parts.extensions.get::<httpd::RequestFields>() {
+        fields.record_fields(fictionet::events::Fields::new().with("forwarded", origin));
+    }
+    parts.extensions.clear();
     strip_hop_by_hop(&mut parts.headers);
     if let Host::Replace(authority) = host {
         parts.headers.insert(http::header::HOST, authority.parse()?);
     }
-    let mut request = Request::from_parts(parts, body);
-    if let Some(fields) = fields {
-        request.extensions_mut().insert(fields);
-        httpd::RequestFields::record(
-            &request,
-            fictionet::events::Fields::new().with("forwarded", origin),
-        );
-        request.extensions_mut().clear();
-    }
+    let request = Request::from_parts(parts, body);
     let mut response = client.request(request).await.map_err(|error| {
         httpd::BadGateway(match error_context {
             Some(context) => format!("{context}: {error}"),

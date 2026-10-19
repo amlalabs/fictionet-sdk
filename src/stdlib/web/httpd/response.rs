@@ -446,6 +446,25 @@ mod tests {
     use crate::stdlib::web::httpd::RequestFields;
 
     #[test]
+    fn request_fields_handle_records_after_extensions_are_cleared() {
+        let mut request = Request::new(());
+        let conn = ConnInfo::default();
+        let mut tracker = Tracker::observing(true, &request, &conn, None);
+        tracker.start(&mut request, &conn, Instant::ZERO);
+        let fields = request.extensions().get::<RequestFields>().unwrap().clone();
+        request.extensions_mut().clear();
+        fields.record_fields(
+            Fields::new()
+                .with("forwarded", "https://example.test")
+                .with("answer", "invented"),
+        );
+        let event = tracker.finish(|| None, None, 0, false).unwrap();
+        assert_eq!(event.str("forwarded"), Some("https://example.test"));
+        assert_ne!(event.str("answer"), Some("invented"));
+        assert!(request.extensions().is_empty());
+    }
+
+    #[test]
     fn request_fields_survive_every_finish_and_keep_field_precedence() {
         struct Classifier;
         impl BodyClassifier for Classifier {

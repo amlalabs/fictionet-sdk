@@ -25,3 +25,5 @@ export function fmtRate(n) {
   if (n < 10) return n.toFixed(1);
   return fmtCount(n);
 }
+
+export const fmtRunTime = (seconds) => `${seconds.toFixed(1)}s`;

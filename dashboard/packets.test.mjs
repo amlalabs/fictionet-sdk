@@ -427,7 +427,7 @@ test('reconnect clears detail and ignores responses from the previous history', 
     if (stage === 'json') resolve(detail(1));
     else request.resolve({ ok: stage !== 'missing', json: async () => detail(1) });
     await settle();
-    assert.match($('tree').textContent, /Packet 100/);
+    assert.equal($('tree').textContent, 'Packet 1, 40 bytes at 100.000000s, From → To');
   }
 });
 
@@ -496,4 +496,29 @@ test('an address pair shows its packets in both directions and nothing else', (t
   $('pfilter').dispatchEvent(new Event('input'));
   h.view.setPair(null);
   assert.deepEqual(h.rows().map((row) => row.hidden), [false, false, false]);
+});
+
+test('merged host rows keep display numbers and link identities in detail and labels', async (t) => {
+  const h = setup(t);
+  h.view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'b' }, host: 'beta' }]);
+  const source = h.sources.at(-1);
+  for (const [link, seq, side] of [['a', 7, 0], ['b', 2, 1]]) source.emit('packet', { link, seq, side, t: .000747, tags: [], src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', len: 28, info: 'Echo request' });
+  h.flush();
+  assert.equal($('drawer').classList.contains('merged-hosts'), true);
+  assert.deepEqual(h.rows().map((row) => row.querySelector('.c-host').textContent), ['alpha', 'beta']);
+  assert.equal(h.rows()[1].classList.contains('back'), true);
+  h.rows()[1].click();
+  assert.match(h.requests.at(-1).url, /link=b&seq=2/);
+  h.requests.at(-1).resolve({ ok: true, json: async () => ({ ...detail(2), len: 28, t: .000747 }) });
+  await settle();
+  assert.equal($('tree').querySelector('.packet-detail-head').textContent, "Packet 2 · beta's link, packet 2 · 28 bytes at 0.000747 s");
+  assert.doesNotMatch($('tree').textContent, /network → All hosts/);
+  h.view.setLabels([{ text: '<download>', target: { kind: 'flow', link: 'b', a: '10.0.0.3', b: '10.0.0.2' } }]);
+  assert.equal(h.rows()[0].querySelector('.label-chip'), null);
+  assert.equal(h.rows()[1].querySelector('.c-info').querySelector('.label-chip').textContent, '<download>');
+  assert.equal(h.rows()[1].querySelector('download'), null);
+  h.view.setLabels([]);
+  assert.equal(h.rows()[1].querySelector('.label-chip'), null);
+  h.view.openLinks('alpha', 'network', [{ e: { id: 'a' }, host: 'alpha' }, { e: { id: 'c' }, host: 'alpha' }]);
+  assert.equal($('drawer').classList.contains('merged-hosts'), false);
 });

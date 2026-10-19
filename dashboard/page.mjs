@@ -211,6 +211,8 @@ export async function mount(root, transport, theme) {
   }));
 
   // The inspector.
+  services.labelState = page.panels.find((panel) => panel.kind === 'labels')?.state;
+  services.containmentState = page.panels.find((panel) => panel.kind === 'containment')?.state;
   services.labelCommand = page.panels.find((panel) => panel.kind === 'labels')?.command;
   const panels = page.panels.filter((panel) => panel.area === 'inspector');
   panels.sort((a, b) => (ORDER.indexOf(a.kind) < 0 ? ORDER.length : ORDER.indexOf(a.kind)) - (ORDER.indexOf(b.kind) < 0 ? ORDER.length : ORDER.indexOf(b.kind)));
@@ -295,6 +297,7 @@ export async function mount(root, transport, theme) {
     cleanup.push(() => observer.disconnect());
   }
   const tabOf = (kind) => tabs.find((tab) => tab.options.kind === kind);
+  services.showPanel = (kind) => { const item = tabOf(kind); if (item) activate(item); };
   services.openPackets = (id) => {
     services.selection.set({ links: [id] });
     const item = tabOf('packets'); if (item) activate(item);

@@ -1,7 +1,8 @@
-import { labelAction } from './labels.mjs';
+import { labelAction, labelChips } from './labels.mjs';
 // mount(root, services, options) returns dispose. Services provide the shared
 // watch, selection and host names.
 import { scoped, listen } from '../dom.mjs';
+import { fmtRunTime } from '../format.mjs';
 import { APPROXIMATE } from './packets.mjs';
 
 // The CLI dashboard's side panel list of recent events.
@@ -15,7 +16,7 @@ export function renderEvents(parent, events, { el, state, drawnSource, tone, foc
       const li = el('li', { class: 'event-row' }, ul);
       if (isMoment(n)) li.classList.add('moment');
       if (newRows.has(n.seq)) li.classList.add('new-row');
-      el('time', { text: `${n.at.toFixed(1)}s` }, li);
+      el('time', { text: fmtRunTime(n.at) }, li);
       const node = state.nodes.get(n.node) || drawnSource(n);
       const head = el('span', {}, li);
       el('span', { class: `kind ${tone(n)}`, text: `${n.source}.${n.kind}` }, head);
@@ -55,12 +56,12 @@ export function mount(root, services, options = {}) {
   const { el } = scoped(root);
   const tools = el('div', { class: 'panel-tools' }, root);
   const filter = el('input', { type: 'search', class: 'text-field', 'aria-label': 'Filter events', placeholder: 'Filter events', autocomplete: 'off' }, tools);
+  const jump = el('button', { class: 'jump', type: 'button', hidden: '' }, tools);
   const loss = el('p', { class: 'loss-note', role: 'status', hidden: '' }, root);
   const wrap = el('div', { class: 'list-wrap' }, root);
   const list = el('div', { class: 'event-list', role: 'list' }, wrap);
-  const jump = el('button', { class: 'jump', type: 'button', hidden: '' }, wrap);
   let events = [], host = services.selection.get().host, chosen = services.selection.get().event?.seq ?? null;
-  let pending = 0, paused = false;
+  let pending = 0, paused = false, labels = [], connection = services.selection.get().event ? null : services.selection.get().connection;
   const editing = () => [...list.querySelectorAll('form')].some((form) => !form.hidden);
   const newRows = new Set();
   const source = services.watch();
@@ -79,8 +80,9 @@ export function mount(root, services, options = {}) {
   }
   function details(event, parent) {
     const box = el('div', { class: 'event-detail' }, parent);
-    labelAction(box, services, { kind: 'event', seq: event.seq });
-    if (event.conn && event.local && event.peer) labelAction(box, services, { kind: 'connection', id: event.conn, local: event.local, peer: event.peer }, 'Label connection');
+    const header = el('div', { class: 'event-detail-head' }, box);
+    el('strong', { text: `Event ${event.seq} · ${event.source}.${event.kind}` }, header);
+    labelAction(header, services, { kind: 'event', seq: event.seq }, 'Label', render);
     const dl = el('dl', { class: 'kv' }, box);
     const add = (key, value) => {
       if (value === null || value === undefined || value === '') return;
@@ -95,8 +97,10 @@ export function mount(root, services, options = {}) {
     add('Server name', event.sni);
     add('Connection', event.conn);
     for (const [key, value] of Object.entries(event.fields || {})) add(key, value);
-    if (event.local && event.peer && services.packetPair) {
+    if (event.local && event.peer && (event.conn || services.packetPair)) {
       const row = el('p', { class: 'event-actions' }, box);
+      if (event.conn) labelAction(row, services, { kind: 'connection', id: event.conn, local: event.local, peer: event.peer }, 'Label connection', render);
+      if (!services.packetPair) return;
       const show = el('button', { class: 'button', type: 'button', text: 'Show matching packets' }, row);
       el('span', { class: 'hint', text: APPROXIMATE }, row);
       show.addEventListener('click', () => services.showPackets?.({ local: event.local, peer: event.peer }));
@@ -105,7 +109,7 @@ export function mount(root, services, options = {}) {
   function render() {
     const query = filter.value.trim().toLowerCase();
     const sandbox = services.hosts?.find((item) => item.name === host)?.sandbox || host;
-    const visible = events.filter((event) => (!sandbox || event.sandbox?.name === sandbox) && (!query || JSON.stringify(event).toLowerCase().includes(query)));
+    const visible = events.filter((event) => (!sandbox || event.sandbox?.name === sandbox) && (!connection || event.conn === connection) && (!query || `${event.source}.${event.kind} ${JSON.stringify(event)}`.toLowerCase().includes(query)));
     const top = list.scrollTop;
     list.replaceChildren();
     if (!visible.length) {
@@ -122,9 +126,11 @@ export function mount(root, services, options = {}) {
       if (services.isMoment?.(event)) services.moment?.(item);
       if (newRows.has(event.seq)) item.classList.add('new-row');
       if (chosen === event.seq) item.classList.add('on');
-      el('time', { text: `${event.at.toFixed(1)}s` }, line);
+      el('time', { text: fmtRunTime(event.at) }, line);
       el('span', { class: 'kind', text: `${event.source}.${event.kind}` }, line);
-      el('span', { class: 'text', text: event.summary || eventText(event.fields) }, line);
+      const summary = el('span', { class: 'text' }, line);
+      el('span', { class: 'event-summary', text: event.summary || eventText(event.fields) }, summary);
+      labelChips(summary, labels.filter((label) => label.target.kind === 'event' ? label.target.seq === event.seq : label.target.kind === 'connection' && label.target.id === event.conn));
       const origin = hostOf(event) || event.task;
       if (origin) el('span', { class: 'pill', text: origin }, line);
       line.addEventListener('click', () => { select(event); render(); });
@@ -162,13 +168,15 @@ export function mount(root, services, options = {}) {
   cleanup.push(listen(jump, 'click', () => { paused = false; render(); }));
   cleanup.push(services.selection.subscribe((selection) => {
     const seq = selection.event?.seq ?? null;
-    if (host !== selection.host || (seq !== null && seq !== chosen)) {
+    if (host !== selection.host || seq !== chosen || connection !== (selection.event ? null : selection.connection)) {
+      connection = selection.event ? null : selection.connection;
       host = selection.host;
-      if (seq !== null) chosen = seq;
+      chosen = seq;
       render();
       if (seq !== null) list.querySelector?.('.event-item.on')?.scrollIntoView?.({ block: 'nearest' });
     }
   }));
+  if (services.labelState) cleanup.push(services.state(services.labelState, (value) => { labels = value.value || []; if (!editing()) render(); }));
   if (services.onMoment) cleanup.push(services.onMoment(() => { if (!paused && !editing()) render(); }));
   render();
   return () => {

@@ -1,6 +1,7 @@
-import { scoped } from '../dom.mjs';
+import { scoped, icon, listen } from '../dom.mjs';
+import { fmtRunTime } from '../format.mjs';
 
-export function labelAction(parent, services, target, title = 'Label') {
+export function labelAction(parent, services, target, title = 'Label', onClose = () => {}) {
   if (!services.labelCommand) return;
   const { el } = scoped(parent);
   const row = el('div', { class: 'label-action' }, parent);
@@ -8,8 +9,13 @@ export function labelAction(parent, services, target, title = 'Label') {
   const form = el('form', { hidden: '' }, row);
   const input = el('input', { class: 'text-field', maxlength: '80', 'aria-label': `${title} text`, required: '' }, form);
   const save = el('button', { class: 'button', type: 'submit', text: 'Save' }, form);
-  const status = el('span', { role: 'status' }, row);
-  open.addEventListener('click', () => { form.hidden = false; input.focus(); });
+  const cancel = el('button', { class: 'button', type: 'button', text: 'Cancel' }, form);
+  const status = el('span', { class: 'label-status', role: 'status' }, row);
+  form.hidden = true;
+  const close = () => { form.hidden = true; open.hidden = false; open.focus(); onClose(); };
+  cancel.addEventListener('click', close);
+  form.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); close(); } });
+  open.addEventListener('click', () => { open.hidden = true; form.hidden = false; status.textContent = ''; input.focus(); });
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     if (save.disabled) return;
@@ -17,23 +23,32 @@ export function labelAction(parent, services, target, title = 'Label') {
     try {
       const result = await services.transport.post(services.labelCommand, { request_id: crypto.randomUUID(), command: { action: 'add', target, text: input.value } });
       status.textContent = result.status === 'applied' ? 'Label added.' : 'Pending. Check Labels and export before trying again.';
-      if (result.status === 'applied') form.hidden = true;
+      if (result.status === 'applied') close();
     } catch (error) { status.textContent = `Label not confirmed: ${error.message}`; }
     finally { save.disabled = false; }
   });
 }
 
-const targetText = (target) => target.kind === 'event' ? `Event ${target.seq}` : target.kind === 'connection'
-  ? `Connection ${target.id}: ${target.local} ↔ ${target.peer}` : `${target.link}: ${target.a} ↔ ${target.b}`;
+export function flowMatches(target, packet) {
+  return target.kind === 'flow' && target.link === packet.link && ((target.a === packet.src && target.b === packet.dst) || (target.b === packet.src && target.a === packet.dst));
+}
+
+export function labelChips(parent, labels) {
+  const { el } = scoped(parent);
+  for (const label of labels) el('span', { class: 'pill label-chip', text: label.text }, parent);
+}
 
 export function mount(root, services, options) {
   const { el } = scoped(root);
+  el('h3', { class: 'labels-heading', text: 'Export' }, root);
   const downloads = el('div', { class: 'label-downloads' }, root);
   const scope = el('p', {}, downloads);
   const status = el('p', { role: 'status' }, downloads);
-  const stopSelection = services.selection.subscribe(({ host }) => { scope.textContent = `Export scope: ${host || 'All hosts'}`; });
+  const stopSelection = services.selection.subscribe(({ host }) => { scope.textContent = host || 'All hosts'; });
   for (const [kind, title] of [['events', 'Events (JSONL)'], ['packets', 'Packets (pcapng)']]) {
     const button = el('button', { class: 'button', type: 'button', text: title }, downloads);
+    icon(button, 'download');
+    el('p', { class: 'egress-muted', text: kind === 'events' ? 'Events: every event this page holds for the scope, with its labels, as JSONL.' : 'Packets: every captured link in the scope, with the run’s TLS keys, as pcapng.' }, downloads);
     button.addEventListener('click', async () => {
       if (button.disabled) return;
       button.disabled = true;
@@ -45,10 +60,45 @@ export function mount(root, services, options) {
       finally { button.disabled = false; }
     });
   }
-  const body = el('div', { class: 'table-scroll' }, root);
+  const heading = el('h3', { class: 'labels-heading', text: 'Labels (0)' }, root);
+  const body = el('div', { class: 'table-scroll labels-table' }, root);
+  let events = [], nodes = [], edges = [], snapshot;
+  const cleanup = [];
+  const watch = services.watch?.();
+  if (watch) {
+    const on = (name, callback) => cleanup.push(listen(watch, name, (event) => callback(JSON.parse(event.data))));
+    on('snapshot', (value) => { events = value.events || []; nodes = value.nodes || []; edges = value.edges || []; draw(); });
+    on('event', (event) => { events = [...events, event].slice(-500); draw(); });
+    on('node', (node) => { nodes = [...nodes.filter((item) => item.id !== node.id), node]; draw(); });
+    on('edge', (edge) => { edges = [...edges.filter((item) => item.id !== edge.id), edge]; draw(); });
+  }
+  function targetText(target) {
+    if (target.kind === 'event') {
+      const event = events.find((event) => event.seq === target.seq);
+      return `Event ${target.seq}${event ? ` · ${event.source}.${event.kind} ${event.summary || ''}` : ''}`;
+    }
+    if (target.kind === 'connection') return `${target.local} ↔ ${target.peer}`;
+    const edge = edges.find((edge) => edge.id === target.link);
+    const node = edge && nodes.find((node) => (node.id === edge.a || node.id === edge.b) && node.kind === 'sandbox');
+    const host = services.hosts?.find((host) => host.sandbox === node?.name)?.name || node?.name;
+    return `${host ? `${host}'s link` : `Link ${target.link}`} · ${target.a} ↔ ${target.b}`;
+  }
+  function selectTarget(target) {
+    if (target.kind === 'flow') {
+      services.selection.set({ host: null, links: [target.link], event: null, connection: null });
+      services.showPackets?.({ local: target.a, peer: target.b });
+    } else {
+      const event = events.find((event) => target.kind === 'event' ? event.seq === target.seq : event.conn === target.id);
+      services.selection.set({ host: null, links: [], event: target.kind === 'event' ? event || { seq: target.seq } : null, connection: target.kind === 'connection' ? target.id : event?.conn ?? null, request: null });
+      services.showPanel?.('events');
+    }
+  }
   let stopState = () => {};
   if (!options.state) el('p', { class: 'empty-note', text: 'This world has not enabled labeling. Run exports are available above.' }, body);
-  else stopState = services.state(options.state, (snapshot) => {
+  else stopState = services.state(options.state, (value) => { snapshot = value; draw(); }, (error) => { status.textContent = `Could not load labels: ${error.message}`; });
+  function draw() {
+    if (!snapshot) return;
+    heading.textContent = `Labels (${snapshot.value?.length || 0})`;
     body.replaceChildren();
     if (snapshot.status?.too_large) status.textContent = 'Label state exceeded its size limit. The last complete labels are shown.';
     const table = el('table', { class: 'data-table' }, body);
@@ -58,9 +108,11 @@ export function mount(root, services, options) {
     for (const label of snapshot.value || []) {
       const row = el('tr', {}, rows);
       el('td', { text: label.text }, row);
-      el('td', { class: 'mono', text: targetText(label.target) }, row);
-      el('td', { class: 'numeric', text: `${Number(label.at.toFixed(3))} s` }, row);
-      const remove = el('button', { class: 'button', type: 'button', text: 'Remove', 'aria-label': `Remove ${label.text}` }, el('td', {}, row));
+      const target = el('button', { class: 'text-button label-target', type: 'button', text: targetText(label.target) }, el('td', {}, row));
+      target.addEventListener('click', () => selectTarget(label.target));
+      el('td', { class: 'numeric', text: fmtRunTime(label.at) }, row);
+      const remove = el('button', { class: 'icon-button label-remove', type: 'button', 'aria-label': `Remove label ${label.text}` }, el('td', {}, row));
+      icon(remove, 'close');
       remove.addEventListener('click', async () => {
         if (remove.disabled) return;
         remove.disabled = true;
@@ -72,6 +124,6 @@ export function mount(root, services, options) {
       });
     }
     if (!snapshot.value?.length) el('p', { class: 'empty-note', text: 'Select an event, connection or packet flow and choose Label.' }, body);
-  }, (error) => { status.textContent = `Could not load labels: ${error.message}`; });
-  return () => { stopState(); stopSelection(); root.replaceChildren(); };
+  }
+  return () => { stopState(); stopSelection(); cleanup.forEach((stop) => stop()); watch?.close(); root.replaceChildren(); };
 }
