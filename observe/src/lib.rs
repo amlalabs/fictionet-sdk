@@ -782,6 +782,9 @@ mod loss;
 mod memory;
 mod topology;
 
+#[cfg(feature = "page")]
+pub mod page;
+
 #[cfg(feature = "decode")]
 mod dashboard;
 #[cfg(feature = "decode")]

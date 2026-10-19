@@ -1,0 +1,9 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { max-width: 1120px; margin: 32px auto; padding: 0 24px; }
+h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -.02em; }
+p { color: light-dark(#4b5563, #b5bdca); margin: 0 0 24px; }
+pre { box-sizing: border-box; max-height: calc(100vh - 160px); overflow: auto;
+  font: 14px/1.6 ui-monospace, monospace; padding: 24px; margin: 0;
+  border: 1px solid light-dark(#ccd2db, #454c59); border-radius: 8px;
+  background: light-dark(#f7f8fa, #191c22); color: light-dark(#17202e, #e3e7ef); }
+pre:focus-visible { outline: 2px solid light-dark(#1759b7, #8cbaff); outline-offset: 4px; }

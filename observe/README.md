@@ -13,6 +13,7 @@ There are no default features.
 | Base | `Memory`, `Aggregate`, `Collector`, bounded topology, packet copies, TLS keys and loss totals. Sans-I/O: no threads, files, sockets or clock reads. |
 | `decode` | Packet decoders, protocol presenters, pcapng output, `DashboardObserver` and transport-independent request sessions. |
 | `native` | Enables `decode`. Adds `Jsonl` workers on native targets and `serve`, `Endpoint` and `Client` on Unix. |
+| `page` | Enables `native`. Adds `page`: a loopback web page served from a `DashboardHandle` in the same process, with world state topics, typed command ports and ticketed screen and terminal consoles. It uses Tokio. |
 | `tracing` | `Tracing`, with a dispatch supplied by the integrator. It installs no global dispatcher. |
 
 ## Retain events for grading
