@@ -27,8 +27,7 @@ pub use addresses::{Cidr, Family, Lease, RA_EVERY};
 use frame::{Frame, Mac, Upper};
 
 /// The VM's side of the link: what to do with each frame from the VM, and
-/// how to frame each packet from the world. It does no I/O, so the tests
-/// drive it directly.
+/// how to frame each packet from the world. It does no I/O.
 pub struct Link {
     v4: Family<Ipv4Addr>,
     v6: Family<Ipv6Addr>,
@@ -51,10 +50,8 @@ pub enum FromVm<'a> {
 /// Why a frame from the VM was dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
-    /// Shorter than its headers, an IP header that does not add up, or a
-    /// transport the link cannot read: an IPv6 extension header that runs
-    /// past its end, a UDP or ICMPv6 header cut short, or a UDP length that
-    /// does not fit the packet.
+    /// Short headers, inconsistent lengths, an IP header the stack silently
+    /// discards, or an unreadable UDP or ICMPv6 transport.
     Malformed,
     /// Longer than the MTU allows.
     TooBig,
@@ -71,35 +68,66 @@ pub enum Why {
     Spoofed,
 }
 
+impl<A: Copy> Family<A> {
+    fn address(&self) -> Option<A> {
+        match self {
+            Family::Serve(lease) => Some(lease.addr.addr),
+            _ => None,
+        }
+    }
+
+    fn handle<'a>(
+        &self,
+        packet: &'a [u8],
+        answer: impl FnOnce(&Lease<A>) -> Option<Vec<u8>>,
+    ) -> FromVm<'a> {
+        match self {
+            Family::Serve(lease) => {
+                answer(lease).map_or(FromVm::Drop(Why::Handled), FromVm::Answer)
+            }
+            Family::FromWorld => FromVm::World(packet),
+            Family::Off => FromVm::Drop(Why::Handled),
+        }
+    }
+}
+
 impl Link {
     /// A link that hands out IPv4 and IPv6 addresses as `v4` and `v6`
     /// say, for a VM whose largest IP packet is `mtu` bytes.
-    pub fn new(v4: Family<Ipv4Addr>, v6: Family<Ipv6Addr>, mtu: u16) -> Link {
-        Link {
+    ///
+    /// Returns an error if a lease has an invalid prefix or the IPv4 lease
+    /// has no room for a DHCP server address.
+    pub fn new(
+        v4: Family<Ipv4Addr>,
+        v6: Family<Ipv6Addr>,
+        mtu: u16,
+    ) -> Result<Link, fictionet::Error> {
+        if let Family::Serve(lease) = &v4 {
+            if lease.addr.prefix > 32 {
+                return Err(fictionet::Error::msg("the IPv4 prefix must be at most 32"));
+            }
+            if addresses::server_id(lease).is_none() {
+                return Err(fictionet::Error::msg(
+                    "the IPv4 lease needs a gateway, DNS server, or room for a DHCP server",
+                ));
+            }
+        }
+        if let Family::Serve(lease) = &v6
+            && lease.addr.prefix > 128
+        {
+            return Err(fictionet::Error::msg("the IPv6 prefix must be at most 128"));
+        }
+        Ok(Link {
             v4,
             v6,
             mtu,
             vm: None,
-        }
+        })
     }
 
     /// The VM's MAC, once its first frame has arrived.
     pub fn vm_mac(&self) -> Option<Mac> {
         self.vm
-    }
-
-    fn own_v4(&self) -> Option<Ipv4Addr> {
-        match &self.v4 {
-            Family::Serve(l) => Some(l.addr.addr),
-            _ => None,
-        }
-    }
-
-    fn own_v6(&self) -> Option<Ipv6Addr> {
-        match &self.v6 {
-            Family::Serve(l) => Some(l.addr.addr),
-            _ => None,
-        }
     }
 
     /// Decides what to do with one frame from the VM.
@@ -122,7 +150,7 @@ impl Link {
             return FromVm::Drop(Why::NotForUs);
         }
         match f.ethertype {
-            frame::ARP => match frame::arp_reply(f.payload, f.src, self.own_v4()) {
+            frame::ARP => match frame::arp_reply(f.payload, f.src, self.v4.address()) {
                 Some(reply) => FromVm::Answer(reply),
                 None => FromVm::Drop(Why::Handled),
             },
@@ -147,22 +175,11 @@ impl Link {
                 port: dhcp::SERVER_PORT,
                 payload: request,
             } => {
-                return match &self.v4 {
-                    Family::Serve(lease) => match addresses::dhcp4(lease, self.mtu, request) {
-                        Some((packet, broadcast)) => {
-                            let to = if broadcast { frame::BROADCAST } else { vm };
-                            FromVm::Answer(frame::frame(
-                                to,
-                                frame::GATEWAY_MAC,
-                                frame::IPV4,
-                                &packet,
-                            ))
-                        }
-                        None => FromVm::Drop(Why::Handled),
-                    },
-                    Family::FromWorld => FromVm::World(p),
-                    Family::Off => FromVm::Drop(Why::Handled),
-                };
+                return self.v4.handle(p, |lease| {
+                    let (packet, broadcast) = addresses::dhcp4(lease, self.mtu, request)?;
+                    let to = if broadcast { frame::BROADCAST } else { vm };
+                    Some(frame::frame(to, frame::GATEWAY_MAC, frame::IPV4, &packet))
+                });
             }
             // The link does not put fragments back together, so it answers no
             // fragmented DHCP request, and lets none past when it owns DHCP.
@@ -181,7 +198,7 @@ impl Link {
         if src.is_unspecified() && self.v4 != Family::FromWorld {
             return FromVm::Drop(Why::Handled);
         }
-        match self.own_v4() {
+        match self.v4.address() {
             Some(own) if src != own => FromVm::Drop(Why::Spoofed),
             _ => FromVm::World(p),
         }
@@ -192,6 +209,10 @@ impl Link {
             return FromVm::Drop(Why::Malformed);
         };
         match upper {
+            Upper::Problem if frame::problem_is_link_scope(p) => {
+                return FromVm::Drop(Why::Handled);
+            }
+
             // Neighbor discovery is never fragmented (RFC 6980), and only
             // makes sense on the link.
             Upper::Icmp6 {
@@ -203,25 +224,23 @@ impl Link {
             }
             Upper::Icmp6 {
                 kind: frame::NEIGHBOR_SOLICITATION,
+                msg,
                 ..
             } => {
-                return match frame::neighbor_advert(p, vm, self.own_v6()) {
+                return match frame::neighbor_advert(p, msg, vm, self.v6.address()) {
                     Some(reply) => FromVm::Answer(reply),
                     None => FromVm::Drop(Why::Handled),
                 };
             }
             Upper::Icmp6 {
                 kind: frame::ROUTER_SOLICITATION,
+                msg,
                 ..
             } => {
-                return match &self.v6 {
-                    Family::Serve(_) => match self.router_advert() {
-                        Some(ra) => FromVm::Answer(ra),
-                        None => FromVm::Drop(Why::Handled),
-                    },
-                    Family::FromWorld => FromVm::World(p),
-                    Family::Off => FromVm::Drop(Why::Handled),
-                };
+                if !frame::solicitation_valid(p, msg, 8) {
+                    return FromVm::Drop(Why::Handled);
+                }
+                return self.v6.handle(p, |_| self.router_advert());
             }
             // Advertisements and redirects only make sense on the link.
             Upper::Icmp6 { kind, .. } if frame::is_neighbor_discovery(kind) => {
@@ -231,27 +250,16 @@ impl Link {
                 port: dhcpv6::SERVER_PORT,
                 payload: request,
             } => {
-                return match &self.v6 {
-                    Family::Serve(lease) => match addresses::dhcp6(
+                return self.v6.handle(p, |lease| {
+                    let answer = addresses::dhcp6(
                         lease,
-                        // Leave room for the IPv6 and UDP headers.
                         usize::from(self.mtu).saturating_sub(40 + 8),
                         request,
-                    ) {
-                        Some(answer) => {
-                            let packet = addresses::dhcp6_packet(p, &answer);
-                            FromVm::Answer(frame::frame(
-                                vm,
-                                frame::GATEWAY_MAC,
-                                frame::IPV6,
-                                &packet,
-                            ))
-                        }
-                        None => FromVm::Drop(Why::Handled),
-                    },
-                    Family::FromWorld => FromVm::World(p),
-                    Family::Off => FromVm::Drop(Why::Handled),
-                };
+                        p[24] != 0xff,
+                    )?;
+                    let packet = addresses::dhcp6_packet(p, &answer);
+                    Some(frame::frame(vm, frame::GATEWAY_MAC, frame::IPV6, &packet))
+                });
             }
             // As for DHCP over IPv4: no answer to a fragment, and none past
             // when the link owns DHCPv6.
@@ -268,7 +276,7 @@ impl Link {
         if self.v6 != Family::FromWorld && (src.is_unspecified() || src.is_unicast_link_local()) {
             return FromVm::Drop(Why::Handled);
         }
-        match self.own_v6() {
+        match self.v6.address() {
             Some(own) if src != own => FromVm::Drop(Why::Spoofed),
             _ => FromVm::World(p),
         }
@@ -311,7 +319,7 @@ impl Link {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Wire;
-    use frame::tests::{VM, solicitation};
+    use frame::tests::{VM, behind_options, solicitation};
 
     fn served() -> Link {
         Link::new(
@@ -333,6 +341,7 @@ mod tests {
             }),
             1500,
         )
+        .unwrap()
     }
 
     fn eth(src: Mac, dst: Mac, ethertype: u16, payload: &[u8]) -> Vec<u8> {
@@ -351,6 +360,244 @@ mod tests {
             &m.to_bytes().unwrap(),
         );
         eth(VM, frame::BROADCAST, frame::IPV4, &p)
+    }
+
+    #[test]
+    fn dhcp6_unicast_obeys_message_rules() {
+        use dhcpv6::{DhcpOption, Duid, IaNa, Message, msg, status};
+        for kind in [
+            msg::SOLICIT,
+            msg::CONFIRM,
+            msg::REBIND,
+            msg::INFORMATION_REQUEST,
+            msg::REQUEST,
+            msg::RENEW,
+            msg::RELEASE,
+            msg::DECLINE,
+        ] {
+            let mut request = Message::new(kind, 1);
+            request.options.push(DhcpOption::ClientId(Duid::ll(1, &VM)));
+            if kind != msg::INFORMATION_REQUEST {
+                request.options.push(DhcpOption::IaNa(IaNa::default()));
+            }
+            let directed = matches!(
+                kind,
+                msg::REQUEST | msg::RENEW | msg::RELEASE | msg::DECLINE
+            );
+            if directed {
+                request
+                    .options
+                    .push(DhcpOption::ServerId(Duid::ll(1, &frame::GATEWAY_MAC)));
+            }
+            let packet = frame::udp6(
+                frame::link_local(VM),
+                546,
+                frame::link_local(frame::GATEWAY_MAC),
+                547,
+                &request.to_bytes().unwrap(),
+            );
+            let f = eth(VM, frame::GATEWAY_MAC, frame::IPV6, &packet);
+            let result = served().frame_from_vm(&f);
+            if directed {
+                let FromVm::Answer(answer) = result else {
+                    panic!("no UseMulticast reply")
+                };
+                let f = Frame::parse(&answer).unwrap();
+                let (_, data) = frame::udp_to(f.payload).unwrap();
+                let reply = Message::parse(data).unwrap();
+                assert_eq!(reply.msg_type, msg::REPLY);
+                assert_eq!(reply.status().unwrap().code, status::USE_MULTICAST);
+                assert_eq!(reply.ia_na().count(), 0);
+            } else {
+                assert_eq!(result, FromVm::Drop(Why::Handled), "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn router_advertisement_prefix_fits_an_ipv6_address() {
+        for prefix in [0, 64, 128, 129, 200, 255] {
+            let lease = Lease {
+                addr: Cidr {
+                    addr: "fd00::2".parse().unwrap(),
+                    prefix,
+                },
+                gateway: None,
+                dns: None,
+            };
+            let link = Link::new(Family::Off, Family::Serve(lease), 1500);
+            if prefix > 128 {
+                assert!(link.is_err());
+            } else {
+                let ra = link.unwrap().router_advert().unwrap();
+                assert_eq!(ra[frame::HEADER + 40 + 16 + 16 + 2], prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn bare_narrow_lease_is_rejected_before_frames_arrive() {
+        for prefix in [31, 32, 40] {
+            assert!(
+                Link::new(
+                    Family::Serve(Lease {
+                        addr: Cidr {
+                            addr: Ipv4Addr::new(10, 0, 0, 1),
+                            prefix
+                        },
+                        gateway: None,
+                        dns: None,
+                    }),
+                    Family::Off,
+                    1500
+                )
+                .is_err(),
+                "/{prefix}"
+            );
+        }
+        for prefix in [0, 30, 31, 32] {
+            let mut link = Link::new(
+                Family::Serve(Lease {
+                    addr: Cidr {
+                        addr: Ipv4Addr::new(10, 0, 0, 2),
+                        prefix,
+                    },
+                    gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                    dns: None,
+                }),
+                Family::Off,
+                1500,
+            )
+            .unwrap();
+            assert!(matches!(link.frame_from_vm(&discover()), FromVm::Answer(_)));
+        }
+    }
+
+    #[test]
+    fn invalid_solicitations_get_no_answer() {
+        let ll = frame::link_local(VM);
+        for (src, hop, body) in [
+            (ll, 64, vec![133, 0, 0, 0, 0, 0, 0, 0]),
+            (ll, 255, vec![133, 1, 0, 0, 0, 0, 0, 0]),
+            (ll, 255, vec![133, 0, 0, 0]),
+            (ll, 255, vec![133, 0, 0, 0, 0, 0, 0, 0, 99, 0]),
+            (ll, 255, vec![133, 0, 0, 0, 0, 0, 0, 0, 99, 2, 0]),
+            (
+                Ipv6Addr::UNSPECIFIED,
+                255,
+                vec![133, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            let p = frame::ipv6(src, "ff02::2".parse().unwrap(), 58, hop, &body);
+            assert_eq!(
+                served().frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
+                FromVm::Drop(Why::Handled),
+                "{hop}: {body:?}"
+            );
+        }
+        for options in [&[1, 0][..], &[1, 2, 0][..], &[1][..]] {
+            let p = solicitation(ll, "fd00::1".parse().unwrap(), 255);
+            let body = [&p[40..64], options].concat();
+            let p = frame::icmp6(ll, "ff02::1".parse().unwrap(), body);
+            assert_eq!(
+                served().frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
+                FromVm::Drop(Why::Handled)
+            );
+        }
+        for src in [ll, Ipv6Addr::UNSPECIFIED] {
+            let p = frame::ipv6(
+                src,
+                "ff02::2".parse().unwrap(),
+                58,
+                255,
+                &[133, 0, 0x12, 0x34, 1, 2, 3, 4, 99, 1, 0, 0, 0, 0, 0, 0],
+            );
+            assert!(matches!(
+                served().frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
+                FromVm::Answer(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_neighbor_probe_for_its_source_gets_no_answer() {
+        let src = frame::link_local(VM);
+        let p = solicitation(src, src, 255);
+        let mut link = Link::new(Family::Off, Family::Off, 1500).unwrap();
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
+            FromVm::Drop(Why::Handled)
+        );
+    }
+
+    #[test]
+    fn parameter_problems_reach_the_world_after_source_checks() {
+        use fictionet::stdlib::network::ip::{self, Header, Reject};
+        for (next, body) in [
+            (0, vec![6, 0, 0x80, 0, 0, 0, 0, 0]),
+            (43, vec![6, 0, 99, 1, 0, 0, 0, 0]),
+            (44, vec![6, 0, 0, 1, 0, 0, 0, 1]),
+            (44, vec![60, 0, 0, 1, 0, 0, 0, 1, 6, 1, 0, 0, 0, 0, 0, 0]),
+        ] {
+            for (src, expected) in [
+                ("fd00::2", None),
+                ("fd00::77", Some(Why::Spoofed)),
+                ("fe80::1", Some(Why::Handled)),
+                ("::", Some(Why::Handled)),
+            ] {
+                let p = frame::ipv6(
+                    src.parse().unwrap(),
+                    "fd00::1".parse().unwrap(),
+                    next,
+                    64,
+                    &body,
+                );
+                let reject = Header::check(&p).unwrap_err();
+                assert!(matches!(reject, Reject::Problem { .. }));
+                if expected.is_none() {
+                    assert!(ip::parameter_problem(&p, reject).is_some());
+                }
+                let f = eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p);
+                assert_eq!(
+                    served().frame_from_vm(&f),
+                    expected.map_or(FromVm::World(&p), FromVm::Drop)
+                );
+            }
+        }
+        for v6 in [served().v6, Family::FromWorld, Family::Off] {
+            let mut link = Link::new(Family::Off, v6, 1500).unwrap();
+            for kind in 133..=137 {
+                let body = [
+                    vec![58, 0, 0x80, 0, 0, 0, 0, 0],
+                    vec![kind, 0, 0, 0, 0, 0, 0, 0],
+                ]
+                .concat();
+                let p = frame::ipv6(
+                    "fd00::2".parse().unwrap(),
+                    "fd00::1".parse().unwrap(),
+                    0,
+                    255,
+                    &body,
+                );
+                assert_eq!(
+                    link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
+                    FromVm::Drop(Why::Handled)
+                );
+            }
+            for dst in ["fe80::1", "ff02::1"] {
+                let p = frame::ipv6(
+                    "fd00::2".parse().unwrap(),
+                    dst.parse().unwrap(),
+                    0,
+                    255,
+                    &[6, 0, 0x80, 0, 0, 0, 0, 0],
+                );
+                assert_eq!(
+                    link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
+                    FromVm::Drop(Why::Handled)
+                );
+            }
+        }
     }
 
     #[test]
@@ -383,7 +630,9 @@ mod tests {
             &ping,
         );
         assert_eq!(
-            Link::new(Family::Off, Family::Off, 1500).frame_from_vm(&group),
+            Link::new(Family::Off, Family::Off, 1500)
+                .unwrap()
+                .frame_from_vm(&group),
             FromVm::Drop(Why::OtherSource)
         );
         let elsewhere = eth(VM, [0x52, 0, 0, 0, 0, 1], frame::IPV4, &ping);
@@ -482,9 +731,9 @@ mod tests {
         assert_eq!(m.yiaddr, Ipv4Addr::new(10, 0, 0, 2));
 
         let d = discover();
-        let mut world = Link::new(Family::FromWorld, Family::Off, 1500);
+        let mut world = Link::new(Family::FromWorld, Family::Off, 1500).unwrap();
         assert!(matches!(world.frame_from_vm(&d), FromVm::World(_)));
-        let mut off = Link::new(Family::Off, Family::Off, 1500);
+        let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
         assert_eq!(off.frame_from_vm(&d), FromVm::Drop(Why::Handled));
     }
 
@@ -538,7 +787,7 @@ mod tests {
         ));
         // With the address left to the world, any source goes to the world,
         // which decides.
-        let mut world = Link::new(Family::FromWorld, Family::FromWorld, 1500);
+        let mut world = Link::new(Family::FromWorld, Family::FromWorld, 1500).unwrap();
         assert!(matches!(
             world.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV4, &spoof)),
             FromVm::World(_)
@@ -573,12 +822,12 @@ mod tests {
         assert_eq!(f.dst, [0x33, 0x33, 0, 0, 0, 1]);
         assert_eq!(f.payload[40], frame::ROUTER_ADVERTISEMENT);
         // Left to the world, the solicitation goes there; turned off, nowhere.
-        let mut world = Link::new(Family::Off, Family::FromWorld, 1500);
+        let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
         assert!(matches!(world.frame_from_vm(&rs_frame), FromVm::World(_)));
         assert!(world.router_advert().is_none());
         assert!(!world.advertises());
         assert!(link.advertises());
-        let mut off = Link::new(Family::Off, Family::Off, 1500);
+        let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
         assert_eq!(off.frame_from_vm(&rs_frame), FromVm::Drop(Why::Handled));
         // An advertisement from the VM never leaves the link.
         let ra_from_vm = frame::icmp6(
@@ -594,7 +843,7 @@ mod tests {
         let mut ext = vec![frame::ICMPV6, 0, 1, 4, 0, 0, 0, 0];
         ext.extend_from_slice(&ra_from_vm[40..]);
         let hidden = frame::ipv6(ll, "ff02::1".parse().unwrap(), 0, 255, &ext);
-        let mut world = Link::new(Family::Off, Family::FromWorld, 1500);
+        let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
         assert_eq!(
             world.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 0, 0, 1], frame::IPV6, &hidden)),
             FromVm::Drop(Why::Handled)
@@ -721,17 +970,6 @@ mod tests {
         );
     }
 
-    /// `n` destination options headers in front of `inner`, whose protocol
-    /// is `proto`, in an IPv6 packet with hop limit 255.
-    fn behind_options(src: Ipv6Addr, dst: Ipv6Addr, n: usize, proto: u8, inner: &[u8]) -> Vec<u8> {
-        let mut ext = Vec::new();
-        for i in 0..n {
-            ext.extend_from_slice(&[if i + 1 == n { proto } else { 60 }, 0, 1, 4, 0, 0, 0, 0]);
-        }
-        ext.extend_from_slice(inner);
-        frame::ipv6(src, dst, if n == 0 { proto } else { 60 }, 255, &ext)
-    }
-
     /// The first `cut` bytes of `packet`'s payload as an IPv6 first
     /// fragment, and the rest as the second.
     fn fragments6(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
@@ -777,7 +1015,7 @@ mod tests {
         );
         let to_all = [0x33, 0x33, 0, 0, 0, 1];
         for v6 in [Family::FromWorld, Family::Off] {
-            let mut link = Link::new(Family::Off, v6, 1500);
+            let mut link = Link::new(Family::Off, v6, 1500).unwrap();
             for n in [1, 8, 9, 30] {
                 let p = behind_options(ll, all, n, frame::ICMPV6, &ra[40..]);
                 assert_eq!(
@@ -847,7 +1085,7 @@ mod tests {
             "ff02::2".parse().unwrap(),
             vec![frame::ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
         );
-        let mut world = Link::new(Family::Off, Family::FromWorld, 1500);
+        let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
         let to = [0x33, 0x33, 0, 0, 0, 2];
         assert_eq!(
             world.frame_from_vm(&eth(VM, to, frame::IPV6, &atomic(&rs))),
@@ -870,7 +1108,7 @@ mod tests {
         );
         let (first, second) = fragments4(&whole, 64);
         let frame = |p: &[u8]| eth(VM, frame::BROADCAST, frame::IPV4, p);
-        let mut off = Link::new(Family::Off, Family::Off, 1500);
+        let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
         assert_eq!(
             off.frame_from_vm(&frame(&whole)),
             FromVm::Drop(Why::Handled)
@@ -892,7 +1130,7 @@ mod tests {
             FromVm::Drop(Why::Handled),
             "the link answers no fragment"
         );
-        let mut world = Link::new(Family::FromWorld, Family::Off, 1500);
+        let mut world = Link::new(Family::FromWorld, Family::Off, 1500).unwrap();
         assert!(
             matches!(world.frame_from_vm(&frame(&first)), FromVm::World(_)),
             "left to the world"
@@ -926,12 +1164,12 @@ mod tests {
             link.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
             FromVm::Drop(Why::Handled)
         );
-        let mut off = Link::new(Family::Off, Family::Off, 1500);
+        let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
         assert_eq!(
             off.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
             FromVm::Drop(Why::Handled)
         );
-        let mut world = Link::new(Family::Off, Family::FromWorld, 1500);
+        let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
         assert!(matches!(
             world.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
             FromVm::World(_)

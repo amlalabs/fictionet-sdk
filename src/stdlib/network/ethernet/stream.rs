@@ -42,7 +42,8 @@ impl Decoder {
         }
     }
 
-    /// Where the next read should go. Never empty.
+    /// Where the next read should go. Drain complete frames before reading
+    /// again: a buffer full of undrained frames has no spare space.
     pub fn spare(&mut self) -> &mut [u8] {
         if self.start == self.end {
             self.start = 0;
@@ -158,6 +159,19 @@ mod tests {
         let spare = d.spare();
         spare[..bytes.len()].copy_from_slice(bytes);
         d.filled(bytes.len());
+    }
+
+    #[test]
+    fn a_full_decoder_needs_draining_before_another_read() {
+        let mut d = Decoder::new();
+        let capacity = d.spare().len();
+        d.spare().fill(0);
+        d.filled(capacity);
+        assert!(d.spare().is_empty());
+        for _ in 0..capacity / 4 {
+            assert_eq!(d.next_frame().unwrap(), Some(&b""[..]));
+        }
+        assert!(!d.spare().is_empty());
     }
 
     #[test]

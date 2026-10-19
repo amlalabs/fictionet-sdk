@@ -138,32 +138,16 @@ pub(super) fn destination(
 /// Ethernet may add after it. `None` if the header is broken or says the
 /// packet is longer than the payload.
 pub(super) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
-    match ethertype {
-        IPV4 => {
-            let b = payload;
-            if b.len() < 20 || b[0] >> 4 != 4 {
-                return None;
-            }
-            let ihl = (b[0] & 0x0f) as usize * 4;
-            let total = u16::from_be_bytes([b[2], b[3]]) as usize;
-            if ihl < 20 || total < ihl || total > b.len() {
-                return None;
-            }
-            Some(&b[..total])
-        }
-        IPV6 => {
-            let b = payload;
-            if b.len() < 40 || b[0] >> 4 != 6 {
-                return None;
-            }
-            let total = 40 + u16::from_be_bytes([b[4], b[5]]) as usize;
-            if total > b.len() {
-                return None;
-            }
-            Some(&b[..total])
-        }
-        _ => None,
+    let version = match ethertype {
+        IPV4 => 4,
+        IPV6 => 6,
+        _ => return None,
+    };
+    if payload.first()? >> 4 != version {
+        return None;
     }
+    let h = Header::parse(payload)?;
+    Some(&payload[..h.payload.end])
 }
 
 // Packet building, on the stdlib's IP layer
@@ -326,18 +310,24 @@ pub(super) enum Upper<'a> {
     /// Any other transport, or a fragment other than the first, which
     /// holds no transport header.
     Other,
+    /// The world must process an IPv6 Parameter Problem.
+    Problem,
 }
 
 /// A packet whose transport the link cannot read: an IPv6 extension header
-/// that runs past its end, a UDP or ICMPv6 header cut short (in a first
-/// fragment, too), or a UDP length that does not fit the packet.
+/// that runs past its end, a UDP or ICMPv6 header cut short, or a UDP length
+/// that does not fit the packet. IPv6 Parameter Problems are passed separately.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Unreadable;
 
 /// Reads the transport of an IP packet, which [`ip_packet`] has checked.
 /// Checks complete UDP lengths, but leaves checksums to the recipient.
 pub(super) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
-    let h = Header::check(packet).map_err(|_| Unreadable)?;
+    let h = match Header::check(packet) {
+        Ok(h) => h,
+        Err(ip::Reject::Problem { .. }) => return Ok(Upper::Problem),
+        Err(ip::Reject::Discard) => return Err(Unreadable),
+    };
     // An atomic fragment is a whole packet, but neighbor discovery may not
     // carry a fragment header at all (RFC 6980), so it counts as a fragment
     // here. A fragment after the first holds no transport header.
@@ -381,27 +371,63 @@ pub(super) fn is_neighbor_discovery(kind: u8) -> bool {
     (ROUTER_SOLICITATION..=REDIRECT).contains(&kind)
 }
 
+/// Checks solicitation fields and option boundaries. Checksums belong to
+/// the recipient because a VM backend may leave them to an offload.
+pub(super) fn solicitation_valid(packet: &[u8], msg: &[u8], fixed: usize) -> bool {
+    if packet[7] != 255 || msg.len() < fixed || msg[1] != 0 {
+        return false;
+    }
+    let mut options = &msg[fixed..];
+    while !options.is_empty() {
+        if options.len() < 2
+            || options[1] == 0
+            || (source_v6(packet).is_unspecified() && options[0] == 1)
+        {
+            return false;
+        }
+        let Some(rest) = options.get(usize::from(options[1]) * 8..) else {
+            return false;
+        };
+        options = rest;
+    }
+    true
+}
+
+/// A rejected packet still needs source checks before reaching the world.
+/// Neighbor discovery and link-scope errors stay on the link.
+pub(super) fn problem_is_link_scope(packet: &[u8]) -> bool {
+    let Some(h) = Header::parse(packet) else {
+        return true;
+    };
+    let scope = |addr: IpAddr| {
+        matches!(addr, IpAddr::V6(a) if a.is_unspecified()
+        || a.is_unicast_link_local() || (a.is_multicast() && a.octets()[1] & 15 <= 2))
+    };
+    scope(h.src)
+        || scope(h.dst)
+        || (h.protocol == ICMPV6
+            && h.payload(packet)
+                .first()
+                .is_some_and(|kind| is_neighbor_discovery(*kind)))
+}
+
 /// The answer to a neighbor solicitation from the VM: a neighbor
 /// advertisement that gives [`GATEWAY_MAC`] for the target, for the same
 /// reason [`arp_reply`] answers every address. It does not answer
-/// duplicate address detection (source `::`), a target that is `own` or
-/// multicast, or a solicitation that is not valid (hop limit other than
-/// 255, code other than 0).
-pub(super) fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
-    let Ok(Upper::Icmp6 {
-        kind: NEIGHBOR_SOLICITATION,
-        msg,
-        fragment: false,
-    }) = upper(packet)
-    else {
-        return None;
-    };
-    if msg[1] != 0 || packet[7] != 255 || msg.len() < 24 {
+/// duplicate address detection (source `::`), a target that is the source,
+/// `own` or multicast, or a solicitation with invalid fields or options.
+pub(super) fn neighbor_advert(
+    packet: &[u8],
+    msg: &[u8],
+    vm: Mac,
+    own: Option<Ipv6Addr>,
+) -> Option<Vec<u8>> {
+    if !solicitation_valid(packet, msg, 24) {
         return None;
     }
-    let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap());
+    let src = source_v6(packet);
     let target = Ipv6Addr::from(<[u8; 16]>::try_from(&msg[8..24]).unwrap());
-    if src.is_unspecified() || target.is_multicast() || Some(target) == own {
+    if src.is_unspecified() || src == target || target.is_multicast() || Some(target) == own {
         return None;
     }
     let mut body = Vec::with_capacity(32);
@@ -439,6 +465,18 @@ pub(super) fn source_v6(packet: &[u8]) -> Ipv6Addr {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
+        let Ok(Upper::Icmp6 {
+            kind: NEIGHBOR_SOLICITATION,
+            msg,
+            fragment: false,
+        }) = upper(packet)
+        else {
+            return None;
+        };
+        super::neighbor_advert(packet, msg, vm, own)
+    }
 
     pub(crate) const VM: Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
@@ -669,22 +707,20 @@ pub(crate) mod tests {
         assert!(neighbor_advert(&short[..60], VM, None).is_none());
     }
 
-    /// `n` destination options headers, then `inner` (an upper-layer
-    /// header of protocol `proto`), in a packet from the VM's link-local
-    /// address.
-    fn behind_options(n: usize, proto: u8, inner: &[u8]) -> Vec<u8> {
+    /// `n` destination options headers before `inner`, with hop limit 255.
+    pub(crate) fn behind_options(
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        n: usize,
+        proto: u8,
+        inner: &[u8],
+    ) -> Vec<u8> {
         let mut ext = Vec::new();
         for i in 0..n {
             ext.extend_from_slice(&[if i + 1 == n { proto } else { 60 }, 0, 1, 4, 0, 0, 0, 0]);
         }
         ext.extend_from_slice(inner);
-        ipv6(
-            link_local(VM),
-            "ff02::1".parse().unwrap(),
-            if n == 0 { proto } else { 60 },
-            255,
-            &ext,
-        )
+        ipv6(src, dst, if n == 0 { proto } else { 60 }, 255, &ext)
     }
 
     fn icmp6_kind(p: &[u8]) -> Option<u8> {
@@ -710,11 +746,23 @@ pub(crate) mod tests {
         // Behind eight destination options headers, and behind sixteen: no
         // chain is too long to read.
         assert_eq!(
-            icmp6_kind(&behind_options(8, ICMPV6, &ra[40..])),
+            icmp6_kind(&behind_options(
+                src,
+                "ff02::1".parse().unwrap(),
+                8,
+                ICMPV6,
+                &ra[40..]
+            )),
             Some(ROUTER_ADVERTISEMENT)
         );
         assert_eq!(
-            icmp6_kind(&behind_options(16, ICMPV6, &ra[40..])),
+            icmp6_kind(&behind_options(
+                src,
+                "ff02::1".parse().unwrap(),
+                16,
+                ICMPV6,
+                &ra[40..]
+            )),
             Some(ROUTER_ADVERTISEMENT)
         );
         // Behind an authentication header.
