@@ -13,7 +13,7 @@ use crate::wire::{
     TcpRepr, TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr,
 };
 
-mod congestion;
+mod reno;
 
 /// Error returned by [`Socket::listen`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -488,7 +488,7 @@ pub struct Socket<'a> {
     nagle: bool,
 
     /// The congestion control algorithm.
-    congestion_controller: congestion::reno::Reno,
+    congestion_controller: reno::Reno,
 
     /// tsval generator - if some, tcp timestamp is enabled
     tsval_generator: Option<TcpTimestampGenerator>,
@@ -565,7 +565,7 @@ impl<'a> Socket<'a> {
             nagle: true,
             tsval_generator: None,
             last_remote_tsval: 0,
-            congestion_controller: congestion::reno::Reno::new(),
+            congestion_controller: reno::Reno::new(),
 
             rx_waker: WakerRegistration::new(),
 
@@ -1846,9 +1846,7 @@ impl<'a> Socket<'a> {
                     }
 
                     // Notify of duplicate ACK
-                    let in_flight = self.flight_size();
-                    self.congestion_controller
-                        .on_dup_ack(cx.now(), self.remote_mss, in_flight);
+                    self.congestion_controller.on_dup_ack(self.remote_mss);
                 }
 
                 // No duplicate ACK means we reset the duplicate ACK count
@@ -1861,13 +1859,7 @@ impl<'a> Socket<'a> {
 
                     // Notify of fresh ACK
                     self.rtte.on_ack(cx.now(), ack_number);
-                    let new_flight_size = self.flight_size().saturating_sub(ack_len);
-                    self.congestion_controller.on_ack(
-                        cx.now(),
-                        ack_len,
-                        new_flight_size,
-                        &self.rtte,
-                    );
+                    self.congestion_controller.on_ack(ack_len);
                 }
             };
 
@@ -1952,10 +1944,6 @@ impl<'a> Socket<'a> {
             self.rx_waker.wake();
         }
 
-        if !self.assembler.is_empty() {
-            // Print the ranges recorded in the assembler.
-        }
-
         // Handle delayed acks
         if let Some(ack_delay) = self.ack_delay
             && self.ack_to_transmit()
@@ -1977,7 +1965,6 @@ impl<'a> Socket<'a> {
             // Note that we change the transmitter state here.
             // This is fine because smoltcp assumes that it can always transmit zero or one
             // packets for every packet it receives.
-
             Some(self.ack_reply(ip_repr, repr))
         } else {
             None
@@ -2135,15 +2122,6 @@ impl<'a> Socket<'a> {
         // NOTE(unwrap): we check tuple is not None above.
         let tuple = self.tuple.unwrap();
 
-        // Check if the interface still has our source IP address.
-        // If not (e.g. the interface's IP changed), reset the socket.
-        // We use reset() instead of set_state(Closed) to avoid sending
-        // an RST packet with the now-invalid source IP.
-        if !cx.has_ip_addr(tuple.local.addr) {
-            self.reset();
-            return Ok(());
-        }
-
         if self.remote_last_ts.is_none() {
             // We get here in exactly two cases:
             //  1) This socket just transitioned into SYN-SENT.
@@ -2158,7 +2136,6 @@ impl<'a> Socket<'a> {
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
-
             self.set_state(State::Closed);
         } else if self.timer.should_retransmit(cx.now()) {
             if let Timer::Retransmit { .. } = self.timer {
@@ -2166,7 +2143,7 @@ impl<'a> Socket<'a> {
 
                 // Inform the congestion controller that we're retransmitting and should enter the slow start state
                 let in_flight = self.flight_size();
-                self.congestion_controller.on_rto(cx.now(), in_flight);
+                self.congestion_controller.on_rto(in_flight);
 
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
@@ -2180,7 +2157,7 @@ impl<'a> Socket<'a> {
 
                 // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
                 let in_flight = self.flight_size();
-                self.congestion_controller.on_loss(cx.now(), in_flight);
+                self.congestion_controller.on_loss(in_flight);
 
                 self.pending_fast_retransmit = true;
             }
@@ -2209,7 +2186,6 @@ impl<'a> Socket<'a> {
         } else if self.timer.should_zero_window_probe(cx.now()) {
         } else if self.timer.should_close(cx.now()) {
             // If we have spent enough time in the TIME-WAIT state, close the socket.
-
             self.reset();
             return Ok(());
         } else {
@@ -2507,7 +2483,7 @@ impl<'a> fmt::Write for Socket<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::wire::{IpCidr, IpRepr};
+    use crate::wire::IpRepr;
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
 
@@ -2525,6 +2501,7 @@ mod test {
         local: LOCAL_END,
         remote: REMOTE_END,
     };
+    // The first ISN from the test interface's seeded generator.
     const LOCAL_SEQ: TcpSeqNumber = TcpSeqNumber(-34801502);
     const REMOTE_SEQ: TcpSeqNumber = TcpSeqNumber(-10001);
 
@@ -9233,37 +9210,5 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-    }
-
-    // =========================================================================================//
-    // Tests for source IP address change.
-    // =========================================================================================//
-
-    #[test]
-    fn test_established_close_on_src_ip_change() {
-        let mut s = socket_established();
-
-        // Verify socket is working normally
-        s.send_slice(b"abc").unwrap();
-        recv!(
-            s,
-            [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"abc"[..],
-                ..RECV_TEMPL
-            }]
-        );
-
-        // Simulate interface IP change - remove the socket's source IP
-        // and add a different one.
-        s.cx.set_ip_addr(IpCidr::new(OTHER_ADDR.into(), 24));
-
-        // The socket's source IP is no longer on the interface.
-        // When dispatch() runs, it should detect this and reset the socket
-        // silently (no RST sent, since that would use the invalid source IP).
-        s.send_slice(b"def").unwrap();
-        recv_nothing!(s);
-        assert_eq!(s.state, State::Closed);
     }
 }
