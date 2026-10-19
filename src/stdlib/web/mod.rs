@@ -480,7 +480,9 @@
 //!   `handler`, `error`, `redirect`, `misdirected`, `no_host` or
 //!   `cancelled`), its status, and how much of the body was sent, also
 //!   when the client gave up before the answer
-//!   ([`fictionet::stdlib::web::httpd`] lists the fields);
+//!   ([`fictionet::stdlib::web::httpd`] lists the fields); a request that
+//!   `web::proxy` or `web::forward` sent on to the real site also has
+//!   `forwarded`, the origin it went to;
 //! - `http.error`: every connection on port 80 or 443 that ended in an HTTP
 //!   error (`cause`: `protocol`, `timeout` or `transport`);
 //! - `net.blocked`: the packets `Sites` itself drops or refuses, with

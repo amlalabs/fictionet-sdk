@@ -1,11 +1,9 @@
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::http::Request;
 
 pub(super) struct Auth {
     pub token: String,
-    used: AtomicBool,
 }
 
 impl Auth {
@@ -14,7 +12,6 @@ impl Auth {
         getrandom::fill(&mut bytes).map_err(io::Error::other)?;
         Ok(Self {
             token: bytes.iter().map(|b| format!("{b:02x}")).collect(),
-            used: AtomicBool::new(false),
         })
     }
 
@@ -33,6 +30,6 @@ impl Auth {
     }
 
     pub fn bootstrap(&self, req: &Request) -> bool {
-        req.query.is_empty() && self.allows(req) && !self.used.swap(true, Ordering::SeqCst)
+        req.query.is_empty() && self.allows(req)
     }
 }

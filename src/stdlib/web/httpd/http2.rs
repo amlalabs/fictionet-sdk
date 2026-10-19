@@ -440,7 +440,7 @@ impl Http2 {
             driver.conn(),
             self.observe.clone(),
         );
-        tracker.start(&request, driver.conn(), driver.now());
+        tracker.start(&mut request, driver.conn(), driver.now());
         if !fits(
             driver.budget(),
             request_held(&request) + tracker.held() + std::mem::size_of::<Stream>(),

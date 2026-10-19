@@ -42,6 +42,10 @@ pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static str)> {
             "text/javascript; charset=utf-8",
             include_str!("../../../dashboard/components/map.mjs"),
         )),
+        "/components/labels.mjs" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../dashboard/components/labels.mjs"),
+        )),
         "/components/packets.mjs" => Some((
             "text/javascript; charset=utf-8",
             include_str!("../../../dashboard/components/packets.mjs"),

@@ -5,6 +5,7 @@ import { mount as packets } from './packets.mjs';
 import { mount as events } from './events.mjs';
 import { watchState } from '../state.mjs';
 import { createSelection } from '../selection.mjs';
+import { createTransport } from '../transport.mjs';
 import { createDocument, Element } from '../test-dom.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
@@ -33,8 +34,15 @@ function fixture(t) {
     selection, reducedMotion: { matches: true }, hosts: [{ name: 'alpha', sandbox: 'guest' }],
     watch, connect: (graph) => watchState(watch(), graph),
     transport: {
+      ...createTransport({}, {
+        location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
+        async fetch(url, options) {
+          assert.equal(options.headers.Authorization, 'Bearer secret');
+          requests.push({ path: new URL(url).pathname, signal: options.signal });
+          return Response.json({ links: ['e2'] });
+        },
+      }),
       packetStream(list) { const source = new Source(); source.links = list; streams.push(source); return source; },
-      async get(path, params, signal) { requests.push({ path, signal }); return { links: ['e2'] }; },
     },
   };
   return { root, frames, observers, watches, streams, services, selection, requests,
@@ -87,6 +95,18 @@ test('packets watches the busiest guest links and scopes a selected host', async
   h.clean();
 });
 
+test('all hosts keeps startup captures after their links leave the map', async (t) => {
+  const h = fixture(t);
+  const dispose = packets(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, nodes: [], edges: [] });
+  await settle();
+  assert.equal(h.requests.at(-1).path, '/api/host/alpha/links');
+  assert.equal(h.streams.at(-1).links, 'e2');
+  assert.match(h.root.querySelector('#drawer-title').textContent, /All hosts/);
+  dispose();
+  h.clean();
+});
+
 test('events filters text, preserves loss and selects only explicit flow identities', (t) => {
   const h = fixture(t);
   const dispose = events(h.root, h.services);
@@ -101,6 +121,26 @@ test('events filters text, preserves loss and selects only explicit flow identit
   const input = h.root.querySelector('input');
   input.value = 'missing'; input.dispatchEvent(new Event('input'));
   assert.doesNotMatch(h.root.querySelector('.event-list').textContent, /hello/);
+  dispose();
+  h.clean();
+});
+
+test('incoming events preserve a label being typed', (t) => {
+  const h = fixture(t);
+  h.services.labelCommand = '/api/command/labels';
+  const dispose = events(h.root, h.services);
+  const event = { seq: 1, at: 2, source: 'http', kind: 'request', summary: 'first', fields: {} };
+  h.watches[0].emit('snapshot', { ...h.snapshot, events: [event] });
+  h.root.querySelector('.event-line').click();
+  h.root.querySelector('.label-action').querySelector('button').click();
+  const input = h.root.querySelector('.label-action').querySelector('input');
+  input.value = 'Follow this request';
+  h.watches[0].emit('event', { ...event, seq: 2, summary: 'second' });
+  assert.equal(h.root.querySelector('.label-action').querySelector('input'), input);
+  assert.equal(input.value, 'Follow this request');
+  assert.equal(h.root.querySelector('.label-action').querySelector('form').hidden, false);
+  assert.equal(h.root.querySelector('.jump').hidden, false);
+  assert.match(h.root.querySelector('.jump').textContent, /1 new/);
   dispose();
   h.clean();
 });

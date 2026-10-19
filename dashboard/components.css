@@ -893,3 +893,74 @@ button.link:hover {
     fill: Highlight;
   }
 }
+
+/* Tables over state and events. */
+.table-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 16px;
+}
+.data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: 28px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line-strong);
+  background: var(--raised);
+  color: var(--muted);
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+.data-table td {
+  height: 24px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.data-table .fit {
+  width: 1%;
+  white-space: nowrap;
+}
+.data-table .numeric {
+  text-align: right;
+}
+.data-table td.numeric {
+  font-family: var(--mono);
+}
+.data-table tbody tr:hover td {
+  background: var(--sunken);
+}
+.data-table .empty-cell {
+  padding: 16px 12px;
+  color: var(--muted);
+}
+
+
+/* Guest destinations. */
+.egress-summary, .egress-lookups { margin: 16px; }
+.egress-summary p { margin: 0 0 8px; }
+.egress-summary p:empty { display: none; }
+.egress-muted { color: var(--muted); }
+.egress-name { font-weight: 600; }
+.egress-complete { color: var(--success); }
+.egress-warning { color: var(--warning); }
+.egress-groups h3 { font-size: 13px; font-weight: 600; margin: 16px; }
+.egress-groups .table-scroll { flex: none; }
+.egress-lookups summary { cursor: pointer; margin-bottom: 8px; }
+
+.egress-groups .data-table { width: max-content; min-width: 100%; }
+.egress-groups .data-table th, .egress-groups .data-table td { padding: 8px; }
+.egress-groups .data-table .numeric { white-space: nowrap; }
+.egress-destination { min-width: 192px; white-space: nowrap; }
+.egress-answer { min-width: 192px; max-width: 256px; }

@@ -311,6 +311,8 @@ struct DropConsoles {}
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let containment = StateTopic::new(StateLimits::default());
+    let labels = fictionet_observe::page::Labels::default();
     let exchanges = StateTopic::new(StateLimits::default());
     let traffic = StateTopic::new(StateLimits::default());
     let commands = CommandPort::<SetTraffic, Traffic>::new(CommandLimits::default());
@@ -358,6 +360,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let server = page
         .standard_panels()
+        .containment(containment.clone())
+        .labels(labels.clone())
         .table(
             "Exchanges",
             exchanges.clone(),
@@ -410,6 +414,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
+    let (started, startup) = tokio::sync::oneshot::channel();
     let world = std::thread::spawn(move || {
         fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(dashboard.observer()),
@@ -419,17 +424,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut a = attachments.next(&cx).await?;
                 let mut beta = attacher.attach("beta").unwrap();
                 let mut b = attachments.next(&cx).await?;
+                recorded_attempts(&cx);
+                exchange(&cx, &mut alpha, &mut a, &mut beta, &mut b).await?;
+                let _ = started.send(());
                 let mut rows = vec![
                     Exchange {
                         host: "alpha",
-                        packets: 0,
-                        bytes: 0,
+                        packets: 1,
+                        bytes: 28,
                         at: 0.0,
                     },
                     Exchange {
                         host: "beta",
-                        packets: 0,
-                        bytes: 0,
+                        packets: 1,
+                        bytes: 28,
                         at: 0.0,
                     },
                 ];
@@ -443,8 +451,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exchanges
                     .publish(cx.now(), &rows)
                     .expect("small exchange table");
+                containment.publish(cx.now(), &recorded_containment())?;
+                for (seq, text) in [(1, "Run start"), (7, "Startup traffic")] {
+                    labels
+                        .apply_change(
+                            &cx,
+                            &fictionet_observe::page::LabelCommand::Add {
+                                target: fictionet_observe::page::LabelTarget::Event { seq },
+                                text: text.into(),
+                            },
+                        )
+                        .map_err(fictionet::Error::msg)?;
+                }
                 let mut stage = 0;
                 while !stopping.load(Ordering::SeqCst) {
+                    while let Some(command) = labels.commands.try_recv() {
+                        labels.apply(&cx, command);
+                    }
                     let elapsed = cx.now().since_start().as_secs();
                     let ready = if elapsed >= 12 {
                         3
@@ -499,18 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         command.reply(&cx, ());
                     }
                     if state.running && stage >= 1 {
-                        alpha.send(fictionet::Packet(vec![
-                            0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0x66, 0xdd, 10, 0, 0, 2, 10, 0, 0,
-                            3, 8, 0, 0xe5, 0xca, 0x12, 0x34, 0, 1,
-                        ]));
-                        b.send(a.recv(&cx).await?);
-                        let mut packet = beta.recv(&cx).await?;
-                        packet.0[12..20].copy_from_slice(&[10, 0, 0, 3, 10, 0, 0, 2]);
-                        packet.0[20] = 0;
-                        packet.0[22..24].copy_from_slice(&[0xed, 0xca]);
-                        beta.send(packet);
-                        a.send(b.recv(&cx).await?);
-                        alpha.recv(&cx).await?;
+                        exchange(&cx, &mut alpha, &mut a, &mut beta, &mut b).await?;
                         for row in &mut rows {
                             row.packets += 1;
                             row.bytes += 28;
@@ -529,6 +541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         ))
     });
+    startup.await?;
     println!("{}", server.url());
     println!("Alpha is ready. Beta starts over 12 seconds. Press Ctrl-C to stop.");
     tokio::signal::ctrl_c().await?;
@@ -538,4 +551,188 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| io::Error::other("fixture world panicked"))?
         .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
+}
+
+async fn exchange(
+    cx: &fictionet::Cx,
+    alpha: &mut impl Interface,
+    a: &mut impl Interface,
+    beta: &mut impl Interface,
+    b: &mut impl Interface,
+) -> fictionet::Result {
+    alpha.send(fictionet::Packet(vec![
+        0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0x66, 0xdd, 10, 0, 0, 2, 10, 0, 0, 3, 8, 0, 0xe5, 0xca,
+        0x12, 0x34, 0, 1,
+    ]));
+    b.send(a.recv(cx).await?);
+    let mut packet = beta.recv(cx).await?;
+    packet.0[12..20].copy_from_slice(&[10, 0, 0, 3, 10, 0, 0, 2]);
+    packet.0[20] = 0;
+    packet.0[22..24].copy_from_slice(&[0xed, 0xca]);
+    beta.send(packet);
+    a.send(b.recv(cx).await?);
+    alpha.recv(cx).await?;
+    Ok(())
+}
+
+// Recorded service outcomes accompany the fixture's live packet exchange.
+fn recorded_attempts(cx: &fictionet::Cx) {
+    use fictionet::events::{ConnInfo, Sandbox};
+    for (name, ip) in [("alpha", "10.0.0.2"), ("beta", "10.0.0.3")] {
+        let sandbox = Sandbox {
+            id: if name == "alpha" { 1 } else { 2 },
+            name: name.into(),
+            addr: Some(ip.parse().unwrap()),
+            addr_v6: None,
+        };
+        for (id, site, extra) in [
+            (1, "example.test", None),
+            (6, "example.test", Some(("answer", "cancelled"))),
+            (
+                2,
+                "archive.ubuntu.com",
+                Some(("forwarded", "http://archive.ubuntu.com")),
+            ),
+            (
+                3,
+                "archive.ubuntu.com",
+                Some(("served_by", "host package cache")),
+            ),
+            (
+                4,
+                "downloads.claude.ai",
+                Some(("forwarded", "https://downloads.claude.ai")),
+            ),
+            (
+                5,
+                "releases.openai.com",
+                Some(("forwarded", "https://releases.openai.com")),
+            ),
+        ] {
+            let conn = ConnInfo::new(
+                id,
+                "203.0.113.10:443".parse().unwrap(),
+                format!("{ip}:{}", 40000 + id).parse().unwrap(),
+            )
+            .from_sandbox(Some(sandbox.clone()));
+            let emit = cx.emitter(&conn);
+            emit.emit("conn", "open", |event| event);
+            emit.emit("http", "request", |event| {
+                let event = event
+                    .field("host", site)
+                    .field("world_site", site)
+                    .field("answer", "handler")
+                    .field(
+                        "status",
+                        if id == 6 {
+                            fictionet::stdlib::protocols::json::Value::Null
+                        } else {
+                            200u32.into()
+                        },
+                    )
+                    .field("complete", id != 6);
+                match extra {
+                    Some((key, value)) => event.field(key, value),
+                    None => event,
+                }
+            });
+            emit.emit("conn", "close", |event| event);
+        }
+        let mut dns = ConnInfo::new(
+            7,
+            "10.0.0.1:53".parse().unwrap(),
+            format!("{ip}:40007").parse().unwrap(),
+        )
+        .from_sandbox(Some(sandbox.clone()));
+        dns.transport = fictionet::events::Transport::Udp;
+        cx.emitter(&dns).emit("dns", "query", |event| {
+            event
+                .field("name", "example.test")
+                .field("answer", "addr")
+                .field("addr", "203.0.113.10")
+        });
+        let conn = ConnInfo::default().from_sandbox(Some(sandbox));
+        for (why, dst, port) in [
+            ("ClosedPort", "203.0.113.10", 22u32),
+            ("NoRoute", "1.1.1.1", 443),
+            ("NoRoute", "8.8.8.8", 53),
+        ] {
+            cx.emitter(&conn).emit("net", "blocked", |event| {
+                event
+                    .field("why", why)
+                    .field("dst", dst)
+                    .field("dst_port", port)
+                    .field("protocol", if port == 53 { 17u32 } else { 6u32 })
+            });
+        }
+    }
+}
+
+fn recorded_containment() -> fictionet_observe::page::Containment {
+    use fictionet_observe::page::{Containment, ProbeOutcome, ProbeResult};
+    Containment {
+        probes: [
+            (
+                "alpha",
+                "Public DNS",
+                "dig @8.8.8.8 example.com",
+                "8.8.8.8:53",
+                ProbeOutcome::Contained,
+                "connection timed out; no servers could be reached",
+                "no route: no machine at that address",
+            ),
+            (
+                "alpha",
+                "Raw public IP",
+                "curl https://1.1.1.1",
+                "1.1.1.1:443",
+                ProbeOutcome::Contained,
+                "Failed to connect",
+                "no route: no machine at that address",
+            ),
+            (
+                "alpha",
+                "Direct public site",
+                "curl https://www.google.com",
+                "www.google.com",
+                ProbeOutcome::NotContained,
+                "HTTP 200",
+                "No matching world observation",
+            ),
+            (
+                "beta",
+                "Public IPv6",
+                "curl -6 'https://[2606:4700:4700::1111]'",
+                "[2606:4700:4700::1111]:443",
+                ProbeOutcome::TimedOut,
+                "Probe timed out",
+                "No matching world observation",
+            ),
+            (
+                "beta",
+                "Proxy environment",
+                "env",
+                "environment",
+                ProbeOutcome::Fact,
+                "No proxy settings set",
+                "Configuration only",
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(guest, name, command, destination, outcome, guest_result, world_answer)| {
+                ProbeResult {
+                    guest: guest.into(),
+                    name: name.into(),
+                    command: command.into(),
+                    destination: destination.into(),
+                    outcome,
+                    guest_result: guest_result.into(),
+                    world_answer: world_answer.into(),
+                    proxies: vec![],
+                }
+            },
+        )
+        .collect(),
+    }
 }

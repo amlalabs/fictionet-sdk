@@ -1,10 +1,10 @@
 //! A loopback page over an in-process dashboard.
 //!
 //! The public page at `GET /`, styles at `GET /page.css` and module at
-//! `GET /page.mjs` contain no world data. Open [`Server::url`] once: the page removes its fragment,
+//! `GET /page.mjs` contain no world data. Each tab signs in with the URL the run printed ([`Server::url`]). The page removes its fragment,
 //! posts to `/api/bootstrap` with `Authorization: Bearer <token>`, and stores
-//! that token in session storage. Bootstrap returns 204 with no body once;
-//! subsequent attempts return 409. All API routes require the bearer header.
+//! that token in session storage. Bootstrap returns 204 with no body for each
+//! valid bearer with an empty query. All API routes require the bearer header.
 //! Query parameters and cookies never authenticate. Errors are
 //! `{"error":"description"}` with an HTTP error status.
 //!
@@ -163,13 +163,45 @@
 //!
 //! Every panel has `{id,title,area,kind,...}`. IDs are slugged titles and
 //! are unique across all panel kinds. `area` is `workspace` or `inspector`.
-//! `standard_panels()` adds `packets`, `events` and `map` in the inspector,
+//! `standard_panels()` adds Packets, Events, Map, Left the box, Containment,
+//! and Labels and export, in that order before world panels,
 //! plus `<host-slug>-screen` and `<host-slug>-terminal` in the workspace for
-//! each offered console. Their kinds are `packets`, `events`, `map`,
+//! each offered console. Their kinds are `packets`, `events`, `map`, `left_the_box`,
 //! `screen` or `terminal`; console panels also have `host`.
 //! `workspace(title)` places that custom panel in the workspace and moves
 //! the consoles to the inspector. Names, columns, actions, paths and
 //! composition conflicts are checked before the listener binds.
+//!
+//! `left_the_box()` adds the destination panel by itself. `GET /api/egress`
+//! returns the dashboard's bounded [`crate::egress::EgressSnapshot`], including
+//! startup observations, pending connections and persistent loss counts.
+//! It requires a bearer and an empty query. Host selection filters the
+//! snapshot by sandbox in the browser; the loss counts cover the whole run.
+//!
+//! `containment(topic)` connects a [`StateTopic<Containment>`]. The guest kit
+//! publishes probe commands, guest results, proxy facts and world answers.
+//! Without a topic, the panel says no checks have been published.
+//!
+//! `labels(Labels::default())` enables typed event, connection and packet-flow
+//! labels. Keep a clone and run [`Labels::run`] in a world task, or receive
+//! from [`Labels::commands`] and call [`Labels::apply`] at a scheduling point.
+//! Labels are limited to 256 entries of 80 UTF-8 bytes each. Changes publish
+//! [`Labels::topic`] and emit `page.label` with the input, assigned identity
+//! and revision. Without this builder call, the panel offers exports and
+//! explains that labeling has not been enabled.
+//!
+//! `GET /api/export/events` streams JSONL in pages of at most 128 events,
+//! ending at the last sequence held when the download began. `host=<name>`
+//! scopes events to that page host; omit it for the whole run. The first
+//! line describes the scope, end sequence and label snapshot. Event lines
+//! carry their event and connection labels. `type: loss` lines report lost
+//! event counts for the run, including for a host-scoped export. Truncated
+//! event markers remain in the event data. A loss during export is reported
+//! on the next bounded page; sequence gaps alone are not treated as loss.
+//! `GET /api/export/packets` accepts the same scope and streams the captured
+//! guest links as pcapng sections, with retained TLS keys. Capture limits
+//! and the 32-link download bound apply. Both exports require the bearer;
+//! browser download links contain only local blob URLs.
 //!
 //! Each host is `{name,sandbox,status,screen,terminal}`. `status` is
 //! `/api/state/host-<name>`; `screen` and `terminal` are panel IDs or null.
@@ -334,8 +366,11 @@ mod auth;
 mod builder;
 mod command;
 mod console;
+mod containment;
+mod export;
 mod host;
 mod http;
+mod labels;
 mod observation;
 mod panel;
 mod rfb;
@@ -345,7 +380,9 @@ pub use builder::EventFilter;
 pub use command::{
     Action, Command, CommandLimits, CommandPort, CommandReply, CommandRequest, Rejected,
 };
+pub use containment::{Containment, ProbeOutcome, ProbeResult, ProxySetting};
 pub use host::{BoxFuture, Console, Duplex, Host, HostDescription, HostState, HostStatus, Pty};
+pub use labels::{Label, LabelCommand, LabelTarget, Labels};
 pub use panel::{Area, Column, Format, PanelContent, PanelDescription};
 pub use state::{PublishError, Snapshot, StateLimits, StateStatus, StateTopic};
 
@@ -407,6 +444,7 @@ pub struct Page {
     errors: Vec<String>,
     hosts: Vec<Host>,
     standard: bool,
+    labels: Option<Labels>,
     workspace: Option<String>,
     modules: Vec<(String, String)>,
     assets: Vec<(String, String, Vec<u8>)>,
@@ -427,6 +465,7 @@ impl Page {
             errors: vec![],
             hosts: vec![],
             standard: false,
+            labels: None,
             workspace: None,
             modules: vec![],
             assets: vec![],
@@ -685,8 +724,7 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
         }
         ("POST", "/api/bootstrap") => {
             if !shared.auth.bootstrap(&req) {
-                return http::error(conn, 409, "bootstrap already used or query is not empty")
-                    .await;
+                return http::error(conn, 409, "bootstrap requires an empty query").await;
             }
             http::respond(conn, 204, "text/plain", b"").await
         }
@@ -700,6 +738,15 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
             if path.starts_with("/api/host/") || path.starts_with("/api/event-table/") =>
         {
             builder::projection(conn, shared, &req).await
+        }
+        ("GET", "/api/export/events" | "/api/export/packets") => {
+            export::route(conn, shared, &req).await
+        }
+        ("GET", "/api/egress") => {
+            if !req.query.is_empty() {
+                return http::error(conn, 400, "egress takes no query parameters").await;
+            }
+            http::json(conn, 200, &shared.page.dashboard.egress()).await
         }
         ("GET", "/api/page") => {
             http::json(

@@ -118,14 +118,17 @@
 //! (whether it took the whole body). Over HTTP/1 a byte counts once it is
 //! written, and the event is made after the last one is; over HTTP/2 once
 //! the service queues it for the stream. A handler adds its own fields by putting
-//! [`Fields`] in its response's extensions. An opt-in [`BodyClassifier`] sees the
+//! [`Fields`] in its response's extensions, or using [`RequestFields`] before
+//! the response exists. Virtual host requests also carry
+//! `world_site`: the matched registered name, or `the default site` for a fallback.
+//! An opt-in [`BodyClassifier`] sees the
 //! head before virtual hosting and admission, body chunks before limits
 //! discard them, and the receipt outcome. Install it with [`Http1::observe`],
 //! [`HttpOptions::observe`], [`Server::observe`] or
 //! [`web::Site::observe`](fictionet::stdlib::web::Site::observe). Its request-local
 //! state can retain authority and classification across chunks without logging
 //! plaintext bodies. BodyClassifier fields come first, handler fields override them,
-//! and service facts win last. `answer` comes from the response, never the
+//! response fields override recorded request fields, and service facts win last. `answer` comes from the response, never the
 //! observer. No body bytes are added to the event automatically.
 //!
 //! A native HTTP/1 body timeout also finishes the request event with
@@ -227,6 +230,48 @@ impl EventInterest {
             .extensions()
             .get::<Self>()
             .is_some_and(|interest| interest.0)
+    }
+}
+
+/// Request-local event fields that survive cancellation and handler errors.
+/// The server installs this extension only when request events are enabled.
+/// Fields use the event's bounds; overflowing them marks the event truncated.
+/// Recorded handler fields override classifier fields. Response fields override
+/// recorded handler fields. Service facts, including the chosen site, win last.
+/// `answer` always comes from the service or response, never this store.
+#[derive(Clone)]
+pub struct RequestFields(
+    Arc<fictionet::sync::Mutex<(fictionet::events::Event, fictionet::events::Event)>>,
+);
+
+impl Default for RequestFields {
+    fn default() -> Self {
+        Self(Arc::new(fictionet::sync::Mutex::new((
+            fictionet::events::Event::new("http", "request"),
+            fictionet::events::Event::new("http", "request"),
+        ))))
+    }
+}
+
+impl RequestFields {
+    /// Records handler fields before a response exists. Does nothing when the
+    /// server is not observing this request. Build fields only when interested.
+    pub fn record<B>(request: &http::Request<B>, fields: Fields) {
+        if let Some(store) = request.extensions().get::<Self>() {
+            store.extend(fields, false);
+        }
+    }
+
+    fn extend(&self, mut fields: Fields, service: bool) {
+        fields.remove("answer");
+        let mut stored = self.0.lock();
+        let event = if service {
+            &mut stored.1
+        } else {
+            &mut stored.0
+        };
+        *event = std::mem::replace(event, fictionet::events::Event::new("http", "request"))
+            .fields(fields);
     }
 }
 

@@ -851,58 +851,6 @@ tr.moment td:first-child {
   border-left: 0;
 }
 
-/* Tables over state and events. */
-.table-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  border-top: 1px solid var(--line);
-}
-.data-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  line-height: 16px;
-}
-.data-table th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  height: 28px;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--line-strong);
-  background: var(--raised);
-  color: var(--muted);
-  font-weight: 500;
-  text-align: left;
-  white-space: nowrap;
-}
-.data-table td {
-  height: 24px;
-  padding: 4px 12px;
-  border-bottom: 1px solid var(--line);
-  color: var(--ink);
-  overflow-wrap: anywhere;
-}
-.data-table .fit {
-  width: 1%;
-  white-space: nowrap;
-}
-.data-table .numeric {
-  text-align: right;
-}
-.data-table td.numeric {
-  font-family: var(--mono);
-}
-.data-table tbody tr:hover td {
-  background: var(--sunken);
-}
-.data-table .empty-cell {
-  padding: 16px 12px;
-  color: var(--muted);
-}
-
 /* Controls. */
 .control-state {
   margin: 16px 16px 0;
@@ -1129,3 +1077,24 @@ body.licenses {
     display: none;
   }
 }
+
+#inspector-content[data-kind="left_the_box"] {
+  display: block;
+  overflow: auto;
+}
+
+#inspector-content[data-kind="containment"] { overflow: auto; display: block; }
+.containment-results { padding: 0 16px 16px; }
+.containment-probe { padding: 16px 0; border-top: 1px solid var(--line); }
+.containment-probe h3 { display: flex; justify-content: space-between; gap: 16px; margin: 0 0 8px; font-size: 13px; }
+.containment-probe h3 span { font-weight: 400; }
+.containment-probe code, .containment-probe pre { font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.containment-probe p { margin: 8px 0; }
+.containment-probe summary { cursor: pointer; color: var(--muted); }
+.containment-ok { color: var(--success); }
+.containment-alert { border-left: 4px solid var(--danger); color: var(--danger); padding-left: 16px; }
+
+.label-action, .label-downloads { margin: 16px; }
+.label-action, .label-action form { display: flex; align-items: center; gap: 8px; }
+.label-downloads button { margin-right: 8px; }
+.label-downloads p { margin: 0 0 8px; }

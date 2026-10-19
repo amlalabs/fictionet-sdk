@@ -25,6 +25,7 @@
 //! ```
 
 pub mod bridge;
+pub mod containment;
 pub mod jump;
 pub mod mirror;
 pub mod net;

@@ -11,6 +11,9 @@ import { scoped, listen } from './dom.mjs';
 import { mount as screen } from './components/screen.mjs';
 import { mount as terminal } from './components/terminal.mjs';
 import { mount as packets } from './components/packets.mjs';
+import { mount as labels } from './components/labels.mjs';
+import { mount as containment } from './components/containment.mjs';
+import { mount as leftTheBox } from './components/left-the-box.mjs';
 import { mount as events } from './components/events.mjs';
 import { mount as map } from './components/map.mjs';
 import { mount as table } from './components/table.mjs';
@@ -18,7 +21,7 @@ import { mount as eventTable } from './components/event-table.mjs';
 import { mount as control } from './components/control.mjs';
 import { mount as custom } from './components/custom.mjs';
 
-const SIGNED_OUT = 'Open the URL the demo printed in its terminal. A URL signs in one tab. Restart the demo for a new one.';
+const SIGNED_OUT = 'Open the URL the demo printed in its terminal.';
 
 // A value components can read and follow.
 function store(value) {
@@ -103,7 +106,7 @@ function icon(el, parent, name, label) {
 }
 
 const READINESS = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', stopped: 'Stopped' };
-const ORDER = ['packets', 'events', 'map'];
+const ORDER = ['packets', 'events', 'map', 'left_the_box', 'containment', 'labels'];
 
 export async function mount(root, transport, theme) {
   const { $, el } = scoped(root);
@@ -208,8 +211,9 @@ export async function mount(root, transport, theme) {
   }));
 
   // The inspector.
+  services.labelCommand = page.panels.find((panel) => panel.kind === 'labels')?.command;
   const panels = page.panels.filter((panel) => panel.area === 'inspector');
-  panels.sort((a, b) => (ORDER.indexOf(a.kind) < 0 ? 3 : ORDER.indexOf(a.kind)) - (ORDER.indexOf(b.kind) < 0 ? 3 : ORDER.indexOf(b.kind)));
+  panels.sort((a, b) => (ORDER.indexOf(a.kind) < 0 ? ORDER.length : ORDER.indexOf(a.kind)) - (ORDER.indexOf(b.kind) < 0 ? ORDER.length : ORDER.indexOf(b.kind)));
   const tabs = [];
   const consoleOptions = (options, controls) => ({
     ...options, controls,
@@ -225,6 +229,9 @@ export async function mount(root, transport, theme) {
         case 'screen': return screen(content, services, consoleOptions(options, controls));
         case 'terminal': return terminal(content, services, consoleOptions(options, controls));
         case 'packets': return packets(content, services, options);
+        case 'labels': return labels(content, services, options);
+        case 'containment': return containment(content, services, options);
+        case 'left_the_box': return leftTheBox(content, services, options);
         case 'events': return events(content, services, options);
         case 'map': return map(content, services, options);
         case 'table': return table(content, services, options);

@@ -30,13 +30,36 @@ impl Page {
         self.hosts.push(host);
         self
     }
-    /// Adds all console panels and Packets, Events and Map at bind.
+    /// Adds consoles, Packets, Events, Map and Left the box at bind.
     pub fn standard_panels(mut self) -> Self {
         if self.standard {
             self.errors
                 .push("standard_panels called twice; call it once".into());
         }
         self.standard = true;
+        self
+    }
+    /// Adds the bounded projection of guest destinations and world answers.
+    pub fn left_the_box(mut self) -> Self {
+        self.panels.push(PanelDescription {
+            id: "left-the-box".into(),
+            title: "Left the box".into(),
+            area: Area::Inspector,
+            content: PanelContent::LeftTheBox,
+        });
+        self
+    }
+    /// Adds startup containment results published by the world or guest kit.
+    pub fn containment(mut self, topic: StateTopic<super::Containment>) -> Self {
+        self.topics.push(("containment".into(), topic.topic));
+        self.panels.push(PanelDescription {
+            id: "containment".into(),
+            title: "Containment".into(),
+            area: Area::Inspector,
+            content: PanelContent::Containment {
+                state: "/api/state/containment".into(),
+            },
+        });
         self
     }
     /// Adds a server-filtered event table over the dashboard session.
@@ -177,11 +200,42 @@ impl Page {
                 }
             }
         }
+        if self.standard
+            && !self
+                .panels
+                .iter()
+                .any(|panel| matches!(panel.content, PanelContent::Containment { .. }))
+        {
+            self.topics.push((
+                "containment".into(),
+                StateTopic::<super::Containment>::new(super::StateLimits::default()).topic,
+            ));
+            self.panels.push(PanelDescription {
+                id: "containment".into(),
+                title: "Containment".into(),
+                area: Area::Inspector,
+                content: PanelContent::Containment {
+                    state: "/api/state/containment".into(),
+                },
+            });
+        }
+        if self.standard && self.labels.is_none() {
+            self.panels.push(PanelDescription {
+                id: "labels".into(),
+                title: "Labels and export".into(),
+                area: Area::Inspector,
+                content: PanelContent::Labels {
+                    state: None,
+                    command: None,
+                },
+            });
+        }
         if self.standard {
             for (title, content) in [
                 ("Packets", PanelContent::Packets),
                 ("Events", PanelContent::Events),
                 ("Map", PanelContent::Map),
+                ("Left the box", PanelContent::LeftTheBox),
             ] {
                 self.panels.push(PanelDescription {
                     id: panel::slug(title),
@@ -259,6 +313,15 @@ impl Page {
                 )));
             }
         }
+        self.panels.sort_by_key(|panel| match panel.content {
+            PanelContent::Packets => 0,
+            PanelContent::Events => 1,
+            PanelContent::Map => 2,
+            PanelContent::LeftTheBox => 3,
+            PanelContent::Containment { .. } => 4,
+            PanelContent::Labels { .. } => 5,
+            _ => 6,
+        });
         Ok(())
     }
 }
@@ -302,12 +365,14 @@ pub(super) async fn projection(
         let Some(host) = shared.page.hosts.iter().find(|h| h.name == host) else {
             return http::error(conn, 404, "no such host").await;
         };
-        let topology = shared.page.dashboard.0.collector.topology();
-        let links: Vec<_> = topology
-            .links
-            .iter()
-            .filter(|(_, link)| link.sandbox.as_deref() == Some(&host.sandbox))
-            .map(|(id, _)| id.to_string())
+        let links: Vec<_> = shared
+            .page
+            .dashboard
+            .0
+            .collector
+            .sandbox_links(Some(&host.sandbox))
+            .into_iter()
+            .map(|id| id.to_string())
             .collect();
         return http::json(conn, 200, &serde_json::json!({"links": links})).await;
     }

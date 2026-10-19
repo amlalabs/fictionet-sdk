@@ -5,6 +5,7 @@ use fictionet::events::{Interest, Loss, Observation, Observer, Stamp};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant as RunTime;
 
+use crate::egress::{Egress, EgressLimits, EgressSnapshot};
 use crate::json::{self, Object, Scalar};
 use crate::watch::{Export, Subscription as Hold, Watches};
 use crate::{Bounds, CapturePolicy, Collector, Options, Registry, Value, view};
@@ -36,6 +37,8 @@ pub struct DashboardOptions {
     /// of any watch. Each watch also keeps at most 4,096 rows and 32 MiB.
     /// The default is 256 MiB.
     pub watch_bytes: usize,
+    /// Bounds on the left-the-box table, [`DashboardHandle::egress`].
+    pub egress: EgressLimits,
 }
 
 impl Default for DashboardOptions {
@@ -48,6 +51,7 @@ impl Default for DashboardOptions {
             protocols: Registry::default(),
             watches: 64,
             watch_bytes: 256 << 20,
+            egress: EgressLimits::default(),
         }
     }
 }
@@ -72,6 +76,7 @@ pub struct DashboardHandle(pub(crate) Arc<Shared>);
 pub(crate) struct Shared {
     pub(crate) collector: Collector,
     pub(crate) watches: Watches,
+    egress: Egress,
     clock: Mutex<Clock>,
 }
 
@@ -93,6 +98,7 @@ impl Observer for Shared {
     fn enabled(&self, interest: Interest<'_>) -> bool {
         matches!(interest, Interest::Event(meta, _) if meta.source == "run" && meta.kind == "start")
             || self.collector.enabled(interest)
+            || self.egress.enabled(interest)
     }
 
     fn observe(&self, stamp: Stamp, item: Observation<'_>) {
@@ -110,9 +116,11 @@ impl Observer for Shared {
                     .and_then(|v| Duration::try_from_secs_f64(v).ok());
             }
         }
+        self.egress.observe(stamp, item.clone());
         self.collector.observe(stamp, item);
     }
     fn lost(&self, loss: Loss) {
+        self.egress.lost(loss.clone());
         self.collector.lost(loss);
     }
     fn end(&self, at: RunTime) {
@@ -135,6 +143,7 @@ impl DashboardObserver {
                 keys,
             ),
             collector: Collector::new(options.collector),
+            egress: Egress::new(options.egress),
             clock: Mutex::new(Clock::default()),
         }))
     }
@@ -157,6 +166,15 @@ impl DashboardHandle {
             subs: Vec::new(),
             downloads: Vec::new(),
         }
+    }
+    /// Every connection attempt from each sandbox so far, grouped by
+    /// destination, with what the world did with it. See [`Egress`].
+    pub fn egress(&self) -> EgressSnapshot {
+        self.0.egress.snapshot()
+    }
+    /// Increases whenever [`DashboardHandle::egress`] would change.
+    pub fn egress_revision(&self) -> u64 {
+        self.0.egress.revision()
     }
     pub(crate) fn begun(&self) -> bool {
         self.0.clock.lock().begun || self.0.collector.ended().is_some()

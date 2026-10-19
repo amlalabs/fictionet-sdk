@@ -1,3 +1,4 @@
+import { labelAction } from './labels.mjs';
 // mount(root, services, options) returns dispose. Services provide the shared
 // watch, selection and host names.
 import { scoped, listen } from '../dom.mjs';
@@ -60,6 +61,7 @@ export function mount(root, services, options = {}) {
   const jump = el('button', { class: 'jump', type: 'button', hidden: '' }, wrap);
   let events = [], host = services.selection.get().host, chosen = services.selection.get().event?.seq ?? null;
   let pending = 0, paused = false;
+  const editing = () => [...list.querySelectorAll('form')].some((form) => !form.hidden);
   const newRows = new Set();
   const source = services.watch();
   const cleanup = [];
@@ -77,6 +79,8 @@ export function mount(root, services, options = {}) {
   }
   function details(event, parent) {
     const box = el('div', { class: 'event-detail' }, parent);
+    labelAction(box, services, { kind: 'event', seq: event.seq });
+    if (event.conn && event.local && event.peer) labelAction(box, services, { kind: 'connection', id: event.conn, local: event.local, peer: event.peer }, 'Label connection');
     const dl = el('dl', { class: 'kv' }, box);
     const add = (key, value) => {
       if (value === null || value === undefined || value === '') return;
@@ -147,7 +151,7 @@ export function mount(root, services, options = {}) {
     events.push(event);
     if (events.length > LIMIT) events = events.slice(-LIMIT);
     newRows.add(event.seq);
-    if (!paused) render();
+    if (!paused && !editing()) render();
     else { pending++; jump.textContent = `↑ ${pending} new`; jump.hidden = false; }
   });
   on('world_error', ({ error }) => { loss.textContent = `Events are unavailable: ${error}`; loss.hidden = false; });
@@ -165,7 +169,7 @@ export function mount(root, services, options = {}) {
       if (seq !== null) list.querySelector?.('.event-item.on')?.scrollIntoView?.({ block: 'nearest' });
     }
   }));
-  if (services.onMoment) cleanup.push(services.onMoment(() => { if (!paused) render(); }));
+  if (services.onMoment) cleanup.push(services.onMoment(() => { if (!paused && !editing()) render(); }));
   render();
   return () => {
     cleanup.forEach((remove) => remove());

@@ -49,11 +49,11 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
 
   // Endpoints are fixed; values are query parameters, never destinations.
   const segment = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
-  const observation = ['world', 'graph', 'counters', 'events', 'link', 'keylog', 'watch', 'packets', 'packet', 'pcap'];
+  const observation = ['egress', 'world', 'graph', 'counters', 'events', 'link', 'keylog', 'watch', 'packets', 'packet', 'pcap'];
   function endpoint(path, method) {
     if (method === 'POST' && ['/api/bootstrap', '/api/ticket', '/api/lease'].includes(path)) return path;
     if (method === 'DELETE' && path === '/api/lease') return path;
-    if (method === 'GET' && (path === '/api/page' || path === '/api/states/stream' || observation.some((op) => path === `/api/${op}`))) return path;
+    if (method === 'GET' && (path === '/api/page' || path === '/api/states/stream' || path === '/api/export/events' || path === '/api/export/packets' || observation.some((op) => path === `/api/${op}`))) return path;
     const parts = path.split('/');
     if (parts[0] !== '' || parts[1] !== 'api' || !segment(parts[3])) throw new Error('Invalid page endpoint');
     if (parts.length === 4 && (
@@ -243,16 +243,17 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
     return request('packet', { link: p.link, seq: p.seq }, signal);
   }
 
-  async function download(kind, list) {
-    if (kind !== 'pcap') throw new Error('Unknown download');
-    const response = await request(kind, { link: list });
+  async function download(kind, list = '') {
+    if (!['pcap', 'events', 'packets'].includes(kind)) throw new Error('Unknown download');
+    const exported = kind !== 'pcap';
+    const response = await request(exported ? `/api/export/${kind}` : kind, exported ? (list ? { host: list } : {}) : { link: list });
     if (!response.ok) throw new Error('Download unavailable');
     const blob = await response.blob();
     if (lifetime.signal.aborted) return;
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = (list.includes(',') ? 'fictionet-links.pcapng' : `fictionet-${list}.pcapng`).replace(/[^a-zA-Z0-9.-]/g, '');
+    anchor.download = kind === 'events' ? 'fictionet-events.jsonl' : (list.includes(',') ? 'fictionet-links.pcapng' : `fictionet-${list}.pcapng`).replace(/[^a-zA-Z0-9.-]/g, '');
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();

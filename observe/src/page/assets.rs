@@ -14,6 +14,13 @@ pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static [u8])> {
         "/layout.mjs" => include_bytes!("../../../dashboard/layout.mjs"),
         "/packets.mjs" => include_bytes!("../../../dashboard/packets.mjs"),
         "/tables.mjs" => include_bytes!("../../../dashboard/tables.mjs"),
+        "/components/left-the-box.mjs" => {
+            include_bytes!("../../../dashboard/components/left-the-box.mjs")
+        }
+        "/components/containment.mjs" => {
+            include_bytes!("../../../dashboard/components/containment.mjs")
+        }
+        "/components/labels.mjs" => include_bytes!("../../../dashboard/components/labels.mjs"),
         "/components/map.mjs" => include_bytes!("../../../dashboard/components/map.mjs"),
         "/components/packets.mjs" => include_bytes!("../../../dashboard/components/packets.mjs"),
         "/components/events.mjs" => include_bytes!("../../../dashboard/components/events.mjs"),

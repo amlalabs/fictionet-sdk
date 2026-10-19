@@ -5,7 +5,7 @@ import { listen } from './dom.mjs';
 export function createPackets({
   $, el, packetStream, packet, download, getEdge, ends, nodeLabel, fmtCount, fit, maxRows = 3000,
   placeholder = (many) => (many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.'),
-  pcapLabel = 'Capture for Wireshark',
+  pcapLabel = 'Capture for Wireshark', onSelect = () => {},
 }) {
   // ---------------------------------------------------------------------------
   // The packet drawer
@@ -285,6 +285,7 @@ export function createPackets({
   async function showPacket(p, tr) {
     if (!packets) return;
     invalidateSelection();
+    onSelect(p);
     const generation = selection;
     const history = packets;
     const request = new AbortController();
@@ -313,6 +314,7 @@ export function createPackets({
   }
 
   function invalidateSelection() {
+    onSelect(null);
     drawer.classList.remove('has-packet');
     selection++;
     detailRequest?.abort();

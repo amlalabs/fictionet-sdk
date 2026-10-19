@@ -340,7 +340,10 @@ where
         let path = disk.root.join(&key);
         match Entry::open(&path).await {
             Ok(entry) => {
-                if let Some(response) = entry.response(request.headers(), disk.clone()).await? {
+                if let Some(mut response) = entry.response(request.headers(), disk.clone()).await? {
+                    response.extensions_mut().insert(
+                        fictionet::events::Fields::new().with("served_by", "host package cache"),
+                    );
                     self.state.stats.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok((response, None));
                 }

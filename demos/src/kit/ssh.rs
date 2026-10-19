@@ -155,6 +155,12 @@ impl Session {
 
     /// Runs `command` and returns what it printed and its exit code.
     pub async fn run(&self, command: &str) -> io::Result<Output> {
+        self.run_bounded(command, usize::MAX).await
+    }
+
+    /// Runs a command with a bound on combined stdout and stderr bytes.
+    /// Closes the channel and reports an error when output exceeds the bound.
+    pub async fn run_bounded(&self, command: &str, max_bytes: usize) -> io::Result<Output> {
         let mut channel = self
             .handle
             .channel_open_session()
@@ -174,6 +180,16 @@ impl Session {
         // Read until the channel is fully closed (`wait` returns `None`), so
         // the exit status is captured even when it arrives after EOF.
         while let Some(msg) = channel.wait().await {
+            let added = match &msg {
+                russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. } => {
+                    data.len()
+                }
+                _ => 0,
+            };
+            if added > max_bytes.saturating_sub(out.len() + err.len()) {
+                channel.close().await.map_err(io::Error::other)?;
+                return Err(io::Error::other("command output exceeded its byte limit"));
+            }
             match msg {
                 russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
                 russh::ChannelMsg::ExtendedData { data, .. } => err.extend_from_slice(&data),

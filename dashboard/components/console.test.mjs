@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mount as screen } from './screen.mjs';
 import { mount as terminal } from './terminal.mjs';
 import { createDocument, Element } from '../test-dom.mjs';
+import { createTransport } from '../transport.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -51,9 +52,15 @@ function fixture() {
     },
     theme: { subscribe(callback) { themes.add(callback); callback('light'); return () => themes.delete(callback); } },
     transport: {
+      ...createTransport({}, {
+        location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
+        async fetch(url, options) {
+          assert.equal(options.headers.Authorization, 'Bearer secret');
+          requests.push({ method: options.method, path: new URL(url).pathname, body: JSON.parse(options.body) });
+          return Response.json({ holder: options.method === 'POST' ? 'ours' : null });
+        },
+      }),
       async socket(capability, host) { const socket = new Socket(); sockets.push(socket); requests.push({ capability, host }); return { socket, session: 'ours' }; },
-      async post(path, body) { requests.push({ method: 'POST', path, body }); return { holder: 'ours' }; },
-      async delete(path, body) { requests.push({ method: 'DELETE', path, body }); return { holder: null }; },
     },
   };
   return {

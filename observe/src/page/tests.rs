@@ -110,10 +110,25 @@ async fn the_page_is_public_and_only_bearers_authenticate() {
         &request(&server, "POST", "/api/bootstrap", &headers, "").await,
         204,
     );
-    status(
-        &request(&server, "POST", "/api/bootstrap", &headers, "").await,
-        409,
-    );
+    for _ in 0..2 {
+        status(
+            &request(&server, "POST", "/api/bootstrap", &headers, "").await,
+            204,
+        );
+    }
+    for authorization in ["", "Authorization: Bearer wrong\r\n"] {
+        status(
+            &request(
+                &server,
+                "POST",
+                "/api/bootstrap",
+                &format!("{authorization}Origin: http://{}\r\n", address(&server)),
+                "",
+            )
+            .await,
+            401,
+        );
+    }
 }
 
 #[tokio::test]
@@ -852,12 +867,23 @@ async fn packet_streams_merge_links_and_downloads_join_sections() {
                 ]));
                 let packet = attached.recv(&cx).await?;
                 attached.send(packet);
+                for _ in 0..16 {
+                    let mut packet = vec![0; 8192];
+                    packet[..28].copy_from_slice(&[
+                        0x45, 0, 0x20, 0, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1, 8, 0,
+                        0, 0, 0x12, 0x34, 0, 1,
+                    ]);
+                    sandbox.send(fictionet::Packet(packet));
+                    attached.recv(&cx).await?;
+                }
             }
             Ok(())
         },
     ))
     .unwrap();
     let server = Page::new("Packets", dashboard.handle())
+        .host(Host::new("one"))
+        .host(Host::new("two"))
         .bind_loopback(0)
         .await
         .unwrap();
@@ -925,7 +951,36 @@ async fn packet_streams_merge_links_and_downloads_join_sections() {
     conn.read_to_end(&mut response).await.unwrap();
     let end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     status(std::str::from_utf8(&response[..end]).unwrap(), 200);
+    assert!(
+        expected.len() > 128 << 10,
+        "both captures require multiple chunks"
+    );
+    assert!(
+        !std::str::from_utf8(&response[..end])
+            .unwrap()
+            .contains("Content-Length:")
+    );
     assert_eq!(response[end..], expected);
+    let mut conn = TcpStream::connect(address(&server)).await.unwrap();
+    conn.write_all(
+        format!(
+            "GET /api/export/packets HTTP/1.1\r\nHost: {}\r\n{}\r\n",
+            address(&server),
+            bearer(&server)
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut exported = Vec::new();
+    conn.read_to_end(&mut exported).await.unwrap();
+    let end = exported.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    status(std::str::from_utf8(&exported[..end]).unwrap(), 200);
+    assert_eq!(
+        exported[end..],
+        expected,
+        "scope keeps captures after guest links close"
+    );
 }
 
 #[tokio::test]
@@ -1794,4 +1849,204 @@ async fn moments_validate_titles_ids_and_host_filters_before_binding() {
             io::ErrorKind::InvalidInput
         );
     }
+}
+
+#[tokio::test]
+async fn left_the_box_is_declared_and_requires_a_bearer() {
+    for standard in [false, true] {
+        let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+        let page = Page::new("Destinations", dashboard.handle());
+        let server = if standard {
+            page.standard_panels()
+        } else {
+            page.left_the_box()
+        }
+        .bind_loopback(0)
+        .await
+        .unwrap();
+        let description =
+            json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+        assert!(
+            description["panels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|panel| panel["kind"] == "left_the_box")
+        );
+        status(&request(&server, "GET", "/api/egress", "", "").await, 401);
+        let response = request(&server, "GET", "/api/egress", &bearer(&server), "").await;
+        status(&response, 200);
+        let snapshot = json_body(&response);
+        assert_eq!(snapshot["destinations"], serde_json::json!([]));
+        assert_eq!(snapshot["dropped"], 0);
+        assert_eq!(snapshot["lost"], 0);
+        status(
+            &request(
+                &server,
+                "GET",
+                "/api/egress?token=wrong",
+                &bearer(&server),
+                "",
+            )
+            .await,
+            400,
+        );
+        status(
+            &request(&server, "GET", "/components/left-the-box.mjs", "", "").await,
+            200,
+        );
+    }
+}
+
+#[tokio::test]
+async fn labels_are_world_commands_and_event_exports_keep_scope_labels_and_loss() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let labels = Labels::default();
+    let worker_labels = labels.clone();
+    let observer = dashboard.observer();
+    let server = Page::new("Export", dashboard.handle())
+        .host(Host::new("alpha"))
+        .host(Host::new("beta"))
+        .labels(labels)
+        .standard_panels()
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    for path in ["/api/export/events", "/api/export/packets"] {
+        status(&request(&server, "GET", path, "", "").await, 401);
+    }
+    let worker = std::thread::spawn(move || {
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(3)).observer(observer.clone()),
+            |cx| async move {
+                let command = worker_labels.commands.recv().await.unwrap();
+                worker_labels.apply(&cx, command);
+                for n in 0..300 {
+                    let guest = if n % 2 == 0 { "alpha" } else { "beta" };
+                    let conn = fictionet::events::ConnInfo::new(
+                        2,
+                        "192.0.2.1:80".parse().unwrap(),
+                        "10.0.2.15:40000".parse().unwrap(),
+                    )
+                    .from_sandbox(Some(fictionet::events::Sandbox {
+                        id: 1,
+                        name: guest.into(),
+                        addr: None,
+                        addr_v6: None,
+                    }));
+                    cx.emitter(&conn).emit("fixture", "request", |event| {
+                        event.field("number", n as u32)
+                    });
+                }
+                observer.lost(fictionet::events::Loss {
+                    stream: fictionet::events::Stream::Events,
+                    reason: fictionet::events::LossReason::Overflow,
+                    count: 7,
+                    bytes: None,
+                    seqs: None,
+                });
+                Ok(())
+            },
+        ))
+        .unwrap();
+    });
+    let headers = format!("{}Origin: http://{}\r\n", bearer(&server), address(&server));
+    let response = request(&server, "POST", "/api/command/labels", &headers,
+        r#"{"request_id":"label","command":{"action":"add","target":{"kind":"connection","id":2,"local":"192.0.2.1:80","peer":"10.0.2.15:40000"},"text":"download"}}"#).await;
+    status(&response, 200);
+    assert_eq!(json_body(&response)["status"], "applied");
+    worker.join().unwrap();
+    let all = request(&server, "GET", "/api/export/events", &bearer(&server), "").await;
+    status(&all, 200);
+    assert!(all.contains("application/x-ndjson"));
+    let lines: Vec<serde_json::Value> = all
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .1
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["source"] == "fixture")
+            .count(),
+        300
+    );
+    assert_eq!(
+        lines.iter().find(|line| line["type"] == "loss").unwrap()["count"],
+        7
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["source"] == "page" && line["kind"] == "label")
+            .count(),
+        1
+    );
+    assert!(
+        lines
+            .iter()
+            .filter(|line| line["source"] == "fixture")
+            .all(|line| line["labels"][0]["text"] == "download")
+    );
+    let scoped = request(
+        &server,
+        "GET",
+        "/api/export/events?host=alpha",
+        &bearer(&server),
+        "",
+    )
+    .await;
+    status(&scoped, 200);
+    let lines: Vec<serde_json::Value> = scoped
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .1
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["source"] == "fixture")
+            .count(),
+        150
+    );
+    assert!(
+        lines
+            .iter()
+            .filter(|line| line["source"] == "fixture")
+            .all(|line| line["sandbox"]["name"] == "alpha")
+    );
+    assert!(lines.iter().any(|line| line["type"] == "loss"));
+    status(
+        &request(
+            &server,
+            "GET",
+            "/api/export/events?host=unknown",
+            &bearer(&server),
+            "",
+        )
+        .await,
+        404,
+    );
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    let kinds: Vec<_> = description["panels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|panel| panel["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "packets",
+            "events",
+            "map",
+            "left_the_box",
+            "containment",
+            "labels"
+        ]
+    );
 }

@@ -5,6 +5,7 @@ import { mount as eventTable } from './event-table.mjs';
 import { mount as control } from './control.mjs';
 import { mount as custom } from './custom.mjs';
 import { createDocument } from '../test-dom.mjs';
+import { createTransport } from '../transport.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 function fixture() {
@@ -14,10 +15,18 @@ function fixture() {
   let publish, fail;
   const services = {
     state(path, snapshot, error) { publish = snapshot; fail = error; subscriptions.add(path); return () => subscriptions.delete(path); },
-    transport: {
-      post(path, body, signal) { return new Promise((resolve, reject) => requests.push({ path, body, signal, resolve, reject })); },
-      get(path, params, signal) { return new Promise((resolve, reject) => requests.push({ path, params, signal, resolve, reject })); },
-    },
+    transport: createTransport({}, {
+      location: { href: 'http://127.0.0.1:7878/' }, storage: { getItem: () => 'secret' },
+      fetch(url, options) {
+        const endpoint = new URL(url);
+        assert.equal(options.headers.Authorization, 'Bearer secret');
+        return new Promise((resolve, reject) => requests.push({
+          path: endpoint.pathname, body: options.body && JSON.parse(options.body), signal: options.signal,
+          params: Object.fromEntries([...endpoint.searchParams].map(([key, value]) => [key, Number(value)])),
+          resolve: (value) => resolve(Response.json(value)), reject,
+        }));
+      },
+    }),
     setTimeout(callback) { const id = Symbol(); timers.set(id, callback); return id; },
     clearTimeout(id) { timers.delete(id); },
   };
@@ -57,6 +66,7 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.deepEqual(h.root.querySelectorAll('dt').map((dt) => dt.textContent), ['Running', 'Last change']);
   assert.deepEqual(h.root.querySelectorAll('dd').map((dd) => dd.textContent), ['true', 'boot']);
   button.click(); button.click();
+  await settle();
   assert.equal(h.requests.length, 1);
   assert.equal(h.requests[0].body.command.expected_revision, 7);
   assert.equal(h.requests[0].body.command.running, false);
@@ -66,17 +76,20 @@ test('control sends the linked revision once and shows replies, rejections and t
   assert.match(h.root.textContent, /<Pause>: applied.*<done>/);
   h.publish({ revision: 8, value: { running: false } });
   button.click();
+  await settle();
   assert.equal(h.requests[1].body.command.expected_revision, 8);
   assert.notEqual(h.requests[0].body.request_id, h.requests[1].body.request_id);
   h.requests[1].reject({ body: { rejection: { reason: 'stale_revision', current: 9 } } });
   await settle();
   assert.match(h.root.textContent, /Not applied: the state changed \(now revision 9\)\. Check it and try again\./);
   button.click();
+  await settle();
   h.requests[2].reject({ body: { status: 'timeout' } });
   await settle();
   assert.match(h.root.textContent, /may still apply/);
   assert.equal(h.requests.length, 3);
   button.click();
+  await settle();
   h.requests[3].resolve({ status: 'applied', reply: null });
   await settle();
   assert.match(h.root.querySelector('.control-reply').textContent, /^<Pause>: applied$/);
@@ -89,11 +102,13 @@ test('control sends the linked revision once and shows replies, rejections and t
 test('event table advances the server cursor and cancels pending reads and timers', async () => {
   const h = fixture();
   const dispose = eventTable(h.root, h.services, { events: '/api/event-table/log', columns: [{ label: 'Text', pointer: '/summary' }] });
+  await settle();
   h.requests[0].resolve({ rows: [{ summary: '<world>' }], next: 11, dropped: 3 });
   await settle();
   assert.match(h.root.textContent, /<world>/);
   assert.match(h.root.textContent, /3 events were lost/);
   const next = [...h.timers.values()][0]; h.timers.clear(); next();
+  await settle();
   assert.deepEqual(h.requests[1].params, { after: 11 });
   dispose();
   h.requests[1].resolve({ rows: [{ summary: 'late' }], next: 12, dropped: 0 });

@@ -286,7 +286,7 @@ impl hyper::service::Service<Request<Incoming>> for Route {
     type Error = Error;
     type Future = Answer;
 
-    fn call(&self, request: Request<Incoming>) -> Answer {
+    fn call(&self, mut request: Request<Incoming>) -> Answer {
         // The observer has seen the handed-off request's head, body and end
         // already, so its tracker is used as it is.
         let handed_off = self.handed_off.lock().take();
@@ -297,9 +297,10 @@ impl hyper::service::Service<Request<Incoming>> for Route {
                 &self.info,
                 self.observe.clone(),
             );
-            tracker.start(&request, &self.info, self.fcx.now());
+            tracker.start(&mut request, &self.info, self.fcx.now());
             tracker
         });
+        tracker.attach(&mut request);
         let metadata = self.budget.as_ref().map(|budget| {
             let head = budget.charge(request_held(&request))?;
             let event = budget.charge(tracker.held())?;

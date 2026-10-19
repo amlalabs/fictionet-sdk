@@ -205,7 +205,7 @@ impl<C, R> Command<C, R> {
     }
 }
 
-fn event_value(value: &Value) -> fictionet::stdlib::protocols::json::Value {
+pub(super) fn event_value(value: &Value) -> fictionet::stdlib::protocols::json::Value {
     use fictionet::stdlib::protocols::json::{Number, Value as EventValue};
     match value {
         Value::Null => EventValue::Null,

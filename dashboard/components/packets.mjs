@@ -1,3 +1,4 @@
+import { labelAction } from './labels.mjs';
 // mount(root, services, options) returns dispose. Services provide transport and selection.
 // The packet list for the selected host's links, or for every guest-facing
 // link when no host is selected, merged as the CLI dashboard merges them.
@@ -12,7 +13,12 @@ export const APPROXIMATE = 'Approximate: matched by address and port, not by con
 export function mount(root, services, options = {}) {
   const { $, el } = scoped(root);
   if (!$('drawer')) structure(root, el);
+  const labels = el('div', {}, $('drawer'));
   const view = createPackets({
+    onSelect(packet) {
+      labels.replaceChildren();
+      if (packet) labelAction(labels, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
+    },
     $, el, ...services.transport, fmtCount, fit() {}, ...options,
     placeholder: options.placeholder || (() => 'Select a packet to see its layers.'),
     ...(options.drawer ? {} : { pcapLabel: 'pcapng' }),
@@ -59,13 +65,16 @@ export function mount(root, services, options = {}) {
     const attempt = ++generation;
     request?.abort();
     if (selected.links.length) return show(selected.links, selected.host || 'Selected links');
+    const live = [...edges.values()].filter((e) => nodes.get(e.a)?.kind === 'sandbox' || nodes.get(e.b)?.kind === 'sandbox').map((e) => e.id);
     if (!selected.host) {
-      return show([...edges.values()].filter((e) => nodes.get(e.a)?.kind === 'sandbox' || nodes.get(e.b)?.kind === 'sandbox').map((e) => e.id), 'All hosts');
+      show(live, 'All hosts');
     }
+    const hosts = selected.host ? [selected.host] : (services.hosts || []).map((host) => host.name);
+    if (!hosts.length) return;
     request = new AbortController();
     try {
-      const value = await services.transport.get(`/api/host/${selected.host}/links`, {}, request.signal);
-      if (attempt === generation) show(value.links, selected.host);
+      const values = await Promise.all(hosts.map((host) => services.transport.get(`/api/host/${host}/links`, {}, request.signal)));
+      if (attempt === generation) show([...new Set([...(selected.host ? [] : live), ...values.flatMap((value) => value.links)])], selected.host || 'All hosts');
     } catch (error) {
       if (attempt !== generation || request.signal.aborted) return;
       current = '';

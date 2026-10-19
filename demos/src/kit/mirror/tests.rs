@@ -162,14 +162,28 @@ async fn miss_then_hit_survives_a_new_run() {
         let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
         let upstream = Upstream::new().await;
         let cache = upstream.cache(&fcx, dir.path());
+        let response = send(&fcx, &cache, request(PACKAGE)).await.unwrap();
         assert_eq!(
-            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
-            "package"
+            response
+                .extensions()
+                .get::<fictionet::events::Fields>()
+                .unwrap()
+                .get("forwarded")
+                .and_then(|v| v.as_str()),
+            Some(upstream.uri.to_string().trim_end_matches('/'))
         );
+        assert_eq!(bytes(response).await, "package");
+        let response = send(&fcx, &cache, request(PACKAGE)).await.unwrap();
+        let fields = response
+            .extensions()
+            .get::<fictionet::events::Fields>()
+            .unwrap();
         assert_eq!(
-            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
-            "package"
+            fields.get("served_by").and_then(|v| v.as_str()),
+            Some("host package cache")
         );
+        assert!(fields.get("forwarded").is_none());
+        assert_eq!(bytes(response).await, "package");
         assert_eq!(upstream.count(), 1);
         assert_eq!(cache.state.stats.saved.load(Ordering::Relaxed), 7);
         drop(cache);

@@ -64,6 +64,20 @@ pub struct PanelDescription {
 pub enum PanelContent {
     /// Captured packets from the dashboard.
     Packets,
+    /// Guest destinations and the world's answers.
+    LeftTheBox,
+    /// Startup guest probes and the corresponding world answers.
+    Containment {
+        /// State snapshot URL.
+        state: String,
+    },
+    /// Labels and scoped run downloads.
+    Labels {
+        /// Label state, absent until the world enables labeling.
+        state: Option<String>,
+        /// World command mailbox, absent until labeling is enabled.
+        command: Option<String>,
+    },
     /// Dashboard events.
     Events,
     /// Dashboard topology.

@@ -75,7 +75,7 @@ pub(super) async fn route(
     }
     let mut session = shared.page.dashboard.session();
     if let Some(links) = merged {
-        return merged_download(conn, &mut session, &links).await;
+        return merged_download(conn, &shared.page.dashboard, &links).await;
     }
     let values = session.request(1, &observe_request(op, query), Instant::now(), wall());
     let Some(value) = values.into_iter().next() else {
@@ -122,31 +122,23 @@ async fn poll(session: &mut Session) -> Vec<Value> {
 
 async fn merged_download(
     conn: &mut TcpStream,
-    session: &mut Session,
+    handle: &DashboardHandle,
     links: &[String],
 ) -> io::Result<()> {
-    // Match the dashboard's all-or-error download, preserving section order.
-    let mut file = Vec::new();
+    // Prepare every bounded capture before sending a header. Each session
+    // holds packet references and emits one chunk at a time, in section order.
+    let mut captures = Vec::new();
     let mut failures = Vec::new();
     for link in links {
+        let mut session = handle.session();
         let query = [("link".into(), link.clone())];
-        let mut values =
-            session.request(1, &observe_request("pcap", &query), Instant::now(), wall());
-        loop {
-            let mut done = false;
-            for value in values {
-                done |= value.end;
-                if value.binary {
-                    file.extend_from_slice(&value.bytes);
-                } else if let Some(Envelope::Error(error)) = value.envelope() {
-                    failures.push(serde_json::json!({"link": link, "error": error}));
-                }
+        let values = session.request(1, &observe_request("pcap", &query), Instant::now(), wall());
+        for value in &values {
+            if let Some(Envelope::Error(error)) = value.envelope() {
+                failures.push(serde_json::json!({"link": link, "error": error}));
             }
-            if done {
-                break;
-            }
-            values = poll(session).await;
         }
+        captures.push((session, values));
     }
     if !failures.is_empty() {
         let names = failures
@@ -157,17 +149,36 @@ async fn merged_download(
         return http::json(
             conn,
             404,
-            &serde_json::json!({"error": format!("no capture for {names}"), "links": failures}),
+            &serde_json::json!({
+                "error": format!("no capture for {names}"), "links": failures,
+            }),
         )
         .await;
     }
-    let extra = format!(
-        "Content-Length: {}\r\n\
-         Content-Disposition: attachment; filename=\"fictionet-links.pcapng\"\r\n",
-        file.len()
-    );
-    http::headers(conn, 200, "application/vnd.tcpdump.pcap", &extra).await?;
-    http::write(conn, &file).await
+    http::headers(
+        conn,
+        200,
+        "application/vnd.tcpdump.pcap",
+        "Content-Disposition: attachment; filename=\"fictionet-links.pcapng\"\r\n",
+    )
+    .await?;
+    for (mut session, mut values) in captures {
+        loop {
+            let mut done = false;
+            for value in values {
+                if !value.binary {
+                    return Err(io::Error::other("the capture did not return binary data"));
+                }
+                http::write(conn, &value.bytes).await?;
+                done |= value.end;
+            }
+            if done {
+                break;
+            }
+            values = poll(&mut session).await;
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn event(conn: &mut TcpStream, name: &str, data: &str) -> io::Result<()> {

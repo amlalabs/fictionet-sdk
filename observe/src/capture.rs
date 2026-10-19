@@ -88,6 +88,7 @@ pub struct PacketBatch {
 
 #[derive(Default)]
 pub(crate) struct Capture {
+    pub(crate) sandbox: Option<String>,
     copies: VecDeque<PacketCopy>,
     bytes: usize,
     next: u64,

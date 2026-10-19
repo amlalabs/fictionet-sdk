@@ -777,6 +777,7 @@ extern crate self as fictionet_observe;
 
 mod aggregate;
 mod capture;
+pub mod egress;
 mod keys;
 mod loss;
 mod memory;
@@ -821,6 +822,7 @@ mod tracing_bridge;
 pub use tracing_bridge::Tracing;
 
 pub use aggregate::Aggregate;
+pub use egress::Egress;
 pub use memory::{DisplayBatch, Incomplete, Limits, Memory};
 
 /// Default number of ordinary events retained by [`Memory`], separate from noise.
@@ -991,6 +993,37 @@ impl Collector {
         let start = items.partition_point(|k| k.stamp.seq <= after);
         items.range(start..).cloned().collect()
     }
+    /// Guest links, including retained captures after the topology removed them.
+    #[cfg(feature = "page")]
+    pub(crate) fn sandbox_links(&self, sandbox: Option<&str>) -> Vec<LinkId> {
+        let state = self.state.lock();
+        let links: std::collections::BTreeSet<_> = state
+            .topology
+            .links
+            .iter()
+            .filter(|(_, link)| {
+                link.sandbox
+                    .as_deref()
+                    .is_some_and(|name| sandbox.is_none_or(|sandbox| sandbox == name))
+            })
+            .map(|(id, _)| *id)
+            .chain(
+                state
+                    .captures
+                    .links
+                    .iter()
+                    .filter(|(_, capture)| {
+                        capture
+                            .sandbox
+                            .as_deref()
+                            .is_some_and(|name| sandbox.is_none_or(|sandbox| sandbox == name))
+                    })
+                    .map(|(id, _)| *id),
+            )
+            .collect();
+        links.into_iter().collect()
+    }
+
     /// The link numbered `number`, if it is current or its capture is kept.
     #[cfg(feature = "decode")]
     pub(crate) fn find_link(&self, number: u64) -> Option<LinkId> {
@@ -1078,7 +1111,16 @@ impl Observer for Collector {
                     len: packet.len,
                     link_type: packet.link_type,
                 })) {
+                    let link = packet.link;
                     captures.push(stamp, packet, &self.options, losses);
+                    if let Some(capture) = captures.links.get_mut(&link)
+                        && capture.sandbox.is_none()
+                    {
+                        capture.sandbox = topology
+                            .links
+                            .get(&link)
+                            .and_then(|link| link.sandbox.clone());
+                    }
                 }
             }
             Observation::Topology(item) => {
@@ -1105,6 +1147,11 @@ impl Observer for Collector {
                     self.options.loss_streams,
                 );
                 if let Some((id, policy)) = link {
+                    if let Some(capture) = captures.links.get_mut(&id)
+                        && let Some(link) = topology.links.get(&id)
+                    {
+                        capture.sandbox.clone_from(&link.sandbox);
+                    }
                     let mut flags = (**self.flags.load()).clone();
                     if let Some(policy) = policy.filter(|_| topology.links.contains_key(&id)) {
                         flags.insert(id, Arc::new(CaptureFlag::new(policy)));

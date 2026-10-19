@@ -1,5 +1,5 @@
 use super::*;
-use fictionet::stdlib::{services::ca::Ca, web::httpd, protocols::x509};
+use fictionet::stdlib::{protocols::x509, services::ca::Ca, web::httpd};
 use fictionet::{Cx, Seed};
 use http_body_util::BodyExt;
 use std::net::TcpListener;
@@ -155,7 +155,11 @@ where
     F: std::future::Future<Output = Result<(), Error>> + Send + 'static,
 {
     let evidence = Arc::new(fictionet::events::recorder::Recorder::default());
-    fictionet::block_on(fictionet::run(fictionet::RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()), move |fcx| test(fcx, evidence))).unwrap();
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()),
+        move |fcx| test(fcx, evidence),
+    ))
+    .unwrap();
 }
 
 async fn poll_once<F: Future + ?Sized>(mut future: Pin<&mut F>) -> Poll<F::Output> {
@@ -200,7 +204,9 @@ fn empty_requests_declare_a_length_only_when_their_method_expects_content() {
                 let expects = matches!(method, "POST" | "PUT" | "PATCH");
                 assert_eq!(head.contains("content-length: 0\r\n"), expects, "{head}");
                 assert!(!head.contains("transfer-encoding"), "{head}");
-                socket.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .unwrap();
                 socket.flush().unwrap();
             }
         });
@@ -558,15 +564,28 @@ fn an_early_answer_during_an_upload_reaches_the_world() {
 struct Downstream {
     input: Bytes,
     output: Arc<Mutex<Vec<u8>>>,
+    reset: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 impl fictionet::stdlib::network::Connection for Downstream {
+    fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
+        match &mut *self.reset.lock() {
+            Some(reset) => Pin::new(reset).poll(cx).map(|_| ()),
+            None => Poll::Pending,
+        }
+    }
+
     fn poll_read(
         &mut self,
         _: &Cx,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, fictionet::stdlib::network::ConnError>> {
         if self.input.is_empty() {
+            if let Some(reset) = &mut *self.reset.lock()
+                && Pin::new(reset).poll(cx).is_ready()
+            {
+                return Poll::Ready(Err(fictionet::stdlib::network::ConnError::Reset));
+            }
             return Poll::Pending;
         }
         let n = buf.len().min(self.input.len());
@@ -591,13 +610,16 @@ impl fictionet::stdlib::network::Connection for Downstream {
     }
 }
 
-/// Serves one request through `forward` the way a site does, checks that
-/// it answered 502 and recorded the error, and returns the answer.
-async fn bad_gateway(fcx: &Cx, evidence: &fictionet::events::recorder::Recorder, forward: super::super::Forward) -> String {
+/// Serves one request through `forward` the way a site does and returns
+/// the answer.
+async fn serve_one(fcx: &Cx, forward: super::super::Forward) -> String {
     let output = Arc::new(Mutex::new(Vec::new()));
     let conn = Downstream {
-        input: Bytes::from_static(b"GET / HTTP/1.1\r\nHost: original.test\r\nConnection: close\r\n\r\n"),
+        input: Bytes::from_static(
+            b"GET / HTTP/1.1\r\nHost: original.test\r\nConnection: close\r\n\r\n",
+        ),
         output: output.clone(),
+        reset: Mutex::new(None),
     };
     fcx.race(
         Some(fcx.now() + Duration::from_secs(5)),
@@ -612,13 +634,56 @@ async fn bad_gateway(fcx: &Cx, evidence: &fictionet::events::recorder::Recorder,
     .await
     .unwrap()
     .unwrap();
-    let output = String::from_utf8(output.lock().clone()).unwrap();
-    assert!(output.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{output}");
+    String::from_utf8(output.lock().clone()).unwrap()
+}
+
+/// Serves one request through `forward`, checks that it answered 502 and
+/// recorded the error and the origin it tried, and returns the answer.
+async fn bad_gateway(
+    fcx: &Cx,
+    evidence: &fictionet::events::recorder::Recorder,
+    forward: super::super::Forward,
+) -> String {
+    let origin = format!("{}://{}", forward.scheme, forward.authority);
+    let output = serve_one(fcx, forward).await;
+    assert!(
+        output.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+        "{output}"
+    );
     let events = evidence.of("http", "request");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].str("answer"), Some("error"));
     assert_eq!(events[0].u64("status"), Some(502));
+    assert_eq!(events[0].str("forwarded"), Some(origin.as_str()));
     output
+}
+
+#[test]
+fn a_forwarded_request_names_the_origin_in_its_event() {
+    for tls in [false, true] {
+        run(async move |fcx, evidence| {
+            let (forward, server) = upstream(&fcx, tls, |socket| {
+                read_head(socket);
+                socket.write_all(OK_CLOSE).unwrap();
+                socket.flush().unwrap();
+            });
+            let origin = format!("{}://{}", forward.scheme, forward.authority);
+            let output = serve_one(&fcx, forward).await;
+            assert!(output.starts_with("HTTP/1.1 200 OK\r\n"), "{output}");
+            let events = evidence.of("http", "request");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].str("answer"), Some("handler"));
+            assert_eq!(events[0].u64("status"), Some(200));
+            assert_eq!(events[0].str("forwarded"), Some(origin.as_str()));
+            assert!(origin.starts_with(if tls {
+                "https://127.0.0.1:"
+            } else {
+                "http://127.0.0.1:"
+            }));
+            server.join().unwrap();
+            Ok(())
+        });
+    }
 }
 
 #[test]
@@ -754,6 +819,41 @@ fn exchanges_past_the_cap_wait_for_a_slot() {
             let response = call.await?;
             assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
         }
+        server.join().unwrap();
+        Ok(())
+    });
+}
+
+#[test]
+fn a_client_reset_before_the_upstream_answers_keeps_the_origin() {
+    run(async move |fcx, events| {
+        let (reset, receive) = tokio::sync::oneshot::channel();
+        let (finish, finished) = mpsc::channel();
+        let (forward, server) = upstream(&fcx, false, move |socket| {
+            read_head(socket);
+            reset.send(()).unwrap();
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let origin = format!("{}://{}", forward.scheme, forward.authority);
+        let conn = Downstream {
+            input: Bytes::from_static(b"GET / HTTP/1.1\r\nHost: original.test\r\n\r\n"),
+            output: Arc::default(),
+            reset: Mutex::new(Some(receive)),
+        };
+        httpd::serve_connection(
+            &fcx,
+            conn,
+            fictionet::events::ConnInfo::default(),
+            Arc::new(forward),
+            &httpd::HttpOptions::default(),
+        )
+        .await?;
+        let requests = events.of("http", "request");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].str("answer"), Some("cancelled"));
+        assert_eq!(requests[0].u64("status"), None);
+        assert_eq!(requests[0].str("forwarded"), Some(origin.as_str()));
+        finish.send(()).unwrap();
         server.join().unwrap();
         Ok(())
     });
