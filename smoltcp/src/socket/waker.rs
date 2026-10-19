@@ -2,17 +2,17 @@ use core::task::Waker;
 
 /// Utility struct to register and wake a waker.
 #[derive(Debug)]
-pub struct WakerRegistration {
+pub(crate) struct WakerRegistration {
     waker: Option<Waker>,
 }
 
 impl WakerRegistration {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self { waker: None }
     }
 
     /// Register a waker. Overwrites the previous waker, if any.
-    pub fn register(&mut self, w: &Waker) {
+    pub(crate) fn register(&mut self, w: &Waker) {
         match self.waker {
             // Optimization: If both the old and new Wakers wake the same task, we can simply
             // keep the old waker, skipping the clone. (In most executor implementations,
@@ -27,7 +27,7 @@ impl WakerRegistration {
     }
 
     /// Wake the registered waker, if any.
-    pub fn wake(&mut self) {
+    pub(crate) fn wake(&mut self) {
         if let Some(w) = self.waker.take() {
             w.wake()
         }
