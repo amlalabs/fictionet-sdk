@@ -3045,10 +3045,59 @@ mod test {
     }
 
     #[test]
-    fn test_listen_sanity() {
+    fn test_listen_handshake() {
         let mut s = socket();
         s.listen(LOCAL_PORT).unwrap();
-        sanity!(s, socket_listen());
+        assert!(s.is_listening());
+        assert_eq!(s.listen_endpoint(), LISTEN_END);
+        assert_eq!(s.local_endpoint(), None);
+        assert_eq!(s.remote_endpoint(), None);
+        assert!(!s.can_send());
+        assert!(!s.can_recv());
+        recv_nothing!(s);
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"hello",
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(s.local_endpoint(), Some(LOCAL_END));
+        assert_eq!(s.remote_endpoint(), Some(REMOTE_END));
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 6),
+                window_len: 59,
+                ..RECV_TEMPL
+            }]
+        );
+        let mut bytes = [0; 5];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(5));
+        assert_eq!(&bytes, b"hello");
     }
 
     #[test]
@@ -3505,11 +3554,65 @@ mod test {
     }
 
     #[test]
-    fn test_syn_sent_sanity() {
+    fn test_connect_handshake() {
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
         s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
-        sanity!(s, socket_syn_sent());
+        assert_eq!(s.state(), State::SynSent);
+        assert_eq!(s.local_endpoint(), Some(LOCAL_END));
+        assert_eq!(s.remote_endpoint(), Some(REMOTE_END));
+        assert!(!s.can_send());
+        assert!(!s.can_recv());
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::Established);
+        assert!(s.can_send());
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.send_slice(b"hello"), Ok(5));
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"hello",
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 6),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.send_queue(), 0);
+        recv_nothing!(s, time 1000);
     }
 
     #[test]
@@ -3847,13 +3950,6 @@ mod test {
 
         // It should trigger a RST, and change no state
         assert_eq!(s.state, State::SynSent);
-    }
-
-    #[test]
-    fn test_syn_sent_close() {
-        let mut s = socket();
-        s.close();
-        assert_eq!(s.state, State::Closed);
     }
 
     #[test]
@@ -10172,7 +10268,41 @@ mod test {
             payload: b"y",
             ..SEND_TEMPL
         });
-        assert_eq!(s.last_scaled_window(), Some(32767));
+        recv!(s, time 30, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 3),
+            window_len: 32767,
+            ..RECV_TEMPL
+        }]);
+        let capacity = 256 * 1024;
+        send!(s, time 40, TcpRepr {
+            seq_number: REMOTE_SEQ + capacity,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"z",
+            ..SEND_TEMPL
+        }, Some(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 3),
+            window_len: 32767,
+            ..RECV_TEMPL
+        }));
+        let data = vec![7; capacity - 3];
+        send!(s, time 50, TcpRepr {
+            seq_number: REMOTE_SEQ + 3,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &data,
+            ..SEND_TEMPL
+        }, Some(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + capacity + 1),
+            window_len: 0,
+            ..RECV_TEMPL
+        }));
+        let mut bytes = vec![0; capacity];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(capacity));
+        assert_eq!(&bytes[..2], b"xy");
+        assert_eq!(&bytes[2..capacity - 1], data.as_slice());
+        assert_eq!(bytes[capacity - 1], b'z');
     }
 
     #[test]

@@ -329,19 +329,23 @@ mod test {
         assert_eq!(ring.capacity(), 2);
         assert_eq!(ring.window(), 2);
 
-        ring.length = 1;
+        assert_eq!(ring.enqueue_slice(b"a"), 1);
         assert!(!ring.is_empty());
         assert!(!ring.is_full());
         assert_eq!(ring.len(), 1);
         assert_eq!(ring.capacity(), 2);
         assert_eq!(ring.window(), 1);
 
-        ring.length = 2;
+        assert_eq!(ring.enqueue_slice(b"b"), 1);
         assert!(!ring.is_empty());
         assert!(ring.is_full());
         assert_eq!(ring.len(), 2);
         assert_eq!(ring.capacity(), 2);
         assert_eq!(ring.window(), 0);
+        assert_eq!(ring.enqueue_slice(b"c"), 0);
+        assert_eq!(ring.dequeue_many(2), b"ab");
+        assert!(ring.is_empty());
+        assert_eq!(ring.window(), 2);
     }
 
     #[test]

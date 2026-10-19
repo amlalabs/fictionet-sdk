@@ -427,8 +427,13 @@ mod test {
     #[test]
     fn reno_set_rwnd() {
         let mut reno = Reno::new();
-        reno.set_remote_window(64 * 1024 * 1024);
-
-        println!("{reno:?}");
+        let remote_window = 64 * 1024 * 1024;
+        reno.set_remote_window(remote_window);
+        for _ in 0..remote_window / MSS {
+            reno.on_ack(MSS);
+        }
+        assert_eq!(reno.window(), remote_window);
+        reno.on_ack(MSS);
+        assert_eq!(reno.window(), remote_window);
     }
 }

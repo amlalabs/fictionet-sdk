@@ -1186,8 +1186,20 @@ mod test {
     #[test]
     fn test_header_len_multiple_of_4() {
         let mut repr = packet_repr();
-        repr.window_scale = Some(0); // This TCP Option needs 3 bytes.
-        assert_eq!(repr.header_len() % 4, 0); // Should e.g. be 28 instead of 27.
+        repr.window_scale = Some(0);
+        assert_eq!(repr.header_len(), 24);
+        let mut bytes = vec![0xa5; repr.buffer_len()];
+        repr.emit(
+            &mut Packet::new_unchecked(&mut bytes),
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+        );
+        let packet = Packet::new_checked(&bytes).unwrap();
+        assert_eq!(packet.options(), &[3, 3, 0, 0]);
+        assert_eq!(
+            Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into()),
+            Ok(repr)
+        );
     }
 
     macro_rules! assert_option_parses {

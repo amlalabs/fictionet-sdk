@@ -390,10 +390,11 @@ mod test {
 
     #[test]
     fn test_instant_conversions_from_std_instant() {
+        let _ = Instant::from(::std::time::Instant::now());
         let std_now = ::std::time::Instant::now();
-
         let before = Instant::from(std_now);
-        ::std::thread::sleep(::std::time::Duration::from_millis(5));
+        let later = Instant::from(std_now + ::std::time::Duration::from_millis(5));
+        assert_eq!(later - before, Duration::from_millis(5));
         let after = Instant::from(std_now);
 
         assert_eq!(

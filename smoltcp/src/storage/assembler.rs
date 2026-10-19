@@ -344,91 +344,91 @@ mod test {
     #[test]
     fn test_new() {
         let assr = Assembler::new();
-        assert_eq!(assr, contigs![]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![]);
     }
 
     #[test]
     fn test_empty_add_full() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(0, 16), Ok(()));
-        assert_eq!(assr, contigs![(0, 16)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 16)]);
     }
 
     #[test]
     fn test_empty_add_front() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(0, 4), Ok(()));
-        assert_eq!(assr, contigs![(0, 4)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 4)]);
     }
 
     #[test]
     fn test_empty_add_back() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(12, 4), Ok(()));
-        assert_eq!(assr, contigs![(12, 4)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(12, 16)]);
     }
 
     #[test]
     fn test_empty_add_mid() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(4, 8), Ok(()));
-        assert_eq!(assr, contigs![(4, 8)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 12)]);
     }
 
     #[test]
     fn test_partial_add_front() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(0, 4), Ok(()));
-        assert_eq!(assr, contigs![(0, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 12)]);
     }
 
     #[test]
     fn test_partial_add_back() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(12, 4), Ok(()));
-        assert_eq!(assr, contigs![(4, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 16)]);
     }
 
     #[test]
     fn test_partial_add_front_overlap() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(0, 8), Ok(()));
-        assert_eq!(assr, contigs![(0, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 12)]);
     }
 
     #[test]
     fn test_partial_add_front_overlap_split() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(2, 6), Ok(()));
-        assert_eq!(assr, contigs![(2, 10)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(2, 12)]);
     }
 
     #[test]
     fn test_partial_add_back_overlap() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(8, 8), Ok(()));
-        assert_eq!(assr, contigs![(4, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 16)]);
     }
 
     #[test]
     fn test_partial_add_back_overlap_split() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(10, 4), Ok(()));
-        assert_eq!(assr, contigs![(4, 10)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 14)]);
     }
 
     #[test]
     fn test_partial_add_both_overlap() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(0, 16), Ok(()));
-        assert_eq!(assr, contigs![(0, 16)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(0, 16)]);
     }
 
     #[test]
     fn test_partial_add_both_overlap_split() {
         let mut assr = contigs![(4, 8)];
         assert_eq!(assr.add(2, 12), Ok(()));
-        assert_eq!(assr, contigs![(2, 12)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(2, 14)]);
     }
 
     #[test]
@@ -453,14 +453,14 @@ mod test {
     fn test_trailing_hole_remove_front() {
         let mut assr = contigs![(0, 4)];
         assert_eq!(assr.remove_front(), 4);
-        assert_eq!(assr, contigs![]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![]);
     }
 
     #[test]
     fn test_trailing_data_remove_front() {
         let mut assr = contigs![(0, 4), (4, 4)];
         assert_eq!(assr.remove_front(), 4);
-        assert_eq!(assr, contigs![(4, 4)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(4, 8)]);
     }
 
     #[test]
@@ -481,7 +481,10 @@ mod test {
         assert_eq!(assr.add(100, 10), Ok(()));
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add(40, 30), Ok(()));
-        assert_eq!(assr, contigs![(40, 30), (30, 10)]);
+        assert_eq!(
+            assr.iter_data().collect::<Vec<_>>(),
+            vec![(40, 70), (100, 110)]
+        );
     }
 
     #[test]
@@ -490,7 +493,7 @@ mod test {
         assert_eq!(assr.add(10, 10), Ok(()));
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add(15, 40), Ok(()));
-        assert_eq!(assr, contigs![(10, 50)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(10, 60)]);
     }
 
     #[test]
@@ -499,7 +502,7 @@ mod test {
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add(10, 10), Ok(()));
         assert_eq!(assr.add(15, 40), Ok(()));
-        assert_eq!(assr, contigs![(10, 50)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(10, 60)]);
     }
 
     #[test]
@@ -508,7 +511,7 @@ mod test {
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add(10, 10), Ok(()));
         assert_eq!(assr.add(15, 60), Ok(()));
-        assert_eq!(assr, contigs![(10, 65)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(10, 75)]);
     }
 
     #[test]
@@ -572,11 +575,13 @@ mod test {
     }
 
     #[test]
-    fn test_issue_694() {
+    fn test_bridge_single_byte_gap() {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(0, 1), Ok(()));
         assert_eq!(assr.add(2, 1), Ok(()));
         assert_eq!(assr.add(1, 1), Ok(()));
+        assert_eq!(assr.remove_front(), 3);
+        assert!(assr.is_empty());
     }
 
     #[test]
@@ -584,7 +589,10 @@ mod test {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add_then_remove_front(10, 10), Ok(0));
-        assert_eq!(assr, contigs![(10, 10), (30, 10)]);
+        assert_eq!(
+            assr.iter_data().collect::<Vec<_>>(),
+            vec![(10, 20), (50, 60)]
+        );
     }
 
     #[test]
@@ -592,7 +600,7 @@ mod test {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add_then_remove_front(0, 10), Ok(10));
-        assert_eq!(assr, contigs![(40, 10)]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![(40, 50)]);
     }
 
     #[test]
@@ -600,7 +608,7 @@ mod test {
         let mut assr = Assembler::new();
         assert_eq!(assr.add(50, 10), Ok(()));
         assert_eq!(assr.add_then_remove_front(0, 50), Ok(60));
-        assert_eq!(assr, contigs![]);
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), vec![]);
     }
 
     #[test]
@@ -622,6 +630,10 @@ mod test {
             assert_eq!(assr.add(c * 10, 3), Ok(()));
         }
         assert_eq!(assr.add_then_remove_front(0, 3), Ok(3));
+        let ranges: Vec<_> = (1..=ASSEMBLER_MAX_SEGMENT_COUNT)
+            .map(|c| (c * 10 - 3, c * 10))
+            .collect();
+        assert_eq!(assr.iter_data().collect::<Vec<_>>(), ranges);
     }
 
     // Test against an obviously-correct but inefficient bitmap impl.
