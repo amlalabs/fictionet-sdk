@@ -76,6 +76,9 @@ impl<A: Copy> Family<A> {
         }
     }
 
+    /// What to do with a DHCP request or router solicitation: answered
+    /// by `answer` when the link serves this family, passed to the world
+    /// when the world sets it up, and dropped when it is off.
     fn handle<'a>(
         &self,
         packet: &'a [u8],
@@ -209,10 +212,12 @@ impl Link {
             return FromVm::Drop(Why::Malformed);
         };
         match upper {
+            // The world answers a packet like this with Parameter Problem,
+            // so it goes on like any other, unless it hides neighbor
+            // discovery, which stays on the link.
             Upper::Problem if frame::problem_hides_neighbor_discovery(p) => {
                 return FromVm::Drop(Why::Handled);
             }
-
             // Neighbor discovery is never fragmented (RFC 6980), and only
             // makes sense on the link.
             Upper::Icmp6 {
@@ -253,6 +258,7 @@ impl Link {
                 return self.v6.handle(p, |lease| {
                     let answer = addresses::dhcp6(
                         lease,
+                        // Leave room for the IPv6 and UDP headers.
                         usize::from(self.mtu).saturating_sub(40 + 8),
                         request,
                         frame::destination_v6(p).is_multicast(),

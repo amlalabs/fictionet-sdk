@@ -3,8 +3,8 @@
 //! IPv6.
 //!
 //! These are small servers for one client on one link. Each has one fixed
-//! lease, so there is no lease table: a VM that asks again,
-//! after a reboot or with a new client ID, gets the same answer.
+//! lease, so there is no lease table: a VM that asks again, after a reboot
+//! or with a new client ID, gets the same answer.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
