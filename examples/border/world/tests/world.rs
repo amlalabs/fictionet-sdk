@@ -8,8 +8,11 @@ mod common;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use border_world::scenario::{BANK_ADDR, FOREIGN, HOME, ROGUE_CA_NAME, STATUS_ADDR, Task, Variant};
+use border_world::scenario::{
+    BANK_ADDR, FOREIGN, HOME, IMPOSTOR_ADDR, ROGUE_CA_NAME, STATUS_ADDR, Task, Variant,
+};
 use common::*;
+use example_common::hyper_io::Io;
 use fictionet::Interface;
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Frames, Stream, Wire};
@@ -1141,9 +1144,10 @@ where
         )),
         |fcx| async move {
             let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "Test Root CA")?;
-            let ids = border_world::identities(&fcx, &scenario, &ca)?;
+            let ids = border_world::identities(&fcx, &ca)?;
             let (attacher, attachments) = fictionet::attachments();
-            border_world::start(&fcx, scenario, ids, log, attachments)?;
+            log.attach(&fcx);
+            border_world::start(&fcx, scenario, ids, attachments)?;
             test(fcx.clone(), attacher, buf, recorded).await?;
             fcx.cancel();
             Ok(())
@@ -1229,7 +1233,7 @@ fn password_in_partial_head_before_eof() {
             assert!(fcx.now() < started + Duration::from_secs(30));
             redacted(&log);
             let lines = log.lines();
-            let local = SocketAddr::new(BANK_ADDR.into(), port);
+            let local = SocketAddr::new(IMPOSTOR_ADDR.into(), port);
             let classified = _recorded.checked_all().unwrap().iter().any(|event| {
                 event.source == "http"
                     && event.conn.local == Some(local)
@@ -1283,7 +1287,7 @@ fn password_in_partial_head_before_reset() {
         let lines = log.lines();
         let mut evidence = Vec::new();
         for (port, peer) in [(443, secure_peer), (80, plain_peer)] {
-            let local = SocketAddr::new(BANK_ADDR.into(), port);
+            let local = SocketAddr::new(IMPOSTOR_ADDR.into(), port);
             let classified = _recorded.checked_all().unwrap().iter().any(|event| {
                 event.source == "http"
                     && event.conn.local == Some(local)
