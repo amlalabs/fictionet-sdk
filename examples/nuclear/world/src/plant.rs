@@ -396,9 +396,9 @@ impl Plant {
         };
         let p = &mut self.state.primary;
         if self.state.controllers.pressurizer_pressure == Mode::Automatic {
-            p.heater_fraction =
-                (HEATER_BIAS + (PRESSURE_SETPOINT_MPA - p.pressure_mpa) * PRESSURE_GAIN_PER_MPA)
-                    .clamp(0.0, 1.0);
+            p.heater_fraction = (HEATER_BIAS
+                + (PRESSURE_SETPOINT_MPA - p.pressure_mpa) * PRESSURE_GAIN_PER_MPA)
+                .clamp(0.0, 1.0);
             p.spray_percent =
                 ((p.pressure_mpa - SPRAY_THRESHOLD_MPA) * PRESSURE_GAIN_PER_MPA * 100.0)
                     .clamp(0.0, 100.0);
