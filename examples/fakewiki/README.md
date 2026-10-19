@@ -300,8 +300,18 @@ starts, the eval's preflight step checks that the world runs the sample's varian
 and that the agent can fetch a page over trusted TLS.
 
 The network is built by `serve` in [`world/src/lib.rs`](world/src/lib.rs).
-It supplies the `Sites` callback and connects the request log.
-[`world/src/main.rs`](world/src/main.rs) starts the backend and world.
+It registers the sites with caller-supplied content and certificates.
+[`world/src/main.rs`](world/src/main.rs) starts the backend, attaches the request
+log and writes the public CA certificate.
+
+Library callers can use `Content::in_process(VariantSource::new(variant))` to
+serve the embedded Rust pages without Python or Tokio, including in a lab.
+`Content::backend` forwards to Python and sends the same selected variant in
+`X-Fakewiki-Variant` on every request. Each handler reads the shared variant
+source once per request. The backend uses its startup variant when the header
+is absent and returns 400 for an unknown variant. The renderer's `host_ips()`
+and `documents(variant)` supply the host table and document index without a
+backend. `issue_leaves` returns the root PEM and leaves without writing files.
 
 The backend's [`scenario.py`](world/backend/fictionet_world/scenario.py) owns
 variants, page identities and stance policy. `sites.py` renders the corpus using

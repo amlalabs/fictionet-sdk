@@ -4,23 +4,27 @@
 //! FakeWiki's eval reads `log.jsonl` after the run, so the same lines mean
 //! the same report. The world runs here with its real Python backend
 //! (`backend/backend.py`, which needs only `python3`) and a CA made for the
-//! test. `ts` is dropped and the lines are compared as sorted sets.
+//! test. A second test runs the script in a lab with embedded content and no Python
+//! or Tokio runtime. `ts` is dropped and the lines are compared as sorted sets.
 //!
 //! `FAKEWIKI_GOLDEN_WRITE=1 cargo test --test golden` records the file again.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use example_common::backend_process::{Args, start_backend};
 use example_common::log::Log;
-use fakewiki_world::content::Content;
+use fakewiki_world::content::{Content, VariantSource};
+use fakewiki_world::pages::{self, Variant};
 use fakewiki_world::{issue_leaves, serve};
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::RecordType;
 use serde_json::Value;
+
+static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -46,6 +50,40 @@ async fn get<C: fictionet::stdlib::network::Connection>(
     )
     .unwrap();
     let response = sandbox::request(fcx, &mut io, &request).await.unwrap();
+    assert!(
+        !response
+            .head
+            .headers
+            .iter()
+            .any(|h| h.name.to_ascii_lowercase().starts_with("x-fakewiki-"))
+    );
+    if matches!(response.head.status, 200 | 404) {
+        let header = |name: &str| {
+            response
+                .head
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(name))
+                .unwrap()
+                .value
+                .as_slice()
+        };
+        assert_eq!(header("server"), b"nginx");
+        assert_eq!(header("content-type"), b"text/html; charset=utf-8");
+        assert_eq!(header("cache-control"), b"private, max-age=0");
+        assert_eq!(header("date").len(), 29);
+        assert!(header("date").ends_with(b" GMT"));
+        let length = std::str::from_utf8(header("content-length"))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        if method == "HEAD" {
+            assert!(response.body.is_empty());
+            assert!(length > 0);
+        } else {
+            assert_eq!(length, response.body.len());
+        }
+    }
     if (300..400).contains(&response.head.status) {
         assert!(
             response
@@ -79,6 +117,7 @@ async fn tls(
 
 #[test]
 fn the_log_is_the_recorded_one() {
+    let _environment = ENVIRONMENT.lock().unwrap();
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let state_dir =
         std::env::temp_dir().join(format!("fakewiki-golden-state-{}", std::process::id()));
@@ -88,7 +127,7 @@ fn the_log_is_the_recorded_one() {
         .local_addr()
         .unwrap()
         .port();
-    // SAFETY: set before any thread of this test process reads the environment.
+    // SAFETY: both tests hold ENVIRONMENT, and this test has not started threads.
     unsafe {
         std::env::set_var("FAKEWIKI_CORPUS", here.join("../fixtures/corpus.json"));
         std::env::set_var("FAKEWIKI_VARIANT", "altered_one");
@@ -115,98 +154,143 @@ fn the_log_is_the_recorded_one() {
         .iter()
         .map(|d| d["url"].as_str().unwrap().to_owned())
         .collect();
+    run_script(&here, &state_dir, hosts, documents, Some(port));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn embedded_log_is_the_recorded_one() {
+    let _environment = ENVIRONMENT.lock().unwrap();
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let embedded_dir =
+        std::env::temp_dir().join(format!("fakewiki-embedded-golden-{}", std::process::id()));
+    std::fs::create_dir_all(&embedded_dir).unwrap();
+    let documents = pages::documents(Variant::AlteredOne)
+        .into_iter()
+        .map(|d| d.url)
+        .collect();
+    run_script(&here, &embedded_dir, pages::host_ips(), documents, None);
+}
+
+async fn script(
+    fcx: Cx,
+    hosts: HashMap<String, Ipv4Addr>,
+    documents: Vec<String>,
+    content: Content,
+    log: Arc<Log>,
+    ca_dir: Option<PathBuf>,
+) -> fictionet::Result {
+    let (root, leaves) = issue_leaves(&fcx, hosts.keys()).unwrap();
+    if let Some(ca_dir) = ca_dir {
+        std::fs::create_dir_all(&ca_dir).unwrap();
+        std::fs::write(ca_dir.join("ca.pem"), root).unwrap();
+    }
+    log.attach(&fcx);
+    let (attacher, attachments) = fictionet::attachments();
+    serve(&fcx, &hosts, leaves, content, attachments)?;
+
+    let end = attacher.attach("agent").unwrap();
+    let m = machine(&fcx, end, ME);
+    let wiki = hosts["en.wikipedia.org"];
+    lookup(&fcx, &m, "en.wikipedia.org", RecordType::A).await;
+    lookup(&fcx, &m, "en.wikipedia.org", RecordType::AAAA).await;
+    lookup(&fcx, &m, "example.com", RecordType::A).await;
+    lookup(&fcx, &m, "rw-desktop", RecordType::A).await;
+    // The first three documents, over HTTPS, and one HEAD.
+    for url in documents.iter().take(3) {
+        let uri: http::Uri = url.parse().unwrap();
+        let host = uri.host().unwrap().to_owned();
+        let stream = tls(&fcx, &m, hosts[&host], &host).await.unwrap();
+        assert_eq!(
+            get(&fcx, stream, "GET", &host, uri.path()).await,
+            200,
+            "{url}"
+        );
+    }
+    let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
+    get(&fcx, stream, "HEAD", "en.wikipedia.org", "/wiki/Main_Page").await;
+    // A backend redirect keeps its Location for the client and the log.
+    let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
+    assert_eq!(
+        get(&fcx, stream, "GET", "en.wikipedia.org", "/wiki").await,
+        301
+    );
+    let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
+    get(&fcx, stream, "GET", "en.wikipedia.org", "/no/such/page?q=1").await;
+    // A host at another address, over this connection.
+    let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
+    assert_eq!(get(&fcx, stream, "GET", "www.gov.uk", "/").await, 421);
+    // Plain HTTP: a redirect.
+    let conn = m
+        .tcp
+        .connect(&fcx, SocketAddr::new(IpAddr::V4(wiki), 80))
+        .await
+        .unwrap();
+    assert_eq!(
+        get(&fcx, conn, "GET", "en.wikipedia.org", "/wiki/X").await,
+        301
+    );
+    // A name the world does not serve.
+    assert!(tls(&fcx, &m, wiki, "example.com").await.is_err());
+    let _ = fcx.sleep(Duration::from_millis(500)).await;
+    Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+}
+
+fn run_script(
+    here: &Path,
+    state_dir: &Path,
+    hosts: HashMap<String, Ipv4Addr>,
+    documents: Vec<String>,
+    port: Option<u16>,
+) {
     let log_path = state_dir.join("log.jsonl");
     let log = Arc::new(Log::new(
         Box::new(std::fs::File::create(&log_path).unwrap()),
         &[],
         |s| s,
     ));
-
+    let ca_dir = port.map(|_| state_dir.join("ca"));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
         let drain = log.clone();
-        let result = rt.block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random())
-                .aggregate_events()
-                .event_history(Arc::new(fictionet::events::Memory::default()))
-                .observer(Arc::new(fakewiki_world::events::LogObserver {
-                    log: log.clone(),
-                    hosts: hosts.clone(),
-                })),
-            move |fcx| async move {
-                let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys()).unwrap();
-                let (attacher, attachments) = fictionet::attachments();
-                serve(
-                    &fcx,
-                    &hosts,
-                    leaves,
-                    Content::new(&fcx, port)?,
-                    log,
-                    attachments,
-                )?;
-
-                let end = attacher.attach("agent").unwrap();
-                let m = machine(&fcx, end, ME);
-                let wiki = hosts["en.wikipedia.org"];
-                lookup(&fcx, &m, "en.wikipedia.org", RecordType::A).await;
-                lookup(&fcx, &m, "en.wikipedia.org", RecordType::AAAA).await;
-                lookup(&fcx, &m, "example.com", RecordType::A).await;
-                lookup(&fcx, &m, "rw-desktop", RecordType::A).await;
-                // The first three documents, over HTTPS, and one HEAD.
-                for url in documents.iter().take(3) {
-                    let uri: http::Uri = url.parse().unwrap();
-                    let host = uri.host().unwrap().to_owned();
-                    let stream = tls(&fcx, &m, hosts[&host], &host).await.unwrap();
-                    assert_eq!(
-                        get(&fcx, stream, "GET", &host, uri.path()).await,
-                        200,
-                        "{url}"
-                    );
-                }
-                let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
-                get(&fcx, stream, "HEAD", "en.wikipedia.org", "/wiki/Main_Page").await;
-                // A backend redirect keeps its Location for the client and the log.
-                let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
-                assert_eq!(
-                    get(&fcx, stream, "GET", "en.wikipedia.org", "/wiki").await,
-                    301
-                );
-                let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
-                get(&fcx, stream, "GET", "en.wikipedia.org", "/no/such/page?q=1").await;
-                // A host at another address, over this connection.
-                let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
-                assert_eq!(get(&fcx, stream, "GET", "www.gov.uk", "/").await, 421);
-                // Plain HTTP: a redirect.
-                let conn = m
-                    .tcp
-                    .connect(&fcx, SocketAddr::new(IpAddr::V4(wiki), 80))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    get(&fcx, conn, "GET", "en.wikipedia.org", "/wiki/X").await,
-                    301
-                );
-                // A name the world does not serve.
-                assert!(tls(&fcx, &m, wiki, "example.com").await.is_err());
-                let _ = fcx.sleep(Duration::from_millis(500)).await;
-                Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
-            },
-        ));
+        let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
+            .aggregate_events()
+            .event_history(Arc::new(fictionet::events::Memory::default()))
+            .observer(Arc::new(fakewiki_world::events::LogObserver {
+                log: log.clone(),
+                hosts: hosts.clone(),
+            }));
+        let world = move |fcx: Cx| async move {
+            let variant = VariantSource::new(Variant::AlteredOne);
+            let content = match port {
+                Some(port) => Content::backend(&fcx, port, variant)?,
+                None => Content::in_process(variant),
+            };
+            script(fcx, hosts, documents, content, log, ca_dir).await
+        };
+        let result = if port.is_some() {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(fictionet::run(options, world))
+        } else {
+            fictionet::block_on(fictionet::lab(options, world))
+        };
         drain.finish().unwrap();
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
-    let result = rx.recv_timeout(Duration::from_secs(90));
-    let _ = child.kill();
-    let _ = child.wait();
-    let result = result.expect("the test timed out");
+    let result = rx
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the test timed out");
     assert_eq!(result.as_deref(), Some("done"));
+    check_log(here, &log_path);
+}
 
-    let text = std::fs::read_to_string(&log_path).unwrap();
+fn check_log(here: &Path, log_path: &Path) {
+    let text = std::fs::read_to_string(log_path).unwrap();
     let entries: Vec<Value> = text
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())

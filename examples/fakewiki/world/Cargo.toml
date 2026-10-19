@@ -10,11 +10,15 @@ publish = false
 example-common = { path = "../../common" }
 bytes = "1"
 fictionet = { path = "../../..", features = ["web-proxy"] }
+form_urlencoded = "1"
 http = "1"
 http-body-util = "0.1"
+icu_properties = "2.3"
+percent-encoding = "2"
+serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
 tower-service = "0.3"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util"] }
