@@ -1,0 +1,1629 @@
+//! Decoding packets the way Wireshark shows them: a list line (source,
+//! destination, protocol, info) and a tree of layers whose fields point at
+//! their bytes.
+//!
+//! Packets on a link are raw IPv4 or IPv6, with no Ethernet header. A
+//! [`Dissector`] sees every copied packet of one link in order, so it can
+//! follow TCP streams across packets.
+
+mod app;
+mod conversation;
+/// Copyable HTTP/2 and gRPC presentation.
+pub mod http2;
+pub(crate) mod pcap;
+mod present;
+/// Copyable capture decoders and presenters for the built-in protocols.
+pub mod protocols;
+mod registry;
+/// Copyable TLS record presentation, handshake state, and decryption.
+pub mod tls;
+
+pub use conversation::Conversation;
+pub use present::{Observed, Place, Placement, Present};
+pub use registry::{Match, Protocol, Registry, Selection};
+
+use std::collections::HashMap;
+use std::fmt::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use crate::json;
+use fictionet::events::Event;
+use fictionet::stdlib::codec::{Wire, be16, be32};
+use fictionet::stdlib::protocols::json::Value;
+use fictionet::stdlib::protocols::tcp_reassembly::{
+    Chunk, FlowKey, Reassembler, Segment, conversation_key,
+};
+
+/// One line of an `SSLKEYLOGFILE`: a TLS secret and the client random it
+/// belongs to. Debug output excludes the secret.
+#[derive(Clone)]
+pub struct KeyLine {
+    /// SSLKEYLOGFILE label, such as CLIENT_TRAFFIC_SECRET_0.
+    pub label: String,
+    /// ClientHello random identifying the session.
+    pub client_random: Vec<u8>,
+    /// Traffic secret bytes.
+    pub secret: Vec<u8>,
+}
+
+impl fmt::Debug for KeyLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyLine")
+            .field("label", &self.label)
+            .field("client_random", &self.client_random)
+            .field("secret_len", &self.secret.len())
+            .finish()
+    }
+}
+
+impl From<&crate::Key> for KeyLine {
+    fn from(key: &crate::Key) -> Self {
+        Self {
+            label: key.label.clone(),
+            client_random: key.client_random.clone(),
+            secret: key.secret().to_vec(),
+        }
+    }
+}
+
+/// Renders bytes as lowercase hexadecimal, with two digits per byte.
+pub fn hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    json::push_hex(&mut s, b);
+    s
+}
+
+/// A field of a layer, and where its bytes are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
+    /// Display name.
+    pub name: String,
+    /// Display value.
+    pub value: String,
+    /// Byte range in the layer's buffer.
+    pub range: Option<(usize, usize)>,
+}
+
+/// One protocol layer of a packet, or an event shown as one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layer {
+    /// Display name.
+    pub name: String,
+    /// One-line description.
+    pub summary: String,
+    /// Which buffer the ranges index: 0 is the packet itself.
+    pub buf: usize,
+    /// Byte range in the selected buffer.
+    pub range: (usize, usize),
+    /// Fields and notes in display order.
+    pub fields: Vec<Field>,
+}
+
+impl Layer {
+    /// Creates an empty layer with the given buffer and byte range.
+    pub fn new(name: &str, buf: usize, range: (usize, usize)) -> Layer {
+        Layer {
+            name: name.to_owned(),
+            summary: String::new(),
+            buf,
+            range,
+            fields: Vec::new(),
+        }
+    }
+
+    /// The event as an observe layer: its summary, and each field as a
+    /// note. The dashboard shows it as it shows a decoded packet.
+    ///
+    /// The name is `source.kind`. Strings appear as text; other values
+    /// appear as JSON, or `unserializable: <error>` if the JSON writer
+    /// refuses them. The layer uses buffer 0 and range `(0, 0)`, and
+    /// its notes have no byte ranges.
+    ///
+    /// ```
+    /// use fictionet::events::Event;
+    /// use fictionet_observe::Layer;
+    ///
+    /// let event = Event::new("http", "request")
+    ///     .summary("GET /")
+    ///     .field("status", 200u32);
+    /// let layer = Layer::from_event(&event);
+    /// assert_eq!(layer.name, "http.request");
+    /// assert_eq!(layer.summary, "GET /");
+    /// assert_eq!(layer.fields[0].value, "200");
+    /// assert_eq!(layer.fields[0].range, None);
+    /// ```
+    pub fn from_event(event: &Event) -> Layer {
+        let name = format!("{}.{}", event.source, event.kind);
+        let mut layer = Layer::new(&name, 0, (0, 0));
+        layer.summary = event.summary.clone();
+        for (n, v) in event.fields.iter() {
+            let text = match v {
+                Value::String(s) => s.clone(),
+                other => other
+                    .to_bytes()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_else(|e| format!("unserializable: {e}")),
+            };
+            layer.note(n, text);
+        }
+        layer
+    }
+
+    /// Adds a field with a byte range in this layer's buffer.
+    pub fn field(&mut self, name: &str, value: impl Into<String>, range: (usize, usize)) {
+        self.fields.push(Field {
+            name: name.to_owned(),
+            value: value.into(),
+            range: Some(range),
+        });
+    }
+
+    /// Adds a note without a byte range.
+    pub fn note(&mut self, name: &str, value: impl Into<String>) {
+        self.fields.push(Field {
+            name: name.to_owned(),
+            value: value.into(),
+            range: None,
+        });
+    }
+
+    /// Roughly how many bytes the layer adds to the packet's detail.
+    fn size(&self) -> usize {
+        let fields = self.fields.iter().fold(0usize, |sum, f| {
+            sum.saturating_add(f.name.len())
+                .saturating_add(f.value.len())
+                .saturating_add(32)
+        });
+        self.name
+            .len()
+            .saturating_add(self.summary.len())
+            .saturating_add(fields)
+            .saturating_add(64)
+    }
+}
+
+/// The most bytes of layers and buffers one packet's detail holds. One
+/// packet can complete many messages at once, such as when it fills a gap
+/// that held segments were waiting on, and HTTP/2 headers can name the
+/// same long table entry many times over. Past this, the decoders still
+/// follow the stream, but what they find is not kept.
+pub(crate) const MAX_DETAIL: usize = 1 << 20;
+/// The longest list line kept.
+const MAX_INFO: usize = 1024;
+
+/// A decoded packet.
+#[derive(Debug, Default)]
+pub struct Decoded {
+    /// Source endpoint.
+    pub src: String,
+    /// Destination endpoint.
+    pub dst: String,
+    /// Highest decoded protocol.
+    pub proto: String,
+    /// Packet list summary.
+    pub info: String,
+    /// Packet annotations.
+    pub tags: Vec<&'static str>,
+    /// How high the protocol in `proto` is: 0 for IP and transport, 1 for
+    /// TLS, 2 for what TLS carries and other applications.
+    pub(crate) level: u8,
+    /// Protocol layers in display order.
+    pub layers: Vec<Layer>,
+    /// Bytes other than the packet that layers point into, such as
+    /// decrypted TLS, with a name for each.
+    pub extra: Vec<(String, Vec<u8>)>,
+    /// Bytes of layers and buffers kept so far, toward [`MAX_DETAIL`].
+    used: usize,
+    /// Layers and buffers not kept, past [`MAX_DETAIL`].
+    pub(crate) cut: usize,
+}
+
+impl Decoded {
+    /// Updates the packet summary at an application level: 1 for TLS,
+    /// 2 for its payload or another application protocol.
+    pub fn application(&mut self, level: u8, protocol: &str, text: &str) {
+        if level > self.level {
+            self.level = level;
+            self.proto = protocol.into();
+            self.info = text.to_owned();
+        } else if level == self.level {
+            self.info.push_str(", ");
+            self.info.push_str(text);
+        }
+        self.cap_info();
+    }
+
+    /// The summary priority: 0 for transport, 1 for TLS, 2 for applications.
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
+    /// The layers as a JSON array.
+    pub fn layers_json(&self) -> String {
+        let mut out = String::new();
+        self.write_layers(&mut out);
+        out
+    }
+
+    /// Appends the layers as a JSON array: objects with `name`, `summary`,
+    /// `buf`, `range` and `fields`, each field with `name`, `value` and,
+    /// if it points at bytes, `range`. Written straight into `out`, since
+    /// this runs for every packet kept on a watched link.
+    pub fn write_layers(&self, out: &mut String) {
+        out.push('[');
+        for (i, l) in self.layers.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            json::string(out, &l.name);
+            out.push_str(",\"summary\":");
+            json::string(out, &l.summary);
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "fmt::Write for String never returns Err"
+            )]
+            let _ = write!(
+                out,
+                ",\"buf\":{},\"range\":[{},{}],\"fields\":[",
+                l.buf, l.range.0, l.range.1
+            );
+            for (j, f) in l.fields.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"name\":");
+                json::string(out, &f.name);
+                out.push_str(",\"value\":");
+                json::string(out, &f.value);
+                if let Some((a, b)) = f.range {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "fmt::Write for String never returns Err"
+                    )]
+                    let _ = write!(out, ",\"range\":[{a},{b}]");
+                }
+                out.push('}');
+            }
+            out.push_str("]}");
+        }
+        out.push(']');
+    }
+
+    /// Appends the buffers as a JSON array: the packet, then each extra
+    /// buffer, as objects with `name` and `hex`.
+    pub fn write_buffers(&self, out: &mut String, packet: &[u8]) {
+        out.reserve(
+            2 * packet.len()
+                + self
+                    .extra
+                    .iter()
+                    .map(|(n, b)| n.len() + 2 * b.len() + 24)
+                    .sum::<usize>()
+                + 32,
+        );
+        out.push('[');
+        let all = std::iter::once(("Packet", packet))
+            .chain(self.extra.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+        for (i, (name, bytes)) in all.enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            json::string(out, name);
+            out.push_str(",\"hex\":\"");
+            json::push_hex(out, bytes);
+            out.push_str("\"}");
+        }
+        out.push(']');
+    }
+
+    /// Adds a buffer and returns its index. Past the 1 MiB detail limit, the buffer
+    /// is not kept, and neither is any layer after it, so the index it
+    /// returns is never shown.
+    pub fn buffer(&mut self, name: &str, bytes: Vec<u8>) -> usize {
+        // Shown as hex: two characters a byte.
+        if !self.take(name.len().saturating_add(bytes.len().saturating_mul(2))) {
+            return self.extra.len() + 1;
+        }
+        self.extra.push((name.to_owned(), bytes));
+        self.extra.len()
+    }
+
+    /// Adds a layer, unless the detail is full.
+    pub fn push(&mut self, layer: Layer) {
+        if self.take(layer.size()) {
+            self.layers.push(layer);
+        }
+    }
+
+    /// Counts `n` more bytes toward [`MAX_DETAIL`], if they fit and nothing
+    /// was cut before.
+    fn take(&mut self, n: usize) -> bool {
+        if self.cut > 0 || n > self.room() {
+            self.cut = self.cut.saturating_add(1);
+            return false;
+        }
+        self.used += n;
+        true
+    }
+
+    /// Bytes the detail still has room for.
+    pub fn room(&self) -> usize {
+        if self.cut > 0 {
+            0
+        } else {
+            MAX_DETAIL - self.used
+        }
+    }
+
+    /// Adds a tag, once.
+    pub fn tag(&mut self, tag: &'static str) {
+        if !self.tags.contains(&tag) {
+            self.tags.push(tag);
+        }
+    }
+
+    /// Keeps at most 1,024 bytes of the list line, then adds an ellipsis
+    /// if it was shortened. The cut preserves UTF-8 character boundaries.
+    pub fn cap_info(&mut self) {
+        if self.info.len() > MAX_INFO {
+            let mut end = MAX_INFO;
+            while !self.info.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.info.truncate(end);
+            self.info.push('…');
+        }
+    }
+}
+
+/// Decodes the packets of one link, in order.
+#[derive(Default)]
+pub struct Dissector {
+    tcp: Reassembler,
+    conversations: HashMap<FlowKey, Conversation>,
+    registry: Registry,
+}
+
+impl std::fmt::Debug for Dissector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dissector")
+            .field("registry", &self.registry)
+            .finish_non_exhaustive()
+    }
+}
+
+fn ip_proto_name(p: u8) -> &'static str {
+    match p {
+        1 => "ICMP",
+        6 => "TCP",
+        17 => "UDP",
+        58 => "ICMPv6",
+        _ => "IP",
+    }
+}
+
+impl Dissector {
+    /// Creates a dissector with built-in or user protocol registrations.
+    pub fn with_registry(registry: Registry) -> Self {
+        Self {
+            registry,
+            ..Self::default()
+        }
+    }
+
+    /// Forgets every connection after packets were missed, such as when a
+    /// capture sampled or evicted some. No decoder joins bytes across the
+    /// gap. Reassembly limits and the registry stay as they are.
+    pub fn lost(&mut self) {
+        self.tcp = Reassembler::new(self.tcp.limits());
+        self.conversations.clear();
+    }
+
+    /// Decodes one raw IPv4 or IPv6 packet. Pass TLS key log entries when
+    /// decryption is wanted. Packet sources may be pcap readers or live captures.
+    pub fn decode(&mut self, p: &[u8], keys: &[KeyLine]) -> Decoded {
+        let mut d = Decoded::default();
+        match p.first().map(|b| b >> 4) {
+            Some(4) => self.ipv4(p, &mut d, keys),
+            Some(6) => self.ipv6(p, &mut d, keys),
+            _ => {
+                d.proto = "?".into();
+                d.info = format!("Not an IP packet ({} bytes)", p.len());
+                d.tag("malformed");
+            }
+        }
+        if d.cut > 0 {
+            let mut l = Layer::new("Not shown", 0, (0, 0));
+            l.summary = format!(
+                "{} more layers and buffers: one packet's detail holds at most 1 MiB",
+                d.cut
+            );
+            d.layers.push(l);
+        }
+        d.cap_info();
+        d
+    }
+
+    fn ipv4(&mut self, p: &[u8], d: &mut Decoded, keys: &[KeyLine]) {
+        if p.len() < 20 {
+            return truncated(d, "IPv4", p.len());
+        }
+        let ihl = usize::from(p[0] & 0x0f) * 4;
+        let Some(total_length) = be16(p, 2) else {
+            return truncated(d, "IPv4", p.len());
+        };
+        let total = usize::from(total_length);
+        if ihl < 20 || p.len() < ihl {
+            return truncated(d, "IPv4", p.len());
+        }
+        let end = total.clamp(ihl, p.len());
+        let src = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
+        let dst = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+        let proto = p[9];
+        let flags = p[6] >> 5;
+        let Some(fragment) = be16(p, 6) else {
+            return truncated(d, "IPv4", p.len());
+        };
+        let offset = (usize::from(fragment) & 0x1fff) * 8;
+        let mut l = Layer::new("Internet Protocol Version 4", 0, (0, ihl));
+        l.summary = format!("Src: {src}, Dst: {dst}");
+        l.field("Version", "4", (0, 1));
+        l.field("Header length", format!("{ihl} bytes"), (0, 1));
+        l.field("Differentiated services", format!("0x{:02x}", p[1]), (1, 2));
+        l.field("Total length", total.to_string(), (2, 4));
+        let Some(identification) = be16(p, 4) else {
+            return truncated(d, "IPv4", p.len());
+        };
+        l.field(
+            "Identification",
+            format!("0x{:04x} ({})", identification, identification),
+            (4, 6),
+        );
+        let mut fl = Vec::new();
+        if flags & 2 != 0 {
+            fl.push("Don't fragment");
+        }
+        if flags & 1 != 0 {
+            fl.push("More fragments");
+        }
+        l.field(
+            "Flags",
+            if fl.is_empty() {
+                "none".to_owned()
+            } else {
+                fl.join(", ")
+            },
+            (6, 7),
+        );
+        l.field("Fragment offset", offset.to_string(), (6, 8));
+        l.field("Time to live", p[8].to_string(), (8, 9));
+        l.field(
+            "Protocol",
+            format!("{} ({proto})", ip_proto_name(proto)),
+            (9, 10),
+        );
+        let Some(checksum) = be16(p, 10) else {
+            return truncated(d, "IPv4", p.len());
+        };
+        l.field("Header checksum", format!("0x{:04x}", checksum), (10, 12));
+        l.field("Source address", src.to_string(), (12, 16));
+        l.field("Destination address", dst.to_string(), (16, 20));
+        d.push(l);
+        d.src = src.to_string();
+        d.dst = dst.to_string();
+        if offset != 0 || flags & 1 != 0 {
+            d.proto = "IPv4".into();
+            d.info = format!(
+                "Fragment of a {} packet (offset {offset}, {} bytes)",
+                ip_proto_name(proto),
+                end - ihl
+            );
+            d.tag("fragment");
+            if offset != 0 {
+                return;
+            }
+        }
+        self.transport(p, ihl, end, proto, src.into(), dst.into(), d, keys);
+    }
+
+    fn ipv6(&mut self, p: &[u8], d: &mut Decoded, keys: &[KeyLine]) {
+        if p.len() < 40 {
+            return truncated(d, "IPv6", p.len());
+        }
+        let src = Ipv6Addr::from(<[u8; 16]>::try_from(&p[8..24]).unwrap());
+        let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap());
+        let Some(payload_length) = be16(p, 4) else {
+            return truncated(d, "IPv6", p.len());
+        };
+        let payload = usize::from(payload_length);
+        let end = (40 + payload).min(p.len());
+        let mut l = Layer::new("Internet Protocol Version 6", 0, (0, 40));
+        l.summary = format!("Src: {src}, Dst: {dst}");
+        l.field("Version", "6", (0, 1));
+        let Some(version_class) = be16(p, 0) else {
+            return truncated(d, "IPv6", p.len());
+        };
+        l.field(
+            "Traffic class",
+            format!("0x{:02x}", (version_class >> 4) as u8),
+            (0, 2),
+        );
+        let Some(version_flow) = be32(p, 0) else {
+            return truncated(d, "IPv6", p.len());
+        };
+        l.field(
+            "Flow label",
+            format!("0x{:05x}", version_flow & 0xfffff),
+            (1, 4),
+        );
+        l.field("Payload length", payload.to_string(), (4, 6));
+        l.field(
+            "Next header",
+            format!("{} ({})", ip_proto_name(p[6]), p[6]),
+            (6, 7),
+        );
+        l.field("Hop limit", p[7].to_string(), (7, 8));
+        l.field("Source address", src.to_string(), (8, 24));
+        l.field("Destination address", dst.to_string(), (24, 40));
+        d.src = src.to_string();
+        d.dst = dst.to_string();
+        // Skip extension headers: hop-by-hop, routing, destination options,
+        // and fragment.
+        let (mut next, mut at) = (p[6], 40);
+        while matches!(next, 0 | 43 | 44 | 60) && at + 8 <= end {
+            if next == 44 {
+                let Some(fragment) = be16(p, at + 2) else {
+                    return truncated(d, "IPv6", p.len());
+                };
+                let offset = usize::from(fragment & 0xfff8);
+                l.field(
+                    "Fragment header",
+                    format!("offset {offset}, more: {}", p[at + 3] & 1 == 1),
+                    (at, at + 8),
+                );
+                if offset != 0 || p[at + 3] & 1 == 1 {
+                    d.proto = "IPv6".into();
+                    d.info = format!("Fragment (offset {offset})");
+                    d.tag("fragment");
+                    l.range.1 = at + 8;
+                    d.push(l);
+                    return;
+                }
+                next = p[at];
+                at += 8;
+            } else {
+                let len = (usize::from(p[at + 1]) + 1) * 8;
+                l.field(
+                    "Extension header",
+                    format!("type {next}, {len} bytes"),
+                    (at, (at + len).min(end)),
+                );
+                next = p[at];
+                at += len;
+            }
+        }
+        l.range.1 = at.min(end);
+        d.push(l);
+        if at > end {
+            return;
+        }
+        self.transport(p, at, end, next, src.into(), dst.into(), d, keys);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transport(
+        &mut self,
+        p: &[u8],
+        at: usize,
+        end: usize,
+        proto: u8,
+        src: IpAddr,
+        dst: IpAddr,
+        d: &mut Decoded,
+        keys: &[KeyLine],
+    ) {
+        let body = &p[at..end];
+        match proto {
+            6 => self.tcp(p, at, end, src, dst, d, keys),
+            17 => udp(p, at, end, d, &self.registry),
+            1 => icmp(p, at, end, d, false),
+            58 => icmp(p, at, end, d, true),
+            other => {
+                d.proto = ip_proto_name(other).into();
+                d.info = format!("IP protocol {other}, {} bytes", body.len());
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tcp(
+        &mut self,
+        p: &[u8],
+        at: usize,
+        end: usize,
+        src: IpAddr,
+        dst: IpAddr,
+        d: &mut Decoded,
+        keys: &[KeyLine],
+    ) {
+        let t = &p[at..end];
+        if t.len() < 20 {
+            return truncated(d, "TCP", t.len());
+        }
+        let off = usize::from(t[12] >> 4) * 4;
+        if off < 20 || off > t.len() {
+            return truncated(d, "TCP", t.len());
+        }
+        let Some(source_port) = be16(t, 0) else {
+            return truncated(d, "TCP", t.len());
+        };
+        let Some(destination_port) = be16(t, 2) else {
+            return truncated(d, "TCP", t.len());
+        };
+        let (sport, dport) = (source_port, destination_port);
+        let Some(sequence) = be32(t, 4) else {
+            return truncated(d, "TCP", t.len());
+        };
+        let Some(acknowledgment) = be32(t, 8) else {
+            return truncated(d, "TCP", t.len());
+        };
+        let Some(window) = be16(t, 14) else {
+            return truncated(d, "TCP", t.len());
+        };
+        let (seq, ack, flags, win) = (sequence, acknowledgment, t[13], window);
+        let payload = (at + off, end);
+        let key = (src, sport, dst, dport);
+        let flow = self.tcp.push(Segment {
+            key,
+            seq,
+            ack,
+            flags,
+            payload: &p[payload.0..payload.1],
+        });
+        let (ckey, reversed) = conversation_key(key);
+        if flow.cleared {
+            self.conversations.clear();
+        }
+        if flow.restarted {
+            self.conversations.remove(&ckey);
+        }
+        let names = flag_names(flags);
+        let mut l = Layer::new("Transmission Control Protocol", 0, (at, at + off));
+        let r = |a: usize, b: usize| (at + a, at + b);
+        l.summary = format!(
+            "Src Port: {sport}, Dst Port: {dport}, Seq: {}, Ack: {}, Len: {}",
+            flow.rel_seq,
+            flow.rel_ack,
+            payload.1 - payload.0
+        );
+        l.field("Source port", sport.to_string(), r(0, 2));
+        l.field("Destination port", dport.to_string(), r(2, 4));
+        l.field(
+            "Sequence number",
+            format!("{} (raw {seq})", flow.rel_seq),
+            r(4, 8),
+        );
+        l.field(
+            "Acknowledgment number",
+            format!("{} (raw {ack})", flow.rel_ack),
+            r(8, 12),
+        );
+        l.field("Header length", format!("{off} bytes"), r(12, 13));
+        l.field(
+            "Flags",
+            format!("0x{flags:03x} ({})", names.join(", ")),
+            r(12, 14),
+        );
+        l.field("Window", win.to_string(), r(14, 16));
+        let Some(checksum) = be16(t, 16) else {
+            return truncated(d, "TCP", t.len());
+        };
+        l.field("Checksum", format!("0x{:04x}", checksum), r(16, 18));
+        let Some(urgent) = be16(t, 18) else {
+            return truncated(d, "TCP", t.len());
+        };
+        l.field("Urgent pointer", urgent.to_string(), r(18, 20));
+        let opts = tcp_options(&t[20..off]);
+        if !opts.is_empty() {
+            l.field("Options", opts.join(", "), r(20, off));
+        }
+        l.note("Payload", format!("{} bytes", payload.1 - payload.0));
+        d.push(l);
+        d.src = sock(&d.src, sport);
+        d.dst = sock(&d.dst, dport);
+        d.proto = "TCP".into();
+        let mut info = format!(
+            "{sport} → {dport} [{}] Seq={} ",
+            names.join(", "),
+            flow.rel_seq
+        );
+        if flags & 0x10 != 0 {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "fmt::Write for String never returns Err"
+            )]
+            let _ = write!(info, "Ack={} ", flow.rel_ack);
+        }
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "fmt::Write for String never returns Err"
+        )]
+        let _ = write!(info, "Win={win} Len={}", payload.1 - payload.0);
+        if !opts.is_empty() && flags & 0x02 != 0 {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "fmt::Write for String never returns Err"
+            )]
+            let _ = write!(info, " {}", opts.join(" "));
+        }
+        if flow.retransmission {
+            d.tag("retransmission");
+            info.push_str(" [retransmission]");
+        }
+        if flags & 0x04 != 0 {
+            d.tag("reset");
+        }
+        d.info = info;
+        let mut gap = false;
+        let layers = d.layers.len().checked_add(d.cut);
+        let mut delivered = false;
+        for event in flow.events {
+            match event {
+                Chunk::Bytes {
+                    offset,
+                    bytes,
+                    input_offset,
+                    ..
+                } => {
+                    let conversation = self.conversations.entry(ckey).or_insert_with(|| {
+                        Conversation::with_registry(ckey.1, ckey.3, self.registry.clone())
+                    });
+                    let place = Place {
+                        stream_start: offset,
+                        buf: 0,
+                        offset: input_offset.and_then(|at| payload.0.checked_add(at)),
+                        len: bytes.len(),
+                    };
+                    conversation.data(reversed, &bytes, place, d, keys);
+                    delivered = true;
+                }
+                Chunk::Gap { resumed: true, .. } => {
+                    let conversation = self.conversations.entry(ckey).or_insert_with(|| {
+                        Conversation::with_registry(ckey.1, ckey.3, self.registry.clone())
+                    });
+                    conversation.lost(reversed);
+                }
+                Chunk::Gap { resumed: false, .. } => gap = true,
+                // Forwarding Protocol::end would end Observed streams, but
+                // reassembly still delivers captured payload after FIN or RST.
+                // Keep the conversation until a SYN replaces it.
+                Chunk::End { .. } => {}
+            }
+        }
+        if gap {
+            d.tag("gap");
+        }
+        if delivered
+            && d.layers.len().checked_add(d.cut) == layers
+            && self
+                .conversations
+                .get(&ckey)
+                .is_some_and(|c| c.waiting(reversed))
+        {
+            d.info.push_str(" [part of a longer message]");
+        }
+    }
+}
+
+fn sock(ip: &str, port: u16) -> String {
+    if ip.contains(':') {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+fn truncated(d: &mut Decoded, what: &str, len: usize) {
+    d.proto = what.into();
+    d.info = format!("Truncated {what} header ({len} bytes)");
+    d.tag("malformed");
+}
+
+fn flag_names(flags: u8) -> Vec<&'static str> {
+    let names = [
+        (0x02, "SYN"),
+        (0x10, "ACK"),
+        (0x08, "PSH"),
+        (0x01, "FIN"),
+        (0x04, "RST"),
+        (0x20, "URG"),
+        (0x40, "ECE"),
+        (0x80, "CWR"),
+    ];
+    names
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, n)| *n)
+        .collect()
+}
+
+fn tcp_options(o: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < o.len() {
+        match o[i] {
+            0 => break,
+            1 => i += 1,
+            kind => {
+                let Some(&len) = o.get(i + 1) else { break };
+                let len = usize::from(len);
+                if len < 2 || i + len > o.len() {
+                    break;
+                }
+                let v = &o[i + 2..i + len];
+                out.push(match (kind, v.len()) {
+                    (2, 2) => {
+                        let Some(mss) = be16(v, 0) else {
+                            break;
+                        };
+                        format!("MSS={mss}")
+                    }
+                    (3, 1) => format!("WS={}", 1u32 << v[0].min(14)),
+                    (4, 0) => "SACK_PERM".to_owned(),
+                    (5, _) => format!("SACK({} blocks)", v.len() / 8),
+                    (8, 8) => {
+                        let (Some(value), Some(echo)) = (be32(v, 0), be32(v, 4)) else {
+                            break;
+                        };
+                        format!("TSval={value} TSecr={echo}")
+                    }
+                    _ => format!("option {kind}"),
+                });
+                i += len;
+            }
+        }
+    }
+    out
+}
+
+fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &Registry) {
+    let u = &p[at..end];
+    if u.len() < 8 {
+        return truncated(d, "UDP", u.len());
+    }
+    let Some(source_port) = be16(u, 0) else {
+        return truncated(d, "UDP", u.len());
+    };
+    let Some(destination_port) = be16(u, 2) else {
+        return truncated(d, "UDP", u.len());
+    };
+    let Some(length) = be16(u, 4) else {
+        return truncated(d, "UDP", u.len());
+    };
+    let (sport, dport, len) = (source_port, destination_port, length);
+    // The datagram is as long as its header says, if the packet holds that
+    // much: bytes after it are not part of it.
+    let ulen = usize::from(len);
+    let short = ulen < 8 || ulen > u.len();
+    let end = if short { end } else { at + ulen };
+    let u = &p[at..end];
+    let mut l = Layer::new("User Datagram Protocol", 0, (at, at + 8));
+    l.summary = format!("Src Port: {sport}, Dst Port: {dport}");
+    l.field("Source port", sport.to_string(), (at, at + 2));
+    l.field("Destination port", dport.to_string(), (at + 2, at + 4));
+    l.field("Length", len.to_string(), (at + 4, at + 6));
+    let Some(checksum) = be16(u, 6) else {
+        return truncated(d, "UDP", u.len());
+    };
+    l.field("Checksum", format!("0x{:04x}", checksum), (at + 6, at + 8));
+    d.push(l);
+    d.src = sock(&d.src, sport);
+    d.dst = sock(&d.dst, dport);
+    d.proto = "UDP".into();
+    d.info = format!("{sport} → {dport} Len={}", u.len() - 8);
+    if short {
+        d.info.push_str(" [bad length]");
+        d.tag("malformed");
+        return;
+    }
+    let body = (at + 8, end);
+    if body.0 >= body.1 {
+        return;
+    }
+    let bytes = &p[body.0..body.1];
+    let selection = Selection {
+        transport: fictionet::events::Transport::Udp,
+        ports: (sport, dport),
+        alpn: None,
+        first: bytes.get(..bytes.len().min(64)).unwrap_or_default(),
+    };
+    if let Ok(mut protocol) = registry.open(selection) {
+        let place = Place {
+            stream_start: 0,
+            buf: 0,
+            offset: Some(body.0),
+            len: bytes.len(),
+        };
+        protocol.data(false, bytes, place, d, &[]);
+        protocol.end(false, d);
+    }
+}
+
+fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
+    let c = &p[at..end];
+    let name = if v6 { "ICMPv6" } else { "ICMP" };
+    if c.len() < 4 {
+        return truncated(d, name, c.len());
+    }
+    let (kind, code) = (c[0], c[1]);
+    let what = icmp_name(kind, code, v6);
+    let mut l = Layer::new(
+        if v6 {
+            "Internet Control Message Protocol v6"
+        } else {
+            "Internet Control Message Protocol"
+        },
+        0,
+        (at, end),
+    );
+    l.summary = what.clone();
+    l.field("Type", format!("{kind} ({what})"), (at, at + 1));
+    l.field("Code", code.to_string(), (at + 1, at + 2));
+    let Some(checksum) = be16(c, 2) else {
+        return truncated(d, name, c.len());
+    };
+    l.field("Checksum", format!("0x{:04x}", checksum), (at + 2, at + 4));
+    let mut info = what;
+    let echo = if v6 {
+        matches!(kind, 128 | 129)
+    } else {
+        matches!(kind, 0 | 8)
+    };
+    if echo && c.len() >= 8 {
+        let Some(identifier) = be16(c, 4) else {
+            return truncated(d, name, c.len());
+        };
+        let Some(sequence) = be16(c, 6) else {
+            return truncated(d, name, c.len());
+        };
+        let (id, seq) = (identifier, sequence);
+        l.field("Identifier", format!("0x{id:04x}"), (at + 4, at + 6));
+        l.field("Sequence number", seq.to_string(), (at + 6, at + 8));
+        l.note("Data", format!("{} bytes", c.len() - 8));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "fmt::Write for String never returns Err"
+        )]
+        let _ = write!(info, " id=0x{id:04x}, seq={seq}");
+    }
+    let quotes = if v6 {
+        matches!(kind, 1..=4)
+    } else {
+        matches!(kind, 3 | 4 | 5 | 11 | 12)
+    };
+    if quotes && c.len() >= 8 + 20 {
+        let inner = &c[8..];
+        let summary = quoted_summary(inner);
+        l.field("Original packet", summary.clone(), (at + 8, end));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "fmt::Write for String never returns Err"
+        )]
+        let _ = write!(info, " ({summary})");
+    }
+    d.push(l);
+    d.proto = name.into();
+    d.info = info;
+}
+
+/// "10.0.0.2:5000 → 203.0.113.9:80 TCP" for a packet quoted in an ICMP
+/// error.
+fn quoted_summary(q: &[u8]) -> String {
+    let (src, dst, proto, at) = match q[0] >> 4 {
+        4 if q.len() >= 20 => {
+            let ihl = usize::from(q[0] & 0xf) * 4;
+            (
+                IpAddr::from([q[12], q[13], q[14], q[15]]),
+                IpAddr::from([q[16], q[17], q[18], q[19]]),
+                q[9],
+                ihl,
+            )
+        }
+        6 if q.len() >= 40 => (
+            IpAddr::from(<[u8; 16]>::try_from(&q[8..24]).unwrap()),
+            IpAddr::from(<[u8; 16]>::try_from(&q[24..40]).unwrap()),
+            q[6],
+            40,
+        ),
+        _ => return "a packet".into(),
+    };
+    if matches!(proto, 6 | 17) && q.len() >= at + 4 {
+        let Some(source_port) = be16(q, at) else {
+            return format!("{src} → {dst} {}", ip_proto_name(proto));
+        };
+        let Some(destination_port) = be16(q, at + 2) else {
+            return format!("{src} → {dst} {}", ip_proto_name(proto));
+        };
+        format!(
+            "{} → {} {}",
+            sock(&src.to_string(), source_port),
+            sock(&dst.to_string(), destination_port),
+            ip_proto_name(proto)
+        )
+    } else {
+        format!("{src} → {dst} {}", ip_proto_name(proto))
+    }
+}
+
+fn icmp_name(kind: u8, code: u8, v6: bool) -> String {
+    let s = if v6 {
+        match (kind, code) {
+            (1, 0) => "Destination unreachable (no route)",
+            (1, 1) => "Destination unreachable (administratively prohibited)",
+            (1, 3) => "Destination unreachable (address unreachable)",
+            (1, 4) => "Destination unreachable (port unreachable)",
+            (1, _) => "Destination unreachable",
+            (2, _) => "Packet too big",
+            (3, _) => "Time exceeded",
+            (4, _) => "Parameter problem",
+            (128, _) => "Echo (ping) request",
+            (129, _) => "Echo (ping) reply",
+            (133, _) => "Router solicitation",
+            (134, _) => "Router advertisement",
+            (135, _) => "Neighbor solicitation",
+            (136, _) => "Neighbor advertisement",
+            (143, _) => "Multicast listener report v2",
+            _ => return format!("Type {kind}"),
+        }
+    } else {
+        match (kind, code) {
+            (0, _) => "Echo (ping) reply",
+            (3, 0) => "Destination unreachable (network unreachable)",
+            (3, 1) => "Destination unreachable (host unreachable)",
+            (3, 3) => "Destination unreachable (port unreachable)",
+            (3, 4) => "Destination unreachable (fragmentation needed)",
+            (3, 13) => "Destination unreachable (administratively prohibited)",
+            (3, _) => "Destination unreachable",
+            (5, _) => "Redirect",
+            (8, _) => "Echo (ping) request",
+            (11, 0) => "Time to live exceeded in transit",
+            (11, _) => "Time exceeded",
+            _ => return format!("Type {kind}"),
+        }
+    };
+    s.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ipv4(proto: u8, src: [u8; 4], dst: [u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x45, 0, 0, 0, 0, 1, 0x40, 0, 64, proto, 0, 0];
+        p.extend_from_slice(&src);
+        p.extend_from_slice(&dst);
+        p.extend_from_slice(body);
+        let len = p.len() as u16;
+        p[2..4].copy_from_slice(&len.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn a_ping_is_decoded() {
+        let mut echo = vec![8, 0, 0, 0, 0x12, 0x34, 0, 7];
+        echo.extend_from_slice(&[0; 16]);
+        let d = Dissector::default().decode(&ipv4(1, [10, 0, 0, 2], [10, 0, 0, 1], &echo), &[]);
+        assert_eq!(
+            (d.src.as_str(), d.dst.as_str(), d.proto.as_str()),
+            ("10.0.0.2", "10.0.0.1", "ICMP")
+        );
+        assert_eq!(d.info, "Echo (ping) request id=0x1234, seq=7");
+        assert_eq!(d.layers.len(), 2);
+        assert_eq!(d.layers[1].fields[3].range, Some((24, 26)));
+    }
+
+    #[test]
+    fn a_syn_shows_its_flags_and_options() {
+        let mut syn = vec![
+            0xc3, 0x50, 0, 80, 0, 0, 0, 100, 0, 0, 0, 0, 0x60, 0x02, 0xfa, 0xf0, 0, 0, 0, 0,
+        ];
+        syn.extend_from_slice(&[2, 4, 0x05, 0xb4]);
+        let d = Dissector::default().decode(&ipv4(6, [10, 0, 0, 2], [203, 0, 113, 10], &syn), &[]);
+        assert_eq!(d.src, "10.0.0.2:50000");
+        assert_eq!(d.dst, "203.0.113.10:80");
+        assert_eq!(d.info, "50000 → 80 [SYN] Seq=0 Win=64240 Len=0 MSS=1460");
+    }
+
+    fn tcp(sport: u16, dport: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut t = vec![0u8; 20];
+        t[0..2].copy_from_slice(&sport.to_be_bytes());
+        t[2..4].copy_from_slice(&dport.to_be_bytes());
+        t[4..8].copy_from_slice(&seq.to_be_bytes());
+        t[12] = 0x50;
+        t[13] = flags;
+        t.extend_from_slice(payload);
+        ipv4(6, [10, 0, 0, 2], [10, 0, 0, 1], &t)
+    }
+
+    #[test]
+    fn a_dns_query_is_decoded() {
+        // A query for example.test, type A.
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
+        let mut udp = vec![0xc0, 0x00, 0, 53, 0, (8 + q.len()) as u8, 0, 0];
+        udp.extend_from_slice(&q);
+        let d = Dissector::default().decode(&ipv4(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp), &[]);
+        assert_eq!(d.proto, "DNS");
+        assert_eq!(d.info, "Standard query 0x1234 A example.test");
+        // The message is in the packet, so its fields point there.
+        let dns = d.layers.last().unwrap();
+        assert_eq!((dns.buf, dns.fields[0].range), (0, Some((28, 30))));
+    }
+
+    /// A request cut over two segments, and the second arriving first, is
+    /// shown whole on the packet that completes it.
+    #[test]
+    fn http_is_reassembled_across_segments() {
+        let mut dis = Dissector::default();
+        let request = b"GET /count HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let second = dis.decode(&tcp(40000, 80, 111, 0x18, &request[10..]), &[]);
+        assert_eq!(second.proto, "TCP");
+        let first = dis.decode(&tcp(40000, 80, 101, 0x18, &request[..10]), &[]);
+        assert_eq!(
+            (first.proto.as_str(), first.info.as_str()),
+            ("HTTP", "GET /count HTTP/1.1")
+        );
+        let http = first.layers.last().unwrap();
+        assert_eq!(
+            http.buf, 1,
+            "the request spans packets, so it has a buffer of its own"
+        );
+        assert_eq!(first.extra[0].1, request);
+        assert!(
+            http.fields
+                .iter()
+                .any(|f| f.name == "Host" && f.value == "example.test")
+        );
+        // The same bytes again are a retransmission, and decode to nothing new.
+        let again = dis.decode(&tcp(40000, 80, 101, 0x18, &request[..10]), &[]);
+        assert!(again.tags.contains(&"retransmission"));
+        assert_eq!(again.proto, "TCP");
+    }
+
+    fn tcp_back(seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut p = tcp(80, 40000, seq, flags, payload);
+        // Swap the addresses: from 10.0.0.1 to 10.0.0.2.
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        p
+    }
+
+    #[test]
+    fn fast_open_and_retransmission_state_are_kept() {
+        for ack in [101u32, 103] {
+            let mut dis = Dissector::default();
+            dis.decode(&tcp(40000, 80, 100, 0x02, b"ab"), &[]);
+            let mut syn_ack = tcp_back(500, 0x12, b"");
+            syn_ack[28..32].copy_from_slice(&ack.to_be_bytes());
+            dis.decode(&syn_ack, &[]);
+            let repeated = dis.decode(&tcp(40000, 80, 101, 0x18, b"ab"), &[]);
+            assert!(repeated.info.contains("Seq=1 "));
+            assert!(repeated.tags.contains(&"retransmission"));
+            let next = dis.decode(&tcp(40000, 80, 103, 0x18, b"cd"), &[]);
+            assert!(next.info.contains("Seq=3 "));
+            assert!(!next.tags.contains(&"retransmission"));
+        }
+    }
+
+    /// A response to HEAD has no body, whatever its content-length says,
+    /// so the next response is still found.
+    #[test]
+    fn a_head_response_has_no_body() {
+        let mut dis = Dissector::default();
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        dis.decode(&tcp_back(500, 0x12, b""), &[]);
+        dis.decode(
+            &tcp(
+                40000,
+                80,
+                101,
+                0x18,
+                b"HEAD / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n",
+            ),
+            &[],
+        );
+        let first = dis.decode(
+            &tcp_back(501, 0x18, b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n"),
+            &[],
+        );
+        assert_eq!(first.info, "HTTP/1.1 200 OK");
+        let second = dis.decode(
+            &tcp_back(
+                541,
+                0x18,
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n",
+            ),
+            &[],
+        );
+        assert_eq!(second.info, "HTTP/1.1 404 Not Found");
+    }
+
+    #[test]
+    fn captured_payload_after_close_still_completes_http2_headers() {
+        for flags in [0x11, 0x14] {
+            let mut dis = Dissector::default();
+            let mut first = fictionet::stdlib::protocols::http2::PREFACE.to_vec();
+            first.extend(h2_frame(1, 0, 1, &[0x82]));
+            dis.decode(&tcp(40000, 80, 100, 2, b""), &[]);
+            dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
+            let end = 101 + first.len() as u32;
+            let close = dis.decode(&tcp(40000, 80, end, flags, b""), &[]);
+            assert!(!close.tags.contains(&"malformed"));
+            let next = end + u32::from(flags & 1 != 0);
+            let done = dis.decode(
+                &tcp(40000, 80, next, 0x18, &h2_frame(9, 4, 1, &[0x84])),
+                &[],
+            );
+            assert_eq!(done.info, "CONTINUATION[1]: GET /");
+            assert!(!done.tags.contains(&"malformed"));
+        }
+    }
+
+    /// Segments held across the point where sequence numbers wrap are
+    /// delivered in order, and an early FIN does not eat a byte.
+    #[test]
+    fn reassembly_across_the_wrap_and_an_early_fin() {
+        let mut dis = Dissector::default();
+        let request = b"GET /wrap HTTP/1.1\r\nHost: x\r\n\r\n";
+        let isn = u32::MAX - 10;
+        dis.decode(&tcp(40000, 80, isn, 0x02, b""), &[]);
+        let (a, b) = request.split_at(10);
+        // The second half, past the wrap, comes first, with a FIN.
+        dis.decode(&tcp(40000, 80, isn.wrapping_add(11), 0x19, b), &[]);
+        let done = dis.decode(&tcp(40000, 80, isn.wrapping_add(1), 0x18, a), &[]);
+        assert_eq!(done.info, "GET /wrap HTTP/1.1");
+    }
+
+    /// When the endpoint that sorts second opens a new connection on the
+    /// same ports, the old connection's decoders are dropped: a request
+    /// that waited for its body does not eat the new one.
+    #[test]
+    fn a_new_connection_on_the_same_ports_starts_over() {
+        let mut dis = Dissector::default();
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        dis.decode(
+            &tcp(
+                40000,
+                80,
+                101,
+                0x18,
+                b"POST / HTTP/1.1\r\ncontent-length: 100\r\n\r\n",
+            ),
+            &[],
+        );
+        dis.decode(&tcp(40000, 80, 5000, 0x02, b""), &[]);
+        let d = dis.decode(
+            &tcp(40000, 80, 5001, 0x18, b"GET /new HTTP/1.1\r\n\r\n"),
+            &[],
+        );
+        assert_eq!(d.info, "GET /new HTTP/1.1");
+        // A SYN-ACK that answers the SYN keeps what the SYN carried, whether
+        // it acknowledges the SYN's data (TCP Fast Open) or only the SYN.
+        for ack in [9001u32, 9010] {
+            let mut dis = Dissector::default();
+            dis.decode(&tcp(40000, 80, 9000, 0x02, b"GET /fast"), &[]);
+            let mut syn_ack = tcp_back(700, 0x12, b"");
+            syn_ack[28..32].copy_from_slice(&ack.to_be_bytes());
+            dis.decode(&syn_ack, &[]);
+            let rest = tcp(40000, 80, 9010, 0x18, b" HTTP/1.1\r\n\r\n");
+            assert_eq!(
+                dis.decode(&rest, &[]).info,
+                "GET /fast HTTP/1.1",
+                "ack {ack}"
+            );
+        }
+    }
+
+    /// One packet that fills a gap can release many held segments at once.
+    /// What it decodes to is bounded, and the HPACK table still follows
+    /// every header block.
+    #[test]
+    fn one_packet_decodes_to_a_bounded_detail() {
+        let mut dis = Dissector::default();
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        // The preface, and a block that adds x: 4,000 bytes to the table.
+        let mut block = vec![0x40, 0x01, b'x', 0x7f, 0xa1, 0x1e];
+        block.extend(std::iter::repeat_n(b'v', 4000));
+        let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        first.extend(h2_frame(1, 0x4, 1, &block));
+        dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
+        let base = 101 + first.len() as u32;
+        // Each segment holds four blocks that name that entry 16 times:
+        // 256 KB of headers a segment, from 100 bytes.
+        let mut segment = Vec::new();
+        for stream in [3, 5, 7, 9] {
+            segment.extend(h2_frame(1, 0x4, stream, &[0xbe; 16]));
+        }
+        for k in (1..256).rev() {
+            dis.decode(&tcp(40000, 80, base + k * 100, 0x18, &segment), &[]);
+        }
+        let d = dis.decode(&tcp(40000, 80, base, 0x18, &segment), &[]);
+        let kept: usize = d
+            .layers
+            .iter()
+            .flat_map(|l| &l.fields)
+            .map(|f| f.value.len())
+            .sum();
+        assert!(kept <= MAX_DETAIL, "{kept} bytes of fields");
+        assert!(d.layers_json().len() < 2 * MAX_DETAIL);
+        assert!(d.info.len() < 2048);
+        assert_eq!(d.layers.last().unwrap().name, "Not shown");
+        // The table is still known.
+        let d = dis.decode(
+            &tcp(
+                40000,
+                80,
+                base + 256 * 100,
+                0x18,
+                &h2_frame(1, 0x4, 11, &[0xbe]),
+            ),
+            &[],
+        );
+        let x = d
+            .layers
+            .last()
+            .unwrap()
+            .fields
+            .iter()
+            .find(|f| f.name == "x")
+            .unwrap();
+        assert_eq!(x.value.len(), 4000);
+    }
+
+    #[test]
+    fn reassembly_gap_resets_the_http2_header_table() {
+        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
+        let mut dis = Dissector {
+            tcp: Reassembler::new(Limits {
+                segments: 1,
+                ..Limits::default()
+            }),
+            ..Dissector::default()
+        };
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        first.extend(h2_frame(1, 0x4, 1, b"\x40\x01x\x01y"));
+        let initial = dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
+        assert!(
+            initial
+                .layers
+                .iter()
+                .any(|l| l.fields.iter().any(|f| f.name == "x" && f.value == "y"))
+        );
+        let next = 101 + first.len() as u32;
+        let indexed = h2_frame(1, 0x4, 3, &[0xbe]);
+        dis.decode(&tcp(40000, 80, next + 10, 0x18, &indexed), &[]);
+        let resumed = dis.decode(&tcp(40000, 80, next + 100, 0x18, b"dropped"), &[]);
+        assert!(
+            !resumed
+                .layers
+                .iter()
+                .any(|l| l.fields.iter().any(|f| f.name == "x" && f.value == "y"))
+        );
+        assert_eq!(resumed.proto, "TCP");
+        assert_eq!(resumed.layers.len(), 2);
+        assert!(resumed.extra.is_empty());
+        assert!(!resumed.tags.contains(&"gap"));
+        let following = dis.decode(
+            &tcp(40000, 80, next + 10 + indexed.len() as u32, 0x18, &indexed),
+            &[],
+        );
+        assert_eq!(following.proto, "TCP");
+        assert_eq!(following.layers.len(), 2);
+    }
+
+    #[test]
+    fn reassembly_gap_before_the_first_bytes_also_stops_http2() {
+        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
+        let mut dis = Dissector {
+            tcp: Reassembler::new(Limits {
+                segments: 1,
+                ..Limits::default()
+            }),
+            ..Dissector::default()
+        };
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        first.extend(h2_frame(1, 0x4, 1, &[0x82]));
+        dis.decode(&tcp(40000, 80, 110, 0x18, &first), &[]);
+        let resumed = dis.decode(&tcp(40000, 80, 1000, 0x18, b"dropped"), &[]);
+        assert_eq!(resumed.proto, "TCP");
+        assert_eq!(resumed.layers.len(), 2);
+        assert!(resumed.extra.is_empty());
+    }
+
+    #[test]
+    fn reassembly_gap_without_held_data_keeps_the_packet_tag() {
+        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
+        let mut dis = Dissector {
+            tcp: Reassembler::new(Limits {
+                buffered: 0,
+                ..Limits::default()
+            }),
+            ..Dissector::default()
+        };
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let gap = dis.decode(&tcp(40000, 80, 110, 0x18, b"dropped"), &[]);
+        assert!(gap.tags.contains(&"gap"));
+        let request = dis.decode(&tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n"), &[]);
+        assert_eq!(request.info, "GET / HTTP/1.1");
+        assert_eq!(request.layers.last().unwrap().buf, 0);
+    }
+
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u32;
+        let mut f = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+        f.extend_from_slice(&stream.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Bytes after a UDP datagram's length are not part of it.
+    #[test]
+    fn udp_bytes_past_the_length_are_ignored() {
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
+        let mut udp = vec![0xc0, 0x00, 0, 53, 0, 8, 0, 0];
+        udp.extend_from_slice(&q);
+        let d = Dissector::default().decode(&ipv4(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp), &[]);
+        assert_eq!(d.proto, "UDP");
+        assert_eq!(d.info, "49152 → 53 Len=0");
+    }
+
+    /// Streams that look like TLS, HTTP/2, HTTP/1.1 and DNS, then turn to
+    /// noise, cut at random, out of order, over many connections: the
+    /// decoder never panics, whatever the agent sends.
+    #[test]
+    fn hostile_streams_are_not_a_panic() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let starts: [&[u8]; 6] = [
+            &[
+                0x16, 0x03, 0x01, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c, 0x03, 0x03,
+            ],
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            &[
+                0x00, 0x00, 0x05, 0x01, 0x2d, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x05,
+                0xff, 0xff,
+            ],
+            b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nffffffff\r\n",
+            b"HTTP/1.1 200 OK\r\ncontent-length: 99999999999\r\n\r\n",
+            &[0x17, 0x03, 0x03, 0x40, 0x00],
+        ];
+        let mut dis = Dissector::default();
+        for round in 0..4000 {
+            let port = 1000 + (rand() % 700) as u16;
+            let dport = [443, 80, 53, 8080][(rand() % 4) as usize];
+            let mut payload = starts[(rand() % 6) as usize].to_vec();
+            for _ in 0..(rand() % 200) {
+                payload.push(rand() as u8);
+            }
+            let flags = [0x02, 0x10, 0x18, 0x11, 0x04][(rand() % 5) as usize];
+            let seq = if round % 3 == 0 {
+                rand() as u32
+            } else {
+                1000 + (rand() % 3000) as u32
+            };
+            let packet = tcp(port, dport, seq, flags, &payload);
+            let mut packet = packet;
+            if round % 7 == 0 {
+                let cut = (rand() as usize) % packet.len();
+                packet.truncate(cut.max(1));
+            }
+            let _ = dis.decode(&packet, &[]);
+        }
+    }
+
+    /// The detail JSON, written the plain way: one object at a time, as
+    /// strings joined together.
+    fn detail_by_objects(d: &Decoded, packet: &[u8]) -> (String, String) {
+        use crate::json::Object;
+        let layers = json::array(d.layers.iter().map(|l| {
+            let fields = json::array(l.fields.iter().map(|f| {
+                let o = Object::new().str("name", &f.name).str("value", &f.value);
+                match f.range {
+                    Some((a, b)) => o.raw("range", &format!("[{a},{b}]")),
+                    None => o,
+                }
+                .done()
+            }));
+            Object::new()
+                .str("name", &l.name)
+                .str("summary", &l.summary)
+                .num("buf", l.buf)
+                .raw("range", &format!("[{},{}]", l.range.0, l.range.1))
+                .raw("fields", &fields)
+                .done()
+        }));
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let first = Object::new()
+            .str("name", "Packet")
+            .str("hex", &hex(packet))
+            .done();
+        let rest = d
+            .extra
+            .iter()
+            .map(|(name, b)| Object::new().str("name", name).str("hex", &hex(b)).done());
+        (layers, json::array(std::iter::once(first).chain(rest)))
+    }
+
+    /// The direct writers give exactly what the plain way gives, for
+    /// HTTP, DNS, odd names and values, and streams of noise.
+    #[test]
+    fn detail_writers_match_the_plain_json() {
+        let mut packets = vec![
+            tcp(40000, 80, 100, 0x02, b""),
+            tcp(
+                40000,
+                80,
+                101,
+                0x18,
+                b"GET /a\"b\\c\x01</script> HTTP/1.1\r\nhost: x\r\n\r\n",
+            ),
+            tcp_back(700, 0x18, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"),
+            tcp(40001, 9000, 5, 0x18, &[0xff; 1460]),
+        ];
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
+        let mut udp = vec![0xc0, 0x00, 0, 53, 0, (8 + q.len()) as u8, 0, 0];
+        udp.extend_from_slice(&q);
+        packets.push(ipv4(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp));
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..300 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let payload: Vec<u8> = (0..(state % 300))
+                .map(|i| (state >> (i % 56)) as u8)
+                .collect();
+            packets.push(tcp(
+                1000 + (state % 50) as u16,
+                [443, 80, 53][(state % 3) as usize],
+                state as u32,
+                0x18,
+                &payload,
+            ));
+        }
+        let mut dis = Dissector::default();
+        for p in &packets {
+            let d = dis.decode(p, &[]);
+            let (layers, buffers) = detail_by_objects(&d, p);
+            assert_eq!(d.layers_json(), layers);
+            let mut out = String::new();
+            d.write_buffers(&mut out, p);
+            assert_eq!(out, buffers);
+        }
+    }
+
+    #[test]
+    fn garbage_is_not_a_panic() {
+        let mut dis = Dissector::default();
+        for len in 0..80 {
+            for fill in [0u8, 0x45, 0x60, 0xff] {
+                let mut p = vec![fill; len];
+                if let Some(b) = p.first_mut() {
+                    *b = if len % 2 == 0 { 0x45 } else { 0x60 };
+                }
+                let _ = dis.decode(&p, &[]);
+            }
+        }
+    }
+}

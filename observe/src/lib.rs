@@ -2,6 +2,9 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+// The copyable decoders name this crate as their users do.
+extern crate self as fictionet_observe;
+
 mod capture;
 mod keys;
 mod loss;
@@ -10,13 +13,22 @@ mod topology;
 #[cfg(feature = "decode")]
 mod dashboard;
 #[cfg(feature = "decode")]
+mod decode;
+#[cfg(feature = "decode")]
 mod json;
 #[cfg(feature = "decode")]
 mod value;
 #[cfg(feature = "decode")]
 mod view;
 #[cfg(feature = "decode")]
+mod watch;
+#[cfg(feature = "decode")]
 pub use dashboard::{DashboardHandle, DashboardObserver, DashboardOptions, Session};
+#[cfg(feature = "decode")]
+pub use decode::{
+    Conversation, Decoded, Dissector, Field, KeyLine, Layer, Match, Observed, Place, Placement,
+    Present, Protocol, Registry, Selection, hex, http2, protocols, tls,
+};
 #[cfg(feature = "decode")]
 pub use value::{Envelope, Value};
 #[cfg(all(feature = "native", unix))]
@@ -188,6 +200,30 @@ impl Collector {
     /// Starts or joins demand capture. Off and unknown links return none.
     pub fn capture_demand(&self, link: LinkId) -> Option<CaptureDemand> {
         self.flags.load().get(&link)?.demand()
+    }
+    /// Retained TLS keys after stream sequence `after`.
+    #[cfg(feature = "decode")]
+    pub(crate) fn keys_after(&self, after: u64) -> Vec<Key> {
+        let state = self.state.lock();
+        let items = &state.keys.items;
+        let start = items.partition_point(|k| k.stamp.seq <= after);
+        items.range(start..).cloned().collect()
+    }
+    /// The link numbered `number`, if it is current or its capture is kept.
+    #[cfg(feature = "decode")]
+    pub(crate) fn find_link(&self, number: u64) -> Option<LinkId> {
+        let state = self.state.lock();
+        let topology = state.topology.links.keys();
+        let captured = state.captures.links.keys();
+        topology
+            .chain(captured)
+            .find(|id| id.get() == number)
+            .copied()
+    }
+    /// Whether `link` is current: registered and not removed.
+    #[cfg(feature = "decode")]
+    pub(crate) fn live(&self, link: LinkId) -> bool {
+        self.state.lock().topology.links.contains_key(&link)
     }
 }
 

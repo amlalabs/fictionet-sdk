@@ -4,7 +4,8 @@
 keys. The base crate is sans-I/O.
 It starts no threads, opens no files or sockets, and reads no clocks.
 
-There are no default features. `decode` adds the dashboard observer and its
+There are no default features. `decode` adds packet decoding and
+presentation, pcapng output, and the dashboard observer with its
 transport-independent request sessions. `native` enables `decode` and adds
 the Unix observation endpoint, client and `Jsonl` worker.
 `tracing` adds `Tracing`, which uses a dispatch supplied by the integrator.
@@ -81,15 +82,44 @@ assert!(replies[0].end);
 ```
 
 A session accepts flat JSON requests with caller-assigned ids. `world`, `graph`,
-`counters`, `events`, `link` and `keylog` return whole values; keylog is binary
-SSLKEYLOGFILE text. `watch` creates a subscription: call `poll` at `next_poll`
-to receive its snapshot, changes, events and final `end`. `cancel` names the
-subscription's request id. Each caller may hold at most 64 subscriptions.
+`counters`, `events`, `link`, `packet` and `keylog` return whole values; keylog
+is binary SSLKEYLOGFILE text. `watch` creates a subscription: call `poll` at
+`next_poll` to receive its snapshot, changes, events and final `end`.
+`packets` (`link`, `after`) subscribes to one link's decoded packets: it sends
+`link`, then `packet` rows and `packet_gap` events, then `end` once the link
+is gone or the run has ended and every captured row was sent. `packet`
+(`link`, `seq`) returns one row's layers and bytes. `pcap` (`link`) returns a
+pcapng file of the link's kept rows with the TLS keys of the watch and the
+collector. It is written as it is read, in several binary values; the last has
+`end`. `cancel` names a subscription's request id. Each caller may hold at
+most 64 subscriptions and downloads.
 The caller supplies monotonic time for scheduling and optional wall time since
 the Unix epoch for real-run elapsed time. Lab time always comes from observations.
 Neither the handle nor the collector reads clocks. Snapshot `revision`, `hosts`
 and `status` extend the dashboard JSON; status includes topology completeness
 and persistent losses by stream and reason.
+
+Each watched link decodes its captured copies in order with
+`DashboardOptions::protocols`, by default the built-in `Registry`. Decoding
+happens when a session polls or asks, on the caller's thread, never in an
+observer callback. A `packets` subscriber holds the link's capture demand, so
+on-demand links capture only while someone watches; startup links keep
+capturing. A capture gap from sampling or eviction resets the link's
+connections, so no decoder joins bytes across it. TLS 1.3 is decrypted with
+the collector's keys and a per-watch key cache bounded like the collector's.
+
+Each watch keeps at most 4,096 rows and 32 MiB. `DashboardOptions::watch_bytes`
+bounds rows across all watches, 256 MiB by default: past it, idle watches are
+forgotten first, longest idle first, then the oldest rows of any watch.
+Subscribers behind the kept rows get a `packet_gap` with the count missed.
+`DashboardOptions::watches` bounds watched links, 64 by default. At capacity a
+new link evicts the longest-idle watch, with the lowest link id breaking ties;
+when every watch has a subscriber, `packets` replies
+`{"error":"this world has too many watched links"}`. A watch keeps its rows
+for a minute after its last subscriber leaves, by the times callers supply.
+`packet` and `pcap` on a link with no kept watch reply
+`{"error":"nothing is watching that link"}`. Captures of removed links can
+still be watched while the collector keeps them.
 
 On Unix, `serve(handle, path)` creates a private socket for external clients.
 Keep the returned `Endpoint` alive; dropping it disconnects sessions, joins

@@ -929,6 +929,9 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "fictionet",
+ "hickory-proto",
+ "ring",
+ "rustls",
  "tracing",
 ]
 

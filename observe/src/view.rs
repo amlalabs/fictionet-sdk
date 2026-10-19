@@ -309,6 +309,26 @@ pub(crate) fn link(graph: &DashboardHandle, id: u64) -> Option<String> {
     ))
 }
 
+/// The `link` event of a packet stream: the edge's ends and label, or
+/// nulls for a link the graph does not show, such as one already removed.
+pub(crate) fn describe(graph: &DashboardHandle, id: fictionet::events::LinkId) -> String {
+    let view = build(
+        graph.0.collector.topology(),
+        graph.0.collector.ended().is_some(),
+    );
+    view.edges
+        .get(&edge_id(id.get()))
+        .cloned()
+        .unwrap_or_else(|| {
+            Object::new()
+                .str("id", &edge_id(id.get()))
+                .raw("a", "null")
+                .raw("b", "null")
+                .raw("label", "null")
+                .done()
+        })
+}
+
 fn counters_json<'a>(counters: impl Iterator<Item = (&'a String, &'a [u64; 4])>) -> String {
     let mut out = String::from("{");
     for (i, (id, c)) in counters.enumerate() {
@@ -510,6 +530,7 @@ mod tests {
                 noise: Limits::new(2, 4096),
                 ..Options::default()
             },
+            ..DashboardOptions::default()
         })
         .handle()
     }

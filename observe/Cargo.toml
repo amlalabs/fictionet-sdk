@@ -9,11 +9,18 @@ publish = false
 
 [features]
 default = []
-decode = []
+decode = ["dep:hickory-proto", "dep:ring"]
 native = ["decode"]
 tracing = ["dep:tracing"]
 
 [dependencies]
 fictionet = { path = "..", default-features = false }
 arc-swap = "1.9.3"
+hickory-proto = { version = "0.26.3", optional = true, default-features = false, features = ["std"] }
+ring = { version = "0.17", optional = true }
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+# The tests run real worlds on threads, which needs the SDK on std.
+fictionet = { path = "..", default-features = false, features = ["std"] }
