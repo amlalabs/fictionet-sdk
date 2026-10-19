@@ -1,16 +1,11 @@
-// Heads up! Before working on this file you should read, at least, RFC 793 and
-// the parts of RFC 1122 that discuss TCP, as well as RFC 7323 for some of the TCP options.
-// Consult RFC 7414 when implementing a new feature.
-
 use core::fmt::Display;
 
 use core::task::Waker;
 use core::{fmt, mem};
 
-use crate::phy::PacketMeta;
-
+use crate::iface::Context;
+use crate::socket::PollAt;
 use crate::socket::WakerRegistration;
-use crate::socket::{Context, PollAt};
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
@@ -19,10 +14,6 @@ use crate::wire::{
 };
 
 mod congestion;
-
-macro_rules! tcp_trace {
-    ($($arg:expr),*) => (net_log!(trace, $($arg),*));
-}
 
 /// Error returned by [`Socket::listen`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -95,7 +86,7 @@ impl Display for RecvError {
 impl core::error::Error for RecvError {}
 
 /// A TCP socket ring buffer.
-pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
+pub type SocketBuffer<'a> = RingBuffer<'a>;
 
 /// The state of a TCP socket, according to [RFC 793].
 ///
@@ -206,14 +197,6 @@ impl RttEstimator {
         self.rto = (self.srtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
 
         self.rto_count = 0;
-
-        tcp_trace!(
-            "rtte: sample={:?} srtt={:?} rttvar={:?} rto={:?}",
-            new_rtt,
-            self.srtt,
-            self.rttvar,
-            self.rto
-        );
     }
 
     fn on_send(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
@@ -225,7 +208,6 @@ impl RttEstimator {
             self.max_seq_sent = Some(seq);
             if self.timestamp.is_none() {
                 self.timestamp = Some((timestamp, seq));
-                tcp_trace!("rtte: sampling at seq={:?}", seq);
             }
         }
     }
@@ -244,7 +226,6 @@ impl RttEstimator {
         // maximum value discussed in (2.5) above may be used to provide
         // an upper bound to this doubling operation.
         self.rto = (self.rto * 2).min(RTTE_MAX_RTO);
-        tcp_trace!("rtte: doubling rto to {:?}", self.rto);
 
         // RFC 6298: a TCP implementation MAY clear SRTT and RTTVAR after
         // backing off the timer multiple times as it is likely that the current
@@ -255,14 +236,10 @@ impl RttEstimator {
         if self.rto_count >= 3 {
             self.rto_count = 0;
             self.have_measurement = false;
-            tcp_trace!("rtte: too many retransmissions, clearing srtt, rttvar.");
         }
     }
 
     fn on_retransmit(&mut self) {
-        if self.timestamp.is_some() {
-            tcp_trace!("rtte: abort sampling due to retransmit");
-        }
         self.timestamp = None;
     }
 }
@@ -434,14 +411,6 @@ impl Display for Tuple {
     }
 }
 
-/// A congestion control algorithm.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum CongestionControl {
-    None,
-
-    Reno,
-}
-
 /// A Transmission Control Protocol socket.
 ///
 /// A TCP socket may passively listen for connections or actively connect to another endpoint.
@@ -519,7 +488,7 @@ pub struct Socket<'a> {
     nagle: bool,
 
     /// The congestion control algorithm.
-    congestion_controller: congestion::AnyController,
+    congestion_controller: congestion::reno::Reno,
 
     /// tsval generator - if some, tcp timestamp is enabled
     tsval_generator: Option<TcpTimestampGenerator>,
@@ -596,7 +565,7 @@ impl<'a> Socket<'a> {
             nagle: true,
             tsval_generator: None,
             last_remote_tsval: 0,
-            congestion_controller: congestion::AnyController::new(),
+            congestion_controller: congestion::reno::Reno::new(),
 
             rx_waker: WakerRegistration::new(),
 
@@ -612,31 +581,6 @@ impl<'a> Socket<'a> {
     /// Return whether TCP Timestamp is enabled.
     pub fn timestamp_enabled(&self) -> bool {
         self.tsval_generator.is_some()
-    }
-
-    /// Set an algorithm for congestion control.
-    ///
-    /// `CongestionControl::None` indicates that no congestion control is applied.
-    /// Reno is the default congestion controller.
-    pub fn set_congestion_control(&mut self, congestion_control: CongestionControl) {
-        use congestion::*;
-
-        self.congestion_controller = match congestion_control {
-            CongestionControl::None => AnyController::None(no_control::NoControl),
-
-            CongestionControl::Reno => AnyController::Reno(reno::Reno::new()),
-        }
-    }
-
-    /// Return the current congestion control algorithm.
-    pub fn congestion_control(&self) -> CongestionControl {
-        use congestion::*;
-
-        match self.congestion_controller {
-            AnyController::None(_) => CongestionControl::None,
-
-            AnyController::Reno(_) => CongestionControl::Reno,
-        }
     }
 
     /// Register a waker for receive operations.
@@ -930,11 +874,11 @@ impl<'a> Socket<'a> {
     /// socket.connect(
     ///     iface.context(),
     ///     (IpAddress::v4(10, 0, 0, 1), 80),
-    ///     get_ephemeral_port()
+    ///     (IpAddress::v4(10, 0, 0, 2), get_ephemeral_port())
     /// ).unwrap();
     /// ```
     ///
-    /// The local address may optionally be provided.
+    /// Both endpoints must specify an address and port.
     ///
     /// This function returns an error if the socket was open; see [is_open](#method.is_open).
     /// It also returns an error if the local or remote port is zero, or if the remote address
@@ -947,10 +891,10 @@ impl<'a> Socket<'a> {
     ) -> Result<(), ConnectError>
     where
         T: Into<IpEndpoint>,
-        U: Into<IpListenEndpoint>,
+        U: Into<IpEndpoint>,
     {
         let remote_endpoint: IpEndpoint = remote_endpoint.into();
-        let local_endpoint: IpListenEndpoint = local_endpoint.into();
+        let local_endpoint: IpEndpoint = local_endpoint.into();
 
         if self.is_open() {
             return Err(ConnectError::InvalidState);
@@ -958,25 +902,9 @@ impl<'a> Socket<'a> {
         if remote_endpoint.port == 0 || remote_endpoint.addr.is_unspecified() {
             return Err(ConnectError::Unaddressable);
         }
-        if local_endpoint.port == 0 {
+        if local_endpoint.port == 0 || local_endpoint.addr.is_unspecified() {
             return Err(ConnectError::Unaddressable);
         }
-
-        // If local address is not provided, choose it automatically.
-        let local_endpoint = IpEndpoint {
-            addr: match local_endpoint.addr {
-                Some(addr) => {
-                    if addr.is_unspecified() {
-                        return Err(ConnectError::Unaddressable);
-                    }
-                    addr
-                }
-                None => cx
-                    .get_source_address(&remote_endpoint.addr)
-                    .ok_or(ConnectError::Unaddressable)?,
-            },
-            port: local_endpoint.port,
-        };
 
         if local_endpoint.addr.version() != remote_endpoint.addr.version() {
             return Err(ConnectError::Unaddressable);
@@ -995,12 +923,6 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn random_seq_no(_cx: &mut Context) -> TcpSeqNumber {
-        TcpSeqNumber(10000)
-    }
-
-    #[cfg(not(test))]
     fn random_seq_no(cx: &mut Context) -> TcpSeqNumber {
         TcpSeqNumber(cx.rand().rand_u32() as i32)
     }
@@ -1186,19 +1108,11 @@ impl<'a> Socket<'a> {
             // send, start the zero window probe timer.
             if self.remote_win_len == 0 && self.timer.is_idle() {
                 let delay = self.rtte.retransmission_timeout();
-                tcp_trace!("starting zero-window-probe timer for t+{}", delay);
 
                 // We don't have access to the current time here, so use Instant::ZERO instead.
                 // this will cause the first ZWP to be sent immediately, but that's okay.
                 self.timer.set_for_zero_window_probe(Instant::ZERO, delay);
             }
-
-            #[cfg(test)]
-            tcp_trace!(
-                "tx buffer: enqueueing {} octets (now {})",
-                size,
-                old_length + size
-            );
         }
         Ok(result)
     }
@@ -1248,17 +1162,8 @@ impl<'a> Socket<'a> {
     {
         self.recv_error_check()?;
 
-        let _old_length = self.rx_buffer.len();
         let (size, result) = f(&mut self.rx_buffer);
         self.remote_seq_no += size;
-        if size > 0 {
-            #[cfg(test)]
-            tcp_trace!(
-                "rx buffer: dequeueing {} octets (now {})",
-                size,
-                _old_length - size
-            );
-        }
         Ok(result)
     }
 
@@ -1300,10 +1205,6 @@ impl<'a> Socket<'a> {
         self.recv_error_check()?;
 
         let buffer = self.rx_buffer.get_allocated(0, size);
-        if !buffer.is_empty() {
-            #[cfg(test)]
-            tcp_trace!("rx buffer: peeking at {} octets", buffer.len());
-        }
         Ok(buffer)
     }
 
@@ -1329,7 +1230,6 @@ impl<'a> Socket<'a> {
 
     fn cwnd_remaining(&self) -> usize {
         self.congestion_controller
-            .inner()
             .window()
             .saturating_sub(self.flight_size())
     }
@@ -1344,10 +1244,6 @@ impl<'a> Socket<'a> {
     }
 
     fn set_state(&mut self, state: State) {
-        if self.state != state {
-            tcp_trace!("state={}=>{}", self.state, state);
-        }
-
         self.state = state;
 
         {
@@ -1423,8 +1319,6 @@ impl<'a> Socket<'a> {
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
         if self.remote_has_sack {
-            net_debug!("sending sACK option with current assembler ranges");
-
             // RFC 2018: The first SACK block (i.e., the one immediately following the kind and
             // length fields in the option) MUST specify the contiguous block of data containing
             // the segment which triggered this ACK, unless that segment advanced the
@@ -1535,12 +1429,10 @@ impl<'a> Socket<'a> {
             // An RST received in response to initial SYN is acceptable if it acknowledges
             // the initial SYN.
             (State::SynSent, TcpControl::Rst, None) => {
-                net_debug!("unacceptable RST (expecting RST|ACK) in response to initial SYN");
                 return None;
             }
             (State::SynSent, TcpControl::Rst, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
-                    net_debug!("unacceptable RST|ACK in response to initial SYN");
                     return None;
                 }
             }
@@ -1553,7 +1445,6 @@ impl<'a> Socket<'a> {
             // SYN|ACK in the SYN-SENT state must have the exact ACK number.
             (State::SynSent, TcpControl::Syn, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
-                    net_debug!("unacceptable SYN|ACK in response to initial SYN");
                     return Some(Self::rst_reply(ip_repr, repr));
                 }
             }
@@ -1568,31 +1459,22 @@ impl<'a> Socket<'a> {
                 // servers, or a defense against reordering. Either way, if Linux
                 // does it, we do too.
                 if ack_number == self.local_seq_no + 1 {
-                    net_debug!(
-                        "expecting a SYN|ACK, received an ACK with the right ack_number, ignoring."
-                    );
                     return None;
                 }
 
-                net_debug!(
-                    "expecting a SYN|ACK, received an ACK with the wrong ack_number, sending RST."
-                );
                 return Some(Self::rst_reply(ip_repr, repr));
             }
             // Anything else in the SYN-SENT state is invalid.
             (State::SynSent, _, _) => {
-                net_debug!("expecting a SYN|ACK");
                 return None;
             }
             // Every packet after the initial SYN must be an acknowledgement.
             (_, _, None) => {
-                net_debug!("expecting an ACK");
                 return None;
             }
             // ACK in the SYN-RECEIVED state must have the exact ACK number, or we RST it.
             (State::SynReceived, _, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
-                    net_debug!("unacceptable ACK in response to SYN|ACK");
                     return Some(Self::rst_reply(ip_repr, repr));
                 }
             }
@@ -1610,22 +1492,10 @@ impl<'a> Socket<'a> {
                 }
 
                 if ack_number < ack_min {
-                    net_debug!(
-                        "duplicate ACK ({} not in {}...{})",
-                        ack_number,
-                        ack_min,
-                        ack_max
-                    );
                     return None;
                 }
 
                 if ack_number > ack_max {
-                    net_debug!(
-                        "unacceptable ACK ({} not in {}...{})",
-                        ack_number,
-                        ack_min,
-                        ack_max
-                    );
                     return self.challenge_ack_reply(cx, ip_repr, repr);
                 }
             }
@@ -1645,57 +1515,19 @@ impl<'a> Socket<'a> {
             State::Listen | State::SynSent => (&[][..], 0),
             _ => {
                 // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
-                let segment_in_window = match (
-                    segment_start == segment_end,
-                    window_start == window_end,
-                ) {
-                    (true, _) if segment_end == window_start - 1 => {
-                        net_debug!(
-                            "received a keep-alive or window probe packet, will send an ACK"
-                        );
-                        false
-                    }
-                    (true, true) => {
-                        if window_start == segment_start {
-                            true
-                        } else {
-                            net_debug!(
-                                "zero-length segment not inside zero-length window, will send an ACK."
-                            );
-                            false
+                let segment_in_window =
+                    match (segment_start == segment_end, window_start == window_end) {
+                        (true, _) if segment_end == window_start - 1 => false,
+                        (true, true) => window_start == segment_start,
+                        (true, false) => {
+                            window_start <= segment_start && segment_start < window_end
                         }
-                    }
-                    (true, false) => {
-                        if window_start <= segment_start && segment_start < window_end {
-                            true
-                        } else {
-                            net_debug!("zero-length segment not inside window, will send an ACK.");
-                            false
+                        (false, true) => false,
+                        (false, false) => {
+                            (window_start <= segment_start && segment_start < window_end)
+                                || (window_start < segment_end && segment_end <= window_end)
                         }
-                    }
-                    (false, true) => {
-                        net_debug!(
-                            "non-zero-length segment with zero receive window, will only send an ACK"
-                        );
-                        false
-                    }
-                    (false, false) => {
-                        if (window_start <= segment_start && segment_start < window_end)
-                            || (window_start < segment_end && segment_end <= window_end)
-                        {
-                            true
-                        } else {
-                            net_debug!(
-                                "segment not in receive window ({}..{} not intersecting {}..{}), will send challenge ACK",
-                                segment_start,
-                                segment_end,
-                                window_start,
-                                window_end
-                            );
-                            false
-                        }
-                    }
-                };
+                    };
 
                 if segment_in_window {
                     let overlap_start = window_start.max(segment_start);
@@ -1716,7 +1548,6 @@ impl<'a> Socket<'a> {
                     // TIME-WAIT timer below is not refreshed. RST senders don't
                     // need a reply to make progress.
                     if repr.control == TcpControl::Rst {
-                        net_debug!("dropping out-of-window RST");
                         return None;
                     }
 
@@ -1780,7 +1611,7 @@ impl<'a> Socket<'a> {
                 // space if all of that data is acknowledged.
                 if sent_fin && self.tx_buffer.len() + 1 == ack_len {
                     ack_len -= 1;
-                    tcp_trace!("received ACK of FIN");
+
                     ack_of_fin = true;
                 }
 
@@ -1795,11 +1626,6 @@ impl<'a> Socket<'a> {
         // If a FIN is received at the end of the current segment, but
         // we have a hole in the assembler before the current segment, disregard this FIN.
         if control == TcpControl::Fin && window_start < segment_start {
-            tcp_trace!(
-                "ignoring FIN because we don't have full data yet. window_start={} segment_start={}",
-                window_start,
-                segment_start
-            );
             control = TcpControl::None;
         }
 
@@ -1813,7 +1639,6 @@ impl<'a> Socket<'a> {
             // that SYN-RECEIVED was actually converted from the LISTEN state (another possible
             // reason is TCP simultaneous open).
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
-                tcp_trace!("received RST");
                 self.tuple = None;
                 self.set_state(State::Listen);
                 return None;
@@ -1821,7 +1646,6 @@ impl<'a> Socket<'a> {
 
             // RSTs in any other state close the socket.
             (_, TcpControl::Rst) => {
-                tcp_trace!("received RST");
                 self.set_state(State::Closed);
                 self.tuple = None;
                 return None;
@@ -1829,14 +1653,11 @@ impl<'a> Socket<'a> {
 
             // SYN packets in the LISTEN state change it to SYN-RECEIVED.
             (State::Listen, TcpControl::Syn) => {
-                tcp_trace!("received SYN");
                 if let Some(max_seg_size) = repr.max_seg_size {
                     // Treat a zero MSS as if the option were absent, like Linux does.
                     if max_seg_size != 0 {
                         self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
-                        self.congestion_controller
-                            .inner_mut()
-                            .set_mss(self.remote_mss);
+                        self.congestion_controller.set_mss(self.remote_mss);
                     }
                 }
 
@@ -1878,18 +1699,11 @@ impl<'a> Socket<'a> {
             // SYN|ACK packets in the SYN-SENT state change it to ESTABLISHED.
             // SYN packets in the SYN-SENT state change it to SYN-RECEIVED.
             (State::SynSent, TcpControl::Syn) => {
-                if repr.ack_number.is_some() {
-                    tcp_trace!("received SYN|ACK");
-                } else {
-                    tcp_trace!("received SYN");
-                }
                 if let Some(max_seg_size) = repr.max_seg_size {
                     // Treat a zero MSS as if the option were absent, like Linux does.
                     if max_seg_size != 0 {
                         self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
-                        self.congestion_controller
-                            .inner_mut()
-                            .set_mss(self.remote_mss);
+                        self.congestion_controller.set_mss(self.remote_mss);
                     }
                 }
 
@@ -1979,7 +1793,6 @@ impl<'a> Socket<'a> {
             }
 
             _ => {
-                net_debug!("unexpected packet {}", repr);
                 return None;
             }
         }
@@ -1998,17 +1811,12 @@ impl<'a> Socket<'a> {
         self.remote_win_len = new_remote_win_len;
 
         self.congestion_controller
-            .inner_mut()
             .set_remote_window(new_remote_win_len);
 
         if ack_len > 0 {
             // Dequeue acknowledged octets.
             debug_assert!(self.tx_buffer.len() >= ack_len);
-            tcp_trace!(
-                "tx buffer: dequeueing {} octets (now {})",
-                ack_len,
-                self.tx_buffer.len() - ack_len
-            );
+
             self.tx_buffer.dequeue_allocated(ack_len);
 
             // There's new room available in tx_buffer, wake the waiting task if any.
@@ -2033,29 +1841,14 @@ impl<'a> Socket<'a> {
                     // Increment duplicate ACK count
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
-                    net_debug!(
-                        "received duplicate ACK for seq {} (duplicate nr {}{})",
-                        ack_number,
-                        self.local_rx_dup_acks,
-                        if self.local_rx_dup_acks == u8::MAX {
-                            "+"
-                        } else {
-                            ""
-                        }
-                    );
-
                     if self.local_rx_dup_acks == 3 {
                         self.timer.set_for_fast_retransmit();
-                        net_debug!("started fast retransmit");
                     }
 
                     // Notify of duplicate ACK
                     let in_flight = self.flight_size();
-                    self.congestion_controller.inner_mut().on_dup_ack(
-                        cx.now(),
-                        self.remote_mss,
-                        in_flight,
-                    );
+                    self.congestion_controller
+                        .on_dup_ack(cx.now(), self.remote_mss, in_flight);
                 }
 
                 // No duplicate ACK means we reset the duplicate ACK count
@@ -2063,14 +1856,13 @@ impl<'a> Socket<'a> {
                 _ => {
                     if self.local_rx_dup_acks > 0 {
                         self.local_rx_dup_acks = 0;
-                        net_debug!("reset duplicate ACK count");
                     }
                     self.local_rx_last_ack = Some(ack_number);
 
                     // Notify of fresh ACK
                     self.rtte.on_ack(cx.now(), ack_number);
                     let new_flight_size = self.flight_size().saturating_sub(ack_len);
-                    self.congestion_controller.inner_mut().on_ack(
+                    self.congestion_controller.on_ack(
                         cx.now(),
                         ack_len,
                         new_flight_size,
@@ -2123,11 +1915,10 @@ impl<'a> Socket<'a> {
             && (self.timer.is_idle() || ack_len > 0)
         {
             let delay = self.rtte.retransmission_timeout();
-            tcp_trace!("starting zero-window-probe timer for t+{}", delay);
+
             self.timer.set_for_zero_window_probe(cx.now(), delay);
         }
         if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
-            tcp_trace!("stopping zero-window-probe timer");
             self.timer.set_for_idle(cx.now(), self.keep_alive);
         }
 
@@ -2143,30 +1934,17 @@ impl<'a> Socket<'a> {
             .assembler
             .add_then_remove_front(payload_offset, payload_len)
         else {
-            net_debug!(
-                "assembler: too many holes to add {} octets at offset {}",
-                payload_len,
-                payload_offset
-            );
             return None;
         };
 
         // Place payload octets into the buffer.
-        tcp_trace!(
-            "rx buffer: receiving {} octets at offset {}",
-            payload_len,
-            payload_offset
-        );
+
         let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
         debug_assert!(len_written == payload_len);
 
         if contig_len != 0 {
             // Enqueue the contiguous data octets in front of the buffer.
-            tcp_trace!(
-                "rx buffer: enqueueing {} octets (now {})",
-                contig_len,
-                self.rx_buffer.len() + contig_len
-            );
+
             self.rx_buffer.enqueue_unallocated(contig_len);
 
             // There's new data in rx_buffer, notify waiting task if any.
@@ -2176,7 +1954,6 @@ impl<'a> Socket<'a> {
 
         if !self.assembler.is_empty() {
             // Print the ranges recorded in the assembler.
-            tcp_trace!("assembler: {}", self.assembler);
         }
 
         // Handle delayed acks
@@ -2184,22 +1961,12 @@ impl<'a> Socket<'a> {
             && self.ack_to_transmit()
         {
             self.ack_delay_timer = match self.ack_delay_timer {
-                AckDelayTimer::Idle => {
-                    tcp_trace!("starting delayed ack timer");
-                    AckDelayTimer::Waiting(cx.now() + ack_delay)
-                }
+                AckDelayTimer::Idle => AckDelayTimer::Waiting(cx.now() + ack_delay),
                 AckDelayTimer::Waiting(_) if self.immediate_ack_to_transmit() => {
-                    tcp_trace!("delayed ack timer already started, forcing expiry");
                     AckDelayTimer::Immediate
                 }
-                timer @ AckDelayTimer::Waiting(_) => {
-                    tcp_trace!("waiting until delayed ack timer expires");
-                    timer
-                }
-                AckDelayTimer::Immediate => {
-                    tcp_trace!("delayed ack timer already force-expired");
-                    AckDelayTimer::Immediate
-                }
+                timer @ AckDelayTimer::Waiting(_) => timer,
+                AckDelayTimer::Immediate => AckDelayTimer::Immediate,
             };
         }
 
@@ -2210,7 +1977,7 @@ impl<'a> Socket<'a> {
             // Note that we change the transmitter state here.
             // This is fine because smoltcp assumes that it can always transmit zero or one
             // packets for every packet it receives.
-            tcp_trace!("ACKing incoming segment");
+
             Some(self.ack_reply(ip_repr, repr))
         } else {
             None
@@ -2359,7 +2126,7 @@ impl<'a> Socket<'a> {
 
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
-        F: FnOnce(&mut Context, PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
+        F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
         if self.tuple.is_none() {
             return Ok(());
@@ -2373,7 +2140,6 @@ impl<'a> Socket<'a> {
         // We use reset() instead of set_state(Closed) to avoid sending
         // an RST packet with the now-invalid source IP.
         if !cx.has_ip_addr(tuple.local.addr) {
-            net_debug!("source IP address no longer available, closing socket");
             self.reset();
             return Ok(());
         }
@@ -2389,25 +2155,18 @@ impl<'a> Socket<'a> {
             self.remote_last_ts = Some(cx.now());
         }
 
-        self.congestion_controller
-            .inner_mut()
-            .pre_transmit(cx.now());
-
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
-            net_debug!("timeout exceeded");
+
             self.set_state(State::Closed);
         } else if self.timer.should_retransmit(cx.now()) {
             if let Timer::Retransmit { .. } = self.timer {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
-                net_debug!("retransmitting after rto");
 
                 // Inform the congestion controller that we're retransmitting and should enter the slow start state
                 let in_flight = self.flight_size();
-                self.congestion_controller
-                    .inner_mut()
-                    .on_rto(cx.now(), in_flight);
+                self.congestion_controller.on_rto(cx.now(), in_flight);
 
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
@@ -2418,13 +2177,10 @@ impl<'a> Socket<'a> {
                 self.rtte.on_rto();
             } else {
                 // If a fast rentrasmit timer expired, we should resend only the earliest unAcked segment
-                net_debug!("retransmitting for fast-retransmit");
 
                 // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
                 let in_flight = self.flight_size();
-                self.congestion_controller
-                    .inner_mut()
-                    .on_loss(cx.now(), in_flight);
+                self.congestion_controller.on_loss(cx.now(), in_flight);
 
                 self.pending_fast_retransmit = true;
             }
@@ -2442,24 +2198,18 @@ impl<'a> Socket<'a> {
         // Decide whether we're sending a packet.
         if self.seq_to_transmit(cx) {
             // If we have data to transmit and it fits into partner's window, do it.
-            tcp_trace!("outgoing segment will send data or flags");
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
             // If we have data to acknowledge, do it.
-            tcp_trace!("outgoing segment will acknowledge");
         } else if self.window_to_update() {
             // If we have window length increase to advertise, do it.
-            tcp_trace!("outgoing segment will update window");
         } else if self.state == State::Closed {
             // If we need to abort the connection, do it.
-            tcp_trace!("outgoing segment will abort connection");
         } else if self.timer.should_keep_alive(cx.now()) {
             // If we need to transmit a keep-alive packet, do it.
-            tcp_trace!("keep-alive timer expired");
         } else if self.timer.should_zero_window_probe(cx.now()) {
-            tcp_trace!("sending zero-window probe");
         } else if self.timer.should_close(cx.now()) {
             // If we have spent enough time in the TIME-WAIT state, close the socket.
-            tcp_trace!("TIME-WAIT timer expired");
+
             self.reset();
             return Ok(());
         } else {
@@ -2497,8 +2247,6 @@ impl<'a> Socket<'a> {
         };
 
         let mut is_zero_window_probe = false;
-
-        let packet_meta = PacketMeta::default();
 
         match self.state {
             // We transmit an RST in the CLOSED state. If we ended up in the CLOSED state
@@ -2637,59 +2385,20 @@ impl<'a> Socket<'a> {
             false
         };
 
-        // Trace a summary of what will be sent.
-        if is_keep_alive {
-            tcp_trace!("sending a keep-alive");
-        } else if !repr.payload.is_empty() {
-            tcp_trace!(
-                "tx buffer: sending {} octets at offset {}",
-                repr.payload.len(),
-                self.flight_size()
-            );
-        }
-        if repr.control != TcpControl::None || repr.payload.is_empty() {
-            let flags = match (repr.control, repr.ack_number) {
-                (TcpControl::Syn, None) => "SYN",
-                (TcpControl::Syn, Some(_)) => "SYN|ACK",
-                (TcpControl::Fin, Some(_)) => "FIN|ACK",
-                (TcpControl::Rst, Some(_)) => "RST|ACK",
-                (TcpControl::Psh, Some(_)) => "PSH|ACK",
-                (TcpControl::None, Some(_)) => "ACK",
-                _ => "<unreachable>",
-            };
-            tcp_trace!("sending {}", flags);
-        }
-
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
             let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
             repr.max_seg_size = Some(max_segment_size as u16);
         }
 
-        // Actually send the packet. If this succeeds, it means the packet is in
-        // the device buffer, and its transmission is imminent. If not, we might have
-        // a number of problems, e.g. we need neighbor discovery.
-        //
-        // Bailing out if the packet isn't placed in the device buffer allows us
-        // to not waste time waiting for the retransmit timer on packets that we know
-        // for sure will not be successfully transmitted.
+        // Advance send state only after the device accepts the packet.
         ip_repr.set_payload_len(repr.buffer_len());
-        emit(cx, packet_meta, (ip_repr, repr))?;
+        emit(cx, (ip_repr, repr))?;
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
         self.timer.rewind_keep_alive(cx.now(), self.keep_alive);
 
-        // Reset delayed-ack timer
-        match self.ack_delay_timer {
-            AckDelayTimer::Idle => {}
-            AckDelayTimer::Waiting(_) => {
-                tcp_trace!("stop delayed ack timer")
-            }
-            AckDelayTimer::Immediate => {
-                tcp_trace!("stop delayed ack timer (was force-expired)")
-            }
-        }
         self.ack_delay_timer = AckDelayTimer::Idle;
 
         // Leave the rest of the state intact if sending a zero-window probe.
@@ -2716,9 +2425,6 @@ impl<'a> Socket<'a> {
         if repr.segment_len() > 0 {
             self.rtte
                 .on_send(cx.now(), repr.seq_number + repr.segment_len());
-            self.congestion_controller
-                .inner_mut()
-                .post_transmit(cx.now(), repr.segment_len());
         }
 
         if repr.segment_len() > 0 && !self.timer.is_retransmit() {
@@ -2801,7 +2507,6 @@ impl<'a> fmt::Write for Socket<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::config::IFACE_MAX_ADDR_COUNT;
     use crate::wire::{IpCidr, IpRepr};
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
@@ -2820,7 +2525,7 @@ mod test {
         local: LOCAL_END,
         remote: REMOTE_END,
     };
-    const LOCAL_SEQ: TcpSeqNumber = TcpSeqNumber(10000);
+    const LOCAL_SEQ: TcpSeqNumber = TcpSeqNumber(-34801502);
     const REMOTE_SEQ: TcpSeqNumber = TcpSeqNumber(-10001);
 
     use crate::wire::Ipv4Address as IpvXAddress;
@@ -2922,17 +2627,13 @@ mod test {
             payload_len: repr.buffer_len(),
             hop_limit: 64,
         });
-        net_trace!("send: {}", repr);
 
         assert!(socket.socket.accepts(&mut socket.cx, &ip_repr, repr));
 
-        match socket.socket.process(&mut socket.cx, &ip_repr, repr) {
-            Some((_ip_repr, repr)) => {
-                net_trace!("recv: {}", repr);
-                Some(repr)
-            }
-            None => None,
-        }
+        socket
+            .socket
+            .process(&mut socket.cx, &ip_repr, repr)
+            .map(|(_, repr)| repr)
     }
 
     #[track_caller]
@@ -2945,13 +2646,12 @@ mod test {
         let mut sent = 0;
         let result = socket
             .socket
-            .dispatch(&mut socket.cx, |_, _, (ip_repr, tcp_repr)| {
+            .dispatch(&mut socket.cx, |_, (ip_repr, tcp_repr)| {
                 assert_eq!(ip_repr.next_header(), IpProtocol::Tcp);
                 assert_eq!(ip_repr.src_addr(), LOCAL_ADDR.into());
                 assert_eq!(ip_repr.dst_addr(), REMOTE_ADDR.into());
                 assert_eq!(ip_repr.payload_len(), tcp_repr.buffer_len());
 
-                net_trace!("recv: {}", tcp_repr);
                 sent += 1;
                 f(Ok(tcp_repr));
                 Ok(())
@@ -2967,7 +2667,7 @@ mod test {
         socket.cx.set_now(timestamp);
 
         let mut fail = false;
-        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _, _| {
+        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _| {
             fail = true;
             Ok(())
         });
@@ -3042,7 +2742,7 @@ mod test {
     }
 
     fn socket_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
-        let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
+        let (iface, _, _) = crate::tests::setup();
 
         let rx_buffer = SocketBuffer::new(vec![0; rx_len]);
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
@@ -3695,9 +3395,7 @@ mod test {
     fn test_connect() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
         assert_eq!(s.tuple, Some(TUPLE));
         recv!(
             s,
@@ -3729,9 +3427,7 @@ mod test {
     fn test_connect_synack_tiny_mss_is_clamped() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
         recv!(
             s,
             [TcpRepr {
@@ -3763,9 +3459,7 @@ mod test {
     fn test_connect_synack_zero_mss_is_ignored() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
         recv!(
             s,
             [TcpRepr {
@@ -3794,12 +3488,6 @@ mod test {
     }
 
     #[test]
-    fn test_connect_unspecified_local() {
-        let mut s = socket();
-        assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, 80), Ok(()));
-    }
-
-    #[test]
     fn test_connect_specified_local() {
         let mut s = socket();
         assert_eq!(
@@ -3811,9 +3499,9 @@ mod test {
     #[test]
     fn test_connect_twice() {
         let mut s = socket();
-        assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, 80), Ok(()));
+        assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END), Ok(()));
         assert_eq!(
-            s.socket.connect(&mut s.cx, REMOTE_END, 80),
+            s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END),
             Err(ConnectError::InvalidState)
         );
     }
@@ -5108,9 +4796,7 @@ mod test {
         let mut s = socket();
         s.set_tsval_generator(Some(|| 1));
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
         recv!(
             s,
             [TcpRepr {
@@ -6269,7 +5955,6 @@ mod test {
     #[test]
     fn test_congestion_window_limits_data_in_flight() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.set_congestion_control(CongestionControl::Reno);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
 
@@ -6311,7 +5996,6 @@ mod test {
     #[test]
     fn test_congestion_window_doesnt_limit_fast_retransmit() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.set_congestion_control(CongestionControl::Reno);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
 
@@ -8071,7 +7755,6 @@ mod test {
     #[test]
     fn test_zero_window_probe_not_capped_by_cwnd() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.set_congestion_control(CongestionControl::Reno);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
 
@@ -8312,9 +7995,7 @@ mod test {
     fn test_connect_timeout() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
         s.set_timeout(Some(Duration::from_millis(100)));
         recv!(s, time 150, Ok(TcpRepr {
             control:    TcpControl::Syn,
@@ -8569,7 +8250,7 @@ mod test {
 
         s.set_hop_limit(Some(0x2a));
         assert_eq!(
-            s.socket.dispatch(&mut s.cx, |_, _, (ip_repr, _)| {
+            s.socket.dispatch(&mut s.cx, |_, (ip_repr, _)| {
                 assert_eq!(ip_repr.hop_limit(), 0x2a);
                 Ok::<_, ()>(())
             }),
@@ -9323,19 +9004,6 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_set_get_congestion_control() {
-        let mut s = socket_established();
-
-        {
-            s.set_congestion_control(CongestionControl::Reno);
-            assert_eq!(s.congestion_control(), CongestionControl::Reno);
-        }
-
-        s.set_congestion_control(CongestionControl::None);
-        assert_eq!(s.congestion_control(), CongestionControl::None);
-    }
-
     // =========================================================================================//
     // Timestamp tests
     // =========================================================================================//
@@ -9480,9 +9148,7 @@ mod test {
         s.set_tsval_generator(Some(|| 1));
         assert!(s.timestamp_enabled());
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
         assert_eq!(s.tuple, Some(TUPLE));
         recv!(
             s,
@@ -9529,9 +9195,7 @@ mod test {
         // s.set_timestamp(false); // commented to alert if the default state changes
         assert!(!s.timestamp_enabled());
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
         assert_eq!(s.tuple, Some(TUPLE));
         recv!(
             s,
@@ -9593,9 +9257,7 @@ mod test {
 
         // Simulate interface IP change - remove the socket's source IP
         // and add a different one.
-        let mut new_addrs = heapless::Vec::<IpCidr, IFACE_MAX_ADDR_COUNT>::new();
-        new_addrs.push(IpCidr::new(OTHER_ADDR.into(), 24)).unwrap();
-        s.cx.set_ip_addrs(new_addrs);
+        s.cx.set_ip_addr(IpCidr::new(OTHER_ADDR.into(), 24));
 
         // The socket's source IP is no longer on the interface.
         // When dispatch() runs, it should detect this and reset the socket

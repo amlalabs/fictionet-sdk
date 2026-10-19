@@ -1,7 +1,5 @@
 use crate::{socket::tcp::RttEstimator, time::Instant};
 
-use super::Controller;
-
 const DEFAULT_MSS: usize = 1024;
 
 #[derive(Debug)]
@@ -31,12 +29,12 @@ impl Reno {
     }
 }
 
-impl Controller for Reno {
-    fn window(&self) -> usize {
+impl Reno {
+    pub fn window(&self) -> usize {
         self.cwnd
     }
 
-    fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
+    pub fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
         // RFC 5681 only acts on ACKs of new data. The socket also notifies us
         // of accepted segments that acknowledge nothing (window updates, data
         // segments from the remote): those must not exit fast recovery nor
@@ -66,13 +64,13 @@ impl Controller for Reno {
         self.cwnd = self.cwnd.saturating_add(inc).min(self.rwnd).max(self.mss);
     }
 
-    fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
+    pub fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
         if self.in_fast_recovery {
             self.cwnd = self.cwnd.saturating_add(len).min(self.rwnd).max(self.mss);
         }
     }
 
-    fn on_loss(&mut self, _now: Instant, in_flight: usize) {
+    pub fn on_loss(&mut self, _now: Instant, in_flight: usize) {
         // Only cut window size on first entrance to fast recovery.
         if !self.in_fast_recovery {
             self.ssthresh = (in_flight >> 1).max(2 * self.mss);
@@ -82,7 +80,7 @@ impl Controller for Reno {
         }
     }
 
-    fn on_rto(&mut self, _now: Instant, in_flight: usize) {
+    pub fn on_rto(&mut self, _now: Instant, in_flight: usize) {
         // RFC 5681: when the retransmission timer fires for a segment that has
         // already been retransmitted by the timer (no new data was ACKed since
         // the previous RTO), ssthresh is held constant.
@@ -98,11 +96,11 @@ impl Controller for Reno {
         self.in_fast_recovery = false
     }
 
-    fn set_mss(&mut self, mss: usize) {
+    pub fn set_mss(&mut self, mss: usize) {
         self.mss = mss;
     }
 
-    fn set_remote_window(&mut self, remote_window: usize) {
+    pub fn set_remote_window(&mut self, remote_window: usize) {
         if self.rwnd < remote_window {
             self.rwnd = remote_window;
         }

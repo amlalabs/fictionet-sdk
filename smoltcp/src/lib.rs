@@ -1,5 +1,4 @@
 #![deny(unsafe_code)]
-// Keep explicit protocol predicate matches consistent with upstream.
 #![allow(clippy::match_like_matches_macro)]
 
 //! Fictionet's fork of smoltcp 0.14.0.
@@ -11,10 +10,7 @@ extern crate alloc;
 
 #[macro_use]
 mod macros;
-mod parsers;
 mod rand;
-
-pub mod config;
 
 pub mod iface;
 

@@ -5,8 +5,6 @@ use core::fmt;
 
 use super::{Error, Result};
 
-use crate::wire::ip::pretty_print_ip_payload;
-
 pub use super::IpProtocol as Protocol;
 
 /// Minimum MTU required of all links supporting IPv6. See [RFC 8200 § 5].
@@ -19,52 +17,6 @@ pub const MIN_MTU: usize = 1280;
 /// [RFC 8200 § 2]: https://www.rfc-editor.org/rfc/rfc4291#section-2
 pub const ADDR_SIZE: usize = 16;
 
-/// The link-local [all nodes multicast address].
-///
-/// [all nodes multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7.1
-pub const LINK_LOCAL_ALL_NODES: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
-
-/// The link-local [all routers multicast address].
-///
-/// [all routers multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7.1
-pub const LINK_LOCAL_ALL_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
-
-/// The [scope] of an address.
-///
-/// [scope]: https://www.rfc-editor.org/rfc/rfc4291#section-2.7
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MulticastScope {
-    /// Interface Local scope
-    InterfaceLocal = 0x1,
-    /// Link local scope
-    LinkLocal = 0x2,
-    /// Administratively configured
-    AdminLocal = 0x4,
-    /// Single site scope
-    SiteLocal = 0x5,
-    /// Organization scope
-    OrganizationLocal = 0x8,
-    /// Global scope
-    Global = 0xE,
-    /// Unknown scope
-    Unknown = 0xFF,
-}
-
-impl From<u8> for MulticastScope {
-    fn from(value: u8) -> Self {
-        match value {
-            0x1 => Self::InterfaceLocal,
-            0x2 => Self::LinkLocal,
-            0x4 => Self::AdminLocal,
-            0x5 => Self::SiteLocal,
-            0x8 => Self::OrganizationLocal,
-            0xE => Self::Global,
-            _ => Self::Unknown,
-        }
-    }
-}
-
 pub use core::net::Ipv6Addr as Address;
 
 pub(crate) trait AddressExt {
@@ -75,32 +27,11 @@ pub(crate) trait AddressExt {
     /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
     fn x_is_unicast(&self) -> bool;
 
-    /// Query whether the IPv6 address is a [global unicast address].
-    ///
-    /// [global unicast address]: https://datatracker.ietf.org/doc/html/rfc3587
-    fn is_global_unicast(&self) -> bool;
-
-    /// Query whether the IPv6 address is in the [link-local] scope.
-    ///
-    /// [link-local]: https://tools.ietf.org/html/rfc4291#section-2.5.6
-    fn is_link_local(&self) -> bool;
-
     /// Helper function used to mask an address given a prefix.
     ///
     /// # Panics
     /// This function panics if `mask` is greater than 128.
     fn mask(&self, mask: u8) -> [u8; ADDR_SIZE];
-
-    /// Return the scope of the address.
-    ///
-    /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
-    fn x_multicast_scope(&self) -> MulticastScope;
-
-    /// Query whether the IPv6 address is a [solicited-node multicast address].
-    ///
-    /// [Solicited-node multicast address]: https://datatracker.ietf.org/doc/html/rfc4291#section-2.7.1
-    #[cfg(test)]
-    fn is_solicited_node_multicast(&self) -> bool;
 
     /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
     /// where `prefix_len` is the number of leading zeroes. Return `None` otherwise.
@@ -110,14 +41,6 @@ pub(crate) trait AddressExt {
 impl AddressExt for Address {
     fn x_is_unicast(&self) -> bool {
         !(self.is_multicast() || self.is_unspecified())
-    }
-
-    fn is_global_unicast(&self) -> bool {
-        (self.octets()[0] >> 5) == 0b001
-    }
-
-    fn is_link_local(&self) -> bool {
-        self.octets()[0..8] == [0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
     }
 
     fn mask(&self, mask: u8) -> [u8; ADDR_SIZE] {
@@ -133,30 +56,6 @@ impl AddressExt for Address {
             bytes[idx] = part & (!(0xff >> modulus) as u8);
         }
         bytes
-    }
-
-    fn x_multicast_scope(&self) -> MulticastScope {
-        if self.is_multicast() {
-            return MulticastScope::from(self.octets()[1] & 0b1111);
-        }
-
-        if self.is_link_local() {
-            MulticastScope::LinkLocal
-        } else if self.is_unique_local() || self.is_global_unicast() {
-            // ULA are considered global scope
-            // https://www.rfc-editor.org/rfc/rfc6724#section-3.1
-            MulticastScope::Global
-        } else {
-            MulticastScope::Unknown
-        }
-    }
-
-    #[cfg(test)]
-    fn is_solicited_node_multicast(&self) -> bool {
-        self.octets()[0..13]
-            == [
-                0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF,
-            ]
     }
 
     fn prefix_len(&self) -> Option<u8> {
@@ -504,24 +403,6 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     }
 }
 
-impl<T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match Repr::parse(self) {
-            Ok(repr) => write!(f, "{repr}"),
-            Err(err) => {
-                write!(f, "IPv6 ({err})")?;
-                Ok(())
-            }
-        }
-    }
-}
-
-impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer.as_ref()
-    }
-}
-
 /// A high-level representation of an Internet Protocol version 6 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Repr {
@@ -578,124 +459,14 @@ impl Repr {
     }
 }
 
-impl fmt::Display for Repr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "IPv6 src={} dst={} nxt_hdr={} hop_limit={}",
-            self.src_addr, self.dst_addr, self.next_header, self.hop_limit
-        )
-    }
-}
-
-use crate::wire::pretty_print::{PrettyIndent, PrettyPrint};
-
-// TODO: This is very similar to the implementation for IPv4. Make
-// a way to have less copy and pasted code here.
-impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
-    fn pretty_print(
-        buffer: &dyn AsRef<[u8]>,
-        f: &mut fmt::Formatter,
-        indent: &mut PrettyIndent,
-    ) -> fmt::Result {
-        let (ip_repr, payload) = match Packet::new_checked(buffer) {
-            Err(err) => return write!(f, "{indent}({err})"),
-            Ok(ip_packet) => match Repr::parse(&ip_packet) {
-                Err(_) => return Ok(()),
-                Ok(ip_repr) => {
-                    write!(f, "{indent}{ip_repr}")?;
-                    (ip_repr, ip_packet.payload())
-                }
-            },
-        };
-
-        pretty_print_ip_payload(f, indent, ip_repr, payload)
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use crate::wire::pretty_print::PrettyPrinter;
+
+    const LINK_LOCAL_ALL_NODES: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+    const LINK_LOCAL_ALL_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
 
     const LINK_LOCAL_ADDR: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-    const UNIQUE_LOCAL_ADDR: Address = Address::new(0xfd00, 0, 0, 201, 1, 1, 1, 1);
-    const GLOBAL_UNICAST_ADDR: Address = Address::new(0x2001, 0xdb8, 0x3, 0, 0, 0, 0, 1);
-
-    const TEST_SOL_NODE_MCAST_ADDR: Address = Address::new(0xff02, 0, 0, 0, 0, 1, 0xff01, 101);
-
-    #[test]
-    fn test_basic_multicast() {
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_unspecified());
-        assert!(LINK_LOCAL_ALL_ROUTERS.is_multicast());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_link_local());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_loopback());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_unique_local());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_global_unicast());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_solicited_node_multicast());
-        assert!(!LINK_LOCAL_ALL_NODES.is_unspecified());
-        assert!(LINK_LOCAL_ALL_NODES.is_multicast());
-        assert!(!LINK_LOCAL_ALL_NODES.is_link_local());
-        assert!(!LINK_LOCAL_ALL_NODES.is_loopback());
-        assert!(!LINK_LOCAL_ALL_NODES.is_unique_local());
-        assert!(!LINK_LOCAL_ALL_NODES.is_global_unicast());
-        assert!(!LINK_LOCAL_ALL_NODES.is_solicited_node_multicast());
-    }
-
-    #[test]
-    fn test_basic_link_local() {
-        assert!(!LINK_LOCAL_ADDR.is_unspecified());
-        assert!(!LINK_LOCAL_ADDR.is_multicast());
-        assert!(LINK_LOCAL_ADDR.is_link_local());
-        assert!(!LINK_LOCAL_ADDR.is_loopback());
-        assert!(!LINK_LOCAL_ADDR.is_unique_local());
-        assert!(!LINK_LOCAL_ADDR.is_global_unicast());
-        assert!(!LINK_LOCAL_ADDR.is_solicited_node_multicast());
-    }
-
-    #[test]
-    fn test_basic_loopback() {
-        assert!(!Address::LOCALHOST.is_unspecified());
-        assert!(!Address::LOCALHOST.is_multicast());
-        assert!(!Address::LOCALHOST.is_link_local());
-        assert!(Address::LOCALHOST.is_loopback());
-        assert!(!Address::LOCALHOST.is_unique_local());
-        assert!(!Address::LOCALHOST.is_global_unicast());
-        assert!(!Address::LOCALHOST.is_solicited_node_multicast());
-    }
-
-    #[test]
-    fn test_unique_local() {
-        assert!(!UNIQUE_LOCAL_ADDR.is_unspecified());
-        assert!(!UNIQUE_LOCAL_ADDR.is_multicast());
-        assert!(!UNIQUE_LOCAL_ADDR.is_link_local());
-        assert!(!UNIQUE_LOCAL_ADDR.is_loopback());
-        assert!(UNIQUE_LOCAL_ADDR.is_unique_local());
-        assert!(!UNIQUE_LOCAL_ADDR.is_global_unicast());
-        assert!(!UNIQUE_LOCAL_ADDR.is_solicited_node_multicast());
-    }
-
-    #[test]
-    fn test_global_unicast() {
-        assert!(!GLOBAL_UNICAST_ADDR.is_unspecified());
-        assert!(!GLOBAL_UNICAST_ADDR.is_multicast());
-        assert!(!GLOBAL_UNICAST_ADDR.is_link_local());
-        assert!(!GLOBAL_UNICAST_ADDR.is_loopback());
-        assert!(!GLOBAL_UNICAST_ADDR.is_unique_local());
-        assert!(GLOBAL_UNICAST_ADDR.is_global_unicast());
-        assert!(!GLOBAL_UNICAST_ADDR.is_solicited_node_multicast());
-    }
-
-    #[test]
-    fn test_sollicited_node_multicast() {
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_unspecified());
-        assert!(TEST_SOL_NODE_MCAST_ADDR.is_multicast());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_link_local());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_loopback());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_unique_local());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_global_unicast());
-        assert!(TEST_SOL_NODE_MCAST_ADDR.is_solicited_node_multicast());
-    }
 
     #[test]
     fn test_mask() {
@@ -864,58 +635,6 @@ pub(crate) mod test {
         assert!(cidr_without_prefix.contains_addr(&Address::LOCALHOST));
     }
 
-    #[test]
-    fn test_scope() {
-        use super::*;
-        assert_eq!(
-            Address::new(0xff01, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::InterfaceLocal
-        );
-        assert_eq!(
-            Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::LinkLocal
-        );
-        assert_eq!(
-            Address::new(0xff03, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::Unknown
-        );
-        assert_eq!(
-            Address::new(0xff04, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::AdminLocal
-        );
-        assert_eq!(
-            Address::new(0xff05, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::SiteLocal
-        );
-        assert_eq!(
-            Address::new(0xff08, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::OrganizationLocal
-        );
-        assert_eq!(
-            Address::new(0xff0e, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::Global
-        );
-
-        assert_eq!(
-            LINK_LOCAL_ALL_NODES.x_multicast_scope(),
-            MulticastScope::LinkLocal
-        );
-
-        // For source address selection, unicast addresses also have a scope:
-        assert_eq!(
-            LINK_LOCAL_ADDR.x_multicast_scope(),
-            MulticastScope::LinkLocal
-        );
-        assert_eq!(
-            GLOBAL_UNICAST_ADDR.x_multicast_scope(),
-            MulticastScope::Global
-        );
-        assert_eq!(
-            UNIQUE_LOCAL_ADDR.x_multicast_scope(),
-            MulticastScope::Global
-        );
-    }
-
     static REPR_PACKET_BYTES: [u8; 52] = [
         0x60, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x11, 0x40, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00,
@@ -1057,16 +776,5 @@ pub(crate) mod test {
         repr.emit(&mut packet);
         packet.payload_mut().copy_from_slice(&REPR_PAYLOAD_BYTES);
         assert_eq!(&*packet.into_inner(), &REPR_PACKET_BYTES[..]);
-    }
-
-    #[test]
-    fn test_pretty_print() {
-        assert_eq!(
-            format!(
-                "{}",
-                PrettyPrinter::<Packet<&'static [u8]>>::new("\n", &&REPR_PACKET_BYTES[..])
-            ),
-            "\nIPv6 src=fe80::1 dst=ff02::1 nxt_hdr=UDP hop_limit=64\n \\ UDP src=1 dst=2 len=4"
-        );
     }
 }

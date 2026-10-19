@@ -1,48 +1,22 @@
 use std::collections::VecDeque;
 
 use crate::iface::*;
-use crate::phy::{self, Device, DeviceCapabilities, Medium};
+use crate::phy::{self, Device, DeviceCapabilities};
 use crate::time::Instant;
 use crate::wire::*;
 
-pub(crate) fn setup<'a>(medium: Medium) -> (Interface, SocketSet<'a>, TestingDevice) {
-    let mut device = TestingDevice::new(medium);
-    let iface = setup_with_device(medium, &mut device);
+pub(crate) fn setup<'a>() -> (Interface, SocketSet<'a>, TestingDevice) {
+    let mut device = TestingDevice::new();
+    let iface = setup_with_device(&mut device);
     (iface, SocketSet::new(vec![]), device)
 }
 
-fn setup_with_device(medium: Medium, device: &mut impl Device) -> Interface {
-    let config = Config::new(match medium {
-        Medium::Ip => HardwareAddress::Ip,
-    });
-
-    let mut iface = Interface::new(config, device, Instant::ZERO);
-
-    {
-        iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs
-                .push(IpCidr::new(IpAddress::v4(192, 168, 1, 1), 24))
-                .unwrap();
-            ip_addrs
-                .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
-                .unwrap();
-        });
-    }
-
-    {
-        iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs
-                .push(IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64))
-                .unwrap();
-            ip_addrs
-                .push(IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128))
-                .unwrap();
-            ip_addrs
-                .push(IpCidr::new(IpAddress::v6(0xfdbe, 0, 0, 0, 0, 0, 0, 1), 64))
-                .unwrap();
-        });
-    }
-    iface
+fn setup_with_device(device: &mut impl Device) -> Interface {
+    let config = Config {
+        random_seed: 0,
+        ip_addr: IpCidr::new(IpAddress::v4(192, 168, 1, 1), 32),
+    };
+    Interface::new(config, device, Instant::ZERO)
 }
 
 /// A testing device.
@@ -51,7 +25,6 @@ pub struct TestingDevice {
     pub(crate) tx_queue: VecDeque<Vec<u8>>,
     pub(crate) rx_queue: VecDeque<Vec<u8>>,
     max_transmission_unit: usize,
-    medium: Medium,
 }
 
 impl TestingDevice {
@@ -59,14 +32,11 @@ impl TestingDevice {
     ///
     /// Every packet transmitted through this device will be received through it
     /// in FIFO order.
-    pub fn new(medium: Medium) -> Self {
+    pub fn new() -> Self {
         TestingDevice {
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
-            max_transmission_unit: match medium {
-                Medium::Ip => 1500,
-            },
-            medium,
+            max_transmission_unit: 1500,
         }
     }
 }
@@ -77,9 +47,7 @@ impl Device for TestingDevice {
 
     fn capabilities(&self) -> DeviceCapabilities {
         DeviceCapabilities {
-            medium: self.medium,
             max_transmission_unit: self.max_transmission_unit,
-            ..DeviceCapabilities::default()
         }
     }
 

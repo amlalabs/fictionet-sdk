@@ -1,42 +1,21 @@
-// Some of the functions in ring buffer is marked as #[must_use]. It notes that
-// these functions may have side effects, and it's implemented by [RFC 1940].
-// [RFC 1940]: https://github.com/rust-lang/rust/issues/43302
-
 use core::cmp;
 use managed::ManagedSlice;
 
-use crate::storage::Resettable;
-
-use super::{Empty, Full};
-
-/// A ring buffer.
-///
-/// This ring buffer implementation provides many ways to interact with it:
-///
-///   * Enqueueing or dequeueing one element from corresponding side of the buffer;
-///   * Enqueueing or dequeueing a slice of elements from corresponding side of the buffer;
-///   * Accessing allocated and unallocated areas directly.
-///
-/// It is also zero-copy; all methods provide references into the buffer's storage.
-/// Note that all references are mutable; it is considered more important to allow
-/// in-place processing than to protect from accidental mutation.
-///
-/// This implementation is suitable for both simple uses such as a FIFO queue
-/// of UDP packets, and advanced ones such as a TCP reassembly buffer.
+/// A byte ring for TCP receive and send buffers.
+/// Storage may be borrowed or owned. Slices can cross the end of the ring.
 #[derive(Debug)]
-pub struct RingBuffer<'a, T: 'a> {
-    storage: ManagedSlice<'a, T>,
+pub struct RingBuffer<'a> {
+    storage: ManagedSlice<'a, u8>,
     read_at: usize,
     length: usize,
 }
 
-impl<'a, T: 'a> RingBuffer<'a, T> {
+impl<'a> RingBuffer<'a> {
     /// Create a ring buffer with the given storage.
     ///
-    /// During creation, every element in `storage` is reset.
-    pub fn new<S>(storage: S) -> RingBuffer<'a, T>
+    pub fn new<S>(storage: S) -> RingBuffer<'a>
     where
-        S: Into<ManagedSlice<'a, T>>,
+        S: Into<ManagedSlice<'a, u8>>,
     {
         RingBuffer {
             storage: storage.into(),
@@ -54,17 +33,6 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// Return the maximum number of elements in the ring buffer.
     pub fn capacity(&self) -> usize {
         self.storage.len()
-    }
-
-    /// Clear the ring buffer, and reset every element.
-    pub fn reset(&mut self)
-    where
-        T: Resettable,
-    {
-        self.clear();
-        for elem in self.storage.iter_mut() {
-            elem.reset();
-        }
     }
 
     /// Return the current number of elements in the ring buffer.
@@ -103,75 +71,11 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
             0
         }
     }
-
-    /// Shorthand for `(self.read + idx) % self.capacity()` with no
-    /// additional checks to ensure the capacity is not zero.
-    fn get_idx_unchecked(&self, idx: usize) -> usize {
-        (self.read_at + idx) % self.capacity()
-    }
-}
-
-/// This is the "discrete" ring buffer interface: it operates with single elements,
-/// and boundary conditions (empty/full) are errors.
-impl<'a, T: 'a> RingBuffer<'a, T> {
-    /// Call `f` with a single buffer element, and enqueue the element if `f`
-    /// returns successfully, or return `Err(Full)` if the buffer is full.
-    pub fn enqueue_one_with<'b, R, E, F>(&'b mut self, f: F) -> Result<Result<R, E>, Full>
-    where
-        F: FnOnce(&'b mut T) -> Result<R, E>,
-    {
-        if self.is_full() {
-            return Err(Full);
-        }
-
-        let index = self.get_idx_unchecked(self.length);
-        let res = f(&mut self.storage[index]);
-        if res.is_ok() {
-            self.length += 1;
-        }
-        Ok(res)
-    }
-
-    /// Enqueue a single element into the buffer, and return a reference to it,
-    /// or return `Err(Full)` if the buffer is full.
-    ///
-    /// This function is a shortcut for `ring_buf.enqueue_one_with(Ok)`.
-    pub fn enqueue_one(&mut self) -> Result<&mut T, Full> {
-        self.enqueue_one_with(Ok)?
-    }
-
-    /// Call `f` with a single buffer element, and dequeue the element if `f`
-    /// returns successfully, or return `Err(Empty)` if the buffer is empty.
-    pub fn dequeue_one_with<'b, R, E, F>(&'b mut self, f: F) -> Result<Result<R, E>, Empty>
-    where
-        F: FnOnce(&'b mut T) -> Result<R, E>,
-    {
-        if self.is_empty() {
-            return Err(Empty);
-        }
-
-        let next_at = self.get_idx_unchecked(1);
-        let res = f(&mut self.storage[self.read_at]);
-
-        if res.is_ok() {
-            self.length -= 1;
-            self.read_at = next_at;
-        }
-        Ok(res)
-    }
-
-    /// Dequeue an element from the buffer, and return a reference to it,
-    /// or return `Err(Empty)` if the buffer is empty.
-    ///
-    /// This function is a shortcut for `ring_buf.dequeue_one_with(Ok)`.
-    pub fn dequeue_one(&mut self) -> Result<&mut T, Empty> {
-        self.dequeue_one_with(Ok)?
-    }
 }
 
 /// This is the "continuous" ring buffer interface: it operates with element slices,
 /// and boundary conditions (empty/full) simply result in empty slices.
-impl<'a, T: 'a> RingBuffer<'a, T> {
+impl<'a> RingBuffer<'a> {
     /// Call `f` with the largest contiguous slice of unallocated buffer elements,
     /// and enqueue the amount of elements returned by `f`.
     ///
@@ -180,7 +84,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// than the size of the slice passed into it.
     pub fn enqueue_many_with<'b, R, F>(&'b mut self, f: F) -> (usize, R)
     where
-        F: FnOnce(&'b mut [T]) -> (usize, R),
+        F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
         if self.length == 0 {
             // Ring is currently empty. Reset `read_at` to optimize
@@ -202,7 +106,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// This function may return a slice smaller than the given size
     /// if the free space in the buffer is not contiguous.
     #[must_use]
-    pub fn enqueue_many(&mut self, size: usize) -> &mut [T] {
+    pub fn enqueue_many(&mut self, size: usize) -> &mut [u8] {
         self.enqueue_many_with(|buf| {
             let size = cmp::min(size, buf.len());
             (size, &mut buf[..size])
@@ -213,10 +117,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// Enqueue as many elements from the given slice into the buffer as possible,
     /// and return the amount of elements that could fit.
     #[must_use]
-    pub fn enqueue_slice(&mut self, data: &[T]) -> usize
-    where
-        T: Copy,
-    {
+    pub fn enqueue_slice(&mut self, data: &[u8]) -> usize {
         let (size_1, data) = self.enqueue_many_with(|buf| {
             let size = cmp::min(buf.len(), data.len());
             buf[..size].copy_from_slice(&data[..size]);
@@ -238,7 +139,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// than the size of the slice passed into it.
     pub fn dequeue_many_with<'b, R, F>(&'b mut self, f: F) -> (usize, R)
     where
-        F: FnOnce(&'b mut [T]) -> (usize, R),
+        F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
         let capacity = self.capacity();
         let max_size = cmp::min(self.len(), capacity - self.read_at);
@@ -259,7 +160,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// This function may return a slice smaller than the given size
     /// if the allocated space in the buffer is not contiguous.
     #[must_use]
-    pub fn dequeue_many(&mut self, size: usize) -> &mut [T] {
+    pub fn dequeue_many(&mut self, size: usize) -> &mut [u8] {
         self.dequeue_many_with(|buf| {
             let size = cmp::min(size, buf.len());
             (size, &mut buf[..size])
@@ -270,10 +171,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// Dequeue as many elements from the buffer into the given slice as possible,
     /// and return the amount of elements that could fit.
     #[must_use]
-    pub fn dequeue_slice(&mut self, data: &mut [T]) -> usize
-    where
-        T: Copy,
-    {
+    pub fn dequeue_slice(&mut self, data: &mut [u8]) -> usize {
         let (size_1, data) = self.dequeue_many_with(|buf| {
             let size = cmp::min(buf.len(), data.len());
             data[..size].copy_from_slice(&buf[..size]);
@@ -290,11 +188,11 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
 
 /// This is the "random access" ring buffer interface: it operates with element slices,
 /// and allows to access elements of the buffer that are not adjacent to its head or tail.
-impl<'a, T: 'a> RingBuffer<'a, T> {
+impl<'a> RingBuffer<'a> {
     /// Return the largest contiguous slice of unallocated buffer elements starting
     /// at the given offset past the last allocated element, and up to the given size.
     #[must_use]
-    pub fn get_unallocated(&mut self, offset: usize, mut size: usize) -> &mut [T] {
+    pub fn get_unallocated(&mut self, offset: usize, mut size: usize) -> &mut [u8] {
         let start_at = self.get_idx(self.length + offset);
         // We can't access past the end of unallocated data.
         if offset > self.window() {
@@ -318,10 +216,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// starting at the given offset past the last allocated element, and return
     /// the amount written.
     #[must_use]
-    pub fn write_unallocated(&mut self, offset: usize, data: &[T]) -> usize
-    where
-        T: Copy,
-    {
+    pub fn write_unallocated(&mut self, offset: usize, data: &[u8]) -> usize {
         let (size_1, offset, data) = {
             let slice = self.get_unallocated(offset, data.len());
             let slice_len = slice.len();
@@ -349,7 +244,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// Return the largest contiguous slice of allocated buffer elements starting
     /// at the given offset past the first allocated element, and up to the given size.
     #[must_use]
-    pub fn get_allocated(&self, offset: usize, mut size: usize) -> &[T] {
+    pub fn get_allocated(&self, offset: usize, mut size: usize) -> &[u8] {
         let start_at = self.get_idx(offset);
         // We can't read past the end of the allocated data.
         if offset > self.length {
@@ -373,10 +268,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     /// starting at the given offset past the first allocated element, and return
     /// the amount read.
     #[must_use]
-    pub fn read_allocated(&mut self, offset: usize, data: &mut [T]) -> usize
-    where
-        T: Copy,
-    {
+    pub fn read_allocated(&mut self, offset: usize, data: &mut [u8]) -> usize {
         let (size_1, offset, data) = {
             let slice = self.get_allocated(offset, data.len());
             data[..slice.len()].copy_from_slice(slice);
@@ -401,8 +293,8 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     }
 }
 
-impl<'a, T: 'a> From<ManagedSlice<'a, T>> for RingBuffer<'a, T> {
-    fn from(slice: ManagedSlice<'a, T>) -> RingBuffer<'a, T> {
+impl<'a> From<ManagedSlice<'a, u8>> for RingBuffer<'a> {
+    fn from(slice: ManagedSlice<'a, u8>) -> RingBuffer<'a> {
         RingBuffer::new(slice)
     }
 }
@@ -433,71 +325,6 @@ mod test {
         assert_eq!(ring.len(), 2);
         assert_eq!(ring.capacity(), 2);
         assert_eq!(ring.window(), 0);
-    }
-
-    #[test]
-    fn test_buffer_enqueue_dequeue_one_with() {
-        let mut ring = RingBuffer::new(vec![0; 5]);
-        assert_eq!(
-            ring.dequeue_one_with(|_| -> Result::<(), ()> { unreachable!() }),
-            Err(Empty)
-        );
-
-        ring.enqueue_one_with(Ok::<_, ()>).unwrap().unwrap();
-        assert!(!ring.is_empty());
-        assert!(!ring.is_full());
-
-        for i in 1..5 {
-            ring.enqueue_one_with(|e| {
-                let _: () = *e = i;
-                Ok::<_, ()>(())
-            })
-            .unwrap()
-            .unwrap();
-            assert!(!ring.is_empty());
-        }
-        assert!(ring.is_full());
-        assert_eq!(
-            ring.enqueue_one_with(|_| -> Result::<(), ()> { unreachable!() }),
-            Err(Full)
-        );
-
-        for i in 0..5 {
-            assert_eq!(
-                ring.dequeue_one_with(|e| Ok::<_, ()>(*e)).unwrap().unwrap(),
-                i
-            );
-            assert!(!ring.is_full());
-        }
-        assert_eq!(
-            ring.dequeue_one_with(|_| -> Result::<(), ()> { unreachable!() }),
-            Err(Empty)
-        );
-        assert!(ring.is_empty());
-    }
-
-    #[test]
-    fn test_buffer_enqueue_dequeue_one() {
-        let mut ring = RingBuffer::new(vec![0; 5]);
-        assert_eq!(ring.dequeue_one(), Err(Empty));
-
-        ring.enqueue_one().unwrap();
-        assert!(!ring.is_empty());
-        assert!(!ring.is_full());
-
-        for i in 1..5 {
-            *ring.enqueue_one().unwrap() = i;
-            assert!(!ring.is_empty());
-        }
-        assert!(ring.is_full());
-        assert_eq!(ring.enqueue_one(), Err(Full));
-
-        for i in 0..5 {
-            assert_eq!(*ring.dequeue_one().unwrap(), i);
-            assert!(!ring.is_full());
-        }
-        assert_eq!(ring.dequeue_one(), Err(Empty));
-        assert!(ring.is_empty());
     }
 
     #[test]
@@ -532,7 +359,7 @@ mod test {
         assert_eq!(&ring.storage[..], b"abcdefgh....");
 
         for _ in 0..4 {
-            *ring.dequeue_one().unwrap() = b'.';
+            ring.dequeue_many(1)[0] = b'.';
         }
         assert_eq!(ring.len(), 4);
         assert_eq!(&ring.storage[..], b"....efgh....");
@@ -554,7 +381,7 @@ mod test {
         assert_eq!(&ring.storage[..], b"abcdefghijkl");
 
         for _ in 0..4 {
-            *ring.dequeue_one().unwrap() = b'.';
+            ring.dequeue_many(1)[0] = b'.';
         }
         assert_eq!(ring.len(), 8);
         assert_eq!(&ring.storage[..], b"abcd....ijkl");
@@ -582,7 +409,7 @@ mod test {
         assert_eq!(&ring.storage[..], b"abcdefgh....");
 
         for _ in 0..4 {
-            *ring.dequeue_one().unwrap() = b'.';
+            ring.dequeue_many(1)[0] = b'.';
         }
         assert_eq!(ring.len(), 4);
         assert_eq!(&ring.storage[..], b"....efgh....");
@@ -775,7 +602,7 @@ mod test {
 
     #[test]
     fn test_buffer_with_no_capacity() {
-        let mut no_capacity: RingBuffer<u8> = RingBuffer::new(vec![]);
+        let mut no_capacity: RingBuffer = RingBuffer::new(vec![]);
 
         // Call all functions that calculate the remainder against rx_buffer.capacity()
         // with a backing storage with a length of 0.
@@ -783,7 +610,6 @@ mod test {
         assert_eq!(no_capacity.get_allocated(0, 0), &[]);
         no_capacity.dequeue_allocated(0);
         assert_eq!(no_capacity.enqueue_many(0), &[]);
-        assert_eq!(no_capacity.enqueue_one(), Err(Full));
         assert_eq!(no_capacity.contiguous_window(), 0);
     }
 

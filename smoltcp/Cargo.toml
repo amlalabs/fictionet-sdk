@@ -1,6 +1,5 @@
-# smoltcp 0.14.0 (https://github.com/smoltcp-rs/smoltcp), copied into
-# Fictionet so its TCP/IP stack can be changed here. 0BSD, see
-# LICENSE-0BSD.txt.
+# Fictionet's TCP stack over whole IPv4 and IPv6 packets.
+# Forked from smoltcp 0.14.0 under 0BSD; see LICENSE-0BSD.txt.
 [package]
 name = "smoltcp"
 version = "0.14.0"
@@ -17,16 +16,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 [dependencies]
 managed = { version = "0.8", default-features = false, features = ["std"] }
 byteorder = { version = "1.0", default-features = false }
-heapless = "0.9"
 
 [dev-dependencies]
-# Only what the unit tests in src use; the examples and integration tests
-# were not copied.
+# Randomized segment assembler tests.
 rand = "0.8"
-rstest = "0.17"
-
-[features]
-# Preserve the SDK's current behavior: IP fragmentation is opt-in.
-proto-ipv4-fragmentation = []
-auto-icmp-echo-reply = []
-default = ["auto-icmp-echo-reply"]

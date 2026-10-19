@@ -1,6 +1,6 @@
 use core::fmt;
 
-use crate::config::ASSEMBLER_MAX_SEGMENT_COUNT;
+const ASSEMBLER_MAX_SEGMENT_COUNT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooManyHolesError;

@@ -59,9 +59,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use smoltcp::iface::{Config, Interface as Iface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
 use smoltcp::socket::tcp::{self as stcp, State as TcpState};
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Packet, TcpPacket, TcpRepr};
+use smoltcp::wire::{IpCidr, Ipv4Packet, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::network::ip::{
@@ -287,15 +287,12 @@ pub fn prepare_endpoint(
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
     let mut dev = Dev::default();
-    let mut config = Config::new(HardwareAddress::Ip);
-    config.random_seed = fcx.random_u64();
-    let mut iface = Iface::new(config, &mut dev, smol_now(fcx));
-    iface.update_ip_addrs(|addrs| {
-        let prefix = if addr.is_ipv4() { 32 } else { 128 };
-        addrs
-            .push(IpCidr::new(addr.into(), prefix))
-            .expect("one address fits");
-    });
+    let prefix = if addr.is_ipv4() { 32 } else { 128 };
+    let config = Config {
+        random_seed: fcx.random_u64(),
+        ip_addr: IpCidr::new(addr.into(), prefix),
+    };
+    let iface = Iface::new(config, &mut dev, smol_now(fcx));
     let shared = Arc::new(Shared {
         addr,
         state: Mutex::new(State {
@@ -378,10 +375,9 @@ impl Device for Dev {
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ip;
-        caps.max_transmission_unit = MTU;
-        caps
+        DeviceCapabilities {
+            max_transmission_unit: MTU,
+        }
     }
 }
 
@@ -769,11 +765,11 @@ impl State {
     }
 
     fn sock(&mut self, h: Id) -> &mut stcp::Socket<'static> {
-        self.sockets.get_mut::<stcp::Socket>(self.handles[&h])
+        self.sockets.get_mut(self.handles[&h])
     }
 
     fn get(&self, h: Id) -> &stcp::Socket<'static> {
-        self.sockets.get::<stcp::Socket>(self.handles[&h])
+        self.sockets.get(self.handles[&h])
     }
 
     /// Moves every socket into a new set without empty slots, once most
@@ -905,10 +901,7 @@ impl State {
                 let win = u16::from_be_bytes([t[14], t[15]]) as u32;
                 let shift = if syn { 0 } else { c.recv_shift };
                 let mut edge = ack.wrapping_add(win << shift);
-                let capacity = self
-                    .sockets
-                    .get::<stcp::Socket>(self.handles[h])
-                    .recv_capacity();
+                let capacity = self.sockets.get(self.handles[h]).recv_capacity();
                 let end = irs
                     .wrapping_add(1)
                     .wrapping_add(c.read)
@@ -953,13 +946,7 @@ impl State {
             return;
         }
         if quoted.len() >= total
-            && TcpRepr::parse(
-                &TcpPacket::new_unchecked(t),
-                &ip.src.into(),
-                &ip.dst.into(),
-                &Default::default(),
-            )
-            .is_err()
+            && TcpRepr::parse(&TcpPacket::new_unchecked(t), &ip.src.into(), &ip.dst.into()).is_err()
         {
             return;
         }
@@ -1016,12 +1003,8 @@ impl State {
             return false;
         }
         let t = &packet[ip.payload.clone()];
-        let Ok(repr) = TcpRepr::parse(
-            &TcpPacket::new_unchecked(t),
-            &ip.src.into(),
-            &ip.dst.into(),
-            &Default::default(),
-        ) else {
+        let Ok(repr) = TcpRepr::parse(&TcpPacket::new_unchecked(t), &ip.src.into(), &ip.dst.into())
+        else {
             return false;
         };
         let data = !repr.payload.is_empty();
@@ -1058,12 +1041,7 @@ impl State {
         if let Some(h) = handle {
             let c = self.conns.get_mut(&h).unwrap();
             if data {
-                trim_payload(
-                    c,
-                    self.sockets.get::<stcp::Socket>(self.handles[&h]),
-                    &mut ip,
-                    &mut packet,
-                );
+                trim_payload(c, self.sockets.get(self.handles[&h]), &mut ip, &mut packet);
             }
             let t = &packet[ip.payload.clone()];
             let data_len = t.len().saturating_sub(((t[12] >> 4) as usize) * 4);
@@ -1073,12 +1051,7 @@ impl State {
                 rx_end = Some(seq.wrapping_add(data_len as u32));
             }
             if ack && !syn && !rst {
-                extra = repair_ack(
-                    c,
-                    self.sockets.get::<stcp::Socket>(self.handles[&h]),
-                    &ip,
-                    &mut packet,
-                );
+                extra = repair_ack(c, self.sockets.get(self.handles[&h]), &ip, &mut packet);
             }
         }
         if let Some((p, count)) = extra {
@@ -1144,9 +1117,7 @@ impl State {
                 c.fin = true;
                 // ACK an accepted FIN immediately, even if the application
                 // drops its handle after reading EOF.
-                self.sockets
-                    .get_mut::<stcp::Socket>(self.handles[&h])
-                    .set_ack_delay(None);
+                self.sockets.get_mut(self.handles[&h]).set_ack_delay(None);
             }
             self.close_if_drained(h);
         }
@@ -1154,12 +1125,14 @@ impl State {
             // At most one idle socket took the SYN.
             let l = self.listeners.get_mut(&dst.port()).unwrap();
             let (sockets, handles) = (&self.sockets, &self.handles);
-            if let Some(i) = l.idle.iter().position(|&h| {
-                sockets.get::<stcp::Socket>(handles[&h]).state() == TcpState::SynReceived
-            }) {
+            if let Some(i) = l
+                .idle
+                .iter()
+                .position(|&h| sockets.get(handles[&h]).state() == TcpState::SynReceived)
+            {
                 let h = l.idle.swap_remove(i);
                 l.embryonic.push(h);
-                let s = self.sockets.get::<stcp::Socket>(self.handles[&h]);
+                let s = self.sockets.get(self.handles[&h]);
                 let local = s.local_endpoint().map(SocketAddr::from).unwrap_or(dst);
                 let remote = s.remote_endpoint().map(SocketAddr::from).unwrap_or(src);
                 *l.per_peer.entry(remote.ip()).or_default() += 1;
@@ -1183,7 +1156,7 @@ impl State {
             let mut moved = false;
             while i < l.embryonic.len() {
                 let h = l.embryonic[i];
-                match self.sockets.get::<stcp::Socket>(self.handles[&h]).state() {
+                match self.sockets.get(self.handles[&h]).state() {
                     TcpState::SynReceived => i += 1,
                     // A RST in SYN-RECEIVED puts the socket back in LISTEN.
                     // One spare listening socket is enough (`ingress` makes
@@ -3018,7 +2991,7 @@ mod tests {
                     let State { conns, sockets, .. } = &mut *st;
                     let repaired = repair_ack(
                         conns.get_mut(&h).unwrap(),
-                        sockets.get::<stcp::Socket>(slot),
+                        sockets.get(slot),
                         &ip,
                         &mut copy,
                     );

@@ -2,8 +2,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
 use super::{Error, Result};
-use crate::phy::ChecksumCapabilities;
-use crate::wire::ip::{checksum, pretty_print_ip_payload};
+use crate::wire::ip::checksum;
 
 pub use super::IpProtocol as Protocol;
 
@@ -21,23 +20,9 @@ pub use super::IpProtocol as Protocol;
 // accept a packet of the following size.
 pub const MIN_MTU: usize = 576;
 
-/// All multicast-capable nodes
-pub const MULTICAST_ALL_SYSTEMS: Address = Address::new(224, 0, 0, 1);
-
-/// All multicast-capable routers
-pub const MULTICAST_ALL_ROUTERS: Address = Address::new(224, 0, 0, 2);
-
 /// Minimum IHL length 5x32 bit words or 20 bytes
 /// [RFC 791 § 3.1]: https://tools.ietf.org/html/rfc791#section-3.1
 const MINIMUM_IHL_BYTES: u8 = 20;
-
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
-pub struct Key {
-    id: u16,
-    src_addr: Address,
-    dst_addr: Address,
-    protocol: Protocol,
-}
 
 pub use core::net::Ipv4Addr as Address;
 
@@ -359,16 +344,6 @@ impl<T: AsRef<[u8]>> Packet<T> {
         let data = self.buffer.as_ref();
         checksum::data(&data[..self.header_len() as usize]) == !0
     }
-
-    /// Returns the key for identifying the packet.
-    pub fn get_key(&self) -> Key {
-        Key {
-            id: self.ident(),
-            src_addr: self.src_addr(),
-            dst_addr: self.dst_addr(),
-            protocol: self.next_header(),
-        }
-    }
 }
 
 impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
@@ -530,21 +505,17 @@ pub struct Repr {
 
 impl Repr {
     /// Parse an Internet Protocol version 4 packet and return a high-level representation.
-    pub fn parse<T: AsRef<[u8]> + ?Sized>(
-        packet: &Packet<&T>,
-        checksum_caps: &ChecksumCapabilities,
-    ) -> Result<Repr> {
+    pub fn parse<T: AsRef<[u8]> + ?Sized>(packet: &Packet<&T>) -> Result<Repr> {
         packet.check_len()?;
         // Version 4 is expected.
         if packet.version() != 4 {
             return Err(Error);
         }
         // Valid checksum is expected.
-        if checksum_caps.ipv4.rx() && !packet.verify_checksum() {
+        if !packet.verify_checksum() {
             return Err(Error);
         }
 
-        #[cfg(not(feature = "proto-ipv4-fragmentation"))]
         // We do not support fragmentation.
         if packet.more_frags() || packet.frag_offset() != 0 {
             return Err(Error);
@@ -571,11 +542,7 @@ impl Repr {
     }
 
     /// Emit a high-level representation into an Internet Protocol version 4 packet.
-    pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(
-        &self,
-        packet: &mut Packet<T>,
-        checksum_caps: &ChecksumCapabilities,
-    ) {
+    pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, packet: &mut Packet<T>) {
         packet.set_version(4);
         packet.set_header_len(field::DST_ADDR.end as u8);
         packet.set_dscp(0);
@@ -594,107 +561,7 @@ impl Repr {
         packet.set_src_addr(self.src_addr);
         packet.set_dst_addr(self.dst_addr);
 
-        if checksum_caps.ipv4.tx() {
-            packet.fill_checksum();
-        } else {
-            // make sure we get a consistently zeroed checksum,
-            // since implementations might rely on it
-            packet.set_checksum(0);
-        }
-    }
-}
-
-impl<T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match Repr::parse(self, &ChecksumCapabilities::ignored()) {
-            Ok(repr) => write!(f, "{repr}"),
-            Err(err) => {
-                write!(f, "IPv4 ({err})")?;
-                write!(
-                    f,
-                    " src={} dst={} proto={} hop_limit={}",
-                    self.src_addr(),
-                    self.dst_addr(),
-                    self.next_header(),
-                    self.hop_limit()
-                )?;
-                if self.version() != 4 {
-                    write!(f, " ver={}", self.version())?;
-                }
-                if self.header_len() != 20 {
-                    write!(f, " hlen={}", self.header_len())?;
-                }
-                if self.dscp() != 0 {
-                    write!(f, " dscp={}", self.dscp())?;
-                }
-                if self.ecn() != 0 {
-                    write!(f, " ecn={}", self.ecn())?;
-                }
-                write!(f, " tlen={}", self.total_len())?;
-                if self.dont_frag() {
-                    write!(f, " df")?;
-                }
-                if self.more_frags() {
-                    write!(f, " mf")?;
-                }
-                if self.frag_offset() != 0 {
-                    write!(f, " off={}", self.frag_offset())?;
-                }
-                if self.more_frags() || self.frag_offset() != 0 {
-                    write!(f, " id={}", self.ident())?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl fmt::Display for Repr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "IPv4 src={} dst={} proto={}",
-            self.src_addr, self.dst_addr, self.next_header
-        )
-    }
-}
-
-use crate::wire::pretty_print::{PrettyIndent, PrettyPrint};
-
-impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
-    fn pretty_print(
-        buffer: &dyn AsRef<[u8]>,
-        f: &mut fmt::Formatter,
-        indent: &mut PrettyIndent,
-    ) -> fmt::Result {
-        use crate::wire::ip::checksum::format_checksum;
-
-        let checksum_caps = ChecksumCapabilities::ignored();
-
-        let (ip_repr, payload) = match Packet::new_checked(buffer) {
-            Err(err) => return write!(f, "{indent}({err})"),
-            Ok(ip_packet) => match Repr::parse(&ip_packet, &checksum_caps) {
-                Err(_) => return Ok(()),
-                Ok(ip_repr) => {
-                    if ip_packet.more_frags() || ip_packet.frag_offset() != 0 {
-                        write!(
-                            f,
-                            "{}IPv4 Fragment more_frags={} offset={}",
-                            indent,
-                            ip_packet.more_frags(),
-                            ip_packet.frag_offset()
-                        )?;
-                        return Ok(());
-                    } else {
-                        write!(f, "{indent}{ip_repr}")?;
-                        format_checksum(f, ip_packet.verify_checksum(), false)?;
-                        (ip_repr, ip_packet.payload())
-                    }
-                }
-            },
-        };
-
-        pretty_print_ip_payload(f, indent, ip_repr, payload)
+        packet.fill_checksum();
     }
 }
 
@@ -798,7 +665,7 @@ pub(crate) mod test {
     #[test]
     fn test_parse() {
         let packet = Packet::new_unchecked(&REPR_PACKET_BYTES[..]);
-        let repr = Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap();
+        let repr = Repr::parse(&packet).unwrap();
         assert_eq!(repr, packet_repr());
     }
 
@@ -810,10 +677,7 @@ pub(crate) mod test {
         packet.set_version(6);
         packet.fill_checksum();
         let packet = Packet::new_unchecked(&*packet.into_inner());
-        assert_eq!(
-            Repr::parse(&packet, &ChecksumCapabilities::default()),
-            Err(Error)
-        );
+        assert_eq!(Repr::parse(&packet), Err(Error));
     }
 
     #[test]
@@ -838,7 +702,7 @@ pub(crate) mod test {
         let repr = packet_repr();
         let mut bytes = vec![0xa5; repr.buffer_len() + REPR_PAYLOAD_BYTES.len()];
         let mut packet = Packet::new_unchecked(&mut bytes);
-        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        repr.emit(&mut packet);
         packet.payload_mut().copy_from_slice(&REPR_PAYLOAD_BYTES);
         assert_eq!(&*packet.into_inner(), &REPR_PACKET_BYTES[..]);
     }
