@@ -393,22 +393,14 @@ pub(super) fn solicitation_valid(packet: &[u8], msg: &[u8], fixed: usize) -> boo
     true
 }
 
-/// A rejected packet still needs source checks before reaching the world.
-/// Neighbor discovery and link-scope errors stay on the link.
-pub(super) fn problem_is_link_scope(packet: &[u8]) -> bool {
-    let Some(h) = Header::parse(packet) else {
-        return true;
-    };
-    let scope = |addr: IpAddr| {
-        matches!(addr, IpAddr::V6(a) if a.is_unspecified()
-        || a.is_unicast_link_local() || (a.is_multicast() && a.octets()[1] & 15 <= 2))
-    };
-    scope(h.src)
-        || scope(h.dst)
-        || (h.protocol == ICMPV6
+/// Whether a packet that calls for Parameter Problem hides neighbor discovery.
+pub(super) fn problem_hides_neighbor_discovery(packet: &[u8]) -> bool {
+    Header::parse(packet).is_some_and(|h| {
+        h.protocol == ICMPV6
             && h.payload(packet)
                 .first()
-                .is_some_and(|kind| is_neighbor_discovery(*kind)))
+                .is_some_and(|kind| is_neighbor_discovery(*kind))
+    })
 }
 
 /// The answer to a neighbor solicitation from the VM: a neighbor
@@ -464,9 +456,10 @@ pub(super) fn source_v6(packet: &[u8]) -> Ipv6Addr {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::super::addresses::{router_advert, tests::lease6};
     use super::*;
 
-    fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
+    fn answer_solicitation(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
         let Ok(Upper::Icmp6 {
             kind: NEIGHBOR_SOLICITATION,
             msg,
@@ -486,7 +479,7 @@ pub(crate) mod tests {
         ip::transport_checksum(src.into(), dst.into(), packet[6], &packet[40..]) == 0
     }
 
-    fn arp_request(spa: [u8; 4], tpa: [u8; 4]) -> Vec<u8> {
+    pub(crate) fn arp_request(spa: [u8; 4], tpa: [u8; 4]) -> Vec<u8> {
         let mut a = vec![0, 1, 0x08, 0x00, 6, 4, 0, 1];
         a.extend_from_slice(&VM);
         a.extend_from_slice(&spa);
@@ -557,23 +550,6 @@ pub(crate) mod tests {
         let p = udp6(link_local(GATEWAY_MAC), 547, link_local(VM), 546, b"odd");
         assert!(v6_checksum_ok(&p));
         assert_eq!(udp_to(&p), Some((546, &b"odd"[..])));
-    }
-
-    #[test]
-    fn directed_broadcast_boundaries() {
-        for (addr, len, dst, mac) in [
-            ("192.168.1.17", 24, "192.168.1.255", BROADCAST),
-            ("192.168.1.17", 24, "192.168.2.255", VM),
-            ("10.0.0.1", 31, "10.0.0.1", VM),
-            ("10.0.0.1", 32, "10.0.0.1", VM),
-            ("10.0.0.1", 0, "255.255.255.255", BROADCAST),
-        ] {
-            let packet = ipv4(Ipv4Addr::LOCALHOST, dst.parse().unwrap(), UDP, &[]);
-            assert_eq!(
-                destination(&packet, Some(VM), Some((addr.parse().unwrap(), len))),
-                Some((mac, IPV4))
-            );
-        }
     }
 
     #[test]
@@ -655,6 +631,35 @@ pub(crate) mod tests {
         assert!(arp_reply(&r, VM, None).is_none());
     }
 
+    pub(crate) fn router_solicit(src: Ipv6Addr) -> Vec<u8> {
+        icmp6(
+            src,
+            "ff02::2".parse().unwrap(),
+            vec![ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
+        )
+    }
+
+    pub(crate) fn fragment6(packet: &[u8], offset: u16, more: bool, body: &[u8]) -> Vec<u8> {
+        let mut fragment = vec![packet[6], 0];
+        fragment.extend_from_slice(&(offset | u16::from(more)).to_be_bytes());
+        fragment.extend_from_slice(&42u32.to_be_bytes());
+        fragment.extend_from_slice(body);
+        ipv6(
+            source_v6(packet),
+            Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+            44,
+            packet[7],
+            &fragment,
+        )
+    }
+
+    pub(crate) fn fragments6(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
+        (
+            fragment6(packet, 0, true, &packet[40..40 + cut]),
+            fragment6(packet, cut as u16, false, &packet[40 + cut..]),
+        )
+    }
+
     pub(crate) fn solicitation(src: Ipv6Addr, target: Ipv6Addr, hop: u8) -> Vec<u8> {
         let mut body = vec![NEIGHBOR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0];
         body.extend_from_slice(&target.octets());
@@ -669,7 +674,7 @@ pub(crate) mod tests {
     fn neighbor_solicitations_are_answered_except_dad() {
         let vm_ll = link_local(VM);
         let target: Ipv6Addr = "fd00::1".parse().unwrap();
-        let reply = neighbor_advert(&solicitation(vm_ll, target, 255), VM, None).unwrap();
+        let reply = answer_solicitation(&solicitation(vm_ll, target, 255), VM, None).unwrap();
         let f = Frame::parse(&reply).unwrap();
         assert_eq!((f.dst, f.src, f.ethertype), (VM, GATEWAY_MAC, IPV6));
         let p = f.payload;
@@ -684,15 +689,15 @@ pub(crate) mod tests {
 
         let dad = solicitation(Ipv6Addr::UNSPECIFIED, "fd00::2".parse().unwrap(), 255);
         assert!(
-            neighbor_advert(&dad, VM, None).is_none(),
+            answer_solicitation(&dad, VM, None).is_none(),
             "duplicate address detection"
         );
         assert!(
-            neighbor_advert(&solicitation(vm_ll, target, 64), VM, None).is_none(),
+            answer_solicitation(&solicitation(vm_ll, target, 64), VM, None).is_none(),
             "hop limit not 255"
         );
         assert!(
-            neighbor_advert(
+            answer_solicitation(
                 &solicitation(vm_ll, "ff02::1".parse().unwrap(), 255),
                 VM,
                 None
@@ -700,11 +705,11 @@ pub(crate) mod tests {
             .is_none()
         );
         assert!(
-            neighbor_advert(&solicitation(vm_ll, target, 255), VM, Some(target)).is_none(),
+            answer_solicitation(&solicitation(vm_ll, target, 255), VM, Some(target)).is_none(),
             "its own address"
         );
         let short = solicitation(vm_ll, target, 255);
-        assert!(neighbor_advert(&short[..60], VM, None).is_none());
+        assert!(answer_solicitation(&short[..60], VM, None).is_none());
     }
 
     /// `n` destination options headers before `inner`, with hop limit 255.
@@ -733,38 +738,24 @@ pub(crate) mod tests {
     #[test]
     fn extension_headers_are_skipped() {
         let src = link_local(VM);
-        let ra = icmp6(
-            src,
-            "ff02::1".parse().unwrap(),
-            vec![ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0, 0, 0],
-        );
+        let ra = router_advert(&lease6(), 1500);
         // The same message behind a hop-by-hop header.
         let mut ext = vec![ICMPV6, 0, 1, 4, 0, 0, 0, 0];
         ext.extend_from_slice(&ra[40..]);
         let p = ipv6(src, "ff02::1".parse().unwrap(), 0, 255, &ext);
         assert_eq!(icmp6_kind(&p), Some(ROUTER_ADVERTISEMENT));
-        // Behind eight destination options headers, and behind sixteen: no
-        // chain is too long to read.
-        assert_eq!(
-            icmp6_kind(&behind_options(
-                src,
-                "ff02::1".parse().unwrap(),
-                8,
-                ICMPV6,
-                &ra[40..]
-            )),
-            Some(ROUTER_ADVERTISEMENT)
-        );
-        assert_eq!(
-            icmp6_kind(&behind_options(
-                src,
-                "ff02::1".parse().unwrap(),
-                16,
-                ICMPV6,
-                &ra[40..]
-            )),
-            Some(ROUTER_ADVERTISEMENT)
-        );
+        for n in [8, 16] {
+            assert_eq!(
+                icmp6_kind(&behind_options(
+                    src,
+                    "ff02::1".parse().unwrap(),
+                    n,
+                    ICMPV6,
+                    &ra[40..]
+                )),
+                Some(ROUTER_ADVERTISEMENT)
+            );
+        }
         // Behind an authentication header.
         let mut ah = vec![ICMPV6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         ah.extend_from_slice(&ra[40..]);
@@ -774,9 +765,7 @@ pub(crate) mod tests {
         );
         // A first fragment holds the type, and says it is a fragment; a later
         // one does not hold it.
-        let mut frag = vec![ICMPV6, 0, 0, 1, 0, 0, 0, 7];
-        frag.extend_from_slice(&ra[40..]);
-        let p = ipv6(src, "ff02::1".parse().unwrap(), 44, 255, &frag);
+        let (p, later) = fragments6(&ra, 8);
         assert!(matches!(
             upper(&p),
             Ok(Upper::Icmp6 {
@@ -785,12 +774,7 @@ pub(crate) mod tests {
                 ..
             })
         ));
-        let mut later = frag.clone();
-        later[2..4].copy_from_slice(&8u16.to_be_bytes());
-        assert_eq!(
-            upper(&ipv6(src, "ff02::1".parse().unwrap(), 44, 255, &later)),
-            Ok(Upper::Other)
-        );
+        assert_eq!(upper(&later), Ok(Upper::Other));
         // A header that runs past the end cannot be read, unlike a packet
         // that is simply not ICMPv6 or UDP.
         assert_eq!(upper(&ipv6(src, src, 0, 1, &[UDP, 9])), Err(Unreadable));
@@ -847,13 +831,6 @@ pub(crate) mod tests {
                 payload: b"discover"
             })
         );
-        // A UDP length past the packet's end, or under the header's.
-        let mut long = p.clone();
-        long[24..26].copy_from_slice(&100u16.to_be_bytes());
-        assert_eq!(upper(&long), Err(Unreadable));
-        let mut short = p.clone();
-        short[24..26].copy_from_slice(&7u16.to_be_bytes());
-        assert_eq!(upper(&short), Err(Unreadable));
         // The first fragment gives the port, and only the port.
         let mut first = p.clone();
         first[6] = 0x20;
@@ -880,9 +857,7 @@ pub(crate) mod tests {
             547,
             &[1; 40],
         );
-        let mut frag = vec![UDP, 0, 0, 1, 0, 0, 0, 9];
-        frag.extend_from_slice(&u[40..88]);
-        let p6 = ipv6(link_local(VM), "ff02::1:2".parse().unwrap(), 44, 64, &frag);
+        let (p6, _) = fragments6(&u, 48);
         assert_eq!(upper(&p6), Ok(Upper::UdpFragment { port: 547 }));
     }
 

@@ -209,7 +209,7 @@ impl Link {
             return FromVm::Drop(Why::Malformed);
         };
         match upper {
-            Upper::Problem if frame::problem_is_link_scope(p) => {
+            Upper::Problem if frame::problem_hides_neighbor_discovery(p) => {
                 return FromVm::Drop(Why::Handled);
             }
 
@@ -251,11 +251,12 @@ impl Link {
                 payload: request,
             } => {
                 return self.v6.handle(p, |lease| {
+                    let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap());
                     let answer = addresses::dhcp6(
                         lease,
                         usize::from(self.mtu).saturating_sub(40 + 8),
                         request,
-                        p[24] != 0xff,
+                        destination.is_multicast(),
                     )?;
                     let packet = addresses::dhcp6_packet(p, &answer);
                     Some(frame::frame(vm, frame::GATEWAY_MAC, frame::IPV6, &packet))
@@ -318,8 +319,12 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use addresses::tests::{ia_with, request6};
+    use dhcpv6::{DhcpOption, Duid, Message, msg, status};
     use fictionet::stdlib::codec::Wire;
-    use frame::tests::{VM, behind_options, solicitation};
+    use frame::tests::{
+        VM, arp_request, behind_options, fragment6, fragments6, router_solicit, solicitation,
+    };
 
     fn served() -> Link {
         Link::new(
@@ -363,53 +368,71 @@ mod tests {
     }
 
     #[test]
-    fn dhcp6_unicast_obeys_message_rules() {
-        use dhcpv6::{DhcpOption, Duid, IaNa, Message, msg, status};
-        for kind in [
-            msg::SOLICIT,
-            msg::CONFIRM,
-            msg::REBIND,
-            msg::INFORMATION_REQUEST,
-            msg::REQUEST,
-            msg::RENEW,
-            msg::RELEASE,
-            msg::DECLINE,
+    fn dhcp6_server_identifier_and_destination_rules() {
+        let server_id = Duid::ll(1, &frame::GATEWAY_MAC);
+        for (kind, servers, directed) in [
+            (msg::SOLICIT, [true, false, false], false),
+            (msg::CONFIRM, [true, false, false], false),
+            (msg::REBIND, [true, false, false], false),
+            (msg::INFORMATION_REQUEST, [true, true, false], false),
+            (msg::REQUEST, [false, true, false], true),
+            (msg::RENEW, [false, true, false], true),
+            (msg::RELEASE, [false, true, false], true),
+            (msg::DECLINE, [false, true, false], true),
         ] {
-            let mut request = Message::new(kind, 1);
-            request.options.push(DhcpOption::ClientId(Duid::ll(1, &VM)));
-            if kind != msg::INFORMATION_REQUEST {
-                request.options.push(DhcpOption::IaNa(IaNa::default()));
-            }
-            let directed = matches!(
-                kind,
-                msg::REQUEST | msg::RENEW | msg::RELEASE | msg::DECLINE
-            );
-            if directed {
+            for (server, server_ok) in [None, Some(server_id.clone()), Some(Duid::ll(1, &[1; 6]))]
+                .into_iter()
+                .zip(servers)
+            {
+                let mut request = request6(
+                    kind,
+                    if kind == msg::INFORMATION_REQUEST {
+                        vec![]
+                    } else {
+                        vec![DhcpOption::IaNa(ia_with(7, &["fd00::2".parse().unwrap()]))]
+                    },
+                );
                 request
                     .options
-                    .push(DhcpOption::ServerId(Duid::ll(1, &frame::GATEWAY_MAC)));
-            }
-            let packet = frame::udp6(
-                frame::link_local(VM),
-                546,
-                frame::link_local(frame::GATEWAY_MAC),
-                547,
-                &request.to_bytes().unwrap(),
-            );
-            let f = eth(VM, frame::GATEWAY_MAC, frame::IPV6, &packet);
-            let result = served().frame_from_vm(&f);
-            if directed {
-                let FromVm::Answer(answer) = result else {
-                    panic!("no UseMulticast reply")
-                };
-                let f = Frame::parse(&answer).unwrap();
-                let (_, data) = frame::udp_to(f.payload).unwrap();
-                let reply = Message::parse(data).unwrap();
-                assert_eq!(reply.msg_type, msg::REPLY);
-                assert_eq!(reply.status().unwrap().code, status::USE_MULTICAST);
-                assert_eq!(reply.ia_na().count(), 0);
-            } else {
-                assert_eq!(result, FromVm::Drop(Why::Handled), "{kind}");
+                    .retain(|o| !matches!(o, DhcpOption::ServerId(_)));
+                if let Some(id) = &server {
+                    request.options.push(DhcpOption::ServerId(id.clone()));
+                }
+                for multicast in [true, false] {
+                    let dst = if multicast {
+                        "ff02::1:2".parse().unwrap()
+                    } else {
+                        frame::link_local(frame::GATEWAY_MAC)
+                    };
+                    let packet = frame::udp6(
+                        frame::link_local(VM),
+                        546,
+                        dst,
+                        547,
+                        &request.to_bytes().unwrap(),
+                    );
+                    let f = eth(VM, frame::GATEWAY_MAC, frame::IPV6, &packet);
+                    let result = served().frame_from_vm(&f);
+                    if server_ok && (multicast || directed) {
+                        let FromVm::Answer(answer) = result else {
+                            panic!("no reply: {kind}, {server:?}, {multicast}")
+                        };
+                        if !multicast {
+                            let f = Frame::parse(&answer).unwrap();
+                            let (_, data) = frame::udp_to(f.payload).unwrap();
+                            let reply = Message::parse(data).unwrap();
+                            assert_eq!(reply.msg_type, msg::REPLY);
+                            assert_eq!(reply.status().unwrap().code, status::USE_MULTICAST);
+                            assert_eq!(reply.ia_na().count(), 0);
+                        }
+                    } else {
+                        assert_eq!(
+                            result,
+                            FromVm::Drop(Why::Handled),
+                            "{kind}: {server:?}, {multicast}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -562,6 +585,17 @@ mod tests {
                     served().frame_from_vm(&f),
                     expected.map_or(FromVm::World(&p), FromVm::Drop)
                 );
+                let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
+                assert_eq!(world.frame_from_vm(&f), FromVm::World(&p));
+                let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
+                assert_eq!(
+                    off.frame_from_vm(&f),
+                    if expected == Some(Why::Handled) {
+                        FromVm::Drop(Why::Handled)
+                    } else {
+                        FromVm::World(&p)
+                    }
+                );
             }
         }
         for v6 in [served().v6, Family::FromWorld, Family::Off] {
@@ -594,7 +628,7 @@ mod tests {
                 );
                 assert_eq!(
                     link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
-                    FromVm::Drop(Why::Handled)
+                    FromVm::World(&p)
                 );
             }
         }
@@ -809,11 +843,7 @@ mod tests {
             frame::NEIGHBOR_ADVERTISEMENT
         );
 
-        let rs = frame::icmp6(
-            ll,
-            "ff02::2".parse().unwrap(),
-            vec![frame::ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
-        );
+        let rs = router_solicit(ll);
         let rs_frame = eth(VM, [0x33, 0x33, 0, 0, 0, 2], frame::IPV6, &rs);
         let FromVm::Answer(ra) = link.frame_from_vm(&rs_frame) else {
             panic!("no advertisement")
@@ -830,11 +860,7 @@ mod tests {
         let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
         assert_eq!(off.frame_from_vm(&rs_frame), FromVm::Drop(Why::Handled));
         // An advertisement from the VM never leaves the link.
-        let ra_from_vm = frame::icmp6(
-            ll,
-            "ff02::1".parse().unwrap(),
-            vec![frame::ROUTER_ADVERTISEMENT, 0, 0, 0, 0, 0, 0, 0],
-        );
+        let ra_from_vm = addresses::router_advert(&addresses::tests::lease6(), 1500);
         assert_eq!(
             link.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 0, 0, 1], frame::IPV6, &ra_from_vm)),
             FromVm::Drop(Why::Handled)
@@ -853,10 +879,9 @@ mod tests {
     #[test]
     fn dhcp6_is_answered_to_the_vm() {
         let mut link = served();
-        let mut solicit = vec![1, 0, 0, 1];
-        solicit.extend_from_slice(&[0, 1, 0, 10, 0, 3, 0, 1]);
-        solicit.extend_from_slice(&VM);
-        solicit.extend_from_slice(&[0, 3, 0, 12, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let solicit = request6(msg::SOLICIT, vec![DhcpOption::IaNa(ia_with(1, &[]))])
+            .to_bytes()
+            .unwrap();
         let p = frame::udp6(
             frame::link_local(VM),
             546,
@@ -876,26 +901,20 @@ mod tests {
     }
 
     fn rebind(stale: usize, client_len: u16) -> Vec<u8> {
-        let mut request = vec![6, 0, 0, 1];
-        request.extend_from_slice(&1u16.to_be_bytes()); // Client ID.
-        request.extend_from_slice(&client_len.to_be_bytes());
-        request.extend_from_slice(&[0, 3, 0, 1]);
-        request.extend_from_slice(&VM);
-        request.resize(8 + usize::from(client_len), 0);
-        request.extend_from_slice(&3u16.to_be_bytes()); // IA_NA.
-        request.extend_from_slice(&u16::try_from(12 + stale * 28).unwrap().to_be_bytes());
-        request.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
-        for i in 0..stale {
-            request.extend_from_slice(&[0, 5, 0, 24]); // IAADDR.
-            request.extend_from_slice(&Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 1, i as u16).octets());
-            request.extend_from_slice(&[0; 8]);
-        }
+        let addresses: Vec<_> = (0..stale)
+            .map(|i| Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 1, i as u16))
+            .collect();
+        let mut request = request6(msg::REBIND, vec![DhcpOption::IaNa(ia_with(1, &addresses))]);
+        request.transaction = 1;
+        let mut client = Duid::ll(1, &VM);
+        client.0.resize(usize::from(client_len), 0);
+        request.options[0] = DhcpOption::ClientId(client);
         let p = frame::udp6(
             frame::link_local(VM),
             546,
             "ff02::1:2".parse().unwrap(),
             547,
-            &request,
+            &request.to_bytes().unwrap(),
         );
         eth(VM, [0x33, 0x33, 0, 1, 0, 2], frame::IPV6, &p)
     }
@@ -933,33 +952,23 @@ mod tests {
             assert!(too_big.len() <= frame::HEADER + usize::from(mtu));
             assert_eq!(link.frame_from_vm(&too_big), FromVm::Drop(Why::Handled));
             assert!(matches!(link.frame_from_vm(&request), FromVm::Answer(_)));
+            if mtu == u16::MAX {
+                let request = rebind(2337, 10);
+                assert_eq!(request.len(), frame::HEADER + 65_518);
+                assert!(request.len() <= frame::HEADER + usize::from(link.mtu));
+                assert_eq!(link.frame_from_vm(&request), FromVm::Drop(Why::Handled));
+                assert!(matches!(
+                    link.frame_from_vm(&rebind(0, 10)),
+                    FromVm::Answer(_)
+                ));
+            }
         }
-    }
-
-    #[test]
-    fn dhcp6_rebind_cannot_overflow_the_udp_length() {
-        let mut link = served();
-        link.mtu = u16::MAX;
-        let Family::Serve(lease) = &mut link.v6 else {
-            unreachable!()
-        };
-        lease.dns = Some("fd00::53".parse().unwrap());
-        let request = rebind(2337, 10);
-        assert_eq!(request.len(), frame::HEADER + 65_518);
-        assert!(request.len() <= frame::HEADER + usize::from(link.mtu));
-        assert_eq!(link.frame_from_vm(&request), FromVm::Drop(Why::Handled));
-        assert!(matches!(
-            link.frame_from_vm(&rebind(0, 10)),
-            FromVm::Answer(_)
-        ));
     }
 
     #[test]
     fn arp_for_the_gateway() {
         let mut link = served();
-        let mut a = vec![0, 1, 8, 0, 6, 4, 0, 1];
-        a.extend_from_slice(&VM);
-        a.extend_from_slice(&[10, 0, 0, 2, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1]);
+        let a = arp_request([10, 0, 0, 2], [10, 0, 0, 1]);
         let FromVm::Answer(reply) = link.frame_from_vm(&eth(VM, frame::BROADCAST, frame::ARP, &a))
         else {
             panic!("no reply")
@@ -968,26 +977,6 @@ mod tests {
             &Frame::parse(&reply).unwrap().payload[8..18],
             &[0x02, 0x66, 0x6e, 0, 0, 1, 10, 0, 0, 1]
         );
-    }
-
-    /// The first `cut` bytes of `packet`'s payload as an IPv6 first
-    /// fragment, and the rest as the second.
-    fn fragments6(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
-        let (src, dst) = (
-            frame::source_v6(packet),
-            Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
-        );
-        let body = &packet[40..];
-        let mut first = vec![packet[6], 0, 0, 1, 0, 0, 0, 42];
-        first.extend_from_slice(&body[..cut]);
-        let mut second = vec![packet[6], 0];
-        second.extend_from_slice(&(cut as u16).to_be_bytes());
-        second.extend_from_slice(&[0, 0, 0, 42]);
-        second.extend_from_slice(&body[cut..]);
-        (
-            frame::ipv6(src, dst, 44, packet[7], &first),
-            frame::ipv6(src, dst, 44, packet[7], &second),
-        )
     }
 
     /// The first `cut` bytes of `packet`'s payload as an IPv4 first
@@ -1008,11 +997,7 @@ mod tests {
     fn control_messages_behind_any_extension_headers_stay_on_the_link() {
         let ll = frame::link_local(VM);
         let all: Ipv6Addr = "ff02::1".parse().unwrap();
-        let ra = frame::icmp6(
-            ll,
-            all,
-            vec![frame::ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0, 0, 0],
-        );
+        let ra = addresses::router_advert(&addresses::tests::lease6(), 1500);
         let to_all = [0x33, 0x33, 0, 0, 0, 1];
         for v6 in [Family::FromWorld, Family::Off] {
             let mut link = Link::new(Family::Off, v6, 1500).unwrap();
@@ -1063,28 +1048,14 @@ mod tests {
         );
         // An atomic fragment (offset 0, no more fragments) is not answered
         // either, and a router solicitation in one does not reach the world.
-        let atomic = |p: &[u8]| {
-            let mut body = vec![p[6], 0, 0, 0, 0, 0, 0, 9];
-            body.extend_from_slice(&p[40..]);
-            frame::ipv6(
-                frame::source_v6(p),
-                Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap()),
-                44,
-                255,
-                &body,
-            )
-        };
+        let atomic = |p: &[u8]| fragment6(p, 0, false, &p[40..]);
         let to = [0x33, 0x33, 0xff, 0, 0, 1];
         assert_eq!(
             link.frame_from_vm(&eth(VM, to, frame::IPV6, &atomic(&ns))),
             FromVm::Drop(Why::Handled)
         );
         let ll = frame::link_local(VM);
-        let rs = frame::icmp6(
-            ll,
-            "ff02::2".parse().unwrap(),
-            vec![frame::ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
-        );
+        let rs = router_solicit(ll);
         let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
         let to = [0x33, 0x33, 0, 0, 0, 2];
         assert_eq!(
@@ -1145,10 +1116,9 @@ mod tests {
 
     #[test]
     fn a_first_fragment_of_a_dhcp6_solicit_gets_no_answer() {
-        let mut solicit = vec![1, 0, 0, 1];
-        solicit.extend_from_slice(&[0, 1, 0, 10, 0, 3, 0, 1]);
-        solicit.extend_from_slice(&VM);
-        solicit.extend_from_slice(&[0, 3, 0, 12, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut solicit = request6(msg::SOLICIT, vec![DhcpOption::IaNa(ia_with(1, &[]))])
+            .to_bytes()
+            .unwrap();
         solicit.extend_from_slice(&[0; 80]);
         let whole = frame::udp6(
             frame::link_local(VM),
@@ -1203,6 +1173,13 @@ mod tests {
         }
         let ra = link.router_advert().unwrap();
         assert_eq!(ra[..6], [0x33, 0x33, 0, 0, 0, 1]);
+        let to_vm = frame::ipv4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            1,
+            &[],
+        );
+        assert!(link.to_vm(&to_vm).is_none(), "before the VM's MAC is known");
         let FromVm::Answer(answer) = link.frame_from_vm(&discover()) else {
             panic!("DHCP answer")
         };
@@ -1225,20 +1202,9 @@ mod tests {
         };
         assert_eq!(answer[..6], VM);
         assert_eq!(link.to_vm(&unicast).unwrap()[..6], VM);
-    }
-
-    #[test]
-    fn world_packets_get_the_vm_or_group_mac() {
-        let mut link = served();
-        let to_vm = frame::ipv4(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(10, 0, 0, 2),
-            1,
-            &[],
+        assert_eq!(
+            link.to_vm(&to_vm).unwrap(),
+            frame::header(VM, frame::GATEWAY_MAC, frame::IPV4)
         );
-        assert!(link.to_vm(&to_vm).is_none(), "before the VM's MAC is known");
-        link.frame_from_vm(&discover());
-        let h = link.to_vm(&to_vm).unwrap();
-        assert_eq!(h, frame::header(VM, frame::GATEWAY_MAC, frame::IPV4));
     }
 }

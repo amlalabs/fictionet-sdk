@@ -207,7 +207,7 @@ fn server_duid() -> Duid {
 
 /// The answer to one DHCPv6 message from the VM, as the UDP payload.
 /// `None` when no answer is due: a malformed message, one for another server,
-/// one with no client ID, or a type a server does not answer. Also returns
+/// one missing a required client ID, or a type a server does not answer. Returns
 /// `None` if the answer exceeds `budget` bytes or an option or UDP length limit.
 /// Unicast is never enabled: forbidden message types are dropped, and the
 /// others get UseMulticast.
@@ -215,7 +215,7 @@ pub(super) fn dhcp6(
     lease: &Lease<Ipv6Addr>,
     budget: usize,
     request: &[u8],
-    unicast: bool,
+    multicast: bool,
 ) -> Option<Vec<u8>> {
     let request = Message::parse(request).ok()?;
     let kind = request.msg_type;
@@ -228,85 +228,80 @@ pub(super) fn dhcp6(
         msg::REQUEST | msg::RENEW | msg::RELEASE | msg::DECLINE => {
             request.server_id() == Some(&server)
         }
-        msg::INFORMATION_REQUEST => {
-            request.server_id().is_none_or(|s| *s == server)
-                && !request.options.iter().any(|o| {
-                    matches!(
-                        o,
-                        DhcpOption::IaNa(_) | DhcpOption::IaTa(_) | DhcpOption::IaPd(_)
-                    )
-                })
-        }
+        msg::INFORMATION_REQUEST => request.server_id().is_none_or(|s| *s == server),
         _ => false,
     };
-    if !server_ok
-        || (unicast
-            && matches!(
-                kind,
-                msg::SOLICIT | msg::CONFIRM | msg::REBIND | msg::INFORMATION_REQUEST
-            ))
+    if !server_ok {
+        return None;
+    }
+    if kind == msg::INFORMATION_REQUEST
+        && request.options.iter().any(|o| {
+            matches!(
+                o,
+                DhcpOption::IaNa(_) | DhcpOption::IaTa(_) | DhcpOption::IaPd(_)
+            )
+        })
+    {
+        return None;
+    }
+    if !multicast
+        && matches!(
+            kind,
+            msg::SOLICIT | msg::CONFIRM | msg::REBIND | msg::INFORMATION_REQUEST
+        )
     {
         return None;
     }
     let rapid = kind == msg::SOLICIT && request.options.contains(&DhcpOption::RapidCommit);
-    let (reply, lease_it, status) = match kind {
-        msg::SOLICIT if rapid => (msg::REPLY, true, false),
-        msg::SOLICIT => (msg::ADVERTISE, true, false),
-        msg::REQUEST | msg::RENEW | msg::REBIND => (msg::REPLY, true, false),
-        msg::CONFIRM => (msg::REPLY, false, false),
-        msg::RELEASE | msg::DECLINE => (msg::REPLY, false, true),
-        msg::INFORMATION_REQUEST => (msg::REPLY, false, false),
-        _ => return None,
+    let reply = if kind == msg::SOLICIT && !rapid {
+        msg::ADVERTISE
+    } else {
+        msg::REPLY
     };
     let mut out = Message::new(reply, request.transaction);
     if let Some(client) = request.client_id() {
         out.options.push(DhcpOption::ClientId(client.clone()));
     }
     out.options.push(DhcpOption::ServerId(server));
-    if unicast {
+    if !multicast {
         out.options.push(status_option(status::USE_MULTICAST));
     } else if kind == msg::CONFIRM {
         out.options.push(status_option(confirm(lease, &request)?));
+    } else if matches!(kind, msg::RELEASE | msg::DECLINE) {
+        out.options.push(status_option(status::SUCCESS));
     } else {
         if rapid {
             out.options.push(DhcpOption::RapidCommit);
-        }
-        if status {
-            out.options
-                .push(DhcpOption::StatusCode(StatusCode::default()));
         }
         // Any other address the VM still holds, from a lease it kept across a
         // restore or a change of flags, comes back with lifetimes of 0 in a
         // Request, Renew or Rebind, so the VM drops it (RFC 8415, section
         // 18.3.4). The link passes packets only from the address it hands out.
         let retire = matches!(kind, msg::REQUEST | msg::RENEW | msg::REBIND);
+        let subnet = Prefix {
+            addr: lease.addr.addr.into(),
+            len: lease.addr.prefix,
+        };
+        let address = |address, secs| {
+            DhcpOption::IaAddr(IaAddr {
+                address,
+                preferred: secs,
+                valid: secs,
+                options: Vec::new(),
+            })
+        };
         for (i, ia) in request.ia_na().enumerate() {
             // The first IA_NA the VM asked for gets the address.
-            let first = i == 0 && lease_it;
-            if !lease_it {
-                continue;
-            }
+            let first = i == 0;
             let mut na = IaNa {
                 iaid: ia.iaid,
                 ..IaNa::default()
-            };
-            let subnet = Prefix {
-                addr: lease.addr.addr.into(),
-                len: lease.addr.prefix,
             };
             if kind == msg::REQUEST && ia.addresses().any(|a| !subnet.contains(a.address.into())) {
                 na.options.push(status_option(status::NOT_ON_LINK));
                 out.options.push(DhcpOption::IaNa(na));
                 continue;
             }
-            let address = |address, secs| {
-                DhcpOption::IaAddr(IaAddr {
-                    address,
-                    preferred: secs,
-                    valid: secs,
-                    options: Vec::new(),
-                })
-            };
             if first {
                 na.t1 = LEASE_SECS / 2;
                 na.t2 = LEASE_SECS / 5 * 4;
@@ -322,23 +317,21 @@ pub(super) fn dhcp6(
             }
             out.options.push(DhcpOption::IaNa(na));
         }
-        if lease_it {
-            for option in &request.options {
-                match option {
-                    DhcpOption::IaTa(ia) => out.options.push(DhcpOption::IaTa(dhcpv6::IaTa {
-                        iaid: ia.iaid,
-                        options: vec![status_option(status::NO_ADDRS_AVAIL)],
-                    })),
-                    DhcpOption::IaPd(ia) => out.options.push(DhcpOption::IaPd(dhcpv6::IaPd {
-                        iaid: ia.iaid,
-                        options: vec![status_option(status::NO_PREFIX_AVAIL)],
-                        ..Default::default()
-                    })),
-                    _ => {}
-                }
+        for option in &request.options {
+            match option {
+                DhcpOption::IaTa(ia) => out.options.push(DhcpOption::IaTa(dhcpv6::IaTa {
+                    iaid: ia.iaid,
+                    options: vec![status_option(status::NO_ADDRS_AVAIL)],
+                })),
+                DhcpOption::IaPd(ia) => out.options.push(DhcpOption::IaPd(dhcpv6::IaPd {
+                    iaid: ia.iaid,
+                    options: vec![status_option(status::NO_PREFIX_AVAIL)],
+                    ..Default::default()
+                })),
+                _ => {}
             }
         }
-        if let (Some(dns), false) = (lease.dns, matches!(kind, msg::RELEASE | msg::DECLINE)) {
+        if let Some(dns) = lease.dns {
             out.options.push(DhcpOption::DnsServers(vec![dns]));
         }
     }
@@ -386,12 +379,12 @@ pub(super) fn dhcp6_packet(request_packet: &[u8], answer: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::frame::tests::{VM, v6_checksum_ok};
     use super::*;
 
     fn dhcp6(lease: &Lease<Ipv6Addr>, budget: usize, request: &[u8]) -> Option<Vec<u8>> {
-        super::dhcp6(lease, budget, request, false)
+        super::dhcp6(lease, budget, request, true)
     }
 
     fn lease4() -> Lease<Ipv4Addr> {
@@ -445,10 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_identity_associations_get_a_status() {
+    fn every_requested_identity_association_gets_an_outcome() {
         let request = request6(
             msg::SOLICIT,
             vec![
+                DhcpOption::IaNa(ia_with(7, &[])),
+                DhcpOption::IaNa(ia_with(8, &[])),
                 DhcpOption::IaTa(dhcpv6::IaTa {
                     iaid: 8,
                     ..Default::default()
@@ -460,6 +455,20 @@ mod tests {
             ],
         );
         let reply = reply6(&request);
+        let nas: Vec<_> = reply.ia_na().collect();
+        assert_eq!(nas.len(), 2);
+        assert_eq!(
+            nas[0].addresses().next().unwrap().address,
+            lease6().addr.addr
+        );
+        assert_eq!(nas[1].iaid, 8);
+        assert_eq!(
+            nas[1].options,
+            vec![DhcpOption::StatusCode(StatusCode {
+                code: status::NO_ADDRS_AVAIL,
+                message: String::new(),
+            })]
+        );
         assert_eq!(
             reply.option(dhcpv6::opt::IA_TA),
             Some(&DhcpOption::IaTa(dhcpv6::IaTa {
@@ -484,32 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn every_requested_identity_association_gets_an_outcome() {
-        let request = request6(
-            msg::SOLICIT,
-            vec![
-                DhcpOption::IaNa(ia_with(7, &[])),
-                DhcpOption::IaNa(ia_with(8, &[])),
-            ],
-        );
-        let reply = reply6(&request);
-        let nas: Vec<_> = reply.ia_na().collect();
-        assert_eq!(nas.len(), 2);
-        assert_eq!(
-            nas[0].addresses().next().unwrap().address,
-            lease6().addr.addr
-        );
-        assert_eq!(nas[1].iaid, 8);
-        assert_eq!(
-            nas[1].options,
-            vec![DhcpOption::StatusCode(StatusCode {
-                code: status::NO_ADDRS_AVAIL,
-                message: String::new()
-            })]
-        );
-    }
-
-    #[test]
     fn information_requests_with_identity_associations_are_discarded() {
         for option in [
             DhcpOption::IaNa(IaNa::default()),
@@ -518,44 +501,6 @@ mod tests {
         ] {
             let request = request6(msg::INFORMATION_REQUEST, vec![option]);
             assert!(dhcp6(&lease6(), 1452, &request.to_bytes().unwrap()).is_none());
-        }
-    }
-
-    #[test]
-    fn dhcp6_server_identifier_rules() {
-        for kind in [
-            msg::SOLICIT,
-            msg::CONFIRM,
-            msg::REBIND,
-            msg::REQUEST,
-            msg::RENEW,
-            msg::RELEASE,
-            msg::DECLINE,
-            msg::INFORMATION_REQUEST,
-        ] {
-            for server in [None, Some(server_duid()), Some(Duid::ll(1, &[1; 6]))] {
-                let mut m = Message::new(kind, 1);
-                m.options.push(DhcpOption::ClientId(Duid(CLIENT.to_vec())));
-                if kind != msg::INFORMATION_REQUEST {
-                    m.options
-                        .push(DhcpOption::IaNa(ia_with(7, &[lease6().addr.addr])));
-                }
-                if let Some(id) = &server {
-                    m.options.push(DhcpOption::ServerId(id.clone()));
-                }
-                let allowed = match kind {
-                    msg::SOLICIT | msg::CONFIRM | msg::REBIND => server.is_none(),
-                    msg::INFORMATION_REQUEST => {
-                        server.as_ref().is_none_or(|id| *id == server_duid())
-                    }
-                    _ => server == Some(server_duid()),
-                };
-                assert_eq!(
-                    dhcp6(&lease6(), 1452, &m.to_bytes().unwrap()).is_some(),
-                    allowed,
-                    "{kind}: {server:?}"
-                );
-            }
         }
     }
 
@@ -732,7 +677,7 @@ mod tests {
         assert_eq!(mask4(32), Ipv4Addr::BROADCAST);
     }
 
-    fn lease6() -> Lease<Ipv6Addr> {
+    pub(crate) fn lease6() -> Lease<Ipv6Addr> {
         Lease {
             addr: Cidr {
                 addr: "fd00::2".parse().unwrap(),
@@ -789,7 +734,7 @@ mod tests {
         assert_eq!(p.len(), 40 + 16 + 48, "no DNS option");
     }
 
-    fn request6(kind: u8, options: Vec<DhcpOption>) -> Message {
+    pub(crate) fn request6(kind: u8, options: Vec<DhcpOption>) -> Message {
         let mut m = Message::new(kind, 0xabcdef);
         m.options.push(DhcpOption::ClientId(Duid(CLIENT.to_vec())));
         if matches!(
@@ -820,7 +765,7 @@ mod tests {
 
     const CLIENT: &[u8] = &[0, 3, 0, 1, 0x52, 0x54, 0, 0x12, 0x34, 0x56];
 
-    fn ia_with(iaid: u32, addresses: &[Ipv6Addr]) -> IaNa {
+    pub(crate) fn ia_with(iaid: u32, addresses: &[Ipv6Addr]) -> IaNa {
         IaNa {
             iaid,
             options: addresses
@@ -895,13 +840,8 @@ mod tests {
 
     #[test]
     fn dhcp6_solicit_advertise_request_reply() {
-        // DUID-LL, IAID 7, transaction abcdef.
-        let solicit = [
-            1, 0xab, 0xcd, 0xef, 0, 1, 0, 10, 0, 3, 0, 1, 0x52, 0x54, 0, 0x12, 0x34, 0x56, 0, 3, 0,
-            12, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        let adv = dhcp6(&lease6(), 1500 - 48, &solicit).unwrap();
-        let adv = Message::parse(&adv).unwrap();
+        let solicit = request6(msg::SOLICIT, vec![DhcpOption::IaNa(ia_with(7, &[]))]);
+        let adv = reply6(&solicit);
         assert_eq!(adv.msg_type, msg::ADVERTISE);
         assert_eq!(adv.transaction, 0xabcdef);
         assert_eq!(adv.client_id(), Some(&Duid(CLIENT.to_vec())));
@@ -920,16 +860,13 @@ mod tests {
 
         let reply = reply6(&request6(
             msg::REQUEST,
-            vec![
-                DhcpOption::ServerId(server_duid()),
-                DhcpOption::IaNa(ia_with(7, &[])),
-            ],
+            vec![DhcpOption::IaNa(ia_with(7, &[]))],
         ));
         assert_eq!(reply.msg_type, msg::REPLY);
         assert_eq!(reply.ia_na().next(), Some(na));
 
         // Rapid commit: the solicit gets a reply at once.
-        let mut rapid = Message::parse(&solicit).unwrap();
+        let mut rapid = solicit;
         rapid.options.push(DhcpOption::RapidCommit);
         let rapid = reply6(&rapid);
         assert_eq!(rapid.msg_type, msg::REPLY);
@@ -938,12 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn dhcp6_leaves_other_servers_and_bad_messages_alone() {
-        let m = request6(
-            msg::REQUEST,
-            vec![DhcpOption::ServerId(Duid::ll(1, &[1, 2, 3, 4, 5, 6]))],
-        );
-        assert!(dhcp6(&lease6(), 1500 - 48, &m.to_bytes().unwrap()).is_none());
+    fn dhcp6_rejects_bad_messages_and_answers_without_leases() {
         let missing = Message::new(msg::SOLICIT, 1);
         assert!(
             dhcp6(&lease6(), 1500 - 48, &missing.to_bytes().unwrap()).is_none(),

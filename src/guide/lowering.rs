@@ -115,6 +115,9 @@
 //! The address flags (`--ip-addr`, `--gateway`, `--dns` and their IPv6
 //! forms) decide some of what happens below. [The VM's
 //! addresses](crate::guide::attaching#the-vms-addresses) explains them.
+//! [`Link::new`](crate::stdlib::network::ethernet::Link::new) checks the leases
+//! before any frames arrive. It rejects invalid prefixes and IPv4 leases
+//! with no address for the DHCP server.
 //!
 //! **What the sandbox sends.** A VM's kernel has an Ethernet card, such as
 //! a virtio-net card under QEMU. It sends Ethernet frames: IP packets with
@@ -153,10 +156,6 @@
 //!   and attach reads it there, one frame per `read`. On the way, the kernel
 //!   finishes any checksums the VM program left to an offload, and splits
 //!   large segments into frames that fit the MTU.
-//!
-//! [`Link::new`](crate::stdlib::network::ethernet::Link::new) rejects invalid
-//! lease prefixes and IPv4 leases with no DHCP server address before any
-//! frame arrives. The CLI and embedded runners handle this construction error.
 //!
 //! **The lowering.** [`Link::frame_from_vm`](crate::stdlib::network::ethernet::Link::frame_from_vm) decides what happens to each
 //! frame, with no I/O of its own. It reads the header, and drops a frame
@@ -203,10 +202,10 @@
 //! (hop-by-hop, routing, destination options, authentication and
 //! fragment), with no limit on how many. A packet that calls for an ICMPv6
 //! Parameter Problem reaches the world after source-address checks, unless
-//! it is neighbor discovery or a link-scope error. The world generates the
-//! error. Other packets whose headers run past their end, whose UDP header
-//! is cut short or whose UDP length does not fit, or whose ICMPv6 header is
-//! cut short, are dropped.
+//! it hides neighbor discovery (ICMPv6 types 133 through 137). The world
+//! decides whether to generate the error. Other packets whose headers run
+//! past their end, whose UDP header is cut short or whose UDP length does
+//! not fit, or whose ICMPv6 header is cut short, are dropped.
 //! Attach does not put fragments back together. The transport header is
 //! in the first fragment, so attach reads it there. It drops neighbor
 //! discovery in a fragment, which RFC 6980 forbids, and never answers a
@@ -223,6 +222,19 @@
 //! | `--ip-addr` (or `--ip-addr-v6`) given | attach answers: `addresses::dhcp4`, or `addresses::router_advert` and `addresses::dhcp6`, with the address, gateway, DNS server and MTU from the flags | passed to the world only from the address attach handed out |
 //! | all three of the family left out | passed to the world as ordinary packets; DHCP and DHCPv6 fragmented or not, router solicitations only whole | passed to the world, including those from `0.0.0.0`, `::` and link-local addresses |
 //! | `--no-ip-addr` (or `--no-ip-addr-v6`) | dropped | passed to the world, except those from `0.0.0.0`, `::` and link-local addresses |
+//!
+//! The DHCPv6 server follows RFC 8415 on which messages it answers.
+//! Solicit, Confirm and Rebind must not name a server. Request, Renew,
+//! Release and Decline must name this one. An Information-request may name
+//! this server or none, and may not hold an identity association (IA).
+//! Solicit, Confirm, Rebind and Information-request sent to a unicast
+//! address are dropped. Other unicast requests get UseMulticast. The first
+//! IA_NA gets the lease. Later IA_NAs and any IA_TA get NoAddrsAvail, and
+//! an IA_PD gets NoPrefixAvail. A Request that names an address outside
+//! the prefix gets NotOnLink for that IA. Request, Renew and Rebind hand
+//! back any other address the VM holds with lifetimes of 0. Confirm
+//! succeeds only for the address attach handed out, and gets no answer
+//! when it names no address.
 //!
 //! When attach hands out IPv6, it also sends router advertisements without
 //! being asked: one as soon as it starts relaying, and then one every 10
