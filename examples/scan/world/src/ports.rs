@@ -1,10 +1,28 @@
-//! Passive IPv4 probe tracking on the scanner's link.
+//! The tap watches IPv4 packets on the scanner's link and changes nothing.
+//! A probe is a TCP SYN with ACK, RST and FIN clear, or a UDP packet, sent
+//! to the office subnet. An answer must match the latest probe's addresses
+//! and ports. TCP answers must also match its sequence number.
 //!
-//! Snapshots and deltas own their rows and use run time in whole milliseconds.
-//! Rows stay for the run. At capacity, new keys count as untracked probes.
-//! Repeated probes advance revisions but keep the last answered state.
-//! Facts mark new rows and state changes; deltas contain only each row's
-//! latest version. JSON bounds apply to compact serialization of these views.
+//! A row starts `unanswered`. A TCP SYN-ACK or UDP reply means `open`.
+//! A TCP RST-ACK or ICMP port-unreachable means `closed`. Other ICMP
+//! destination unreachable codes mean `unreachable`. Repeated probes keep
+//! the last answered state. Stale replies and noninitial fragments are ignored.
+//!
+//! A `scan.port` fact marks a new row or a state change. It includes the
+//! previous state, probe count, first and last probe times, and revision.
+//! The previous state is null for a new row. Times are whole milliseconds
+//! since the run began.
+//!
+//! [`Ports::snapshot`] copies the five office labels and all rows, sorted
+//! by address, protocol, then port. [`Ports::changes_since`] copies the latest
+//! version of each row changed after a revision. Each tracked probe or state
+//! change advances the revision. Both views include the last row change time
+//! and `untracked` count. Their `MAX_JSON_BYTES` constants bound compact JSON.
+//!
+//! Rows stay for the run, up to [`MAX_ROWS`] (16,384). At capacity, probes for
+//! new keys increment `untracked`; existing rows still update. The first
+//! untracked probe emits one `scan.full` fact with `max_rows`.
+
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -24,11 +42,14 @@ pub const MAX_ROWS: usize = 16_384;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
+    /// A TCP probe.
     Tcp,
+    /// A UDP probe.
     Udp,
 }
 
 impl Protocol {
+    /// Returns the protocol name used in facts and JSON.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
@@ -41,13 +62,18 @@ impl Protocol {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PortState {
+    /// No matching answer has arrived.
     Unanswered,
+    /// A matching TCP SYN-ACK or UDP reply arrived.
     Open,
+    /// A matching TCP RST-ACK or ICMP port-unreachable arrived.
     Closed,
+    /// A matching ICMP destination unreachable with another code arrived.
     Unreachable,
 }
 
 impl PortState {
+    /// Returns the state name used in facts and JSON.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unanswered => "unanswered",
@@ -61,13 +87,21 @@ impl PortState {
 /// One port's probes and latest answered state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortRow {
+    /// The probed host's IPv4 address.
     pub host: Ipv4Addr,
+    /// The probed destination port.
     pub port: u16,
+    /// The probe's transport protocol.
     pub protocol: Protocol,
+    /// The latest answered state, or no answer yet.
     pub state: PortState,
+    /// The first probe's time in whole milliseconds since the run began.
     pub first_probe_ms: u64,
+    /// The latest probe's time in whole milliseconds since the run began.
     pub last_probe_ms: u64,
+    /// The number of probes for this row.
     pub probes: u64,
+    /// The map revision when this row last changed.
     pub revision: u64,
 }
 
@@ -89,15 +123,20 @@ impl PortRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MachineKind {
+    /// Runs inside the world.
     Simulated,
+    /// Runs behind a real attachment.
     Real,
 }
 
 /// An office machine's label and address.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Machine {
+    /// The machine's label.
     pub name: String,
+    /// The machine's IPv4 address.
     pub addr: Ipv4Addr,
+    /// Whether the machine is simulated or real.
     pub kind: MachineKind,
 }
 
@@ -127,11 +166,17 @@ const fn machines_json_bytes() -> usize {
 /// A complete port map. Rows sort by address, protocol, then port.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMap {
+    /// The current map revision.
     pub revision: u64,
+    /// The last row change time in milliseconds since the run began, or zero.
     pub at_ms: u64,
+    /// The maximum number of rows the map can hold.
     pub max_rows: usize,
+    /// Probes for new keys that could not fit in the map.
     pub untracked: u64,
+    /// The five office machines, including those with no probes.
     pub machines: Vec<Machine>,
+    /// All tracked rows, sorted by address, protocol, then port.
     pub rows: Vec<PortRow>,
 }
 
@@ -146,10 +191,15 @@ impl PortMap {
 /// This is a delta of rows, not a history of every probe or answer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortChanges {
+    /// The requested revision, excluded from these changes.
     pub from_revision: u64,
+    /// The current map revision.
     pub revision: u64,
+    /// The last row change time in milliseconds since the run began, or zero.
     pub at_ms: u64,
+    /// Probes for new keys that could not fit in the map.
     pub untracked: u64,
+    /// Changed rows at their latest versions, sorted by address, protocol, then port.
     pub rows: Vec<PortRow>,
 }
 

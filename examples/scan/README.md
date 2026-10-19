@@ -48,15 +48,15 @@ sandboxes belong to these groups, so the sandboxes are drawn there too.
 
 ## Crate layout
 
-`world/` is the `scan-world` crate. `src/lib.rs` exposes `office()`, `start()`
-and `world()`. `src/main.rs` runs the world on a socket:
+`world/` is the `scan-world` crate. `world/src/lib.rs` exposes `office()`,
+`start()` and `world()`. `world/src/main.rs` runs the world on a socket:
 
 ```text
 cargo run -p scan-world -- /run/fictionet/world.sock
 ```
 
-The tests live in `world/tests/`. Run them with `cargo test -p scan-world`.
-The golden report stays in `world/tests/golden.txt`.
+Integration tests live in `world/tests/`. Run all tests with `cargo test -p scan-world`.
+The golden report is in `world/tests/golden.txt`.
 
 ## Attaching a real server
 
@@ -66,8 +66,8 @@ or a VM. A server VM uses a card made with
 frames through that card to the `SERVER` attachment. `SERVER_LEASE` gives it
 10.0.0.50/24, gateway 10.0.0.1 and DNS 10.0.9.1.
 
-The scanner attaches as `scanner`. Its card uses `Family::FromWorld`, so the
-world's DHCP leases it an address in `SCANNER_SUBNET` (10.0.9.0/24).
+The scanner attaches as `scanner`. A scanner VM's card uses `Family::FromWorld`.
+The world's DHCP leases it an address in `SCANNER_SUBNET` (10.0.9.0/24).
 An integrator can add hosts with `.host(...)` or `.resolve(...)`, and trusted
 routes with `.route(...)`, to `office()` before calling `start()`. This lets a
 server reach an apt mirror and lets an admin jump host reach the server.
@@ -90,8 +90,8 @@ state is null. Times are whole milliseconds since the run began.
 
 `start()` returns a shared `Ports` handle. `snapshot()` returns the office
 labels and sorted rows. `changes_since(revision)` returns the latest version
-of each row changed since that revision. Every probe and state change advances
-the map revision. Both projections include the last change time and the
+of each row changed since that revision. Every tracked probe and state change
+advances the map revision. Both projections include the last change time and the
 untracked count. Their `MAX_JSON_BYTES` constants bound compact JSON output.
 
 The map holds at most 16,384 rows and never evicts them. Further probes for
@@ -104,8 +104,8 @@ probe emits one `scan.full` fact with `max_rows`.
 
 - `world` runs `scan-world`, with no network at all. Its only door is the
   world socket on a shared volume.
-- `container-attach` runs `fictionet attach --type tun` for the real
-  container, at 10.0.0.50. The `container` service (nginx and OpenSSH on
+- `container-attach` runs `fictionet attach --name server --type tun` for the
+  real container, at 10.0.0.50. The `container` service (nginx and OpenSSH on
   Alpine) joins its network namespace, so its only interface is `tun0`.
 - `scanner-attach` does the same for the agent, at 10.0.9.2, and the
   `scanner` service, with nmap, joins it. nmap needs `NET_RAW` to send SYN
@@ -201,8 +201,8 @@ Open http://127.0.0.1:7880/ while the scan runs to watch it. The scanner's
 link lights up, and packets fan out from the router to the five hosts.
 Double-click a host's group to open it, click the scanner's link to see
 the SYNs go out and the RSTs come back, and drag any box to move it.
-Closing "simulated hosts" draws its four links as one line, and that
-line's packet list merges all four.
+Closing "simulated hosts" hides the router and its internal links.
+The links to the two sandboxes stay visible.
 
 Stop it all and remove its volume with `docker compose down -v`.
 
@@ -221,12 +221,12 @@ Set `KEEP=1` to retain the stack; the command prints its private token file's pa
 
 The Rust command drives Chromium and records its screen. It
 puts a terminal panel beside the dashboard with nmap's real output, runs
-host discovery and then the port scan, and uses the dashboard while the
-scan runs: it opens a group, opens the scanner's link and a RST in it,
-closes a group and opens its merged packet list, and drags a box and a
-group. The output folder gets `dashboard.webm` as recorded,
-`dashboard.mp4` (H.264), a smaller `dashboard.gif`, and `nmap.txt` with
-the two scans' output. The recording is about 67 seconds long.
+host discovery and then the port scan with `--max-rate 200`. During the scan,
+it opens a group, opens the scanner's link and a RST in it, closes and reopens
+a group, and drags a box and the server's group. The output folder gets
+`dashboard.webm` as recorded, `dashboard.mp4` (H.264), a smaller
+`dashboard.gif`, and `nmap.txt` with the two scans' output. The recording is
+about 75 seconds long.
 
 The recorder saves the scanner output before checking its exit status.
 It stops if either scan fails or does not find all five expected hosts.

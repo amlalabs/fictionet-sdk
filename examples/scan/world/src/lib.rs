@@ -1,11 +1,48 @@
-//! A small office subnet with four simulated machines and one real server.
-//! Use [`office`] to add hosts or routes, then [`start`] to attach guests in-process.
-//! The server uses [`SERVER_LEASE`]. The scanner gets DHCP from the world.
-//! The socket executable runs the same world for Docker Compose.
+//! A small office subnet for a port scanner, on a
+//! [`fictionet::stdlib::world::net::Net`]. Four machines are simulated:
+//! `www` at 10.0.0.10, `mail` at 10.0.0.11, `files` at 10.0.0.12, and
+//! `printer` at 10.0.0.13. A real server attaches at 10.0.0.50.
+//! The scanner uses 10.0.9.0/24, so a scan of 10.0.0.0/24 excludes it.
 //!
-//! [`start`] returns a shared [`Ports`] handle for snapshots and row deltas.
-//! The passive scanner tap emits `scan.port` facts for new rows and state
-//! changes. All probe times use the run clock. See [`ports`] for the bounds.
+//! Each simulated machine is a [`fictionet::stdlib::world::net::Host`].
+//! Each open port runs a small [`fictionet::stdlib::services::serve::Service`].
+//! It sends a banner or a page for each HTTP request, so `nmap -sV` can name it.
+//! A port with no service answers a SYN with a RST. A scanner reports it
+//! closed rather than filtered. An address with no host answers "host unreachable".
+//! The dashboard shows "simulated hosts", with one group per machine inside it.
+//! The two guests have their own groups: "real server" and "scanner".
+//!
+//! To run in-process, build [`office`] and add hosts or routes if needed.
+//! Call [`start`] with the world's attachments. Keep the [`Ports`] handle
+//! for snapshots and changes since a revision. See [`ports`] for probe facts.
+//!
+//! ```
+//! use fictionet::{RunOptions, Seed};
+//! use scan_world::{office, start};
+//!
+//! fictionet::block_on(fictionet::lab(
+//!     RunOptions::new(Seed::from_u64(42)),
+//!     |fcx| async move {
+//!         let (_attacher, attachments) = fictionet::attachments();
+//!         let ports = start(&fcx, office(), attachments)?;
+//!         let snapshot = ports.snapshot();
+//!         let names: Vec<_> = snapshot.machines.iter().map(|m| m.name.as_str()).collect();
+//!         assert_eq!(names, ["www", "mail", "files", "printer", "server"]);
+//!         assert!(snapshot.rows.is_empty());
+//!         fcx.cancel();
+//!         Ok(())
+//!     },
+//! ))?;
+//! # Ok::<(), fictionet::Error>(())
+//! ```
+//!
+//! The server's card takes [`SERVER_LEASE`]:
+//! `Link::new(Family::Serve(SERVER_LEASE), Family::Off, mtu)`.
+//! Use [`fictionet::stdlib::network::ethernet::Link`] and
+//! [`fictionet::stdlib::network::ethernet::Family`]. Bridge its frames
+//! through the card to the [`SERVER`] attachment. The scanner's card uses
+//! [`fictionet::stdlib::network::ethernet::Family::FromWorld`] and the
+//! [`SCANNER`] attachment. The Net's DHCP leases it an address in [`SCANNER_SUBNET`].
 
 pub mod ports;
 pub use ports::{Machine, MachineKind, PortChanges, PortMap, PortRow, PortState, Ports, Protocol};

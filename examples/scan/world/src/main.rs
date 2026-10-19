@@ -1,3 +1,7 @@
+//! Runs the world on a world socket for `fictionet attach` in the Compose demo.
+//! The first argument is the socket path, defaulting to `/run/fictionet/world.sock`.
+//! Keeps events for the dashboard and prints `attached <name>` for each sandbox.
+
 use fictionet::Result;
 
 fn main() -> Result {
