@@ -200,13 +200,13 @@ pub async fn start(config: Config) -> Result<World> {
     tokio::spawn(fictionet::run(options, move |fcx| async move {
         let z = zscaler(&fcx, DEFAULT_CLOUD, now_unix)?;
         let www = format!("www.{site}");
-        let site_cfg = z.server_config(&fcx, &[site.as_str(), www.as_str()], now_sys, now_unix)?;
+        let site_cfg = z.server_config(&fcx, &[site.as_str(), www.as_str()], now_sys)?;
         // The Zscaler leaves the world presents for the HTTPS download hosts:
         // Mozilla's apt repository, and the release servers the guest
         // installs Claude Code and Codex from.
-        let mozilla_cfg = z.server_config(&fcx, &["packages.mozilla.org"], now_sys, now_unix)?;
-        let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys, now_unix)?;
-        let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys, now_unix)?;
+        let mozilla_cfg = z.server_config(&fcx, &["packages.mozilla.org"], now_sys)?;
+        let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys)?;
+        let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys)?;
         // The jump host: a machine of the world's own, on a trusted route
         // to its address. No host of the world serves the admin flows, so
         // they make no service events, but they cross the router and the

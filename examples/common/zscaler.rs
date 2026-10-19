@@ -1,49 +1,29 @@
 //! A look-alike Zscaler TLS-inspection chain for the desktop world.
 //!
-//! A real enterprise running Zscaler intercepts TLS: the client trusts a
-//! locally installed "Zscaler Root CA", and every site it visits is
-//! re-signed on the fly, so the browser sees a four-level chain ending in
-//! that root instead of the site's real certificate. A sandboxed desktop
-//! that trusts this root sees the same familiar chain, not an obvious
-//! one-off synthetic certificate.
-//!
-//! [`zscaler`] builds the three CAs once (root, a long-lived intermediate,
-//! and the short-lived "(t)" issuing CA). [`Zscaler::server_config`] then
-//! mints a leaf per site, re-signed by the "(t)" CA, and hands back the
-//! chain the world presents in every handshake: the leaf and both
-//! intermediates, never the root. The guest trusts only the root, as
-//! [`Zscaler::root_pem`] gives it.
-//!
-//! Nothing here is Zscaler's: fresh RSA keys are generated from the run's
-//! seed and the root is self-signed. Only the public, observable field
-//! layout of a real deployment is reproduced, from a field map built by
-//! parsing the published Zscaler root and real `openssl s_client` captures.
-//! The field choices (exact subject names, the `mailto:` quirk on the first
-//! intermediate, the `(t)` suffix, criticality, the absence of SCTs, AIA and
-//! CRL on the leaf) are what make the chain recognizable.
+//! The guest installs a local root. Each site presents a leaf, the
+//! short-lived issuing CA, and the long-lived intermediate CA.
+//! [`zscaler`] generates the CA keys from the run seed. Only the public
+//! field layout matches Zscaler. All keys and signatures are generated here.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::protocols::asn1::StringKind::{Ia5, Printable, Utf8};
 use fictionet::stdlib::protocols::asn1::{Oid, StringKind};
 use fictionet::stdlib::protocols::x509::{self, ExtensionValue, GeneralName, KeyUsage, oid};
-use fictionet::stdlib::services::ca::{KeyKind, SigningKey};
+use fictionet::stdlib::services::ca::{KeyKind, Leaf, SigningKey};
 use fictionet::stdlib::services::tls;
 use fictionet::{Cx, Error, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::CertificateDer;
 
-/// The default Zscaler cloud whose name is embedded in the intermediate
-/// common names. The observed capture is `zscalertwo.net`; every cloud
-/// shares the same root and differs only in this token.
+/// The cloud name embedded in the intermediate common names.
 pub const DEFAULT_CLOUD: &str = "zscalertwo.net";
 
 /// A day, in seconds.
 const DAY: i64 = 86_400;
 
-/// The root's validity: the 2025 reissue's window (2025-02-02 to
-/// 2052-06-20), which contains any plausible run date.
+/// The root's validity, from the 2025 reissue.
 const ROOT_NOT_BEFORE: i64 = 1_738_514_300;
 const ROOT_NOT_AFTER: i64 = 2_602_514_300;
 /// The long-lived intermediate's window: wide, 2024 to 2039.
@@ -53,7 +33,6 @@ const INT_NOT_AFTER: i64 = 2_177_452_800;
 /// A built chain of Zscaler-shaped CAs, which issues per-site leaves.
 pub struct Zscaler {
     root_pem: String,
-    root_der: CertificateDer<'static>,
     /// The short-lived "(t)" issuing CA's key, which signs every leaf.
     issuing_key: SigningKey,
     /// The "(t)" CA's subject, which becomes each leaf's issuer.
@@ -69,59 +48,56 @@ pub struct Zscaler {
 /// Builds the root, the long-lived intermediate and the short-lived "(t)"
 /// issuing CA for `cloud` (for example [`DEFAULT_CLOUD`]), with fresh RSA
 /// 2048 keys from `fcx`. `now_unix` is the run's wall-clock time in Unix
-/// seconds; the "(t)" CA's two-week window straddles it.
+/// seconds. The "(t)" CA's two-week window straddles it.
 pub fn zscaler(fcx: &Cx, cloud: &str, now_unix: i64) -> Result<Zscaler> {
+    let root_validity = validity(ROOT_NOT_BEFORE, ROOT_NOT_AFTER)?;
+    let int_validity = validity(INT_NOT_BEFORE, INT_NOT_AFTER)?;
+    let issuing_validity = validity(
+        now_unix.saturating_sub(3 * DAY),
+        now_unix.saturating_add(11 * DAY),
+    )?;
+    // The root uses PrintableString except for its IA5String email.
+    let root_dn = dn(&[
+        (oid::COUNTRY, Printable, "US"),
+        (oid::STATE, Printable, "California"),
+        (oid::LOCALITY, Printable, "San Jose"),
+        (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+        (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
+        (oid::COMMON_NAME, Printable, "Zscaler Root CA"),
+        (oid::EMAIL_ADDRESS, Ia5, "support@zscaler.com"),
+    ]);
+    // The intermediate has no locality and keeps the mailto: email prefix.
+    let int_cn = format!("Zscaler Intermediate Root CA ({cloud})");
+    let int_dn = dn(&[
+        (oid::COUNTRY, Printable, "US"),
+        (oid::STATE, Printable, "California"),
+        (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+        (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
+        (oid::COMMON_NAME, Printable, &int_cn),
+        (oid::EMAIL_ADDRESS, Ia5, "mailto:support@zscaler.com"),
+    ]);
+    // The issuing CA has no locality or email.
+    let issuing_cn = format!("{int_cn} (t)");
+    let issuing_dn = dn(&[
+        (oid::COUNTRY, Printable, "US"),
+        (oid::STATE, Printable, "California"),
+        (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+        (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
+        (oid::COMMON_NAME, Printable, &issuing_cn),
+    ]);
+
     let root_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
     let int_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
     let issuing_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
 
-    // §1 Root CA. C, ST, L, O, OU, CN, emailAddress; every attribute
-    // PrintableString except the IA5String email. O and OU are identical.
-    let root_dn = dn(&[
-        (oid::COUNTRY, StringKind::Printable, "US"),
-        (oid::STATE, StringKind::Printable, "California"),
-        (oid::LOCALITY, StringKind::Printable, "San Jose"),
-        (oid::ORGANIZATION, StringKind::Printable, "Zscaler Inc."),
-        (oid::ORGANIZATIONAL_UNIT, StringKind::Printable, "Zscaler Inc."),
-        (oid::COMMON_NAME, StringKind::Printable, "Zscaler Root CA"),
-        (oid::EMAIL_ADDRESS, StringKind::Ia5, "support@zscaler.com"),
-    ]);
-    // §2 Long-lived intermediate (depth 2). No locality; the email keeps
-    // the literal `mailto:` prefix seen in the capture.
-    let int_cn = format!("Zscaler Intermediate Root CA ({cloud})");
-    let int_dn = dn(&[
-        (oid::COUNTRY, StringKind::Printable, "US"),
-        (oid::STATE, StringKind::Printable, "California"),
-        (oid::ORGANIZATION, StringKind::Printable, "Zscaler Inc."),
-        (oid::ORGANIZATIONAL_UNIT, StringKind::Printable, "Zscaler Inc."),
-        (oid::COMMON_NAME, StringKind::Printable, &int_cn),
-        (
-            oid::EMAIL_ADDRESS,
-            StringKind::Ia5,
-            "mailto:support@zscaler.com",
-        ),
-    ]);
-    // §3 Short-lived "(t)" issuing CA (depth 1). No locality, no email; the
-    // common name is the intermediate's with " (t)" appended.
-    let issuing_cn = format!("{int_cn} (t)");
-    let issuing_dn = dn(&[
-        (oid::COUNTRY, StringKind::Printable, "US"),
-        (oid::STATE, StringKind::Printable, "California"),
-        (oid::ORGANIZATION, StringKind::Printable, "Zscaler Inc."),
-        (oid::ORGANIZATIONAL_UNIT, StringKind::Printable, "Zscaler Inc."),
-        (oid::COMMON_NAME, StringKind::Printable, &issuing_cn),
-    ]);
-
     let root_key_id = root_key.key_identifier();
     let root_serial = serial(fcx, true);
-    // The root's authority key identifier carries all three forms: the key
-    // id, the issuer's own directory name, and the issuer's serial.
-    let root = issue(
+    let root = certificate(
         &root_key,
         &root_key,
         root_dn.clone(),
         root_dn.clone(),
-        validity(ROOT_NOT_BEFORE, ROOT_NOT_AFTER)?,
+        root_validity,
         root_serial.clone(),
         vec![
             x509::SubjectKeyIdentifier(root_key_id.clone()).to_extension(false)?,
@@ -130,43 +106,41 @@ pub fn zscaler(fcx: &Cx, cloud: &str, now_unix: i64) -> Result<Zscaler> {
                 path_len: None,
             }
             .to_extension(true)?,
-            KeyUsage(KeyUsage::DIGITAL_SIGNATURE | KeyUsage::KEY_CERT_SIGN | KeyUsage::CRL_SIGN)
-                .to_extension(true)?,
             x509::AuthorityKeyIdentifier {
                 key_id: Some(root_key_id.clone()),
                 issuer: Some(vec![GeneralName::Directory(root_dn.clone())]),
                 serial: Some(root_serial),
             }
             .to_extension(false)?,
+            KeyUsage(KeyUsage::DIGITAL_SIGNATURE | KeyUsage::KEY_CERT_SIGN | KeyUsage::CRL_SIGN)
+                .to_extension(true)?,
         ],
     )?;
 
     let int_key_id = int_key.key_identifier();
-    let int = issue(
+    let int = certificate(
         &int_key,
         &root_key,
         int_dn.clone(),
         root_dn,
-        validity(INT_NOT_BEFORE, INT_NOT_AFTER)?,
+        int_validity,
         serial(fcx, false),
         ca_extensions(&int_key_id, &root_key_id)?,
     )?;
 
     let issuing_key_id = issuing_key.key_identifier();
-    // The "(t)" CA is rotated weekly; its ~two-week window straddles now.
-    let issuing = issue(
+    let issuing = certificate(
         &issuing_key,
         &int_key,
         issuing_dn.clone(),
         int_dn,
-        validity(now_unix - 3 * DAY, now_unix + 11 * DAY)?,
+        issuing_validity,
         serial(fcx, false),
         ca_extensions(&issuing_key_id, &int_key_id)?,
     )?;
 
     Ok(Zscaler {
         root_pem: pem(&root)?,
-        root_der: root.to_bytes()?.into(),
         issuing_key,
         issuing_subject: issuing_dn,
         issuing_key_id,
@@ -181,59 +155,46 @@ impl Zscaler {
         &self.root_pem
     }
 
-    /// The root certificate as DER.
-    pub fn root_der(&self) -> &CertificateDer<'static> {
-        &self.root_der
-    }
-
-    /// Mints a leaf for `names` (the site's SANs; the first is the common
-    /// name), re-signed by the "(t)" issuing CA, and returns the chain the
-    /// world presents in a handshake (leaf, then both intermediate CAs,
-    /// never the root) and the leaf's private key. The leaf's window
-    /// straddles `now_unix`.
-    pub fn issue(
-        &self,
-        fcx: &Cx,
-        names: &[&str],
-        now_unix: i64,
-    ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-        let leaf_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
+    /// Mints a leaf for `names`, the site's SANs, signed by the "(t)" issuing CA.
+    /// Returns the leaf's private key and the chain the world presents in a
+    /// handshake: the leaf, then both intermediate CAs, without the root.
+    /// The leaf's window straddles `now_unix`. The first name is the common
+    /// name, cut to 64 characters.
+    pub fn issue(&self, fcx: &Cx, names: &[&str], now_unix: i64) -> Result<Leaf> {
+        let validity = validity(
+            now_unix.saturating_sub(DAY),
+            now_unix.saturating_add(395 * DAY),
+        )?;
+        let sans = x509::SubjectAltName(
+            names
+                .iter()
+                .map(|name| GeneralName::from_host(name))
+                .collect(),
+        );
         let cn = names
             .first()
             .ok_or_else(|| Error::msg("a leaf needs at least one name"))?;
-        // The leaf's subject carries the origin's host as the common name
-        // but Zscaler's own O and OU, and no country, state, locality or
-        // email. A wildcard host is not a PrintableString, so the common
-        // name is UTF-8.
+        let cn = cn.chars().take(64).collect::<String>();
+        // Wildcards need UTF8String rather than PrintableString.
         let subject = dn(&[
-            (oid::COMMON_NAME, StringKind::Utf8, cn),
-            (oid::ORGANIZATION, StringKind::Printable, "Zscaler Inc."),
-            (oid::ORGANIZATIONAL_UNIT, StringKind::Printable, "Zscaler Inc."),
+            (oid::COMMON_NAME, Utf8, &cn),
+            (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+            (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
         ]);
-        let sans = names
-            .iter()
-            .map(|name| match name.parse::<IpAddr>() {
-                Ok(IpAddr::V4(ip)) => GeneralName::Ip(ip.octets().to_vec()),
-                Ok(IpAddr::V6(ip)) => GeneralName::Ip(ip.octets().to_vec()),
-                Err(_) => GeneralName::Dns((*name).to_string()),
-            })
-            .collect();
-        // serverAuth, a server leaf's key usage, the origin's names, and the
-        // issuer's key id. No basic constraints (not a CA), and no SCT, AIA
-        // or CRL: a re-signed inspection leaf is never logged and carries
-        // the whole chain inline.
-        let leaf = issue(
+        let leaf_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
+        // No basic constraints, SCT, AIA, or CRL distribution points.
+        let leaf = certificate(
             &leaf_key,
             &self.issuing_key,
             subject,
             self.issuing_subject.clone(),
-            validity(now_unix - DAY, now_unix + 395 * DAY)?,
+            validity.clone(),
             serial(fcx, false),
             vec![
                 KeyUsage(KeyUsage::DIGITAL_SIGNATURE | KeyUsage::KEY_ENCIPHERMENT)
                     .to_extension(true)?,
                 x509::ExtendedKeyUsage(vec![object_id(oid::SERVER_AUTH)]).to_extension(false)?,
-                x509::SubjectAltName(sans).to_extension(false)?,
+                sans.to_extension(false)?,
                 x509::SubjectKeyIdentifier(leaf_key.key_identifier()).to_extension(false)?,
                 x509::AuthorityKeyIdentifier {
                     key_id: Some(self.issuing_key_id.clone()),
@@ -245,32 +206,28 @@ impl Zscaler {
         )?;
         let mut chain = vec![leaf.to_bytes()?.into()];
         chain.extend(self.intermediates.iter().cloned());
-        Ok((chain, leaf_key.private_key_der()?.into()))
+        Ok(Leaf {
+            chain,
+            key: leaf_key.private_key_der()?.into(),
+            validity,
+        })
     }
 
     /// A rustls server configuration for a site at `names`: the chain from
     /// [`issue`](Self::issue) and its key, with the run's clock for
-    /// validity checks. `now` and `now_unix` are the same instant.
+    /// validity checks.
     pub fn server_config(
         &self,
         fcx: &Cx,
         names: &[&str],
         now: SystemTime,
-        now_unix: i64,
     ) -> Result<Arc<tls::ServerConfig>> {
-        let (chain, key) = self.issue(fcx, names, now_unix)?;
-        Ok(Arc::new(
-            tls::config_builder(fcx, now)
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(chain, key)?,
-        ))
+        let now_unix = i64::try_from(now.duration_since(SystemTime::UNIX_EPOCH)?.as_secs())?;
+        self.issue(fcx, names, now_unix)?.server_config(fcx, now)
     }
 }
 
-/// The extensions shared by both intermediate CAs: a critical CA basic
-/// constraint, a critical key usage for signing certificates and CRLs, this
-/// CA's own key id, and the parent's key id as the authority key id.
+/// The extensions shared by both intermediate CAs.
 fn ca_extensions(key_id: &[u8], parent_key_id: &[u8]) -> Result<Vec<x509::Extension>> {
     Ok(vec![
         x509::BasicConstraints {
@@ -292,7 +249,7 @@ fn ca_extensions(key_id: &[u8], parent_key_id: &[u8]) -> Result<Vec<x509::Extens
 
 /// Assembles a certificate: `subject_key`'s public key, signed by `signer`,
 /// with the caller's subject, issuer, validity, serial and extensions.
-fn issue(
+fn certificate(
     subject_key: &SigningKey,
     signer: &SigningKey,
     subject: x509::Name,
@@ -369,6 +326,8 @@ fn pem(cert: &x509::Certificate) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::protocols::asn1::{Reader, Rules};
+    use x509::{AuthorityKeyIdentifier, BasicConstraints, SubjectKeyIdentifier, Time, Version};
 
     /// The SCT (signed certificate timestamp) extension, 1.3.6.1.4.1.11129.2.4.2.
     const SCT: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0xd6, 0x79, 0x02, 0x04, 0x02];
@@ -391,10 +350,10 @@ mod tests {
             |fcx| async move {
                 let now = 1_800_000_000;
                 let z = zscaler(&fcx, DEFAULT_CLOUD, now)?;
-                let (chain, _key) =
+                let Leaf { chain, .. } =
                     z.issue(&fcx, &["example.test", "www.example.test"], now)?;
-
-                let verifier = verifier(z.root_der());
+                let root = x509::Certificate::from_pem(z.root_pem().as_bytes())?;
+                let verifier = verifier(&root.to_bytes()?.into());
                 let at = rustls::pki_types::UnixTime::since_unix_epoch(
                     std::time::Duration::from_secs(now as u64),
                 );
@@ -422,107 +381,363 @@ mod tests {
     }
 
     #[test]
-    fn the_fields_match_the_zscaler_layout() {
+    fn extreme_dates_return_errors() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(11)),
+            |fcx| async move {
+                let z = zscaler(&fcx, DEFAULT_CLOUD, 1_800_000_000)?;
+                for now in [i64::MIN, i64::MAX] {
+                    assert!(zscaler(&fcx, DEFAULT_CLOUD, now).is_err());
+                    assert!(z.issue(&fcx, &["example.test"], now).is_err());
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn long_leaf_names_keep_the_full_san() {
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(11)),
             |fcx| async move {
                 let now = 1_800_000_000;
                 let z = zscaler(&fcx, DEFAULT_CLOUD, now)?;
-                let (chain, _key) = z.issue(&fcx, &["example.test"], now)?;
-
-                let root = x509::Certificate::parse(z.root_der())?;
-                // RSA 2048 with a SHA-256 signature.
-                assert_eq!(root.signature_algorithm.oid.as_bytes(), oid::SHA256_WITH_RSA);
+                let name = format!("{}.test", "a".repeat(60));
+                let leaf = z.issue(&fcx, &[&name], now)?;
+                let cert = x509::Certificate::parse(&leaf.chain[0])?;
+                assert_eq!(cert.tbs.subject.common_name(), Some(&name[..64]));
                 assert_eq!(
-                    root.tbs.public_key.algorithm.oid.as_bytes(),
-                    oid::RSA_ENCRYPTION
+                    cert.tbs.get::<x509::SubjectAltName>()?,
+                    Some(x509::SubjectAltName(vec![GeneralName::Dns(name)]))
                 );
-                // A 2048-bit RSA public key is a ~270-byte RSAPublicKey.
-                assert!((260..=280).contains(&root.tbs.public_key.key.bytes().len()));
-                // The serial renders as sixteen hex digits: eight bytes with
-                // the top bit set, so a leading zero byte makes it positive.
-                assert_eq!(root.tbs.serial.len(), 9);
-                assert_eq!(root.tbs.serial[0], 0x00);
-                assert!(root.tbs.serial[1] & 0x80 != 0);
-                // Self-signed: issuer equals subject, seven attributes in order.
-                assert_eq!(root.tbs.issuer, root.tbs.subject);
-                assert_eq!(root.tbs.subject.rdns.len(), 7);
-                assert_eq!(root.tbs.subject.common_name(), Some("Zscaler Root CA"));
-                // The email is an IA5String; the rest are PrintableString.
-                match root.tbs.subject.find(oid::EMAIL_ADDRESS) {
-                    Some(x509::Value::Text { kind, text }) => {
-                        assert_eq!(*kind, StringKind::Ia5);
-                        assert_eq!(text, "support@zscaler.com");
-                    }
-                    other => panic!("unexpected email attribute: {other:?}"),
-                }
-                match root.tbs.subject.find(oid::COUNTRY) {
-                    Some(x509::Value::Text { kind, .. }) => {
-                        assert_eq!(*kind, StringKind::Printable)
-                    }
-                    other => panic!("unexpected country attribute: {other:?}"),
-                }
-                // Basic constraints critical CA:TRUE; key usage critical.
-                let bc = root
-                    .tbs
-                    .extension(oid::BASIC_CONSTRAINTS)
-                    .expect("basic constraints");
-                assert!(bc.critical);
-                assert!(root.tbs.get::<x509::BasicConstraints>()?.unwrap().ca);
-                assert!(
-                    root.tbs
-                        .extension(oid::KEY_USAGE)
-                        .expect("key usage")
-                        .critical
-                );
-                // The root's authority key id carries key id, issuer and serial.
-                let aki = root
-                    .tbs
-                    .get::<x509::AuthorityKeyIdentifier>()?
-                    .expect("authority key id");
-                assert!(aki.key_id.is_some());
-                assert!(aki.issuer.is_some());
-                assert_eq!(aki.serial.as_deref(), Some(root.tbs.serial.as_slice()));
-
-                // The first intermediate's common name carries the cloud; the
-                // issuing CA appends " (t)".
-                let int = x509::Certificate::parse(&chain[2])?;
-                let issuing = x509::Certificate::parse(&chain[1])?;
-                assert_eq!(
-                    int.tbs.subject.common_name(),
-                    Some("Zscaler Intermediate Root CA (zscalertwo.net)")
-                );
-                assert_eq!(
-                    issuing.tbs.subject.common_name(),
-                    Some("Zscaler Intermediate Root CA (zscalertwo.net) (t)")
-                );
-                // The first intermediate keeps the mailto: email quirk.
-                assert_eq!(
-                    int.tbs.subject.find(oid::EMAIL_ADDRESS).and_then(|v| v.as_text()),
-                    Some("mailto:support@zscaler.com")
-                );
-
-                // The leaf: the origin's name, Zscaler's O and OU, serverAuth,
-                // and no SCT, AIA or CRL.
-                let leaf = x509::Certificate::parse(&chain[0])?;
-                assert_eq!(leaf.tbs.subject.common_name(), Some("example.test"));
-                assert_eq!(
-                    leaf.tbs.subject.find(oid::ORGANIZATION).and_then(|v| v.as_text()),
-                    Some("Zscaler Inc.")
-                );
-                assert!(
-                    leaf.tbs
-                        .get::<x509::ExtendedKeyUsage>()?
-                        .unwrap()
-                        .contains(oid::SERVER_AUTH)
-                );
-                assert!(leaf.tbs.extension(SCT).is_none());
-                assert!(leaf.tbs.extension(oid::AUTHORITY_INFO_ACCESS).is_none());
-                assert!(leaf.tbs.extension(oid::CRL_DISTRIBUTION_POINTS).is_none());
-                assert!(leaf.tbs.extension(oid::BASIC_CONSTRAINTS).is_none());
                 Ok(())
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn chains_and_keys_follow_the_seed() {
+        fn run(seed: u64) -> Vec<Vec<u8>> {
+            let bytes = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
+            let output = bytes.clone();
+            fictionet::block_on(fictionet::lab(
+                fictionet::RunOptions::new(fictionet::Seed::from_u64(seed)),
+                move |fcx| async move {
+                    let z = zscaler(&fcx, DEFAULT_CLOUD, 1_800_000_000)?;
+                    let Leaf { chain, key, .. } =
+                        z.issue(&fcx, &["example.test"], 1_800_000_000)?;
+                    let mut result =
+                        vec![x509::Certificate::from_pem(z.root_pem().as_bytes())?.to_bytes()?];
+                    result.extend(chain.iter().map(|c| c.to_vec()));
+                    result.push(key.secret_der().to_vec());
+                    *output.lock() = result;
+                    Ok(())
+                },
+            ))
+            .unwrap();
+            std::mem::take(Arc::try_unwrap(bytes).unwrap().get_mut())
+        }
+        let first = run(11);
+        assert_eq!(first, run(11));
+        let other = run(12);
+        assert_eq!(first.len(), 5);
+        assert_eq!(other.len(), first.len());
+        for (i, (a, b)) in first.iter().zip(other).enumerate() {
+            assert_ne!(a, &b);
+            if i < 4 {
+                assert_ne!(
+                    x509::Certificate::parse(a).unwrap().tbs.public_key,
+                    x509::Certificate::parse(&b).unwrap().tbs.public_key
+                );
+            }
+        }
+    }
+
+    fn parsed_chain(seed: u64) -> [x509::Certificate; 4] {
+        let certificates = Arc::new(fictionet::sync::Mutex::new(None));
+        let output = certificates.clone();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(seed)),
+            move |fcx| async move {
+                let now = 1_800_000_000;
+                let z = zscaler(&fcx, DEFAULT_CLOUD, now)?;
+                let Leaf { chain, key, .. } = z.issue(
+                    &fcx,
+                    &["*.example.test", "example.test", "192.0.2.1", "2001:db8::1"],
+                    now,
+                )?;
+                assert_eq!(chain.len(), 3);
+                let root = x509::Certificate::from_pem(z.root_pem().as_bytes())?;
+                assert_eq!(pem(&root)?, z.root_pem());
+                let int = x509::Certificate::parse(&chain[2])?;
+                let issuing = x509::Certificate::parse(&chain[1])?;
+                let leaf = x509::Certificate::parse(&chain[0])?;
+                tls::config_builder(&fcx, SystemTime::UNIX_EPOCH)
+                    .with_safe_default_protocol_versions()?
+                    .with_no_client_auth()
+                    .with_single_cert(chain, key)?;
+                *output.lock() = Some([root, int, issuing, leaf]);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        Arc::try_unwrap(certificates)
+            .unwrap()
+            .get_mut()
+            .take()
+            .unwrap()
+    }
+
+    #[test]
+    fn names_match_the_zscaler_layout() -> Result {
+        let [root, int, issuing, leaf] = parsed_chain(11);
+        // The published root's subject DER contains only its public name fields.
+        let root_name = b"\x30\x81\xa1\x31\x0b\x30\x09\x06\x03U\x04\x06\x13\x02US\
+            \x31\x13\x30\x11\x06\x03U\x04\x08\x13\x0aCalifornia\
+            \x31\x11\x30\x0f\x06\x03U\x04\x07\x13\x08San Jose\
+            \x31\x15\x30\x13\x06\x03U\x04\x0a\x13\x0cZscaler Inc.\
+            \x31\x15\x30\x13\x06\x03U\x04\x0b\x13\x0cZscaler Inc.\
+            \x31\x18\x30\x16\x06\x03U\x04\x03\x13\x0fZscaler Root CA\
+            \x31\x22\x30\x20\x06\x09\x2a\x86H\x86\xf7\x0d\x01\x09\x01\x16\x13\
+            support@zscaler.com";
+        assert_eq!(root.tbs.subject.to_bytes()?, root_name);
+        let expected_name = |attributes: &[(&[u8], StringKind, &str)]| x509::Name {
+            rdns: attributes
+                .iter()
+                .map(|&(id, kind, text)| {
+                    vec![x509::Attribute {
+                        oid: Oid::from_contents(id).unwrap(),
+                        value: x509::Value::Text {
+                            kind,
+                            text: text.into(),
+                        },
+                    }]
+                })
+                .collect(),
+        };
+        assert_eq!(
+            int.tbs.subject,
+            expected_name(&[
+                (oid::COUNTRY, Printable, "US"),
+                (oid::STATE, Printable, "California"),
+                (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+                (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
+                (
+                    oid::COMMON_NAME,
+                    Printable,
+                    "Zscaler Intermediate Root CA (zscalertwo.net)"
+                ),
+                (oid::EMAIL_ADDRESS, Ia5, "mailto:support@zscaler.com"),
+            ])
+        );
+        assert_eq!(
+            issuing.tbs.subject,
+            expected_name(&[
+                (oid::COUNTRY, Printable, "US"),
+                (oid::STATE, Printable, "California"),
+                (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+                (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
+                (
+                    oid::COMMON_NAME,
+                    Printable,
+                    "Zscaler Intermediate Root CA (zscalertwo.net) (t)"
+                ),
+            ])
+        );
+        assert_eq!(
+            leaf.tbs.subject,
+            expected_name(&[
+                (oid::COMMON_NAME, Utf8, "*.example.test"),
+                (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+                (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
+            ])
+        );
+        for (cert, issuer) in [
+            (&root, &root),
+            (&int, &root),
+            (&issuing, &int),
+            (&leaf, &issuing),
+        ] {
+            assert_eq!(cert.tbs.issuer, issuer.tbs.subject);
+            assert_eq!(cert.tbs.issuer_unique_id, None);
+            assert_eq!(cert.tbs.subject_unique_id, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validity_matches_the_zscaler_layout() -> Result {
+        let [root, int, issuing, leaf] = parsed_chain(11);
+        assert_eq!(
+            root.tbs.validity,
+            x509::Validity {
+                not_before: Time::Utc("250202163820Z".into()),
+                not_after: Time::Generalized("20520620163820Z".into()),
+            }
+        );
+        assert_eq!(
+            int.tbs.validity,
+            x509::Validity {
+                not_before: Time::Utc("240101000000Z".into()),
+                not_after: Time::Utc("390101000000Z".into()),
+            }
+        );
+        assert_eq!(
+            issuing.tbs.validity,
+            x509::Validity {
+                not_before: Time::Utc("270112080000Z".into()),
+                not_after: Time::Utc("270126080000Z".into()),
+            }
+        );
+        assert_eq!(
+            leaf.tbs.validity,
+            x509::Validity {
+                not_before: Time::Utc("270114080000Z".into()),
+                not_after: Time::Utc("280214080000Z".into()),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keys_and_signatures_match_the_zscaler_layout() -> Result {
+        let [root, int, issuing, leaf] = parsed_chain(11);
+        assert_eq!(root.tbs.serial.len(), 9);
+        assert_eq!(root.tbs.serial[0], 0);
+        assert_ne!(root.tbs.serial[1] & 0x80, 0);
+        let signature_algorithm = x509::AlgorithmIdentifier {
+            oid: object_id(oid::SHA256_WITH_RSA),
+            parameters: Some(vec![5, 0]),
+        };
+        let public_key_algorithm = x509::AlgorithmIdentifier {
+            oid: object_id(oid::RSA_ENCRYPTION),
+            parameters: Some(vec![5, 0]),
+        };
+        for (cert, issuer) in [
+            (&root, &root),
+            (&int, &root),
+            (&issuing, &int),
+            (&leaf, &issuing),
+        ] {
+            let tbs = &cert.tbs;
+            assert_eq!(tbs.version, Version::V3);
+            assert_eq!(tbs.signature, signature_algorithm);
+            assert_eq!(cert.signature_algorithm, signature_algorithm);
+            assert_eq!(tbs.public_key.algorithm, public_key_algorithm);
+            assert_eq!(tbs.public_key.key.unused(), 0);
+            assert_eq!(tbs.public_key.key.bytes().len(), 270);
+            let mut r = Reader::new(tbs.public_key.key.bytes(), Rules::Der);
+            let mut rsa = r.read_sequence()?;
+            let n = rsa.read_integer()?;
+            assert_eq!(n.as_bytes().len(), 257);
+            assert_eq!(n.as_bytes()[0], 0);
+            assert_ne!(n.as_bytes()[1] & 0x80, 0);
+            assert_eq!(rsa.read_u64()?, 65_537);
+            rsa.finish()?;
+            r.finish()?;
+            assert_eq!(cert.signature.unused(), 0);
+            assert_eq!(cert.signature.bytes().len(), 256);
+            ring::signature::UnparsedPublicKey::new(
+                &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                issuer.tbs.public_key.key.bytes(),
+            )
+            .verify(&cert.tbs_der, cert.signature.bytes())
+            .unwrap();
+            if cert != &root {
+                assert_eq!(tbs.serial.len(), 8);
+                assert!((1..=0x7f).contains(&tbs.serial[0]));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn extensions_match_the_zscaler_layout() -> Result {
+        let [root, int, issuing, leaf] = parsed_chain(11);
+        let mut root_authority = vec![0x30, 0x81, 0xcb, 0x80, 0x14];
+        root_authority.extend(root.tbs.get::<SubjectKeyIdentifier>()?.unwrap().0);
+        root_authority.extend([0xa1, 0x81, 0xa7, 0xa4, 0x81, 0xa4]);
+        root_authority.extend(root.tbs.subject.to_bytes()?);
+        root_authority.extend([0x82, 9]);
+        root_authority.extend(&root.tbs.serial);
+        assert_eq!(
+            root.tbs
+                .extension(oid::AUTHORITY_KEY_IDENTIFIER)
+                .unwrap()
+                .value,
+            root_authority
+        );
+        let ski =
+            |cert: &x509::Certificate| cert.tbs.get::<SubjectKeyIdentifier>().unwrap().unwrap().0;
+        for (cert, issuer) in [
+            (&root, &root),
+            (&int, &root),
+            (&issuing, &int),
+            (&leaf, &issuing),
+        ] {
+            let tbs = &cert.tbs;
+            assert_eq!(
+                ski(cert),
+                ring::digest::digest(
+                    &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                    tbs.public_key.key.bytes(),
+                )
+                .as_ref()
+            );
+            let aki = AuthorityKeyIdentifier {
+                key_id: Some(ski(issuer)),
+                issuer: (cert == &root)
+                    .then(|| vec![GeneralName::Directory(root.tbs.subject.clone())]),
+                serial: (cert == &root).then(|| root.tbs.serial.clone()),
+            };
+            assert_eq!(tbs.get::<AuthorityKeyIdentifier>()?, Some(aki.clone()));
+            let own_ski = SubjectKeyIdentifier(ski(cert)).to_extension(false)?;
+            let authority = aki.to_extension(false)?;
+            let bc = BasicConstraints {
+                ca: true,
+                path_len: None,
+            }
+            .to_extension(true)?;
+            assert_eq!(bc.value, [0x30, 3, 1, 1, 0xff]);
+            let ca_ku = x509::Extension {
+                oid: object_id(oid::KEY_USAGE),
+                critical: true,
+                value: vec![3, 2, 1, 0x86],
+            };
+            let expected = if cert == &root {
+                vec![own_ski, bc, authority, ca_ku]
+            } else if cert != &leaf {
+                vec![bc, ca_ku, own_ski, authority]
+            } else {
+                vec![
+                    x509::Extension {
+                        oid: object_id(oid::KEY_USAGE),
+                        critical: true,
+                        value: vec![3, 2, 5, 0xa0],
+                    },
+                    x509::ExtendedKeyUsage(vec![object_id(oid::SERVER_AUTH)])
+                        .to_extension(false)?,
+                    x509::SubjectAltName(vec![
+                        GeneralName::Dns("*.example.test".into()),
+                        GeneralName::Dns("example.test".into()),
+                        GeneralName::Ip(vec![192, 0, 2, 1]),
+                        GeneralName::Ip(vec![
+                            0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ]),
+                    ])
+                    .to_extension(false)?,
+                    own_ski,
+                    authority,
+                ]
+            };
+            assert_eq!(tbs.extensions, expected);
+        }
+        assert!(leaf.tbs.extension(SCT).is_none());
+        assert!(leaf.tbs.extension(oid::AUTHORITY_INFO_ACCESS).is_none());
+        assert!(leaf.tbs.extension(oid::CRL_DISTRIBUTION_POINTS).is_none());
+        assert!(leaf.tbs.extension(oid::BASIC_CONSTRAINTS).is_none());
+        Ok(())
     }
 }

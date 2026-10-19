@@ -23,3 +23,7 @@ axum = { version = "0.8", default-features = false }
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+fictionet = { path = "../..", features = ["std"], default-features = false }
+ring = "0.17"
