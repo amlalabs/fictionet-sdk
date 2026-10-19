@@ -115,6 +115,9 @@
 //! The address flags (`--ip-addr`, `--gateway`, `--dns` and their IPv6
 //! forms) decide some of what happens below. [The VM's
 //! addresses](crate::guide::attaching#the-vms-addresses) explains them.
+//! [`Link::new`](crate::stdlib::network::ethernet::Link::new) checks the leases
+//! before any frames arrive. It rejects invalid prefixes and IPv4 leases
+//! with no address for the DHCP server.
 //!
 //! **What the sandbox sends.** A VM's kernel has an Ethernet card, such as
 //! a virtio-net card under QEMU. It sends Ethernet frames: IP packets with
@@ -162,43 +165,47 @@
 //! drops frames from any other MAC after that. Then it looks at the
 //! EtherType:
 //!
-//! - **ARP.** `ether::arp_reply` answers every request with attach's own
+//! - **ARP.** `frame::arp_reply` answers every request with attach's own
 //!   MAC, `02:66:6e:00:00:01`, whatever address is asked for, as a proxy
 //!   ARP router does. It stays quiet for ARP probes, gratuitous ARP, and
 //!   the address attach handed the VM, so the VM never sees its own
 //!   address as taken. ARP never reaches the world.
-//! - **IPv4.** `ether::ip_packet` takes the IP packet out of the frame,
+//! - **IPv4.** `frame::ip_packet` takes the IP packet out of the frame,
 //!   without the padding Ethernet adds to short frames. It checks the
 //!   version and that the lengths in the header fit the frame, but not
-//!   the checksum. `ether::upper` then reads the transport, as described
+//!   the checksum. `frame::upper` then reads the transport, as described
 //!   below, and drops a packet it cannot read. A DHCP request (UDP to port 67) is answered,
 //!   passed on or dropped, as the table below says. Other packets from
 //!   `0.0.0.0` stay on the link, unless the IPv4 address flags were left
 //!   out. When attach handed out the address, packets from any other
 //!   source address are dropped. The rest go to the world.
-//! - **IPv6.** `ether::upper` reads the transport past any extension
+//! - **IPv6.** `frame::upper` reads the transport past any extension
 //!   headers, and drops a packet it cannot read. A neighbor solicitation gets a neighbor advertisement from
-//!   `ether::neighbor_advert`, with attach's MAC and the router flag set,
+//!   `frame::neighbor_advert`, with attach's MAC and the router flag set,
 //!   for the same reason ARP does. It stays quiet for duplicate address
 //!   detection (source `::`), for a multicast target or the address attach
-//!   handed the VM, and for a solicitation that is not valid. No neighbor
-//!   solicitation reaches the world. Router advertisements, neighbor
+//!   handed the VM, for a target equal to its source, and for a solicitation
+//!   that is not valid. No neighbor solicitation reaches the world. Router advertisements, neighbor
 //!   advertisements and redirects from the VM are dropped. Router
-//!   solicitations and DHCPv6 requests (UDP to port 547) are handled as
+//!   solicitations are checked for hop limit, code, length and options.
+//!   Valid solicitations and DHCPv6 requests (UDP to port 547) are handled as
 //!   the table below says. Packets from `::` or a link-local address stay
 //!   on the link, unless the IPv6 address flags were left out. When attach
 //!   handed out the address, packets from any other source are dropped.
 //!   The rest go to the world.
 //! - **Anything else,** such as VLAN-tagged frames or LLDP, is dropped.
 //!
-//! `ether::upper` finds the transport with
+//! `frame::upper` finds the transport with
 //! [`ip::Header::check`](crate::stdlib::network::ip::Header::check), the parser that
 //! [`ip::split_protocols`](crate::stdlib::network::ip::split_protocols) uses. So
 //! attach walks the same IPv6 extension headers as the world's stack
 //! (hop-by-hop, routing, destination options, authentication and
-//! fragment), with no limit on how many. A packet whose
-//! headers run past its end, whose UDP header is cut short or whose UDP
-//! length does not fit, or whose ICMPv6 header is cut short, is dropped.
+//! fragment), with no limit on how many. A packet that calls for an ICMPv6
+//! Parameter Problem reaches the world after source-address checks, unless
+//! it hides neighbor discovery (ICMPv6 types 133 through 137). The world
+//! decides whether to generate the error. Other packets whose headers run
+//! past their end, whose UDP header is cut short or whose UDP length does
+//! not fit, or whose ICMPv6 header is cut short, are dropped.
 //! Attach does not put fragments back together. The transport header is
 //! in the first fragment, so attach reads it there. It drops neighbor
 //! discovery in a fragment, which RFC 6980 forbids, and never answers a
@@ -215,6 +222,19 @@
 //! | `--ip-addr` (or `--ip-addr-v6`) given | attach answers: `addresses::dhcp4`, or `addresses::router_advert` and `addresses::dhcp6`, with the address, gateway, DNS server and MTU from the flags | passed to the world only from the address attach handed out |
 //! | all three of the family left out | passed to the world as ordinary packets; DHCP and DHCPv6 fragmented or not, router solicitations only whole | passed to the world, including those from `0.0.0.0`, `::` and link-local addresses |
 //! | `--no-ip-addr` (or `--no-ip-addr-v6`) | dropped | passed to the world, except those from `0.0.0.0`, `::` and link-local addresses |
+//!
+//! The DHCPv6 server follows RFC 8415 on which messages it answers.
+//! Solicit, Confirm and Rebind must not name a server. Request, Renew,
+//! Release and Decline must name this one. An Information-request may name
+//! this server or none, and may not hold an identity association (IA).
+//! Solicit, Confirm, Rebind and Information-request sent to a unicast
+//! address are dropped. Other unicast requests get UseMulticast. The first
+//! IA_NA gets the lease. Later IA_NAs and any IA_TA get NoAddrsAvail, and
+//! an IA_PD gets NoPrefixAvail. A Request that names an address outside
+//! the prefix gets NotOnLink for that IA. Request, Renew and Rebind hand
+//! back any other address the VM holds with lifetimes of 0. Confirm
+//! succeeds only for the address attach handed out, and gets no answer
+//! when it names no address.
 //!
 //! When attach hands out IPv6, it also sends router advertisements without
 //! being asked: one as soon as it starts relaying, and then one every 10
@@ -240,9 +260,11 @@
 //! **The way back.** [`Link::to_vm`](crate::stdlib::network::ethernet::Link::to_vm) drops a packet from the world that is
 //! longer than `--mtu` or is not IPv4 or IPv6. For the rest, it builds an
 //! Ethernet header. The source is attach's MAC. The destination is the
-//! VM's MAC, or broadcast for `255.255.255.255` or while the VM's MAC is
-//! not known yet, or the matching multicast MAC (`01:00:5e:...` or
-//! `33:33:...`) for a multicast address (`ether::destination`). The
+//! VM's MAC for unicast, or broadcast for `255.255.255.255` and the served
+//! IPv4 subnet's directed broadcast. Prefixes /31 and /32 have no directed
+//! broadcast. Without a served subnet, directed broadcasts use the VM's MAC.
+//! Unicast is dropped until that MAC is known. Multicast uses the matching
+//! MAC (`01:00:5e:...` or `33:33:...`) (`frame::destination`). The
 //! EtherType comes from the packet's version. The header and the packet
 //! go to the VM as one frame: through the `Outbox` to QEMU's socket, or
 //! with one `writev` to attach's TAP device, which the redirect passes to
@@ -418,7 +440,7 @@
 //!    `frame_from_vm` answers it, and the REQUEST after it, with
 //!    `addresses::dhcp4`. The world sees neither.
 //! 2. Before it sends its first packet to `10.0.0.1`, the VM's kernel asks
-//!    for the gateway's MAC with ARP. `ether::arp_reply` answers with
+//!    for the gateway's MAC with ARP. `frame::arp_reply` answers with
 //!    `02:66:6e:00:00:01`. The world does not see this either. After the
 //!    request, `ip neigh` in the VM showed `10.0.0.1 dev ens3 lladdr
 //!    02:66:6e:00:00:01 REACHABLE`.

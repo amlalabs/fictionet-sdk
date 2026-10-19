@@ -264,10 +264,11 @@ pub async fn start(config: Config) -> Result<World> {
 }
 
 /// Moves frames between the guest (through the backend) and the world,
-/// answering ARP and the link-local questions itself, as the CLI's tun
+/// answering ARP and the link-local questions itself, as the CLI's TAP
 /// lowering does.
 async fn bridge(mut to_world: UnboundedReceiver<Vec<u8>>, rx: RxQueue, mut sandbox: End, fcx: Cx) {
-    let mut link = Link::new(Family::FromWorld, Family::Off, MTU);
+    let mut link = Link::new(Family::FromWorld, Family::Off, MTU)
+        .expect("a link without served leases is valid");
     loop {
         tokio::select! {
             frame = to_world.recv() => {
