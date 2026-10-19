@@ -17,11 +17,15 @@
 //! [`packages`] builds the seeded wheels. [`repository`] serves the indexes,
 //! storage API and cache. [`ssrf`] extracts off-site request targets without
 //! fetching them. [`events`] defines the log format and [`log`] writes it.
+//! [`inventory`] is the revisioned package and cache snapshot a dashboard may
+//! show. [`facts`] projects request rows and door attempts from observer events.
 //! This module issues certificates and connects the sites to the packet network.
 
 #![warn(missing_docs)]
 
 pub mod events;
+pub mod facts;
+pub mod inventory;
 pub mod log;
 pub mod packages;
 pub mod repository;
