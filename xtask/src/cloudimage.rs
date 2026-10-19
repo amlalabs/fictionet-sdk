@@ -5,20 +5,18 @@
 //! each file pinned by the sha256 Canonical signs in its `SHA256SUMS`: the
 //! image, its matching kernel and initrd. The image is never modified; the
 //! kernel and initrd boot it directly, so nothing is extracted or rebuilt.
-//! A Cloud Hypervisor static binary is also pinned; it booted the image
-//! unmodified in a probe, and the pin is kept for whichever hypervisor the
-//! single-process demo settles on.
+//! Cloud Hypervisor's static binary is pinned too; the demo embeds it and
+//! runs it from memory.
 //!
-//! Turning a download into a per-run overlay and cloud-init seed is the
-//! `cloudimage` demo binary; booting it is the hypervisor's job.
+//! Turning a download into a per-run overlay and cloud-init seed, and
+//! booting it, is the `cloudimage` demo binary's job.
 
 use std::path::Path;
 
 use crate::process::{Result, capture, cmd, run as execute};
 use crate::vm::{download, private_dir};
 
-/// A Cloud Hypervisor static x86-64 release binary (used in the boot probe;
-/// kept pinned pending the single-process hypervisor choice).
+/// Cloud Hypervisor's static x86-64 release binary, which the demo embeds.
 const CH_URL: &str = "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/cloud-hypervisor-static";
 const CH_SHA256: &str = "4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b";
 

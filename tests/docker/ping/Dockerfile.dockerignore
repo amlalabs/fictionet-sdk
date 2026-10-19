@@ -9,10 +9,9 @@
 !codegen
 !xtask
 !demos
-!microvm
 !tests
 !examples
 **/target
 **/.venv
 **/__pycache__
-demos/assets
+demos/downloads

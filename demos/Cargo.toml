@@ -3,16 +3,14 @@ name = "fictionet-demo"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
-description = "Fictionet's demos as one program: the world in the process, the sandbox in an embedded microVM."
+description = "Fictionet's VM demo: Ubuntu's official cloud image in an embedded Cloud Hypervisor, networked by a world in the same process."
 license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
 example-common = { path = "../examples/common" }
 fictionet = { path = "..", features = ["web-proxy"] }
-fictionet-microvm = { path = "../microvm" }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync"] }
 bytes = "1"
 http = "1.5.0"
 http-body = "1.1.0"

@@ -1,29 +1,19 @@
-//! The guest assets are embedded when `cargo xtask microvm` has made them,
-//! so a workspace build without them still compiles; the program then says
-//! how to make them. The same goes for noVNC, which `cargo xtask cloudimage`
-//! unpacks into `downloads/cloudimage/novnc`: its files become a table in
-//! `OUT_DIR/novnc.rs`, empty without them. Cloud Hypervisor's static binary,
-//! when `cargo xtask cloudimage` has downloaded it, is embedded the same way
-//! (`OUT_DIR/ch_bin.rs`, `None` without it) so the cloud-image demo can run it
-//! from memory with nothing written to disk.
+//! Embeds the files `cargo xtask cloudimage` downloads to
+//! `downloads/cloudimage` when they are there, so a workspace build without
+//! them still compiles. noVNC's files become a table in `OUT_DIR/novnc.rs`,
+//! empty without them.
+//! Cloud Hypervisor's static binary becomes `OUT_DIR/ch_bin.rs`, `None`
+//! without it, so the cloud-image demo can run it from memory with nothing
+//! written to disk.
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-const ASSETS: [&str; 3] = ["kernel.zst", "agentd.zst", "rootfs.ext4.zst"];
-
 fn main() {
-    println!("cargo::rerun-if-changed=assets");
     println!("cargo::rerun-if-changed=downloads/cloudimage/novnc");
-    println!("cargo::rustc-check-cfg=cfg(guest_assets)");
     // Read at run time: a build script compiled for another checkout that
     // shares the target directory would carry that checkout's path.
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));
-    let dir = manifest.join("assets");
-    if ASSETS.iter().all(|name| dir.join(name).is_file()) {
-        println!("cargo::rustc-cfg=guest_assets");
-    }
-
     let novnc = manifest.join("downloads/cloudimage/novnc");
     let mut files = Vec::new();
     if novnc.is_dir() {

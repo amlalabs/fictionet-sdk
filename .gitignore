@@ -1,8 +1,6 @@
-# Build output, here and in the examples' own packages, the guest assets
-# `cargo xtask microvm` makes for the demo, and the images and binaries
-# `cargo xtask cloudimage` downloads
+# Build output, here and in the examples' own packages, and the images and
+# binaries `cargo xtask cloudimage` downloads
 target/
-/demos/assets/
 /demos/downloads/
 # Python environments, caches and eval logs
 .venv/
