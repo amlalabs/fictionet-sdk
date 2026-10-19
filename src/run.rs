@@ -1,6 +1,6 @@
 use fictionet::sync::Mutex;
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::Location;
@@ -60,7 +60,7 @@ impl RunOptions {
         }
     }
 
-    /// Installs the run's event destination.
+    /// Installs the run's destination for events, packets, TLS keys and topology.
     pub fn observer(mut self, observer: Arc<dyn crate::events::Observer>) -> Self {
         self.observer = Some(observer);
         self
@@ -238,6 +238,7 @@ where
     let root = Region::root(Arc::downgrade(&shared));
     let mut state = RunState {
         shared: shared.clone(),
+        dispatch: shared.observer.shared().cloned(),
         root: root.clone(),
         slots: BTreeMap::new(),
         turn: VecDeque::new(),
@@ -254,6 +255,7 @@ where
     shared
         .graph
         .task_started(id, Cow::Borrowed("world"), Location::caller(), None);
+    shared.task_added(id);
     let start = shared.start.lock().take();
     if let Some(mut event) = start {
         event.origin = shared.graph.origin(id);
@@ -264,7 +266,10 @@ where
         region: root.clone(),
         group: None,
     };
-    let future = world(cx);
+    let future = {
+        let _guard = CurrentGuard::enter(&shared.graph, id, Waker::noop(), &mut state.dispatch);
+        world(cx)
+    };
     if root.try_start_task() {
         shared.queue.lock().incoming.push(NewTask {
             id,
@@ -273,17 +278,36 @@ where
             join: Arc::new(JoinState::default()),
         });
     } else {
-        shared.graph.task_ended(id);
+        drop(future);
+        shared.task_removed(id);
     }
     std::future::poll_fn(move |cx| state.poll(cx)).await
 }
 
 type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 
+/// Shares dispatch only when a destination is installed.
+pub(crate) struct RunObserver(Option<Arc<crate::events::Dispatch>>);
+
+impl RunObserver {
+    pub(crate) fn shared(&self) -> Option<&Arc<crate::events::Dispatch>> {
+        self.0.as_ref()
+    }
+}
+
+impl std::ops::Deref for RunObserver {
+    type Target = crate::events::Dispatch;
+    fn deref(&self) -> &Self::Target {
+        static ABSENT: crate::events::Dispatch = crate::events::Dispatch::empty();
+        self.0.as_deref().unwrap_or(&ABSENT)
+    }
+}
+
 /// The part of a run that wakers and every [`Cx`] share.
 pub(crate) struct RunShared {
     pub(crate) environment: Arc<crate::environment::RunEnvironment>,
-    pub(crate) observer: crate::events::Dispatch,
+    pub(crate) observer: RunObserver,
+    pub(crate) next_group: AtomicU64,
     start: Mutex<Option<crate::events::Event>>,
     /// The run's TLS key log, shared with the graph for observers.
     #[cfg(feature = "observe")]
@@ -400,15 +424,17 @@ impl RunShared {
         } else {
             crate::sys::UNIX_EPOCH
         };
-        let observer = crate::events::Dispatch::new(observer);
+        let observer = RunObserver(observer.map(|observer| {
+            crate::events::Dispatch::for_run(Some(observer), run_id, &environment.clock)
+        }));
         let start = observer
-            .enabled(
+            .enabled(crate::events::Interest::Event(
                 crate::events::Metadata {
                     source: "run",
                     kind: "start",
                 },
                 &crate::events::ConnInfo::default(),
-            )
+            ))
             .then(|| {
                 crate::events::Event::new("run", "start")
                     .summary("the run started")
@@ -441,6 +467,7 @@ impl RunShared {
         Arc::new(Self {
             environment,
             observer,
+            next_group: AtomicU64::new(1),
             start: Mutex::new(start),
             #[cfg(feature = "observe")]
             keys,
@@ -450,6 +477,32 @@ impl RunShared {
             }),
             graph,
         })
+    }
+
+    fn task_added(&self, id: u64) {
+        use crate::events::{GroupId, TaskId, TopologyKind, TopologyRef};
+        if !self.observer.topology_enabled(TopologyKind::Task) {
+            return;
+        }
+        let info = self.graph.state().tasks.get(&id).cloned();
+        if let Some(info) = info {
+            self.observer.topology(TopologyRef::TaskAdded {
+                task: TaskId(id),
+                parent: (info.parent != 0).then_some(TaskId(info.parent)),
+                name: &info.name,
+                file: info.file,
+                line: info.line,
+                group: info.group.as_ref().map(|g| GroupId(g.id)),
+            });
+        }
+    }
+
+    fn task_removed(&self, id: u64) {
+        self.observer
+            .topology(crate::events::TopologyRef::TaskRemoved {
+                task: crate::events::TaskId(id),
+            });
+        self.graph.task_ended(id);
     }
 
     pub(crate) fn end(&self) {
@@ -548,6 +601,7 @@ impl Wake for TaskWaker {
 }
 
 struct Slot {
+    started: bool,
     future: BoxFuture,
     task_waker: Arc<TaskWaker>,
     waker: Waker,
@@ -557,12 +611,12 @@ struct Slot {
 
 /// A task number qualified by its run.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TaskId {
-    run: u64,
+pub(crate) struct RunTask {
+    pub(crate) run: u64,
     pub(crate) id: u64,
 }
 
-impl TaskId {
+impl RunTask {
     pub(crate) fn current() -> Option<Self> {
         CURRENT.with(Cell::get).map(|current| current.task)
     }
@@ -580,19 +634,24 @@ impl TaskId {
 
 #[derive(Clone, Copy)]
 struct CurrentTask {
-    task: TaskId,
+    task: RunTask,
     waker: *const (),
 }
 
 thread_local! {
     /// The run, task and waker being polled on this thread, if any.
+    static DISPATCH: RefCell<Option<Arc<crate::events::Dispatch>>> = const { RefCell::new(None) };
     static CURRENT: Cell<Option<CurrentTask>> = const { Cell::new(None) };
+}
+
+pub(crate) fn with_dispatch(f: impl FnOnce(Option<&Arc<crate::events::Dispatch>>)) {
+    DISPATCH.with(|dispatch| f(dispatch.borrow().as_ref()));
 }
 
 /// The task this thread is polling in `graph`, or 0.
 #[inline]
 pub(crate) fn current_task(graph: &Graph) -> u64 {
-    TaskId::current().map_or(0, |t| t.in_graph(graph))
+    RunTask::current().map_or(0, |t| t.in_graph(graph))
 }
 
 /// Whether `waker` is the waker of the task of `run` that is being polled
@@ -604,30 +663,51 @@ pub(crate) fn is_current_task(run: &Arc<RunShared>, waker: &Waker) -> bool {
     })
 }
 
-/// Restores [`CURRENT`] when a poll ends, even by a panic.
-struct CurrentGuard(Option<CurrentTask>);
+/// Restores [`CURRENT`] when a poll ends, even by a panic. Topology the
+/// poll produces is delivered after it returns, outside any lock the task
+/// held.
+struct CurrentGuard<'a> {
+    previous: Option<CurrentTask>,
+    dispatch: &'a mut Option<Arc<crate::events::Dispatch>>,
+    previous_dispatch: Option<Arc<crate::events::Dispatch>>,
+    _topology: crate::events::staging::Scope,
+}
 
-impl CurrentGuard {
-    fn enter(graph: &Graph, id: u64, waker: &Waker) -> Self {
+impl<'a> CurrentGuard<'a> {
+    fn enter(
+        graph: &Graph,
+        id: u64,
+        waker: &Waker,
+        dispatch: &'a mut Option<Arc<crate::events::Dispatch>>,
+    ) -> Self {
         let current = CurrentTask {
-            task: TaskId {
+            task: RunTask {
                 run: graph.run_id,
                 id,
             },
             waker: waker.data(),
         };
-        Self(CURRENT.with(|c| c.replace(Some(current))))
+        let topology = crate::events::staging::Scope::new(dispatch.as_ref());
+        let previous_dispatch = DISPATCH.with(|d| d.replace(dispatch.take()));
+        Self {
+            previous: CURRENT.with(|c| c.replace(Some(current))),
+            dispatch,
+            previous_dispatch,
+            _topology: topology,
+        }
     }
 }
 
-impl Drop for CurrentGuard {
+impl Drop for CurrentGuard<'_> {
     fn drop(&mut self) {
-        CURRENT.with(|c| c.set(self.0));
+        CURRENT.with(|c| c.set(self.previous));
+        *self.dispatch = DISPATCH.with(|d| d.replace(self.previous_dispatch.take()));
     }
 }
 
 /// The state of a run that only the future returned by [`run`] touches.
 struct RunState {
+    dispatch: Option<Arc<crate::events::Dispatch>>,
     shared: Arc<RunShared>,
     root: Arc<Region>,
     /// Live tasks in spawn order, including when their futures are dropped.
@@ -663,6 +743,7 @@ impl RunState {
                 self.slots.insert(
                     new.id,
                     Slot {
+                        started: false,
                         future: new.future,
                         task_waker,
                         waker,
@@ -686,13 +767,20 @@ impl RunState {
             std::mem::swap(&mut q.ready, &mut turn);
         }
 
+        for &id in &turn {
+            if id != 1 && self.slots.get(&id).is_some_and(|s| !s.started) {
+                self.shared.task_added(id);
+                self.slots.get_mut(&id).unwrap().started = true;
+            }
+        }
         while let Some(id) = turn.pop_front() {
             let Some(slot) = self.slots.get_mut(&id) else {
                 continue;
             };
             slot.task_waker.queued.store(false, Ordering::Release);
             let result = {
-                let _guard = CurrentGuard::enter(&self.shared.graph, id, &slot.waker);
+                let _guard =
+                    CurrentGuard::enter(&self.shared.graph, id, &slot.waker, &mut self.dispatch);
                 slot.future
                     .as_mut()
                     .poll(&mut Context::from_waker(&slot.waker))
@@ -723,7 +811,7 @@ impl RunState {
                 // 2. Drop the work, so its interfaces close before a joiner
                 //    or the region sees it as ended.
                 drop(future);
-                self.shared.graph.task_ended(id);
+                self.shared.task_removed(id);
                 // 3. The joiner's result, before the failure cancels the
                 //    region the joiner may be waiting in.
                 join.finish(joined);
@@ -787,10 +875,16 @@ impl Drop for RunState {
             .map(|t| t.join.clone())
             .chain(self.slots.values().map(|s| s.join.clone()))
             .collect();
-        drop(incoming);
+        for task in incoming {
+            self.shared.task_added(task.id);
+            let id = task.id;
+            drop(task);
+            self.shared.task_removed(id);
+        }
         // Task destructors run in ascending task ID order.
-        for slot in std::mem::take(&mut self.slots).into_values() {
+        for (id, slot) in std::mem::take(&mut self.slots) {
             drop(slot);
+            self.shared.task_removed(id);
         }
         // Work spawned while the slots were dropped.
         let late = std::mem::take(&mut self.shared.queue.lock().incoming);

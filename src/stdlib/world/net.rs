@@ -704,7 +704,7 @@ fn make_lans(
 fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
     let gateways = std::iter::once(IpAddr::V4(shared.subnet.gateway))
         .chain(shared.subnet6.map(|s| IpAddr::V6(s.gateway)));
-    let fcx = &shared.fcx.group("gateway");
+    let fcx = &shared.fcx.host("gateway");
     for gateway in gateways {
         let (router_side, side) = link();
         shared
@@ -716,12 +716,7 @@ fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
     for seg in shared.lans.values() {
         let (lan_side, side) = link();
         seg.lan.add(seg.dns, Box::new(lan_side), None)?;
-        let tcp = start_dns(
-            shared.dns(),
-            &shared.fcx.group("lan gateway"),
-            side,
-            seg.dns,
-        )?;
+        let tcp = start_dns(shared.dns(), &shared.fcx.host("lan gateway"), side, seg.dns)?;
         shared.gateway_tcp.lock().push(tcp);
     }
     Ok(())

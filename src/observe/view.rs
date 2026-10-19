@@ -525,7 +525,14 @@ mod tests {
     fn retain_at(graph: &Graph, seq: u64, event: Event) {
         use crate::events::{Observation, Observer, Stamp};
         let history = graph.events.as_ref().unwrap();
-        history.observe(Stamp { seq, at: event.at }, Observation::Event(&event));
+        history.observe(
+            Stamp {
+                stream: fictionet::events::Stream::Events,
+                seq,
+                at: event.at,
+            },
+            Observation::Event(&event),
+        );
     }
 
     fn serialization_graph() -> Arc<Graph> {
@@ -1021,13 +1028,22 @@ mod tests {
     /// A group that empties is announced gone, after its nodes.
     #[test]
     fn groups_come_and_go_with_their_tasks() {
-        let graph = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real)
-            .graph
-            .clone();
+        let run = crate::run::RunShared::new(crate::Seed::random(), crate::RunMode::Real);
+        let graph = run.graph.clone();
         graph.task_started(1, "world".into(), Location::caller(), None);
         let (mut view, _) = snapshot(&graph, None);
-        let outer = Group::new(graph.next_group(), "outer".into(), None);
-        let inner = Group::new(graph.next_group(), "inner".into(), Some(outer.clone()));
+        let next_group = || {
+            run.next_group
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let outer = Group::new(next_group(), "outer".into(), None, None, false);
+        let inner = Group::new(
+            next_group(),
+            "inner".into(),
+            Some(outer.clone()),
+            None,
+            false,
+        );
         graph.task_started(2, "delay".into(), Location::caller(), Some(inner));
         let m = changes(&graph, &mut view);
         assert_eq!(names(&m), ["group", "group", "node"]);

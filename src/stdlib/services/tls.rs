@@ -434,13 +434,24 @@ impl<C: Connection> ClientHello<C> {
         fcx: &Cx,
         config: Arc<ServerConfig>,
     ) -> Result<TlsConnection<C>, HandshakeError> {
+        self.finish_observed(fcx, config, None).await
+    }
+
+    /// [`finish_detailed`](ClientHello::finish_detailed), naming the
+    /// connection in the TLS key records the run's observer receives.
+    pub async fn finish_observed(
+        self,
+        fcx: &Cx,
+        config: Arc<ServerConfig>,
+        connection: Option<&fictionet::events::ConnInfo>,
+    ) -> Result<TlsConnection<C>, HandshakeError> {
         let mut io = Io {
             conn: self.conn,
             inbuf: self.inbuf,
             output: Output::default(),
             eof: false,
         };
-        let config = match fcx.tls_key_log() {
+        let config = match fcx.tls_key_log(connection) {
             Some(key_log) => {
                 let mut logged = (*config).clone();
                 logged.key_log = key_log;

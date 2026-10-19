@@ -272,8 +272,8 @@ impl Interface for Member {
         self.sandbox.send(packet);
     }
 
-    fn observe_link(&self) -> Option<fictionet::observe::LinkHandle> {
-        self.sandbox.observe_link()
+    fn link(&self) -> Option<fictionet::LinkHandle> {
+        self.sandbox.link()
     }
 }
 

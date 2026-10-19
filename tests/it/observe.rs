@@ -661,7 +661,7 @@ fn watch_capacity_errors_preserve_shared_streams_and_cancel_frees_admission() {
             fcx.set_observe_watch_limit(1);
             let mut links = Vec::new();
             for (end, mut other) in [fictionet::pair(), fictionet::pair()] {
-                end.observe_link().unwrap().label(&fcx, "test".into());
+                end.link().unwrap().label(&fcx, "test".into());
                 fcx.spawn(move |fcx| async move {
                     other.recv(&fcx).await?;
                     Ok(())

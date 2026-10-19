@@ -5,7 +5,7 @@ use crate::stdlib::protocols::json::Value;
 use crate::sync::Mutex;
 use crate::time::Instant;
 
-use super::{ConnInfo, Event, Limits, Metadata, Observation, Observer, Stamp};
+use super::{Event, Limits, Observation, Observer, Stamp};
 
 /// Optional, bounded aggregation of facts marked with [`Event::repeat`].
 ///
@@ -61,6 +61,7 @@ impl Aggregate {
     fn deliver(&self, event: &Event) {
         self.next.observe(
             Stamp {
+                stream: fictionet::events::Stream::Events,
                 seq: event.seq,
                 at: event.at,
             },
@@ -70,12 +71,18 @@ impl Aggregate {
 }
 
 impl Observer for Aggregate {
-    fn enabled(&self, metadata: Metadata, connection: &ConnInfo) -> bool {
-        self.next.enabled(metadata, connection)
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(metadata, connection) = interest else {
+            return false;
+        };
+        self.next
+            .enabled(fictionet::events::Interest::Event(metadata, connection))
     }
 
     fn observe(&self, stamp: Stamp, observation: Observation<'_>) {
-        let Observation::Event(event) = observation;
+        let Observation::Event(event) = observation else {
+            return;
+        };
         let mut state = self.state.lock();
         if state.ended {
             return;
@@ -91,8 +98,11 @@ impl Observer for Aggregate {
         }
     }
 
-    fn lost(&self, count: u64) {
-        self.next.lost(count);
+    fn lost(&self, loss: fictionet::events::Loss) {
+        if loss.stream != fictionet::events::Stream::Events {
+            return;
+        }
+        self.next.lost(loss);
     }
 
     fn end(&self, at: Instant) {
@@ -236,6 +246,7 @@ fn matches(a: &Event, b: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::ConnInfo;
     use crate::events::{Fields, Memory};
     use crate::{RunOptions, Seed, block_on, lab};
 
@@ -291,6 +302,7 @@ mod tests {
             .repeat(Fields::new());
         observer.observe(
             Stamp {
+                stream: fictionet::events::Stream::Events,
                 seq,
                 at: Instant::ZERO + Duration::from_secs(seconds),
             },
@@ -319,7 +331,13 @@ mod tests {
         assert_eq!(memory.after(3, 10)[0].seq, 4);
         aggregate.end(Instant::ZERO);
         assert_eq!(memory.checked_all().unwrap().len(), 4);
-        aggregate.lost(7);
+        aggregate.lost(crate::events::Loss {
+            stream: crate::events::Stream::Events,
+            reason: crate::events::LossReason::Staging,
+            count: 7,
+            bytes: None,
+            seqs: None,
+        });
         assert_eq!(memory.checked_all().unwrap_err().dropped, 7);
     }
 
@@ -367,6 +385,7 @@ mod tests {
                 .repeat(Fields::new().with("detail", value));
             aggregate.observe(
                 Stamp {
+                    stream: fictionet::events::Stream::Events,
                     seq,
                     at: Instant::ZERO,
                 },
@@ -398,6 +417,7 @@ mod tests {
         for seq in 1..=2 {
             aggregate.observe(
                 Stamp {
+                    stream: fictionet::events::Stream::Events,
                     seq,
                     at: Instant::ZERO,
                 },

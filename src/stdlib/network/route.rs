@@ -276,7 +276,7 @@ pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
                         }
                     };
                     let prefix = prefix.canonical();
-                    if let Some(link) = interface.observe_link() {
+                    if let Some(link) = interface.link() {
                         link.label(&fcx, format!("{}/{}", prefix.addr, prefix.len));
                     }
                     match table.routes.get(&prefix) {
@@ -780,7 +780,7 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
     fn join<I: Interface>(&mut self, fcx: &Cx, ports: &mut Ports<I>, join: Join<I>) {
         match join {
             Join::Member(addr, interface, attachment) => {
-                if let Some(link) = interface.observe_link() {
+                if let Some(link) = interface.link() {
                     link.label(fcx, addr.to_string());
                 }
                 let i = match self.by_addr.get(&addr).copied() {
@@ -811,7 +811,7 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
                 }
             }
             Join::Gateway(interface) => {
-                if let Some(link) = interface.observe_link() {
+                if let Some(link) = interface.link() {
                     link.label(fcx, "gateway".into());
                 }
                 match self.gateway {

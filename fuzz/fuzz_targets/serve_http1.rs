@@ -25,7 +25,10 @@ fn router() -> Router {
 struct Count(std::sync::atomic::AtomicUsize);
 
 impl fictionet::events::Observer for Count {
-    fn enabled(&self, _: fictionet::events::Metadata, _: &fictionet::events::ConnInfo) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(_, _) = interest else {
+            return false;
+        };
         true
     }
 

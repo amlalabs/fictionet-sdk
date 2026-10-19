@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use crate::stdlib::codec::Wire;
 use crate::sync::Mutex;
 
-use super::{ConnInfo, Event, Limits, Metadata, Observation, Observer, Stamp};
+use super::{Event, Limits, Observation, Observer, Stamp};
 
 /// A bounded native JSON Lines exporter.
 ///
@@ -118,16 +118,25 @@ impl Jsonl {
 }
 
 impl Observer for Jsonl {
-    fn lost(&self, count: u64) {
+    fn lost(&self, loss: fictionet::events::Loss) {
+        if loss.stream != fictionet::events::Stream::Events {
+            return;
+        }
+        let count = loss.count;
         self.status.lost.fetch_add(count, Ordering::Relaxed);
     }
 
-    fn enabled(&self, _: Metadata, _: &ConnInfo) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(_, _) = interest else {
+            return false;
+        };
         true
     }
 
     fn observe(&self, stamp: Stamp, observation: Observation<'_>) {
-        let Observation::Event(event) = observation;
+        let Observation::Event(event) = observation else {
+            return;
+        };
         let sender = self.sender.lock();
         let Some(sender) = sender.as_ref() else {
             self.status.lost.fetch_add(1, Ordering::Relaxed);
@@ -192,6 +201,7 @@ mod tests {
         let event = Event::new("shop", "order").field("item", "pump");
         jsonl.observe(
             Stamp {
+                stream: fictionet::events::Stream::Events,
                 seq,
                 at: Instant::ZERO,
             },
@@ -222,6 +232,7 @@ mod tests {
         event.summary = "x".repeat(1 << 20);
         jsonl.observe(
             Stamp {
+                stream: fictionet::events::Stream::Events,
                 seq: 1,
                 at: Instant::ZERO,
             },

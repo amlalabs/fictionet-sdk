@@ -240,11 +240,10 @@ const PROXY_AUTH: &str = "Basic cmVsYXk6YmVuY2gtdG9rZW4=";
 struct Queries(Mutex<std::collections::HashMap<String, u64>>);
 
 impl fictionet::events::Observer for Queries {
-    fn enabled(
-        &self,
-        metadata: fictionet::events::Metadata,
-        _: &fictionet::events::ConnInfo,
-    ) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(metadata, _) = interest else {
+            return false;
+        };
         metadata.source == "dns" && metadata.kind == "query"
     }
     fn observe(

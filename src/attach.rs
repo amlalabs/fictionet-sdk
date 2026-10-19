@@ -41,7 +41,7 @@ pub struct Attachment {
     meter: Arc<Meter>,
     /// The last task seen polling this attachment.
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-    seen: Option<crate::run::TaskId>,
+    seen: Option<crate::run::RunTask>,
     /// The wraps of [`Attachments::map`] still to run, closest to the
     /// sandbox first. They run when the world takes the attachment.
     wraps: Vec<Wrap>,
@@ -106,6 +106,7 @@ impl Attachment {
     pub(crate) fn from_socket(name: String, mtu: u16, link: SocketLink) -> Attachment {
         let meter = Meter::new();
         meter.set_sandbox(&name);
+        meter.register_current();
         Attachment {
             name,
             mtu,
@@ -142,12 +143,13 @@ impl Interface for Attachment {
             Link::Cable(end) => end.poll_recv(fcx, cx),
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Link::Socket(link) => {
-                let current = crate::run::TaskId::current_in(fcx.graph());
+                let current = crate::run::RunTask::current_in(fcx.graph());
                 if current != self.seen
                     && let Some(task) = current
                 {
                     self.seen = current;
                     fcx.graph().owns(&self.meter, 0, task.id);
+                    self.meter.owner(fcx, 0, task.id);
                 }
                 let polled = link.poll_recv(fcx, cx);
                 if let Poll::Ready(Ok(packet)) = &polled {
@@ -171,10 +173,19 @@ impl Interface for Attachment {
         }
     }
 
-    fn observe_link(&self) -> Option<crate::observe::LinkHandle> {
+    fn link(&self) -> Option<crate::LinkHandle> {
         match &self.link {
-            Link::Mapped { interface, .. } => interface.observe_link(),
-            _ => Some(crate::observe::LinkHandle::new(self.meter.clone())),
+            Link::Mapped { interface, .. } => interface.link(),
+            _ => Some(crate::LinkHandle::new(self.meter.clone())),
+        }
+    }
+}
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        if matches!(self.link, Link::Socket(_)) {
+            self.meter.close_attachment();
         }
     }
 }
@@ -323,6 +334,7 @@ impl Attacher {
         let (world, sandbox) = pair_with_guard(Some(Box::new(guard)));
         let meter = world.meter().clone();
         meter.set_sandbox(name);
+        meter.register_current();
         self.deliver(Attachment {
             name: name.to_owned(),
             mtu: 1500,
@@ -592,7 +604,7 @@ impl Attachments {
                         (sandbox.name.clone(), sandbox.mtu, sandbox.detached_check());
                     let interface = Box::new((wrap.lock())(&fcx, sandbox));
                     // The wrapped interface counts its own packets, so this
-                    // meter stays unused: `observe_link` hands out the
+                    // meter stays unused: `link` hands out the
                     // interface's.
                     let link = Link::Mapped { interface, gone };
                     Attachment {

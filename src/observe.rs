@@ -635,9 +635,6 @@ mod view;
 #[cfg(feature = "observe")]
 mod watches;
 
-use std::sync::Arc;
-
-use crate::Cx;
 pub use keys::observed_config;
 #[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
 pub(crate) use session::{SessionSlot, Sessions};
@@ -653,29 +650,6 @@ pub(crate) fn serve_session(
     slot: SessionSlot,
 ) {
     session::start(attacher, fd, slot);
-}
-
-/// An opaque link an [`Interface`](crate::Interface) belongs to.
-/// Use [`LinkHandle::label`] to name it for observers.
-#[derive(Clone)]
-pub struct LinkHandle(Arc<crate::watch::Meter>);
-
-impl LinkHandle {
-    pub(crate) fn new(meter: Arc<crate::watch::Meter>) -> Self {
-        Self(meter)
-    }
-
-    /// Names this link in `fcx`'s observation graph.
-    /// Replaces any label already set for this link in that run.
-    pub fn label(&self, fcx: &Cx, label: String) {
-        fcx.graph().label(&self.0, label);
-    }
-}
-
-impl std::fmt::Debug for LinkHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("LinkHandle").field(&self.0.id).finish()
-    }
 }
 
 #[cfg(all(test, feature = "observe"))]

@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::{Cancelled, Cx, observe};
+use crate::{Cancelled, Cx};
 
 /// One IPv4 or IPv6 packet, exactly the bytes on the wire.
 ///
@@ -87,10 +87,11 @@ pub trait Interface: Send + 'static {
     /// would take the queue past that budget is dropped. See [`listen`](crate::listen).
     fn send(&mut self, packet: Packet);
 
-    /// The link this interface is one end of, for the
-    /// [dashboard](crate::observe#the-dashboard). Only [`End`](crate::End) and [`Attachment`](crate::Attachment) have
-    /// one. Use [`observe::LinkHandle::label`] to name the link.
-    fn observe_link(&self) -> Option<observe::LinkHandle> {
+    /// A handle to this interface's link, when it has one.
+    /// [`End`](crate::End) and [`Attachment`](crate::Attachment) provide handles.
+    /// Wrappers may forward them. Use [`LinkHandle::label`] to publish a label
+    /// to the run's observer and the dashboard.
+    fn link(&self) -> Option<crate::LinkHandle> {
         None
     }
 }
@@ -104,8 +105,8 @@ impl Interface for Box<dyn Interface> {
         (**self).send(packet)
     }
 
-    fn observe_link(&self) -> Option<observe::LinkHandle> {
-        (**self).observe_link()
+    fn link(&self) -> Option<crate::LinkHandle> {
+        (**self).link()
     }
 }
 
@@ -166,5 +167,31 @@ impl std::error::Error for RecvError {
 impl From<Cancelled> for RecvError {
     fn from(_: Cancelled) -> Self {
         RecvError::Cancelled
+    }
+}
+
+/// An opaque link an [`Interface`](crate::Interface) belongs to.
+/// Use [`LinkHandle::label`] to name it for observers.
+#[derive(Clone)]
+pub struct LinkHandle(std::sync::Arc<crate::watch::Meter>);
+
+impl LinkHandle {
+    pub(crate) fn new(meter: std::sync::Arc<crate::watch::Meter>) -> Self {
+        Self(meter)
+    }
+
+    /// Names this link in `fcx`'s observation graph.
+    /// Replaces any label already set for this link in that run.
+    pub fn label(&self, fcx: &Cx, label: String) {
+        self.0.label(fcx, &label);
+        fcx.graph().label(&self.0, label);
+    }
+}
+
+impl std::fmt::Debug for LinkHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LinkHandle")
+            .field(&self.0.link_id())
+            .finish()
     }
 }

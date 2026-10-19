@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use example_common::web_world::{SHARED, app};
 use example_common::zscaler::{DEFAULT_CLOUD, zscaler};
-use fictionet::events::{ConnInfo, Event, Fanout, Metadata, Observation, Observer, Stamp};
+use fictionet::events::{Event, Fanout, Observation, Observer, Stamp};
 use fictionet::stdlib::network::ethernet::{Family, FromVm, Link};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::tcp::{self, TcpConnection};
@@ -117,7 +117,10 @@ struct SiteLoaded {
 }
 
 impl Observer for SiteLoaded {
-    fn enabled(&self, metadata: Metadata, _connection: &ConnInfo) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(metadata, _connection) = interest else {
+            return false;
+        };
         metadata.source == "http" && metadata.kind == "request"
     }
 
@@ -150,7 +153,10 @@ struct Lease {
 }
 
 impl Observer for Lease {
-    fn enabled(&self, metadata: Metadata, connection: &ConnInfo) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(metadata, connection) = interest else {
+            return false;
+        };
         metadata.source == "net"
             && metadata.kind == "bound"
             && connection

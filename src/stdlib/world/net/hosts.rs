@@ -914,7 +914,7 @@ impl Machine {
                 start: None,
             };
         }
-        let fcx = installation.fcx.group(format!("{label} ({addr})"));
+        let fcx = installation.fcx.host(format!("{label} ({addr})"));
         let (router_side, side) = link();
         let ((tcp, udp, icmp, _other), split) = ip::prepare_split_protocols(&fcx, side);
         let (tcp, tcp_task) = tcp::prepare_endpoint(&fcx, tcp, addr, tcp::Options::default());

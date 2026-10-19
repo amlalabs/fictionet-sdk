@@ -17,7 +17,7 @@ use crate::Cx;
 /// clones it and replaces its key logger with one that records session
 /// secrets for packet decryption.
 pub fn observed_config(fcx: &Cx, config: Arc<ServerConfig>) -> Arc<ServerConfig> {
-    match fcx.tls_key_log() {
+    match fcx.tls_key_log(None) {
         Some(key_log) => {
             let mut logged = (*config).clone();
             logged.key_log = key_log;

@@ -38,11 +38,10 @@ const SECURE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 struct Queries(Mutex<std::collections::HashMap<String, usize>>);
 
 impl fictionet::events::Observer for Queries {
-    fn enabled(
-        &self,
-        metadata: fictionet::events::Metadata,
-        _: &fictionet::events::ConnInfo,
-    ) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(metadata, _) = interest else {
+            return false;
+        };
         metadata.source == "dns" && metadata.kind == "query"
     }
     fn observe(

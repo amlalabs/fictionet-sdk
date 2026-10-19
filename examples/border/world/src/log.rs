@@ -68,14 +68,17 @@ impl Log {
     }
 }
 impl fictionet::events::Observer for Log {
-    fn enabled(
-        &self,
-        metadata: fictionet::events::Metadata,
-        _: &fictionet::events::ConnInfo,
-    ) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(metadata, _) = interest else {
+            return false;
+        };
         events::LOGGED.contains(&metadata.source)
     }
-    fn lost(&self, count: u64) {
+    fn lost(&self, loss: fictionet::events::Loss) {
+        if loss.stream != fictionet::events::Stream::Events {
+            return;
+        }
+        let count = loss.count;
         if count != 0 {
             self.inner
                 .write(serde_json::json!({"type": "lost", "count": count}));
@@ -134,7 +137,16 @@ mod tests {
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             |cx| {
                 log.attach(&cx);
-                fictionet::events::Observer::lost(&log, 3);
+                fictionet::events::Observer::lost(
+                    &log,
+                    fictionet::events::Loss {
+                        stream: fictionet::events::Stream::Events,
+                        reason: fictionet::events::LossReason::Staging,
+                        count: 3,
+                        bytes: None,
+                        seqs: None,
+                    },
+                );
                 async { Ok(()) }
             },
         ))

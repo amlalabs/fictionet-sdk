@@ -3,7 +3,9 @@ use std::sync::Arc;
 use crate::time::Instant;
 use crate::{Cx, sync::Mutex};
 
-use super::{ConnInfo, Event};
+use super::{
+    ConnInfo, Event, Interest, KeyRef, Loss, LossReason, PacketMeta, PacketRef, Stream, TopologyRef,
+};
 
 /// Metadata available before constructing an event.
 #[derive(Clone, Copy, Debug)]
@@ -17,33 +19,67 @@ pub struct Metadata {
 /// Order and time assigned by the run, before fan-out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
+    /// The independently numbered stream.
+    pub stream: Stream,
     /// Sequence number, starting at one after interest filtering.
     pub seq: u64,
     /// Time on the run's clock.
     pub at: Instant,
 }
 
-/// A borrowed observation. Additional typed streams may be added later.
+/// A borrowed observation from one of the run's typed streams.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Observation<'a> {
     /// A structured service or network fact.
     Event(&'a Event),
+    /// A successful link crossing.
+    Packet(PacketRef<'a>),
+    /// A TLS secret.
+    TlsKey(KeyRef<'a>),
+    /// A topology change.
+    Topology(TopologyRef<'a>),
+}
+
+impl Observation<'_> {
+    /// Metadata for this observation's own interest filter.
+    pub fn interest(&self) -> Interest<'_> {
+        match self {
+            Self::Event(event) => Interest::Event(
+                Metadata {
+                    source: event.source,
+                    kind: event.kind,
+                },
+                &event.conn,
+            ),
+            Self::Packet(packet) => Interest::Packet(PacketMeta {
+                link: packet.link,
+                side: packet.side,
+                len: packet.len,
+                link_type: packet.link_type,
+            }),
+            Self::TlsKey(key) => Interest::TlsKey(super::KeyMeta {
+                label: key.label,
+                connection: key.connection,
+            }),
+            Self::Topology(topology) => Interest::Topology(topology.kind()),
+        }
+    }
 }
 
 /// A run's immutable observation destination.
 ///
-/// Delivery is synchronous and serialized. Implementations must return promptly
+/// Delivery is synchronous and serialized per stream. Implementations must return promptly
 /// and must not call back into the world. I/O belongs on a bounded worker queue.
-/// Interest must stay fixed for repeatable lab evidence. Connection context is
+/// Interest must stay fixed for repeatable lab runs. Connection context is
 /// explicit, including during the interest check.
 pub trait Observer: Send + Sync + 'static {
     /// Whether constructing this event is useful.
-    fn enabled(&self, metadata: Metadata, connection: &ConnInfo) -> bool;
+    fn enabled(&self, interest: Interest<'_>) -> bool;
     /// Receives a borrowed fact with its run-assigned stamp.
     fn observe(&self, stamp: Stamp, observation: Observation<'_>);
     /// Reports facts lost before delivery, such as a full producer staging buffer.
-    fn lost(&self, _count: u64) {}
+    fn lost(&self, _loss: Loss) {}
     /// Seals input when the run ends, including cancellation or drop.
     fn end(&self, _at: Instant) {}
 }
@@ -59,26 +95,21 @@ impl Fanout {
 }
 
 impl Observer for Fanout {
-    fn enabled(&self, metadata: Metadata, connection: &ConnInfo) -> bool {
-        self.0.iter().any(|o| o.enabled(metadata, connection))
+    fn enabled(&self, interest: Interest<'_>) -> bool {
+        self.0.iter().any(|o| o.enabled(interest))
     }
 
     fn observe(&self, stamp: Stamp, observation: Observation<'_>) {
-        let Observation::Event(event) = observation;
-        let metadata = Metadata {
-            source: event.source,
-            kind: event.kind,
-        };
         for observer in &self.0 {
-            if observer.enabled(metadata, &event.conn) {
-                observer.observe(stamp, observation);
+            if observer.enabled(observation.interest()) {
+                observer.observe(stamp, observation.clone());
             }
         }
     }
 
-    fn lost(&self, count: u64) {
+    fn lost(&self, loss: Loss) {
         for observer in &self.0 {
-            observer.lost(count);
+            observer.lost(loss.clone());
         }
     }
 
@@ -102,7 +133,7 @@ impl Emitter<'_> {
         self.cx
             .run
             .observer
-            .enabled(Metadata { source, kind }, self.connection)
+            .enabled(Interest::Event(Metadata { source, kind }, self.connection))
     }
 
     /// Builds an event only when a destination is interested.
@@ -124,28 +155,141 @@ impl Emitter<'_> {
 pub struct Dispatch {
     observer: Option<Arc<dyn Observer>>,
     state: Mutex<State>,
+    clock: Option<Arc<crate::clock::Clock>>,
+    topology: [bool; 5],
+    pub(crate) run_id: u64,
+    next_link: std::sync::atomic::AtomicU64,
+    next_host: std::sync::atomic::AtomicU64,
 }
 
-#[derive(Default)]
 struct State {
     seq: u64,
+    topology: u64,
+    keys: u64,
     ended: bool,
 }
 
 impl Dispatch {
-    /// Creates a dispatch with an optional, fixed destination.
-    pub fn new(observer: Option<Arc<dyn Observer>>) -> Self {
+    pub(crate) const fn empty() -> Self {
         Self {
-            observer,
-            state: Mutex::new(State::default()),
+            observer: None,
+            state: Mutex::new(State {
+                seq: 0,
+                topology: 0,
+                keys: 0,
+                ended: false,
+            }),
+            clock: None,
+            topology: [false; 5],
+            run_id: 0,
+            next_link: std::sync::atomic::AtomicU64::new(1),
+            next_host: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
+    /// Creates a dispatch with an optional, fixed destination.
+    pub fn new(observer: Option<Arc<dyn Observer>>) -> Self {
+        let topology = [
+            super::TopologyKind::Task,
+            super::TopologyKind::Group,
+            super::TopologyKind::Host,
+            super::TopologyKind::Link,
+            super::TopologyKind::Connection,
+        ]
+        .map(|kind| {
+            observer
+                .as_ref()
+                .is_some_and(|o| o.enabled(Interest::Topology(kind)))
+        });
+        Self {
+            observer,
+            topology,
+            ..Self::empty()
+        }
+    }
+
+    pub(crate) fn for_run(
+        observer: Option<Arc<dyn Observer>>,
+        run_id: u64,
+        clock: &Arc<crate::clock::Clock>,
+    ) -> Arc<Self> {
+        let mut dispatch = Self::new(observer);
+        if dispatch.observer.is_some() {
+            dispatch.clock = Some(clock.clone());
+        }
+        dispatch.run_id = run_id;
+        Arc::new(dispatch)
+    }
+
+    pub(crate) fn topology_enabled(&self, kind: super::TopologyKind) -> bool {
+        self.topology[kind as usize]
+    }
+
+    pub(crate) fn next_link(&self) -> super::LinkId {
+        super::LinkId(
+            self.next_link
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn next_host(&self) -> super::HostId {
+        super::HostId(
+            self.next_host
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn has_topology(&self) -> bool {
+        self.topology.iter().any(|enabled| *enabled)
+    }
+
+    pub(crate) fn topology(&self, item: TopologyRef<'_>) {
+        if self.topology_enabled(item.kind())
+            && let Some(item) = super::staging::stage(self, item)
+        {
+            self.publish(Stream::Topology, Observation::Topology(item));
+        }
+    }
+
+    pub(crate) fn key(&self, key: KeyRef<'_>) {
+        if self.enabled(Interest::TlsKey(super::KeyMeta {
+            label: key.label,
+            connection: key.connection,
+        })) {
+            self.publish(Stream::Keys, Observation::TlsKey(key));
+        }
+    }
+
+    fn publish(&self, stream: Stream, item: Observation<'_>) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        let mut state = self.state.lock();
+        if state.ended {
+            return;
+        }
+        let seq = match stream {
+            Stream::Topology => &mut state.topology,
+            Stream::Keys => &mut state.keys,
+            _ => unreachable!(),
+        };
+        *seq += 1;
+        observer.observe(
+            Stamp {
+                stream,
+                seq: *seq,
+                at: self.clock.as_ref().expect("run clock").now(),
+            },
+            item,
+        );
+    }
+
     /// Checks interest without reading the clock or numbering an event.
-    pub fn enabled(&self, metadata: Metadata, connection: &ConnInfo) -> bool {
-        self.observer
-            .as_ref()
-            .is_some_and(|o| o.enabled(metadata, connection))
+    pub fn enabled(&self, interest: Interest<'_>) -> bool {
+        self.observer.as_ref().is_some_and(|observer| {
+            let ended = self.state.lock().ended;
+            !ended && observer.enabled(interest)
+        })
     }
 
     /// Delivers an interested event, assigning its sequence and reading run time.
@@ -159,6 +303,7 @@ impl Dispatch {
         }
         state.seq += 1;
         let stamp = Stamp {
+            stream: fictionet::events::Stream::Events,
             seq: state.seq,
             at: at(),
         };
@@ -169,12 +314,22 @@ impl Dispatch {
 
     /// Reports facts omitted by a producer before delivery.
     pub fn lost(&self, count: u64) {
-        if count != 0
+        self.report_loss(Loss {
+            stream: Stream::Events,
+            reason: LossReason::Staging,
+            count,
+            bytes: None,
+            seqs: None,
+        });
+    }
+
+    pub(crate) fn report_loss(&self, loss: Loss) {
+        if loss.count != 0
             && let Some(observer) = &self.observer
         {
             let state = self.state.lock();
             if !state.ended {
-                observer.lost(count);
+                observer.lost(loss);
             }
         }
     }
@@ -205,6 +360,7 @@ mod tests {
         block_on(lab(
             fictionet::RunOptions::new(Seed::from_u64(1)),
             |cx| async move {
+                assert!(cx.run.observer.shared().is_none());
                 assert!(!cx.event_enabled("shop", "order"));
                 cx.emit("shop", "order", |_| panic!("unobserved event was built"));
                 let conn = ConnInfo::default();
@@ -217,7 +373,21 @@ mod tests {
         .unwrap();
         let dispatch = Dispatch::new(None);
         dispatch.emit(Event::new("shop", "order"), || panic!("clock read"));
-        assert_eq!(dispatch.state.lock().seq, 0);
+        dispatch.topology(TopologyRef::TaskRemoved {
+            task: super::super::TaskId(1),
+        });
+        dispatch.key(KeyRef {
+            label: "CLIENT_RANDOM",
+            client_random: &[],
+            secret: &[],
+            connection: None,
+        });
+        dispatch.end(|| panic!("clock read"));
+        let state = dispatch.state.lock();
+        assert_eq!((state.seq, state.topology, state.keys), (0, 0, 0));
+        assert!(dispatch.clock.is_none());
+        assert_eq!(dispatch.next_link.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatch.next_host.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -385,7 +555,10 @@ mod tests {
 
     struct Orders(Arc<Memory>);
     impl Observer for Orders {
-        fn enabled(&self, metadata: Metadata, _: &ConnInfo) -> bool {
+        fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+            let fictionet::events::Interest::Event(metadata, _) = interest else {
+                return false;
+            };
             metadata.source == "shop"
         }
         fn observe(&self, stamp: Stamp, item: Observation<'_>) {
@@ -441,6 +614,7 @@ mod tests {
         let memory = Memory::new(Limits::new(4, 2048));
         memory.observe(
             Stamp {
+                stream: fictionet::events::Stream::Events,
                 seq: 1,
                 at: Instant::ZERO,
             },
@@ -448,6 +622,7 @@ mod tests {
         );
         memory.observe(
             Stamp {
+                stream: fictionet::events::Stream::Events,
                 seq: 2,
                 at: Instant::ZERO,
             },
@@ -461,7 +636,10 @@ mod tests {
 
     struct Ended(Arc<AtomicUsize>);
     impl Observer for Ended {
-        fn enabled(&self, _: Metadata, _: &ConnInfo) -> bool {
+        fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+            let fictionet::events::Interest::Event(_, _) = interest else {
+                return false;
+            };
             false
         }
         fn observe(&self, _: Stamp, _: Observation<'_>) {

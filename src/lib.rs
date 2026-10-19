@@ -380,7 +380,7 @@ pub use cable::{End, PACKET_COST, pair, pair_with_limit};
 pub use clock::RunMode;
 pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
-pub use interface::{Interface, InterfaceExt, Packet, Recv, RecvError};
+pub use interface::{Interface, InterfaceExt, LinkHandle, Packet, Recv, RecvError};
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
 #[cfg(feature = "std")]

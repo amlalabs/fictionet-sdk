@@ -4,7 +4,7 @@ use std::task::{Poll, Waker};
 
 use crate::sync::Mutex;
 
-use super::{ConnInfo, Event, Metadata, Observation, Observer, Stamp};
+use super::{Event, Observation, Observer, Stamp};
 
 /// Independent count and byte bounds for retained or queued events.
 #[derive(Clone, Copy, Debug)]
@@ -289,7 +289,11 @@ impl Memory {
 }
 
 impl Observer for Memory {
-    fn lost(&self, count: u64) {
+    fn lost(&self, loss: fictionet::events::Loss) {
+        if loss.stream != fictionet::events::Stream::Events {
+            return;
+        }
+        let count = loss.count;
         let mut state = self.state.lock();
         state.dropped = state.dropped.saturating_add(count);
         let waiters: Vec<_> = state.waiters.iter().filter_map(Weak::upgrade).collect();
@@ -302,12 +306,17 @@ impl Observer for Memory {
         }
     }
 
-    fn enabled(&self, _: Metadata, _: &ConnInfo) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(_, _) = interest else {
+            return false;
+        };
         true
     }
 
     fn observe(&self, stamp: Stamp, observation: Observation<'_>) {
-        let Observation::Event(event) = observation;
+        let Observation::Event(event) = observation else {
+            return;
+        };
         let size = event.size();
         let mut state = self.state.lock();
         state.last = stamp.seq;
@@ -418,6 +427,7 @@ mod tests {
             {
                 memory.observe(
                     Stamp {
+                        stream: fictionet::events::Stream::Events,
                         seq: seq as u64 + 1,
                         at: crate::time::Instant::ZERO,
                     },
@@ -534,6 +544,7 @@ mod tests {
                 );
                 memory.observe(
                     Stamp {
+                        stream: fictionet::events::Stream::Events,
                         seq: 1,
                         at: crate::time::Instant::ZERO,
                     },
@@ -544,7 +555,13 @@ mod tests {
                         .poll(&mut Context::from_waker(&waker))
                         .is_pending()
                 );
-                memory.lost(1);
+                memory.lost(crate::events::Loss {
+                    stream: crate::events::Stream::Events,
+                    reason: crate::events::LossReason::Staging,
+                    count: 1,
+                    bytes: None,
+                    seqs: None,
+                });
                 assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 2);
                 assert!(
                     wait.as_mut()

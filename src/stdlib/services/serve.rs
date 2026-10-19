@@ -833,10 +833,12 @@ impl Staged {
         self.fcx
             .as_ref()
             .is_some_and(|cx| cx.emitter(conn).enabled(source, kind))
-            || self
-                .observer
-                .as_ref()
-                .is_some_and(|o| o.enabled(fictionet::events::Metadata { source, kind }, conn))
+            || self.observer.as_ref().is_some_and(|o| {
+                o.enabled(fictionet::events::Interest::Event(
+                    fictionet::events::Metadata { source, kind },
+                    conn,
+                ))
+            })
     }
 
     fn emit(
@@ -878,13 +880,13 @@ impl Staged {
                     .emit(event.source, event.kind, |_| event.clone());
             }
             if let Some(observer) = &self.observer
-                && observer.enabled(
+                && observer.enabled(fictionet::events::Interest::Event(
                     fictionet::events::Metadata {
                         source: event.source,
                         kind: event.kind,
                     },
                     &event.conn,
-                )
+                ))
             {
                 observer.emit(event, &now);
             }
@@ -3129,7 +3131,7 @@ pub async fn accept_tls<C: Connection>(
             let _ = hello.reject(fcx).await;
             return Err(HandshakeError::Rejected);
         };
-        hello.finish_detailed(fcx, config).await
+        hello.finish_observed(fcx, config, Some(info)).await
     };
     let done = match fcx.race(Some(deadline), handshake).await {
         Ok(done) => done,

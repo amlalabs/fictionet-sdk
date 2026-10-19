@@ -212,7 +212,10 @@ pub fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
 pub struct EventFormatting;
 
 impl fictionet::events::Observer for EventFormatting {
-    fn enabled(&self, _: fictionet::events::Metadata, _: &fictionet::events::ConnInfo) -> bool {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        let fictionet::events::Interest::Event(_, _) = interest else {
+            return false;
+        };
         true
     }
     fn observe(

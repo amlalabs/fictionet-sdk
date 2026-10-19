@@ -4,7 +4,7 @@
 //! JavaScript also runs an event-loop case.
 //! The README says which requests a world cannot serve in a JavaScript engine.
 
-use fictionet::events::{ConnInfo, Fanout, Memory, Metadata, Observation, Observer, Stamp};
+use fictionet::events::{Fanout, Memory, Observation, Observer, Stamp};
 use fictionet::stdlib::protocols::json::Value;
 use http::Version;
 use std::io::Write;
@@ -59,7 +59,10 @@ fn real_run_writes_events_to_memory() {
     }
 
     impl Observer for Sink {
-        fn enabled(&self, _: Metadata, _: &ConnInfo) -> bool {
+        fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+            let fictionet::events::Interest::Event(_, _) = interest else {
+                return false;
+            };
             true
         }
         fn observe(&self, _: Stamp, observation: Observation<'_>) {

@@ -27,13 +27,13 @@ use crate::{Cx, Interface, Packet, RecvError};
 /// routes. Sandboxes do not come from `pair`: each one reaches the
 /// world as an [`Attachment`](crate::Attachment).
 pub fn pair() -> (End, End) {
-    pair_with_guard(None)
+    make(None, None, true)
 }
 
 /// Makes a cable that drops `guard` when the cable closes, from either end.
 /// [`Attacher`](crate::Attacher) uses this to hold a name until then.
 pub(crate) fn pair_with_guard(guard: Option<Box<dyn Send>>) -> (End, End) {
-    make(guard, None)
+    make(guard, None, false)
 }
 
 /// What a queued packet costs against a limit beyond its bytes: its place
@@ -46,10 +46,10 @@ pub const PACKET_COST: usize = 64;
 /// unlimited queue would let the agent grow the world's memory without
 /// end.
 pub fn pair_with_limit(limit: usize) -> (End, End) {
-    make(None, Some(limit))
+    make(None, Some(limit), true)
 }
 
-fn make(guard: Option<Box<dyn Send>>, limit: Option<usize>) -> (End, End) {
+fn make(guard: Option<Box<dyn Send>>, limit: Option<usize>, register: bool) -> (End, End) {
     let cable = Arc::new(Cable {
         dirs: [
             Mutex::new(Direction::default()),
@@ -61,6 +61,9 @@ fn make(guard: Option<Box<dyn Send>>, limit: Option<usize>) -> (End, End) {
     });
     let counted: Weak<dyn Counted> = Arc::downgrade(&cable) as Weak<Cable>;
     cable.meter.count_in(counted);
+    if register {
+        cable.meter.register_current();
+    }
     (
         End {
             cable: cable.clone(),
@@ -115,7 +118,7 @@ pub struct End {
     /// Where a receiver outside the run waits for a cancel.
     wait: CancelWait,
     /// The last task seen polling this end, for the dashboard.
-    seen: Option<crate::run::TaskId>,
+    seen: Option<crate::run::RunTask>,
 }
 
 impl Interface for End {
@@ -123,12 +126,13 @@ impl Interface for End {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
-        let current = crate::run::TaskId::current_in(fcx.graph());
+        let current = crate::run::RunTask::current_in(fcx.graph());
         if current != self.seen
             && let Some(task) = current
         {
             self.seen = current;
             fcx.graph().owns(&self.cable.meter, self.side, task.id);
+            self.cable.meter.owner(fcx, self.side, task.id);
         }
         {
             let mut dir = self.cable.dirs[self.side].lock();
@@ -169,8 +173,8 @@ impl Interface for End {
         }
     }
 
-    fn observe_link(&self) -> Option<crate::observe::LinkHandle> {
-        Some(crate::observe::LinkHandle::new(self.cable.meter.clone()))
+    fn link(&self) -> Option<crate::LinkHandle> {
+        Some(crate::LinkHandle::new(self.cable.meter.clone()))
     }
 }
 
@@ -195,6 +199,9 @@ impl Drop for End {
         }
         let guard = self.cable.guard.lock().take();
         drop(guard);
+        if self.side == 0 {
+            self.cable.meter.close_attachment();
+        }
     }
 }
 
@@ -225,8 +232,13 @@ impl End {
     }
 }
 
+impl Drop for Cable {
+    fn drop(&mut self) {
+        self.meter.close(self.totals());
+    }
+}
+
 impl Counted for Cable {
-    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     fn totals(&self) -> [u64; 4] {
         // End `s` sends into `dirs[1 - s]`.
         let (p1, b1) = {

@@ -68,14 +68,14 @@ static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 /// `counted`. An attachment counts in `counts`, with atomics.
 pub(crate) struct Meter {
     pub(crate) id: u64,
+    registration: Mutex<Option<Registration>>,
     /// What end `s` sent, for an attachment.
     #[cfg(feature = "std")]
     counts: [Count; 2],
     /// What holds the counts of a pair.
     counted: OnceLock<Weak<dyn Counted>>,
     /// The task that made the link, if any.
-    #[cfg(feature = "observe")]
-    creator: Option<crate::run::TaskId>,
+    creator: Option<crate::run::RunTask>,
     /// For an attachment: the sandbox's name. Side 1 is the sandbox.
     sandbox: OnceLock<Arc<str>>,
     /// Set while a viewer watches: `send` then copies packets into `tap`.
@@ -83,6 +83,20 @@ pub(crate) struct Meter {
     tapped: AtomicBool,
     #[cfg(any(feature = "observe", all(test, feature = "std")))]
     tap: Mutex<Option<Arc<Tap>>>,
+}
+
+struct Registration {
+    observer: Arc<crate::events::Dispatch>,
+    link: crate::events::LinkId,
+    host: Option<crate::events::HostId>,
+    owners: [Option<crate::events::TaskId>; 2],
+    ended: bool,
+}
+
+impl Drop for Meter {
+    fn drop(&mut self) {
+        self.close(self.totals());
+    }
 }
 
 #[derive(Default)]
@@ -96,17 +110,132 @@ impl Meter {
     pub(crate) fn new() -> Arc<Meter> {
         Arc::new(Meter {
             id: NEXT_LINK.fetch_add(1, Ordering::Relaxed),
+            registration: Mutex::new(None),
             #[cfg(feature = "std")]
             counts: Default::default(),
             counted: OnceLock::new(),
-            #[cfg(feature = "observe")]
-            creator: crate::run::TaskId::current(),
+            creator: crate::run::RunTask::current(),
             sandbox: OnceLock::new(),
             #[cfg(any(feature = "observe", all(test, feature = "std")))]
             tapped: AtomicBool::new(false),
             #[cfg(any(feature = "observe", all(test, feature = "std")))]
             tap: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn link_id(&self) -> Option<crate::events::LinkId> {
+        self.registration
+            .lock()
+            .as_ref()
+            .map(|registration| registration.link)
+    }
+
+    pub(crate) fn register_current(self: &Arc<Self>) {
+        crate::run::with_dispatch(|observer| {
+            if let Some(observer) = observer {
+                self.register(observer);
+            }
+        });
+    }
+
+    fn register(self: &Arc<Self>, observer: &Arc<crate::events::Dispatch>) {
+        use crate::events::{LinkCounters, TaskId, TopologyKind, TopologyRef};
+        if !observer.topology_enabled(TopologyKind::Link)
+            && !observer.topology_enabled(TopologyKind::Host)
+        {
+            return;
+        }
+        let mut registration = self.registration.lock();
+        if registration.is_some() {
+            return;
+        }
+        let link = observer.next_link();
+        let sandbox = self.sandbox.get();
+        let host = sandbox.map(|_| observer.next_host());
+        *registration = Some(Registration {
+            observer: observer.clone(),
+            link,
+            host,
+            owners: [None; 2],
+            ended: false,
+        });
+        if let (Some(name), Some(host)) = (sandbox, host) {
+            observer.topology(TopologyRef::HostAdded {
+                host,
+                name,
+                group: None,
+                sandbox: Some(name),
+            });
+        }
+        observer.topology(TopologyRef::LinkAdded {
+            link,
+            creator: self
+                .creator
+                .filter(|task| task.run == observer.run_id)
+                .map(|task| TaskId(task.id)),
+            sandbox: sandbox.map(AsRef::as_ref),
+            host,
+            counters: LinkCounters(Arc::downgrade(self)),
+        });
+    }
+
+    pub(crate) fn owner(self: &Arc<Self>, fcx: &crate::Cx, side: usize, task: u64) {
+        use crate::events::{Side, TaskId, TopologyRef};
+        let Some(observer) = fcx.run.observer.shared() else {
+            return;
+        };
+        self.register(observer);
+        let mut registration = self.registration.lock();
+        if let Some(r) = registration.as_mut()
+            && r.observer.run_id == fcx.run.observer.run_id
+            && !r.ended
+            && r.owners[side] != Some(TaskId(task))
+        {
+            r.owners[side] = Some(TaskId(task));
+            r.observer.topology(TopologyRef::LinkOwner {
+                link: r.link,
+                side: if side == 0 { Side::A } else { Side::B },
+                task: TaskId(task),
+            });
+        }
+    }
+
+    pub(crate) fn label(self: &Arc<Self>, fcx: &crate::Cx, label: &str) {
+        let Some(observer) = fcx.run.observer.shared() else {
+            return;
+        };
+        self.register(observer);
+        if let Some(r) = self.registration.lock().as_ref()
+            && r.observer.run_id == fcx.run.observer.run_id
+            && !r.ended
+        {
+            r.observer.topology(crate::events::TopologyRef::LinkLabel {
+                link: r.link,
+                label,
+            });
+        }
+    }
+
+    pub(crate) fn close_attachment(&self) {
+        if self.sandbox.get().is_some() {
+            self.close(self.totals());
+        }
+    }
+
+    pub(crate) fn close(&self, totals: [u64; 4]) {
+        use crate::events::TopologyRef;
+        if let Some(r) = self.registration.lock().as_mut()
+            && !r.ended
+        {
+            r.ended = true;
+            r.observer.topology(TopologyRef::LinkRemoved {
+                link: r.link,
+                totals: crate::events::streams::counts(totals),
+            });
+            if let Some(host) = r.host {
+                r.observer.topology(TopologyRef::HostRemoved { host });
+            }
+        }
     }
 
     /// Marks side 1 as the sandbox called `name`.
@@ -159,11 +288,15 @@ impl Meter {
 
     /// Packets and bytes each side has sent: `[packets 0, bytes 0, packets
     /// 1, bytes 1]`.
-    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     pub(crate) fn totals(&self) -> [u64; 4] {
         if let Some(counted) = self.counted.get() {
             return counted.upgrade().map_or([0; 4], |c| c.totals());
         }
+        #[cfg(not(feature = "std"))]
+        {
+            [0; 4]
+        }
+        #[cfg(feature = "std")]
         [
             self.counts[0].packets.load(Ordering::Relaxed),
             self.counts[0].bytes.load(Ordering::Relaxed),
@@ -194,7 +327,6 @@ impl Meter {
 /// Whatever counts a link's packets itself.
 pub(crate) trait Counted: Send + Sync {
     /// `[packets 0, bytes 0, packets 1, bytes 1]`, by the side that sent.
-    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     fn totals(&self) -> [u64; 4];
 }
 
@@ -366,30 +498,57 @@ pub(crate) fn keep(k: u64) -> bool {
 
 /// A named group of tasks, from [`Cx::group`](crate::Cx::group). Only
 /// observers read it.
-#[derive(Debug)]
 pub(crate) struct Group {
-    /// Unique in its run, from 1.
-    #[cfg(feature = "observe")]
     pub(crate) id: u64,
-    #[cfg(feature = "observe")]
     pub(crate) name: String,
-    /// The group this one is inside.
-    #[cfg(feature = "observe")]
     pub(crate) parent: Option<Arc<Group>>,
+    observer: Option<Arc<crate::events::Dispatch>>,
+    host: Option<crate::events::HostId>,
+}
+
+impl std::fmt::Debug for Group {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Group")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("parent", &self.parent)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Group {
-    pub(crate) fn new(id: u64, name: String, parent: Option<Arc<Group>>) -> Arc<Group> {
-        #[cfg(not(feature = "observe"))]
-        let _ = (id, name, parent);
-        Arc::new(Group {
-            #[cfg(feature = "observe")]
+    pub(crate) fn new(
+        id: u64,
+        name: String,
+        parent: Option<Arc<Group>>,
+        observer: Option<Arc<crate::events::Dispatch>>,
+        host: bool,
+    ) -> Arc<Group> {
+        use crate::events::{GroupId, TopologyRef};
+        let host = observer.as_ref().filter(|_| host).map(|o| o.next_host());
+        let group = Arc::new(Group {
             id,
-            #[cfg(feature = "observe")]
             name,
-            #[cfg(feature = "observe")]
             parent,
-        })
+            observer,
+            host,
+        });
+        if let Some(observer) = &group.observer {
+            observer.topology(TopologyRef::GroupAdded {
+                group: GroupId(id),
+                name: &group.name,
+                parent: group.parent.as_ref().map(|p| GroupId(p.id)),
+            });
+            if let Some(host) = group.host {
+                observer.topology(TopologyRef::HostAdded {
+                    host,
+                    name: &group.name,
+                    group: Some(GroupId(id)),
+                    sandbox: None,
+                });
+            }
+        }
+        group
     }
 
     /// This group and the groups it is inside, innermost first.
@@ -399,12 +558,25 @@ impl Group {
     }
 }
 
+impl Drop for Group {
+    fn drop(&mut self) {
+        use crate::events::{GroupId, TopologyRef};
+        if let Some(observer) = &self.observer {
+            if let Some(host) = self.host {
+                observer.topology(TopologyRef::HostRemoved { host });
+            }
+            observer.topology(TopologyRef::GroupRemoved {
+                group: GroupId(self.id),
+            });
+        }
+    }
+}
+
 /// A task as observers see it.
 #[derive(Clone, Debug)]
 pub(crate) struct TaskInfo {
     pub(crate) parent: u64,
     /// The group the task belongs to, if any.
-    #[cfg(feature = "observe")]
     pub(crate) group: Option<Arc<Group>>,
     /// The stdlib function's name, or the full type name of the task's
     /// future, shortened by [`short_name`] only when an observer asks.
@@ -445,8 +617,6 @@ pub(crate) struct Graph {
     /// TLS keys recorded by the run's protocol producers.
     #[cfg(feature = "observe")]
     pub(crate) keys: Arc<crate::telemetry::KeyRecorder>,
-    /// The id of the next group.
-    next_group: AtomicU64,
     state: Mutex<GraphState>,
     /// Application decoders for links watched from now on.
     pub(crate) protocols: Mutex<crate::observe::Registry>,
@@ -485,7 +655,6 @@ impl Graph {
             #[cfg(feature = "observe")]
             start_wall,
             viewers: AtomicUsize::new(0),
-            next_group: AtomicU64::new(1),
             state: Mutex::new(GraphState {
                 sweep_at: 64,
                 ..GraphState::default()
@@ -515,11 +684,6 @@ impl Graph {
         self.environment.clock.now().since_start()
     }
 
-    /// A new group id.
-    pub(crate) fn next_group(&self) -> u64 {
-        self.next_group.fetch_add(1, Ordering::Relaxed)
-    }
-
     pub(crate) fn task_started(
         &self,
         id: u64,
@@ -527,11 +691,8 @@ impl Graph {
         location: &'static Location<'static>,
         group: Option<Arc<Group>>,
     ) {
-        #[cfg(not(feature = "observe"))]
-        let _ = group;
         let info = TaskInfo {
             parent: crate::run::current_task(self),
-            #[cfg(feature = "observe")]
             group,
             name,
             file: location.file(),
@@ -546,16 +707,21 @@ impl Graph {
 
     pub(crate) fn task_ended(&self, id: u64) {
         let mut s = self.state();
-        if s.tasks.remove(&id).is_some() {
+        let removed = s.tasks.remove(&id);
+        if removed.is_some() {
             s.revision += 1;
         }
+        drop(s);
+        drop(removed);
     }
 
     pub(crate) fn run_ended(&self) {
         let mut s = self.state();
         s.ended = true;
         s.revision += 1;
-        s.tasks.clear();
+        let tasks = std::mem::take(&mut s.tasks);
+        drop(s);
+        drop(tasks);
     }
 
     fn link<'a>(&self, s: &'a mut GraphState, meter: &Arc<Meter>) -> &'a mut LinkInfo {
@@ -619,7 +785,7 @@ pub(crate) fn task_name<T: ?Sized>() -> Cow<'static, str> {
 /// path segments, without closures and generics.
 /// `fictionet::stdlib::web::net::pings::{{closure}}` becomes `net::pings`.
 /// A name with no path, such as `delay`, stays as it is.
-pub(crate) fn short_name(full: &str) -> String {
+pub fn short_name(full: &str) -> String {
     // Cut generic arguments, which can hold paths of their own.
     let mut depth = 0;
     let mut plain = String::with_capacity(full.len());
@@ -642,6 +808,23 @@ pub(crate) fn short_name(full: &str) -> String {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unobserved_links_do_not_register() {
+        use crate::{Interface, InterfaceExt};
+        crate::block_on(crate::lab(
+            crate::RunOptions::new(crate::Seed::from_u64(1)),
+            |cx| async move {
+                let (mut a, mut b) = crate::pair();
+                a.link().unwrap().label(&cx, "link".into());
+                a.send(crate::Packet(vec![1]));
+                b.recv(&cx).await?;
+                assert!(a.meter().registration.lock().is_none());
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn names_come_from_the_future_type() {

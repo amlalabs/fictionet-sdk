@@ -4,7 +4,11 @@
 //! [`Fields`]. Integrators install an [`Observer`] before execution through
 //! [`RunOptions`](crate::RunOptions): none, [`Memory`], native `Jsonl`,
 //! [`Aggregate`], dashboard retention, or their own implementation. [`Fanout`]
-//! combines destinations. Regions share the run's immutable observer.
+//! combines destinations and filters each delivery by its own interest.
+//! The same observer receives typed topology changes and borrowed TLS keys.
+//! Packet types describe future link crossings; links currently publish topology
+//! and live absolute counters. Each stream has its own sequence and run time.
+//! Event-only consumers decline the other streams. Regions share the run's immutable observer.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -95,3 +99,9 @@ pub const MAX_EVENT_BYTES: usize = 16 << 20;
 
 #[cfg(all(test, feature = "std"))]
 mod tests;
+
+pub(crate) mod streams;
+pub use crate::watch::short_name;
+pub use streams::*;
+
+pub(crate) mod staging;

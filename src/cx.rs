@@ -327,11 +327,34 @@ impl Cx {
     /// [`delay`](crate::stdlib::network::delay) started with a grouped `Cx`. Each
     /// call makes a new group,
     /// even with a name used before. Making a group allocates its name and
-    /// one small struct. A task in a group holds two more reference counts,
+    /// one small struct. With group or host interest it also holds a dispatch
+    /// reference. A task in a group holds two more reference counts,
     /// one in its `Cx` and one in what the run records about it, whether or
     /// not anyone observes the world.
     pub fn group(&self, name: impl Into<String>) -> Cx {
-        let group = Group::new(self.run.graph.next_group(), name.into(), self.group.clone());
+        self.make_group(name, false)
+    }
+
+    /// Makes a simulated host in a new group inside this context's group.
+    /// The host and group live until their last task or context reference drops.
+    /// Costs are the same as [`Self::group`].
+    pub fn host(&self, name: impl Into<String>) -> Cx {
+        self.make_group(name, true)
+    }
+
+    fn make_group(&self, name: impl Into<String>, host: bool) -> Cx {
+        let observer = &self.run.observer;
+        let group = Group::new(
+            self.run
+                .next_group
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name.into(),
+            self.group.clone(),
+            (observer.topology_enabled(crate::events::TopologyKind::Group)
+                || observer.topology_enabled(crate::events::TopologyKind::Host))
+            .then(|| observer.shared().unwrap().clone()),
+            host,
+        );
         Cx {
             run: self.run.clone(),
             region: self.region.clone(),
@@ -349,18 +372,14 @@ impl Cx {
         self.run.graph.observed()
     }
 
-    /// The run's TLS key recorder, for copyable protocol modules.
-    ///
-    /// Returns `None` without the `observe` feature or when no observer is
-    /// connected. A returned recorder keeps recording for that connection
-    /// even if observers leave. It retains only the run's bounded key log.
+    /// A connection's TLS key adapter for interested observers and legacy viewers.
+    /// The typed stream stops when the run ends. The adapter does not retain the run.
     #[doc(hidden)]
-    pub fn tls_key_log(&self) -> Option<Arc<dyn rustls::KeyLog>> {
-        #[cfg(feature = "observe")]
-        if self.observed() {
-            return Some(self.run.keys.clone());
-        }
-        None
+    pub fn tls_key_log(
+        &self,
+        connection: Option<&crate::events::ConnInfo>,
+    ) -> Option<Arc<dyn rustls::KeyLog>> {
+        crate::telemetry::KeyLog::for_cx(self, connection)
     }
 
     /// Sets application decoders for newly watched links in this world.
@@ -387,10 +406,10 @@ impl Cx {
 
     /// Checks interest before constructing event-specific tracking state.
     pub fn event_enabled(&self, source: &'static str, kind: &'static str) -> bool {
-        self.run.observer.enabled(
+        self.run.observer.enabled(crate::events::Interest::Event(
             crate::events::Metadata { source, kind },
             &crate::events::ConnInfo::default(),
-        )
+        ))
     }
 
     /// Builds and emits an event only when a destination is interested.

@@ -833,3 +833,115 @@ fn sandbox_client_returns_invalid_server_name() {
     }))
     .unwrap();
 }
+
+#[derive(Default)]
+struct KeyObserver(Mutex<Vec<ObservedKey>>);
+
+type ObservedKey = (fictionet::events::Stamp, String, Vec<u8>, Vec<u8>);
+
+impl std::fmt::Debug for KeyObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeyObserver")
+    }
+}
+impl fictionet::events::Observer for KeyObserver {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        matches!(interest, fictionet::events::Interest::TlsKey(_))
+    }
+
+    fn observe(&self, stamp: fictionet::events::Stamp, item: fictionet::events::Observation<'_>) {
+        let fictionet::events::Observation::TlsKey(key) = item else {
+            panic!("unexpected stream")
+        };
+        self.0.lock().unwrap().push((
+            stamp,
+            key.label.to_owned(),
+            key.client_random.to_vec(),
+            key.secret().to_vec(),
+        ));
+    }
+}
+
+#[test]
+fn a_lab_tls_handshake_emits_borrowed_keys() {
+    let observer = Arc::new(KeyObserver::default());
+    let client_keys = Arc::new(KeyObserver::default());
+    let kept = Arc::new(Mutex::new(None));
+    let keep = kept.clone();
+    let client_log = client_keys.clone();
+    #[derive(Debug)]
+    struct ClientLog(Arc<KeyObserver>);
+    impl rustls::KeyLog for ClientLog {
+        fn log(&self, label: &str, random: &[u8], secret: &[u8]) {
+            self.0.0.lock().unwrap().push((
+                fictionet::events::Stamp {
+                    stream: fictionet::events::Stream::Keys,
+                    seq: 0,
+                    at: fictionet::time::Instant::ZERO,
+                },
+                label.to_owned(),
+                random.to_vec(),
+                secret.to_vec(),
+            ));
+        }
+    }
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(9)).observer(observer.clone()),
+        move |cx| async move {
+            let ca = Ca::new(&cx, "Test CA")?;
+            let config = server_config(&cx, &ca, "example.test", &[]);
+            let mut client_config = (*client_config(&cx, &ca, &[])).clone();
+            client_config.key_log = Arc::new(ClientLog(client_log));
+            let (server_side, client_side) = mem_pair();
+            *keep.lock().unwrap() = Some((cx.clone(), cx.tls_key_log(None).unwrap()));
+            let server = cx.spawn(move |cx| async move {
+                let mut conn = tls::server(&cx, server_side)
+                    .await?
+                    .finish(&cx, config)
+                    .await?;
+                conn.write_all(&cx, b"ok").await?;
+                conn.shutdown(&cx).await?;
+                Ok(())
+            });
+            let mut client =
+                Client::connect(&cx, client_side, Arc::new(client_config), "example.test").await?;
+            let mut bytes = Vec::new();
+            let mut buf = [0; 16];
+            loop {
+                let len = client.read(&cx, &mut buf).await?;
+                if len == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..len]);
+            }
+            assert_eq!(bytes, b"ok");
+            server.join(&cx).await?;
+            Ok(())
+        },
+    ))
+    .unwrap();
+    let keys = observer.0.lock().unwrap();
+    assert!(!keys.is_empty());
+    let client = client_keys.0.lock().unwrap();
+    for (i, (stamp, label, random, secret)) in keys.iter().enumerate() {
+        assert_eq!(stamp.stream, fictionet::events::Stream::Keys);
+        assert_eq!(stamp.seq, i as u64 + 1);
+        assert_eq!(random.len(), 32);
+        assert!(
+            client
+                .iter()
+                .any(|(_, l, r, s)| l == label && r == random && s == secret)
+        );
+    }
+    assert!(
+        keys.iter()
+            .any(|(_, label, _, _)| label == "SERVER_TRAFFIC_SECRET_0")
+    );
+    let count = keys.len();
+    drop(keys);
+    let (cx, logger) = kept.lock().unwrap().take().unwrap();
+    assert!(!logger.will_log("CLIENT_RANDOM"));
+    logger.log("CLIENT_RANDOM", &[0; 32], &[1; 32]);
+    assert_eq!(observer.0.lock().unwrap().len(), count);
+    drop(cx);
+}

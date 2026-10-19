@@ -147,8 +147,8 @@ impl<I: Interface> Interface for Counted<I> {
         self.inner.send(packet)
     }
 
-    fn observe_link(&self) -> Option<fictionet::observe::LinkHandle> {
-        self.inner.observe_link()
+    fn link(&self) -> Option<fictionet::LinkHandle> {
+        self.inner.link()
     }
 }
 
