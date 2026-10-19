@@ -2,8 +2,8 @@
 //!
 //! An [`Event`] has a source, kind, summary, [`Level`], [`ConnInfo`] and JSON
 //! [`Fields`]. Integrators install an [`Observer`] before execution through
-//! [`RunOptions`](crate::RunOptions): none, [`Memory`], native `fictionet_observe::Jsonl`,
-//! [`Aggregate`], dashboard retention, or their own implementation. [`Fanout`]
+//! [`RunOptions`](crate::RunOptions): none, `fictionet_observe::Memory`, native `fictionet_observe::Jsonl`,
+//! `fictionet_observe::Aggregate`, dashboard retention, or their own implementation. [`Fanout`]
 //! combines destinations and filters each delivery by its own interest.
 //! The same observer receives typed topology changes and borrowed TLS keys.
 //! Links publish borrowed packets at each interested successful crossing,
@@ -18,7 +18,7 @@
 //! ```
 //! use std::sync::Arc;
 //! use fictionet::{RunOptions, Seed, block_on, lab};
-//! use fictionet::events::{Aggregate, Memory};
+//! use fictionet_observe::{Aggregate, Memory};
 //! let evidence = Arc::new(Memory::default());
 //! let options = RunOptions::new(Seed::from_u64(7))
 //!     .observer(Arc::new(Aggregate::new(evidence.clone())));
@@ -48,11 +48,11 @@
 //! Fixed inputs, observer configuration and lab scheduling produce repeatable
 //! evidence; see [Repeatable runs](crate::guide::running#repeatable-runs).
 //!
-//! [`Memory`] owns count- and byte-bounded history. Its default reserves separate
+//! `fictionet_observe::Memory` owns count- and byte-bounded history. Its default reserves separate
 //! event and network-noise budgets, so a flood cannot evict unrelated facts.
 //! Oldest events in each budget are evicted first, and loss remains visible
-//! through [`Memory::dropped`]. Graders use
-//! [`Memory::checked_of`] or [`Memory::checked_all`] to reject incomplete
+//! through `fictionet_observe::Memory::dropped`. Graders use
+//! `fictionet_observe::Memory::checked_of` or `fictionet_observe::Memory::checked_all` to reject incomplete
 //! evidence. Reads neither flush nor change retained events. Dashboard clients
 //! can attach late to history retained by an installed
 //! `fictionet_observe::DashboardObserver`.
@@ -60,13 +60,13 @@
 //! Native `fictionet_observe::Jsonl` keeps the event JSON Lines format and enqueues events within
 //! count and byte limits. Its worker performs serialization and I/O. Call its
 //! `finish` method outside the run to drain output and check errors. Worker
-//! scheduling can affect overflow; synchronous [`Memory`] supplies lab evidence.
+//! scheduling can affect overflow; synchronous `fictionet_observe::Memory` supplies lab evidence.
 //!
 //! # Repeats
 //!
 //! Services emit every occurrence. [`Event::repeat`] marks facts such as a
 //! blocked packet or network drop and identifies variable detail, such as the
-//! destination port. An optional [`Aggregate`] wraps a destination, counts
+//! destination port. An optional `fictionet_observe::Aggregate` wraps a destination, counts
 //! repeats within bounded run-time windows, delivering the first occurrence
 //! immediately. Summaries record first and last
 //! sequence references and numeric detail ranges. Reads cannot close windows.
@@ -80,24 +80,18 @@
 //! for each retained copy. They exclude spare collection capacity and copies
 //! held by readers, so they are retention budgets, not process-memory limits.
 
-mod aggregate;
-mod memory;
 mod model;
 mod observer;
 
-pub use aggregate::Aggregate;
-pub use memory::{DisplayBatch, Incomplete, Limits, Memory};
 pub(crate) use model::Origin;
 pub use model::{ConnInfo, Event, EventValue, Fields, Level, Sandbox, Transport, float, opt};
 pub use observer::{Dispatch, Emitter, Fanout, Metadata, Observation, Observer, Stamp};
 
-/// Default number of ordinary events retained by [`Memory`], separate from noise.
-pub const MAX_EVENTS: usize = 50_000;
-/// Default ordinary event bytes, as counted by [`Event::size`], separate from noise.
-pub const MAX_EVENT_BYTES: usize = 16 << 20;
-
 #[cfg(all(test, feature = "std"))]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod recorder;
 
 pub(crate) mod streams;
 

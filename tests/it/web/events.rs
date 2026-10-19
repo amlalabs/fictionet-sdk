@@ -1485,7 +1485,7 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     world_events_with_memory(
         |memory| {
             RunOptions::new(Seed::from_u64(1)).observer(Arc::new(
-                fictionet::events::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
+                fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
                     memory,
                     jsonl.clone(),
                 ]))),

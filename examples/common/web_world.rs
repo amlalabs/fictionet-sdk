@@ -44,7 +44,7 @@ pub fn run(
     let _observation = if let Some(path) = args.get(3) {
         let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
         options = options.observer(std::sync::Arc::new(
-            fictionet::events::Aggregate::new(dashboard.observer()),
+            fictionet_observe::Aggregate::new(dashboard.observer()),
         ));
         Some(fictionet_observe::serve(dashboard.handle(), path)?)
     } else {

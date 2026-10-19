@@ -352,9 +352,10 @@ pub struct Loss {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{Fanout, Memory, Observation, Observer, Stamp};
+    use crate::events::{Fanout, Observation, Observer, Stamp};
     use crate::sync::Mutex;
     use crate::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
+    use fictionet::events::recorder::Recorder;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -389,7 +390,7 @@ mod tests {
     fn topology_run() -> Vec<(Stamp, String)> {
         let first = Arc::new(Topology::default());
         let second = Arc::new(Topology::default());
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         let observer = Arc::new(Fanout::new(vec![
             first.clone(),
             memory.clone(),
@@ -440,7 +441,7 @@ mod tests {
                 bytes: 12
             }; 2]]
         );
-        assert_eq!(memory.checked_all().unwrap().len(), 1);
+        assert_eq!(memory.all().len(), 1);
         let items = first.items.lock().clone();
         for (index, (stamp, _)) in items.iter().enumerate() {
             assert_eq!(stamp.stream, Stream::Topology);
@@ -673,22 +674,5 @@ mod tests {
         assert!(!debug.contains("private secret"));
         assert!(!debug.contains("112, 114, 105"));
         assert!(debug.contains("secret_len: 14"));
-    }
-
-    #[test]
-    fn only_event_losses_affect_memory() {
-        let memory = Memory::default();
-        let mut loss = Loss {
-            stream: Stream::Keys,
-            reason: LossReason::Staging,
-            count: 3,
-            bytes: None,
-            seqs: None,
-        };
-        memory.lost(loss.clone());
-        assert!(memory.checked_all().is_ok());
-        loss.stream = Stream::Events;
-        memory.lost(loss);
-        assert_eq!(memory.checked_of("shop", "order").unwrap_err().dropped, 3);
     }
 }

@@ -45,9 +45,9 @@ fn event_layers_keep_field_order_and_render_json_values() {
 #[test]
 fn installed_observers_keep_events_and_write_json_lines() {
     let path = std::env::temp_dir().join(format!("fictionet-events-{}.jsonl", std::process::id()));
-    let evidence = Arc::new(fictionet::events::Memory::default());
+    let evidence = Arc::new(fictionet_observe::Memory::default());
     let jsonl = Arc::new(
-        fictionet_observe::Jsonl::open(&path, fictionet::events::Limits::default()).unwrap(),
+        fictionet_observe::Jsonl::open(&path, fictionet_observe::Limits::default()).unwrap(),
     );
     let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
         fictionet::events::Fanout::new(vec![evidence.clone(), jsonl.clone()]),
@@ -149,7 +149,7 @@ fn a_reader_added_mid_connection_sees_its_events() {
 /// calendar.
 #[test]
 fn a_net_starts_its_events_with_a_wall_clock_anchor() {
-    let evidence = Arc::new(fictionet::events::Memory::default());
+    let evidence = Arc::new(fictionet_observe::Memory::default());
     world::seeded_real_world(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(42))
             .observer(evidence.clone())

@@ -560,7 +560,8 @@ impl Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::events::{Event, Limits, LossReason, Stream};
+    use crate::Limits;
+    use fictionet::events::{Event, LossReason, Stream};
     use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::protocols::json::Value as Json;
     use fictionet::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};

@@ -200,7 +200,7 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
     }
     let writer = case.writer.then(|| {
         Arc::new(
-            fictionet_observe::Jsonl::new(std::io::sink(), fictionet::events::Limits::default())
+            fictionet_observe::Jsonl::new(std::io::sink(), fictionet_observe::Limits::default())
                 .unwrap(),
         )
     });

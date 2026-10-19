@@ -48,7 +48,7 @@ where
     let output = log.clone();
     fictionet_test_support::harness::run(
         fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
-            fictionet::events::Aggregate::new(Arc::new(log.clone())),
+            fictionet_observe::Aggregate::new(Arc::new(log.clone())),
         )),
         move |fcx| async move {
             let (ids, root) = {

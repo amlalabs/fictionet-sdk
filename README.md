@@ -153,8 +153,8 @@ connection, written with no I/O: it gets decoded items and appends reply bytes,
 and one driver runs it over any connection. HTTP is a service
 (`stdlib::web::httpd`), and `web::Sites` is a preset on `Net` for websites. Every
 service emits structured events (`fictionet::events`). The integrator installs
-observers through `RunOptions`: none, bounded `Memory`, native `fictionet_observe::Jsonl`, an
-`Aggregate` around retention, the dashboard's retention, or a custom observer.
+observers through `RunOptions`: none, bounded `fictionet_observe::Memory`, native `fictionet_observe::Jsonl`, an
+`fictionet_observe::Aggregate` around retention, the dashboard's retention, or a custom observer.
 With no observer, the interest check skips event construction and recording. Graders check
 retention completeness before using evidence.
 [docs/services.md](docs/services.md) builds a small world this way, step by

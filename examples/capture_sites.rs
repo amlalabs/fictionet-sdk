@@ -28,7 +28,7 @@ fn main() -> fictionet::Result {
     let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
     let _observation = if let Some(path) = args.next() {
         let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
-        options = options.observer(std::sync::Arc::new(fictionet::events::Aggregate::new(
+        options = options.observer(std::sync::Arc::new(fictionet_observe::Aggregate::new(
             dashboard.observer(),
         )));
         Some(fictionet_observe::serve(dashboard.handle(), path)?)

@@ -150,11 +150,11 @@ fn upload(size: usize) -> Request<Body> {
     request
 }
 
-fn run<F>(test: impl FnOnce(Cx, Arc<fictionet::events::Memory>) -> F + Send)
+fn run<F>(test: impl FnOnce(Cx, Arc<fictionet::events::recorder::Recorder>) -> F + Send)
 where
     F: std::future::Future<Output = Result<(), Error>> + Send + 'static,
 {
-    let evidence = Arc::new(fictionet::events::Memory::default());
+    let evidence = Arc::new(fictionet::events::recorder::Recorder::default());
     fictionet::block_on(fictionet::run(fictionet::RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()), move |fcx| test(fcx, evidence))).unwrap();
 }
 
@@ -593,7 +593,7 @@ impl fictionet::stdlib::network::Connection for Downstream {
 
 /// Serves one request through `forward` the way a site does, checks that
 /// it answered 502 and recorded the error, and returns the answer.
-async fn bad_gateway(fcx: &Cx, evidence: &fictionet::events::Memory, forward: super::super::Forward) -> String {
+async fn bad_gateway(fcx: &Cx, evidence: &fictionet::events::recorder::Recorder, forward: super::super::Forward) -> String {
     let output = Arc::new(Mutex::new(Vec::new()));
     let conn = Downstream {
         input: Bytes::from_static(b"GET / HTTP/1.1\r\nHost: original.test\r\nConnection: close\r\n\r\n"),
@@ -614,7 +614,7 @@ async fn bad_gateway(fcx: &Cx, evidence: &fictionet::events::Memory, forward: su
     .unwrap();
     let output = String::from_utf8(output.lock().clone()).unwrap();
     assert!(output.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{output}");
-    let events = evidence.checked_of("http", "request").unwrap();
+    let events = evidence.of("http", "request");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].str("answer"), Some("error"));
     assert_eq!(events[0].u64("status"), Some(502));

@@ -199,7 +199,7 @@ fn the_log_is_the_recorded_one() {
         let drain = log.clone();
         let result = rt.block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
-                fictionet::events::Aggregate::new(Arc::new(
+                fictionet_observe::Aggregate::new(Arc::new(
                     adaptive_web_world::events::LogObserver { log: log.clone() },
                 )),
             )),

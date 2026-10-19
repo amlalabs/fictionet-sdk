@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::task::{Poll, Waker};
 
-use crate::sync::Mutex;
+use fictionet::sync::Mutex;
 
-use super::{Event, Observation, Observer, Stamp};
+use fictionet::events::{Event, Observation, Observer, Stamp};
 
 /// Independent count and byte bounds for retained or queued events.
 #[derive(Clone, Copy, Debug)]
@@ -167,14 +167,14 @@ impl Memory {
     /// loss are errors. At most thirty-two waits may be outstanding.
     pub async fn wait(
         &self,
-        cx: &crate::Cx,
+        cx: &fictionet::Cx,
         mut after: u64,
         count: usize,
         limit: std::time::Duration,
         pick: impl Fn(&Event) -> bool,
-    ) -> crate::Result<Vec<Event>> {
+    ) -> fictionet::Result<Vec<Event>> {
         if cx.is_cancelled() {
-            return Err(crate::Cancelled.into());
+            return Err(fictionet::Cancelled.into());
         }
         // The future owns its registration; dropping it releases the waker.
         let wake = Arc::new(Mutex::new(None));
@@ -182,17 +182,18 @@ impl Memory {
             let mut state = self.state.lock();
             state.waiters.retain(|wait| wait.strong_count() != 0);
             if state.waiters.len() == 32 {
-                return Err(crate::Error::msg("too many evidence waits"));
+                return Err(fictionet::Error::msg("too many evidence waits"));
             }
             state.waiters.push(Arc::downgrade(&wake));
         }
-        let deadline =
-            crate::time::Instant::from_since_start(cx.now().since_start().saturating_add(limit));
-        let mut timer = crate::Timer::new(cx);
+        let deadline = fictionet::time::Instant::from_since_start(
+            cx.now().since_start().saturating_add(limit),
+        );
+        let mut timer = fictionet::Timer::new(cx);
         let mut matches = Vec::new();
         std::future::poll_fn(|task| {
             if cx.is_cancelled() {
-                return Poll::Ready(Err(crate::Cancelled.into()));
+                return Poll::Ready(Err(fictionet::Cancelled.into()));
             }
             let previous = wake.lock().replace(task.waker().clone());
             drop(previous);
@@ -213,7 +214,7 @@ impl Memory {
                 }
             }
             if cx.is_cancelled() {
-                return Poll::Ready(Err(crate::Cancelled.into()));
+                return Poll::Ready(Err(fictionet::Cancelled.into()));
             }
             let dropped = self.dropped();
             if dropped != 0 {
@@ -327,7 +328,7 @@ impl Observer for Memory {
         let size = event.size();
         let mut state = self.state.lock();
         state.last = stamp.seq;
-        let (index, limits) = match (event.repeat.is_some(), self.noise_limits) {
+        let (index, limits) = match (event.repeat_fields().is_some(), self.noise_limits) {
             (true, Some(limits)) => (1, limits),
             _ => (0, self.limits),
         };
@@ -367,8 +368,11 @@ impl Observer for Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::time::ms;
-    use crate::{RunOptions, Seed, block_on, lab};
+    use fictionet::events::{Loss, LossReason, Stream};
+    use fictionet::stdlib::network::bottleneck;
+    use fictionet::time::{Instant, ms};
+    use fictionet::{Interface, Packet, pair};
+    use fictionet::{RunOptions, Seed, block_on, lab};
     use std::future::Future;
     use std::sync::Arc;
     use std::task::{Context, Waker};
@@ -377,10 +381,9 @@ mod tests {
     fn a_flood_of_distinct_noise_preserves_other_events() {
         let memory = Arc::new(Memory::default());
         let retained = memory.clone();
-        let flood = super::super::MAX_EVENTS as u64 + 10;
+        let flood = crate::MAX_EVENTS as u64 + 10;
         block_on(lab(
-            RunOptions::new(Seed::from_u64(1))
-                .observer(Arc::new(crate::events::Aggregate::new(retained))),
+            RunOptions::new(Seed::from_u64(1)).observer(Arc::new(crate::Aggregate::new(retained))),
             |cx| async move {
                 for i in 0..10u64 {
                     cx.emit("http", "request", |event| event.field("i", i));
@@ -389,7 +392,7 @@ mod tests {
                     cx.emit("net", "blocked", |event| {
                         event
                             .field("destination", i)
-                            .repeat(super::super::Fields::new())
+                            .repeat(fictionet::events::Fields::new())
                     });
                     if i == flood / 2 {
                         cx.emit("dns", "query", |event| event);
@@ -418,7 +421,7 @@ mod tests {
 
     #[test]
     fn noise_has_independent_count_and_byte_limits() {
-        let event = Event::new("net", "blocked").repeat(super::super::Fields::new());
+        let event = Event::new("net", "blocked").repeat(fictionet::events::Fields::new());
         for limits in [Limits::new(1, 8192), Limits::new(10, event.size())] {
             let memory = Memory::with_noise_limits(Limits::new(2, 8192), limits);
             for (seq, event) in [
@@ -435,7 +438,7 @@ mod tests {
                     Stamp {
                         stream: fictionet::events::Stream::Events,
                         seq: seq as u64 + 1,
-                        at: crate::time::Instant::ZERO,
+                        at: fictionet::time::Instant::ZERO,
                     },
                     Observation::Event(event),
                 );
@@ -487,7 +490,7 @@ mod tests {
                         .len(),
                     1
                 );
-                assert_eq!(cx.now(), crate::time::Instant::ZERO);
+                assert_eq!(cx.now(), fictionet::time::Instant::ZERO);
                 Ok(())
             },
         ))
@@ -552,7 +555,7 @@ mod tests {
                     Stamp {
                         stream: fictionet::events::Stream::Events,
                         seq: 1,
-                        at: crate::time::Instant::ZERO,
+                        at: fictionet::time::Instant::ZERO,
                     },
                     Observation::Event(&Event::new("test", "ready")),
                 );
@@ -561,9 +564,9 @@ mod tests {
                         .poll(&mut Context::from_waker(&waker))
                         .is_pending()
                 );
-                memory.lost(crate::events::Loss {
-                    stream: crate::events::Stream::Events,
-                    reason: crate::events::LossReason::Staging,
+                memory.lost(fictionet::events::Loss {
+                    stream: fictionet::events::Stream::Events,
+                    reason: fictionet::events::LossReason::Staging,
                     count: 1,
                     bytes: None,
                     seqs: None,
@@ -601,5 +604,138 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn memory_flood_is_bounded_and_cannot_be_graded() {
+        let memory = Arc::new(Memory::new(Limits::new(3, 4096)));
+        block_on(lab(
+            RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
+            |cx| async move {
+                for i in 0..1000u64 {
+                    cx.emit("shop", "order", |e| e.field("item", i));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        assert_eq!(memory.retained().0, 3);
+        assert!(memory.retained().1 <= 4096);
+        assert_eq!(memory.dropped(), 998);
+        assert_eq!(memory.checked_of("shop", "order").unwrap_err().dropped, 998);
+        assert!(memory.checked_of("unrelated", "kind").is_err());
+        assert_eq!(memory.checked_all().unwrap_err().dropped, 998);
+        assert_eq!(memory.after(0, usize::MAX).len(), 3);
+    }
+
+    #[test]
+    fn oversized_events_are_rejected_without_evicting_retained_evidence() {
+        let memory = Memory::new(Limits::new(4, 2048));
+        memory.observe(
+            Stamp {
+                stream: fictionet::events::Stream::Events,
+                seq: 1,
+                at: Instant::ZERO,
+            },
+            Observation::Event(&Event::new("shop", "order")),
+        );
+        memory.observe(
+            Stamp {
+                stream: fictionet::events::Stream::Events,
+                seq: 2,
+                at: Instant::ZERO,
+            },
+            Observation::Event(&Event::new("shop", "order").summary("x".repeat(4096))),
+        );
+        assert_eq!(memory.retained().0, 1);
+        assert_eq!(memory.dropped(), 1);
+        assert_eq!(memory.last(), 2);
+        assert_eq!(memory.after(0, 4)[0].seq, 1);
+    }
+
+    #[test]
+    fn only_event_losses_affect_memory() {
+        let memory = Memory::default();
+        let mut loss = Loss {
+            stream: Stream::Keys,
+            reason: LossReason::Staging,
+            count: 3,
+            bytes: None,
+            seqs: None,
+        };
+        memory.lost(loss.clone());
+        assert!(memory.checked_all().is_ok());
+        loss.stream = Stream::Events;
+        memory.lost(loss);
+        assert_eq!(memory.checked_of("shop", "order").unwrap_err().dropped, 3);
+    }
+
+    /// A bounded observer reports incomplete evidence when a flood exceeds
+    /// its retention budget; the bottleneck still reports every raw drop.
+    #[test]
+    fn a_flooded_bottleneck_reports_raw_drops_and_retention_loss() {
+        use crate::{Limits, Memory};
+        use std::sync::Arc;
+        let flood = crate::MAX_EVENTS + 10_000;
+        let bounded = Arc::new(Memory::with_noise_limits(
+            Limits::new(3, 4 << 10),
+            Limits::new(29, 28 << 10),
+        ));
+        let aggregated = Arc::new(Memory::new(Limits::new(32, 32 << 10)));
+        let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(
+            std::sync::Arc::new(fictionet::events::Fanout::new(vec![
+                bounded.clone(),
+                Arc::new(crate::Aggregate::new(aggregated.clone())),
+            ])),
+        );
+        block_on(fictionet::lab(options, move |fcx| async move {
+            let (mut sandbox, inner) = pair();
+            let _far = bottleneck(&fcx, 0, 10, inner);
+            fcx.emit("http", "request", |event| event);
+            for i in 0..flood {
+                sandbox.send(Packet(vec![0x45; 20]));
+                if i % 32 == 31 {
+                    fcx.yield_now().await?;
+                }
+            }
+            fcx.idle().await?;
+            fcx.emit("http", "request", |event| event);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+        let raw = bounded.after(0, usize::MAX);
+        assert_eq!(
+            raw.iter()
+                .filter(|event| event.is("http", "request"))
+                .count(),
+            2
+        );
+        let raw_drops: Vec<_> = raw
+            .iter()
+            .filter(|event| event.is("bottleneck", "drop"))
+            .collect();
+        for event in &raw_drops {
+            assert!(event.get("count").is_none());
+            assert_eq!(event.str("why"), Some("the queue was full"));
+        }
+        assert_eq!(
+            bounded.dropped() + raw_drops.len() as u64,
+            flood as u64 - 10
+        );
+        assert!(bounded.checked_all().is_err());
+        assert!(bounded.dropped() > 0);
+        let (count, bytes) = bounded.retained();
+        assert!(count <= 32 && bytes <= 32 << 10);
+        assert_eq!(aggregated.checked_of("http", "request").unwrap().len(), 2);
+        let drops = aggregated.checked_of("bottleneck", "drop").unwrap();
+        assert!(!drops.is_empty() && drops.len() <= 4, "{drops:?}");
+        assert_eq!(
+            drops
+                .iter()
+                .map(|event| event.u64("count").unwrap_or(1))
+                .sum::<u64>(),
+            flood as u64 - 10
+        );
     }
 }

@@ -122,7 +122,8 @@ mod tests {
 
     #[test]
     fn gateway_dns_stays_separate_from_other_ports() {
-        use fictionet::events::{Aggregate, ConnInfo};
+        use fictionet::events::ConnInfo;
+        use fictionet_observe::Aggregate;
         use std::sync::{Arc, atomic::AtomicUsize};
         let output = Output::default();
         let log = Arc::new(Log::start(Box::new(output.clone())).unwrap());

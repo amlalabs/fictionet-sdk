@@ -378,7 +378,7 @@ impl Event {
     }
 
     /// Marks a repeatable fact and adds per-occurrence detail.
-    /// An optional [`super::Aggregate`] combines matching facts and summarizes
+    /// An optional `fictionet_observe::Aggregate` combines matching facts and summarizes
     /// numeric detail as ranges. Detail names must not replace identifying fields.
     /// Without that observer, every occurrence is delivered unchanged.
     pub fn repeat(mut self, detail: Fields) -> Self {
@@ -407,6 +407,16 @@ impl Event {
         self.fields.get(name)
     }
 
+    /// Names of variable detail fields on a repeatable fact, or none for an ordinary event.
+    pub fn repeat_fields(&self) -> Option<&[&'static str]> {
+        self.repeat.as_deref()
+    }
+
+    /// Whether both events carry the same originating task identity.
+    pub fn same_origin(&self, other: &Self) -> bool {
+        self.origin == other.origin
+    }
+
     /// The field `name` as text.
     pub fn str(&self, name: &str) -> Option<&str> {
         self.get(name).and_then(Value::as_str)
@@ -424,7 +434,7 @@ impl Event {
 
     /// About how many bytes the event holds in memory, each allocation's
     /// overhead included, as retention counts them against
-    /// [`MAX_EVENT_BYTES`](super::MAX_EVENT_BYTES). Shared connection metadata is charged in full
+    /// `fictionet_observe::MAX_EVENT_BYTES`. Shared connection metadata is charged in full
     /// for each event. Owned task names are included; static strings are not.
     pub fn size(&self) -> usize {
         heap(std::mem::size_of::<Event>() + ARC_COUNTS)

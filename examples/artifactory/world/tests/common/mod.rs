@@ -43,7 +43,7 @@ where
     let output = log.clone();
     fictionet_test_support::harness::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
-            fictionet::events::Aggregate::new(Arc::new(log.clone())),
+            fictionet_observe::Aggregate::new(Arc::new(log.clone())),
         )),
         move |fcx| async move {
             let contents = Arc::new(Contents::new(variant, "", &[1; 32]).unwrap());

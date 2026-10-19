@@ -383,14 +383,14 @@ impl Dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{Limits, Memory};
     use crate::{RunOptions, Seed, block_on, lab};
+    use fictionet::events::recorder::Recorder;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[test]
     fn interest_checks_do_not_take_the_delivery_lock() {
-        let dispatch = Arc::new(Dispatch::new(Some(Arc::new(Memory::default()))));
+        let dispatch = Arc::new(Dispatch::new(Some(Arc::new(Recorder::default()))));
         let state = dispatch.state.lock();
         let checking = dispatch.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn bounded_builders_report_truncation_without_copying_large_text() {
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         block_on(lab(
             RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
             |cx| async move {
@@ -493,16 +493,12 @@ mod tests {
         assert!(events[1].size() < 16 * 1024);
         assert!(events[1].str("text").unwrap().ends_with("[truncated]"));
         assert_eq!(events[1].summary.len(), 4096);
-        assert!(
-            memory.checked_all().unwrap()[0..]
-                .iter()
-                .any(Event::is_truncated)
-        );
+        assert!(memory.all()[0..].iter().any(Event::is_truncated));
     }
 
     #[test]
     fn run_metadata_is_bounded_without_losing_the_event() {
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         block_on(lab(
             RunOptions::new(Seed::from_u64(1))
                 .observer(memory.clone())
@@ -513,16 +509,12 @@ mod tests {
         let start = &memory.after(0, 1)[0];
         assert!(start.str("large").unwrap().ends_with("[truncated]"));
         assert!(start.size() < 8192);
-        assert!(
-            memory.checked_all().unwrap()[0..]
-                .iter()
-                .any(Event::is_truncated)
-        );
+        assert!(memory.all()[0..].iter().any(Event::is_truncated));
     }
 
     #[test]
     fn caller_metadata_cannot_displace_run_identity() {
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         let mut fields = crate::events::Fields::new();
         for name in [
             "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
@@ -541,7 +533,7 @@ mod tests {
             |_| async { Ok(()) },
         ))
         .unwrap();
-        let events = memory.checked_all().unwrap();
+        let events = memory.all();
         assert_eq!(events.len(), 1);
         assert!(events[0].is_truncated());
         assert_eq!(events[0].str("seed"), Some(seed.to_string().as_str()));
@@ -550,7 +542,7 @@ mod tests {
     }
 
     fn records() -> Vec<Event> {
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         let options = RunOptions::new(Seed::from_u64(42))
             .observer(memory.clone())
             .fields(crate::events::Fields::new().with("world", "shop"));
@@ -595,7 +587,7 @@ mod tests {
 
     #[test]
     fn start_precedes_world_builder_emissions() {
-        let memory = Arc::new(Memory::default());
+        let memory = Arc::new(Recorder::default());
         block_on(lab(
             RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
             |cx| {
@@ -608,7 +600,7 @@ mod tests {
             },
         ))
         .unwrap();
-        let events = memory.checked_all().unwrap();
+        let events = memory.all();
         assert!(events[0].is("run", "start"));
         assert_eq!(events[0].seq, 1);
         assert_eq!(events[0].origin.as_ref().unwrap().task, 1);
@@ -616,7 +608,7 @@ mod tests {
         assert_eq!(events[2].origin.as_ref().unwrap().task, 2);
     }
 
-    struct Orders(Arc<Memory>);
+    struct Orders(Arc<Recorder>);
     impl Observer for Orders {
         fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
             let fictionet::events::Interest::Event(metadata, _) = interest else {
@@ -631,8 +623,8 @@ mod tests {
 
     #[test]
     fn fanout_shares_stamps_and_filters_each_recipient() {
-        let all = Arc::new(Memory::default());
-        let orders = Arc::new(Memory::default());
+        let all = Arc::new(Recorder::default());
+        let orders = Arc::new(Recorder::default());
         let fanout = Fanout::new(vec![all.clone(), Arc::new(Orders(orders.clone()))]);
         block_on(lab(
             RunOptions::new(Seed::from_u64(1)).observer(Arc::new(fanout)),
@@ -642,59 +634,9 @@ mod tests {
             },
         ))
         .unwrap();
-        assert_eq!(
-            all.checked_of("shop", "order").unwrap(),
-            orders.checked_of("shop", "order").unwrap()
-        );
+        assert_eq!(all.of("shop", "order"), orders.of("shop", "order"));
         assert_eq!(orders.after(0, 10)[0].seq, 2);
-        assert!(orders.checked_of("run", "start").unwrap().is_empty());
-    }
-
-    #[test]
-    fn memory_flood_is_bounded_and_cannot_be_graded() {
-        let memory = Arc::new(Memory::new(Limits::new(3, 4096)));
-        block_on(lab(
-            RunOptions::new(Seed::from_u64(1)).observer(memory.clone()),
-            |cx| async move {
-                for i in 0..1000u64 {
-                    cx.emit("shop", "order", |e| e.field("item", i));
-                }
-                Ok(())
-            },
-        ))
-        .unwrap();
-        assert_eq!(memory.retained().0, 3);
-        assert!(memory.retained().1 <= 4096);
-        assert_eq!(memory.dropped(), 998);
-        assert_eq!(memory.checked_of("shop", "order").unwrap_err().dropped, 998);
-        assert!(memory.checked_of("unrelated", "kind").is_err());
-        assert_eq!(memory.checked_all().unwrap_err().dropped, 998);
-        assert_eq!(memory.after(0, usize::MAX).len(), 3);
-    }
-
-    #[test]
-    fn oversized_events_are_rejected_without_evicting_retained_evidence() {
-        let memory = Memory::new(Limits::new(4, 2048));
-        memory.observe(
-            Stamp {
-                stream: fictionet::events::Stream::Events,
-                seq: 1,
-                at: Instant::ZERO,
-            },
-            Observation::Event(&Event::new("shop", "order")),
-        );
-        memory.observe(
-            Stamp {
-                stream: fictionet::events::Stream::Events,
-                seq: 2,
-                at: Instant::ZERO,
-            },
-            Observation::Event(&Event::new("shop", "order").summary("x".repeat(4096))),
-        );
-        assert_eq!(memory.retained().0, 1);
-        assert_eq!(memory.dropped(), 1);
-        assert_eq!(memory.last(), 2);
-        assert_eq!(memory.after(0, 4)[0].seq, 1);
+        assert!(orders.of("run", "start").is_empty());
     }
 
     struct Ended(Arc<AtomicUsize>);

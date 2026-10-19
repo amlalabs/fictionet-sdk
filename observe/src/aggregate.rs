@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::stdlib::protocols::json::Value;
-use crate::sync::Mutex;
-use crate::time::Instant;
+use fictionet::stdlib::protocols::json::Value;
+use fictionet::sync::Mutex;
+use fictionet::time::Instant;
 
-use super::{Event, Limits, Observation, Observer, Stamp};
+use crate::Limits;
+use fictionet::events::{Event, Observation, Observer, Stamp};
 
 /// Optional, bounded aggregation of facts marked with [`Event::repeat`].
 /// Other streams and their losses pass through unchanged.
@@ -148,14 +149,14 @@ impl State {
         limits: Limits,
         ready: &mut Vec<Event>,
     ) -> bool {
-        if event.repeat.is_none()
+        if event.repeat_fields().is_none()
             || self.start.is_some_and(|start| {
                 stamp.at.since_start().saturating_sub(start.since_start()) >= window
             })
         {
             self.flush(ready);
         }
-        if event.repeat.is_none() || window.is_zero() {
+        if event.repeat_fields().is_none() || window.is_zero() {
             return true;
         }
         if let Some(pending) = self.pending.iter_mut().find(|p| matches(&p.event, event)) {
@@ -163,7 +164,7 @@ impl State {
                 pending.event = event.clone();
                 pending.first = stamp.seq;
             }
-            for name in event.repeat.as_ref().unwrap() {
+            for name in event.repeat_fields().unwrap() {
                 if pending.count != 0
                     && let Some(n) = event.u64(name)
                     && let Some((low, high)) = pending.event.get(name).and_then(range)
@@ -182,7 +183,7 @@ impl State {
         // Reserve space for numeric ranges and summary fields before copying.
         let size = event
             .size()
-            .saturating_add(event.repeat.as_ref().unwrap().len().saturating_mul(256))
+            .saturating_add(event.repeat_fields().unwrap().len().saturating_mul(256))
             .saturating_add((event.fields.len() + 3) * std::mem::size_of::<(&str, Value)>())
             .saturating_add(1024);
         if self.pending.len() >= limits.events || size > limits.bytes.saturating_sub(self.bytes) {
@@ -222,9 +223,9 @@ fn matches(a: &Event, b: &Event) -> bool {
         && a.kind == b.kind
         && a.level == b.level
         && a.conn == b.conn
-        && a.origin == b.origin
+        && a.same_origin(b)
         && a.summary == b.summary
-        && a.repeat == b.repeat
+        && a.repeat_fields() == b.repeat_fields()
         && a.fields.len() == b.fields.len()
         && a.fields
             .iter()
@@ -232,7 +233,7 @@ fn matches(a: &Event, b: &Event) -> bool {
             .all(|((name, av), (other, bv))| {
                 name == other
                     && (av == bv
-                        || (a.repeat.as_ref().unwrap().contains(&name)
+                        || (a.repeat_fields().unwrap().contains(&name)
                             && range(av).is_some()
                             && bv.as_u64().is_some()))
             })
@@ -241,9 +242,10 @@ fn matches(a: &Event, b: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::ConnInfo;
-    use crate::events::{Fields, Memory};
-    use crate::{RunOptions, Seed, block_on, lab};
+    use crate::Memory;
+    use fictionet::events::ConnInfo;
+    use fictionet::events::Fields;
+    use fictionet::{RunOptions, Seed, block_on, lab};
 
     fn flood(read: bool) -> Vec<Event> {
         let memory = Arc::new(Memory::new(Limits::new(8, 32 << 10)));
@@ -326,9 +328,9 @@ mod tests {
         assert_eq!(memory.after(3, 10)[0].seq, 4);
         aggregate.end(Instant::ZERO);
         assert_eq!(memory.checked_all().unwrap().len(), 4);
-        aggregate.lost(crate::events::Loss {
-            stream: crate::events::Stream::Events,
-            reason: crate::events::LossReason::Staging,
+        aggregate.lost(fictionet::events::Loss {
+            stream: fictionet::events::Stream::Events,
+            reason: fictionet::events::LossReason::Staging,
             count: 7,
             bytes: None,
             seqs: None,
@@ -342,7 +344,7 @@ mod tests {
         let evidence = Arc::new(Memory::new(Limits::new(4, 8192)));
         block_on(lab(
             RunOptions::new(Seed::from_u64(7)).observer(Arc::new(Aggregate::new(Arc::new(
-                crate::events::Fanout::new(vec![history.clone(), evidence.clone()]),
+                fictionet::events::Fanout::new(vec![history.clone(), evidence.clone()]),
             )))),
             |cx| async move {
                 for _ in 0..1000 {

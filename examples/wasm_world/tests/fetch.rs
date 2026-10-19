@@ -4,8 +4,9 @@
 //! JavaScript also runs an event-loop case.
 //! The README says which requests a world cannot serve in a JavaScript engine.
 
-use fictionet::events::{Fanout, Memory, Observation, Observer, Stamp};
+use fictionet::events::{Fanout, Observation, Observer, Stamp};
 use fictionet::stdlib::protocols::json::Value;
+use fictionet_observe::Memory;
 use http::Version;
 use std::io::Write;
 use std::sync::{Arc, Mutex};

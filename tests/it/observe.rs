@@ -87,7 +87,7 @@ async fn fetch<C: Connection>(
 fn one_run(observe: bool) -> Vec<Vec<u8>> {
     let out = Arc::new(fictionet::sync::Mutex::new(None));
     let o = out.clone();
-    let evidence = Arc::new(fictionet::events::Memory::default());
+    let evidence = Arc::new(fictionet_observe::Memory::default());
     let collector = Arc::new(fictionet_observe::Collector::new(
         fictionet_observe::Options {
             keys: if observe {

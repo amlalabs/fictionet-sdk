@@ -95,7 +95,7 @@ fn real_main() -> fictionet::Result {
     };
     let result = runtime.block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
-            .observer(Arc::new(fictionet::events::Aggregate::new(observer))),
+            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
         move |fcx| async move {
             let backend = Backend::new(&fcx, args.backend_port)?;
             let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);

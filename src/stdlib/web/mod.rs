@@ -486,7 +486,7 @@
 //! - `net.blocked`: the packets `Sites` itself drops or refuses, with
 //!   `why` (see [`BlockedWhy`](fictionet::stdlib::world::net::BlockedWhy)),
 //!   `protocol`, `src`, `dst`, `dst_port` and `count`. These are
-//!   repeatable facts: an optional [`Aggregate`](fictionet::events::Aggregate)
+//!   repeatable facts: an optional `fictionet_observe::Aggregate`
 //!   counts a scan or flood within bounded run-time windows.
 //!
 //! Every event names the sandbox it came from; events about a connection
@@ -501,7 +501,7 @@
 #![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
 //!
 //! The integrator installs observers before running the world. With no observer,
-//! services skip event construction. [`Memory`](fictionet::events::Memory) keeps
+//! services skip event construction. `fictionet_observe::Memory` keeps
 //! a bounded history for grading. Native `fictionet_observe::Jsonl` writes files
 //! and needs an explicit `finish` outside the run. Custom observers must return promptly without calling back
 //! into the world. A grader can install memory and optional repeat aggregation:
@@ -509,7 +509,7 @@
 //! ```
 //! use std::sync::Arc;
 //! use fictionet::{RunOptions, Seed, block_on, lab};
-//! use fictionet::events::{Aggregate, Memory};
+//! use fictionet_observe::{Aggregate, Memory};
 //! let evidence = Arc::new(Memory::default());
 //! let options = RunOptions::new(Seed::from_u64(7))
 //!     .observer(Arc::new(Aggregate::new(evidence.clone())));

@@ -17,8 +17,8 @@ observers:
 ```rust
 use std::sync::Arc;
 use fictionet::{RunOptions, Seed};
-use fictionet::events::{Fanout, Memory};
-use fictionet_observe::{Collector, Options};
+use fictionet::events::Fanout;
+use fictionet_observe::{Collector, Memory, Options};
 
 let collector = Arc::new(Collector::new(Options::default()));
 let grader = Arc::new(Memory::default());
@@ -53,7 +53,7 @@ Snapshots and copies held by readers are outside retention budgets.
 Retained keys can be rendered as SSLKEYLOGFILE text. Key debug output hides
 secrets. `Jsonl::finish` must run outside observer callbacks to drain its
 worker and report incomplete output or writer errors. The collector uses
-`fictionet::events::Memory` for events.
+`fictionet_observe::Memory` for events.
 
 `DashboardObserver` owns one collector and serves one run. Its default captures
 all links on demand and retains TLS keys from startup. `DashboardOptions::demo()`

@@ -5,9 +5,11 @@
 // The copyable decoders name this crate as their users do.
 extern crate self as fictionet_observe;
 
+mod aggregate;
 mod capture;
 mod keys;
 mod loss;
+mod memory;
 mod topology;
 
 #[cfg(feature = "decode")]
@@ -45,6 +47,14 @@ mod tracing_bridge;
 #[cfg(feature = "tracing")]
 pub use tracing_bridge::Tracing;
 
+pub use aggregate::Aggregate;
+pub use memory::{DisplayBatch, Incomplete, Limits, Memory};
+
+/// Default number of ordinary events retained by [`Memory`], separate from noise.
+pub const MAX_EVENTS: usize = 50_000;
+/// Default ordinary event bytes, as counted by [`fictionet::events::Event::size`], separate from noise.
+pub const MAX_EVENT_BYTES: usize = 16 << 20;
+
 pub use capture::{CaptureDemand, CapturePolicy, PacketBatch, PacketCopy};
 pub use keys::{Key, keylog};
 pub use loss::{LossStatus, LossTotal};
@@ -55,8 +65,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use fictionet::events::{
-    Counts, Interest, Limits, LinkId, Loss, LossReason, Memory, Observation, Observer, Stamp,
-    Stream, TopologyRef,
+    Counts, Interest, LinkId, Loss, LossReason, Observation, Observer, Stamp, Stream, TopologyRef,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;

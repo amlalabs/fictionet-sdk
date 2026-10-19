@@ -203,7 +203,7 @@ mod http {
     #[cfg(feature = "tokio")]
     #[test]
     fn tower_upgrade_with_a_cut_off_body_is_answered() {
-        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence = std::sync::Arc::new(fictionet_observe::Memory::default());
         fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)).observer(evidence.clone()), |fcx| async move {
             let app = axum::Router::new().route("/", axum::routing::post(|| async { "reached" }));
             let mut conn = client(&fcx, httpd::tower(app)).await;

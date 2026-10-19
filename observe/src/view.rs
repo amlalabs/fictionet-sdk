@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::DisplayBatch;
 use crate::json::{self, Object};
 use crate::{DashboardHandle, Topology};
-use fictionet::events::{DisplayBatch, Event};
+use fictionet::events::Event;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::json::Value;
 
@@ -561,8 +562,9 @@ pub(crate) fn event_changes(graph: &DashboardHandle, view: &mut View) -> (Vec<Me
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Limits;
     use crate::{DashboardObserver, DashboardOptions, Options};
-    use fictionet::events::{Interest, Limits, Observation, Observer, Stamp, Stream, TopologyRef};
+    use fictionet::events::{Interest, Observation, Observer, Stamp, Stream, TopologyRef};
 
     fn identities(count: usize) -> Topology {
         struct Added(crate::Collector);
@@ -1197,7 +1199,8 @@ mod tests {
         );
     }
     fn event_with_metadata(name: &'static str) -> Event {
-        use fictionet::events::{ConnInfo, Level, Memory, Sandbox, Transport};
+        use crate::Memory;
+        use fictionet::events::{ConnInfo, Level, Sandbox, Transport};
         let mut conn = ConnInfo::new(
             42,
             "10.0.0.1:443".parse().unwrap(),

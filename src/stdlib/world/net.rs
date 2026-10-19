@@ -81,7 +81,7 @@
 //!   machines on one Ethernet: broadcast and multicast reach every member.
 //!   The router sends the LAN's prefix to its gateway, the LAN's first
 //!   address answers DNS, and the packets the LAN drops are recorded
-//!   (optionally summarized by [`Aggregate`](fictionet::events::Aggregate)).
+//!   (optionally summarized by `fictionet_observe::Aggregate`).
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
 //!   closed ports with "port unreachable". UDP delivery and closed-port
 //!   events use the declared UDP length. Invalid lengths are dropped;

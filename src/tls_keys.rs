@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn an_event_observer_does_not_create_a_key_adapter() {
-        let memory = std::sync::Arc::new(crate::events::Memory::default());
+        let memory = std::sync::Arc::new(fictionet::events::recorder::Recorder::default());
         block_on(lab(
             crate::RunOptions::new(Seed::from_u64(7)).observer(memory),
             |cx| async move {

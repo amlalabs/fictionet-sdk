@@ -26,7 +26,7 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// ```
 /// use std::sync::Arc;
 /// use fictionet::{RunOptions, Seed, block_on, lab};
-/// use fictionet::events::{Limits, Memory};
+/// use fictionet_observe::{Limits, Memory};
 ///
 /// let evidence = Arc::new(Memory::new(Limits::new(1000, 1 << 20)));
 /// let options = RunOptions::new(Seed::from_u64(7)).observer(evidence.clone());
@@ -187,7 +187,7 @@ where
 ///
 /// Like [`run`], `lab` emits `run.start` automatically when an observer wants it.
 /// Observer configuration is part of a repeatable run; synchronous
-/// [`Memory`](crate::events::Memory) retains deterministic evidence.
+/// `fictionet_observe::Memory` retains deterministic evidence.
 ///
 /// Each run has its own task identities. A lab started inside another
 /// run's task has a world root with no parent in the outer run.
@@ -1070,7 +1070,7 @@ mod tests {
     #[test]
     fn retained_evidence_outlives_completed_and_dropped_runs() {
         for complete in [true, false] {
-            let evidence = Arc::new(crate::events::Memory::default());
+            let evidence = Arc::new(fictionet::events::recorder::Recorder::default());
             let shared = RunShared::with_options(
                 RunOptions::new(crate::Seed::from_u64(7)).observer(evidence.clone()),
                 crate::RunMode::Lab,
@@ -1099,7 +1099,7 @@ mod tests {
             assert!(weak_run.upgrade().is_none());
             assert!(weak_environment.upgrade().is_none());
             assert_eq!(Arc::strong_count(&evidence), 1);
-            let events = evidence.checked_all().unwrap();
+            let events = evidence.all();
             assert_eq!(
                 events
                     .iter()
@@ -1118,7 +1118,7 @@ mod tests {
                 assert_eq!(origin.task, 1);
                 assert_eq!(origin.name, "world");
             }
-            assert_eq!(evidence.checked_all().unwrap(), events);
+            assert_eq!(evidence.all(), events);
         }
     }
 }

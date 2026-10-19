@@ -19,7 +19,7 @@ fn start_world(path: &str) -> fictionet_observe::Endpoint {
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(std::sync::Arc::new(
-                fictionet::events::Aggregate::new(dashboard.observer()),
+                fictionet_observe::Aggregate::new(dashboard.observer()),
             )),
             move |fcx| async move {
                 let mut n = 0i64;
@@ -872,7 +872,7 @@ fn start_two_links(path: &str) -> fictionet_observe::Endpoint {
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(std::sync::Arc::new(
-                fictionet::events::Aggregate::new(dashboard.observer()),
+                fictionet_observe::Aggregate::new(dashboard.observer()),
             )),
             move |fcx| async move {
                 let lan = fcx.group("lan");
@@ -1143,7 +1143,7 @@ fn a_watch_exits_0_when_the_world_ends() {
     let world_thread = std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(std::sync::Arc::new(
-                fictionet::events::Aggregate::new(dashboard.observer()),
+                fictionet_observe::Aggregate::new(dashboard.observer()),
             )),
             move |fcx| async move {
                 assert_eq!(stopped.recv(&fcx).await, Err(fictionet::RecvError::Closed));

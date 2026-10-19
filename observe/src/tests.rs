@@ -862,7 +862,7 @@ fn aggregation_preserves_packets_keys_topology_and_loss() {
         capture: CapturePolicy::Startup,
         ..Options::default()
     }));
-    let aggregate = Arc::new(fictionet::events::Aggregate::new(collector.clone()));
+    let aggregate = Arc::new(crate::Aggregate::new(collector.clone()));
     let reader = collector.clone();
     let destination = aggregate.clone();
     block_on(lab(

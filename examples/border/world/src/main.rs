@@ -141,7 +141,7 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     };
     let result = fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
-            .observer(Arc::new(fictionet::events::Aggregate::new(observer))),
+            .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
         move |fcx| async move {
             let ids = border_world::identities(&fcx, &scenario, &world_ca)?;
             border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;

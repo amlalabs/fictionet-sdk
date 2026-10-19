@@ -27,4 +27,5 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
+fictionet-observe = { path = "../../observe" }
 wasm-bindgen-test = "0.3"

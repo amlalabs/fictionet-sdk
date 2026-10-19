@@ -21,7 +21,7 @@ fn observer_sees_no_host_body() {
     for version in ["1.0", "1.1"] {
         let observer = Arc::new(Exposure::default());
         let service = Http1::new(httpd::VirtualHosts::new()).observe(observer.clone());
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h =
             Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
         let mut request = format!(
@@ -78,7 +78,7 @@ fn body_limit_exposure() {
         },
     )
     .observe(observer.clone());
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h =
         Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
     h.push(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 20\r\n\r\n01234567890123456789")
@@ -119,7 +119,7 @@ fn partial_timeout_exposure() {
         let observer = Arc::new(Exposure::default());
         let router = Router::new().post("/", |_, _| panic!("timed out body reached handler"));
         let service = Http1::new(router).observe(observer.clone());
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h =
             Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
         h.push(format!("POST / HTTP/1.1\r\nHost: a\r\n{framing}\r\n\r\n").as_bytes())
@@ -181,7 +181,7 @@ fn body_timeout_preserves_item_faults() {
                 }],
                 ..Plan::default()
             }));
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts)
             .observer(evidence_h.clone());
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nxy")
@@ -236,7 +236,7 @@ fn body_decode_failure_preserves_item_faults() {
                 }],
                 ..Plan::default()
             }));
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::with_options(fictionet::Seed::from_u64(0), service, (), opts)
             .observer(evidence_h.clone());
         assert!(matches!(
@@ -286,7 +286,7 @@ fn hook_redacts_before_log() {
         );
         response
     });
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(
         fictionet::Seed::from_u64(0),
         Http1::new(router).observe(observer.clone()),
@@ -327,7 +327,7 @@ fn observer_sees_cut_off_body_without_framing() {
     for tail in [SECRET, b"64\r\nprivate-credential!!".as_slice()] {
         let observer = Arc::new(Exposure::default());
         let router = Router::new().post("/", |_, _| panic!("partial body reached byte handler"));
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(
             fictionet::Seed::from_u64(0),
             Http1::new(router).observe(observer.clone()),
@@ -368,7 +368,7 @@ fn received_does_not_require_an_observer() {
                 ..httpd::Limits::default()
             },
         );
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h =
             Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
         h.push(
@@ -404,7 +404,7 @@ fn missing_host_does_not_hide_an_oversized_body() {
         },
     )
     .observe(observer.clone());
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h =
         Harness::new(fictionet::Seed::from_u64(0), service, ()).observer(evidence_h.clone());
     assert!(
@@ -479,7 +479,7 @@ fn http1_streams_chunks_once_and_keeps_alive() {
         } else {
             answer
         };
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(StreamHandler), ())
             .observer(evidence_h.clone());
         let request = format!("GET {path} HTTP/1.1\r\nHost: a.test\r\n\r\n");
@@ -522,7 +522,7 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
         .get("/files/*", |_, r| {
             http::Response::new(Bytes::from(r.uri().path().to_owned()))
         });
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
         .observer(evidence_h.clone());
     // Two pipelined requests, then HEAD, then an unknown path and method.
@@ -597,7 +597,7 @@ fn http1_response_policy_preserves_native_framing() {
                 .body(Bytes::from_static(b"body"))
                 .unwrap()
         });
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
             .observer(evidence_h.clone());
         let request = format!("{method} / HTTP/1.1\r\nHost: a.test\r\n\r\n");
@@ -717,7 +717,7 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
 #[test]
 fn an_http11_request_with_no_host_gets_400_from_the_service() {
     let vhosts = httpd::VirtualHosts::new();
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ())
         .observer(evidence_h.clone());
     let _ = h.push(b"GET /x HTTP/1.1\r\nAccept: */*\r\n\r\n");
@@ -758,7 +758,7 @@ fn an_http11_absolute_request_with_no_host_gets_400_from_the_service() {
             http::Response::new(Bytes::from("ok"))
         })),
     );
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ())
         .observer(evidence_h.clone());
     assert!(h.push(b"GET http://a.test/ HTTP/1.1\r\n\r\n").is_err());
@@ -922,7 +922,7 @@ fn http1_rejects_unsupported_transfer_codings_before_dispatch() {
             count.fetch_add(1, Ordering::SeqCst);
             http::Response::new(Bytes::new())
         });
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
             .observer(evidence_h.clone());
         let request = format!(
@@ -946,7 +946,7 @@ fn http1_rejects_unsupported_transfer_codings_before_dispatch() {
 
 #[test]
 fn http1_answers_bytes_that_are_not_http_with_400_and_an_error_event() {
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
         .observer(evidence_h.clone());
     assert!(h.push(b"\x16\x03\x01\x00\x05hello\r\n\r\n").is_err());
@@ -1153,7 +1153,7 @@ fn virtual_hosts_pick_a_site_by_host() {
         "203.0.113.1:80".parse().unwrap(),
         "10.0.0.2:5000".parse().unwrap(),
     );
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ())
         .observer(evidence_h.clone())
         .with_conn(conn);
@@ -1208,7 +1208,7 @@ fn http1_survives_mixed_and_random_input() {
             })
     };
     let run = |chunks: &[&[u8]]| {
-        let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+        let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ())
             .observer(evidence_h.clone());
         for c in chunks {
@@ -1289,7 +1289,7 @@ fn http1_oversized_body_returns_413_without_calling_handler() {
 /// Header timeouts close the connection and record their cause.
 #[test]
 fn http1_header_timeout_records_an_error() {
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
         .observer(evidence_h.clone());
     h.open().unwrap();
@@ -1311,7 +1311,7 @@ fn http1_header_timeout_records_an_error() {
 #[test]
 fn http1_idle_keep_alive_timeout_closes_without_an_error() {
     let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("ok")));
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
         .observer(evidence_h.clone());
     let reply = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap();
@@ -1331,7 +1331,7 @@ fn http1_idle_keep_alive_timeout_closes_without_an_error() {
 #[test]
 fn http1_pipelined_partial_head_timeout_records_an_error() {
     let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("ok")));
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ())
         .observer(evidence_h.clone());
     let reply = h
@@ -1368,7 +1368,7 @@ fn router_known_path_returns_405_before_fallback() {
 
 #[test]
 fn http1_body_timeout_records_an_error() {
-    let evidence_h = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence_h = std::sync::Arc::new(fictionet_observe::Memory::default());
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ())
         .observer(evidence_h.clone());
     h.open().unwrap();
@@ -1392,7 +1392,7 @@ fn observation_does_not_change_http_responses_or_protocol_budgets() {
     for budget in [1024, 4096, 64 * 1024] {
         let run = |observed| {
             let heads = Arc::new(crate::common::http_observer::CountHeads::default());
-            let memory = Arc::new(fictionet::events::Memory::default());
+            let memory = Arc::new(fictionet_observe::Memory::default());
             let service = Http1::with(
                 Arc::new(Router::new().get("/", move |_, request| {
                     assert_eq!(
@@ -1450,7 +1450,7 @@ fn accepted_large_requests_keep_fields_and_classification() {
     ] {
         let path = format!("/{}", "p".repeat(path_len - 1));
         let observer = Arc::new(Exposure::default());
-        let memory = Arc::new(fictionet::events::Memory::default());
+        let memory = Arc::new(fictionet_observe::Memory::default());
         let service =
             Http1::new(Router::new().fallback(|_, _| http::Response::new(Bytes::from("ok"))))
                 .observe(observer.clone());
@@ -1507,7 +1507,7 @@ fn accepted_large_requests_keep_fields_and_classification() {
 fn interrupted_large_requests_keep_fields_and_classification() {
     for timeout in [false, true] {
         let observer = Arc::new(Exposure::default());
-        let memory = Arc::new(fictionet::events::Memory::default());
+        let memory = Arc::new(fictionet_observe::Memory::default());
         let service = Http1::new(Router::new()).observe(observer.clone());
         let mut harness =
             Harness::new(fictionet::Seed::from_u64(1), service, ()).observer(memory.clone());
@@ -1548,7 +1548,7 @@ fn interrupted_large_requests_keep_fields_and_classification() {
 
 #[test]
 fn response_metadata_cannot_displace_http_facts() {
-    let memory = Arc::new(fictionet::events::Memory::default());
+    let memory = Arc::new(fictionet_observe::Memory::default());
     let router = Router::new().get("/", |_, _| {
         let mut fields = fictionet::events::Fields::new();
         for name in [

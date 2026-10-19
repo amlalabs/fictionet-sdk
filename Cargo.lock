@@ -3187,6 +3187,7 @@ dependencies = [
  "bytes",
  "example-common",
  "fictionet",
+ "fictionet-observe",
  "http",
  "http-body-util",
  "hyper",
