@@ -1599,13 +1599,7 @@ impl<'a> Socket<'a> {
 
             // SYN packets in the LISTEN state change it to SYN-RECEIVED.
             (State::Listen, TcpControl::Syn) => {
-                if let Some(max_seg_size) = repr.max_seg_size {
-                    // Treat a zero MSS as if the option were absent, like Linux does.
-                    if max_seg_size != 0 {
-                        self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
-                        self.congestion_controller.set_mss(self.remote_mss);
-                    }
-                }
+                self.negotiate_options(repr);
 
                 self.tuple = Some(Tuple {
                     local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
@@ -1615,16 +1609,6 @@ impl<'a> Socket<'a> {
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
                 self.local_seq_max = self.local_seq_no;
-                self.remote_has_sack = repr.sack_permitted;
-                self.remote_win_scale = repr.window_scale;
-                // Remote doesn't support window scaling, don't do it.
-                if self.remote_win_scale.is_none() {
-                    self.remote_win_shift = 0;
-                }
-                // Remote doesn't support timestamping, don't do it.
-                if repr.timestamp.is_none() {
-                    self.tsval_generator = None;
-                }
                 self.set_state(State::SynReceived);
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
@@ -1646,32 +1630,16 @@ impl<'a> Socket<'a> {
             // SYN|ACK packets in the SYN-SENT state change it to ESTABLISHED.
             // SYN packets in the SYN-SENT state change it to SYN-RECEIVED.
             (State::SynSent, TcpControl::Syn) => {
-                if let Some(max_seg_size) = repr.max_seg_size {
-                    // Treat a zero MSS as if the option were absent, like Linux does.
-                    if max_seg_size != 0 {
-                        self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
-                        self.congestion_controller.set_mss(self.remote_mss);
-                    }
-                }
+                self.negotiate_options(repr);
 
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
-                self.remote_has_sack = repr.sack_permitted;
-                self.remote_win_scale = repr.window_scale;
-                // Remote doesn't support window scaling, don't do it.
-                if self.remote_win_scale.is_none() {
-                    self.remote_win_shift = 0;
-                }
                 self.remote_win_end = Some(
                     self.remote_seq_no
                         + ((self.remote_last_win as usize) << self.remote_win_shift)
                             .min(self.rx_buffer.capacity()),
                 );
-                // Remote doesn't support timestamping, don't do it.
-                if repr.timestamp.is_none() {
-                    self.tsval_generator = None;
-                }
 
                 if repr.ack_number.is_some() {
                     self.set_state(State::Established);
@@ -1867,6 +1835,22 @@ impl<'a> Socket<'a> {
             Some(self.ack_reply(ip_repr, repr))
         } else {
             None
+        }
+    }
+
+    fn negotiate_options(&mut self, repr: &TcpRepr) {
+        // A zero MSS leaves the default in place.
+        if let Some(mss) = repr.max_seg_size.filter(|&mss| mss != 0) {
+            self.remote_mss = (mss as usize).max(MIN_REMOTE_MSS);
+            self.congestion_controller.set_mss(self.remote_mss);
+        }
+        self.remote_has_sack = repr.sack_permitted;
+        self.remote_win_scale = repr.window_scale;
+        if self.remote_win_scale.is_none() {
+            self.remote_win_shift = 0;
+        }
+        if repr.timestamp.is_none() {
+            self.tsval_generator = None;
         }
     }
 
