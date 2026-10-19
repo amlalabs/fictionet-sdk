@@ -781,7 +781,7 @@ impl<'a> TcpOption<'a> {
                         data: provided,
                     } => {
                         buffer[0] = kind;
-                        buffer[2..].copy_from_slice(provided)
+                        buffer[2..length].copy_from_slice(provided)
                     }
                 }
             }
@@ -1073,6 +1073,16 @@ mod test {
     static OPTION_BYTES: [u8; 4] = [0x03, 0x03, 0x0c, 0x01];
 
     static PAYLOAD_BYTES: [u8; 4] = [0xaa, 0x00, 0x00, 0xff];
+
+    #[test]
+    fn test_unknown_option_emit_preserves_following_options() {
+        let option = TcpOption::parse(&[30, 4, 0xab, 0xcd]).unwrap().1;
+        let mut bytes = [0xa5; 8];
+        let rest = option.emit(&mut bytes);
+        assert_eq!(rest, [0xa5; 4]);
+        TcpOption::MaxSegmentSize(1460).emit(rest);
+        assert_eq!(bytes, [30, 4, 0xab, 0xcd, 2, 4, 5, 0xb4]);
+    }
 
     #[test]
     fn test_deconstruct() {

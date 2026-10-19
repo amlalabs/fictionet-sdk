@@ -18,9 +18,12 @@ pub enum Version {
 impl Version {
     /// Return the version of an IP packet stored in the provided buffer.
     ///
-    /// Unknown versions return `Err(Error)`. The buffer must not be empty.
+    /// Empty packets and unknown versions return `Err(Error)`.
     pub const fn of_packet(data: &[u8]) -> Result<Version> {
-        match data[0] >> 4 {
+        let Some(&first) = data.first() else {
+            return Err(Error);
+        };
+        match first >> 4 {
             4 => Ok(Version::Ipv4),
 
             6 => Ok(Version::Ipv6),
@@ -692,6 +695,11 @@ pub(crate) mod test {
     use crate::wire::IpAddress;
 
     use crate::wire::Ipv4Address;
+
+    #[test]
+    fn test_empty_packet_version() {
+        assert_eq!(Version::of_packet(&[]), Err(Error));
+    }
 
     #[test]
     fn to_prefix_len_ipv4() {

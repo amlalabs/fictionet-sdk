@@ -164,7 +164,7 @@ impl ops::Sub<Instant> for Instant {
     type Output = Duration;
 
     fn sub(self, rhs: Instant) -> Duration {
-        Duration::from_micros((self.micros - rhs.micros).unsigned_abs())
+        Duration::from_micros(self.micros.abs_diff(rhs.micros))
     }
 }
 
@@ -335,6 +335,14 @@ impl From<Duration> for ::core::time::Duration {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_instant_difference_across_signed_range() {
+        let first = Instant::from_micros(i64::MIN);
+        let last = Instant::from_micros(i64::MAX);
+        assert_eq!(last - first, Duration::from_micros(u64::MAX));
+        assert_eq!(first - last, Duration::from_micros(u64::MAX));
+    }
 
     #[test]
     fn test_instant_ops() {

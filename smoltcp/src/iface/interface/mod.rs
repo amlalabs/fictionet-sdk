@@ -151,7 +151,6 @@ impl InterfaceInner {
         sockets: &mut SocketSet,
         bytes: &'a [u8],
     ) -> Option<(IpRepr, TcpRepr<'a>)> {
-        bytes.first()?;
         match IpVersion::of_packet(bytes).ok()? {
             IpVersion::Ipv4 => self.process_ipv4(sockets, &Ipv4Packet::new_checked(bytes).ok()?),
             IpVersion::Ipv6 => self.process_ipv6(sockets, &Ipv6Packet::new_checked(bytes).ok()?),

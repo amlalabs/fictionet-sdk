@@ -193,12 +193,12 @@ impl<'a> RingBuffer<'a> {
     /// at the given offset past the last allocated element, and up to the given size.
     #[must_use]
     pub fn get_unallocated(&mut self, offset: usize, mut size: usize) -> &mut [u8] {
-        let start_at = self.get_idx(self.length + offset);
         // We can't access past the end of unallocated data.
         if offset > self.window() {
             return &mut [];
         }
         // We can't enqueue more than there is free space.
+        let start_at = self.get_idx(self.length + offset);
         let clamped_window = self.window() - offset;
         if size > clamped_window {
             size = clamped_window
@@ -245,12 +245,12 @@ impl<'a> RingBuffer<'a> {
     /// at the given offset past the first allocated element, and up to the given size.
     #[must_use]
     pub fn get_allocated(&self, offset: usize, mut size: usize) -> &[u8] {
-        let start_at = self.get_idx(offset);
         // We can't read past the end of the allocated data.
         if offset > self.length {
             return &mut [];
         }
         // We can't read more than we have allocated.
+        let start_at = self.get_idx(offset);
         let clamped_length = self.length - offset;
         if size > clamped_length {
             size = clamped_length
@@ -302,6 +302,23 @@ impl<'a> From<ManagedSlice<'a, u8>> for RingBuffer<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_buffer_unallocated_offset_overflow() {
+        let mut ring = RingBuffer::new(vec![0; 4]);
+        assert_eq!(ring.enqueue_slice(b"ab"), 2);
+        assert_eq!(ring.write_unallocated(usize::MAX, b"x"), 0);
+        assert_eq!(ring.dequeue_many(4), b"ab");
+    }
+
+    #[test]
+    fn test_buffer_allocated_offset_overflow() {
+        let mut ring = RingBuffer::new(vec![0; 4]);
+        assert_eq!(ring.enqueue_slice(b"ab"), 2);
+        assert_eq!(ring.dequeue_many(1), b"a");
+        assert_eq!(ring.get_allocated(usize::MAX, 1), b"");
+        assert_eq!(ring.dequeue_many(4), b"b");
+    }
 
     #[test]
     fn test_buffer_length_changes() {
