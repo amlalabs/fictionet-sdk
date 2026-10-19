@@ -5,9 +5,11 @@
 //!
 //! The user-data installs an Xfce desktop from the world's apt mirror
 //! (Firefox from Mozilla's repository, not the snap), one system-wide trust
-//! store pointing every TLS client at the world's CA, Xvnc with an Xfce
-//! session, and sshd and VNC reached over vsock. The config files go in as
-//! base64 `write_files`, and a setup script does the install and wiring.
+//! store pointing every TLS client at the world's CA, and Xvnc with an Xfce
+//! session on the loopback. The admin reaches the guest with Ubuntu's own
+//! sshd on port 22, as the image ships it, with this run's key, and tunnels
+//! VNC through it. The config files go in as base64 `write_files`, and a
+//! setup script does the install and wiring.
 
 use std::io::{Cursor, Write};
 
@@ -20,7 +22,7 @@ const MOZILLA_KEY: &str = include_str!("packages.mozilla.org.asc");
 pub struct Provision<'a> {
     /// A neutral hostname, nothing that names an eval.
     pub hostname: &'a str,
-    /// The login the control plane uses, and the desktop's user.
+    /// The admin's login, and the desktop's user.
     pub user: &'a str,
     /// This run's SSH public key, as one `authorized_keys` line.
     pub authorized_key: &'a str,
@@ -102,8 +104,8 @@ fn user_data(p: &Provision) -> String {
            }}\
          }}}}"
     );
-    // Xvnc on :1 (5901), loopback only, no auth; an Xfce session and Firefox
-    // for the user.
+    // Xvnc on :1 (5901), loopback only, no auth: reached only through an SSH
+    // tunnel. An Xfce session and Firefox for the user.
     let start_desktop = format!(
         "#!/bin/bash\n\
          set -x\n\
@@ -137,19 +139,6 @@ fn user_data(p: &Provision) -> String {
          WantedBy=multi-user.target\n",
         user = p.user,
     );
-    // VNC over vsock port 5900, proxied to Xvnc on the loopback.
-    let vnc_socket = "[Unit]\n\
-         Description=VNC over vsock\n\
-         [Socket]\n\
-         ListenStream=vsock::5900\n\
-         [Install]\n\
-         WantedBy=sockets.target\n";
-    let vnc_proxy = "[Unit]\n\
-         Description=proxy vsock VNC to Xvnc\n\
-         Requires=vnc-vsock.socket\n\
-         After=vnc-vsock.socket\n\
-         [Service]\n\
-         ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:5901\n";
     // The trust store for every service started by systemd (the desktop
     // session included); /etc/environment covers login shells.
     let trust_conf = "[Manager]\n\
@@ -178,32 +167,12 @@ fn user_data(p: &Provision) -> String {
     ));
     files.push(("/etc/firefox/policies/policies.json", "0644", policies));
     files.push((
-        "/etc/systemd/system/sshd-vsock.socket",
-        "0644",
-        "[Unit]\nDescription=sshd over vsock\n[Socket]\nListenStream=vsock::22\nAccept=yes\n[Install]\nWantedBy=sockets.target\n".into(),
-    ));
-    files.push((
-        "/etc/systemd/system/sshd-vsock@.service",
-        "0644",
-        "[Unit]\nDescription=sshd for one vsock connection\n[Service]\nExecStart=-/usr/sbin/sshd -i\nStandardInput=socket\nStandardOutput=socket\n".into(),
-    ));
-    files.push((
         "/etc/systemd/network/05-eth0.network",
         "0644",
         "[Match]\nName=eth0\n[Network]\nDHCP=ipv4\n".into(),
     ));
     files.push(("/opt/start-desktop.sh", "0755", start_desktop));
     files.push(("/etc/systemd/system/vnc.service", "0644", vnc_service));
-    files.push((
-        "/etc/systemd/system/vnc-vsock.socket",
-        "0644",
-        vnc_socket.into(),
-    ));
-    files.push((
-        "/etc/systemd/system/vnc-vsock.service",
-        "0644",
-        vnc_proxy.into(),
-    ));
     files.push((
         "/etc/systemd/system.conf.d/trust.conf",
         "0644",
@@ -260,12 +229,6 @@ fn setup_script(user: &str) -> String {
         "#!/bin/bash\n\
          set -euo pipefail\n\
          export DEBIAN_FRONTEND=noninteractive\n\
-         # ssh over vsock up first, so the control plane reaches the guest\n\
-         # while the desktop installs.\n\
-         install -d -m0755 /run/sshd\n\
-         ssh-keygen -A\n\
-         systemctl daemon-reload\n\
-         systemctl enable --now sshd-vsock.socket\n\
          # The world's CA first, so HTTPS apt sources work.\n\
          apt-get update\n\
          apt-get install -y --no-install-recommends ca-certificates\n\
@@ -296,7 +259,6 @@ fn setup_script(user: &str) -> String {
          # Apply the DefaultEnvironment drop-in, then bring the desktop up.\n\
          systemctl daemon-reexec\n\
          systemctl daemon-reload\n\
-         systemctl enable --now vnc-vsock.socket\n\
          systemctl enable --now vnc.service\n",
     )
 }

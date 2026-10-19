@@ -1,20 +1,21 @@
-//! An embedded SSH client that reaches the guest's sshd over Cloud
-//! Hypervisor's hybrid vsock, with no system `ssh` and nothing listening on
-//! a network port.
-//!
-//! CH exposes the guest's vsock as a host Unix socket. A client connects to
-//! it, sends `CONNECT <port>\n`, reads back `OK <n>\n`, and from then on the
-//! stream is wired to that guest vsock port. We run russh over that stream.
+//! An embedded SSH client: it reaches Ubuntu's own sshd on the guest's port
+//! 22 over a stream the caller opens, with no system `ssh`. The demo opens
+//! that stream from the world's jump host, so the session crosses the
+//! world's network as an admin's would, and forwards VNC through it as an
+//! admin tunnels it.
 
+use std::future::Future;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use russh::client::{self, Handle, Handler};
+use russh::ChannelStream;
+use russh::client::{self, Handle, Handler, Msg};
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// How long one connection attempt may take, from dialing to logging in.
+const ATTEMPT: Duration = Duration::from_secs(30);
 
 /// A per-run SSH identity.
 pub struct Identity {
@@ -46,32 +47,43 @@ pub struct Output {
     pub stderr: String,
 }
 
-/// A connection to the guest over vsock. The control-plane client: a
-/// hypervisor integration opens it to run commands once the VMM is chosen.
+/// An SSH session with the guest: the commands the demo runs, and the
+/// tunnels the viewer uses.
 pub struct Session {
     handle: Handle<Client>,
 }
 
 impl Session {
-    /// Connects over the CH vsock socket to the guest's port 22, retrying
-    /// until sshd answers or `deadline` passes, then authenticates as
-    /// `user` with `identity`.
-    pub async fn connect(
-        vsock_socket: &Path,
+    /// Connects over a stream from `dial`, retrying until sshd answers or
+    /// `deadline` passes, then authenticates as `user` with `identity`.
+    pub async fn connect<D, F, S>(
+        dial: D,
         identity: &Identity,
         user: &str,
         deadline: Duration,
-    ) -> io::Result<Session> {
+    ) -> io::Result<Session>
+    where
+        D: Fn() -> F,
+        F: Future<Output = io::Result<S>>,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let start = std::time::Instant::now();
         let config = Arc::new(client::Config::default());
         loop {
-            match Self::try_connect(vsock_socket, &config, identity, user).await {
+            // One attempt is bounded too: a connection that sshd accepts but
+            // never answers must not outlast the deadline.
+            let attempt = tokio::time::timeout(ATTEMPT, async {
+                Self::handshake(dial().await?, &config, identity, user).await
+            })
+            .await
+            .unwrap_or_else(|_| Err(io::Error::other("sshd did not answer")));
+            match attempt {
                 Ok(session) => return Ok(session),
                 Err(error) => {
                     if start.elapsed() >= deadline {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
-                            format!("sshd over vsock was not ready in {deadline:?}: {error}"),
+                            format!("sshd was not ready in {deadline:?}: {error}"),
                         ));
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -80,32 +92,15 @@ impl Session {
         }
     }
 
-    async fn try_connect(
-        vsock_socket: &Path,
+    async fn handshake<S>(
+        stream: S,
         config: &Arc<client::Config>,
         identity: &Identity,
         user: &str,
-    ) -> io::Result<Session> {
-        let mut stream = UnixStream::connect(vsock_socket).await?;
-        // CH's hybrid vsock handshake: ask for guest port 22.
-        stream.write_all(b"CONNECT 22\n").await?;
-        let mut line = Vec::new();
-        loop {
-            let byte = stream.read_u8().await?;
-            if byte == b'\n' {
-                break;
-            }
-            line.push(byte);
-            if line.len() > 64 {
-                return Err(io::Error::other("vsock handshake reply too long"));
-            }
-        }
-        if !line.starts_with(b"OK") {
-            return Err(io::Error::other(format!(
-                "vsock refused the connection: {}",
-                String::from_utf8_lossy(&line)
-            )));
-        }
+    ) -> io::Result<Session>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let mut handle = client::connect_stream(config.clone(), stream, Client)
             .await
             .map_err(|e| io::Error::other(format!("ssh handshake: {e}")))?;
@@ -117,6 +112,22 @@ impl Session {
             return Err(io::Error::other("ssh public-key authentication rejected"));
         }
         Ok(Session { handle })
+    }
+
+    /// Opens a `direct-tcpip` channel to `host:port` as the guest sees it,
+    /// as `ssh -L` does, for a client of ours at `originator`'s port.
+    pub async fn forward(
+        &self,
+        host: &str,
+        port: u16,
+        originator: u16,
+    ) -> io::Result<ChannelStream<Msg>> {
+        let channel = self
+            .handle
+            .channel_open_direct_tcpip(host, port.into(), "127.0.0.1", originator.into())
+            .await
+            .map_err(|e| io::Error::other(format!("forwarding to {host}:{port}: {e}")))?;
+        Ok(channel.into_stream())
     }
 
     /// Runs `command` and returns what it printed and its exit code.
@@ -154,7 +165,7 @@ impl Session {
 }
 
 /// Accepts the guest's host key: the guest is this run's own, reached only
-/// over its private vsock, so there is nothing to pin.
+/// through the world in this process, so there is nothing to pin.
 struct Client;
 
 impl Handler for Client {

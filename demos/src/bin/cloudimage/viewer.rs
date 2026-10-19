@@ -1,9 +1,10 @@
 //! The host side of the viewer. It connects to the demo's own page exactly as
 //! the browser does -- a WebSocket to `/websockify`, which the page bridges to
-//! the guest's VNC server over vsock -- speaks RFB over it, and captures the
-//! guest's screen. This proves the whole viewer path (page listener ->
-//! WebSocket bridge -> vsock -> Xvnc) and yields a real image of the desktop
-//! as the viewer delivers it, with no browser needed.
+//! the guest's VNC server through the admin's SSH session -- speaks RFB over
+//! it, and captures the guest's screen. This proves the whole viewer path
+//! (page listener -> WebSocket bridge -> SSH tunnel across the world -> Xvnc)
+//! and yields a real image of the desktop as the viewer delivers it, with no
+//! browser needed.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -21,6 +22,9 @@ pub struct Capture {
     pub banner: String,
     pub width: u16,
     pub height: u16,
+    /// How many colors the screen shows, counted up to 256: one for a blank
+    /// screen, many for a desktop.
+    pub colors: usize,
     /// Where the PNG of the guest's screen was written.
     pub png: PathBuf,
 }
@@ -143,10 +147,18 @@ pub async fn capture(port: u16, out: &Path) -> io::Result<Capture> {
     }
 
     write_png(out, width as u32, height as u32, &rgb)?;
+    let mut colors = std::collections::HashSet::new();
+    for pixel in rgb.as_chunks::<3>().0 {
+        if colors.len() == 256 {
+            break;
+        }
+        colors.insert(*pixel);
+    }
     Ok(Capture {
         banner,
         width,
         height,
+        colors: colors.len(),
         png: out.to_path_buf(),
     })
 }

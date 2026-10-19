@@ -1,7 +1,8 @@
 //! Cloud Hypervisor as a child process: it boots the unmodified image's
 //! kernel and initrd directly, attaches the per-run overlay and the
-//! cloud-init seed, exposes the guest over vsock, and takes its network card
-//! from our vhost-user backend.
+//! cloud-init seed, and takes the guest's one network card from our
+//! vhost-user backend. The guest has no vsock or other side channel: the
+//! host reaches it over that card, through the world.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -35,10 +36,9 @@ pub struct Config<'a> {
     pub mac: &'a str,
 }
 
-/// A running VM child, with the sockets the host talks to it on.
+/// A running VM child.
 pub struct Vm {
     child: Child,
-    vsock_socket: PathBuf,
     console_log: PathBuf,
     stderr_log: PathBuf,
     /// The sealed memfd the embedded binary runs from, held open for the
@@ -48,9 +48,8 @@ pub struct Vm {
 
 impl Vm {
     /// Starts Cloud Hypervisor in its own process group. `dir` holds the
-    /// run's sockets and console log.
+    /// run's API socket and logs.
     pub fn start(config: &Config, dir: &Path) -> io::Result<Vm> {
-        let vsock_socket = dir.join("vsock.sock");
         let console_log = dir.join("console.log");
         let stderr_log = dir.join("ch.stderr.log");
         let api_socket = dir.join("api.sock");
@@ -97,8 +96,6 @@ impl Vm {
             .arg(format!("file={}", console_log.display()))
             .arg("--console")
             .arg("off")
-            .arg("--vsock")
-            .arg(format!("cid=3,socket={}", vsock_socket.display()))
             .arg("--platform")
             .arg(format!(
                 "system_manufacturer={},system_product_name={},system_uuid={}",
@@ -124,7 +121,6 @@ impl Vm {
         let child = command.spawn()?;
         Ok(Vm {
             child,
-            vsock_socket,
             console_log,
             stderr_log,
             _ch_memfd: ch_memfd,
@@ -136,11 +132,6 @@ impl Vm {
         let log = std::fs::read_to_string(&self.stderr_log).unwrap_or_default();
         let lines: Vec<&str> = log.lines().collect();
         lines[lines.len().saturating_sub(30)..].join("\n")
-    }
-
-    /// The host Unix socket for the guest's vsock (CH's hybrid protocol).
-    pub fn vsock_socket(&self) -> &Path {
-        &self.vsock_socket
     }
 
     /// Cloud Hypervisor's process ID, while it runs.

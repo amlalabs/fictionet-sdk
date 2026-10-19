@@ -1,12 +1,14 @@
 //! Boots Ubuntu 24.04's official cloud image unmodified in Cloud
 //! Hypervisor, provisions it through cloud-init from a Fictionet world, and
-//! reaches it over ssh on vsock with no guest agent.
+//! reaches it the way an admin would, with no guest agent: SSH from a jump
+//! host across the world's network, and VNC tunneled through that session.
 //!
 //! `cargo xtask cloudimage` downloads the pinned image, kernel, initrd and
 //! Cloud Hypervisor binary and runs this with their paths. The per-run
 //! overlay ([`disk`]) and cloud-init seed ([`seed`]) are written in Rust;
 //! the world ([`world`]) joins the guest to the network through the
-//! vhost-user backend ([`net`]) and reaches it over vsock ([`ssh`]).
+//! vhost-user backend ([`net`]), and its jump host carries the SSH session
+//! ([`ssh`]) that the desktop viewer ([`page`]) tunnels VNC through.
 
 mod ch;
 mod disk;
@@ -19,8 +21,10 @@ mod ssh;
 mod viewer;
 mod world;
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The overlay's virtual size: well above the image, so growpart has room.
@@ -138,7 +142,8 @@ async fn gate(ch_bin: &Path, image: &Path, vmlinuz: &Path, initrd: &Path) -> Res
 
     // The desktop viewer, bound before boot so a port already in use fails
     // here rather than after a minute of install. It serves on 127.0.0.1
-    // only and bridges to the guest's VNC over vsock once the guest is up.
+    // only and tunnels to the guest's VNC through the admin's SSH session
+    // once that is up.
     let page = page::Page::bind(0).await.map_err(boxed)?;
     let page_url = page.url();
     let page_port = page.port();
@@ -165,49 +170,113 @@ async fn gate(ch_bin: &Path, image: &Path, vmlinuz: &Path, initrd: &Path) -> Res
     )?;
 
     // Serve the viewer for the rest of the run; dropped when the gate returns.
-    let viewer = tokio::spawn(page.serve(vm.vsock_socket().to_path_buf()));
+    let tunnel = page::Tunnel::default();
+    let viewer = tokio::spawn(page.serve(tunnel.clone()));
     println!("desktop viewer: {page_url}");
 
     // Show where Cloud Hypervisor runs from: a memfd when the binary is
     // embedded (nothing on disk), the downloaded path otherwise.
-    if let Some(pid) = vm.pid()
+    let ch_pid = vm.pid();
+    if let Some(pid) = ch_pid
         && let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
     {
         println!("Cloud Hypervisor (pid {pid}) runs from {}\n", exe.display());
     }
 
-    let result = run_checks(&vm, &identity, boot, &shots, &world, &page_url, page_port).await;
+    // The admin's SSH session, from the jump host to the guest's sshd. The
+    // viewer tunnels through it once it is up.
+    let result = match admin_session(&vm, &world, &identity).await {
+        Ok(session) => {
+            let ssh_ready_ms = boot.elapsed().as_millis();
+            println!(
+                "ssh from the jump host ({}) is up after {ssh_ready_ms} ms; waiting for the desktop install\n",
+                world::JUMP_ADDR
+            );
+            let session = Arc::new(session);
+            let _ = tunnel.set(session.clone());
+            run_checks(&vm, &session, &world, boot, &shots, &page_url, page_port)
+                .await
+                .map(|checks| (ssh_ready_ms, checks))
+        }
+        Err(error) => Err(error),
+    };
     viewer.abort();
 
-    // ACPI poweroff over ssh, then a bounded kill as backup.
-    if let Ok(session) =
-        ssh::Session::connect(vm.vsock_socket(), &identity, USER, Duration::from_secs(5)).await
-    {
-        let _ = session.run("sudo systemctl poweroff").await;
+    // ACPI poweroff over the session, then a bounded kill as backup. The
+    // guest may go before it answers, so the command is not waited on long.
+    if let Some(session) = tunnel.get() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            session.run("sudo systemctl poweroff"),
+        )
+        .await;
     }
     let stop = vm.stop(Duration::from_secs(60)).await;
     world.shutdown();
+    let run_dir = dir.path().to_path_buf();
+    drop(dir);
 
-    let checks = result?;
+    println!("\n=== shutdown ===");
+    let mut failures = Vec::new();
+    if let Err(error) = &stop {
+        println!("shutdown: {error}");
+    }
+    check(
+        &mut failures,
+        "the guest powered off over ACPI and Cloud Hypervisor exited",
+        stop.is_ok(),
+    );
+    let ch_gone = ch_pid.is_none_or(|pid| !Path::new(&format!("/proc/{pid}")).exists());
+    check(
+        &mut failures,
+        "nothing is left behind: no Cloud Hypervisor process, no run directory",
+        ch_gone && !run_dir.exists(),
+    );
+
+    let (ssh_ready_ms, checks) = result?;
     println!("\n=== measurements ===");
-    println!("boot to ssh-ready:  {} ms", checks.ssh_ready_ms);
+    println!("boot to ssh-ready:  {ssh_ready_ms} ms");
     println!("boot to desktop:    {} ms", checks.desktop_ready_ms);
     println!("whole run:          {} ms", total.elapsed().as_millis());
     println!("peak VM memory:     {} MiB", checks.peak_rss_mib);
     for shot in &checks.screenshots {
         println!("screenshot:         {shot}");
     }
-    match &stop {
-        Ok(()) => println!("the guest powered off; Cloud Hypervisor exited"),
-        Err(e) => println!("shutdown: {e}"),
+    if !failures.is_empty() {
+        return Err(format!("the gate's shutdown checks failed: {}", failures.join("; ")).into());
     }
-    println!("the run directory is removed; nothing is left behind");
-    stop?;
+    println!("\nevery required check passed");
     Ok(())
 }
 
+/// Prints a required check's outcome, and records it when it failed.
+fn check(failures: &mut Vec<String>, what: &str, ok: bool) {
+    println!("[{}] {what}", if ok { "pass" } else { "FAIL" });
+    if !ok {
+        failures.push(what.to_string());
+    }
+}
+
+/// Connects the admin's SSH session: from the jump host, through the world,
+/// to the guest's sshd on the address it leased.
+async fn admin_session(
+    vm: &ch::Vm,
+    world: &world::World,
+    identity: &ssh::Identity,
+) -> Result<ssh::Session, Error> {
+    let dial = || world.connect_guest(22, Duration::from_secs(10));
+    match ssh::Session::connect(dial, identity, USER, Duration::from_secs(300)).await {
+        Ok(session) => Ok(session),
+        Err(error) => Err(format!(
+            "{error}\n--- cloud-hypervisor stderr ---\n{}\n--- guest console tail ---\n{}",
+            vm.ch_stderr_tail(),
+            vm.console_tail()
+        )
+        .into()),
+    }
+}
+
 struct Checks {
-    ssh_ready_ms: u128,
     desktop_ready_ms: u128,
     peak_rss_mib: u64,
     screenshots: Vec<String>,
@@ -215,30 +284,13 @@ struct Checks {
 
 async fn run_checks(
     vm: &ch::Vm,
-    identity: &ssh::Identity,
+    session: &ssh::Session,
+    world: &world::World,
     boot: Instant,
     shots: &Path,
-    world: &world::World,
     page_url: &str,
     page_port: u16,
 ) -> Result<Checks, Error> {
-    let session =
-        match ssh::Session::connect(vm.vsock_socket(), identity, USER, Duration::from_secs(300))
-            .await
-        {
-            Ok(session) => session,
-            Err(error) => {
-                return Err(format!(
-                    "{error}\n--- cloud-hypervisor stderr ---\n{}\n--- guest console tail ---\n{}",
-                    vm.ch_stderr_tail(),
-                    vm.console_tail()
-                )
-                .into());
-            }
-        };
-    let ssh_ready_ms = boot.elapsed().as_millis();
-    println!("ssh over vsock is up after {ssh_ready_ms} ms; waiting for the desktop install\n");
-
     // Every required check that failed; the gate fails at the end if any did.
     let mut failures: Vec<String> = Vec::new();
 
@@ -256,9 +308,7 @@ async fn run_checks(
     let desktop_ready_ms = boot.elapsed().as_millis();
     let cloud_init_rc = wait.stdout.trim().to_string();
     println!("cloud-init finished after {desktop_ready_ms} ms (rc {cloud_init_rc})\n");
-    if cloud_init_rc != "0" {
-        failures.push(format!("cloud-init exited {cloud_init_rc}"));
-    }
+    check(&mut failures, "cloud-init finished", cloud_init_rc == "0");
 
     // What the guest looks like, for the log.
     for command in [
@@ -270,60 +320,126 @@ async fn run_checks(
         "ls /etc/ssl/certs | grep -i zscaler || echo 'no zscaler cert'",
         // How much the guest pulled from the world's mirror at boot.
         "echo \"packages downloaded: $(du -shc /var/cache/apt/archives/*.deb 2>/dev/null | tail -1 | cut -f1) in $(ls /var/cache/apt/archives/*.deb 2>/dev/null | wc -l) files\"",
+        // Every socket the guest listens on, and from where.
+        "sudo ss -tulnpH",
     ] {
-        guest_cmd(&session, command).await?;
+        guest_cmd(session, command).await?;
     }
 
-    // Required: the services, the trust store, the Zscaler chain, Firefox.
-    let services = guest_cmd(
-        &session,
-        "systemctl is-active vnc.service vnc-vsock.socket sshd-vsock.socket",
-    )
-    .await?;
-    if services
+    // Required: the guest's address is the one the world leased it by DHCP.
+    let lease = world.guest_addr();
+    let addr = guest_cmd(session, "ip -4 -o addr show dev eth0").await?;
+    check(
+        &mut failures,
+        &format!(
+            "the guest has its address from the world's DHCP ({})",
+            lease.map_or("no lease".to_string(), |a| a.to_string())
+        ),
+        lease.is_some_and(|a| addr.stdout.contains(&format!("inet {a}/"))),
+    );
+
+    // Required: no vsock device for the guest to find.
+    let pci = guest_cmd(session, "lspci -nn").await?;
+    let vsock = pci.stdout.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("socket") || line.contains("[1af4:1053]") || line.contains("[1af4:1012]")
+    });
+    check(
+        &mut failures,
+        "lspci shows no Virtio socket device",
+        pci.code == 0 && !pci.stdout.is_empty() && !vsock,
+    );
+
+    // Required: this session reaches sshd from the jump host's address.
+    let ssh_peers = guest_cmd(session, "ss -tnH state established '( sport = :22 )'").await?;
+    let peers: Vec<Option<IpAddr>> = ssh_peers
         .stdout
         .lines()
-        .filter(|l| l.trim() == "active")
-        .count()
-        != 3
-    {
-        failures.push("a required service is not active".into());
-    }
+        .filter_map(|line| line.split_whitespace().last())
+        .map(peer_ip)
+        .collect();
+    check(
+        &mut failures,
+        &format!(
+            "ss shows the SSH session coming from the jump host ({})",
+            world::JUMP_ADDR
+        ),
+        !peers.is_empty() && peers.iter().all(|p| *p == Some(world::JUMP_ADDR.into())),
+    );
+
+    // Required: Ubuntu's sshd and the desktop are running, and Xvnc listens
+    // on the loopback only, so sshd is the guest's one network service of ours.
+    let services = guest_cmd(session, "systemctl is-active ssh.service vnc.service").await?;
+    check(
+        &mut failures,
+        "ssh.service and vnc.service are active",
+        services
+            .stdout
+            .lines()
+            .filter(|l| l.trim() == "active")
+            .count()
+            == 2,
+    );
+    let vnc = guest_cmd(session, "ss -tlnH '( sport = :5900 or sport = :5901 )'").await?;
+    let vnc_listeners: Vec<Option<IpAddr>> = vnc
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(3))
+        .map(peer_ip)
+        .collect();
+    check(
+        &mut failures,
+        "Xvnc listens on the guest's loopback only",
+        !vnc_listeners.is_empty()
+            && vnc_listeners
+                .iter()
+                .all(|a| a.is_some_and(|a| a.is_loopback())),
+    );
+
+    // Required: the trust store, the Zscaler chain, Firefox.
     let login_env = guest_cmd(
-        &session,
+        session,
         "bash -lc 'env | grep -iE \"SSL_CERT|REQUESTS_CA|NODE_USE\"' || echo 'no login trust env'",
     )
     .await?;
-    if !login_env.stdout.contains("SSL_CERT_FILE=") {
-        failures.push("the trust store is missing from login shells".into());
-    }
+    check(
+        &mut failures,
+        "login shells have the trust environment",
+        login_env.stdout.contains("SSL_CERT_FILE="),
+    );
     let session_env = guest_cmd(
-        &session,
+        session,
         "sudo cat /proc/$(pgrep -xo xfce4-session || echo 1)/environ 2>/dev/null | tr '\\0' '\\n' | grep -iE 'SSL_CERT|REQUESTS_CA|NODE_USE' || echo 'no session trust env'",
     )
     .await?;
-    if !session_env.stdout.contains("SSL_CERT_FILE=") {
-        failures.push("the trust store is missing from the desktop session".into());
-    }
+    check(
+        &mut failures,
+        "the desktop session has the trust environment",
+        session_env.stdout.contains("SSL_CERT_FILE="),
+    );
     let verify = guest_cmd(
-        &session,
+        session,
         &format!(
             "openssl s_client -connect {SITE}:443 -servername {SITE} \
              </dev/null 2>&1 | grep -E 'Verify return code|issuer='"
         ),
     )
     .await?;
-    if !verify.stdout.contains("Verify return code: 0") {
-        failures.push(format!("the guest did not trust the {SITE} chain"));
-    }
+    check(
+        &mut failures,
+        &format!("openssl verifies the {SITE} chain"),
+        verify.stdout.contains("Verify return code: 0"),
+    );
     let firefox = guest_cmd(
-        &session,
+        session,
         "firefox --version 2>/dev/null; test -x /usr/lib/firefox/firefox && echo 'Mozilla firefox (not snap)'",
     )
     .await?;
-    if !firefox.stdout.contains("not snap") {
-        failures.push("Mozilla's Firefox is not installed".into());
-    }
+    check(
+        &mut failures,
+        "Mozilla's Firefox is installed, not the snap",
+        firefox.stdout.contains("not snap"),
+    );
 
     // Required: Firefox loaded the site, seen as the world's http.request
     // event (nothing else fetches it over HTTP).
@@ -331,13 +447,15 @@ async fn run_checks(
     while !world.firefox_loaded() && Instant::now() < firefox_deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    check(
+        &mut failures,
+        "Firefox loaded the site (the world's http.request event)",
+        world.firefox_loaded(),
+    );
     if world.firefox_loaded() {
-        println!("Firefox loaded the site (seen as the world's http.request event)\n");
         // A moment for Firefox to finish painting the page and its padlock.
         tokio::time::sleep(Duration::from_secs(6)).await;
     } else {
-        failures.push("Firefox did not load the site".into());
-        println!("Firefox did not load the site within the deadline\n");
         // Pull the launch logs so a failed run still shows why.
         for command in [
             "pgrep -af firefox || echo 'no firefox process'",
@@ -345,7 +463,7 @@ async fn run_checks(
             "echo '--- /tmp/xfce.log ---'; tail -20 /tmp/xfce.log 2>&1",
             "echo '--- .mozilla ---'; ls -laR /home/analyst/.mozilla 2>&1 | head -30",
         ] {
-            guest_cmd(&session, command).await?;
+            guest_cmd(session, command).await?;
         }
     }
 
@@ -354,44 +472,46 @@ async fn run_checks(
     let shot = session
         .run("sudo -u analyst env DISPLAY=:1 scrot -o /tmp/guest.png 2>/dev/null && base64 -w0 /tmp/guest.png")
         .await?;
-    if let Some(path) = save_png(&shot.stdout, &shots.join("guest-desktop.png")) {
-        println!("guest screenshot saved: {path}");
-        screenshots.push(path);
-    } else {
-        failures.push("the guest's screen could not be captured".into());
-        println!("guest screenshot: not captured");
-    }
+    let guest_png = save_png(&shot.stdout, &shots.join("guest-desktop.png"));
+    check(
+        &mut failures,
+        "the guest's own screen was captured",
+        guest_png.is_some(),
+    );
+    screenshots.extend(guest_png);
 
     // Required: the desktop as the viewer delivers it, proved without a
     // browser -- connect to the page's own WebSocket and speak RFB through the
-    // bridge (page -> WebSocket -> vsock -> Xvnc), saving the guest's screen.
+    // bridge (page -> WebSocket -> SSH tunnel across the world -> Xvnc),
+    // saving the guest's screen.
     let viewer_png = shots.join("viewer-desktop.png");
-    match tokio::time::timeout(
+    let capture = tokio::time::timeout(
         Duration::from_secs(30),
         viewer::capture(page_port, &viewer_png),
     )
     .await
-    {
-        Ok(Ok(cap)) => {
+    .unwrap_or_else(|_| Err(std::io::Error::other("timed out")));
+    match &capture {
+        Ok(cap) => {
             println!(
-                "viewer path verified: the guest's VNC server answered through the page's \
-                 WebSocket bridge with \"{}\"; its {}x{} screen saved to {}\n",
+                "the guest's VNC server answered through the page's WebSocket bridge with \
+                 \"{}\"; its {}x{} screen, {}{} colors, saved to {}",
                 cap.banner,
                 cap.width,
                 cap.height,
+                cap.colors,
+                if cap.colors == 256 { "+" } else { "" },
                 cap.png.display()
             );
             screenshots.push(cap.png.display().to_string());
         }
-        Ok(Err(error)) => {
-            failures.push(format!("the viewer path did not work ({error})"));
-            println!("viewer capture: not completed ({error})\n");
-        }
-        Err(_) => {
-            failures.push("the viewer path did not work (timed out)".into());
-            println!("viewer capture: not completed (timed out)\n");
-        }
+        Err(error) => println!("viewer capture: not completed ({error})"),
     }
+    check(
+        &mut failures,
+        "the viewer shows the desktop through the SSH tunnel",
+        capture.is_ok_and(|cap| cap.colors >= 16),
+    );
 
     // The same desktop as a real browser renders it: the host's headless
     // Chromium loads the embedded noVNC page over the same bridge. Best
@@ -412,11 +532,22 @@ async fn run_checks(
         return Err(format!("the gate's required checks failed: {}", failures.join("; ")).into());
     }
     Ok(Checks {
-        ssh_ready_ms,
         desktop_ready_ms,
         peak_rss_mib,
         screenshots,
     })
+}
+
+/// The address in an `ss` address column (`10.0.0.2:22`,
+/// `[::ffff:10.10.5.20]:51234`, `*:22`), with IPv4-mapped IPv6 as IPv4.
+fn peer_ip(column: &str) -> Option<IpAddr> {
+    let (host, _port) = column.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.split('%').next()?;
+    match host.parse::<IpAddr>().ok()? {
+        IpAddr::V6(v6) => Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4)),
+        v4 => Some(v4),
+    }
 }
 
 /// Runs a command on the guest, prints it and its output for the log, and
