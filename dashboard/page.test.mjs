@@ -41,8 +41,15 @@ test('every state topic shares one stream, reopened with cursors when the topics
   await settle();
   assert.deepEqual(values.map((snapshot) => snapshot.revision), [1, 4, 4]);
   assert.deepEqual(other, values);
-  streams[0].emit('error', { error: 'Connection lost' });
-  assert.match(errors[0].message, /Connection lost/);
+  // A dropped connection reconnects on its own: it fails nothing, and what
+  // arrives after the reconnect is delivered.
+  streams[0].emit('error', { error: 'Connection dropped. Reconnecting.' });
+  assert.equal(errors.length, 0);
+  streams[0].emit('snapshot', { topic: 'host-alpha', revision: 4, value: { state: 'ssh_up' } });
+  assert.deepEqual(hosts.map((snapshot) => snapshot.value.state), ['booting', 'ssh_up']);
+  // A refusal ends the stream, and every topic on it hears why.
+  streams[0].emit('world_error', { error: 'too many streams' });
+  assert.match(errors[0].message, /too many streams/);
   // Dropping a topic reopens the stream for the rest, with what is held.
   stopHost();
   await settle();
@@ -74,6 +81,15 @@ test('the watch hub replays the latest snapshot and changes to a late subscriber
   assert.equal(seen.length, 3);
   assert.equal(replayed.length, 3, 'live events follow the replay once');
   assert.equal(upstreams.length, 1, 'subscribers share one stream');
+  // Counters are absolute: a late subscriber gets only the latest, and they
+  // never fill the replay.
+  for (let t = 1; t <= 50; t++) upstreams[0].emit('counters', { t });
+  assert.equal(upstreams[0].closed, undefined);
+  const third = hub.subscribe(), counters = [];
+  third.addEventListener('counters', (event) => counters.push(event.data));
+  await settle();
+  assert.deepEqual(counters, ['{"t":50}']);
+  third.close();
   // Past its limit the hub starts again from a fresh snapshot.
   upstreams[0].emit('event', { seq: 2 });
   upstreams[0].emit('event', { seq: 3 });
@@ -188,6 +204,8 @@ test('the page holds at most three long-lived streams across every panel, and no
   const watch = h.streams.find((source) => source.tag === 'watch');
   watch.emit('snapshot', { t: 1, started: 0, ended: false, hosts: [], groups: [], nodes: [{ id: 's1', kind: 'sandbox', name: 'alpha' }], edges: [{ id: 'e1', a: 's1', b: 't1' }], counters: { e1: [1, 1, 0, 0] }, events: [] });
   await settle();
+  assert.equal(h.root.querySelectorAll('section.workspace-tile').length, 1);
+  assert.equal(h.root.querySelector('section.workspace-tile').getAttribute('aria-label'), 'alpha');
   const pins = h.root.querySelectorAll('button.pin');
   pins[0].click(); pins[1].click();
   assert.equal(h.root.querySelectorAll('section.workspace-tile').length, 2);
@@ -230,4 +248,31 @@ test('a refused page description shows one not signed in card', async (t) => {
   assert.match(h.root.querySelector('#notice-text').textContent, /Open the URL the demo printed/);
   assert.equal(h.root.querySelector('#host-bar').children.length, 0);
   stop();
+});
+
+test('a custom workspace panel replaces the console tiles and hides the pins', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = {
+    ...DESCRIPTION,
+    panels: [
+      { id: 'packets', title: 'Packets', area: 'inspector', kind: 'packets' },
+      { id: 'plant', title: 'Plant', area: 'workspace', kind: 'custom', module: '/panels/plant.mjs', state: '/api/state/rows' },
+    ],
+  };
+  const stop = await mount(h.root, {
+    get: async (path) => (path === '/api/page' ? description : { rows: [], next: 0, dropped: 0 }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  }, { subscribe: (listener) => { listener('light'); return () => {}; }, dispose() {} });
+  await settle();
+  const workspace = h.root.querySelector('#workspace');
+  assert.equal(workspace.querySelectorAll('section.custom-workspace').length, 1);
+  assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 0);
+  assert.ok(h.root.querySelectorAll('button.pin').every((pin) => pin.hidden));
+  assert.deepEqual(h.root.querySelector('#tabs').children.map((tab) => tab.textContent), ['Packets']);
+  stop();
+  assert.equal(h.budget.open, 0);
 });

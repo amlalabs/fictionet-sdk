@@ -4,9 +4,10 @@
 
 const queue = globalThis.queueMicrotask || ((callback) => Promise.resolve().then(callback));
 
-// Watch events that change what a late subscriber must be told.
-const RECORDED = ['waiting', 'snapshot', 'host', 'host_end', 'group', 'group_end', 'node', 'node_end', 'edge', 'edge_end', 'status', 'counters', 'event', 'ended', 'end', 'world_error'];
-const FORWARDED = [...RECORDED, 'open', 'error'];
+// Watch events that change what a late subscriber must be told. Counters
+// are absolute, so only the latest is kept for a late subscriber.
+const RECORDED = ['waiting', 'snapshot', 'host', 'host_end', 'group', 'group_end', 'node', 'node_end', 'edge', 'edge_end', 'status', 'event', 'ended', 'end', 'world_error'];
+const FORWARDED = [...RECORDED, 'counters', 'open', 'error'];
 
 /// One watch stream for the page. `subscribe()` returns a source with the
 /// stream's events: first the latest snapshot and the changes since it, then
@@ -14,15 +15,20 @@ const FORWARDED = [...RECORDED, 'open', 'error'];
 /// open until `dispose()`.
 export function createWatchHub(transport, { limit = 5000 } = {}) {
   const subscribers = new Set();
-  let upstream, unbind = () => {}, history = [];
+  let upstream, unbind = () => {}, history = [], counters = null;
 
   function open() {
     history = [];
+    counters = null;
     const source = upstream = transport.watch();
     const removers = FORWARDED.map((name) => {
       const listener = (event) => {
-        if (RECORDED.includes(name)) {
-          if (name === 'snapshot') history = [];
+        if (name === 'counters') counters = event.data;
+        else if (RECORDED.includes(name)) {
+          if (name === 'snapshot') {
+            history = [];
+            counters = null;
+          }
           history.push([name, event.data]);
         }
         for (const subscriber of subscribers) if (!subscriber.pending) subscriber.emit(name, event.data);
@@ -60,6 +66,7 @@ export function createWatchHub(transport, { limit = 5000 } = {}) {
         if (!subscribers.has(source)) return;
         source.pending = false;
         for (const [name, data] of history) source.emit(name, data);
+        if (counters !== null) source.emit('counters', counters);
       });
       return source;
     },
@@ -123,7 +130,10 @@ export function createStateHub(transport) {
         const topic = topics.get(id);
         if (topic && revision > (topic.latest?.revision ?? 0)) void refresh(id, topic);
       }),
-      on('error', ({ error }) => topics.forEach((topic) => fail(topic, new Error(error)))),
+      // A dropped connection is not a failure: the transport reconnects with
+      // the cursors this stream opened with, which are never newer than what
+      // the topics hold, so the server sends what changed in between. Only a
+      // refusal ends the stream.
       on('world_error', ({ error }) => topics.forEach((topic) => fail(topic, new Error(error)))),
     ];
     unbind = () => removers.forEach((remove) => remove());

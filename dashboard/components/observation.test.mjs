@@ -126,3 +126,51 @@ test('a selected event shows its fields and offers only an approximate packet ma
   dispose();
   h.clean();
 });
+
+test('packets says when its links have nothing captured yet', (t) => {
+  const h = fixture(t);
+  const dispose = packets(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e1', a: 's1', b: 't1' }], counters: { e1: [0, 0, 0, 0] } });
+  h.frame();
+  const note = h.root.querySelector('#plist-empty');
+  assert.equal(note.hidden, false);
+  assert.match(note.textContent, /No packets yet/);
+  h.streams[0].emit('packet', { seq: 1, t: 1, side: 0, len: 28, skipped: 0, evicted: 0, src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', info: 'Echo', tags: [] });
+  h.frame();
+  assert.equal(note.hidden, true);
+  dispose();
+  h.clean();
+});
+
+test('the map keeps its own selection instead of applying it back to itself', (t) => {
+  // Drawn links move packets along their paths; the fake DOM has no geometry.
+  for (const [name, value] of [['getTotalLength', () => 100], ['getPointAtLength', () => ({ x: 0, y: 0 })]]) {
+    if (Element.prototype[name]) continue;
+    Element.prototype[name] = value;
+    t.after(() => { delete Element.prototype[name]; });
+  }
+  const h = fixture(t);
+  const dispose = map(h.root, h.services);
+  const snapshot = {
+    ...h.snapshot,
+    nodes: [...h.snapshot.nodes, { id: 't1', kind: 'task', name: 'filter', parent: null }],
+    edges: [{ id: 'e1', a: 's1', b: 't1' }],
+    counters: { e1: [1, 40, 1, 40] },
+  };
+  h.watches[0].emit('snapshot', snapshot);
+  h.frame();
+  h.frame();
+  const hit = h.root.querySelectorAll('path.hit')[0];
+  assert.ok(hit, 'the link is drawn');
+  hit.dispatchEvent(new Event('click'));
+  assert.deepEqual(h.selection.get().links, ['e1']);
+  // The next frames must not undo the selection the map just made: the side
+  // panel keeps describing the link.
+  h.frame();
+  h.frame();
+  assert.deepEqual(h.selection.get().links, ['e1']);
+  assert.match(h.root.querySelector('#side').textContent, /A link between/);
+  assert.doesNotMatch(h.root.querySelector('#side').textContent, /This world/);
+  dispose();
+  h.clean();
+});

@@ -15,11 +15,20 @@ export function mount(root, services, options = {}) {
   const view = createPackets({
     $, el, ...services.transport, fmtCount, fit() {}, ...options,
     placeholder: options.placeholder || (() => 'Select a packet to see its layers.'),
-    pcapLabel: options.pcapLabel || 'pcapng',
+    ...(options.drawer ? {} : { pcapLabel: 'pcapng' }),
   });
   options.onReady?.(view);
   let animation;
-  const frame = () => { view.flush(); animation = requestAnimationFrame(frame); };
+  // A list with links open but nothing captured yet says so.
+  const note = $('plist-empty');
+  const frame = () => {
+    view.flush();
+    if (note) {
+      const empty = !$('drawer').hidden && !$('prows').children.length;
+      if (note.hidden === empty) note.hidden = !empty;
+    }
+    animation = requestAnimationFrame(frame);
+  };
   animation = requestAnimationFrame(frame);
   const cleanup = [];
   let watch, request, generation = 0, current = '';
@@ -139,6 +148,7 @@ function structure(root, el) {
   }
   el('tbody', { id: 'prows' }, table);
   el('button', { id: 'jump-packets', class: 'jump', type: 'button', hidden: '' }, list);
+  el('p', { id: 'plist-empty', class: 'list-empty', role: 'status', hidden: '', text: 'No packets yet. They appear here as the world sends them.' }, list);
   const detail = el('div', { class: 'detail' }, body);
   el('div', { id: 'tree', class: 'tree' }, detail);
   const hex = el('div', { id: 'hex', class: 'hex', hidden: '' }, detail);

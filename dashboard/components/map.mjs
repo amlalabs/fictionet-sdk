@@ -125,6 +125,8 @@ export function mount(root, services, options = {}) {
     }
     const host = services.hosts?.find((host) => host.sandbox === sandbox || host.name === sandbox)?.name || null;
     services.selection.set({ connection: null, request: null, node: node?.id || null, host, event: selected?.event || null, links: selected?.kind === 'edge' ? (view.dedges.get(selected.id)?.members || []).map(({ e }) => e.id) : [] });
+    // The map made this selection: it is not applied back to the map.
+    pendingSelection = null;
   }
   const keydown = listen(options.persist ? root.ownerDocument : root, 'keydown', (ev) => {
     const active = root.ownerDocument.activeElement;
