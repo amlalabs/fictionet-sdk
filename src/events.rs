@@ -86,9 +86,7 @@ mod model;
 mod observer;
 
 pub use aggregate::Aggregate;
-#[cfg(feature = "observe")]
-pub(crate) use memory::DisplayBatch;
-pub use memory::{Incomplete, Limits, Memory};
+pub use memory::{DisplayBatch, Incomplete, Limits, Memory};
 pub(crate) use model::Origin;
 pub use model::{ConnInfo, Event, EventValue, Fields, Level, Sandbox, Transport, float, opt};
 pub use observer::{Dispatch, Emitter, Fanout, Metadata, Observation, Observer, Stamp};

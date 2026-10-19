@@ -712,3 +712,79 @@ fn startup_capture_accepts_packets_before_out_of_order_registration() {
     ))
     .unwrap();
 }
+
+#[test]
+fn removed_captures_stay_readable_and_evict_before_active_captures() {
+    let collector = Arc::new(Collector::new(Options {
+        capture: CapturePolicy::Startup,
+        packet_bytes: 6,
+        ..Options::default()
+    }));
+    let reader = collector.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(7)).observer(collector),
+        move |cx| async move {
+            let (a, _b) = fictionet::pair();
+            let (c, d) = fictionet::pair();
+            a.link().unwrap().label(&cx, "active".into());
+            c.link().unwrap().label(&cx, "removed".into());
+            cx.yield_now().await?;
+            let links: Vec<_> = reader.topology().links.keys().copied().collect();
+            packet(&reader, links[0], 1, Instant::ZERO, &[1; 3]);
+            packet(&reader, links[1], 1, Instant::ZERO, &[2; 3]);
+            drop((c, d));
+            cx.yield_now().await?;
+            assert!(!reader.topology().links.contains_key(&links[1]));
+            assert_eq!(
+                reader.packets(links[1], 0, 10).packets[0].bytes.as_ref(),
+                &[2; 3]
+            );
+            packet(&reader, links[0], 2, Instant::ZERO, &[3; 3]);
+            assert_eq!(reader.packets(links[0], 0, 10).packets.len(), 2);
+            assert_eq!(reader.packets(links[1], 0, 10).missed, 1);
+            assert!(reader.packets(links[1], 0, 10).packets.is_empty());
+            assert_eq!(
+                count(&reader, Stream::Packets(links[1]), LossReason::Eviction),
+                1
+            );
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn removed_capture_metadata_keeps_the_link_count_bound() {
+    let collector = Arc::new(Collector::new(Options {
+        capture: CapturePolicy::Startup,
+        topology: TopologyLimits {
+            links: 2,
+            ..TopologyLimits::default()
+        },
+        ..Options::default()
+    }));
+    let reader = collector.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(8)).observer(collector),
+        move |cx| async move {
+            let mut previous = Vec::new();
+            for _ in 0..8 {
+                let (a, b) = fictionet::pair();
+                a.link().unwrap().label(&cx, "short link".into());
+                cx.yield_now().await?;
+                let link = *reader.topology().links.keys().next().unwrap();
+                packet(&reader, link, 1, Instant::ZERO, &[0]);
+                previous.push(link);
+                assert!(reader.state.lock().captures.links.len() <= 2);
+                drop((a, b));
+                cx.yield_now().await?;
+                assert_eq!(reader.packets(link, 0, 1).packets.len(), 1);
+            }
+            assert!(reader.packets(previous[0], 0, 1).packets.is_empty());
+            assert_eq!(reader.packets(previous[6], 0, 1).packets.len(), 1);
+            assert_eq!(reader.packets(previous[7], 0, 1).packets.len(), 1);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}

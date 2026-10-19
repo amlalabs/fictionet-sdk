@@ -7,6 +7,23 @@ mod keys;
 mod loss;
 mod topology;
 
+#[cfg(feature = "decode")]
+mod dashboard;
+#[cfg(feature = "decode")]
+mod json;
+#[cfg(feature = "decode")]
+mod value;
+#[cfg(feature = "decode")]
+mod view;
+#[cfg(feature = "decode")]
+pub use dashboard::{DashboardHandle, DashboardObserver, DashboardOptions, Session};
+#[cfg(feature = "decode")]
+pub use value::{Envelope, Value};
+#[cfg(all(feature = "native", unix))]
+mod endpoint;
+#[cfg(all(feature = "native", unix))]
+pub use endpoint::{Client, Endpoint, serve};
+
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod jsonl;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
@@ -256,7 +273,10 @@ impl Observer for Collector {
                             self.options.capture
                         }),
                     )),
-                    TopologyRef::LinkRemoved { link, .. } => Some((*link, None)),
+                    TopologyRef::LinkRemoved { link, .. } => {
+                        captures.retired(*link);
+                        Some((*link, None))
+                    }
                     _ => None,
                 };
                 topology.apply(
@@ -275,7 +295,9 @@ impl Observer for Collector {
                         }
                     } else {
                         flags.remove(&id);
-                        captures.remove(id, losses, self.options.loss_streams);
+                        if policy.is_some() {
+                            captures.remove(id, losses, self.options.loss_streams);
+                        }
                     }
                     self.flags.store(Arc::new(flags));
                 }

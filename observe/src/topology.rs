@@ -47,6 +47,8 @@ impl Default for TopologyLimits {
 /// A current task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task {
+    /// Run time when the task was created.
+    pub started: fictionet::time::Instant,
     /// Spawning task.
     pub parent: Option<TaskId>,
     /// Function or future name.
@@ -254,6 +256,7 @@ impl Topology {
                         &mut self.tasks,
                         task,
                         Task {
+                            started: stamp.at,
                             parent,
                             name: text(name, limits.name_bytes, &mut cut),
                             file,

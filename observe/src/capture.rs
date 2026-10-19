@@ -94,6 +94,7 @@ pub(crate) struct Capture {
     window: Option<Instant>,
     in_window: u64,
     skipped: u64,
+    removed: Option<u64>,
 }
 
 impl Capture {
@@ -131,10 +132,29 @@ pub(crate) struct Captures {
 }
 
 impl Captures {
+    pub(crate) fn retired(&mut self, id: LinkId) {
+        self.order = self.order.saturating_add(1);
+        if let Some(capture) = self.links.get_mut(&id) {
+            capture.removed = Some(self.order);
+        }
+    }
+
+    fn oldest_removed(&self) -> Option<LinkId> {
+        self.links
+            .iter()
+            .filter_map(|(id, c)| c.removed.map(|order| (*id, order)))
+            .min_by_key(|(_, order)| *order)
+            .map(|(id, _)| id)
+    }
+
     fn oldest(&self) -> Option<LinkId> {
         self.links
             .iter()
-            .filter_map(|(id, c)| c.copies.front().map(|p| (*id, p.order)))
+            .filter_map(|(id, c)| {
+                c.copies
+                    .front()
+                    .map(|p| (*id, (c.removed.is_none(), c.removed.unwrap_or(p.order))))
+            })
             .min_by_key(|(_, order)| *order)
             .map(|(id, _)| id)
     }
@@ -174,6 +194,12 @@ impl Captures {
         options: &Options,
         losses: &mut LossStatus,
     ) {
+        if !self.links.contains_key(&packet.link)
+            && self.links.len() >= options.topology.links
+            && let Some(id) = self.oldest_removed()
+        {
+            self.remove(id, losses, options.loss_streams);
+        }
         if !self.links.contains_key(&packet.link) && self.links.len() >= options.topology.links {
             losses.record(
                 options.loss_streams,

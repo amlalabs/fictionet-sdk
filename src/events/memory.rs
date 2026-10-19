@@ -73,13 +73,19 @@ struct History {
     evicted: u64,
 }
 
+/// A consistent history batch and cursors for displaying loss without counting
+/// gaps caused by event filtering. Array entries are ordinary events and noise.
 #[derive(Default)]
-#[cfg(feature = "observe")]
-pub(crate) struct DisplayBatch {
+pub struct DisplayBatch {
+    /// Retained events in sequence order.
     pub events: Vec<Event>,
+    /// Last delivered event sequence.
     pub last: u64,
+    /// Total events lost, including rejected events and evictions.
     pub dropped: u64,
+    /// Evictions from each retention budget.
     pub evicted: [u64; 2],
+    /// Positions through this batch, including earlier evictions, per budget.
     pub position: [u64; 2],
 }
 
@@ -236,8 +242,9 @@ impl Memory {
             .collect()
     }
 
-    #[cfg(feature = "observe")]
-    pub(crate) fn display_batch(&self, after: Option<u64>, max: usize) -> DisplayBatch {
+    /// Reads events and loss cursors together. `None` selects the newest `max`
+    /// events; `Some(after)` selects events following that sequence.
+    pub fn display_batch(&self, after: Option<u64>, max: usize) -> DisplayBatch {
         let state = self.state.lock();
         let skip = if after.is_none() {
             state
