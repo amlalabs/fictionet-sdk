@@ -146,8 +146,6 @@ impl DashboardObserver {
     pub fn handle(&self) -> DashboardHandle {
         DashboardHandle(self.0.clone())
     }
-    /// Releases workers after the run. Retained data remains readable.
-    pub fn finish(&self) {}
 }
 
 impl DashboardHandle {
@@ -643,7 +641,6 @@ mod tests {
         assert!(!end[0].end);
         assert!(end[1].end);
         assert!(session.next_poll().is_none());
-        dashboard.finish();
         let value = request(&mut session, 4, r#"{"op":"world"}"#, now);
         assert_eq!(json(&value).get("t").and_then(Json::as_f64), Some(2.0));
     }

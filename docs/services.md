@@ -808,228 +808,65 @@ See [`httpd`'s event contract](../src/stdlib/web/httpd.rs) for `sent` and
 
 ## 5. Events
 
-Services emit structured facts: sandboxes attaching and binding addresses, DNS
-queries, TLS handshakes, HTTP requests, dropped packets, route changes and
-service-specific events. World code uses `fcx.emit("source", "kind", |event| ...)`.
-The integrator installs observers through `RunOptions` before execution: none,
-bounded `fictionet_observe::Memory`, native `fictionet_observe::Jsonl`, optional `fictionet_observe::Aggregate`, dashboard retention, or
-its own implementation. `Fanout` combines destinations. Without an observer,
-emission performs no allocation, formatting, clock read, task lookup or numbering.
+Services emit structured facts about sandbox attachments, address bindings,
+DNS queries, TLS handshakes, HTTP requests, packet drops and route changes.
+World code emits through `fcx.emit("source", "kind", |event| ...)`. The
+closure runs only when an installed observer wants that event. With no
+observer, emission does no allocation, formatting, clock read, task lookup
+or numbering.
+
+The integrator installs observers in `RunOptions` before the run starts.
+`fictionet::events::Fanout` combines destinations. The companion crate supplies
+`Memory` for bounded grading history, `Aggregate` for repeated facts, and
+`Jsonl` for a native writer worker. Its `Collector` retains all four streams;
+`DashboardObserver` adds the dashboard request service to a collector.
 
 ```rust
 use std::sync::Arc;
 use fictionet::{RunOptions, Seed, block_on, lab};
 use fictionet_observe::{Aggregate, Memory};
-let evidence = Arc::new(Memory::default());
+
+let grader = Arc::new(Memory::default());
 let options = RunOptions::new(Seed::from_u64(7))
-    .observer(Arc::new(Aggregate::new(evidence.clone())));
+    .observer(Arc::new(Aggregate::new(grader.clone())));
 block_on(lab(options, |fcx| async move {
     fcx.emit("prompt", "login", |event| event.field("right", true));
     Ok(())
 }))?;
-let logins = evidence.checked_of("prompt", "login")?;
+let logins = grader.checked_of("prompt", "login")?;
 ```
 
-`Memory::wait` waits for matching complete evidence on the run's clock, bounded
-by a deadline. At the deadline it returns matches so far. Retention loss and
-cancellation are errors. Reads do not flush aggregation or change history.
-Use `checked_of` or `checked_all` for grading; `after` supplies bounded display
-batches without certifying completeness.
+`Memory::wait` waits for matching complete results on the run's clock,
+bounded by a deadline. At the deadline it returns matches so far.
+Retention loss and cancellation are errors. Reads do not flush aggregation
+or change history. Use `checked_of` or `checked_all` for grading; `after`
+supplies bounded display batches without certifying completeness.
 
-Task identities belong to one run. An event recorded through a `Cx` from
-another run has no task metadata. The same applies outside any world task.
-A nested lab starts its own world root with no parent. Tasks spawned
-through another run's `Cx` also have no parent in their run's graph.
-Link owners and creators name only tasks from the graph's own run.
+Task identities belong to one run. Events emitted through another run's
+`Cx`, or outside a world task, have no task metadata. A nested lab has its
+own world root with no parent. Tasks spawned through another run's `Cx`
+also have no parent in their run. Link owners and creators belong to that
+link's run.
 
-The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
-`level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
-`tls`, `sni`, `alpn`, `fields`, then the task that recorded it (`node`,
-`task`, `file`, `line`, `parent`). The run automatically emits
-`run.start` at zero to interested observers. Its `wall` field puts a real run's
-clock on a calendar; a lab records `null` for `wall`. The `seed` field contains the 32-byte run seed as
-64 lowercase hexadecimal digits.
-The `rng` field is `chacha20-v1`: ChaCha20 with contiguous byte consumption,
-little-endian integers and the high 53 bits for fractions. Field
-names are fixed by the code that records; names that come from the wire,
-such as LDAP attributes, go under one field as an object.
+The run emits `run.start` at time zero to interested observers. Its `wall`
+field gives a real run's Unix epoch time; a lab uses `null`. Its `seed` is
+the 32-byte run seed as 64 lowercase hexadecimal digits. Its `rng` is
+`chacha20-v1`: ChaCha20 with contiguous byte consumption, little-endian
+integers and the high 53 bits for fractions. Event field names are fixed
+by the emitting code. Names from the wire, such as LDAP attributes, belong
+in an object under one field.
 
-The [events module](../src/events.rs) documents delivery, retention and repeat
-aggregation. The dispatch assigns sequence numbers and run-clock timestamps
-before fan-out. Filtering and aggregation may leave sequence gaps; explicit loss
-status, rather than gaps, establishes whether evidence is incomplete.
-Observers receive borrowed events synchronously in sequence order and must return
-promptly without calling back into the world.
-
-`Memory` defaults to 50,000 ordinary events within 16 MiB, plus a separate
-5,000-record, 2 MiB budget for facts marked with `Event::repeat`. Oldest events
-in each budget are evicted first;
-loss persists even if a later query selects a different kind of fact. An optional
-`Aggregate` wraps retention with one-second run-time windows, at most 1,024
-pending facts and two MiB of event storage. Services mark repeatable facts with
-`Event::repeat`, including detail such as the destination port. Matching facts
-become summaries with `count`, `first_seq`, `last_seq` and numeric detail ranges.
-A fact without `count` represents one occurrence; summaries carry their total.
-Ordinary events, the next emission after window expiry, capacity pressure and run
-end deliver pending summaries in sequence order.
-Reads never flush them. Unlimited distinct traffic can still overflow retention.
-
-Byte accounting includes owned capacities, task names and shared connection
-metadata charged in full per copy, plus estimated allocation overhead. It excludes
-spare collection capacity and copies held by readers. Retention limits do not
-bound total process memory.
-
-Native `fictionet_observe::Jsonl` enqueues events within explicit count and byte bounds; its worker
-serializes and writes the existing JSON Lines format. Full queues count loss
-without blocking the world. `end` seals input; the host calls `finish` outside the
-run to drain output and report errors. `lost` reports rejected or unwritten events.
-Discard samples with incomplete output. Worker scheduling can affect overflow,
-so use synchronous `Memory` for deterministic lab evidence. Browser and builds
-without `std` can use `Memory` or a custom observer without a filesystem worker.
-
-`Event::to_line()` now returns `Result<String, json::Error>`. Callers must
-handle JSON size, depth and value-count errors. File sinks count events
-that cannot be serialized as lost. Observer replies and streams instead
-deliver a replacement with the same sequence, time, category, level,
-connection and task metadata. Its summary is `unserializable: <error>` and
-its only field is `unserializable`, containing the error text. Replacement
-text values longer than 1,024 bytes are shortened at a UTF-8 boundary and
-end in `…`. The cursor advances past this explicit error record as it does
-past an original event.
-
-### Packet drops and event layers
-
-Packet-drop construction lives in [`fictionet::stdlib::network::ip::record_drop`](../src/stdlib/network/ip.rs).
-It reads the packet's addresses and protocol and records a `drop` repeat.
-[`fictionet_observe::Layer::from_event(&event)`](../observe/src/decode.rs)
-turns an event into a display layer, with its summary and fields as notes.
-If a non-string field cannot be serialized, its note is
-`unserializable: <error>`.
-
-The helper checks interest before parsing packet details. It emits each occurrence;
-optional aggregation and retention belong to installed observers. Generic event
-construction stays independent of packet parsing and display-layer construction.
+The [events module](../src/events.rs) describes production and delivery.
+The [companion crate docs](../observe/src/lib.rs)
+describe retention, event JSON, loss reports and grading.
 
 ## 6. The dashboard
 
-Open `/#token=<URL-encoded-token>` on the dashboard's origin to sign in.
-The page removes the fragment immediately, then sends the token in a bearer
-header to `/api/bootstrap`. Bootstrap succeeds once per dashboard process.
-The browser stores the token in `sessionStorage` for this origin and tab.
-Reloading keeps it. Opening the bootstrap URL again in the same tab also
-removes the fragment and keeps the session if the stored token matches.
-Log out or close the tab to clear it; restart the dashboard to use an already
-used bootstrap URL again. Logout cancels requests and streams but does not
-revoke the file token for scripts or other signed-in tabs.
-
-The static shell is public and contains no world data. It expires the old
-authentication cookie when a browser upgrades. All API calls, streams
-and downloads require `Authorization: Bearer <token>`. Cookie authorization
-and `/login?token=...` are no longer supported. The browser uses authenticated
-fetch, omits cookies and refuses redirects. It only sends credentials to fixed
-API paths at its own origin. Another service on the same hostname at a
-different port receives no dashboard credentials. Stream reconnects send the
-bearer header again. An authorization failure stops requests, clears the
-stored token and closes the packet drawer. After signing in again, reopen
-the drawer to start a new packet stream.
-
-Selecting a packet clears the previous layers and bytes while it loads.
-Only the current selection can fill them. Closing or reopening the drawer,
-or reconnecting its stream, cancels pending detail requests. If a packet is
-unavailable or its request fails, both views clear. Select it again to retry.
-
-When a packet stream reconnects, the dashboard reloads retained history and
-shows a reload notice. It clears old rows, pending and paused packets,
-sampling totals and the selected detail before replay. A paused view stays
-paused until resumed. This also applies to merged links and captures whose
-packet numbering restarts.
-
-Dropped browser connections show a reconnect notice. A subscription refusal
-shows its reason and stops that subscription. In a merged view it names the
-failed link, and the other links keep streaming. A refusal never appears as
-a normal link close.
-
-A capture download for several links includes a pcapng section for each link.
-If any link has no capture, the whole download fails with HTTP 404 and JSON.
-The `error` message names every failed link. The `links` array gives each
-failed `link` and its `error` reason. No partial capture is returned.
-
-The dashboard serves one HTTP/1.0 or HTTP/1.1 GET request per connection.
-The target must be a path starting with `/`. The head may be at most 16 KiB,
-including the first `\r\n\r\n`. Bytes after it cannot supply headers or another
-request. Invalid request lines and headers close the connection. Repeated
-`Host`, `Authorization`, `Cookie`, `Origin`, or `Sec-Fetch-Site` fields are
-rejected. Request bodies are unsupported: `Transfer-Encoding` is rejected,
-and `Content-Length` may occur only once and must be zero.
-
-The dashboard and `fictionet observe` use a temporary 11-second timeout
-when sending hello to the observation socket and waiting for its answer. A silent
-endpoint causes a handshake-timeout error. After acceptance, the read timeout
-is cleared; callers control how long to wait for subscription replies. Sends
-time out after ten seconds. Both commands take `--observation unix:<path>`;
-the world installs a `DashboardObserver` and explicitly serves its handle.
-
-Both commands inspect observer event and error envelopes as JSON. Field
-order, whitespace and string escapes do not affect recognition. Inspection
-uses `fictionet_observe::Value::envelope`. Recognition does not depend on size,
-element count or nesting depth.
-Invalid JSON, missing or wrongly typed fields, duplicate envelope fields,
-and mixed event/error objects are not recognized. Binary values are never
-inspected. Raw reply bytes and flags stay intact. The CLI writes the original
-bytes; the dashboard forwards the original JSON data in SSE, with one `data:`
-line per line of JSON. Event names with line breaks, or the browser's reserved
-`error` name, are sent as errors instead.
-
-A close between reply values is distinct from a truncated value. The CLI
-exits with status 0 for a boundary close after `ended`. A partial value exits
-with status 1 and its framing error, even after `ended`.
-The dashboard sends `end` with `the world closed` for a boundary close.
-Framing errors and single-stream refusals send `world_error` with an `error`
-string. Merged refusals send `link_error` with `link` and `error` strings;
-other links continue. Once all links finish, the merged stream sends `end`.
-The browser displays terminal reasons without retrying. Its local `error`
-event is reserved for transient connection drops, which still reconnect.
-Non-stream API replies use HTTP 502 with the framing error in the JSON body.
-
-Each observation endpoint admits 64 sessions by default, including idle
-clients and direct API users. A full endpoint refuses the greeting with
-`too many observation sessions`. Disconnecting frees a slot.
-`Endpoint::set_session_limit` changes this ceiling for one endpoint.
-Each session can hold 64 subscriptions. Each run retains at most 64 link
-watches by default, shared by all subscribers to each link.
-`DashboardOptions::watches` sets that ceiling before the run. The defaults fit the
-dashboard's 64-connection cap and a session watching 64 distinct links.
-
-When a new link needs a slot, idle watches are evicted longest-idle first,
-with the lowest link id breaking ties.
-If all watches are active, `packets` returns
-`{"error":"this world has too many watched links"}` and ends that request.
-Unknown links return `{"error":"no such link"}` even at capacity.
-Existing streams and subscriptions to retained links keep working.
-Idle history lasts up to a minute, but admission can evict it sooner.
-Eviction removes packet details and capture history; a later watch starts
-numbering packets at 1. Lowering a ceiling preserves active users until
-they leave. Zero refuses new sessions or new links.
-
-The default retained-row budget totals at most 256 MiB across watches.
-This is not a process-memory bound. Packet capture, event retention, TLS keys,
-decoder state, graph views, thread stacks, socket buffers, temporary replies
-and exports, and allocation overhead are separate costs. Reads in progress
-and streams draining an ended run can keep their own watch holds until they
-finish. Multiple listeners and runs have separate budgets.
-Pending observation handshakes count toward the session limit; attached
-sandboxes are independent of observation sessions.
-
-If the kernel refuses to watch a sandbox connection, the listener closes it.
-An existing attachment's next receive reports `RecvError::Closed`, and its
-queued outgoing packets are dropped. After a resource shortage pauses accepts,
-the listener keeps retrying registration until it can accept again.
-
-The dashboard lists the events under **Events**, from explicitly installed retention
-when it connected. To decode a service's packets there, register its decoder as a `Present`
-in a `fictionet_observe::Registry`, and set `DashboardOptions::protocols`. The
-built-in registry has six decoders: `http1`, `http2`, `tls`, `modbus`, `dhcp`
-and `dns`.
+The dashboard draws a run's tasks and groups and lists its events and
+captured packets through an installed `DashboardObserver`. See the
+[companion README](../observe/README.md) for setup and the
+[crate walkthrough](../observe/src/lib.rs)
+for sign-in, the drawing, capture and observation requests.
 
 ## Changing framing between items
 

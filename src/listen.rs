@@ -98,6 +98,8 @@ impl std::error::Error for ParseWorldSocketError {}
 /// polling [`Attachments`](crate::Attachments).
 /// If the kernel refuses to watch a sandbox connection, it is closed and
 /// any existing attachment's next receive reports [`RecvError::Closed`].
+/// Its queued outgoing packets are dropped. After a resource shortage
+/// pauses accepts, the listener retries registration until it can accept again.
 ///
 /// The attachment hub is marked as fed by a real listener. Using its
 /// [`Attachments`](crate::Attachments) in a [`lab`](crate::lab), through

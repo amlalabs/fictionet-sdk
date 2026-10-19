@@ -379,7 +379,16 @@ impl Client {
         let mut hello = vec![HELLO];
         hello.extend_from_slice(&VERSION.to_be_bytes());
         hello.extend_from_slice(PROTOCOL.as_bytes());
-        send(&socket, &hello)?;
+        // A full endpoint sends its refusal and closes at once, so the
+        // hello can fail to send. The refusal is still there to read.
+        if let Err(error) = send(&socket, &hello)
+            && !matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            )
+        {
+            return Err(error);
+        }
         let mut reader = Reader::default();
         let answer = reader
             .read_until(&socket, Some(Instant::now() + timeout))?

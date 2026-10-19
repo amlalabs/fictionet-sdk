@@ -415,7 +415,7 @@ impl Tls {
                         let why = if !self.tls13 {
                             "only TLS 1.3 is decrypted; download the capture to decrypt it in Wireshark"
                         } else if self.keys[i].is_none() {
-                            "no keys: the handshake happened before anyone observed the world"
+                            "no keys for this session"
                         } else {
                             "could not be decrypted"
                         };
