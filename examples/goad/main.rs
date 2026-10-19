@@ -5,7 +5,7 @@
 //! packets unchanged. The default addresses are the upstream GOAD topology.
 //!
 //! ```text
-//! cargo run --example goad -- /run/fictionet/goad.sock 192.168.56
+//! cargo run --example goad -- /run/fictionet/goad.sock 192.168.56 [observation.sock]
 //! ```
 //!
 //! Attach members by these names: `provisioner`, `attacker`, `dc01`, `dc02`,
@@ -30,10 +30,11 @@ const MEMBERS: &[(&str, u8)] = &[
 ];
 
 const USAGE: &str = "\
-usage: goad [WORLD_SOCKET] [A.B.C]
+usage: goad [WORLD_SOCKET] [A.B.C] [OBSERVATION_SOCKET]
 
-  WORLD_SOCKET  the Unix socket the world listens on (default /run/fictionet/goad.sock)
-  A.B.C         the first three octets of the lab's /24 (default 192.168.56)
+  WORLD_SOCKET        the Unix socket the world listens on (default /run/fictionet/goad.sock)
+  A.B.C               the first three octets of the lab's /24 (default 192.168.56)
+  OBSERVATION_SOCKET  an optional Unix observation socket
 ";
 
 fn main() -> Result {
@@ -47,10 +48,10 @@ fn main() -> Result {
             "unknown option {flag:?}\n{USAGE}"
         )));
     }
-    if args.len() > 2 {
+    if args.len() > 3 {
         return Err(fictionet::Error::msg(format!(
             "unexpected argument {:?}\n{USAGE}",
-            args[2]
+            args[3]
         )));
     }
     let socket = args
@@ -70,6 +71,16 @@ fn main() -> Result {
         })
         .collect();
 
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
+    let _observation = if let Some(path) = args.get(2) {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        options = options.observer(std::sync::Arc::new(fictionet::events::Aggregate::new(
+            dashboard.observer(),
+        )));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let (_listening, mut attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(socket.clone().into()))?;
     println!("GOAD LAN {}/24 listening on {socket}", subnet.addr);
@@ -78,30 +89,25 @@ fn main() -> Result {
         println!("  {name:<11} {addr}");
     }
 
-    fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
-        move |fcx| async move {
-            let lan = route::lan(&fcx, subnet, |event| event);
-            loop {
-                let sandbox = attachments.next(&fcx).await?;
-                let name = sandbox.name().to_owned();
-                let Some(&addr) = members.get(name.as_str()) else {
-                    println!("turned away {name}: no address is assigned to that member");
-                    continue;
-                };
-                println!("attached {name} at {addr}");
-                fcx.emit("goad", "member_attached", |event| {
-                    event
-                        .summary(format_args!("{name} attached at {addr}"))
-                        .field("name", name.as_str())
-                        .field("address", addr.to_string())
-                });
-                lan.add(addr, Box::new(sandbox) as Box<dyn Interface>, None)?;
-            }
-        },
-    ))
+    fictionet::block_on(fictionet::run(options, move |fcx| async move {
+        let lan = route::lan(&fcx, subnet, |event| event);
+        loop {
+            let sandbox = attachments.next(&fcx).await?;
+            let name = sandbox.name().to_owned();
+            let Some(&addr) = members.get(name.as_str()) else {
+                println!("turned away {name}: no address is assigned to that member");
+                continue;
+            };
+            println!("attached {name} at {addr}");
+            fcx.emit("goad", "member_attached", |event| {
+                event
+                    .summary(format_args!("{name} attached at {addr}"))
+                    .field("name", name.as_str())
+                    .field("address", addr.to_string())
+            });
+            lan.add(addr, Box::new(sandbox) as Box<dyn Interface>, None)?;
+        }
+    }))
 }
 
 fn parse_prefix(text: &str) -> Result<[u8; 3]> {

@@ -8,6 +8,7 @@ use crate::time::Instant;
 use super::{Event, Limits, Observation, Observer, Stamp};
 
 /// Optional, bounded aggregation of facts marked with [`Event::repeat`].
+/// Other streams and their losses pass through unchanged.
 ///
 /// Matching source, kind, level, connection, task, summary and identifying fields
 /// share a window. Numeric detail becomes a `[low, high]` range; other detail
@@ -72,15 +73,12 @@ impl Aggregate {
 
 impl Observer for Aggregate {
     fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        let fictionet::events::Interest::Event(metadata, connection) = interest else {
-            return false;
-        };
-        self.next
-            .enabled(fictionet::events::Interest::Event(metadata, connection))
+        self.next.enabled(interest)
     }
 
     fn observe(&self, stamp: Stamp, observation: Observation<'_>) {
         let Observation::Event(event) = observation else {
+            self.next.observe(stamp, observation);
             return;
         };
         let mut state = self.state.lock();
@@ -99,9 +97,6 @@ impl Observer for Aggregate {
     }
 
     fn lost(&self, loss: fictionet::events::Loss) {
-        if loss.stream != fictionet::events::Stream::Events {
-            return;
-        }
         self.next.lost(loss);
     }
 

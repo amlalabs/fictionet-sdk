@@ -4,7 +4,7 @@
 //! ```text
 //! fakewiki-world --socket /run/fictionet/sock/world.sock --ca-dir /app/ca \
 //!     --backend /app/backend --backend-port 8080 \
-//!     --state-dir /var/lib/fictionet --ready /run/fictionet/ready
+//!     --state-dir /var/lib/fictionet --ready /run/fictionet/ready [--observation <path>]
 //! ```
 
 use std::collections::{BTreeSet, HashMap};
@@ -83,14 +83,24 @@ fn real_main() -> fictionet::Result {
         .worker_threads(2)
         .enable_all()
         .build()?;
+    let mut observer: Arc<dyn fictionet::events::Observer> =
+        Arc::new(fakewiki_world::events::LogObserver {
+            log: log.clone(),
+            hosts: hosts.clone(),
+        });
+    let _observation = if let Some(path) = &args.observation {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        observer = Arc::new(fictionet::events::Fanout::new(vec![
+            dashboard.observer(),
+            observer,
+        ]));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let result = runtime.block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(Arc::new(fictionet::events::Memory::default()))
-            .observer(Arc::new(fakewiki_world::events::LogObserver {
-                log: log.clone(),
-                hosts: hosts.clone(),
-            })),
+            .observer(Arc::new(fictionet::events::Aggregate::new(observer))),
         move |fcx| async move {
             let content = Content::new(&fcx, args.backend_port)?;
             let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys())?;

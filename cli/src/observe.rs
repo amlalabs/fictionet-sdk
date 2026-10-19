@@ -1,18 +1,18 @@
 //! `fictionet observe`: the observe API from a shell. Writes each JSON value
 //! followed by a newline, so scripts can read a world without speaking the
-//! relay protocol themselves. The original bytes are preserved.
+//! observation protocol themselves. The original bytes are preserved.
 
 use std::io::Write;
 
-use fictionet::relay::observer::{Client, Envelope};
+use fictionet_observe::Envelope;
 
-use crate::args::take_world;
-use crate::config::world_path;
+use crate::args::take_observation;
+use crate::config::{connect_observation, observation_path};
 
 pub(crate) const USAGE: &str = "\
-usage: fictionet observe --world unix:<path> [<request>]
+usage: fictionet observe --observation unix:<path> [<request>]
 
-Connects to a world socket as an observer, sends one request, and writes
+Connects to an observation socket as an observer, sends one request, and writes
 each JSON reply followed by a newline. Streams (watch, packets) run
 until the world ends them or you stop the command. Binary values (pcap,
 keylog) are written to stdout as they are.
@@ -67,8 +67,8 @@ pub(crate) fn main(args: &[String]) -> i32 {
         println!("{USAGE}");
         return 0;
     }
-    let parsed = take_world(args).and_then(|(world, rest)| {
-        let path = world_path(&world)?;
+    let parsed = take_observation(args).and_then(|(world, rest)| {
+        let path = observation_path(&world)?;
         Ok((path, request(&rest)?))
     });
     let (path, request) = match parsed {
@@ -78,7 +78,7 @@ pub(crate) fn main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let mut client = match Client::connect(&path, "fictionet observe") {
+    let mut client = match connect_observation(&path) {
         Ok(c) => c,
         Err(msg) => {
             eprintln!("fictionet observe: {msg}");

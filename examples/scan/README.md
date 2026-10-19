@@ -49,8 +49,8 @@ group too.
 
 `compose.yaml` runs the world, the two sandboxes and the dashboard:
 
-- `world` runs `main.rs`, with no network at all. Its only door is the
-  world socket on a shared volume.
+- `world` runs `main.rs`, with no network at all. Its world and observation
+  sockets are on a shared volume.
 - `container-attach` runs `fictionet attach --type tun` for the real
   container, at 10.0.0.50. The `container` service (nginx and OpenSSH on
   Alpine) joins its network namespace, so its only interface is `tun0`.
@@ -58,7 +58,7 @@ group too.
   `scanner` service, with nmap, joins it. nmap needs `NET_RAW` to send SYN
   scans and pings, and the compose file grants it. The scanner does not
   see the world socket.
-- `dashboard` runs `fictionet dashboard` on the socket, published on
+- `dashboard` runs `fictionet dashboard --observation` on the observation socket, published on
   `127.0.0.1:7880` only (`SCAN_DASHBOARD_PORT` picks another port). Its
   token file is mounted only in the dashboard container.
 

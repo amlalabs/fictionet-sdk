@@ -902,7 +902,7 @@ past an original event.
 
 Packet-drop construction lives in [`fictionet::stdlib::network::ip::record_drop`](../src/stdlib/network/ip.rs).
 It reads the packet's addresses and protocol and records a `drop` repeat.
-[`fictionet::observe::Layer::from_event(&event)`](../src/observe/decode.rs)
+[`fictionet_observe::Layer::from_event(&event)`](../observe/src/decode.rs)
 turns an event into a display layer, with its summary and fields as notes.
 If a non-string field cannot be serialized, its note is
 `unserializable: <error>`.
@@ -964,13 +964,15 @@ rejected. Request bodies are unsupported: `Transfer-Encoding` is rejected,
 and `Content-Length` may occur only once and must be zero.
 
 The dashboard and `fictionet observe` use a temporary 11-second timeout
-when sending hello to the world and waiting for its answer. A silent world
-causes a handshake-timeout error. After acceptance, these greeting timeouts
-are cleared; callers control how long to wait for subscription replies.
+when sending hello to the observation socket and waiting for its answer. A silent
+endpoint causes a handshake-timeout error. After acceptance, the read timeout
+is cleared; callers control how long to wait for subscription replies. Sends
+time out after ten seconds. Both commands take `--observation unix:<path>`;
+the world installs a `DashboardObserver` and explicitly serves its handle.
 
 Both commands inspect observer event and error envelopes as JSON. Field
 order, whitespace and string escapes do not affect recognition. Inspection
-uses `relay::observer::Value::envelope`. Recognition does not depend on size,
+uses `fictionet_observe::Value::envelope`. Recognition does not depend on size,
 element count or nesting depth.
 Invalid JSON, missing or wrongly typed fields, duplicate envelope fields,
 and mixed event/error objects are not recognized. Binary values are never
@@ -990,13 +992,13 @@ The browser displays terminal reasons without retrying. Its local `error`
 event is reserved for transient connection drops, which still reconnect.
 Non-stream API replies use HTTP 502 with the framing error in the JSON body.
 
-Each world listener admits 64 observer sessions by default, including idle
-clients and direct API users. A full listener refuses the greeting with
-`this listener has too many observer sessions`. Disconnecting frees a slot.
-`Listening::set_observer_limit` changes this ceiling for one listener.
+Each observation endpoint admits 64 sessions by default, including idle
+clients and direct API users. A full endpoint refuses the greeting with
+`too many observation sessions`. Disconnecting frees a slot.
+`Endpoint::set_session_limit` changes this ceiling for one endpoint.
 Each session can hold 64 subscriptions. Each run retains at most 64 link
 watches by default, shared by all subscribers to each link.
-`Cx::set_observe_watch_limit` changes that ceiling. The defaults fit the
+`DashboardOptions::watches` sets that ceiling before the run. The defaults fit the
 dashboard's 64-connection cap and a session watching 64 distinct links.
 
 When a new link needs a slot, idle watches are evicted longest-idle first,
@@ -1010,13 +1012,14 @@ Eviction removes packet details and capture history; a later watch starts
 numbering packets at 1. Lowering a ceiling preserves active users until
 they leave. Zero refuses new sessions or new links.
 
-The default retained-row budget totals at most 2 GiB (64 times 32 MiB).
-This is not a process-memory bound. Packet taps, event retention, TLS keys,
+The default retained-row budget totals at most 256 MiB across watches.
+This is not a process-memory bound. Packet capture, event retention, TLS keys,
 decoder state, graph views, thread stacks, socket buffers, temporary replies
 and exports, and allocation overhead are separate costs. Reads in progress
 and streams draining an ended run can keep their own watch holds until they
 finish. Multiple listeners and runs have separate budgets.
-Pending handshakes and attached sandboxes are outside these observer limits.
+Pending observation handshakes count toward the session limit; attached
+sandboxes are independent of observation sessions.
 
 If the kernel refuses to watch a sandbox connection, the listener closes it.
 An existing attachment's next receive reports `RecvError::Closed`, and its
@@ -1025,7 +1028,7 @@ the listener keeps retrying registration until it can accept again.
 
 The dashboard lists the events under **Events**, from explicitly installed retention
 when it connected. To decode a service's packets there, register its decoder as a `Present`
-in an `observe::Registry`, and give the registry to `Net::observe`. The
+in a `fictionet_observe::Registry`, and set `DashboardOptions::protocols`. The
 built-in registry has six decoders: `http1`, `http2`, `tls`, `modbus`, `dhcp`
 and `dns`.
 

@@ -1,6 +1,5 @@
 //! A Modbus gateway that accepts nonzero protocol identifiers on a simulated network.
 use fictionet::events::Transport;
-use fictionet::observe::{Conversation, Decoded, Layer, Match, Place, Present, Registry};
 use fictionet::stdlib::{
     codec::{Decode, Frames, Step, Wire},
     network::{ConnectionExt, ip, tcp},
@@ -8,6 +7,7 @@ use fictionet::stdlib::{
     world::net::Net,
 };
 use fictionet::{Cx, Seed, block_on, lab};
+use fictionet_observe::{Conversation, Decoded, Layer, Match, Place, Present, Registry};
 use std::{convert::Infallible, net::Ipv4Addr, sync::Arc};
 
 #[allow(dead_code)]
@@ -83,7 +83,6 @@ fn registry() -> Registry {
 }
 
 async fn read_planted_register(fcx: Cx) -> fictionet::Result {
-    fcx.observe_protocols(registry());
     let (attacher, attachments) = fictionet::attachments();
     let address = Ipv4Addr::new(10, 30, 0, 3);
     Net::new()
@@ -152,7 +151,13 @@ async fn read_planted_register(fcx: Cx) -> fictionet::Result {
 }
 fn main() -> fictionet::Result {
     block_on(lab(
-        fictionet::RunOptions::new(Seed::from_u64(7)),
+        fictionet::RunOptions::new(Seed::from_u64(7)).observer(
+            fictionet_observe::DashboardObserver::new(fictionet_observe::DashboardOptions {
+                protocols: registry(),
+                ..Default::default()
+            })
+            .observer(),
+        ),
         read_planted_register,
     ))
 }
@@ -164,7 +169,13 @@ mod tests {
     #[test]
     fn custom_protocol_scenario() -> fictionet::Result {
         block_on(lab(
-            fictionet::RunOptions::new(Seed::from_u64(7)),
+            fictionet::RunOptions::new(Seed::from_u64(7)).observer(
+                fictionet_observe::DashboardObserver::new(fictionet_observe::DashboardOptions {
+                    protocols: registry(),
+                    ..Default::default()
+                })
+                .observer(),
+            ),
             read_planted_register,
         ))
     }

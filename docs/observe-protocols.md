@@ -1,29 +1,29 @@
 # Add an observe protocol
 
-Implement `fictionet::stdlib::codec::Decode` and `fictionet::observe::Present`
+Implement `fictionet::stdlib::codec::Decode` and `fictionet_observe::Present`
 on your decoder. You can copy a protocol file from `src/stdlib/protocols/`
 into your crate and edit it, or write a decoder from scratch. `Present::summary`
 describes one item. `Present::fields` adds fields to a `Layer`, with ranges
 relative to the item's raw bytes. `Layer::note` adds text without a range.
 The `Present` rustdoc includes a complete decoder and registration example.
 
-Use [`Registry`](../src/observe/registry.rs) to register a name, a matcher,
+Use [`Registry`](../observe/src/decode/registry.rs) to register a name, a matcher,
 and a factory for the two direction decoders. Its contract covers defaults,
 selection precedence, TCP prefix limits, UDP handling and explicit choice.
 Built-ins use the same registration methods.
 
 `Registry::names()` lists the registered names in registration order, oldest
 first. Each name appears once. Replacing a name moves it to the end.
-`Registry::default()` includes built-ins with the `observe` feature and is
-empty without it. Matchers, factories and presenters live in `src/observe/`.
+`Registry::default()` includes the built-ins. The registry, matchers, factories
+and presenters are available with the companion's `decode` feature.
 
 Each built-in adapter owns its matcher, factory, and input read-ahead.
 Use `Http1::register`, `Dns::register`, `Dhcp::register`, or
-`ModbusSession::register` from `observe::protocols`,
-`observe::http2::Capture::register`, or `observe::tls::TlsSession::register`
+`ModbusSession::register` from `fictionet_observe::protocols`,
+`fictionet_observe::http2::Capture::register`, or `fictionet_observe::tls::TlsSession::register`
 to add just that protocol. These methods use the built-in name and replace
 any earlier registration with that name. The default composition in
-`src/observe/app.rs` registers HTTP/1, HTTP/2, TLS, Modbus, DHCP, then DNS.
+`observe/src/decode/app.rs` registers HTTP/1, HTTP/2, TLS, Modbus, DHCP, then DNS.
 Later registrations take precedence, so port-based DNS and Modbus matching
 still win over HTTP prefixes. HTTP/2 waits for a partial preface on TCP.
 
@@ -32,7 +32,7 @@ one budget for all its connections and registry clones, including TLS
 plaintext. Keep that budget outside the per-connection factory:
 
 ```rust
-use fictionet::observe::{Registry, http2, protocols::Http1, tls::TlsSession};
+use fictionet_observe::{Registry, http2, protocols::Http1, tls::TlsSession};
 
 let mut registry = Registry::new();
 Http1::register(&mut registry);
@@ -48,11 +48,10 @@ payload. Supply TLS key log entries when decryption is wanted, or `&[]`.
 The returned `Decoded` exposes layers, fields, tags, and summaries.
 `write_layers` and `write_buffers` use the dashboard's JSON format.
 
-For a running world, call `fcx.observe_protocols(registry)` before observers
-start watching links. New watches use that registry. The existing
-`fictionet observe` command and dashboard then show the custom protocol
-without binary changes. Watches already running retain their registry and
-connection state.
+Set `DashboardOptions::protocols` before constructing the `DashboardObserver`
+and install its observer in `RunOptions`. Serve its handle on an observation
+socket with `fictionet_observe::serve`. The `fictionet observe` command and
+dashboard connect with `--observation unix:<path>` and show the custom protocol.
 
 Packet streams distinguish three kinds of missing data. `skipped` counts
 packets omitted by sampling since the previous tap copy. The additive
@@ -88,13 +87,13 @@ can retain secrets after the world ring rotates. Retention is best effort:
 secrets evicted from both caches are unavailable even if their packets remain.
 The `keylog` operation returns only the current world ring.
 
-`Observed<D>` drives ordered bytes directly. Its [placement contract](../src/observe/present.rs)
+`Observed<D>` drives ordered bytes directly. Its [placement contract](../observe/src/decode/present.rs)
 covers exact spans, hop limits, live updates, resets and reassembly buffers.
 For a removed outer header, record `Spans::skip`, then record its unchanged
 payload with `Spans::push_exact`. Follow the documented order when recording
 payload spans and calling `data` or `reset`.
 
-[`Conversation`](../src/observe/conversation.rs) supplies the TCP selection
+[`Conversation`](../observe/src/decode/conversation.rs) supplies the TCP selection
 and flush driver, including ordered input, gaps, waiting status and ALPN.
 
 TLS and Modbus sessions use `Registry::register_protocol` when
@@ -130,7 +129,7 @@ policy. The adapter and registry require cloneable decoder errors so `Stream`
 can retain a terminal error while reporting it once.
 
 HTTP/2's `Capture::register` uses `register_with_buffer` with
-`observe::http2::CAPTURE_READ_AHEAD`. Copy `src/observe/http2.rs` to
+`fictionet_observe::http2::CAPTURE_READ_AHEAD`. Copy `observe/src/decode/http2.rs` to
 customize presentation; it uses only public SDK APIs. It reads frames with
 `stdlib::protocols::http2::Inputs::for_observation` and header blocks with
 `stdlib::protocols::http2::HeaderBlocks::for_observation`, the same frame parser and
@@ -153,7 +152,7 @@ frame boundary.
 source-breaking API change. Match `http2::BlockDiagnostic` variants instead
 of field labels or sentences. They report continuation state, promised stream
 IDs, interruptions, invalid fragments, and byte limits. Strict assembly also
-reports continuation and promised-stream facts. `observe::http2::Capture`
+reports continuation and promised-stream facts. `fictionet_observe::http2::Capture`
 renders the labels and sentences, in the same order as before. Wire acceptance,
 capture recovery, and displayed diagnostics are unchanged.
 
@@ -166,4 +165,4 @@ clones, including nested TLS streams, through `Capture::pair_in`.
 Message layers point at payload bytes when one
 contiguous range is available; otherwise they use a reassembly buffer.
 To show a copied `src/stdlib/protocols/grpc.rs` in HTTP/2 display, also copy
-`src/observe/http2.rs` and change its `grpc` import to the copied module.
+`observe/src/decode/http2.rs` and change its `grpc` import to the copied module.

@@ -42,13 +42,17 @@ fn boxed<E: std::fmt::Display>(error: E) -> Error {
 
 fn main() -> ExitCode {
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let [ch_bin, image, vmlinuz, initrd] = args.as_slice() else {
+    let [ch_bin, image, vmlinuz, initrd, rest @ ..] = args.as_slice() else {
         eprintln!(
-            "usage: cloudimage <cloud-hypervisor> <image.img> <vmlinuz> <initrd>\n\
+            "usage: cloudimage <cloud-hypervisor> <image.img> <vmlinuz> <initrd> [observation-socket]\n\
              run it with `cargo xtask cloudimage` first to fetch the pinned files"
         );
         return ExitCode::FAILURE;
     };
+    if rest.len() > 1 {
+        eprintln!("cloudimage: too many arguments");
+        return ExitCode::FAILURE;
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -59,7 +63,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(gate(ch_bin, image, vmlinuz, initrd)) {
+    match runtime.block_on(gate(ch_bin, image, vmlinuz, initrd, rest.first().cloned())) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("cloudimage: {error}");
@@ -98,7 +102,13 @@ fn getrandom(dest: &mut [u8]) {
         .expect("read /dev/urandom");
 }
 
-async fn gate(ch_bin: &Path, image: &Path, vmlinuz: &Path, initrd: &Path) -> Result<(), Error> {
+async fn gate(
+    ch_bin: &Path,
+    image: &Path,
+    vmlinuz: &Path,
+    initrd: &Path,
+    observation: Option<PathBuf>,
+) -> Result<(), Error> {
     let total = Instant::now();
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let dir = RunDir::new()?;
@@ -112,6 +122,7 @@ async fn gate(ch_bin: &Path, image: &Path, vmlinuz: &Path, initrd: &Path) -> Res
     let net_socket = dir.path().join("net.sock");
     let world = world::start(world::Config {
         now_unix,
+        observation,
         site: SITE.to_string(),
         net_socket: net_socket.clone(),
     })

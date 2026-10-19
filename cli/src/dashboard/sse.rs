@@ -9,7 +9,7 @@ use std::io::{self, BufWriter, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use fictionet::relay::observer::{Client, Envelope, Value};
+use fictionet_observe::{Client, Envelope, Value};
 
 use super::api::{observe_request, quote, with_link};
 

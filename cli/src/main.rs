@@ -3,7 +3,7 @@
 //! file; `wait-blocked`, which waits until a pod's NetworkPolicy blocks its
 //! direct traffic; `observe`, the observe API from a shell; and `dashboard`, which
 //! serves the dashboard app. See the crate docs, `fictionet::guide::attaching`
-//! and `fictionet::observe`.
+//! and `fictionet_observe`.
 //!
 //! Exit status of `attach`: 0 when the world closed the connection (or,
 //! for `tap`, when QEMU closed its connection) or after `--help`, 1 on an error, 2 on bad arguments, 3 when the world
@@ -37,8 +37,8 @@ usage: fictionet attach --world unix:<path> --name <name> --type tun|tap|http_pr
        fictionet --version
        fictionet ready <path>
        fictionet wait-blocked [--api-server] [--timeout <seconds>] [<ip:port>...]
-       fictionet observe --world unix:<path> [<request>]
-       fictionet dashboard --world unix:<path> --token-file <path> [--listen <address:port>]
+       fictionet observe --observation unix:<path> [<request>]
+       fictionet dashboard --observation unix:<path> --token-file <path> [--listen <address:port>]
 
 Run `fictionet attach --help` for the flags, and `fictionet observe --help`
 for the requests an observer can make.

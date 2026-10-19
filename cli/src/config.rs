@@ -1,6 +1,6 @@
 //! The settings each attach type runs with, which `args` reads from the
-//! flags, and the values the commands share: the socket path in
-//! `--world`, and an IPv4 netmask.
+//! flags, and the values the commands share: world and observation socket
+//! paths, and an IPv4 netmask.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -154,6 +154,31 @@ pub(crate) fn world_path(world: &str) -> Result<String, String> {
         )),
         Err(e) => Err(format!("--world: {e}")),
     }
+}
+
+/// The socket path in `--observation unix:<path>`.
+pub(crate) fn observation_path(observation: &str) -> Result<String, String> {
+    match observation.strip_prefix("unix:") {
+        Some(path) if !path.is_empty() => Ok(path.to_owned()),
+        _ => Err(format!(
+            "--observation: expected unix:<path>, not {observation:?}"
+        )),
+    }
+}
+
+/// Connects to the observation service with the command line's error context.
+pub(crate) fn connect_observation(path: &str) -> Result<fictionet_observe::Client, String> {
+    fictionet_observe::Client::connect(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            "the observer hello handshake timed out".into()
+        }
+        _ if error.raw_os_error().is_some() => {
+            format!("connecting to the observation socket at {path}: {error}")
+        }
+        std::io::ErrorKind::ConnectionRefused => format!("the world refused: {error}"),
+        std::io::ErrorKind::UnexpectedEof => "the world closed the connection".into(),
+        _ => error.to_string(),
+    })
 }
 
 /// The netmask of an IPv4 prefix length, 0 to 32.

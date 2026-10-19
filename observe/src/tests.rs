@@ -788,3 +788,47 @@ fn removed_capture_metadata_keeps_the_link_count_bound() {
     ))
     .unwrap();
 }
+
+#[test]
+fn aggregation_preserves_packets_keys_topology_and_loss() {
+    let collector = Arc::new(Collector::new(Options {
+        capture: CapturePolicy::Startup,
+        ..Options::default()
+    }));
+    let aggregate = Arc::new(fictionet::events::Aggregate::new(collector.clone()));
+    let reader = collector.clone();
+    let destination = aggregate.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(7)).observer(aggregate),
+        move |cx| async move {
+            let (mut a, mut b) = fictionet::pair();
+            a.link().unwrap().label(&cx, "collected".into());
+            a.send(Packet(vec![1, 2, 3]));
+            assert_eq!(b.recv(&cx).await?.0, [1, 2, 3]);
+            cx.yield_now().await?;
+            let link = *reader.topology().links.keys().next().unwrap();
+            assert_eq!(
+                reader.packets(link, 0, 10).packets[0].bytes.as_ref(),
+                [1, 2, 3]
+            );
+            cx.tls_key_log(None)
+                .unwrap()
+                .log("CLIENT_RANDOM", &[0], &[1]);
+            assert_eq!(reader.keylog(), "CLIENT_RANDOM 00 01\n");
+            destination.lost(Loss {
+                stream: Stream::Packets(link),
+                reason: LossReason::Staging,
+                count: 2,
+                bytes: Some(6),
+                seqs: Some(2..=3),
+            });
+            assert_eq!(
+                count(&reader, Stream::Packets(link), LossReason::Staging),
+                2
+            );
+            Ok(())
+        },
+    ))
+    .unwrap();
+    assert!(collector.ended().is_some());
+}

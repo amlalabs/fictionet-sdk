@@ -44,6 +44,8 @@ const JUMP: &str = "jump";
 
 /// How to start the world.
 pub struct Config {
+    /// An optional Unix observation socket.
+    pub observation: Option<PathBuf>,
     /// The run's wall-clock time, for certificate validity and the `Date`
     /// header.
     pub now_unix: i64,
@@ -55,6 +57,7 @@ pub struct Config {
 
 /// A running world. [`shutdown`](World::shutdown) stops it.
 pub struct World {
+    _observation: Option<fictionet_observe::Endpoint>,
     /// The CA root in PEM, for the guest's trust store.
     pub ca_pem: String,
     fcx: Cx,
@@ -195,7 +198,15 @@ pub async fn start(config: Config) -> Result<World> {
 
     let (ready, world_ready) = oneshot::channel();
     // The demo's observers; an integrator's own join them here.
+    let dashboard =
+        fictionet_observe::DashboardObserver::new(fictionet_observe::DashboardOptions::demo());
+    let observation = config
+        .observation
+        .as_ref()
+        .map(|path| fictionet_observe::serve(dashboard.handle(), path))
+        .transpose()?;
     let observers: Vec<Arc<dyn Observer>> = vec![
+        dashboard.observer(),
         Arc::new(SiteLoaded {
             host: site.clone(),
             loaded: firefox_loaded.clone(),
@@ -261,6 +272,7 @@ pub async fn start(config: Config) -> Result<World> {
 
     tokio::spawn(bridge(to_world_rx, rx, sandbox, fcx.clone()));
     Ok(World {
+        _observation: observation,
         ca_pem,
         fcx,
         firefox_loaded,

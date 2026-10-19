@@ -23,11 +23,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use fictionet::relay::observer::Client;
 use fictionet_cli::attach_proxy::auth::Token;
 
-use crate::args::take_world;
-use crate::config::world_path;
+use crate::args::take_observation;
+use crate::config::{connect_observation, observation_path};
 
 mod api;
 mod assets;
@@ -40,11 +39,11 @@ use auth::Auth;
 use http::{host_allowed, parse_request, read_head, same_site};
 
 pub(crate) const USAGE: &str = "\
-usage: fictionet dashboard --world unix:<path> --token-file <path> [--listen <address:port>]
+usage: fictionet dashboard --observation unix:<path> --token-file <path> [--listen <address:port>]
 
 Serves the dashboard, a live view of the world on <path>, at
-http://127.0.0.1:7878/ (or --listen). It connects to the world socket as an
-observer, so the world needs no flag of its own.
+http://127.0.0.1:7878/ (or --listen). It connects to the observation socket as an
+observer; start the world with an observation socket explicitly.
 
 The dashboard shows everything the world carries, decrypted TLS included.
 The token file is required. Open /#token=<URL-encoded-token> once to sign in.
@@ -65,8 +64,8 @@ pub(crate) fn main(args: &[String]) -> i32 {
         println!("{USAGE}");
         return 0;
     }
-    let parsed = take_world(args).and_then(|(world, rest)| {
-        let path = world_path(&world)?;
+    let parsed = take_observation(args).and_then(|(world, rest)| {
+        let path = observation_path(&world)?;
         let mut listen = "127.0.0.1:7878".to_owned();
         let mut token_file = None;
         let mut args = rest.iter();
@@ -98,7 +97,7 @@ pub(crate) fn main(args: &[String]) -> i32 {
         }
     };
     // Check the world is there, so a wrong path fails now, not in a browser.
-    match Client::connect(&path, "fictionet dashboard") {
+    match connect_observation(&path) {
         Ok(_) => {}
         Err(msg) => {
             eprintln!("fictionet dashboard: {msg}");
@@ -288,7 +287,7 @@ mod tests {
     #[test]
     fn stream_values_split_into_events() {
         let inspect = |bytes: &[u8]| {
-            event(&fictionet::relay::observer::Value {
+            event(&fictionet_observe::Value {
                 id: 1,
                 bytes: bytes.to_vec(),
                 binary: false,

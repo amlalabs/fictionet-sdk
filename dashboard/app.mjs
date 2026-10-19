@@ -1,6 +1,6 @@
 // The Fictionet dashboard: draws a running world from the observe API.
 // `fictionet dashboard` serves this page and turns each `GET api/<op>?...`
-// into one observe request (see `fictionet::observe`): `watch` for the
+// into one observe request (see `fictionet_observe`): `watch` for the
 // graph and its changes, `packets` for the packets of one link or several,
 // `packet` for one packet's layers, `pcap` for a capture. No libraries: the
 // graph is SVG, laid out in columns by distance from the sandboxes, with

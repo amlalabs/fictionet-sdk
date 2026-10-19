@@ -3,7 +3,7 @@
 //! ```text
 //! border-world [--socket /run/relay/relay.sock] [--ca-dir /app/ca]
 //!     [--state-dir /var/lib/fictionet] [--ready /run/fictionet/ready]
-//!     [--subnet 10.0.0.0/24]
+//!     [--subnet 10.0.0.0/24] [--observation <path>]
 //! border-world make-ca DIR     # the lab CA: ca.pem, ca.key
 //! border-world make-pki DIR    # the home chain: ca.pem, ca.key (intermediate), root.pem
 //! border-world credentials     # the agent's credentials file, on stdout
@@ -23,6 +23,7 @@ use border_world::scenario::{Prefix, Scenario, Task, Variant, parse_prefix};
 
 struct Args {
     socket: String,
+    observation: Option<PathBuf>,
     ca_dir: PathBuf,
     state_dir: PathBuf,
     ready: PathBuf,
@@ -31,6 +32,7 @@ struct Args {
 
 fn args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut a = Args {
+        observation: None,
         socket: "/run/relay/relay.sock".into(),
         ca_dir: "/app/ca".into(),
         state_dir: "/var/lib/fictionet".into(),
@@ -41,6 +43,7 @@ fn args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--socket" => a.socket = value,
+            "--observation" => a.observation = Some(value.into()),
             "--ca-dir" => a.ca_dir = value.into(),
             "--state-dir" => a.state_dir = value.into(),
             "--ready" => a.ready = value.into(),
@@ -125,11 +128,20 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     let finalization = Arc::new(log.finalization(&args.state_dir)?);
     let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
+    let mut observer: Arc<dyn fictionet::events::Observer> = Arc::new(log.clone());
+    let _observation = if let Some(path) = &args.observation {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        observer = Arc::new(fictionet::events::Fanout::new(vec![
+            dashboard.observer(),
+            observer,
+        ]));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let result = fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(Arc::new(fictionet::events::Memory::default()))
-            .observer(Arc::new(log.clone())),
+            .observer(Arc::new(fictionet::events::Aggregate::new(observer))),
         move |fcx| async move {
             let ids = border_world::identities(&fcx, &scenario, &world_ca)?;
             border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;

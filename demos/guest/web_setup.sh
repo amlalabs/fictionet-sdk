@@ -11,7 +11,7 @@ cleanup_web() {
 start_web() {
     mkdir -p /run/fictionet
     chmod 700 /run/fictionet
-    web_world /run/fictionet/world.sock /run/fictionet/ca.pem >/run/world.log 2>&1 &
+    web_world /run/fictionet/world.sock /run/fictionet/ca.pem "$@" >/run/world.log 2>&1 &
     world_pid=$!
     local i
     for ((i = 0; i < 100; i++)); do

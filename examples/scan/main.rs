@@ -2,7 +2,7 @@
 //! one real container, on a [`Net`].
 //!
 //! ```text
-//! cargo run --example scan -- /run/fictionet/world.sock
+//! cargo run --example scan -- /run/fictionet/world.sock [observation.sock]
 //! ```
 //!
 //! The world waits for two sandboxes:
@@ -118,18 +118,24 @@ const CONTAINER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 50);
 const SCANNER_NET: &str = "10.0.9.0/24";
 
 fn main() -> Result {
-    let path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
         .unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
+    let _observation = if let Some(path) = args.next() {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        options = options.observer(std::sync::Arc::new(fictionet::events::Aggregate::new(
+            dashboard.observer(),
+        )));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");
-    fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
-        move |fcx| world(fcx, attachments),
-    ))
+    fictionet::block_on(fictionet::run(options, move |fcx| world(fcx, attachments)))
 }
 
 async fn world(fcx: Cx, attachments: Attachments) -> Result {

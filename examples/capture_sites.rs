@@ -3,7 +3,7 @@
 // packet could not be written. Controlled shutdown drains the writer; an
 // abrupt exit can truncate the pcap.
 //
-//     cargo run --example capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap
+//     cargo run --example capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap [observation.sock]
 
 use std::io::Write;
 use std::sync::Arc;
@@ -25,6 +25,16 @@ fn main() -> fictionet::Result {
     let pcap = args
         .next()
         .unwrap_or_else(|| "/run/fictionet/agent.pcap".into());
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::random());
+    let _observation = if let Some(path) = args.next() {
+        let dashboard = fictionet_observe::DashboardObserver::new(Default::default());
+        options = options.observer(std::sync::Arc::new(fictionet::events::Aggregate::new(
+            dashboard.observer(),
+        )));
+        Some(fictionet_observe::serve(dashboard.handle(), path)?)
+    } else {
+        None
+    };
     let (_listening, attachments) =
         fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}, writing packets to {pcap}");
@@ -49,33 +59,28 @@ fn main() -> fictionet::Result {
         }
         result
     });
-    let result = fictionet::block_on(fictionet::run(
-        fictionet::RunOptions::new(fictionet::Seed::random())
-            .aggregate_events()
-            .event_history(std::sync::Arc::new(fictionet::events::Memory::default())),
-        move |fcx| async move {
-            let app = axum::Router::new()
-                .route("/", axum::routing::get(|| async { "hello, captured\n" }));
+    let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
+        let app =
+            axum::Router::new().route("/", axum::routing::get(|| async { "hello, captured\n" }));
 
-            let watched = attachments.map(&fcx, move |fcx, sandbox| {
-                let (tx, lost) = (tx.clone(), lost.clone());
-                stdlib::network::filter(fcx, sandbox, move |fcx, _direction, packet| {
-                    let at = start + fcx.now().since_start();
-                    if tx.try_send((at, packet.0.clone())).is_err() {
-                        lost.fetch_add(1, Ordering::Relaxed);
-                    }
-                    true // pass every packet on
-                })
-            });
-
-            web::Sites::new(move |host: &str| match host {
-                "example.test" => Some(web::Site::new(app.clone())),
-                _ => None,
+        let watched = attachments.map(&fcx, move |fcx, sandbox| {
+            let (tx, lost) = (tx.clone(), lost.clone());
+            stdlib::network::filter(fcx, sandbox, move |fcx, _direction, packet| {
+                let at = start + fcx.now().since_start();
+                if tx.try_send((at, packet.0.clone())).is_err() {
+                    lost.fetch_add(1, Ordering::Relaxed);
+                }
+                true // pass every packet on
             })
-            .start(&fcx, watched)?;
-            Ok(())
-        },
-    ));
+        });
+
+        web::Sites::new(move |host: &str| match host {
+            "example.test" => Some(web::Site::new(app.clone())),
+            _ => None,
+        })
+        .start(&fcx, watched)?;
+        Ok(())
+    }));
     writer
         .join()
         .map_err(|_| std::io::Error::other("capture writer panicked"))??;

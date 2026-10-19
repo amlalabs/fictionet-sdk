@@ -77,7 +77,7 @@ world:
 ```console
 $ cargo build --release --bin fictionet --example goad
 $ mkdir -p /run/user/$(id -u)/fictionet-goad
-$ target/release/examples/goad /run/user/$(id -u)/fictionet-goad/world.sock 192.168.56
+$ target/release/examples/goad /run/user/$(id -u)/fictionet-goad/world.sock 192.168.56 /run/user/$(id -u)/fictionet-goad/observation.sock
 ```
 
 Use another three-octet prefix as the second argument when the guests were
@@ -144,12 +144,13 @@ $ sudo ip netns exec goad-attacker nmap -Pn -sV \
     -p 53,88,135,389,445,636,1433,3268,3389,5985 192.168.56.10-23
 ```
 
-Run the dashboard against the same world socket to watch the real exchange:
+The optional third argument opens an observation socket. Run the dashboard
+against that socket to watch the real exchange:
 
 ```console
 $ (umask 077; openssl rand -hex 32 > /tmp/goad-dashboard-token)
 $ target/release/fictionet dashboard --token-file /tmp/goad-dashboard-token \
-    --world unix:/run/user/$(id -u)/fictionet-goad/world.sock \
+    --observation unix:/run/user/$(id -u)/fictionet-goad/observation.sock \
     --listen 127.0.0.1:7878
 ```
 

@@ -434,7 +434,10 @@ impl Client {
         loop {
             let Some(frame) = self.reader.read(&self.socket)? else {
                 return if self.partial.is_some() {
-                    Err(io::ErrorKind::UnexpectedEof.into())
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the world closed during a reply value",
+                    ))
                 } else {
                     Ok(None)
                 };
@@ -777,10 +780,9 @@ mod tests {
         let (mut client, peer) = client_peer();
         send(&peer, &reply_frame(7, MORE, b"first")).unwrap();
         drop(peer);
-        assert_eq!(
-            client.next_value().unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
+        let error = client.next_value().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "the world closed during a reply value");
         assert!(client.next_value().unwrap().is_none());
     }
 
