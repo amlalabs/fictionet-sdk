@@ -1084,17 +1084,23 @@ dependencies = [
 name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "crc32fast",
  "example-common",
  "fatfs",
  "fictionet",
  "fictionet-microvm",
  "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httpdate",
  "libc",
  "russh",
  "rustls",
  "serde_json",
  "tokio",
+ "tower-service",
  "vhost",
  "vhost-user-backend",
  "virtio-queue",

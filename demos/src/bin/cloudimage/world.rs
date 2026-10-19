@@ -113,7 +113,7 @@ pub async fn start(config: Config) -> Result<World> {
         // The apt mirror: the world forwards these names to the real servers
         // over the host's network, so the guest installs the desktop at
         // boot. apt's signatures verify everything.
-        let mirror = web::proxy(&fcx)?;
+        let mirror = crate::mirror::new(&fcx)?;
         web::Sites::new(move |host: &str| match host {
             h if h == site || h == www => {
                 Some(web::Site::new(app()).at(SHARED).tls(site_cfg.clone()))

@@ -10,6 +10,7 @@
 
 mod ch;
 mod disk;
+mod mirror;
 mod net;
 mod page;
 mod seed;

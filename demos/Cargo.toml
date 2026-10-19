@@ -12,7 +12,13 @@ example-common = { path = "../examples/common" }
 fictionet = { path = "..", features = ["web-proxy"] }
 fictionet-microvm = { path = "../microvm" }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs"] }
+bytes = "1"
+http = "1.5.0"
+http-body = "1.1.0"
+http-body-util = "0.1"
+httpdate = "1"
+tower-service = "0.3.3"
 # Parses the Chrome DevTools Protocol replies the desktop demo drives Chromium
 # with to screenshot the noVNC viewer.
 serde_json = "1"
