@@ -161,6 +161,7 @@ def main() -> int:
     addresses |= {h: {"addr": a, "why": "seed"} for h, a in seed.addresses.items()}
     print(json.dumps({
         "seed": seed.name, "date": seed.date, "question": seed.question, "generator": kind,
+        "facts": seed.facts, "sites": [s.host for s in seed.sites],
         "model": world.model, "prefetch": world.prefetch, "store": str(store.root.resolve()),
         "addresses": addresses, "fixed": [f.url for f in seed.fixed],
     }), flush=True)

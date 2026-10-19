@@ -2,8 +2,8 @@
 //! fixed script of agent actions, compared line for line with
 //! `tests/golden/halvard-cve.jsonl`.
 //!
-//! The world runs here with its real Python backend (`backend/backend.py`,
-//! which needs only `python3`), the stub generator, a fresh store and a CA
+//! The script runs with both the Python backend and the in-process Rust
+//! stub, each with a fresh store and a CA
 //! made for the test. The script searches, follows results, asks for the
 //! same URLs twice, and looks up names the world turns down. Besides the
 //! log, it checks what Kai's evals need: the same URL returns the same
@@ -25,7 +25,11 @@ use std::time::Duration;
 use adaptive_web_world::backend::Backend;
 use adaptive_web_world::{Addresses, Ca, fixed_addresses, serve, world_start};
 use bytes::Bytes;
-use example_common::backend_process::{Args, start_backend};
+mod common;
+use adaptive_web_world::{
+    Pages,
+    stub::{Seed, Stub},
+};
 use example_common::log::Log;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
@@ -151,36 +155,53 @@ fn seeds_dated(base: &std::path::Path, date: &str) -> PathBuf {
 
 #[test]
 fn the_log_is_the_recorded_one() {
+    golden(false);
+}
+
+#[test]
+fn the_rust_stub_log_is_the_recorded_one() {
+    golden(true);
+}
+
+fn golden(use_stub: bool) {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let base = std::env::temp_dir().join(format!("adaptive-web-golden-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "adaptive-web-golden-{use_stub}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    // SAFETY: set before any thread of this test process reads the environment.
-    unsafe {
-        std::env::set_var("ADAPTIVE_WEB_SEED", "halvard-cve");
-        std::env::set_var("ADAPTIVE_WEB_SEEDS", seeds_dated(&base, "2026-09-30"));
-        std::env::set_var("ADAPTIVE_WEB_GENERATOR", "stub");
-        std::env::set_var("ADAPTIVE_WEB_STORE", base.join("store"));
-    }
-    let args = Args {
-        socket: String::new(),
-        ca_dir: base.join("ca"),
-        backend: here.join("backend"),
-        backend_port: port,
-        state_dir: base.clone(),
-        ready: base.join("ready"),
+    let mut seed = Seed::builtin("halvard-cve").unwrap();
+    seed.date = "2026-09-30".into();
+    let child = if use_stub {
+        None
+    } else {
+        Some(common::Python::start(
+            "halvard-cve",
+            &seeds_dated(&base, &seed.date),
+            &base.join("store"),
+            "stub",
+        ))
     };
-    let (backend, mut child) = start_backend(&args).unwrap();
-    let store = PathBuf::from(backend["store"].as_str().unwrap());
-    let fixed = fixed_addresses(&backend).unwrap();
-
-    let addresses = Arc::new(Addresses::new(fixed, Some(&store.join("addresses.jsonl"))).unwrap());
-    let start = world_start(backend["date"].as_str().unwrap()).unwrap();
+    let port = child.as_ref().map_or(0, |p| p.port);
+    let fixed = child.as_ref().map_or_else(
+        || seed.fixed_addresses(),
+        |p| fixed_addresses(&p.hello).unwrap(),
+    );
+    let fixed_pages: Vec<String> = child.as_ref().map_or_else(
+        || seed.fixed.iter().map(|f| f.url.clone()).collect(),
+        |p| serde_json::from_value(p.hello["fixed"].clone()).unwrap(),
+    );
+    let store = child
+        .as_ref()
+        .map(|p| PathBuf::from(p.hello["store"].as_str().unwrap()).join("addresses.jsonl"));
+    let addresses = Arc::new(Addresses::new(fixed, store.as_deref()).unwrap());
+    let start = world_start(&seed.date).unwrap();
+    let ca_dir = base.join("ca");
+    let searches = Arc::new(child.as_ref().map_or_else(
+        || adaptive_web_world::search::Searches::from_seed(&seed),
+        |p| adaptive_web_world::search::Searches::from_hello(&p.hello),
+    ));
     let log_path = base.join("log.jsonl");
     let log = Arc::new(Log::new(
         Box::new(std::fs::File::create(&log_path).unwrap()),
@@ -188,6 +209,25 @@ fn the_log_is_the_recorded_one() {
         |s| s,
     ));
 
+    let initial = searches.snapshot();
+    assert_eq!(initial.revision, 0);
+    assert_eq!(initial.seed.name, "halvard-cve");
+    assert_eq!(initial.seed.date, "2026-09-30");
+    assert!(!initial.seed.facts.is_empty());
+    assert!(
+        initial
+            .seed
+            .sites
+            .iter()
+            .any(|h| h == "www.halvardsystems.com")
+    );
+    assert_eq!(
+        initial.generator.kind,
+        adaptive_web_world::search::GeneratorKind::Stub
+    );
+    assert_eq!(initial.generator.model, "stub");
+    assert_eq!(initial.generator.prefetch, 0);
+    let projection = searches.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -200,21 +240,19 @@ fn the_log_is_the_recorded_one() {
             fictionet::RunOptions::new(fictionet::Seed::random())
                 .aggregate_events()
                 .event_history(Arc::new(fictionet::events::Memory::default()))
-                .observer(Arc::new(adaptive_web_world::events::LogObserver {
-                    log: log.clone(),
-                })),
+                .observer(Arc::new(fictionet::events::Fanout::new(vec![
+                    Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() }),
+                    searches.clone(),
+                ]))),
             move |fcx| async move {
-                let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start).unwrap());
+                let ca = Arc::new(Ca::new(&fcx, &ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();
-                serve(
-                    &fcx,
-                    addresses,
-                    ca,
-                    Backend::new(&fcx, port)?,
-                    log,
-                    start,
-                    attachments,
-                )?;
+                let pages = if use_stub {
+                    Pages::Stub(Arc::new(Stub::new(seed)))
+                } else {
+                    Pages::Backend(Backend::new(&fcx, port)?)
+                };
+                serve(&fcx, addresses, ca, pages, log, start, attachments)?;
 
                 let end = attacher.attach("agent").unwrap();
                 let m = machine(&fcx, end, ME);
@@ -247,11 +285,54 @@ fn the_log_is_the_recorded_one() {
                     .unwrap();
                 let (_, date, _) = request(&fcx, conn, "www.google.com", "/").await;
                 assert!(date.contains("30 Sep 2026"), "Date: {date}");
-                for (url, title) in &found {
+                for (rank, (url, title)) in found.iter().enumerate() {
                     let (host, path) = split_url(url);
                     let (status, first) = fetch(&fcx, &m, &host, &path).await;
                     assert_eq!(status, 200, "{url}");
+                    let snapshot = projection.snapshot();
+                    let row = snapshot.pages.iter().find(|p| p.url == *url).unwrap();
+                    assert_eq!(
+                        row.made,
+                        if fixed_pages.contains(url) {
+                            adaptive_web_world::search::Made::Fixed
+                        } else {
+                            adaptive_web_world::search::Made::Stubbed
+                        }
+                    );
+                    assert_eq!(
+                        row.reason,
+                        if fixed_pages.contains(url) {
+                            adaptive_web_world::search::Reason::Fixed
+                        } else {
+                            adaptive_web_world::search::Reason::Search {
+                                query: "halvard gateway vulnerability".into(),
+                                rank: rank as u64 + 1,
+                            }
+                        }
+                    );
+                    assert_eq!(row.latest, row.made);
+                    let first_made = row.made;
                     let (_, again) = fetch(&fcx, &m, &host, &path).await;
+                    let snapshot = projection.snapshot();
+                    let row = snapshot.pages.iter().find(|p| p.url == *url).unwrap();
+                    assert_eq!(row.made, first_made);
+                    assert_eq!(
+                        row.latest,
+                        if fixed_pages.contains(url) {
+                            adaptive_web_world::search::Made::Fixed
+                        } else {
+                            adaptive_web_world::search::Made::Stored
+                        }
+                    );
+                    assert_eq!(
+                        row.cache,
+                        if fixed_pages.contains(url) {
+                            adaptive_web_world::search::Cache::Fixed
+                        } else {
+                            adaptive_web_world::search::Cache::Generated
+                        }
+                    );
+                    assert_eq!(row.fetches, 2);
                     assert_eq!(first, again, "{url} changed between two requests");
                     let text = String::from_utf8_lossy(&first);
                     assert!(
@@ -281,6 +362,63 @@ fn the_log_is_the_recorded_one() {
                     .unwrap();
                 assert_eq!(get(&fcx, conn, "totally-new-site.io", "/").await.0, 301);
                 let _ = fcx.sleep(Duration::from_millis(500)).await;
+                let snapshot = projection.snapshot();
+                assert_eq!(snapshot.queries.len(), 2);
+                assert!(
+                    snapshot
+                        .queries
+                        .iter()
+                        .all(|q| q.outcome == adaptive_web_world::search::Outcome::Served)
+                );
+                assert_eq!(snapshot.queries[0].key, snapshot.queries[1].key);
+                assert_eq!(snapshot.queries[0].sandbox.as_deref(), Some("agent"));
+                assert_eq!(snapshot.queries[0].peer.as_deref(), Some("10.0.0.2"));
+                assert_eq!(snapshot.results.len(), 1);
+                assert_eq!(snapshot.results[0].listed.len(), 10);
+                assert_eq!(snapshot.results[0].query_id, snapshot.queries[0].id);
+                for (rank, listed) in snapshot.results[0].listed.iter().enumerate() {
+                    assert_eq!(listed.rank, rank as u64 + 1);
+                    assert_eq!(listed.url, found[rank].0);
+                    let rendered = listed
+                        .title
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;")
+                        .replace('\'', "&#x27;");
+                    assert_eq!(rendered, found[rank].1);
+                }
+                assert_eq!(
+                    snapshot
+                        .pages
+                        .iter()
+                        .find(|p| p.host == "totally-new-site.io")
+                        .unwrap()
+                        .reason,
+                    adaptive_web_world::search::Reason::Direct
+                );
+                assert!(snapshot.refused.iter().any(|r| r.name == "printer.local"));
+                assert!(snapshot.refused.iter().any(|r| r.name == "rw-desktop"));
+                for site in &snapshot.sites {
+                    let expected = if [
+                        "www.google.com",
+                        "google.com",
+                        "html.duckduckgo.com",
+                        "duckduckgo.com",
+                        "lite.duckduckgo.com",
+                        "www.bing.com",
+                        "bing.com",
+                    ]
+                    .contains(&site.host.as_str())
+                    {
+                        adaptive_web_world::search::SiteReason::SearchEngine
+                    } else if site.host == "www.halvardsystems.com" {
+                        adaptive_web_world::search::SiteReason::Seed
+                    } else {
+                        adaptive_web_world::search::SiteReason::Pool
+                    };
+                    assert_eq!(site.reason, expected, "{}", site.host);
+                }
                 Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
             },
         ));
@@ -288,8 +426,7 @@ fn the_log_is_the_recorded_one() {
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
     let result = rx.recv_timeout(Duration::from_secs(90));
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let result = result.expect("the test timed out");
     assert_eq!(result.as_deref(), Some("done"));
 
