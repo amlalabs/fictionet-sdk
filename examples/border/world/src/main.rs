@@ -131,8 +131,9 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
             .event_history(Arc::new(fictionet::events::Memory::default()))
             .observer(Arc::new(log.clone())),
         move |fcx| async move {
-            let ids = border_world::identities(&fcx, &scenario, &world_ca)?;
-            border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
+            let ids = border_world::identities(&fcx, &world_ca)?;
+            log.attach(&fcx);
+            let _routing = border_world::start(&fcx, scenario.clone(), ids, attachments)?;
             let _listening = fictionet::listen(
                 fictionet::WorldSocket::UnixSocket(args.socket.clone().into()),
                 attacher,

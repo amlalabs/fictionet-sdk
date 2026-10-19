@@ -19,7 +19,6 @@ use fictionet::stdlib::services::ca::Ca;
 use fictionet::{Attacher, Cx, End, Packet};
 use rustls::RootCertStore;
 
-pub use example_common::hyper_io::Io;
 pub use fictionet_test_support::harness::*;
 pub use fictionet_test_support::timeout;
 
@@ -29,6 +28,8 @@ pub struct Env {
     pub roots: Arc<RootCertStore>,
     pub log: Buf,
     pub scenario: Arc<Scenario>,
+    pub routing: border_world::routing::Routing,
+    pub events: Arc<fictionet::events::Memory>,
 }
 
 /// Runs a Border world for `variant` and `task`, on a tokio runtime. `f`
@@ -46,23 +47,22 @@ where
     ));
     let log = Log::start(Box::new(buf.clone()), scenario.clone());
     let output = log.clone();
+    let events = Arc::new(fictionet::events::Memory::default());
     fictionet_test_support::harness::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
             .aggregate_events()
-            .event_history(Arc::new(fictionet::events::Memory::default()))
+            .event_history(events.clone())
             .observer(Arc::new(log.clone())),
         move |fcx| async move {
             let (ids, root) = {
                 let ca = Ca::new(&fcx, "Test Root CA")?;
-                (
-                    border_world::identities(&fcx, &scenario, &ca)?,
-                    ca.cert_der(),
-                )
+                (border_world::identities(&fcx, &ca)?, ca.cert_der())
             };
             let mut roots = RootCertStore::empty();
             roots.add(root)?;
             let (attacher, attachments) = fictionet::attachments();
-            border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
+            log.attach(&fcx);
+            let routing = border_world::start(&fcx, scenario.clone(), ids, attachments)?;
             f(
                 fcx,
                 attacher,
@@ -70,6 +70,8 @@ where
                     roots: Arc::new(roots),
                     log: buf,
                     scenario,
+                    routing,
+                    events,
                 },
             )
             .await

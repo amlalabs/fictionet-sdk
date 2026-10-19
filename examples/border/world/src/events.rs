@@ -1,4 +1,6 @@
-//! The network's events as log lines.
+//! Network and world observer facts as the eval's log lines.
+//! Machine addresses stay in the facts. The projection maps the impostor
+//! address to the bank address the sandbox reached.
 //!
 //! Every line names the sandbox it came from. TLS and HTTP lines carry the
 //! connection number, so the eval joins a request to the handshake it rode
@@ -17,7 +19,7 @@
 //!
 //! Every HTTP line carries `carries_password` and `body_unknown`, including
 //! requests rejected before the bank ran. A positive match is always true.
-//! Without a match, incomplete evidence is null, never false. The observer
+//! Without a match, incomplete classification is null, never false. The observer
 //! classifies body chunks before routing and limits; handler labels describe
 //! the page only. HTTP errors can contain unclassifiable bytes.
 
@@ -26,19 +28,60 @@ use fictionet::stdlib::protocols::json::Value as J;
 use serde_json::{Value, json};
 
 use crate::bank::{ACCOUNT, carries_password, unquote_to_bytes};
-use crate::scenario::Scenario;
+use crate::scenario::{BANK_ADDR, IMPOSTOR_ADDR, Scenario};
 
 /// The sources of the events [`line()`] makes lines of.
-pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
+pub const LOGGED: [&str; 7] = ["net", "dns", "tls", "http", "bgp", "path", "border"];
 
 use example_common::events::{js, sandbox};
 
 /// The log line for `e`, if it gets one.
 pub fn line(scenario: &Scenario, e: &Event) -> Option<Value> {
-    match (e.source, e.kind) {
+    let mut line = match (e.source, e.kind) {
         ("tls", "handshake") => Some(tls(scenario, e)),
         ("http", "request") => Some(http(e)),
+        ("bgp", _) => Some(world(
+            e,
+            json!({"type": "bgp", "sandbox": e.str("sandbox"), "peer": e.str("peer"), "event": e.kind}),
+        )),
+        ("path" | "border", _) => Some(world(e, json!({"type": e.kind}))),
         _ => example_common::events::line(e),
+    }?;
+    if matches!(e.source, "tls" | "http" | "net") {
+        public_addresses(&mut line);
+    }
+    Some(line)
+}
+
+/// A world fact's line: `head`, then every field in order.
+fn world(e: &Event, mut head: Value) -> Value {
+    let fields = head.as_object_mut().expect("an object");
+    for (name, value) in e.fields.iter() {
+        fields.insert(name.into(), js(Some(value)));
+    }
+    head
+}
+
+/// The eval names the address the sandbox reached; facts keep machine addresses.
+fn public_addresses(line: &mut Value) {
+    for key in ["addr", "local", "dst", "src"] {
+        if let Some(value) = line.get_mut(key) {
+            let mapped = value.as_str().and_then(|text| {
+                if text.parse::<std::net::Ipv4Addr>().ok() == Some(IMPOSTOR_ADDR) {
+                    Some(BANK_ADDR.to_string())
+                } else {
+                    let mut addr = text.parse::<std::net::SocketAddr>().ok()?;
+                    if addr.ip() != std::net::IpAddr::V4(IMPOSTOR_ADDR) {
+                        return None;
+                    }
+                    addr.set_ip(BANK_ADDR.into());
+                    Some(addr.to_string())
+                }
+            });
+            if let Some(mapped) = mapped {
+                *value = mapped.into();
+            }
+        }
     }
 }
 

@@ -315,6 +315,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
  "tower-service",

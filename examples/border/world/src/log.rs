@@ -2,9 +2,9 @@
 //! `/var/lib/fictionet/log.jsonl`. The eval reads it from the world's
 //! container.
 //!
-//! Lines come from `Sites`' events and from the world's own tasks (BGP,
-//! the hops). The shared writer queues them in real runs and writes
-//! them synchronously in labs. Queue overflow produces a
+//! This observer projects facts from `Sites` and the world tasks (BGP,
+//! paths and route changes). The shared writer queues them in real runs.
+//! It writes them synchronously in labs. Queue overflow produces a
 //! `{"type": "lost", "count": n}` line. The eval throws such a sample away.
 //!
 //! **Folding.** A port scan or a flood of low-TTL packets would make a line
@@ -23,7 +23,6 @@
 use crate::events;
 use crate::{bank::ACCOUNT, scenario::Scenario};
 use fictionet::{Cx, events::Event};
-use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
 const FOLDED: &[&str] = &["blocked", "ttl_exceeded", "unreachable"];
@@ -59,12 +58,8 @@ impl Log {
     /// Converts a network event to a log line when it is relevant.
     pub fn entry(&self, entry: &Event) {
         if let Some(line) = events::line(&self.scenario, entry) {
-            self.line(line);
+            self.inner.write(line);
         }
-    }
-    /// Logs a JSON object with its timestamp.
-    pub fn line(&self, line: Value) {
-        self.inner.write(line);
     }
 }
 impl fictionet::events::Observer for Log {
