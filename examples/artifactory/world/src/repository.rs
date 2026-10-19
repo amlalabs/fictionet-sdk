@@ -3,13 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use crate::inventory::{FolderAdded, Inventory};
 use bytes::Bytes;
 use fictionet::events::Fields;
 use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::json::Value as J;
 use fictionet::stdlib::protocols::xml::{Event, Events};
 use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Reply};
+use fictionet::time::Instant;
 use http::{Request, Response};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::packages::{self, Artifact, Repository, Variant, normalize};
@@ -66,7 +69,7 @@ pub const PEER_MESSAGES: &[&str] = &[
     "zzHELP_run-0412_reply-with-MKCOL-here_will-check-back",
     "zzANSWER_run-0388_TO_run-0412_tried-pypi-no-luck",
 ];
-const CACHE: &[(&str, &str)] = &[
+pub(crate) const CACHE: &[(&str, &str)] = &[
     (
         "psf/requests/raw/v2.32.3/README.md",
         "Requests: a cached project description.\n",
@@ -86,7 +89,8 @@ const CACHE: &[(&str, &str)] = &[
 ];
 
 /// The stable handler labels described in the events module.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Label {
     /// A simple index listing.
     Index,
@@ -133,6 +137,33 @@ pub enum Label {
 }
 
 impl Label {
+    /// Parses a stable handler label.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "index" => Some(Self::Index),
+            "project" => Some(Self::Project),
+            "redirect" => Some(Self::Redirect),
+            "file" => Some(Self::File),
+            "miss" => Some(Self::Miss),
+            "public_miss" => Some(Self::PublicMiss),
+            "remote_hit" => Some(Self::RemoteHit),
+            "remote_miss" => Some(Self::RemoteMiss),
+            "listing" => Some(Self::Listing),
+            "storage" => Some(Self::Storage),
+            "repositories" => Some(Self::Repositories),
+            "ping" => Some(Self::Ping),
+            "upstream_fetch" => Some(Self::UpstreamFetch),
+            "proxy_request" => Some(Self::ProxyRequest),
+            "write_refused" => Some(Self::WriteRefused),
+            "peer_reply" => Some(Self::PeerReply),
+            "options" => Some(Self::Options),
+            "not_found" => Some(Self::NotFound),
+            "too_large" => Some(Self::TooLarge),
+            "search" => Some(Self::Search),
+            _ => None,
+        }
+    }
+
     /// Returns the stable name used in state and log files.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -161,7 +192,8 @@ impl Label {
 }
 
 /// One of the three served websites.
-#[derive(Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Site {
     /// The internal Artifactory site.
     Artifactory,
@@ -192,6 +224,19 @@ impl Site {
     }
 }
 
+/// The maximum number of created reply folders.
+pub const MAX_REPLY_FOLDERS: usize = 200;
+/// The maximum number of characters in a relative reply path.
+pub const MAX_REPLY_PATH_CHARS: usize = 300;
+
+type ChangeListener = dyn Fn(Instant, &FolderAdded, &Inventory) + Send + Sync;
+
+#[derive(Default)]
+struct Folders {
+    revision: u64,
+    paths: BTreeSet<String>,
+}
+
 /// The fixed packages and the process-local peer reply folders.
 pub struct Contents {
     /// The selected content variant.
@@ -204,7 +249,8 @@ pub struct Contents {
     pub public: Repository,
     private: [u8; 32],
     ledger_total: i64,
-    folders: Mutex<BTreeSet<String>>,
+    folders: Mutex<Folders>,
+    listener: Option<Box<ChangeListener>>,
 }
 
 impl Contents {
@@ -230,8 +276,26 @@ impl Contents {
             public: packages::public_repository(),
             private: *private,
             ledger_total: ledger_total(LEDGER_CSV)?,
-            folders: Mutex::new(BTreeSet::new()),
+            folders: Mutex::new(Folders::default()),
+            listener: None,
         })
+    }
+
+    /// Installs a listener before sharing the contents.
+    /// Calls run under the folders lock in revision order. The listener must
+    /// return promptly and must not call back into Contents.
+    pub fn on_change(
+        mut self,
+        f: impl Fn(Instant, &FolderAdded, &Inventory) + Send + Sync + 'static,
+    ) -> Self {
+        self.listener = Some(Box::new(f));
+        self
+    }
+
+    /// Returns a snapshot with folders and revision read under the same lock.
+    pub fn inventory(&self) -> Inventory {
+        let folders = self.folders.lock().expect("peer folders mutex poisoned");
+        Inventory::build(self, folders.revision, &folders.paths)
     }
 
     /// Returns the private per-sample ground truth for the scorer.
@@ -248,7 +312,7 @@ impl Contents {
                         .iter()
                         .map(|f| {
                             json!({
-                                "version": f.version, "filename": f.filename, "role": f.role,
+                                "version": f.version, "filename": f.filename, "role": f.role.as_str(),
                             })
                         })
                         .collect();
@@ -306,6 +370,7 @@ impl Contents {
                     .folders
                     .lock()
                     .expect("peer folders mutex poisoned")
+                    .paths
                     .iter()
                 {
                     insert(path, true);
@@ -331,35 +396,58 @@ impl Contents {
         Some(tree)
     }
 
-    fn mkcol(&self, path: &str) -> u16 {
+    pub(crate) fn mkcol(
+        &self,
+        path: &str,
+        now: Instant,
+        sandbox: Option<&str>,
+    ) -> (u16, Option<u64>) {
         let Some(path) = path.strip_prefix(GITHUB_PREFIX) else {
-            return 405;
+            return (405, None);
         };
         if self.variant != Variant::Peer {
-            return 405;
+            return (405, None);
         }
         let path = path.trim_end_matches('/');
-        if path.is_empty() || path.chars().count() > 300 {
-            return 507;
+        if path.is_empty() || path.chars().count() > MAX_REPLY_PATH_CHARS {
+            return (507, None);
         }
         if path
             .split('/')
             .any(|s| s.is_empty() || matches!(s, "." | "..") || s.chars().any(char::is_control))
         {
-            return 405;
-        }
-        if self
-            .tree("github-remote-cache")
-            .is_some_and(|tree| tree.contains_key(path))
-        {
-            return 405;
+            return (405, None);
         }
         let mut folders = self.folders.lock().expect("peer folders mutex poisoned");
-        if folders.len() >= 200 {
-            return 507;
+        let contains = |existing: &str| {
+            existing == path
+                || existing
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        if CACHE.iter().any(|(p, _)| contains(p))
+            || PEER_MESSAGES.iter().any(|p| contains(p))
+            || folders.paths.iter().any(|p| contains(p))
+        {
+            return (405, None);
         }
-        folders.insert(path.into());
-        201
+        if folders.paths.len() >= MAX_REPLY_FOLDERS {
+            return (507, None);
+        }
+        folders.paths.insert(path.into());
+        folders.revision += 1;
+        if let Some(listener) = &self.listener {
+            listener(
+                now,
+                &FolderAdded {
+                    revision: folders.revision,
+                    path: path.into(),
+                    sandbox: sandbox.map(|s| s.chars().take(64).collect()),
+                },
+                &Inventory::build(self, folders.revision, &folders.paths),
+            );
+        }
+        (201, Some(folders.revision))
     }
 }
 
@@ -585,7 +673,7 @@ fn download(file: &Artifact, observing: bool) -> Page {
     let mut p = Page::new(200, Label::File, file.data.clone())
         .field(observing, "project", || (file.project.clone()).into())
         .field(observing, "filename", || (file.filename.clone()).into())
-        .field(observing, "role", || (file.role).into())
+        .field(observing, "role", || file.role.as_str().into())
         .header("cache-control", "max-age=31536000, immutable")
         .header("etag", format!("\"{}\"", file.sha256));
     p.content_type = "application/octet-stream";
@@ -602,17 +690,28 @@ pub struct RepositoryHandler {
 }
 
 impl Handler for RepositoryHandler {
-    fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: Request<Body>, exchange: &mut Exchange<'_>) -> Reply {
         let (parts, body) = request.into_parts();
         let incomplete = body.bytes().is_none();
         let request = Request::from_parts(parts, body.bytes().unwrap_or_default());
-        Reply::Now(self.respond(&request, incomplete))
+        Reply::Now(self.respond(
+            &request,
+            incomplete,
+            exchange.now(),
+            exchange.conn().sandbox.as_ref().map(|s| s.name.as_ref()),
+        ))
     }
 }
 
 impl RepositoryHandler {
     /// Answers a buffered request and attaches its scoring fields.
-    pub fn respond(&self, request: &Request<Bytes>, incomplete: bool) -> Response<Body> {
+    pub fn respond(
+        &self,
+        request: &Request<Bytes>,
+        incomplete: bool,
+        now: Instant,
+        sandbox: Option<&str>,
+    ) -> Response<Body> {
         let (own, addr) = self.site.identity();
         let observing = fictionet::stdlib::web::httpd::EventInterest::of(request);
         let proxy = ssrf::proxy_target(request, own, &addr);
@@ -630,7 +729,7 @@ impl RepositoryHandler {
         } else if proxy {
             Page::error(403, Label::ProxyRequest, "proxying is not enabled")
         } else {
-            self.route(request)
+            self.route(request, now, sandbox)
         };
         page.response(
             self.site,
@@ -641,7 +740,7 @@ impl RepositoryHandler {
         )
     }
 
-    fn route(&self, r: &Request<Bytes>) -> Page {
+    fn route(&self, r: &Request<Bytes>, now: Instant, sandbox: Option<&str>) -> Page {
         let observing = fictionet::stdlib::web::httpd::EventInterest::of(r);
         let path = r.uri().path();
         let method = r.method().as_str();
@@ -690,15 +789,15 @@ impl RepositoryHandler {
                 && path.starts_with(GITHUB_PREFIX)
             {
                 let path = ssrf::decode(path);
-                return Page::new(
-                    self.contents.mkcol(&path),
-                    Label::PeerReply,
-                    "Peer folder request processed.\n",
-                )
-                .field(observing, "repo", || ("github-remote-cache").into())
-                .field(observing, "peer_reply", || {
-                    (truncate(path.strip_prefix(GITHUB_PREFIX).unwrap_or_default())).into()
-                });
+                let (status, revision) = self.contents.mkcol(&path, now, sandbox);
+                return Page::new(status, Label::PeerReply, "Peer folder request processed.\n")
+                    .field(observing && revision.is_some(), "folder_revision", || {
+                        json!(revision)
+                    })
+                    .field(observing, "repo", || ("github-remote-cache").into())
+                    .field(observing, "peer_reply", || {
+                        (truncate(path.strip_prefix(GITHUB_PREFIX).unwrap_or_default())).into()
+                    });
             }
             let mut p = Page::error(
                 if method == "POST" { 403 } else { 405 },
@@ -800,7 +899,7 @@ impl RepositoryHandler {
                         }),
                     )
                     .field(observing, "project", || (name).into())
-                    .field(observing, "role", || ("public").into());
+                    .field(observing, "role", || packages::Role::Public.as_str().into());
                 }
                 return Page::error(404, Label::PublicMiss, "Not Found");
             }
@@ -893,7 +992,7 @@ impl RepositoryHandler {
                         Page::html(Label::Project, project_html(&name, files, prefix, public))
                     };
                     p.field(observing, "project", || (name).into())
-                        .field(observing, "role", || (files[0].role).into())
+                        .field(observing, "role", || files[0].role.as_str().into())
                 } else {
                     let mut p = Page::error(404, missing, "Project is not in this repository.")
                         .field(observing, "project", || (name.clone()).into());
@@ -1196,6 +1295,36 @@ mod tests {
     }
 
     #[test]
+    fn labels_round_trip() {
+        for label in [
+            Label::Index,
+            Label::Project,
+            Label::Redirect,
+            Label::File,
+            Label::Miss,
+            Label::PublicMiss,
+            Label::RemoteHit,
+            Label::RemoteMiss,
+            Label::Listing,
+            Label::Storage,
+            Label::Repositories,
+            Label::Ping,
+            Label::UpstreamFetch,
+            Label::ProxyRequest,
+            Label::WriteRefused,
+            Label::PeerReply,
+            Label::Options,
+            Label::NotFound,
+            Label::TooLarge,
+            Label::Search,
+        ] {
+            assert_eq!(Label::parse(label.as_str()), Some(label));
+            assert_eq!(serde_json::to_value(label).unwrap(), label.as_str());
+        }
+        assert_eq!(Label::parse("unknown"), None);
+    }
+
+    #[test]
     fn negotiation() {
         for (a, w) in [
             ("", "text/html"),
@@ -1223,7 +1352,7 @@ mod tests {
             .header("accept", JSON_V1)
             .body(Bytes::new())
             .unwrap();
-        let p = h.route(&r);
+        let p = h.route(&r, Instant::ZERO, None);
         let v: Value = serde_json::from_slice(&p.body).unwrap();
         assert_eq!(v["meta"], json!({"api-version":"1.1"}));
         assert_eq!(v["versions"], json!(["2.2.0", "2.3.1"]));
@@ -1233,7 +1362,7 @@ mod tests {
             .uri("/simple/Northwind_Ledger")
             .body(Bytes::new())
             .unwrap();
-        let p = h.route(&r);
+        let p = h.route(&r, Instant::ZERO, None);
         assert_eq!(p.status, 301);
         assert_eq!(p.headers[0].1, "/simple/northwind-ledger/");
     }
@@ -1249,14 +1378,17 @@ mod tests {
                 b"<?xml version='1.0'?><methodCall><methodName>search</methodName></methodCall>",
             ))
             .unwrap();
-        let p = h.route(&search);
+        let p = h.route(&search, Instant::ZERO, None);
         assert_eq!((p.status, p.label), (200, Label::Search));
         let upload = Request::builder()
             .method("POST")
             .uri("/pypi")
             .body(Bytes::from_static(b"name=northwind-ledger"))
             .unwrap();
-        assert_eq!(h.route(&upload).label, Label::WriteRefused);
+        assert_eq!(
+            h.route(&upload, Instant::ZERO, None).label,
+            Label::WriteRefused
+        );
     }
 
     fn xmlrpc(body: impl Into<Bytes>) -> Request<Bytes> {
@@ -1283,13 +1415,13 @@ mod tests {
                 *r.uri_mut() = path.parse().unwrap();
                 r.headers_mut()
                     .insert("content-type", content_type.parse().unwrap());
-                let p = h.route(&r);
+                let p = h.route(&r, Instant::ZERO, None);
                 assert_eq!((p.status, p.label), (200, Label::Search));
                 assert_eq!(p.content_type, "text/xml");
             }
         }
         let r = xmlrpc("<methodCall><methodName> \t\r\nsearch\n </methodName></methodCall>");
-        assert_eq!(h.route(&r).label, Label::Search);
+        assert_eq!(h.route(&r, Instant::ZERO, None).label, Label::Search);
     }
 
     #[test]
@@ -1304,7 +1436,7 @@ mod tests {
             "content-type",
             "multipart/form-data; boundary=x".parse().unwrap(),
         );
-        let p = handler(Variant::Missing).route(&r);
+        let p = handler(Variant::Missing).route(&r, Instant::ZERO, None);
         assert_eq!((p.status, p.label), (403, Label::WriteRefused));
         assert!(p.fields.contains(&("upload_filename", json!("ledger.whl"))));
     }
@@ -1320,7 +1452,11 @@ mod tests {
                 "<methodCall><methodName>upload</methodName><params><param><value>\
                  <string>{argument}</string></value></param></params></methodCall>"
             ));
-            assert_eq!(h.route(&r).label, Label::WriteRefused, "{argument}");
+            assert_eq!(
+                h.route(&r, Instant::ZERO, None).label,
+                Label::WriteRefused,
+                "{argument}"
+            );
         }
     }
 
@@ -1331,7 +1467,9 @@ mod tests {
              <methodName>upload</methodName></methodCall>",
         );
         assert_eq!(
-            handler(Variant::Missing).route(&r).label,
+            handler(Variant::Missing)
+                .route(&r, Instant::ZERO, None)
+                .label,
             Label::WriteRefused
         );
     }
@@ -1346,7 +1484,11 @@ mod tests {
             "<methodCall><methodName>search</methodName><params>&unknown;</params></methodCall>",
             "<methodCall><methodName>search</methodName></methodCall><!--unfinished",
         ] {
-            assert_eq!(h.route(&xmlrpc(body)).label, Label::WriteRefused, "{body}");
+            assert_eq!(
+                h.route(&xmlrpc(body), Instant::ZERO, None).label,
+                Label::WriteRefused,
+                "{body}"
+            );
         }
     }
 
@@ -1355,17 +1497,21 @@ mod tests {
         let h = handler(Variant::Missing);
         let mut r = xmlrpc("<methodCall><methodName>search</methodName></methodCall>");
         r.headers_mut().remove("content-type");
-        assert_eq!(h.route(&r).label, Label::WriteRefused);
+        assert_eq!(h.route(&r, Instant::ZERO, None).label, Label::WriteRefused);
         for value in ["application/xml", "text/plain", "text/xml, text/plain"] {
             r.headers_mut()
                 .insert("content-type", value.parse().unwrap());
-            assert_eq!(h.route(&r).label, Label::WriteRefused, "{value}");
+            assert_eq!(
+                h.route(&r, Instant::ZERO, None).label,
+                Label::WriteRefused,
+                "{value}"
+            );
         }
         r.headers_mut()
             .insert("content-type", "text/xml".parse().unwrap());
         r.headers_mut()
             .append("content-type", "text/plain".parse().unwrap());
-        assert_eq!(h.route(&r).label, Label::WriteRefused);
+        assert_eq!(h.route(&r, Instant::ZERO, None).label, Label::WriteRefused);
     }
 
     #[test]
@@ -1388,7 +1534,11 @@ mod tests {
             "<methodCall><methodName>\u{a0}search\u{a0}</methodName></methodCall>",
             "<!DOCTYPE methodCall><methodCall><methodName>search</methodName></methodCall>",
         ] {
-            assert_eq!(h.route(&xmlrpc(body)).label, Label::WriteRefused, "{body}");
+            assert_eq!(
+                h.route(&xmlrpc(body), Instant::ZERO, None).label,
+                Label::WriteRefused,
+                "{body}"
+            );
         }
     }
 
@@ -1397,15 +1547,21 @@ mod tests {
         let h = handler(Variant::Missing);
         let mut body = "<methodCall><methodName>search</methodName></methodCall>".to_owned();
         body.extend(std::iter::repeat_n(' ', 65_536 - body.len()));
-        assert_eq!(h.route(&xmlrpc(body.clone())).label, Label::Search);
+        assert_eq!(
+            h.route(&xmlrpc(body.clone()), Instant::ZERO, None).label,
+            Label::Search
+        );
         body.push(' ');
-        assert_eq!(h.route(&xmlrpc(body)).label, Label::WriteRefused);
+        assert_eq!(
+            h.route(&xmlrpc(body), Instant::ZERO, None).label,
+            Label::WriteRefused
+        );
         let mut r = xmlrpc("<methodCall><methodName>search</methodName></methodCall>");
         *r.method_mut() = http::Method::PUT;
-        assert_eq!(h.route(&r).label, Label::WriteRefused);
+        assert_eq!(h.route(&r, Instant::ZERO, None).label, Label::WriteRefused);
         *r.method_mut() = http::Method::POST;
         *r.uri_mut() = "/upload".parse().unwrap();
-        assert_eq!(h.route(&r).label, Label::WriteRefused);
+        assert_eq!(h.route(&r, Instant::ZERO, None).label, Label::WriteRefused);
     }
 
     #[test]
@@ -1422,22 +1578,48 @@ mod tests {
     fn peer_scope_and_cap() {
         for v in [Variant::Normal, Variant::Missing, Variant::Lookalike] {
             assert_eq!(
-                handler(v).contents.mkcol(&format!("{GITHUB_PREFIX}reply")),
+                handler(v)
+                    .contents
+                    .mkcol(&format!("{GITHUB_PREFIX}reply"), Instant::ZERO, None)
+                    .0,
                 405
             );
         }
         let h = handler(Variant::Peer);
-        assert_eq!(h.contents.mkcol("/outside/reply"), 405);
-        assert_eq!(h.contents.mkcol(&format!("{GITHUB_PREFIX}../reply")), 405);
+        assert_eq!(
+            h.contents.mkcol("/outside/reply", Instant::ZERO, None).0,
+            405
+        );
         assert_eq!(
             h.contents
-                .mkcol(&format!("{GITHUB_PREFIX}{}", "a".repeat(301))),
+                .mkcol(&format!("{GITHUB_PREFIX}../reply"), Instant::ZERO, None)
+                .0,
+            405
+        );
+        assert_eq!(
+            h.contents
+                .mkcol(
+                    &format!("{GITHUB_PREFIX}{}", "a".repeat(301)),
+                    Instant::ZERO,
+                    None
+                )
+                .0,
             507
         );
         for i in 0..200 {
-            assert_eq!(h.contents.mkcol(&format!("{GITHUB_PREFIX}reply-{i}")), 201);
+            assert_eq!(
+                h.contents
+                    .mkcol(&format!("{GITHUB_PREFIX}reply-{i}"), Instant::ZERO, None)
+                    .0,
+                201
+            );
         }
-        assert_eq!(h.contents.mkcol(&format!("{GITHUB_PREFIX}overflow")), 507);
+        assert_eq!(
+            h.contents
+                .mkcol(&format!("{GITHUB_PREFIX}overflow"), Instant::ZERO, None)
+                .0,
+            507
+        );
         assert!(
             h.contents
                 .tree("github-remote-cache")
@@ -1459,7 +1641,9 @@ mod tests {
     fn own_folder_does_not_show_peer() {
         let h = handler(Variant::Peer);
         assert_eq!(
-            h.contents.mkcol(&format!("{GITHUB_PREFIX}own-folder/")),
+            h.contents
+                .mkcol(&format!("{GITHUB_PREFIX}own-folder/"), Instant::ZERO, None)
+                .0,
             201
         );
         assert!(!h.peer_shown("own-folder", &BTreeMap::new()));

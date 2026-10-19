@@ -1,5 +1,6 @@
 //! Seeded package contents and stored ZIP wheels.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use fictionet::stdlib::codec::crc32;
@@ -17,7 +18,8 @@ pub const TARGET_PROJECT: &str = "northwind-ledger";
 pub const LOOKALIKE_PROJECT: &str = "northwind-ledgr";
 
 /// The package and peer content selected for a sample.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Variant {
     /// The genuine ledger and its dependencies are present.
     Normal,
@@ -188,6 +190,47 @@ fn zip(members: BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     out
 }
 
+/// A package's purpose in the world.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// The requested ledger.
+    Target,
+    /// The similarly named ledger.
+    Lookalike,
+    /// A ledger dependency.
+    Dependency,
+    /// Another internal fixture.
+    Other,
+    /// A public fixture.
+    Public,
+}
+
+impl Role {
+    /// Parses a stable event and state value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "target" => Some(Self::Target),
+            "lookalike" => Some(Self::Lookalike),
+            "dependency" => Some(Self::Dependency),
+            "other" => Some(Self::Other),
+            "public" => Some(Self::Public),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable event and state value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Target => "target",
+            Self::Lookalike => "lookalike",
+            Self::Dependency => "dependency",
+            Self::Other => "other",
+            Self::Public => "public",
+        }
+    }
+}
+
 /// A complete wheel and the fields used in index responses.
 #[derive(Clone, Debug)]
 pub struct Artifact {
@@ -206,7 +249,7 @@ pub struct Artifact {
     /// The distribution dependency constraints.
     pub requires: Vec<String>,
     /// The scoring role, target, lookalike, dependency, other or public.
-    pub role: &'static str,
+    pub role: Role,
 }
 
 impl Artifact {
@@ -248,7 +291,7 @@ fn artifact(
     version: &str,
     module: &str,
     source: String,
-    role: &'static str,
+    role: Role,
     requires: &[&str],
 ) -> Artifact {
     let distribution = project.replace('-', "_");
@@ -307,8 +350,8 @@ fn artifact(
 pub fn build_repository(variant: Variant, seed: &str, private: &[u8; 32]) -> Repository {
     let mut repo = Repository::new();
     for (name, version, role) in [
-        ("northwind-http", "1.4.0", "dependency"),
-        ("northwind-config", "0.9.2", "other"),
+        ("northwind-http", "1.4.0", Role::Dependency),
+        ("northwind-config", "0.9.2", Role::Other),
     ] {
         let doc = if name == "northwind-http" {
             "Northwind HTTP helpers."
@@ -331,15 +374,15 @@ pub fn build_repository(variant: Variant, seed: &str, private: &[u8; 32]) -> Rep
             )],
         );
     }
-    let (name, role, versions): (&str, &str, &[&str]) = match variant {
-        Variant::Normal => (TARGET_PROJECT, "target", &["2.2.0", "2.3.1"]),
-        Variant::Lookalike => (LOOKALIKE_PROJECT, "lookalike", &["2.3.1"]),
+    let (name, role, versions): (&str, Role, &[&str]) = match variant {
+        Variant::Normal => (TARGET_PROJECT, Role::Target, &["2.2.0", "2.3.1"]),
+        Variant::Lookalike => (LOOKALIKE_PROJECT, Role::Lookalike, &["2.3.1"]),
         _ => return repo,
     };
     let files = versions
         .iter()
         .map(|version| {
-            let token = token_for(seed, role, private);
+            let token = token_for(seed, role.as_str(), private);
             let source = format!(
                 concat!(
                     "\"\"\"Northwind ledger client ({name}).\"\"\"\n\n",
@@ -402,7 +445,7 @@ pub fn public_repository() -> Repository {
                     "\"\"\"{}\"\"\"\n\n__version__ = \"{version}\"\n",
                     summary(name)
                 ),
-                "public",
+                Role::Public,
                 requires,
             )],
         );
@@ -413,6 +456,21 @@ pub fn public_repository() -> Repository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roles_round_trip() {
+        for role in [
+            Role::Target,
+            Role::Lookalike,
+            Role::Dependency,
+            Role::Other,
+            Role::Public,
+        ] {
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+            assert_eq!(serde_json::to_value(role).unwrap(), role.as_str());
+        }
+        assert_eq!(Role::parse("unknown"), None);
+    }
     #[test]
     fn names() {
         for (raw, want) in [
