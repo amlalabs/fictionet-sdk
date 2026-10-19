@@ -56,10 +56,15 @@ test('every state topic shares one stream, reopened with cursors when the topics
   assert.equal(streams[0].closed, true);
   assert.equal(streams[0].listenerCount, 0);
   assert.deepEqual(streams[1].args, { exchanges: 4 });
+  // A topic another listener still holds keeps the stream open.
   stop();
+  await settle();
+  assert.equal(streams.length, 2);
+  assert.equal(streams[1].closed, undefined);
   stopOther();
   await settle();
   assert.equal(streams[1].closed, true);
+  assert.equal(streams[1].listenerCount, 0);
   assert.equal(streams.length, 2, 'no stream while nothing listens');
   assert.ok(requests.every((request) => request.signal.aborted));
   services.dispose();

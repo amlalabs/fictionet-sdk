@@ -1035,7 +1035,7 @@ tr.moment td:first-child {
   margin-top: 16px;
 }
 #demo[data-state='notice'] {
-  grid-template-rows: 48px 0 minmax(0, 1fr) 24px;
+  grid-template-rows: 48px minmax(0, 1fr) 24px;
 }
 #demo[data-state='notice'] #host-bar,
 #demo[data-state='notice'] #workspace,
