@@ -342,6 +342,7 @@ dependencies = [
  "fictionet",
  "fictionet-cli",
  "fictionet-codegen-golden",
+ "fictionet-observe",
  "http",
  "http-body-util",
  "libfuzzer-sys",

@@ -314,6 +314,48 @@ fn capture_keeps_rows_and_keys_after_the_run_ends() {
 }
 
 #[test]
+fn a_subscription_does_not_keep_its_run_or_link_alive() {
+    let saved = Arc::new(Mutex::new(None));
+    let save = saved.clone();
+    let dashboard = with_dashboard(DashboardOptions::default(), move |cx, handle| async move {
+        let (ends, links) = links(&cx, &handle, 1).await;
+        let now = Instant::now();
+        let id = handle.0.collector.find_link(links[0]).unwrap();
+        let subscription = handle
+            .0
+            .watches
+            .acquire(&handle.0.collector, links[0], now, || {
+                Some((id, crate::view::describe(&handle, id)))
+            })
+            .unwrap();
+        log_key(&cx, &key(0));
+        let expected = handle.0.collector.keylog();
+        let mut ends = ends;
+        ends[0].send(ip());
+        subscription.watch().pump(&handle.0);
+        drop(ends);
+        *save.lock() = Some((subscription, Arc::downgrade(&handle.0), expected, id));
+        Ok(())
+    });
+    assert!(dashboard.handle().0.collector.ended().is_some());
+    let (subscription, weak, expected, id) = saved.lock().take().unwrap();
+    assert!(!dashboard.handle().0.collector.live(id));
+    drop(dashboard);
+    assert!(weak.upgrade().is_none());
+    let watch = subscription.watch().clone();
+    assert_eq!(watch.rows_after(0, 10).1.len(), 1);
+    let mut export = watch.export(&Collector::default());
+    let (file, end) = export.next_chunk();
+    assert!(end);
+    assert_eq!(exported_keys(&file), expected);
+    let weak = Arc::downgrade(&watch);
+    drop(watch);
+    assert!(weak.upgrade().is_some());
+    drop(subscription);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
 fn watch_capacity_shares_watches_and_refuses_new_links_while_all_are_active() {
     let options = DashboardOptions {
         watches: 1,
@@ -325,7 +367,9 @@ fn watch_capacity_shares_watches_and_refuses_new_links_while_all_are_active() {
         let mut first = handle.session();
         let mut second = handle.session();
         call(&mut first, 1, &packets(links[0], 0), now);
+        let original = watch_of(&handle, links[0], now);
         call(&mut second, 1, &packets(links[0], 0), now);
+        assert!(Arc::ptr_eq(&original, &watch_of(&handle, links[0], now)));
         assert_eq!(handle.0.watches.kept(), [links[0]]);
         assert_eq!(
             text(&call(&mut second, 2, &packets(999, 0), now)),
@@ -346,7 +390,11 @@ fn watch_capacity_shares_watches_and_refuses_new_links_while_all_are_active() {
         assert_eq!(shared.rows_after(0, 10).1.len(), 1);
         second.request(9, r#"{"op":"cancel","id":1}"#, now, None);
         assert_eq!(handle.0.watches.kept(), [links[0]], "idle history lingers");
+        let weak = Arc::downgrade(&original);
+        drop((original, shared));
+        assert!(weak.upgrade().is_some());
         assert!(!call(&mut first, 10, &packets(links[1], 0), now).end);
+        assert!(weak.upgrade().is_none());
         assert_eq!(
             handle.0.watches.kept(),
             [links[1]],

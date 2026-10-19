@@ -81,7 +81,7 @@ pub use timer::Timer;
 ///
 /// Groups change nothing about how the world runs. A grouped `Cx` stays in
 /// the same [region](Cx#regions), so cancelling and errors work as before.
-/// Only observers read groups: the [dashboard](crate::observe) draws a
+/// Only observers read groups: the dashboard draws a
 /// group as one box, with the traffic that crosses its edge added up, and
 /// opens it to show what is inside.
 ///
@@ -392,46 +392,14 @@ impl Cx {
         }
     }
 
-    /// Whether an observer, such as the dashboard or `fictionet observe
-    /// watch`, is connected to this world right now.
-    ///
-    /// Packet copies and TLS session keys depend on connected viewers. Event
-    /// emission instead checks the observer installed through [`crate::RunOptions`].
-    /// This reads one number, so it is cheap to call on every packet.
-    pub fn observed(&self) -> bool {
-        self.run.graph.observed()
-    }
-
-    /// A connection's TLS key adapter for interested observers and legacy viewers.
+    /// A connection's TLS key adapter for interested observers.
     /// The typed stream stops when the run ends. The adapter does not retain the run.
     #[doc(hidden)]
     pub fn tls_key_log(
         &self,
         connection: Option<&crate::events::ConnInfo>,
     ) -> Option<Arc<dyn rustls::KeyLog>> {
-        crate::telemetry::KeyLog::for_cx(self, connection)
-    }
-
-    /// Sets application decoders for newly watched links in this world.
-    /// Existing watches keep their registry and connection state. Call this
-    /// before clients start observing to include custom protocols in the
-    /// dashboard, JSON replies, and captured packet details.
-    pub fn observe_protocols(&self, registry: crate::observe::Registry) {
-        *self.run.graph.protocols.lock() = registry;
-    }
-
-    /// Sets the maximum number of retained link watches in this run.
-    /// The default is 64. Observers of the same link share one watch.
-    /// At capacity, a new link evicts the longest-idle watch, with the
-    /// lowest link id breaking ties. If all watches are active, its request
-    /// gets a capacity error.
-    ///
-    /// Lowering the limit evicts idle watches first. Active watches stay
-    /// until their subscribers leave, even if they exceed the new limit.
-    /// Zero refuses new links. Subscriptions to retained links still work.
-    #[cfg(feature = "observe")]
-    pub fn set_observe_watch_limit(&self, limit: usize) {
-        self.run.graph.watches.set_limit(limit);
+        crate::tls_keys::KeyLog::for_cx(self, connection)
     }
 
     /// Checks interest before constructing event-specific tracking state.

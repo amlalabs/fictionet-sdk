@@ -603,8 +603,15 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )
         );
+        assert_eq!(
+            request(&mut session, 5, r#"{"op":"graph"}"#, now).bytes,
+            br#"{"error":"no world is running yet"}"#
+        );
         session.request(2, r#"{"op":"watch"}"#, now, None);
-        assert_eq!(names(&session.poll(now, None)), ["waiting"]);
+        let waiting = session.poll(now, None);
+        assert_eq!(names(&waiting), ["waiting"]);
+        assert_eq!(waiting[0].bytes, br#"{"event":"waiting","data":{}}"#);
+        assert!(!waiting[0].end);
         emit(
             dashboard.observer().as_ref(),
             1,
@@ -656,14 +663,19 @@ mod tests {
             request(&mut session, 65, r#"{"op":"watch"}"#, now).envelope(),
             Some(crate::Envelope::Error(_))
         ));
-        assert!(matches!(
-            request(&mut session, 66, r#"{"op":"cancel","id":4294967297}"#, now).envelope(),
-            Some(crate::Envelope::Error(_))
-        ));
+        assert_eq!(
+            request(&mut session, 66, r#"{"op":"cancel","id":4294967297}"#, now).bytes,
+            br#"{"error":"no such subscription"}"#
+        );
         assert_eq!(session.subs.len(), 64);
         let cancelled = session.request(67, r#"{"op":"cancel","id":1}"#, now, None);
         assert_eq!(cancelled[0].id, 1);
         assert!(cancelled[0].end);
+        assert_eq!(
+            cancelled[0].bytes,
+            br#"{"event":"end","data":{"reason":"cancelled"}}"#
+        );
+        assert_eq!(session.subs.len(), 63);
         assert_eq!(cancelled[1].bytes, br#"{"ok":true}"#);
         assert!(
             session

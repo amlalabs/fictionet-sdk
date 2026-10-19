@@ -1,5 +1,5 @@
 use super::*;
-use fictionet::observe::Layer;
+use fictionet_observe::Layer;
 
 // ---------------------------------------------------------------------------
 // Events

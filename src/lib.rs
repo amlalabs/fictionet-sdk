@@ -246,9 +246,8 @@
 //! # Watching a world
 //!
 //! Services emit [`events`] to observers explicitly installed by the integrator.
-//! Dashboard history requires [`RunOptions::event_history`] before execution;
-//! late viewers see only retained evidence. The world itself can be watched
-//! while it runs ([`observe`]):
+//! Install `fictionet_observe::DashboardObserver` before execution and serve
+//! its handle on an observation socket; late viewers see retained history.
 //! `fictionet dashboard` draws its tasks and links and decodes the packets
 //! that cross them, HTTPS included, and `fictionet observe` prints the
 //! graph, its changes and the world's events as lines of JSON for scripts.
@@ -267,7 +266,7 @@
 //!    services in a few lines. [`stdlib::web`] does the same for websites.
 //! 6. [`recipes`](guide::recipes): a delayed website, a slow or lossy link, a
 //!    packet capture, and a route that changes mid-run.
-//! 7. [`observe`]: watching a running world, in the dashboard or from a
+//! 7. `fictionet-observe`: watching a running world, in the dashboard or from a
 //!    shell, and sending your own events from world code.
 //! 8. [`proto`](guide::proto): the protocol between attach and a world, if you
 //!    want to write your own attach.
@@ -280,7 +279,6 @@
 //! |---|---|---|---|
 //! | `std` | Real clocks, OS entropy, world sockets, event files, timer threads, relay, and native HTTP/1 and HTTP/2 servers | — | Yes |
 //! | `tokio` | Tokio adapters and axum upgrades | `std` | No |
-//! | `observe` | Observer sessions, TLS key capture, and built-in protocol presenters | `std` | Yes |
 //! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `std` | No |
 //!
 //! The default features build without tokio, hyper or h2.
@@ -302,7 +300,7 @@
 //! whose [`End`] carries raw IP packets.
 //!
 //! What needs an operating system is left out of that build: [`listen`],
-//! [`WorldSocket`] and observer sessions. The clocks come from `performance.now()` and
+//! [`WorldSocket`]. The clocks come from `performance.now()` and
 //! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
 //! from `setTimeout`. In a page, hand [`run`] to the event loop with
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
@@ -313,18 +311,10 @@
 
 #![warn(missing_docs)]
 #![cfg_attr(
-    not(all(
-        feature = "std",
-        feature = "tokio",
-        feature = "observe",
-        feature = "web-proxy"
-    )),
+    not(all(feature = "std", feature = "tokio", feature = "web-proxy")),
     allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// A browser build leaves out the observer sessions, which are what reads
-// the watches, taps and packet decoding. That code stays in, unused there.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 // Protocol files use the same imports here and when copied into a user crate.
 extern crate self as fictionet;
@@ -344,7 +334,6 @@ pub mod guide;
 mod interface;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 mod listen;
-pub mod observe;
 mod packet_queue;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[doc(hidden)]
@@ -354,9 +343,9 @@ mod run;
 pub mod stdlib;
 pub mod sync;
 mod sys;
-mod telemetry;
 pub mod time;
 mod timer;
+mod tls_keys;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 mod watch;
@@ -437,27 +426,6 @@ macro_rules! cfg_std {
 #[cfg(not(feature = "std"))]
 #[macro_export]
 macro_rules! cfg_std {
-    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
-    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
-    ($($enabled:tt)*) => {};
-}
-
-/// Includes tokens when the SDK's `observe` feature is enabled.
-///
-/// An optional `else` block supplies the tokens for builds without the
-/// feature. Prefix the branches with `items` to select item definitions.
-#[cfg(feature = "observe")]
-#[macro_export]
-macro_rules! cfg_observe {
-    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($enabled)* };
-    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($enabled)* }};
-    ($($enabled:tt)*) => { $($enabled)* };
-}
-
-/// Includes tokens selected by the SDK's `observe` feature.
-#[cfg(not(feature = "observe"))]
-#[macro_export]
-macro_rules! cfg_observe {
     (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
     ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
     ($($enabled:tt)*) => {};

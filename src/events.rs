@@ -54,8 +54,8 @@
 //! through [`Memory::dropped`]. Graders use
 //! [`Memory::checked_of`] or [`Memory::checked_all`] to reject incomplete
 //! evidence. Reads neither flush nor change retained events. Dashboard clients
-//! can attach late only to history explicitly installed with
-//! [`RunOptions::event_history`](crate::RunOptions::event_history).
+//! can attach late to history retained by an installed
+//! `fictionet_observe::DashboardObserver`.
 //!
 //! Native `fictionet_observe::Jsonl` keeps the event JSON Lines format and enqueues events within
 //! count and byte limits. Its worker performs serialization and I/O. Call its

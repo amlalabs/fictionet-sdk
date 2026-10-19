@@ -152,7 +152,6 @@ impl Interface for Attachment {
                     && let Some(task) = current
                 {
                     self.seen = current;
-                    fcx.graph().owns(&self.meter, 0, task.id);
                     self.meter.owner(fcx, 0, task.id);
                     self.packets = self.meter.packets();
                 }
@@ -282,8 +281,7 @@ struct HubState {
     feeder: Option<Waker>,
     /// The [`Attachments`] was dropped.
     closed: bool,
-    /// What the run that takes these attachments tracks, so that an
-    /// observer that connects to the world socket finds it.
+    /// The receiving run, used to check real I/O access.
     graph: Weak<Graph>,
 }
 
@@ -367,13 +365,6 @@ impl Attacher {
             wraps: Vec::new(),
         });
         Ok(sandbox)
-    }
-
-    /// What the run that takes these attachments tracks, once the world
-    /// has asked for one.
-    #[cfg(feature = "std")]
-    pub(crate) fn graph(&self) -> Option<Arc<Graph>> {
-        self.hub.state.lock().graph.upgrade()
     }
 
     /// Marks the hub before a real listener can feed it.
@@ -794,7 +785,7 @@ mod tests {
                     Err(Cancelled)
                 ));
                 assert!(fcx.is_cancelled());
-                assert!(attacher.graph().is_none());
+                assert!(attacher.hub.state.lock().graph.upgrade().is_none());
                 assert_eq!(attacher.hub.state.lock().pending.len(), 1);
                 Ok(())
             },
@@ -839,7 +830,7 @@ mod tests {
                 });
                 assert!(fcx.is_cancelled());
                 assert!(matches!(mapped.next(&fcx).await, Err(Cancelled)));
-                assert!(attacher.graph().is_none());
+                assert!(attacher.hub.state.lock().graph.upgrade().is_none());
                 Ok(())
             },
         ))

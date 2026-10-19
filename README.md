@@ -77,8 +77,8 @@ demo, what each one needs and shows, and how to make a demo of your own.
 
 ## Install
 
-Add `fictionet` to your Cargo dependencies. The default features are
-`std` and `observe`, and neither needs tokio. Set `default-features = false`
+Add `fictionet` to your Cargo dependencies. The default feature is
+`std`, which does not need tokio. Set `default-features = false`
 for a closed simulated-time world, or enable `std` for host integration,
 HTTP/1.1 and HTTP/2. Enable `tokio` for the tokio adapters (`into_tokio`)
 and axum WebSocket upgrades. Enable `web-proxy` for upstream HTTP/1.1
@@ -243,7 +243,7 @@ Start at the crate root, which explains the main ideas, then read in this order:
    websites.
 6. [`recipes`](src/guide/recipes.rs): a delayed website, a slow or lossy link, a packet
    capture, and a route that changes mid-run.
-7. [`observe`](src/observe.rs): watching a running world, in the dashboard or
+7. [`fictionet-observe`](observe/README.md): watching a running world, in the dashboard or
    from a shell.
 8. [`proto`](src/guide/proto.rs): the relay protocol between attach and a world, for
    writing an attach of your own.

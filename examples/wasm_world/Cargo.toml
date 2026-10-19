@@ -11,8 +11,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# The browser serves HTTP/1.1 and HTTP/2 with `std` alone, without
-# observer sessions.
+# The browser serves HTTP/1.1 and HTTP/2 with `std` alone.
 fictionet = { path = "../..", default-features = false, features = ["std"] }
 example-common = { path = "../common" }
 bytes = "1"

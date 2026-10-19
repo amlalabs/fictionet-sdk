@@ -51,14 +51,8 @@ mod listen;
 mod mail_codec;
 mod media_codec;
 mod messaging_codec;
-#[cfg(all(feature = "std", feature = "observe"))]
+#[cfg(feature = "std")]
 mod observe;
-#[cfg(feature = "observe")]
-mod observe_http2;
-#[cfg(all(feature = "std", feature = "observe"))]
-mod observe_present;
-#[cfg(all(feature = "std", feature = "observe"))]
-mod observe_tls;
 #[cfg(feature = "std")]
 mod packets;
 mod protocol_primitives;
@@ -75,7 +69,7 @@ mod serve_decoder;
 mod serve_harness;
 #[cfg(feature = "std")]
 mod serve_limits;
-#[cfg(all(feature = "std", feature = "observe"))]
+#[cfg(feature = "std")]
 mod services;
 mod sse_codec;
 mod streams_codec;

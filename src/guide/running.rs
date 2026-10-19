@@ -332,7 +332,7 @@
 //! - **A lab run is closed.** The test plays the sandboxes through
 //!   [`attachments`](crate::attachments), as above, and fakes play other
 //!   services. Attachments that a [`listen`](crate::listen) socket feeds,
-//!   observer sessions, `web::proxy` and `web::forward` refuse to work in a
+//!   `web::proxy` and `web::forward` refuse to work in a
 //!   lab. Fictionet cannot stop world code from using `std::net`, tokio timers
 //!   or other real I/O, so keeping the rest of a lab world closed is up to its author.
 //! - **The test runs inside the lab too.** The code that plays the

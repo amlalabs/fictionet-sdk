@@ -44,8 +44,6 @@ pub struct RunOptions {
     seed: crate::Seed,
     observer: Option<Arc<dyn crate::events::Observer>>,
     fields: crate::events::Fields,
-    event_history: Option<Arc<crate::events::Memory>>,
-    aggregate_events: bool,
 }
 
 impl RunOptions {
@@ -54,8 +52,6 @@ impl RunOptions {
         Self {
             seed,
             observer: None,
-            event_history: None,
-            aggregate_events: false,
             fields: crate::events::Fields::new(),
         }
     }
@@ -63,22 +59,6 @@ impl RunOptions {
     /// Installs the run's destination for events, packets, TLS keys and topology.
     pub fn observer(mut self, observer: Arc<dyn crate::events::Observer>) -> Self {
         self.observer = Some(observer);
-        self
-    }
-
-    /// Installs bounded event retention for world socket viewers, including
-    /// viewers that connect after events were emitted. Other observers also
-    /// receive the events, regardless of builder call order.
-    pub fn event_history(mut self, history: Arc<crate::events::Memory>) -> Self {
-        self.event_history = Some(history);
-        self
-    }
-
-    /// Aggregates repeatable facts before all installed destinations, including
-    /// dashboard retention. Uses [`crate::events::Aggregate`]'s default bounds.
-    /// Builder call order does not affect which destinations receive summaries.
-    pub fn aggregate_events(mut self) -> Self {
-        self.aggregate_events = true;
         self
     }
 
@@ -220,7 +200,7 @@ where
 /// never moves the clock. Attachments fed by [`listen`](crate::listen) fail
 /// the lab on their first `get`, `next` or `map`, before handing out an
 /// attachment, and `get` and `next` return [`Cancelled`](crate::Cancelled).
-/// Observer sessions, `web::proxy` and `web::forward` refuse a lab too.
+/// `web::proxy` and `web::forward` refuse a lab too.
 pub async fn lab<F, Fut>(options: RunOptions, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
@@ -310,9 +290,6 @@ pub(crate) struct RunShared {
     pub(crate) observer: RunObserver,
     pub(crate) next_group: AtomicU64,
     start: Mutex<Option<crate::events::Event>>,
-    /// The run's TLS key log, shared with the graph for observers.
-    #[cfg(feature = "observe")]
-    pub(crate) keys: Arc<crate::telemetry::KeyRecorder>,
     queue: Mutex<Queue>,
     /// What the run records for observers.
     pub(crate) graph: Arc<Graph>,
@@ -388,37 +365,12 @@ impl RunShared {
         .await
     }
 
-    #[cfg(all(test, feature = "std"))]
-    pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Self> {
-        Self::with_options(RunOptions::new(seed), mode)
-    }
-
     pub(crate) fn with_options(options: RunOptions, mode: crate::RunMode) -> Arc<Self> {
         let RunOptions {
             seed,
             observer,
             fields,
-            event_history,
-            aggregate_events,
         } = options;
-        let observer = match (observer, event_history.as_ref()) {
-            (Some(observer), Some(history)) => {
-                Some(
-                    Arc::new(crate::events::Fanout::new(vec![observer, history.clone()]))
-                        as Arc<dyn crate::events::Observer>,
-                )
-            }
-            (None, Some(history)) => Some(history.clone() as Arc<dyn crate::events::Observer>),
-            (observer, None) => observer,
-        };
-        let observer = observer.map(|observer| {
-            if aggregate_events {
-                Arc::new(crate::events::Aggregate::new(observer))
-                    as Arc<dyn crate::events::Observer>
-            } else {
-                observer
-            }
-        });
         let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
         let start_wall = if mode == crate::RunMode::Real {
@@ -456,23 +408,12 @@ impl RunShared {
                     .field("rng", "chacha20-v1")
                     .prepend_fields(fields)
             });
-        #[cfg(feature = "observe")]
-        let keys = Arc::new(crate::telemetry::KeyRecorder::default());
-        let graph = Graph::new(
-            run_id,
-            environment.clone(),
-            start_wall,
-            event_history,
-            #[cfg(feature = "observe")]
-            keys.clone(),
-        );
+        let graph = Graph::new(run_id, environment.clone());
         Arc::new(Self {
             environment,
             observer,
             next_group: AtomicU64::new(1),
             start: Mutex::new(start),
-            #[cfg(feature = "observe")]
-            keys,
             queue: Mutex::new(Queue {
                 next_id: 1,
                 ..Queue::default()
@@ -510,9 +451,6 @@ impl RunShared {
     pub(crate) fn end(&self) {
         self.graph.run_ended();
         self.observer.end(|| self.environment.clock.now());
-        // Nothing more crosses the world's links: stop watching them.
-        #[cfg(feature = "observe")]
-        self.graph.watches.end_run();
     }
 
     /// Adds a task. Gives the future back if the run is gone.
@@ -971,7 +909,6 @@ mod tests {
                 drop(world);
             }
             assert!(weak_run.upgrade().is_none());
-            assert!(graph.state().ended);
             assert!(graph.state().tasks.is_empty());
             drop(graph);
             assert!(weak_graph.upgrade().is_none());

@@ -396,6 +396,50 @@ pub(crate) fn changes(
     old: &mut View,
     wall: Option<Duration>,
 ) -> Vec<Message> {
+    let state = graph.0.collector.state.lock();
+    if state.topology.revision == old.revision {
+        let links: Vec<_> = state
+            .topology
+            .links
+            .iter()
+            .filter_map(|(id, link)| {
+                let id = id.to_string();
+                old.counters
+                    .contains_key(&id)
+                    .then(|| (id, link.counters.clone()))
+            })
+            .collect();
+        let ended = state.ended.is_some();
+        drop(state);
+        // Reading a weak counter may release the last reference to its link.
+        let counters = links
+            .into_iter()
+            .map(|(id, counters)| {
+                let [a, b] = counters.totals();
+                (id, [a.packets, a.bytes, b.packets, b.bytes])
+            })
+            .collect();
+        let mut out = Vec::new();
+        let current = status(graph);
+        if current != old.status {
+            out.push((
+                "status",
+                Object::new()
+                    .num("revision", old.revision)
+                    .raw("status", &current)
+                    .done(),
+            ));
+            old.status = current;
+        }
+        out.extend(counter_changes(graph, &old.counters, &counters, wall));
+        old.counters = counters;
+        if ended && !old.ended {
+            out.push(("ended", Object::new().secs("t", graph.elapsed(wall)).done()));
+        }
+        old.ended = ended;
+        return out;
+    }
+    drop(state);
     let mut new = build(
         graph.0.collector.topology(),
         graph.0.collector.ended().is_some(),
@@ -518,7 +562,50 @@ pub(crate) fn event_changes(graph: &DashboardHandle, view: &mut View) -> (Vec<Me
 mod tests {
     use super::*;
     use crate::{DashboardObserver, DashboardOptions, Options};
-    use fictionet::events::{Limits, Observation, Observer, Stamp, Stream};
+    use fictionet::events::{Interest, Limits, Observation, Observer, Stamp, Stream, TopologyRef};
+
+    fn identities(count: usize) -> Topology {
+        struct Added(crate::Collector);
+        impl Observer for Added {
+            fn enabled(&self, interest: Interest<'_>) -> bool {
+                matches!(interest, Interest::Topology(_))
+            }
+            fn observe(&self, stamp: Stamp, item: Observation<'_>) {
+                if matches!(
+                    item,
+                    Observation::Topology(
+                        TopologyRef::TaskAdded { .. } | TopologyRef::GroupAdded { .. }
+                    )
+                ) {
+                    self.0.observe(stamp, item);
+                }
+            }
+        }
+        let added = std::sync::Arc::new(Added(crate::Collector::default()));
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(added.clone()),
+            move |cx| async move {
+                let group = cx.group("outer").group("inner");
+                for _ in 1..count {
+                    group.spawn_as(|| "worker".into(), |_| async { Ok(()) });
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        added.0.topology()
+    }
+
+    fn topology(graph: &DashboardHandle, item: TopologyRef<'_>) {
+        graph.0.observe(
+            Stamp {
+                stream: Stream::Topology,
+                seq: graph.0.collector.topology().revision + 1,
+                at: fictionet::time::Instant::ZERO,
+            },
+            Observation::Topology(item),
+        );
+    }
 
     fn history_graph() -> DashboardHandle {
         DashboardObserver::new(DashboardOptions::default()).handle()
@@ -557,6 +644,334 @@ mod tests {
     }
     fn names(messages: &[Message]) -> Vec<&'static str> {
         messages.iter().map(|(name, _)| *name).collect()
+    }
+
+    #[test]
+    fn late_viewers_see_retained_history_and_loss() {
+        let graph = limited();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(graph.0.clone()),
+            |cx| async move {
+                for i in 0..3u64 {
+                    cx.emit("test", "tick", |event| event.field("i", i));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let (mut view, (_, data)) = snapshot(&graph, None, None);
+        let data = Value::parse(data.as_bytes()).unwrap();
+        let events = data.get("events").unwrap().as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].get("kind").and_then(Value::as_str),
+            Some("dropped")
+        );
+        assert_eq!(events[1].get("seq").and_then(Value::as_u64), Some(3));
+        assert_eq!(events[2].get("seq").and_then(Value::as_u64), Some(4));
+        assert!(event_changes(&graph, &mut view).0.is_empty());
+
+        // A rejected final event must not leave a viewer waiting forever.
+        let graph = limited();
+        for _ in 0..4 {
+            retain(&graph, Event::new("test", "tick"));
+        }
+        let (mut replay, _) = snapshot(&graph, Some(0), None);
+        retain(
+            &graph,
+            Event::new("test", "large").summary("x".repeat(8192)),
+        );
+        let (messages, full) = event_changes(&graph, &mut replay);
+        assert!(!full);
+        assert_eq!(messages.len(), 3);
+        assert!(!replay.events_pending(&graph));
+    }
+
+    #[test]
+    fn events_can_be_declined_by_the_dashboard() {
+        let dashboard = DashboardObserver::new(DashboardOptions {
+            collector: Options {
+                events: None,
+                ..Options::default()
+            },
+            ..DashboardOptions::default()
+        });
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(dashboard.observer()),
+            |cx| async move {
+                cx.emit("test", "tick", |event| event);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let reply = Value::parse(events(&dashboard.handle(), 0, 10).as_bytes()).unwrap();
+        assert!(reply.get("events").unwrap().as_array().unwrap().is_empty());
+        assert_eq!(reply.get("last").and_then(Value::as_u64), Some(0));
+    }
+
+    #[test]
+    fn changes_follow_the_graph() {
+        use fictionet::{Interface, InterfaceExt, Packet};
+        let graph = history_graph();
+        let handle = graph.clone();
+        let saved = std::sync::Arc::new(fictionet::sync::Mutex::new(None));
+        let save = saved.clone();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(graph.0.clone()),
+            move |cx| async move {
+                let (mut view, (name, data)) = snapshot(&handle, None, None);
+                assert_eq!(name, "snapshot");
+                assert!(data.contains(r#""id":"t1","kind":"world""#), "{data}");
+                assert!(changes(&handle, &mut view, None).is_empty());
+                let (mut a, mut b) = fictionet::pair();
+                a.link().unwrap().label(&cx, "pair".into());
+                let worker = cx.spawn_as(
+                    || "delay".into(),
+                    move |cx| async move {
+                        b.send(Packet(vec![0; 32]));
+                        b.recv(&cx).await?;
+                        Ok(())
+                    },
+                );
+                a.recv(&cx).await?;
+                let messages = changes(&handle, &mut view, None);
+                assert_eq!(names(&messages), ["node", "edge", "status", "counters"]);
+                assert!(messages[1].1.contains(r#""a":"t1","b":"t2""#));
+                let expected = counters_json(view.counters.iter());
+                assert!(counters(&handle, None).contains(&format!("\"edges\":{expected}")));
+                a.send(Packet(vec![0; 32]));
+                worker.join(&cx).await?;
+                drop(a);
+                assert_eq!(
+                    names(&changes(&handle, &mut view, None)),
+                    ["edge_end", "node_end", "status"]
+                );
+                cx.emit("bottleneck", "drop", |event| event.summary("queue full"));
+                let (messages, full) = event_changes(&handle, &mut view);
+                assert!(!full);
+                assert_eq!(names(&messages), ["event"]);
+                assert!(messages[0].1.contains(
+                    r#""source":"bottleneck","kind":"drop","level":"info","summary":"queue full""#
+                ));
+                assert!(event_changes(&handle, &mut view).0.is_empty());
+                *save.lock() = Some(view);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let mut view = saved.lock().take().unwrap();
+        assert_eq!(
+            names(&changes(&graph, &mut view, None)),
+            ["node_end", "status", "ended"]
+        );
+    }
+
+    #[test]
+    fn groups_come_and_go_with_their_tasks() {
+        let ids = identities(2);
+        let groups: Vec<_> = ids.groups.keys().copied().collect();
+        let tasks: Vec<_> = ids.tasks.keys().copied().collect();
+        let graph = history_graph();
+        topology(
+            &graph,
+            TopologyRef::TaskAdded {
+                task: tasks[0],
+                parent: None,
+                name: "world",
+                file: file!(),
+                line: line!(),
+                group: None,
+            },
+        );
+        let (mut view, _) = snapshot(&graph, None, None);
+        topology(
+            &graph,
+            TopologyRef::GroupAdded {
+                group: groups[0],
+                name: "outer",
+                parent: None,
+            },
+        );
+        topology(
+            &graph,
+            TopologyRef::GroupAdded {
+                group: groups[1],
+                name: "inner",
+                parent: Some(groups[0]),
+            },
+        );
+        topology(
+            &graph,
+            TopologyRef::TaskAdded {
+                task: tasks[1],
+                parent: Some(tasks[0]),
+                name: "delay",
+                file: file!(),
+                line: line!(),
+                group: Some(groups[1]),
+            },
+        );
+        let messages = changes(&graph, &mut view, None);
+        assert_eq!(names(&messages), ["group", "group", "node", "status"]);
+        assert!(messages[1].1.contains(r#""name":"inner","parent":"g1""#));
+        assert!(messages[2].1.contains(r#""group":"g2""#));
+        topology(&graph, TopologyRef::TaskRemoved { task: tasks[1] });
+        topology(&graph, TopologyRef::GroupRemoved { group: groups[1] });
+        topology(&graph, TopologyRef::GroupRemoved { group: groups[0] });
+        assert_eq!(
+            names(&changes(&graph, &mut view, None)),
+            ["node_end", "group_end", "group_end", "status"]
+        );
+    }
+
+    #[test]
+    fn link_changes_refresh_cached_topology() {
+        use fictionet::{Interface, InterfaceExt, Packet};
+        let graph = history_graph();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(graph.0.clone()),
+            move |cx| async move {
+                let (mut a, mut b) = fictionet::pair();
+                a.link().unwrap().label(&cx, "pair".into());
+                let worker = cx.spawn(move |cx| async move {
+                    b.send(Packet(vec![0; 32]));
+                    cx.cancelled().await;
+                    Ok(())
+                });
+                a.recv(&cx).await?;
+                let current = graph.0.collector.topology();
+                let id = *current.links.keys().next().unwrap();
+                let task = *current.tasks.keys().last().unwrap();
+                topology(
+                    &graph,
+                    TopologyRef::LinkOwner {
+                        link: id,
+                        side: fictionet::events::Side::B,
+                        task,
+                    },
+                );
+                let (mut view, _) = snapshot(&graph, None, None);
+                topology(
+                    &graph,
+                    TopologyRef::LinkLabel {
+                        link: id,
+                        label: "link label",
+                    },
+                );
+                let update = changes(&graph, &mut view, None);
+                assert_eq!(names(&update), ["edge", "status"]);
+                assert!(update[0].1.contains("link label"));
+                assert!(changes(&graph, &mut view, None).is_empty());
+                a.send(Packet(vec![0; 32]));
+                assert_eq!(names(&changes(&graph, &mut view, None)), ["counters"]);
+                assert!(changes(&graph, &mut view, None).is_empty());
+                drop(a);
+                topology(
+                    &graph,
+                    TopologyRef::LinkRemoved {
+                        link: id,
+                        totals: Default::default(),
+                    },
+                );
+                assert_eq!(
+                    names(&changes(&graph, &mut view, None)),
+                    ["edge_end", "status"]
+                );
+                assert_eq!(view.nodes.len(), 2);
+                drop(worker);
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn tasks_and_sandboxes_report_their_groups() {
+        use fictionet::stdlib::network::{delay, route};
+        use fictionet::{Interface, InterfaceExt};
+        let graph = history_graph();
+        let (attacher, mut attachments) = fictionet::attachments();
+        let _sandbox = attacher.attach("agent").unwrap();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(graph.0.clone()),
+            move |cx| async move {
+                let lan = cx.group("office LAN");
+                let hosts = lan.group("hosts");
+                let sandbox = attachments.get(&cx, "agent").await?;
+                let slow = delay(&lan, fictionet::time::ms(1), sandbox);
+                let (to_host, mut host) = fictionet::pair();
+                route::router(
+                    &cx,
+                    vec![
+                        ("0.0.0.0/0".parse()?, Box::new(slow) as Box<dyn Interface>),
+                        ("10.0.0.5/32".parse()?, Box::new(to_host)),
+                    ],
+                );
+                hosts.spawn(move |cx| async move {
+                    cx.spawn(move |cx| async move {
+                        host.recv(&cx).await?;
+                        Ok(())
+                    });
+                    Ok(())
+                });
+                cx.idle().await?;
+                let (view, _) = snapshot(&graph, None, None);
+                assert_eq!(
+                    view.groups.values().cloned().collect::<Vec<_>>(),
+                    [
+                        r#"{"id":"g1","name":"office LAN","parent":null}"#,
+                        r#"{"id":"g2","name":"hosts","parent":"g1"}"#,
+                    ]
+                );
+                let node = |name: &str| {
+                    view.nodes
+                        .values()
+                        .find(|n| n.contains(&format!(r#""name":"{name}""#)))
+                        .unwrap()
+                };
+                assert!(node("delay").contains(r#""group":"g1""#));
+                assert!(node("agent").contains(r#""kind":"sandbox""#));
+                assert!(node("agent").contains(r#""group":"g1""#));
+                assert!(node("router").contains(r#""group":null"#));
+                assert!(node("world").contains(r#""group":null"#));
+                assert_eq!(
+                    view.nodes
+                        .values()
+                        .filter(|n| n.contains(r#""group":"g2""#))
+                        .count(),
+                    1
+                );
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn unchanged_large_graph() {
+        let graph = history_graph();
+        for task in identities(1000).tasks.keys().copied() {
+            topology(
+                &graph,
+                TopologyRef::TaskAdded {
+                    task,
+                    parent: None,
+                    name: "worker",
+                    file: file!(),
+                    line: line!(),
+                    group: None,
+                },
+            );
+        }
+        let (mut view, _) = snapshot(&graph, None, None);
+        assert_eq!(view.nodes.len(), 1000);
+        let node = view.nodes["t1"].as_ptr();
+        for _ in 0..100 {
+            assert!(changes(&graph, &mut view, None).is_empty());
+            assert_eq!(view.nodes["t1"].as_ptr(), node);
+        }
     }
     #[test]
     fn live_viewers_only_report_evictions_after_their_cursor() {
@@ -736,5 +1151,139 @@ mod tests {
         );
         assert!(event_changes(&graph, &mut view).0.is_empty());
         assert!(!view.events_pending(&graph));
+    }
+    #[test]
+    fn nested_value_failure_visible() {
+        let mut value = Value::Null;
+        for _ in 0..129 {
+            value = Value::Array(vec![value]);
+        }
+        let mut event = Event::new("test", "nested");
+        event.fields.set("nested", value);
+        let layer = crate::Layer::from_event(&event);
+        assert_eq!(layer.fields.len(), 1);
+        assert_eq!(layer.fields[0].name, "nested");
+        assert!(layer.fields[0].value.starts_with("unserializable:"));
+        assert_eq!(
+            event.to_line().unwrap_err().kind,
+            fictionet::stdlib::protocols::json::ErrorKind::TooDeep
+        );
+        let replacement = Value::parse(event_line(&event).as_bytes()).unwrap();
+        assert_serialization_error(&replacement, 0);
+    }
+
+    #[test]
+    fn many_value_failure_visible() {
+        let mut event = Event::new("test", "many");
+        event.fields.set(
+            "many",
+            Value::Array(vec![
+                Value::Null;
+                fictionet::stdlib::protocols::json::MAX_ELEMENTS
+            ]),
+        );
+        let error = event.to_line().unwrap_err();
+        assert_eq!(
+            error.kind,
+            fictionet::stdlib::protocols::json::ErrorKind::TooManyElements
+        );
+        let layer = crate::Layer::from_event(&event);
+        assert!(layer.fields[0].value.starts_with("unserializable:"));
+        let replacement = Value::parse(event_line(&event).as_bytes()).unwrap();
+        assert_serialization_error(&replacement, 0);
+        assert_eq!(
+            replacement.get("fields").unwrap().get("unserializable"),
+            Some(&Value::from(error.to_string()))
+        );
+    }
+    fn event_with_metadata(name: &str) -> Event {
+        use fictionet::events::{ConnInfo, Level, Memory, Sandbox, Transport};
+        let mut conn = ConnInfo::new(
+            42,
+            "10.0.0.1:443".parse().unwrap(),
+            "10.0.0.2:5000".parse().unwrap(),
+        )
+        .over_tls(Some("example.test"), Some(b"h2"))
+        .from_sandbox(Some(Sandbox {
+            id: 7,
+            name: "agent".into(),
+            addr: Some("10.0.0.2".parse().unwrap()),
+            addr_v6: Some("fd00::2".parse().unwrap()),
+        }));
+        conn.transport = Transport::Udp;
+        let memory = std::sync::Arc::new(Memory::default());
+        let name = name.to_owned();
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(memory.clone()),
+            |cx| async move {
+                cx.spawn_as(
+                    || name.into(),
+                    |cx| async move {
+                        cx.emit("test", "big", |event| {
+                            event
+                                .level(Level::Alarm)
+                                .conn(&conn)
+                                .field("original", "discarded")
+                        });
+                        Ok(())
+                    },
+                )
+                .join(&cx)
+                .await?;
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let mut event = memory.checked_of("test", "big").unwrap().remove(0);
+        event.summary = "x".repeat(1 << 20);
+        event.seq = u64::MAX;
+        event.at = fictionet::time::Instant::from_since_start(fictionet::time::ms(42));
+        event
+    }
+
+    #[test]
+    fn serialization_error_keeps_metadata() {
+        let event = event_with_metadata("worker");
+        let replacement = Value::parse(event_line(&event).as_bytes()).unwrap();
+        assert_serialization_error(&replacement, event.seq);
+        for (name, value) in event.to_json().as_object().unwrap() {
+            if name != "summary" && name != "fields" {
+                assert_eq!(replacement.get(name), Some(value), "{name}");
+            }
+        }
+        assert_eq!(
+            replacement.get("fields").unwrap().get("unserializable"),
+            Some(&Value::from(event.to_line().unwrap_err().to_string()))
+        );
+    }
+
+    #[test]
+    fn serialization_error_is_bounded() {
+        for text in ["\0".repeat(1 << 20), "€".repeat(1 << 19)] {
+            let text: &'static str = Box::leak(text.into_boxed_str());
+            let mut event = event_with_metadata(text).summary("");
+            event.source = text;
+            event.kind = text;
+            event.conn.sandbox.as_mut().unwrap().name = text.into();
+            event.conn.sni = Some(text.into());
+            event.conn.alpn = Some(text.as_bytes().into());
+            assert!(event.to_line().is_err());
+            let line = event_line(&event);
+            assert!(line.len() < 128 * 1024);
+            let replacement = Value::parse(line.as_bytes()).unwrap();
+            assert_serialization_error(&replacement, event.seq);
+            for name in ["source", "kind", "sni", "alpn", "task"] {
+                let value = replacement.get(name).and_then(Value::as_str).unwrap();
+                assert!(value.ends_with('…'), "{name}");
+                assert!(value.len() <= 1024 + '…'.len_utf8(), "{name}");
+            }
+            let sandbox = replacement.get("sandbox").unwrap();
+            let name = sandbox.get("name").and_then(Value::as_str).unwrap();
+            assert!(name.ends_with('…'));
+            assert!(name.len() <= 1024 + '…'.len_utf8());
+            for name in ["file", "line", "parent", "node"] {
+                assert_eq!(replacement.get(name), event.to_json().get(name));
+            }
+        }
     }
 }

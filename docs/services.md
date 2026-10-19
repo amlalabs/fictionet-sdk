@@ -570,10 +570,9 @@ TLS ownership and reproducibility are split across these files:
 - [`tls.rs`](../src/stdlib/services/tls.rs) owns transport, handshakes, ALPN selection
   and installs the run's key recorder. [`ca.rs`](../src/stdlib/services/ca.rs) issues certificates
   using the run's randomness and world-supplied leaf validity.
-- [`telemetry.rs`](../src/telemetry.rs) owns the bounded TLS key log, created
-  by the run. TLS acquires a recorder only while an observer is connected.
-  The recorder holds only that log. Capture, key export and decryption stay
-  in `observe`, including the public `observe::observed_config` helper.
+- [`tls_keys.rs`](../src/tls_keys.rs) emits TLS keys to interested run observers.
+  The adapter holds a weak dispatch reference. Capture, key retention, export
+  and decryption belong to `fictionet-observe`.
 - [`tls/output.rs`](../src/stdlib/services/tls/output.rs) drains ciphertext for both
   the server and the simulated client.
 

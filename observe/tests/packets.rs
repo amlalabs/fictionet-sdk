@@ -118,7 +118,7 @@ fn ping(seq: u16) -> Packet {
 }
 
 #[test]
-fn an_observer_watches_a_sandbox_links_packets_until_it_closes() {
+fn an_observer_sees_the_graph_its_changes_events_and_packets() {
     let directory = Directory::new();
     let dashboard = DashboardObserver::new(DashboardOptions::default());
     let _endpoint = serve(dashboard.handle(), directory.socket()).unwrap();
@@ -132,6 +132,7 @@ fn an_observer_watches_a_sandbox_links_packets_until_it_closes() {
                 let (mut mine, mut theirs) = fictionet::pair();
                 fcx.spawn(move |fcx| async move {
                     while let Ok(p) = theirs.recv(&fcx).await {
+                        fcx.emit("test", "echo", |event| event.field("len", p.0.len() as u64));
                         theirs.send(p);
                     }
                     Ok(())
@@ -159,8 +160,59 @@ fn an_observer_watches_a_sandbox_links_packets_until_it_closes() {
         edge.is_some()
     });
     let edge = edge.unwrap();
+    sandbox.send(ping(0));
+    let (mut counters, mut echoes) = (0, 0);
+    until(&mut client, |v| {
+        assert_eq!(v.id, watch);
+        assert!(!v.end);
+        let t = text(v);
+        if t.starts_with(r#"{"event":"counters""#) {
+            counters += 1;
+            if counters < 2 {
+                sandbox.send(ping(1));
+            }
+        }
+        if t.starts_with(r#"{"event":"event""#)
+            && t.contains(r#""source":"test","kind":"echo","#)
+            && t.contains(r#""fields":{"len":28}"#)
+        {
+            echoes += 1;
+        }
+        counters >= 2 && echoes >= 1
+    });
+    for request in [r#"{"op":"world"}"#, r#"{"op":"graph"}"#] {
+        let id = client.request(request).unwrap();
+        let value = until(&mut client, |v| v.id == id).pop().unwrap();
+        assert!(value.end && !value.binary);
+        if request.contains("world") {
+            assert!(text(&value).starts_with(r#"{"observe":2,"#));
+            assert!(text(&value).contains(r#""running":true"#));
+        } else {
+            assert!(text(&value).contains(r#""kind":"sandbox","name":"agent""#));
+            assert!(text(&value).contains(r#""file":"observe/tests/packets.rs""#));
+        }
+    }
     let cancel = client
         .request(&format!(r#"{{"op":"cancel","id":{watch}}}"#))
+        .unwrap();
+    let seen = until(&mut client, |v| v.id == cancel);
+    let ended = seen.iter().find(|v| v.id == watch && v.end).unwrap();
+    assert_eq!(
+        text(ended),
+        r#"{"event":"end","data":{"reason":"cancelled"}}"#
+    );
+    let events = text(&client.call(r#"{"op":"events","after":0,"max":2}"#).unwrap());
+    assert!(events.starts_with(r#"{"events":[{"seq":1,"#));
+    assert!(events.contains(r#""seq":2,"#));
+    assert!(!events.contains(r#""seq":3,"#));
+    let replay = client.request(r#"{"op":"watch","after":0}"#).unwrap();
+    let seen = until(&mut client, |v| {
+        v.id == replay && text(v).starts_with(r#"{"event":"event""#)
+    });
+    assert!(text(&seen[0]).contains(r#""events":[]"#));
+    assert!(text(seen.last().unwrap()).starts_with(r#"{"event":"event","data":{"seq":1,"#));
+    let cancel = client
+        .request(&format!(r#"{{"op":"cancel","id":{replay}}}"#))
         .unwrap();
     until(&mut client, |v| v.id == cancel);
 

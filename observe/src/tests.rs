@@ -77,6 +77,11 @@ fn sampling_uses_run_time_and_keeps_stream_sequences() {
             );
             assert_eq!(copies.packets[64].stamp.seq, 65);
             assert_eq!(copies.packets[65].stamp.seq, 67);
+            assert_eq!(copies.packets[66].stamp.seq, 69);
+            assert_eq!(
+                copies.packets.iter().filter(|p| p.stamp.seq <= 256).count(),
+                64 + 32 + 16 + 8
+            );
             assert_eq!(copies.packets[65].skipped, 1);
             assert_eq!(
                 count(&collector, Stream::Packets(link), LossReason::Sampling),
@@ -141,6 +146,23 @@ fn packet_bounds_and_snap_length_report_separate_losses() {
                     count(&collector, Stream::Packets(link), LossReason::Eviction),
                     3
                 );
+                let first = collector.packets(link, 0, 1);
+                assert_eq!(first.missed, 3);
+                assert_eq!(first.packets.len(), 1);
+                assert_eq!(first.packets[0].stamp.seq, 4);
+                assert_eq!(first.packets[0].skipped, 0);
+                for (after, missed) in [(1, 2), (2, 1), (3, 0)] {
+                    assert_eq!(collector.packets(link, after, 10).missed, missed);
+                }
+                let last = collector.packets(link, 4, 10);
+                assert_eq!(last.missed, 0);
+                assert_eq!(last.packets.len(), 1);
+                assert_eq!(last.packets[0].stamp.seq, 5);
+                for after in [5, u64::MAX] {
+                    let batch = collector.packets(link, after, 10);
+                    assert_eq!(batch.missed, 0);
+                    assert!(batch.packets.is_empty());
+                }
             },
         );
     }

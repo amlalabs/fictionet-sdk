@@ -62,7 +62,7 @@
 //! it.
 //!
 //! [`listen`](crate::listen) reads the attach type from `hello` only to
-//! tell an [observer](crate::observe), such as the dashboard, from a
+//! tell an observer, such as the dashboard, from a
 //! sandbox. World code is never told the type. It
 //! can only guess it from [`Attachment::mtu`](crate::Attachment::mtu),
 //! which is always 1500 for the proxy types, and from what the packets
@@ -360,7 +360,7 @@
 //! each type. The world is the `web_world` example from
 //! [`getting_started`](crate::guide::getting_started). The packet lists are what
 //! the world saw on the sandbox's `Attachment`, from
-//! `fictionet observe ... packets <link>` (see [`observe`](crate::observe)),
+//! `fictionet observe ... packets <link>` (see `fictionet-observe`),
 //! cut to their source, destination and summary. TLS 1.3 is shown
 //! decrypted, because the observer had the world's keys.
 //!

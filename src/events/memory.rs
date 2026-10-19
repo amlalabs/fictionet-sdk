@@ -380,8 +380,7 @@ mod tests {
         let flood = super::super::MAX_EVENTS as u64 + 10;
         block_on(lab(
             RunOptions::new(Seed::from_u64(1))
-                .aggregate_events()
-                .observer(retained),
+                .observer(Arc::new(crate::events::Aggregate::new(retained))),
             |cx| async move {
                 for i in 0..10u64 {
                     cx.emit("http", "request", |event| event.field("i", i));

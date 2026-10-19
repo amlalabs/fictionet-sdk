@@ -337,14 +337,13 @@ mod tests {
     }
 
     #[test]
-    fn run_options_aggregate_before_retention_and_fanout() {
+    fn aggregation_precedes_retention_and_fanout() {
         let history = Arc::new(Memory::new(Limits::new(4, 8192)));
         let evidence = Arc::new(Memory::new(Limits::new(4, 8192)));
         block_on(lab(
-            RunOptions::new(Seed::from_u64(7))
-                .aggregate_events()
-                .event_history(history.clone())
-                .observer(evidence.clone()),
+            RunOptions::new(Seed::from_u64(7)).observer(Arc::new(Aggregate::new(Arc::new(
+                crate::events::Fanout::new(vec![history.clone(), evidence.clone()]),
+            )))),
             |cx| async move {
                 for _ in 0..1000 {
                     cx.emit("lan", "drop", |e| e.repeat(Fields::new()));

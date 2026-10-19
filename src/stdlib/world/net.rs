@@ -220,7 +220,6 @@ pub struct Net {
     resolver: Option<Arc<Resolver>>,
     max_hosts: usize,
     routes: Vec<(String, Prefix)>,
-    registry: Option<fictionet::observe::Registry>,
     group: String,
     limits: Limits,
     lans: Vec<(String, Prefix)>,
@@ -250,7 +249,6 @@ impl Net {
             resolver: None,
             max_hosts: MAX_HOSTS,
             routes: Vec::new(),
-            registry: None,
             group: "net".to_owned(),
             limits: Limits::default(),
             lans: Vec::new(),
@@ -353,15 +351,6 @@ impl Net {
         self
     }
 
-    /// Installs `registry` for observers when the network starts, so the
-    /// dashboard decodes the services' protocols.
-    pub fn observe(self, registry: fictionet::observe::Registry) -> Net {
-        Net {
-            registry: Some(registry),
-            ..self
-        }
-    }
-
     /// Names the group observers see for the network's tasks.
     pub fn group(self, name: &str) -> Net {
         Net {
@@ -390,9 +379,6 @@ impl Net {
         } else {
             None
         };
-        if let Some(registry) = self.registry {
-            fcx.observe_protocols(registry);
-        }
         let caller = fcx.clone();
         let fcx = &fcx.group(self.group.clone());
         let router = route::router::<Box<dyn Interface>>(fcx, Vec::new());

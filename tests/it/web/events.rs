@@ -37,19 +37,22 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     world_events_with_memory(
-        RunOptions::new(Seed::from_u64(1)),
+        |memory| RunOptions::new(Seed::from_u64(1)).observer(memory),
         Arc::new(Memory::default()),
         f,
     )
 }
 
-fn world_events_with_memory<F, Fut>(options: RunOptions, evidence: Arc<Memory>, f: F)
-where
+fn world_events_with_memory<F, Fut>(
+    options: impl FnOnce(Arc<Memory>) -> RunOptions,
+    evidence: Arc<Memory>,
+    f: F,
+) where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     run_world::seeded_world(
-        options.event_history(evidence.clone()),
+        options(evidence.clone()),
         Duration::from_secs(60),
         move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
@@ -1480,9 +1483,14 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     let kept: Arc<std::sync::Mutex<Option<Arc<Memory>>>> = Arc::default();
     let keep = kept.clone();
     world_events_with_memory(
-        RunOptions::new(Seed::from_u64(1))
-            .aggregate_events()
-            .observer(jsonl.clone()),
+        |memory| {
+            RunOptions::new(Seed::from_u64(1)).observer(Arc::new(
+                fictionet::events::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
+                    memory,
+                    jsonl.clone(),
+                ]))),
+            ))
+        },
         Arc::new(Memory::default()),
         move |fcx, attacher, env, log| async move {
             // What a grader reads: a lookup, a TLS handshake and a request.

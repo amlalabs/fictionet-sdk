@@ -157,7 +157,7 @@
 //! - **N5.** A [`Service`](super::services::serve::Service) is named for what it
 //!   serves, with no suffix. Its associated types are `Decoder` and
 //!   `State`.
-//! - **N6.** [`Present`](fictionet::observe::Present) is implemented on the
+//! - **N6.** `fictionet_observe::Present` is implemented on the
 //!   decoder it presents.
 //!
 //! ## Framing errors and deliberate exceptions

@@ -184,7 +184,6 @@ impl LinkHandle {
     /// Replaces any label already set for this link in that run.
     pub fn label(&self, fcx: &Cx, label: String) {
         self.0.label(fcx, &label);
-        fcx.graph().label(&self.0, label);
     }
 }
 

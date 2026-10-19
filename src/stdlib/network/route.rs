@@ -1342,7 +1342,6 @@ mod tests {
                 let (b_lan, _b) = fictionet::pair();
                 lan.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
                 lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
-                assert!(!fcx.observed());
                 a.send(v4([192, 168, 56, 10], [192, 168, 56, 12]));
                 a.send(v4([192, 168, 56, 10], [10, 0, 0, 1]));
                 a.send(v4([192, 168, 56, 10], [192, 168, 56, 10]));
@@ -1424,6 +1423,32 @@ mod tests {
                     "the LAN has stopped"
                 );
                 assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// A router delivers a removed route to the installed observer.
+    #[test]
+    fn routers_record_routes_they_remove() {
+        let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(evidence.clone()),
+            |fcx| async move {
+                let (a, b) = fictionet::pair();
+                let (c, d) = fictionet::pair();
+                let router = fictionet::stdlib::network::route::router(
+                    &fcx,
+                    vec![("10.0.0.0/24".parse().unwrap(), a)],
+                );
+                router.add("10.0.1.0/24".parse().unwrap(), c);
+                drop(b);
+                fcx.sleep(Duration::from_millis(10)).await?;
+                let removed = evidence.checked_of("router", "route_removed").unwrap();
+                assert_eq!(removed.len(), 1);
+                assert_eq!(removed[0].str("prefix"), Some("10.0.0.0/24"));
+                drop(d);
                 Ok(())
             },
         ))

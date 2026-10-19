@@ -136,7 +136,6 @@ impl Interface for End {
             && let Some(task) = current
         {
             self.seen = current;
-            fcx.graph().owns(&self.cable.meter, self.side, task.id);
             self.cable.meter.owner(fcx, self.side, task.id);
         }
         {
@@ -176,10 +175,9 @@ impl Interface for End {
                 return;
             }
             let bytes = packet.0.len() as u64;
-            let Ok(packet) = dir.queue.try_push(packet, self.cable.limit) else {
+            let Ok(_) = dir.queue.try_push(packet, self.cable.limit) else {
                 return;
             };
-            self.cable.meter.copy(self.side, packet);
             dir.packets += 1;
             dir.bytes += bytes;
             dir.waker.take()
@@ -218,7 +216,6 @@ fn send_observed(
         }
         dir.packets += 1;
         dir.bytes += packet.0.len() as u64;
-        cable.meter.copy(side, &packet);
     }
     publication.publish(&packet);
     let waker = {

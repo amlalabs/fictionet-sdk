@@ -145,11 +145,6 @@
 //! reads [`RecvError::Closed`](crate::RecvError::Closed) and its name is
 //! free again. Until then, a new `hello` for that name is refused.
 //!
-//! **Observers.** [Observer sessions](crate::guide::proto#observer-sessions) are
-//! messages like any other, so a remote connection will carry them too,
-//! and `fictionet dashboard` will be able to watch a world on another
-//! machine.
-//!
 //! ## Writing to a stream
 //!
 //! On the Unix socket, each message is one datagram. The socket takes all

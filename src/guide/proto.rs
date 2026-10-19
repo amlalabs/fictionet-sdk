@@ -8,9 +8,8 @@
 //! Attach and the world talk over a Unix socket on the same machine, such
 //! as `/run/fictionet/world.sock`. The connection starts with a short
 //! handshake, in which attach names the sandbox, and then carries IP
-//! packets both ways until either side closes it. Observers, such as
-//! `fictionet dashboard`, use the same socket to watch the world: see
-//! [Observer sessions](#observer-sessions).
+//! packets both ways until either side closes it. Observation uses a separate
+//! socket served by `fictionet-observe`.
 //!
 //! # The socket
 //!
@@ -38,8 +37,6 @@
 //! | 2 | `accept` | the world | empty |
 //! | 3 | `refuse` | the world | the reason, in UTF-8, such as "agent is already attached" |
 //! | 4 | `packet` | both | one IP packet |
-//! | 5 | `request` | an observer | an id (u32), then a JSON object |
-//! | 6 | `reply` | the world, to an observer | the request's id (u32), flags (u8), then part of a value |
 //!
 //! Kind 0 is reserved for a remote transport (see the
 //! [roadmap](crate::guide::roadmap#remote-attach-a-tls-transport)).
@@ -54,8 +51,8 @@
 //! Numbers are big-endian. The version is 1, and the world refuses a
 //! `hello` with any other version. The MTU is the sandbox's, and the world
 //! reads it with [`Attachment::mtu`](crate::Attachment::mtu). The type is
-//! the attach type, such as `tun`, or `observe` for an
-//! [observer](#observer-sessions).
+//! the attach type, such as `tun`, `tap`, `http_proxy`, or `socks5`.
+//! Observation hellos are refused as unknown attach types.
 //!
 //! For example, attach started with `--name agent --type tun` (see
 //! [`attaching`](crate::guide::attaching)) on a sandbox with an MTU of 1500 sends
@@ -106,80 +103,3 @@
 //!    │                                        │  reads RecvError::Closed
 //! ```
 //!
-//! # Observer sessions
-//!
-//! An observer, such as `fictionet dashboard` or `fictionet observe`, uses
-//! the same socket as attach. It sends a `hello` with the type `observe`
-//! and version 1. The world ignores the MTU, and treats the name as a label
-//! for the observer: unlike a sandbox's name, it is not reserved, so multiple
-//! admitted observers can use the same one. The world answers `accept`
-//! when observation is enabled, the version is supported, and its listener
-//! has a session slot. By default each listener admits 64 observers,
-//! including idle clients. At capacity it sends `refuse` with the reason
-//! `this listener has too many observer sessions`. See
-//! [resource limits](crate::observe#resource-limits) for configuration.
-//! It never makes the connection an [`Attachment`](crate::Attachment).
-//! It refuses any other type that starts with `observe`, such as `observe2`:
-//! those are kept for later
-//! versions of the observe API. Anyone who can open the world
-//! socket can observe the world, so the socket's file permissions decide
-//! who may watch, as they decide who may attach.
-//!
-//! Then the observer sends `request` messages, and the world answers each
-//! with `reply` messages that carry the same id. The observer picks the
-//! ids, and must not reuse one while it is still being answered. What the
-//! requests ask for, and what the replies say, is the
-//! [observe API](crate::observe#the-api).
-//! The observer closes the session on a malformed or oversized reply.
-//!
-//! ```text
-//!   kind     id        a JSON object
-//! ┌──────┬─────────────┬────────────────────────┐
-//! │  05  │ 00 00 00 01 │ {"op":"graph"}         │   request
-//! └──────┴─────────────┴────────────────────────┘
-//!
-//!   kind     id       flags   part of a value
-//! ┌──────┬─────────────┬────┬────────────────────┐
-//! │  06  │ 00 00 00 01 │ 02 │ {"t":12.5,...}     │   reply
-//! └──────┴─────────────┴────┴────────────────────┘
-//! ```
-//!
-//! A reply's flags:
-//!
-//! | Mask | Name | Meaning |
-//! |---|---|---|
-//! | 1 | `MORE` | the value goes on in the next reply with this id |
-//! | 2 | `END` | no more replies come for this id |
-//! | 4 | `BINARY` | the value is raw bytes, such as a pcapng file, not JSON |
-//!
-//! A value longer than one message (65,530 bytes after the reply's header)
-//! is cut into parts. Each part but the last has `MORE`, and the observer
-//! joins them. A request for one value gets one value, with `END`. A
-//! stream, such as `watch`, gets values until its last one, which has
-//! `END`. Replies to different requests can arrive between each other, but
-//! the parts of one value never do.
-//! All parts of a value have the same id and `BINARY` flag. Unknown flag bits
-//! and `MORE` combined with `END` are invalid. The observer closes the
-//! session on invalid flags or a mismatched continuation. A connection that
-//! closes during a value cuts it short. This is not a clean end of the session.
-//!
-//! ```text
-//! observer                                  world
-//!    │                                        │
-//!    │ ── hello: version 1, type observe ───▶ │
-//!    │ ◀─────────────────────────── accept ── │
-//!    │ ── request 1: {"op":"watch"} ────────▶ │
-//!    │ ◀── reply 1: {"event":"snapshot",.. ── │  MORE, MORE, then the last
-//!    │ ◀── reply 1: {"event":"counters",.. ── │  part: one value each
-//!    │ ── request 2: {"op":"graph"} ────────▶ │
-//!    │ ◀── reply 2: {"t":..,"nodes":[..]} ─── │  END: request 2 is answered
-//!    │ ◀── reply 1: {"event":"event",.. ───── │  the stream goes on
-//!    │ ── request 3: {"op":"cancel","id":1} ▶ │
-//!    │ ◀── reply 1: {"event":"end",..} ────── │  END: the stream is over
-//!    │ ◀── reply 3: {"ok":true} ──────────── │  END
-//!    │ ┄┄┄┄┄┄┄┄┄ either side closes ┄┄┄┄┄┄┄┄┄ │
-//! ```
-//!
-//! Any other message from the observer closes the connection. So does an
-//! observer that stops reading for 10 seconds, so that a reply cannot be
-//! sent.

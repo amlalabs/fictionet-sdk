@@ -64,11 +64,11 @@
 //!
 //! # 3. Start the world
 //!
-//! In a first terminal, start the world. Its two arguments are the socket
-//! to listen on and the file to write its certificate authority to:
+//! In a first terminal, start the world. Its arguments are the attachment
+//! socket, the certificate authority file, and the optional observation socket:
 //!
 //! ```text
-//! $ target/release/examples/web_world /run/fictionet/world.sock /run/fictionet/ca.pem
+//! $ target/release/examples/web_world /run/fictionet/world.sock /run/fictionet/ca.pem /run/fictionet/observe.sock
 //! listening on /run/fictionet/world.sock, CA in /run/fictionet/ca.pem
 //! ```
 //!
@@ -290,7 +290,7 @@
 //! In another terminal, start watching the world's HTTP requests:
 //!
 //! ```text
-//! $ target/release/fictionet observe --world unix:/run/fictionet/world.sock watch | grep '"kind":"request"'
+//! $ target/release/fictionet observe --observation unix:/run/fictionet/observe.sock watch | grep '"kind":"request"'
 //! ```
 //!
 //! Back in the third terminal, repeat these two requests:
@@ -318,7 +318,7 @@
 //! ```
 //!
 //! `fictionet dashboard` shows the same world in a browser
-//! ([`observe`](crate::observe)). An eval writes such events to a log file of its own,
+//! (`fictionet-observe`). An eval writes such events to a log file of its own,
 //! as the [Border](https://github.com/amlalabs/fictionet-sdk/tree/main/examples/border)
 //! and [FakeWiki](https://github.com/amlalabs/fictionet-sdk/tree/main/examples/fakewiki) worlds do.
 //!
