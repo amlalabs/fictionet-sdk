@@ -10,8 +10,51 @@ pub use seed::Seed;
 use crate::route::{Engine, Route, query_key, route};
 use fictionet::Cx;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
+
+/// A change to the stub's generation settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum Command {
+    /// Make new result lists and pages, or serve only stored ones.
+    SetGeneration {
+        generate: bool,
+        expected_revision: u64,
+    },
+}
+
+/// The settings revision after an accepted command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Applied {
+    pub revision: u64,
+    /// Run time when the command was applied, in milliseconds.
+    pub at_ms: u64,
+}
+
+/// A command that did not change the settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum Rejected {
+    /// The caller's revision differs from the current settings revision.
+    Stale { current: u64 },
+}
+
+/// The current generation setting and its revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Generation {
+    pub generate: bool,
+    pub revision: u64,
+}
+impl Default for Generation {
+    fn default() -> Self {
+        Self {
+            generate: true,
+            revision: 0,
+        }
+    }
+}
 
 /// A backend answer before its metadata is moved to the request event.
 #[derive(Clone, Debug)]
@@ -56,6 +99,7 @@ struct StoredPage {
 }
 #[derive(Default)]
 struct Store {
+    generation: Generation,
     pages: Vec<StoredPage>,
     mentions: Vec<((String, String), Vec<Value>)>,
     sites: Vec<(String, make::Profile)>,
@@ -259,6 +303,45 @@ impl Stub {
         &self.seed
     }
 
+    /// Applies a command against the current revision, without clearing pages.
+    /// Only a changed setting advances the revision and emits an event.
+    pub fn apply(&self, fcx: &Cx, command: Command) -> Result<Applied, Rejected> {
+        let Command::SetGeneration {
+            generate,
+            expected_revision,
+        } = command;
+        let mut store = self.store.lock().unwrap();
+        let generation = &mut store.generation;
+        if expected_revision != generation.revision {
+            return Err(Rejected::Stale {
+                current: generation.revision,
+            });
+        }
+        if generate != generation.generate {
+            generation.generate = generate;
+            generation.revision += 1;
+            fcx.emit("adaptive", "generation", |event| {
+                event
+                    .summary(format_args!(
+                        "generation {} at revision {}",
+                        if generate { "enabled" } else { "disabled" },
+                        generation.revision
+                    ))
+                    .field("generate", generate)
+                    .field("revision", generation.revision)
+            });
+        }
+        Ok(Applied {
+            revision: generation.revision,
+            at_ms: fcx.now().since_start().as_millis() as u64,
+        })
+    }
+
+    /// Returns the generation setting without reading or writing files.
+    pub fn generation(&self) -> Generation {
+        self.store.lock().unwrap().generation
+    }
+
     /// Answers a request without real I/O. Supply form bytes for form POSTs.
     pub fn handle(
         &self,
@@ -329,6 +412,20 @@ impl Stub {
         let index = if let Some(i) = cached {
             i
         } else {
+            if !store.generation.generate {
+                let search = make::Search {
+                    results: vec![],
+                    related: vec![],
+                    questions: vec![],
+                    ads: vec![],
+                };
+                return Response::html(
+                    render::search(engine, query, &search, start),
+                    json!({"kind":"search","engine":engine.as_str(),"search":query,"cache":"missing","model":null,"results":0,"listed":[]}),
+                    200,
+                    render::engine_server(engine),
+                );
+            }
             if !store.begin_generation() {
                 return Response::budget("search");
             }
@@ -376,6 +473,15 @@ impl Stub {
                 meta.shift_remove("cost");
             }
             return response;
+        }
+        if !store.generation.generate {
+            let profile = store.sites.iter().find(|(h, _)| h == host).map(|(_, p)| p);
+            return Response::html(
+                render::not_found(host, profile, target, &self.seed.date[..4]),
+                json!({"kind":"page","cache":"missing"}),
+                404,
+                render::server_of(profile),
+            );
         }
         let (url, title, description, response) = if let Some(fixed) =
             self.seed.fixed_for(host, target)

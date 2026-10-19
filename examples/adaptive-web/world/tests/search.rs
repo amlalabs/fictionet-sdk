@@ -17,6 +17,48 @@ fn feed(s: &Searches, seq: u64, event: Event) {
 fn searches() -> Searches {
     Searches::new(SeedCard::default(), Generator::default())
 }
+
+#[test]
+fn generation_events_update_the_card() {
+    let s = searches();
+    assert!(s.enabled(
+        Metadata {
+            source: "adaptive",
+            kind: "generation"
+        },
+        &ConnInfo::default(),
+    ));
+    feed(&s, 1, query(1, "google", "a"));
+    let generation = |generate, revision: u64| {
+        Event::new("adaptive", "generation")
+            .field("generate", generate)
+            .field("revision", revision)
+    };
+    feed(&s, 2, generation(false, 1));
+    let off = s.snapshot();
+    assert!(!off.generator.generate);
+    assert_eq!(off.generator.generation_revision, 1);
+    assert_eq!((off.revision, off.at_ms), (2, 20));
+    for event in [
+        generation(false, 1),
+        generation(true, 0),
+        Event::new("adaptive", "generation").field("revision", 2u64),
+        Event::new("adaptive", "generation").field("generate", true),
+    ] {
+        feed(&s, 3, event);
+        assert_eq!(s.snapshot(), off);
+    }
+    feed(&s, 4, generation(true, 2));
+    let on = s.snapshot();
+    assert!(on.generator.generate);
+    assert_eq!(on.generator.generation_revision, 2);
+    assert_eq!((on.revision, on.at_ms), (3, 40));
+    assert_eq!(on.queries, off.queries);
+    let replay = Searches::from_hello(&json!({"generator":"replay"})).snapshot();
+    assert!(!replay.generator.generate);
+    assert_eq!(replay.generator.generation_revision, 0);
+}
+
 fn query(id: u64, engine: &str, key: &str) -> Event {
     Event::new("adaptive", "query")
         .field("query_id", id)
@@ -400,6 +442,8 @@ fn worst_case_snapshot_fits() {
             kind: GeneratorKind::Openrouter,
             model: t,
             prefetch: n,
+            generate: false,
+            generation_revision: n,
         },
         queries: vec![q; MAX_QUERIES],
         results: vec![list; MAX_RESULTS],

@@ -22,13 +22,13 @@ pub const MAX_SITES: usize = 128;
 pub const MAX_REFUSED: usize = 64;
 /// Facts and site hosts retained in each seed list.
 pub const MAX_SEED_ITEMS: usize = 32;
-/// Maximum compact snapshot JSON size: 3,934,927 bytes at these limits.
+/// Maximum compact snapshot JSON size: 3,934,987 bytes at these limits.
 /// Each string byte can need six JSON bytes. Numbers use twenty digits.
 /// Fixed costs include field names, punctuation and the longest enum values.
 pub const MAX_SNAPSHOT_BYTES: usize = {
     let string = 6 * STRING_BYTES;
     // Snapshot, seed, generator and omitted counts, with four strings.
-    519 + 4 * string
+    579 + 4 * string
         // Two seed lists, with quotes and a comma per item.
         + 2 * MAX_SEED_ITEMS * (3 + string)
         // Query rows, including failure text and a comma per row.
@@ -84,12 +84,27 @@ pub enum GeneratorKind {
     Unknown,
 }
 /// The generator settings for a run.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generator {
     pub kind: GeneratorKind,
     pub model: String,
     /// Maximum result pages to fetch ahead of time per search.
     pub prefetch: u64,
+    /// Whether new searches and pages can be made.
+    pub generate: bool,
+    /// Revision of the generation setting, independent of the snapshot.
+    pub generation_revision: u64,
+}
+impl Default for Generator {
+    fn default() -> Self {
+        Self {
+            kind: GeneratorKind::default(),
+            model: String::new(),
+            prefetch: 0,
+            generate: true,
+            generation_revision: 0,
+        }
+    }
 }
 /// How the backend supplied an answer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +415,7 @@ impl Searches {
                 kind: GeneratorKind::Stub,
                 model: "stub".into(),
                 prefetch: 0,
+                ..Generator::default()
             },
         )
     }
@@ -426,6 +442,8 @@ impl Searches {
                 kind: serde_json::from_value(hello["generator"].clone()).unwrap_or_default(),
                 model: string("model"),
                 prefetch: hello["prefetch"].as_u64().unwrap_or(0),
+                generate: hello["generator"] != "replay",
+                ..Generator::default()
             },
         )
     }
@@ -441,7 +459,10 @@ impl Observer for Searches {
     fn enabled(&self, m: Metadata, _: &ConnInfo) -> bool {
         matches!(
             (m.source, m.kind),
-            ("adaptive", "site" | "refused" | "query" | "query_failed") | ("http", "request")
+            (
+                "adaptive",
+                "site" | "refused" | "query" | "query_failed" | "generation"
+            ) | ("http", "request")
         )
     }
     fn observe(&self, stamp: Stamp, observation: Observation<'_>) {
@@ -477,6 +498,18 @@ fn host(url: &str) -> String {
 impl Snapshot {
     fn apply(&mut self, e: &Event, seq: u64, ms: u64) -> bool {
         match (e.source, e.kind) {
+            ("adaptive", "generation") => {
+                let (Some(generate), Some(revision)) = (parse(e, "generate"), e.u64("revision"))
+                else {
+                    return false;
+                };
+                if revision <= self.generator.generation_revision {
+                    return false;
+                }
+                self.generator.generate = generate;
+                self.generator.generation_revision = revision;
+                true
+            }
             ("adaptive", "query") => {
                 let (Some(id), Some(engine)) = (e.u64("query_id"), parse(e, "engine")) else {
                     return false;

@@ -32,6 +32,51 @@
 //! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, the
 //!   ready file, and the store. The log is written from the run's events
 //!   ([`events`]).
+//!
+//! An in-process world can keep its addresses, pages and CA in memory.
+//! This example sends its log to standard output. Give the PEM root and
+//! attacher to the guest runner, then use commands to change generation.
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use adaptive_web_world::{Addresses, Ca, serve, world_start};
+//! use adaptive_web_world::{events::LogObserver, search::Searches};
+//! use adaptive_web_world::stub::{Command, Seed, Stub};
+//! use example_common::log::Log;
+//! use fictionet::events::Fanout;
+//!
+//! # fn main() -> fictionet::Result {
+//! let seed = Seed::builtin("halvard-cve")?;
+//! let start = world_start(&seed.date)?;
+//! let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), None)?);
+//! let searches = Arc::new(Searches::from_seed(&seed));
+//! let stub = Arc::new(Stub::new(seed));
+//! let log = Arc::new(Log::new(Box::new(std::io::stdout()), &[], |s| s));
+//! let observer = Arc::new(Fanout::new(vec![
+//!     searches.clone(),
+//!     Arc::new(LogObserver { log: log.clone() }),
+//! ]));
+//! let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(7))
+//!     .observer(observer);
+//! let output = log.clone();
+//! fictionet::block_on(fictionet::run(options, |cx| async move {
+//!     let ca = Arc::new(Ca::in_memory(&cx, start)?);
+//!     let root_pem = ca.cert_pem();
+//!     let (attacher, attachments) = fictionet::attachments();
+//!     serve(&cx, addresses, ca, stub.clone(), log.clone(), start, attachments)?;
+//!     // Start a guest with root_pem and attacher here.
+//!     let applied = stub.apply(&cx, Command::SetGeneration {
+//!         generate: false,
+//!         expected_revision: stub.generation().revision,
+//!     }).unwrap();
+//!     assert_eq!(applied.revision, 1);
+//!     cx.cancelled().await;
+//!     Ok(())
+//! }))?;
+//! output.finish()?;
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod backend;
 pub mod events;
@@ -311,7 +356,7 @@ impl Ca {
     pub fn new(fcx: &Cx, dir: &Path, start: SystemTime) -> fictionet::Result<Ca> {
         let ca = Self::in_memory(fcx, start)?;
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("ca.pem"), ca.issuer.cert_pem())?;
+        std::fs::write(dir.join("ca.pem"), ca.cert_pem())?;
         Ok(ca)
     }
 
@@ -321,6 +366,11 @@ impl Ca {
             issuer: fictionet::stdlib::services::ca::Ca::new(fcx, "Internet Security Root CA")?,
             start,
         })
+    }
+
+    /// Returns the public root certificate in PEM format for a guest to trust.
+    pub fn cert_pem(&self) -> String {
+        self.issuer.cert_pem()
     }
 
     /// A certificate for `host`: the host as CN and SAN, for server auth,

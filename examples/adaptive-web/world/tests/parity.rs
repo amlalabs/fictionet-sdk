@@ -112,7 +112,7 @@ fn parity(name: &'static str) {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let base = std::env::temp_dir().join(format!("adaptive-parity-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
-    let python = common::Python::start(name, &here.join("../seeds"), &base);
+    let python = common::Python::start(name, &here.join("../seeds"), &base, "stub");
     let seed = Seed::builtin(name).unwrap();
     assert_eq!(
         seed.fixed_addresses(),
@@ -272,11 +272,125 @@ fn fastjsonl() {
 }
 
 #[test]
+fn generation_switch_matches_python_replay() {
+    use adaptive_web_world::stub::Command;
+    for capture_fixed in [false, true] {
+        let seeds = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seeds");
+        let base = std::env::temp_dir().join(format!(
+            "adaptive-parity-replay-{capture_fixed}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let stub = Stub::new(Seed::builtin("halvard-cve").unwrap());
+        fictionet::block_on(fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            |cx| async move {
+                let ask = |python: &common::Python, host: &str, target: &str| {
+                    let rust = stub.handle(&cx, "GET", host, target, None);
+                    compare(
+                        &format!("{host}{target}"),
+                        rust.clone(),
+                        python_request(python, "GET", host, target, None),
+                    );
+                    rust
+                };
+                let python = common::Python::start("halvard-cve", &seeds, &base, "stub");
+                let query = ask(&python, "www.google.com", "/search?q=stored");
+                let page = ask(&python, "pages.io", "/stored");
+                let fixed = &stub.seed().fixed[0];
+                if capture_fixed {
+                    assert_eq!(ask(&python, &fixed.host, &fixed.target).body, fixed.body);
+                }
+                drop(python);
+                assert_eq!(
+                    stub.apply(
+                        &cx,
+                        Command::SetGeneration {
+                            generate: false,
+                            expected_revision: 0,
+                        }
+                    )
+                    .unwrap()
+                    .revision,
+                    1
+                );
+                let python = common::Python::start("halvard-cve", &seeds, &base, "replay");
+                let cached_query = ask(&python, "www.google.com", "/search?q=stored");
+                assert_eq!(cached_query.meta["cache"], "cached");
+                assert_eq!(cached_query.body, query.body);
+                let cached_page = ask(&python, "pages.io", "/stored");
+                assert_eq!(cached_page.meta["cache"], "cached");
+                assert_eq!(cached_page.body, page.body);
+                for (host, target) in [
+                    ("www.google.com", "/search?q=new&start=10"),
+                    ("html.duckduckgo.com", "/html/?q=new&s=10"),
+                    ("www.bing.com", "/search?q=new&first=11"),
+                ] {
+                    let missing = ask(&python, host, target);
+                    assert_eq!(missing.status, 200);
+                    assert_eq!(missing.meta["cache"], "missing");
+                    assert_eq!(missing.meta["model"], serde_json::Value::Null);
+                    assert_eq!(missing.meta["results"], 0);
+                    assert_eq!(missing.meta["listed"], serde_json::json!([]));
+                }
+                for host in ["pages.io", "new-pages.io"] {
+                    let missing = ask(&python, host, "/new?a=1&b=2");
+                    assert_eq!(missing.status, 404);
+                    assert_eq!(missing.meta["cache"], "missing");
+                    assert!(missing.meta.get("model").is_none());
+                }
+                let fixed_response = ask(&python, &fixed.host, &fixed.target);
+                assert_eq!(fixed_response.status, if capture_fixed { 200 } else { 404 });
+                assert_eq!(
+                    fixed_response.meta["cache"],
+                    if capture_fixed { "fixed" } else { "missing" }
+                );
+                if capture_fixed {
+                    assert_eq!(fixed_response.body, fixed.body);
+                }
+                drop(python);
+                assert_eq!(
+                    stub.apply(
+                        &cx,
+                        Command::SetGeneration {
+                            generate: true,
+                            expected_revision: 1,
+                        }
+                    )
+                    .unwrap()
+                    .revision,
+                    2
+                );
+                let python = common::Python::start("halvard-cve", &seeds, &base, "stub");
+                assert_eq!(
+                    ask(&python, "www.google.com", "/search?q=stored").body,
+                    query.body
+                );
+                assert_eq!(ask(&python, "pages.io", "/stored").body, page.body);
+                for host in ["pages.io", "new-pages.io"] {
+                    let made = ask(&python, host, "/new?a=1&b=2");
+                    assert_eq!(made.status, 200);
+                    assert_eq!(made.meta["cache"], "generated");
+                }
+                let made = ask(&python, "www.google.com", "/search?q=new&start=10");
+                assert_eq!(made.meta["cache"], "generated");
+                assert_eq!(made.meta["results"], 10);
+                assert_eq!(ask(&python, &fixed.host, &fixed.target).body, fixed.body);
+                drop(python);
+                std::fs::remove_dir_all(base).unwrap();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+}
+
+#[test]
 fn generation_budget_matches_python() {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let base = std::env::temp_dir().join(format!("adaptive-parity-budget-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
-    let python = common::Python::start("halvard-cve", &here.join("../seeds"), &base);
+    let python = common::Python::start("halvard-cve", &here.join("../seeds"), &base, "stub");
     let stub = Stub::new(Seed::builtin("halvard-cve").unwrap());
     fictionet::block_on(fictionet::lab(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),

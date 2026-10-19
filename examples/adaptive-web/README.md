@@ -259,6 +259,8 @@ Three containers, as in FakeWiki:
     from, `direct`, or `fixed`). The log leaves both out. A search's id is
     `query_id` in the `adaptive.query`, `adaptive.query_failed` and
     answering `http.request` events, and `id` in the log.
+    A `generation` line carries `generate` and `revision` when the Rust
+    stub's generation setting changes.
   * **For a live page.** `Searches` (`world/src/search.rs`) is an observer
     that turns these events into one serde snapshot with a revision and the
     run time of its last change: the seed card and generator, each search
@@ -268,7 +270,7 @@ Three containers, as in FakeWiki:
     their address, and the refused names. Named limits keep the most recent
     128 searches, 24 result lists and 128 pages, the first 128 sites and
     the last 64 refused names, and cut strings at 256 bytes. `omitted`
-    counts what was dropped. The snapshot stays under 3,934,927 bytes of
+    counts what was dropped. The snapshot stays under 3,934,987 bytes of
     JSON.
 * **`attach`** runs `fictionet attach --type tun` with IPv6 off.
 * **`default`, the agent**, shares attach's network namespace. Its only
@@ -279,7 +281,12 @@ Three containers, as in FakeWiki:
 (`world/src/stub/`) that serves the same bytes and metadata as the Python
 stub. A demo can run the whole world inside one Rust program, with the
 seeds embedded and no Python or page files on the host. It keeps pages in
-memory for the run. Evals and model generation use the Python backend.
+memory for the run. It takes one command, `SetGeneration`. With
+generation off it serves only what it has already made, as the Python
+backend does in replay: a new search gets no results and a new URL gets a
+404. Turning generation back on keeps everything made so far. A command
+names the setting's revision it expects and is rejected if that revision
+is stale. Evals and model generation use the Python backend.
 
 What one new page is made from:
 

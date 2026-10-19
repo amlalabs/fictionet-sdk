@@ -12,7 +12,7 @@ pub struct Python {
     pub port: u16,
 }
 impl Python {
-    pub fn start(seed: &str, seeds: &Path, store: &Path) -> Self {
+    pub fn start(seed: &str, seeds: &Path, store: &Path, generator: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -22,7 +22,7 @@ impl Python {
             .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("backend"))
             .env("ADAPTIVE_WEB_SEED", seed)
             .env("ADAPTIVE_WEB_SEEDS", seeds)
-            .env("ADAPTIVE_WEB_GENERATOR", "stub")
+            .env("ADAPTIVE_WEB_GENERATOR", generator)
             .env("ADAPTIVE_WEB_STORE", store)
             .env_remove("ADAPTIVE_WEB_PREFETCH")
             .stdout(Stdio::piped())

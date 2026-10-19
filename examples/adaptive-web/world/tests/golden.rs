@@ -180,6 +180,7 @@ fn golden(use_stub: bool) {
             "halvard-cve",
             &seeds_dated(&base, &seed.date),
             &base.join("store"),
+            "stub",
         ))
     };
     let port = child.as_ref().map_or(0, |p| p.port);
