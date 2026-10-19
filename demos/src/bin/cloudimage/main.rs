@@ -237,6 +237,7 @@ async fn gate(ch_bin: &Path, image: &Path, vmlinuz: &Path, initrd: &Path) -> Res
     println!("\n=== measurements ===");
     println!("boot to ssh-ready:  {ssh_ready_ms} ms");
     println!("boot to desktop:    {} ms", checks.desktop_ready_ms);
+    println!("coding agents:      {}", checks.agents_install);
     println!("whole run:          {} ms", total.elapsed().as_millis());
     println!("peak VM memory:     {} MiB", checks.peak_rss_mib);
     for shot in &checks.screenshots {
@@ -278,6 +279,9 @@ async fn admin_session(
 
 struct Checks {
     desktop_ready_ms: u128,
+    /// The guest's own measure of the coding agents' install: bytes
+    /// downloaded and seconds taken.
+    agents_install: String,
     peak_rss_mib: u64,
     screenshots: Vec<String>,
 }
@@ -442,7 +446,7 @@ async fn run_checks(
     );
 
     // Required: Firefox loaded the site, seen as the world's http.request
-    // event (nothing else fetches it over HTTP).
+    // event with Firefox's User-Agent.
     let firefox_deadline = Instant::now() + Duration::from_secs(90);
     while !world.firefox_loaded() && Instant::now() < firefox_deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -527,12 +531,74 @@ async fn run_checks(
         None => println!("noVNC viewer screenshot: not captured"),
     }
 
+    // Required: the coding agents are on the desktop user's PATH over SSH,
+    // each at its pinned release.
+    let claude = guest_cmd(session, "claude --version").await?;
+    check(
+        &mut failures,
+        &format!("claude --version is Claude Code {}", seed::CLAUDE_VERSION),
+        claude.code == 0
+            && claude
+                .stdout
+                .contains(&format!("{} (Claude Code)", seed::CLAUDE_VERSION)),
+    );
+    let codex = guest_cmd(session, "codex --version").await?;
+    check(
+        &mut failures,
+        &format!("codex --version is codex-cli {}", seed::CODEX_VERSION),
+        codex.code == 0 && codex.stdout.trim() == format!("codex-cli {}", seed::CODEX_VERSION),
+    );
+
+    // Required: each agent's own HTTP client trusts the world's CA through
+    // the system store, with no flags. Each asks the site for a path it does
+    // not serve; reporting the site's 404 means the client verified the
+    // Zscaler chain, where a distrusted chain reports a certificate error.
+    let claude_tls = guest_cmd(
+        session,
+        &format!("timeout 60 claude plugin marketplace add https://{SITE}/marketplace.json 2>&1"),
+    )
+    .await?;
+    check(
+        &mut failures,
+        &format!("Claude Code's client gets the {SITE} site's answer over the Zscaler chain"),
+        claude_tls.stdout.contains("HTTP 404") && !claude_tls.stdout.contains("certificate"),
+    );
+    // Codex's doctor probes the active model provider's inference URL.
+    let codex_tls = guest_cmd(
+        session,
+        &format!(
+            "timeout 60 codex -c model_provider=site \
+             -c 'model_providers.site={{name=\"site\",base_url=\"https://{SITE}\",requires_openai_auth=false}}' \
+             doctor --no-color --ascii 2>&1 | grep -iE 'inference URL|TLS|certificate|sandbox'"
+        ),
+    )
+    .await?;
+    check(
+        &mut failures,
+        &format!("Codex's client gets the {SITE} site's answer over the Zscaler chain"),
+        codex_tls
+            .stdout
+            .contains(&format!("https://{SITE}/responses reachable (HTTP 404)")),
+    );
+    let agents = guest_cmd(
+        session,
+        "sudo grep -h '^coding agents:' /var/log/cloud-init-output.log || echo 'coding agents: not installed'",
+    )
+    .await?;
+    let agents_install = agents
+        .stdout
+        .trim()
+        .trim_start_matches("coding agents:")
+        .trim()
+        .to_string();
+
     let peak_rss_mib = vm_peak_rss_mib(vm).unwrap_or(0);
     if !failures.is_empty() {
         return Err(format!("the gate's required checks failed: {}", failures.join("; ")).into());
     }
     Ok(Checks {
         desktop_ready_ms,
+        agents_install,
         peak_rss_mib,
         screenshots,
     })

@@ -6,10 +6,12 @@
 //! The user-data installs an Xfce desktop from the world's apt mirror
 //! (Firefox from Mozilla's repository, not the snap), one system-wide trust
 //! store pointing every TLS client at the world's CA, and Xvnc with an Xfce
-//! session on the loopback. The admin reaches the guest with Ubuntu's own
-//! sshd on port 22, as the image ships it, with this run's key, and tunnels
-//! VNC through it. The config files go in as base64 `write_files`, and a
-//! setup script does the install and wiring.
+//! session on the loopback. It also installs two coding agents, Claude Code
+//! and Codex, from their vendors' release servers: pinned releases, each
+//! checked against the sha256 its own installer checks. The admin reaches
+//! the guest with Ubuntu's own sshd on port 22, as the image ships it, with
+//! this run's key, and tunnels VNC through it. The config files go in as
+//! base64 `write_files`, and a setup script does the install and wiring.
 
 use std::io::{Cursor, Write};
 
@@ -17,6 +19,20 @@ use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 
 /// Mozilla's apt signing key, armored (public; checked against its sha256).
 const MOZILLA_KEY: &str = include_str!("packages.mozilla.org.asc");
+
+/// Claude Code's native build, on Anthropic's stable channel. The guest
+/// fetches the zstd file as Anthropic's installer does, and checks it and
+/// the binary it unpacks to against the sha256s in the release's
+/// `manifest.zst.json` and `manifest.json`, both signed with Anthropic's
+/// release key.
+pub const CLAUDE_VERSION: &str = "2.1.292";
+const CLAUDE_ZST_SHA256: &str = "28509427a53a5c15bd94d022d39013cc4b867a8e6305497f48162dcf91576326";
+const CLAUDE_SHA256: &str = "a967e7b1d8b4e47ee421d5433027880347952b0c0857abf880e2c942a4ec93b3";
+/// Codex's standalone package for x86-64 Linux (musl), the one OpenAI's
+/// installer unpacks: the CLI with its ripgrep and bubblewrap. Its sha256 is
+/// the digest the release lists on GitHub and on releases.openai.com.
+pub const CODEX_VERSION: &str = "0.163.0";
+const CODEX_SHA256: &str = "df22dac1f24b7927e817e8b113067fbe1caa586aba7554247fabd49464cf9c96";
 
 /// What the guest is provisioned with.
 pub struct Provision<'a> {
@@ -188,6 +204,13 @@ fn user_data(p: &Provision) -> String {
          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
             .into(),
     ));
+    // Claude Code stays at the pinned release: Anthropic's setting for a
+    // binary distributed through the organization's own channel.
+    files.push((
+        "/etc/claude-code/managed-settings.json",
+        "0644",
+        "{\"env\":{\"DISABLE_UPDATES\":\"1\"}}\n".into(),
+    ));
     files.push(("/opt/setup-desktop.sh", "0755", setup));
 
     let mut out = String::from(
@@ -259,7 +282,26 @@ fn setup_script(user: &str) -> String {
          # Apply the DefaultEnvironment drop-in, then bring the desktop up.\n\
          systemctl daemon-reexec\n\
          systemctl daemon-reload\n\
-         systemctl enable --now vnc.service\n",
+         systemctl enable --now vnc.service\n\
+         # The coding agents, from their vendors' release servers, each checked\n\
+         # against its pinned sha256; sha256sum -c stops the script on a mismatch.\n\
+         # Both go in /usr/local/bin, on PATH in every shell and session.\n\
+         started=$SECONDS\n\
+         work=$(mktemp -d)\n\
+         curl -fsSLo \"$work/claude.zst\" \
+           https://downloads.claude.ai/claude-code-releases/{CLAUDE_VERSION}/linux-x64/claude.zst\n\
+         echo \"{CLAUDE_ZST_SHA256}  $work/claude.zst\" | sha256sum -c -\n\
+         zstd -dq \"$work/claude.zst\" -o \"$work/claude\"\n\
+         echo \"{CLAUDE_SHA256}  $work/claude\" | sha256sum -c -\n\
+         install -m0755 \"$work/claude\" /usr/local/bin/claude\n\
+         curl -fsSLo \"$work/codex.tar.zst\" \
+           https://releases.openai.com/codex/releases/{CODEX_VERSION}/codex-package-x86_64-unknown-linux-musl.tar.zst\n\
+         echo \"{CODEX_SHA256}  $work/codex.tar.zst\" | sha256sum -c -\n\
+         install -d /opt/codex\n\
+         tar --zstd -xf \"$work/codex.tar.zst\" --no-same-owner -C /opt/codex\n\
+         ln -sf /opt/codex/bin/codex /usr/local/bin/codex\n\
+         echo \"coding agents: $(cat \"$work/claude.zst\" \"$work/codex.tar.zst\" | wc -c) bytes in $((SECONDS - started)) s\"\n\
+         rm -rf \"$work\"\n",
     )
 }
 

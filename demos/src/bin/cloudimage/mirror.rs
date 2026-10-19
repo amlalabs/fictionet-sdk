@@ -1,5 +1,6 @@
-//! A bounded host cache for immutable apt objects. Mutable indexes always go
-//! upstream with apt's validators. Only complete responses are published.
+//! A bounded host cache for immutable apt objects and versioned release
+//! files. Mutable indexes and release channels always go upstream, apt's with
+//! its validators. Only complete responses are published.
 //! The directory has one owner; other demo processes forward without caching.
 
 use std::collections::BTreeMap;
@@ -33,6 +34,9 @@ const MAX_NODES: u64 = 16_384;
 const MAX_HEAD: usize = 32 << 10;
 const CHUNK: usize = 64 << 10;
 const DEADLINE: Duration = Duration::from_secs(120);
+/// How long, in all, a slow disk may hold one download back before the
+/// cache gives up storing it.
+const STALL: Duration = Duration::from_secs(2);
 const SLOTS: usize = 16;
 
 type Answer = Result<Response<Body>, Error>;
@@ -108,16 +112,22 @@ impl<S> Cache<S> {
     }
 }
 
+/// Hosts that publish each release under a directory named for its version,
+/// and the path to those directories. A file below one never changes.
+const RELEASES: [(&str, &[&str]); 2] = [
+    // Claude Code's native builds and their manifests.
+    ("downloads.claude.ai", &["claude-code-releases"]),
+    // Codex's packages and their checksums.
+    ("releases.openai.com", &["codex", "releases"]),
+];
+
 // No decoding is done on disk. Permit the encoded colon used in package
 // versions, but reject encoded separators, dots, NULs and ambiguous escapes.
-fn immutable(path: &str) -> bool {
+fn segments(path: &str) -> Option<Vec<&str>> {
     if path.len() > 2048 {
-        return false;
+        return None;
     }
-    let Some(path) = path.strip_prefix('/') else {
-        return false;
-    };
-    let parts: Vec<_> = path.split('/').collect();
+    let parts: Vec<_> = path.strip_prefix('/')?.split('/').collect();
     if parts.len() > 32
         || parts.iter().any(|p| {
             p.is_empty()
@@ -131,8 +141,38 @@ fn immutable(path: &str) -> bool {
                     .all(|b| b.is_ascii_alphanumeric() || b"-_.:+~".contains(&b))
         })
     {
-        return false;
+        return None;
     }
+    Some(parts)
+}
+
+/// A file inside a version directory of a host in [`RELEASES`].
+fn release(host: &str, path: &str) -> bool {
+    let Some((_, prefix)) = RELEASES.iter().find(|(name, _)| *name == host) else {
+        return false;
+    };
+    segments(path).is_some_and(|parts| {
+        parts.len() > prefix.len() + 1 && parts.starts_with(prefix) && version(parts[prefix.len()])
+    })
+}
+
+/// A release version: `2.1.292`, or one with a suffix like `0.164.0-alpha.3`.
+fn version(name: &str) -> bool {
+    let (number, suffix) = name.split_once('-').unwrap_or((name, ""));
+    let fields: Vec<_> = number.split('.').collect();
+    fields.len() == 3
+        && fields
+            .iter()
+            .all(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.')
+}
+
+fn immutable(path: &str) -> bool {
+    let Some(parts) = segments(path) else {
+        return false;
+    };
     if let Some(at) = parts.iter().position(|p| *p == "by-hash") {
         return parts[..at].contains(&"dists")
             && at + 3 == parts.len()
@@ -164,7 +204,8 @@ fn key(request: &Request<Body>) -> Result<PathBuf, &'static str> {
     if request.body().bytes().is_none_or(|b| !b.is_empty()) {
         return Err("request body");
     }
-    if !immutable(request.uri().path()) {
+    let path = request.uri().path();
+    if !immutable(path) && !release(&target.host, path) {
         return Err("not immutable");
     }
     let headers = request.headers();
@@ -323,9 +364,19 @@ where
         request
             .headers_mut()
             .insert(header::ACCEPT_ENCODING, "identity".parse()?);
+        let release_file = request
+            .extensions()
+            .get::<Target>()
+            .is_some_and(|t| release(&t.host, request.uri().path()));
         self.state.stats.misses.fetch_add(1, Ordering::Relaxed);
         let requested = SystemTime::now();
-        let response = self.forward(request).await?.map(Source::Upstream);
+        let mut response = self.forward(request).await?.map(Source::Upstream);
+        // Release servers behind Cloudflare set per-client bot-management
+        // cookies on their files. A release file is the same for every
+        // client, so the world passes it on, and stores it, without them.
+        if release_file {
+            response.headers_mut().remove(header::SET_COOKIE);
+        }
         let expected = match cacheable(response.status(), response.headers()) {
             Ok(expected) => expected,
             Err(reason) => {
@@ -588,14 +639,22 @@ async fn tee(
                 tx.send(Ok(Frame::data(chunk.clone())))
                     .await
                     .map_err(|_| Error::msg("apt client disconnected"))?;
-                // Storage is best effort: a slow disk must not throttle the guest.
-                if writer
-                    .as_ref()
-                    .is_some_and(|w| w.write.try_send(Some(chunk)).is_err())
+                // Storage is best effort: a slow disk may hold the guest back
+                // for a moment, never for long.
+                if let Some(w) = writer.as_mut()
+                    && !w.send(chunk).await
                 {
                     stats.bypass("storage");
                     writer = None;
                 }
+            }
+            // The last byte is queued: commit before the next await. A client
+            // that stops reading at Content-Length and leaves, as curl does,
+            // drops this body before its end, and a committed file still lands.
+            if expected == Some(received)
+                && let Some(w) = writer.as_mut()
+            {
+                w.commit();
             }
         }
         if expected.is_some_and(|n| received != n) {
@@ -605,15 +664,15 @@ async fn tee(
     }
     .await;
     if let Some(mut writer) = writer {
-        if result.is_err() || writer.write.try_send(None).is_err() {
-            stats.bypass(if result.is_err() {
-                "invalid body"
-            } else {
-                "storage"
-            });
+        if result.is_err() {
+            stats.bypass("invalid body");
             writer.task.abort();
             let _ = (&mut writer.task).await;
-        } else if let Err(error) = (&mut writer.task).await? {
+            return result;
+        }
+        // An empty body has no last byte to commit at.
+        writer.commit();
+        if let Err(error) = (&mut writer.task).await? {
             stats.bypass("storage");
             eprintln!("apt cache write: {error}");
         }
@@ -622,19 +681,57 @@ async fn tee(
 }
 
 struct CacheWriter {
-    write: mpsc::Sender<Option<Bytes>>,
+    /// The body's chunks for [`persist`]. Dropping it commits: the writer
+    /// publishes the file once it has written every byte.
+    write: Option<mpsc::Sender<Bytes>>,
     task: tokio::task::JoinHandle<Result<(), Error>>,
+    /// What is left of [`STALL`] for this download.
+    stall: Duration,
+}
+impl CacheWriter {
+    fn new(write: mpsc::Sender<Bytes>, task: tokio::task::JoinHandle<Result<(), Error>>) -> Self {
+        Self {
+            write: Some(write),
+            task,
+            stall: STALL,
+        }
+    }
+
+    /// Queues a chunk, waiting while the writer is behind for what is left
+    /// of the stall budget; false once it is spent.
+    async fn send(&mut self, chunk: Bytes) -> bool {
+        let Some(write) = &self.write else {
+            return false;
+        };
+        let chunk = match write.try_send(chunk) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Full(chunk)) => chunk,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        };
+        let started = tokio::time::Instant::now();
+        let sent = tokio::time::timeout(self.stall, write.send(chunk)).await;
+        self.stall = self.stall.saturating_sub(started.elapsed());
+        matches!(sent, Ok(Ok(())))
+    }
+
+    /// Every byte is queued: the file lands even if this writer is dropped.
+    fn commit(&mut self) {
+        self.write = None;
+    }
 }
 impl Drop for CacheWriter {
     fn drop(&mut self) {
-        self.task.abort();
+        if self.write.is_some() {
+            self.task.abort();
+        }
     }
 }
 
 async fn persist(
-    mut incoming: mpsc::Receiver<Option<Bytes>>,
+    mut incoming: mpsc::Receiver<Bytes>,
     mut reservation: Reservation,
     head: Vec<u8>,
+    expected: u64,
     received_at: SystemTime,
 ) -> Result<(), Error> {
     let mut random = [0; 8];
@@ -647,20 +744,24 @@ async fn persist(
     let (temp, mut file) = Temporary::create(path)?;
     file.write_u32(head.len() as u32).await?;
     file.write_all(&head).await?;
+    let mut written = 0;
     while let Some(chunk) = incoming.recv().await {
-        match chunk {
-            Some(chunk) => file.write_all(&chunk).await?,
-            None => {
-                file.flush().await?;
-                file.sync_all().await?;
-                file.into_std().await.set_modified(received_at)?;
-                // No await between publication and accounting, including cancellation.
-                std::fs::rename(&temp.0, &reservation.path)?;
-                reservation.committed = true;
-                return Ok(());
-            }
+        written += chunk.len() as u64;
+        if written > expected {
+            return Ok(());
         }
+        file.write_all(&chunk).await?;
     }
+    // The sender is gone. Only a commit leaves every byte written.
+    if written != expected {
+        return Ok(());
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    file.into_std().await.set_modified(received_at)?;
+    // No await between publication and accounting, including cancellation.
+    std::fs::rename(&temp.0, &reservation.path)?;
+    reservation.committed = true;
     Ok(())
 }
 
@@ -677,8 +778,14 @@ fn stream(
         let expected = fill.as_ref().map(|f| f.expected);
         let writer = fill.map(|f| {
             let (write, incoming) = mpsc::channel(32);
-            let task = tokio::spawn(persist(incoming, f.reservation, f.head, f.received_at));
-            CacheWriter { write, task }
+            let task = tokio::spawn(persist(
+                incoming,
+                f.reservation,
+                f.head,
+                f.expected,
+                f.received_at,
+            ));
+            CacheWriter::new(write, task)
         });
         let result = tokio::select! {
             _ = tx.closed() => Ok(()),

@@ -121,6 +121,7 @@ where
     let mut host = VHost::new(httpd::tower(cache.clone()));
     host.https = tls;
     hosts.insert("mirror.test", host.clone());
+    hosts.insert("releases.openai.com", host.clone());
     hosts.insert("other.test", host);
     let conn = ConnInfo {
         local: Some(
@@ -453,6 +454,101 @@ fn repository_policy_and_path_limits() {
     assert!(!immutable(&format!("/pool/{}.deb", "a".repeat(250))));
     assert!(!immutable(&format!("/pool/{}a.deb", "a/".repeat(33))));
     assert!(!immutable(&format!("/pool/{}a.deb", "a".repeat(2048))));
+}
+
+#[test]
+fn release_files_are_immutable_inside_version_directories() {
+    const CLAUDE: &str = "downloads.claude.ai";
+    const OPENAI: &str = "releases.openai.com";
+    for (host, path) in [
+        (CLAUDE, "/claude-code-releases/2.1.292/linux-x64/claude.zst"),
+        (CLAUDE, "/claude-code-releases/2.1.292/manifest.json"),
+        (OPENAI, "/codex/releases/0.163.0/codex-package_SHA256SUMS"),
+        (OPENAI, "/codex/releases/0.164.0-alpha.3/codex.tar.zst"),
+    ] {
+        assert!(release(host, path), "{host}{path}");
+    }
+    for (host, path) in [
+        // Channels move to new releases.
+        (CLAUDE, "/claude-code-releases/stable"),
+        (CLAUDE, "/claude-code-releases/latest"),
+        (OPENAI, "/codex/channels/latest"),
+        (OPENAI, "/codex/install.sh"),
+        // A version directory itself, and names that are not versions.
+        (CLAUDE, "/claude-code-releases/2.1.292"),
+        (CLAUDE, "/claude-code-releases/2.1/manifest.json"),
+        (CLAUDE, "/claude-code-releases/2.1.x/manifest.json"),
+        (OPENAI, "/codex/releases/latest/release.json"),
+        // The layout belongs to its own host.
+        ("mirror.test", "/claude-code-releases/2.1.292/manifest.json"),
+        (CLAUDE, "/codex/releases/0.163.0/release.json"),
+        // Ambiguous or encoded names.
+        (CLAUDE, "/claude-code-releases/2.1.292/../stable"),
+        (CLAUDE, "/claude-code-releases/2.1.292/%2e%2e/a"),
+        (CLAUDE, "/claude-code-releases/2.1.292//claude"),
+    ] {
+        assert!(!release(host, path), "{host}{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_stops_at_content_length_still_leaves_the_file() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let upstream = Upstream::new().await;
+        let cache = upstream.cache(&fcx, dir.path());
+        let mut body = send(&fcx, &cache, request(PACKAGE))
+            .await
+            .unwrap()
+            .into_body();
+        let mut got = Vec::new();
+        while got.len() < "package".len() {
+            let frame = body.frame().await.unwrap().unwrap();
+            got.extend_from_slice(&frame.into_data().unwrap());
+        }
+        // Leave before the end of the stream, as curl does.
+        drop(body);
+        assert_eq!(got, b"package");
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(upstream.count(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn release_files_are_passed_on_and_stored_without_cookies() {
+    run(|fcx| async move {
+        let dir = crate::RunDir::new().unwrap();
+        let upstream = Upstream::new().await;
+        let cache = upstream.cache(&fcx, dir.path());
+        let release = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .header("host", "releases.openai.com")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let file = "/codex/releases/0.163.0/codex.tar.zst";
+        upstream.push(reply("200 OK", "Set-Cookie: __cf_bm=one\r\n", b"package"));
+        for _ in 0..2 {
+            let response = send(&fcx, &cache, release(file)).await.unwrap();
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+            assert_eq!(bytes(response).await, "package");
+        }
+        assert_eq!(upstream.count(), 1);
+        // A channel moves, so it passes through, cookies and all.
+        upstream.push(reply("200 OK", "Set-Cookie: __cf_bm=two\r\n", b"0.163.0"));
+        let channel = send(&fcx, &cache, release("/codex/channels/latest"))
+            .await
+            .unwrap();
+        assert!(channel.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(bytes(channel).await, "0.163.0");
+        assert_eq!(upstream.count(), 2);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1348,16 +1444,14 @@ async fn cached_readers_keep_directory_ownership_until_their_files_close() {
 }
 
 #[tokio::test]
-async fn stalled_storage_is_abandoned_without_stalling_the_guest() {
+async fn stalled_storage_holds_the_guest_back_only_briefly() {
     run(|_| async move {
         let payload = Bytes::from(vec![b'p'; CHUNK * 4]);
         let expected = payload.clone();
         let (write, mut disk) = mpsc::channel(1);
-        let writer = CacheWriter {
-            write,
-            task: tokio::spawn(std::future::pending()),
-        };
+        let writer = CacheWriter::new(write, tokio::spawn(std::future::pending()));
         let (tx, rx) = mpsc::channel(1);
+        let started = std::time::Instant::now();
         let task = tokio::spawn(async move {
             tee(
                 Source::Upstream(Body::from(payload.clone())),
@@ -1373,11 +1467,43 @@ async fn stalled_storage_is_abandoned_without_stalling_the_guest() {
             expected
         );
         task.await.unwrap().unwrap();
-        assert_eq!(disk.try_recv().unwrap().unwrap(), expected.slice(..CHUNK));
+        // The disk never reads: the guest waits out the stall budget once.
+        assert!(started.elapsed() >= STALL);
+        assert!(started.elapsed() < STALL * 3);
+        assert_eq!(disk.try_recv().unwrap(), expected.slice(..CHUNK));
         assert!(matches!(
             disk.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_disk_that_lags_briefly_still_gets_every_chunk() {
+    run(|_| async move {
+        let payload = Bytes::from(vec![b'p'; CHUNK * 4]);
+        let len = payload.len() as u64;
+        let (write, mut disk) = mpsc::channel(1);
+        let writer = CacheWriter::new(write, tokio::spawn(async { Ok(()) }));
+        let (tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let body = Source::Upstream(Body::from(payload));
+            tee(body, &tx, Some(writer), Some(len), Arc::default()).await
+        });
+        let slow = tokio::spawn(async move {
+            let mut stored = 0;
+            while let Some(chunk) = disk.recv().await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                stored += chunk.len();
+            }
+            stored
+        });
+        let body = ControlledBody(rx).collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), CHUNK * 4);
+        task.await.unwrap().unwrap();
+        // Every chunk reached the disk, and the commit closed the queue.
+        assert_eq!(slow.await.unwrap(), CHUNK * 4);
     })
     .await;
 }

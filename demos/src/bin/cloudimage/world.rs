@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use example_common::web_world::{SHARED, app};
 use example_common::zscaler::{DEFAULT_CLOUD, zscaler};
-use fictionet::events::{ConnInfo, Fanout, Metadata, Observation, Observer, Stamp};
+use fictionet::events::{ConnInfo, Event, Fanout, Metadata, Observation, Observer, Stamp};
 use fictionet::stdlib::network::ethernet::{Family, FromVm, Link};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::tcp::{self, TcpConnection};
@@ -58,8 +58,8 @@ pub struct World {
     /// The CA root in PEM, for the guest's trust store.
     pub ca_pem: String,
     fcx: Cx,
-    /// Set once the world answers an `http.request` for the site, which is
-    /// Firefox's GET (nothing else fetches it over HTTP).
+    /// Set once the world answers an `http.request` for the site with
+    /// Firefox's User-Agent.
     firefox_loaded: Arc<AtomicBool>,
     /// The guest's address, once the world has leased it by DHCP.
     lease: watch::Receiver<Option<Ipv4Addr>>,
@@ -108,8 +108,9 @@ impl World {
     }
 }
 
-/// Watches the world's `http.request` events for the site, which only
-/// Firefox's GET produces.
+/// Watches the world's `http.request` events for Firefox's GET of the site.
+/// The coding agents' checks fetch the site too, so the request must carry
+/// Firefox's User-Agent.
 struct SiteLoaded {
     host: String,
     loaded: Arc<AtomicBool>,
@@ -123,10 +124,23 @@ impl Observer for SiteLoaded {
     fn observe(&self, _stamp: Stamp, observation: Observation<'_>) {
         if let Observation::Event(event) = observation
             && event.str("host") == Some(self.host.as_str())
+            && user_agent(event).is_some_and(|agent| agent.contains("Firefox/"))
         {
             self.loaded.store(true, Ordering::SeqCst);
         }
     }
+}
+
+/// The `User-Agent` of an `http.request` event, from its header pairs.
+fn user_agent(event: &Event) -> Option<&str> {
+    event.get("headers")?.as_array()?.iter().find_map(|pair| {
+        let [name, value] = pair.as_array()? else {
+            return None;
+        };
+        (name.as_str()? == "user-agent")
+            .then(|| value.as_str())
+            .flatten()
+    })
 }
 
 /// Watches the world's `net.bound` events for the address it leases the
@@ -187,8 +201,12 @@ pub async fn start(config: Config) -> Result<World> {
         let z = zscaler(&fcx, DEFAULT_CLOUD, now_unix)?;
         let www = format!("www.{site}");
         let site_cfg = z.server_config(&fcx, &[site.as_str(), www.as_str()], now_sys, now_unix)?;
-        // The Zscaler leaf the world presents for Mozilla's HTTPS mirror.
+        // The Zscaler leaves the world presents for the HTTPS download hosts:
+        // Mozilla's apt repository, and the release servers the guest
+        // installs Claude Code and Codex from.
         let mozilla_cfg = z.server_config(&fcx, &["packages.mozilla.org"], now_sys, now_unix)?;
+        let claude_cfg = z.server_config(&fcx, &["downloads.claude.ai"], now_sys, now_unix)?;
+        let openai_cfg = z.server_config(&fcx, &["releases.openai.com"], now_sys, now_unix)?;
         // The jump host: a machine of the world's own, on a trusted route
         // to its address. No host of the world serves the admin flows, so
         // they make no service events, but they cross the router and the
@@ -202,9 +220,10 @@ pub async fn start(config: Config) -> Result<World> {
         {
             return Ok(());
         }
-        // The apt mirror: the world forwards these names to the real servers
-        // over the host's network, so the guest installs the desktop at
-        // boot. apt's signatures verify everything.
+        // The mirror: the world forwards these names to the real servers over
+        // the host's network, so the guest installs the desktop and the
+        // coding agents at boot. apt's signatures verify the packages, and
+        // the guest checks each agent download against its pinned sha256.
         let mirror = crate::mirror::new(&fcx)?;
         web::Sites::new(move |host: &str| match host {
             h if h == site || h == www => {
@@ -214,6 +233,8 @@ pub async fn start(config: Config) -> Result<World> {
                 Some(web::Site::new(mirror.clone()))
             }
             "packages.mozilla.org" => Some(web::Site::new(mirror.clone()).tls(mozilla_cfg.clone())),
+            "downloads.claude.ai" => Some(web::Site::new(mirror.clone()).tls(claude_cfg.clone())),
+            "releases.openai.com" => Some(web::Site::new(mirror.clone()).tls(openai_cfg.clone())),
             _ => None,
         })
         .date(now_sys)
