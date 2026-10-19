@@ -829,12 +829,13 @@ impl<'a> Repr<'a> {
             return Err(Error);
         }
 
+        // RFC 9293 processes RST before SYN or FIN.
         let control = match (packet.syn(), packet.fin(), packet.rst(), packet.psh()) {
             (false, false, false, false) => Control::None,
             (false, false, false, true) => Control::Psh,
             (true, false, false, _) => Control::Syn,
             (false, true, false, _) => Control::Fin,
-            (false, false, true, _) => Control::Rst,
+            (_, _, true, _) => Control::Rst,
             _ => return Err(Error),
         };
         let ack_number = match packet.ack() {
@@ -1011,6 +1012,18 @@ mod test {
     static OPTION_BYTES: [u8; 4] = [0x03, 0x03, 0x0c, 0x01];
 
     static PAYLOAD_BYTES: [u8; 4] = [0xaa, 0x00, 0x00, 0xff];
+
+    #[test]
+    fn test_parse_reset_with_other_control_flags() {
+        for flags in [0x04, 0x05, 0x06, 0x07, 0x3f] {
+            let mut bytes = SYN_PACKET_BYTES;
+            bytes[13] = flags;
+            Packet::new_unchecked(&mut bytes).fill_checksum(&SRC_ADDR.into(), &DST_ADDR.into());
+            let packet = Packet::new_checked(&bytes).unwrap();
+            let repr = Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into()).unwrap();
+            assert_eq!(repr.control, Control::Rst, "flags {flags:#x}");
+        }
+    }
 
     #[test]
     fn test_unknown_option_emit_preserves_following_options() {

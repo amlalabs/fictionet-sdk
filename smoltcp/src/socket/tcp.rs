@@ -3067,6 +3067,42 @@ mod test {
         assert_eq!(s.state, State::Listen);
     }
 
+    fn reset_with_flags(
+        seq: TcpSeqNumber,
+        ack: Option<TcpSeqNumber>,
+        flags: u8,
+    ) -> TcpRepr<'static> {
+        let repr = TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: seq,
+            ack_number: ack,
+            ..SEND_TEMPL
+        };
+        let mut bytes = [0; 20];
+        let mut packet = crate::wire::TcpPacket::new_unchecked(&mut bytes);
+        repr.emit(&mut packet, &REMOTE_ADDR.into(), &LOCAL_ADDR.into());
+        packet.set_syn(flags & 2 != 0);
+        packet.set_fin(flags & 1 != 0);
+        packet.fill_checksum(&REMOTE_ADDR.into(), &LOCAL_ADDR.into());
+        let packet = crate::wire::TcpPacket::new_unchecked(&bytes);
+        let parsed = TcpRepr::parse(&packet, &REMOTE_ADDR.into(), &LOCAL_ADDR.into()).unwrap();
+        TcpRepr {
+            payload: &[],
+            ..parsed
+        }
+    }
+
+    #[test]
+    fn test_listen_syn_rst() {
+        for ack in [None, Some(LOCAL_SEQ + 1)] {
+            let mut s = socket_listen();
+            let rst = reset_with_flags(REMOTE_SEQ, ack, 2);
+            assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &rst));
+            assert_eq!(s.state(), State::Listen);
+            recv!(s, []);
+        }
+    }
+
     #[test]
     fn test_listen_rst() {
         let mut s = socket_listen();
@@ -3724,6 +3760,40 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Closed);
+    }
+
+    #[test]
+    fn test_syn_sent_syn_rst() {
+        for ack in [
+            None,
+            Some(LOCAL_SEQ),
+            Some(LOCAL_SEQ + 1),
+            Some(LOCAL_SEQ + 2),
+        ] {
+            let mut s = socket_syn_sent();
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: None,
+                    max_seg_size: Some(BASE_MSS),
+                    window_scale: Some(0),
+                    sack_permitted: true,
+                    ..RECV_TEMPL
+                }]
+            );
+            send!(s, reset_with_flags(REMOTE_SEQ, ack, 2));
+            assert_eq!(
+                s.state(),
+                if ack == Some(LOCAL_SEQ + 1) {
+                    State::Closed
+                } else {
+                    State::SynSent
+                }
+            );
+            recv!(s, []);
+        }
     }
 
     #[test]
@@ -8094,6 +8164,37 @@ mod test {
                         ..RECV_TEMPL
                     }
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_established_combined_reset_flags() {
+        for flags in [1, 2, 3] {
+            for offset in [0, 1, 2, 64, 65] {
+                for ack in [None, Some(LOCAL_SEQ + 1)] {
+                    let mut s = socket_established();
+                    let rst = reset_with_flags(REMOTE_SEQ + offset, ack, flags);
+                    let reply = if (2..65).contains(&offset) {
+                        Some(TcpRepr {
+                            seq_number: LOCAL_SEQ + 1,
+                            ack_number: Some(REMOTE_SEQ + 1),
+                            ..RECV_TEMPL
+                        })
+                    } else {
+                        None
+                    };
+                    send!(s, rst, reply);
+                    assert_eq!(
+                        s.state(),
+                        if offset == 1 {
+                            State::Closed
+                        } else {
+                            State::Established
+                        }
+                    );
+                    recv!(s, []);
+                }
             }
         }
     }

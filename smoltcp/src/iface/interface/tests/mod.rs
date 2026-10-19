@@ -345,3 +345,51 @@ fn egress_respects_ip_mtu() {
         }
     }
 }
+
+#[test]
+fn tcp_reset_with_syn_or_fin_closes_connection() {
+    use crate::socket::tcp::{Socket, SocketBuffer, State};
+
+    for flags in [0x04, 0x05, 0x06, 0x07, 0x3f] {
+        let (mut iface, mut sockets, mut device) = setup();
+        let mut socket = Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        );
+        socket.listen(4243).unwrap();
+        let handle = sockets.add(socket);
+        let ip = IpRepr::Ipv4(Ipv4Repr {
+            src_addr: Ipv4Address::new(192, 168, 1, 2),
+            dst_addr: Ipv4Address::new(192, 168, 1, 1),
+            next_header: IpProtocol::Tcp,
+            payload_len: 20,
+            hop_limit: 64,
+        });
+        let mut bytes = syn_bytes(ip.clone());
+        device.rx_queue.push_back(bytes.clone());
+        iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
+        iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+        let reply = device.tx_queue.pop_front().unwrap();
+        let syn_ack = TcpPacket::new_checked(&reply[20..]).unwrap();
+        assert!(syn_ack.syn() && syn_ack.ack());
+        let mut packet = TcpPacket::new_unchecked(&mut bytes[20..]);
+        packet.set_syn(false);
+        packet.set_ack(true);
+        packet.set_seq_number(TcpSeqNumber(8));
+        packet.set_ack_number(syn_ack.seq_number() + 1);
+        packet.fill_checksum(&ip.src_addr(), &ip.dst_addr());
+        device.rx_queue.push_back(bytes.clone());
+        iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
+        assert_eq!(sockets.get(handle).state(), State::Established);
+        bytes[33] = flags;
+        TcpPacket::new_unchecked(&mut bytes[20..]).fill_checksum(&ip.src_addr(), &ip.dst_addr());
+        device.rx_queue.push_back(bytes);
+        iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
+        assert_eq!(
+            sockets.get(handle).state(),
+            State::Closed,
+            "flags {flags:#x}"
+        );
+        assert!(device.tx_queue.is_empty());
+    }
+}

@@ -937,7 +937,7 @@ impl State {
         let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
         let flags = t[13];
-        let (syn, rst, ack) = (flags & 2 != 0, flags & 4 != 0, flags & 16 != 0);
+        let (syn, rst, ack) = (flags & 6 == 2, flags & 4 != 0, flags & 16 != 0);
         let mut listening = false;
         if syn
             && !self.by_tuple.contains_key(&(dst, src))
@@ -2349,6 +2349,32 @@ mod tests {
     }
 
     #[test]
+    fn syn_rst_does_not_prepare_a_listening_socket() {
+        block_on(lab(fictionet::RunOptions::new(Seed::from_u64(1)), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            st.ingress(local.ip(), now, segment(peer, local, 7, 0, 0x02).0);
+            egress(&mut st, now);
+            assert!(st.listeners[&80].idle.is_empty());
+            let count = st.sockets.iter().count();
+            let other = SocketAddr::new(peer.ip(), peer.port() + 1);
+            st.ingress(local.ip(), now, segment(other, local, 7, 0, 0x06).0);
+            assert_eq!(st.sockets.iter().count(), count);
+            assert!(st.listeners[&80].idle.is_empty());
+            assert!(!st.by_tuple.contains_key(&(local, other)));
+            assert!(egress(&mut st, now).is_empty());
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
     fn rejected_syn_acks_leave_handshake_bookkeeping_unchanged() {
         rejected_syn_acks(false);
     }
@@ -2388,7 +2414,7 @@ mod tests {
                 for fault in [
                     "empty_checksum", "checksum", "ack", "offset", "options", "flags", "ip", "none",
                 ] {
-                    if fault == "none" && !established || fault == "ip" && local.is_ipv6() {
+                    if matches!(fault, "none" | "flags") && !established || fault == "ip" && local.is_ipv6() {
                         continue;
                     }
                     // This origin would put the receive edge at the first real byte.
@@ -2443,6 +2469,30 @@ mod tests {
                 let mut got = [0; 8];
                 assert_eq!(st.sock(h).recv_slice(&mut got).unwrap(), expected.len());
                 assert_eq!(&got, expected);
+                if !established {
+                    let local = SocketAddr::new(local.ip(), local.port() + 1);
+                    let mut s = new_socket(MIN_BUFFER);
+                    s.0.connect(st.iface.context(), peer, local).unwrap();
+                    let h = st.add_socket(s);
+                    st.conns.insert(h, Conn::new(local, peer, Side::Client));
+                    st.by_tuple.insert((local, peer), h);
+                    let packets = egress(&mut st, now);
+                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                    let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
+                    let seq = irs.wrapping_sub(MIN_BUFFER as u32);
+                    let mut p = segment(peer, local, seq, ack, 0x16).0;
+                    let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
+                    p.extend_from_slice(b"ignored");
+                    fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
+                    // RFC 9293 section 3.10.7.3 accepts RST with an acceptable ACK in SYN-SENT.
+                    st.ingress(local.ip(), now, p);
+                    assert_eq!(st.get(h).state(), TcpState::Closed);
+                    assert_eq!(st.closed_reason(h), ConnError::Reset);
+                    assert_eq!(st.get(h).recv_queue(), 0, "flags");
+                    assert!(!st.get(h).has_pending_recv(), "flags");
+                    assert!(!st.dirty.contains(&h), "flags");
+                    assert!(egress(&mut st, now).is_empty());
+                }
                 drop(st);
                 fcx.cancel();
                 Ok(())
