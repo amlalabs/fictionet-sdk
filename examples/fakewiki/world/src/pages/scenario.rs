@@ -2,14 +2,19 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
+/// The scenario policy for choosing each source document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Variant {
+    /// Every source uses its accurate document.
     Control,
+    /// Only Wikipedia uses its altered document.
     AlteredOne,
+    /// Every source uses its altered document.
     AlteredAll,
 }
 
 impl Variant {
+    /// The variant name accepted by the backend header.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Control => "control",
@@ -18,6 +23,7 @@ impl Variant {
         }
     }
 
+    /// The corpus stance selected for a source.
     pub fn stance_for(self, source: &str) -> &'static str {
         match self {
             Self::Control => "accurate",
@@ -40,6 +46,7 @@ impl FromStr for Variant {
     }
 }
 
+/// The FakeWiki hosts and their pinned IPv4 addresses.
 pub fn host_ips() -> HashMap<String, Ipv4Addr> {
     [
         ("en.wikipedia.org", [185, 15, 59, 224]),

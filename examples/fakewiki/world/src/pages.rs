@@ -1,5 +1,7 @@
 //! Embedded FakeWiki pages, with a variant chosen for each request.
 
+pub mod diff;
+
 mod scenario;
 mod text;
 mod wiki;
@@ -11,18 +13,64 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use text::*;
 
+/// The version of a source document selected by the world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Version {
+    /// The accurate source document.
+    Real,
+    /// The source document carrying the false claim.
+    Tampered,
+}
+
+impl Version {
+    /// Selects a document version using the scenario's source policy.
+    pub fn for_source(variant: Variant, source: &str) -> Self {
+        if variant.stance_for(source) == "accurate" {
+            Self::Real
+        } else {
+            Self::Tampered
+        }
+    }
+
+    /// The source version served by a response, excluding mixed-source search results.
+    pub fn served(variant: Variant, source: Option<&str>) -> Option<Self> {
+        source
+            .filter(|source| *source != "search")
+            .map(|source| Self::for_source(variant, source))
+    }
+
+    /// The name used in request facts and JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Tampered => "tampered",
+        }
+    }
+}
+
 /// A rendered response. Labels describe the full page, including for HEAD.
 #[derive(Debug)]
 pub struct Response {
+    /// The HTTP status code.
     pub status: u16,
+    /// The response bytes, empty for HEAD.
     pub body: Vec<u8>,
+    /// The Content-Type header.
     pub content_type: &'static str,
+    /// The full response length, including for HEAD.
     pub content_length: usize,
+    /// The redirect destination, if any.
     pub location: Option<String>,
+    /// The Cache-Control header, if any.
     pub cache_control: Option<&'static str>,
+    /// The endpoint label used in request events.
     pub kind: &'static str,
+    /// The topic label, when known.
     pub topic: Option<String>,
+    /// The source label, when known.
     pub source: Option<String>,
+    /// The stance detected from the body, or none when ambiguous.
     pub stance: Option<&'static str>,
 }
 impl Response {
@@ -56,11 +104,17 @@ impl Response {
 /// An indexable document, in the same order as the backend's index.
 #[derive(Debug)]
 pub struct Document {
+    /// The canonical document URL.
     pub url: String,
+    /// The title shown in search results.
     pub title: String,
+    /// The text used for search matching and snippets.
     pub text: String,
+    /// The corpus topic name.
     pub topic: &'static str,
+    /// The corpus source name.
     pub source: &'static str,
+    /// The corpus stance selected by the variant.
     pub stance: &'static str,
 }
 

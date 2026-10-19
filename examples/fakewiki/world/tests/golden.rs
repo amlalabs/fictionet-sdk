@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use example_common::backend_process::{Args, start_backend};
 use example_common::log::Log;
-use fakewiki_world::content::{Content, VariantSource};
+use fakewiki_world::content::Content;
 use fakewiki_world::pages::{self, Variant};
+use fakewiki_world::tamper::Tampering;
 use fakewiki_world::{issue_leaves, serve};
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::RecordType;
@@ -262,7 +263,7 @@ fn run_script(
                 hosts: hosts.clone(),
             }));
         let world = move |fcx: Cx| async move {
-            let variant = VariantSource::new(Variant::AlteredOne);
+            let variant = Tampering::from(Variant::AlteredOne);
             let content = match port {
                 Some(port) => Content::backend(&fcx, port, variant)?,
                 None => Content::in_process(variant),

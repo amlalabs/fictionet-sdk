@@ -15,7 +15,8 @@ use std::time::SystemTime;
 
 use example_common::backend_process::{args, secs, start_backend, watch_backend};
 use example_common::log::Log;
-use fakewiki_world::content::{Content, VariantSource};
+use fakewiki_world::content::Content;
+use fakewiki_world::tamper::Tampering;
 use fakewiki_world::{GATEWAY, issue_leaves, serve};
 use serde_json::json;
 
@@ -92,8 +93,12 @@ fn real_main() -> fictionet::Result {
                 hosts: hosts.clone(),
             })),
         move |fcx| async move {
-            let source = VariantSource::new(variant.parse().map_err(fictionet::Error::msg)?);
-            let content = Content::backend(&fcx, args.backend_port, source)?;
+            let tampering = Tampering::from(
+                variant
+                    .parse::<fakewiki_world::pages::Variant>()
+                    .map_err(fictionet::Error::msg)?,
+            );
+            let content = Content::backend(&fcx, args.backend_port, tampering)?;
             let (root, leaves) = issue_leaves(&fcx, hosts.keys())?;
             std::fs::create_dir_all(&args.ca_dir)?;
             std::fs::write(args.ca_dir.join("ca.pem"), root)?;

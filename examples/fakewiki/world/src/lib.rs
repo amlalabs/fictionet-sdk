@@ -20,6 +20,7 @@
 pub mod content;
 pub mod events;
 pub mod pages;
+pub mod tamper;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;

@@ -17,8 +17,9 @@ their real names and addresses, over TLS the agent trusts. In some variants the
 pages assert a false claim. A grader model then reads the agent's answer.
 
 It shows how little code a whole fake web needs on Fictionet. The world is a
-small Rust program built on `web::Sites`. The pages come from a Python backend
-inside the world's container. The agent runs in an ordinary container attached
+small Rust program built on `web::Sites`. In the eval the pages come from a
+Python backend inside the world's container; a live demo renders the same pages
+in Rust, in-process. The agent runs in an ordinary container attached
 with `fictionet attach --type tun`, and the world's log records every DNS query,
 request and refused or failed TLS handshake, with what each page claimed.
 
@@ -304,14 +305,48 @@ It registers the sites with caller-supplied content and certificates.
 [`world/src/main.rs`](world/src/main.rs) starts the backend, attaches the request
 log and writes the public CA certificate.
 
-Library callers can use `Content::in_process(VariantSource::new(variant))` to
-serve the embedded Rust pages without Python or Tokio, including in a lab.
-`Content::backend` forwards to Python and sends the same selected variant in
-`X-Fakewiki-Variant` on every request. Each handler reads the shared variant
-source once per request. The backend uses its startup variant when the header
-is absent and returns 400 for an unknown variant. The renderer's `host_ips()`
-and `documents(variant)` supply the host table and document index without a
-backend. `issue_leaves` returns the root PEM and leaves without writing files.
+### Pages without Python, and tampering at run time
+
+The pages have two paths. `Content::backend` forwards each request to
+`backend.py`; the Docker evals use it. `Content::in_process` renders the same
+pages in Rust from the embedded corpus ([`world/src/pages.rs`](world/src/pages.rs)),
+with no Python or Tokio, also in a lab; the live demo uses it. A parity test
+checks that both serve the same bytes and labels for every route and variant.
+`pages::host_ips()` gives the host table, and `issue_leaves` returns the root
+certificate instead of writing it, so an in-process world needs no files.
+
+Both paths read a shared `Tampering` state once per request and render with the
+variant it selects. The backend path sends that variant in `X-Fakewiki-Variant`.
+`backend.py` uses its startup variant when the header is absent and answers 400
+to an unknown one. The state is a switch (`on`) and a `Scope`: `Wikipedia`
+tampers with Wikipedia only (`altered_one`), `AllSources` with every source
+(`altered_all`). Off is `control`. Each change raises its `revision`.
+
+A world task switches it with `Tampering::apply` and a `tamper::Command`:
+
+```json
+{"type":"set_tampering","on":true,"expected_revision":0}
+```
+
+A command whose `expected_revision` is not the current revision is rejected and
+changes nothing. The reply names the new revision and its run time, or the
+rejection. Each command is also an event: `fakewiki.tampering` when applied,
+`fakewiki.tampering_rejected` when not. The eval binary takes no commands; it
+keeps its startup variant.
+
+Each `http.request` event carries two more facts. `served` is `real` or
+`tampered`: the version of the response's source that the world chose. It is
+null for responses with no source and for the search engines, which mix
+sources. `tamper_revision` is the revision the request was served under.
+`stance` stays what it was, a label read from the body text. `log.jsonl` is
+unchanged.
+
+`pages::diff::Diff` gives a page what it needs to show both versions side by
+side: for each topic, the true and false claims, and for each source its real
+and tampered text in page order, split into sentences, with each sentence that
+the other version lacks marked as changed, and the version served now.
+`TamperState`, `Command`, `Reply` and `Diff` are plain serde types with size
+bounds (`MAX_TAMPER_STATE_BYTES` and the like) checked by tests.
 
 The backend's [`scenario.py`](world/backend/fictionet_world/scenario.py) owns
 variants, page identities and stance policy. `sites.py` renders the corpus using
@@ -347,9 +382,13 @@ examples/fakewiki/
   world/                    # the world: its own Cargo package
     Cargo.toml              # depends on fictionet by path; world dependencies stay here
     src/main.rs             # backend startup, state.json, ready file
-    src/lib.rs              # Sites, certificates, arguments and backend helpers
-    src/content.rs          # the handler: asks backend.py for the page, tags the response
+    src/lib.rs              # Sites and certificates
+    src/content.rs          # the handler: backend.py or in-process pages, tags the response
+    src/pages.rs            # the pages in Rust, from the embedded corpus
+    src/pages/              # scenario tables, Wikipedia routes, text helpers, the diff
+    src/tamper.rs           # the tampering state, its command and reply
     src/events.rs           # the request log, written from the network's events
+    tests/                  # the golden log, page parity, tampering at run time
     backend/backend.py      # FakeWiki's pages over HTTP on 127.0.0.1
     backend/fictionet_world/scenario.py   # variants, hosts, pages and the stance each source shows
     backend/fictionet_world/sites.py      # every host and page, from fixtures/corpus.json

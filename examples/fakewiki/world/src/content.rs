@@ -3,7 +3,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -16,7 +15,10 @@ use http_body_util::{BodyExt, Full};
 use httpd::Handler;
 
 use crate::events::Page;
-use crate::pages::{self, Variant};
+use crate::pages;
+#[cfg(test)]
+use crate::pages::Variant;
+use crate::tamper::{TamperState, Tampering};
 
 /// The headers backend.py adds for the log.
 const KIND: &str = "x-fakewiki-kind";
@@ -24,58 +26,47 @@ const TOPIC: &str = "x-fakewiki-topic";
 const SOURCE: &str = "x-fakewiki-source";
 const STANCE: &str = "x-fakewiki-stance";
 
-/// The world chooses one variant source shared by all its sites.
-#[derive(Clone)]
-pub struct VariantSource(Arc<Variant>);
-
-impl VariantSource {
-    pub fn new(variant: Variant) -> Self {
-        Self(Arc::new(variant))
-    }
-
-    pub fn get(&self) -> Variant {
-        *self.0
-    }
-}
-
+/// A page handler sharing one tampering state across all sites.
+/// Each request captures its state before rendering or forwarding.
 #[derive(Clone)]
 pub struct Content {
     forward: Option<web::Forward>,
-    variant: VariantSource,
+    tampering: Tampering,
 }
 
 impl Content {
-    /// Forwards each request with the world's selected variant.
+    /// Forwards to Python with the captured variant in `X-Fakewiki-Variant`.
+    /// Used by Docker evals. Requires real I/O and cannot run in a lab.
     pub fn backend(
         fcx: &fictionet::Cx,
         port: u16,
-        variant: VariantSource,
+        tampering: Tampering,
     ) -> Result<Self, fictionet::Error> {
         Ok(Self {
             forward: Some(web::forward(
                 fcx,
                 format!("http://127.0.0.1:{port}").parse().unwrap(),
             )?),
-            variant,
+            tampering,
         })
     }
 
-    /// Renders pages without real I/O or an async runtime.
-    pub fn in_process(variant: VariantSource) -> Self {
+    /// Renders embedded pages for live demos and labs without Python or Tokio.
+    pub fn in_process(tampering: Tampering) -> Self {
         Self {
             forward: None,
-            variant,
+            tampering,
         }
     }
 }
 
 impl Handler for Content {
     fn call(&self, request: Request<Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
-        let variant = self.variant.get();
+        let state = self.tampering.state();
         if let Some(forward) = &self.forward {
             return httpd::tower(Backend {
                 forward: forward.clone(),
-                variant,
+                state,
             })
             .call(request, ex);
         }
@@ -91,7 +82,7 @@ impl Handler for Content {
             &target.host,
             request.uri().path_and_query().map_or("/", |p| p.as_str()),
             request.method().as_str(),
-            variant,
+            state.variant(),
             ex.random_u64(),
         );
         let mut response = Response::builder()
@@ -111,6 +102,8 @@ impl Handler for Content {
         if httpd::EventInterest::of(&request) {
             response.extensions_mut().insert(
                 Page {
+                    served: pages::Version::served(state.variant(), page.source.as_deref()),
+                    tamper_revision: state.revision,
                     kind: page.kind.into(),
                     topic: page.topic,
                     source: page.source,
@@ -129,7 +122,7 @@ impl Handler for Content {
 #[derive(Clone)]
 struct Backend {
     forward: web::Forward,
-    variant: Variant,
+    state: TamperState,
 }
 
 impl Backend {
@@ -150,9 +143,9 @@ impl Backend {
         let reply = async {
             let mut ask = Request::builder()
                 .method(method.clone())
-                .uri(uri)
+                .uri(uri.clone())
                 .header(HOST, target.host.as_str())
-                .header("X-Fakewiki-Variant", self.variant.as_str());
+                .header("X-Fakewiki-Variant", self.state.variant().as_str());
             if let Some(ua) = &ua {
                 ask = ask.header(USER_AGENT, ua);
             }
@@ -172,6 +165,8 @@ impl Backend {
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                 if observing {
                     let page = Page {
+                        served: None,
+                        tamper_revision: self.state.revision,
                         kind: "backend_error".into(),
                         topic: None,
                         source: None,
@@ -197,11 +192,17 @@ impl Backend {
                 .remove(name)
                 .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
         };
+        let kind = take(KIND).unwrap_or_else(|| "other".into());
+        let topic = take(TOPIC);
+        let source = take(SOURCE);
+        let stance = take(STANCE);
         let page = Page {
-            kind: take(KIND).unwrap_or_else(|| "other".into()),
-            topic: take(TOPIC),
-            source: take(SOURCE),
-            stance: take(STANCE),
+            served: pages::Version::served(self.state.variant(), source.as_deref()),
+            tamper_revision: self.state.revision,
+            kind,
+            topic,
+            source,
+            stance,
             bytes: 0,
             location: None,
             error: None,
@@ -280,7 +281,7 @@ mod tests {
                     VHost::new(Content::backend(
                         &fcx,
                         address.port(),
-                        VariantSource::new(Variant::Control),
+                        Tampering::from(Variant::Control),
                     )?),
                 );
                 let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
@@ -323,10 +324,9 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
             |fcx| async move {
-                let error =
-                    super::Content::backend(&fcx, 8080, VariantSource::new(Variant::Control))
-                        .err()
-                        .unwrap();
+                let error = super::Content::backend(&fcx, 8080, Tampering::from(Variant::Control))
+                    .err()
+                    .unwrap();
                 assert_eq!(error.to_string(), "real I/O is unavailable in a lab run");
                 Ok(())
             },
@@ -355,7 +355,7 @@ mod embedded_tests {
                     let vhosts = VirtualHosts::new();
                     vhosts.insert(
                         "en.wikipedia.org",
-                        VHost::new(Content::in_process(VariantSource::new(variant))),
+                        VHost::new(Content::in_process(Tampering::from(variant))),
                     );
                     let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
                     let mut ex =
