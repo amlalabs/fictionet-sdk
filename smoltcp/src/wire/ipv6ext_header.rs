@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use super::IpProtocol;
 use super::{Error, Result};
 
@@ -24,7 +22,6 @@ mod field {
 
 /// A read/write wrapper around an IPv6 Extension Header buffer.
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Header<T: AsRef<[u8]>> {
     buffer: T,
 }
@@ -122,7 +119,6 @@ impl<T: AsRef<[u8]> + AsMut<[u8]> + ?Sized> Header<&mut T> {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr<'a> {
     pub next_header: IpProtocol,
     pub length: u8,

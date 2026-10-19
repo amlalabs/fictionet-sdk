@@ -122,6 +122,9 @@ fn manifest(sdk: &Value, root: &Path) -> Result<String> {
             Some(rename) => format!("{rename} = {{ package = {name:?}, version = {req:?}"),
             None => format!("{name} = {{ version = {req:?}"),
         };
+        if let Some(path) = dep["path"].as_str() {
+            write!(line, ", path = {path:?}")?;
+        }
         if dep["uses_default_features"] == false {
             line.push_str(", default-features = false");
         }

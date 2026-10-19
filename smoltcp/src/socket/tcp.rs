@@ -3,12 +3,12 @@
 // Consult RFC 7414 when implementing a new feature.
 
 use core::fmt::Display;
-#[cfg(feature = "async")]
+
 use core::task::Waker;
 use core::{fmt, mem};
 
 use crate::phy::PacketMeta;
-#[cfg(feature = "async")]
+
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
 use crate::storage::{Assembler, RingBuffer};
@@ -26,7 +26,6 @@ macro_rules! tcp_trace {
 
 /// Error returned by [`Socket::listen`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ListenError {
     InvalidState,
     Unaddressable,
@@ -45,7 +44,6 @@ impl core::error::Error for ListenError {}
 
 /// Error returned by [`Socket::connect`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ConnectError {
     InvalidState,
     Unaddressable,
@@ -64,7 +62,6 @@ impl core::error::Error for ConnectError {}
 
 /// Error returned by [`Socket::send`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SendError {
     InvalidState,
 }
@@ -81,7 +78,6 @@ impl core::error::Error for SendError {}
 
 /// Error returned by [`Socket::recv`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RecvError {
     InvalidState,
     Finished,
@@ -105,7 +101,6 @@ pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
 ///
 /// [RFC 793]: https://tools.ietf.org/html/rfc793
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum State {
     Closed,
     Listen,
@@ -159,7 +154,6 @@ const RTTE_MIN_RTO: u32 = 1000;
 const RTTE_MAX_RTO: u32 = 60_000;
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct RttEstimator {
     /// true if we have made at least one rtt measurement.
     have_measurement: bool,
@@ -192,11 +186,6 @@ impl Default for RttEstimator {
 impl RttEstimator {
     fn retransmission_timeout(&self) -> Duration {
         Duration::from_millis(self.rto as _)
-    }
-
-    #[cfg(feature = "socket-tcp-cubic")]
-    fn smoothed_rtt(&self) -> u32 {
-        if self.have_measurement { self.srtt } else { 0 }
     }
 
     fn sample(&mut self, new_rtt: u32) {
@@ -279,7 +268,6 @@ impl RttEstimator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum Timer {
     Idle {
         keep_alive_at: Option<Instant>,
@@ -435,7 +423,6 @@ enum AckDelayTimer {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct Tuple {
     local: IpEndpoint,
     remote: IpEndpoint,
@@ -449,15 +436,10 @@ impl Display for Tuple {
 
 /// A congestion control algorithm.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum CongestionControl {
     None,
 
-    #[cfg(feature = "socket-tcp-reno")]
     Reno,
-
-    #[cfg(feature = "socket-tcp-cubic")]
-    Cubic,
 }
 
 /// A Transmission Control Protocol socket.
@@ -545,14 +527,9 @@ pub struct Socket<'a> {
     /// 0 if not seen or timestamp not enabled
     last_remote_tsval: u32,
 
-    #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
-    #[cfg(feature = "async")]
-    tx_waker: WakerRegistration,
 
-    /// If this is set, we will not send a SYN|ACK until this is unset.
-    #[cfg(feature = "socket-tcp-pause-synack")]
-    synack_paused: bool,
+    tx_waker: WakerRegistration,
 }
 
 const DEFAULT_MSS: usize = 536;
@@ -567,7 +544,6 @@ const DEFAULT_MSS: usize = 536;
 const MIN_REMOTE_MSS: usize = 48;
 
 impl<'a> Socket<'a> {
-    #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
     pub fn new<T>(rx_buffer: T, tx_buffer: T) -> Socket<'a>
     where
@@ -580,7 +556,7 @@ impl<'a> Socket<'a> {
         // [...] the above constraints imply that 2 * the max window size must be less
         // than 2**31 [...] Thus, the shift count must be limited to 14 (which allows
         // windows of 2**30 = 1 Gbyte).
-        #[cfg(not(target_pointer_width = "16"))] // Prevent overflow
+
         if rx_capacity > (1 << 30) {
             panic!("receiving buffer too large, cannot exceed 1 GiB")
         }
@@ -622,13 +598,9 @@ impl<'a> Socket<'a> {
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
 
-            #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
-            #[cfg(feature = "async")]
-            tx_waker: WakerRegistration::new(),
 
-            #[cfg(feature = "socket-tcp-pause-synack")]
-            synack_paused: false,
+            tx_waker: WakerRegistration::new(),
         }
     }
 
@@ -645,34 +617,14 @@ impl<'a> Socket<'a> {
     /// Set an algorithm for congestion control.
     ///
     /// `CongestionControl::None` indicates that no congestion control is applied.
-    /// Options `CongestionControl::Cubic` and `CongestionControl::Reno` are also available.
-    /// To use Reno and Cubic, please enable the `socket-tcp-reno` and `socket-tcp-cubic` features
-    /// in the `smoltcp` crate, respectively.
-    ///
-    /// `CongestionControl::Reno` is a classic congestion control algorithm valued for its simplicity.
-    /// Despite having a lower algorithmic complexity than `Cubic`,
-    /// it is less efficient in terms of bandwidth usage.
-    ///
-    /// `CongestionControl::Cubic` represents a modern congestion control algorithm designed to
-    /// be more efficient and fair compared to `CongestionControl::Reno`.
-    /// It is the default choice for Linux, Windows, and macOS.
-    /// `CongestionControl::Cubic` relies on double precision (`f64`) floating point operations, which may cause issues in some contexts:
-    /// * Small embedded processors (such as Cortex-M0, Cortex-M1, and Cortex-M3) do not have an FPU, and floating point operations consume significant amounts of CPU time and Flash space.
-    /// * Interrupt handlers should almost always avoid floating-point operations.
-    /// * Kernel-mode code on desktop processors usually avoids FPU operations to reduce the penalty of saving and restoring FPU registers.
-    ///
-    /// In all these cases, `CongestionControl::Reno` is a better choice of congestion control algorithm.
+    /// Reno is the default congestion controller.
     pub fn set_congestion_control(&mut self, congestion_control: CongestionControl) {
         use congestion::*;
 
         self.congestion_controller = match congestion_control {
             CongestionControl::None => AnyController::None(no_control::NoControl),
 
-            #[cfg(feature = "socket-tcp-reno")]
             CongestionControl::Reno => AnyController::Reno(reno::Reno::new()),
-
-            #[cfg(feature = "socket-tcp-cubic")]
-            CongestionControl::Cubic => AnyController::Cubic(cubic::Cubic::new()),
         }
     }
 
@@ -683,11 +635,7 @@ impl<'a> Socket<'a> {
         match self.congestion_controller {
             AnyController::None(_) => CongestionControl::None,
 
-            #[cfg(feature = "socket-tcp-reno")]
             AnyController::Reno(_) => CongestionControl::Reno,
-
-            #[cfg(feature = "socket-tcp-cubic")]
-            AnyController::Cubic(_) => CongestionControl::Cubic,
         }
     }
 
@@ -703,7 +651,6 @@ impl<'a> Socket<'a> {
     /// - The Waker is woken only once. Once woken, you must register it again to receive more wakes.
     /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of `recv` has
     ///   necessarily changed.
-    #[cfg(feature = "async")]
     pub fn register_recv_waker(&mut self, waker: &Waker) {
         self.rx_waker.register(waker)
     }
@@ -721,7 +668,6 @@ impl<'a> Socket<'a> {
     /// - The Waker is woken only once. Once woken, you must register it again to receive more wakes.
     /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of `send` has
     ///   necessarily changed.
-    #[cfg(feature = "async")]
     pub fn register_send_waker(&mut self, waker: &Waker) {
         self.tx_waker.register(waker)
     }
@@ -745,16 +691,6 @@ impl<'a> Socket<'a> {
     /// See also the [set_nagle_enabled](#method.set_nagle_enabled) method.
     pub fn nagle_enabled(&self) -> bool {
         self.nagle
-    }
-
-    /// Pause sending of SYN|ACK packets.
-    ///
-    /// When this flag is set, the socket will get stuck in `SynReceived` state without sending
-    /// any SYN|ACK packets back, until this flag is unset. This is useful for certain niche TCP
-    /// proxy usecases.
-    #[cfg(feature = "socket-tcp-pause-synack")]
-    pub fn pause_synack(&mut self, pause: bool) {
-        self.synack_paused = pause;
     }
 
     /// Return the current window field value, including scaling according to RFC 1323.
@@ -927,7 +863,6 @@ impl<'a> Socket<'a> {
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
-        #[cfg(feature = "async")]
         {
             self.rx_waker.wake();
             self.tx_waker.wake();
@@ -977,11 +912,6 @@ impl<'a> Socket<'a> {
     /// allocates a port between 49152 and 65535, a connection may be established as follows:
     ///
     /// ```no_run
-    /// # #[cfg(all(
-    /// #     feature = "medium-ethernet",
-    /// #     feature = "proto-ipv4",
-    /// # ))]
-    /// # {
     /// # use smoltcp::socket::tcp::{Socket, SocketBuffer};
     /// # use smoltcp::iface::Interface;
     /// # use smoltcp::wire::IpAddress;
@@ -1002,7 +932,6 @@ impl<'a> Socket<'a> {
     ///     (IpAddress::v4(10, 0, 0, 1), 80),
     ///     get_ephemeral_port()
     /// ).unwrap();
-    /// # }
     /// ```
     ///
     /// The local address may optionally be provided.
@@ -1264,7 +1193,7 @@ impl<'a> Socket<'a> {
                 self.timer.set_for_zero_window_probe(Instant::ZERO, delay);
             }
 
-            #[cfg(any(test, feature = "verbose"))]
+            #[cfg(test)]
             tcp_trace!(
                 "tx buffer: enqueueing {} octets (now {})",
                 size,
@@ -1323,7 +1252,7 @@ impl<'a> Socket<'a> {
         let (size, result) = f(&mut self.rx_buffer);
         self.remote_seq_no += size;
         if size > 0 {
-            #[cfg(any(test, feature = "verbose"))]
+            #[cfg(test)]
             tcp_trace!(
                 "rx buffer: dequeueing {} octets (now {})",
                 size,
@@ -1372,7 +1301,7 @@ impl<'a> Socket<'a> {
 
         let buffer = self.rx_buffer.get_allocated(0, size);
         if !buffer.is_empty() {
-            #[cfg(any(test, feature = "verbose"))]
+            #[cfg(test)]
             tcp_trace!("rx buffer: peeking at {} octets", buffer.len());
         }
         Ok(buffer)
@@ -1421,7 +1350,6 @@ impl<'a> Socket<'a> {
 
         self.state = state;
 
-        #[cfg(feature = "async")]
         {
             // Wake all tasks waiting. Even if we haven't received/sent data, this
             // is needed because return values of functions may change depending on the state.
@@ -2084,7 +2012,7 @@ impl<'a> Socket<'a> {
             self.tx_buffer.dequeue_allocated(ack_len);
 
             // There's new room available in tx_buffer, wake the waiting task if any.
-            #[cfg(feature = "async")]
+
             self.tx_waker.wake();
         }
 
@@ -2242,7 +2170,7 @@ impl<'a> Socket<'a> {
             self.rx_buffer.enqueue_unallocated(contig_len);
 
             // There's new data in rx_buffer, notify waiting task if any.
-            #[cfg(feature = "async")]
+
             self.rx_waker.wake();
         }
 
@@ -2303,9 +2231,8 @@ impl<'a> Socket<'a> {
         }
 
         let ip_header_len = match self.tuple.unwrap().local.addr {
-            #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(_) => crate::wire::IPV4_HEADER_LEN,
-            #[cfg(feature = "proto-ipv6")]
+
             IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
         };
 
@@ -2512,11 +2439,6 @@ impl<'a> Socket<'a> {
             self.rtte.on_retransmit();
         }
 
-        #[cfg(feature = "socket-tcp-pause-synack")]
-        if matches!(self.state, State::SynReceived) && self.synack_paused {
-            return Ok(());
-        }
-
         // Decide whether we're sending a packet.
         if self.seq_to_transmit(cx) {
             // If we have data to transmit and it fits into partner's window, do it.
@@ -2576,14 +2498,7 @@ impl<'a> Socket<'a> {
 
         let mut is_zero_window_probe = false;
 
-        #[cfg_attr(
-            not(feature = "segmentation-offload"),
-            expect(
-                unused_mut,
-                reason = "The default is not mutated if the segmentation offload feature is not enabled."
-            )
-        )]
-        let mut packet_meta = PacketMeta::default();
+        let packet_meta = PacketMeta::default();
 
         match self.state {
             // We transmit an RST in the CLOSED state. If we ended up in the CLOSED state
@@ -2671,28 +2586,7 @@ impl<'a> Socket<'a> {
                     // to comply with the latter two will be handled by the device based on the
                     // metadata we provide.
 
-                    #[cfg(not(feature = "segmentation-offload"))]
                     let device_limit = effective_mss;
-
-                    #[cfg(feature = "segmentation-offload")]
-                    let device_limit = {
-                        let segmentation_caps = cx.segmentation_caps();
-                        match ip_repr.version() {
-                            #[cfg(feature = "proto-ipv4")]
-                            crate::wire::IpVersion::Ipv4 => segmentation_caps.tcpv4,
-                            #[cfg(feature = "proto-ipv6")]
-                            crate::wire::IpVersion::Ipv6 => segmentation_caps.tcpv6,
-                        }
-                        .map(|buf_size| {
-                            let pre_ip_header_len = cx.max_transmission_unit() - cx.ip_mtu();
-                            buf_size.get()
-                                - pre_ip_header_len
-                                - ip_repr.header_len()
-                                - TCP_HEADER_LEN
-                                - options_len
-                        })
-                        .unwrap_or(effective_mss)
-                    };
 
                     let size = if is_zero_window_probe {
                         // Zero-window probes are exempt from the congestion window: they
@@ -2707,14 +2601,6 @@ impl<'a> Socket<'a> {
 
                     let offset = self.flight_size();
                     repr.payload = self.tx_buffer.get_allocated(offset, size);
-
-                    #[cfg(feature = "segmentation-offload")]
-                    if repr.payload.len() > effective_mss {
-                        packet_meta.segmentation_offload_size =
-                            core::num::NonZeroU16::try_from(u16::try_from(effective_mss).unwrap())
-                                .unwrap()
-                                .into();
-                    }
 
                     offset
                 };
@@ -2742,14 +2628,14 @@ impl<'a> Socket<'a> {
         // has expired, and we also have data in transmit buffer. Since any packet that occupies
         // sequence space will elicit an ACK, we only need to send an explicit packet if we
         // couldn't fill the sequence space with anything.
-        let is_keep_alive;
-        if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
+
+        let is_keep_alive = if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
             repr.seq_number = repr.seq_number - 1;
             repr.payload = b"\x00"; // RFC 1122 says we should do this
-            is_keep_alive = true;
+            true
         } else {
-            is_keep_alive = false;
-        }
+            false
+        };
 
         // Trace a summary of what will be sent.
         if is_keep_alive {
@@ -2846,7 +2732,7 @@ impl<'a> Socket<'a> {
         if self.state == State::Closed {
             // When aborting a connection, forget about it after sending a single RST packet.
             self.tuple = None;
-            #[cfg(feature = "async")]
+
             {
                 // Wake tx now so that async users can wait for the RST to be sent
                 self.tx_waker.wake();
@@ -2912,10 +2798,7 @@ impl<'a> fmt::Write for Socket<'a> {
     }
 }
 
-// TODO: TCP should work for all features. For now, we only test with the IP feature. We could do
-// it for other features as well with rstest, however, this means we have to modify a lot of the
-// tests in here, which I didn't had the time for at the moment.
-#[cfg(all(test, feature = "medium-ip"))]
+#[cfg(test)]
 mod test {
     use super::*;
     use crate::config::IFACE_MAX_ADDR_COUNT;
@@ -2940,47 +2823,24 @@ mod test {
     const LOCAL_SEQ: TcpSeqNumber = TcpSeqNumber(10000);
     const REMOTE_SEQ: TcpSeqNumber = TcpSeqNumber(-10001);
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "proto-ipv4")] {
-            use crate::wire::Ipv4Address as IpvXAddress;
-            use crate::wire::Ipv4Repr as IpvXRepr;
-            use IpRepr::Ipv4 as IpReprIpvX;
+    use crate::wire::Ipv4Address as IpvXAddress;
+    use crate::wire::Ipv4Repr as IpvXRepr;
+    use IpRepr::Ipv4 as IpReprIpvX;
 
-            const LOCAL_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 1);
-            const REMOTE_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 2);
-            const OTHER_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 3);
+    const LOCAL_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 1);
+    const REMOTE_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 2);
+    const OTHER_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 3);
 
-            const BASE_MSS: u16 = 1460;
+    const BASE_MSS: u16 = 1460;
 
-            const LOCAL_END: IpEndpoint = IpEndpoint {
-                addr: IpAddress::Ipv4(LOCAL_ADDR),
-                port: LOCAL_PORT,
-            };
-            const REMOTE_END: IpEndpoint = IpEndpoint {
-                addr: IpAddress::Ipv4(REMOTE_ADDR),
-                port: REMOTE_PORT,
-            };
-        } else {
-            use crate::wire::Ipv6Address as IpvXAddress;
-            use crate::wire::Ipv6Repr as IpvXRepr;
-            use IpRepr::Ipv6 as IpReprIpvX;
-
-            const LOCAL_ADDR: IpvXAddress = IpvXAddress::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-            const REMOTE_ADDR: IpvXAddress = IpvXAddress::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
-            const OTHER_ADDR: IpvXAddress = IpvXAddress::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
-
-            const BASE_MSS: u16 = 1440;
-
-            const LOCAL_END: IpEndpoint = IpEndpoint {
-                addr: IpAddress::Ipv6(LOCAL_ADDR),
-                port: LOCAL_PORT,
-            };
-            const REMOTE_END: IpEndpoint = IpEndpoint {
-                addr: IpAddress::Ipv6(REMOTE_ADDR),
-                port: REMOTE_PORT,
-            };
-        }
-    }
+    const LOCAL_END: IpEndpoint = IpEndpoint {
+        addr: IpAddress::Ipv4(LOCAL_ADDR),
+        port: LOCAL_PORT,
+    };
+    const REMOTE_END: IpEndpoint = IpEndpoint {
+        addr: IpAddress::Ipv4(REMOTE_ADDR),
+        port: REMOTE_PORT,
+    };
 
     const SEND_IP_TEMPL: IpRepr = IpReprIpvX(IpvXRepr {
         src_addr: LOCAL_ADDR,
@@ -3093,7 +2953,8 @@ mod test {
 
                 net_trace!("recv: {}", tcp_repr);
                 sent += 1;
-                Ok(f(Ok(tcp_repr)))
+                f(Ok(tcp_repr));
+                Ok(())
             });
         match result {
             Ok(()) => assert_eq!(sent, 1, "Exactly one packet should be sent"),
@@ -3585,37 +3446,6 @@ mod test {
         );
         assert_eq!(s.state, State::Established);
         sanity!(s, socket_established());
-    }
-
-    #[cfg(feature = "socket-tcp-pause-synack")]
-    #[test]
-    fn test_syn_paused_ack() {
-        let mut s = socket_syn_received();
-
-        s.pause_synack(true);
-        recv_nothing!(s);
-        assert_eq!(s.state, State::SynReceived);
-
-        s.pause_synack(false);
-        recv!(
-            s,
-            [TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: LOCAL_SEQ,
-                ack_number: Some(REMOTE_SEQ + 1),
-                max_seg_size: Some(BASE_MSS),
-                ..RECV_TEMPL
-            }]
-        );
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.state, State::Established);
     }
 
     #[test]
@@ -6437,7 +6267,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "socket-tcp-reno")]
     fn test_congestion_window_limits_data_in_flight() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.set_congestion_control(CongestionControl::Reno);
@@ -6480,7 +6309,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "socket-tcp-reno")]
     fn test_congestion_window_doesnt_limit_fast_retransmit() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.set_congestion_control(CongestionControl::Reno);
@@ -7566,94 +7394,6 @@ mod test {
         );
     }
 
-    #[cfg(feature = "segmentation-offload")]
-    #[test]
-    fn test_segmentation_offload() {
-        use crate::tests::segmentation_offload::MAX_SEGMENTABLE_SIZE;
-        use crate::wire;
-
-        let (interface, _, _) =
-            crate::tests::segmentation_offload::setup_segmenting(crate::phy::Medium::Ip);
-        let mut s = TestSocket {
-            cx: interface.inner,
-            ..socket_listen()
-        };
-        s.tx_buffer = SocketBuffer::new(vec![0; 2 * MAX_SEGMENTABLE_SIZE]);
-
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                window_scale: Some(2),
-                ..SEND_TEMPL
-            }
-        );
-        recv!(
-            s,
-            [TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: LOCAL_SEQ,
-                ack_number: Some(REMOTE_SEQ + 1),
-                max_seg_size: Some(BASE_MSS),
-                window_scale: Some(0),
-                ..RECV_TEMPL
-            }]
-        );
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                window_len: u16::MAX,
-                ..SEND_TEMPL
-            }
-        );
-
-        s.send_slice(&[0; 2 * MAX_SEGMENTABLE_SIZE][..]).unwrap();
-
-        // We want to ensure that the size of the unsegmented packets exceed the
-        // maximum allowed by the length field in the IP headers to check if the
-        // relevant code incorrectly assumes that the length fits into the
-        // field.
-        let ip_header_len = match s.local_endpoint().unwrap().addr {
-            #[cfg(feature = "proto-ipv4")]
-            IpAddress::Ipv4(_) => {
-                assert!(MAX_SEGMENTABLE_SIZE > usize::from(u16::MAX));
-                wire::IPV4_HEADER_LEN
-            }
-            #[cfg(feature = "proto-ipv6")]
-            IpAddress::Ipv6(_) => {
-                assert!(MAX_SEGMENTABLE_SIZE - wire::IPV6_HEADER_LEN > usize::from(u16::MAX));
-                wire::IPV6_HEADER_LEN
-            }
-        };
-        let payload = vec![0; MAX_SEGMENTABLE_SIZE - ip_header_len - TCP_HEADER_LEN];
-        assert!(
-            payload.len() > usize::from(BASE_MSS),
-            "the payload is not large enough to require segmentation!"
-        );
-
-        recv!(
-            s,
-            [
-                TcpRepr {
-                    seq_number: LOCAL_SEQ + 1,
-                    ack_number: Some(REMOTE_SEQ + 1),
-                    payload: payload.as_slice(),
-                    ..RECV_TEMPL
-                },
-                TcpRepr {
-                    seq_number: LOCAL_SEQ + payload.len() + 1,
-                    ack_number: Some(REMOTE_SEQ + 1),
-                    payload: payload.as_slice(),
-                    ..RECV_TEMPL
-                }
-            ]
-        );
-    }
-
     #[test]
     fn test_recv_out_of_recv_win() {
         let mut s = socket_established();
@@ -8329,7 +8069,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "socket-tcp-reno")]
     fn test_zero_window_probe_not_capped_by_cwnd() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.set_congestion_control(CongestionControl::Reno);
@@ -9588,16 +9327,9 @@ mod test {
     fn test_set_get_congestion_control() {
         let mut s = socket_established();
 
-        #[cfg(feature = "socket-tcp-reno")]
         {
             s.set_congestion_control(CongestionControl::Reno);
             assert_eq!(s.congestion_control(), CongestionControl::Reno);
-        }
-
-        #[cfg(feature = "socket-tcp-cubic")]
-        {
-            s.set_congestion_control(CongestionControl::Cubic);
-            assert_eq!(s.congestion_control(), CongestionControl::Cubic);
         }
 
         s.set_congestion_control(CongestionControl::None);

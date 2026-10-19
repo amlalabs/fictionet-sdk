@@ -35,21 +35,6 @@ impl fmt::Display for Contig {
     }
 }
 
-#[cfg(feature = "defmt")]
-impl defmt::Format for Contig {
-    fn format(&self, fmt: defmt::Formatter) {
-        if self.has_hole() {
-            defmt::write!(fmt, "({})", self.hole_size);
-        }
-        if self.has_hole() && self.has_data() {
-            defmt::write!(fmt, " ");
-        }
-        if self.has_data() {
-            defmt::write!(fmt, "{}", self.data_size);
-        }
-    }
-}
-
 impl Contig {
     const fn empty() -> Contig {
         Contig {
@@ -109,20 +94,6 @@ impl fmt::Display for Assembler {
         }
         write!(f, "]")?;
         Ok(())
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Assembler {
-    fn format(&self, fmt: defmt::Formatter) {
-        defmt::write!(fmt, "[ ");
-        for contig in self.contigs.iter() {
-            if !contig.has_data() {
-                break;
-            }
-            defmt::write!(fmt, "{} ", contig);
-        }
-        defmt::write!(fmt, "]");
     }
 }
 
@@ -335,6 +306,12 @@ impl Assembler {
                 None
             }
         })
+    }
+}
+
+impl Default for Assembler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

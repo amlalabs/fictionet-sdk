@@ -1,6 +1,3 @@
-#![allow(unsafe_code)]
-#![allow(unused)]
-
 #[derive(Debug)]
 pub(crate) struct Rand {
     state: u64,
@@ -27,14 +24,5 @@ impl Rand {
     pub(crate) fn rand_u16(&mut self) -> u16 {
         let n = self.rand_u32();
         (n ^ (n >> 16)) as u16
-    }
-
-    pub(crate) fn rand_source_port(&mut self) -> u16 {
-        loop {
-            let res = self.rand_u16();
-            if res > 1024 {
-                return res;
-            }
-        }
     }
 }

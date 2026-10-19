@@ -1,6 +1,4 @@
 use super::{Error, Result};
-#[cfg(feature = "proto-rpl")]
-use super::{RplHopByHopPacket, RplHopByHopRepr};
 
 use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
@@ -14,8 +12,6 @@ enum_with_unknown! {
         PadN = 1,
         /// Router Alert
         RouterAlert = 5,
-        /// RPL Option
-        Rpl  = 0x63,
     }
 }
 
@@ -24,7 +20,6 @@ impl fmt::Display for Type {
         match *self {
             Type::Pad1 => write!(f, "Pad1"),
             Type::PadN => write!(f, "PadN"),
-            Type::Rpl => write!(f, "RPL"),
             Type::RouterAlert => write!(f, "RouterAlert"),
             Type::Unknown(id) => write!(f, "{id}"),
         }
@@ -54,7 +49,6 @@ impl RouterAlert {
 /// Action required when parsing the given IPv6 Extension
 /// Header Option Type fails
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum FailureType {
     /// Skip this option and continue processing the packet
     Skip = 0b00000000,
@@ -110,7 +104,6 @@ impl From<Type> for FailureType {
 
 /// A read/write wrapper around an IPv6 Extension Header Option.
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Ipv6Option<T: AsRef<[u8]>> {
     buffer: T,
 }
@@ -267,14 +260,12 @@ impl<T: AsRef<[u8]> + ?Sized> fmt::Display for Ipv6Option<&T> {
 
 /// A high-level representation of an IPv6 Extension Header Option.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Repr<'a> {
     Pad1,
     PadN(u8),
     RouterAlert(RouterAlert),
-    #[cfg(feature = "proto-rpl")]
-    Rpl(RplHopByHopRepr),
+
     Unknown {
         type_: Type,
         length: u8,
@@ -300,16 +291,6 @@ impl<'a> Repr<'a> {
                     Err(Error)
                 }
             }
-            #[cfg(feature = "proto-rpl")]
-            Type::Rpl => Ok(Repr::Rpl(RplHopByHopRepr::parse(
-                &RplHopByHopPacket::new_checked(opt.data())?,
-            ))),
-            #[cfg(not(feature = "proto-rpl"))]
-            Type::Rpl => Ok(Repr::Unknown {
-                type_: Type::Rpl,
-                length: opt.data_len(),
-                data: opt.data(),
-            }),
 
             unknown_type @ Type::Unknown(_) => Ok(Repr::Unknown {
                 type_: unknown_type,
@@ -325,8 +306,7 @@ impl<'a> Repr<'a> {
             Repr::Pad1 => 1,
             Repr::PadN(length) => field::DATA(length).end,
             Repr::RouterAlert(_) => field::DATA(RouterAlert::DATA_LEN).end,
-            #[cfg(feature = "proto-rpl")]
-            Repr::Rpl(opt) => field::DATA(opt.buffer_len() as u8).end,
+
             Repr::Unknown { length, .. } => field::DATA(length).end,
         }
     }
@@ -348,14 +328,7 @@ impl<'a> Repr<'a> {
                 opt.set_data_len(RouterAlert::DATA_LEN);
                 NetworkEndian::write_u16(opt.data_mut(), router_alert.into());
             }
-            #[cfg(feature = "proto-rpl")]
-            Repr::Rpl(rpl) => {
-                opt.set_option_type(Type::Rpl);
-                opt.set_data_len(4);
-                rpl.emit(&mut crate::wire::RplHopByHopPacket::new_unchecked(
-                    opt.data_mut(),
-                ));
-            }
+
             Repr::Unknown {
                 type_,
                 length,
@@ -371,7 +344,6 @@ impl<'a> Repr<'a> {
 
 /// A iterator for IPv6 options.
 #[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Ipv6OptionsIterator<'a> {
     pos: usize,
     length: usize,
@@ -432,8 +404,7 @@ impl<'a> fmt::Display for Repr<'a> {
             Repr::Pad1 => write!(f, "{} ", Type::Pad1),
             Repr::PadN(len) => write!(f, "{} length={} ", Type::PadN, len),
             Repr::RouterAlert(alert) => write!(f, "{} value={:?}", Type::RouterAlert, alert),
-            #[cfg(feature = "proto-rpl")]
-            Repr::Rpl(rpl) => write!(f, "{} {rpl}", Type::Rpl),
+
             Repr::Unknown { type_, length, .. } => write!(f, "{type_} length={length} "),
         }
     }
@@ -450,8 +421,6 @@ mod test {
     static IPV6OPTION_BYTES_ROUTER_ALERT_RSVP: [u8; 4] = [0x05, 0x02, 0x00, 0x01];
     static IPV6OPTION_BYTES_ROUTER_ALERT_ACTIVE_NETWORKS: [u8; 4] = [0x05, 0x02, 0x00, 0x02];
     static IPV6OPTION_BYTES_ROUTER_ALERT_UNKNOWN: [u8; 4] = [0x05, 0x02, 0xbe, 0xef];
-    #[cfg(feature = "proto-rpl")]
-    static IPV6OPTION_BYTES_RPL: [u8; 6] = [0x63, 0x04, 0x00, 0x1e, 0x08, 0x00];
 
     #[test]
     fn test_check_len() {
@@ -503,14 +472,6 @@ mod test {
             Ok(()),
             Ipv6Option::new_unchecked(&IPV6OPTION_BYTES_UNKNOWN).check_len()
         );
-
-        #[cfg(feature = "proto-rpl")]
-        {
-            assert_eq!(
-                Ok(()),
-                Ipv6Option::new_unchecked(&IPV6OPTION_BYTES_RPL).check_len()
-            );
-        }
     }
 
     #[test]
@@ -558,14 +519,6 @@ mod test {
 
         // unrecognized option without length and data
         assert_eq!(Ipv6Option::new_checked(&bytes), Err(Error));
-
-        #[cfg(feature = "proto-rpl")]
-        {
-            let opt = Ipv6Option::new_unchecked(&IPV6OPTION_BYTES_RPL);
-            assert_eq!(opt.option_type(), Type::Rpl);
-            assert_eq!(opt.data_len(), 4);
-            assert_eq!(opt.data(), &[0x00, 0x1e, 0x08, 0x00]);
-        }
     }
 
     #[test]
@@ -626,23 +579,6 @@ mod test {
                 data: &data
             }
         );
-
-        #[cfg(feature = "proto-rpl")]
-        {
-            let opt = Ipv6Option::new_unchecked(&IPV6OPTION_BYTES_RPL);
-            let rpl = Repr::parse(&opt).unwrap();
-
-            assert_eq!(
-                rpl,
-                Repr::Rpl(crate::wire::RplHopByHopRepr {
-                    down: false,
-                    rank_error: false,
-                    forwarding_error: false,
-                    instance_id: crate::wire::RplInstanceId::from(0x1e),
-                    sender_rank: 0x0800,
-                })
-            );
-        }
     }
 
     #[test]
@@ -675,16 +611,6 @@ mod test {
         let mut opt = Ipv6Option::new_unchecked(&mut bytes);
         repr.emit(&mut opt);
         assert_eq!(opt.into_inner(), &IPV6OPTION_BYTES_UNKNOWN);
-
-        #[cfg(feature = "proto-rpl")]
-        {
-            let opt = Ipv6Option::new_unchecked(&IPV6OPTION_BYTES_RPL);
-            let rpl = Repr::parse(&opt).unwrap();
-            let mut bytes = [0u8; 6];
-            rpl.emit(&mut Ipv6Option::new_unchecked(&mut bytes));
-
-            assert_eq!(&bytes, &IPV6OPTION_BYTES_RPL);
-        }
     }
 
     #[test]

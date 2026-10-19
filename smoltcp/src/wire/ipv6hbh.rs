@@ -1,6 +1,5 @@
 use super::{Error, Ipv6Option, Ipv6OptionRepr, Ipv6OptionsIterator, Result};
 use crate::config;
-use crate::wire::ipv6option::RouterAlert;
 use heapless::Vec;
 
 /// A read/write wrapper around an IPv6 Hop-by-Hop Header buffer.
@@ -60,7 +59,6 @@ impl<T: AsRef<[u8]> + AsMut<[u8]> + ?Sized> Header<&mut T> {
 
 /// A high-level representation of an IPv6 Hop-by-Hop Header.
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr<'a> {
     pub options: Vec<Ipv6OptionRepr<'a>, { config::IPV6_HBH_MAX_OPTIONS }>,
 }
@@ -105,17 +103,6 @@ impl<'a> Repr<'a> {
             ));
             buffer = &mut buffer[opt.buffer_len()..];
         }
-    }
-
-    /// The hop-by-hop header containing a MLDv2 router alert option
-    pub fn mldv2_router_alert() -> Self {
-        let mut options = Vec::new();
-        options
-            .push(Ipv6OptionRepr::RouterAlert(
-                RouterAlert::MulticastListenerDiscovery,
-            ))
-            .unwrap();
-        Self { options }
     }
 
     /// Append a PadN option to the vector of hop-by-hop options

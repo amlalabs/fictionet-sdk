@@ -3,11 +3,7 @@ use core::{cmp, fmt};
 
 use super::{Error, Result};
 use crate::phy::ChecksumCapabilities;
-use crate::wire::MldRepr;
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-use crate::wire::NdiscRepr;
-#[cfg(feature = "proto-rpl")]
-use crate::wire::RplRepr;
+
 use crate::wire::ip::checksum;
 use crate::wire::{IPV6_HEADER_LEN, IPV6_MIN_MTU};
 use crate::wire::{IpProtocol, Ipv6Address, Ipv6Packet, Ipv6Repr};
@@ -30,22 +26,6 @@ enum_with_unknown! {
         EchoRequest     = 0x80,
         /// Echo Reply
         EchoReply       = 0x81,
-        /// Multicast Listener Query
-        MldQuery        = 0x82,
-        /// Router Solicitation
-        RouterSolicit   = 0x85,
-        /// Router Advertisement
-        RouterAdvert    = 0x86,
-        /// Neighbor Solicitation
-        NeighborSolicit = 0x87,
-        /// Neighbor Advertisement
-        NeighborAdvert  = 0x88,
-        /// Redirect
-        Redirect        = 0x89,
-        /// Multicast Listener Report
-        MldReport       = 0x8f,
-        /// RPL Control Message
-        RplControl      = 0x9b,
     }
 }
 
@@ -58,32 +38,6 @@ impl Message {
     pub fn is_error(&self) -> bool {
         (u8::from(*self) & 0x80) != 0x80
     }
-
-    /// Return a boolean value indicating if the given message type
-    /// is an [NDISC] message type.
-    ///
-    /// [NDISC]: https://tools.ietf.org/html/rfc4861
-    pub const fn is_ndisc(&self) -> bool {
-        match *self {
-            Message::RouterSolicit
-            | Message::RouterAdvert
-            | Message::NeighborSolicit
-            | Message::NeighborAdvert
-            | Message::Redirect => true,
-            _ => false,
-        }
-    }
-
-    /// Return a boolean value indicating if the given message type
-    /// is an [MLD] message type.
-    ///
-    /// [MLD]: https://tools.ietf.org/html/rfc3810
-    pub const fn is_mld(&self) -> bool {
-        match *self {
-            Message::MldQuery | Message::MldReport => true,
-            _ => false,
-        }
-    }
 }
 
 impl fmt::Display for Message {
@@ -95,14 +49,6 @@ impl fmt::Display for Message {
             Message::ParamProblem => write!(f, "parameter problem"),
             Message::EchoReply => write!(f, "echo reply"),
             Message::EchoRequest => write!(f, "echo request"),
-            Message::RouterSolicit => write!(f, "router solicitation"),
-            Message::RouterAdvert => write!(f, "router advertisement"),
-            Message::NeighborSolicit => write!(f, "neighbor solicitation"),
-            Message::NeighborAdvert => write!(f, "neighbor advert"),
-            Message::Redirect => write!(f, "redirect"),
-            Message::MldQuery => write!(f, "multicast listener query"),
-            Message::MldReport => write!(f, "multicast listener report"),
-            Message::RplControl => write!(f, "RPL control message"),
             Message::Unknown(id) => write!(f, "{id}"),
         }
     }
@@ -193,7 +139,6 @@ impl fmt::Display for TimeExceeded {
 
 /// A read/write wrapper around an Internet Control Message Protocol version 6 packet buffer.
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     pub(super) buffer: T,
 }
@@ -214,44 +159,6 @@ pub(super) mod field {
     pub const ECHO_SEQNO: Field = 6..8;
 
     pub const HEADER_END: usize = 8;
-
-    // NDISC: See https://tools.ietf.org/html/rfc4861
-    // Router Advertisement message offsets
-    pub const CUR_HOP_LIMIT: usize = 4;
-    pub const ROUTER_FLAGS: usize = 5;
-    pub const ROUTER_LT: Field = 6..8;
-    pub const REACHABLE_TM: Field = 8..12;
-    pub const RETRANS_TM: Field = 12..16;
-
-    // Neighbor Solicitation message offsets
-    pub const TARGET_ADDR: Field = 8..24;
-
-    // Neighbor Advertisement message offsets
-    pub const NEIGH_FLAGS: usize = 4;
-
-    // Redirected Header message offsets
-    pub const DEST_ADDR: Field = 24..40;
-
-    // MLD:
-    //   - https://tools.ietf.org/html/rfc3810
-    //   - https://tools.ietf.org/html/rfc3810
-    // Multicast Listener Query message
-    pub const MAX_RESP_CODE: Field = 4..6;
-    pub const QUERY_RESV: Field = 6..8;
-    pub const QUERY_MCAST_ADDR: Field = 8..24;
-    pub const SQRV: usize = 24;
-    pub const QQIC: usize = 25;
-    pub const QUERY_NUM_SRCS: Field = 26..28;
-
-    // Multicast Listener Report Message
-    pub const RECORD_RESV: Field = 4..6;
-    pub const NR_MCAST_RCRDS: Field = 6..8;
-
-    // Multicast Address Record Offsets
-    pub const RECORD_TYPE: usize = 0;
-    pub const AUX_DATA_LEN: usize = 1;
-    pub const RECORD_NUM_SRCS: Field = 2..4;
-    pub const RECORD_MCAST_ADDR: Field = 4..20;
 }
 
 impl<T: AsRef<[u8]>> Packet<T> {
@@ -285,53 +192,12 @@ impl<T: AsRef<[u8]>> Packet<T> {
             | Message::TimeExceeded
             | Message::ParamProblem
             | Message::EchoRequest
-            | Message::EchoReply
-            | Message::MldQuery
-            | Message::RouterSolicit
-            | Message::RouterAdvert
-            | Message::NeighborSolicit
-            | Message::NeighborAdvert
-            | Message::Redirect
-            | Message::MldReport => {
+            | Message::EchoReply => {
                 if len < field::HEADER_END || len < self.header_len() {
                     return Err(Error);
                 }
             }
-            #[cfg(feature = "proto-rpl")]
-            Message::RplControl => match super::rpl::RplControlMessage::from(self.msg_code()) {
-                super::rpl::RplControlMessage::DodagInformationSolicitation => {
-                    // TODO(thvdveld): replace magic number
-                    if len < 6 {
-                        return Err(Error);
-                    }
-                }
-                super::rpl::RplControlMessage::DodagInformationObject => {
-                    // TODO(thvdveld): replace magic number
-                    if len < 28 {
-                        return Err(Error);
-                    }
-                }
-                super::rpl::RplControlMessage::DestinationAdvertisementObject => {
-                    // TODO(thvdveld): replace magic number
-                    if len < 8 || (self.dao_dodag_id_present() && len < 24) {
-                        return Err(Error);
-                    }
-                }
-                super::rpl::RplControlMessage::DestinationAdvertisementObjectAck => {
-                    // TODO(thvdveld): replace magic number
-                    if len < 8 || (self.dao_dodag_id_present() && len < 24) {
-                        return Err(Error);
-                    }
-                }
-                super::rpl::RplControlMessage::SecureDodagInformationSolicitation
-                | super::rpl::RplControlMessage::SecureDodagInformationObject
-                | super::rpl::RplControlMessage::SecureDestinationAdvertisementObject
-                | super::rpl::RplControlMessage::SecureDestinationAdvertisementObjectAck
-                | super::rpl::RplControlMessage::ConsistencyCheck => return Err(Error),
-                super::rpl::RplControlMessage::Unknown(_) => return Err(Error),
-            },
-            #[cfg(not(feature = "proto-rpl"))]
-            Message::RplControl => return Err(Error),
+
             Message::Unknown(_) => return Err(Error),
         }
 
@@ -402,13 +268,6 @@ impl<T: AsRef<[u8]>> Packet<T> {
             Message::ParamProblem => field::POINTER.end,
             Message::EchoRequest => field::ECHO_SEQNO.end,
             Message::EchoReply => field::ECHO_SEQNO.end,
-            Message::RouterSolicit => field::UNUSED.end,
-            Message::RouterAdvert => field::RETRANS_TM.end,
-            Message::NeighborSolicit => field::TARGET_ADDR.end,
-            Message::NeighborAdvert => field::TARGET_ADDR.end,
-            Message::Redirect => field::DEST_ADDR.end,
-            Message::MldQuery => field::QUERY_NUM_SRCS.end,
-            Message::MldReport => field::NR_MCAST_RCRDS.end,
             // For packets that are not included in RFC 4443, do not
             // include the last 32 bits of the ICMPv6 header in
             // `header_bytes`. This must be done so that these bytes
@@ -456,36 +315,6 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     pub fn set_msg_code(&mut self, value: u8) {
         let data = self.buffer.as_mut();
         data[field::CODE] = value
-    }
-
-    /// Clear any reserved fields in the message header.
-    ///
-    /// # Panics
-    /// This function panics if the message type has not been set.
-    /// See [set_msg_type].
-    ///
-    /// [set_msg_type]: #method.set_msg_type
-    #[inline]
-    pub fn clear_reserved(&mut self) {
-        match self.msg_type() {
-            Message::RouterSolicit
-            | Message::NeighborSolicit
-            | Message::NeighborAdvert
-            | Message::Redirect => {
-                let data = self.buffer.as_mut();
-                NetworkEndian::write_u32(&mut data[field::UNUSED], 0);
-            }
-            Message::MldQuery => {
-                let data = self.buffer.as_mut();
-                NetworkEndian::write_u16(&mut data[field::QUERY_RESV], 0);
-                data[field::SQRV] &= 0xf;
-            }
-            Message::MldReport => {
-                let data = self.buffer.as_mut();
-                NetworkEndian::write_u16(&mut data[field::RECORD_RESV], 0);
-            }
-            ty => panic!("Message type `{ty}` does not have any reserved fields."),
-        }
     }
 
     #[inline]
@@ -569,7 +398,6 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
 
 /// A high-level representation of an Internet Control Message Protocol version 6 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Repr<'a> {
     DstUnreachable {
@@ -603,11 +431,6 @@ pub enum Repr<'a> {
         seq_no: u16,
         data: &'a [u8],
     },
-    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    Ndisc(NdiscRepr<'a>),
-    Mld(MldRepr<'a>),
-    #[cfg(feature = "proto-rpl")]
-    Rpl(RplRepr<'a>),
 }
 
 impl<'a> Repr<'a> {
@@ -696,11 +519,7 @@ impl<'a> Repr<'a> {
                 seq_no: packet.echo_seq_no(),
                 data: packet.payload(),
             }),
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            (msg_type, 0) if msg_type.is_ndisc() => NdiscRepr::parse(packet).map(Repr::Ndisc),
-            (msg_type, 0) if msg_type.is_mld() => MldRepr::parse(packet).map(Repr::Mld),
-            #[cfg(feature = "proto-rpl")]
-            (Message::RplControl, _) => RplRepr::parse(packet).map(Repr::Rpl),
+
             _ => Err(Error),
         }
     }
@@ -718,11 +537,6 @@ impl<'a> Repr<'a> {
             &Repr::EchoRequest { data, .. } | &Repr::EchoReply { data, .. } => {
                 field::ECHO_SEQNO.end + data.len()
             }
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            &Repr::Ndisc(ndisc) => ndisc.buffer_len(),
-            &Repr::Mld(mld) => mld.buffer_len(),
-            #[cfg(feature = "proto-rpl")]
-            Repr::Rpl(rpl) => rpl.buffer_len(),
         }
     }
 
@@ -823,14 +637,6 @@ impl<'a> Repr<'a> {
                 let data_len = cmp::min(packet.payload_mut().len(), data.len());
                 packet.payload_mut()[..data_len].copy_from_slice(&data[..data_len])
             }
-
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            Repr::Ndisc(ndisc) => ndisc.emit(packet),
-
-            Repr::Mld(mld) => mld.emit(packet),
-
-            #[cfg(feature = "proto-rpl")]
-            Repr::Rpl(ref rpl) => rpl.emit(packet),
         }
 
         if checksum_caps.icmpv6.tx() {

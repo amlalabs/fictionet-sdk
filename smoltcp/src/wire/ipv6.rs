@@ -4,7 +4,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
 use super::{Error, Result};
-use crate::wire::HardwareAddress;
+
 use crate::wire::ip::pretty_print_ip_payload;
 
 pub use super::IpProtocol as Protocol;
@@ -28,16 +28,6 @@ pub const LINK_LOCAL_ALL_NODES: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0,
 ///
 /// [all routers multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7.1
 pub const LINK_LOCAL_ALL_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
-
-/// The link-local [all MLVDv2-capable routers multicast address].
-///
-/// [all MLVDv2-capable routers multicast address]: https://tools.ietf.org/html/rfc3810#section-11
-pub const LINK_LOCAL_ALL_MLDV2_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16);
-
-/// The link-local [all RPL nodes multicast address].
-///
-/// [all RPL nodes multicast address]: https://www.rfc-editor.org/rfc/rfc6550.html#section-20.19
-pub const LINK_LOCAL_ALL_RPL_NODES: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x1a);
 
 /// The [scope] of an address.
 ///
@@ -78,12 +68,6 @@ impl From<u8> for MulticastScope {
 pub use core::net::Ipv6Addr as Address;
 
 pub(crate) trait AddressExt {
-    /// Create an IPv6 address based on the provided prefix and hardware identifier.
-    fn from_link_prefix(
-        link_prefix: &Cidr,
-        interface_identifier: HardwareAddress,
-    ) -> Option<Address>;
-
     /// Query whether the IPv6 address is an [unicast address].
     ///
     /// [unicast address]: https://tools.ietf.org/html/rfc4291#section-2.5
@@ -107,13 +91,6 @@ pub(crate) trait AddressExt {
     /// This function panics if `mask` is greater than 128.
     fn mask(&self, mask: u8) -> [u8; ADDR_SIZE];
 
-    /// The solicited node for the given unicast address.
-    ///
-    /// # Panics
-    /// This function panics if the given address is not
-    /// unicast.
-    fn solicited_node(&self) -> Address;
-
     /// Return the scope of the address.
     ///
     /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
@@ -122,6 +99,7 @@ pub(crate) trait AddressExt {
     /// Query whether the IPv6 address is a [solicited-node multicast address].
     ///
     /// [Solicited-node multicast address]: https://datatracker.ietf.org/doc/html/rfc4291#section-2.7.1
+    #[cfg(test)]
     fn is_solicited_node_multicast(&self) -> bool;
 
     /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
@@ -130,23 +108,6 @@ pub(crate) trait AddressExt {
 }
 
 impl AddressExt for Address {
-    fn from_link_prefix(
-        link_prefix: &Cidr,
-        interface_identifier: HardwareAddress,
-    ) -> Option<Address> {
-        if let Some(eui64) = interface_identifier.as_eui_64() {
-            if link_prefix.prefix_len() != 64 {
-                return None;
-            }
-            let mut bytes = [0; 16];
-            bytes[0..8].copy_from_slice(&link_prefix.address().octets()[0..8]);
-            bytes[8..16].copy_from_slice(&eui64);
-            Some(Address::from_octets(bytes))
-        } else {
-            None
-        }
-    }
-
     fn x_is_unicast(&self) -> bool {
         !(self.is_multicast() || self.is_unspecified())
     }
@@ -174,15 +135,6 @@ impl AddressExt for Address {
         bytes
     }
 
-    fn solicited_node(&self) -> Address {
-        assert!(self.x_is_unicast());
-        let o = self.octets();
-        Address::from([
-            0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, o[13],
-            o[14], o[15],
-        ])
-    }
-
     fn x_multicast_scope(&self) -> MulticastScope {
         if self.is_multicast() {
             return MulticastScope::from(self.octets()[1] & 0b1111);
@@ -199,6 +151,7 @@ impl AddressExt for Address {
         }
     }
 
+    #[cfg(test)]
     fn is_solicited_node_multicast(&self) -> bool {
         self.octets()[0..13]
             == [
@@ -266,15 +219,6 @@ impl Cidr {
         }
     }
 
-    /// Create an IPv6 CIDR based on the provided prefix and hardware identifier.
-    pub fn from_link_prefix(
-        link_prefix: &Cidr,
-        interface_identifier: HardwareAddress,
-    ) -> Option<Self> {
-        Address::from_link_prefix(link_prefix, interface_identifier)
-            .map(|address| Self::new(address, link_prefix.prefix_len()))
-    }
-
     /// Return the address of this IPv6 CIDR block.
     pub const fn address(&self) -> Address {
         self.address
@@ -310,16 +254,8 @@ impl fmt::Display for Cidr {
     }
 }
 
-#[cfg(feature = "defmt")]
-impl defmt::Format for Cidr {
-    fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "{}/{=u8}", self.address, self.prefix_len);
-    }
-}
-
 /// A read/write wrapper around an Internet Protocol version 6 packet buffer.
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
 }
@@ -631,13 +567,9 @@ impl Repr {
         packet.set_version(6);
         packet.set_traffic_class(0);
         packet.set_flow_label(0);
-        #[cfg(not(feature = "segmentation-offload"))]
+
         let payload_len = self.payload_len as u16;
-        #[cfg(feature = "segmentation-offload")]
-        // If because of segmentation offload the length of the buffer exceeds what can be
-        // represented in the length field of the IP header, we fall back to 0. It will be
-        // filled by the device during segmentation anyways.
-        let payload_len = u16::try_from(self.payload_len).unwrap_or(0);
+
         packet.set_payload_len(payload_len);
         packet.set_hop_limit(self.hop_limit);
         packet.set_next_header(self.next_header);
@@ -652,20 +584,6 @@ impl fmt::Display for Repr {
             f,
             "IPv6 src={} dst={} nxt_hdr={} hop_limit={}",
             self.src_addr, self.dst_addr, self.next_header, self.hop_limit
-        )
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Repr {
-    fn format(&self, fmt: defmt::Formatter) {
-        defmt::write!(
-            fmt,
-            "IPv6 src={} dst={} nxt_hdr={} hop_limit={}",
-            self.src_addr,
-            self.dst_addr,
-            self.next_header,
-            self.hop_limit
         )
     }
 }
@@ -699,17 +617,6 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
 pub(crate) mod test {
     use super::*;
     use crate::wire::pretty_print::PrettyPrinter;
-
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_1: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_2: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_3: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_4: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 4);
-    #[allow(unused)]
-    pub(crate) const MOCK_UNSPECIFIED: Address = Address::UNSPECIFIED;
 
     const LINK_LOCAL_ADDR: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
     const UNIQUE_LOCAL_ADDR: Address = Address::new(0xfd00, 0, 0, 201, 1, 1, 1, 1);
@@ -955,45 +862,6 @@ pub(crate) mod test {
 
         let cidr_without_prefix = Cidr::new(LINK_LOCAL_ADDR, 0);
         assert!(cidr_without_prefix.contains_addr(&Address::LOCALHOST));
-    }
-
-    #[test]
-    fn test_from_eui_64() {
-        #[cfg(feature = "medium-ethernet")]
-        use crate::wire::EthernetAddress;
-        #[cfg(feature = "medium-ieee802154")]
-        use crate::wire::Ieee802154Address;
-        let tests: std::vec::Vec<(HardwareAddress, Address)> = vec![
-            #[cfg(feature = "medium-ethernet")]
-            (
-                HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
-                    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-                ])),
-                Address::new(0x2001, 0xdb8, 0x3, 0x0, 0xa8bb, 0xccff, 0xfedd, 0xeeff),
-            ),
-            #[cfg(feature = "medium-ieee802154")]
-            (
-                HardwareAddress::Ieee802154(Ieee802154Address::from_bytes(&[
-                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                ])),
-                Address::new(0x2001, 0xdb8, 0x3, 0x0, 0x0211, 0x2233, 0x4455, 0x6677),
-            ),
-        ];
-
-        let prefix = Cidr::new(GLOBAL_UNICAST_ADDR.mask(64).into(), 64);
-        let wrong_prefix = Cidr::new(GLOBAL_UNICAST_ADDR.mask(72).into(), 72);
-
-        for (hardware, result) in tests {
-            let generated = Address::from_link_prefix(&prefix, hardware).unwrap();
-            assert!(prefix.contains_addr(&generated));
-            assert_eq!(generated, result);
-            assert!(Address::from_link_prefix(&wrong_prefix, hardware).is_none());
-
-            let generated = Cidr::from_link_prefix(&prefix, hardware).unwrap();
-            assert!(prefix.contains_subnet(&generated));
-            assert_eq!(generated.address(), result);
-            assert!(Cidr::from_link_prefix(&wrong_prefix, hardware).is_none());
-        }
     }
 
     #[test]

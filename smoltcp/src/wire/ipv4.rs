@@ -32,7 +32,6 @@ pub const MULTICAST_ALL_ROUTERS: Address = Address::new(224, 0, 0, 2);
 const MINIMUM_IHL_BYTES: u8 = 20;
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Key {
     id: u16,
     src_addr: Address,
@@ -179,16 +178,8 @@ impl fmt::Display for Cidr {
     }
 }
 
-#[cfg(feature = "defmt")]
-impl defmt::Format for Cidr {
-    fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "{}/{=u8}", self.address, self.prefix_len);
-    }
-}
-
 /// A read/write wrapper around an Internet Protocol version 4 packet buffer.
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
 }
@@ -529,7 +520,6 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
 
 /// A high-level representation of an Internet Protocol version 4 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr {
     pub src_addr: Address,
     pub dst_addr: Address,
@@ -590,16 +580,9 @@ impl Repr {
         packet.set_header_len(field::DST_ADDR.end as u8);
         packet.set_dscp(0);
         packet.set_ecn(0);
-        #[cfg(not(feature = "segmentation-offload"))]
+
         let total_len = packet.header_len() as u16 + self.payload_len as u16;
-        #[cfg(feature = "segmentation-offload")]
-        // If because of segmentation offload the length of the buffer exceeds what can be
-        // represented in the length field of the IP header, we fall back to 0. It will be
-        // filled by the device during segmentation anyways.
-        let total_len = u16::try_from(self.payload_len)
-            .ok()
-            .and_then(|payload_len: u16| payload_len.checked_add(packet.header_len() as u16))
-            .unwrap_or(0);
+
         packet.set_total_len(total_len);
         packet.set_ident(0);
         packet.clear_flags();
@@ -718,17 +701,6 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_1: Address = Address::new(192, 168, 1, 1);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_2: Address = Address::new(192, 168, 1, 2);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_3: Address = Address::new(192, 168, 1, 3);
-    #[allow(unused)]
-    pub(crate) const MOCK_IP_ADDR_4: Address = Address::new(192, 168, 1, 4);
-    #[allow(unused)]
-    pub(crate) const MOCK_UNSPECIFIED: Address = Address::UNSPECIFIED;
 
     static PACKET_BYTES: [u8; 30] = [
         0x45, 0x00, 0x00, 0x1e, 0x01, 0x02, 0x62, 0x03, 0x1a, 0x01, 0xd5, 0x6e, 0x11, 0x12, 0x13,

@@ -1,17 +1,10 @@
-#![cfg_attr(
-    not(all(feature = "proto-ipv6", feature = "proto-ipv4")),
-    allow(dead_code)
-)]
-
 use core::result;
 use core::str::FromStr;
 
-#[cfg(feature = "medium-ethernet")]
-use crate::wire::EthernetAddress;
 use crate::wire::{IpAddress, IpCidr, IpEndpoint};
-#[cfg(feature = "proto-ipv4")]
+
 use crate::wire::{Ipv4Address, Ipv4Cidr};
-#[cfg(feature = "proto-ipv6")]
+
 use crate::wire::{Ipv6Address, Ipv6Cidr};
 
 type Result<T> = result::Result<T, ()>;
@@ -124,30 +117,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    #[cfg(feature = "medium-ethernet")]
-    fn accept_mac_joined_with(&mut self, separator: u8) -> Result<EthernetAddress> {
-        let mut octets = [0u8; 6];
-        for (n, octet) in octets.iter_mut().enumerate() {
-            *octet = self.accept_number(2, 0x100, true)? as u8;
-            if n != 5 {
-                self.accept_char(separator)?;
-            }
-        }
-        Ok(EthernetAddress(octets))
-    }
-
-    #[cfg(feature = "medium-ethernet")]
-    fn accept_mac(&mut self) -> Result<EthernetAddress> {
-        if let Some(mac) = self.try_do(|p| p.accept_mac_joined_with(b'-')) {
-            return Ok(mac);
-        }
-        if let Some(mac) = self.try_do(|p| p.accept_mac_joined_with(b':')) {
-            return Ok(mac);
-        }
-        Err(())
-    }
-
-    #[cfg(feature = "proto-ipv6")]
     fn accept_ipv4_mapped_ipv6_part(&mut self, parts: &mut [u16], idx: &mut usize) -> Result<()> {
         let octets = self.accept_ipv4_octets()?;
 
@@ -159,7 +128,6 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    #[cfg(feature = "proto-ipv6")]
     fn accept_ipv6_part(
         &mut self,
         (head, tail): (&mut [u16; 8], &mut [u16; 6]),
@@ -245,7 +213,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    #[cfg(feature = "proto-ipv6")]
     fn accept_ipv6(&mut self) -> Result<Ipv6Address> {
         // IPv6 addresses may contain a "::" to indicate a series of
         // 16 bit sections that evaluate to 0. E.g.
@@ -291,31 +258,23 @@ impl<'a> Parser<'a> {
         Ok(octets)
     }
 
-    #[cfg(feature = "proto-ipv4")]
     fn accept_ipv4(&mut self) -> Result<Ipv4Address> {
         let octets = self.accept_ipv4_octets()?;
         Ok(Ipv4Address::from_octets(octets))
     }
 
     fn accept_ip(&mut self) -> Result<IpAddress> {
-        #[cfg(feature = "proto-ipv4")]
-        #[allow(clippy::single_match)]
-        match self.try_do(|p| p.accept_ipv4()) {
-            Some(ipv4) => return Ok(IpAddress::Ipv4(ipv4)),
-            None => (),
+        if let Some(ipv4) = self.try_do(|p| p.accept_ipv4()) {
+            return Ok(IpAddress::Ipv4(ipv4));
         }
 
-        #[cfg(feature = "proto-ipv6")]
-        #[allow(clippy::single_match)]
-        match self.try_do(|p| p.accept_ipv6()) {
-            Some(ipv6) => return Ok(IpAddress::Ipv6(ipv6)),
-            None => (),
+        if let Some(ipv6) = self.try_do(|p| p.accept_ipv6()) {
+            return Ok(IpAddress::Ipv6(ipv6));
         }
 
         Err(())
     }
 
-    #[cfg(feature = "proto-ipv4")]
     fn accept_ipv4_endpoint(&mut self) -> Result<IpEndpoint> {
         let ip = self.accept_ipv4()?;
 
@@ -332,7 +291,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    #[cfg(feature = "proto-ipv6")]
     fn accept_ipv6_endpoint(&mut self) -> Result<IpEndpoint> {
         if self.lookahead_char(b'[') {
             self.accept_char(b'[')?;
@@ -355,31 +313,15 @@ impl<'a> Parser<'a> {
     }
 
     fn accept_ip_endpoint(&mut self) -> Result<IpEndpoint> {
-        #[cfg(feature = "proto-ipv4")]
-        #[allow(clippy::single_match)]
-        match self.try_do(|p| p.accept_ipv4_endpoint()) {
-            Some(ipv4) => return Ok(ipv4),
-            None => (),
+        if let Some(ipv4) = self.try_do(|p| p.accept_ipv4_endpoint()) {
+            return Ok(ipv4);
         }
 
-        #[cfg(feature = "proto-ipv6")]
-        #[allow(clippy::single_match)]
-        match self.try_do(|p| p.accept_ipv6_endpoint()) {
-            Some(ipv6) => return Ok(ipv6),
-            None => (),
+        if let Some(ipv6) = self.try_do(|p| p.accept_ipv6_endpoint()) {
+            return Ok(ipv6);
         }
 
         Err(())
-    }
-}
-
-#[cfg(feature = "medium-ethernet")]
-impl FromStr for EthernetAddress {
-    type Err = ();
-
-    /// Parse a string representation of an Ethernet address.
-    fn from_str(s: &str) -> Result<EthernetAddress> {
-        Parser::new(s).until_eof(|p| p.accept_mac())
     }
 }
 
@@ -392,7 +334,6 @@ impl FromStr for IpAddress {
     }
 }
 
-#[cfg(feature = "proto-ipv4")]
 impl FromStr for Ipv4Cidr {
     type Err = ();
 
@@ -407,7 +348,6 @@ impl FromStr for Ipv4Cidr {
     }
 }
 
-#[cfg(feature = "proto-ipv6")]
 impl FromStr for Ipv6Cidr {
     type Err = ();
 
@@ -428,18 +368,12 @@ impl FromStr for IpCidr {
 
     /// Parse a string representation of an IP CIDR.
     fn from_str(s: &str) -> Result<IpCidr> {
-        #[cfg(feature = "proto-ipv4")]
-        #[allow(clippy::single_match)]
-        match Ipv4Cidr::from_str(s) {
-            Ok(cidr) => return Ok(IpCidr::Ipv4(cidr)),
-            Err(_) => (),
+        if let Ok(cidr) = Ipv4Cidr::from_str(s) {
+            return Ok(IpCidr::Ipv4(cidr));
         }
 
-        #[cfg(feature = "proto-ipv6")]
-        #[allow(clippy::single_match)]
-        match Ipv6Cidr::from_str(s) {
-            Ok(cidr) => return Ok(IpCidr::Ipv6(cidr)),
-            Err(_) => (),
+        if let Ok(cidr) = Ipv6Cidr::from_str(s) {
+            return Ok(IpCidr::Ipv6(cidr));
         }
 
         Err(())
@@ -473,41 +407,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(all(feature = "proto-ipv4", feature = "medium-ethernet"))]
-    fn test_mac() {
-        assert_eq!(EthernetAddress::from_str(""), Err(()));
-        assert_eq!(
-            EthernetAddress::from_str("02:00:00:00:00:00"),
-            Ok(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x00]))
-        );
-        assert_eq!(
-            EthernetAddress::from_str("01:23:45:67:89:ab"),
-            Ok(EthernetAddress([0x01, 0x23, 0x45, 0x67, 0x89, 0xab]))
-        );
-        assert_eq!(
-            EthernetAddress::from_str("cd:ef:10:00:00:00"),
-            Ok(EthernetAddress([0xcd, 0xef, 0x10, 0x00, 0x00, 0x00]))
-        );
-        assert_eq!(
-            EthernetAddress::from_str("00:00:00:ab:cd:ef"),
-            Ok(EthernetAddress([0x00, 0x00, 0x00, 0xab, 0xcd, 0xef]))
-        );
-        assert_eq!(
-            EthernetAddress::from_str("00-00-00-ab-cd-ef"),
-            Ok(EthernetAddress([0x00, 0x00, 0x00, 0xab, 0xcd, 0xef]))
-        );
-        assert_eq!(
-            EthernetAddress::from_str("AB-CD-EF-00-00-00"),
-            Ok(EthernetAddress([0xab, 0xcd, 0xef, 0x00, 0x00, 0x00]))
-        );
-        assert_eq!(EthernetAddress::from_str("100:00:00:00:00:00"), Err(()));
-        assert_eq!(EthernetAddress::from_str("002:00:00:00:00:00"), Err(()));
-        assert_eq!(EthernetAddress::from_str("02:00:00:00:00:000"), Err(()));
-        assert_eq!(EthernetAddress::from_str("02:00:00:00:00:0x"), Err(()));
-    }
-
-    #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_ip_ipv4() {
         assert_eq!(IpAddress::from_str(""), Err(()));
         assert_eq!(
@@ -518,7 +417,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv6")]
     fn test_ip_ipv6() {
         assert_eq!(IpAddress::from_str(""), Err(()));
         assert_eq!(
@@ -531,7 +429,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_cidr_ipv4() {
         let tests = [
             (
@@ -563,7 +460,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv6")]
     fn test_cidr_ipv6() {
         let tests = [
             (
@@ -597,7 +493,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_endpoint_ipv4() {
         assert_eq!(IpEndpoint::from_str(""), Err(()));
         assert_eq!(IpEndpoint::from_str("x"), Err(()));
@@ -618,7 +513,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv6")]
     fn test_endpoint_ipv6() {
         assert_eq!(IpEndpoint::from_str(""), Err(()));
         assert_eq!(IpEndpoint::from_str("x"), Err(()));

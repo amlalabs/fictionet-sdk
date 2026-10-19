@@ -448,9 +448,12 @@ mod test {
         assert!(!ring.is_full());
 
         for i in 1..5 {
-            ring.enqueue_one_with(|e| Ok::<_, ()>(*e = i))
-                .unwrap()
-                .unwrap();
+            ring.enqueue_one_with(|e| {
+                let _: () = *e = i;
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .unwrap();
             assert!(!ring.is_empty());
         }
         assert!(ring.is_full());

@@ -29,13 +29,6 @@ impl fmt::Display for SeqNumber {
     }
 }
 
-#[cfg(feature = "defmt")]
-impl defmt::Format for SeqNumber {
-    fn format(&self, fmt: defmt::Formatter) {
-        defmt::write!(fmt, "{}", self.0 as u32);
-    }
-}
-
 impl ops::Add<usize> for SeqNumber {
     type Output = SeqNumber;
 
@@ -84,7 +77,6 @@ impl cmp::PartialOrd for SeqNumber {
 
 /// A read/write wrapper around a Transmission Control Protocol packet buffer.
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
 }
@@ -651,7 +643,6 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
 /// A summary of all standard options contained in a TCP header.
 #[non_exhaustive]
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TcpOptionSummary {
     pub max_segment_size: Option<u16>,
     pub window_scale: Option<u8>,
@@ -662,7 +653,6 @@ pub struct TcpOptionSummary {
 
 /// A representation of a single TCP option.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TcpOption<'a> {
     EndOfList,
     NoOperation,
@@ -823,7 +813,6 @@ impl<'a> TcpOption<'a> {
 
 /// The possible control flags of a Transmission Control Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Control {
     None,
     Psh,
@@ -978,15 +967,15 @@ impl<'a> Repr<'a> {
         Ok(Repr {
             src_port: packet.src_port(),
             dst_port: packet.dst_port(),
-            control: control,
+            control,
             seq_number: packet.seq_number(),
-            ack_number: ack_number,
+            ack_number,
             window_len: packet.window_len(),
-            window_scale: window_scale,
-            max_seg_size: max_seg_size,
-            sack_permitted: sack_permitted,
-            sack_ranges: sack_ranges,
-            timestamp: timestamp,
+            window_scale,
+            max_seg_size,
+            sack_permitted,
+            sack_ranges,
+            timestamp,
             payload: packet.payload(),
         })
     }
@@ -1192,29 +1181,6 @@ impl<'a> fmt::Display for Repr<'a> {
     }
 }
 
-#[cfg(feature = "defmt")]
-impl<'a> defmt::Format for Repr<'a> {
-    fn format(&self, fmt: defmt::Formatter) {
-        defmt::write!(fmt, "TCP src={} dst={}", self.src_port, self.dst_port);
-        match self.control {
-            Control::Syn => defmt::write!(fmt, " syn"),
-            Control::Fin => defmt::write!(fmt, " fin"),
-            Control::Rst => defmt::write!(fmt, " rst"),
-            Control::Psh => defmt::write!(fmt, " psh"),
-            Control::None => (),
-        }
-        defmt::write!(fmt, " seq={}", self.seq_number);
-        if let Some(ack_number) = self.ack_number {
-            defmt::write!(fmt, " ack={}", ack_number);
-        }
-        defmt::write!(fmt, " win={}", self.window_len);
-        defmt::write!(fmt, " len={}", self.payload.len());
-        if let Some(max_seg_size) = self.max_seg_size {
-            defmt::write!(fmt, " mss={}", max_seg_size);
-        }
-    }
-}
-
 use crate::wire::pretty_print::{PrettyIndent, PrettyPrint};
 
 impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
@@ -1233,28 +1199,23 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    #[cfg(feature = "proto-ipv4")]
+
     use crate::wire::Ipv4Address;
 
-    #[cfg(feature = "proto-ipv4")]
     const SRC_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
-    #[cfg(feature = "proto-ipv4")]
+
     const DST_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
 
-    #[cfg(feature = "proto-ipv4")]
     static PACKET_BYTES: [u8; 28] = [
         0xbf, 0x00, 0x00, 0x50, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x60, 0x35, 0x01,
         0x23, 0x01, 0xb6, 0x02, 0x01, 0x03, 0x03, 0x0c, 0x01, 0xaa, 0x00, 0x00, 0xff,
     ];
 
-    #[cfg(feature = "proto-ipv4")]
     static OPTION_BYTES: [u8; 4] = [0x03, 0x03, 0x0c, 0x01];
 
-    #[cfg(feature = "proto-ipv4")]
     static PAYLOAD_BYTES: [u8; 4] = [0xaa, 0x00, 0x00, 0xff];
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_deconstruct() {
         let packet = Packet::new_unchecked(&PACKET_BYTES[..]);
         assert_eq!(packet.src_port(), 48896);
@@ -1277,7 +1238,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_construct() {
         let mut bytes = vec![0xa5; PACKET_BYTES.len()];
         let mut packet = Packet::new_unchecked(&mut bytes);
@@ -1303,7 +1263,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_truncated() {
         let packet = Packet::new_unchecked(&PACKET_BYTES[..23]);
         assert_eq!(packet.check_len(), Err(Error));
@@ -1317,13 +1276,11 @@ mod test {
         assert_eq!(packet.check_len(), Err(Error));
     }
 
-    #[cfg(feature = "proto-ipv4")]
     static SYN_PACKET_BYTES: [u8; 24] = [
         0xbf, 0x00, 0x00, 0x50, 0x01, 0x23, 0x45, 0x67, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x01,
         0x23, 0x7a, 0x8d, 0x00, 0x00, 0xaa, 0x00, 0x00, 0xff,
     ];
 
-    #[cfg(feature = "proto-ipv4")]
     fn packet_repr() -> Repr<'static> {
         Repr {
             src_port: 48896,
@@ -1342,7 +1299,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_parse() {
         let packet = Packet::new_unchecked(&SYN_PACKET_BYTES[..]);
         let repr = Repr::parse(
@@ -1356,7 +1312,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_emit() {
         let repr = packet_repr();
         let mut bytes = vec![0xa5; repr.buffer_len()];
@@ -1371,7 +1326,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
     fn test_header_len_multiple_of_4() {
         let mut repr = packet_repr();
         repr.window_scale = Some(0); // This TCP Option needs 3 bytes.

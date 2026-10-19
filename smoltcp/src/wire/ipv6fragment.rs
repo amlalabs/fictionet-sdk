@@ -5,7 +5,6 @@ use byteorder::{ByteOrder, NetworkEndian};
 
 /// A read/write wrapper around an IPv6 Fragment Header.
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Header<T: AsRef<[u8]>> {
     buffer: T,
 }
@@ -140,7 +139,6 @@ impl<T: AsRef<[u8]> + ?Sized> fmt::Display for Header<&T> {
 
 /// A high-level representation of an IPv6 Fragment header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr {
     /// The offset of the data following this header, relative to the start of the Fragmentable
     /// Part of the original packet.

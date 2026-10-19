@@ -67,7 +67,6 @@ impl Instant {
     ///
     /// [std::time::SystemTime]: https://doc.rust-lang.org/std/time/struct.SystemTime.html
     /// [std::time::SystemTime::now]: https://doc.rust-lang.org/std/time/struct.SystemTime.html#method.now
-    #[cfg(feature = "std")]
     pub fn now() -> Instant {
         Self::from(::std::time::SystemTime::now())
     }
@@ -102,7 +101,6 @@ impl Instant {
     }
 }
 
-#[cfg(feature = "std")]
 impl From<::std::time::Instant> for Instant {
     fn from(other: ::std::time::Instant) -> Instant {
         static REFERENTIAL: ::std::sync::LazyLock<::std::time::Instant> =
@@ -113,7 +111,6 @@ impl From<::std::time::Instant> for Instant {
     }
 }
 
-#[cfg(feature = "std")]
 impl From<::std::time::SystemTime> for Instant {
     fn from(other: ::std::time::SystemTime) -> Instant {
         let n = other
@@ -123,7 +120,6 @@ impl From<::std::time::SystemTime> for Instant {
     }
 }
 
-#[cfg(feature = "std")]
 impl From<Instant> for ::std::time::SystemTime {
     fn from(val: Instant) -> Self {
         ::std::time::UNIX_EPOCH + ::std::time::Duration::from_micros(val.micros as u64)
@@ -133,13 +129,6 @@ impl From<Instant> for ::std::time::SystemTime {
 impl fmt::Display for Instant {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}.{:0>3}s", self.secs(), self.millis())
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Instant {
-    fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "{}.{:03}s", self.secs(), self.millis());
     }
 }
 
@@ -237,13 +226,6 @@ impl Duration {
 impl fmt::Display for Duration {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}.{:03}s", self.secs(), self.millis())
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Duration {
-    fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "{}.{:03}s", self.secs(), self.millis());
     }
 }
 
@@ -384,7 +366,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "std")]
     fn test_instant_conversions() {
         let mut epoc: ::std::time::SystemTime = Instant::from_millis(0).into();
         assert_eq!(
@@ -400,7 +381,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "std")]
     fn test_instant_conversions_from_std_instant() {
         let std_now = ::std::time::Instant::now();
 

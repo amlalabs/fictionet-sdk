@@ -250,7 +250,6 @@ impl Repr {
         if checksum_caps.udp.rx() && !packet.verify_checksum(src_addr, dst_addr) {
             match (src_addr, dst_addr) {
                 // ... except on UDP-over-IPv4, where it can be omitted.
-                #[cfg(feature = "proto-ipv4")]
                 (&IpAddress::Ipv4(_), &IpAddress::Ipv4(_)) if packet.checksum() == 0 => (),
                 _ => return Err(Error),
             }
@@ -265,21 +264,6 @@ impl Repr {
     /// Return the length of the packet header that will be emitted from this high-level representation.
     pub const fn header_len(&self) -> usize {
         HEADER_LEN
-    }
-
-    /// Emit a high-level representation into an User Datagram Protocol packet.
-    ///
-    /// This never calculates the checksum, and is intended for internal-use only,
-    /// not for packets that are going to be actually sent over the network. For
-    /// example, when decompressing 6lowpan.
-    pub(crate) fn emit_header<T>(&self, packet: &mut Packet<&mut T>, payload_len: usize)
-    where
-        T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
-    {
-        packet.set_src_port(self.src_port);
-        packet.set_dst_port(self.dst_port);
-        packet.set_len((HEADER_LEN + payload_len) as u16);
-        packet.set_checksum(0);
     }
 
     /// Emit a high-level representation into an User Datagram Protocol packet.
@@ -322,30 +306,9 @@ impl<T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&T> {
     }
 }
 
-#[cfg(feature = "defmt")]
-impl<'a, T: AsRef<[u8]> + ?Sized> defmt::Format for Packet<&'a T> {
-    fn format(&self, fmt: defmt::Formatter) {
-        // Cannot use Repr::parse because we don't have the IP addresses.
-        defmt::write!(
-            fmt,
-            "UDP src={} dst={} len={}",
-            self.src_port(),
-            self.dst_port(),
-            self.payload().len()
-        );
-    }
-}
-
 impl fmt::Display for Repr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "UDP src={} dst={}", self.src_port, self.dst_port)
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Repr {
-    fn format(&self, fmt: defmt::Formatter) {
-        defmt::write!(fmt, "UDP src={} dst={}", self.src_port, self.dst_port);
     }
 }
 
@@ -367,29 +330,25 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    #[cfg(feature = "proto-ipv4")]
+
     use crate::wire::Ipv4Address;
 
-    #[cfg(feature = "proto-ipv4")]
     const SRC_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
-    #[cfg(feature = "proto-ipv4")]
+
     const DST_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
 
-    #[cfg(feature = "proto-ipv4")]
     static PACKET_BYTES: [u8; 12] = [
         0xbf, 0x00, 0x00, 0x35, 0x00, 0x0c, 0x12, 0x4d, 0xaa, 0x00, 0x00, 0xff,
     ];
 
-    #[cfg(feature = "proto-ipv4")]
     static NO_CHECKSUM_PACKET: [u8; 12] = [
         0xbf, 0x00, 0x00, 0x35, 0x00, 0x0c, 0x00, 0x00, 0xaa, 0x00, 0x00, 0xff,
     ];
 
-    #[cfg(feature = "proto-ipv4")]
     static PAYLOAD_BYTES: [u8; 4] = [0xaa, 0x00, 0x00, 0xff];
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
+
     fn test_deconstruct() {
         let packet = Packet::new_unchecked(&PACKET_BYTES[..]);
         assert_eq!(packet.src_port(), 48896);
@@ -401,7 +360,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
+
     fn test_construct() {
         let mut bytes = vec![0xa5; 12];
         let mut packet = Packet::new_unchecked(&mut bytes);
@@ -423,7 +382,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
+
     fn test_zero_checksum() {
         let mut bytes = vec![0; 8];
         let mut packet = Packet::new_unchecked(&mut bytes);
@@ -435,7 +394,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
+
     fn test_no_checksum() {
         let mut bytes = vec![0; 8];
         let mut packet = Packet::new_unchecked(&mut bytes);
@@ -446,7 +405,6 @@ mod test {
         assert!(packet.verify_checksum(&SRC_ADDR.into(), &DST_ADDR.into()));
     }
 
-    #[cfg(feature = "proto-ipv4")]
     fn packet_repr() -> Repr {
         Repr {
             src_port: 48896,
@@ -455,7 +413,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
+
     fn test_parse() {
         let packet = Packet::new_unchecked(&PACKET_BYTES[..]);
         let repr = Repr::parse(
@@ -469,7 +427,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
+
     fn test_emit() {
         let repr = packet_repr();
         let mut bytes = vec![0xa5; repr.header_len() + PAYLOAD_BYTES.len()];
@@ -486,7 +444,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4")]
+
     fn test_checksum_omitted() {
         let packet = Packet::new_unchecked(&NO_CHECKSUM_PACKET[..]);
         let repr = Repr::parse(

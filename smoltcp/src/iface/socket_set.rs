@@ -1,7 +1,6 @@
 use core::fmt;
 use managed::ManagedSlice;
 
-use super::socket_meta::Meta;
 use crate::socket::{AnySocket, Socket};
 
 /// Opaque struct with space for storing one socket.
@@ -20,13 +19,12 @@ impl<'a> SocketStorage<'a> {
 /// An item of a socket set.
 #[derive(Debug)]
 pub(crate) struct Item<'a> {
-    pub(crate) meta: Meta,
+    pub(crate) handle: SocketHandle,
     pub(crate) socket: Socket<'a>,
 }
 
 /// A handle, identifying a socket in an Interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SocketHandle(usize);
 
 impl fmt::Display for SocketHandle {
@@ -63,10 +61,8 @@ impl<'a> SocketSet<'a> {
         fn put<'a>(index: usize, slot: &mut SocketStorage<'a>, socket: Socket<'a>) -> SocketHandle {
             net_trace!("[{}]: adding", index);
             let handle = SocketHandle(index);
-            let mut meta = Meta::default();
-            meta.handle = handle;
             *slot = SocketStorage {
-                inner: Some(Item { meta, socket }),
+                inner: Some(Item { handle, socket }),
             };
             handle
         }
@@ -81,7 +77,7 @@ impl<'a> SocketSet<'a> {
 
         match &mut self.sockets {
             ManagedSlice::Borrowed(_) => panic!("adding a socket to a full SocketSet"),
-            #[cfg(feature = "alloc")]
+
             ManagedSlice::Owned(sockets) => {
                 sockets.push(SocketStorage { inner: None });
                 let index = sockets.len() - 1;
@@ -131,12 +127,12 @@ impl<'a> SocketSet<'a> {
 
     /// Get an iterator to the inner sockets.
     pub fn iter(&self) -> impl Iterator<Item = (SocketHandle, &Socket<'a>)> {
-        self.items().map(|i| (i.meta.handle, &i.socket))
+        self.items().map(|i| (i.handle, &i.socket))
     }
 
     /// Get a mutable iterator to the inner sockets.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (SocketHandle, &mut Socket<'a>)> {
-        self.items_mut().map(|i| (i.meta.handle, &mut i.socket))
+        self.items_mut().map(|i| (i.handle, &mut i.socket))
     }
 
     /// Iterate every socket in this set.
