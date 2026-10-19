@@ -1,4 +1,10 @@
-//! Rustls key emission for the run observer.
+//! Rustls key emission for the run's observer.
+//!
+//! Interest is checked before allocating an adapter or copying connection
+//! metadata. Each emitted key borrows its label, client random and secret.
+//! Core retains no keys. The companion's `Collector` keeps bounded keys for
+//! decryption and export. The adapter holds a weak dispatch reference and
+//! stops delivery when the run ends.
 
 /// Rustls delivery scoped to a connection, without retaining its run.
 pub(crate) struct KeyLog {

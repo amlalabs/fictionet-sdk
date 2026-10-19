@@ -61,9 +61,8 @@
 //! plus 64 bytes against their 32 MiB budget, and drop new packets past
 //! it.
 //!
-//! [`listen`](crate::listen) reads the attach type from `hello` only to
-//! tell an observer, such as the dashboard, from a
-//! sandbox. World code is never told the type. It
+//! [`listen`](crate::listen) validates the attach type in `hello`.
+//! World code is never told the type. It
 //! can only guess it from [`Attachment::mtu`](crate::Attachment::mtu),
 //! which is always 1500 for the proxy types, and from what the packets
 //! look like, which the sections below describe.
@@ -360,9 +359,10 @@
 //! each type. The world is the `web_world` example from
 //! [`getting_started`](crate::guide::getting_started). The packet lists are what
 //! the world saw on the sandbox's `Attachment`, from
-//! `fictionet observe ... packets <link>` (see `fictionet-observe`),
+//! `fictionet observe --observation unix:PATH packets <link>` (see
+//! [Fictionet Observe](../../../fictionet_observe/index.html)),
 //! cut to their source, destination and summary. TLS 1.3 is shown
-//! decrypted, because the observer had the world's keys.
+//! decrypted with keys emitted by the world and retained by the companion.
 //!
 //! ## `tun`
 //!

@@ -500,25 +500,25 @@
 //!
 #![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
 //!
-//! The integrator installs observers before running the world. With no observer,
-//! services skip event construction. `fictionet_observe::Memory` keeps
-//! a bounded history for grading. Native `fictionet_observe::Jsonl` writes files
-//! and needs an explicit `finish` outside the run. Custom observers must return promptly without calling back
-//! into the world. A grader can install memory and optional repeat aggregation:
+//! Install the observer in `RunOptions` before running the world. With no
+//! observer, services skip event construction. The companion's `Memory` and
+//! `Aggregate` retain events for grading; `Jsonl` exports files. See
+//! [Fictionet Observe](../../../fictionet_observe/index.html) for consumption.
+//! A grader can install bounded memory and repeat aggregation:
 //!
 //! ```
 //! use std::sync::Arc;
 //! use fictionet::{RunOptions, Seed, block_on, lab};
 //! use fictionet_observe::{Aggregate, Memory};
-//! let evidence = Arc::new(Memory::default());
+//! let grader = Arc::new(Memory::default());
 //! let options = RunOptions::new(Seed::from_u64(7))
-//!     .observer(Arc::new(Aggregate::new(evidence.clone())));
+//!     .observer(Arc::new(Aggregate::new(grader.clone())));
 //! block_on(lab(options, |fcx| async move {
 //!     // Start the sites and simulated clients here.
 //!     fcx.emit("shop", "order", |event| event.field("item", "pump"));
 //!     Ok(())
 //! }))?;
-//! let events = evidence.checked_all()?;
+//! let events = grader.checked_all()?;
 //! assert!(events.iter().any(|event| event.is("shop", "order")));
 //! # Ok::<(), fictionet::Error>(())
 //! ```

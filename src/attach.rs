@@ -39,7 +39,7 @@ pub struct Attachment {
     name: String,
     mtu: u16,
     link: Link,
-    /// Counts for the dashboard. Side 0 is the world, side 1 the sandbox.
+    /// Counters published to the observer. Side 0 is the world, side 1 the sandbox.
     meter: Arc<Meter>,
     /// The last task seen polling this attachment.
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]

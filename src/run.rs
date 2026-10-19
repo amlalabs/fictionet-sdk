@@ -20,21 +20,26 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// Configuration installed before a run starts.
 ///
-/// Options select the seed and an optional observation destination, shared by
-/// every region.
+/// Options select the seed and one optional observer, shared by every region.
+/// It receives events, packets, TLS keys and topology according to its interest.
+/// Use [`Fanout`](crate::events::Fanout) to combine consumers.
+/// [Fictionet Observe](../fictionet_observe/index.html) supplies `Memory`,
+/// `Aggregate`, `Jsonl`, `Collector` and `DashboardObserver`.
+/// Core keeps no history. Without an observer, observation allocates nothing,
+/// reads no clock, increments no sequence and registers no links.
 ///
 /// ```
 /// use std::sync::Arc;
 /// use fictionet::{RunOptions, Seed, block_on, lab};
 /// use fictionet_observe::{Limits, Memory};
 ///
-/// let evidence = Arc::new(Memory::new(Limits::new(1000, 1 << 20)));
-/// let options = RunOptions::new(Seed::from_u64(7)).observer(evidence.clone());
+/// let grader = Arc::new(Memory::new(Limits::new(1000, 1 << 20)));
+/// let options = RunOptions::new(Seed::from_u64(7)).observer(grader.clone());
 /// block_on(lab(options, |fcx| async move {
 ///     fcx.emit("shop", "order", |e| e.field("item", "pump"));
 ///     Ok(())
 /// }))?;
-/// let orders = evidence.checked_of("shop", "order")?;
+/// let orders = grader.checked_of("shop", "order")?;
 /// assert_eq!(orders[0].str("item"), Some("pump"));
 /// # Ok::<(), fictionet::Error>(())
 /// ```
@@ -55,6 +60,8 @@ impl RunOptions {
     }
 
     /// Installs the run's destination for events, packets, TLS keys and topology.
+    /// Replaces any destination set on these options. Use
+    /// [`Fanout`](crate::events::Fanout) to combine observers before the run.
     pub fn observer(mut self, observer: Arc<dyn crate::events::Observer>) -> Self {
         self.observer = Some(observer);
         self
@@ -88,8 +95,10 @@ impl RunOptions {
 /// [`Seed::random`](crate::Seed::random) for a fresh seed, or
 /// [`Seed::from_u64`](crate::Seed::from_u64) for a fixed one.
 /// The run emits `run.start` automatically to interested observers, once at
-/// zero, with the seed and clock origin. Install observers through [`RunOptions`];
-/// without one, events are neither constructed nor retained.
+/// zero, with the seed and clock origin. Install the observer through
+/// [`RunOptions`]. It can consume events, packets, TLS keys and topology.
+/// Without one, observation allocates nothing, reads no clock, increments no
+/// sequence and registers no links.
 ///
 /// # When the future finishes
 ///
@@ -183,11 +192,14 @@ where
 /// world, the same seed and ordered inputs give the same observed events and
 /// packets. This requires the world to use the run's clock, randomness and
 /// task scheduling. [Repeatable runs](crate::guide::running#repeatable-runs)
-/// lists the requirements and the HTTP/2 host-clock exception.
+/// lists the requirements and runtime boundaries.
 ///
 /// Like [`run`], `lab` emits `run.start` automatically when an observer wants it.
-/// Observer configuration is part of a repeatable run; synchronous
-/// `fictionet_observe::Memory` retains deterministic evidence.
+/// Keep inputs, interests and limits fixed to repeat observations and stamps.
+/// The companion's synchronous `Memory` retains events for grading;
+/// `Aggregate` can summarize repeats. Worker queue overflow and interactive
+/// capture depend on external scheduling. See
+/// [Fictionet Observe](../fictionet_observe/index.html).
 ///
 /// Each run has its own task identities. A lab started inside another
 /// run's task has a world root with no parent in the outer run.

@@ -88,7 +88,7 @@ struct Cable {
     dirs: [Mutex<Direction>; 2],
     /// Dropped when the first end is dropped.
     guard: Mutex<Option<Box<dyn Send>>>,
-    /// Counts for the dashboard.
+    /// Counters published to the observer.
     meter: Arc<Meter>,
     /// The most bytes each queue may hold, if limited.
     limit: Option<usize>,
@@ -102,10 +102,10 @@ struct Direction {
     waker: Option<Waker>,
     /// One end was dropped.
     closed: bool,
-    /// Packets and bytes put into this queue, for the dashboard.
+    /// Packets and bytes put into this queue, published to the observer.
     packets: u64,
     bytes: u64,
-    /// The link's packet stream, once it registers with an observed run.
+    /// The packet stream after the link registers with the run's observer.
     observation: Option<Arc<crate::link::PacketStream>>,
 }
 
@@ -122,7 +122,7 @@ pub struct End {
     side: usize,
     /// Where a receiver outside the run waits for a cancel.
     wait: CancelWait,
-    /// The last task seen polling this end, for the dashboard.
+    /// The last task polling this end, published as link ownership.
     seen: Option<crate::run::RunTask>,
 }
 
@@ -279,7 +279,7 @@ impl End {
         move || cable.upgrade().is_none_or(|c| c.dirs[side].lock().closed)
     }
 
-    /// The counts and tap of this end's pair.
+    /// The counters and packet stream of this end's pair.
     pub(crate) fn meter(&self) -> &Arc<Meter> {
         &self.cable.meter
     }

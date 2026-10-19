@@ -2,8 +2,12 @@
 
 use std::sync::Arc;
 
-/// A named group of tasks, from [`Cx::group`](crate::Cx::group). Only
-/// observers read it.
+/// Shared group identity, name and parent for contexts and tasks.
+/// Allocated by `Cx::group` and `Cx::host` even without an observer.
+/// Group, host or connection topology interest adds a dispatch reference.
+/// A simulated host has a separate host id stored here, without another
+/// allocation. Interested lifecycle changes are published on creation and drop.
+/// This state does not affect world execution.
 pub(crate) struct Group {
     pub(crate) id: u64,
     pub(crate) name: String,

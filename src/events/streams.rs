@@ -9,6 +9,8 @@ use super::{ConnInfo, Metadata};
 macro_rules! identity {
     ($name:ident, $prefix:literal, $doc:literal) => {
         #[doc = $doc]
+        /// Assigned when the entity registers with a run. Numbers start at 1
+        /// and are never reused within that run.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub(crate) u64);
         impl $name {
@@ -29,7 +31,8 @@ identity!(GroupId, "g", "A group identity within a run.");
 identity!(HostId, "h", "A host identity within a run.");
 identity!(LinkId, "e", "A link identity within a run.");
 
-/// A separately numbered stream.
+/// A separately numbered stream. Each starts at 1 after interest filtering.
+/// Packet interest does not affect event numbering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stream {
     /// Service and network facts.
@@ -72,7 +75,8 @@ pub struct PacketMeta {
     pub link_type: LinkType,
 }
 
-/// Borrowed bytes of a successful link crossing.
+/// Borrowed bytes of an interested successful link crossing.
+/// Core delivers every such crossing without copying, decoding or sampling.
 #[derive(Clone, Copy, Debug)]
 pub struct PacketRef<'a> {
     /// The link crossed.
@@ -96,7 +100,9 @@ pub struct KeyMeta<'a> {
     pub connection: Option<&'a ConnInfo>,
 }
 
-/// A borrowed TLS secret. Debug formatting includes only its length.
+/// A borrowed TLS secret. Debug formatting shows the label, client random,
+/// connection and secret length, but never the secret bytes.
+/// Core does not retain keys.
 #[derive(Clone, Copy)]
 pub struct KeyRef<'a> {
     /// The TLS key log label.
@@ -182,6 +188,8 @@ pub enum TopologyKind {
 }
 
 /// A borrowed change to the run's topology.
+/// Consumers materialize topology. Core keeps identity and producer state.
+/// Link creation lends live absolute counters; removal carries final totals.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum TopologyRef<'a> {
@@ -275,7 +283,7 @@ pub enum TopologyRef<'a> {
     LinkLabel {
         /// Link identity.
         link: LinkId,
-        /// New label.
+        /// Label text.
         label: &'a str,
     },
     /// A link has been removed.
@@ -334,7 +342,9 @@ pub enum LossReason {
     Overflow,
 }
 
-/// Explicit loss within one stream.
+/// Explicit loss within one stream, reported by a producer or consumer.
+/// Missing sequence numbers alone do not imply loss: filters can leave gaps.
+/// Loss before numbering can have no sequence range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loss {
     /// Affected stream.

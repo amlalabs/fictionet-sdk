@@ -161,13 +161,10 @@
 //! replies and the facts it records, and
 //! [`serve::connection`](services::serve::connection) runs it over a
 //! connection. A [`net::Host`](world::net::Host) puts the service on a port of
-//! a machine with a name and an address. To show a protocol's items in the
-//! dashboard and in captures, implement
-//! `fictionet_observe::Present` for its framer and add it to the
-//! observe `fictionet_observe::Registry`. The guide [Add an
-//! observe
-//! protocol](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/observe-protocols.md)
-//! walks through it. Wire parsing, serving and capture presentation are
+//! a machine with a name and an address. Capture presentation belongs to
+//! [Fictionet Observe](../../fictionet_observe/index.html). Its `Present`
+//! adapters use these codecs, and its `Registry` selects adapters for traffic.
+//! Wire parsing, serving and capture presentation are
 //! separate responsibilities. A codec does not imply a live server or a
 //! built-in capture presenter. See the codec's [serving and capture
 //! boundaries](codec#serving-and-capture-boundaries) for runtime support and
@@ -191,16 +188,10 @@
 //!
 //! A service and a presenter are optional additions. A service owns replies,
 //! connection state and events; install it on a [`net::Host`](world::net::Host)
-//! port. A capture adapter belongs in `observe/src/decode/`, implements
-//! `fictionet_observe::Present` on its decoder, and keeps observe
-//! dependencies out of the protocol file. For a built-in presenter, declare the
-//! adapter in the observe module. Put its matcher, factory and input read-ahead
-//! in the adapter's `register` method. Call that method from
-//! `observe/src/decode/app.rs`. That file sets the default registration order and
-//! creates the shared HTTP/2 `CaptureBudget`. For a local copy, install a
-//! custom `fictionet_observe::Registry` in
-//! `fictionet_observe::DashboardOptions::protocols` before watches
-//! start, as the observe guide shows.
+//! port. Capture adapters and their registration belong to the companion.
+//! Set `fictionet_observe::DashboardOptions::protocols` before installing the
+//! observer to use a custom `Registry`. See the
+//! [companion's protocol guide](../../fictionet_observe/index.html#user-protocols).
 //!
 //! ## Changing a protocol by copying it
 //!
@@ -216,10 +207,10 @@
 //! [`serve::Service`](services::serve::Service) whose decoder is
 //! `codec::Frames<modbus::Frame>` from that copy, and install it with
 //! [`net::Host::tcp`](world::net::Host::tcp). Fault plans and transcripts use
-//! the same service driver. Register a presenter using the copied parser in the
-//! dashboard's `fictionet_observe::Registry`, then set
-//! `fictionet_observe::DashboardOptions::protocols` before
-//! observing. `examples/custom_protocol` runs this gateway on a
+//! the same service driver. A companion `Present` adapter can use the copied
+//! parser. Register it in `fictionet_observe::Registry` and set
+//! `fictionet_observe::DashboardOptions::protocols` before installing the observer.
+//! `examples/custom_protocol` runs this gateway on a
 //! [`net::Net`](world::net::Net) and reads a register using a request with a
 //! nonzero protocol identifier.
 //!

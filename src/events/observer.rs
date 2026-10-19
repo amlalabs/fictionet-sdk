@@ -17,14 +17,14 @@ pub struct Metadata {
     pub kind: &'static str,
 }
 
-/// Order and time assigned by the run, before fan-out.
+/// Stream, order and run time assigned before fan-out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     /// The independently numbered stream.
     pub stream: Stream,
-    /// Sequence number, starting at one after interest filtering.
+    /// Sequence within this stream, starting at 1 after interest filtering.
     pub seq: u64,
-    /// Time on the run's clock.
+    /// Time on the run's clock, including simulated time in a lab.
     pub at: Instant,
 }
 
@@ -70,18 +70,24 @@ impl Observation<'_> {
 
 /// A run's immutable observation destination.
 ///
-/// Delivery is synchronous and serialized per stream. Implementations must return promptly
-/// and must not call back into the world. I/O belongs on a bounded worker queue.
-/// Interest must stay fixed for repeatable lab runs. Connection context is
-/// explicit, including during the interest check.
-/// Streams have no ordering relative to each other. Packet callbacks run at
-/// the crossing; topology created during a task poll is delivered after it.
-/// Packet sequences count only crossings accepted by the interest check.
-/// Changing interest does not leave gaps in that link's sequence.
+/// Install one through [`RunOptions`](crate::RunOptions). Delivery is
+/// synchronous and serialized per stream. Streams may arrive concurrently
+/// from different threads, with no ordering between streams. Callbacks run
+/// outside cable, network, queue and group locks. Per-link order is kept.
+/// Return promptly and never call back into the world. I/O belongs on a
+/// bounded worker queue.
+///
+/// Interest checks precede observation work. Event-only observers must decline
+/// packets, TLS keys and topology. Topology interest is fixed at run start.
+/// Keep all interests and limits fixed for repeatable lab runs.
+/// Connection context is explicit, including during interest checks.
+/// Packet callbacks run at the crossing; topology made during a task poll
+/// arrives after it returns. Packet numbers count every interested successful
+/// crossing. Declined crossings consume no numbers. Event numbers are separate.
 pub trait Observer: Send + Sync + 'static {
-    /// Whether constructing this event is useful.
+    /// Whether producing this observation is useful. Keep this check cheap.
     fn enabled(&self, interest: Interest<'_>) -> bool;
-    /// Receives a borrowed fact with its run-assigned stamp.
+    /// Receives a borrowed observation with its run-assigned stamp.
     fn observe(&self, stamp: Stamp, observation: Observation<'_>);
     /// Reports facts lost before delivery, such as a full producer staging buffer.
     fn lost(&self, _loss: Loss) {}
@@ -89,7 +95,11 @@ pub trait Observer: Send + Sync + 'static {
     fn end(&self, _at: Instant) {}
 }
 
-/// A fixed set of destinations sharing one event and stamp.
+/// A fixed set of destinations sharing observations and stamps.
+///
+/// Interest is the union of the children. Each delivery is filtered for each
+/// child using its own observation metadata. Filtering can leave sequence gaps
+/// in a child's input. Loss and run end are forwarded to every child.
 pub struct Fanout(Vec<Arc<dyn Observer>>);
 
 impl Fanout {
@@ -155,7 +165,7 @@ impl Emitter<'_> {
     }
 }
 
-/// Serialized numbering and delivery for a run or a standalone service harness.
+/// Stream numbering and serialized delivery for a run or service harness.
 /// All destinations share stamps. Call [`Self::enabled`] before constructing events.
 pub struct Dispatch {
     observer: Option<Arc<dyn Observer>>,

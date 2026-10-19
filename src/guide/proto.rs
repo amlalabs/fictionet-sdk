@@ -9,7 +9,8 @@
 //! as `/run/fictionet/world.sock`. The connection starts with a short
 //! handshake, in which attach names the sandbox, and then carries IP
 //! packets both ways until either side closes it. Observation uses a separate
-//! socket served by `fictionet-observe`.
+//! socket and protocol, specified in
+//! [Fictionet Observe](../../../fictionet_observe/index.html#observation-protocol-reference).
 //!
 //! # The socket
 //!
@@ -52,7 +53,6 @@
 //! `hello` with any other version. The MTU is the sandbox's, and the world
 //! reads it with [`Attachment::mtu`](crate::Attachment::mtu). The type is
 //! the attach type, such as `tun`, `tap`, `http_proxy`, or `socks5`.
-//! Observation hellos are refused as unknown attach types.
 //!
 //! For example, attach started with `--name agent --type tun` (see
 //! [`attaching`](crate::guide::attaching)) on a sandbox with an MTU of 1500 sends

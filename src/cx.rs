@@ -72,17 +72,19 @@ pub use timer::Timer;
 ///
 /// A group names a set of tasks for the people watching a world, such as
 /// "office LAN" or "simulated hosts". [`Cx::group`] returns a `Cx` whose
-/// tasks belong to a new group. Every task started with that `Cx`, and
+/// tasks belong to that group. Every task started with that `Cx`, and
 /// every task those tasks start, belongs to the group too, and so do the
 /// stdlib's own tasks, such as a [`router`](crate::stdlib::network::route::router)
 /// or a [`tcp::endpoint`](crate::stdlib::network::tcp::endpoint). Groups nest: a
 /// group made from a grouped `Cx` sits inside that group.
 ///
 /// Groups change nothing about how the world runs. A grouped `Cx` stays in
-/// the same [region](Cx#regions), so cancelling and errors work as before.
-/// Only observers read groups: the dashboard draws a
-/// group as one box, with the traffic that crosses its edge added up, and
-/// opens it to show what is inside.
+/// the same [region](Cx#regions), with the same cancellation and error rules.
+/// [`Cx::host`] also creates an explicit host entity with its own identity.
+/// Observers can bind connections to the nearest enclosing host.
+/// Both calls allocate group state even without topology interest; see their
+/// method docs for costs. Core publishes topology changes. The
+/// [companion crate](../fictionet_observe/index.html) collects them for display.
 ///
 /// # Waiting
 ///
@@ -302,10 +304,10 @@ impl Cx {
         Task { join }
     }
 
-    /// Returns a `Cx` whose tasks belong to a new [group](Cx#groups) called
+    /// Returns a `Cx` whose tasks belong to a [group](Cx#groups) called
     /// `name`, inside this `Cx`'s group if it has one.
     ///
-    /// The new `Cx` is in the same [region](Cx#regions) as this one, so
+    /// The returned `Cx` is in the same [region](Cx#regions) as this one, so
     /// only observers see the difference. Hand it to the code that builds
     /// one part of the world, and every task that code starts, directly or
     /// through the stdlib, belongs to the group:
@@ -325,19 +327,26 @@ impl Cx {
     /// A sandbox belongs to the group of the task that reads its
     /// [`Attachment`](crate::Attachment), such as a
     /// [`delay`](crate::stdlib::network::delay) started with a grouped `Cx`. Each
-    /// call makes a new group,
-    /// even with a name used before. Making a group allocates its name and
-    /// one small struct. With group or host interest it also holds a dispatch
-    /// reference. A task in a group holds two more reference counts,
-    /// one in its `Cx` and one in what the run records about it, whether or
-    /// not anyone observes the world.
+    /// call makes a distinct group, even when names match. It owns the name
+    /// string, allocates one shared struct and assigns a run-scoped group id.
+    /// This cost applies without an observer too. Group, host or connection
+    /// topology interest adds a dispatch reference. Interested group creation
+    /// and removal are published as topology, with bounded staging during polls.
+    /// A grouped task holds two group references: one in its `Cx` and one in
+    /// its runtime identity. A nested group also holds its parent.
     pub fn group(&self, name: impl Into<String>) -> Cx {
         self.make_group(name, false)
     }
 
-    /// Makes a simulated host in a new group inside this context's group.
-    /// The host and group live until their last task or context reference drops.
-    /// Costs are the same as [`Self::group`].
+    /// Makes a simulated host and its group inside this context's group.
+    /// A host is its own topology entity, distinct from the group. It changes
+    /// no scheduling, cancellation or packet behavior.
+    ///
+    /// Allocation and reference costs match [`Self::group`], even without
+    /// topology interest. Group, host or connection interest also assigns a
+    /// run-scoped host id, without another host allocation. Interested host
+    /// creation and removal are published separately from group changes.
+    /// The host and group live until the last group reference drops.
     pub fn host(&self, name: impl Into<String>) -> Cx {
         self.make_group(name, true)
     }
@@ -345,8 +354,11 @@ impl Cx {
     /// Tells interested observers that a service in this context accepted
     /// `conn`, binding it to the serving task and the nearest
     /// [host](Cx::host). A custom service calls this when it accepts a
-    /// connection, and [`Cx::connection_closed`] when it closes. Without
-    /// connection interest this does nothing.
+    /// connection, and [`Cx::connection_closed`] when it closes. This publishes
+    /// topology; it changes nothing about the connection or world execution.
+    /// Without connection topology interest it does nothing. With interest,
+    /// it looks up the current task and nearest host and publishes the binding.
+    /// During a task poll, bounded staging owns a copy of the connection data.
     pub fn connection_opened(&self, conn: &crate::events::ConnInfo) {
         use crate::events::{TaskId, TopologyKind, TopologyRef};
         if self.run.observer.topology_enabled(TopologyKind::Connection) {
@@ -361,7 +373,10 @@ impl Cx {
     }
 
     /// Tells interested observers that `conn`, opened with
-    /// [`Cx::connection_opened`], has closed.
+    /// [`Cx::connection_opened`], has closed. This publishes a topology removal;
+    /// it does not close the connection itself. Without connection topology
+    /// interest it does nothing. During a task poll, bounded staging owns a
+    /// copy of the connection data.
     pub fn connection_closed(&self, conn: &crate::events::ConnInfo) {
         use crate::events::{TopologyKind, TopologyRef};
         if self.run.observer.topology_enabled(TopologyKind::Connection) {

@@ -1,84 +1,108 @@
-//! Optional observation of facts emitted by services, networks and world code.
+//! Four typed observation streams from a run.
 //!
-//! An [`Event`] has a source, kind, summary, [`Level`], [`ConnInfo`] and JSON
-//! [`Fields`]. Integrators install an [`Observer`] before execution through
-//! [`RunOptions`](crate::RunOptions): none, `fictionet_observe::Memory`, native `fictionet_observe::Jsonl`,
-//! `fictionet_observe::Aggregate`, dashboard retention, or their own implementation. [`Fanout`]
-//! combines destinations and filters each delivery by its own interest.
-//! The same observer receives typed topology changes and borrowed TLS keys.
-//! Links publish borrowed packets at each interested successful crossing,
-//! topology changes and live absolute counters. Served connections publish their
-//! addresses, serving task and nearest host. Each stream has its own sequence
-//! and run time. Different streams have no ordering relative to each other.
-//! Packet sequences count interested crossings from one, without sampling.
-//! Declining a crossing does not consume a sequence number. Each child of a
-//! fanout can still see gaps when another child accepts more crossings.
-//! Event-only consumers decline the other streams. Regions share the run's immutable observer.
+//! The integrator installs one [`Observer`] in [`RunOptions`](crate::RunOptions).
+//! Every region shares it. [`Interest`] checks whether work is wanted;
+//! [`Observation`] borrows the result for delivery:
+//!
+//! | Stream | Interest | Observation | Contents |
+//! |---|---|---|---|
+//! | [`Stream::Events`] | `Interest::Event` | `Observation::Event` | Structured service, network and world facts with [`ConnInfo`] and [`Fields`]. |
+//! | [`Stream::Packets`] | `Interest::Packet` | `Observation::Packet` | One [`PacketRef`] per interested successful link crossing. |
+//! | [`Stream::Keys`] | `Interest::TlsKey` | `Observation::TlsKey` | A [`KeyRef`] with TLS label, client random, secret and optional connection context. |
+//! | [`Stream::Topology`] | `Interest::Topology` | `Observation::Topology` | [`TopologyRef`] changes for tasks, groups, hosts, links and connection bindings. |
+//!
+//! Packet bytes are borrowed, without copying, decoding or sampling in core.
+//! [`LinkType::Ip`] means IP bytes without a link-layer header. The packet
+//! includes its link, sending side and original length. TLS key debug output
+//! omits secret bytes. Topology includes link owners, labels and absolute
+//! directional counters. Hosts have their own identity, separate from groups.
+//!
+//! # Interest, identity and order
+//!
+//! Producers check interest before observation work. [`Cx::emit`](crate::Cx::emit)
+//! invokes its builder only for an interested observer. With no observer,
+//! observation allocates nothing, reads no clock, increments no sequence and
+//! registers no links. Normal runtime state still exists: tasks need identity,
+//! and explicit [`Cx::group`](crate::Cx::group) calls allocate group state.
+//! Use [`Cx::event_enabled`](crate::Cx::event_enabled) or [`Emitter::enabled`]
+//! before building longer-lived event tracking state.
+//!
+//! [`Stamp`] gives the stream, its sequence from 1, and the run-clock time.
+//! A lab uses lab time. Events, keys and topology have separate sequences;
+//! each link has its own packet sequence. Packet interest cannot change event
+//! numbering. Every interested successful crossing consumes a packet number.
+//! A consumer can sample after delivery; core does not sample. Declined
+//! crossings consume no numbers.
+//!
+//! [`TaskId`], [`GroupId`], [`HostId`] and [`LinkId`] are run-scoped identities.
+//! Each kind starts at 1. An entity gets its identity when it registers with
+//! the run, and that identity is never reused within the run. Link identity
+//! comes from the run, not a process-wide counter. Handles carry identity,
+//! not a materialized graph.
+//!
+//! [`Fanout`] unions its children's interest. It filters each delivery for
+//! each child using that observation's own interest. Children share stamps,
+//! so a child's filtered stream can have gaps. Gaps alone do not imply loss.
+//! Event-only observers must decline packets, TLS keys and topology explicitly.
+//! Topology interest is fixed when the run starts.
+//!
+//! # Delivery and loss
+//!
+//! Delivery is synchronous. Numbering and callbacks are serialized per stream.
+//! Different streams may arrive concurrently from different threads, with no
+//! ordering between streams. Callbacks run outside cable, network, queue and
+//! group locks. Per-link publication order is kept. Topology made during a
+//! task poll is staged within bounds and delivered when that poll returns.
+//! Observers must return promptly and must not call back into the world.
+//! Put I/O on a bounded worker queue.
+//!
+//! [`Loss`] names the stream, reason, count, optional byte count and optional
+//! inclusive sequence range. [`LossReason`] distinguishes a full producer
+//! staging buffer, consumer sampling, truncation, retention eviction and a
+//! full worker queue. Producers can lose items before assigning a sequence.
+//! Consumers must track their own loss as well as loss reported by core.
+//!
+//! `run.start` emits the seed and clock origin once at zero when interested.
+//! [`RunOptions::fields`](crate::RunOptions::fields) adds caller metadata.
+//! Fixed inputs, interests, limits and lab scheduling give the same
+//! observations and stamps. See [Repeatable runs](crate::guide::running#repeatable-runs).
+//! Interactive capture and worker overflow depend on external scheduling.
+//!
+//! # Consumption
+//!
+//! Core keeps dispatch, bounded event construction, run clocks, identity,
+//! producer hooks and the rustls key adapter. It keeps no history, topology
+//! graph, retained keys, packet collection or decoders.
+//! [Fictionet Observe](../../fictionet_observe/index.html) owns those consumers:
+//! `Memory` and `Aggregate` for grading, `Jsonl` for files, `Collector` for
+//! bounded collection, and `DashboardObserver` for dashboard requests.
+//! Serve its handle on an observation socket for `fictionet dashboard` and
+//! `fictionet observe`. Late clients see what the installed consumer kept.
 //!
 //! ```
 //! use std::sync::Arc;
 //! use fictionet::{RunOptions, Seed, block_on, lab};
 //! use fictionet_observe::{Aggregate, Memory};
-//! let evidence = Arc::new(Memory::default());
+//! let grader = Arc::new(Memory::default());
 //! let options = RunOptions::new(Seed::from_u64(7))
-//!     .observer(Arc::new(Aggregate::new(evidence.clone())));
+//!     .observer(Arc::new(Aggregate::new(grader.clone())));
 //! block_on(lab(options, |fcx| async move {
 //!     fcx.emit("modbus", "write_register", |event| event
 //!         .summary("register 40001 = 900")
 //!         .field("register", 40001u32).field("value", 900u32));
 //!     Ok(())
 //! }))?;
-//! assert_eq!(evidence.checked_of("modbus", "write_register")?[0].u64("value"), Some(900));
+//! assert_eq!(grader.checked_of("modbus", "write_register")?[0].u64("value"), Some(900));
 //! # Ok::<(), fictionet::Error>(())
 //! ```
 //!
-//! # Delivery and retention
-//!
-//! [`Cx::emit`](crate::Cx::emit) checks interest before invoking its builder.
-//! With no observer, recording does no allocation, formatting, clock read,
-//! task lookup or sequence increment. Longer-lived service tracking uses
-//! [`Cx::event_enabled`](crate::Cx::event_enabled) or a connection's [`Emitter`].
-//! Interested observers receive a borrowed event synchronously, in order, and
-//! must return promptly without calling back into the world.
-//!
-//! The dispatch assigns [`Stamp`] sequence numbers and run-clock timestamps
-//! before fan-out. Filters can leave gaps; gaps alone do not imply loss.
-//! `run.start` is emitted once at zero, with the seed and clock origin.
-//! [`RunOptions::fields`](crate::RunOptions::fields) adds caller metadata.
-//! Fixed inputs, observer configuration and lab scheduling produce repeatable
-//! evidence; see [Repeatable runs](crate::guide::running#repeatable-runs).
-//!
-//! `fictionet_observe::Memory` owns count- and byte-bounded history. Its default reserves separate
-//! event and network-noise budgets, so a flood cannot evict unrelated facts.
-//! Oldest events in each budget are evicted first, and loss remains visible
-//! through `fictionet_observe::Memory::dropped`. Graders use
-//! `fictionet_observe::Memory::checked_of` or `fictionet_observe::Memory::checked_all` to reject incomplete
-//! evidence. Reads neither flush nor change retained events. Dashboard clients
-//! can attach late to history retained by an installed
-//! `fictionet_observe::DashboardObserver`.
-//!
-//! Native `fictionet_observe::Jsonl` keeps the event JSON Lines format and enqueues events within
-//! count and byte limits. Its worker performs serialization and I/O. Call its
-//! `finish` method outside the run to drain output and check errors. Worker
-//! scheduling can affect overflow; synchronous `fictionet_observe::Memory` supplies lab evidence.
-//!
 //! # Repeats
 //!
-//! Services emit every occurrence. [`Event::repeat`] marks facts such as a
-//! blocked packet or network drop and identifies variable detail, such as the
-//! destination port. An optional `fictionet_observe::Aggregate` wraps a destination, counts
-//! repeats within bounded run-time windows, delivering the first occurrence
-//! immediately. Summaries record first and last
-//! sequence references and numeric detail ranges. Reads cannot close windows.
-//! Ordinary events, window expiry on the next emission, capacity pressure and
-//! run end deliver pending summaries in sequence order. Without aggregation,
-//! an observer receives each fact without summary fields.
-//!
-//! Aggregation bounds pending facts; retention and exporter queues have their
-//! own bounds. Unlimited distinct traffic can still exhaust finite history.
-//! Byte budgets include owned allocations and charge shared connection data
-//! for each retained copy. They exclude spare collection capacity and copies
-//! held by readers, so they are retention budgets, not process-memory limits.
+//! Services emit every occurrence. [`Event::repeat`] marks repeatable facts
+//! and their variable detail. The companion's `Aggregate` can combine them
+//! within bounded run-time windows. Its `Memory::checked_of` and
+//! `Memory::checked_all` reject incomplete history. See the
+//! [companion crate](../../fictionet_observe/index.html) for limits and export.
 
 mod model;
 mod observer;

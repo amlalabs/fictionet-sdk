@@ -157,8 +157,9 @@
 //! - **N5.** A [`Service`](super::services::serve::Service) is named for what it
 //!   serves, with no suffix. Its associated types are `Decoder` and
 //!   `State`.
-//! - **N6.** `fictionet_observe::Present` is implemented on the
-//!   decoder it presents.
+//! - **N6.** Capture adapters implement `fictionet_observe::Present` in the
+//!   companion or the consumer's crate. Core codecs keep no presentation code.
+//!   See [Fictionet Observe](../../../fictionet_observe/index.html#user-protocols).
 //!
 //! ## Framing errors and deliberate exceptions
 //!

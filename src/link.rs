@@ -1,4 +1,5 @@
-//! Link counters, run registration, and packet streams.
+//! Link identity, counters, run registration and borrowed packet streams.
+//! Core publishes topology and counters to the observer; consumers build graphs.
 
 use fictionet::sync::{Mutex, MutexGuard};
 #[cfg(feature = "std")]
@@ -15,6 +16,9 @@ use crate::Packet;
 /// A pair counts its packets itself, as plain numbers under the lock it
 /// takes for each packet anyway, and the meter reads them through
 /// `counted`. An attachment counts in `counts`, with atomics.
+/// Registration assigns a run-scoped link id and installs a packet stream.
+/// Without an observer the link does not register. A handle shares this
+/// lightweight state, without retaining a topology graph.
 pub(crate) struct Meter {
     registration: Mutex<Option<Registration>>,
     packets: OnceLock<Arc<PacketStream>>,
@@ -251,7 +255,7 @@ impl Meter {
         let _ = self.sandbox.set(Arc::from(name));
     }
 
-    /// Reads the counts from `counted` from now on.
+    /// Uses `counted` as the source of link counters.
     pub(crate) fn count_in(&self, counted: Weak<dyn Counted>) {
         #[expect(
             clippy::let_underscore_must_use,
@@ -387,8 +391,7 @@ mod tests {
         }
     }
 
-    /// A watched run knows its tasks, where they were spawned, which task
-    /// uses which end of a pair, and how much went each way.
+    /// The observer receives tasks, spawn locations, link owners and counters.
     #[test]
     fn a_watched_run_records_tasks_owners_and_counts() {
         use crate::Interface;
