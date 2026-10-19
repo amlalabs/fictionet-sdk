@@ -7,7 +7,7 @@ import { createTransport } from './transport.mjs';
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 function transport(t, { fragment = '', token = 'secret', bootstrap = 204, onLogout } = {}) {
-  const requests = [], sources = [], calls = [], downloads = [], revoked = [];
+  const requests = [], sources = [], calls = [], downloads = [], revoked = [], sockets = [];
   const timers = new Map(), stored = new Map(token ? [['fictionet_token', token]] : []);
   const window = new EventTarget(), anchors = new Set(), delays = [];
   const state = { connected: false, ended: false, sideDirty: false };
@@ -20,6 +20,10 @@ function transport(t, { fragment = '', token = 'secret', bootstrap = 204, onLogo
   let nextResponse;
   const api = createTransport(reducers, {
     location, storage, window,
+    WebSocket: class extends EventTarget {
+      constructor(url) { super(); this.url = url; this.closed = false; sockets.push(this); }
+      close() { this.closed = true; this.dispatchEvent(new Event('close')); }
+    },
     history: { replaceState(_, __, path) { location.href = `http://127.0.0.1:7878${path}`; } },
     setTimeout(fn, delay) { const id = Symbol(); timers.set(id, fn); delays.push(delay); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -42,13 +46,15 @@ function transport(t, { fragment = '', token = 'secret', bootstrap = 204, onLogo
       assert.equal(options.credentials, 'omit');
       assert.equal(options.redirect, 'error');
       assert.equal(options.mode, 'same-origin');
+      assert.equal(options.cache, 'no-store');
       if (url.endsWith('/bootstrap')) {
+        assert.equal(options.method, 'POST');
         assert.equal(location.href, 'http://127.0.0.1:7878/');
         if (stored.has('fictionet_token')) assert.equal(options.headers.Authorization, `Bearer ${stored.get('fictionet_token')}`);
         return typeof bootstrap === 'function' ? bootstrap() : new Response(null, { status: bootstrap });
       }
       if (nextResponse) { const response = nextResponse; nextResponse = undefined; return response; }
-      if (/\/(watch|packets)(\?|$)/.test(url)) {
+      if (/\/(watch|packets|stream)(\?|$)/.test(url)) {
         const source = { cancelled: false };
         const body = new ReadableStream({
           start(controller) { source.controller = controller; },
@@ -65,7 +71,7 @@ function transport(t, { fragment = '', token = 'secret', bootstrap = 204, onLogo
   });
   t.after(api.close);
   return {
-    ...api, state, requests, sources, calls, timers, stored, location, downloads, revoked, anchors, delays,
+    ...api, state, requests, sources, calls, timers, stored, location, downloads, revoked, anchors, delays, sockets,
     navigate(fragment) { location.href = `http://127.0.0.1:7878/${fragment}`; window.dispatchEvent(new Event('hashchange')); },
     respond(response) { nextResponse = response; },
     retry() { const [id, fn] = timers.entries().next().value; timers.delete(id); fn(); },
@@ -389,5 +395,126 @@ test('non-stream HTTP responses stop a stream without reconnecting', async (t) =
     assert.equal(h.requests.length, 1);
     assert.equal(h.timers.size, 0);
     assert.equal(h.stored.get('fictionet_token'), 'secret');
+  }
+});
+
+test('page JSON requests use fixed paths, bearers and JSON bodies', async (t) => {
+  const h = transport(t);
+  for (const path of ['/api/page', '/api/state/host-alpha', '/api/event-table/exchanges', '/api/host/alpha/links', '/api/world', '/api/events']) {
+    h.respond(Response.json({ value: path }));
+    assert.deepEqual(await h.get(path), { value: path });
+    assert.equal(h.requests.at(-1).method, 'GET');
+    assert.equal(h.requests.at(-1).body, undefined);
+  }
+  for (const [method, path] of [['post', '/api/command/traffic'], ['post', '/api/lease'], ['delete', '/api/lease'], ['post', '/api/ticket']]) {
+    const body = { host: 'alpha', command: { running: false }, request_id: 'request' };
+    h.respond(Response.json({ status: 'applied' }));
+    assert.deepEqual(await h[method](path, body), { status: 'applied' });
+    const request = h.requests.at(-1);
+    assert.equal(request.method, method.toUpperCase());
+    assert.equal(request.body, JSON.stringify(body));
+    assert.equal(request.headers['Content-Type'], 'application/json');
+  }
+  assert.ok(h.requests.every((r) => r.headers.Authorization === 'Bearer secret'));
+  h.respond(Response.json({ status: 'rejected', rejection: { reason: 'stale_revision', current: 4 } }, { status: 409 }));
+  await assert.rejects(h.post('/api/command/traffic', {}), (error) => error.status === 409 && error.body.rejection.current === 4);
+});
+
+test('page paths reject foreign origins, traversal, encoded segments and wrong methods before fetch', async (t) => {
+  const h = transport(t);
+  for (const path of [
+    'https://example.com/api/page', '//example.com/api/page', '/api/state/../page',
+    '/api/state/%2e%2e', '/api/state/a/b', '/api/state/', '/api/state/a?x=1',
+    '/api/state/a#token=x', '/api/state/a.b', `/api/state/${'a'.repeat(129)}`,
+    '/api/host/a/links/extra', '/api/unknown',
+  ]) await assert.rejects(h.get(path));
+  await assert.rejects(h.post('/api/page', {}));
+  await assert.rejects(h.delete('/api/command/traffic', {}));
+  for (const id of ['../leases', '%2f', '', undefined, 123]) assert.throws(() => h.stateStream(id));
+  for (const [capability, host] of [['screen/alpha', 'alpha'], ['screen', '../alpha'], ['terminal', ''], ['screen', undefined]]) {
+    await assert.rejects(h.socket(capability, host));
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test('state streams share the SSE reader, send revisions and close with the transport', async (t) => {
+  const h = transport(t), seen = [];
+  const stream = h.stateStream('leases', 4);
+  stream.addEventListener('snapshot', (event) => seen.push(JSON.parse(event.data)));
+  stream.addEventListener('delta', (event) => seen.push(JSON.parse(event.data)));
+  await settle();
+  assert.equal(h.requests[0].url, 'http://127.0.0.1:7878/api/state/leases/stream?after=4');
+  assert.equal(h.requests[0].headers.Authorization, 'Bearer secret');
+  h.sources[0].emit('snapshot', { revision: 5, value: { alpha: { holder: null } } });
+  h.sources[0].emit('delta', { revision: 6, delta: {} });
+  await settle();
+  assert.deepEqual(seen.map((v) => v.revision), [5, 6]);
+  h.close();
+  await settle();
+  assert.equal(h.sources[0].cancelled, true);
+  assert.equal(h.timers.size, 0);
+});
+
+test('sockets use a single use ticket in the query and never the bearer', async (t) => {
+  for (const action of ['close', 'logout']) {
+    const h = transport(t);
+    const ticket = 'a'.repeat(64), session = 'b'.repeat(64);
+    h.respond(Response.json({ ticket, session, expires_in: 30 }));
+    const result = await h.socket('screen', 'alpha');
+    assert.equal(result.session, session);
+    assert.equal(result.socket, h.sockets[0]);
+    assert.equal(result.socket.url, `ws://127.0.0.1:7878/ws/screen/alpha?ticket=${ticket}`);
+    assert.equal(result.socket.binaryType, 'arraybuffer');
+    assert.equal(h.requests[0].headers.Authorization, 'Bearer secret');
+    assert.equal(h.requests[0].url, 'http://127.0.0.1:7878/api/ticket');
+    assert.deepEqual(JSON.parse(h.requests[0].body), { capability: 'screen', host: 'alpha' });
+    h[action]();
+    assert.equal(result.socket.closed, true);
+    await assert.rejects(h.socket('screen', 'alpha'));
+    assert.equal(h.sockets.length, 1);
+  }
+});
+
+test('refused and cancelled console requests never open a socket', async (t) => {
+  const h = transport(t);
+  h.respond(Response.json({ error: 'beta is still booting' }, { status: 404 }));
+  await assert.rejects(h.socket('terminal', 'beta'), /beta is still booting/);
+  assert.equal(h.sockets.length, 0);
+  h.respond(Response.json({ ticket: 'not a ticket', session: 'bad' }));
+  await assert.rejects(h.socket('screen', 'alpha'), /Invalid console ticket/);
+  assert.equal(h.sockets.length, 0);
+  let finish;
+  h.respond(new Promise((resolve) => { finish = resolve; }));
+  const pending = h.socket('screen', 'alpha');
+  await settle();
+  h.close();
+  finish(Response.json({ ticket: 'a'.repeat(64), session: 'b'.repeat(64) }));
+  await assert.rejects(pending, /cancelled/);
+  assert.equal(h.sockets.length, 0);
+});
+
+test('disposing a console closes its socket and releases download timers on transport close', async (t) => {
+  const h = transport(t), controller = new AbortController();
+  h.respond(Response.json({ ticket: 'a'.repeat(64), session: 'b'.repeat(64) }));
+  const { socket } = await h.socket('terminal', 'alpha', controller.signal);
+  controller.abort();
+  assert.equal(socket.closed, true);
+  await h.download('pcap', 'e1');
+  assert.equal(h.timers.size, 1);
+  h.close();
+  assert.equal(h.timers.size, 0);
+  assert.deepEqual(h.revoked, ['blob:download']);
+});
+
+test('authorization refusal on page JSON routes also closes open consoles', async (t) => {
+  for (const status of [401, 403]) {
+    const h = transport(t);
+    h.respond(Response.json({ ticket: 'a'.repeat(64), session: 'b'.repeat(64) }));
+    const { socket } = await h.socket('screen', 'alpha');
+    h.respond(Response.json({ error: 'not signed in' }, { status }));
+    await assert.rejects(h.post('/api/lease', { host: 'alpha', session: 'b'.repeat(64) }));
+    assert.equal(socket.closed, true);
+    assert.equal(h.stored.size, 0);
+    assert.equal(h.timers.size, 0);
   }
 });

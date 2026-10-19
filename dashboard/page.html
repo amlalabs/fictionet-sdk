@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fictionet demo</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/page.css">
+  <script type="importmap" nonce="PAGE_NONCE">{"imports":{"three":"/vendor/three/build/three.module.js"}}</script>
+  <script type="module" src="/page.mjs"></script>
+</head>
+<body>
+<div id="demo">
+  <header class="top-bar">
+    <div class="wordmark"><img src="/icon.svg" alt="" width="28" height="28">Fictionet</div>
+    <h1 id="page-title">Demo</h1>
+    <span id="page-status" role="status">Loading…</span><time id="run-clock"></time>
+    <button id="moment-banner" class="moment" type="button" hidden></button>
+    <button id="theme" type="button" aria-label="Switch theme">Theme</button>
+  </header>
+  <nav id="host-bar" aria-label="Hosts"></nav>
+  <main id="workbench">
+    <div id="workspace" aria-label="Workspace"><p class="loading-line">Loading hosts…</p></div>
+    <div id="divider" role="separator" aria-label="Workspace size" aria-orientation="vertical" aria-valuemin="25" aria-valuemax="80" aria-valuenow="62" tabindex="0"></div>
+    <aside id="inspector" aria-label="Inspector">
+      <div id="tabs" role="tablist" aria-label="Inspector panels"></div>
+      <div id="scope"><span id="scope-text">All hosts</span><button id="clear-scope" type="button" hidden>All hosts</button><span id="moment-status" role="status"></span></div>
+      <section id="inspector-content" role="tabpanel" tabindex="0"><p class="loading-line">Loading panels…</p></section>
+    </aside>
+  </main>
+  <footer>Fictionet by Amla Labs <a href="/vendor/licenses">Licenses</a></footer>
+</div>
+</body>
+</html>

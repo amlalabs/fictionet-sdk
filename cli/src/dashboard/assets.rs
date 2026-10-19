@@ -26,6 +26,34 @@ pub(super) fn lookup(path: &str) -> Option<(&'static str, &'static str)> {
         "/tables.mjs" => Some(("text/javascript; charset=utf-8", TABLES_JS)),
         "/transport.mjs" => Some(("text/javascript; charset=utf-8", TRANSPORT_JS)),
         "/dom.mjs" => Some(("text/javascript; charset=utf-8", DOM_JS)),
+        "/theme.mjs" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../dashboard/theme.mjs"),
+        )),
+        "/selection.mjs" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../dashboard/selection.mjs"),
+        )),
+        "/format.mjs" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../dashboard/format.mjs"),
+        )),
+        "/components/map.mjs" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../dashboard/components/map.mjs"),
+        )),
+        "/components/packets.mjs" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../dashboard/components/packets.mjs"),
+        )),
+        "/components/events.mjs" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../../../dashboard/components/events.mjs"),
+        )),
+        "/tokens.css" => Some((
+            "text/css; charset=utf-8",
+            include_str!("../../../dashboard/tokens.css"),
+        )),
         "/app.css" => Some(("text/css; charset=utf-8", APP_CSS)),
         "/icon.svg" => Some(("image/svg+xml", ICON_SVG)),
         _ => None,
@@ -69,9 +97,24 @@ mod tests {
                 let import = import.trim_start();
                 if let Some(quote @ ('\'' | '"')) = import.chars().next() {
                     let name = import[1..].split(quote).next().unwrap();
-                    if let Some(name) = name.strip_prefix("./") {
+                    if name.starts_with('.') || name.starts_with('/') {
                         let parent = path.rsplit_once('/').unwrap().0;
-                        pending.push(format!("{parent}/{name}"));
+                        let joined = if name.starts_with('/') {
+                            name.to_owned()
+                        } else {
+                            format!("{parent}/{name}")
+                        };
+                        let mut parts = Vec::new();
+                        for part in joined.split('/') {
+                            match part {
+                                "" | "." => {}
+                                ".." => {
+                                    parts.pop().expect("import stays inside the site");
+                                }
+                                _ => parts.push(part),
+                            }
+                        }
+                        pending.push(format!("/{}", parts.join("/")));
                     }
                 }
             }

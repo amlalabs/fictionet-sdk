@@ -50,6 +50,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
       fetch('/result', { method: 'POST', credentials: 'omit', body: document.body.textContent });
     </script>`);
   });
+  const state = await readFile(new URL('./state.mjs', import.meta.url));
   const transport = await readFile(new URL('./transport.mjs', import.meta.url));
   const origin = await serve((req, res) => {
     received.push({ url: req.url, ...req.headers });
@@ -62,6 +63,11 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
       return;
     }
     if (req.url === '/') res.setHeader('Set-Cookie', 'fictionet_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict');
+    if (req.url === '/state.mjs') {
+      res.setHeader('Content-Type', 'text/javascript');
+      res.end(state);
+      return;
+    }
     if (req.url === '/transport.mjs') {
       res.setHeader('Content-Type', 'text/javascript');
       res.end(transport);
@@ -150,7 +156,7 @@ test('browser bootstrap, reconnect and downloads keep credentials away from anot
     '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
     '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
     // The throwaway profile must not wait on the desktop keyring, which can be locked.
-    '--password-store=basic', `${origin}/legacy`,
+    '--password-store=basic', '--use-mock-keychain', `${origin}/legacy`,
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   browser.stderr.setEncoding('utf8');

@@ -178,13 +178,23 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io
     if !host_allowed(req.host.as_deref(), bound) {
         return respond(&mut conn, "403 Forbidden", text, b"bad Host header\n", "");
     }
-    if req.method != "GET" {
+    if req.method
+        != if req.path == "/api/bootstrap" {
+            "POST"
+        } else {
+            "GET"
+        }
+    {
         return respond(
             &mut conn,
             "405 Method Not Allowed",
             text,
-            b"GET only\n",
-            "Allow: GET\r\n",
+            b"method not allowed\n",
+            if req.path == "/api/bootstrap" {
+                "Allow: POST\r\n"
+            } else {
+                "Allow: GET\r\n"
+            },
         );
     }
     if !same_site(&req) {

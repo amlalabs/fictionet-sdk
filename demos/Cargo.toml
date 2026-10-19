@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-fictionet-observe = { path = "../observe", features = ["native"] }
+fictionet-observe = { path = "../observe", features = ["page"] }
 example-common = { path = "../examples/common" }
 # `tokio` hands the jump host's TCP connection to the SSH client.
 fictionet = { path = "..", features = ["web-proxy", "tokio"] }

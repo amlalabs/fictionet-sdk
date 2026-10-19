@@ -2,6 +2,7 @@
 # binaries `cargo xtask demo assets` downloads
 target/
 /demos/downloads/
+/observe/downloads/
 # Python environments, caches and eval logs
 .venv/
 __pycache__/

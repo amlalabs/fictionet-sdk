@@ -204,9 +204,20 @@ pub(super) async fn headers(
     kind: &str,
     extra: &str,
 ) -> io::Result<()> {
+    headers_with_policy(conn, status, kind, extra, SECURITY).await
+}
+
+async fn headers_with_policy(
+    conn: &mut TcpStream,
+    status: u16,
+    kind: &str,
+    extra: &str,
+    security: &str,
+) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -217,10 +228,36 @@ pub(super) async fn headers(
         _ => "Error",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\n{SECURITY}{extra}\
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\n{security}{extra}\
          Connection: close\r\n\r\n"
     );
     write(conn, head.as_bytes()).await
+}
+
+pub(super) async fn page(conn: &mut TcpStream) -> io::Result<()> {
+    let mut bytes = [0; 32];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let body = super::assets::HTML.replace("PAGE_NONCE", &nonce);
+    // xterm injects style elements; style attributes in markup remain blocked.
+    let security = SECURITY
+        .replace(
+            "script-src 'self';",
+            &format!("script-src 'self' 'nonce-{nonce}';"),
+        )
+        .replace(
+            "style-src 'self';",
+            "style-src 'self'; style-src-elem 'self' 'unsafe-inline';",
+        );
+    headers_with_policy(
+        conn,
+        200,
+        "text/html; charset=utf-8",
+        &format!("Content-Length: {}\r\n", body.len()),
+        &security,
+    )
+    .await?;
+    write(conn, body.as_bytes()).await
 }
 
 pub(super) async fn respond(

@@ -2,40 +2,66 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use fictionet::{Interface, InterfaceExt};
 use fictionet_observe::page::{
-    BoxFuture, Console, Duplex, Host, HostState, HostStatus, Page, Pty, StateLimits, StateTopic,
+    Action, BoxFuture, Column, CommandLimits, CommandPort, Console, Duplex, EventFilter, Format,
+    Host, HostState, HostStatus, Page, Pty, Rejected, StateLimits, StateTopic,
 };
 use fictionet_observe::{DashboardObserver, DashboardOptions};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-struct FixtureConsole;
+struct FixtureConsole {
+    name: &'static str,
+    ready: Arc<AtomicU8>,
+    drops: tokio::sync::watch::Sender<u64>,
+}
 impl Console for FixtureConsole {
     fn screen(&self) -> Option<BoxFuture<'static, io::Result<Box<dyn Duplex>>>> {
-        Some(Box::pin(async {
+        let name = self.name;
+        let ready = self.ready.clone();
+        let mut drops = self.drops.subscribe();
+        Some(Box::pin(async move {
+            if ready.load(Ordering::SeqCst) < 3 {
+                return Err(io::Error::other(format!("{name} is still booting")));
+            }
             let (client, server) = tokio::io::duplex(64 << 10);
             tokio::spawn(async move {
-                let _ = screen(server).await;
+                tokio::select! {
+                    _ = screen(server, name) => {},
+                    _ = drops.changed() => {},
+                }
             });
             Ok(Box::new(client) as Box<dyn Duplex>)
         }))
     }
     fn terminal(&self, _: u16, _: u16) -> Option<BoxFuture<'static, io::Result<Box<dyn Pty>>>> {
-        Some(Box::pin(async {
+        let name = self.name;
+        let ready = self.ready.clone();
+        let mut drops = self.drops.subscribe();
+        Some(Box::pin(async move {
+            if ready.load(Ordering::SeqCst) < 2 {
+                return Err(io::Error::other(format!("{name} is still booting")));
+            }
             let (client, mut server) = tokio::io::duplex(64 << 10);
             tokio::spawn(async move {
-                server.write_all(b"Echo terminal\r\n").await?;
-                let mut bytes = [0; 4096];
-                loop {
-                    let n = server.read(&mut bytes).await?;
-                    if n == 0 {
-                        return Ok::<_, io::Error>(());
+                let echo = async {
+                    server
+                        .write_all(format!("{name} echo terminal\r\n").as_bytes())
+                        .await?;
+                    let mut bytes = [0; 4096];
+                    loop {
+                        let n = server.read(&mut bytes).await?;
+                        if n == 0 {
+                            return Ok::<_, io::Error>(());
+                        }
+                        server.write_all(&bytes[..n]).await?;
                     }
-                    server.write_all(&bytes[..n]).await?;
-                }
+                };
+                tokio::select! { _ = echo => {}, _ = drops.changed() => {} }
             });
             let (read, write) = tokio::io::split(client);
             Ok(Box::new(EchoPty {
@@ -69,7 +95,7 @@ impl Pty for EchoPty {
     }
 }
 
-async fn screen(mut stream: DuplexStream) -> io::Result<()> {
+async fn screen(mut stream: DuplexStream, name: &str) -> io::Result<()> {
     stream.write_all(b"RFB 003.008\n").await?;
     let mut version = [0; 12];
     stream.read_exact(&mut version).await?;
@@ -79,14 +105,15 @@ async fn screen(mut stream: DuplexStream) -> io::Result<()> {
     }
     stream.write_all(&[0; 4]).await?;
     stream.read_u8().await?;
-    let (width, height) = (160u16, 100u16);
+    let (width, height) = (1280u16, 800u16);
     let mut format = [32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0];
     let mut init = Vec::new();
     init.extend_from_slice(&width.to_be_bytes());
     init.extend_from_slice(&height.to_be_bytes());
     init.extend_from_slice(&format);
-    init.extend_from_slice(&7u32.to_be_bytes());
-    init.extend_from_slice(b"Pattern");
+    init.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    init.extend_from_slice(name.as_bytes());
+    let label = format!("{} 1280 X 800", name.to_ascii_uppercase());
     stream.write_all(&init).await?;
     let mut extended_mouse = false;
     loop {
@@ -118,6 +145,9 @@ async fn screen(mut stream: DuplexStream) -> io::Result<()> {
             3 => {
                 let mut request = [0; 9];
                 stream.read_exact(&mut request).await?;
+                if request[0] != 0 {
+                    continue;
+                }
                 let x = u16::from_be_bytes([request[1], request[2]]).min(width);
                 let y = u16::from_be_bytes([request[3], request[4]]).min(height);
                 let w = u16::from_be_bytes([request[5], request[6]]).min(width - x);
@@ -129,15 +159,21 @@ async fn screen(mut stream: DuplexStream) -> io::Result<()> {
                 frame.extend_from_slice(&0i32.to_be_bytes());
                 for row in y..y + h {
                     for col in x..x + w {
-                        let rgb = [
-                            (col as u32 * 255 / width as u32),
-                            (row as u32 * 255 / height as u32),
-                            if (col / 16 + row / 16) % 2 == 0 {
-                                192
-                            } else {
-                                64
-                            },
-                        ];
+                        let rgb = if label_pixel(&label, col, row) {
+                            [240, 240, 224]
+                        } else if (320..416).contains(&row) {
+                            [24, 32, 28]
+                        } else {
+                            [
+                                col as u32 * 160 / width as u32,
+                                row as u32 * 160 / height as u32,
+                                if (col / 80 + row / 80) % 2 == 0 {
+                                    128
+                                } else {
+                                    48
+                                },
+                            ]
+                        };
                         let mut pixel = 0u32;
                         for (i, value) in rgb.iter().enumerate() {
                             let max =
@@ -228,29 +264,150 @@ async fn discard(stream: &mut DuplexStream, mut remaining: usize) -> io::Result<
     Ok(())
 }
 
+fn label_pixel(label: &str, x: u16, y: u16) -> bool {
+    if !(64..1216).contains(&x) || !(336..392).contains(&y) {
+        return false;
+    }
+    let x = (x - 64) as usize / 8;
+    let y = (y - 336) as usize / 8;
+    let glyph = match label.as_bytes().get(x / 6).copied().unwrap_or(b' ') {
+        b'A' => [14, 17, 17, 31, 17, 17, 17],
+        b'B' => [30, 17, 17, 30, 17, 17, 30],
+        b'E' => [31, 16, 16, 30, 16, 16, 31],
+        b'H' => [17, 17, 17, 31, 17, 17, 17],
+        b'L' => [16, 16, 16, 16, 16, 16, 31],
+        b'P' => [30, 17, 17, 30, 16, 16, 16],
+        b'T' => [31, 4, 4, 4, 4, 4, 4],
+        b'X' => [17, 17, 10, 4, 10, 17, 17],
+        b'0' => [14, 17, 19, 21, 25, 17, 14],
+        b'1' => [4, 12, 4, 4, 4, 4, 14],
+        b'2' => [14, 17, 1, 2, 4, 8, 31],
+        b'8' => [14, 17, 17, 14, 17, 17, 14],
+        _ => [0; 7],
+    };
+    x % 6 < 5 && glyph[y] & (1 << (4 - x % 6)) != 0
+}
+
+#[derive(Clone, Serialize)]
+struct Exchange {
+    host: &'static str,
+    packets: u64,
+    bytes: u64,
+    at: f64,
+}
+#[derive(Clone, Serialize)]
+struct Traffic {
+    running: bool,
+    revision: u64,
+}
+#[derive(Deserialize)]
+struct SetTraffic {
+    running: bool,
+    expected_revision: u64,
+}
+#[derive(Deserialize)]
+struct DropConsoles {}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let exchanges = StateTopic::new(StateLimits::default());
+    let traffic = StateTopic::new(StateLimits::default());
+    let commands = CommandPort::<SetTraffic, Traffic>::new(CommandLimits::default());
+    let consoles = CommandPort::<DropConsoles, ()>::new(CommandLimits::default());
+    let (drops, _) = tokio::sync::watch::channel(0u64);
+    let beta_ready = Arc::new(AtomicU8::new(0));
     let mut page = Page::new("Two-host fixture", dashboard.handle());
+    let mut statuses = Vec::new();
     for (name, address) in [("alpha", "10.0.0.2"), ("beta", "10.0.0.3")] {
         let status = StateTopic::new(StateLimits::default());
+        let up = name == "alpha";
         status.publish(
             fictionet::time::Instant::from_since_start(Duration::ZERO),
             &HostStatus {
-                state: HostState::DesktopUp,
-                addresses: vec![address.into()],
-                screen: true,
-                terminal: true,
+                state: if up {
+                    HostState::DesktopUp
+                } else {
+                    HostState::Booting
+                },
+                addresses: if up { vec![address.into()] } else { vec![] },
+                screen: up,
+                terminal: up,
             },
         )?;
         page = page.host(
             Host::new(name)
                 .sandbox(name)
-                .console(FixtureConsole)
-                .status(status),
+                .console(FixtureConsole {
+                    name,
+                    ready: if up {
+                        Arc::new(AtomicU8::new(3))
+                    } else {
+                        beta_ready.clone()
+                    },
+                    drops: drops.clone(),
+                })
+                .status(status.clone()),
         );
+        statuses.push(status);
     }
-    let server = page.standard_panels().bind_loopback(0).await?;
+    let filter = |kind: &str| EventFilter {
+        source: Some("fixture".into()),
+        kind: Some(kind.into()),
+        ..EventFilter::default()
+    };
+    let server = page
+        .standard_panels()
+        .table(
+            "Exchanges",
+            exchanges.clone(),
+            vec![
+                Column::new("Host", "/host"),
+                Column::new("Packets sent", "/packets").format(Format::Number),
+                Column::new("Bytes", "/bytes").format(Format::Bytes),
+                Column::new("Last exchange", "/at").format(Format::Time),
+            ],
+        )
+        .event_table(
+            "Exchange log",
+            filter("exchange"),
+            vec![
+                Column::new("Time", "/at").format(Format::Time),
+                Column::new("From", "/fields/from"),
+                Column::new("To", "/fields/to"),
+            ],
+        )
+        .control(
+            "Traffic controls",
+            commands.clone(),
+            vec![
+                Action {
+                    label: "Pause".into(),
+                    command: serde_json::json!({"running": false}),
+                },
+                Action {
+                    label: "Resume".into(),
+                    command: serde_json::json!({"running": true}),
+                },
+            ],
+        )
+        .control_state(traffic.clone())
+        .control(
+            "Consoles",
+            consoles.clone(),
+            vec![Action {
+                label: "Drop consoles".into(),
+                command: serde_json::json!({}),
+            }],
+        )
+        .custom(
+            "Traffic",
+            include_str!("page_fixture/traffic.mjs"),
+            exchanges.clone(),
+        )
+        .moment("Traffic paused", filter("paused"))
+        .bind_loopback(0)
+        .await?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
     let world = std::thread::spawn(move || {
@@ -262,22 +419,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut a = attachments.next(&cx).await?;
                 let mut beta = attacher.attach("beta").unwrap();
                 let mut b = attachments.next(&cx).await?;
+                let mut rows = vec![
+                    Exchange {
+                        host: "alpha",
+                        packets: 0,
+                        bytes: 0,
+                        at: 0.0,
+                    },
+                    Exchange {
+                        host: "beta",
+                        packets: 0,
+                        bytes: 0,
+                        at: 0.0,
+                    },
+                ];
+                let mut state = Traffic {
+                    running: true,
+                    revision: 1,
+                };
+                traffic
+                    .publish(cx.now(), &state)
+                    .expect("small traffic state");
+                exchanges
+                    .publish(cx.now(), &rows)
+                    .expect("small exchange table");
+                let mut stage = 0;
                 while !stopping.load(Ordering::SeqCst) {
-                    alpha.send(fictionet::Packet(vec![
-                        0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0x66, 0xdd, 10, 0, 0, 2, 10, 0, 0, 3, 8,
-                        0, 0xe5, 0xca, 0x12, 0x34, 0, 1,
-                    ]));
-                    b.send(a.recv(&cx).await?);
-                    let mut packet = beta.recv(&cx).await?;
-                    packet.0[12..20].copy_from_slice(&[10, 0, 0, 3, 10, 0, 0, 2]);
-                    packet.0[20] = 0;
-                    packet.0[22..24].copy_from_slice(&[0xed, 0xca]);
-                    beta.send(packet);
-                    a.send(b.recv(&cx).await?);
-                    alpha.recv(&cx).await?;
-                    cx.emit("fixture", "exchange", |e| {
-                        e.field("from", "alpha").field("to", "beta")
-                    });
+                    let elapsed = cx.now().since_start().as_secs();
+                    let ready = if elapsed >= 12 {
+                        3
+                    } else if elapsed >= 8 {
+                        2
+                    } else if elapsed >= 4 {
+                        1
+                    } else {
+                        0
+                    };
+                    if stage != ready {
+                        stage = ready;
+                        beta_ready.store(stage, Ordering::SeqCst);
+                        statuses[1]
+                            .publish(
+                                cx.now(),
+                                &HostStatus {
+                                    state: match stage {
+                                        1 => HostState::NetworkUp,
+                                        2 => HostState::SshUp,
+                                        _ => HostState::DesktopUp,
+                                    },
+                                    addresses: vec!["10.0.0.3".into()],
+                                    screen: stage >= 3,
+                                    terminal: stage >= 2,
+                                },
+                            )
+                            .expect("small host status");
+                    }
+                    while let Some(command) = commands.try_recv() {
+                        if command.command.expected_revision != state.revision {
+                            command.reject(
+                                &cx,
+                                Rejected::StaleRevision {
+                                    current: state.revision,
+                                },
+                            );
+                            continue;
+                        }
+                        state.running = command.command.running;
+                        state.revision += 1;
+                        traffic
+                            .publish(cx.now(), &state)
+                            .expect("small traffic state");
+                        if !state.running {
+                            cx.emit("fixture", "paused", |event| event.summary("Traffic paused"));
+                        }
+                        command.reply(&cx, state.clone());
+                    }
+                    while let Some(command) = consoles.try_recv() {
+                        drops.send_modify(|revision| *revision += 1);
+                        command.reply(&cx, ());
+                    }
+                    if state.running && stage >= 1 {
+                        alpha.send(fictionet::Packet(vec![
+                            0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0x66, 0xdd, 10, 0, 0, 2, 10, 0, 0,
+                            3, 8, 0, 0xe5, 0xca, 0x12, 0x34, 0, 1,
+                        ]));
+                        b.send(a.recv(&cx).await?);
+                        let mut packet = beta.recv(&cx).await?;
+                        packet.0[12..20].copy_from_slice(&[10, 0, 0, 3, 10, 0, 0, 2]);
+                        packet.0[20] = 0;
+                        packet.0[22..24].copy_from_slice(&[0xed, 0xca]);
+                        beta.send(packet);
+                        a.send(b.recv(&cx).await?);
+                        alpha.recv(&cx).await?;
+                        for row in &mut rows {
+                            row.packets += 1;
+                            row.bytes += 28;
+                            row.at = cx.now().since_start().as_secs_f64();
+                        }
+                        exchanges
+                            .publish(cx.now(), &rows)
+                            .expect("small exchange table");
+                        cx.emit("fixture", "exchange", |e| {
+                            e.field("from", "alpha").field("to", "beta")
+                        });
+                    }
                     cx.sleep(Duration::from_secs(1)).await?;
                 }
                 Ok(())
@@ -285,7 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     });
     println!("{}", server.url());
-    println!("Two hosts are exchanging packets. Press Ctrl-C to stop.");
+    println!("Alpha is ready. Beta starts over 12 seconds. Press Ctrl-C to stop.");
     tokio::signal::ctrl_c().await?;
     stop.store(true, Ordering::SeqCst);
     world

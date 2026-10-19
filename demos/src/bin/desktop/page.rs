@@ -24,8 +24,6 @@ use tokio::task::JoinSet;
 
 use fictionet_demo::kit::ssh;
 
-include!(concat!(env!("OUT_DIR"), "/novnc.rs"));
-
 /// The page itself, which loads noVNC from `/novnc/`.
 const PAGE: &str = include_str!("desktop.html");
 
@@ -147,10 +145,9 @@ async fn request(mut stream: TcpStream, tunnel: &Tunnel, port: u16) -> io::Resul
     }
     let file = match path {
         "/" => Some(("index.html", PAGE.as_bytes())),
-        _ => path
-            .strip_prefix("/novnc/")
-            .and_then(|name| NOVNC.iter().find(|(n, _)| *n == name))
-            .copied(),
+        _ => path.strip_prefix("/novnc/").and_then(|name| {
+            fictionet_observe::page::vendored(&format!("novnc/{name}")).map(|bytes| (name, bytes))
+        }),
     };
     match file {
         Some((name, bytes)) => respond(&mut stream, 200, content_type(name), bytes).await,

@@ -3,51 +3,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPackets } from './packets.mjs';
-import { $, el } from './dom.mjs';
+import { el } from './dom.mjs';
 
-class Element extends EventTarget {
-  constructor(tag) {
-    super();
-    this.tag = tag;
-    this.children = [];
-    this.dataset = {};
-    this.hidden = false;
-    this.value = '';
-    this.scrollHeight = this.scrollTop = this.clientHeight = 0;
-    const classes = new Set();
-    this.classList = {
-      add: (name) => classes.add(name),
-      remove: (name) => classes.delete(name),
-      contains: (name) => classes.has(name),
-      toggle: (name, on) => on ? classes.add(name) : classes.delete(name),
-    };
-  }
-  setAttribute(name, value) {
-    if (name === 'class') String(value).split(/\s+/).forEach((c) => this.classList.add(c));
-    if (name.startsWith('data-')) this.dataset[name.slice(5)] = String(value);
-  }
-  appendChild(child) {
-    if (child.tag === 'fragment') child.children.forEach((c) => this.appendChild(c));
-    else {
-      this.children.push(child);
-      if (typeof child !== 'string') child.parent = this;
-    }
-  }
-  get firstChild() { return this.children[0]; }
-  remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); }
-  append(...children) { children.forEach((child) => this.appendChild(child)); }
-  replaceChildren(...children) {
-    this.children = [];
-    this.append(...children);
-  }
-  set textContent(text) { this.children = [String(text)]; }
-  get textContent() { return this.children.map((c) => typeof c === 'string' ? c : c.textContent).join(''); }
-  querySelectorAll(selector) {
-    assert.equal(selector, 'tr.on');
-    return this.children.filter((c) => c.classList?.contains('on'));
-  }
-  click() { this.dispatchEvent(new Event('click')); }
-}
+const $ = (id) => document.getElementById(id);
+
+import { Element } from './test-dom.mjs';
 
 function setup(t, links = ['a'], maxRows = 3000) {
   const elements = new Map();
@@ -500,4 +460,22 @@ test('a successful capture download clears the previous failure label', async (t
   $('pcap').click();
   await settle();
   assert.equal($('pcap-label').textContent, 'Capture for Wireshark');
+});
+
+test('packets keep the reading position and offer a jump to new rows', (t) => {
+  const h = setup(t);
+  $('plist').scrollHeight = 1000;
+  $('plist').clientHeight = 100;
+  $('plist').scrollTop = 40;
+  h.send(1);
+  h.flush();
+  assert.equal($('plist').scrollTop, 40);
+  assert.equal($('jump-packets').hidden, false);
+  assert.equal($('jump-packets').textContent, '1 new');
+  $('jump-packets').click();
+  assert.equal($('plist').scrollTop, 1000);
+  assert.equal($('jump-packets').hidden, true);
+  h.view.dispose();
+  assert.equal($('jump-packets').listenerCount, 0);
+  assert.equal($('plist').listenerCount, 0);
 });

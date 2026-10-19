@@ -1,6 +1,10 @@
+import { watchState } from './state.mjs';
+
 // One owner for origin-scoped authorization, requests, streams and downloads.
-export function createTransport({ state, setStatus = () => {}, onLogout = () => {}, tick, snapshot, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent }, {
+export function createTransport({ state, setStatus = () => {}, onLogout = () => {}, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent }, {
   fetch = globalThis.fetch, location = globalThis.location, history = globalThis.history, window = globalThis.window,
+  signedOutMessage = 'Not signed in. Open the dashboard bootstrap URL to sign in. If it was already used, restart the dashboard first.',
+  WebSocket = globalThis.WebSocket,
   storage, document = globalThis.document, URL = globalThis.URL,
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout,
 } = {}) {
@@ -8,13 +12,25 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
   const key = 'fictionet_token';
   let lifetime = new AbortController();
   const streams = new Set();
+  const sockets = new Set();
+  const downloads = new Map();
   let bootstrap = 0;
   let token;
   let events;
+  let stopWatch;
+  let watching = false;
 
   function stop() {
+    stopWatch?.();
     lifetime.abort();
     for (const source of streams) source.close();
+    for (const socket of sockets) socket.close();
+    sockets.clear();
+    for (const [url, timer] of downloads) {
+      clearTimeout(timer);
+      URL.revokeObjectURL(url);
+    }
+    downloads.clear();
     token = null;
   }
 
@@ -28,16 +44,37 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
     try { storage?.removeItem(key); } catch { /* Storage may be disabled. */ }
     if (state) state.connected = false;
     onLogout();
-    setStatus('ended', 'Not signed in. Open the dashboard bootstrap URL to sign in. If it was already used, restart the dashboard first.');
+    setStatus('ended', signedOutMessage);
   }
 
   // Endpoints are fixed; values are query parameters, never destinations.
-  function send(op, params, signal, bearer = token) {
-    if (!['bootstrap', 'watch', 'packets', 'packet', 'pcap'].includes(op)) throw new Error('Unknown dashboard endpoint');
-    const url = new URL(`/api/${op}`, page.origin);
+  const segment = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+  const observation = ['world', 'graph', 'counters', 'events', 'link', 'keylog', 'watch', 'packets', 'packet', 'pcap'];
+  function endpoint(path, method) {
+    if (method === 'POST' && ['/api/bootstrap', '/api/ticket', '/api/lease'].includes(path)) return path;
+    if (method === 'DELETE' && path === '/api/lease') return path;
+    if (method === 'GET' && (path === '/api/page' || observation.some((op) => path === `/api/${op}`))) return path;
+    const parts = path.split('/');
+    if (parts[0] !== '' || parts[1] !== 'api' || !segment(parts[3])) throw new Error('Invalid page endpoint');
+    if (parts.length === 4 && (
+      (method === 'GET' && ['state', 'event-table'].includes(parts[2])) ||
+      (method === 'POST' && parts[2] === 'command')
+    )) return path;
+    if (method === 'GET' && parts.length === 5 && (
+      (parts[2] === 'state' && parts[4] === 'stream') ||
+      (parts[2] === 'host' && parts[4] === 'links')
+    )) return path;
+    throw new Error('Invalid page endpoint');
+  }
+
+  function send(op, params, signal, bearer = token, method = op === 'bootstrap' ? 'POST' : 'GET', body) {
+    const path = endpoint(op.startsWith('/') ? op : `/api/${op}`, method);
+    const url = new URL(path, page.origin);
     url.search = new URLSearchParams(params).toString();
     return fetch(url.href, {
-      headers: { Authorization: `Bearer ${bearer}` },
+      method,
+      headers: { Authorization: `Bearer ${bearer}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       credentials: 'omit', mode: 'same-origin', redirect: 'error', cache: 'no-store', referrerPolicy: 'no-referrer',
       signal: signal ? AbortSignal.any([lifetime.signal, signal]) : lifetime.signal,
     });
@@ -84,16 +121,17 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
     const reconnect = lifetime.signal.aborted;
     if (reconnect) lifetime = new AbortController();
     ready = authorize(fragment);
-    if (reconnect && events) connect();
+    if (reconnect && watching) connect();
   }
   window?.addEventListener('hashchange', hashchange);
 
-  async function request(op, params, signal) {
-    if (!await ready || lifetime.signal.aborted) throw new Error('Dashboard is closed');
-    const response = await send(op, params, signal);
+  async function request(op, params, signal, method, body) {
+    endpoint(op.startsWith('/') ? op : `/api/${op}`, method || 'GET');
+    if (!await ready || lifetime.signal.aborted) throw new Error('The page is closed. Reload to reconnect.');
+    const response = await send(op, params, signal, token, method, body);
     if (response.status === 401 || response.status === 403) {
       logout();
-      throw new Error('Dashboard authorization failed');
+      throw new Error(signedOutMessage);
     }
     return response;
   }
@@ -180,40 +218,18 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
     return source;
   }
 
-  function connect() {
-    events?.close();
+  function connect(observer) {
+    watching = true;
+    if (observer) ({ state, setStatus, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent } = observer);
+    stopWatch?.();
     events = stream('watch', {});
-    events.addEventListener('waiting', () => {
-      state.connected = true;
-      setStatus('waiting', 'Waiting for a world');
-    });
-    events.addEventListener('snapshot', (e) => snapshot(JSON.parse(e.data)));
-    events.addEventListener('group', (e) => upsertGroup(JSON.parse(e.data)));
-    events.addEventListener('group_end', (e) => removeGroup(JSON.parse(e.data).id));
-    events.addEventListener('node', (e) => upsertNode(JSON.parse(e.data)));
-    events.addEventListener('node_end', (e) => removeNode(JSON.parse(e.data).id));
-    events.addEventListener('edge', (e) => upsertEdge(JSON.parse(e.data)));
-    events.addEventListener('edge_end', (e) => removeEdge(JSON.parse(e.data).id));
-    events.addEventListener('counters', (e) => counters(JSON.parse(e.data)));
-    events.addEventListener('event', (e) => addEvent(JSON.parse(e.data)));
-    events.addEventListener('ended', (e) => {
-      tick(JSON.parse(e.data).t);
-      state.ended = true;
-      setStatus('ended', 'World stopped');
-      state.sideDirty = true;
-    });
-    events.addEventListener('end', () => {
-      events.close();
-      if (!state.ended) setStatus('ended', 'The world closed');
-      state.ended = true;
-    });
-    events.addEventListener('world_error', (e) => {
-      state.ended = true;
-      setStatus('ended', JSON.parse(e.data).error);
-    });
-    events.addEventListener('error', () => {
-      if (!state.ended) setStatus('connecting', 'Reconnecting');
-    });
+    const source = events;
+    const unbind = watchState(source, { state, setStatus, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent });
+    stopWatch = () => {
+      unbind();
+      if (events === source) events = null;
+    };
+    return () => { watching = false; stopWatch?.(); };
   }
 
   function packetStream(list, reconnected = () => {}) {
@@ -243,8 +259,53 @@ export function createTransport({ state, setStatus = () => {}, onLogout = () => 
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    downloads.set(url, setTimeout(() => {
+      URL.revokeObjectURL(url);
+      downloads.delete(url);
+    }, 60000));
   }
 
-  return { connect, packetStream, packet, download, logout, close };
+  async function json(method, path, params, body, signal) {
+    const response = await request(path, params, signal, method, body);
+    const value = response.status === 204 ? null : await response.json();
+    if (!response.ok) {
+      const error = new Error(value?.error || value?.rejection?.message || value?.rejection?.reason || `HTTP ${response.status}`);
+      error.status = response.status;
+      error.body = value;
+      throw error;
+    }
+    return value;
+  }
+
+  const get = (path, params = {}, signal) => json('GET', path, params, undefined, signal);
+  const post = (path, body, signal) => json('POST', path, {}, body, signal);
+  const remove = (path, body, signal) => json('DELETE', path, {}, body, signal);
+
+  function stateStream(id, after) {
+    if (!segment(id)) throw new Error('Invalid state id');
+    return stream(`/api/state/${id}/stream`, after === undefined ? {} : { after });
+  }
+
+  async function socket(capability, host, signal) {
+    if (!['screen', 'terminal'].includes(capability) || !segment(host)) throw new Error('Invalid console path');
+    const result = await post('/api/ticket', { capability, host }, signal);
+    if (lifetime.signal.aborted || signal?.aborted) throw new Error('Console request cancelled');
+    if (typeof result.ticket !== 'string' || !/^[a-f0-9]{64}$/.test(result.ticket) ||
+        typeof result.session !== 'string' || !/^[a-f0-9]{64}$/.test(result.session)) throw new Error('Invalid console ticket');
+    const url = new URL(`/ws/${capability}/${host}`, page.origin);
+    url.protocol = page.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.searchParams.set('ticket', result.ticket);
+    const socket = new WebSocket(url.href);
+    socket.binaryType = 'arraybuffer';
+    sockets.add(socket);
+    const cancel = () => socket.close();
+    signal?.addEventListener('abort', cancel, { once: true });
+    socket.addEventListener('close', () => {
+      sockets.delete(socket);
+      signal?.removeEventListener('abort', cancel);
+    }, { once: true });
+    return { socket, session: result.session };
+  }
+
+  return { get, post, delete: remove, stateStream, socket, watch: () => stream('watch', {}), connect, packetStream, packet, download, logout, close };
 }

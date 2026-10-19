@@ -726,18 +726,21 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
         "/api/pcap",
         "/api/bootstrap",
     ] {
-        assert!(raw_get(port, route, "").starts_with("HTTP/1.1 401"));
+        let send = if route == "/api/bootstrap" {
+            raw_post
+        } else {
+            raw_get
+        };
+        assert!(send(port, route, "").starts_with("HTTP/1.1 401"));
         assert!(
-            raw_get(
+            send(
                 port,
                 route,
                 "Cookie: fictionet_token=dashboard-test-token\r\n"
             )
             .starts_with("HTTP/1.1 401")
         );
-        assert!(
-            raw_get(port, route, "Authorization: Bearer wrong\r\n").starts_with("HTTP/1.1 401")
-        );
+        assert!(send(port, route, "Authorization: Bearer wrong\r\n").starts_with("HTTP/1.1 401"));
     }
     // A coalesced request or body suffix cannot supply the first request's headers.
     for suffix in [
@@ -777,9 +780,9 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
         assert!(!shell.contains("dashboard-test-token"));
     }
     assert!(
-        raw_get(port, "/api/bootstrap?token=dashboard-test-token", "").starts_with("HTTP/1.1 401")
+        raw_post(port, "/api/bootstrap?token=dashboard-test-token", "").starts_with("HTTP/1.1 401")
     );
-    let bootstrap = raw_get(
+    let bootstrap = raw_post(
         port,
         "/api/bootstrap",
         "Authorization: Bearer dashboard-test-token\r\n",
@@ -788,7 +791,7 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     assert!(!bootstrap.contains("Set-Cookie:"));
     assert!(!bootstrap.contains("dashboard-test-token"));
     assert!(
-        raw_get(
+        raw_post(
             port,
             "/api/bootstrap",
             "Authorization: Bearer dashboard-test-token\r\n"
@@ -1211,6 +1214,15 @@ fn raw_get(port: u16, path: &str, headers: &str) -> String {
     raw_request(
         port,
         &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n"),
+    )
+}
+
+fn raw_post(port: u16, path: &str, headers: &str) -> String {
+    raw_request(
+        port,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n{headers}\r\n"
+        ),
     )
 }
 

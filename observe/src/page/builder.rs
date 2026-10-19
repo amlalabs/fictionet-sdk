@@ -60,6 +60,18 @@ impl Page {
         });
         self
     }
+    /// Names a story moment by the world events that mark it.
+    pub fn moment(mut self, title: impl Into<String>, filter: EventFilter) -> Self {
+        let title = title.into();
+        let id = panel::slug(&title);
+        self.filters.push((id.clone(), filter));
+        self.moments.push(super::MomentDescription {
+            events: format!("/api/event-table/{id}"),
+            id,
+            title,
+        });
+        self
+    }
     /// Embeds a module exporting mount(root, services, options), returning dispose.
     pub fn custom<T: Serialize>(
         mut self,
@@ -242,7 +254,7 @@ impl Page {
                 .is_some_and(|name| !names.contains(name))
             {
                 return Err(invalid(format!(
-                    "event_table({id:?}) host {:?} is unknown; declare that host first",
+                    "event filter {id:?} host {:?} is unknown; declare that host first",
                     filter.host
                 )));
             }

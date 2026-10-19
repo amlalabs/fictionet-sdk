@@ -1,3 +1,4 @@
+mod libraries;
 mod microvm;
 
 use crate::process::{Result, run as execute};

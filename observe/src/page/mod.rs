@@ -1,10 +1,9 @@
 //! A loopback page over an in-process dashboard.
 //!
-//! The public shell at `GET /`, styles at `GET /shell.css` and module at
-//! `GET /shell.mjs` contain no
-//! world data. Open [`Server::url`] once: the shell removes its fragment,
+//! The public page at `GET /`, styles at `GET /page.css` and module at
+//! `GET /page.mjs` contain no world data. Open [`Server::url`] once: the page removes its fragment,
 //! posts to `/api/bootstrap` with `Authorization: Bearer <token>`, and stores
-//! that token in session storage. Bootstrap returns `{"ok":true}` once;
+//! that token in session storage. Bootstrap returns 204 with no body once;
 //! subsequent attempts return 409. All API routes require the bearer header.
 //! Query parameters and cookies never authenticate. Errors are
 //! `{"error":"description"}` with an HTTP error status.
@@ -24,9 +23,10 @@
 //! topic is linked. `state` and `command` are same-origin absolute paths.
 //! A column is `{label,pointer,format}`, with a JSON pointer and a format of
 //! `text`, `number`, `bytes`, `time` or `status`. An action is `{label,command}`.
-//! Values and labels must be rendered as text. The shell deliberately only
-//! prints the description and `world` reply; application components can
-//! replace the files in `shell/` without changing the API.
+//! Values and labels are rendered as text. Browser modules live in `dashboard/`.
+//! Pinned libraries are embedded at `/vendor/<name>/<path>` after running
+//! `cargo xtask demo assets`. `/vendor/licenses` lists their versions and licenses.
+//! The page response uses a fresh nonce for its inline import map.
 //!
 //! # Observation
 //!
@@ -187,11 +187,18 @@
 //! when rows is empty. `dropped` has the session's loss semantics. Pass next
 //! as after on the next request. Only after is accepted as a query field.
 //!
+//! `moment(title, EventFilter)` names a story moment. `/api/page` includes
+//! `moments: [{id,title,events}]`. Each events URL uses the event-table
+//! projection above, including its cursor and loss behavior. A moment is
+//! not a panel and has no columns. Its first matching world event supplies
+//! the banner's run time and selection. A newer moment replaces the banner.
+//! IDs must be unique across panels and moments; validation happens at bind.
+//!
 //! Custom panels are `{id,title,area,kind:"custom",module,state}`.
 //! `GET /panels/<id>.mjs` serves the declared module as JavaScript.
 //! It exports `mount(root, services, options)` returning a dispose function.
 //! `GET /assets/<path>` serves an embedded asset with its declared media
-//! type. These files, like the shell, are public static resources: never
+//! type. These files, like the page, are public static resources: never
 //! embed world secrets in them. Paths are relative, slash-separated ASCII
 //! letters, digits, `-`, `_`, and `.`, with no empty, dot or parent segments.
 //! Content types accept type/subtype and optional token parameters such as
@@ -227,6 +234,7 @@
 //!         source: Some("http".into()), kind: Some("request".into()),
 //!         ..EventFilter::default()
 //!     }, vec![Column::new("Summary", "/summary")])
+//!     .moment("Ready", EventFilter { kind: Some("ready".into()), ..EventFilter::default() })
 //!     .custom("Plant", "export function mount() { return () => {}; }", routing.clone())
 //!     .asset("plant/data.json", "application/json", b"{}".to_vec())
 //!     .workspace("Plant")
@@ -311,6 +319,7 @@
 //! message, so takeover blocks the previous session's next input immediately.
 //! Taking control never pauses the agent; it claims browser input only.
 
+mod assets;
 mod auth;
 mod builder;
 mod command;
@@ -347,11 +356,10 @@ pub struct ErrorReply {
     pub error: String,
 }
 
-/// Successful bootstrap response.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BootstrapReply {
-    /// Always true after the bootstrap has been consumed.
-    pub ok: bool,
+/// Looks up an embedded browser library by its path under `/vendor/`.
+/// Returns `None` when the file was not downloaded before building.
+pub fn vendored(path: &str) -> Option<&'static [u8]> {
+    assets::vendored(path)
 }
 
 /// Page composition returned by `/api/page`.
@@ -363,6 +371,19 @@ pub struct PageDescription {
     pub hosts: Vec<HostDescription>,
     /// Declared panels.
     pub panels: Vec<PanelDescription>,
+    /// Named event projections shown in the top bar.
+    pub moments: Vec<MomentDescription>,
+}
+
+/// A named moment marked by world events.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MomentDescription {
+    /// Identifier shared with its event projection.
+    pub id: String,
+    /// Banner title.
+    pub title: String,
+    /// Server-filtered event endpoint.
+    pub events: String,
 }
 
 /// An embedded page served from the loopback interface.
@@ -370,6 +391,7 @@ pub struct Page {
     title: String,
     dashboard: DashboardHandle,
     panels: Vec<PanelDescription>,
+    moments: Vec<MomentDescription>,
     topics: Vec<(String, state::Topic)>,
     commands: Vec<(String, Box<dyn command::Dispatch>)>,
     errors: Vec<String>,
@@ -389,6 +411,7 @@ impl Page {
             title: title.into(),
             dashboard,
             panels: vec![],
+            moments: vec![],
             topics: vec![],
             commands: vec![],
             errors: vec![],
@@ -539,6 +562,18 @@ impl Page {
                 }
             }
         }
+        for moment in &self.moments {
+            if moment.id.is_empty() || moment.id.len() > 128 || ids.contains_key(&moment.id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "moment({:?}) has an invalid or duplicate id; choose a distinct title with at most 128 ASCII letters, digits or separators",
+                        moment.title
+                    ),
+                ));
+            }
+            ids.insert(&moment.id, format!("moment({:?})", moment.title));
+        }
         let mut topics = std::collections::BTreeSet::from(["leases"]);
         for (id, _) in &self.topics {
             if !topics.insert(id) {
@@ -624,39 +659,26 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
         return http::error(conn, 401, "bearer token required").await;
     }
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => {
+        ("GET", "/") => http::page(conn).await,
+        ("GET", "/vendor/licenses") => {
             http::respond(
                 conn,
                 200,
                 "text/html; charset=utf-8",
-                include_bytes!("shell/index.html"),
+                assets::licenses().as_bytes(),
             )
             .await
         }
-        ("GET", "/shell.css") => {
-            http::respond(
-                conn,
-                200,
-                "text/css; charset=utf-8",
-                include_bytes!("shell/shell.css"),
-            )
-            .await
-        }
-        ("GET", "/shell.mjs") => {
-            http::respond(
-                conn,
-                200,
-                "text/javascript; charset=utf-8",
-                include_bytes!("shell/shell.mjs"),
-            )
-            .await
+        ("GET", path) if assets::lookup(path).is_some() => {
+            let (kind, bytes) = assets::lookup(path).expect("matched asset");
+            http::respond(conn, 200, kind, bytes).await
         }
         ("POST", "/api/bootstrap") => {
             if !shared.auth.bootstrap(&req) {
                 return http::error(conn, 409, "bootstrap already used or query is not empty")
                     .await;
             }
-            http::json(conn, 200, &BootstrapReply { ok: true }).await
+            http::respond(conn, 204, "text/plain", b"").await
         }
         ("POST", "/api/ticket") => console::ticket(conn, shared, &req).await,
         ("POST" | "DELETE", "/api/lease") => console::lease(conn, shared, &req).await,
@@ -677,6 +699,7 @@ async fn serve(conn: &mut TcpStream, shared: &Shared) -> io::Result<()> {
                     title: shared.page.title.clone(),
                     hosts: shared.page.hosts.iter().map(Host::description).collect(),
                     panels: shared.page.panels.clone(),
+                    moments: shared.page.moments.clone(),
                 },
             )
             .await

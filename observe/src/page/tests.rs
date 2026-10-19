@@ -67,10 +67,10 @@ fn status(response: &str, code: u16) {
 }
 
 #[tokio::test]
-async fn the_shell_is_public_and_only_bearers_authenticate() {
+async fn the_page_is_public_and_only_bearers_authenticate() {
     let server = server().await;
     status(&request(&server, "GET", "/", "", "").await, 200);
-    status(&request(&server, "GET", "/shell.mjs", "", "").await, 200);
+    status(&request(&server, "GET", "/page.mjs", "", "").await, 200);
     for path in [
         "/api/page",
         "/api/world",
@@ -108,12 +108,56 @@ async fn the_shell_is_public_and_only_bearers_authenticate() {
     );
     status(
         &request(&server, "POST", "/api/bootstrap", &headers, "").await,
-        200,
+        204,
     );
     status(
         &request(&server, "POST", "/api/bootstrap", &headers, "").await,
         409,
     );
+}
+
+#[tokio::test]
+async fn the_import_map_nonce_is_fresh_and_only_the_page_relaxes_style_elements() {
+    let server = server().await;
+    let first = request(&server, "GET", "/", "", "").await;
+    let second = request(&server, "GET", "/", "", "").await;
+    let nonce = |response: &str| {
+        response
+            .split_once("nonce=\"")
+            .unwrap()
+            .1
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(nonce(&first), nonce(&second));
+    for response in [&first, &second] {
+        status(response, 200);
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let value = nonce(response);
+        assert_eq!(value.len(), 64);
+        assert!(value.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(head.contains(&format!("script-src 'self' 'nonce-{value}';")));
+        assert!(head.contains("style-src 'self'; style-src-elem 'self' 'unsafe-inline';"));
+        assert!(!head.contains("sha256-"));
+        assert!(!body.contains("PAGE_NONCE"));
+        assert!(body.contains("type=\"importmap\""));
+    }
+    for path in ["/page.mjs", "/page.css", "/vendor/licenses", "/missing"] {
+        let response = request(&server, "GET", path, "", "").await;
+        let head = response.split_once("\r\n\r\n").unwrap().0;
+        assert!(head.contains(http::SECURITY));
+        assert!(!head.contains("nonce-"));
+        assert!(!head.contains("unsafe-inline"));
+    }
+    for path in ["/shell.mjs", "/shell.css"] {
+        status(&request(&server, "GET", path, "", "").await, 404);
+    }
+    let headers = format!("{}Origin: http://{}\r\n", bearer(&server), address(&server));
+    let response = request(&server, "POST", "/api/bootstrap", &headers, "").await;
+    status(&response, 204);
+    assert_eq!(response.split_once("\r\n\r\n").unwrap().1, "");
 }
 
 #[tokio::test]
@@ -1365,6 +1409,15 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
             },
             vec![Column::new("Route", "/fields/route")],
         )
+        .moment(
+            "Bank requested",
+            EventFilter {
+                source: Some("fixture".into()),
+                kind: Some("request".into()),
+                field: Some(("route".into(), "bank".into())),
+                host: None,
+            },
+        )
         .custom(
             "Plant",
             "export function mount() { return () => {}; }",
@@ -1441,6 +1494,20 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
     );
     assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
     assert_eq!(rows["rows"][0]["fields"]["route"], "bank");
+    assert_eq!(description.moments.len(), 1);
+    assert_eq!(description.moments[0].id, "bank-requested");
+    assert_eq!(description.moments[0].title, "Bank requested");
+    let moment_rows = json_body(
+        &request(
+            &server,
+            "GET",
+            &description.moments[0].events,
+            &bearer(&server),
+            "",
+        )
+        .await,
+    );
+    assert_eq!(moment_rows, rows);
     let next = rows["next"].as_u64().unwrap();
     assert!(next > rows["rows"][0]["seq"].as_u64().unwrap());
     let rows = json_body(
@@ -1570,5 +1637,43 @@ async fn console_open_errors_and_oversized_messages_close_the_socket() {
         head.extend_from_slice(&[1, 2, 3, 4]);
         ws.conn.write_all(&head).await.unwrap();
         assert!(matches!(ws.recv().await, Message::Close(Some(_))));
+    }
+}
+
+#[tokio::test]
+async fn moments_validate_titles_ids_and_host_filters_before_binding() {
+    let page = || {
+        Page::new(
+            "Moments",
+            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        )
+    };
+    for invalid in [
+        page().moment("", EventFilter::default()),
+        page().moment("---", EventFilter::default()),
+        page().moment("a".repeat(129), EventFilter::default()),
+        page()
+            .moment("Ready", EventFilter::default())
+            .moment("ready", EventFilter::default()),
+        page()
+            .moment("Map", EventFilter::default())
+            .standard_panels(),
+        page().moment("Rows", EventFilter::default()).table(
+            "Rows",
+            StateTopic::<Vec<u32>>::new(StateLimits::default()),
+            vec![],
+        ),
+        page().moment(
+            "Ready",
+            EventFilter {
+                host: Some("missing".into()),
+                ..EventFilter::default()
+            },
+        ),
+    ] {
+        assert_eq!(
+            invalid.bind_loopback(0).await.err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }
