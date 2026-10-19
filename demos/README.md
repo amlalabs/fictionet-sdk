@@ -47,7 +47,7 @@ The scripts that run inside the VM are in [`guest/`](guest), one per demo, with
 [`lib.sh`](guest/lib.sh) for the steps, the commands and the checks. Each starts
 with a `# needs:` line that says what [`vm/guest/build.sh`](../vm/guest/build.sh)
 builds for it: `sdk` is `fictionet` and the crate's examples, and `border`,
-`fakewiki` and `adaptive-web` are those examples' worlds. The Compose demos
+`fakewiki`, `adaptive-web` and `scan` are those examples' worlds. The Compose demos
 run the examples' own Compose files, plus a small file next to the script
 (`border.compose.yaml` and the others) that puts the binaries the VM built in
 place of the Dockerfile's build stage, so nothing compiles twice.
@@ -77,14 +77,14 @@ or E2B sandbox. `cargo xtask scan` records the scan demo's dashboard as a video.
 ## Making a demo of your own
 
 Start from [`examples/scan`](../examples/scan), the smallest Docker example with
-an agent container: the world in one file, a Dockerfile with one stage per
-container, and a Compose file.
+an agent container: a world library and socket executable, a Dockerfile with
+one stage per container, and a Compose file.
 
-1. Copy `examples/scan` to `examples/<name>`, and add the world to the crate's
-   `Cargo.toml` as an example, next to `scan`'s entry: `name = "<name>"`,
-   `path = "examples/<name>/main.rs"`. Write your world in `main.rs`;
-   `cargo run --example <name> -- /tmp/world.sock` runs it on its own.
-2. In `docker/Dockerfile`, build and copy your example instead of `scan` (its
+1. Copy `examples/scan` to `examples/<name>` and rename the package and binary
+   in `world/Cargo.toml` to `<name>-world`. The workspace includes it already.
+   Write your world in `world/src/lib.rs`;
+   `cargo run -p <name>-world -- /tmp/world.sock` runs it on its own.
+2. In `docker/Dockerfile`, build and copy your world instead of `scan-world` (its
    `build` and `fictionet` stages name it), and give the agent's stage the
    tools your agent uses instead of nmap. Drop the `container` stage if your
    world has no real host.
@@ -97,5 +97,6 @@ container, and a Compose file.
 5. For `cargo xtask demo <name>`, copy `demos/guest/scan.sh` to
    `demos/guest/<name>.sh` and `scan.compose.yaml` to `<name>.compose.yaml`,
    and change the Compose file, the project name and the steps. Keep the
-   `# needs: sdk` line: the VM builds every example. `cargo xtask demo` finds
-   the script by its name. Add a row to the table above.
+   `# needs: sdk <name>` line and add `<name>` to the world targets in
+   `vm/guest/build.sh`. `cargo xtask demo` finds the script by its name.
+   Add a row to the table above.

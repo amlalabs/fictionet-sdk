@@ -3,7 +3,7 @@
 # office subnet (examples/scan) under Docker Compose: nmap in the agent's
 # sandbox finds four simulated hosts and one real container, and the
 # dashboard shows the scan as it happens.
-# needs: sdk
+# needs: sdk scan
 . "$(dirname "$0")/lib.sh"
 host_port="${FICTIONET_DASHBOARD_PORT:-7878}"
 seconds="${DASHBOARD_SECONDS:-}"

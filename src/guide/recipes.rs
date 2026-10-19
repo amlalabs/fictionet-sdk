@@ -324,7 +324,7 @@
 //! # A subnet for a port scanner
 //!
 //! `examples/scan` is a five-host subnet that `nmap` scans from a sandbox:
-//! four simulated machines and one real container, wired with a router and
+//! four simulated machines and one real server, wired with a router and
 //! [grouped](crate::Cx#groups) for the dashboard. Its
 //! [README](https://github.com/amlalabs/fictionet-sdk/blob/main/examples/scan/README.md)
 //! runs it under Docker Compose and shows the scan.
