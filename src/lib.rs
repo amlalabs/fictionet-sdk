@@ -339,6 +339,8 @@ mod packet_queue;
 #[doc(hidden)]
 pub mod relay;
 pub use entropy::{Entropy, Seed, SeededEntropy};
+mod group;
+mod link;
 mod run;
 pub mod stdlib;
 pub mod sync;
@@ -348,7 +350,6 @@ mod timer;
 mod tls_keys;
 #[cfg(feature = "tokio")]
 pub mod tokio;
-mod watch;
 
 /// The extension traits. Import this to call methods such as
 /// [`recv`](InterfaceExt::recv) and [`read`](stdlib::network::ConnectionExt::read).

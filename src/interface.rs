@@ -173,10 +173,10 @@ impl From<Cancelled> for RecvError {
 /// An opaque link an [`Interface`](crate::Interface) belongs to.
 /// Use [`LinkHandle::label`] to name it for observers.
 #[derive(Clone)]
-pub struct LinkHandle(std::sync::Arc<crate::watch::Meter>);
+pub struct LinkHandle(std::sync::Arc<crate::link::Meter>);
 
 impl LinkHandle {
-    pub(crate) fn new(meter: std::sync::Arc<crate::watch::Meter>) -> Self {
+    pub(crate) fn new(meter: std::sync::Arc<crate::link::Meter>) -> Self {
         Self(meter)
     }
 

@@ -249,7 +249,7 @@ pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
         handle: Arc::new(sender),
     };
     fcx.spawn_as(
-        || "router".into(),
+        || "router",
         move |fcx| async move {
             let mut ports = Ports::new(Vec::new());
             // Which port each prefix goes out on.
@@ -655,7 +655,7 @@ where
         handle: Arc::new(LanHandle { subnet, sender }),
     };
     fcx.spawn_as(
-        || "lan".into(),
+        || "lan",
         move |fcx| async move {
             let mut ports = Ports::new(Vec::new());
             let mut members = Members::new(enrich);

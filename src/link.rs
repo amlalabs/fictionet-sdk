@@ -1,39 +1,11 @@
-//! Link counters, stream registration, and task origins.
+//! Link counters, run registration, and packet streams.
 
 use fictionet::sync::{Mutex, MutexGuard};
-
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::panic::Location;
 #[cfg(feature = "std")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use crate::Packet;
-
-/// Hashes task and link ids, which are small distinct numbers, with one
-/// multiplication instead of SipHash.
-pub(crate) type Ids = std::hash::BuildHasherDefault<IdHasher>;
-
-#[derive(Default)]
-pub(crate) struct IdHasher(u64);
-
-impl std::hash::Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for b in bytes {
-            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
-        }
-    }
-    fn write_u64(&mut self, n: u64) {
-        self.0 = n.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Meters
 
 /// The counts and packet stream of one link: a pair, or an attachment.
 ///
@@ -324,205 +296,10 @@ pub(crate) trait Counted: Send + Sync {
     fn observe_packets(&self, packets: Arc<PacketStream>);
 }
 
-// ---------------------------------------------------------------------------
-// The graph
-
-/// A named group of tasks, from [`Cx::group`](crate::Cx::group). Only
-/// observers read it.
-pub(crate) struct Group {
-    pub(crate) id: u64,
-    pub(crate) name: String,
-    pub(crate) parent: Option<Arc<Group>>,
-    observer: Option<Arc<crate::events::Dispatch>>,
-    pub(crate) host: Option<crate::events::HostId>,
-}
-
-impl std::fmt::Debug for Group {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Group")
-            .field("id", &self.id)
-            .field("name", &self.name)
-            .field("parent", &self.parent)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Group {
-    pub(crate) fn new(
-        id: u64,
-        name: String,
-        parent: Option<Arc<Group>>,
-        observer: Option<Arc<crate::events::Dispatch>>,
-        host: bool,
-    ) -> Arc<Group> {
-        use crate::events::{GroupId, TopologyRef};
-        let host = observer.as_ref().filter(|_| host).map(|o| o.next_host());
-        let group = Arc::new(Group {
-            id,
-            name,
-            parent,
-            observer,
-            host,
-        });
-        if let Some(observer) = &group.observer {
-            observer.topology(TopologyRef::GroupAdded {
-                group: GroupId(id),
-                name: &group.name,
-                parent: group.parent.as_ref().map(|p| GroupId(p.id)),
-            });
-            if let Some(host) = group.host {
-                observer.topology(TopologyRef::HostAdded {
-                    host,
-                    name: &group.name,
-                    group: Some(GroupId(id)),
-                    sandbox: None,
-                });
-            }
-        }
-        group
-    }
-}
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        use crate::events::{GroupId, TopologyRef};
-        if let Some(observer) = &self.observer {
-            if let Some(host) = self.host {
-                observer.topology(TopologyRef::HostRemoved { host });
-            }
-            observer.topology(TopologyRef::GroupRemoved {
-                group: GroupId(self.id),
-            });
-        }
-    }
-}
-
-/// A task as observers see it.
-#[derive(Clone, Debug)]
-pub(crate) struct TaskInfo {
-    pub(crate) parent: u64,
-    /// The group the task belongs to, if any.
-    pub(crate) group: Option<Arc<Group>>,
-    /// The stdlib function's name, or the full type name of the task's
-    /// future, shortened by [`short_name`] only when an observer asks.
-    pub(crate) name: Cow<'static, str>,
-    pub(crate) file: &'static str,
-    pub(crate) line: u32,
-}
-
-/// Task origins retained while their tasks are running.
-pub(crate) struct Graph {
-    pub(crate) run_id: u64,
-    #[cfg(feature = "std")]
-    pub(crate) environment: Arc<crate::environment::RunEnvironment>,
-    state: Mutex<GraphState>,
-}
-
-#[derive(Default)]
-pub(crate) struct GraphState {
-    pub(crate) tasks: HashMap<u64, TaskInfo, Ids>,
-}
-
-impl Graph {
-    pub(crate) fn new(
-        run_id: u64,
-        environment: Arc<crate::environment::RunEnvironment>,
-    ) -> Arc<Graph> {
-        #[cfg(not(feature = "std"))]
-        let _ = environment;
-        Arc::new(Graph {
-            run_id,
-            #[cfg(feature = "std")]
-            environment,
-            state: Mutex::default(),
-        })
-    }
-
-    pub(crate) fn state(&self) -> MutexGuard<'_, GraphState> {
-        self.state.lock()
-    }
-
-    pub(crate) fn task_started(
-        &self,
-        id: u64,
-        name: Cow<'static, str>,
-        location: &'static Location<'static>,
-        group: Option<Arc<Group>>,
-    ) {
-        let info = TaskInfo {
-            parent: crate::run::current_task(self),
-            group,
-            name,
-            file: location.file(),
-            line: location.line(),
-        };
-        let mut s = self.state();
-        s.tasks.insert(id, info);
-    }
-
-    pub(crate) fn task_ended(&self, id: u64) {
-        let mut s = self.state();
-        let removed = s.tasks.remove(&id);
-        drop(s);
-        drop(removed);
-    }
-
-    pub(crate) fn run_ended(&self) {
-        let mut s = self.state();
-        let tasks = std::mem::take(&mut s.tasks);
-        drop(s);
-        drop(tasks);
-    }
-
-    /// The task `task` as an event records it, if it is running.
-    pub(crate) fn origin(&self, task: u64) -> Option<crate::events::Origin> {
-        if task == 0 {
-            return None;
-        }
-        let s = self.state();
-        let t = s.tasks.get(&task)?;
-        Some(crate::events::Origin {
-            task,
-            name: t.name.clone(),
-            file: t.file,
-            line: t.line,
-            parent: t.parent,
-        })
-    }
-}
-
-/// The name of a task's future type, for [`TaskInfo::name`].
-pub(crate) fn task_name<T: ?Sized>() -> Cow<'static, str> {
-    Cow::Borrowed(std::any::type_name::<T>())
-}
-
-/// A short name for a task, from the type of its future: the last two
-/// path segments, without closures and generics.
-/// `fictionet::stdlib::web::net::pings::{{closure}}` becomes `net::pings`.
-/// A name with no path, such as `delay`, stays as it is.
-pub fn short_name(full: &str) -> String {
-    // Cut generic arguments, which can hold paths of their own.
-    let mut depth = 0;
-    let mut plain = String::with_capacity(full.len());
-    for ch in full.chars() {
-        match ch {
-            '<' => depth += 1,
-            '>' => depth -= 1,
-            _ if depth == 0 => plain.push(ch),
-            _ => {}
-        }
-    }
-    let parts: Vec<&str> = plain
-        .split("::")
-        .filter(|p| !p.is_empty() && !p.starts_with('{'))
-        .collect();
-    let n = parts.len();
-    parts[n.saturating_sub(2)..].join("::")
-}
-
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn unobserved_links_do_not_register() {
@@ -541,19 +318,10 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn names_come_from_the_future_type() {
-        async fn pings() {}
-        fn name_of<F>(_: &F) -> String {
-            short_name(&task_name::<F>())
-        }
-        assert_eq!(name_of(&pings()), "names_come_from_the_future_type::pings");
-        let block = async {};
-        assert_eq!(name_of(&block), "tests::names_come_from_the_future_type");
-    }
-
     #[derive(Default)]
     struct Topology {
+        tasks: Mutex<HashMap<u64, crate::events::Origin>>,
+        live: Mutex<HashSet<u64>>,
         links: Mutex<HashMap<crate::events::LinkId, Link>>,
         ended: std::sync::atomic::AtomicBool,
     }
@@ -572,6 +340,29 @@ mod tests {
         fn observe(&self, _: crate::events::Stamp, item: crate::events::Observation<'_>) {
             use crate::events::{Observation, Side, TopologyRef};
             match item {
+                Observation::Topology(TopologyRef::TaskAdded {
+                    task,
+                    parent,
+                    name,
+                    file,
+                    line,
+                    ..
+                }) => {
+                    self.tasks.lock().insert(
+                        task.get(),
+                        crate::events::Origin {
+                            task: task.get(),
+                            parent: parent.map_or(0, crate::events::TaskId::get),
+                            name: name.to_owned().into(),
+                            file,
+                            line,
+                        },
+                    );
+                    self.live.lock().insert(task.get());
+                }
+                Observation::Topology(TopologyRef::TaskRemoved { task }) => {
+                    assert!(self.live.lock().remove(&task.get()));
+                }
                 Observation::Topology(TopologyRef::LinkAdded { link, creator, .. }) => {
                     self.links.lock().insert(
                         link,
@@ -608,8 +399,6 @@ mod tests {
             crate::RunMode::Real,
         );
         let observer = sink.clone();
-        let graph = shared.graph.clone();
-        let g = graph.clone();
         let (spawn_line, seen) = (Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(None)));
         let (line, s) = (spawn_line.clone(), seen.clone());
         let out = crate::block_on(crate::run::run_with(shared, move |fcx| async move {
@@ -625,12 +414,13 @@ mod tests {
                 a.send(Packet(vec![i; 100]));
                 a.recv(&fcx).await?;
             }
-            *s.lock() = Some((g.state().tasks.clone(), a.meter().totals()));
+            *s.lock() = Some(a.meter().totals());
             drop(a);
             Ok(echo.join(&fcx).await?)
         }));
         out.unwrap();
-        let (tasks, totals) = seen.lock().take().unwrap();
+        let totals = seen.lock().take().unwrap();
+        let tasks = observer.tasks.lock();
         let world = tasks
             .iter()
             .find(|(_, t)| t.name == "world")
@@ -641,7 +431,7 @@ mod tests {
             .find(|(_, t)| t.name != "world")
             .expect("the echo task");
         assert_eq!(info.line as u64, spawn_line.load(Ordering::SeqCst));
-        assert!(info.file.ends_with("watch.rs"));
+        assert!(info.file.ends_with("link.rs"));
         assert_eq!(info.parent, *world);
         let links = observer.links.lock();
         assert_eq!(links.len(), 1);
@@ -650,7 +440,7 @@ mod tests {
         assert_eq!(link.creator, *world);
         assert_eq!(totals, [10, 1000, 10, 1000]);
         // Once the run is over, its tasks are gone.
-        assert!(graph.state().tasks.is_empty());
+        assert!(observer.live.lock().is_empty());
         assert!(observer.ended.load(Ordering::Relaxed));
     }
 
@@ -717,22 +507,25 @@ mod tests {
     /// `filter` shows as `filter`, at the line that called it.
     #[test]
     fn filter_reports_its_caller() {
+        let observer = Arc::new(Topology::default());
+        let spawn_line = Arc::new(AtomicU64::new(0));
+        let line = spawn_line.clone();
         crate::block_on(crate::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(observer.clone()),
             |fcx| async move {
                 let (a, _b) = crate::pair();
-                let line = line!() + 1;
+                line.store(u64::from(line!()) + 1, Ordering::Relaxed);
                 let _f = crate::stdlib::network::filter(&fcx, a, |_, _, _| true);
-                let tasks: Vec<_> = fcx.graph().state().tasks.values().cloned().collect();
-                assert!(
-                    tasks
-                        .iter()
-                        .any(|t| t.name == "filter" && t.file == file!() && t.line == line),
-                    "{tasks:?}"
-                );
                 Ok(())
             },
         ))
         .unwrap();
+        let tasks = observer.tasks.lock();
+        assert!(
+            tasks.values().any(|t| t.name == "filter"
+                && t.file == file!()
+                && u64::from(t.line) == spawn_line.load(Ordering::Relaxed)),
+            "{tasks:?}"
+        );
     }
 }

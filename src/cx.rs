@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::future::{Future, poll_fn};
 use std::panic::Location;
 use std::sync::Arc;
@@ -6,9 +5,9 @@ use std::sync::atomic::Ordering;
 use std::task::{Poll, Waker};
 
 use crate::events::Event;
+use crate::group::Group;
 use crate::run::RunShared;
 use crate::time::{Duration, Instant};
-use crate::watch::Group;
 
 mod region;
 mod task;
@@ -256,18 +255,19 @@ impl Cx {
         F: FnOnce(Cx) -> Fut,
         Fut: Future<Output = crate::Result> + Send + 'static,
     {
-        self.spawn_as(crate::watch::task_name::<Fut>, work)
+        self.spawn_as(std::any::type_name::<Fut>, work)
     }
 
     /// [`Cx::spawn`], with the name observers see for the task. The
     /// stdlib names its tasks after the function that starts them, and a
     /// copy of a stdlib file can do the same.
     ///
-    /// `name` is called only if the region admits the task, before taking
-    /// the scheduler's queue lock. It may call methods on this `Cx`,
-    /// including [`Cx::cancel`].
+    /// The `name` closure returns a borrowed static task name. It runs once
+    /// if the region admits the task, even without an observer, before taking
+    /// the scheduler's queue lock. It may call methods on this `Cx`, including
+    /// [`Cx::cancel`].
     #[track_caller]
-    pub fn spawn_as<F, Fut>(&self, name: impl FnOnce() -> Cow<'static, str>, work: F) -> Task
+    pub fn spawn_as<F, Fut>(&self, name: impl FnOnce() -> &'static str, work: F) -> Task
     where
         F: FnOnce(Cx) -> Fut,
         Fut: Future<Output = crate::Result> + Send + 'static,
@@ -354,7 +354,7 @@ impl Cx {
                 .find_map(|group| group.host);
             self.run.observer.topology(TopologyRef::ConnectionOpened {
                 conn,
-                task: crate::run::RunTask::current_in(self.graph()).map(|task| TaskId(task.id)),
+                task: crate::run::RunTask::current_in(self.run.id).map(|task| TaskId(task.id)),
                 host,
             });
         }
@@ -441,8 +441,7 @@ impl Cx {
     }
 
     pub(crate) fn emit_observation(&self, mut event: Event) {
-        let graph = &self.run.graph;
-        event.origin = graph.origin(crate::run::current_task(graph));
+        event.origin = crate::run::current_origin(self.run.id);
         self.run.observer.emit(event, || self.now());
     }
 
@@ -638,12 +637,6 @@ impl Cx {
             None if child.cut_short() => Err(Cancelled.into()),
             None => Ok(()),
         }
-    }
-
-    /// What this run records for observers.
-    #[inline]
-    pub(crate) fn graph(&self) -> &Arc<crate::watch::Graph> {
-        &self.run.graph
     }
 
     /// Makes sure `waker` is woken when this region is cancelled. Returns

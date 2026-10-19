@@ -1,5 +1,4 @@
 use fictionet::sync::Mutex;
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -12,7 +11,6 @@ use std::task::{Context, Poll, Wake, Waker};
 use crate::JoinError;
 use crate::cx::{JoinState, Region, is_cancel};
 use crate::sys::SystemTime;
-use crate::watch::Graph;
 use crate::{Cx, Result};
 
 /// Run ids, unique in the process. They are only compared for equality,
@@ -232,13 +230,18 @@ where
         queue.next_id += 1;
         id
     };
-    shared
-        .graph
-        .task_started(id, Cow::Borrowed("world"), Location::caller(), None);
-    shared.task_added(id);
+    let identity = TaskIdentity {
+        origin: TaskOrigin {
+            name: "world",
+            location: Location::caller(),
+            parent: 0,
+        },
+        group: None,
+    };
+    shared.task_added(id, &identity);
     let start = shared.start.lock().take();
     if let Some(mut event) = start {
-        event.origin = shared.graph.origin(id);
+        event.origin = Some(identity.origin.event(id));
         shared.observer.emit(event, || crate::time::Instant::ZERO);
     }
     let cx = Cx {
@@ -247,12 +250,14 @@ where
         group: None,
     };
     let future = {
-        let _guard = CurrentGuard::enter(&shared.graph, id, Waker::noop(), &mut state.dispatch);
+        let _guard =
+            CurrentGuard::enter(shared.id, id, &identity, Waker::noop(), &mut state.dispatch);
         world(cx)
     };
     if root.try_start_task() {
         shared.queue.lock().incoming.push(NewTask {
             pending_announcement: false,
+            identity,
             id,
             future: Box::pin(future),
             region: root,
@@ -291,8 +296,7 @@ pub(crate) struct RunShared {
     pub(crate) next_group: AtomicU64,
     start: Mutex<Option<crate::events::Event>>,
     queue: Mutex<Queue>,
-    /// What the run records for observers.
-    pub(crate) graph: Arc<Graph>,
+    pub(crate) id: u64,
 }
 
 #[derive(Default)]
@@ -316,6 +320,7 @@ struct Queue {
 }
 
 struct NewTask {
+    identity: TaskIdentity,
     pending_announcement: bool,
     id: u64,
     future: BoxFuture,
@@ -408,7 +413,6 @@ impl RunShared {
                     .field("rng", "chacha20-v1")
                     .prepend_fields(fields)
             });
-        let graph = Graph::new(run_id, environment.clone());
         Arc::new(Self {
             environment,
             observer,
@@ -418,26 +422,21 @@ impl RunShared {
                 next_id: 1,
                 ..Queue::default()
             }),
-            graph,
+            id: run_id,
         })
     }
 
-    fn task_added(&self, id: u64) {
-        use crate::events::{GroupId, TaskId, TopologyKind, TopologyRef};
-        if !self.observer.topology_enabled(TopologyKind::Task) {
-            return;
-        }
-        let info = self.graph.state().tasks.get(&id).cloned();
-        if let Some(info) = info {
-            self.observer.topology(TopologyRef::TaskAdded {
-                task: TaskId(id),
-                parent: (info.parent != 0).then_some(TaskId(info.parent)),
-                name: &info.name,
-                file: info.file,
-                line: info.line,
-                group: info.group.as_ref().map(|g| GroupId(g.id)),
-            });
-        }
+    fn task_added(&self, id: u64, identity: &TaskIdentity) {
+        use crate::events::{GroupId, TaskId, TopologyRef};
+        let origin = identity.origin;
+        self.observer.topology(TopologyRef::TaskAdded {
+            task: TaskId(id),
+            parent: (origin.parent != 0).then_some(TaskId(origin.parent)),
+            name: origin.name,
+            file: origin.location.file(),
+            line: origin.location.line(),
+            group: identity.group.as_ref().map(|g| GroupId(g.id)),
+        });
     }
 
     fn task_removed(&self, id: u64) {
@@ -445,11 +444,9 @@ impl RunShared {
             .topology(crate::events::TopologyRef::TaskRemoved {
                 task: crate::events::TaskId(id),
             });
-        self.graph.task_ended(id);
     }
 
     pub(crate) fn end(&self) {
-        self.graph.run_ended();
         self.observer.end(|| self.environment.clock.now());
     }
 
@@ -459,37 +456,49 @@ impl RunShared {
         future: BoxFuture,
         region: Arc<Region>,
         join: Arc<JoinState>,
-        name: impl FnOnce() -> Cow<'static, str>,
+        name: impl FnOnce() -> &'static str,
         location: &'static Location<'static>,
-        group: Option<&Arc<crate::watch::Group>>,
+        group: Option<&Arc<crate::group::Group>>,
     ) -> std::result::Result<(), BoxFuture> {
-        let name = name();
+        let identity = TaskIdentity {
+            origin: TaskOrigin {
+                name: name(),
+                location,
+                parent: RunTask::current_in(self.id).map_or(0, |task| task.id),
+            },
+            group: group.cloned(),
+        };
         let task_topology = self
             .observer
             .topology_enabled(crate::events::TopologyKind::Task);
-        let announce = task_topology && RunTask::current_in(&self.graph).is_some();
-        let (id, outer) = {
+        let announce = task_topology && identity.origin.parent != 0;
+        let (id, announcement, outer) = {
             let mut q = self.queue.lock();
             if q.closed {
                 return Err(future);
             }
             let id = q.next_id;
             q.next_id += 1;
-            // Before the task can be polled, so its links find it.
-            self.graph.task_started(id, name, location, group.cloned());
-            q.incoming.push(NewTask {
+            let task = NewTask {
+                identity,
                 pending_announcement: task_topology && !announce,
                 id,
                 future,
                 region,
                 join,
-            });
-            (id, if q.polling { None } else { q.outer.clone() })
+            };
+            let announcement = announce.then(|| task.identity.clone());
+            q.incoming.push(task);
+            (
+                id,
+                announcement,
+                if q.polling { None } else { q.outer.clone() },
+            )
         };
         // A parent's poll stages its children's announcements before it
         // ends. Foreign spawns leave announcement to the run thread.
-        if announce {
-            self.task_added(id);
+        if let Some(identity) = announcement {
+            self.task_added(id, &identity);
         }
         if let Some(w) = outer {
             w.wake();
@@ -551,6 +560,7 @@ impl Wake for TaskWaker {
 }
 
 struct Slot {
+    identity: TaskIdentity,
     pending_announcement: bool,
     future: BoxFuture,
     task_waker: Arc<TaskWaker>,
@@ -568,23 +578,45 @@ pub(crate) struct RunTask {
 
 impl RunTask {
     pub(crate) fn current() -> Option<Self> {
-        CURRENT.with(Cell::get).map(|current| current.task)
+        CURRENT.with(|current| current.get().map(|current| current.task))
     }
 
-    /// The current task, only if it belongs to `graph`'s run.
-    pub(crate) fn current_in(graph: &Graph) -> Option<Self> {
-        Self::current().filter(|t| t.run == graph.run_id)
+    /// The current task, only if it belongs to `run`.
+    pub(crate) fn current_in(run: u64) -> Option<Self> {
+        Self::current().filter(|t| t.run == run)
     }
+}
 
-    /// The task number in `graph`, or 0 if it belongs to another run.
-    pub(crate) fn in_graph(&self, graph: &Graph) -> u64 {
-        if self.run == graph.run_id { self.id } else { 0 }
+/// Origin carried by a task from its queue entry through its last poll.
+#[derive(Clone)]
+struct TaskIdentity {
+    origin: TaskOrigin,
+    group: Option<Arc<crate::group::Group>>,
+}
+
+#[derive(Clone, Copy)]
+struct TaskOrigin {
+    name: &'static str,
+    location: &'static Location<'static>,
+    parent: u64,
+}
+
+impl TaskOrigin {
+    fn event(self, task: u64) -> crate::events::Origin {
+        crate::events::Origin {
+            task,
+            name: self.name.into(),
+            file: self.location.file(),
+            line: self.location.line(),
+            parent: self.parent,
+        }
     }
 }
 
 #[derive(Clone, Copy)]
 struct CurrentTask {
     task: RunTask,
+    origin: TaskOrigin,
     waker: *const (),
 }
 
@@ -608,10 +640,14 @@ pub(crate) fn with_dispatch(f: impl FnOnce(Option<&Arc<crate::events::Dispatch>>
     });
 }
 
-/// The task this thread is polling in `graph`, or 0.
-#[inline]
-pub(crate) fn current_task(graph: &Graph) -> u64 {
-    RunTask::current().map_or(0, |t| t.in_graph(graph))
+/// The origin of the task this thread is polling in `run`.
+pub(crate) fn current_origin(run: u64) -> Option<crate::events::Origin> {
+    CURRENT.with(|current| {
+        current
+            .get()
+            .filter(|current| current.task.run == run)
+            .map(|current| current.origin.event(current.task.id))
+    })
 }
 
 /// Whether `waker` is the waker of the task of `run` that is being polled
@@ -619,7 +655,7 @@ pub(crate) fn current_task(graph: &Graph) -> u64 {
 pub(crate) fn is_current_task(run: &Arc<RunShared>, waker: &Waker) -> bool {
     CURRENT.with(|c| {
         c.get()
-            .is_some_and(|t| t.task.run == run.graph.run_id && t.waker == waker.data())
+            .is_some_and(|t| t.task.run == run.id && t.waker == waker.data())
     })
 }
 
@@ -640,16 +676,15 @@ struct CurrentGuard<'a> {
 
 impl<'a> CurrentGuard<'a> {
     fn enter(
-        graph: &Graph,
+        run: u64,
         id: u64,
+        identity: &TaskIdentity,
         waker: &Waker,
         dispatch: &'a mut Option<Arc<crate::events::Dispatch>>,
     ) -> Self {
         let current = CurrentTask {
-            task: RunTask {
-                run: graph.run_id,
-                id,
-            },
+            task: RunTask { run, id },
+            origin: identity.origin,
             waker: waker.data(),
         };
         let topology = dispatch
@@ -669,7 +704,9 @@ impl<'a> CurrentGuard<'a> {
 
 impl Drop for CurrentGuard<'_> {
     fn drop(&mut self) {
-        CURRENT.with(|c| c.set(self.previous));
+        CURRENT.with(|c| {
+            c.replace(self.previous.take());
+        });
         if let Some((dispatch, previous)) = &mut self.dispatch {
             **dispatch = DISPATCH.with(|d| d.replace(previous.take()));
         }
@@ -714,6 +751,7 @@ impl RunState {
                 self.slots.insert(
                     new.id,
                     Slot {
+                        identity: new.identity,
                         pending_announcement: new.pending_announcement,
                         future: new.future,
                         task_waker,
@@ -744,12 +782,17 @@ impl RunState {
             };
             if slot.pending_announcement {
                 slot.pending_announcement = false;
-                self.shared.task_added(id);
+                self.shared.task_added(id, &slot.identity);
             }
             slot.task_waker.queued.store(false, Ordering::Release);
             let result = {
-                let _guard =
-                    CurrentGuard::enter(&self.shared.graph, id, &slot.waker, &mut self.dispatch);
+                let _guard = CurrentGuard::enter(
+                    self.shared.id,
+                    id,
+                    &slot.identity,
+                    &slot.waker,
+                    &mut self.dispatch,
+                );
                 slot.future
                     .as_mut()
                     .poll(&mut Context::from_waker(&slot.waker))
@@ -757,6 +800,7 @@ impl RunState {
             if let Poll::Ready(result) = result {
                 let slot = self.slots.remove(&id).unwrap();
                 let Slot {
+                    identity,
                     future,
                     region,
                     join,
@@ -781,6 +825,7 @@ impl RunState {
                 //    or the region sees it as ended.
                 drop(future);
                 self.shared.task_removed(id);
+                drop(identity);
                 // 3. The joiner's result, before the failure cancels the
                 //    region the joiner may be waiting in.
                 join.finish(joined);
@@ -846,19 +891,37 @@ impl Drop for RunState {
             .collect();
         for task in incoming {
             if task.pending_announcement {
-                self.shared.task_added(task.id);
+                self.shared.task_added(task.id, &task.identity);
             }
-            let id = task.id;
-            drop(task);
+            let NewTask {
+                id,
+                identity,
+                future,
+                region,
+                join,
+                ..
+            } = task;
+            drop((future, region, join));
             self.shared.task_removed(id);
+            drop(identity);
         }
         // Task destructors run in ascending task ID order.
         for (id, slot) in std::mem::take(&mut self.slots) {
             if slot.pending_announcement {
-                self.shared.task_added(id);
+                self.shared.task_added(id, &slot.identity);
             }
-            drop(slot);
+            let Slot {
+                identity,
+                future,
+                task_waker,
+                waker,
+                region,
+                join,
+                ..
+            } = slot;
+            drop((future, task_waker, waker, region, join));
             self.shared.task_removed(id);
+            drop(identity);
         }
         // Work spawned while the slots were dropped.
         let late = std::mem::take(&mut self.shared.queue.lock().incoming);
@@ -877,6 +940,133 @@ impl Drop for RunState {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct Origins {
+        events: Mutex<Vec<crate::events::Event>>,
+        tasks: Mutex<Vec<(crate::events::Origin, Option<crate::events::GroupId>)>>,
+    }
+
+    impl crate::events::Observer for Origins {
+        fn enabled(&self, interest: crate::events::Interest<'_>) -> bool {
+            matches!(
+                interest,
+                crate::events::Interest::Event(_, _)
+                    | crate::events::Interest::Topology(crate::events::TopologyKind::Task)
+            )
+        }
+
+        fn observe(&self, _: crate::events::Stamp, item: crate::events::Observation<'_>) {
+            use crate::events::{Observation, Origin, TaskId, TopologyRef};
+            match item {
+                Observation::Event(event) => self.events.lock().push(event.clone()),
+                Observation::Topology(TopologyRef::TaskAdded {
+                    task,
+                    parent,
+                    name,
+                    file,
+                    line,
+                    group,
+                }) => self.tasks.lock().push((
+                    Origin {
+                        task: task.get(),
+                        parent: parent.map_or(0, TaskId::get),
+                        name: name.to_owned().into(),
+                        file,
+                        line,
+                    },
+                    group,
+                )),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_tasks_emit_their_own_origin_and_parent() {
+        let observer = Arc::new(Origins::default());
+        crate::block_on(crate::lab(
+            RunOptions::new(crate::Seed::from_u64(7)).observer(observer.clone()),
+            |cx| async move {
+                let group = cx.group("workers");
+                let parent = cx.clone();
+                let child_line = line!() + 1;
+                let child = group.spawn_as(
+                    || "child",
+                    move |cx| async move {
+                        parent.emit("test", "child", |e| e.field("spawn_line", child_line));
+                        cx.yield_now().await?;
+                        cx.emit("test", "child", |e| e.field("spawn_line", child_line));
+                        let grandchild_line = line!() + 1;
+                        cx.spawn_as(
+                            || "grandchild",
+                            move |cx| async move {
+                                cx.emit("test", "grandchild", |e| {
+                                    e.field("spawn_line", grandchild_line)
+                                });
+                                Ok(())
+                            },
+                        )
+                        .join(&cx)
+                        .await?;
+                        Ok(())
+                    },
+                );
+                child.join(&cx).await?;
+                cx.emit("test", "world", |e| e);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let tasks = observer.tasks.lock();
+        assert_eq!(tasks.len(), 3);
+        for ((origin, group), (task, parent, name, expected_group)) in tasks.iter().zip([
+            (1, 0, "world", None),
+            (2, 1, "child", Some(crate::events::GroupId(1))),
+            (3, 2, "grandchild", Some(crate::events::GroupId(1))),
+        ]) {
+            assert_eq!(
+                (origin.task, origin.parent, origin.name.as_ref(), *group),
+                (task, parent, name, expected_group)
+            );
+        }
+        let events = observer.events.lock();
+        assert_eq!(events.len(), 5);
+        for event in events.iter() {
+            let origin = event.origin.as_ref().unwrap();
+            assert_eq!(
+                origin,
+                &tasks
+                    .iter()
+                    .find(|(task, _)| task.task == origin.task)
+                    .unwrap()
+                    .0
+            );
+            if let Some(line) = event.u64("spawn_line") {
+                assert_eq!(u64::from(origin.line), line);
+                assert_eq!(origin.file, file!());
+            }
+            let json = event.to_json();
+            assert_eq!(
+                json.get("node").unwrap().as_str(),
+                Some(format!("t{}", origin.task).as_str())
+            );
+            assert_eq!(
+                json.get("task").unwrap().as_str(),
+                Some(origin.name.as_ref())
+            );
+            assert_eq!(json.get("file").unwrap().as_str(), Some(origin.file));
+            assert_eq!(json.get("line"), Some(&origin.line.into()));
+            assert_eq!(
+                json.get("parent"),
+                Some(&if origin.parent == 0 {
+                    crate::stdlib::protocols::json::Value::Null
+                } else {
+                    format!("t{}", origin.parent).into()
+                })
+            );
+        }
+    }
+
     #[test]
     fn retained_evidence_outlives_completed_and_dropped_runs() {
         for complete in [true, false] {
@@ -885,9 +1075,7 @@ mod tests {
                 RunOptions::new(crate::Seed::from_u64(7)).observer(evidence.clone()),
                 crate::RunMode::Lab,
             );
-            let graph = shared.graph.clone();
             let weak_run = Arc::downgrade(&shared);
-            let weak_graph = Arc::downgrade(&graph);
             let weak_environment = Arc::downgrade(&shared.environment);
             let mut world = Box::pin(run_with(shared, move |fcx| async move {
                 fcx.emit("test", "hello", |event| event);
@@ -909,9 +1097,6 @@ mod tests {
                 drop(world);
             }
             assert!(weak_run.upgrade().is_none());
-            assert!(graph.state().tasks.is_empty());
-            drop(graph);
-            assert!(weak_graph.upgrade().is_none());
             assert!(weak_environment.upgrade().is_none());
             assert_eq!(Arc::strong_count(&evidence), 1);
             let events = evidence.checked_all().unwrap();

@@ -100,7 +100,46 @@ pub const MAX_EVENT_BYTES: usize = 16 << 20;
 mod tests;
 
 pub(crate) mod streams;
-pub use crate::watch::short_name;
+
 pub use streams::*;
 
 pub(crate) mod staging;
+
+/// A short name for a task, from the type of its future: the last two
+/// path segments, without closures and generics.
+/// `fictionet::stdlib::web::net::pings::{{closure}}` becomes `net::pings`.
+/// A name with no path, such as `delay`, stays as it is.
+pub fn short_name(full: &str) -> String {
+    // Cut generic arguments, which can hold paths of their own.
+    let mut depth = 0;
+    let mut plain = String::with_capacity(full.len());
+    for ch in full.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            _ if depth == 0 => plain.push(ch),
+            _ => {}
+        }
+    }
+    let parts: Vec<&str> = plain
+        .split("::")
+        .filter(|p| !p.is_empty() && !p.starts_with('{'))
+        .collect();
+    let n = parts.len();
+    parts[n.saturating_sub(2)..].join("::")
+}
+
+#[cfg(test)]
+mod names {
+    use super::short_name;
+    #[test]
+    fn names_come_from_the_future_type() {
+        async fn pings() {}
+        fn name_of<F>(_: &F) -> String {
+            short_name(std::any::type_name::<F>())
+        }
+        assert_eq!(name_of(&pings()), "names_come_from_the_future_type::pings");
+        let block = async {};
+        assert_eq!(name_of(&block), "names::names_come_from_the_future_type");
+    }
+}

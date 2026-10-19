@@ -177,7 +177,7 @@ where
 {
     let (outer, mine) = link_pair();
     fcx.spawn_as(
-        || "filter".into(),
+        || "filter",
         move |fcx| async move {
             // Port 0 is `inner`, port 1 our end of the new pair.
             let mut ports =
@@ -261,7 +261,7 @@ where
 {
     let (outer, mine) = link_pair();
     fcx.spawn_as(
-        move || name.into(),
+        move || name,
         move |fcx| async move {
             // Port 0 is `inner`, port 1 our end of the new pair. A packet from
             // port `i` waits in `queues[i]`, then goes out on port `1 - i`.

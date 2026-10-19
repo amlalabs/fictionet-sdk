@@ -137,7 +137,7 @@ pub struct Counts {
 
 /// A weak handle to a link's live counters, readable from any thread.
 #[derive(Clone)]
-pub struct LinkCounters(pub(crate) Weak<crate::watch::Meter>);
+pub struct LinkCounters(pub(crate) Weak<crate::link::Meter>);
 
 impl LinkCounters {
     /// Absolute totals for A and B, or zero after the link is gone.
@@ -463,6 +463,7 @@ mod tests {
             )
         );
         assert!(text.contains("LinkAdded { link: LinkId(1), creator: Some(TaskId(1))"));
+        assert!(text.contains("LinkLabel { link: LinkId(1), label: \"uplink\" }"));
         assert!(text.contains("LinkOwner { link: LinkId(1), side: A, task: TaskId(1) }"));
         assert!(text.contains("LinkOwner { link: LinkId(1), side: B, task: TaskId(2) }"));
         assert!(text.find("HostRemoved").unwrap() < text.find("GroupRemoved").unwrap());
@@ -637,6 +638,16 @@ mod tests {
             "HostAdded { host: HostId(1), name: \"guest\", group: None, sandbox: Some(\"guest\")"
         ));
         assert!(items[2].1.starts_with("LinkAdded { link: LinkId(1), creator: None, sandbox: Some(\"guest\"), host: Some(HostId(1))"));
+        assert!(
+            items
+                .iter()
+                .any(|(_, item)| item == "LinkLabel { link: LinkId(1), label: \"guest uplink\" }")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|(_, item)| item == "LinkOwner { link: LinkId(1), side: A, task: TaskId(1) }")
+        );
         assert_eq!(
             *topology.removed.lock(),
             [[

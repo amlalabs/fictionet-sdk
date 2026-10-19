@@ -587,7 +587,7 @@ mod tests {
             move |cx| async move {
                 let group = cx.group("outer").group("inner");
                 for _ in 1..count {
-                    group.spawn_as(|| "worker".into(), |_| async { Ok(()) });
+                    group.spawn_as(|| "worker", |_| async { Ok(()) });
                 }
                 Ok(())
             },
@@ -726,7 +726,7 @@ mod tests {
                 let (mut a, mut b) = fictionet::pair();
                 a.link().unwrap().label(&cx, "pair".into());
                 let worker = cx.spawn_as(
-                    || "delay".into(),
+                    || "delay",
                     move |cx| async move {
                         b.send(Packet(vec![0; 32]));
                         b.recv(&cx).await?;
@@ -1196,7 +1196,7 @@ mod tests {
             Some(&Value::from(error.to_string()))
         );
     }
-    fn event_with_metadata(name: &str) -> Event {
+    fn event_with_metadata(name: &'static str) -> Event {
         use fictionet::events::{ConnInfo, Level, Memory, Sandbox, Transport};
         let mut conn = ConnInfo::new(
             42,
@@ -1212,12 +1212,11 @@ mod tests {
         }));
         conn.transport = Transport::Udp;
         let memory = std::sync::Arc::new(Memory::default());
-        let name = name.to_owned();
         fictionet::block_on(fictionet::lab(
             fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(memory.clone()),
             |cx| async move {
                 cx.spawn_as(
-                    || name.into(),
+                    || name,
                     |cx| async move {
                         cx.emit("test", "big", |event| {
                             event

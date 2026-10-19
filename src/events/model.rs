@@ -484,7 +484,7 @@ impl Event {
                 }
             };
             out.push(("node".into(), id(o.task)));
-            out.push(("task".into(), crate::watch::short_name(&o.name).into()));
+            out.push(("task".into(), crate::events::short_name(&o.name).into()));
             out.push(("file".into(), o.file.into()));
             out.push(("line".into(), o.line.into()));
             out.push(("parent".into(), id(o.parent)));

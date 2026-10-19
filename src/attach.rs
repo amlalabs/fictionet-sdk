@@ -6,9 +6,9 @@ use std::task::{Context, Poll, Waker};
 
 use crate::cable::pair_with_guard;
 use crate::cx::CancelWait;
+use crate::link::Meter;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use crate::listen::SocketLink;
-use crate::watch::{Graph, Meter};
 use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 
 /// One attached sandbox: its name, and the [`Interface`] that carries its
@@ -35,7 +35,7 @@ use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 /// [What ends what](crate::guide::running#what-ends-what)).
 pub struct Attachment {
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-    packets: Option<Arc<crate::watch::PacketStream>>,
+    packets: Option<Arc<crate::link::PacketStream>>,
     name: String,
     mtu: u16,
     link: Link,
@@ -147,7 +147,7 @@ impl Interface for Attachment {
             Link::Cable(end) => end.poll_recv(fcx, cx),
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Link::Socket(link) => {
-                let current = crate::run::RunTask::current_in(fcx.graph());
+                let current = crate::run::RunTask::current_in(fcx.run.id);
                 if current != self.seen
                     && let Some(task) = current
                 {
@@ -282,7 +282,7 @@ struct HubState {
     /// The [`Attachments`] was dropped.
     closed: bool,
     /// The receiving run, used to check real I/O access.
-    graph: Weak<Graph>,
+    run: Weak<crate::run::RunShared>,
 }
 
 impl HubState {
@@ -306,8 +306,8 @@ impl HubState {
             ));
             return false;
         }
-        if !std::ptr::eq(self.graph.as_ptr(), Arc::as_ptr(fcx.graph())) {
-            self.graph = Arc::downgrade(fcx.graph());
+        if !std::ptr::eq(self.run.as_ptr(), Arc::as_ptr(&fcx.run)) {
+            self.run = Arc::downgrade(&fcx.run);
         }
         true
     }
@@ -371,8 +371,8 @@ impl Attacher {
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     pub(crate) fn mark_listener(&self) -> std::io::Result<()> {
         let mut state = self.hub.state.lock();
-        if let Some(graph) = state.graph.upgrade() {
-            graph.environment.require_real_io()?;
+        if let Some(run) = state.run.upgrade() {
+            run.environment.require_real_io()?;
         }
         state.real_listener = true;
         Ok(())
@@ -785,7 +785,7 @@ mod tests {
                     Err(Cancelled)
                 ));
                 assert!(fcx.is_cancelled());
-                assert!(attacher.hub.state.lock().graph.upgrade().is_none());
+                assert!(attacher.hub.state.lock().run.upgrade().is_none());
                 assert_eq!(attacher.hub.state.lock().pending.len(), 1);
                 Ok(())
             },
@@ -830,7 +830,7 @@ mod tests {
                 });
                 assert!(fcx.is_cancelled());
                 assert!(matches!(mapped.next(&fcx).await, Err(Cancelled)));
-                assert!(attacher.hub.state.lock().graph.upgrade().is_none());
+                assert!(attacher.hub.state.lock().run.upgrade().is_none());
                 Ok(())
             },
         ))

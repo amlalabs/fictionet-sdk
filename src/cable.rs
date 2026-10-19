@@ -3,8 +3,8 @@ use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 
 use crate::cx::CancelWait;
+use crate::link::{Counted, Meter};
 use crate::packet_queue::PacketQueue;
-use crate::watch::{Counted, Meter};
 use crate::{Cx, Interface, Packet, RecvError};
 
 /// Makes two connected [`Interface`]s and returns them.
@@ -106,7 +106,7 @@ struct Direction {
     packets: u64,
     bytes: u64,
     /// The link's packet stream, once it registers with an observed run.
-    observation: Option<Arc<crate::watch::PacketStream>>,
+    observation: Option<Arc<crate::link::PacketStream>>,
 }
 
 /// One of the two connected [`Interface`]s made by [`pair`].
@@ -115,7 +115,7 @@ struct Direction {
 /// lost. The other end receives what was already sent to it, and then
 /// [`RecvError::Closed`].
 pub struct End {
-    packets: Option<Arc<crate::watch::PacketStream>>,
+    packets: Option<Arc<crate::link::PacketStream>>,
     cable: Arc<Cable>,
     /// Which end this is: 0 or 1. It receives from `dirs[side]` and sends
     /// into `dirs[1 - side]`.
@@ -131,7 +131,7 @@ impl Interface for End {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
-        let current = crate::run::RunTask::current_in(fcx.graph());
+        let current = crate::run::RunTask::current_in(fcx.run.id);
         if current != self.seen
             && let Some(task) = current
         {
@@ -175,9 +175,9 @@ impl Interface for End {
                 return;
             }
             let bytes = packet.0.len() as u64;
-            let Ok(_) = dir.queue.try_push(packet, self.cable.limit) else {
+            if dir.queue.try_push(packet, self.cable.limit).is_err() {
                 return;
-            };
+            }
             dir.packets += 1;
             dir.bytes += bytes;
             dir.waker.take()
@@ -202,7 +202,7 @@ impl Interface for End {
 fn send_observed(
     cable: &Cable,
     side: usize,
-    mut publication: crate::watch::Publication<'_>,
+    mut publication: crate::link::Publication<'_>,
     packet: Packet,
 ) {
     {
@@ -292,7 +292,7 @@ impl Drop for Cable {
 }
 
 impl Counted for Cable {
-    fn observe_packets(&self, packets: Arc<crate::watch::PacketStream>) {
+    fn observe_packets(&self, packets: Arc<crate::link::PacketStream>) {
         for direction in &self.dirs {
             direction.lock().observation = Some(packets.clone());
         }
