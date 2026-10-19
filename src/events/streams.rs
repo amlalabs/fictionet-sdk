@@ -83,7 +83,7 @@ pub struct PacketRef<'a> {
     pub len: usize,
     /// The packet framing.
     pub link_type: LinkType,
-    /// The packet bytes.
+    /// The whole packet, without truncation or a link-layer header.
     pub bytes: &'a [u8],
 }
 
@@ -185,6 +185,20 @@ pub enum TopologyKind {
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum TopologyRef<'a> {
+    /// A service has accepted a connection.
+    ConnectionOpened {
+        /// Connection identity and local and peer addresses.
+        conn: &'a ConnInfo,
+        /// Serving task, when known.
+        task: Option<TaskId>,
+        /// Nearest host containing the serving context.
+        host: Option<HostId>,
+    },
+    /// A served connection has closed.
+    ConnectionClosed {
+        /// Connection identity and local and peer addresses.
+        conn: &'a ConnInfo,
+    },
     /// A task has been created, before its first poll.
     TaskAdded {
         /// Task identity.
@@ -277,6 +291,9 @@ impl TopologyRef<'_> {
     /// The category used for interest filtering.
     pub fn kind(&self) -> TopologyKind {
         match self {
+            Self::ConnectionOpened { .. } | Self::ConnectionClosed { .. } => {
+                TopologyKind::Connection
+            }
             Self::TaskAdded { .. } | Self::TaskRemoved { .. } => TopologyKind::Task,
             Self::GroupAdded { .. } | Self::GroupRemoved { .. } => TopologyKind::Group,
             Self::HostAdded { .. } | Self::HostRemoved { .. } => TopologyKind::Host,

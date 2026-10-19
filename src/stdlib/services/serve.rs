@@ -2670,6 +2670,7 @@ where
     C: Connection,
     <S::Decoder as Decode>::Error: Clone + Send,
 {
+    fcx.connection_opened(&info);
     let mut result = None;
     let region_result = {
         let slot = &mut result;
@@ -2695,7 +2696,7 @@ where
         })
         .await
     };
-    let result = result.expect("the connection region completed");
+    let mut result = result.expect("the connection region completed");
     if let Err(e) = region_result {
         let cancelled =
             std::iter::successors(Some(&*e as &(dyn std::error::Error + 'static)), |e| {
@@ -2711,13 +2712,16 @@ where
                     .display("error", chain)
                     .field("kind", "task")
             });
-            return match result {
+            result = match result {
                 Err(ServeError::Service(_) | ServeError::Pending(_) | ServeError::Faults(_)) => {
                     result
                 }
                 _ => Err(ServeError::Pending(e)),
             };
         }
+    }
+    if !matches!(&result, Ok(Served::Upgraded(..))) {
+        fcx.connection_closed(&info);
     }
     result
 }
@@ -3947,6 +3951,112 @@ mod observation_tests {
             }
             driver.reply().extend_from_slice(&line);
             Ok(Flow::Close)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn served_connections_bind_to_the_nearest_host() {
+        use fictionet::events::{
+            HostId, Interest, Observation, Observer, Stamp, TaskId, TopologyRef,
+        };
+        use fictionet::stdlib::network::tcp;
+        use fictionet::sync::Mutex;
+
+        type Opened = (ConnInfo, Option<TaskId>, Option<HostId>);
+        struct Bindings {
+            topology: bool,
+            hosts: Mutex<Vec<(HostId, String)>>,
+            opened: Mutex<Vec<Opened>>,
+            closed: Mutex<Vec<ConnInfo>>,
+        }
+        impl Observer for Bindings {
+            fn enabled(&self, interest: Interest<'_>) -> bool {
+                match interest {
+                    Interest::Event(..) => true,
+                    Interest::Topology(_) => self.topology,
+                    Interest::Packet(_) | Interest::TlsKey(_) => false,
+                }
+            }
+            fn observe(&self, _: Stamp, item: Observation<'_>) {
+                match item {
+                    Observation::Topology(TopologyRef::HostAdded { host, name, .. }) => {
+                        self.hosts.lock().push((host, name.to_owned()))
+                    }
+                    Observation::Topology(TopologyRef::ConnectionOpened { conn, task, host }) => {
+                        self.opened.lock().push((conn.clone(), task, host))
+                    }
+                    Observation::Topology(TopologyRef::ConnectionClosed { conn }) => {
+                        self.closed.lock().push(conn.clone())
+                    }
+                    Observation::Topology(_) | Observation::Event(_) => {}
+                    _ => panic!("unexpected stream"),
+                }
+            }
+        }
+        for topology in [false, true] {
+            let sink = Arc::new(Bindings {
+                topology,
+                hosts: Mutex::new(Vec::new()),
+                opened: Mutex::new(Vec::new()),
+                closed: Mutex::new(Vec::new()),
+            });
+            fictionet::block_on(fictionet::lab(
+                fictionet::RunOptions::new(Seed::from_u64(1)).observer(sink.clone()),
+                |cx| async move {
+                    let server_cx = cx.host("outer").host("server").group("service");
+                    let (a, b) = fictionet::pair();
+                    let client = tcp::endpoint(&cx, a, "10.0.0.1".parse()?);
+                    let server = tcp::endpoint(&server_cx, b, "10.0.0.2".parse()?);
+                    let mut listener = server.listen(7)?;
+                    let task = server_cx.spawn(move |cx| async move {
+                        let conn = listener.accept(&cx).await?;
+                        let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+                        let mut service = Echo {
+                            builds: Arc::new(AtomicUsize::new(0)),
+                            count: 0,
+                        };
+                        connection(&cx, conn, info, &mut service, &(), &ServeOptions::default())
+                            .await?;
+                        Ok(())
+                    });
+                    let mut conn = client.connect(&cx, "10.0.0.2:7".parse()?).await?;
+                    conn.write_all(&cx, b"hello\n").await?;
+                    let mut buf = [0; 5];
+                    let mut len = 0;
+                    while len < buf.len() {
+                        let n = conn.read(&cx, &mut buf[len..]).await?;
+                        assert!(n > 0);
+                        len += n;
+                    }
+                    assert_eq!(&buf, b"hello");
+                    task.join(&cx).await?;
+                    cx.cancel();
+                    Ok(())
+                },
+            ))
+            .unwrap();
+            let opened = sink.opened.lock();
+            let closed = sink.closed.lock();
+            assert_eq!(opened.len(), usize::from(topology));
+            assert_eq!(closed.len(), usize::from(topology));
+            if topology {
+                let host = sink
+                    .hosts
+                    .lock()
+                    .iter()
+                    .find(|(_, name)| name == "server")
+                    .unwrap()
+                    .0;
+                assert_eq!(opened[0].2, Some(host));
+                assert!(opened[0].1.is_some());
+                assert_eq!(opened[0].0, closed[0]);
+                assert_eq!(closed[0].local, Some("10.0.0.2:7".parse().unwrap()));
+                assert_eq!(
+                    closed[0].peer.unwrap().ip(),
+                    "10.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+            }
         }
     }
 

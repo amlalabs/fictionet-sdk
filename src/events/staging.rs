@@ -109,6 +109,8 @@ pub(crate) fn stage<'a>(dispatch: &Dispatch, item: TopologyRef<'a>) -> Option<To
                 }
                 TopologyRef::LinkAdded { sandbox, .. } => sandbox.map_or(0, str::len),
                 TopologyRef::LinkLabel { label, .. } => label.len(),
+                TopologyRef::ConnectionOpened { conn, .. }
+                | TopologyRef::ConnectionClosed { conn } => conn_bytes(conn),
                 _ => 0,
             };
         if batch.items.len() == MAX_ITEMS || bytes > MAX_BYTES - batch.bytes {
@@ -121,8 +123,34 @@ pub(crate) fn stage<'a>(dispatch: &Dispatch, item: TopologyRef<'a>) -> Option<To
     })
 }
 
+fn conn_bytes(conn: &super::ConnInfo) -> usize {
+    std::mem::size_of::<super::ConnInfo>()
+        + conn
+            .sandbox
+            .as_ref()
+            .map_or(0, |sandbox| sandbox.name.len())
+        + conn.sni.as_ref().map_or(0, |sni| sni.len())
+        + conn.alpn.as_ref().map_or(0, |alpn| alpn.len())
+}
+
 fn own(item: TopologyRef<'_>) -> Delivery {
     match item {
+        TopologyRef::ConnectionOpened { conn, task, host } => {
+            let conn = conn.clone();
+            Box::new(move |dispatch| {
+                dispatch.topology(TopologyRef::ConnectionOpened {
+                    conn: &conn,
+                    task,
+                    host,
+                })
+            })
+        }
+        TopologyRef::ConnectionClosed { conn } => {
+            let conn = conn.clone();
+            Box::new(move |dispatch| {
+                dispatch.topology(TopologyRef::ConnectionClosed { conn: &conn })
+            })
+        }
         TopologyRef::TaskAdded {
             task,
             parent,

@@ -342,6 +342,35 @@ impl Cx {
         self.make_group(name, true)
     }
 
+    /// Tells interested observers that a service in this context accepted
+    /// `conn`, binding it to the serving task and the nearest
+    /// [host](Cx::host). A custom service calls this when it accepts a
+    /// connection, and [`Cx::connection_closed`] when it closes. Without
+    /// connection interest this does nothing.
+    pub fn connection_opened(&self, conn: &crate::events::ConnInfo) {
+        use crate::events::{TaskId, TopologyKind, TopologyRef};
+        if self.run.observer.topology_enabled(TopologyKind::Connection) {
+            let host = std::iter::successors(self.group.as_ref(), |group| group.parent.as_ref())
+                .find_map(|group| group.host);
+            self.run.observer.topology(TopologyRef::ConnectionOpened {
+                conn,
+                task: crate::run::RunTask::current_in(self.graph()).map(|task| TaskId(task.id)),
+                host,
+            });
+        }
+    }
+
+    /// Tells interested observers that `conn`, opened with
+    /// [`Cx::connection_opened`], has closed.
+    pub fn connection_closed(&self, conn: &crate::events::ConnInfo) {
+        use crate::events::{TopologyKind, TopologyRef};
+        if self.run.observer.topology_enabled(TopologyKind::Connection) {
+            self.run
+                .observer
+                .topology(TopologyRef::ConnectionClosed { conn });
+        }
+    }
+
     fn make_group(&self, name: impl Into<String>, host: bool) -> Cx {
         let observer = &self.run.observer;
         let group = Group::new(
@@ -351,7 +380,8 @@ impl Cx {
             name.into(),
             self.group.clone(),
             (observer.topology_enabled(crate::events::TopologyKind::Group)
-                || observer.topology_enabled(crate::events::TopologyKind::Host))
+                || observer.topology_enabled(crate::events::TopologyKind::Host)
+                || observer.topology_enabled(crate::events::TopologyKind::Connection))
             .then(|| observer.shared().unwrap().clone()),
             host,
         );

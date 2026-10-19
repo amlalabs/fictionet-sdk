@@ -272,6 +272,7 @@ where
     };
     if root.try_start_task() {
         shared.queue.lock().incoming.push(NewTask {
+            started: true,
             id,
             future: Box::pin(future),
             region: root,
@@ -338,6 +339,7 @@ struct Queue {
 }
 
 struct NewTask {
+    started: bool,
     id: u64,
     future: BoxFuture,
     region: Arc<Region>,
@@ -534,6 +536,7 @@ impl RunShared {
             // Before the task can be polled, so its links find it.
             self.graph.task_started(id, name, location, group.cloned());
             q.incoming.push(NewTask {
+                started: false,
                 id,
                 future,
                 region,
@@ -644,8 +647,18 @@ thread_local! {
     static CURRENT: Cell<Option<CurrentTask>> = const { Cell::new(None) };
 }
 
+/// Calls `f` with the dispatch of the run whose task this thread is
+/// polling, if that run has an observer.
 pub(crate) fn with_dispatch(f: impl FnOnce(Option<&Arc<crate::events::Dispatch>>)) {
-    DISPATCH.with(|dispatch| f(dispatch.borrow().as_ref()));
+    let Some(run) = RunTask::current().map(|task| task.run) else {
+        return f(None);
+    };
+    DISPATCH.with(|dispatch| {
+        f(dispatch
+            .borrow()
+            .as_ref()
+            .filter(|dispatch| dispatch.run_id == run))
+    });
 }
 
 /// The task this thread is polling in `graph`, or 0.
@@ -663,14 +676,19 @@ pub(crate) fn is_current_task(run: &Arc<RunShared>, waker: &Waker) -> bool {
     })
 }
 
+/// A run's dispatch, present only when the run has an observer.
+type RunDispatch = Option<Arc<crate::events::Dispatch>>;
+
 /// Restores [`CURRENT`] when a poll ends, even by a panic. Topology the
 /// poll produces is delivered after it returns, outside any lock the task
 /// held.
 struct CurrentGuard<'a> {
     previous: Option<CurrentTask>,
-    dispatch: &'a mut Option<Arc<crate::events::Dispatch>>,
-    previous_dispatch: Option<Arc<crate::events::Dispatch>>,
-    _topology: crate::events::staging::Scope,
+    /// The run's dispatch, lent to [`DISPATCH`] for the poll. A run with no
+    /// observer leaves the thread-local alone: [`with_dispatch`] only hands
+    /// out a dispatch of the run being polled.
+    dispatch: Option<(&'a mut RunDispatch, RunDispatch)>,
+    _topology: Option<crate::events::staging::Scope>,
 }
 
 impl<'a> CurrentGuard<'a> {
@@ -687,12 +705,16 @@ impl<'a> CurrentGuard<'a> {
             },
             waker: waker.data(),
         };
-        let topology = crate::events::staging::Scope::new(dispatch.as_ref());
-        let previous_dispatch = DISPATCH.with(|d| d.replace(dispatch.take()));
+        let topology = dispatch
+            .as_ref()
+            .map(|dispatch| crate::events::staging::Scope::new(Some(dispatch)));
+        let dispatch = dispatch.is_some().then(|| {
+            let previous = DISPATCH.with(|d| d.replace(dispatch.take()));
+            (dispatch, previous)
+        });
         Self {
             previous: CURRENT.with(|c| c.replace(Some(current))),
             dispatch,
-            previous_dispatch,
             _topology: topology,
         }
     }
@@ -701,7 +723,9 @@ impl<'a> CurrentGuard<'a> {
 impl Drop for CurrentGuard<'_> {
     fn drop(&mut self) {
         CURRENT.with(|c| c.set(self.previous));
-        *self.dispatch = DISPATCH.with(|d| d.replace(self.previous_dispatch.take()));
+        if let Some((dispatch, previous)) = &mut self.dispatch {
+            **dispatch = DISPATCH.with(|d| d.replace(previous.take()));
+        }
     }
 }
 
@@ -743,7 +767,7 @@ impl RunState {
                 self.slots.insert(
                     new.id,
                     Slot {
-                        started: false,
+                        started: new.started,
                         future: new.future,
                         task_waker,
                         waker,
@@ -767,16 +791,16 @@ impl RunState {
             std::mem::swap(&mut q.ready, &mut turn);
         }
 
-        for &id in &turn {
-            if id != 1 && self.slots.get(&id).is_some_and(|s| !s.started) {
-                self.shared.task_added(id);
-                self.slots.get_mut(&id).unwrap().started = true;
-            }
-        }
         while let Some(id) = turn.pop_front() {
             let Some(slot) = self.slots.get_mut(&id) else {
                 continue;
             };
+            // Announced outside the queue lock, before the task's first
+            // poll can publish anything that names it.
+            if !slot.started {
+                slot.started = true;
+                self.shared.task_added(id);
+            }
             slot.task_waker.queued.store(false, Ordering::Release);
             let result = {
                 let _guard =
@@ -876,7 +900,9 @@ impl Drop for RunState {
             .chain(self.slots.values().map(|s| s.join.clone()))
             .collect();
         for task in incoming {
-            self.shared.task_added(task.id);
+            if !task.started {
+                self.shared.task_added(task.id);
+            }
             let id = task.id;
             drop(task);
             self.shared.task_removed(id);

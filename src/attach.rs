@@ -34,6 +34,8 @@ use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
 /// detach cancels nothing, so the world's other tasks keep running (see
 /// [What ends what](crate::guide::running#what-ends-what)).
 pub struct Attachment {
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    packets: Option<Arc<crate::watch::PacketStream>>,
     name: String,
     mtu: u16,
     link: Link,
@@ -111,6 +113,8 @@ impl Attachment {
             name,
             mtu,
             link: Link::Socket(link),
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+            packets: meter.packets(),
             meter,
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             seen: None,
@@ -150,10 +154,18 @@ impl Interface for Attachment {
                     self.seen = current;
                     fcx.graph().owns(&self.meter, 0, task.id);
                     self.meter.owner(fcx, 0, task.id);
+                    self.packets = self.meter.packets();
                 }
                 let polled = link.poll_recv(fcx, cx);
                 if let Poll::Ready(Ok(packet)) = &polled {
+                    let mut publication = self
+                        .packets
+                        .as_ref()
+                        .and_then(|stream| stream.packet(1, packet));
                     self.meter.sent(1, packet);
+                    if let Some(publication) = &mut publication {
+                        publication.publish(packet);
+                    }
                 }
                 polled
             }
@@ -166,8 +178,16 @@ impl Interface for Attachment {
             Link::Cable(end) => end.send(packet),
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Link::Socket(link) => {
-                self.meter.sent(0, &packet);
-                link.send(packet)
+                let mut publication = self
+                    .packets
+                    .as_ref()
+                    .and_then(|stream| stream.packet(0, &packet));
+                link.send(packet, publication.is_some(), |packet| {
+                    self.meter.sent(0, packet);
+                    if let Some(publication) = &mut publication {
+                        publication.publish(packet);
+                    }
+                });
             }
             Link::Mapped { interface, .. } => interface.send(packet),
         }
@@ -339,6 +359,8 @@ impl Attacher {
             name: name.to_owned(),
             mtu: 1500,
             link: Link::Cable(world),
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+            packets: meter.packets(),
             meter,
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             seen: None,
@@ -611,6 +633,8 @@ impl Attachments {
                         name,
                         mtu,
                         link,
+                        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+                        packets: None,
                         meter: Meter::new(),
                         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                         seen: None,
@@ -649,6 +673,15 @@ impl Attachments {
             {
                 drop(state);
                 drop(gone);
+                if let Some(observer) = fcx.run.observer.shared() {
+                    found.meter.register(observer);
+                }
+                #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+                let found = {
+                    let mut found = found;
+                    found.packets = found.meter.packets();
+                    found
+                };
                 return Poll::Ready(Ok(found));
             }
             match &state.waker {

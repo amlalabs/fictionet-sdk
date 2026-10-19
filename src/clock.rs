@@ -17,6 +17,8 @@ pub enum RunMode {
 }
 
 pub(crate) struct Clock {
+    #[cfg(test)]
+    pub(crate) reads: std::sync::atomic::AtomicUsize,
     origin: Option<crate::sys::Instant>,
     state: Mutex<State>,
     wake: Option<Waker>,
@@ -34,6 +36,8 @@ struct State {
 impl Clock {
     pub(crate) fn new(mode: RunMode) -> Arc<Self> {
         Arc::new_cyclic(|wake| Self {
+            #[cfg(test)]
+            reads: std::sync::atomic::AtomicUsize::new(0),
             origin: (mode == RunMode::Real).then(crate::sys::Instant::now),
             state: Mutex::new(State::default()),
             wake: (mode == RunMode::Real).then(|| Waker::from(Arc::new(HostWake(wake.clone())))),
@@ -49,6 +53,9 @@ impl Clock {
     }
 
     pub(crate) fn now(&self) -> Instant {
+        #[cfg(test)]
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Instant::from_since_start(
             self.origin
                 .map_or_else(|| self.state.lock().now, |o| o.elapsed()),

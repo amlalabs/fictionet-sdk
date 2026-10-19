@@ -69,6 +69,7 @@ static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct Meter {
     pub(crate) id: u64,
     registration: Mutex<Option<Registration>>,
+    packets: OnceLock<Arc<PacketStream>>,
     /// What end `s` sent, for an attachment.
     #[cfg(feature = "std")]
     counts: [Count; 2],
@@ -83,6 +84,57 @@ pub(crate) struct Meter {
     tapped: AtomicBool,
     #[cfg(any(feature = "observe", all(test, feature = "std")))]
     tap: Mutex<Option<Arc<Tap>>>,
+}
+
+pub(crate) struct PacketStream {
+    observer: Arc<crate::events::Dispatch>,
+    link: crate::events::LinkId,
+    sequence: Mutex<u64>,
+}
+
+impl PacketStream {
+    pub(crate) fn packet(&self, side: usize, packet: &Packet) -> Option<Publication<'_>> {
+        let stream = self;
+        let meta = crate::events::PacketMeta {
+            link: stream.link,
+            side: if side == 0 {
+                crate::events::Side::A
+            } else {
+                crate::events::Side::B
+            },
+            len: packet.0.len(),
+            link_type: crate::events::LinkType::Ip,
+        };
+        stream
+            .observer
+            .enabled(crate::events::Interest::Packet(meta))
+            .then(|| Publication {
+                stream,
+                sequence: stream.sequence.lock(),
+                meta,
+            })
+    }
+}
+
+pub(crate) struct Publication<'a> {
+    stream: &'a PacketStream,
+    sequence: MutexGuard<'a, u64>,
+    meta: crate::events::PacketMeta,
+}
+
+impl Publication<'_> {
+    pub(crate) fn publish(&mut self, packet: &Packet) {
+        self.stream.observer.packet(
+            &mut self.sequence,
+            crate::events::PacketRef {
+                link: self.meta.link,
+                side: self.meta.side,
+                len: self.meta.len,
+                link_type: self.meta.link_type,
+                bytes: &packet.0,
+            },
+        );
+    }
 }
 
 struct Registration {
@@ -111,6 +163,7 @@ impl Meter {
         Arc::new(Meter {
             id: NEXT_LINK.fetch_add(1, Ordering::Relaxed),
             registration: Mutex::new(None),
+            packets: OnceLock::new(),
             #[cfg(feature = "std")]
             counts: Default::default(),
             counted: OnceLock::new(),
@@ -121,6 +174,10 @@ impl Meter {
             #[cfg(any(feature = "observe", all(test, feature = "std")))]
             tap: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn packets(&self) -> Option<Arc<PacketStream>> {
+        self.packets.get().cloned()
     }
 
     pub(crate) fn link_id(&self) -> Option<crate::events::LinkId> {
@@ -138,11 +195,10 @@ impl Meter {
         });
     }
 
-    fn register(self: &Arc<Self>, observer: &Arc<crate::events::Dispatch>) {
-        use crate::events::{LinkCounters, TaskId, TopologyKind, TopologyRef};
-        if !observer.topology_enabled(TopologyKind::Link)
-            && !observer.topology_enabled(TopologyKind::Host)
-        {
+    #[cold]
+    pub(crate) fn register(self: &Arc<Self>, observer: &Arc<crate::events::Dispatch>) {
+        use crate::events::{LinkCounters, TaskId, TopologyRef};
+        if !observer.installed() {
             return;
         }
         let mut registration = self.registration.lock();
@@ -150,6 +206,15 @@ impl Meter {
             return;
         }
         let link = observer.next_link();
+        let packets = Arc::new(PacketStream {
+            observer: observer.clone(),
+            link,
+            sequence: Mutex::new(0),
+        });
+        assert!(self.packets.set(packets.clone()).is_ok());
+        if let Some(counted) = self.counted.get().and_then(Weak::upgrade) {
+            counted.observe_packets(packets);
+        }
         let sandbox = self.sandbox.get();
         let host = sandbox.map(|_| observer.next_host());
         *registration = Some(Registration {
@@ -179,6 +244,7 @@ impl Meter {
         });
     }
 
+    #[cold]
     pub(crate) fn owner(self: &Arc<Self>, fcx: &crate::Cx, side: usize, task: u64) {
         use crate::events::{Side, TaskId, TopologyRef};
         let Some(observer) = fcx.run.observer.shared() else {
@@ -328,6 +394,7 @@ impl Meter {
 pub(crate) trait Counted: Send + Sync {
     /// `[packets 0, bytes 0, packets 1, bytes 1]`, by the side that sent.
     fn totals(&self) -> [u64; 4];
+    fn observe_packets(&self, packets: Arc<PacketStream>);
 }
 
 /// One viewer of a link's packets. Dropping the last one stops the copies.
@@ -503,7 +570,7 @@ pub(crate) struct Group {
     pub(crate) name: String,
     pub(crate) parent: Option<Arc<Group>>,
     observer: Option<Arc<crate::events::Dispatch>>,
-    host: Option<crate::events::HostId>,
+    pub(crate) host: Option<crate::events::HostId>,
 }
 
 impl std::fmt::Debug for Group {

@@ -6,8 +6,13 @@
 //! [`Aggregate`], dashboard retention, or their own implementation. [`Fanout`]
 //! combines destinations and filters each delivery by its own interest.
 //! The same observer receives typed topology changes and borrowed TLS keys.
-//! Packet types describe future link crossings; links currently publish topology
-//! and live absolute counters. Each stream has its own sequence and run time.
+//! Links publish borrowed packets at each interested successful crossing,
+//! topology changes and live absolute counters. Served connections publish their
+//! addresses, serving task and nearest host. Each stream has its own sequence
+//! and run time. Different streams have no ordering relative to each other.
+//! Packet sequences count interested crossings from one, without sampling.
+//! Declining a crossing does not consume a sequence number. Each child of a
+//! fanout can still see gaps when another child accepts more crossings.
 //! Event-only consumers decline the other streams. Regions share the run's immutable observer.
 //!
 //! ```

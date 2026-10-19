@@ -72,14 +72,43 @@ fn bulk(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Observation {
+    None,
+    Events,
+    Packets,
+}
+
+struct PacketObserver {
+    packets: bool,
+    bytes: AtomicU64,
+}
+
+impl fictionet::events::Observer for PacketObserver {
+    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
+        use fictionet::events::Interest;
+        match interest {
+            Interest::Event(..) => true,
+            Interest::Packet(_) => self.packets,
+            Interest::TlsKey(_) | Interest::Topology(_) => false,
+        }
+    }
+
+    fn observe(&self, _: fictionet::events::Stamp, item: fictionet::events::Observation<'_>) {
+        if let fictionet::events::Observation::Packet(packet) = item {
+            self.bytes.fetch_add(packet.len as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 mod sched {
     use super::*;
 
-    #[divan::bench(sample_count = 3, sample_size = 1)]
-    fn packet_round_trips(bencher: Bencher) {
+    #[divan::bench(args = [Observation::None, Observation::Events, Observation::Packets], sample_count = 3, sample_size = 1)]
+    fn packet_round_trips(bencher: Bencher, observation: Observation) {
         bencher
             .counter(ItemsCount::new(500_000_u64))
-            .with_inputs(|| ping_pong(500_000))
+            .with_inputs(|| ping_pong(500_000, observation))
             .bench_local_values(World::measure);
     }
 
@@ -314,8 +343,15 @@ async fn c_read_exact(fcx: &Cx, c: &mut tcp::TcpConnection, buf: &mut [u8]) -> f
 
 /// Sends one packet back and forth `n` times between the world and an echo
 /// task, reusing its buffer.
-fn ping_pong(n: usize) -> World {
-    World::new(move |fcx, checkpoint| async move {
+fn ping_pong(n: usize, observation: Observation) -> World {
+    let mut options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1));
+    if !matches!(observation, Observation::None) {
+        options = options.observer(Arc::new(PacketObserver {
+            packets: matches!(observation, Observation::Packets),
+            bytes: AtomicU64::new(0),
+        }));
+    }
+    World::with_options(options, move |fcx, checkpoint| async move {
         let (mut a, mut b) = pair();
         let echo = fcx.spawn(move |fcx| async move {
             for _ in 0..n {

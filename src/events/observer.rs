@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::time::Instant;
 use crate::{Cx, sync::Mutex};
@@ -73,6 +74,10 @@ impl Observation<'_> {
 /// and must not call back into the world. I/O belongs on a bounded worker queue.
 /// Interest must stay fixed for repeatable lab runs. Connection context is
 /// explicit, including during the interest check.
+/// Streams have no ordering relative to each other. Packet callbacks run at
+/// the crossing; topology created during a task poll is delivered after it.
+/// Packet sequences count only crossings accepted by the interest check.
+/// Changing interest does not leave gaps in that link's sequence.
 pub trait Observer: Send + Sync + 'static {
     /// Whether constructing this event is useful.
     fn enabled(&self, interest: Interest<'_>) -> bool;
@@ -155,6 +160,8 @@ impl Emitter<'_> {
 pub struct Dispatch {
     observer: Option<Arc<dyn Observer>>,
     state: Mutex<State>,
+    ended: AtomicBool,
+    deliveries: RwLock<()>,
     clock: Option<Arc<crate::clock::Clock>>,
     topology: [bool; 5],
     pub(crate) run_id: u64,
@@ -173,6 +180,8 @@ impl Dispatch {
     pub(crate) const fn empty() -> Self {
         Self {
             observer: None,
+            ended: AtomicBool::new(false),
+            deliveries: RwLock::new(()),
             state: Mutex::new(State {
                 seq: 0,
                 topology: 0,
@@ -219,6 +228,29 @@ impl Dispatch {
         }
         dispatch.run_id = run_id;
         Arc::new(dispatch)
+    }
+
+    pub(crate) fn installed(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    pub(crate) fn packet(&self, seq: &mut u64, packet: PacketRef<'_>) {
+        let _deliveries = self.deliveries.read().unwrap_or_else(|e| e.into_inner());
+        if self.ended.load(Ordering::Acquire) {
+            return;
+        }
+        *seq += 1;
+        self.observer
+            .as_ref()
+            .expect("registered observer")
+            .observe(
+                Stamp {
+                    stream: Stream::Packets(packet.link),
+                    seq: *seq,
+                    at: self.clock.as_ref().expect("run clock").now(),
+                },
+                Observation::Packet(packet),
+            );
     }
 
     pub(crate) fn topology_enabled(&self, kind: super::TopologyKind) -> bool {
@@ -287,8 +319,7 @@ impl Dispatch {
     /// Checks interest without reading the clock or numbering an event.
     pub fn enabled(&self, interest: Interest<'_>) -> bool {
         self.observer.as_ref().is_some_and(|observer| {
-            let ended = self.state.lock().ended;
-            !ended && observer.enabled(interest)
+            !self.ended.load(Ordering::Acquire) && observer.enabled(interest)
         })
     }
 
@@ -339,9 +370,11 @@ impl Dispatch {
         let Some(observer) = &self.observer else {
             return;
         };
+        let _deliveries = self.deliveries.write().unwrap_or_else(|e| e.into_inner());
         let mut state = self.state.lock();
         if !state.ended {
             state.ended = true;
+            self.ended.store(true, Ordering::Release);
             observer.end(at());
         }
     }
@@ -354,6 +387,36 @@ mod tests {
     use crate::{RunOptions, Seed, block_on, lab};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn interest_checks_do_not_take_the_delivery_lock() {
+        let dispatch = Arc::new(Dispatch::new(Some(Arc::new(Memory::default()))));
+        let state = dispatch.state.lock();
+        let checking = dispatch.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tx.send(checking.enabled(Interest::Event(
+                Metadata {
+                    source: "test",
+                    kind: "check",
+                },
+                &ConnInfo::default(),
+            )))
+            .unwrap();
+        });
+        let enabled = rx.recv_timeout(Duration::from_secs(5));
+        drop(state);
+        thread.join().unwrap();
+        assert!(enabled.expect("interest check must finish while delivery is locked"));
+        dispatch.end(|| Instant::ZERO);
+        assert!(!dispatch.enabled(Interest::Event(
+            Metadata {
+                source: "test",
+                kind: "check"
+            },
+            &ConnInfo::default()
+        )));
+    }
 
     #[test]
     fn absent_observer_does_not_build_events() {
