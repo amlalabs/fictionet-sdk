@@ -920,9 +920,11 @@ impl<'a> Socket<'a> {
         match self.state {
             // In the LISTEN state there is no established connection.
             State::Listen => self.set_state(State::Closed),
-            // In the SYN-SENT state the remote endpoint is not yet synchronized and, upon
-            // receiving an RST, will abort the connection.
-            State::SynSent => self.set_state(State::Closed),
+            // RFC 9293 section 3.10.4 closes SYN-SENT without sending a reset.
+            State::SynSent => {
+                self.tuple = None;
+                self.set_state(State::Closed);
+            }
             // In the SYN-RECEIVED, ESTABLISHED and CLOSE-WAIT states the transmit half
             // of the connection is open, and needs to be explicitly closed with a FIN.
             State::SynReceived | State::Established => self.set_state(State::FinWait1),
@@ -3794,6 +3796,15 @@ mod test {
             );
             recv!(s, []);
         }
+    }
+
+    #[test]
+    fn test_syn_sent_close() {
+        let mut s = socket_syn_sent();
+        // RFC 9293 section 3.10.4 closes an active open without sending a segment.
+        s.close();
+        assert_eq!(s.state(), State::Closed);
+        recv!(s, []);
     }
 
     #[test]
