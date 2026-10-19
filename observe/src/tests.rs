@@ -1,5 +1,7 @@
 use super::*;
-use fictionet::events::{ConnInfo, KeyMeta, LinkType, PacketMeta, PacketRef, Side};
+use fictionet::events::{
+    ConnInfo, GroupId, KeyMeta, LinkType, PacketMeta, PacketRef, Side, TaskId,
+};
 use fictionet::time::ms;
 use fictionet::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
 
@@ -394,6 +396,49 @@ fn world_snapshot() -> (String, Vec<PacketCopy>) {
 #[test]
 fn lab_topology_and_capture_repeat_and_removal_is_visible() {
     assert_eq!(world_snapshot(), world_snapshot());
+}
+
+#[test]
+fn spawned_tasks_remain_visible_after_their_parent_ends() {
+    let collector = Arc::new(Collector::new(Options::default()));
+    let reader = collector.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(7)).observer(collector.clone()),
+        move |cx| async move {
+            cx.spawn(move |_| async move {
+                let snapshot = reader.topology();
+                assert_eq!(
+                    snapshot
+                        .tasks
+                        .iter()
+                        .map(|(id, task)| (
+                            id.get(),
+                            task.parent.map(TaskId::get),
+                            task.group.map(GroupId::get),
+                        ))
+                        .collect::<Vec<_>>(),
+                    [(2, None, None), (3, None, Some(1))]
+                );
+                assert_eq!(snapshot.groups.len(), 1);
+                let (id, group) = snapshot.groups.first_key_value().unwrap();
+                assert_eq!((id.get(), group.name.as_str()), (1, "children"));
+                assert_eq!(snapshot.missing, 0);
+                assert_eq!(snapshot.refused, 0);
+                assert!(!snapshot.incomplete);
+                Ok(())
+            });
+            cx.group("children").spawn(|_| async { Ok(()) });
+            Ok(())
+        },
+    ))
+    .unwrap();
+    let snapshot = collector.topology();
+    assert!(snapshot.tasks.is_empty());
+    assert!(snapshot.groups.is_empty());
+    assert_eq!(snapshot.missing, 0);
+    assert_eq!(snapshot.refused, 0);
+    assert!(!snapshot.incomplete);
+    assert!(collector.losses().streams.is_empty());
 }
 
 #[test]

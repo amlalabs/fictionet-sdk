@@ -272,7 +272,7 @@ where
     };
     if root.try_start_task() {
         shared.queue.lock().incoming.push(NewTask {
-            started: true,
+            pending_announcement: false,
             id,
             future: Box::pin(future),
             region: root,
@@ -339,7 +339,7 @@ struct Queue {
 }
 
 struct NewTask {
-    started: bool,
+    pending_announcement: bool,
     id: u64,
     future: BoxFuture,
     region: Arc<Region>,
@@ -526,7 +526,11 @@ impl RunShared {
         group: Option<&Arc<crate::watch::Group>>,
     ) -> std::result::Result<(), BoxFuture> {
         let name = name();
-        let outer = {
+        let task_topology = self
+            .observer
+            .topology_enabled(crate::events::TopologyKind::Task);
+        let announce = task_topology && RunTask::current_in(&self.graph).is_some();
+        let (id, outer) = {
             let mut q = self.queue.lock();
             if q.closed {
                 return Err(future);
@@ -536,14 +540,19 @@ impl RunShared {
             // Before the task can be polled, so its links find it.
             self.graph.task_started(id, name, location, group.cloned());
             q.incoming.push(NewTask {
-                started: false,
+                pending_announcement: task_topology && !announce,
                 id,
                 future,
                 region,
                 join,
             });
-            if q.polling { None } else { q.outer.clone() }
+            (id, if q.polling { None } else { q.outer.clone() })
         };
+        // A parent's poll stages its children's announcements before it
+        // ends. Foreign spawns leave announcement to the run thread.
+        if announce {
+            self.task_added(id);
+        }
         if let Some(w) = outer {
             w.wake();
         }
@@ -604,7 +613,7 @@ impl Wake for TaskWaker {
 }
 
 struct Slot {
-    started: bool,
+    pending_announcement: bool,
     future: BoxFuture,
     task_waker: Arc<TaskWaker>,
     waker: Waker,
@@ -767,7 +776,7 @@ impl RunState {
                 self.slots.insert(
                     new.id,
                     Slot {
-                        started: new.started,
+                        pending_announcement: new.pending_announcement,
                         future: new.future,
                         task_waker,
                         waker,
@@ -795,10 +804,8 @@ impl RunState {
             let Some(slot) = self.slots.get_mut(&id) else {
                 continue;
             };
-            // Announced outside the queue lock, before the task's first
-            // poll can publish anything that names it.
-            if !slot.started {
-                slot.started = true;
+            if slot.pending_announcement {
+                slot.pending_announcement = false;
                 self.shared.task_added(id);
             }
             slot.task_waker.queued.store(false, Ordering::Release);
@@ -900,7 +907,7 @@ impl Drop for RunState {
             .chain(self.slots.values().map(|s| s.join.clone()))
             .collect();
         for task in incoming {
-            if !task.started {
+            if task.pending_announcement {
                 self.shared.task_added(task.id);
             }
             let id = task.id;
@@ -909,6 +916,9 @@ impl Drop for RunState {
         }
         // Task destructors run in ascending task ID order.
         for (id, slot) in std::mem::take(&mut self.slots) {
+            if slot.pending_announcement {
+                self.shared.task_added(id);
+            }
             drop(slot);
             self.shared.task_removed(id);
         }

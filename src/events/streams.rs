@@ -361,6 +361,7 @@ mod tests {
     #[derive(Default)]
     struct Topology {
         items: Mutex<Vec<(Stamp, String)>>,
+        threads: Mutex<Vec<std::thread::ThreadId>>,
         counters: Mutex<Option<LinkCounters>>,
         removed: Mutex<Vec<[Counts; 2]>>,
     }
@@ -381,6 +382,7 @@ mod tests {
                 self.removed.lock().push(*totals);
             }
             self.items.lock().push((stamp, format!("{topology:?}")));
+            self.threads.lock().push(std::thread::current().id());
         }
     }
 
@@ -470,6 +472,146 @@ mod tests {
     #[test]
     fn topology_lifecycles_and_stamps_repeat() {
         assert_eq!(topology_run(), topology_run());
+    }
+
+    #[test]
+    fn spawned_tasks_are_announced_before_their_parent_ends() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        for complete in [true, false] {
+            let topology = Arc::new(Topology::default());
+            let reader = topology.clone();
+            let mut world = Box::pin(lab(
+                RunOptions::new(Seed::from_u64(7)).observer(topology.clone()),
+                move |cx| async move {
+                    cx.spawn(|_| async { Ok(()) });
+                    cx.group("children").spawn(|_| async { Ok(()) });
+                    assert_eq!(reader.items.lock().len(), 1);
+                    Ok(())
+                },
+            ));
+            assert!(
+                world
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            {
+                let items = topology.items.lock();
+                let root_removed = items
+                    .iter()
+                    .position(|(_, item)| item == "TaskRemoved { task: TaskId(1) }")
+                    .unwrap();
+                for (id, group) in [(2, "group: None"), (3, "group: Some(GroupId(1))")] {
+                    let child_added = items
+                        .iter()
+                        .position(|(_, item)| {
+                            item.starts_with(&format!(
+                                "TaskAdded {{ task: TaskId({id}), parent: Some(TaskId(1)),"
+                            )) && item.contains(group)
+                        })
+                        .unwrap();
+                    assert!(child_added < root_removed);
+                }
+            }
+            if complete {
+                block_on(world).unwrap();
+            } else {
+                drop(world);
+            }
+            let items = topology.items.lock();
+            for id in 1..=3 {
+                assert_eq!(
+                    items
+                        .iter()
+                        .filter(|(_, item)| item
+                            .starts_with(&format!("TaskAdded {{ task: TaskId({id}),")))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    items
+                        .iter()
+                        .filter(|(_, item)| item == &format!("TaskRemoved {{ task: TaskId({id}) }}"))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_spawns_are_announced_on_the_polling_thread() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        for complete in [true, false] {
+            let topology = Arc::new(Topology::default());
+            let polling_thread = std::thread::current().id();
+            let mut world = Box::pin(lab(
+                RunOptions::new(Seed::from_u64(7)).observer(topology.clone()),
+                move |cx| async move {
+                    assert_eq!(std::thread::current().id(), polling_thread);
+                    let foreign = cx.clone();
+                    std::thread::spawn(move || {
+                        assert_ne!(std::thread::current().id(), polling_thread);
+                        foreign.spawn(move |cx| async move {
+                            assert_eq!(std::thread::current().id(), polling_thread);
+                            let (mut a, mut b) = crate::pair();
+                            a.link().unwrap().label(&cx, "foreign".into());
+                            b.send(Packet(vec![1]));
+                            a.recv(&cx).await?;
+                            Ok(())
+                        });
+                    })
+                    .join()
+                    .unwrap();
+                    Ok(())
+                },
+            ));
+            assert!(
+                world
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            if complete {
+                block_on(world).unwrap();
+            } else {
+                drop(world);
+            }
+            let items = topology.items.lock();
+            let mentions = items
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, item))| item.contains("TaskId(2)"))
+                .collect::<Vec<_>>();
+            let (added, (_, first)) = mentions[0];
+            assert!(first.starts_with("TaskAdded { task: TaskId(2), parent: None,"));
+            assert_eq!(topology.threads.lock()[added], polling_thread);
+            assert_eq!(
+                mentions
+                    .iter()
+                    .filter(|(_, (_, item))| item.starts_with("TaskAdded"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                mentions
+                    .iter()
+                    .filter(|(_, (_, item))| item.starts_with("TaskRemoved"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                mentions
+                    .iter()
+                    .filter(|(_, (_, item))| item.starts_with("LinkOwner"))
+                    .count(),
+                usize::from(complete)
+            );
+        }
     }
 
     #[test]
