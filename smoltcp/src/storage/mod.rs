@@ -3,5 +3,5 @@
 mod assembler;
 mod ring_buffer;
 
-pub use self::assembler::Assembler;
-pub use self::ring_buffer::RingBuffer;
+pub(crate) use self::assembler::Assembler;
+pub(crate) use self::ring_buffer::RingBuffer;

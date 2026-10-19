@@ -1,16 +1,10 @@
 #![deny(missing_docs)]
 
 use byteorder::{ByteOrder, NetworkEndian};
-use core::fmt;
 
 use super::{Error, Result};
 
 use super::IpProtocol as Protocol;
-
-/// Size of an IPv6 address in octets.
-///
-/// [RFC 8200 § 2]: https://www.rfc-editor.org/rfc/rfc4291#section-2
-pub const ADDR_SIZE: usize = 16;
 
 pub use core::net::Ipv6Addr as Address;
 
@@ -21,136 +15,37 @@ pub(crate) trait AddressExt {
     ///
     /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
     fn x_is_unicast(&self) -> bool;
-
-    /// Helper function used to mask an address given a prefix.
-    ///
-    /// # Panics
-    /// This function panics if `mask` is greater than 128.
-    fn mask(&self, mask: u8) -> [u8; ADDR_SIZE];
-
-    /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
-    /// where `prefix_len` is the number of leading ones. Return `None` otherwise.
-    fn prefix_len(&self) -> Option<u8>;
 }
 
 impl AddressExt for Address {
     fn x_is_unicast(&self) -> bool {
         !(self.is_multicast() || self.is_unspecified())
     }
-
-    fn mask(&self, mask: u8) -> [u8; ADDR_SIZE] {
-        assert!(mask <= 128);
-        let mut bytes = [0u8; ADDR_SIZE];
-        let idx = (mask as usize) / 8;
-        let modulus = (mask as usize) % 8;
-        let octets = self.octets();
-        let (first, second) = octets.split_at(idx);
-        bytes[0..idx].copy_from_slice(first);
-        if idx < ADDR_SIZE {
-            let part = second[0];
-            bytes[idx] = part & (!(0xff >> modulus) as u8);
-        }
-        bytes
-    }
-
-    fn prefix_len(&self) -> Option<u8> {
-        let mut ones = true;
-        let mut prefix_len = 0;
-        for byte in self.octets() {
-            let mut mask = 0x80;
-            for _ in 0..8 {
-                let one = byte & mask != 0;
-                if ones {
-                    // Expect 1s until first 0
-                    if one {
-                        prefix_len += 1;
-                    } else {
-                        ones = false;
-                    }
-                } else if one {
-                    // 1 where 0 was expected
-                    return None;
-                }
-                mask >>= 1;
-            }
-        }
-        Some(prefix_len)
-    }
-}
-
-/// A specification of an IPv6 CIDR block, containing an address and a variable-length
-/// subnet masking prefix length.
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub struct Cidr {
-    address: Address,
-    prefix_len: u8,
-}
-
-impl Cidr {
-    /// Create an IPv6 CIDR block from the given address and prefix length.
-    ///
-    /// # Panics
-    /// This function panics if the prefix length is larger than 128.
-    pub const fn new(address: Address, prefix_len: u8) -> Cidr {
-        assert!(prefix_len <= 128);
-        Cidr {
-            address,
-            prefix_len,
-        }
-    }
-
-    /// Return the address of this IPv6 CIDR block.
-    pub const fn address(&self) -> Address {
-        self.address
-    }
-
-    /// Query whether the subnetwork described by this IPv6 CIDR block contains
-    /// the given address.
-    pub fn contains_addr(&self, addr: &Address) -> bool {
-        if self.prefix_len == 0 {
-            return true;
-        }
-
-        self.address.mask(self.prefix_len) == addr.mask(self.prefix_len)
-    }
-
-    /// Query whether the subnetwork described by this IPV6 CIDR block contains
-    /// the subnetwork described by the given IPv6 CIDR block.
-    pub fn contains_subnet(&self, subnet: &Cidr) -> bool {
-        self.prefix_len <= subnet.prefix_len && self.contains_addr(&subnet.address)
-    }
-}
-
-impl fmt::Display for Cidr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // https://tools.ietf.org/html/rfc4291#section-2.3
-        write!(f, "{}/{}", self.address, self.prefix_len)
-    }
 }
 
 /// A read/write wrapper around an Internet Protocol version 6 packet buffer.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Packet<T: AsRef<[u8]>> {
+pub(crate) struct Packet<T: AsRef<[u8]>> {
     buffer: T,
 }
 
 mod field {
     use crate::wire::field::*;
-    pub const VER_TC_FLOW: Field = 0..4;
-    pub const LENGTH: Field = 4..6;
-    pub const NXT_HDR: usize = 6;
-    pub const HOP_LIMIT: usize = 7;
-    pub const SRC_ADDR: Field = 8..24;
-    pub const DST_ADDR: Field = 24..40;
+    pub(super) const VER_TC_FLOW: Field = 0..4;
+    pub(super) const LENGTH: Field = 4..6;
+    pub(super) const NXT_HDR: usize = 6;
+    pub(super) const HOP_LIMIT: usize = 7;
+    pub(super) const SRC_ADDR: Field = 8..24;
+    pub(super) const DST_ADDR: Field = 24..40;
 }
 
 /// Length of an IPv6 header.
-pub const HEADER_LEN: usize = field::DST_ADDR.end;
+pub(crate) const HEADER_LEN: usize = field::DST_ADDR.end;
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Create a raw octet buffer with an IPv6 packet structure.
     #[inline]
-    pub const fn new_unchecked(buffer: T) -> Packet<T> {
+    pub(crate) const fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -159,7 +54,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
     #[inline]
-    pub fn new_checked(buffer: T) -> Result<Packet<T>> {
+    pub(crate) fn new_checked(buffer: T) -> Result<Packet<T>> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
@@ -172,7 +67,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     ///
     /// [set_payload_len]: #method.set_payload_len
     #[inline]
-    pub fn check_len(&self) -> Result<()> {
+    pub(crate) fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
         if len < field::DST_ADDR.end || len < self.total_len() {
             Err(Error)
@@ -181,76 +76,56 @@ impl<T: AsRef<[u8]>> Packet<T> {
         }
     }
 
-    /// Consume the packet, returning the underlying buffer.
-    #[inline]
-    pub fn into_inner(self) -> T {
-        self.buffer
-    }
-
     /// Return the header length.
     #[inline]
-    pub const fn header_len(&self) -> usize {
+    pub(crate) const fn header_len(&self) -> usize {
         field::DST_ADDR.end
     }
 
     /// Return the version field.
     #[inline]
-    pub fn version(&self) -> u8 {
+    pub(crate) fn version(&self) -> u8 {
         let data = self.buffer.as_ref();
         data[field::VER_TC_FLOW.start] >> 4
     }
 
-    /// Return the traffic class.
-    #[inline]
-    pub fn traffic_class(&self) -> u8 {
-        let data = self.buffer.as_ref();
-        ((NetworkEndian::read_u16(&data[0..2]) & 0x0ff0) >> 4) as u8
-    }
-
-    /// Return the flow label field.
-    #[inline]
-    pub fn flow_label(&self) -> u32 {
-        let data = self.buffer.as_ref();
-        NetworkEndian::read_u24(&data[1..4]) & 0x000fffff
-    }
-
     /// Return the payload length field.
     #[inline]
-    pub fn payload_len(&self) -> u16 {
+    pub(crate) fn payload_len(&self) -> u16 {
         let data = self.buffer.as_ref();
         NetworkEndian::read_u16(&data[field::LENGTH])
     }
 
     /// Return the payload length added to the known header length.
     #[inline]
-    pub fn total_len(&self) -> usize {
+    pub(crate) fn total_len(&self) -> usize {
         self.header_len() + self.payload_len() as usize
     }
 
     /// Return the next header field.
     #[inline]
-    pub fn next_header(&self) -> Protocol {
+    pub(crate) fn next_header(&self) -> Protocol {
         let data = self.buffer.as_ref();
         Protocol::from(data[field::NXT_HDR])
     }
 
     /// Return the hop limit field.
     #[inline]
-    pub fn hop_limit(&self) -> u8 {
+    pub(crate) fn hop_limit(&self) -> u8 {
         let data = self.buffer.as_ref();
         data[field::HOP_LIMIT]
     }
 
     /// Return the source address field.
     #[inline]
-    pub fn src_addr(&self) -> Address {
+    pub(crate) fn src_addr(&self) -> Address {
         let data = self.buffer.as_ref();
         Address::from_octets(data[field::SRC_ADDR].try_into().unwrap())
     }
 
     /// Return the destination address field.
     #[inline]
-    pub fn dst_addr(&self) -> Address {
+    pub(crate) fn dst_addr(&self) -> Address {
         let data = self.buffer.as_ref();
         Address::from_octets(data[field::DST_ADDR].try_into().unwrap())
     }
@@ -259,7 +134,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
     /// Return a pointer to the payload.
     #[inline]
-    pub fn payload(&self) -> &'a [u8] {
+    pub(crate) fn payload(&self) -> &'a [u8] {
         let data = self.buffer.as_ref();
         let range = self.header_len()..self.total_len();
         &data[range]
@@ -269,14 +144,14 @@ impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
 impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     /// Set the version field.
     #[inline]
-    pub fn set_version(&mut self, value: u8) {
+    pub(crate) fn set_version(&mut self, value: u8) {
         let data = self.buffer.as_mut();
         data[0] = (data[0] & 0x0f) | ((value & 0x0f) << 4);
     }
 
     /// Set the traffic class field.
     #[inline]
-    pub fn set_traffic_class(&mut self, value: u8) {
+    pub(crate) fn set_traffic_class(&mut self, value: u8) {
         let data = self.buffer.as_mut();
         data[0] = (data[0] & 0xf0) | ((value & 0xf0) >> 4);
         data[1] = (data[1] & 0x0f) | ((value & 0x0f) << 4);
@@ -284,7 +159,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the flow label field.
     #[inline]
-    pub fn set_flow_label(&mut self, value: u32) {
+    pub(crate) fn set_flow_label(&mut self, value: u32) {
         let data = self.buffer.as_mut();
         let raw = (((data[1] & 0xf0) as u32) << 16) | (value & 0x0fffff);
         NetworkEndian::write_u24(&mut data[1..4], raw);
@@ -292,66 +167,58 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the payload length field.
     #[inline]
-    pub fn set_payload_len(&mut self, value: u16) {
+    pub(crate) fn set_payload_len(&mut self, value: u16) {
         let data = self.buffer.as_mut();
         NetworkEndian::write_u16(&mut data[field::LENGTH], value);
     }
 
     /// Set the next header field.
     #[inline]
-    pub fn set_next_header(&mut self, value: Protocol) {
+    pub(crate) fn set_next_header(&mut self, value: Protocol) {
         let data = self.buffer.as_mut();
         data[field::NXT_HDR] = value.into();
     }
 
     /// Set the hop limit field.
     #[inline]
-    pub fn set_hop_limit(&mut self, value: u8) {
+    pub(crate) fn set_hop_limit(&mut self, value: u8) {
         let data = self.buffer.as_mut();
         data[field::HOP_LIMIT] = value;
     }
 
     /// Set the source address field.
     #[inline]
-    pub fn set_src_addr(&mut self, value: Address) {
+    pub(crate) fn set_src_addr(&mut self, value: Address) {
         let data = self.buffer.as_mut();
         data[field::SRC_ADDR].copy_from_slice(&value.octets());
     }
 
     /// Set the destination address field.
     #[inline]
-    pub fn set_dst_addr(&mut self, value: Address) {
+    pub(crate) fn set_dst_addr(&mut self, value: Address) {
         let data = self.buffer.as_mut();
         data[field::DST_ADDR].copy_from_slice(&value.octets());
-    }
-
-    /// Return a mutable pointer to the payload.
-    #[inline]
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        let range = self.header_len()..self.total_len();
-        let data = self.buffer.as_mut();
-        &mut data[range]
     }
 }
 
 /// A high-level representation of an Internet Protocol version 6 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub struct Repr {
+pub(crate) struct Repr {
     /// IPv6 address of the source node.
-    pub src_addr: Address,
+    pub(crate) src_addr: Address,
     /// IPv6 address of the destination node.
-    pub dst_addr: Address,
+    pub(crate) dst_addr: Address,
     /// Protocol contained in the next header.
-    pub next_header: Protocol,
+    pub(crate) next_header: Protocol,
     /// Length of the payload including the extension headers.
-    pub payload_len: usize,
+    pub(crate) payload_len: usize,
     /// The 8-bit hop limit field.
-    pub hop_limit: u8,
+    pub(crate) hop_limit: u8,
 }
 
 impl Repr {
     /// Parse an Internet Protocol version 6 packet and return a high-level representation.
-    pub fn parse<T: AsRef<[u8]> + ?Sized>(packet: &Packet<&T>) -> Result<Repr> {
+    pub(crate) fn parse<T: AsRef<[u8]> + ?Sized>(packet: &Packet<&T>) -> Result<Repr> {
         packet.check_len()?;
         if packet.version() != 6 {
             return Err(Error);
@@ -366,12 +233,12 @@ impl Repr {
     }
 
     /// Return the length of a header that will be emitted from this high-level representation.
-    pub const fn buffer_len(&self) -> usize {
+    pub(crate) const fn buffer_len(&self) -> usize {
         field::DST_ADDR.end
     }
 
     /// Emit a high-level representation into an Internet Protocol version 6 packet.
-    pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, packet: &mut Packet<T>) {
+    pub(crate) fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, packet: &mut Packet<T>) {
         packet.set_version(6);
         packet.set_traffic_class(0);
         packet.set_flow_label(0);
@@ -392,175 +259,6 @@ pub(crate) mod test {
 
     const LINK_LOCAL_ALL_NODES: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
     const LINK_LOCAL_ALL_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
-
-    const LINK_LOCAL_ADDR: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-
-    #[test]
-    fn test_mask() {
-        let addr = Address::new(0x0123, 0x4567, 0x89ab, 0, 0, 0, 0, 1);
-        assert_eq!(
-            addr.mask(11),
-            [0x01, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            addr.mask(15),
-            [0x01, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            addr.mask(26),
-            [0x01, 0x23, 0x45, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            addr.mask(128),
-            [
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
-            ]
-        );
-        assert_eq!(
-            addr.mask(127),
-            [
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-            ]
-        );
-    }
-
-    #[test]
-    fn test_cidr() {
-        // fe80::1/56
-        // 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-        // 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        let cidr = Cidr::new(LINK_LOCAL_ADDR, 56);
-
-        let inside_subnet = [
-            // fe80::2
-            [
-                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x02,
-            ],
-            // fe80::1122:3344:5566:7788
-            [
-                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-                0x77, 0x88,
-            ],
-            // fe80::ff00:0:0:0
-            [
-                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00,
-            ],
-            // fe80::ff
-            [
-                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0xff,
-            ],
-        ];
-
-        let outside_subnet = [
-            // fe80:0:0:101::1
-            [
-                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x01,
-            ],
-            // ::1
-            [
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x01,
-            ],
-            // ff02::1
-            [
-                0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x01,
-            ],
-            // ff02::2
-            [
-                0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x02,
-            ],
-        ];
-
-        let subnets = [
-            // fe80::ffff:ffff:ffff:ffff/65
-            (
-                [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff,
-                    0xff, 0xff, 0xff,
-                ],
-                65,
-            ),
-            // fe80::1/128
-            (
-                [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x01,
-                ],
-                128,
-            ),
-            // fe80::1234:5678/96
-            (
-                [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12,
-                    0x34, 0x56, 0x78,
-                ],
-                96,
-            ),
-        ];
-
-        let not_subnets = [
-            // fe80::101:ffff:ffff:ffff:ffff/55
-            (
-                [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
-                    0xff, 0xff, 0xff,
-                ],
-                55,
-            ),
-            // fe80::101:ffff:ffff:ffff:ffff/56
-            (
-                [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
-                    0xff, 0xff, 0xff,
-                ],
-                56,
-            ),
-            // fe80::101:ffff:ffff:ffff:ffff/57
-            (
-                [
-                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
-                    0xff, 0xff, 0xff,
-                ],
-                57,
-            ),
-            // ::1/128
-            (
-                [
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x01,
-                ],
-                128,
-            ),
-        ];
-
-        for addr in inside_subnet.iter().map(|a| Address::from_octets(*a)) {
-            assert!(cidr.contains_addr(&addr));
-        }
-
-        for addr in outside_subnet.iter().map(|a| Address::from_octets(*a)) {
-            assert!(!cidr.contains_addr(&addr));
-        }
-
-        for subnet in subnets.iter().map(|&(a, p)| Cidr::new(Address::from(a), p)) {
-            assert!(cidr.contains_subnet(&subnet));
-        }
-
-        for subnet in not_subnets
-            .iter()
-            .map(|&(a, p)| Cidr::new(Address::from(a), p))
-        {
-            assert!(!cidr.contains_subnet(&subnet));
-        }
-
-        let cidr_without_prefix = Cidr::new(LINK_LOCAL_ADDR, 0);
-        assert!(cidr_without_prefix.contains_addr(&Address::LOCALHOST));
-    }
 
     static REPR_PACKET_BYTES: [u8; 52] = [
         0x60, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x11, 0x40, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -587,8 +285,7 @@ pub(crate) mod test {
         let packet = Packet::new_unchecked(&REPR_PACKET_BYTES[..]);
         assert_eq!(packet.check_len(), Ok(()));
         assert_eq!(packet.version(), 6);
-        assert_eq!(packet.traffic_class(), 0);
-        assert_eq!(packet.flow_label(), 0);
+        assert_eq!(&packet.buffer[..4], &[0x60, 0, 0, 0]);
         assert_eq!(packet.total_len(), 0x34);
         assert_eq!(packet.payload_len() as usize, REPR_PAYLOAD_BYTES.len());
         assert_eq!(packet.next_header(), Protocol::Udp);
@@ -602,25 +299,20 @@ pub(crate) mod test {
     fn test_packet_construction() {
         let mut bytes = [0xff; 52];
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
-        // Version, Traffic Class, and Flow Label are not
-        // byte aligned. make sure the setters and getters
-        // do not interfere with each other.
+        // Check that setters preserve adjacent fields.
         packet.set_version(6);
         assert_eq!(packet.version(), 6);
         packet.set_traffic_class(0x99);
         assert_eq!(packet.version(), 6);
-        assert_eq!(packet.traffic_class(), 0x99);
+        assert_eq!(&packet.buffer[..4], &[0x69, 0x9f, 0xff, 0xff]);
         packet.set_flow_label(0x54321);
-        assert_eq!(packet.traffic_class(), 0x99);
-        assert_eq!(packet.flow_label(), 0x54321);
+        assert_eq!(&packet.buffer[..4], &[0x69, 0x95, 0x43, 0x21]);
         packet.set_payload_len(0xc);
         packet.set_next_header(Protocol::Udp);
         packet.set_hop_limit(0xfe);
         packet.set_src_addr(LINK_LOCAL_ALL_ROUTERS);
         packet.set_dst_addr(LINK_LOCAL_ALL_NODES);
-        packet
-            .payload_mut()
-            .copy_from_slice(&REPR_PAYLOAD_BYTES[..]);
+        packet.buffer[HEADER_LEN..].copy_from_slice(&REPR_PAYLOAD_BYTES[..]);
         let mut expected_bytes = [
             0x69, 0x95, 0x43, 0x21, 0x00, 0x0c, 0x11, 0xfe, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x02, 0x00, 0x00,
@@ -630,7 +322,7 @@ pub(crate) mod test {
         let start = expected_bytes.len() - REPR_PAYLOAD_BYTES.len();
         expected_bytes[start..].copy_from_slice(&REPR_PAYLOAD_BYTES[..]);
         assert_eq!(packet.check_len(), Ok(()));
-        assert_eq!(&*packet.into_inner(), &expected_bytes[..]);
+        assert_eq!(&bytes[..], &expected_bytes[..]);
     }
 
     #[test]
@@ -641,10 +333,6 @@ pub(crate) mod test {
 
         assert_eq!(
             Packet::new_unchecked(&bytes).payload().len(),
-            REPR_PAYLOAD_BYTES.len()
-        );
-        assert_eq!(
-            Packet::new_unchecked(&mut bytes).payload_mut().len(),
             REPR_PAYLOAD_BYTES.len()
         );
     }
@@ -671,7 +359,7 @@ pub(crate) mod test {
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
         packet.set_version(4);
         packet.set_payload_len(0);
-        let packet = Packet::new_unchecked(&*packet.into_inner());
+        let packet = Packet::new_unchecked(&bytes[..]);
         assert_eq!(Repr::parse(&packet), Err(Error));
     }
 
@@ -681,7 +369,7 @@ pub(crate) mod test {
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
         packet.set_version(6);
         packet.set_payload_len(39);
-        let packet = Packet::new_unchecked(&*packet.into_inner());
+        let packet = Packet::new_unchecked(&bytes[..]);
         assert_eq!(Repr::parse(&packet), Err(Error));
     }
 
@@ -691,7 +379,7 @@ pub(crate) mod test {
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
         packet.set_version(6);
         packet.set_payload_len(1);
-        let packet = Packet::new_unchecked(&*packet.into_inner());
+        let packet = Packet::new_unchecked(&bytes[..]);
         assert_eq!(Repr::parse(&packet), Err(Error));
     }
 
@@ -701,7 +389,7 @@ pub(crate) mod test {
         let mut bytes = vec![0xff; repr.buffer_len() + REPR_PAYLOAD_BYTES.len()];
         let mut packet = Packet::new_unchecked(&mut bytes);
         repr.emit(&mut packet);
-        packet.payload_mut().copy_from_slice(&REPR_PAYLOAD_BYTES);
-        assert_eq!(&*packet.into_inner(), &REPR_PACKET_BYTES[..]);
+        bytes[HEADER_LEN..].copy_from_slice(&REPR_PAYLOAD_BYTES);
+        assert_eq!(&bytes[..], &REPR_PACKET_BYTES[..]);
     }
 }

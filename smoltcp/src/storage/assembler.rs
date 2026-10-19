@@ -1,38 +1,13 @@
-use core::fmt;
-
 const ASSEMBLER_MAX_SEGMENT_COUNT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TooManyHolesError;
-
-impl fmt::Display for TooManyHolesError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "too many holes")
-    }
-}
-
-impl core::error::Error for TooManyHolesError {}
+pub(crate) struct TooManyHolesError;
 
 /// A contiguous chunk of absent data, followed by a contiguous chunk of present data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Contig {
     hole_size: usize,
     data_size: usize,
-}
-
-impl fmt::Display for Contig {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if self.has_hole() {
-            write!(f, "({})", self.hole_size)?;
-        }
-        if self.has_hole() && self.has_data() {
-            write!(f, " ")?;
-        }
-        if self.has_data() {
-            write!(f, "{}", self.data_size)?;
-        }
-        Ok(())
-    }
 }
 
 impl Contig {
@@ -77,22 +52,8 @@ impl Contig {
 
 /// Tracks up to four disjoint byte ranges.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Assembler {
+pub(crate) struct Assembler {
     contigs: [Contig; ASSEMBLER_MAX_SEGMENT_COUNT],
-}
-
-impl fmt::Display for Assembler {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "[ ")?;
-        for contig in self.contigs.iter() {
-            if !contig.has_data() {
-                break;
-            }
-            write!(f, "{contig} ")?;
-        }
-        write!(f, "]")?;
-        Ok(())
-    }
 }
 
 // Invariant on Assembler::contigs:
@@ -101,7 +62,7 @@ impl fmt::Display for Assembler {
 
 impl Assembler {
     /// Create a new buffer assembler.
-    pub const fn new() -> Assembler {
+    pub(crate) const fn new() -> Assembler {
         const EMPTY: Contig = Contig::empty();
         Assembler {
             contigs: [EMPTY; ASSEMBLER_MAX_SEGMENT_COUNT],
@@ -117,7 +78,7 @@ impl Assembler {
     }
 
     /// Return whether the assembler contains no data.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         !self.front().has_data()
     }
 
@@ -151,7 +112,7 @@ impl Assembler {
 
     /// Add a new contiguous range to the assembler,
     /// or return `Err(TooManyHolesError)` if too many discontinuities are already recorded.
-    pub fn add(&mut self, mut offset: usize, size: usize) -> Result<(), TooManyHolesError> {
+    pub(crate) fn add(&mut self, mut offset: usize, size: usize) -> Result<(), TooManyHolesError> {
         if size == 0 {
             return Ok(());
         }
@@ -235,7 +196,7 @@ impl Assembler {
 
     /// Remove a contiguous range from the front of the assembler.
     /// If no such range, return 0.
-    pub fn remove_front(&mut self) -> usize {
+    pub(crate) fn remove_front(&mut self) -> usize {
         let front = self.front();
         if front.has_hole() || !front.has_data() {
             0
@@ -252,7 +213,7 @@ impl Assembler {
     /// except it's guaranteed to not fail when offset = 0.
     /// This is required for TCP: we must never drop the next expected segment, or
     /// the protocol might get stuck.
-    pub fn add_then_remove_front(
+    pub(crate) fn add_then_remove_front(
         &mut self,
         offset: usize,
         size: usize,
@@ -278,7 +239,7 @@ impl Assembler {
     /// |--- 100 ---|--- 200 ---|--- 100 ---|
     ///
     /// Would return the ranges: ``(0, 100), (300, 400)``
-    pub fn iter_data(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+    pub(crate) fn iter_data(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         let mut offset = 0;
         self.contigs.iter().filter_map(move |contig| {
             offset += contig.hole_size;
@@ -291,12 +252,6 @@ impl Assembler {
                 None
             }
         })
-    }
-}
-
-impl Default for Assembler {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

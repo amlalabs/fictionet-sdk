@@ -1,5 +1,5 @@
 use byteorder::{ByteOrder, NetworkEndian};
-use core::{cmp, fmt, ops};
+use core::{cmp, ops};
 
 use super::{Error, Result};
 use crate::wire::ip::checksum;
@@ -10,21 +10,15 @@ use crate::wire::{IpAddress, IpProtocol};
 /// A sequence number is a monotonically advancing integer modulo 2<sup>32</sup>.
 /// Sequence numbers do not have a discontiguity when compared pairwise across a signed overflow.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
-pub struct SeqNumber(pub i32);
+pub(crate) struct SeqNumber(pub(crate) i32);
 
 impl SeqNumber {
-    pub fn max(self, rhs: Self) -> Self {
+    pub(crate) fn max(self, rhs: Self) -> Self {
         if self > rhs { self } else { rhs }
     }
 
-    pub fn min(self, rhs: Self) -> Self {
+    pub(crate) fn min(self, rhs: Self) -> Self {
         if self < rhs { self } else { rhs }
-    }
-}
-
-impl fmt::Display for SeqNumber {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0 as u32)
     }
 }
 
@@ -85,39 +79,38 @@ mod field {
 
     use crate::wire::field::*;
 
-    pub const SRC_PORT: Field = 0..2;
-    pub const DST_PORT: Field = 2..4;
-    pub const SEQ_NUM: Field = 4..8;
-    pub const ACK_NUM: Field = 8..12;
-    pub const FLAGS: Field = 12..14;
-    pub const WIN_SIZE: Field = 14..16;
-    pub const CHECKSUM: Field = 16..18;
-    pub const URGENT: Field = 18..20;
+    pub(super) const SRC_PORT: Field = 0..2;
+    pub(super) const DST_PORT: Field = 2..4;
+    pub(super) const SEQ_NUM: Field = 4..8;
+    pub(super) const ACK_NUM: Field = 8..12;
+    pub(super) const FLAGS: Field = 12..14;
+    pub(super) const WIN_SIZE: Field = 14..16;
+    pub(super) const CHECKSUM: Field = 16..18;
+    pub(super) const URGENT: Field = 18..20;
 
-    pub const fn OPTIONS(length: u8) -> Field {
+    pub(crate) const fn OPTIONS(length: u8) -> Field {
         URGENT.end..(length as usize)
     }
 
-    pub const FLG_FIN: u16 = 0x001;
-    pub const FLG_SYN: u16 = 0x002;
-    pub const FLG_RST: u16 = 0x004;
-    pub const FLG_PSH: u16 = 0x008;
-    pub const FLG_ACK: u16 = 0x010;
-    pub const FLG_URG: u16 = 0x020;
-    pub const FLG_ECE: u16 = 0x040;
-    pub const FLG_CWR: u16 = 0x080;
-    pub const FLG_NS: u16 = 0x100;
+    pub(super) const FLG_FIN: u16 = 0x001;
+    pub(super) const FLG_SYN: u16 = 0x002;
+    pub(super) const FLG_RST: u16 = 0x004;
+    pub(super) const FLG_PSH: u16 = 0x008;
+    pub(super) const FLG_ACK: u16 = 0x010;
+    pub(super) const FLG_ECE: u16 = 0x040;
+    pub(super) const FLG_CWR: u16 = 0x080;
+    pub(super) const FLG_NS: u16 = 0x100;
 
-    pub const OPT_END: u8 = 0x00;
-    pub const OPT_NOP: u8 = 0x01;
-    pub const OPT_MSS: u8 = 0x02;
-    pub const OPT_WS: u8 = 0x03;
-    pub const OPT_SACKPERM: u8 = 0x04;
-    pub const OPT_SACKRNG: u8 = 0x05;
-    pub const OPT_TSTAMP: u8 = 0x08;
+    pub(super) const OPT_END: u8 = 0x00;
+    pub(super) const OPT_NOP: u8 = 0x01;
+    pub(super) const OPT_MSS: u8 = 0x02;
+    pub(super) const OPT_WS: u8 = 0x03;
+    pub(super) const OPT_SACKPERM: u8 = 0x04;
+    pub(super) const OPT_SACKRNG: u8 = 0x05;
+    pub(super) const OPT_TSTAMP: u8 = 0x08;
 }
 
-pub const HEADER_LEN: usize = field::URGENT.end;
+pub(crate) const HEADER_LEN: usize = field::URGENT.end;
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with TCP packet structure.
@@ -129,7 +122,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: T) -> Result<Packet<T>> {
+    pub(crate) fn new_checked(buffer: T) -> Result<Packet<T>> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
@@ -143,7 +136,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     /// The result of this check is invalidated by calling [set_header_len].
     ///
     /// [set_header_len]: #method.set_header_len
-    pub fn check_len(&self) -> Result<()> {
+    pub(crate) fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
         if len < field::URGENT.end {
             Err(Error)
@@ -157,42 +150,37 @@ impl<T: AsRef<[u8]>> Packet<T> {
         }
     }
 
-    /// Consume the packet, returning the underlying buffer.
-    pub fn into_inner(self) -> T {
-        self.buffer
-    }
-
     /// Return the source port field.
     #[inline]
-    pub fn src_port(&self) -> u16 {
+    pub(crate) fn src_port(&self) -> u16 {
         let data = self.buffer.as_ref();
         NetworkEndian::read_u16(&data[field::SRC_PORT])
     }
 
     /// Return the destination port field.
     #[inline]
-    pub fn dst_port(&self) -> u16 {
+    pub(crate) fn dst_port(&self) -> u16 {
         let data = self.buffer.as_ref();
         NetworkEndian::read_u16(&data[field::DST_PORT])
     }
 
     /// Return the sequence number field.
     #[inline]
-    pub fn seq_number(&self) -> SeqNumber {
+    pub(crate) fn seq_number(&self) -> SeqNumber {
         let data = self.buffer.as_ref();
         SeqNumber(NetworkEndian::read_i32(&data[field::SEQ_NUM]))
     }
 
     /// Return the acknowledgement number field.
     #[inline]
-    pub fn ack_number(&self) -> SeqNumber {
+    pub(crate) fn ack_number(&self) -> SeqNumber {
         let data = self.buffer.as_ref();
         SeqNumber(NetworkEndian::read_i32(&data[field::ACK_NUM]))
     }
 
     /// Return the FIN flag.
     #[inline]
-    pub fn fin(&self) -> bool {
+    pub(crate) fn fin(&self) -> bool {
         let data = self.buffer.as_ref();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         raw & field::FLG_FIN != 0
@@ -200,7 +188,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the SYN flag.
     #[inline]
-    pub fn syn(&self) -> bool {
+    pub(crate) fn syn(&self) -> bool {
         let data = self.buffer.as_ref();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         raw & field::FLG_SYN != 0
@@ -208,7 +196,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the RST flag.
     #[inline]
-    pub fn rst(&self) -> bool {
+    pub(crate) fn rst(&self) -> bool {
         let data = self.buffer.as_ref();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         raw & field::FLG_RST != 0
@@ -216,7 +204,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the PSH flag.
     #[inline]
-    pub fn psh(&self) -> bool {
+    pub(crate) fn psh(&self) -> bool {
         let data = self.buffer.as_ref();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         raw & field::FLG_PSH != 0
@@ -224,18 +212,10 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the ACK flag.
     #[inline]
-    pub fn ack(&self) -> bool {
+    pub(crate) fn ack(&self) -> bool {
         let data = self.buffer.as_ref();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         raw & field::FLG_ACK != 0
-    }
-
-    /// Return the URG flag.
-    #[inline]
-    pub fn urg(&self) -> bool {
-        let data = self.buffer.as_ref();
-        let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
-        raw & field::FLG_URG != 0
     }
 
     /// Return the ECE flag.
@@ -264,7 +244,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the header length, in octets.
     #[inline]
-    pub fn header_len(&self) -> u8 {
+    pub(crate) fn header_len(&self) -> u8 {
         let data = self.buffer.as_ref();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         ((raw >> 12) * 4) as u8
@@ -272,23 +252,9 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the window size field.
     #[inline]
-    pub fn window_len(&self) -> u16 {
+    pub(crate) fn window_len(&self) -> u16 {
         let data = self.buffer.as_ref();
         NetworkEndian::read_u16(&data[field::WIN_SIZE])
-    }
-
-    /// Return the checksum field.
-    #[inline]
-    pub fn checksum(&self) -> u16 {
-        let data = self.buffer.as_ref();
-        NetworkEndian::read_u16(&data[field::CHECKSUM])
-    }
-
-    /// Return the urgent pointer field.
-    #[inline]
-    pub fn urgent_at(&self) -> u16 {
-        let data = self.buffer.as_ref();
-        NetworkEndian::read_u16(&data[field::URGENT])
     }
 
     /// Parse and summarize all TCP options in a single pass.
@@ -321,7 +287,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     ///
     /// # Fuzzing
     /// This function always returns `true` when fuzzing.
-    pub fn verify_checksum(&self, src_addr: &IpAddress, dst_addr: &IpAddress) -> bool {
+    pub(crate) fn verify_checksum(&self, src_addr: &IpAddress, dst_addr: &IpAddress) -> bool {
         if cfg!(fuzzing) {
             return true;
         }
@@ -337,7 +303,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
     /// Return a pointer to the options.
     #[inline]
-    pub fn options(&self) -> &'a [u8] {
+    pub(crate) fn options(&self) -> &'a [u8] {
         let header_len = self.header_len();
         let data = self.buffer.as_ref();
         &data[field::OPTIONS(header_len)]
@@ -345,7 +311,7 @@ impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
 
     /// Return a pointer to the payload.
     #[inline]
-    pub fn payload(&self) -> &'a [u8] {
+    pub(crate) fn payload(&self) -> &'a [u8] {
         let header_len = self.header_len() as usize;
         let data = self.buffer.as_ref();
         &data[header_len..]
@@ -355,35 +321,35 @@ impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
 impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     /// Set the source port field.
     #[inline]
-    pub fn set_src_port(&mut self, value: u16) {
+    pub(crate) fn set_src_port(&mut self, value: u16) {
         let data = self.buffer.as_mut();
         NetworkEndian::write_u16(&mut data[field::SRC_PORT], value)
     }
 
     /// Set the destination port field.
     #[inline]
-    pub fn set_dst_port(&mut self, value: u16) {
+    pub(crate) fn set_dst_port(&mut self, value: u16) {
         let data = self.buffer.as_mut();
         NetworkEndian::write_u16(&mut data[field::DST_PORT], value)
     }
 
     /// Set the sequence number field.
     #[inline]
-    pub fn set_seq_number(&mut self, value: SeqNumber) {
+    pub(crate) fn set_seq_number(&mut self, value: SeqNumber) {
         let data = self.buffer.as_mut();
         NetworkEndian::write_i32(&mut data[field::SEQ_NUM], value.0)
     }
 
     /// Set the acknowledgement number field.
     #[inline]
-    pub fn set_ack_number(&mut self, value: SeqNumber) {
+    pub(crate) fn set_ack_number(&mut self, value: SeqNumber) {
         let data = self.buffer.as_mut();
         NetworkEndian::write_i32(&mut data[field::ACK_NUM], value.0)
     }
 
     /// Clear the entire flags field.
     #[inline]
-    pub fn clear_flags(&mut self) {
+    pub(crate) fn clear_flags(&mut self) {
         let data = self.buffer.as_mut();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         let raw = raw & !0x0fff;
@@ -392,7 +358,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the FIN flag.
     #[inline]
-    pub fn set_fin(&mut self, value: bool) {
+    pub(crate) fn set_fin(&mut self, value: bool) {
         let data = self.buffer.as_mut();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         let raw = if value {
@@ -405,7 +371,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the SYN flag.
     #[inline]
-    pub fn set_syn(&mut self, value: bool) {
+    pub(crate) fn set_syn(&mut self, value: bool) {
         let data = self.buffer.as_mut();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         let raw = if value {
@@ -418,7 +384,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the RST flag.
     #[inline]
-    pub fn set_rst(&mut self, value: bool) {
+    pub(crate) fn set_rst(&mut self, value: bool) {
         let data = self.buffer.as_mut();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         let raw = if value {
@@ -431,7 +397,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the PSH flag.
     #[inline]
-    pub fn set_psh(&mut self, value: bool) {
+    pub(crate) fn set_psh(&mut self, value: bool) {
         let data = self.buffer.as_mut();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         let raw = if value {
@@ -444,26 +410,13 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the ACK flag.
     #[inline]
-    pub fn set_ack(&mut self, value: bool) {
+    pub(crate) fn set_ack(&mut self, value: bool) {
         let data = self.buffer.as_mut();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         let raw = if value {
             raw | field::FLG_ACK
         } else {
             raw & !field::FLG_ACK
-        };
-        NetworkEndian::write_u16(&mut data[field::FLAGS], raw)
-    }
-
-    /// Set the URG flag.
-    #[inline]
-    pub fn set_urg(&mut self, value: bool) {
-        let data = self.buffer.as_mut();
-        let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
-        let raw = if value {
-            raw | field::FLG_URG
-        } else {
-            raw & !field::FLG_URG
         };
         NetworkEndian::write_u16(&mut data[field::FLAGS], raw)
     }
@@ -509,7 +462,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the header length, in octets.
     #[inline]
-    pub fn set_header_len(&mut self, value: u8) {
+    pub(crate) fn set_header_len(&mut self, value: u8) {
         let data = self.buffer.as_mut();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         let raw = (raw & !0xf000) | ((value as u16) / 4) << 12;
@@ -518,21 +471,21 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Set the window size field.
     #[inline]
-    pub fn set_window_len(&mut self, value: u16) {
+    pub(crate) fn set_window_len(&mut self, value: u16) {
         let data = self.buffer.as_mut();
         NetworkEndian::write_u16(&mut data[field::WIN_SIZE], value)
     }
 
     /// Set the checksum field.
     #[inline]
-    pub fn set_checksum(&mut self, value: u16) {
+    pub(crate) fn set_checksum(&mut self, value: u16) {
         let data = self.buffer.as_mut();
         NetworkEndian::write_u16(&mut data[field::CHECKSUM], value)
     }
 
     /// Set the urgent pointer field.
     #[inline]
-    pub fn set_urgent_at(&mut self, value: u16) {
+    pub(crate) fn set_urgent_at(&mut self, value: u16) {
         let data = self.buffer.as_mut();
         NetworkEndian::write_u16(&mut data[field::URGENT], value)
     }
@@ -542,7 +495,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     /// # Panics
     /// This function panics unless `src_addr` and `dst_addr` belong to the same family,
     /// and that family is IPv4 or IPv6.
-    pub fn fill_checksum(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress) {
+    pub(crate) fn fill_checksum(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress) {
         self.set_checksum(0);
         let checksum = {
             let data = self.buffer.as_ref();
@@ -556,7 +509,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Return a pointer to the options.
     #[inline]
-    pub fn options_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn options_mut(&mut self) -> &mut [u8] {
         let header_len = self.header_len();
         let data = self.buffer.as_mut();
         &mut data[field::OPTIONS(header_len)]
@@ -564,7 +517,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
     /// Return a mutable pointer to the payload data.
     #[inline]
-    pub fn payload_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn payload_mut(&mut self) -> &mut [u8] {
         let header_len = self.header_len() as usize;
         let data = self.buffer.as_mut();
         &mut data[header_len..]
@@ -590,7 +543,7 @@ pub struct TcpOptionSummary {
 
 /// A representation of a single TCP option.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum TcpOption<'a> {
+pub(crate) enum TcpOption<'a> {
     EndOfList,
     NoOperation,
     MaxSegmentSize(u16),
@@ -602,7 +555,7 @@ pub enum TcpOption<'a> {
 }
 
 impl<'a> TcpOption<'a> {
-    pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], TcpOption<'a>)> {
+    pub(crate) fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], TcpOption<'a>)> {
         let (length, option);
         match *buffer.first().ok_or(Error)? {
             field::OPT_END => {
@@ -659,7 +612,7 @@ impl<'a> TcpOption<'a> {
         Ok((&buffer[length..], option))
     }
 
-    pub fn buffer_len(&self) -> usize {
+    pub(crate) fn buffer_len(&self) -> usize {
         match *self {
             TcpOption::EndOfList => 1,
             TcpOption::NoOperation => 1,
@@ -672,7 +625,7 @@ impl<'a> TcpOption<'a> {
         }
     }
 
-    pub fn emit<'b>(&self, buffer: &'b mut [u8]) -> &'b mut [u8] {
+    pub(crate) fn emit<'b>(&self, buffer: &'b mut [u8]) -> &'b mut [u8] {
         let length;
         match *self {
             TcpOption::EndOfList => {
@@ -736,7 +689,7 @@ impl<'a> TcpOption<'a> {
 
 /// The possible control flags of a Transmission Control Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum Control {
+pub(crate) enum Control {
     None,
     Psh,
     Syn,
@@ -747,7 +700,7 @@ pub enum Control {
 #[allow(clippy::len_without_is_empty)]
 impl Control {
     /// Return the length of a control flag, in terms of sequence space.
-    pub const fn len(self) -> usize {
+    pub(crate) const fn len(self) -> usize {
         match self {
             Control::Syn | Control::Fin => 1,
             _ => 0,
@@ -755,7 +708,7 @@ impl Control {
     }
 
     /// Turn the PSH flag into no flag, and keep the rest as-is.
-    pub const fn quash_psh(self) -> Control {
+    pub(crate) const fn quash_psh(self) -> Control {
         match self {
             Control::Psh => Control::None,
             _ => self,
@@ -766,38 +719,38 @@ impl Control {
 /// A high-level representation of a Transmission Control Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Repr<'a> {
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub control: Control,
-    pub seq_number: SeqNumber,
-    pub ack_number: Option<SeqNumber>,
-    pub window_len: u16,
-    pub window_scale: Option<u8>,
-    pub max_seg_size: Option<u16>,
-    pub sack_permitted: bool,
-    pub sack_ranges: [Option<(u32, u32)>; 3],
-    pub timestamp: Option<TcpTimestampRepr>,
+    pub(crate) src_port: u16,
+    pub(crate) dst_port: u16,
+    pub(crate) control: Control,
+    pub(crate) seq_number: SeqNumber,
+    pub(crate) ack_number: Option<SeqNumber>,
+    pub(crate) window_len: u16,
+    pub(crate) window_scale: Option<u8>,
+    pub(crate) max_seg_size: Option<u16>,
+    pub(crate) sack_permitted: bool,
+    pub(crate) sack_ranges: [Option<(u32, u32)>; 3],
+    pub(crate) timestamp: Option<TcpTimestampRepr>,
     pub payload: &'a [u8],
 }
 
 pub type TcpTimestampGenerator = fn() -> u32;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub struct TcpTimestampRepr {
-    pub tsval: u32,
-    pub tsecr: u32,
+pub(crate) struct TcpTimestampRepr {
+    pub(crate) tsval: u32,
+    pub(crate) tsecr: u32,
 }
 
 impl TcpTimestampRepr {
-    pub fn new(tsval: u32, tsecr: u32) -> Self {
+    pub(crate) fn new(tsval: u32, tsecr: u32) -> Self {
         Self { tsval, tsecr }
     }
 
-    pub fn generate_reply(&self, generator: Option<TcpTimestampGenerator>) -> Option<Self> {
+    pub(crate) fn generate_reply(&self, generator: Option<TcpTimestampGenerator>) -> Option<Self> {
         Self::generate_reply_with_tsval(generator, self.tsval)
     }
 
-    pub fn generate_reply_with_tsval(
+    pub(crate) fn generate_reply_with_tsval(
         generator: Option<TcpTimestampGenerator>,
         tsval: u32,
     ) -> Option<Self> {
@@ -890,7 +843,7 @@ impl<'a> Repr<'a> {
     ///
     /// This should be used for buffer space calculations.
     /// The TCP header length is a multiple of 4.
-    pub fn header_len(&self) -> usize {
+    pub(crate) fn header_len(&self) -> usize {
         let mut length = field::URGENT.end;
         if self.max_seg_size.is_some() {
             length += 4
@@ -919,13 +872,17 @@ impl<'a> Repr<'a> {
     }
 
     /// Return the length of a packet that will be emitted from this high-level representation.
-    pub fn buffer_len(&self) -> usize {
+    pub(crate) fn buffer_len(&self) -> usize {
         self.header_len() + self.payload.len()
     }
 
     /// Emit a high-level representation into a Transmission Control Protocol packet.
-    pub fn emit<T>(&self, packet: &mut Packet<&mut T>, src_addr: &IpAddress, dst_addr: &IpAddress)
-    where
+    pub(crate) fn emit<T>(
+        &self,
+        packet: &mut Packet<&mut T>,
+        src_addr: &IpAddress,
+        dst_addr: &IpAddress,
+    ) where
         T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
     {
         packet.set_src_port(self.src_port);
@@ -944,6 +901,7 @@ impl<'a> Repr<'a> {
         }
         packet.set_ack(self.ack_number.is_some());
         {
+            // SYN and SYN-ACK options are emitted in this order.
             let mut options = packet.options_mut();
             if let Some(value) = self.max_seg_size {
                 let tmp = options;
@@ -980,12 +938,12 @@ impl<'a> Repr<'a> {
     }
 
     /// Return the length of the segment, in terms of sequence space.
-    pub const fn segment_len(&self) -> usize {
+    pub(crate) const fn segment_len(&self) -> usize {
         self.payload.len() + self.control.len()
     }
 
     /// Return whether the segment has no flags set (except PSH) and no data.
-    pub const fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         match self.control {
             _ if !self.payload.is_empty() => false,
             Control::Syn | Control::Fin | Control::Rst => false,
@@ -1048,10 +1006,7 @@ mod test {
         assert!(packet.rst());
         assert!(!packet.psh());
         assert!(packet.ack());
-        assert!(packet.urg());
         assert_eq!(packet.window_len(), 0x0123);
-        assert_eq!(packet.urgent_at(), 0x0201);
-        assert_eq!(packet.checksum(), 0x01b6);
         assert_eq!(packet.options(), &OPTION_BYTES[..]);
         assert_eq!(packet.payload(), &PAYLOAD_BYTES[..]);
         assert!(packet.verify_checksum(&SRC_ADDR.into(), &DST_ADDR.into()));
@@ -1072,14 +1027,14 @@ mod test {
         packet.set_rst(true);
         packet.set_psh(false);
         packet.set_ack(true);
-        packet.set_urg(true);
+        packet.buffer[13] |= 0x20;
         packet.set_window_len(0x0123);
         packet.set_urgent_at(0x0201);
         packet.set_checksum(0xEEEE);
         packet.options_mut().copy_from_slice(&OPTION_BYTES[..]);
         packet.payload_mut().copy_from_slice(&PAYLOAD_BYTES[..]);
         packet.fill_checksum(&SRC_ADDR.into(), &DST_ADDR.into());
-        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
+        assert_eq!(&bytes[..], &PACKET_BYTES[..]);
     }
 
     #[test]
@@ -1131,7 +1086,7 @@ mod test {
         let mut bytes = vec![0xa5; repr.buffer_len()];
         let mut packet = Packet::new_unchecked(&mut bytes);
         repr.emit(&mut packet, &SRC_ADDR.into(), &DST_ADDR.into());
-        assert_eq!(&*packet.into_inner(), &SYN_PACKET_BYTES[..]);
+        assert_eq!(&bytes[..], &SYN_PACKET_BYTES[..]);
     }
 
     #[test]

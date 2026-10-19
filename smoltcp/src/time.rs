@@ -1,6 +1,6 @@
 //! Simulation instants and durations in microseconds.
 
-use core::{fmt, ops};
+use core::ops;
 
 /// A representation of an absolute time value.
 ///
@@ -17,17 +17,13 @@ pub struct Instant {
 }
 
 impl Instant {
-    pub const ZERO: Instant = Instant::from_micros_const(0);
+    pub(crate) const ZERO: Instant = Instant { micros: 0 };
 
     /// Create a new `Instant` from a number of microseconds.
     pub fn from_micros<T: Into<i64>>(micros: T) -> Instant {
         Instant {
             micros: micros.into(),
         }
-    }
-
-    pub const fn from_micros_const(micros: i64) -> Instant {
-        Instant { micros }
     }
 
     /// Create a new `Instant` from a number of milliseconds.
@@ -37,71 +33,16 @@ impl Instant {
         }
     }
 
-    /// Create a new `Instant` from a number of milliseconds.
-    pub const fn from_millis_const(millis: i64) -> Instant {
-        Instant {
-            micros: millis * 1000,
-        }
-    }
-
     /// Create a new `Instant` from a number of seconds.
-    pub fn from_secs<T: Into<i64>>(secs: T) -> Instant {
+    pub(crate) fn from_secs<T: Into<i64>>(secs: T) -> Instant {
         Instant {
             micros: secs.into() * 1000000,
         }
     }
 
-    /// The fractional number of milliseconds that have passed
-    /// since the beginning of time.
-    pub const fn millis(&self) -> i64 {
-        self.micros % 1000000 / 1000
-    }
-
-    /// The number of whole seconds that have passed since the
-    /// beginning of time.
-    pub const fn secs(&self) -> i64 {
-        self.micros / 1000000
-    }
-
-    /// The total number of milliseconds that have passed since
-    /// the beginning of time.
-    pub const fn total_millis(&self) -> i64 {
-        self.micros / 1000
-    }
     /// The total number of microseconds since the clock origin.
     pub const fn total_micros(&self) -> i64 {
         self.micros
-    }
-}
-
-impl From<::std::time::Instant> for Instant {
-    fn from(other: ::std::time::Instant) -> Instant {
-        static REFERENTIAL: ::std::sync::LazyLock<::std::time::Instant> =
-            ::std::sync::LazyLock::new(::std::time::Instant::now);
-
-        let n = other.saturating_duration_since(*REFERENTIAL);
-        Self::from_micros(n.as_secs() as i64 * 1000000 + n.subsec_micros() as i64)
-    }
-}
-
-impl From<::std::time::SystemTime> for Instant {
-    fn from(other: ::std::time::SystemTime) -> Instant {
-        let n = other
-            .duration_since(::std::time::UNIX_EPOCH)
-            .expect("start time must not be before the unix epoch");
-        Self::from_micros(n.as_secs() as i64 * 1000000 + n.subsec_micros() as i64)
-    }
-}
-
-impl From<Instant> for ::std::time::SystemTime {
-    fn from(val: Instant) -> Self {
-        ::std::time::UNIX_EPOCH + ::std::time::Duration::from_micros(val.micros as u64)
-    }
-}
-
-impl fmt::Display for Instant {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}.{:0>3}s", self.secs(), self.millis())
     }
 }
 
@@ -137,7 +78,7 @@ pub struct Duration {
 
 impl Duration {
     /// Create a new `Duration` from a number of microseconds.
-    pub const fn from_micros(micros: u64) -> Duration {
+    pub(crate) const fn from_micros(micros: u64) -> Duration {
         Duration { micros }
     }
 
@@ -155,30 +96,14 @@ impl Duration {
         }
     }
 
-    /// The fractional number of milliseconds in this `Duration`.
-    pub const fn millis(&self) -> u64 {
-        self.micros / 1000 % 1000
-    }
-
-    /// The number of whole seconds in this `Duration`.
-    pub const fn secs(&self) -> u64 {
-        self.micros / 1000000
-    }
-
     /// The total number of milliseconds in this `Duration`.
-    pub const fn total_millis(&self) -> u64 {
+    pub(crate) const fn total_millis(&self) -> u64 {
         self.micros / 1000
     }
 
     /// The total number of microseconds in this `Duration`.
-    pub const fn total_micros(&self) -> u64 {
+    const fn total_micros(&self) -> u64 {
         self.micros
-    }
-}
-
-impl fmt::Display for Duration {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}.{:03}s", self.secs(), self.millis())
     }
 }
 
@@ -282,51 +207,6 @@ mod test {
     }
 
     #[test]
-    fn test_instant_getters() {
-        let instant = Instant::from_millis(5674);
-        assert_eq!(instant.secs(), 5);
-        assert_eq!(instant.millis(), 674);
-        assert_eq!(instant.total_millis(), 5674);
-    }
-
-    #[test]
-    fn test_instant_display() {
-        assert_eq!(format!("{}", Instant::from_millis(74)), "0.074s");
-        assert_eq!(format!("{}", Instant::from_millis(5674)), "5.674s");
-        assert_eq!(format!("{}", Instant::from_millis(5000)), "5.000s");
-    }
-
-    #[test]
-    fn test_instant_conversions() {
-        let mut epoc: ::std::time::SystemTime = Instant::from_millis(0).into();
-        assert_eq!(
-            Instant::from(::std::time::UNIX_EPOCH),
-            Instant::from_millis(0)
-        );
-        assert_eq!(epoc, ::std::time::UNIX_EPOCH);
-        epoc = Instant::from_millis(2085955200i64 * 1000).into();
-        assert_eq!(
-            epoc,
-            ::std::time::UNIX_EPOCH + ::std::time::Duration::from_secs(2085955200)
-        );
-    }
-
-    #[test]
-    fn test_instant_conversions_from_std_instant() {
-        let _ = Instant::from(::std::time::Instant::now());
-        let std_now = ::std::time::Instant::now();
-        let before = Instant::from(std_now);
-        let later = Instant::from(std_now + ::std::time::Duration::from_millis(5));
-        assert_eq!(later - before, Duration::from_millis(5));
-        let after = Instant::from(std_now);
-
-        assert_eq!(
-            before, after,
-            "converting the same std Instant twice should yield the same result"
-        );
-    }
-
-    #[test]
     fn test_duration_ops() {
         assert_eq!(
             Duration::from_millis(40) + Duration::from_millis(2),
@@ -368,8 +248,6 @@ mod test {
     #[test]
     fn test_duration_getters() {
         let instant = Duration::from_millis(4934);
-        assert_eq!(instant.secs(), 4);
-        assert_eq!(instant.millis(), 934);
         assert_eq!(instant.total_millis(), 4934);
     }
 

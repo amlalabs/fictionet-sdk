@@ -1,15 +1,14 @@
 use core::convert::From;
-use core::fmt;
 
 use super::{Error, Result};
 
-use crate::wire::{Ipv4Address, Ipv4AddressExt, Ipv4Cidr, Ipv4Packet, Ipv4Repr};
+use crate::wire::{Ipv4Address, Ipv4AddressExt, Ipv4Packet, Ipv4Repr};
 
-use crate::wire::{Ipv6Address, Ipv6AddressExt, Ipv6Cidr, Ipv6Packet, Ipv6Repr};
+use crate::wire::{Ipv6Address, Ipv6AddressExt, Ipv6Packet, Ipv6Repr};
 
 /// Internet protocol version.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub enum Version {
+pub(crate) enum Version {
     Ipv4,
 
     Ipv6,
@@ -19,7 +18,7 @@ impl Version {
     /// Return the version of an IP packet stored in the provided buffer.
     ///
     /// Empty packets and unknown versions return `Err(Error)`.
-    pub const fn of_packet(data: &[u8]) -> Result<Version> {
+    pub(crate) const fn of_packet(data: &[u8]) -> Result<Version> {
         let Some(&first) = data.first() else {
             return Err(Error);
         };
@@ -32,18 +31,9 @@ impl Version {
     }
 }
 
-impl fmt::Display for Version {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Version::Ipv4 => write!(f, "IPv4"),
-            Version::Ipv6 => write!(f, "IPv6"),
-        }
-    }
-}
-
 enum_with_unknown! {
     /// IP datagram encapsulated protocol.
-    pub enum Protocol(u8) {
+    pub(crate) enum Protocol(u8) {
         HopByHop  = 0x00,
         Icmp      = 0x01,
         Igmp      = 0x02,
@@ -59,26 +49,6 @@ enum_with_unknown! {
     }
 }
 
-impl fmt::Display for Protocol {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Protocol::HopByHop => write!(f, "Hop-by-Hop"),
-            Protocol::Icmp => write!(f, "ICMP"),
-            Protocol::Igmp => write!(f, "IGMP"),
-            Protocol::Tcp => write!(f, "TCP"),
-            Protocol::Udp => write!(f, "UDP"),
-            Protocol::Ipv6Route => write!(f, "IPv6-Route"),
-            Protocol::Ipv6Frag => write!(f, "IPv6-Frag"),
-            Protocol::IpSecEsp => write!(f, "IPsec-ESP"),
-            Protocol::IpSecAh => write!(f, "IPsec-AH"),
-            Protocol::Icmpv6 => write!(f, "ICMPv6"),
-            Protocol::Ipv6NoNxt => write!(f, "IPv6-NoNxt"),
-            Protocol::Ipv6Opts => write!(f, "IPv6-Opts"),
-            Protocol::Unknown(id) => write!(f, "0x{id:02x}"),
-        }
-    }
-}
-
 /// An internetworking address.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum Address {
@@ -89,28 +59,8 @@ pub enum Address {
 }
 
 impl Address {
-    /// Create an address wrapping an IPv4 address with the given octets.
-    pub const fn v4(a0: u8, a1: u8, a2: u8, a3: u8) -> Address {
-        Address::Ipv4(Ipv4Address::new(a0, a1, a2, a3))
-    }
-
-    /// Create an address wrapping an IPv6 address with the given octets.
-    #[allow(clippy::too_many_arguments)]
-    pub const fn v6(
-        a0: u16,
-        a1: u16,
-        a2: u16,
-        a3: u16,
-        a4: u16,
-        a5: u16,
-        a6: u16,
-        a7: u16,
-    ) -> Address {
-        Address::Ipv6(Ipv6Address::new(a0, a1, a2, a3, a4, a5, a6, a7))
-    }
-
     /// Return the protocol version.
-    pub const fn version(&self) -> Version {
+    pub(crate) const fn version(&self) -> Version {
         match self {
             Address::Ipv4(_) => Version::Ipv4,
             Address::Ipv6(_) => Version::Ipv6,
@@ -118,7 +68,7 @@ impl Address {
     }
 
     /// Query whether the address is a valid unicast address.
-    pub fn is_unicast(&self) -> bool {
+    pub(crate) fn is_unicast(&self) -> bool {
         match self {
             Address::Ipv4(addr) => addr.x_is_unicast(),
             Address::Ipv6(addr) => addr.x_is_unicast(),
@@ -126,19 +76,10 @@ impl Address {
     }
 
     /// Query whether the address falls into the "unspecified" range.
-    pub fn is_unspecified(&self) -> bool {
+    pub(crate) fn is_unspecified(&self) -> bool {
         match self {
             Address::Ipv4(addr) => addr.is_unspecified(),
             Address::Ipv6(addr) => addr.is_unspecified(),
-        }
-    }
-
-    /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
-    /// where `prefix_len` is the number of leading ones. Return `None` otherwise.
-    pub fn prefix_len(&self) -> Option<u8> {
-        match self {
-            Address::Ipv4(addr) => addr.prefix_len(),
-            Address::Ipv6(addr) => addr.prefix_len(),
         }
     }
 }
@@ -173,54 +114,6 @@ impl From<Ipv6Address> for Address {
     }
 }
 
-impl fmt::Display for Address {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Address::Ipv4(addr) => write!(f, "{addr}"),
-            Address::Ipv6(addr) => write!(f, "{addr}"),
-        }
-    }
-}
-
-/// A specification of a CIDR block, containing an address and a variable-length
-/// subnet masking prefix length.
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub enum Cidr {
-    Ipv4(Ipv4Cidr),
-
-    Ipv6(Ipv6Cidr),
-}
-
-impl Cidr {
-    /// Create a CIDR block from the given address and prefix length.
-    ///
-    /// # Panics
-    /// This function panics if the given prefix length is invalid for the given address.
-    pub const fn new(addr: Address, prefix_len: u8) -> Cidr {
-        match addr {
-            Address::Ipv4(addr) => Cidr::Ipv4(Ipv4Cidr::new(addr, prefix_len)),
-            Address::Ipv6(addr) => Cidr::Ipv6(Ipv6Cidr::new(addr, prefix_len)),
-        }
-    }
-
-    /// Return the IP address of this CIDR block.
-    pub const fn address(&self) -> Address {
-        match *self {
-            Cidr::Ipv4(cidr) => Address::Ipv4(cidr.address()),
-            Cidr::Ipv6(cidr) => Address::Ipv6(cidr.address()),
-        }
-    }
-}
-
-impl fmt::Display for Cidr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Cidr::Ipv4(cidr) => write!(f, "{cidr}"),
-            Cidr::Ipv6(cidr) => write!(f, "{cidr}"),
-        }
-    }
-}
-
 /// An internet endpoint address.
 ///
 /// `Endpoint` always fully specifies both the address and the port.
@@ -229,13 +122,13 @@ impl fmt::Display for Cidr {
 /// in order to listen on a given port on any address.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct Endpoint {
-    pub addr: Address,
-    pub port: u16,
+    pub(crate) addr: Address,
+    pub(crate) port: u16,
 }
 
 impl Endpoint {
     /// Create an endpoint address from given address and port.
-    pub const fn new(addr: Address, port: u16) -> Endpoint {
+    pub(crate) const fn new(addr: Address, port: u16) -> Endpoint {
         Endpoint { addr, port }
     }
 }
@@ -252,12 +145,6 @@ impl From<::core::net::SocketAddr> for Endpoint {
 impl From<Endpoint> for ::core::net::SocketAddr {
     fn from(x: Endpoint) -> ::core::net::SocketAddr {
         ::core::net::SocketAddr::new(x.addr.into(), x.port)
-    }
-}
-
-impl fmt::Display for Endpoint {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}:{}", self.addr, self.port)
     }
 }
 
@@ -278,8 +165,8 @@ impl<T: Into<Address>> From<(T, u16)> for Endpoint {
 /// An endpoint can be constructed from a port, in which case the address is unspecified.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct ListenEndpoint {
-    pub addr: Option<Address>,
-    pub port: u16,
+    pub(crate) addr: Option<Address>,
+    pub(crate) port: u16,
 }
 
 impl From<::core::net::SocketAddr> for ListenEndpoint {
@@ -287,16 +174,6 @@ impl From<::core::net::SocketAddr> for ListenEndpoint {
         ListenEndpoint {
             addr: Some(x.ip().into()),
             port: x.port(),
-        }
-    }
-}
-
-impl fmt::Display for ListenEndpoint {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Some(addr) = self.addr {
-            write!(f, "{}:{}", addr, self.port)
-        } else {
-            write!(f, "*:{}", self.port)
         }
     }
 }
@@ -330,7 +207,7 @@ impl<T: Into<Address>> From<(T, u16)> for ListenEndpoint {
 /// This enum abstracts the various versions of IP packets. It either contains an IPv4
 /// or IPv6 concrete high-level representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Repr {
+pub(crate) enum Repr {
     Ipv4(Ipv4Repr),
 
     Ipv6(Ipv6Repr),
@@ -354,7 +231,7 @@ impl Repr {
     /// # Panics
     ///
     /// Panics if `src_addr` and `dst_addr` are different IP version.
-    pub fn new(
+    pub(crate) fn new(
         src_addr: Address,
         dst_addr: Address,
         next_header: Protocol,
@@ -382,7 +259,7 @@ impl Repr {
     }
 
     /// Return the source address.
-    pub const fn src_addr(&self) -> Address {
+    pub(crate) const fn src_addr(&self) -> Address {
         match *self {
             Repr::Ipv4(repr) => Address::Ipv4(repr.src_addr),
             Repr::Ipv6(repr) => Address::Ipv6(repr.src_addr),
@@ -390,23 +267,15 @@ impl Repr {
     }
 
     /// Return the destination address.
-    pub const fn dst_addr(&self) -> Address {
+    pub(crate) const fn dst_addr(&self) -> Address {
         match *self {
             Repr::Ipv4(repr) => Address::Ipv4(repr.dst_addr),
             Repr::Ipv6(repr) => Address::Ipv6(repr.dst_addr),
         }
     }
 
-    /// Return the next header (protocol).
-    pub const fn next_header(&self) -> Protocol {
-        match *self {
-            Repr::Ipv4(repr) => repr.next_header,
-            Repr::Ipv6(repr) => repr.next_header,
-        }
-    }
-
     /// Return the payload length.
-    pub const fn payload_len(&self) -> usize {
+    pub(crate) const fn payload_len(&self) -> usize {
         match *self {
             Repr::Ipv4(repr) => repr.payload_len,
             Repr::Ipv6(repr) => repr.payload_len,
@@ -414,23 +283,15 @@ impl Repr {
     }
 
     /// Set the payload length.
-    pub fn set_payload_len(&mut self, length: usize) {
+    pub(crate) fn set_payload_len(&mut self, length: usize) {
         match self {
             Repr::Ipv4(Ipv4Repr { payload_len, .. }) => *payload_len = length,
             Repr::Ipv6(Ipv6Repr { payload_len, .. }) => *payload_len = length,
         }
     }
 
-    /// Return the TTL value.
-    pub const fn hop_limit(&self) -> u8 {
-        match *self {
-            Repr::Ipv4(Ipv4Repr { hop_limit, .. }) => hop_limit,
-            Repr::Ipv6(Ipv6Repr { hop_limit, .. }) => hop_limit,
-        }
-    }
-
     /// Return the length of a header that will be emitted from this high-level representation.
-    pub const fn header_len(&self) -> usize {
+    pub(crate) const fn header_len(&self) -> usize {
         match *self {
             Repr::Ipv4(repr) => repr.buffer_len(),
             Repr::Ipv6(repr) => repr.buffer_len(),
@@ -438,7 +299,7 @@ impl Repr {
     }
 
     /// Emit this high-level representation into a buffer.
-    pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, buffer: T) {
+    pub(crate) fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, buffer: T) {
         match *self {
             Repr::Ipv4(repr) => repr.emit(&mut Ipv4Packet::new_unchecked(buffer)),
             Repr::Ipv6(repr) => repr.emit(&mut Ipv6Packet::new_unchecked(buffer)),
@@ -449,7 +310,7 @@ impl Repr {
     /// high-level representation.
     ///
     /// This is the same as `repr.buffer_len() + repr.payload_len()`.
-    pub const fn buffer_len(&self) -> usize {
+    pub(crate) const fn buffer_len(&self) -> usize {
         self.header_len() + self.payload_len()
     }
 }
@@ -465,7 +326,7 @@ pub(crate) mod checksum {
     }
 
     /// Compute an RFC 1071 compliant checksum (without the final complement).
-    pub fn data(data: &[u8]) -> u16 {
+    pub(crate) fn data(data: &[u8]) -> u16 {
         // We calculate the sum in native-endian before converting to big-endian at the end
         // see RFC 1071 section 2.(B) for details
         let mut accum: u32 = 0;
@@ -496,7 +357,7 @@ pub(crate) mod checksum {
     }
 
     /// Combine several RFC 1071 compliant checksums.
-    pub fn combine(checksums: &[u16]) -> u16 {
+    pub(crate) fn combine(checksums: &[u16]) -> u16 {
         let mut accum: u32 = 0;
         for &word in checksums {
             accum += word as u32;
@@ -504,7 +365,7 @@ pub(crate) mod checksum {
         propagate_carries(accum)
     }
 
-    pub fn pseudo_header_v4(
+    pub(crate) fn pseudo_header_v4(
         src_addr: &Ipv4Address,
         dst_addr: &Ipv4Address,
         next_header: Protocol,
@@ -521,7 +382,7 @@ pub(crate) mod checksum {
         ])
     }
 
-    pub fn pseudo_header_v6(
+    pub(crate) fn pseudo_header_v6(
         src_addr: &Ipv6Address,
         dst_addr: &Ipv6Address,
         next_header: Protocol,
@@ -538,7 +399,7 @@ pub(crate) mod checksum {
         ])
     }
 
-    pub fn pseudo_header(
+    pub(crate) fn pseudo_header(
         src_addr: &Address,
         dst_addr: &Address,
         next_header: Protocol,
@@ -561,87 +422,9 @@ pub(crate) mod checksum {
 pub(crate) mod test {
 
     use super::*;
-    use crate::wire::IpAddress;
-
-    use crate::wire::Ipv4Address;
 
     #[test]
     fn test_empty_packet_version() {
         assert_eq!(Version::of_packet(&[]), Err(Error));
-    }
-
-    #[test]
-    fn to_prefix_len_ipv4() {
-        fn test_eq<A: Into<Address>>(prefix_len: u8, mask: A) {
-            assert_eq!(Some(prefix_len), mask.into().prefix_len());
-        }
-
-        test_eq(0, Ipv4Address::new(0, 0, 0, 0));
-        test_eq(1, Ipv4Address::new(128, 0, 0, 0));
-        test_eq(2, Ipv4Address::new(192, 0, 0, 0));
-        test_eq(3, Ipv4Address::new(224, 0, 0, 0));
-        test_eq(4, Ipv4Address::new(240, 0, 0, 0));
-        test_eq(5, Ipv4Address::new(248, 0, 0, 0));
-        test_eq(6, Ipv4Address::new(252, 0, 0, 0));
-        test_eq(7, Ipv4Address::new(254, 0, 0, 0));
-        test_eq(8, Ipv4Address::new(255, 0, 0, 0));
-        test_eq(9, Ipv4Address::new(255, 128, 0, 0));
-        test_eq(10, Ipv4Address::new(255, 192, 0, 0));
-        test_eq(11, Ipv4Address::new(255, 224, 0, 0));
-        test_eq(12, Ipv4Address::new(255, 240, 0, 0));
-        test_eq(13, Ipv4Address::new(255, 248, 0, 0));
-        test_eq(14, Ipv4Address::new(255, 252, 0, 0));
-        test_eq(15, Ipv4Address::new(255, 254, 0, 0));
-        test_eq(16, Ipv4Address::new(255, 255, 0, 0));
-        test_eq(17, Ipv4Address::new(255, 255, 128, 0));
-        test_eq(18, Ipv4Address::new(255, 255, 192, 0));
-        test_eq(19, Ipv4Address::new(255, 255, 224, 0));
-        test_eq(20, Ipv4Address::new(255, 255, 240, 0));
-        test_eq(21, Ipv4Address::new(255, 255, 248, 0));
-        test_eq(22, Ipv4Address::new(255, 255, 252, 0));
-        test_eq(23, Ipv4Address::new(255, 255, 254, 0));
-        test_eq(24, Ipv4Address::new(255, 255, 255, 0));
-        test_eq(25, Ipv4Address::new(255, 255, 255, 128));
-        test_eq(26, Ipv4Address::new(255, 255, 255, 192));
-        test_eq(27, Ipv4Address::new(255, 255, 255, 224));
-        test_eq(28, Ipv4Address::new(255, 255, 255, 240));
-        test_eq(29, Ipv4Address::new(255, 255, 255, 248));
-        test_eq(30, Ipv4Address::new(255, 255, 255, 252));
-        test_eq(31, Ipv4Address::new(255, 255, 255, 254));
-        test_eq(32, Ipv4Address::new(255, 255, 255, 255));
-    }
-
-    #[test]
-    fn to_prefix_len_ipv4_error() {
-        assert_eq!(
-            None,
-            IpAddress::from(Ipv4Address::new(255, 255, 255, 1)).prefix_len()
-        );
-    }
-
-    #[test]
-    fn to_prefix_len_ipv6() {
-        fn test_eq<A: Into<Address>>(prefix_len: u8, mask: A) {
-            assert_eq!(Some(prefix_len), mask.into().prefix_len());
-        }
-
-        test_eq(0, Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0));
-        test_eq(
-            128,
-            Ipv6Address::new(
-                0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-            ),
-        );
-    }
-
-    #[test]
-    fn to_prefix_len_ipv6_error() {
-        assert_eq!(
-            None,
-            IpAddress::from(Ipv6Address::new(
-                0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0, 1
-            ))
-            .prefix_len()
-        );
     }
 }

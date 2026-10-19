@@ -1,7 +1,7 @@
 macro_rules! enum_with_unknown {
     (
         $( #[$enum_attr:meta] )*
-        pub enum $name:ident($ty:ty) {
+        $vis:vis enum $name:ident($ty:ty) {
             $(
               $( #[$variant_attr:meta] )*
               $variant:ident = $value:expr
@@ -10,7 +10,7 @@ macro_rules! enum_with_unknown {
     ) => {
         #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
         $( #[$enum_attr] )*
-        pub enum $name {
+        $vis enum $name {
             $(
               $( #[$variant_attr] )*
               $variant

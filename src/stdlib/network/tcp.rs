@@ -58,7 +58,7 @@ use std::task::{Context, Poll, Waker};
 use smoltcp::iface::{Config, Interface as Iface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
 use smoltcp::socket::tcp::{self as stcp, State as TcpState};
-use smoltcp::wire::{IpCidr, Ipv4Packet, TcpPacket, TcpRepr};
+use smoltcp::wire::{Ipv4Packet, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::network::ip::{
@@ -282,10 +282,9 @@ pub fn prepare_endpoint(
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
     let mut dev = Dev::default();
-    let prefix = if addr.is_ipv4() { 32 } else { 128 };
     let config = Config {
         random_seed: fcx.random_u64(),
-        ip_addr: IpCidr::new(addr.into(), prefix),
+        ip_addr: addr.into(),
     };
     let iface = Iface::new(config, &mut dev, smol_now(fcx));
     let shared = Arc::new(Shared {

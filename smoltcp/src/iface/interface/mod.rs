@@ -29,20 +29,20 @@ pub struct InterfaceInner {
     mtu: usize,
     now: Instant,
     rand: Rand,
-    ip_addr: IpCidr,
+    ip_addr: IpAddress,
 }
 
 /// Configuration for a simulated host's TCP interface.
 pub struct Config {
     /// The host address.
-    pub ip_addr: IpCidr,
+    pub ip_addr: IpAddress,
     /// Seed for TCP initial sequence numbers.
     pub random_seed: u64,
 }
 
 impl Interface {
     pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
-        assert!(config.ip_addr.address().is_unicast() || config.ip_addr.address().is_unspecified());
+        assert!(config.ip_addr.is_unicast() || config.ip_addr.is_unspecified());
         let mut rand = Rand::new(config.random_seed);
         // Preserve the sequence of random values used by existing simulations.
         while rand.rand_u16() == 0 {}
@@ -137,13 +137,13 @@ impl InterfaceInner {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_ip_addr(&mut self, addr: IpCidr) {
+    pub(crate) fn set_ip_addr(&mut self, addr: IpAddress) {
         self.ip_addr = addr;
     }
 
     pub(crate) fn has_ip_addr(&self, addr: impl Into<IpAddress>) -> bool {
         let addr = addr.into();
-        self.ip_addr.address() == addr
+        self.ip_addr == addr
     }
 
     fn process_ip<'a>(

@@ -3,7 +3,7 @@ use crate::tests::setup;
 use super::*;
 
 #[test]
-pub fn tcp_not_accepted() {
+fn tcp_not_accepted() {
     let (mut iface, mut sockets, _) = setup();
     let tcp = TcpRepr {
         src_port: 4242,
@@ -89,7 +89,7 @@ pub fn tcp_not_accepted() {
 }
 
 #[test]
-pub fn tcp_listen_drops_unspecified_src() {
+fn tcp_listen_drops_unspecified_src() {
     use crate::socket::tcp;
 
     let (mut iface, mut sockets, _) = setup();
@@ -136,7 +136,10 @@ pub fn tcp_listen_drops_unspecified_src() {
     );
 
     assert_eq!(reply, None);
-    assert!(sockets.get_mut(handle).is_listening());
+    assert_eq!(
+        sockets.get(handle).state(),
+        crate::socket::tcp::State::Listen
+    );
 }
 
 fn syn_bytes(ip: IpRepr) -> std::vec::Vec<u8> {
@@ -195,7 +198,7 @@ fn ipv6_requires_tcp_next_header() {
         let (mut iface, mut sockets, mut device) = setup();
         iface
             .inner
-            .set_ip_addr(IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 128));
+            .set_ip_addr(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into());
         let mut bytes = syn_bytes(
             Ipv6Repr {
                 src_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
@@ -236,7 +239,7 @@ fn tcp_ingress_checks_addresses_and_checksums() {
             let (mut iface, mut sockets, mut device) = setup();
             let ip: IpRepr = if ipv6 {
                 let dst = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-                iface.inner.set_ip_addr(IpCidr::new(dst.into(), 128));
+                iface.inner.set_ip_addr(dst.into());
                 Ipv6Repr {
                     src_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
                     dst_addr: dst,

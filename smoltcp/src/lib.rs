@@ -6,8 +6,6 @@
 //! TCP sockets, an in-memory IP interface, and IPv4/IPv6 packet handling.
 //! Fictionet supplies the device, simulation clock, and seeded entropy.
 
-extern crate alloc;
-
 #[macro_use]
 mod macros;
 mod rand;
@@ -17,7 +15,7 @@ pub mod iface;
 pub mod phy;
 
 pub mod socket;
-pub mod storage;
+mod storage;
 pub mod time;
 pub mod wire;
 

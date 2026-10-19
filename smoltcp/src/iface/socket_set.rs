@@ -1,15 +1,8 @@
 use crate::socket::tcp::Socket;
-use core::fmt;
 
 /// A socket's slot in a set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub struct SocketHandle(usize);
-
-impl fmt::Display for SocketHandle {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "#{}", self.0)
-    }
-}
 
 /// TCP sockets in slot order. Removed slots are reused before the set grows.
 #[derive(Debug)]

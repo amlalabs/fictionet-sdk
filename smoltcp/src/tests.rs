@@ -14,25 +14,22 @@ pub(crate) fn setup<'a>() -> (Interface, SocketSet<'a>, TestingDevice) {
 fn setup_with_device(device: &mut impl Device) -> Interface {
     let config = Config {
         random_seed: 0,
-        ip_addr: IpCidr::new(IpAddress::v4(192, 168, 1, 1), 32),
+        ip_addr: Ipv4Address::new(192, 168, 1, 1).into(),
     };
     Interface::new(config, device, Instant::ZERO)
 }
 
 /// A testing device.
 #[derive(Debug)]
-pub struct TestingDevice {
+pub(crate) struct TestingDevice {
     pub(crate) tx_queue: VecDeque<Vec<u8>>,
     pub(crate) rx_queue: VecDeque<Vec<u8>>,
     max_transmission_unit: usize,
 }
 
 impl TestingDevice {
-    /// Creates a testing device.
-    ///
-    /// Every packet transmitted through this device will be received through it
-    /// in FIFO order.
-    pub fn new() -> Self {
+    /// Create a test device with empty receive and transmit queues.
+    pub(crate) fn new() -> Self {
         TestingDevice {
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
@@ -69,7 +66,7 @@ impl Device for TestingDevice {
 }
 
 #[doc(hidden)]
-pub struct RxToken {
+pub(crate) struct RxToken {
     buffer: Vec<u8>,
 }
 
@@ -84,7 +81,7 @@ impl phy::RxToken for RxToken {
 
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct TxToken<'a> {
+pub(crate) struct TxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
 }
 
