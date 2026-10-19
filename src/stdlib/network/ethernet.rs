@@ -251,14 +251,19 @@ impl Link {
                 payload: request,
             } => {
                 return self.v6.handle(p, |lease| {
-                    let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap());
                     let answer = addresses::dhcp6(
                         lease,
                         usize::from(self.mtu).saturating_sub(40 + 8),
                         request,
-                        destination.is_multicast(),
+                        frame::destination_v6(p).is_multicast(),
                     )?;
-                    let packet = addresses::dhcp6_packet(p, &answer);
+                    let packet = frame::udp6(
+                        frame::link_local(frame::GATEWAY_MAC),
+                        dhcpv6::SERVER_PORT,
+                        frame::source_v6(p),
+                        dhcpv6::CLIENT_PORT,
+                        &answer,
+                    );
                     Some(frame::frame(vm, frame::GATEWAY_MAC, frame::IPV6, &packet))
                 });
             }
@@ -319,30 +324,20 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use addresses::tests::{ia_with, request6};
+    use addresses::tests::{client, ia_with, lease4, lease6, request6};
     use dhcpv6::{DhcpOption, Duid, Message, msg, status};
     use fictionet::stdlib::codec::Wire;
     use frame::tests::{
-        VM, arp_request, behind_options, fragment6, fragments6, router_solicit, solicitation,
+        VM, arp_request, behind_options, fragment6, fragments4, fragments6, router_solicit,
+        solicitation,
     };
 
     fn served() -> Link {
         Link::new(
+            Family::Serve(lease4()),
             Family::Serve(Lease {
-                addr: Cidr {
-                    addr: Ipv4Addr::new(10, 0, 0, 2),
-                    prefix: 24,
-                },
-                gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
-                dns: Some(Ipv4Addr::new(10, 0, 0, 1)),
-            }),
-            Family::Serve(Lease {
-                addr: Cidr {
-                    addr: "fd00::2".parse().unwrap(),
-                    prefix: 64,
-                },
-                gateway: Some("fd00::1".parse().unwrap()),
                 dns: None,
+                ..lease6()
             }),
             1500,
         )
@@ -354,9 +349,8 @@ mod tests {
     }
 
     fn discover() -> Vec<u8> {
-        let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 7);
-        m.chaddr[..6].copy_from_slice(&VM);
-        m.push(dhcp::opt::MESSAGE_TYPE, [dhcp::DISCOVER]);
+        let mut m = client(dhcp::DISCOVER);
+        m.xid = 7;
         let p = frame::udp4(
             Ipv4Addr::UNSPECIFIED,
             68,
@@ -518,6 +512,36 @@ mod tests {
                 "{hop}: {body:?}"
             );
         }
+        for (src, target, hop, own) in [
+            (ll, ll, 255, None),
+            (Ipv6Addr::UNSPECIFIED, "fd00::2".parse().unwrap(), 255, None),
+            (ll, "fd00::1".parse().unwrap(), 64, None),
+            (ll, "ff02::1".parse().unwrap(), 255, None),
+            (
+                ll,
+                "fd00::1".parse().unwrap(),
+                255,
+                Some("fd00::1".parse().unwrap()),
+            ),
+        ] {
+            let v6 = own.map_or(Family::Off, |addr| {
+                Family::Serve(Lease {
+                    addr: Cidr { addr, prefix: 64 },
+                    ..lease6()
+                })
+            });
+            let mut link = Link::new(Family::Off, v6, 1500).unwrap();
+            let p = solicitation(src, target, hop);
+            assert_eq!(
+                link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
+                FromVm::Drop(Why::Handled)
+            );
+        }
+        let short = solicitation(ll, "fd00::1".parse().unwrap(), 255);
+        assert_eq!(
+            served().frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &short[..60])),
+            FromVm::Drop(Why::Malformed)
+        );
         for options in [&[1, 0][..], &[1, 2, 0][..], &[1][..]] {
             let p = solicitation(ll, "fd00::1".parse().unwrap(), 255);
             let body = [&p[40..64], options].concat();
@@ -540,17 +564,6 @@ mod tests {
                 FromVm::Answer(_)
             ));
         }
-    }
-
-    #[test]
-    fn a_neighbor_probe_for_its_source_gets_no_answer() {
-        let src = frame::link_local(VM);
-        let p = solicitation(src, src, 255);
-        let mut link = Link::new(Family::Off, Family::Off, 1500).unwrap();
-        assert_eq!(
-            link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &p)),
-            FromVm::Drop(Why::Handled)
-        );
     }
 
     #[test]
@@ -723,31 +736,26 @@ mod tests {
     #[test]
     fn frames_over_the_mtu_are_dropped_both_ways() {
         let mut link = served();
-        let big = frame::udp4(
-            Ipv4Addr::new(10, 0, 0, 2),
-            1,
-            Ipv4Addr::new(10, 0, 0, 1),
-            2,
-            &[0; 1472],
-        );
-        assert_eq!(big.len(), 1500);
-        assert!(matches!(
-            link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV4, &big)),
-            FromVm::World(_)
-        ));
-        let bigger = frame::udp4(
-            Ipv4Addr::new(10, 0, 0, 2),
-            1,
-            Ipv4Addr::new(10, 0, 0, 1),
-            2,
-            &[0; 1473],
-        );
-        assert_eq!(
-            link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV4, &bigger)),
-            FromVm::Drop(Why::TooBig)
-        );
-        assert!(link.to_vm(&big).is_some());
-        assert!(link.to_vm(&bigger).is_none());
+        for size in [1500, 1501] {
+            let packet = frame::udp4(
+                Ipv4Addr::new(10, 0, 0, 2),
+                1,
+                Ipv4Addr::new(10, 0, 0, 1),
+                2,
+                &vec![0; size - 28],
+            );
+            assert_eq!(packet.len(), size);
+            let expected = if size == 1500 {
+                FromVm::World(&packet)
+            } else {
+                FromVm::Drop(Why::TooBig)
+            };
+            assert_eq!(
+                link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV4, &packet)),
+                expected
+            );
+            assert_eq!(link.to_vm(&packet).is_some(), size == 1500);
+        }
         assert!(link.to_vm(&[0x10; 40]).is_none(), "not IP");
     }
 
@@ -774,27 +782,32 @@ mod tests {
     #[test]
     fn served_addresses_are_the_only_sources_passed() {
         let mut link = served();
-        let spoof = frame::ipv4(
-            Ipv4Addr::new(10, 0, 0, 77),
-            Ipv4Addr::new(10, 0, 0, 1),
-            1,
-            &[],
-        );
-        assert_eq!(
-            link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV4, &spoof)),
-            FromVm::Drop(Why::Spoofed)
-        );
-        let spoof6 = frame::udp6(
-            "fd00::77".parse().unwrap(),
-            1,
-            "fd00::1".parse().unwrap(),
-            2,
-            &[],
-        );
-        assert_eq!(
-            link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &spoof6)),
-            FromVm::Drop(Why::Spoofed)
-        );
+        for (packet, ethertype) in [
+            (
+                frame::ipv4(
+                    Ipv4Addr::new(10, 0, 0, 77),
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    1,
+                    &[],
+                ),
+                frame::IPV4,
+            ),
+            (
+                frame::udp6(
+                    "fd00::77".parse().unwrap(),
+                    1,
+                    "fd00::1".parse().unwrap(),
+                    2,
+                    &[],
+                ),
+                frame::IPV6,
+            ),
+        ] {
+            let f = eth(VM, frame::GATEWAY_MAC, ethertype, &packet);
+            assert_eq!(link.frame_from_vm(&f), FromVm::Drop(Why::Spoofed));
+            let mut world = Link::new(Family::FromWorld, Family::FromWorld, 1500).unwrap();
+            assert_eq!(world.frame_from_vm(&f), FromVm::World(&packet));
+        }
         // A multicast listener report: a hop-by-hop header with a router
         // alert, then ICMPv6 type 143.
         let mld = frame::ipv6(
@@ -819,13 +832,6 @@ mod tests {
             link.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV6, &ok6)),
             FromVm::World(_)
         ));
-        // With the address left to the world, any source goes to the world,
-        // which decides.
-        let mut world = Link::new(Family::FromWorld, Family::FromWorld, 1500).unwrap();
-        assert!(matches!(
-            world.frame_from_vm(&eth(VM, frame::GATEWAY_MAC, frame::IPV4, &spoof)),
-            FromVm::World(_)
-        ));
     }
 
     #[test]
@@ -838,10 +844,21 @@ mod tests {
         else {
             panic!("no advertisement")
         };
+        let target = "fd00::1".parse::<Ipv6Addr>().unwrap();
+        let f = Frame::parse(&na).unwrap();
         assert_eq!(
-            Frame::parse(&na).unwrap().payload[40],
-            frame::NEIGHBOR_ADVERTISEMENT
+            (f.dst, f.src, f.ethertype),
+            (VM, frame::GATEWAY_MAC, frame::IPV6)
         );
+        let p = f.payload;
+        assert!(frame::tests::v6_checksum_ok(p));
+        assert_eq!(p[7], 255, "hop limit");
+        assert_eq!(frame::source_v6(p), target);
+        assert_eq!(&p[24..40], &ll.octets());
+        assert_eq!(p[40], frame::NEIGHBOR_ADVERTISEMENT);
+        assert_eq!(p[44], 0xe0, "router, solicited, override");
+        assert_eq!(&p[48..64], &target.octets());
+        assert_eq!(&p[64..72], &[2, 1, 0x02, 0x66, 0x6e, 0, 0, 1]);
 
         let rs = router_solicit(ll);
         let rs_frame = eth(VM, [0x33, 0x33, 0, 0, 0, 2], frame::IPV6, &rs);
@@ -877,9 +894,9 @@ mod tests {
     }
 
     #[test]
-    fn dhcp6_is_answered_to_the_vm() {
+    fn dhcp6_solicit_answers_and_fragments() {
         let mut link = served();
-        let solicit = request6(msg::SOLICIT, vec![DhcpOption::IaNa(ia_with(1, &[]))])
+        let mut solicit = request6(msg::SOLICIT, vec![DhcpOption::IaNa(ia_with(1, &[]))])
             .to_bytes()
             .unwrap();
         let p = frame::udp6(
@@ -896,8 +913,48 @@ mod tests {
         };
         let f = Frame::parse(&adv).unwrap();
         assert_eq!(f.dst, VM);
+        assert!(frame::tests::v6_checksum_ok(f.payload));
+        assert_eq!(&f.payload[24..40], &frame::link_local(VM).octets());
         let (port, payload) = frame::udp_to(f.payload).unwrap();
         assert_eq!((port, payload[0]), (546, 2));
+        let Family::Serve(lease) = &link.v6 else {
+            unreachable!()
+        };
+        assert_eq!(
+            payload,
+            addresses::dhcp6(lease, 1452, &solicit, true).unwrap()
+        );
+        solicit.extend_from_slice(&[0; 80]);
+        let whole = frame::udp6(
+            frame::link_local(VM),
+            546,
+            "ff02::1:2".parse().unwrap(),
+            547,
+            &solicit,
+        );
+        let (first, _) = fragments6(&whole, 48);
+        let to = [0x33, 0x33, 0, 1, 0, 2];
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
+            FromVm::Drop(Why::Handled)
+        );
+        let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
+        assert_eq!(
+            off.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
+            FromVm::Drop(Why::Handled)
+        );
+        let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
+        assert!(matches!(
+            world.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
+            FromVm::World(_)
+        ));
+        // A UDP length that does not fit the packet is not clamped to it.
+        let mut lying = whole.clone();
+        lying[44..46].copy_from_slice(&200u16.to_be_bytes());
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, to, frame::IPV6, &lying)),
+            FromVm::Drop(Why::Malformed)
+        );
     }
 
     fn rebind(stale: usize, client_len: u16) -> Vec<u8> {
@@ -966,31 +1023,50 @@ mod tests {
     }
 
     #[test]
-    fn arp_for_the_gateway() {
-        let mut link = served();
-        let a = arp_request([10, 0, 0, 2], [10, 0, 0, 1]);
-        let FromVm::Answer(reply) = link.frame_from_vm(&eth(VM, frame::BROADCAST, frame::ARP, &a))
-        else {
-            panic!("no reply")
-        };
-        assert_eq!(
-            &Frame::parse(&reply).unwrap().payload[8..18],
-            &[0x02, 0x66, 0x6e, 0, 0, 1, 10, 0, 0, 1]
-        );
-    }
-
-    /// The first `cut` bytes of `packet`'s payload as an IPv4 first
-    /// fragment, and the rest as the second.
-    fn fragments4(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
-        let (src, dst) = (
-            frame::source_v4(packet),
-            Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
-        );
-        let mut first = frame::ipv4(src, dst, packet[9], &packet[20..20 + cut]);
-        first[6] = 0x20;
-        let mut second = frame::ipv4(src, dst, packet[9], &packet[20 + cut..]);
-        second[6..8].copy_from_slice(&((cut / 8) as u16).to_be_bytes());
-        (first, second)
+    fn arp_answers_every_address_but_probes_gratuitous_and_its_own() {
+        for (spa, tpa, own, answer) in [
+            ([10, 0, 0, 2], [10, 0, 0, 1], false, true),
+            ([10, 0, 0, 2], [10, 0, 0, 1], true, true),
+            ([10, 0, 0, 2], [10, 0, 0, 77], false, true),
+            ([0; 4], [10, 0, 0, 2], false, false),
+            ([10, 0, 0, 2], [10, 0, 0, 2], false, false),
+            ([10, 0, 0, 9], [10, 0, 0, 2], true, false),
+        ] {
+            let request = eth(VM, frame::BROADCAST, frame::ARP, &arp_request(spa, tpa));
+            let v4 = if own {
+                Family::Serve(lease4())
+            } else {
+                Family::Off
+            };
+            let result = Link::new(v4, Family::Off, 1500)
+                .unwrap()
+                .frame_from_vm(&request);
+            if answer {
+                let FromVm::Answer(reply) = result else {
+                    panic!("no ARP reply")
+                };
+                let f = Frame::parse(&reply).unwrap();
+                assert_eq!(
+                    (f.dst, f.src, f.ethertype),
+                    (VM, frame::GATEWAY_MAC, frame::ARP)
+                );
+                assert_eq!(&f.payload[6..8], &[0, 2]);
+                assert_eq!(&f.payload[8..14], &frame::GATEWAY_MAC);
+                assert_eq!(&f.payload[14..18], &tpa);
+                assert_eq!(&f.payload[18..24], &VM);
+                assert_eq!(&f.payload[24..28], &spa);
+            } else {
+                assert_eq!(result, FromVm::Drop(Why::Handled));
+            }
+        }
+        for (offset, value, len) in [(7, 2, 28), (1, 6, 28), (7, 1, 27)] {
+            let mut arp = arp_request([10, 0, 0, 2], [10, 0, 0, 1]);
+            arp[offset] = value;
+            // Keep the short request short instead of padding its Ethernet frame.
+            let mut request = frame::header(frame::BROADCAST, VM, frame::ARP).to_vec();
+            request.extend_from_slice(&arp[..len]);
+            assert_eq!(served().frame_from_vm(&request), FromVm::Drop(Why::Handled));
+        }
     }
 
     #[test]
@@ -1067,9 +1143,8 @@ mod tests {
     #[test]
     fn fragmented_dhcp_is_never_answered_and_passes_only_when_left_to_the_world() {
         // A DISCOVER from a static address, split in two.
-        let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 7);
-        m.chaddr[..6].copy_from_slice(&VM);
-        m.push(dhcp::opt::MESSAGE_TYPE, [dhcp::DISCOVER]);
+        let mut m = client(dhcp::DISCOVER);
+        m.xid = 7;
         let whole = frame::udp4(
             Ipv4Addr::new(10, 0, 0, 2),
             68,
@@ -1079,33 +1154,22 @@ mod tests {
         );
         let (first, second) = fragments4(&whole, 64);
         let frame = |p: &[u8]| eth(VM, frame::BROADCAST, frame::IPV4, p);
+        for v4 in [served().v4, Family::Off, Family::FromWorld] {
+            let expected = if v4 == Family::FromWorld {
+                FromVm::World(&first)
+            } else {
+                FromVm::Drop(Why::Handled)
+            };
+            let mut link = Link::new(v4, Family::Off, 1500).unwrap();
+            assert_eq!(link.frame_from_vm(&frame(&first)), expected);
+        }
         let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
         assert_eq!(
             off.frame_from_vm(&frame(&whole)),
             FromVm::Drop(Why::Handled)
         );
-        assert_eq!(
-            off.frame_from_vm(&frame(&first)),
-            FromVm::Drop(Why::Handled),
-            "--no-ip-addr"
-        );
-        // The second fragment alone carries no UDP header, and the world
-        // cannot put the request together without the first.
-        assert!(matches!(
-            off.frame_from_vm(&frame(&second)),
-            FromVm::World(_)
-        ));
-        let mut link = served();
-        assert_eq!(
-            link.frame_from_vm(&frame(&first)),
-            FromVm::Drop(Why::Handled),
-            "the link answers no fragment"
-        );
-        let mut world = Link::new(Family::FromWorld, Family::Off, 1500).unwrap();
-        assert!(
-            matches!(world.frame_from_vm(&frame(&first)), FromVm::World(_)),
-            "left to the world"
-        );
+        // Later fragments have no UDP header.
+        assert_eq!(off.frame_from_vm(&frame(&second)), FromVm::World(&second));
         // A first fragment cut inside the UDP header cannot be read.
         let (stub, _) = fragments4(&whole, 0);
         assert_eq!(
@@ -1115,79 +1179,55 @@ mod tests {
     }
 
     #[test]
-    fn a_first_fragment_of_a_dhcp6_solicit_gets_no_answer() {
-        let mut solicit = request6(msg::SOLICIT, vec![DhcpOption::IaNa(ia_with(1, &[]))])
-            .to_bytes()
-            .unwrap();
-        solicit.extend_from_slice(&[0; 80]);
-        let whole = frame::udp6(
-            frame::link_local(VM),
-            546,
-            "ff02::1:2".parse().unwrap(),
-            547,
-            &solicit,
-        );
-        let (first, _) = fragments6(&whole, 48);
-        let to = [0x33, 0x33, 0, 1, 0, 2];
+    fn world_packets_get_the_vm_or_group_mac() {
         let mut link = served();
-        assert_eq!(
-            link.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
-            FromVm::Drop(Why::Handled)
-        );
-        let mut off = Link::new(Family::Off, Family::Off, 1500).unwrap();
-        assert_eq!(
-            off.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
-            FromVm::Drop(Why::Handled)
-        );
-        let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
-        assert!(matches!(
-            world.frame_from_vm(&eth(VM, to, frame::IPV6, &first)),
-            FromVm::World(_)
-        ));
-        // A UDP length that does not fit the packet is not clamped to it.
-        let mut lying = whole.clone();
-        lying[44..46].copy_from_slice(&200u16.to_be_bytes());
-        assert_eq!(
-            link.frame_from_vm(&eth(VM, to, frame::IPV6, &lying)),
-            FromVm::Drop(Why::Malformed)
-        );
-    }
-
-    #[test]
-    fn world_unicast_waits_for_the_vm_mac() {
-        let mut link = served();
-        let unicast = frame::ipv6(
-            "fd00::1".parse().unwrap(),
-            "fd00::2".parse().unwrap(),
-            6,
-            64,
-            &[],
-        );
-        assert!(link.to_vm(&unicast).is_none());
-        for (dst, mac) in [
-            (Ipv4Addr::BROADCAST, frame::BROADCAST),
-            (Ipv4Addr::new(239, 129, 2, 3), [1, 0, 0x5e, 1, 2, 3]),
-        ] {
-            let p = frame::ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, 17, &[]);
-            assert_eq!(link.to_vm(&p).unwrap()[..6], mac);
-        }
+        let packets = [
+            ("10.0.0.2", VM, frame::IPV4),
+            ("255.255.255.255", frame::BROADCAST, frame::IPV4),
+            ("239.129.2.3", [1, 0, 0x5e, 1, 2, 3], frame::IPV4),
+            ("fd00::2", VM, frame::IPV6),
+            (
+                "ff02::1:ff12:3456",
+                [0x33, 0x33, 0xff, 0x12, 0x34, 0x56],
+                frame::IPV6,
+            ),
+        ]
+        .map(|(dst, mac, ethertype)| {
+            let packet = match ethertype {
+                frame::IPV4 => {
+                    frame::ipv4(Ipv4Addr::new(10, 0, 0, 1), dst.parse().unwrap(), 1, &[])
+                }
+                _ => frame::ipv6(
+                    frame::link_local(frame::GATEWAY_MAC),
+                    dst.parse().unwrap(),
+                    6,
+                    64,
+                    &[],
+                ),
+            };
+            (packet, mac, ethertype)
+        });
         let ra = link.router_advert().unwrap();
         assert_eq!(ra[..6], [0x33, 0x33, 0, 0, 0, 1]);
-        let to_vm = frame::ipv4(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(10, 0, 0, 2),
-            1,
-            &[],
-        );
-        assert!(link.to_vm(&to_vm).is_none(), "before the VM's MAC is known");
-        let FromVm::Answer(answer) = link.frame_from_vm(&discover()) else {
-            panic!("DHCP answer")
-        };
-        assert_eq!(answer[..6], frame::BROADCAST);
-        let mut renew = dhcp::Message::new(dhcp::BOOTREQUEST, 8);
-        renew.chaddr[..6].copy_from_slice(&VM);
+        for v4 in [Family::Serve(lease4()), Family::FromWorld] {
+            link.v4 = v4;
+            link.vm = None;
+            for learned in [false, true] {
+                for (packet, mac, ethertype) in &packets {
+                    let expected = (learned || *mac != VM)
+                        .then(|| frame::header(*mac, frame::GATEWAY_MAC, *ethertype));
+                    assert_eq!(link.to_vm(packet), expected);
+                }
+                for bad in [&[0x50; 40][..], &[0x45; 19], &[]] {
+                    assert!(link.to_vm(bad).is_none());
+                }
+                link.frame_from_vm(&discover());
+            }
+        }
+        link.v4 = Family::Serve(lease4());
+        let mut renew = client(dhcp::REQUEST);
+        renew.xid = 8;
         renew.ciaddr = Ipv4Addr::new(10, 0, 0, 2);
-        renew.push(dhcp::opt::MESSAGE_TYPE, [dhcp::REQUEST]);
         let p = frame::udp4(
             renew.ciaddr,
             68,
@@ -1201,10 +1241,5 @@ mod tests {
             panic!("DHCP renewal answer");
         };
         assert_eq!(answer[..6], VM);
-        assert_eq!(link.to_vm(&unicast).unwrap()[..6], VM);
-        assert_eq!(
-            link.to_vm(&to_vm).unwrap(),
-            frame::header(VM, frame::GATEWAY_MAC, frame::IPV4)
-        );
     }
 }

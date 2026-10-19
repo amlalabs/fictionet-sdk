@@ -179,27 +179,19 @@ mod tests {
         let big = vec![7u8; 9014];
         let s = stream(&[b"first", &big, b"", b"last"]);
         let mut d = Decoder::new();
-        let mut got: Vec<Vec<u8>> = Vec::new();
-        // One byte at a time, then in odd pieces.
-        for b in &s {
-            feed(&mut d, std::slice::from_ref(b));
-            while let Some(f) = d.next_frame().unwrap() {
-                got.push(f.to_vec());
+        for size in [1, 1000] {
+            let mut got = Vec::new();
+            for piece in s.chunks(size) {
+                feed(&mut d, piece);
+                while let Some(f) = d.next_frame().unwrap() {
+                    got.push(f.to_vec());
+                }
             }
+            assert_eq!(
+                got,
+                vec![b"first".to_vec(), big.clone(), vec![], b"last".to_vec()]
+            );
         }
-        assert_eq!(
-            got,
-            vec![b"first".to_vec(), big.clone(), vec![], b"last".to_vec()]
-        );
-        got.clear();
-        for piece in s.chunks(1000) {
-            feed(&mut d, piece);
-            while let Some(f) = d.next_frame().unwrap() {
-                got.push(f.to_vec());
-            }
-        }
-        assert_eq!(got.len(), 4);
-        assert_eq!(got[1], big);
     }
 
     #[test]

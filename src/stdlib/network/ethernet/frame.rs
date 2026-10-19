@@ -32,7 +32,7 @@ pub const IPV6: u16 = 0x86dd;
 /// The length of an Ethernet header.
 pub const HEADER: usize = 14;
 
-pub(super) const UDP: u8 = 17;
+const UDP: u8 = 17;
 pub(super) const ICMPV6: u8 = 58;
 
 /// An Ethernet frame, read.
@@ -418,7 +418,7 @@ pub(super) fn neighbor_advert(
         return None;
     }
     let src = source_v6(packet);
-    let target = Ipv6Addr::from(<[u8; 16]>::try_from(&msg[8..24]).unwrap());
+    let target = address_v6(&msg[8..24]);
     if src.is_unspecified() || src == target || target.is_multicast() || Some(target) == own {
         return None;
     }
@@ -444,38 +444,39 @@ pub(super) fn udp_to(packet: &[u8]) -> Option<(u16, &[u8])> {
     }
 }
 
-/// The source address of an IPv4 or IPv6 packet. The packet must be at
+/// The source address of an IPv4 packet. The packet must be at
 /// least a header long, as [`ip_packet`] checks.
 pub(super) fn source_v4(packet: &[u8]) -> Ipv4Addr {
     Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15])
 }
 
+/// The source address of an IPv6 packet. The packet must be at least a
+/// header long, as [`ip_packet`] checks.
 pub(super) fn source_v6(packet: &[u8]) -> Ipv6Addr {
-    Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap())
+    address_v6(&packet[8..24])
+}
+
+/// The destination address of an IPv6 packet, which must be at least a
+/// header long.
+pub(super) fn destination_v6(packet: &[u8]) -> Ipv6Addr {
+    address_v6(&packet[24..40])
+}
+
+/// An IPv6 address from a sixteen-byte field.
+fn address_v6(bytes: &[u8]) -> Ipv6Addr {
+    Ipv6Addr::from(<[u8; 16]>::try_from(bytes).unwrap())
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub(super) mod tests {
     use super::super::addresses::{router_advert, tests::lease6};
     use super::*;
-
-    fn answer_solicitation(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
-        let Ok(Upper::Icmp6 {
-            kind: NEIGHBOR_SOLICITATION,
-            msg,
-            fragment: false,
-        }) = upper(packet)
-        else {
-            return None;
-        };
-        super::neighbor_advert(packet, msg, vm, own)
-    }
 
     pub(crate) const VM: Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
     pub(crate) fn v6_checksum_ok(packet: &[u8]) -> bool {
         let src = source_v6(packet);
-        let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap());
+        let dst = destination_v6(packet);
         ip::transport_checksum(src.into(), dst.into(), packet[6], &packet[40..]) == 0
     }
 
@@ -552,91 +553,26 @@ pub(crate) mod tests {
         assert_eq!(udp_to(&p), Some((546, &b"odd"[..])));
     }
 
-    #[test]
-    fn destinations() {
-        let to = |dst: Ipv4Addr| {
-            destination(
-                &ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, UDP, &[]),
-                Some(VM),
-                None,
-            )
-        };
-        assert_eq!(to(Ipv4Addr::new(10, 0, 0, 2)), Some((VM, IPV4)));
-        assert_eq!(to(Ipv4Addr::BROADCAST), Some((BROADCAST, IPV4)));
-        assert_eq!(
-            to(Ipv4Addr::new(239, 129, 2, 3)),
-            Some(([1, 0, 0x5e, 1, 2, 3], IPV4))
-        );
-        let p = ipv4(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(10, 0, 0, 2),
-            UDP,
-            &[],
-        );
-        assert_eq!(
-            destination(&p, None, None),
-            None,
-            "the VM's MAC is not known yet"
-        );
-        let p = ipv6(
-            link_local(GATEWAY_MAC),
-            "ff02::1:ff12:3456".parse().unwrap(),
-            UDP,
-            1,
-            &[],
-        );
-        assert_eq!(
-            destination(&p, Some(VM), None),
-            Some(([0x33, 0x33, 0xff, 0x12, 0x34, 0x56], IPV6))
-        );
-        let p = ipv6(
-            link_local(GATEWAY_MAC),
-            "fd00::2".parse().unwrap(),
-            UDP,
-            1,
-            &[],
-        );
-        assert_eq!(destination(&p, Some(VM), None), Some((VM, IPV6)));
-        assert_eq!(destination(&p, None, None), None);
-        assert_eq!(destination(&[0x50; 40], Some(VM), None), None);
-        assert_eq!(destination(&[0x45; 19], Some(VM), None), None);
-        assert_eq!(destination(&[], Some(VM), None), None);
-    }
-
-    #[test]
-    fn arp_answers_every_address_but_probes_gratuitous_and_its_own() {
-        let reply = arp_reply(&arp_request([10, 0, 0, 2], [10, 0, 0, 1]), VM, None).unwrap();
-        let f = Frame::parse(&reply).unwrap();
-        assert_eq!((f.dst, f.src, f.ethertype), (VM, GATEWAY_MAC, ARP));
-        let a = f.payload;
-        assert_eq!(&a[6..8], &[0, 2], "a reply");
-        assert_eq!(&a[8..14], &GATEWAY_MAC, "the gateway's MAC");
-        assert_eq!(&a[14..18], &[10, 0, 0, 1], "for the asked address");
-        assert_eq!(&a[18..24], &VM);
-        assert_eq!(&a[24..28], &[10, 0, 0, 2]);
-        // Any address: the world decides what is there.
-        assert!(arp_reply(&arp_request([10, 0, 0, 2], [10, 0, 0, 77]), VM, None).is_some());
-        // A probe, a gratuitous ARP, and a question about the VM's own address.
-        assert!(arp_reply(&arp_request([0; 4], [10, 0, 0, 2]), VM, None).is_none());
-        assert!(arp_reply(&arp_request([10, 0, 0, 2], [10, 0, 0, 2]), VM, None).is_none());
-        let own = Some(Ipv4Addr::new(10, 0, 0, 2));
-        assert!(arp_reply(&arp_request([10, 0, 0, 9], [10, 0, 0, 2]), VM, own).is_none());
-        // A reply, a short request, another hardware type.
-        let mut r = arp_request([10, 0, 0, 2], [10, 0, 0, 1]);
-        r[7] = 2;
-        assert!(arp_reply(&r, VM, None).is_none());
-        assert!(arp_reply(&arp_request([10, 0, 0, 2], [10, 0, 0, 1])[..27], VM, None).is_none());
-        let mut r = arp_request([10, 0, 0, 2], [10, 0, 0, 1]);
-        r[1] = 6;
-        assert!(arp_reply(&r, VM, None).is_none());
-    }
-
     pub(crate) fn router_solicit(src: Ipv6Addr) -> Vec<u8> {
         icmp6(
             src,
             "ff02::2".parse().unwrap(),
             vec![ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
         )
+    }
+
+    /// The first `cut` bytes of `packet`'s payload as an IPv4 first
+    /// fragment, and the rest as the second.
+    pub(crate) fn fragments4(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
+        let (src, dst) = (
+            source_v4(packet),
+            Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+        );
+        let mut first = ipv4(src, dst, packet[9], &packet[20..20 + cut]);
+        first[6] = 0x20;
+        let mut second = ipv4(src, dst, packet[9], &packet[20 + cut..]);
+        second[6..8].copy_from_slice(&((cut / 8) as u16).to_be_bytes());
+        (first, second)
     }
 
     pub(crate) fn fragment6(packet: &[u8], offset: u16, more: bool, body: &[u8]) -> Vec<u8> {
@@ -646,7 +582,7 @@ pub(crate) mod tests {
         fragment.extend_from_slice(body);
         ipv6(
             source_v6(packet),
-            Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+            destination_v6(packet),
             44,
             packet[7],
             &fragment,
@@ -668,48 +604,6 @@ pub(crate) mod tests {
         let mut p = icmp6(src, "ff02::1:ff00:1".parse().unwrap(), body);
         p[7] = hop;
         p
-    }
-
-    #[test]
-    fn neighbor_solicitations_are_answered_except_dad() {
-        let vm_ll = link_local(VM);
-        let target: Ipv6Addr = "fd00::1".parse().unwrap();
-        let reply = answer_solicitation(&solicitation(vm_ll, target, 255), VM, None).unwrap();
-        let f = Frame::parse(&reply).unwrap();
-        assert_eq!((f.dst, f.src, f.ethertype), (VM, GATEWAY_MAC, IPV6));
-        let p = f.payload;
-        assert!(v6_checksum_ok(p));
-        assert_eq!(p[7], 255, "hop limit");
-        assert_eq!(source_v6(p), target);
-        assert_eq!(&p[24..40], &vm_ll.octets());
-        assert_eq!(p[40], NEIGHBOR_ADVERTISEMENT);
-        assert_eq!(p[44], 0xe0, "router, solicited, override");
-        assert_eq!(&p[48..64], &target.octets());
-        assert_eq!(&p[64..72], &[2, 1, 0x02, 0x66, 0x6e, 0, 0, 1]);
-
-        let dad = solicitation(Ipv6Addr::UNSPECIFIED, "fd00::2".parse().unwrap(), 255);
-        assert!(
-            answer_solicitation(&dad, VM, None).is_none(),
-            "duplicate address detection"
-        );
-        assert!(
-            answer_solicitation(&solicitation(vm_ll, target, 64), VM, None).is_none(),
-            "hop limit not 255"
-        );
-        assert!(
-            answer_solicitation(
-                &solicitation(vm_ll, "ff02::1".parse().unwrap(), 255),
-                VM,
-                None
-            )
-            .is_none()
-        );
-        assert!(
-            answer_solicitation(&solicitation(vm_ll, target, 255), VM, Some(target)).is_none(),
-            "its own address"
-        );
-        let short = solicitation(vm_ll, target, 255);
-        assert!(answer_solicitation(&short[..60], VM, None).is_none());
     }
 
     /// `n` destination options headers before `inner`, with hop limit 255.

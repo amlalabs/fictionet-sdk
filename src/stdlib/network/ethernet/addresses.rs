@@ -365,19 +365,6 @@ fn confirm(lease: &Lease<Ipv6Addr>, request: &Message) -> Option<u16> {
     })
 }
 
-/// The DHCPv6 answer as a packet: from the link's link-local address to the
-/// VM's, which sent `request_packet`.
-pub(super) fn dhcp6_packet(request_packet: &[u8], answer: &[u8]) -> Vec<u8> {
-    let to = frame::source_v6(request_packet);
-    frame::udp6(
-        frame::link_local(frame::GATEWAY_MAC),
-        dhcpv6::SERVER_PORT,
-        to,
-        dhcpv6::CLIENT_PORT,
-        answer,
-    )
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::frame::tests::{VM, v6_checksum_ok};
@@ -387,7 +374,7 @@ pub(super) mod tests {
         super::dhcp6(lease, budget, request, true)
     }
 
-    fn lease4() -> Lease<Ipv4Addr> {
+    pub(crate) fn lease4() -> Lease<Ipv4Addr> {
         Lease {
             addr: Cidr {
                 addr: Ipv4Addr::new(10, 0, 0, 2),
@@ -398,22 +385,11 @@ pub(super) mod tests {
         }
     }
 
-    fn client(kind: u8) -> dhcp::Message {
+    pub(crate) fn client(kind: u8) -> dhcp::Message {
         let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 0x1234_5678);
         m.chaddr[..6].copy_from_slice(&VM);
         m.push(opt::MESSAGE_TYPE, [kind]);
         m
-    }
-
-    /// The DHCP message in an answer packet, and the packet's destination.
-    fn answer(packet: &[u8]) -> (dhcp::Message, Ipv4Addr) {
-        let (port, payload) = frame::udp_to(packet).unwrap();
-        assert_eq!(port, dhcp::CLIENT_PORT);
-        assert_eq!(&packet[12..16], &[10, 0, 0, 1], "from the server ID");
-        (
-            dhcp::Message::parse(payload).unwrap(),
-            Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
-        )
     }
 
     #[test]
@@ -512,105 +488,72 @@ pub(super) mod tests {
             (dhcp::REQUEST, [10, 0, 0, 2], None, 5, [10, 0, 0, 2]),
             (dhcp::INFORM, [10, 0, 0, 2], None, 5, [0; 4]),
             (dhcp::REQUEST, [10, 0, 0, 2], Some([10, 0, 0, 9]), 6, [0; 4]),
+            (dhcp::REQUEST, [0; 4], Some([10, 0, 0, 9]), 6, [0; 4]),
         ] {
-            let mut request = client(kind);
-            request.flags = 0x8000;
-            request.ciaddr = ciaddr.into();
-            request.giaddr = Ipv4Addr::new(10, 0, 0, 254);
-            if let Some(wanted) = wanted {
-                request.push(opt::REQUESTED_IP, wanted);
-            }
-            let (packet, broadcast) = dhcp4(&lease4(), 1500, &request.to_bytes().unwrap()).unwrap();
-            let expected_broadcast = ciaddr == [0; 4] || reply_kind == 6;
-            assert_eq!(broadcast, expected_broadcast);
-            assert_eq!(
-                &packet[16..20],
-                if expected_broadcast {
-                    &[255; 4]
-                } else {
-                    &ciaddr
+            for (flags, relay, mtu) in [
+                (0, [0; 4], 1500u16),
+                (0x8000, [10, 0, 0, 254], 1500),
+                (0, [0; 4], 9000),
+            ] {
+                for server in [None, Some([10, 0, 0, 1])] {
+                    let mut request = client(kind);
+                    request.flags = flags;
+                    request.ciaddr = ciaddr.into();
+                    request.giaddr = relay.into();
+                    if let Some(server) = server {
+                        request.push(opt::SERVER_ID, server);
+                    }
+                    if let Some(wanted) = wanted {
+                        request.push(opt::REQUESTED_IP, wanted);
+                    }
+                    let (packet, broadcast) =
+                        dhcp4(&lease4(), mtu, &request.to_bytes().unwrap()).unwrap();
+                    let expected_broadcast = ciaddr == [0; 4] || reply_kind == 6;
+                    assert_eq!(broadcast, expected_broadcast);
+                    assert_eq!(
+                        &packet[16..20],
+                        if expected_broadcast {
+                            &[255; 4]
+                        } else {
+                            &ciaddr
+                        }
+                    );
+                    let mut expected = vec![0; 240];
+                    expected[..12]
+                        .copy_from_slice(&[2, 1, 6, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]);
+                    expected[10..12].copy_from_slice(&flags.to_be_bytes());
+                    if kind == dhcp::INFORM {
+                        expected[12..16].copy_from_slice(&ciaddr);
+                    }
+                    expected[16..20].copy_from_slice(&assigned);
+                    expected[24..28].copy_from_slice(&relay);
+                    expected[28..34].copy_from_slice(&VM);
+                    expected[236..240].copy_from_slice(&[99, 130, 83, 99]);
+                    expected.extend_from_slice(&[53, 1, reply_kind, 54, 4, 10, 0, 0, 1]);
+                    if reply_kind != 6 {
+                        if kind != dhcp::INFORM {
+                            expected.extend_from_slice(&[
+                                51, 4, 0, 1, 81, 128, 58, 4, 0, 0, 168, 192, 59, 4, 0, 1, 39, 80,
+                            ]);
+                        }
+                        expected.extend_from_slice(&[
+                            1, 4, 255, 255, 255, 0, 3, 4, 10, 0, 0, 1, 6, 4, 10, 0, 0, 1, 26, 2,
+                        ]);
+                        expected.extend_from_slice(&mtu.to_be_bytes());
+                    }
+                    expected.push(255);
+                    expected.resize(300, 0);
+                    let (port, payload) = frame::udp_to(&packet).unwrap();
+                    assert_eq!(port, dhcp::CLIENT_PORT);
+                    assert_eq!(&packet[12..16], &[10, 0, 0, 1]);
+                    assert_eq!(payload, expected, "{kind}");
                 }
-            );
-            let mut expected = vec![0; 240];
-            expected[..12].copy_from_slice(&[2, 1, 6, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 0x80, 0]);
-            if kind == dhcp::INFORM {
-                expected[12..16].copy_from_slice(&ciaddr);
             }
-            expected[16..20].copy_from_slice(&assigned);
-            expected[24..28].copy_from_slice(&[10, 0, 0, 254]);
-            expected[28..34].copy_from_slice(&VM);
-            expected[236..240].copy_from_slice(&[99, 130, 83, 99]);
-            expected.extend_from_slice(&[53, 1, reply_kind, 54, 4, 10, 0, 0, 1]);
-            if reply_kind != 6 {
-                if kind != dhcp::INFORM {
-                    expected.extend_from_slice(&[
-                        51, 4, 0, 1, 81, 128, 58, 4, 0, 0, 168, 192, 59, 4, 0, 1, 39, 80,
-                    ]);
-                }
-                expected.extend_from_slice(&[
-                    1, 4, 255, 255, 255, 0, 3, 4, 10, 0, 0, 1, 6, 4, 10, 0, 0, 1, 26, 2, 5, 220,
-                ]);
-            }
-            expected.push(255);
-            expected.resize(300, 0);
-            assert_eq!(frame::udp_to(&packet).unwrap().1, expected, "{kind}");
         }
     }
 
     #[test]
-    fn discover_request_ack() {
-        let (offer, broadcast) =
-            dhcp4(&lease4(), 1500, &client(dhcp::DISCOVER).to_bytes().unwrap()).unwrap();
-        assert!(broadcast);
-        let (m, to) = answer(&offer);
-        assert_eq!(to, Ipv4Addr::BROADCAST);
-        assert_eq!(m.op, dhcp::BOOTREPLY);
-        assert_eq!(m.xid, 0x1234_5678);
-        assert_eq!(&m.chaddr[..6], &VM);
-        assert_eq!(m.message_type(), Some(dhcp::OFFER));
-        assert_eq!(m.yiaddr, Ipv4Addr::new(10, 0, 0, 2));
-        assert_eq!(
-            m.option_addr(opt::SUBNET_MASK),
-            Some(Ipv4Addr::new(255, 255, 255, 0))
-        );
-        assert_eq!(m.option_addr(opt::ROUTER), Some(Ipv4Addr::new(10, 0, 0, 1)));
-        assert_eq!(m.option_addr(opt::DNS), Some(Ipv4Addr::new(10, 0, 0, 1)));
-        assert_eq!(
-            m.option_addr(opt::SERVER_ID),
-            Some(Ipv4Addr::new(10, 0, 0, 1))
-        );
-        assert_eq!(m.option_u32(opt::LEASE_TIME), Some(86_400));
-        assert_eq!(m.option(opt::INTERFACE_MTU), Some(&[5, 220][..]));
-
-        let mut req = client(dhcp::REQUEST);
-        req.push(opt::REQUESTED_IP, [10, 0, 0, 2]);
-        req.push(opt::SERVER_ID, [10, 0, 0, 1]);
-        let (ack, _) = dhcp4(&lease4(), 1500, &req.to_bytes().unwrap()).unwrap();
-        assert_eq!(answer(&ack).0.message_type(), Some(dhcp::ACK));
-
-        // A renewal comes from the address, and the answer goes back to it.
-        let mut renew = client(dhcp::REQUEST);
-        renew.ciaddr = Ipv4Addr::new(10, 0, 0, 2);
-        let (ack, broadcast) = dhcp4(&lease4(), 1500, &renew.to_bytes().unwrap()).unwrap();
-        assert!(!broadcast);
-        let (m, to) = answer(&ack);
-        assert_eq!(
-            (m.message_type(), to),
-            (Some(dhcp::ACK), Ipv4Addr::new(10, 0, 0, 2))
-        );
-    }
-
-    #[test]
-    fn wrong_address_is_nakked_and_other_servers_are_left_alone() {
-        let mut req = client(dhcp::REQUEST);
-        req.push(opt::REQUESTED_IP, [10, 0, 0, 9]);
-        let (nak, broadcast) = dhcp4(&lease4(), 1500, &req.to_bytes().unwrap()).unwrap();
-        assert!(broadcast);
-        let (m, _) = answer(&nak);
-        assert_eq!(m.message_type(), Some(dhcp::NAK));
-        assert_eq!(m.yiaddr, Ipv4Addr::UNSPECIFIED);
-        assert_eq!(m.option(opt::ROUTER), None);
-
+    fn dhcp4_leaves_other_servers_and_bad_messages_alone() {
         let mut other = client(dhcp::REQUEST);
         other.push(opt::REQUESTED_IP, [10, 0, 0, 2]);
         other.push(opt::SERVER_ID, [10, 0, 0, 254]);
@@ -636,19 +579,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn inform_and_turned_off_settings() {
-        let mut inform = client(dhcp::INFORM);
-        inform.ciaddr = Ipv4Addr::new(10, 0, 0, 2);
-        let (ack, _) = dhcp4(&lease4(), 9000, &inform.to_bytes().unwrap()).unwrap();
-        let (m, _) = answer(&ack);
-        assert_eq!(m.message_type(), Some(dhcp::ACK));
-        assert_eq!(m.yiaddr, Ipv4Addr::UNSPECIFIED);
-        assert_eq!(m.option(opt::LEASE_TIME), None);
-        assert_eq!(
-            m.option(opt::INTERFACE_MTU),
-            Some(&9000u16.to_be_bytes()[..])
-        );
-
+    fn dhcp4_without_gateway_or_dns() {
         let bare = Lease {
             gateway: None,
             dns: None,
@@ -1142,18 +1073,5 @@ pub(super) mod tests {
         assert_eq!(reply.client_id(), Some(&Duid(CLIENT.to_vec())));
         assert_eq!(reply.server_id(), Some(&server_duid()));
         assert!(reply.option(65000).is_none());
-    }
-
-    #[test]
-    fn dhcp6_answer_goes_to_the_asker() {
-        let vm_ll = frame::link_local(VM);
-        let req = frame::udp6(vm_ll, 546, "ff02::1:2".parse().unwrap(), 547, b"x");
-        let p = dhcp6_packet(&req, b"answer");
-        assert!(v6_checksum_ok(&p));
-        assert_eq!(&p[24..40], &vm_ll.octets());
-        assert_eq!(
-            frame::udp_to(&p),
-            Some((dhcpv6::CLIENT_PORT, &b"answer"[..]))
-        );
     }
 }
