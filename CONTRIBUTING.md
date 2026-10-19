@@ -9,6 +9,11 @@ The `fictionet` command is the `fictionet-cli` package in `cli/`, and Cargo
 builds it with the SDK from the top directory. Install it from a checkout with
 `cargo install --locked --path cli`.
 
+The `fictionet-observe` crate in `observe/` owns bounded collectors. Its base
+builds without default features, including on wasm. `native` adds the JSONL
+worker, `decode` reserves packet presentation, and `tracing` adds the explicit
+dispatch bridge. Run its tests with `--all-features` as well as its base checks.
+
 CI runs these commands with four sets of flags:
 
 - the default features: `-p fictionet -p fictionet-codegen -p fictionet-codegen-golden -p fictionet-codegen-layouts -p xtask`

@@ -2,6 +2,7 @@
 members = [
     ".",
     "cli",
+    "observe",
     "codegen",
     "codegen/tests/golden",
     "codegen/tests/layouts",
@@ -11,7 +12,7 @@ members = [
     "smoltcp",
     "xtask",
 ]
-default-members = [".", "cli", "codegen", "codegen/tests/golden", "codegen/tests/layouts", "xtask"]
+default-members = [".", "observe", "cli", "codegen", "codegen/tests/golden", "codegen/tests/layouts", "xtask"]
 exclude = ["fuzz"]
 resolver = "3"
 
@@ -88,6 +89,7 @@ wasm-bindgen = "0.2"
 web-time = "1"
 
 [dev-dependencies]
+fictionet-observe = { path = "observe", features = ["native"] }
 h2 = "0.4"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 http-body-util = "0.1"

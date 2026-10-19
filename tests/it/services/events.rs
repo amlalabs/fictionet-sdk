@@ -47,7 +47,7 @@ fn installed_observers_keep_events_and_write_json_lines() {
     let path = std::env::temp_dir().join(format!("fictionet-events-{}.jsonl", std::process::id()));
     let evidence = Arc::new(fictionet::events::Memory::default());
     let jsonl = Arc::new(
-        fictionet::events::Jsonl::open(&path, fictionet::events::Limits::default()).unwrap(),
+        fictionet_observe::Jsonl::open(&path, fictionet::events::Limits::default()).unwrap(),
     );
     let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
         fictionet::events::Fanout::new(vec![evidence.clone(), jsonl.clone()]),

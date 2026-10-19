@@ -25,7 +25,7 @@
 //! the HTTP/2 host-clock exception. [`running`](guide::running) is the guide;
 //! [`run`], [`lab`] and [`Cx`] document the runtime operations, and [`events`]
 //! documents lazy emission and optional retention. Integrators install observers
-//! through [`RunOptions`]: [`events::Memory`], native `Jsonl`, [`events::Aggregate`],
+//! through [`RunOptions`]: [`events::Memory`], native `fictionet_observe::Jsonl`, [`events::Aggregate`],
 //! dashboard retention, or their own. With none, an interest check skips event
 //! construction and recording.
 //! `run.start` emits the seed automatically to interested observers.

@@ -826,6 +826,7 @@ dependencies = [
  "example-common",
  "fictionet-codegen",
  "fictionet-codegen-golden",
+ "fictionet-observe",
  "fictionet-test-support",
  "getrandom 0.4.3",
  "h2",
@@ -923,6 +924,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-observe"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "fictionet",
+ "tracing",
+]
+
+[[package]]
 name = "fictionet-test-support"
 version = "0.0.0"
 dependencies = [
@@ -930,6 +940,7 @@ dependencies = [
  "divan",
  "example-common",
  "fictionet",
+ "fictionet-observe",
  "http",
  "http-body-util",
  "hyper",

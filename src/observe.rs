@@ -536,7 +536,7 @@
 //! `{"unserializable":"<error>"}`. Replacement text values longer than
 //! 1,024 bytes are shortened at a UTF-8 boundary and end in `…`, so the
 //! replacement itself fits the writer's limits. Cursors advance past these
-//! explicit error records just as they do past original events. Native `Jsonl`
+//! explicit error records just as they do past original events. Native `fictionet_observe::Jsonl`
 //! counts unserializable events as lost and reports the error from `finish`.
 //!
 //! ## Packets

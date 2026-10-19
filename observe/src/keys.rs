@@ -1,0 +1,111 @@
+use std::collections::VecDeque;
+use std::fmt::{self, Write};
+
+use fictionet::events::{ConnInfo, KeyRef, LossReason, Stamp};
+
+use crate::{Bounds, LossStatus};
+
+/// An owned TLS key. Debug output excludes its secret.
+#[derive(Clone)]
+pub struct Key {
+    /// Run sequence and time.
+    pub stamp: Stamp,
+    /// TLS key log label.
+    pub label: String,
+    /// ClientHello random.
+    pub client_random: Vec<u8>,
+    /// Connection context, when supplied by the producer.
+    pub connection: Option<ConnInfo>,
+    secret: Vec<u8>,
+}
+
+impl Key {
+    /// Secret bytes for an explicitly interested consumer.
+    pub fn secret(&self) -> &[u8] {
+        &self.secret
+    }
+
+    fn size(&self) -> usize {
+        size_of::<Self>()
+            + self.label.len()
+            + self.client_random.len()
+            + self.secret.len()
+            + self.connection.as_ref().map_or(0, connection_bytes)
+    }
+}
+
+impl fmt::Debug for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Key")
+            .field("stamp", &self.stamp)
+            .field("label", &self.label)
+            .field("client_random", &self.client_random)
+            .field("connection", &self.connection)
+            .field("secret_len", &self.secret.len())
+            .finish()
+    }
+}
+
+pub(crate) fn connection_bytes(conn: &ConnInfo) -> usize {
+    conn.sni
+        .as_ref()
+        .map_or(0, |s| s.len())
+        .saturating_add(conn.alpn.as_ref().map_or(0, |s| s.len()))
+        .saturating_add(conn.sandbox.as_ref().map_or(0, |s| s.name.len()))
+}
+
+#[derive(Default)]
+pub(crate) struct Keys {
+    pub(crate) items: VecDeque<Key>,
+    bytes: usize,
+}
+
+impl Keys {
+    pub(crate) fn push(
+        &mut self,
+        stamp: Stamp,
+        key: KeyRef<'_>,
+        bounds: Bounds,
+        losses: &mut LossStatus,
+        loss_streams: usize,
+    ) {
+        let size = size_of::<Key>()
+            .saturating_add(key.label.len())
+            .saturating_add(key.client_random.len())
+            .saturating_add(key.secret().len())
+            .saturating_add(key.connection.map_or(0, connection_bytes));
+        if bounds.count == 0 || size > bounds.bytes {
+            losses.record(loss_streams, stamp, LossReason::Overflow, size);
+            return;
+        }
+        while self.items.len() >= bounds.count || self.bytes > bounds.bytes - size {
+            let old = self.items.pop_front().expect("key budget");
+            self.bytes -= old.size();
+            losses.record(loss_streams, old.stamp, LossReason::Eviction, old.size());
+        }
+        self.items.push_back(Key {
+            stamp,
+            label: key.label.into(),
+            client_random: key.client_random.into(),
+            secret: key.secret().into(),
+            connection: key.connection.cloned(),
+        });
+        self.bytes += size;
+    }
+}
+
+/// Renders retained keys in SSLKEYLOGFILE format.
+pub fn keylog(keys: &[Key]) -> String {
+    let mut output = String::new();
+    for key in keys {
+        output.push_str(&key.label);
+        for bytes in [&key.client_random, &key.secret] {
+            output.push(' ');
+            for byte in bytes {
+                write!(output, "{byte:02x}").expect("string write");
+            }
+        }
+        output.push('\n');
+    }
+    output
+}

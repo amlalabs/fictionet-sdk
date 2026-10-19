@@ -195,7 +195,7 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
         let fictionet::events::Interest::Event(_, _) = interest else { return false; }; true }
         fn observe(&self, _: fictionet::events::Stamp, _: fictionet::events::Observation<'_>) {}
     }
-    let writer = case.writer.then(|| Arc::new(fictionet::events::Jsonl::new(std::io::sink(), fictionet::events::Limits::default()).unwrap()));
+    let writer = case.writer.then(|| Arc::new(fictionet_observe::Jsonl::new(std::io::sink(), fictionet::events::Limits::default()).unwrap()));
     let mut destinations: Vec<Arc<dyn fictionet::events::Observer>> = Vec::new();
     if let Some(writer) = &writer { destinations.push(writer.clone()); }
     if case.hooks { destinations.push(Arc::new(Hook)); }

@@ -12,6 +12,7 @@ path = "lib.rs"
 doctest = false
 
 [dependencies]
+fictionet-observe = { path = "../../observe", features = ["native"] }
 # No default features, so each test build keeps the SDK features it chose.
 # The helpers that need `std` or `observe` turn on with the SDK's features.
 fictionet = { path = "../..", default-features = false }

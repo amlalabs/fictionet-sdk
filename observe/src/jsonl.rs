@@ -5,17 +5,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
-use crate::stdlib::codec::Wire;
-use crate::sync::Mutex;
+use fictionet::stdlib::codec::Wire;
+use fictionet::sync::Mutex;
 
-use super::{Event, Limits, Observation, Observer, Stamp};
+use fictionet::events::{Event, Limits, Observation, Observer, Stamp};
 
 /// A bounded native JSON Lines exporter.
 ///
 /// The run only enqueues owned events. Serialization and writes happen on a
 /// worker thread. A full queue counts loss without waiting. Call [`Self::finish`]
 /// outside the run to drain output and report loss or writer errors. Worker
-/// scheduling can affect overflow, so use [`super::Memory`] for lab evidence.
+/// scheduling can affect overflow, so use [`fictionet::events::Memory`] for repeatable lab output.
 pub struct Jsonl {
     sender: Mutex<Option<SyncSender<Event>>>,
     worker: Mutex<Option<JoinHandle<io::Result<()>>>>,
@@ -174,7 +174,7 @@ impl Observer for Jsonl {
         }
     }
 
-    fn end(&self, _: crate::time::Instant) {
+    fn end(&self, _: fictionet::time::Instant) {
         self.sender.lock().take();
     }
 }
@@ -182,7 +182,7 @@ impl Observer for Jsonl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::time::Instant;
+    use fictionet::time::Instant;
     use std::sync::mpsc::{Receiver, Sender, channel};
 
     #[derive(Clone, Default)]
@@ -245,7 +245,7 @@ mod tests {
         let lines: Vec<_> = output
             .split(|b| *b == b'\n')
             .filter(|line| !line.is_empty())
-            .map(|line| crate::stdlib::protocols::json::Value::parse(line).unwrap())
+            .map(|line| fictionet::stdlib::protocols::json::Value::parse(line).unwrap())
             .collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].get("seq").and_then(|v| v.as_u64()), Some(2));
@@ -307,7 +307,7 @@ mod tests {
             .filter(|line| !line.is_empty())
             .collect();
         assert_eq!(lines.len(), 3);
-        let lost = crate::stdlib::protocols::json::Value::parse(lines[2]).unwrap();
+        let lost = fictionet::stdlib::protocols::json::Value::parse(lines[2]).unwrap();
         assert_eq!(lost.get("kind").and_then(|v| v.as_str()), Some("lost"));
         assert_eq!(
             lost.get("fields")

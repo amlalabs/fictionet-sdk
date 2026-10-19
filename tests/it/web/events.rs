@@ -1476,7 +1476,7 @@ fn events_for_blocked_packets() {
 fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     const SCAN: u16 = 55_000;
     let path = std::env::temp_dir().join(format!("fictionet-scan-{}.jsonl", std::process::id()));
-    let jsonl = Arc::new(fictionet::events::Jsonl::open(&path, Default::default()).unwrap());
+    let jsonl = Arc::new(fictionet_observe::Jsonl::open(&path, Default::default()).unwrap());
     let kept: Arc<std::sync::Mutex<Option<Arc<Memory>>>> = Arc::default();
     let keep = kept.clone();
     world_events_with_memory(

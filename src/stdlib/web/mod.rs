@@ -501,9 +501,9 @@
 #![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
 //!
 //! The integrator installs observers before running the world. With no observer,
-//! services skip event construction. [`Memory`](fictionet::events::Memory) retains
-//! bounded evidence; native `Jsonl` writes files and requires an explicit `finish`
-//! outside the run. Custom observers must return promptly without calling back
+//! services skip event construction. [`Memory`](fictionet::events::Memory) keeps
+//! a bounded history for grading. Native `fictionet_observe::Jsonl` writes files
+//! and needs an explicit `finish` outside the run. Custom observers must return promptly without calling back
 //! into the world. A grader can install memory and optional repeat aggregation:
 //!
 //! ```

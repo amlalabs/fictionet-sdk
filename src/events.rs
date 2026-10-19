@@ -2,7 +2,7 @@
 //!
 //! An [`Event`] has a source, kind, summary, [`Level`], [`ConnInfo`] and JSON
 //! [`Fields`]. Integrators install an [`Observer`] before execution through
-//! [`RunOptions`](crate::RunOptions): none, [`Memory`], native `Jsonl`,
+//! [`RunOptions`](crate::RunOptions): none, [`Memory`], native `fictionet_observe::Jsonl`,
 //! [`Aggregate`], dashboard retention, or their own implementation. [`Fanout`]
 //! combines destinations and filters each delivery by its own interest.
 //! The same observer receives typed topology changes and borrowed TLS keys.
@@ -57,7 +57,7 @@
 //! can attach late only to history explicitly installed with
 //! [`RunOptions::event_history`](crate::RunOptions::event_history).
 //!
-//! Native `Jsonl` keeps the event JSON Lines format and enqueues events within
+//! Native `fictionet_observe::Jsonl` keeps the event JSON Lines format and enqueues events within
 //! count and byte limits. Its worker performs serialization and I/O. Call its
 //! `finish` method outside the run to drain output and check errors. Worker
 //! scheduling can affect overflow; synchronous [`Memory`] supplies lab evidence.
@@ -81,15 +81,11 @@
 //! held by readers, so they are retention budgets, not process-memory limits.
 
 mod aggregate;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-mod jsonl;
 mod memory;
 mod model;
 mod observer;
 
 pub use aggregate::Aggregate;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-pub use jsonl::Jsonl;
 #[cfg(feature = "observe")]
 pub(crate) use memory::DisplayBatch;
 pub use memory::{Incomplete, Limits, Memory};

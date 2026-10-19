@@ -9,7 +9,7 @@ to optional observers installed by the integrator.
 | Module | What it gives |
 |---|---|
 | `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests, transcripts and fault plans |
-| `fictionet::events` | Not in the stdlib: lazy structured events and optional observers (`Memory`, `Jsonl`, `Aggregate`, dashboard retention, or custom observers); no observer means no recording work |
+| `fictionet::events` | Not in the stdlib: lazy structured events and optional observers (`Memory`, `fictionet_observe::Jsonl`, `Aggregate`, dashboard retention, or custom observers); no observer means no recording work |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Router`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
@@ -813,7 +813,7 @@ Services emit structured facts: sandboxes attaching and binding addresses, DNS
 queries, TLS handshakes, HTTP requests, dropped packets, route changes and
 service-specific events. World code uses `fcx.emit("source", "kind", |event| ...)`.
 The integrator installs observers through `RunOptions` before execution: none,
-bounded `Memory`, native `Jsonl`, optional `Aggregate`, dashboard retention, or
+bounded `Memory`, native `fictionet_observe::Jsonl`, optional `Aggregate`, dashboard retention, or
 its own implementation. `Fanout` combines destinations. Without an observer,
 emission performs no allocation, formatting, clock read, task lookup or numbering.
 
@@ -880,7 +880,7 @@ metadata charged in full per copy, plus estimated allocation overhead. It exclud
 spare collection capacity and copies held by readers. Retention limits do not
 bound total process memory.
 
-Native `Jsonl` enqueues events within explicit count and byte bounds; its worker
+Native `fictionet_observe::Jsonl` enqueues events within explicit count and byte bounds; its worker
 serializes and writes the existing JSON Lines format. Full queues count loss
 without blocking the world. `end` seals input; the host calls `finish` outside the
 run to drain output and report errors. `lost` reports rejected or unwritten events.
