@@ -1260,6 +1260,12 @@ impl<'a> Socket<'a> {
         self.rx_buffer.len()
     }
 
+    /// Whether received data is waiting for a gap to fill before it can be read.
+    /// These bytes are not included in [`Self::recv_queue`].
+    pub fn has_pending_recv(&self) -> bool {
+        !self.assembler.is_empty()
+    }
+
     fn set_state(&mut self, state: State) {
         self.state = state;
 
@@ -1831,6 +1837,7 @@ impl<'a> Socket<'a> {
             (repr.window_len as usize) << (scale as usize)
         };
         let is_duplicate_ack = self.is_duplicate_ack(repr, new_remote_win_len);
+        let window_reopened = self.remote_win_len == 0 && new_remote_win_len != 0;
         self.remote_win_len = new_remote_win_len;
 
         self.congestion_controller
@@ -1866,6 +1873,15 @@ impl<'a> Socket<'a> {
             // Skip retransmissions of bytes already acknowledged.
             if self.remote_last_seq < self.local_seq_no {
                 self.remote_last_seq = self.local_seq_no
+            }
+
+            // Retry data the peer may have refused when its window closed.
+            // Keep the running retransmission timer and congestion window.
+            if window_reopened
+                && !self.tx_buffer.is_empty()
+                && self.local_seq_no < self.remote_last_seq
+            {
+                self.pending_fast_retransmit = true;
             }
         }
 
@@ -4080,6 +4096,49 @@ mod test {
             &mut peeked_buf[..actually_peeked],
             &mut recv_buf[..actually_recvd]
         );
+    }
+
+    #[test]
+    fn test_pending_recv_waits_for_gap() {
+        let mut s = socket_established();
+        assert!(!s.has_pending_recv());
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 5,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"efgh",
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.recv_queue(), 0);
+        assert!(s.has_pending_recv());
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abcd",
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 9),
+                window_len: 56,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.recv_queue(), 8);
+        assert!(!s.has_pending_recv());
+        let mut data = [0; 8];
+        assert_eq!(s.recv_slice(&mut data).unwrap(), 8);
+        assert_eq!(&data, b"abcdefgh");
+        assert!(!s.has_pending_recv());
     }
 
     fn setup_rfc2018_cases() -> (TestSocket, Vec<u8>) {
@@ -7698,6 +7757,9 @@ mod test {
                 sack_ranges: [Some(((LOCAL_SEQ + 5).0 as u32, (LOCAL_SEQ + 9).0 as u32)), None, None],
                 ..SEND_TEMPL
             });
+            if time == 3 {
+                recv!(s, time at, [data]);
+            }
             if time < 6 {
                 recv_nothing!(s, time at);
             }
@@ -8137,6 +8199,12 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 5),
             ..SEND_TEMPL
         });
+        recv!(s, time 200, [TcpRepr {
+            seq_number: LOCAL_SEQ + 5,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"efgh",
+            ..RECV_TEMPL
+        }]);
         recv_nothing!(s, time 1099);
         recv!(s, time 1100, [TcpRepr {
             seq_number: LOCAL_SEQ + 5,
