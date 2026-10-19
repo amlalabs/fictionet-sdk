@@ -29,7 +29,7 @@ use std::time::SystemTime;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::asn1::{Oid, StringKind};
 use fictionet::stdlib::protocols::x509::{self, ExtensionValue, GeneralName, KeyUsage, oid};
-use fictionet::stdlib::services::ca::{Curve, SigningKey};
+use fictionet::stdlib::services::ca::{KeyKind, SigningKey};
 use fictionet::stdlib::services::tls;
 use fictionet::{Cx, Error, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -71,9 +71,9 @@ pub struct Zscaler {
 /// 2048 keys from `fcx`. `now_unix` is the run's wall-clock time in Unix
 /// seconds; the "(t)" CA's two-week window straddles it.
 pub fn zscaler(fcx: &Cx, cloud: &str, now_unix: i64) -> Result<Zscaler> {
-    let root_key = SigningKey::generate(fcx, Curve::Rsa2048);
-    let int_key = SigningKey::generate(fcx, Curve::Rsa2048);
-    let issuing_key = SigningKey::generate(fcx, Curve::Rsa2048);
+    let root_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
+    let int_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
+    let issuing_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
 
     // §1 Root CA. C, ST, L, O, OU, CN, emailAddress; every attribute
     // PrintableString except the IA5String email. O and OU are identical.
@@ -197,7 +197,7 @@ impl Zscaler {
         names: &[&str],
         now_unix: i64,
     ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-        let leaf_key = SigningKey::generate(fcx, Curve::Rsa2048);
+        let leaf_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
         let cn = names
             .first()
             .ok_or_else(|| Error::msg("a leaf needs at least one name"))?;
