@@ -872,8 +872,8 @@ tr.moment td:first-child {
   .packet-panel.merged-hosts .plist .c-proto { padding: 0; visibility: hidden; }
   .packet-panel.merged-hosts .packet-info-protocol { display: inline; font-weight: 600; }
 }
-/* In a narrow inspector the addresses give way so Info keeps room; a cut
-   address shows in full on hover and in the packet's layers. A fixed table
+/* In a narrow inspector the addresses give way so Info keeps room: ports
+   hide, and a cut address shows in full on hover and in the packet's layers. A fixed table
    takes a plain percentage only: with min() the columns went auto and split
    the width evenly with Info. A Host column already names the guest, so the
    addresses give more. Cells pad 4 px a side, so fitted columns need 8 px. */
@@ -888,6 +888,7 @@ tr.moment td:first-child {
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .packet-panel .plist .port { display: none; }
 }
 .packet-panel .detail {
   display: block;

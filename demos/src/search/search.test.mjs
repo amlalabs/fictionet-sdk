@@ -62,13 +62,19 @@ test('stream renders every outcome, failure, host, cache and timing', (t) => {
   h.dispose();
 });
 
-test('until a search is selected, the result list follows the newest one', (t) => {
-  const h = harness(t), s = fixture(); h.publish(s);
-  const newest = s.queries.at(-1);
+test('until a search is selected, the result list follows the newest one with results', (t) => {
+  const h = harness(t), s = fixture();
+  s.queries.push(query(3, 'served', { results: 0, cache: 'missing', search: 'Nothing here' }));
+  h.publish(s);
   const results = h.root.querySelector('.search-results');
-  assert.match(results.textContent, new RegExp(`${newest.search} · `));
-  assert.match(results.textContent, /Newest search; select one to keep it here\./);
+  assert.match(results.textContent, /A Question · Bing/);
+  assert.match(results.textContent, /Newest search with results; select one to keep it here\./);
   assert.equal(results.querySelector('ol').children.length, 1);
+  s.queries = [query(3, 'served', { results: 0, cache: 'missing', search: 'Nothing here' })];
+  h.publish(s);
+  assert.match(results.textContent, /Nothing here · Google/);
+  assert.match(results.textContent, /Newest search; select one to keep it here\. No results: generation was off/);
+  h.publish(fixture());
   const stream = h.root.querySelector('.search-stream');
   const older = stream.children.at(-1);
   h.click(stream, older);

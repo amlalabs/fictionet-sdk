@@ -548,12 +548,19 @@ test('merged host rows keep display numbers and link identities in detail and la
 });
 
 
-test('address cells carry their full address, for a narrow list that cuts them', (t) => {
+test('address cells carry their full address, and a port a narrow list can hide', (t) => {
   const h = setup(t);
   h.send(1, { src: '185.15.59.224:443', dst: '10.0.0.2:60483' });
+  h.send(2, { src: '[fe80::1]:546', dst: 'ff02::1:2' });
   h.flush();
   const cells = h.rows()[0].children;
   assert.deepEqual([cells[3], cells[4]].map((cell) => cell.getAttribute('title')), ['185.15.59.224:443', '10.0.0.2:60483']);
+  const parts = (cell) => [cell.querySelector('.addr')?.textContent, cell.querySelector('.port')?.textContent];
+  assert.deepEqual(parts(cells[3]), ['185.15.59.224', ':443']);
+  assert.equal(cells[3].textContent, '185.15.59.224:443');
+  const v6 = h.rows()[1].children;
+  assert.deepEqual(parts(v6[3]), ['[fe80::1]', ':546']);
+  assert.deepEqual(parts(v6[4]), ['ff02::1:2', undefined], 'a bare IPv6 address has no port');
 });
 
 test('host columns fit the declared names and stay fixed as packets arrive', (t) => {

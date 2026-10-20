@@ -166,14 +166,15 @@ test('the page\'s own console traffic is hidden with a count until a viewer show
   sent(h.streams.at(-1));
   assert.deepEqual(rows(), ['10.0.0.2:40000']);
   assert.equal(note.hidden, false);
-  assert.equal(h.root.querySelector('#console-text').textContent, "1 packet of the page's own console traffic hidden, to and from 10.10.5.20.");
+  assert.equal(h.root.querySelector('#console-text').textContent, '1 console packet hidden · 10.10.5.20');
+  assert.match(note.title, /page's own screen and terminal sessions/);
   assert.match(h.root.querySelector('#sampled').textContent, /3 packets not copied/, 'a hidden packet keeps its sampling count');
   const opened = h.streams.length;
   h.root.querySelector('#console-toggle').click();
   assert.equal(h.streams.length, opened + 1, 'showing reopens the stream to replay its history');
   sent(h.streams.at(-1));
   assert.deepEqual(rows(), ['10.10.5.20:54926', '10.0.0.2:40000']);
-  assert.equal(h.root.querySelector('#console-text').textContent, "Showing the page's own console traffic, to and from 10.10.5.20.");
+  assert.equal(h.root.querySelector('#console-text').textContent, 'Showing console packets · 10.10.5.20');
   assert.equal(h.root.querySelector('#console-toggle').textContent, 'Hide');
   dispose();
   h.clean();

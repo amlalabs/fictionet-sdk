@@ -171,11 +171,14 @@ export function mount(root, services, options) {
       set(entry.note, `${outcome(q)}${label ? ` · ${label}` : ''}${q.serve_ms != null ? ` · ${ms(q.serve_ms)}` : ''}`);
       if (fresh) entry.node.classList.add('search-arrival');
     }, rows);
-    // Until a viewer selects a search, the result list follows the newest.
-    const q = s.queries.find((q) => q.id === (chosen ?? s.queries.at(-1)?.id));
+    // Until a viewer selects a search, the result list follows the newest
+    // one that has results, or the newest when none has.
+    const newest = s.queries.findLast((q) => q.results > 0) ?? s.queries.at(-1);
+    const q = chosen == null ? newest : s.queries.find((q) => q.id === chosen);
     if (q) {
       set(detailTitle, `${q.search} · ${engine(q.engine)}`);
-      const view = resultView(s, q); set(origin, chosen == null ? `Newest search; select one to keep it here. ${view.origin}` : view.origin);
+      const following = chosen == null ? `Newest search${q.results > 0 ? ' with results' : ''}; select one to keep it here. ` : '';
+      const view = resultView(s, q); set(origin, `${following}${view.origin}`);
       reconcile(resultList, view.rows, (r) => `${q.key}:${r.rank}:${r.url}`, () => {
         const node = el('li', null, null);
         return { node, title: line(node, 'search-row-title'), host: line(node, 'search-url'), url: line(node, 'search-path'), note: line(node, 'search-row-note'), open: el('button', '', node, 'search-open') };

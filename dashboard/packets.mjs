@@ -41,8 +41,13 @@ export function createPackets({
   const MAX_ROWS = maxRows;
   /// How long a merged packet view holds packets to put them in order.
   const MERGE_HOLD_MS = 400;
-  // The address of `10.0.0.2:22`, `[fe80::1]:22` or a bare address.
-  const address = (text) => (text.startsWith('[') ? text.slice(1, text.indexOf(']')) : text.split(':').length === 2 ? text.split(':')[0] : text);
+  // `10.0.0.2:22` or `[fe80::1]:22` as [address, port]; a bare address has
+  // no port.
+  const endpoint = (text) => {
+    const cut = text.startsWith('[') ? text.indexOf(']') + 1 : text.split(':').length === 2 ? text.indexOf(':') : -1;
+    return cut > 0 && text[cut] === ':' ? [text.slice(0, cut), text.slice(cut)] : [text, ''];
+  };
+  const address = (text) => endpoint(text)[0].replace(/^\[(.*)\]$/, '$1');
   const fromConsole = (p) => consoleAddresses.includes(address(p.src)) || consoleAddresses.includes(address(p.dst));
   let showConsole = false, reopen = null;
   const consoleNote = $('console-note');
@@ -50,8 +55,9 @@ export function createPackets({
     if (!consoleNote || !consoleAddresses.length || !packets) return;
     const where = consoleAddresses.join(', ');
     $('console-text').textContent = showConsole
-      ? `Showing the page's own console traffic, to and from ${where}.`
-      : `${fmtCount(packets.console)} ${packets.console === 1 ? 'packet' : 'packets'} of the page's own console traffic hidden, to and from ${where}.`;
+      ? `Showing console packets · ${where}`
+      : `${fmtCount(packets.console)} console ${packets.console === 1 ? 'packet' : 'packets'} hidden · ${where}`;
+    consoleNote.title = `The page's own screen and terminal sessions, and the gate's commands, reach the hosts from ${where}.`;
     $('console-toggle').textContent = showConsole ? 'Hide' : 'Show';
     consoleNote.hidden = !showConsole && !packets.console;
   }
@@ -340,7 +346,13 @@ export function createPackets({
     p.no = no;
     const cells = [no, time, '', p.src, p.dst, p.proto, p.len, p.info];
     cells.forEach((c, i) => {
-      const td = el('td', i === 7 ? {} : i === 3 || i === 4 ? { text: String(c), title: String(c) } : { text: String(c) }, tr);
+      const td = el('td', i === 7 ? {} : i === 3 || i === 4 ? { title: String(c) } : { text: String(c) }, tr);
+      // A narrow list hides the port; the cell's title keeps it.
+      if (i === 3 || i === 4) {
+        const [host, port] = endpoint(String(c));
+        el('span', { class: 'addr', text: host }, td);
+        if (port) el('span', { class: 'port', text: port }, td);
+      }
       if (i === 2) {
         td.className = 'dir';
         el('i', {}, td);
