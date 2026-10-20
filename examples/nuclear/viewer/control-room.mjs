@@ -44,6 +44,12 @@ const TURBINE_VALVE_VALUES = Object.freeze([0, 250, 500, 750, 1000]);
 export const PALETTE_TOKENS = Object.freeze({
   lightKey: '--light-key',
   lightGround: '--light-ground',
+  plantKey: '--plant-key',
+  rubber: '--rubber',
+  lampGlow: '--lamp-glow',
+  lampOff: '--lamp-off',
+  lampInk: '--lamp-ink',
+  lampLegend: '--lamp-legend',
   surface: '--surface',
   raised: '--surface-raised',
   sunken: '--surface-sunken',

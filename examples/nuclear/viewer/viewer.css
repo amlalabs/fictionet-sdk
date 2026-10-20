@@ -20,6 +20,12 @@
   --shadow-soft: rgba(0, 0, 0, 0.12);
   --shadow-deep: rgba(0, 0, 0, 0.25);
   --surface: #f7f6f0;
+  --plant-key: #c4d9ef;
+  --rubber: #252d29;
+  --lamp-glow: #ffbe50;
+  --lamp-off: #222b27;
+  --lamp-ink: #281b0b;
+  --lamp-legend: #f7f6f0;
   --surface-raised: #fbfaf6;
   --surface-sunken: #e9eddf;
   --ink: #263e35;
@@ -41,6 +47,12 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --surface: #141915;
+    --plant-key: #c4d9ef;
+    --rubber: #252d29;
+    --lamp-glow: #ffbe50;
+    --lamp-off: #222b27;
+    --lamp-ink: #281b0b;
+    --lamp-legend: #f7f6f0;
     --surface-raised: #1b211c;
     --surface-sunken: #1d241e;
     --ink: #e2e4d6;
@@ -62,6 +74,12 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   --surface: #141915;
+  --plant-key: #c4d9ef;
+  --rubber: #252d29;
+  --lamp-glow: #ffbe50;
+  --lamp-off: #222b27;
+  --lamp-ink: #281b0b;
+  --lamp-legend: #f7f6f0;
   --surface-raised: #1b211c;
   --surface-sunken: #1d241e;
   --ink: #e2e4d6;

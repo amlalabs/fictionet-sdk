@@ -1,0 +1,108 @@
+// Three is supplied by the stage so the material specs can also run in Node.
+export const MATERIAL_ROLES = Object.freeze({
+  paintedSteel: Object.freeze({ roughness: 0.72, metalness: 0.18 }),
+  brushedMetal: Object.freeze({ roughness: 0.32, metalness: 0.8 }),
+  glass: Object.freeze({ roughness: 0.12, metalness: 0 }),
+  rubber: Object.freeze({ roughness: 0.96, metalness: 0 }),
+  concrete: Object.freeze({ roughness: 0.92, metalness: 0 }),
+  lamp: Object.freeze({ roughness: 0.28, metalness: 0 }),
+});
+
+export function materialSpec(palette, role, token) {
+  const surface = MATERIAL_ROLES[role];
+  if (!surface) throw new RangeError(`Unknown material role: ${role}`);
+  if (!palette[token]) throw new RangeError(`Missing palette color: ${token}`);
+  return { ...surface, color: palette[token] };
+}
+
+export function createMaterial(THREE, palette, role, token, options = {}) {
+  const material = new THREE.MeshStandardMaterial({ ...materialSpec(palette, role, token), ...options });
+  material.userData.paletteToken = token;
+  return material;
+}
+
+export function applyMaterialPalette(material, palette) {
+  material.color.set(palette[material.userData.paletteToken]);
+}
+
+export function indicatorSpec(palette, { lit }) {
+  return {
+    color: lit ? palette.lampGlow : palette.lampOff,
+    emissive: palette.lampGlow,
+    emissiveIntensity: lit ? 2.4 : 0,
+  };
+}
+
+export function setIndicator(material, palette, state) {
+  const spec = indicatorSpec(palette, state);
+  material.color.set(spec.color);
+  material.emissive.set(spec.emissive);
+  material.emissiveIntensity = spec.emissiveIntensity;
+}
+
+export function createRenderer(THREE) {
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 0.95;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.info.autoReset = false;
+  return renderer;
+}
+
+export function createEnvironment(THREE, renderer, palette) {
+  const room = new THREE.Scene();
+  const box = new THREE.BoxGeometry(10, 6, 10);
+  const panel = new THREE.PlaneGeometry(1, 1);
+  const walls = new THREE.MeshBasicMaterial({ color: palette.lightGround, side: THREE.BackSide });
+  const glow = createMaterial(THREE, palette, 'lamp', 'lightKey', {
+    emissive: palette.lightKey, emissiveIntensity: 5, side: THREE.DoubleSide,
+  });
+  room.add(new THREE.Mesh(box, walls));
+  for (const [position, rotation, scale] of [
+    [[-2.5, 2.9, 0], [Math.PI / 2, 0, 0], [1.5, 4, 1]],
+    [[2.5, 2.9, 0], [Math.PI / 2, 0, 0], [1.5, 4, 1]],
+    [[0, 1, -4.9], [0, 0, 0], [4, 1.5, 1]],
+  ]) {
+    const mesh = new THREE.Mesh(panel, glow);
+    mesh.position.set(...position); mesh.rotation.set(...rotation); mesh.scale.set(...scale);
+    room.add(mesh);
+  }
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  try {
+    return pmrem.fromScene(room, 0.04, 0.1, 30, { size: 128 });
+  } finally {
+    pmrem.dispose();
+    box.dispose(); panel.dispose(); walls.dispose(); glow.dispose(); room.clear();
+  }
+}
+
+export function createLighting(THREE, scene, palette, plant = false) {
+  const fill = new THREE.HemisphereLight(palette.lightKey, palette.lightGround, plant ? 0.35 : 0.65);
+  const key = new THREE.DirectionalLight(palette[plant ? 'plantKey' : 'lightKey'], plant ? 1.25 : 2.6);
+  key.position.set(...(plant ? [-6, 14, 18] : [-3, 3.4, 3]));
+  key.target.position.set(...(plant ? [0, 0, 0] : [0, 0, -1.5]));
+  key.castShadow = true;
+  key.shadow.mapSize.set(1024, 1024);
+  const extent = plant ? 19 : 8;
+  Object.assign(key.shadow.camera, {
+    left: -extent, right: extent, top: extent, bottom: -extent, near: 0.1, far: plant ? 65 : 22,
+  });
+  key.shadow.camera.updateProjectionMatrix();
+  key.shadow.normalBias = 0.025;
+  key.shadow.bias = -0.00015;
+  scene.add(fill, key, key.target);
+  scene.environmentIntensity = plant ? 0.22 : 0.45;
+  return {
+    setTheme(next) {
+      fill.color.set(next[plant ? 'plantKey' : 'lightKey']);
+      fill.groundColor.set(next.lightGround);
+      key.color.set(next[plant ? 'plantKey' : 'lightKey']);
+    },
+    dispose() {
+      key.dispose(); fill.dispose();
+      scene.remove(key, fill, key.target);
+    },
+  };
+}

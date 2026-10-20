@@ -29,11 +29,28 @@ test('the light, automatic dark and explicit dark board palettes have readable t
       ['text', 'surface'],
       ['warning', 'surface-raised'],
       ['surface', 'warning'],
+      ['lamp-ink', 'lamp-glow'],
+      ['lamp-legend', 'lamp-off'],
     ]) {
       const light = Math.max(colors[foreground], colors[background]);
       const dark = Math.min(colors[foreground], colors[background]);
       const contrast = (light + 0.05) / (dark + 0.05);
       assert.ok(contrast >= 4.5, `Palette ${index}: ${foreground} on ${background} is ${contrast}`);
+    }
+  }
+});
+
+test('lamp states and window borders have graphic contrast in every theme', () => {
+  for (const [block] of palettes) {
+    const colors = Object.fromEntries(
+      [...block.matchAll(/--([\w-]+):\s*#([\da-f]+);/g)].map(([, name, hex]) => [name, luminance(hex)]),
+    );
+    for (const [a, b] of [['lamp-glow', 'lamp-off'], ['ink', 'steel']]) {
+      const contrast = (Math.max(colors[a], colors[b]) + 0.05) / (Math.min(colors[a], colors[b]) + 0.05);
+      assert.ok(contrast >= 3, `${a} against ${b}: ${contrast}`);
+    }
+    for (const name of ['plant-key', 'rubber', 'lamp-glow', 'lamp-off', 'lamp-ink', 'lamp-legend']) {
+      assert.ok(Number.isFinite(colors[name]), `${name} is defined in each theme`);
     }
   }
 });

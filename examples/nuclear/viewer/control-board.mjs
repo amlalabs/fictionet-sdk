@@ -5,6 +5,7 @@ import { ROOM, FLOOR, CEILING_LIGHTS, DEFAULT_VIEW, BOARD, BOARDS, BOARD_PX, DES
   boardPoint, boardLayout, cellLayout, gapLayout, windowState } from './board-layout.mjs';
 import { look, walk, walkDelta, walkPath, glidePose } from './room-motion.mjs';
 import { createPlantScene, mergeStatic } from './plant-scene.mjs';
+import { createRenderer, createEnvironment, createLighting, createMaterial, applyMaterialPalette, setIndicator } from './look.mjs';
 
 const TAU = Math.PI * 2;
 const NEEDLE_START = 135 * Math.PI / 180;
@@ -44,35 +45,43 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     target.addEventListener(event, fn);
     listeners.push(() => target.removeEventListener(event, fn));
   };
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  const renderer = createRenderer(THREE);
   let pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
   renderer.setPixelRatio(pixelRatio);
-  renderer.info.autoReset = false;
   const canvas = renderer.domElement;
   canvas.setAttribute('role', 'img');
   canvas.tabIndex = 0;
   canvas.setAttribute('aria-describedby', 'cr-walk-help');
   container.append(canvas);
   const scene = new THREE.Scene();
+  const environment = track(createEnvironment(THREE, renderer, theme));
+  scene.environment = environment.texture;
   const camera = new THREE.PerspectiveCamera(ROOM.fov, 1, 0.05, 100);
   camera.rotation.order = 'YXZ';
-  const fill = new THREE.HemisphereLight(theme.lightKey, theme.lightGround, 2);
-  const sun = new THREE.DirectionalLight(theme.lightKey, 1.2);
-  sun.position.set(0, 3.5, 2);
-  scene.add(fill, sun);
-  const material = Object.fromEntries(['wall', 'ceiling', 'floor', 'metal', 'ink', 'steel', 'light', 'accent'].map(name => [name,
-    track(name === 'light' || name === 'ceiling' ? new THREE.MeshBasicMaterial() : new THREE.MeshLambertMaterial())]));
+  const lighting = createLighting(THREE, scene, theme);
+  const material = Object.fromEntries([
+    ['wall', 'concrete', 'sunken'], ['ceiling', 'concrete', 'steel'], ['floor', 'concrete', 'steel'],
+    ['metal', 'brushedMetal', 'metal'], ['ink', 'rubber', 'rubber'], ['steel', 'paintedSteel', 'steel'],
+    ['light', 'lamp', 'lightKey'], ['accent', 'paintedSteel', 'accent'],
+    ['glass', 'glass', 'lightKey'], ['lamp', 'lamp', 'lampGlow'],
+  ].map(([name, role, token]) => [name, track(createMaterial(THREE, theme, role, token))]));
+  Object.assign(material.glass, { transparent: true, opacity: 0.08, depthWrite: false });
+  material.light.emissiveIntensity = 3;
+  setIndicator(material.lamp, theme, { lit: true });
   const staticRoom = new THREE.Group();
   scene.add(staticRoom);
   const unitBox = track(new THREE.BoxGeometry(1, 1, 1));
   const dummy = new THREE.Object3D();
   function block(parent, size, position, mat, rotation = 0) {
     const mesh = new THREE.Mesh(unitBox, mat);
+    mesh.castShadow = mat === material.metal || mat === material.steel || mat === material.ink;
+    mesh.receiveShadow = mat !== material.light;
     mesh.scale.set(...size); mesh.position.set(...position); mesh.rotation.y = rotation;
     parent.add(mesh); return mesh;
   }
   function instance(geometry, mat, poses) {
     const mesh = track(new THREE.InstancedMesh(geometry, mat, poses.length));
+    mesh.receiveShadow = mat !== material.light && mat !== material.glass && mat !== material.lamp;
     poses.forEach((p, i) => {
       dummy.position.set(...p.position); dummy.rotation.set(...(p.rotation ?? [0, 0, 0]));
       dummy.scale.set(...(p.scale ?? [1, 1, 1])); dummy.updateMatrix(); mesh.setMatrixAt(i, dummy.matrix);
@@ -120,13 +129,37 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     const desk = block(group, [BOARD.width, 0.12, BOARD.deskDepth], [0, BOARD.deskY, BOARD.deskDepth / 2], material.steel);
     desk.rotation.x = BOARD.slope;
     for (const x of [-1.8, 1.8]) block(group, [0.12, 0.85, 0.65], [x, 0.425, 0.4], material.metal);
-    const face = paintedFace(BOARD.width, BOARD.top - BOARD.bottom, group, [0, (BOARD.top + BOARD.bottom) / 2, 0.001], 0, BOARD_PX.width, BOARD_PX.height);
+    block(group, [BOARD.width, BOARD.top - BOARD.bottom, 0.03], [0, (BOARD.top + BOARD.bottom) / 2, -0.015], material.steel);
+    const face = paintedFace(BOARD.width, BOARD.top - BOARD.bottom, group, [0, (BOARD.top + BOARD.bottom) / 2, 0.031], 0, BOARD_PX.width, BOARD_PX.height);
+    Object.assign(face.mesh.material, { transparent: true, depthWrite: false });
+    face.mesh.renderOrder = 1;
+    const layout = boardLayout(config.points.length, config.view);
+    const windows = layout.windows.map(w => {
+      const mat = track(createMaterial(THREE, theme, 'lamp', 'lampOff'));
+      const mesh = block(group, [w.w / BOARD_PX.width * BOARD.width, w.h / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.022],
+        [(w.x + w.w / 2) / BOARD_PX.width * BOARD.width - BOARD.width / 2,
+          BOARD.top - (w.y + w.h / 2) / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.014], mat);
+      mesh.userData.animated = true;
+      mesh.receiveShadow = false;
+      return mesh;
+    });
     const labels = paintedFace(BOARD.width, 0.16, group, [0, 0.88, 0.81], 0, 1600, 80);
-    return { ...face, config, labels };
+    return { ...face, config, labels, windows };
   });
+  const dialPoses = BOARDS.flatMap(config => boardLayout(config.points.length, config.view).cells.flatMap(cell =>
+    cellLayout(cell.w, cell.h).dials.map(dial => {
+      const p = boardPoint(config, (cell.x + dial.x + dial.radius) / BOARD_PX.width * BOARD.width - BOARD.width / 2,
+        BOARD.top - (cell.y + dial.y + dial.radius) / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.043);
+      const radius = dial.radius / BOARD_PX.width * BOARD.width;
+      return { position: [p.x, p.y, p.z], rotation: [0, config.yaw, 0], scale: [radius, radius, 1] };
+    })));
+  instance(track(new THREE.RingGeometry(1.01, 1.09, 24)), material.metal, dialPoses);
+  const glass = instance(track(new THREE.CircleGeometry(0.93, 24)), material.glass, dialPoses);
+  glass.renderOrder = 2;
   const screens = [];
   for (const desk of DESKS) {
     block(staticRoom, [desk.w, 0.1, desk.d], [desk.x, 0.76, desk.z], material.steel);
+    block(staticRoom, [desk.w * 0.74, 0.012, desk.d * 0.57], [desk.x, 0.817, desk.z + 0.08], material.ink);
     for (const x of [-desk.w / 2 + 0.18, desk.w / 2 - 0.18])
       block(staticRoom, [0.16, 0.73, desk.d - 0.12], [desk.x + x, 0.365, desk.z], material.metal);
     if (!desk.supervisor) for (const offset of [-0.51, 0.51]) {
@@ -145,10 +178,10 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     { text: 'CONTAINMENT CAMERA', face: paintedFace(1.7, 0.22, staticRoom, [CCTV.x + 0.02, CCTV.y + 0.66, CCTV.z], Math.PI / 2, 768, 112) },
     { text: 'SHIFT SUPERVISOR', face: paintedFace(1.6, 0.18, staticRoom, [0, 0.62, 5.06], 0, 768, 112) },
   ];
-  const plant = createPlantScene({ theme, reducedMotion });
-  const cctvTarget = track(new THREE.WebGLRenderTarget(480, 270));
-  cctvTarget.texture.colorSpace = THREE.SRGBColorSpace;
-  const cctvMat = track(new THREE.MeshBasicMaterial({ map: cctvTarget.texture, toneMapped: false }));
+  const plant = createPlantScene({ theme, reducedMotion, environment: environment.texture });
+  const cctvTarget = track(new THREE.WebGLRenderTarget(480, 270, { type: THREE.HalfFloatType }));
+  cctvTarget.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  const cctvMat = track(new THREE.MeshBasicMaterial({ map: cctvTarget.texture }));
   block(staticRoom, [0.12, CCTV.height + 0.16, CCTV.width + 0.16], [CCTV.x - 0.01, CCTV.y, CCTV.z], material.ink);
   const cctvScreen = new THREE.Mesh(track(new THREE.PlaneGeometry(CCTV.width, CCTV.height)), cctvMat);
   cctvScreen.rotation.y = Math.PI / 2; cctvScreen.position.set(CCTV.x + 0.06, CCTV.y, CCTV.z); staticRoom.add(cctvScreen);
@@ -168,7 +201,9 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
   const knobBodies = instance(track(new THREE.CylinderGeometry(0.075, 0.085, 0.07, 16)), material.metal, knobPoses);
   const knobMarks = instance(unitBox, material.ink, knobPoses);
   const knobLevers = instance(unitBox, material.ink, knobPoses);
-  const knobCaps = instance(track(new THREE.CylinderGeometry(0.065, 0.075, 0.05, 16)), material.accent, knobPoses);
+  const capGeometry = track(new THREE.CylinderGeometry(0.065, 0.075, 0.05, 16));
+  const knobCaps = instance(capGeometry, material.accent, knobPoses);
+  const litCaps = instance(capGeometry, material.lamp, knobPoses);
 
   let palette = theme, view = null, text = null, knobStates = [];
   let pose = { ...STANDING_SPOTS[DEFAULT_VIEW] }, selected = DEFAULT_VIEW, glide = null;
@@ -181,11 +216,10 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
   function applyTheme(next) {
     palette = next;
     scene.background = new THREE.Color(palette.sunken);
-    fill.color.set(palette.lightKey); fill.groundColor.set(palette.lightGround); sun.color.set(palette.lightKey);
-    for (const [name, token] of Object.entries({ wall: 'sunken', floor: 'steel', metal: 'metal', ink: 'ink', steel: 'steel', light: 'lightKey', accent: 'accent' }))
-      material[name].color.set(palette[token]);
-    const brightness = color => color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722;
-    material.ceiling.color.copy(brightness(material.ink.color) < brightness(material.wall.color) ? material.ink.color : material.wall.color);
+    lighting.setTheme(palette);
+    Object.values(material).forEach(mat => applyMaterialPalette(mat, palette));
+    material.light.emissive.set(palette.lightKey);
+    setIndicator(material.lamp, palette, { lit: true });
     plant.setTheme(next); themeDirty = true; plantDirty = true;
     boards.forEach(b => { b.signature = ''; }); screens.forEach(s => { s.signature = ''; });
     for (const sign of signs) paintSign(sign.face, sign.text);
@@ -297,16 +331,21 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
       if (signature === board.signature && !themeDirty) continue;
       board.signature = signature;
       const ctx = board.canvas.getContext('2d');
-      ctx.fillStyle = palette.raised; ctx.fillRect(0, 0, BOARD_PX.width, BOARD_PX.height);
+      ctx.clearRect(0, 0, BOARD_PX.width, BOARD_PX.height);
       ctx.fillStyle = palette.surface; ctx.fillRect(0, 0, BOARD_PX.width, layout.header.h);
       paintText(ctx, board.config.title, layout.text.title, palette.ink, 'left');
       paintText(ctx, text ? `Plant time ${text.plantTime}` : 'Waiting for snapshot', layout.text.time, palette.text, 'right');
       paintText(ctx, text?.telemetry ?? 'No telemetry received', layout.text.telemetry, palette.text, 'left');
       layout.windows.forEach((w, i) => {
-        const state = states[i]; ctx.fillStyle = state.lit ? palette.warning : palette.sunken; ctx.fillRect(w.x, w.y, w.w, w.h);
+        const state = states[i];
+        setIndicator(board.windows[i].material, palette, state);
+        ctx.strokeStyle = palette.ink; ctx.lineWidth = 2;
+        ctx.strokeRect(w.x - 2, w.y - 2, w.w + 4, w.h + 4);
+        ctx.strokeStyle = state.lit ? palette.lampInk : palette.lampLegend;
+        ctx.strokeRect(w.x + 1, w.y + 1, w.w - 2, w.h - 2);
         const lines = wrapLines(ctx, w.legend, w.w - 20, w.font);
-        lines.forEach((line, j) => paintText(ctx, line, { x: w.x + 10, y: w.y + j * 23, w: w.w - 20, h: 23, font: w.font }, state.lit ? palette.surface : palette.ink));
-        if (state.mark) { ctx.fillStyle = palette.surface; ctx.fillRect(w.x + w.w - 9, w.y + 3, 6, 6); }
+        lines.forEach((line, j) => paintText(ctx, line, { x: w.x + 10, y: w.y + j * 23, w: w.w - 20, h: 23, font: w.font }, state.lit ? palette.lampInk : palette.lampLegend));
+        if (state.mark) { ctx.fillStyle = palette.lampInk; ctx.fillRect(w.x + w.w - 9, w.y + 3, 6, 6); }
       });
       board.config.points.forEach((key, i) => {
         const pair = view?.pairs.find(p => p.key === key); if (pair) paintCell(ctx, pair, layout.cells[i]);
@@ -336,17 +375,20 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     });
   }
   function placeKnobs() {
-    const meshes = [knobBodies, knobMarks, knobLevers, knobCaps];
+    const meshes = [knobBodies, knobMarks, knobLevers, knobCaps, litCaps];
     knobPoses.forEach((p, i) => {
       const state = knobStates[i] ?? { kind: 'switch', travel: 0 };
       const dial = state.kind === 'dial' || state.kind === 'rotary';
       for (let part = 0; part < meshes.length; part++) {
-        const on = part < 2 ? dial : part === 2 ? state.kind === 'switch' : state.kind === 'button';
+        const lit = knobIds[i] === 'manual-trip' ? view?.reportedStatus.reactorTripped
+          : knobIds[i] === 'acknowledge' && view?.alarms.some(a => a.state === 'active');
+        const on = part < 2 ? dial : part === 2 ? state.kind === 'switch'
+          : state.kind === 'button' && (part === 4 ? lit : !lit);
         dummy.position.set(...p.position); dummy.position.y += part === 1 ? 0.075 : 0.045;
         dummy.rotation.set(0, p.yaw, 0); dummy.scale.setScalar(on ? 1 : 0);
         if (part === 1 && on) { dummy.scale.set(0.014, 0.008, 0.065); dummy.rotation.y += Math.PI - ((state.fraction ?? 0) - 0.5) * NEEDLE_SWEEP; }
         if (part === 2 && on) { dummy.scale.set(0.035, 0.12, 0.035); dummy.rotation.x = ((state.travel ?? 0) * 2 - 1) * -0.42; }
-        if (part === 3) dummy.position.y -= (state.depth ?? 0) * 0.02;
+        if (part >= 3) dummy.position.y -= (state.depth ?? 0) * 0.02;
         dummy.updateMatrix(); meshes[part].setMatrixAt(i, dummy.matrix);
       }
     });
@@ -367,6 +409,9 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
     const level = shown.get(pair.key) ?? { reported: 0, truth: 0 };
     ctx.save();
     ctx.translate(cell.x, cell.y);
+    ctx.fillStyle = palette.raised;
+    for (const box of Object.values(boxes)) ctx.fillRect(box.x, box.y, box.w, box.h);
+    ctx.fillRect(layout.gapLine.x, layout.gapLine.y, layout.gapLine.w, layout.gapLine.h);
     paintText(ctx, (LABELS[pair.key] ?? [pair.label]).join(' '), boxes.label, palette.ink);
     paintText(ctx, 'HMI', boxes.hmi, palette.text);
     paintText(ctx, 'Plant', boxes.plant, palette.text);
@@ -511,7 +556,8 @@ export function createControlBoard(container, { knobIds, knobLabels, theme, redu
       disposed = true; cancelAnimationFrame(raf); clearTimeout(timer);
       if (document.pointerLockElement === canvas) document.exitPointerLock();
       listeners.forEach(remove => remove()); resizeObserver.disconnect(); visibilityObserver.disconnect();
-      plant.dispose(); resources.forEach(resource => resource.dispose()); renderer.dispose(); renderer.forceContextLoss(); canvas.remove();
+      plant.dispose(); lighting.dispose(); scene.environment = null; scene.clear();
+      resources.forEach(resource => resource.dispose()); renderer.dispose(); renderer.forceContextLoss(); canvas.remove();
       for (const key of ['drawCalls', 'triangles', 'renderMs', 'pixelRatio', 'view', 'camera']) delete container.dataset[key];
     },
   };

@@ -10,6 +10,7 @@
 
 import * as THREE from '/vendor/three/build/three.module.js';
 import { formatGap, formatValue, instruments } from './instruments.mjs';
+import { createMaterial, createLighting, applyMaterialPalette, setIndicator } from './look.mjs';
 
 const TAU = Math.PI * 2;
 const HALF_PI = Math.PI / 2;
@@ -219,13 +220,17 @@ export function mergeStatic(root, track) {
     if (!(object instanceof THREE.Mesh) || object instanceof THREE.InstancedMesh) return;
     if (isAnimated(object, root)) return;
     found.push(object);
-    const list = byMaterial.get(object.material) ?? [];
-    list.push({ geometry: object.geometry, matrix: object.matrixWorld.clone() });
-    byMaterial.set(object.material, list);
+    const key = `${object.material.uuid}:${object.castShadow}:${object.receiveShadow}:${object.renderOrder}`;
+    const batch = byMaterial.get(key) ?? { material: object.material, castShadow: object.castShadow,
+      receiveShadow: object.receiveShadow, renderOrder: object.renderOrder, entries: [] };
+    batch.entries.push({ geometry: object.geometry, matrix: object.matrixWorld.clone() });
+    byMaterial.set(key, batch);
   });
   for (const mesh of found) mesh.removeFromParent();
-  for (const [material, list] of byMaterial) {
-    root.add(new THREE.Mesh(joinGeometries(list, track), material));
+  for (const { material, castShadow, receiveShadow, renderOrder, entries } of byMaterial.values()) {
+    const mesh = new THREE.Mesh(joinGeometries(entries, track), material);
+    Object.assign(mesh, { castShadow, receiveShadow, renderOrder });
+    root.add(mesh);
   }
 }
 
@@ -320,7 +325,7 @@ function paintRack(canvas, rack, colors) {
   const ctx = canvas.getContext('2d');
   const px = (metres) => metres * PX_PER_M;
   const left = rack.x - RACK_W / 2;
-  ctx.fillStyle = colors.steel;
+  ctx.fillStyle = colors.raised;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = colors.ink;
   ctx.textBaseline = 'top';
@@ -343,33 +348,32 @@ function paintRack(canvas, rack, colors) {
  * Builds the plant for the shared stage. The stage advances and renders it.
  * Cameras, geometry and animation state belong to this scene.
  */
-export function createPlantScene({ theme, reducedMotion }) {
+export function createPlantScene({ theme, reducedMotion, environment }) {
   const resources = tracker();
-  const colors = { ...theme, line: theme.strongLine };
+  const colors = { ...theme };
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 200);
-  const fill = new THREE.HemisphereLight();
-  scene.add(fill);
-  const sun = new THREE.DirectionalLight();
-  sun.intensity = 1.5;
-  sun.position.set(-6, 14, 18);
-  scene.add(sun);
-
-  // One material per role. applyColors() sets the colors from the page's tokens.
+  scene.environment = environment;
+  scene.fog = new THREE.Fog(theme.sunken, 32, 95);
+  const lighting = createLighting(THREE, scene, theme, true);
+  const make = (role, token, options) => resources.add(createMaterial(THREE, colors, role, token, options));
   const mat = {
-    shell: resources.add(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.22, depthWrite: false })),
-    containment: resources.add(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.1, depthWrite: false })),
-    metal: resources.add(new THREE.MeshLambertMaterial()),
-    concrete: resources.add(new THREE.MeshLambertMaterial()),
-    ink: resources.add(new THREE.MeshLambertMaterial()),
-    water: resources.add(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.32, depthWrite: false })),
-    steam: resources.add(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.5, depthWrite: false })),
-    steamBead: resources.add(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.85, depthWrite: false })),
-    face: resources.add(new THREE.MeshLambertMaterial()),
-    core: resources.add(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.2, depthWrite: false })),
-    accent: resources.add(new THREE.MeshBasicMaterial()),
-    warning: resources.add(new THREE.MeshBasicMaterial()),
-    coolant: [resources.add(new THREE.MeshLambertMaterial()), resources.add(new THREE.MeshLambertMaterial())],
+    shell: make('glass', 'raised', { transparent: true, opacity: 0.22, depthWrite: false }),
+    containment: make('glass', 'strongLine', { transparent: true, opacity: 0.1, depthWrite: false }),
+    metal: make('brushedMetal', 'metal'),
+    concrete: make('concrete', 'sunken'),
+    ink: make('paintedSteel', 'ink'),
+    water: make('glass', 'coldCoolant', { transparent: true, opacity: 0.32, depthWrite: false }),
+    steam: make('concrete', 'steam', { transparent: true, opacity: 0.5, depthWrite: false }),
+    steamBead: make('concrete', 'steam', { transparent: true, opacity: 0.85, depthWrite: false }),
+    face: make('paintedSteel', 'raised'),
+    core: make('lamp', 'accent', { transparent: true, opacity: 0.2, depthWrite: false }),
+    accent: make('paintedSteel', 'accent'),
+    warning: make('paintedSteel', 'warning'),
+    lamp: make('lamp', 'lampGlow'),
+    lampOff: make('lamp', 'lampOff'),
+    fixture: make('lamp', 'plantKey', { emissiveIntensity: 3 }),
+    coolant: [make('paintedSteel', 'coldCoolant'), make('paintedSteel', 'coldCoolant')],
   };
   const coldCoolant = new THREE.Color(colors.coldCoolant);
   const hotCoolant = new THREE.Color(colors.hotCoolant);
@@ -382,26 +386,18 @@ export function createPlantScene({ theme, reducedMotion }) {
     canvas.height = Math.round(RACK_H * PX_PER_M);
     const texture = resources.add(new THREE.CanvasTexture(canvas));
     texture.colorSpace = THREE.SRGBColorSpace;
-    const material = resources.add(new THREE.MeshBasicMaterial({ map: texture }));
+    const material = resources.add(new THREE.MeshBasicMaterial({ map: texture, toneMapped: false }));
     return { rack, canvas, texture, material };
   });
 
   function applyColors() {
-    fill.color.set(colors.lightKey);
-    fill.groundColor.set(colors.lightKey);
-    sun.color.set(colors.lightKey);
-    mat.shell.color.set(colors.raised);
-    mat.containment.color.set(colors.line);
-    mat.metal.color.set(colors.metal);
-    mat.concrete.color.set(colors.line);
-    mat.ink.color.set(colors.ink);
-    mat.water.color.set(colors.ink);
-    mat.steam.color.set(colors.steam);
-    mat.steamBead.color.set(colors.steam);
-    mat.face.color.set(colors.raised);
-    mat.core.color.set(colors.accent);
-    mat.accent.color.set(colors.accent);
-    mat.warning.color.set(colors.warning);
+    lighting.setTheme(colors);
+    for (const material of Object.values(mat).flat()) applyMaterialPalette(material, colors);
+    setIndicator(mat.lamp, colors, { lit: true });
+    setIndicator(mat.lampOff, colors, { lit: false });
+    mat.fixture.emissive.set(colors.plantKey);
+    mat.core.emissive.set(colors.accent); mat.core.emissiveIntensity = 0.6;
+    scene.fog.color.set(colors.sunken);
     coldCoolant.set(colors.coldCoolant);
     hotCoolant.set(colors.hotCoolant);
     scene.background = new THREE.Color(colors.sunken);
@@ -526,6 +522,12 @@ export function createPlantScene({ theme, reducedMotion }) {
   }
   box(hall, [16, 0.4, 0.4], mat.metal, [HALL_X, 8.8, -5.6], resources);
   box(hall, [16, 0.4, 0.4], mat.metal, [HALL_X, 8.8, 5.6], resources);
+  for (const x of [REACTOR_X - 2.5, REACTOR_X + 2.5, HALL_X - 4, HALL_X + 4]) {
+    for (const z of [-3.5, 3.5]) {
+      box(plant, [1.6, 0.16, 0.8], mat.metal, [x, 8.6, z], resources);
+      box(plant, [1.4, 0.035, 0.65], mat.fixture, [x, 8.5, z], resources);
+    }
+  }
 
   // Turbine casings are glass, so the rotors show; the last casing is the generator.
   const casings = [
@@ -592,6 +594,11 @@ export function createPlantScene({ theme, reducedMotion }) {
   for (const m of [reportedFaces, trueFaces, trueRings]) m.instanceMatrix.needsUpdate = true;
 
   // Static parts are joined by material; the moving parts above stay separate.
+  plant.traverse(object => {
+    if (!object.isMesh || object.isInstancedMesh || isAnimated(object, plant)) return;
+    object.castShadow = object.material === mat.metal || object.material === mat.concrete;
+    object.receiveShadow = object.castShadow || mat.coolant.includes(object.material);
+  });
   mergeStatic(plant, resources);
 
   // --- Animation state -----------------------------------------------------
@@ -702,7 +709,7 @@ export function createPlantScene({ theme, reducedMotion }) {
     }
     for (let i = 0; i < 2; i++) {
       const running = latest ? latest.loops[i].pumpRunning : false;
-      pumps[i].lamp.material = running ? mat.accent : mat.ink;
+      pumps[i].lamp.material = running ? mat.lamp : mat.lampOff;
     }
 
     // Steam beads run along the header while steam goes to the turbine.
@@ -775,11 +782,12 @@ export function createPlantScene({ theme, reducedMotion }) {
       return latest;
     },
     setTheme(theme) {
-      Object.assign(colors, theme, { line: theme.strongLine });
+      Object.assign(colors, theme);
       applyColors();
     },
     dispose() {
       scene.traverse(object => { if (object.isInstancedMesh) object.dispose(); });
+      lighting.dispose(); scene.environment = null; scene.clear();
       resources.disposeAll();
     },
   };

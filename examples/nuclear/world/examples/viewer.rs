@@ -36,6 +36,7 @@ const CONTROL_ROOM: &str = include_str!("../../viewer/control-room.mjs");
 const CONTROL_BOARD: &str = include_str!("../../viewer/control-board.mjs");
 const BOARD_LAYOUT: &str = include_str!("../../viewer/board-layout.mjs");
 const ROOM_MOTION: &str = include_str!("../../viewer/room-motion.mjs");
+const LOOK: &str = include_str!("../../viewer/look.mjs");
 const INSTRUMENTS: &str = include_str!("../../viewer/instruments.mjs");
 const KNOBS: &str = include_str!("../../viewer/knobs.mjs");
 const PLANT_SCENE: &str = include_str!("../../viewer/plant-scene.mjs");
@@ -115,6 +116,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .asset("nuclear/control-board.mjs", JS, CONTROL_BOARD)
         .asset("nuclear/board-layout.mjs", JS, BOARD_LAYOUT)
         .asset("nuclear/room-motion.mjs", JS, ROOM_MOTION)
+        .asset("nuclear/look.mjs", JS, LOOK)
         .asset("nuclear/instruments.mjs", JS, INSTRUMENTS)
         .asset("nuclear/knobs.mjs", JS, KNOBS)
         .asset("nuclear/plant-scene.mjs", JS, PLANT_SCENE)
