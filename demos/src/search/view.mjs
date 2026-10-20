@@ -128,15 +128,17 @@ export function mount(root, services, options) {
     });
     if (view.more) add('text', { class: 'label small muted', x: 490, y: 300, 'text-anchor': 'end' }, `+${view.more}`);
     view.planted.forEach((p, n) => {
-      const x = 300 + n * 110;
+      const x = 250 + n * 135;
       add('circle', { class: 'node planted', cx: x, cy: 404, r: 9 });
-      add('text', { class: 'label small', x: x + 16, y: 408 }, p.label).append(el('svg:title', { text: p.text }, null));
+      const label = p.label.length > 14 ? `${p.label.slice(0, 13)}…` : p.label;
+      add('text', { class: 'label small', x: x + 16, y: 408 }, label).append(el('svg:title', { text: p.text }, null));
     });
     if (view.refused) {
-      add('circle', { class: 'node refused', cx: 50, cy: 404, r: 11 });
-      add('line', { class: 'cross', x1: 43, y1: 397, x2: 57, y2: 411 });
-      add('line', { class: 'cross', x1: 57, y1: 397, x2: 43, y2: 411 });
-      add('text', { class: 'label refused', x: 70, y: 409 }, view.refused);
+      add('circle', { class: 'node refused', cx: 40, cy: 404, r: 11 });
+      add('line', { class: 'cross', x1: 33, y1: 397, x2: 47, y2: 411 });
+      add('line', { class: 'cross', x1: 47, y1: 397, x2: 33, y2: 411 });
+      const name = view.refused.length > 22 ? `${view.refused.slice(0, 21)}…` : view.refused;
+      add('text', { class: 'label refused', x: 60, y: 409 }, name);
     }
   }
   function render() {

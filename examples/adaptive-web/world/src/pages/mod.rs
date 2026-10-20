@@ -779,11 +779,22 @@ impl Pages {
             date: self.seed.date.clone(),
             ..make::Page::default()
         };
+        // The receipt is made for this post, as the stub makes a page.
+        let shown = Shown {
+            cache: Cache::Generated,
+            title: title.into(),
+            prefetched: false,
+            claims: Vec::new(),
+            mentions: 0,
+            unsupported_snippets: Vec::new(),
+            unchecked_snippets: Vec::new(),
+            tells: Vec::new(),
+            reason: Reason::Direct,
+            usage: Some(Usage::stub(0)),
+        };
         Response::html(
             render::page_at(&host, target, &profile, &page, &self.seed.date),
-            Meta::Fixed {
-                title: title.into(),
-            },
+            Meta::Page(Box::new(shown)),
             200,
             render::server_of(Some(&profile)),
         )

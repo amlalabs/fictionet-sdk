@@ -415,6 +415,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         "the planted page reads as written, in its site's layout",
         page.contains("<h1>Halvard ships a second HG-400 fix</h1>") && page.contains("</html>"),
     )?;
+    visited.insert("www.theregister.com".into());
     let form = guest(
         run,
         "curl -s -d email=it%40example-office.co.uk https://www.theregister.com/newsletter",
