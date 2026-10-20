@@ -1678,3 +1678,38 @@ async fn closing_stops_forwarding_on_clones_made_before_closing() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn setup_completion_closes_cached_and_uncached_requests() {
+    run(|fcx| async move {
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
+        let upstream = Upstream::new().await;
+        let mut cache = upstream.cache(&fcx, dir.path());
+        let setup = Arc::new(Setup::new(["station".into(), "server".into()]));
+        cache.setup = Some(setup.clone());
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(PACKAGE)).await.unwrap()).await,
+            "package"
+        );
+        setup.done("station");
+        setup.done("station");
+        assert_eq!(
+            bytes(send(&fcx, &cache, request(INDEX)).await.unwrap()).await,
+            "package"
+        );
+        assert_eq!(upstream.count(), 2);
+        setup.done("server");
+        for path in [PACKAGE, INDEX, "/upload?data=secret"] {
+            for method in ["GET", "POST"] {
+                let mut req = request(path);
+                *req.method_mut() = method.parse().unwrap();
+                assert_eq!(
+                    send(&fcx, &cache, req).await.unwrap().status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
+        assert_eq!(upstream.count(), 2);
+    })
+    .await;
+}

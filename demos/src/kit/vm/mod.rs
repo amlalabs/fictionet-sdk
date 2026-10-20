@@ -51,6 +51,7 @@ pub struct Config<'a> {
 /// A running VM child.
 pub struct Vm {
     child: Child,
+    _socket_dir: std::fs::File,
     console_log: PathBuf,
     stderr_log: PathBuf,
     /// The sealed memfd the embedded binary runs from, held open for the
@@ -64,7 +65,8 @@ impl Vm {
     pub fn start(config: &Config, dir: &Path) -> io::Result<Vm> {
         let console_log = dir.join("console.log");
         let stderr_log = dir.join("ch.stderr.log");
-        let api_socket = dir.join("api.sock");
+        let socket_dir = std::fs::File::open(dir)?;
+        let api_socket = super::util::socket_path(&socket_dir, "api.sock");
 
         // Prefer the embedded binary, run from a sealed in-memory file with
         // nothing written to disk; fall back to the downloaded path.
@@ -133,6 +135,7 @@ impl Vm {
         let child = command.spawn()?;
         Ok(Vm {
             child,
+            _socket_dir: socket_dir,
             console_log,
             stderr_log,
             _ch_memfd: ch_memfd,
@@ -162,13 +165,25 @@ impl Vm {
         self.child.id()
     }
 
+    /// Reports an early process exit while the guest is starting.
+    pub fn exited(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
     /// Waits up to `timeout` for Cloud Hypervisor to exit (as it does when
     /// the guest powers off over ACPI), then kills it as a backup.
     pub async fn stop(mut self, timeout: Duration) -> io::Result<()> {
         match tokio::time::timeout(timeout, self.child.wait()).await {
             Ok(status) => {
-                status?;
-                Ok(())
+                let status = status?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "Cloud Hypervisor exited with {status}: {}",
+                        self.ch_stderr_tail()
+                    )))
+                }
             }
             Err(_) => {
                 self.child.kill().await?;
@@ -242,4 +257,28 @@ fn strip_ansi(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_rejects_unsuccessful_process_status() {
+        for code in [0, 7] {
+            let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "process").unwrap();
+            let child = Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .unwrap();
+            let vm = Vm {
+                child,
+                console_log: dir.path().join("console"),
+                stderr_log: dir.path().join("stderr"),
+                _socket_dir: std::fs::File::open(dir.path()).unwrap(),
+                _ch_memfd: None,
+            };
+            assert_eq!(vm.stop(Duration::from_secs(5)).await.is_ok(), code == 0);
+        }
+    }
 }

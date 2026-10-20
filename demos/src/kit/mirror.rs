@@ -54,6 +54,27 @@ pub fn new(fcx: &Cx) -> Result<Cache<web::Proxy>, Error> {
 pub struct Cache<S> {
     upstream: S,
     state: Arc<State>,
+    pub(crate) setup: Option<Arc<Setup>>,
+}
+
+pub(crate) struct Setup {
+    pending: Mutex<std::collections::HashSet<String>>,
+}
+
+impl Setup {
+    pub(crate) fn new(guests: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            pending: Mutex::new(guests.into_iter().collect()),
+        }
+    }
+
+    pub(crate) fn done(&self, guest: &str) {
+        self.pending.lock().unwrap().remove(guest);
+    }
+
+    fn closed(&self) -> bool {
+        self.pending.lock().unwrap().is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -105,6 +126,7 @@ impl<S> Cache<S> {
         };
         Self {
             upstream,
+            setup: None,
             state: Arc::new(State {
                 disk,
                 keys: Mutex::new(BTreeMap::new()),
@@ -268,6 +290,12 @@ where
         // Admit before per-key waits; hold through EOF, cancellation or deadline.
         let permit = self.state.slots.clone().try_acquire_owned();
         Box::pin(async move {
+            if cache.setup.as_ref().is_some_and(|setup| setup.closed()) {
+                return Ok(web::httpd::text(
+                    StatusCode::FORBIDDEN,
+                    "Package mirror closed\n",
+                ));
+            }
             let Ok(permit) = permit else {
                 cache.state.stats.bypass("admission");
                 return Ok(web::httpd::text(
@@ -361,6 +389,12 @@ where
     async fn forward(&self, request: Request<Body>) -> Answer {
         let mut upstream = self.upstream.clone();
         std::future::poll_fn(|cx| upstream.poll_ready(cx)).await?;
+        if self.setup.as_ref().is_some_and(|setup| setup.closed()) {
+            return Ok(web::httpd::text(
+                StatusCode::FORBIDDEN,
+                "Package mirror closed\n",
+            ));
+        }
         upstream.call(request).await
     }
 

@@ -32,8 +32,9 @@ the first run on a machine also fetches about 280 MB of Ubuntu packages and
 later runs reuse them.
 
 Each run prints its page URL before the guests boot. It then runs the
-demo's story and its checks. Every demo checks that no containment probe was
-forwarded or answered from outside the world. The run saves screenshots,
+demo's story and its checks. Every demo requires each declared containment probe exactly once, with an
+affirmative result. Configuration probes report facts. The shared package
+mirror closes once every guest has finished its cloud-init check. The run saves screenshots,
 powers the guests off, and checks that no Cloud Hypervisor process or run
 directory is left. A passing run ends with `every required check passed`. A
 failing run prints the guests' cloud-init report, log tails and console tail.
@@ -66,7 +67,7 @@ The checks cover the guest's address and devices, the trust store, Firefox, the
 agents' own TLS clients, and the page's access controls. They type a command
 in the page terminal and move the pointer with and without the screen lease.
 
-- Options: a Unix socket path. With it,
+- Options: `--stay` keeps the page open until Ctrl-C. A Unix socket path lets
   `fictionet observe --observation unix:PATH watch` follows the same
   collector from another terminal.
 - Screenshots: `downloads/cloudimage/shots/`, with `guest-desktop.png` from
@@ -193,6 +194,7 @@ keeps a strip of this run's reads. The inspector adds a Reads table.
 The checks cover both reads, the switch's revisions, a stale switch command,
 and that the panels have data.
 
+- Options: `--stay` keeps the page open after the checks until Ctrl-C.
 - Screenshots: `desktop.png` and `page.png` in a new directory under
   `downloads/cloudimage/shots/` for each run.
 - Without a VM: `cargo xtask demo fakewiki preview` serves the same page and
@@ -215,6 +217,7 @@ banners seen on the wire beside what nmap says, with the shared panels. See
 The checks compare each nmap report with the ports the world served, and the
 page's access controls and terminal.
 
+- Options: `--stay` keeps the page open after the checks until Ctrl-C.
 - Screenshots: `downloads/cloudimage/shots/`, with `viewer-scan.png`,
   `page-scan.png`, and each step's nmap report and the world's ports beside it.
 - Without a VM: `cargo xtask demo scan preview` serves the same page,

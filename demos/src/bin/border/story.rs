@@ -39,7 +39,7 @@ async fn begin(ssh: &ssh::Session, step: &str) -> io::Result<()> {
     Ok(())
 }
 
-async fn finish(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> {
+async fn output(ssh: &ssh::Session, step: &str) -> io::Result<ssh::Output> {
     command(ssh, "timeout 90 tmux wait-for bank-check").await?;
     let text = command(ssh, "cat ~/.cache/bank-check/output").await?;
     let status = command(ssh, "cat ~/.cache/bank-check/status").await?;
@@ -52,6 +52,11 @@ async fn finish(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()
         "agent$ bank-check {step}\n{}[exit {}]",
         output.stdout, output.code
     );
+    Ok(output)
+}
+
+async fn finish(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> {
+    let output = output(ssh, step).await?;
     if !checks::check(step, &output, &routed(hijacked)) {
         return Err(io::Error::other(format!(
             "bank-check {step} did not produce the expected result"
@@ -70,6 +75,21 @@ fn routed(hijacked: bool) -> border_world::scenario::Scenario {
 }
 
 async fn step(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> {
+    if step == "bgp" {
+        return tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                begin(ssh, step).await?;
+                let output = output(ssh, step).await?;
+                if output.code != 0 {
+                    return Err(io::Error::other(format!("BIRD exit {}", output.code)));
+                }
+                if checks::check(step, &output, &routed(hijacked)) {
+                    return Ok(());
+                }
+            }
+        })
+        .await?;
+    }
     begin(ssh, step).await?;
     finish(ssh, step, hijacked).await
 }
@@ -197,7 +217,7 @@ async fn terminal(client: &PageClient, ssh: &ssh::Session) -> io::Result<()> {
         socket.write_all(format!("touch {}\r", quote(&marker)).as_bytes()).await?;
         socket.flush().await?;
         // A fresh agent command supplies output after the viewer's input.
-        step(ssh, "bgp 2", false).await?;
+        step(ssh, "bgp", false).await?;
         command(ssh, &format!("test ! -e {}", quote(&marker))).await?;
         let pane = command(ssh, "tmux capture-pane -p -t main").await?;
         if pane.stdout.contains(&marker) {
@@ -255,7 +275,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
     println!("Normal: trusted sign-in, balance, certificate, three hops and two BGP routes.");
-    for name in ["signin", "balance", "cert", "route", "bgp 2"] {
+    for name in ["signin", "balance", "cert", "route", "bgp"] {
         step(ssh, name, false).await?;
     }
     terminal(&client, ssh).await?;
@@ -285,7 +305,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     println!(
         "Hijacked: the existing session fails, four hops, three BGP routes, and an untrusted certificate."
     );
-    for name in ["route", "bgp 3", "balance", "cert -k"] {
+    for name in ["route", "bgp", "balance", "cert -k"] {
         step(ssh, name, true).await?;
     }
     let cursor = client.last_event().await?;
@@ -304,7 +324,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     .await?;
     screen(run, out, true).await?;
     flip(&client, "legitimate", 1).await?;
-    for name in ["route", "balance", "bgp 2"] {
+    for name in ["route", "balance", "bgp"] {
         step(ssh, name, false).await?;
     }
     reload(run, false).await?;

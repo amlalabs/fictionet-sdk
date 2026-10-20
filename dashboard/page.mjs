@@ -147,7 +147,7 @@ function icon(el, parent, name, label) {
   return svg;
 }
 
-const READINESS = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', stopped: 'Stopped' };
+const READINESS = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', failed: 'Failed', stopped: 'Stopped' };
 // The kinds of the standard panels. The page server sorts the panels; a
 // page's own panels are the other kinds.
 const STANDARD = ['packets', 'events', 'map', 'left_the_box', 'containment', 'labels'];

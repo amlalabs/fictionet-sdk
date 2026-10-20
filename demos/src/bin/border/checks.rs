@@ -67,7 +67,7 @@ pub fn check(step: &str, output: &Output, scenario: &Scenario) -> bool {
             expected.push(BANK_ADDR);
             route(&text, &expected)
         }
-        "bgp 2" | "bgp 3" => routes(
+        "bgp" => routes(
             &text,
             &state
                 .routes
@@ -123,8 +123,8 @@ mod tests {
         for (step, text, hijacked, code) in [
             ("route", normal, false, 0),
             ("route", hijack, true, 0),
-            ("bgp 2", two, false, 0),
-            ("bgp 3", &three, true, 0),
+            ("bgp", two, false, 0),
+            ("bgp", &three, true, 0),
             (
                 "balance",
                 "curl: (60) SSL certificate problem: self-signed certificate in certificate chain",
@@ -165,8 +165,8 @@ mod tests {
             &output(0, &normal.replace("192.168.1.1", "*")),
             &mode(false)
         ));
-        assert!(!check("bgp 3", &output(0, two), &mode(true)));
-        assert!(!check("bgp 2", &output(0, &three), &mode(false)));
+        assert!(!check("bgp", &output(0, two), &mode(true)));
+        assert!(!check("bgp", &output(0, &three), &mode(false)));
         assert!(!check(
             "cert",
             &output(0, "issuer: CN=Anchorpoint Root CA R1"),

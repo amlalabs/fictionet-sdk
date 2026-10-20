@@ -103,6 +103,14 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
     if topics.story.replay {
         return Err("story: the page calls the run a replay".into());
     }
+    if topics.story.steps.len() != crate::script::STEPS.len()
+        || topics.story.steps.iter().enumerate().any(|(index, step)| {
+            step.title != crate::script::STEPS[index].title
+                || step.command != crate::script::command(index)
+        })
+    {
+        return Err("story: steps or commands do not match the declared story".into());
+    }
     if let Some(step) = topics
         .story
         .steps
@@ -201,6 +209,19 @@ mod tests {
         let summary = check(&topics, &moment).unwrap();
         assert!(summary.starts_with("five hosts answered, 251 other addresses unreachable"));
         assert!(summary.contains("5 OS matches and 0 with no match"));
+    }
+
+    #[test]
+    fn story_identity_is_required() {
+        for change in [0, 1, 2] {
+            let (mut topics, moment) = topics();
+            match change {
+                0 => topics.story.steps.clear(),
+                1 => topics.story.steps.swap(0, 1),
+                _ => topics.story.steps[0].command = "true".into(),
+            }
+            assert!(check(&topics, &moment).is_err());
+        }
     }
 
     #[test]

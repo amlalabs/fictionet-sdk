@@ -278,6 +278,7 @@ async fn addresses_follow_each_guests_lease() {
         }));
         let resources = Resources::new(dir.path(), &guest, index).unwrap();
         handles.push(GuestHandle {
+            setup: Arc::new(mirror::Setup::new([])),
             console: page::GuestConsole::new(&guest),
             guest,
             resources,
@@ -326,6 +327,7 @@ async fn addresses_follow_each_guests_lease() {
 fn root_certificate_names_are_neutral() {
     let (_, attachments) = fictionet::attachments();
     let mut world = World {
+        setup: Arc::new(mirror::Setup::new([])),
         attachments,
         ca: Arc::new(Mutex::new(None)),
         now_unix: 0,
@@ -680,8 +682,30 @@ async fn page_wires_containment_and_labels() {
             containment::PROBES.len()
         );
     }
+    assert!(fixture.run.containment().await.is_err());
+    let mut all = fixture.run.probes.lock().unwrap().clone();
+    for probe in &mut all.probes {
+        probe.outcome = if matches!(
+            probe.destination.as_str(),
+            "IPv6 routing table" | "environment" | "/etc/environment" | "apt configuration"
+        ) {
+            fictionet_observe::page::ProbeOutcome::Fact
+        } else {
+            fictionet_observe::page::ProbeOutcome::Contained
+        };
+    }
+    *fixture.run.probes.lock().unwrap() = all.clone();
+    fixture
+        .run
+        .containment
+        .publish(fictionet::time::Instant::ZERO, &all)
+        .unwrap();
     fixture.run.containment().await.unwrap();
     for outcome in [
+        fictionet_observe::page::ProbeOutcome::Unknown,
+        fictionet_observe::page::ProbeOutcome::MissingTool,
+        fictionet_observe::page::ProbeOutcome::TimedOut,
+        fictionet_observe::page::ProbeOutcome::Fact,
         fictionet_observe::page::ProbeOutcome::Forwarded,
         fictionet_observe::page::ProbeOutcome::NotContained,
     ] {
@@ -1751,4 +1775,39 @@ fn kit_rules_precede_world_policy_and_preserve_non_console_flows() {
         },
     ))
     .unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_reports_world_failure_after_cleanup() {
+    let mut kit = Kit::new("cleanup").guest(Guest::ubuntu("station", "analyst"));
+    let (mut run, _) = kit.prepare().unwrap();
+    let path = run.path().to_owned();
+    run.world = Some(tokio::spawn(async {
+        Err(fictionet::Error::msg("world stopped unexpectedly"))
+    }));
+    let error = run.shutdown().await.unwrap_err();
+    assert!(error.to_string().contains("world stopped unexpectedly"));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn configured_address_does_not_claim_network_readiness() {
+    let fixture = PageFixture::new().await;
+    let cx = fixture.run.fcx.lock().unwrap().as_ref().unwrap().clone();
+    fixture.run.guests[0]
+        .console
+        .booting(&cx, Some(Ipv4Addr::new(10, 0, 0, 3)));
+    let status = fixture.state("host-workstation").await;
+    assert_eq!(status["value"]["state"], "booting");
+    assert_eq!(
+        status["value"]["addresses"],
+        serde_json::json!(["10.0.0.3"])
+    );
+    fixture.run.guests[0].console.failed(&cx, "process exited");
+    fixture.run.stop_status();
+    assert_eq!(
+        fixture.state("host-workstation").await["value"]["state"],
+        "failed"
+    );
+    fixture.run.shutdown().await.unwrap();
 }

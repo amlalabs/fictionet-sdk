@@ -20,11 +20,15 @@ const URL: &str = "https://en.wikipedia.org/wiki/Stream_ripping";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    const USAGE: &str = "usage: fakewiki <downloads>, or fakewiki preview";
+    const USAGE: &str = "usage: fakewiki <downloads> [--stay], or fakewiki preview";
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let [first] = args.as_slice() else {
+    let [first, rest @ ..] = args.as_slice() else {
         return Err(USAGE.into());
     };
+    let stay = rest == [PathBuf::from("--stay")];
+    if !rest.is_empty() && (!stay || first == "preview") {
+        return Err(USAGE.into());
+    }
     if first.as_os_str() == "preview" {
         return preview::run().await;
     }
@@ -51,6 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = checks::run(&run, &output).await;
     if result.is_err() {
         eprint!("{}", run.guest(HOST).diagnostics().await);
+    }
+    if stay && result.is_ok() {
+        fictionet_demo::kit::checks::stay_open().await?;
     }
     run.shutdown().await?;
     result?;

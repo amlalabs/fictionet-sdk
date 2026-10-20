@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use vhost::vhost_user::message::VhostUserProtocolFeatures;
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
 use virtio_queue::QueueT;
@@ -31,6 +31,8 @@ use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 /// The guest's virtio-net header is 12 bytes under VIRTIO_F_VERSION_1.
 const VNET_HDR: usize = 12;
+const MAX_FRAME: usize = super::MTU as usize + 14;
+pub(crate) const QUEUE_LIMIT: usize = 256;
 
 const RX_QUEUE: u16 = 0;
 const TX_QUEUE: u16 = 1;
@@ -67,7 +69,12 @@ impl RxQueue {
 
     /// Hands a frame to the guest and wakes the backend.
     pub fn push(&self, frame: Vec<u8>) {
-        self.frames.lock().unwrap().push_back(frame);
+        let mut frames = self.frames.lock().unwrap();
+        if frame.len() > MAX_FRAME || frames.len() >= QUEUE_LIMIT {
+            return;
+        }
+        frames.push_back(frame);
+        drop(frames);
         let _ = self.notify.write(1);
     }
 }
@@ -75,7 +82,7 @@ impl RxQueue {
 struct NetBackend {
     mem: Option<Mem>,
     mac: [u8; 6],
-    to_world: UnboundedSender<Vec<u8>>,
+    to_world: Sender<Vec<u8>>,
     rx: RxQueue,
     exit: EventFd,
 }
@@ -111,7 +118,7 @@ impl VhostUserBackendMut for NetBackend {
         // The virtio-net config starts with the 6-byte MAC.
         let mut config = self.mac.to_vec();
         config.resize(12, 0);
-        let (start, end) = (offset as usize, (offset + size) as usize);
+        let (start, end) = (offset as usize, offset.saturating_add(size) as usize);
         config
             .get(start..end.min(config.len()))
             .unwrap_or(&[])
@@ -166,17 +173,22 @@ impl NetBackend {
                 while let Some(chain) = queue.pop_descriptor_chain(mem.clone()) {
                     let head = chain.head_index();
                     let mut frame = Vec::new();
+                    let mut valid = true;
                     for desc in chain {
-                        if desc.is_write_only() {
+                        let len = desc.len() as usize;
+                        if desc.is_write_only() || len > MAX_FRAME + VNET_HDR - frame.len() {
+                            valid = false;
                             break;
                         }
-                        let mut buf = vec![0u8; desc.len() as usize];
-                        if mem.read_slice(&mut buf, desc.addr()).is_ok() {
-                            frame.extend_from_slice(&buf);
+                        let start = frame.len();
+                        frame.resize(start + len, 0);
+                        if mem.read_slice(&mut frame[start..], desc.addr()).is_err() {
+                            valid = false;
+                            break;
                         }
                     }
-                    if frame.len() > VNET_HDR {
-                        let _ = self.to_world.send(frame.split_off(VNET_HDR));
+                    if valid && frame.len() > VNET_HDR {
+                        let _ = self.to_world.try_send(frame.split_off(VNET_HDR));
                     }
                     let _ = queue.add_used(&*mem, head, 0);
                     used = true;
@@ -244,7 +256,7 @@ impl NetBackend {
 pub fn start(
     socket: &Path,
     mac: [u8; 6],
-    to_world: UnboundedSender<Vec<u8>>,
+    to_world: Sender<Vec<u8>>,
     rx: RxQueue,
 ) -> std::io::Result<Backend> {
     let mem: Mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
@@ -302,5 +314,68 @@ impl Drop for Backend {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transmit_rejects_oversized_chains_and_bounds_pending_frames() {
+        use vm_memory::GuestAddress;
+        for lengths in [vec![u32::MAX], vec![1000, 1000], vec![64]] {
+            let mem = GuestMemoryAtomic::new(
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+            );
+            let vring = VringRwLock::new(mem.clone(), 256).unwrap();
+            vring.set_queue_info(0x1000, 0x2000, 0x3000).unwrap();
+            vring.set_queue_size(256);
+            vring.set_queue_ready(true);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let mut backend = NetBackend {
+                mem: Some(mem.clone()),
+                mac: [0; 6],
+                to_world: tx,
+                rx: RxQueue::new().unwrap(),
+                exit: EventFd::new(EFD_NONBLOCK).unwrap(),
+            };
+            for (index, len) in lengths.iter().enumerate() {
+                let mut desc = Vec::new();
+                desc.extend_from_slice(&0x4000u64.to_le_bytes());
+                desc.extend_from_slice(&len.to_le_bytes());
+                desc.extend_from_slice(&u16::from(index + 1 < lengths.len()).to_le_bytes());
+                desc.extend_from_slice(&((index + 1) as u16).to_le_bytes());
+                mem.memory()
+                    .write_slice(&desc, GuestAddress(0x1000 + index as u64 * 16))
+                    .unwrap();
+            }
+            mem.memory().write_obj(1u16, GuestAddress(0x2002)).unwrap();
+            backend.process_tx(&vring);
+            if lengths == [64] {
+                assert_eq!(rx.len(), 1);
+                mem.memory().write_obj(2u16, GuestAddress(0x2002)).unwrap();
+                backend.process_tx(&vring);
+                assert_eq!(rx.len(), 1);
+                assert_eq!(rx.try_recv().unwrap().len(), 64 - VNET_HDR);
+            } else {
+                assert!(rx.try_recv().is_err());
+            }
+            assert_eq!(
+                vring.queue_next_avail(),
+                if lengths == [64] { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn receive_queue_bounds_packets_and_bytes() {
+        let rx = RxQueue::new().unwrap();
+        rx.push(vec![0; MAX_FRAME + 1]);
+        assert!(rx.frames.lock().unwrap().is_empty());
+        for _ in 0..QUEUE_LIMIT + 1 {
+            rx.push(vec![0; MAX_FRAME]);
+        }
+        assert_eq!(rx.frames.lock().unwrap().len(), QUEUE_LIMIT);
     }
 }

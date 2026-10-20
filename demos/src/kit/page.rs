@@ -89,6 +89,7 @@ enum Readiness {
     Waiting(String),
     Ready(Duration),
     Stopped,
+    Failed(String),
 }
 
 impl GuestConsole {
@@ -120,8 +121,22 @@ impl GuestConsole {
         })
     }
 
-    pub(super) fn booting(&self, cx: &Cx) {
-        self.publish(cx, HostState::Booting, vec![], false, false);
+    pub(super) fn booting(&self, cx: &Cx, configured: Option<std::net::Ipv4Addr>) {
+        self.publish(
+            cx,
+            HostState::Booting,
+            configured.into_iter().map(|a| a.to_string()).collect(),
+            false,
+            false,
+        );
+    }
+
+    pub(super) fn failed(&self, cx: &Cx, message: &str) {
+        let mut state = self.session.lock().unwrap();
+        state.stopped = true;
+        state.session.take();
+        self.ready.send_replace(Readiness::Failed(message.into()));
+        self.publish(cx, HostState::Failed, vec![], false, false);
     }
 
     pub(super) fn network(&self, cx: &Cx, addr: std::net::Ipv4Addr) {
@@ -251,6 +266,7 @@ impl GuestConsole {
         {
             Ok(Ok(value)) => match &*value {
                 Readiness::Ready(elapsed) => Ok(*elapsed),
+                Readiness::Failed(message) => Err(io::Error::other(message.clone())),
                 _ => Err(io::Error::other(format!("{} has stopped", self.name))),
             },
             Ok(Err(error)) => Err(io::Error::other(error)),
