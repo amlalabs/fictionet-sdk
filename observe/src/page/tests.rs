@@ -2051,6 +2051,111 @@ async fn labels_are_world_commands_and_event_exports_keep_scope_labels_and_loss(
     );
 }
 
+#[tokio::test]
+async fn state_can_be_registered_without_a_panel() {
+    let topic = StateTopic::new(StateLimits::default());
+    topic
+        .publish(
+            fictionet::time::Instant::from_since_start(std::time::Duration::ZERO),
+            &serde_json::json!({"enabled":true,"revision":0}),
+        )
+        .unwrap();
+    let page = Page::new(
+        "Settings",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .state("settings", topic.clone());
+    let server = page.bind_loopback(0).await.unwrap();
+    let state =
+        json_body(&request(&server, "GET", "/api/state/settings", &bearer(&server), "").await);
+    assert_eq!(state["revision"], 1);
+    assert_eq!(state["value"]["revision"], 0);
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    let panels = description["panels"].as_array().unwrap();
+    assert!(panels.is_empty());
+}
+
+#[tokio::test]
+async fn command_endpoint_works_without_a_control_panel() {
+    let port = CommandPort::<SetRoute, u64>::new(CommandLimits::default());
+    let server = Page::new(
+        "Commands",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .command("settings", port.clone())
+    .bind_loopback(0)
+    .await
+    .unwrap();
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    assert!(description["panels"].as_array().unwrap().is_empty());
+    let auth = format!("{}Origin: http://{}\r\n", bearer(&server), address(&server));
+    let send = request(
+        &server,
+        "POST",
+        "/api/command/settings",
+        &auth,
+        r#"{"request_id":"change","command":{"mode":"direct","expected_revision":7}}"#,
+    );
+    let receive = async {
+        let command = port.recv().await.unwrap();
+        assert_eq!(command.command.expected_revision, 7);
+        fictionet::lab(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(7)),
+            |cx| async move {
+                command.reply(&cx, 8);
+                cx.cancel();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    };
+    let (reply, ()) = tokio::join!(send, receive);
+    assert_eq!(json_body(&reply)["reply"], 8);
+    let invalid = Page::new(
+        "Commands",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .command("same", port.clone())
+    .command("same", port)
+    .bind_loopback(0)
+    .await;
+    assert!(invalid.is_err());
+}
+
+#[tokio::test]
+async fn workspace_with_hosts_keeps_consoles_beside_the_custom_panel() {
+    let server = Page::new(
+        "Tiles",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    )
+    .host(Host::new("workstation").console(FakeConsole::default()))
+    .standard_panels()
+    .custom(
+        "View",
+        "export function mount() { return () => {}; }",
+        StateTopic::<u64>::new(StateLimits::default()),
+    )
+    .workspace_with_hosts("View")
+    .bind_loopback(0)
+    .await
+    .unwrap();
+    let description = json_body(&request(&server, "GET", "/api/page", &bearer(&server), "").await);
+    let panels = description["panels"].as_array().unwrap();
+    for kind in ["screen", "terminal", "custom"] {
+        assert!(
+            panels
+                .iter()
+                .any(|p| p["kind"] == kind && p["area"] == "workspace")
+        );
+    }
+    assert!(
+        panels
+            .iter()
+            .any(|p| p["kind"] == "packets" && p["area"] == "inspector")
+    );
+}
+
 async fn open_events(server: &Server, path: &str) -> (TcpStream, Vec<u8>) {
     let mut conn = TcpStream::connect(address(server)).await.unwrap();
     conn.write_all(

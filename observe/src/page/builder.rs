@@ -138,6 +138,12 @@ impl Page {
         }
         self
     }
+    /// Places a custom panel beside the selected or pinned host consoles.
+    pub fn workspace_with_hosts(mut self, title: impl Into<String>) -> Self {
+        self = self.workspace(title);
+        self.workspace_hosts = true;
+        self
+    }
     /// Injects elapsed monotonic time for ticket expiration and lease timestamps.
     pub fn clock(mut self, clock: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
         self.clock = Arc::new(clock);
@@ -258,7 +264,14 @@ impl Page {
                     ))
                 })?;
             for panel in &mut self.panels {
-                panel.area = Area::Inspector;
+                if !self.workspace_hosts
+                    || !matches!(
+                        panel.content,
+                        PanelContent::Screen { .. } | PanelContent::Terminal { .. }
+                    )
+                {
+                    panel.area = Area::Inspector;
+                }
             }
             self.panels[selected].area = Area::Workspace;
         }

@@ -265,7 +265,9 @@ class World:
                     self.pool.submit(self._prefetch, *target_of(r["url"]))
         body = {"google": render.google, "duckduckgo": render.duckduckgo, "bing": render.bing}[engine](query, record, start)
         meta = {"kind": "search", "engine": engine, "search": query, "cache": cache, "model": record.get("model"),
-                "results": len(record["results"])}
+                "results": len(record["results"]),
+                "listed": [{"rank": rank, "url": r["url"], "title": r["title"]}
+                           for rank, r in enumerate(record["results"], 1)]}
         if cache == "generated":
             meta |= {"gen_ms": record.get("gen_ms"), "cost": record.get("cost")}
         return html_response(body, meta, server=render.ENGINE_SERVERS[engine])
@@ -281,13 +283,13 @@ class World:
         self._reserve_generation()
         made = self._generate("search", query, self._known(), self.store.recent_claims(), self.cast(), query=query)
         results = []
-        for rank, r in enumerate(made.fields["results"], 1):
+        for r in made.fields["results"]:
             host, target = target_of(r["url"])
             if not host or any(x["url"] == r["url"] for x in results):
                 continue
             fixed = self.seed.fixed_for(host, target)
             mention = self.store.reserve_mention(
-                host, target, {"via": "search", "query": query, "rank": rank, "title": r["title"],
+                host, target, {"via": "search", "query": query, "rank": len(results) + 1, "title": r["title"],
                                "snippet": r["snippet"], "date": r.get("date", "")},
                 {"title": fixed.title, "description": fixed.description} if fixed else None)
             results.append(dict(r, title=mention["title"], snippet=mention["snippet"]))
@@ -333,6 +335,9 @@ class World:
                 "mentions": len(record.get("context", {}).get("mentions", [])),
                 "unsupported_snippets": record.get("unsupported_snippets", []),
                 "unchecked_snippets": record.get("unchecked_snippets", []), "tells": record.get("tells", [])}
+        mentions = record.get("context", {}).get("mentions", [])
+        first = mentions[0] if mentions else {"via": "direct"}
+        meta["reason"] = {k: first[k] for k in ("via", "query", "rank", "from") if k in first}
         if cache != "cached":
             meta |= {"gen_ms": record.get("gen_ms"), "cost": record.get("cost")}
         profile = self.store.site(host)
@@ -358,7 +363,7 @@ class World:
         if made and record["content_type"].startswith("text/html"):
             self._note_links(record["url"], body.decode("utf-8", "replace"))
         return Response(record["status"], record["content_type"], body, record["headers"],
-                        {"kind": "page", "cache": "fixed", "title": record["title"]})
+                        {"kind": "page", "cache": "fixed", "title": record["title"], "reason": {"via": "fixed"}})
 
     def _not_found(self, host: str, target: str, cache: str) -> Response:
         profile = self.store.site(host)

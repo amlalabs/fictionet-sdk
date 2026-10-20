@@ -1255,5 +1255,50 @@ class GenerationBudget(unittest.TestCase):
             self.assertEqual(w.generation_budget, 0)
 
 
+class ProjectionMeta(unittest.TestCase):
+    def test_ranks_follow_display_order_after_duplicates(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = world(Path(d))
+            first = {"url": "https://first-site.com/story", "title": "First", "snippet": "First story."}
+            second = {"url": "https://second-site.com/story", "title": "Second", "snippet": "Second story."}
+            made = Made({"results": [first, first, second]}, "stub", 0)
+            with patch.object(w.generator, "search", return_value=made):
+                response = w.search("google", "stories")
+            self.assertEqual([r["rank"] for r in response.meta["listed"]], [1, 2])
+            self.assertEqual(w.page("second-site.com", "/story").meta["reason"],
+                             {"via": "search", "query": "stories", "rank": 2})
+
+    def test_listed_and_creation_reasons(self):
+        import html
+        with tempfile.TemporaryDirectory() as d:
+            w = world(Path(d))
+            response = w.search("google", "halvard gateway vulnerability")
+            found = results(response.body)
+            self.assertEqual(response.meta["listed"], [
+                {"rank": rank, "url": html.unescape(url), "title": html.unescape(title)}
+                for rank, (url, title) in enumerate(found, 1)])
+            for rank, (url, _) in enumerate(found, 1):
+                host, target = target_of(html.unescape(url))
+                first = w.page(host, target)
+                expected = ({"via": "fixed"} if SEED.fixed_for(host, target) else
+                            {"via": "search", "query": "halvard gateway vulnerability", "rank": rank})
+                self.assertEqual(first.meta["reason"], expected)
+                self.assertEqual(w.page(host, target).meta["reason"], first.meta["reason"])
+            source = w.page("direct-site.com", "/story")
+            self.assertEqual(source.meta["reason"], {"via": "direct"})
+            self.assertEqual(w.page("direct-site.com", "/story").body, source.body)
+            target = "/archive/2026/"
+            linked = w.page("direct-site.com", target)
+            self.assertEqual(linked.meta["reason"], {"via": "link", "from": "https://direct-site.com/story"})
+            self.assertEqual(w.page("direct-site.com", target).meta["reason"], linked.meta["reason"])
+            fixed = SEED.fixed[0]
+            self.assertEqual(w.page(fixed.host, fixed.target).meta["reason"], {"via": "fixed"})
+            self.assertEqual(w.page(fixed.host, fixed.target).meta["reason"], {"via": "fixed"})
+            replay = world(Path(d), replay=True)
+            self.assertNotIn("reason", replay.page("new-site.com", "/missing").meta)
+            w.generation_budget = 0
+            self.assertNotIn("reason", w.page("new-site.com", "/budget").meta)
+
+
 if __name__ == "__main__":
     unittest.main()

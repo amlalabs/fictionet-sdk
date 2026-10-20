@@ -453,6 +453,7 @@ pub struct Page {
     standard: bool,
     labels: Option<Labels>,
     workspace: Option<String>,
+    workspace_hosts: bool,
     modules: Vec<(String, String)>,
     assets: Vec<(String, String, Vec<u8>)>,
     filters: Vec<(String, EventFilter)>,
@@ -474,6 +475,7 @@ impl Page {
             standard: false,
             labels: None,
             workspace: None,
+            workspace_hosts: false,
             modules: vec![],
             assets: vec![],
             filters: vec![],
@@ -482,6 +484,22 @@ impl Page {
                 Arc::new(move || start.elapsed())
             },
         }
+    }
+
+    /// Registers an authoritative topic without adding a panel.
+    pub fn state<T: Serialize>(mut self, name: impl Into<String>, topic: StateTopic<T>) -> Self {
+        self.topics.push((name.into(), topic.topic));
+        self
+    }
+
+    /// Registers a typed command endpoint without adding a control panel.
+    pub fn command<C: serde::de::DeserializeOwned + Send + 'static, R: Serialize + 'static>(
+        mut self,
+        name: impl Into<String>,
+        port: CommandPort<C, R>,
+    ) -> Self {
+        self.commands.push((name.into(), Box::new(port)));
+        self
     }
 
     /// Adds a table over an authoritative state topic.
@@ -638,6 +656,21 @@ impl Page {
                     format!(
                         "state topic {id:?} conflicts with a host status or built-in topic; rename the panel or host"
                     ),
+                ));
+            }
+        }
+        let mut command_names = std::collections::BTreeSet::new();
+        for (name, _) in &self.commands {
+            if name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                || !command_names.insert(name)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command names must be unique and contain one to 128 ASCII letters, digits, - or _",
                 ));
             }
         }
