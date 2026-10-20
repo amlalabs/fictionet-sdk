@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 const HOSTNAME: &str = "workstation";
 const USER: &str = "analyst";
 /// The world's HTTPS site the guest fetches with the Zscaler chain.
-const SITE: &str = "example.test";
+const SITE: &str = "intranet.northwind.internal";
 
 type Error = Box<dyn std::error::Error>;
 
@@ -135,7 +135,7 @@ async fn run(downloads: &Path, observation: Option<PathBuf>) -> Result<(), Error
         println!("{error}");
     }
     let shutdown = check(
-        "the guest powered off over ACPI, and no Cloud Hypervisor process or run directory is left",
+        "shutdown, cleanup and guest content checks passed",
         stop.is_ok(),
     );
 
@@ -181,15 +181,34 @@ async fn run_checks(
     cx: &fictionet::Cx,
 ) -> Result<Checks, Error> {
     let workstation = run.guest(HOSTNAME);
-    let boot = run.boot_started();
-    let page_url = run.page_url();
-    let vm = workstation.vm();
     let session = workstation.ssh();
-    // Every required check that failed; the run fails at the end if any did.
     let mut failures = Vec::new();
+    let (cloud_init_ready_ms, desktop_ready_ms) = provisioning(run, &mut failures).await?;
+    machine_checks(workstation, &mut failures).await?;
+    trust_checks(session, loaded, &mut failures).await?;
+    agent_checks(session, agents, cx, &mut failures).await?;
+    let screenshots = screen_checks(run, shots, &mut failures).await?;
+    let agents_install = agent_tls_checks(session, &mut failures).await?;
+    failures.extend(run.containment().await.err());
+    let peak_rss_mib = workstation.vm().peak_rss_mib().unwrap_or(0);
+    if !failures.is_empty() {
+        return Err(format!("the required checks failed: {}", joined(&failures)).into());
+    }
+    Ok(Checks {
+        desktop_ready_ms,
+        cloud_init_ready_ms,
+        agents_install,
+        peak_rss_mib,
+        screenshots,
+    })
+}
 
-    // Block until cloud-init finishes, but not forever: a stalled install must
-    // fail the run, not hang it.
+async fn provisioning(
+    run: &kit::Run,
+    failures: &mut Vec<std::io::Error>,
+) -> Result<(u128, u128), Error> {
+    let workstation = run.guest(HOSTNAME);
+    let boot = run.boot_started();
     let cloud_init = workstation.wait_cloud_init(Duration::from_secs(300)).await;
     let cloud_init_ready_ms = match &cloud_init {
         Ok(ready) => {
@@ -210,6 +229,14 @@ async fn run_checks(
         .await?
         .as_millis();
 
+    Ok((cloud_init_ready_ms, desktop_ready_ms))
+}
+
+async fn machine_checks(
+    workstation: &kit::GuestHandle,
+    failures: &mut Vec<std::io::Error>,
+) -> Result<(), Error> {
+    let session = workstation.ssh();
     // What the guest looks like, for the log.
     for command in [
         "cloud-init status --long",
@@ -227,7 +254,6 @@ async fn run_checks(
         guest_cmd(session, command).await?;
     }
 
-    // Required: the guest's address is the one the world leased it by DHCP.
     let lease = workstation.addr();
     let addr = guest_cmd(session, "ip -4 -o addr show dev eth0").await?;
     failures.extend(
@@ -241,7 +267,6 @@ async fn run_checks(
         .err(),
     );
 
-    // Required: no vsock device for the guest to find.
     let pci = guest_cmd(session, "lspci -nn").await?;
     let vsock = pci.stdout.lines().any(|line| {
         let line = line.to_ascii_lowercase();
@@ -255,7 +280,6 @@ async fn run_checks(
         .err(),
     );
 
-    // Required: this session reaches sshd from the jump host's address.
     let ssh_peers = guest_cmd(session, "ss -tnH state established '( sport = :22 )'").await?;
     let peers: Vec<Option<IpAddr>> = ssh_peers
         .stdout
@@ -277,8 +301,6 @@ async fn run_checks(
         .err(),
     );
 
-    // Required: Ubuntu's sshd and the desktop are running, and Xvnc listens
-    // on the loopback only, so sshd is the guest's one network service of ours.
     let services = guest_cmd(session, "systemctl is-active ssh.service vnc.service").await?;
     failures.extend(
         check(
@@ -310,7 +332,14 @@ async fn run_checks(
         .err(),
     );
 
-    // Required: the trust store, the Zscaler chain, Firefox.
+    Ok(())
+}
+
+async fn trust_checks(
+    session: &ssh::Session,
+    loaded: &AtomicBool,
+    failures: &mut Vec<std::io::Error>,
+) -> Result<(), Error> {
     let login_env = guest_cmd(
         session,
         "bash -lc 'env | grep -iE \"SSL_CERT|REQUESTS_CA|NODE_USE\"' || echo 'no login trust env'",
@@ -365,8 +394,6 @@ async fn run_checks(
         .err(),
     );
 
-    // Required: Firefox loaded the site, seen as the world's http.request
-    // event with Firefox's User-Agent.
     let firefox_deadline = Instant::now() + Duration::from_secs(90);
     while !loaded.load(Ordering::SeqCst) && Instant::now() < firefox_deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -379,8 +406,15 @@ async fn run_checks(
         .err(),
     );
 
-    // Required: the coding agents are on the desktop user's PATH over SSH,
-    // each at its pinned release.
+    Ok(())
+}
+
+async fn agent_checks(
+    session: &ssh::Session,
+    agents: &StateTopic<Vec<Value>>,
+    cx: &fictionet::Cx,
+    failures: &mut Vec<std::io::Error>,
+) -> Result<(), Error> {
     let claude = guest_cmd(session, "claude --version").await?;
     failures.extend(
         check(
@@ -410,11 +444,16 @@ async fn run_checks(
         .collect();
     agents.publish(cx.now(), &rows).map_err(boxed)?;
 
-    // Required: the desktop as the viewer delivers it, proved without a
-    // browser -- connect to the page's own WebSocket and speak RFB through the
-    // bridge (page -> WebSocket -> SSH tunnel across the world -> Xvnc) --
-    // once two captures in a row match, so Firefox has finished painting,
-    // and then as the host's headless Chromium renders the page.
+    Ok(())
+}
+
+async fn screen_checks(
+    run: &kit::Run,
+    shots: &Path,
+    failures: &mut Vec<std::io::Error>,
+) -> Result<Vec<String>, Error> {
+    let session = run.guest(HOSTNAME).ssh();
+    let page_url = run.page_url();
     let mut screenshots = Vec::new();
     let captured = run
         .screenshots(
@@ -449,12 +488,15 @@ async fn run_checks(
     failures.extend(check("the guest's own screen was captured", guest_png.is_some()).err());
     screenshots.extend(guest_png);
 
-    page_checks(page_url, session, &mut failures).await;
+    page_checks(page_url, session, failures).await;
 
-    // Required: each agent's own HTTP client trusts the world's CA through
-    // the system store, with no flags. Each asks the site for a path it does
-    // not serve; reporting the site's 404 means the client verified the
-    // Zscaler chain, where a distrusted chain reports a certificate error.
+    Ok(screenshots)
+}
+
+async fn agent_tls_checks(
+    session: &ssh::Session,
+    failures: &mut Vec<std::io::Error>,
+) -> Result<String, Error> {
     let claude_tls = guest_cmd(
         session,
         &format!("timeout 60 claude plugin marketplace add https://{SITE}/marketplace.json 2>&1"),
@@ -500,18 +542,7 @@ async fn run_checks(
         .trim()
         .to_string();
 
-    failures.extend(run.containment().await.err());
-    let peak_rss_mib = vm.peak_rss_mib().unwrap_or(0);
-    if !failures.is_empty() {
-        return Err(format!("the required checks failed: {}", joined(&failures)).into());
-    }
-    Ok(Checks {
-        desktop_ready_ms,
-        cloud_init_ready_ms,
-        agents_install,
-        peak_rss_mib,
-        screenshots,
-    })
+    Ok(agents_install)
 }
 
 async fn probe(

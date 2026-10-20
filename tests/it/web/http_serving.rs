@@ -358,7 +358,13 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
         RunOptions::new(fictionet::Seed::from_u64(1)),
         move |fcx| async move {
             let vhosts = VirtualHosts::new();
-            vhosts.insert("127.0.0.1", VHost::new(httpd::tower(web::proxy(&fcx)?)));
+            vhosts.insert(
+                "127.0.0.1",
+                VHost::new(httpd::tower(web::proxy(
+                    &fcx,
+                    std::sync::Arc::new(fictionet_host::Client::new()),
+                )?)),
+            );
             let conn = fictionet::events::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
             let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
             let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
@@ -412,7 +418,8 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
             RunOptions::new(fictionet::Seed::random()),
             |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
-                let upstream = web::proxy(&fcx)?;
+                let upstream =
+                    web::proxy(&fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
                 web::Sites::new(move |h| {
                     (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
                 })
@@ -504,7 +511,7 @@ async fn the_proxy_refuses_hosts_routed_by_default_host() {
             move |fcx| async move {
                 let log = super::events::Log::new(events);
                 let (attacher, attachments) = fictionet::attachments();
-                let proxy = web::proxy(&fcx)?;
+                let proxy = web::proxy(&fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
                 web::Sites::new(move |h| {
                     (h == "allowed.test").then(|| {
                         web::Site::new(ToTestUpstream {

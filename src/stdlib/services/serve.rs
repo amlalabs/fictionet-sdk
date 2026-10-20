@@ -2845,6 +2845,16 @@ where
     core.open(service, state, fcx.now());
     let tag = core.info.id.unwrap_or(0);
     let mut buf = vec![0u8; READ];
+    let mut content = (opts.protocol != "http1" && opts.protocol != "http2")
+        .then(|| {
+            fcx.content(crate::events::Content {
+                kind: "service",
+                name: opts.protocol,
+                encoding: "",
+                origin: None,
+            })
+        })
+        .flatten();
     let mut out_offset = 0u64;
     let mut run = 0u32;
     loop {
@@ -2869,6 +2879,9 @@ where
                                 range: out_offset..end,
                             },
                         );
+                    }
+                    if let Some(sink) = &mut content {
+                        sink.write(&bytes);
                     }
                     out_offset = out_offset.saturating_add(bytes.len() as u64);
                     match write_all(fcx, &mut conn, &bytes, opts.write_timeout).await {

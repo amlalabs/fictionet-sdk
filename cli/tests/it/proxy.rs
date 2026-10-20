@@ -1477,7 +1477,10 @@ mod upstream {
         fictionet::run(
             fictionet::RunOptions::new(Seed::from_u64(0)),
             |fcx| async move {
-                let site = VHost::new(httpd::tower(web::proxy(&fcx)?));
+                let site = VHost::new(httpd::tower(web::proxy(
+                    &fcx,
+                    std::sync::Arc::new(fictionet_host::Client::new()),
+                )?));
                 let vhosts = VirtualHosts::new();
                 vhosts.insert("allowed.test", site.clone());
                 vhosts.set_default(site);
@@ -1521,7 +1524,10 @@ mod upstream {
         fictionet::run(
             fictionet::RunOptions::new(Seed::from_u64(0)),
             |fcx| async move {
-                let site = VHost::new(httpd::tower(web::proxy(&fcx)?));
+                let site = VHost::new(httpd::tower(web::proxy(
+                    &fcx,
+                    std::sync::Arc::new(fictionet_host::Client::new()),
+                )?));
                 let vhosts = VirtualHosts::new();
                 vhosts.insert("127.0.0.1", site.clone());
                 vhosts.set_default(site);
@@ -1545,7 +1551,11 @@ mod upstream {
         fictionet::run(
             fictionet::RunOptions::new(Seed::from_u64(0)),
             |fcx| async move {
-                let site = VHost::new(web::forward(&fcx, format!("http://{address}").parse()?)?);
+                let site = VHost::new(web::forward(
+                    &fcx,
+                    format!("http://{address}").parse()?,
+                    std::sync::Arc::new(fictionet_host::Client::new()),
+                )?);
                 let vhosts = VirtualHosts::new();
                 vhosts.insert("allowed.test", site.clone());
                 vhosts.set_default(site);

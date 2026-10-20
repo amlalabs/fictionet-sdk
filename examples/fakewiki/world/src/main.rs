@@ -2,7 +2,7 @@
 //! what it builds.
 //!
 //! ```text
-//! FAKEWIKI_VARIANT=altered_one fakewiki-world --socket /run/fictionet/sock/world.sock \
+//! fakewiki-world '{"variant":"altered_one"}' --socket /run/fictionet/sock/world.sock \
 //!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready \
 //!     [--observation <path>]
 //! ```
@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use example_common::args::{args, secs};
+use example_common::args::{Args, secs, unknown};
 use example_common::log::Log;
 use fakewiki_world::content::Content;
 use fakewiki_world::pages::{self, Variant};
@@ -27,16 +27,26 @@ fn main() {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configuration {
+    variant: String,
+}
+
 fn real_main() -> fictionet::Result {
-    let args = args().map_err(fictionet::Error::msg)?;
+    let mut argv = std::env::args().skip(1);
+    let Configuration { variant } =
+        example_common::args::configuration(&mut argv).map_err(fictionet::Error::msg)?;
+    let args = Args::default()
+        .read(argv, unknown)
+        .map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
 
     // 1. The variant, from the sample's metadata.
     let started = SystemTime::now();
-    let variant = std::env::var("FAKEWIKI_VARIANT").unwrap_or_default();
     let variant: Variant = variant.parse().map_err(|_| {
         fictionet::Error::msg(format!(
-            "FAKEWIKI_VARIANT must be control, altered_one or altered_all, not {variant:?}"
+            "variant must be control, altered_one or altered_all, not {variant:?}"
         ))
     })?;
     let hosts = pages::host_ips();

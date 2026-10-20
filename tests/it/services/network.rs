@@ -938,6 +938,50 @@ fn hosts_and_members_share_a_lan_on_the_net() {
 }
 
 #[test]
+fn trusted_routes_attribute_requests_and_refusals() {
+    crate::common::world::observed_world(Duration::from_secs(10), |fcx, kept| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let address: Ipv4Addr = "192.168.56.50".parse()?;
+        Net::new()
+            .ipv4_only()
+            .host("office", |host| {
+                host.at(PLC_ADDR).dns_name("office.internal")
+            })
+            .route("server", "192.168.56.0/24".parse()?)
+            .start(&fcx, attachments)?;
+        let server = machine(&fcx, attacher.attach("server")?, address);
+        assert_eq!(
+            lookup(&fcx, &server, "office.internal").await,
+            Some(PLC_ADDR)
+        );
+        let queries = kept.checked_of("dns", "query").unwrap();
+        assert!(queries.iter().any(|event| {
+            event.str("name") == Some("office.internal")
+                && event.conn.sandbox.as_ref().is_some_and(|sandbox| {
+                    sandbox.name.as_ref() == "server" && sandbox.addr == Some(address)
+                })
+        }));
+        let mut socket = server.udp.bind(40001)?;
+        socket.send_to(b"query", "8.8.8.8:53".parse()?);
+        let refused = kept
+            .wait(&fcx, 0, 1, Duration::from_secs(2), |event| {
+                event.is("net", "blocked") && event.str("dst") == Some("8.8.8.8")
+            })
+            .await?;
+        assert_eq!(refused[0].str("why"), Some("NoRoute"));
+        assert_eq!(
+            refused[0]
+                .conn
+                .sandbox
+                .as_ref()
+                .map(|sandbox| &*sandbox.name),
+            Some("server")
+        );
+        Ok(())
+    });
+}
+
+#[test]
 fn net_refuses_lans_that_overlap() {
     world(Duration::from_secs(60), |fcx| async move {
         let fail = |net: Net| {

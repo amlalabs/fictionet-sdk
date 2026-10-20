@@ -182,7 +182,7 @@ assert 'inspect_ai' not in sys.modules
     def test_world_pages_cover_every_probe(self):
         self.assertEqual(set(_pages()["probes"]), {url for url, _, _ in expected_targets()},
                          "list each probe URL in pages.json, then run the world's tests "
-                         "with FAKEWIKI_GOLDEN_WRITE=1")
+                         "after checking the changed page content")
 
     def test_world_pages_and_negative_controls(self):
         for variant in STANCES:

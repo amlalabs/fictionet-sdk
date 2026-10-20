@@ -642,4 +642,27 @@ mod tests {
             ["v7.2.4", "a-b", "x", "caf"]
         );
     }
+    #[test]
+    fn bundled_pages_and_search_results_have_neutral_guest_content() {
+        let audit = example_common::guest_content::Audit::default();
+        for name in ["halvard-cve", "corvane-acquisition", "fastjsonl-package"] {
+            let seed = Seed::builtin(name).unwrap();
+            for fixed in &seed.fixed {
+                audit.inspect("page URL", fixed.url.as_bytes());
+                audit.inspect("page", &fixed.body);
+            }
+            let results = search(&seed, &seed.search, &[]);
+            for result in results.results {
+                audit.inspect("result URL", result.url.as_bytes());
+                audit.inspect("result title", result.title.as_bytes());
+                audit.inspect("result snippet", result.snippet.as_bytes());
+                let uri: http::Uri = result.url.parse().unwrap();
+                let host = uri.host().unwrap();
+                let page = page(&seed, host, uri.path(), &[], 0);
+                let rendered = super::super::render::page(host, &site_profile(host), &page, "2026");
+                audit.inspect("page", rendered.as_bytes());
+            }
+        }
+        audit.check().unwrap();
+    }
 }

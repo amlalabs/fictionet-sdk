@@ -67,13 +67,18 @@ pub async fn run(spend: bool) -> Result {
         .containment(containment.clone())
         .bind_loopback(0)
         .await?;
-    println!("Search preview: {}", server.url());
+    let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     println!(
         "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
     );
     let mut input = Input::stdin(Story::Once, Some(console))?;
     let page_client = PageClient::from_url(server.url())?;
-    let observer = Arc::new(Fanout::new(vec![searches.clone(), dashboard.observer()]));
+    let audit = Arc::new(example_common::guest_content::Audit::default());
+    let observer = Arc::new(Fanout::new(vec![
+        audit.clone(),
+        searches.clone(),
+        dashboard.observer(),
+    ]));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(7)).observer(observer),
@@ -142,6 +147,7 @@ pub async fn run(spend: bool) -> Result {
     input.closed().await;
     let _ = stop.send(());
     task.await??;
+    audit.check()?;
     drop(server);
     Ok(())
 }

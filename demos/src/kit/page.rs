@@ -89,6 +89,7 @@ enum Readiness {
     Waiting(String),
     Ready(Duration),
     Stopped,
+    Failed(String),
 }
 
 impl GuestConsole {
@@ -120,8 +121,22 @@ impl GuestConsole {
         })
     }
 
-    pub(super) fn booting(&self, cx: &Cx) {
-        self.publish(cx, HostState::Booting, vec![], false, false);
+    pub(super) fn booting(&self, cx: &Cx, configured: Option<std::net::Ipv4Addr>) {
+        self.publish(
+            cx,
+            HostState::Booting,
+            configured.into_iter().map(|a| a.to_string()).collect(),
+            false,
+            false,
+        );
+    }
+
+    pub(super) fn failed(&self, cx: &Cx, message: &str) {
+        let mut state = self.session.lock().unwrap();
+        state.stopped = true;
+        state.session.take();
+        self.ready.send_replace(Readiness::Failed(message.into()));
+        self.publish(cx, HostState::Failed, vec![], false, false);
     }
 
     pub(super) fn network(&self, cx: &Cx, addr: std::net::Ipv4Addr) {
@@ -251,6 +266,7 @@ impl GuestConsole {
         {
             Ok(Ok(value)) => match &*value {
                 Readiness::Ready(elapsed) => Ok(*elapsed),
+                Readiness::Failed(message) => Err(io::Error::other(message.clone())),
                 _ => Err(io::Error::other(format!("{} has stopped", self.name))),
             },
             Ok(Err(error)) => Err(io::Error::other(error)),
@@ -324,5 +340,66 @@ impl Pty for ssh::Pty {
     }
     fn close(&self) -> BoxFuture<'_, io::Result<()>> {
         Box::pin(self.close())
+    }
+}
+
+/// A private browser bootstrap, removed when its run ends.
+pub struct PageAccess {
+    _dir: super::util::RunDir,
+}
+
+impl PageAccess {
+    /// Prints the public address and a separate action to open the authenticated page.
+    pub fn new(url: &str) -> io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        super::client::PageClient::from_url(url)?;
+        let dir = super::util::RunDir::new(&std::env::temp_dir(), "page")?;
+        let path = dir.path().join("open.html");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        write!(
+            file,
+            "<!doctype html><meta http-equiv=\"refresh\" content=\"0;url={}\">",
+            url.replace('&', "&amp;")
+        )?;
+        println!("Page: {}", url.split('#').next().unwrap());
+        println!(
+            "Open: cargo xtask demo open {}",
+            super::ssh::quote(&path.display().to_string())
+        );
+        Ok(Self { _dir: dir })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PageAccess;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn bootstrap_is_private_and_removed_with_its_owner() {
+        let token = "ab".repeat(32);
+        let access = PageAccess::new(&format!("http://127.0.0.1:8080/#token={token}")).unwrap();
+        let dir = access._dir.path().to_path_buf();
+        let file = dir.join("open.html");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains(&format!("#token={token}"))
+        );
+        drop(access);
+        assert!(!dir.exists());
     }
 }

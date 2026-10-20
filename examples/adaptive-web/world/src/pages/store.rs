@@ -169,8 +169,8 @@ fn key(host: &str, target: &str) -> (String, String) {
 /// Why a store cannot be used, and how to start over.
 fn incompatible(root: &Path, reason: &str) -> String {
     format!(
-        "cannot reuse store {}: {reason}; rebuild in a fresh ADAPTIVE_WEB_STORE_DIR \
-        (ADAPTIVE_WEB_STORE for the world). Keep the old store for audit",
+        "cannot reuse store {}: {reason}; rebuild in a fresh --store \
+        (--store for the world). Keep the old store for audit",
         root.display()
     )
 }

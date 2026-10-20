@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 const HELP: &str = "cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [--no-build] [Inspect arguments...]
   --probes       Run containment and world probes without a model
   --scripted     Run Border or Artifactory's scripted scorer tests
-  --live [seed] [query...]   Browse the adaptive web without an agent model
+  --live [JSON] [query...]   Browse the adaptive web without an agent model
 Images are built from this checkout unless --no-build is given.
 Inspect arguments, including --model, --epochs, --log-dir and -T, pass through.
 Logs default to logs/<world>. FakeWiki defaults to the three local Ollama models.";
@@ -82,10 +82,7 @@ pub fn run(args: &[String]) -> Result {
         }
     }
     if world == "fakewiki" && mode.is_empty() && option(&args, "--epochs").is_none() {
-        args.extend([
-            "--epochs".into(),
-            std::env::var("EPOCHS").unwrap_or_else(|_| "2".into()),
-        ]);
+        args.extend(["--epochs".into(), "2".into()]);
     }
     if mode == "--probes" || mode == "--scripted" {
         return checked_eval(module, &mode, &task, &args);
@@ -205,8 +202,26 @@ fn task_path(module: &str, mode: &str) -> Result<String> {
 }
 
 fn live(args: &[String]) -> Result {
-    let seed = args.first().map_or("halvard-cve", String::as_str);
-    let generator = std::env::var("ADAPTIVE_WEB_GENERATOR").unwrap_or_else(|_| "openrouter".into());
+    let mut config: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(args.first().map_or("{}", String::as_str))?;
+    let seed = config
+        .remove("seed")
+        .unwrap_or_else(|| "halvard-cve".into());
+    let generator = config
+        .remove("generator")
+        .unwrap_or_else(|| "openrouter".into());
+    let store = config.remove("store").unwrap_or_else(|| {
+        crate::root()
+            .join("examples/adaptive-web/store")
+            .display()
+            .to_string()
+    });
+    let model = config.remove("model").unwrap_or_default();
+    let reasoning = config.remove("reasoning").unwrap_or_default();
+    let prefetch = config.remove("prefetch").unwrap_or_default();
+    if !config.is_empty() {
+        return Err(format!("unknown configuration fields: {:?}", config.keys()).into());
+    }
     let key = match generator.as_str() {
         "openrouter" => Some("OPENROUTER_API_KEY"),
         "anthropic" => Some("ANTHROPIC_API_KEY"),
@@ -217,23 +232,22 @@ fn live(args: &[String]) -> Result {
     {
         return Err(format!("{key} is not set").into());
     }
-    let store = std::env::var_os("ADAPTIVE_WEB_STORE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::root().join("examples/adaptive-web/store"));
     let mut config = uv(&[
         "python",
         "-c",
-        "import json, sys; from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, seed_front; print(json.dumps([world_sandbox().config, seed_front(sys.argv[1])['question']]))",
-        seed,
+        "import json, sys; from inspect_fictionet.worlds.adaptive_web.world import world_sandbox, seed_front; print(json.dumps([world_sandbox(seed=sys.argv[1], generator=sys.argv[2], store_dir=sys.argv[3], model=sys.argv[4], reasoning=sys.argv[5], prefetch=sys.argv[6]).config, seed_front(sys.argv[1])['question']]))",
+        &seed,
+        &generator,
+        &store,
+        &model,
+        &reasoning,
+        &prefetch,
     ]);
-    config
-        .env("ADAPTIVE_WEB_GENERATOR", &generator)
-        .env("ADAPTIVE_WEB_STORE_DIR", &store);
     let (file, question): (String, String) = serde_json::from_str(&capture(&mut config)?)?;
     let project = format!("adaptive-web-{}", crate::process::token(6)?);
     let compose = |args: &[&str]| {
         let mut command = cmd("docker", &["compose", "-f", &file, "-p", &project]);
-        command.args(args).env("ADAPTIVE_WEB_SEED", seed);
+        command.args(args);
         command
     };
     let mut cleanup = Cleanup::default();

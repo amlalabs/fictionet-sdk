@@ -1,5 +1,5 @@
 /// How a viewer signs in.
-export const SIGN_IN = 'Open the URL the demo printed in its terminal.';
+export const SIGN_IN = 'Run the page-opening command printed by the demo.';
 const SIGNED_OUT = `Not signed in. ${SIGN_IN}`;
 
 // One owner for origin-scoped authorization, requests, streams and downloads.
@@ -295,4 +295,26 @@ export function createTransport({ setStatus = () => {} } = {}, {
   }
 
   return { get, post, delete: remove, stateStream, socket, watch: () => stream('watch', {}), packetStream, packet, download, logout, close };
+}
+
+// One in-flight command per control, with no automatic retry.
+export function createCommand(transport, signal, changed) {
+  let busy = false;
+  return {
+    get busy() { return busy; },
+    async send(path, value, revision, { reply, error }) {
+      if (busy || signal.aborted) return;
+      busy = true; changed();
+      const command = revision === undefined ? value : { ...value, expected_revision: revision };
+      try {
+        const result = await transport.post(path, { request_id: crypto.randomUUID(), command }, signal);
+        if (!signal.aborted) reply(result);
+      } catch (failure) {
+        if (!signal.aborted) error(failure);
+      } finally {
+        busy = false;
+        if (!signal.aborted) changed();
+      }
+    },
+  };
 }

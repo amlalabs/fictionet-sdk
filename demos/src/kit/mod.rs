@@ -47,7 +47,7 @@ pub mod bridge;
 pub mod checks;
 pub mod client;
 mod page;
-pub use page::{Hosts, answer_command, serve_commands};
+pub use page::{Hosts, PageAccess, answer_command, serve_commands};
 pub mod containment;
 pub mod desktop;
 pub mod jump;
@@ -319,8 +319,9 @@ pub struct World {
     attachments: Attachments,
     ca: Arc<Mutex<Option<(String, String)>>>,
     now_unix: i64,
-    mirror: Option<mirror::Cache<fictionet::stdlib::web::Proxy>>,
+    mirror: Arc<Mutex<Option<mirror::Cache<fictionet::stdlib::web::Proxy>>>>,
     mirror_addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
+    setup: Arc<mirror::Setup>,
 }
 
 impl World {
@@ -342,12 +343,14 @@ impl World {
         &mut self,
         fcx: &Cx,
     ) -> fictionet::Result<mirror::Cache<fictionet::stdlib::web::Proxy>> {
-        if self.mirror.is_none() {
-            let mut mirror = mirror::new(fcx)?;
-            mirror.addresses = self.mirror_addresses.clone();
-            self.mirror = Some(mirror);
+        let mut mirror = self.mirror.lock().unwrap();
+        if mirror.is_none() {
+            let mut cache = mirror::new(fcx)?;
+            cache.addresses = self.mirror_addresses.clone();
+            cache.setup = Some(self.setup.clone());
+            *mirror = Some(cache);
         }
-        Ok(self.mirror.as_ref().unwrap().clone())
+        Ok(mirror.as_ref().unwrap().clone())
     }
     /// Returns the guest and jump host attachments for the world to serve.
     pub fn into_attachments(self) -> Attachments {
@@ -433,6 +436,7 @@ impl<W> Kit<W> {
 struct Resources {
     dir: PathBuf,
     socket: PathBuf,
+    _socket_dir: std::fs::File,
     overlay: PathBuf,
     seed: PathBuf,
     mac: [u8; 6],
@@ -446,8 +450,10 @@ impl Resources {
         let number = u32::try_from(index + 2)
             .map_err(io::Error::other)?
             .to_be_bytes();
+        let socket_dir = std::fs::File::open(&dir)?;
         Ok(Self {
-            socket: dir.join("net.sock"),
+            socket: util::socket_path(&socket_dir, "net.sock"),
+            _socket_dir: socket_dir,
             overlay: dir.join("overlay.qcow2"),
             seed: dir.join("seed.img"),
             dir,
@@ -468,6 +474,7 @@ pub struct GuestHandle {
     boot: Instant,
     ssh_ready: Duration,
     console: page::GuestConsole,
+    setup: Arc<mirror::Setup>,
 }
 
 impl GuestHandle {
@@ -501,6 +508,7 @@ impl GuestHandle {
 
 /// Owns every process, bridge, and temporary file of a run.
 pub struct Run {
+    audit: Arc<example_common::guest_content::Audit>,
     guests: Vec<GuestHandle>,
     fcx: Arc<Mutex<Option<Cx>>>,
     world: Option<JoinHandle<fictionet::Result>>,
@@ -509,10 +517,13 @@ pub struct Run {
     dir: Option<util::RunDir>,
     boot: Instant,
     page: Option<Server>,
+    access: Option<PageAccess>,
     dashboard: Option<DashboardHandle>,
     labels: Option<Labels>,
     containment: StateTopic<Containment>,
     probes: Arc<Mutex<Containment>>,
+    setup: Arc<mirror::Setup>,
+    mirror: Arc<Mutex<Option<mirror::Cache<fictionet::stdlib::web::Proxy>>>>,
 }
 
 impl Run {
@@ -595,13 +606,28 @@ impl Run {
         for guest in &mut self.guests {
             guest.backend.take();
         }
-        if let Some(mut world) = self.world.take()
-            && tokio::time::timeout(Duration::from_secs(5), &mut world)
-                .await
-                .is_err()
-        {
-            world.abort();
-            let _ = world.await;
+        if let Some(mut world) = self.world.take() {
+            match tokio::time::timeout(Duration::from_secs(5), &mut world).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => failures.push(format!("world failed: {error}")),
+                Ok(Err(error)) => failures.push(format!("world task failed: {error}")),
+                Err(_) => {
+                    world.abort();
+                    let _ = world.await;
+                    failures.push("world did not stop within five seconds".into());
+                }
+            }
+        }
+        match self.audit.check() {
+            Ok(report) => println!(
+                "guest content: {} items, {} bytes checked",
+                report.contents, report.bytes
+            ),
+            Err(error) => failures.push(error),
+        }
+        let mirror = self.mirror.lock().unwrap().take();
+        if let Some(mirror) = mirror {
+            mirror.close().await;
         }
         if let Some(dir) = self.dir.take()
             && let Err(error) = std::fs::remove_dir_all(dir.path())
@@ -683,10 +709,10 @@ impl Observer for Lease {
     }
 }
 
-type BackendInput = (tokio::sync::mpsc::UnboundedSender<Vec<u8>>, net::RxQueue);
+type BackendInput = (tokio::sync::mpsc::Sender<Vec<u8>>, net::RxQueue);
 
 struct Bridge {
-    frames: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
     queue: net::RxQueue,
     link: fictionet::End,
     family: Family<Ipv4Addr>,
@@ -733,8 +759,16 @@ impl<W> Kit<W> {
                 return Err(io::Error::other("duplicate guest hostname or attachment"));
             }
         }
+        let setup = Arc::new(mirror::Setup::new(
+            self.guests.iter().map(|g| g.hostname.clone()),
+        ));
+        let audit = Arc::new(example_common::guest_content::Audit::default());
+        self.observers.push(audit.clone());
         let mut run = Run {
+            audit,
             guests: Vec::new(),
+            setup: setup.clone(),
+            mirror: Arc::default(),
             fcx: Arc::new(Mutex::new(None)),
             world: None,
             jump: None,
@@ -742,6 +776,7 @@ impl<W> Kit<W> {
             dir: Some(util::RunDir::new(&self.run_parent, &self.name)?),
             boot: Instant::now(),
             page: None,
+            access: None,
             dashboard: None,
             labels: None,
             containment: StateTopic::new(StateLimits::default()),
@@ -762,7 +797,7 @@ impl<W> Kit<W> {
             let link = attacher
                 .attach(&guest.attachment)
                 .map_err(io::Error::other)?;
-            let (tx, frames) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, frames) = tokio::sync::mpsc::channel(net::QUEUE_LIMIT);
             let queue = net::RxQueue::new()?;
             prepared.backends.push((tx, queue.clone()));
             prepared.bridges.push(Bridge {
@@ -778,6 +813,7 @@ impl<W> Kit<W> {
             }));
             let console = page::GuestConsole::new(&guest);
             run.guests.push(GuestHandle {
+                setup: setup.clone(),
                 console,
                 guest,
                 resources,
@@ -803,6 +839,11 @@ where
     pub async fn boot(mut self, downloads: impl AsRef<Path>) -> io::Result<Run> {
         let downloads = downloads.as_ref();
         self.check_downloads(downloads)?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .map_err(|error| io::Error::other(format!("/dev/kvm is not usable: {error}")))?;
         let identity = Arc::new(ssh::Identity::generate()?);
         let (mut run, mut prepared) = self.prepare()?;
         if let Some(build) = self.page.take() {
@@ -982,7 +1023,7 @@ impl Observer for PageObserver {
 impl Run {
     async fn bind_page(
         &mut self,
-        name: &str,
+        _name: &str,
         build: PageBuilder,
         prepared: &mut Prepared,
     ) -> io::Result<()> {
@@ -1027,7 +1068,7 @@ impl Run {
         })?);
         self.dashboard = Some(dashboard);
         self.labels = Some(labels);
-        println!("{name} page: {}", self.page_url());
+        self.access = Some(PageAccess::new(self.page_url())?);
         Ok(())
     }
 
@@ -1044,8 +1085,9 @@ impl Run {
         let world = World {
             attachments: prepared.attachments,
             ca: ca.clone(),
-            mirror: None,
+            mirror: self.mirror.clone(),
             mirror_addresses: prepared.mirror_addresses,
+            setup: self.setup.clone(),
             now_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(io::Error::other)?
@@ -1067,10 +1109,7 @@ impl Run {
             move |fcx| async move {
                 *fcx_slot.lock().unwrap() = Some(fcx.clone());
                 for (console, address) in consoles {
-                    console.booting(&fcx);
-                    if let Some(address) = address {
-                        console.network(&fcx, address);
-                    }
+                    console.booting(&fcx, address);
                 }
                 if let Some(labels) = labels {
                     fcx.spawn(move |cx| async move {
@@ -1160,6 +1199,7 @@ impl Run {
             let addr = guest.addr.clone();
             let user = guest.guest.user.clone();
             let console = guest.console.clone();
+            let configured = guest.guest.initial_addr().is_some();
             let cx = self.fcx.lock().unwrap().as_ref().unwrap().clone();
             sessions.spawn(async move {
                 {
@@ -1170,7 +1210,11 @@ impl Run {
                     )
                     .await
                     {
-                        Ok(Ok(address)) => console.network(&cx, address.unwrap()),
+                        Ok(Ok(address)) => {
+                            if !configured {
+                                console.network(&cx, address.unwrap());
+                            }
+                        }
                         Ok(Err(error)) => return (index, Err(io::Error::other(error))),
                         Err(_) => {
                             return (
@@ -1193,7 +1237,22 @@ impl Run {
                 (index, session)
             });
         }
-        while let Some(result) = sessions.join_next().await {
+        let mut exited = tokio::time::interval(Duration::from_millis(50));
+        while !sessions.is_empty() {
+            let result = tokio::select! {
+                result = sessions.join_next() => result.expect("pending guest session"),
+                _ = exited.tick() => {
+                    for guest in &mut self.guests {
+                        if let Some(status) = guest.vm.as_mut().expect("started").exited()? {
+                            let message = format!("{}: Cloud Hypervisor exited with {status}\n{}\n{}",
+                                guest.name(), guest.vm().ch_stderr_tail(), guest.vm().console_tail());
+                            guest.console.failed(self.fcx.lock().unwrap().as_ref().unwrap(), &message);
+                            return Err(io::Error::other(message));
+                        }
+                    }
+                    continue;
+                }
+            };
             let (index, result) = result.map_err(io::Error::other)?;
             let guest = &mut self.guests[index];
             let session = result.map_err(|e| {

@@ -853,14 +853,14 @@ impl Options {
             if !option::is_critical(o.number) {
                 continue;
             }
-            let repeated = !seen.insert(o.number);
             let bad = match format(o.number) {
                 None => true,
                 Some(f) => {
                     o.value.len() < f.min
                         || o.value.len() > f.max
-                        || (repeated && !f.repeatable)
+                        || (!f.repeatable && !seen.insert(o.number))
                         || (f.value == ValueFormat::String
+                            && !o.value.is_ascii()
                             && std::str::from_utf8(&o.value).is_err())
                         || (o.number == option::URI_PATH && is_dot_segment(&o.value))
                 }

@@ -1,5 +1,5 @@
 //! The desktop sites and Firefox request observer.
-use example_common::web_world::{SHARED, app};
+use example_common::web_world::SHARED;
 use example_common::zscaler::{DEFAULT_CLOUD, zscaler};
 use fictionet::events::{Event, Observation, Observer, Stamp};
 use fictionet::stdlib::web;
@@ -28,6 +28,10 @@ impl Observer for SiteLoaded {
     fn observe(&self, _stamp: Stamp, observation: Observation<'_>) {
         if let Observation::Event(event) = observation
             && event.str("host") == Some(self.host.as_str())
+            && event.str("method") == Some("GET")
+            && event.str("path") == Some("/")
+            && event.get("status").and_then(|v| v.as_u64()) == Some(200)
+            && event.get("complete").and_then(|v| v.as_bool()) == Some(true)
             && user_agent(event).is_some_and(|agent| agent.contains("Firefox/"))
         {
             self.loaded.store(true, Ordering::SeqCst);
@@ -65,8 +69,17 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
     // coding agents at boot. apt's signatures verify the packages, and
     // the guest checks each agent download against its pinned sha256.
     let mirror = world.mirror(&fcx)?;
+    let operations = fictionet::stdlib::web::httpd::Router::new().get("/", |_, _| {
+        http::Response::new(bytes::Bytes::from_static(
+            b"Northwind Operations\nService desk: available\nPackage repository: online\nMaintenance: Sunday 02:00 UTC\n",
+        ))
+    });
     web::Sites::new(move |host: &str| match host {
-        h if h == site || h == www => Some(web::Site::new(app()).at(SHARED).tls(site_cfg.clone())),
+        h if h == site || h == www => Some(
+            web::Site::handler(operations.clone())
+                .at(SHARED)
+                .tls(site_cfg.clone()),
+        ),
         "archive.ubuntu.com" | "security.ubuntu.com" | "ports.ubuntu.com" => {
             Some(web::Site::new(mirror.clone()))
         }
@@ -79,4 +92,53 @@ pub async fn start(fcx: Cx, mut world: kit::World, site: String) -> Result {
     .into_net()
     .route(kit::JUMP, kit::jump_prefix())
     .start(&fcx, world.into_attachments())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::events::{Fields, Stream};
+
+    #[test]
+    fn only_a_complete_firefox_page_read_marks_the_site_loaded() {
+        let loaded = Arc::new(AtomicBool::new(false));
+        let observer = SiteLoaded {
+            host: "intranet.northwind.internal".into(),
+            loaded: loaded.clone(),
+        };
+        for (method, path, status, complete, agent, passes) in [
+            ("GET", "/", 200, true, "Firefox/140", true),
+            ("POST", "/", 200, true, "Firefox/140", false),
+            ("GET", "/favicon.ico", 200, true, "Firefox/140", false),
+            ("GET", "/", 404, true, "Firefox/140", false),
+            ("GET", "/", 200, false, "Firefox/140", false),
+            ("GET", "/", 200, true, "curl", false),
+        ] {
+            loaded.store(false, Ordering::SeqCst);
+            let event = Event::new("http", "request").fields(
+                Fields::new()
+                    .with("host", "intranet.northwind.internal")
+                    .with("method", method)
+                    .with("path", path)
+                    .with("status", status)
+                    .with("complete", complete)
+                    .with(
+                        "headers",
+                        vec![fictionet::stdlib::protocols::json::Value::Array(vec![
+                            "user-agent".into(),
+                            agent.into(),
+                        ])],
+                    ),
+            );
+            observer.observe(
+                Stamp {
+                    stream: Stream::Events,
+                    seq: 1,
+                    at: fictionet::time::Instant::ZERO,
+                },
+                Observation::Event(&event),
+            );
+            assert_eq!(loaded.load(Ordering::SeqCst), passes);
+        }
+    }
 }

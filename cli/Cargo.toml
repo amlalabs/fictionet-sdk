@@ -24,6 +24,7 @@ libc = "0.2.189"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
 
 [dev-dependencies]
+fictionet-host = { path = "../host" }
 axum = { version = "0.8", default-features = false, features = ["ws"] }
 bytes = "1"
 divan = "0.1.21"

@@ -1,20 +1,13 @@
 //! The Artifactory world process.
 //!
 //! ```text
-//! artifactory-world [--socket /run/relay/relay.sock] [--ca-dir /run/ca]
+//! artifactory-world JSON [--socket /run/relay/relay.sock] [--ca-dir /run/ca]
 //!     [--state-dir /var/lib/fictionet] [--ready /run/fictionet/ready]
 //!     [--observation <path>]
 //! ```
 //!
-//! `ARTIFACTORY_VARIANT` must name `normal`, `missing`, `lookalike` or `peer`.
-//! `ARTIFACTORY_SEED` is a UTF-8 string of at least 16 bytes. An absent or
-//! empty seed selects the fixed development seed. Inspect supplies both from
-//! sample metadata. Tokens also use a fresh private seed drawn from the OS before
-//! world construction. `ARTIFACTORY_PRIVATE_SEED` may supply exactly 64 hex digits
-//! for tests or replay only; absent or empty draws a fresh seed. The private seed
-//! is saved only in trusted `state.json`. The ready file is written after all
-//! three sites are registered and the Unix packet socket is listening. The CA
-//! certificate goes to `ca.pem` in `--ca-dir`; the CA key is never written.
+//! The first argument is JSON with `variant`, optional `seed`, and optional
+//! `private_seed` (64 hex digits for replay).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +17,7 @@ use artifactory_world::packages::{Variant, private_seed};
 use artifactory_world::repository::Contents;
 use artifactory_world::repository::Sessions;
 use artifactory_world::{Identity, Result};
-use example_common::args::{Args, unknown};
+use example_common::args::{Args, configuration, unknown};
 use example_common::names::{name, parse};
 
 fn main() {
@@ -41,40 +34,35 @@ fn parent(path: &Path) -> Result {
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configuration {
+    variant: String,
+    #[serde(default)]
+    seed: String,
+    private_seed: Option<String>,
+}
+
 fn serve() -> Result {
+    let mut argv = std::env::args().skip(1);
+    let config: Configuration = configuration(&mut argv).map_err(fictionet::Error::msg)?;
     let args = Args {
         socket: "/run/relay/relay.sock".into(),
         ca_dir: "/run/ca".into(),
         ..Args::default()
     }
-    .read(std::env::args().skip(1), unknown)
+    .read(argv, unknown)
     .map_err(fictionet::Error::msg)?;
     match std::fs::remove_file(&args.ready) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let variant = std::env::var("ARTIFACTORY_VARIANT").unwrap_or_default();
-    let variant = parse::<Variant>(&variant).ok_or_else(|| {
-        fictionet::Error::msg(format!(
-            "ARTIFACTORY_VARIANT must be normal, missing, lookalike or peer, not {variant:?}"
-        ))
+    let variant = parse::<Variant>(&config.variant).ok_or_else(|| {
+        fictionet::Error::msg("variant must be normal, missing, lookalike or peer")
     })?;
-    let seed = match std::env::var("ARTIFACTORY_SEED") {
-        Ok(s) => s,
-        Err(std::env::VarError::NotPresent) => String::new(),
-        Err(e) => return Err(e.into()),
-    };
-    let private = match std::env::var("ARTIFACTORY_PRIVATE_SEED") {
-        Ok(s) => private_seed(Some(&s))?,
-        Err(std::env::VarError::NotPresent) => private_seed(None)?,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(fictionet::Error::msg(
-                "ARTIFACTORY_PRIVATE_SEED must be exactly 64 hexadecimal digits",
-            ));
-        }
-    };
-    let contents = Arc::new(Contents::new(variant, &seed, &private)?);
+    let private = private_seed(config.private_seed.as_deref())?;
+    let contents = Arc::new(Contents::new(variant, &config.seed, &private)?);
     std::fs::create_dir_all(&args.state_dir)?;
     std::fs::write(
         args.state_dir.join("state.json"),

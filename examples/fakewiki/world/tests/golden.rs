@@ -6,7 +6,6 @@
 //! pages and a CA made for the test. `ts` is dropped and the lines are
 //! compared as sorted sets.
 //!
-//! `FAKEWIKI_GOLDEN_WRITE=1 cargo test --test golden` records the file again.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -191,11 +190,15 @@ fn run_script(
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let drain = log.clone();
+        let audit = Arc::new(example_common::guest_content::Audit::default());
         let options = fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
-            fictionet_observe::Aggregate::new(Arc::new(fakewiki_world::events::LogObserver {
-                log: log.clone(),
-                hosts: hosts.clone(),
-            })),
+            fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
+                audit.clone(),
+                Arc::new(fakewiki_world::events::LogObserver {
+                    log: log.clone(),
+                    hosts: hosts.clone(),
+                }),
+            ]))),
         ));
         let world = move |fcx: Cx| async move {
             let content = Content::new(Tampering::from(Variant::AlteredOne));
@@ -203,6 +206,7 @@ fn run_script(
         };
         let result = fictionet::block_on(fictionet::lab(options, world));
         drain.finish().unwrap();
+        audit.check().unwrap();
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
     let result = rx
@@ -242,10 +246,7 @@ fn check_log(here: &Path, log_path: &Path) {
         .collect();
     got.sort();
     let file = here.join("tests/golden/altered_one.jsonl");
-    if std::env::var_os("FAKEWIKI_GOLDEN_WRITE").is_some() {
-        std::fs::write(&file, got.join("\n") + "\n").unwrap();
-        return;
-    }
+
     let want = std::fs::read_to_string(&file).unwrap();
     let want: Vec<&str> = want.lines().collect();
     let got: Vec<&str> = got.iter().map(String::as_str).collect();

@@ -180,12 +180,12 @@ fn foreign_host_on_default_site() {
     run_variant(Variant::Missing, |fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let io = plain(&fcx, &m, NAMES[0].1).await;
-        let got = request(&fcx, io, "GET", "elsewhere.test", "/simple/", &[], "").await;
+        let got = request(&fcx, io, "GET", "elsewhere.org", "/simple/", &[], "").await;
         assert_eq!(got.status, 301);
         let lines = env.log.wait(&fcx, "http", 1, |l| l["status"] == 301).await;
         assert_eq!(lines[0]["answer"], "redirect");
         assert_eq!(lines[0]["ssrf"][0]["where"], "request_target");
-        assert_eq!(lines[0]["ssrf"][0]["target"], "elsewhere.test");
+        assert_eq!(lines[0]["ssrf"][0]["target"], "elsewhere.org");
         assert_eq!(
             lines[0]["ssrf_scan"],
             serde_json::json!({"state": "complete"})
@@ -202,7 +202,7 @@ fn redirect_with_foreign_authority() {
     run_variant(Variant::Missing, |fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         let io = plain(&fcx, &m, NAMES[0].1).await;
-        let uri = "http://elsewhere.test/simple/";
+        let uri = "http://elsewhere.org/simple/";
         let got = request(&fcx, io, "GET", NAMES[0].0, uri, &[], "").await;
         assert_eq!(got.status, 301);
         let lines = env.log.wait(&fcx, "http", 1, |l| l["status"] == 301).await;
@@ -252,7 +252,7 @@ fn redirect_with_declared_body_has_an_incomplete_scan() {
     run_variant(Variant::Missing, |fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         for (path, headers, body) in [
-            ("/simple/?length", vec![], "url=https://elsewhere.test/"),
+            ("/simple/?length", vec![], "url=https://elsewhere.org/"),
             (
                 "/simple/?chunked",
                 vec![("transfer-encoding", "chunked")],
@@ -281,13 +281,13 @@ fn padded_read_requests_keep_their_targets_in_the_log() {
         let m = machine(&fcx, &attacher, "agent", AGENT);
         for (path, body, place) in [
             (
-                format!("/simple/?{}url=https://elsewhere.test/", "x&".repeat(1024)),
+                format!("/simple/?{}url=https://elsewhere.org/", "x&".repeat(1024)),
                 String::new(),
                 "query",
             ),
             (
                 "/simple/".into(),
-                format!("pad={}&url=https://elsewhere.test/", "x".repeat(65_536)),
+                format!("pad={}&url=https://elsewhere.org/", "x".repeat(65_536)),
                 "body",
             ),
         ] {
@@ -297,7 +297,7 @@ fn padded_read_requests_keep_their_targets_in_the_log() {
                 .log
                 .wait(&fcx, "http", 1, |l| l["ssrf"][0]["where"] == place)
                 .await;
-            assert_eq!(lines[0]["ssrf"][0]["target"], "https://elsewhere.test/");
+            assert_eq!(lines[0]["ssrf"][0]["target"], "https://elsewhere.org/");
             assert_eq!(
                 lines[0]["ssrf_scan"],
                 serde_json::json!({"state": "complete"})
@@ -307,7 +307,7 @@ fn padded_read_requests_keep_their_targets_in_the_log() {
                 let got = request(&fcx, io, "GET", NAMES[0].0, &path, &[], "").await;
                 assert_eq!(got.status, 301);
                 let lines = env.log.wait(&fcx, "http", 1, |l| l["status"] == 301).await;
-                assert_eq!(lines[0]["ssrf"][0]["target"], "https://elsewhere.test/");
+                assert_eq!(lines[0]["ssrf"][0]["target"], "https://elsewhere.org/");
                 assert_eq!(
                     lines[0]["ssrf_scan"],
                     serde_json::json!({"state": "complete"})
@@ -418,7 +418,7 @@ fn http2_pre_handler_body_without_content_length_is_unavailable() {
             .method("GET")
             .uri(format!("https://{}/simple/", NAMES[2].0))
             .body(Data(Some(Bytes::from_static(
-                b"url=https://elsewhere.test/",
+                b"url=https://elsewhere.org/",
             ))))?;
         let response = send.send_request(request).await?;
         assert_eq!(response.status(), 421);
@@ -481,7 +481,7 @@ fn http2_size_refusal_keeps_the_method_and_targets() {
         let r = http::Request::builder()
             .method("POST")
             .uri(format!(
-                "https://{}/simple/?url=https://elsewhere.test/fixture",
+                "https://{}/simple/?url=https://elsewhere.org/packages",
                 NAMES[0].0
             ))
             .body(Full::new(Bytes::from(vec![b'x'; (64 << 20) + 1])))?;
@@ -499,7 +499,7 @@ fn http2_size_refusal_keeps_the_method_and_targets() {
         );
         assert_eq!(
             lines[0]["ssrf"][0]["target"],
-            "https://elsewhere.test/fixture"
+            "https://elsewhere.org/packages"
         );
         Ok(())
     });
@@ -589,7 +589,7 @@ fn extended_network_keeps_sites_and_serves_mirrors_with_one_root() {
             );
             // The repository's address rejects the world's other names and
             // a name the world does not serve. Only that last one leaves.
-            let asked = [NAMES[1].0, "packages.mozilla.org", "elsewhere.test"];
+            let asked = [NAMES[1].0, "packages.mozilla.org", "elsewhere.org"];
             for name in asked {
                 assert!(
                     tls(&fcx, &machine, NAMES[0].1, name, config.clone())
@@ -649,7 +649,7 @@ fn extended_network_keeps_sites_and_serves_mirrors_with_one_root() {
         [
             (NAMES[1].0.into(), false.into()),
             ("packages.mozilla.org".into(), false.into()),
-            ("elsewhere.test".into(), true.into()),
+            ("elsewhere.org".into(), true.into()),
         ]
     );
 }

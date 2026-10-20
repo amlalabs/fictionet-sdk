@@ -65,6 +65,10 @@ fn fetch_base(dir: &Path) -> Result<PathBuf> {
 
 pub fn download(url: &str, path: &Path, algorithm: &str, hash: &str) -> Result {
     if path.is_file() {
+        let actual = capture(cmd(algorithm, &[]).arg(path))?;
+        if actual.split_whitespace().next() != Some(hash) {
+            return Err(format!("{}: {algorithm} mismatch", path.display()).into());
+        }
         return Ok(());
     }
     private_dir(path.parent().ok_or("download needs a directory")?)?;

@@ -50,7 +50,7 @@
 <ports><extraports state="closed" count="1021">
 <extrareasons reason="reset" count="1021" proto="tcp" ports="1-24,26-109,111-142,144-1024"/>
 </extraports>
-<port protocol="tcp" portid="25"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="smtp" product="Postfix smtpd" hostname=" mail.corp.test" method="probed" conf="10"><cpe>cpe:/a:postfix:postfix</cpe></service></port>
+<port protocol="tcp" portid="25"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="smtp" product="Postfix smtpd" hostname=" mail.northwind.internal" method="probed" conf="10"><cpe>cpe:/a:postfix:postfix</cpe></service></port>
 <port protocol="tcp" portid="110"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="pop3" product="Dovecot pop3d" method="probed" conf="10"><cpe>cpe:/a:dovecot:dovecot</cpe></service></port>
 <port protocol="tcp" portid="143"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="imap" product="Dovecot imapd" method="probed" conf="10"><cpe>cpe:/a:dovecot:dovecot</cpe></service></port>
 </ports>

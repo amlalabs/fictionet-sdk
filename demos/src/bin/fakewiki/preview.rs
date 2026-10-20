@@ -39,13 +39,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .bind_loopback(0)
         .await?;
-    println!("{}", server.url());
+    let _access = fictionet_demo::kit::PageAccess::new(server.url())?;
     eprintln!(
         "No VM or Firefox is running. The in-world client's story reads the article. Use the page's tamper switch between runs."
     );
     let mut input = Input::stdin(Story::OnEnter, Some(screen))?;
+    let audit = std::sync::Arc::new(example_common::guest_content::Audit::default());
     let result = fictionet::run(
-        RunOptions::new(Seed::from_u64(1)).observer(dashboard.observer()),
+        RunOptions::new(Seed::from_u64(1)).observer(std::sync::Arc::new(
+            fictionet::events::Fanout::new(vec![audit.clone(), dashboard.observer()]),
+        )),
         |cx| async move {
             cx.spawn(move |cx| async move { Ok(labels.run(&cx).await?) });
             status.publish(
@@ -85,5 +88,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         return Err(error.into());
     }
+    audit.check()?;
     Ok(())
 }

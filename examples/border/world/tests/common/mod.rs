@@ -47,17 +47,19 @@ where
     ));
     let log = Log::start(Box::new(buf.clone()), scenario.clone());
     let output = log.clone();
+    let audit = Arc::new(example_common::guest_content::Audit::default());
     let events = Arc::new(fictionet_observe::Memory::default());
     fictionet_test_support::harness::run(
         fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
             fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
                 Arc::new(log.clone()),
                 events.clone(),
+                audit.clone(),
             ]))),
         )),
         move |fcx| async move {
             let (ids, root) = {
-                let ca = Ca::new(&fcx, "Test Root CA")?;
+                let ca = Ca::new(&fcx, border_world::certs::LAB_CA_NAME)?;
                 (border_world::identities(&fcx, &ca)?, ca.cert_der())
             };
             let mut roots = RootCertStore::empty();
@@ -80,6 +82,7 @@ where
         },
     );
     output.finish().unwrap();
+    audit.check().unwrap();
 }
 
 /// Writes a message with two-octet AS numbers.

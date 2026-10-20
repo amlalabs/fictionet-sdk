@@ -1255,7 +1255,7 @@ impl Pending for Sending {
             });
         }
         if let Some(response) = self.response.take() {
-            let (mut parts, body) = response.into_parts();
+            let (mut parts, body) = super::response::inspect(driver.fcx(), response).into_parts();
             let now = driver.fcx().map_or(self.asked, Cx::now);
             let date = self.date.and_then(|date| {
                 HeaderValue::from_str(&super::http_date(

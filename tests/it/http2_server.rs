@@ -512,7 +512,7 @@ window.addEventListener('load', () => {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(output.stdout, b"2 413");
-            let chromium = std::env::var_os("CHROMIUM").unwrap_or_else(|| "chromium".into());
+            let chromium = "chromium";
             let output = Command::new(chromium)
                 .args([
                     "--headless",

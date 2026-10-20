@@ -116,6 +116,45 @@ pub const PROBES: &[Probe] = &[
     },
 ];
 
+/// Requires every declared probe exactly once for each guest.
+pub fn complete(probes: &Containment, guests: &[&str]) -> bool {
+    probes.probes.len() == guests.len() * PROBES.len()
+        && guests.iter().all(|guest| {
+            PROBES.iter().all(|probe| {
+                probes
+                    .probes
+                    .iter()
+                    .filter(|result| {
+                        result.guest == *guest
+                            && result.name == probe.name
+                            && result.command == probe.command
+                            && result.destination == probe.destination
+                    })
+                    .count()
+                    == 1
+            })
+        })
+}
+
+/// Only configuration probes may report facts without a containment result.
+pub fn passed(probes: &Containment, guests: &[&str]) -> bool {
+    !guests.is_empty()
+        && complete(probes, guests)
+        && probes.probes.iter().all(|result| {
+            PROBES
+                .iter()
+                .find(|probe| probe.name == result.name)
+                .is_some_and(|probe| {
+                    result.outcome
+                        == if matches!(probe.kind, Kind::Routes | Kind::Proxy) {
+                            ProbeOutcome::Fact
+                        } else {
+                            ProbeOutcome::Contained
+                        }
+                })
+        })
+}
+
 /// Runs each probe once and compares only observations added during that probe.
 /// SSH errors and deadlines become results.
 pub async fn run(session: &Session, guest: &str, dashboard: &DashboardHandle) -> Containment {
@@ -452,6 +491,47 @@ mod tests {
             Observation::Event(&event),
         );
         egress.snapshot()
+    }
+
+    #[test]
+    fn only_complete_affirmative_results_pass() {
+        let mut probes = Containment {
+            probes: PROBES
+                .iter()
+                .map(|probe| {
+                    let mut result = result(probe, "station", String::new(), String::new());
+                    result.outcome = if matches!(probe.kind, Kind::Routes | Kind::Proxy) {
+                        ProbeOutcome::Fact
+                    } else {
+                        ProbeOutcome::Contained
+                    };
+                    result
+                })
+                .collect(),
+        };
+        assert!(passed(&probes, &["station"]));
+        for outcome in [
+            ProbeOutcome::Unknown,
+            ProbeOutcome::MissingTool,
+            ProbeOutcome::TimedOut,
+            ProbeOutcome::Forwarded,
+            ProbeOutcome::NotContained,
+            ProbeOutcome::Fact,
+        ] {
+            probes.probes[0].outcome = outcome;
+            assert!(!passed(&probes, &["station"]), "{outcome:?}");
+        }
+        probes.probes[0].outcome = ProbeOutcome::Contained;
+        assert!(!passed(&probes, &["station", "server"]));
+        let first = probes.probes[0].clone();
+        probes.probes[0] = probes.probes[1].clone();
+        assert!(!complete(&probes, &["station"]));
+        probes.probes[0] = first;
+        probes.probes[0].destination = "another address".into();
+        assert!(!complete(&probes, &["station"]));
+        probes.probes.clear();
+        assert!(!passed(&probes, &["station"]));
+        assert!(!passed(&probes, &[]));
     }
 
     #[test]

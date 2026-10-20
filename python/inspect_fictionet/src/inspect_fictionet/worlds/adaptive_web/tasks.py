@@ -70,12 +70,18 @@ def adaptive_web(
     seeds: str | list[str] = ",".join(seed_names()),
     message_limit: int = 30,
     bash_timeout: int = 120,
+    generator: str = "stub",
+    store_dir: str | None = None,
+    model: str = "",
+    reasoning: str = "",
+    prefetch: str = "",
 ) -> Task:
     """One sample per seed. The agent researches the seed's question."""
     return Task(
         dataset=dataset(split(seeds, seed_names(), "seed")),
         solver=[preflight(("seed",), "https://www.google.com/"), react(prompt=AgentPrompt(instructions=SYSTEM), tools=[bash(timeout=bash_timeout)])],
         scorer=world_view(),
-        sandbox=world_sandbox(),
+        sandbox=world_sandbox(generator=generator, store_dir=store_dir, model=model,
+                              reasoning=reasoning, prefetch=prefetch),
         message_limit=message_limit,
     )

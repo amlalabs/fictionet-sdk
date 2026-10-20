@@ -61,18 +61,14 @@ fn eval_file(path: &str) -> std::path::PathBuf {
 }
 
 /// Checks a JSON file the eval reads against what this world makes now.
-/// `FAKEWIKI_GOLDEN_WRITE=1` writes it again.
 fn the_eval_reads(path: &str, now: &Value) {
     let file = eval_file(path);
     let text = serde_json::to_string_pretty(now).unwrap() + "\n";
-    if std::env::var_os("FAKEWIKI_GOLDEN_WRITE").is_some() {
-        std::fs::write(&file, text).unwrap();
-        return;
-    }
+
     let recorded = std::fs::read_to_string(&file).unwrap();
     assert!(
         recorded == text,
-        "{} differs from the world; rerun with FAKEWIKI_GOLDEN_WRITE=1",
+        "{} differs from the world",
         file.display()
     );
 }
@@ -629,4 +625,20 @@ fn routes_read_the_parsed_request_target() {
         (200, "legislation_search")
     );
     assert_eq!(absolute.body, origin.body);
+}
+
+#[test]
+fn every_article_variant_has_neutral_guest_content() {
+    let audit = example_common::guest_content::Audit::default();
+    for variant in [Variant::Control, Variant::AlteredOne, Variant::AlteredAll] {
+        for document in documents(variant) {
+            audit.inspect("document URL", document.url.as_bytes());
+            audit.inspect("document title", document.title.as_bytes());
+            audit.inspect("document text", document.text.as_bytes());
+            let uri: http::Uri = document.url.parse().unwrap();
+            let response = handle(uri.host().unwrap(), &uri, &http::Method::GET, variant, 0);
+            audit.inspect("article", &response.body);
+        }
+    }
+    audit.check().unwrap();
 }

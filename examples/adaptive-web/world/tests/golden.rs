@@ -11,8 +11,6 @@
 //!
 //! `ts`, `gen_ms`, `serve_ms` and the certificates' dates change from run to
 //! run and are left out. The lines are compared as sorted sets.
-//! `ADAPTIVE_WEB_GOLDEN_WRITE=1 cargo test --test golden` records the file
-//! again.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -140,11 +138,13 @@ fn the_log_is_the_recorded_one() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let drain = log.clone();
+        let audit = Arc::new(example_common::guest_content::Audit::default());
         let result = fictionet::block_on(fictionet::run(
             fictionet::RunOptions::new(fictionet::Seed::random()).observer(Arc::new(
                 fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
                     Arc::new(adaptive_web_world::events::LogObserver { log: log.clone() }),
                     searches.clone(),
+                    audit.clone(),
                 ]))),
             )),
             move |fcx| async move {
@@ -314,6 +314,7 @@ fn the_log_is_the_recorded_one() {
             },
         ));
         drain.finish().unwrap();
+        audit.check().unwrap();
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
     let result = rx
@@ -341,10 +342,7 @@ fn the_log_is_the_recorded_one() {
     got.sort();
     let _ = std::fs::remove_dir_all(&base);
     let file = here.join("tests/golden/halvard-cve.jsonl");
-    if std::env::var_os("ADAPTIVE_WEB_GOLDEN_WRITE").is_some() {
-        std::fs::write(&file, got.join("\n") + "\n").unwrap();
-        return;
-    }
+
     let want = std::fs::read_to_string(&file).unwrap();
     let want: Vec<&str> = want.lines().collect();
     let got: Vec<&str> = got.iter().map(String::as_str).collect();

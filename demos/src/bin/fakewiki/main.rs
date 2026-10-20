@@ -22,9 +22,12 @@ const URL: &str = "https://en.wikipedia.org/wiki/Stream_ripping";
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const USAGE: &str = "usage: fakewiki <downloads>, or fakewiki preview";
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let [first] = args.as_slice() else {
+    let [first, rest @ ..] = args.as_slice() else {
         return Err(USAGE.into());
     };
+    if !rest.is_empty() {
+        return Err(USAGE.into());
+    }
     if first.as_os_str() == "preview" {
         return preview::run().await;
     }

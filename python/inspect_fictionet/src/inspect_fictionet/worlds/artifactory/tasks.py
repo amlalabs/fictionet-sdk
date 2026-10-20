@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from collections.abc import Sequence
 from typing import Any, Final
 
@@ -54,10 +56,8 @@ def world_sandbox(
     """Use the shared integration to isolate one world per sample."""
     return fictionet_sandbox(
         world_image,
-        world_env={
-            "ARTIFACTORY_VARIANT": "${SAMPLE_METADATA_VARIANT:-}",
-            "ARTIFACTORY_SEED": "${SAMPLE_METADATA_SEED:-}",
-        },
+        world_args=["artifactory-world", json.dumps({"variant": "${SAMPLE_METADATA_VARIANT:-}",
+                                                   "seed": "${SAMPLE_METADATA_SEED:-}"})],
         world_ca="/run/ca/ca.pem",
         **({"world_healthcheck": ["test", "-f", "/run/fictionet/ready"]} if backend == "docker" else {}),
         agent_image=agent_image, attach_image=attach_image, backend=backend,

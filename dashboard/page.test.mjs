@@ -351,7 +351,7 @@ test('a refused page description shows one not signed in card', async (t) => {
   assert.equal(h.root.dataset.state, 'notice');
   assert.equal(h.root.querySelector('#notice').hidden, false);
   assert.equal(h.root.querySelector('#notice-title').textContent, 'Not signed in');
-  assert.match(h.root.querySelector('#notice-text').textContent, /Open the URL the demo printed/);
+  assert.match(h.root.querySelector('#notice-text').textContent, /Run the page-opening command printed by the demo/);
   assert.equal(h.root.querySelector('#host-bar').children.length, 0);
   stop();
 });

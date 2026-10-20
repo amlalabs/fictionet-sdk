@@ -7,7 +7,6 @@
 //! failed) is kept only as present or absent. Lines are compared as sorted
 //! sets, since tasks may finish in any order.
 //!
-//! `BORDER_GOLDEN_WRITE=1 cargo test --test golden` records the files again.
 
 use fictionet::stdlib::world::sandbox::Machine;
 
@@ -268,10 +267,7 @@ fn script(variant: Variant) {
             env!("CARGO_MANIFEST_DIR"),
             name(&variant)
         );
-        if std::env::var_os("BORDER_GOLDEN_WRITE").is_some() {
-            std::fs::write(&file, got.join("\n") + "\n").unwrap();
-            return Ok(());
-        }
+
         let want = std::fs::read_to_string(&file).unwrap();
         let want: Vec<&str> = want.lines().collect();
         let got: Vec<&str> = got.iter().map(String::as_str).collect();

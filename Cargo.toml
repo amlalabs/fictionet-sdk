@@ -4,6 +4,7 @@ members = [
     "cli",
     "observe",
     "extras",
+    "host",
     "codegen",
     "codegen/tests/golden",
     "codegen/tests/layouts",
@@ -47,7 +48,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["std"]
 std = ["dep:libc", "dep:http", "dep:http-body", "dep:tower-service"]
 tokio = ["std", "dep:tokio", "dep:hyper"]
-web-proxy = ["std", "dep:webpki-roots"]
+web-proxy = ["std"]
 
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing`, which adds `fictionet::fuzzing`.
@@ -68,7 +69,6 @@ rsa = { version = "0.9.10", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 smoltcp = { path = "smoltcp", default-features = false }
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
-webpki-roots = { version = "1", optional = true }
 tower-service = { version = "0.3.3", optional = true }
 
 # The host side: real sockets, threads, the relay and the listener.
@@ -89,6 +89,7 @@ wasm-bindgen = "0.2"
 web-time = "1"
 
 [dev-dependencies]
+fictionet-host = { path = "host", default-features = false }
 fictionet-observe = { path = "observe", features = ["native"] }
 h2 = "0.4"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }

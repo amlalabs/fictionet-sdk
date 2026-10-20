@@ -31,9 +31,13 @@ world's mirror. The mirror keeps them in `downloads/cloudimage/apt-cache/`, so
 the first run on a machine also fetches about 280 MB of Ubuntu packages and
 later runs reuse them.
 
-Each run prints its page URL before the guests boot. It then runs the
-demo's story and its checks. Every demo checks that no containment probe was
-forwarded or answered from outside the world. The run saves screenshots,
+Each run prints its public page URL before the guests boot. The accompanying
+`cargo xtask demo open PATH` action opens a private bootstrap file with the
+authentication token. Routine output contains no token; the bootstrap is
+removed with the run. It then runs the
+demo's story and its checks. Every demo requires each declared containment probe exactly once, with an
+affirmative result. Configuration probes report facts. The shared package
+mirror closes once every guest has finished its cloud-init check. The run saves screenshots,
 powers the guests off, and checks that no Cloud Hypervisor process or run
 directory is left. A passing run ends with `every required check passed`. A
 failing run prints the guests' cloud-init report, log tails and console tail.
@@ -66,8 +70,8 @@ The checks cover the guest's address and devices, the trust store, Firefox, the
 agents' own TLS clients, and the page's access controls. They type a command
 in the page terminal and move the pointer with and without the screen lease.
 
-- Options: a Unix socket path. With it,
-  `fictionet observe --observation unix:PATH watch` follows the same
+- A Unix socket path lets
+  `fictionet observe --observation unix:PATH watch` follow the same
   collector from another terminal.
 - Screenshots: `downloads/cloudimage/shots/`, with `guest-desktop.png` from
   the guest, `viewer-desktop.png` through the page's screen socket, and
@@ -353,7 +357,10 @@ call gives.
 `Guest::typed_commands` adds that program to any guest, as Artifactory's
 browser desktop does. `Guest::validate` refuses a guest whose names, files,
 packages or commands contain one of the words in `kit::FORBIDDEN`, such as
-eval or world, and `Guest::forbid` adds a demo's own words. A demo's page
+eval or world, and `Guest::forbid` adds a demo's own words. The host also checks
+rendered guest files, served pages and headers, certificates, DNS names, service
+output and decoded package archives with the shared [guest content check](../examples/common/guest-content.md).
+VM runs, previews and example-world integration tests use the same check. A demo's page
 without a VM is its `preview` subcommand. See the [kit API](src/kit/mod.rs)
 and the desktop's [guest](src/bin/desktop/guest.rs) and
 [world](src/bin/desktop/world.rs).

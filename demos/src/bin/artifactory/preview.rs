@@ -82,14 +82,15 @@ pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> 
     println!(
         "Replay without VMs: an in-process client sends the story's requests. No guest runs, so steps have no exit status."
     );
-    println!("Page: {}", page.url());
+    let _access = fictionet_demo::kit::PageAccess::new(page.url())?;
     let mut input = Input::stdin(Story::Once, Some(screen))?;
+    let audit = Arc::new(example_common::guest_content::Audit::default());
     let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
+        audit.clone(),
         facts.clone(),
     ])));
-    let story = run(options, replay, Duration::from_secs(1), extra_reads);
-    tokio::pin!(story);
+    let mut story = Box::pin(run(options, replay, Duration::from_secs(1), extra_reads));
     let mut replaying = true;
     loop {
         tokio::select! {
@@ -101,6 +102,8 @@ pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> 
             () = input.closed() => break,
         }
     }
+    drop(story);
+    audit.check()?;
     drop(page);
     Ok(())
 }

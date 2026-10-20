@@ -419,6 +419,14 @@ impl Cx {
         }
     }
 
+    /// Opens a consumer for service output before transport encryption.
+    pub fn content(
+        &self,
+        source: crate::events::Content<'_>,
+    ) -> Option<Box<dyn crate::events::ContentSink>> {
+        self.run.observer.shared()?.content(source)
+    }
+
     /// A connection's TLS key adapter for interested observers.
     /// The typed stream stops when the run ends. The adapter does not retain the run.
     #[doc(hidden)]

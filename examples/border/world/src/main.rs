@@ -1,7 +1,7 @@
 //! The Border world process.
 //!
 //! ```text
-//! border-world [--socket /run/relay/relay.sock] [--ca-dir /app/ca]
+//! border-world JSON [--socket /run/relay/relay.sock] [--ca-dir /app/ca]
 //!     [--state-dir /var/lib/fictionet] [--ready /run/fictionet/ready]
 //!     [--subnet 10.0.0.0/24] [--observation <path>]
 //! border-world make-ca DIR     # the lab CA: ca.pem, ca.key
@@ -9,10 +9,7 @@
 //! border-world credentials     # the agent's credentials file, on stdout
 //! ```
 //!
-//! The variant and the task come from the environment, as Compose
-//! interpolates them from each sample's metadata: `BORDER_VARIANT`
-//! (`legitimate` or `hijack`; the world refuses to start without one) and
-//! `BORDER_TASK` (`read`, `login` or `pay`; `read` when empty).
+//! The first argument is JSON with `variant` and optional `task`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,11 +17,23 @@ use std::sync::Arc;
 use border_world::certs;
 use border_world::log::Log;
 use border_world::scenario::{Prefix, Scenario, Task, Variant, parse_prefix};
-use example_common::args::{Args, unknown};
+use example_common::args::{Args, configuration, unknown};
 use example_common::names::{name, parse};
 
 /// The shared command line, and the subnet the world serves.
-fn args(flags: impl Iterator<Item = String>) -> Result<(Args, Prefix), String> {
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configuration {
+    variant: String,
+    task: Option<String>,
+}
+
+fn args(mut flags: impl Iterator<Item = String>) -> Result<(Args, Prefix, Variant, Task), String> {
+    let config: Configuration = configuration(&mut flags)?;
+    let variant =
+        parse::<Variant>(&config.variant).ok_or("variant must be legitimate or hijack")?;
+    let task =
+        parse(config.task.as_deref().unwrap_or("read")).ok_or("task must be read, login or pay")?;
     let mut subnet = parse_prefix("10.0.0.0/24").expect("a prefix");
     let args = Args {
         socket: "/run/relay/relay.sock".into(),
@@ -37,7 +46,7 @@ fn args(flags: impl Iterator<Item = String>) -> Result<(Args, Prefix), String> {
         }
         _ => unknown(flag, value),
     })?;
-    Ok((args, subnet))
+    Ok((args, subnet, variant, task))
 }
 
 fn main() {
@@ -74,24 +83,8 @@ fn main() {
 }
 
 fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
-    let (args, subnet) = args(argv).map_err(fictionet::Error::msg)?;
+    let (args, subnet, variant, task) = args(argv).map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
-    let variant = std::env::var("BORDER_VARIANT").unwrap_or_default();
-    let variant = parse::<Variant>(&variant).ok_or_else(|| {
-        fictionet::Error::msg(format!(
-            "BORDER_VARIANT must be legitimate or hijack, not {variant:?}"
-        ))
-    })?;
-    let task = std::env::var("BORDER_TASK").unwrap_or_default();
-    let task = if task.is_empty() {
-        Task::Read
-    } else {
-        parse::<Task>(&task).ok_or_else(|| {
-            fictionet::Error::msg(format!(
-                "BORDER_TASK must be read, login or pay, not {task:?}"
-            ))
-        })?
-    };
     let scenario = Arc::new(Scenario::new(variant, task, subnet));
 
     let world_ca = certs::load(&args.ca_dir)?;

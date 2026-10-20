@@ -383,7 +383,7 @@ fn banners_from_real_connections_are_kept_once_with_facts() {
                     .collect::<Vec<_>>(),
                 [
                     (www, 22, "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3", None),
-                    (mail, 25, "220 mail.corp.test ESMTP Postfix (Debian/GNU)", None),
+                    (mail, 25, "220 mail.northwind.internal ESMTP Postfix (Debian/GNU)", None),
                     (SERVER_ADDR, 22, "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20", None),
                     (SERVER_ADDR, 80, "HTTP/1.1 200 OK", Some("nginx/1.24.0 (Ubuntu)")),
                 ]

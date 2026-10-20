@@ -2,7 +2,7 @@
 //! a certificate, and every page is made the first time it is asked for.
 //!
 //! ```text
-//! ADAPTIVE_WEB_SEED=halvard-cve adaptive-web-world --socket /run/fictionet/sock/world.sock \
+//! adaptive-web-world --seed halvard-cve --socket /run/fictionet/sock/world.sock \
 //!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready
 //! ```
 //!

@@ -57,3 +57,31 @@ pub fn random_uuid() -> String {
         b[15]
     )
 }
+
+/// A short path through a directory held open by this process.
+pub(crate) fn socket_path(directory: &std::fs::File, name: &str) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!(
+        "/proc/{}/fd/{}/{name}",
+        std::process::id(),
+        directory.as_raw_fd()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sockets_work_in_long_directories() {
+        let root = RunDir::new(&std::env::temp_dir(), "socket").unwrap();
+        let path = root.path().join("a".repeat(120));
+        std::fs::create_dir(&path).unwrap();
+        let directory = std::fs::File::open(&path).unwrap();
+        let socket = socket_path(&directory, "net.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let _server = listener.accept().unwrap();
+        assert!(path.join("net.sock").exists());
+    }
+}

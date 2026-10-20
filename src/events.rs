@@ -107,6 +107,14 @@
 //! # Ok::<(), fictionet::Error>(())
 //! ```
 //!
+//! Services can also offer plaintext output through [`Observer::content`].
+//! This opt-in callback is separate from the numbered streams and has no core
+//! retention. HTTP supplies entity bytes and their content encoding, TLS supplies
+//! its selected certificate chain, and other services supply their output bytes.
+//! A [`ContentSink`] receives chunks and a completion marker; a cutoff or a range
+//! response does not mark a whole representation complete. Consumers own decoding,
+//! limits and any worker queues. Packet policies do not select this content.
+//!
 //! # Repeats
 //!
 //! Services emit every occurrence. [`Event::repeat`] marks repeatable facts
@@ -114,6 +122,8 @@
 //! within bounded run-time windows. Its `Memory::checked_of` and
 //! `Memory::checked_all` reject incomplete history. See the
 //! [companion crate](../../fictionet_observe/index.html) for limits and export.
+
+pub use observer::{Content, ContentSink};
 
 mod model;
 mod observer;

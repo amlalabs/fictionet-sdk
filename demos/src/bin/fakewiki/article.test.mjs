@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mount } from './article.mjs';
 import { createDocument, Element } from '../../../../dashboard/test-dom.mjs';
+import { createCommand } from '../../../../dashboard/transport.mjs';
 import * as dom from '../../../../dashboard/dom.mjs';
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const segment = (text, changed) => ({ text, changed });
@@ -18,6 +19,7 @@ function harness() {
     format: { fmtRunTime: (n) => `${n.toFixed(1)} s` }, runTime: () => 10,
     selection: { set: (value) => selections.push(value) },
   };
+  services.command = (signal, changed) => createCommand(services.transport, signal, changed);
   const dispose = mount(root, services);
   const emit = (type, value) => { const event = new Event(type); event.data = JSON.stringify(value); watch.dispatchEvent(event); };
   const publish = (served = 'real', revision = 0) => {

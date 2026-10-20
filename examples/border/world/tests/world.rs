@@ -69,7 +69,7 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
             .await?;
             let chain = stream.tls.peer_certificates().unwrap().to_vec();
             assert_eq!(chain.len(), 2);
-            assert!(contains(&chain[1], b"Test Root CA"));
+            assert!(contains(&chain[1], b"Internet Security Root CA"));
             let got = request(
                 &fcx,
                 stream,
@@ -1191,7 +1191,7 @@ where
             fictionet::events::Fanout::new(vec![Arc::new(log.clone()), recorded.clone()]),
         )),
         |fcx| async move {
-            let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "Test Root CA")?;
+            let ca = fictionet::stdlib::services::ca::Ca::new(&fcx, "Internet Security Root CA")?;
             let ids = border_world::identities(&fcx, &ca)?;
             let (attacher, attachments) = fictionet::attachments();
             log.attach(&fcx);

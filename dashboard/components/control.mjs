@@ -40,36 +40,31 @@ export function mount(root, services, options) {
   const controller = new AbortController();
   const cleanup = [];
   const buttons = [];
-  let revision, busy = false;
+  let revision;
+  const request = services.command(controller.signal, enabled);
   const when = () => ` at ${fmtDuration(services.runTime())}`;
   function say(line, value) {
     reply.replaceChildren();
     el('p', { text: line }, reply);
     if (value !== undefined && value !== null) keyValues(reply, el, value);
   }
-  function enabled() { for (const button of buttons) button.disabled = busy || (!!options.state && revision === undefined); }
+  function enabled() { for (const button of buttons) button.disabled = request.busy || (!!options.state && revision === undefined); }
   for (const action of options.actions) {
     const button = el('button', { class: 'button', type: 'button', text: action.label }, actions);
     buttons.push(button);
     cleanup.push(listen(button, 'click', async () => {
       if (button.disabled || controller.signal.aborted) return;
-      busy = true;
-      enabled();
       say('Waiting for the world…');
-      const command = options.state ? { ...action.command, expected_revision: revision } : action.command;
-      try {
-        const result = await services.transport.post(options.command, { request_id: crypto.randomUUID(), command }, controller.signal);
-        if (controller.signal.aborted) return;
+      await request.send(options.command, action.command, options.state ? revision : undefined, {
+        reply(result) {
         if (result.status === 'pending') say(`Pending${when()}. Read the state before trying again.`);
         else say(`${action.label}: applied${when()}`, result.reply);
-      } catch (error) {
-        if (controller.signal.aborted) return;
+        }, error(error) {
         if (error.body?.status === 'timeout') say(`${action.label}: no reply yet${when()}. It may still apply. Read the state before trying again.`);
         else if (error.body?.rejection) say(`${action.label}${when()}. ${rejection(error.body.rejection)}`);
         else say(`${action.label}: the command failed: ${error.message}`);
-      } finally {
-        if (!controller.signal.aborted) { busy = false; enabled(); }
-      }
+        },
+      });
     }));
   }
   if (options.state) {

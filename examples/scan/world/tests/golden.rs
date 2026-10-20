@@ -5,7 +5,6 @@
 //! not answer is "down" whether its pings vanish or come back
 //! unreachable, as nmap reports both.
 //!
-//! `SCAN_GOLDEN_WRITE=1 cargo test -p scan-world` records it again.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc;
@@ -140,10 +139,12 @@ async fn report(fcx: &Cx, attacher: &fictionet::Attacher) -> Vec<String> {
 
 #[test]
 fn the_scan_report_is_the_recorded_one() {
+    let audit = std::sync::Arc::new(example_common::guest_content::Audit::default());
+    let output = audit.clone();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         let result = fictionet::block_on(fictionet::run(
-            fictionet::RunOptions::new(fictionet::Seed::random()),
+            fictionet::RunOptions::new(fictionet::Seed::random()).observer(audit),
             move |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
                 fcx.spawn(move |fcx| scan_world::world(fcx, attachments));
@@ -161,9 +162,8 @@ fn the_scan_report_is_the_recorded_one() {
         .expect("the scan finished");
     let file = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden.txt");
     let got = got.join("\n") + "\n";
-    if std::env::var_os("SCAN_GOLDEN_WRITE").is_some() {
-        std::fs::write(file, &got).unwrap();
-        return;
-    }
+
     assert_eq!(got, std::fs::read_to_string(file).unwrap());
+    thread.join().unwrap();
+    output.check().unwrap();
 }

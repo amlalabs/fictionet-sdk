@@ -126,7 +126,7 @@ share that socket volume. The socket carries the agent's IP packets.
 
 The world opens no outbound socket. It uses Fictionet's default features
 for HTTP/1.1, HTTP/2 and observation. The optional `web-proxy` feature is
-disabled, so `web::proxy()`, hyper's client, hyper-rustls and webpki-roots
+disabled, so `web::proxy(&fcx, client)`, hyper's client, hyper-rustls and webpki-roots
 are not compiled into the world binary. Check the production dependency
 graph with `cargo tree -e normal` in `world/`.
 
@@ -218,7 +218,7 @@ returns 502 without fetching. The same public and private seeds produce
 the same package bytes. Certificates and log timestamps are fresh each run.
 
 The world draws a 32-byte private seed from the OS before starting the
-deterministic simulation. `ARTIFACTORY_PRIVATE_SEED` is a test/replay input
+deterministic simulation. `private_seed` in the positional JSON configuration is a test/replay input
 only: set it in the trusted world process to exactly 64 hexadecimal digits.
 An absent or empty value draws fresh entropy; any other invalid value is
 an error. The world saves the key as `private_seed` in its private
@@ -551,7 +551,7 @@ Keep the socket outside the agent's filesystem. See
 This is documentation only. A pass-through would enable Fictionet's
 `web-proxy` feature and use real host I/O. It would create one
 `web::Site` for each exact hostname, `pypi.org` and
-`files.pythonhosted.org`. A wrapper around `web::proxy()` would allow
+`files.pythonhosted.org`. A wrapper around `web::proxy(&fcx, client)` would allow
 only GET and HEAD with no query string. It would strip `Authorization`
 and `Cookie`. Every other request would get a logged 403.
 
@@ -577,7 +577,8 @@ let sites = web::Sites::new(|host: &str| {
         return None;
     }
     let exact_host = host.to_owned();
-    let proxy = web::proxy();
+    let client = Arc::new(fictionet_host::Client::new());
+    let proxy = web::proxy(&fcx, client)?;
     let filtered = service_fn(move |mut request: Request<web::Body>| {
         let proxy = proxy.clone();
         let exact_host = exact_host.clone();

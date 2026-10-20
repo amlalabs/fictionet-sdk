@@ -61,6 +61,27 @@ impl Observation<'_> {
     }
 }
 
+/// Content produced by a service for its client, before transport encryption.
+#[derive(Clone, Copy)]
+pub struct Content<'a> {
+    /// Protocol or installed file category.
+    pub kind: &'a str,
+    /// Content name or path.
+    pub name: &'a str,
+    /// Content encoding, if present.
+    pub encoding: &'a str,
+    /// Upstream origin, when forwarded.
+    pub origin: Option<&'a str>,
+}
+
+/// A streaming consumer of service output. Dropping without finish means cutoff.
+pub trait ContentSink: Send {
+    /// Receives the next bytes.
+    fn write(&mut self, bytes: &[u8]);
+    /// Marks the content complete.
+    fn finish(&mut self);
+}
+
 /// A run's immutable observation destination.
 ///
 /// Install one through [`RunOptions`](crate::RunOptions). Delivery is
@@ -78,6 +99,10 @@ impl Observation<'_> {
 /// arrives after it returns. Packet numbers count every interested successful
 /// crossing. Declined crossings consume no numbers. Event numbers are separate.
 pub trait Observer: Send + Sync + 'static {
+    /// Opens an optional service content consumer.
+    fn content(&self, _source: Content<'_>) -> Option<Box<dyn ContentSink>> {
+        None
+    }
     /// Whether producing this observation is useful. Keep this check cheap.
     fn enabled(&self, interest: Interest<'_>) -> bool;
     /// Receives a borrowed observation with its run-assigned stamp.
@@ -102,7 +127,26 @@ impl Fanout {
     }
 }
 
+struct ContentFanout(Vec<Box<dyn ContentSink>>);
+impl ContentSink for ContentFanout {
+    fn write(&mut self, bytes: &[u8]) {
+        for sink in &mut self.0 {
+            sink.write(bytes);
+        }
+    }
+    fn finish(&mut self) {
+        for sink in &mut self.0 {
+            sink.finish();
+        }
+    }
+}
+
 impl Observer for Fanout {
+    fn content(&self, source: Content<'_>) -> Option<Box<dyn ContentSink>> {
+        let sinks: Vec<_> = self.0.iter().filter_map(|o| o.content(source)).collect();
+        (!sinks.is_empty()).then(|| Box::new(ContentFanout(sinks)) as Box<dyn ContentSink>)
+    }
+
     fn enabled(&self, interest: Interest<'_>) -> bool {
         self.0.iter().any(|o| o.enabled(interest))
     }
@@ -180,6 +224,10 @@ struct State {
 }
 
 impl Dispatch {
+    pub(crate) fn content(&self, source: Content<'_>) -> Option<Box<dyn ContentSink>> {
+        self.observer.as_ref()?.content(source)
+    }
+
     pub(crate) const fn empty() -> Self {
         Self {
             observer: None,

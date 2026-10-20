@@ -6,7 +6,8 @@ which the agent cannot reach.
 """
 from __future__ import annotations
 
-import os
+import json
+
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -28,10 +29,9 @@ def seed_front(name: str) -> dict[str, Any]:
     return tomllib.loads(text.split("+++", 2)[1])
 
 
-def world_sandbox():
-    generator = os.environ.get("ADAPTIVE_WEB_GENERATOR", "stub")
+def world_sandbox(generator="stub", store_dir=None, model="", reasoning="", prefetch="",
+                  seed="${SAMPLE_METADATA_SEED:-halvard-cve}"):
     network = "bridge" if generator in ("openrouter", "anthropic") else "none"
-    store_dir = os.environ.get("ADAPTIVE_WEB_STORE_DIR")
     mounts = {}
     if store_dir:
         path = Path(store_dir).resolve()
@@ -39,16 +39,12 @@ def world_sandbox():
         mounts[str(path)] = "/var/lib/adaptive-web"
     return fictionet_sandbox(
         "fictionet-adaptive-web-world:dev",
-        world_args=["adaptive-web-world", "--socket", "/run/relay/relay.sock"],
-        world_env={
-            "ADAPTIVE_WEB_SEED": "${SAMPLE_METADATA_SEED:-${ADAPTIVE_WEB_SEED:-halvard-cve}}",
-            "ADAPTIVE_WEB_GENERATOR": generator,
-            **{key: "${" + key + ":-}" for key in (
-                "ADAPTIVE_WEB_MODEL", "ADAPTIVE_WEB_PREFETCH", "ADAPTIVE_WEB_REASONING",
-                "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
-            )},
-        },
-        world_network=os.environ.get("ADAPTIVE_WEB_NETWORK", network),
+        world_args=["adaptive-web-world", json.dumps({"seed": seed, "generator": generator,
+                                                    "model": model, "reasoning": reasoning,
+                                                    "prefetch": str(prefetch)}),
+                    "--socket", "/run/relay/relay.sock"],
+        world_env={key: "${" + key + ":-}" for key in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY")},
+        world_network=network,
         world_mounts=mounts,
         world_ca="/app/ca/ca.pem",
         world_healthcheck=["test", "-f", "/run/fictionet/ready"],

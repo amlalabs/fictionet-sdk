@@ -291,7 +291,7 @@
 //! |---|---|---|---|
 //! | `std` | Real clocks, OS entropy, real-time timers, HTTP/1 and HTTP/2 servers; world sockets and relay on native targets | — | Yes |
 //! | `tokio` | Tokio adapters and axum upgrades | `std` | No |
-//! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `std` | No |
+//! | `web-proxy` | `web::proxy` and `web::forward`, with an injected `Upstream` transport | `std` | No |
 //!
 //! The default features build without tokio, hyper or h2. File export belongs
 //! to the companion's `native` feature, not core's `std` feature.

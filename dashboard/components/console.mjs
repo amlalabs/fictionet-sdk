@@ -67,7 +67,7 @@ export function mountConsole(root, services, options, parts) {
       panel.stop();
       if (!panel.missing) {
         const state = snapshot.value?.state;
-        panel.show(state === 'stopped' ? `${options.host} has stopped.` : parts.waiting(state));
+        panel.show(state === 'failed' ? `${options.host} failed to start.` : state === 'stopped' ? `${options.host} has stopped.` : parts.waiting(state));
       }
     } else if (!was) panel.open();
   }, (error) => {

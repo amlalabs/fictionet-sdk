@@ -47,7 +47,6 @@ pub fn desktop_painted(host: &str) -> String {
 /// The timeout bounds navigation and readiness. Errors include the condition,
 /// Chromium's stderr tail, and collected JavaScript exceptions.
 pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io::Result<String> {
-    let chromium = std::env::var_os("CHROMIUM").unwrap_or_else(|| "chromium".into());
     let profile_dir = super::util::RunDir::new(&std::env::temp_dir(), "chrome")?;
     let profile = profile_dir.path();
     let stderr_log = profile.join("chromium.stderr");
@@ -58,7 +57,7 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
     let child_cmd_fd = to_read.as_raw_fd();
     let child_reply_fd = from_write.as_raw_fd();
 
-    let mut command = Command::new(&chromium);
+    let mut command = Command::new("chromium");
     command
         .args([
             // New headless has a real compositor; old headless never produces

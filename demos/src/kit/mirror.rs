@@ -44,7 +44,7 @@ type Answer = Result<Response<Body>, Error>;
 /// Opens the shared host cache and its upstream web proxy.
 pub fn new(fcx: &Cx) -> Result<Cache<web::Proxy>, Error> {
     Ok(Cache::new(
-        web::proxy(fcx)?,
+        web::proxy(fcx, std::sync::Arc::new(fictionet_host::Client::new()))?,
         Path::new(env!("CARGO_MANIFEST_DIR")).join("downloads/cloudimage/apt-cache"),
     ))
 }
@@ -55,6 +55,27 @@ pub struct Cache<S> {
     upstream: S,
     state: Arc<State>,
     pub(super) addresses: Arc<arc_swap::ArcSwap<Vec<std::net::IpAddr>>>,
+    pub(crate) setup: Option<Arc<Setup>>,
+}
+
+pub(crate) struct Setup {
+    pending: Mutex<std::collections::HashSet<String>>,
+}
+
+impl Setup {
+    pub(crate) fn new(guests: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            pending: Mutex::new(guests.into_iter().collect()),
+        }
+    }
+
+    pub(crate) fn done(&self, guest: &str) {
+        self.pending.lock().unwrap().remove(guest);
+    }
+
+    fn closed(&self) -> bool {
+        self.pending.lock().unwrap().is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -70,6 +91,7 @@ struct State {
     disk: Option<Arc<Disk>>,
     keys: Mutex<BTreeMap<PathBuf, Arc<AsyncMutex<()>>>>,
     slots: Arc<Semaphore>,
+    tasks: tokio_util::task::TaskTracker,
     stats: Arc<Stats>,
 }
 
@@ -96,6 +118,13 @@ impl Drop for State {
 }
 
 impl<S> Cache<S> {
+    /// Waits for readers and committed writes before releasing this cache owner.
+    /// Call after dropping response bodies and other service clones.
+    pub async fn close(self) {
+        self.state.tasks.close();
+        self.state.tasks.wait().await;
+    }
+
     fn new(upstream: S, root: PathBuf) -> Self {
         let disk = match Disk::open(root) {
             Ok(disk) => Some(Arc::new(disk)),
@@ -107,10 +136,12 @@ impl<S> Cache<S> {
         Self {
             upstream,
             addresses: Default::default(),
+            setup: None,
             state: Arc::new(State {
                 disk,
                 keys: Mutex::new(BTreeMap::new()),
                 slots: Arc::new(Semaphore::new(SLOTS)),
+                tasks: tokio_util::task::TaskTracker::new(),
                 stats: Arc::new(Stats::default()),
             }),
         }
@@ -285,6 +316,12 @@ where
         // Admit before per-key waits; hold through EOF, cancellation or deadline.
         let permit = self.state.slots.clone().try_acquire_owned();
         Box::pin(async move {
+            if cache.setup.as_ref().is_some_and(|setup| setup.closed()) {
+                return Ok(web::httpd::text(
+                    StatusCode::FORBIDDEN,
+                    "Package mirror closed\n",
+                ));
+            }
             let Ok(permit) = permit else {
                 cache.state.stats.bypass("admission");
                 return Ok(web::httpd::text(
@@ -307,6 +344,7 @@ where
                     deadline,
                     fill,
                     cache.state.stats.clone(),
+                    cache.state.tasks.clone(),
                 )),
             ))
         })
@@ -378,6 +416,12 @@ where
     async fn forward(&self, request: Request<Body>) -> Answer {
         let mut upstream = self.upstream.clone();
         std::future::poll_fn(|cx| upstream.poll_ready(cx)).await?;
+        if self.setup.as_ref().is_some_and(|setup| setup.closed()) {
+            return Ok(web::httpd::text(
+                StatusCode::FORBIDDEN,
+                "Package mirror closed\n",
+            ));
+        }
         upstream.call(request).await
     }
 
@@ -516,8 +560,17 @@ where
 // Validate the trusted host's tree and hold exclusive ownership while in use.
 struct Disk {
     root: PathBuf,
-    _lock: std::fs::File,
+    lock: std::fs::File,
     budget: Mutex<(u64, u64)>,
+}
+
+impl Drop for Disk {
+    fn drop(&mut self) {
+        // Release ownership even if a child inherited the open file description.
+        if let Err(error) = self.lock.unlock() {
+            eprintln!("apt cache unlock: {error}");
+        }
+    }
 }
 
 impl Disk {
@@ -547,7 +600,7 @@ impl Disk {
         scan(&root, &mut budget, 0)?;
         Ok(Self {
             root,
-            _lock: lock,
+            lock,
             budget: Mutex::new(budget),
         })
     }
@@ -847,14 +900,16 @@ fn stream(
     deadline: tokio::time::Instant,
     fill: Option<Fill>,
     stats: Arc<Stats>,
+    tasks: tokio_util::task::TaskTracker,
 ) -> DownloadBody {
     let (tx, rx) = mpsc::channel(2);
-    let task = tokio::spawn(async move {
+    let writers = tasks.clone();
+    let task = tasks.spawn(async move {
         let _permit = permit;
         let expected = fill.as_ref().map(|f| f.expected);
         let writer = fill.map(|f| {
             let (write, incoming) = mpsc::channel(32);
-            let task = tokio::spawn(persist(
+            let task = writers.spawn(persist(
                 incoming,
                 f.reservation,
                 f.head,

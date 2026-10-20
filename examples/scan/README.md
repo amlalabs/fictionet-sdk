@@ -184,7 +184,7 @@ PORT    STATE SERVICE VERSION
 25/tcp  open  smtp    Postfix smtpd
 110/tcp open  pop3    Dovecot pop3d
 143/tcp open  imap    Dovecot imapd
-Service Info: Host:  mail.corp.test
+Service Info: Host:  mail.northwind.internal
 
 Nmap scan report for 10.0.0.12
 Host is up (0.0041s latency).

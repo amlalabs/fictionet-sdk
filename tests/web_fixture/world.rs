@@ -38,7 +38,7 @@ fn world(
         .route("/big", get(|| async { vec![b'x'; 16 << 20] }))
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
     let sites = web_world::sites(fcx, chain, key, app, plain)?;
-    let upstream = web::proxy(fcx)?;
+    let upstream = web::proxy(fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
     web::Sites::new(move |host: &str| {
         if host == "upstream" {
             println!("lookup {host}");

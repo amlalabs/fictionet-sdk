@@ -1,5 +1,4 @@
 // A real browser regression for two ports on the same host. No npm packages.
-// Set CHROMIUM to a Chromium executable if it is not named `chromium`.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -247,9 +246,9 @@ async function checkTextStaysText() {
 }
 
 test('browser bootstrap, reconnect and downloads keep credentials away from another port', async (t) => {
-  const chromium = process.env.CHROMIUM || 'chromium';
+  const chromium = 'chromium';
   try { await exec(chromium, ['--version'], { timeout: 10000 }); } catch (error) {
-    assert.fail(`Chromium is unavailable (${error.message}); set CHROMIUM to run the two-origin regression`);
+    assert.fail(`Chromium is unavailable (${error.message})`);
   }
   const profile = await mkdtemp(join(tmpdir(), 'fictionet-browser-'));
   t.after(() => rm(profile, { recursive: true, force: true }));

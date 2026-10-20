@@ -179,8 +179,11 @@ mod tests {
             ("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20".into(), None)
         );
         assert_eq!(
-            read(b"220 mail.corp.test ESMTP Postfix (Debian/GNU)\r\n250 more\r\n"),
-            ("220 mail.corp.test ESMTP Postfix (Debian/GNU)".into(), None)
+            read(b"220 mail.northwind.internal ESMTP Postfix (Debian/GNU)\r\n250 more\r\n"),
+            (
+                "220 mail.northwind.internal ESMTP Postfix (Debian/GNU)".into(),
+                None
+            )
         );
         assert_eq!(read(b"no line ending"), ("no line ending".into(), None));
         assert_eq!(read(b"bare\nnewline"), ("bare".into(), None));

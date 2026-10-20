@@ -1,7 +1,7 @@
 // The demo page: a host bar, a workspace of consoles beside a tabbed
 // inspector, built from the page description the server gives at /api/page.
 // Components share one watch stream and one state stream (see streams.mjs).
-import { createTransport, SIGN_IN } from './transport.mjs';
+import { createTransport, createCommand, SIGN_IN } from './transport.mjs';
 import { createSelection } from './selection.mjs';
 import { createTheme } from './theme.mjs';
 import { createStateHub, createWatchHub } from './streams.mjs';
@@ -59,6 +59,7 @@ export function createServices(transport, theme, importModule = (url) => import(
   const clock = { t: 0, at: performance.now(), ended: true };
   const services = {
     transport, selection, theme, format, dom, clock, run,
+    command: (signal, changed) => createCommand(transport, signal, changed),
     // The page's one graph model (see state.mjs), on the page's watch. It
     // binds the first time a part of the page reads it.
     get graph() { graph ??= createModel(watches.subscribe()); return graph; },
@@ -147,7 +148,7 @@ function icon(el, parent, name, label) {
   return svg;
 }
 
-const READINESS = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', stopped: 'Stopped' };
+const READINESS = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH up', desktop_up: 'Desktop up', failed: 'Failed', stopped: 'Stopped' };
 // The kinds of the standard panels. The page server sorts the panels; a
 // page's own panels are the other kinds.
 const STANDARD = ['packets', 'events', 'map', 'left_the_box', 'containment', 'labels'];

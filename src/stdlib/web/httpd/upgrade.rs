@@ -405,7 +405,7 @@ impl hyper::service::Service<Request<Incoming>> for Route {
                     Ok(())
                 });
             }
-            let (parts, body) = response.into_parts();
+            let (parts, body) = super::response::inspect(Some(&route.fcx), response).into_parts();
             let fits = charge.as_mut().is_none_or(|c| c.set(body.full_len()));
             let (mut parts, body) = if fits {
                 (parts, body)

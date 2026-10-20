@@ -3,13 +3,13 @@
 use super::net::RxQueue;
 use fictionet::stdlib::network::ethernet::{Family, FromVm, Link};
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RecvError};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 /// Moves frames between the guest (through the backend) and the world,
 /// answering ARP and the link-local questions itself, as the CLI's TAP
 /// lowering does.
 pub async fn run(
-    mut to_world: UnboundedReceiver<Vec<u8>>,
+    mut to_world: Receiver<Vec<u8>>,
     rx: RxQueue,
     mut sandbox: End,
     fcx: Cx,

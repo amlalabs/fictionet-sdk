@@ -55,6 +55,8 @@ pub enum HostState {
     SshUp,
     /// Its desktop is available.
     DesktopUp,
+    /// Startup failed.
+    Failed,
     /// The machine has stopped.
     Stopped,
 }

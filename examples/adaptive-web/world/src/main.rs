@@ -1,25 +1,9 @@
 //! The adaptive web's world process. See the library ([`adaptive_web_world`])
 //! for what it builds.
 //!
-//! ```text
-//! ADAPTIVE_WEB_SEED=halvard-cve adaptive-web-world --socket /run/fictionet/sock/world.sock \
-//!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready \
-//!     [--observation <path>]
-//! ```
-//!
-//! The rest of the setting comes from the environment:
-//!
-//! - `ADAPTIVE_WEB_SEED`: the seed's name, in `ADAPTIVE_WEB_SEEDS`
-//!   (default `/app/seeds`), or a seed file's path. Required.
-//! - `ADAPTIVE_WEB_GENERATOR`: `stub` (default), `openrouter`, `anthropic`,
-//!   or `replay` to make nothing new.
-//! - `ADAPTIVE_WEB_MODEL`: the model; each provider has a default.
-//! - `ADAPTIVE_WEB_REASONING`: the reasoning effort sent to OpenRouter.
-//! - `ADAPTIVE_WEB_PREFETCH`: pages to make ahead behind each new result
-//!   list (default 3 with a model, else 0).
-//! - `ADAPTIVE_WEB_STORE`: where stores live (default `/var/lib/adaptive-web`);
-//!   each seed has its own directory there.
-//! - `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`: the provider's key.
+//! The first argument is JSON with `seed` and optional `seeds`, `generator`,
+//! `model`, `reasoning`, `prefetch`, and `store`.
+//! Only provider API keys come from the environment.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +13,7 @@ use adaptive_web_world::pages::model::{self, Https, Key, Model};
 use adaptive_web_world::pages::store::Store;
 use adaptive_web_world::pages::{GeneratorKind, Maker, Pages, Seed};
 use adaptive_web_world::{Addresses, Ca, GATEWAY, serve, world_start};
-use example_common::args::{args, secs};
+use example_common::args::{Args, configuration, secs, unknown};
 use example_common::log::Log;
 use example_common::names;
 use serde_json::json;
@@ -41,26 +25,51 @@ fn main() {
     }
 }
 
-fn var(name: &str) -> String {
-    std::env::var(name).unwrap_or_default()
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configuration {
+    seed: String,
+    #[serde(default)]
+    generator: String,
+    seeds: Option<String>,
+    store: Option<String>,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    prefetch: String,
 }
 
 fn real_main() -> fictionet::Result {
-    let args = args().map_err(fictionet::Error::msg)?;
+    let mut argv = std::env::args().skip(1);
+    let Configuration {
+        seed: name,
+        generator,
+        seeds,
+        store,
+        model,
+        reasoning,
+        prefetch,
+    } = configuration(&mut argv).map_err(fictionet::Error::msg)?;
+    let seeds = seeds.unwrap_or_else(|| "/app/seeds".into());
+    let stores = store.unwrap_or_else(|| "/var/lib/adaptive-web".into());
+    let args = Args::default()
+        .read(argv, unknown)
+        .map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
     let started = SystemTime::now();
 
     // 1. The seed and the generator, checked before anything is written.
-    let name = var("ADAPTIVE_WEB_SEED");
     if name.is_empty() {
-        return Err(fictionet::Error::msg("ADAPTIVE_WEB_SEED is not set"));
+        return Err(fictionet::Error::msg("seed is required"));
     }
-    let kind = match var("ADAPTIVE_WEB_GENERATOR").as_str() {
+    let kind = match generator.as_str() {
         "" => GeneratorKind::default(),
         text => names::parse(text).ok_or_else(|| {
             let kinds: Vec<_> = GeneratorKind::ALL.iter().map(names::name).collect();
             fictionet::Error::msg(format!(
-                "ADAPTIVE_WEB_GENERATOR must be one of {}, not {text:?}",
+                "generator must be one of {}, not {text:?}",
                 kinds.join(", ")
             ))
         })?,
@@ -74,7 +83,6 @@ fn real_main() -> fictionet::Result {
     let path = if Path::new(&name).is_file() {
         PathBuf::from(&name)
     } else {
-        let seeds = std::env::var("ADAPTIVE_WEB_SEEDS").unwrap_or_else(|_| "/app/seeds".into());
         Path::new(&seeds).join(format!("{name}.md"))
     };
     // Replay serves the bytes the store captured, never the seed's files.
@@ -87,24 +95,21 @@ fn real_main() -> fictionet::Result {
         _ => Seed::load(&path)
             .map_err(|e| fictionet::Error::msg(format!("{}: {e}", path.display())))?,
     };
-    let (model, reasoning) = (var("ADAPTIVE_WEB_MODEL"), var("ADAPTIVE_WEB_REASONING"));
     let identity = match kind {
         GeneratorKind::Stub => Some(Maker::Stub.identity()),
         GeneratorKind::Model(provider) => Some(model::identity(provider, &model, &reasoning)),
         GeneratorKind::Replay => None,
     };
-    let prefetch = match (kind, var("ADAPTIVE_WEB_PREFETCH").as_str()) {
+    let prefetch = match (kind, prefetch.as_str()) {
         (GeneratorKind::Replay, _) => 0,
         (GeneratorKind::Model(_), "") => 3,
         (_, "") => 0,
-        (_, n) => n.parse().map_err(|e| {
-            fictionet::Error::msg(format!("ADAPTIVE_WEB_PREFETCH must be a count: {e}"))
-        })?,
+        (_, n) => n
+            .parse()
+            .map_err(|e| fictionet::Error::msg(format!("prefetch must be a count: {e}")))?,
     };
 
     // 2. The store, and the addresses it remembers.
-    let stores =
-        std::env::var("ADAPTIVE_WEB_STORE").unwrap_or_else(|_| "/var/lib/adaptive-web".into());
     let root = Path::new(&stores).join(&seed.name);
     let (store, _) = Store::open(&root, &seed, identity.as_ref()).map_err(fictionet::Error::msg)?;
     let addresses = Arc::new(Addresses::new(seed.fixed_addresses(), Some(&root))?);

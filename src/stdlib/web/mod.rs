@@ -36,7 +36,8 @@
 //!     // Yours: an Arc<ServerConfig> per certificate, each issued by the world's CA.
 //!     let certs = my_certs()?;
 //!
-//!     let upstream = web::proxy(&fcx)?;
+//!     let client = Arc::new(fictionet_host::Client::new());
+//!     let upstream = web::proxy(&fcx, client)?;
 //!     web::Sites::new(move |host: &str| match host {
 //!         "en.wikipedia.org" | "www.wikipedia.org" => Some(
 //!             web::Site::new(wiki.clone())
@@ -118,7 +119,7 @@
 //! [`Site::new`] takes any [`tower_service::Service`] that takes an
 //! `http::Request<web::Body>` and returns an `http::Response`. An
 //! `axum::Router` is one. So is a plain async function wrapped in
-//! `tower::service_fn`. So is `web::proxy(&fcx)?` (feature `web-proxy`, off by
+//! `tower::service_fn`. So is `web::proxy(&fcx, client)?` (feature `web-proxy`, off by
 //! default), which forwards to the real site. [`Site::handler`] takes an
 //! [`httpd::Handler`] instead, such as an
 //! [`httpd::Router`], whose handlers get plain
@@ -127,7 +128,7 @@
 //!
 //! # Passing a site through to the real one
 //!
-//! A site whose handler is `web::proxy(&fcx)?`, such as `github.com` above, shows
+//! A site whose handler is `web::proxy(&fcx, client)?`, such as `github.com` above, shows
 //! the agent the real site's pages. Each request then travels over two
 //! separate connections:
 //!
@@ -151,7 +152,7 @@
 //!
 //! Only an exact match to a registered host can be proxied. A request
 //! routed through [`default_host`](Site::default_host) gets `421 Misdirected
-//! Request` before any upstream I/O. Use `web::forward(&fcx, upstream)?` for a
+//! Request` before any upstream I/O. Use `web::forward(&fcx, upstream, client)?` for a
 //! catch-all that forwards to one fixed origin. Both constructors refuse
 //! a lab before constructing a client.
 //!
@@ -169,7 +170,7 @@
 //! Python clones of Gmail or Slack on local ports. A world serves each
 //! clone at the real hostname over HTTPS, with the world's certificate for
 //! that name. The clone needs no change.
-//! `web::forward(&fcx, upstream)?` (feature `web-proxy`) forwards every
+//! `web::forward(&fcx, upstream, client)?` (feature `web-proxy`) forwards every
 //! request to one fixed origin over the world's own network. It takes the
 //! scheme and authority from `upstream` and ignores its path. An upstream
 //! without an `http` or `https` scheme, or without an authority, is an
@@ -181,7 +182,7 @@
 //! It works with any executor and needs a run with real I/O:
 //! use [`fictionet::run`]. In a lab, `web::forward` returns an error.
 //!
-//! `web::proxy(&fcx)?` goes to the real site for the name; `web::forward`
+//! `web::proxy(&fcx, client)?` goes to the real site for the name; `web::forward`
 //! goes to the one origin you give it, whatever the name.
 //! Return one [`Site`] per name the clone answers, such as `slack.com` and
 //! `api.slack.com`, each with a certificate from the world's CA that lists
@@ -228,7 +229,8 @@
 //! #     roots.add(ca.cert_der())?;
 //! #     let roots = Arc::new(roots);
 //! #     let (attacher, attachments) = fictionet::attachments();
-//!     let gmail = web::forward(&fcx, upstream)?;
+//!     let client = Arc::new(fictionet_host::Client::new());
+//!     let gmail = web::forward(&fcx, upstream, client)?;
 //!     web::Sites::new(move |name: &str| match name {
 //!         "gmail.googleapis.com" => Some(
 //!             web::Site::new(gmail.clone()).tls(config.clone()),
@@ -640,12 +642,12 @@ use std::sync::Arc;
 
 use http::{Request, Response};
 
-use httpd::{Handler, Server};
-pub use httpd::{Body, Routing, Target};
-use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::services::tls::ServerConfig;
+use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::{Attachments, Cx, Error};
+pub use httpd::{Body, Routing, Target};
+use httpd::{Handler, Server};
 
 /// Websites by hostname, and the network around them. See the
 /// [module docs](fictionet::stdlib::web).
@@ -940,5 +942,5 @@ impl Site {
 
 fictionet::cfg_web_proxy! {
 mod proxy;
-pub use proxy::{Forward, Proxy, forward, proxy};
+pub use proxy::{Forward, Proxy, Upstream, UpstreamFuture, forward, proxy};
 }

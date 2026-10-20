@@ -33,6 +33,15 @@ pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other("invalid root certificate name"));
     }
     let user_data = user_data(provision);
+    let audit = example_common::guest_content::Audit::default();
+    for (path, content) in files(&user_data)? {
+        audit.installed(&path, content.as_bytes());
+    }
+    audit.inspect(
+        "device manufacturer",
+        provision.guest.manufacturer.as_bytes(),
+    );
+    audit.inspect("device product", provision.guest.product.as_bytes());
     let meta_data = format!(
         "instance-id: iid-{0}\nlocal-hostname: {0}\n",
         provision.guest.hostname
@@ -64,11 +73,13 @@ pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
             ("network-config", network_config),
             ("vendor-data", ""),
         ] {
+            audit.installed(name, body.as_bytes());
             let mut file = root.create_file(name).map_err(std::io::Error::other)?;
             file.truncate().map_err(std::io::Error::other)?;
             file.write_all(body.as_bytes())?;
         }
     }
+    audit.check().map_err(std::io::Error::other)?;
     Ok(cursor.into_inner())
 }
 
@@ -84,6 +95,7 @@ pub fn files(user_data: &str) -> std::io::Result<BTreeMap<String, String>> {
             let path = path
                 .take()
                 .ok_or_else(|| std::io::Error::other("file content without a path"))?;
+            let encoded: String = serde_json::from_str(encoded)?;
             let bytes = base64::decode(encoded.as_bytes(), base64::Padding::Required)
                 .ok_or_else(|| std::io::Error::other(format!("{path}: invalid base64")))?;
             files.insert(
@@ -138,7 +150,7 @@ pub fn user_data(p: &Provision) -> String {
         out.push_str(&format!(
             "  - path: {}\n    permissions: '{mode:04o}'\n    encoding: b64\n    content: {}\n",
             quote(path),
-            base64::encode(content.as_bytes())
+            quote(&base64::encode(content.as_bytes()))
         ));
         if path.starts_with(&format!("/home/{}/", g.user)) {
             out.push_str(&format!(

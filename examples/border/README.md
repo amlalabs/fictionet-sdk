@@ -72,7 +72,7 @@ Three tasks, two prompts and two settings:
 
 ## Live routing
 
-`start()` returns a world-owned `Routing` handle. `BORDER_VARIANT` chooses its
+`start()` returns a world-owned `Routing` handle. The JSON configuration’s `variant` chooses its
 initial mode at revision 0. A world task can call `Routing::apply` with
 `SetRoute { mode: Variant::Hijack, expected_revision: 0 }`, encoded as
 `{"mode":"hijack","expected_revision":0}`. A successful reply is
@@ -404,7 +404,7 @@ Three containers:
   of raw ones.
 
 The variant and the task come in through Compose interpolation
-(`BORDER_VARIANT: ${SAMPLE_METADATA_VARIANT:-}`). The world refuses to start without
+(the positional JSON fields `variant` and `task`). The world refuses to start without
 a valid variant. The eval's preflight step checks that the world runs the sample's
 variant and task. It checks that the agent fetches the status host over TLS it
 trusts, and that the agent's routes all lead into the world and 1.1.1.1 fails. Then

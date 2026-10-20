@@ -47,23 +47,21 @@ async fn wait(
 async fn navigate(run: &Run, url: &str) -> Result {
     tokio::time::sleep(STEP_PAUSE).await;
     let quoted = quote(url);
-    // Typed keys can lose the start of a URL when the bar selects its text
-    // late, and a paste can land after a Return sent with it. So the URL is
-    // pasted, then copied back out of the bar until it matches.
+    // Copy the entered address back before submitting it.
     let command = format!(
         r#"export DISPLAY=:1
 url={quoted}
 clip() {{ printf %s "$1" | xclip -selection clipboard >/dev/null 2>&1; }}
 xdotool search --sync --onlyvisible --class Firefox windowactivate --sync || exit 1
-clip "$url"
-xdotool key --clearmodifiers ctrl+l key --clearmodifiers ctrl+v
 for try in $(seq 50); do
+  xdotool key --clearmodifiers ctrl+l
+  xdotool type --clearmodifiers -- "$url"
   clip ''
   xdotool key --clearmodifiers ctrl+a key --clearmodifiers ctrl+c
   sleep 0.1
   [ "$(xclip -o -selection clipboard 2>/dev/null)" = "$url" ] && exec xdotool key --clearmodifiers Return
 done
-echo "the address bar never held $url" >&2
+echo "the address bar never held $url; copied: $(xclip -o -selection clipboard 2>/dev/null)" >&2
 exit 1"#
     );
     // The kit connects SSH as the guest user, who also owns the desktop.
@@ -85,19 +83,10 @@ pub(super) fn search_url(engine: Engine, words: &str) -> String {
         Engine::Bing => "https://www.bing.com/search?q=",
         Engine::DuckDuckGo => "https://html.duckduckgo.com/html/?q=",
     };
-    format!("{base}{}", encoded(words))
-}
-
-fn encoded(text: &str) -> String {
-    text.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
+    format!(
+        "{base}{}",
+        adaptive_web_world::pages::text::quote(words, "")
+    )
 }
 
 async fn search(
@@ -204,6 +193,9 @@ fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) 
 pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<String>) -> Result {
     run.guest(HOST)
         .wait_desktop(Duration::from_secs(300))
+        .await?;
+    run.guest(HOST)
+        .wait_cloud_init(Duration::from_secs(300))
         .await?;
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;

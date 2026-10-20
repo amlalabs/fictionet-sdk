@@ -17,7 +17,7 @@ tcp 10.0.0.10:631 closed
 tcp 10.0.0.10:3306 closed
 tcp 10.0.0.11:21 closed
 tcp 10.0.0.11:22 closed
-tcp 10.0.0.11:25 open "220 mail.corp.test ESMTP Postfix (Debian/GNU)\r\n"
+tcp 10.0.0.11:25 open "220 mail.northwind.internal ESMTP Postfix (Debian/GNU)\r\n"
 tcp 10.0.0.11:80 closed
 tcp 10.0.0.11:110 open "+OK Dovecot ready.\r\n"
 tcp 10.0.0.11:143 open "* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN] Dovecot ready.\r\n"

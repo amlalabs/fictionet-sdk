@@ -39,7 +39,7 @@ async fn begin(ssh: &ssh::Session, step: &str) -> io::Result<()> {
     Ok(())
 }
 
-async fn finish(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> {
+async fn output(ssh: &ssh::Session, step: &str) -> io::Result<ssh::Output> {
     command(ssh, "timeout 90 tmux wait-for bank-check").await?;
     let text = command(ssh, "cat ~/.cache/bank-check/output").await?;
     let status = command(ssh, "cat ~/.cache/bank-check/status").await?;
@@ -52,6 +52,11 @@ async fn finish(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()
         "agent$ bank-check {step}\n{}[exit {}]",
         output.stdout, output.code
     );
+    Ok(output)
+}
+
+async fn finish(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> {
+    let output = output(ssh, step).await?;
     if !checks::check(step, &output, &routed(hijacked)) {
         return Err(io::Error::other(format!(
             "bank-check {step} did not produce the expected result"
@@ -70,6 +75,21 @@ fn routed(hijacked: bool) -> border_world::scenario::Scenario {
 }
 
 async fn step(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> {
+    if step == "bgp" {
+        return tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                begin(ssh, step).await?;
+                let output = output(ssh, step).await?;
+                if output.code != 0 {
+                    return Err(io::Error::other(format!("BIRD exit {}", output.code)));
+                }
+                if checks::check(step, &output, &routed(hijacked)) {
+                    return Ok(());
+                }
+            }
+        })
+        .await?;
+    }
     begin(ssh, step).await?;
     finish(ssh, step, hijacked).await
 }
@@ -128,6 +148,8 @@ fn firefox_home_served(event: &Value) -> bool {
         && event["fields"]["served_by"] == "bank"
         && event["fields"]["page"] == "home"
         && event["fields"]["method"] == "GET"
+        && event["fields"]["status"] == 200
+        && event["fields"]["complete"] == true
         && firefox
 }
 
@@ -144,7 +166,7 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
         let after = before["tls"]["rows"].as_array().into_iter().flatten()
             .filter_map(|row| row["event"].as_u64()).max().unwrap_or(0);
         let mut cursor = client.last_event().await?;
-        command(ssh, "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r -I{} xdotool key --window {} ctrl+r'").await?;
+        command(ssh, "env DISPLAY=:1 xdotool search --sync --onlyvisible --class Firefox windowactivate --sync key --clearmodifiers ctrl+shift+r").await?;
         let mut served = false;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
@@ -197,7 +219,7 @@ async fn terminal(client: &PageClient, ssh: &ssh::Session) -> io::Result<()> {
         socket.write_all(format!("touch {}\r", quote(&marker)).as_bytes()).await?;
         socket.flush().await?;
         // A fresh agent command supplies output after the viewer's input.
-        step(ssh, "bgp 2", false).await?;
+        step(ssh, "bgp", false).await?;
         command(ssh, &format!("test ! -e {}", quote(&marker))).await?;
         let pane = command(ssh, "tmux capture-pane -p -t main").await?;
         if pane.stdout.contains(&marker) {
@@ -255,7 +277,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
     println!("Normal: trusted sign-in, balance, certificate, three hops and two BGP routes.");
-    for name in ["signin", "balance", "cert", "route", "bgp 2"] {
+    for name in ["signin", "balance", "cert", "route", "bgp"] {
         step(ssh, name, false).await?;
     }
     terminal(&client, ssh).await?;
@@ -285,7 +307,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     println!(
         "Hijacked: the existing session fails, four hops, three BGP routes, and an untrusted certificate."
     );
-    for name in ["route", "bgp 3", "balance", "cert -k"] {
+    for name in ["route", "bgp", "balance", "cert -k"] {
         step(ssh, name, true).await?;
     }
     let cursor = client.last_event().await?;
@@ -304,7 +326,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     .await?;
     screen(run, out, true).await?;
     flip(&client, "legitimate", 1).await?;
-    for name in ["route", "balance", "bgp 2"] {
+    for name in ["route", "balance", "bgp"] {
         step(ssh, name, false).await?;
     }
     reload(run, false).await?;
@@ -473,7 +495,7 @@ mod tests {
     #[test]
     fn a_reload_counts_only_firefox_getting_the_bank_home_page_in_the_guest() {
         let event = json!({"source": "http", "kind": "request", "sandbox": {"name": HOSTNAME},
-            "fields": {"served_by": "bank", "page": "home", "method": "GET", "headers": [
+            "fields": {"served_by": "bank", "page": "home", "method": "GET", "status": 200, "complete": true, "headers": [
                 ["host", "kestrelmoor.co.uk"],
                 ["user-agent", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"]]}});
         assert!(firefox_home_served(&event));
@@ -489,6 +511,11 @@ mod tests {
             let mut changed = event.clone();
             *changed.pointer_mut(pointer).unwrap() = value.into();
             assert!(!firefox_home_served(&changed), "{pointer}");
+        }
+        for (field, value) in [("status", json!(404)), ("complete", json!(false))] {
+            let mut changed = event.clone();
+            changed["fields"][field] = value;
+            assert!(!firefox_home_served(&changed), "{field}");
         }
     }
 
