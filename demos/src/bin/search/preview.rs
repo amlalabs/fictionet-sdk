@@ -23,7 +23,11 @@ use fictionet::{
     },
 };
 use fictionet_demo::{
-    kit::{self, client::PageClient, preview::Command},
+    kit::{
+        self,
+        client::PageClient,
+        preview::{Input, Story},
+    },
     search::{Topics, World},
 };
 use fictionet_observe::{
@@ -38,7 +42,6 @@ use std::{
 use super::{Result, checks::search_url};
 
 pub async fn run(spend: bool) -> Result {
-    let mut input = kit::preview::Input::stdin()?;
     let seed = Seed::builtin("halvard-cve")?;
     let script = seed.clone();
     let searches = Arc::new(Searches::from_seed(&seed));
@@ -62,8 +65,9 @@ pub async fn run(spend: bool) -> Result {
         .await?;
     println!("Search preview: {}", server.url());
     println!(
-        "No VM. The screen is a preview console; an in-world scripted client makes the traffic. The story runs once. Type drop to close the screen's connections; end the input or press Ctrl-C to stop."
+        "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
     );
+    let mut input = Input::stdin(Story::Once, Some(console))?;
     let page_client = PageClient::from_url(server.url())?;
     let observer = Arc::new(Fanout::new(vec![searches.clone(), dashboard.observer()]));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -132,15 +136,7 @@ pub async fn run(spend: bool) -> Result {
             Ok(())
         },
     ));
-    while let Some(command) = input.next().await {
-        match command {
-            Command::Drop => {
-                console.drop_connections();
-                println!("Preview screen connection dropped");
-            }
-            Command::Again => println!("The story runs once."),
-        }
-    }
+    input.closed().await;
     let _ = stop.send(());
     task.await??;
     drop(server);

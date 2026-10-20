@@ -142,21 +142,17 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
 }
 
 pub async fn run() -> Result<(), Error> {
-    let mut input = kit::preview::Input::stdin()?;
     let out = std::env::temp_dir().join(format!("border-page-{}", kit::random_uuid()));
     let preview = start(&out).await?;
     println!("Output: {}", out.display());
     println!(
-        "In-process scripted client; no VM, so the screen says NO VM. Change the route on the page, then press Enter here to run sign-in, balance and traceroute on that route. Type drop to close the screen's connections; end the input or press Ctrl-C to stop."
+        "In-process scripted client; no VM, so the screen says NO VM. Its story signs in, checks the balance and runs traceroute on the route the page shows. Change the route on the page between runs."
     );
-    while let Some(command) = input.next().await {
-        match command {
-            kit::preview::Command::Again => {
-                preview.traffic().await?;
-                println!("Client checks complete. Change the route and press Enter to run again.");
-            }
-            kit::preview::Command::Drop => preview.screen.drop_connections(),
-        }
+    let mut input =
+        kit::preview::Input::stdin(kit::preview::Story::OnEnter, Some(preview.screen.clone()))?;
+    while input.run().await {
+        preview.traffic().await?;
+        println!("Client checks complete.");
     }
     preview.shutdown().await
 }

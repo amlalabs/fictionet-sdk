@@ -1,11 +1,12 @@
 //! A placeholder screen and the standard input of pages that run without
 //! a VM.
 //!
-//! Every demo's `preview` subcommand reads standard input the same way. An
-//! empty line asks for the in-world client's story again. A preview whose
-//! story runs once says so. On a page with a screen, `drop` closes the
-//! screen's open connections, as a lost guest connection would. The end of
-//! input or Ctrl-C stops the preview.
+//! Every demo's `preview` subcommand reads standard input through [`Input`],
+//! which prints the one line that says what the input does. Where the
+//! in-world client runs on request, Enter runs its story. Where the story
+//! runs once by itself, Enter says so. On a page with a screen, `drop` closes
+//! the screen's open connections, as a lost guest connection would. The end
+//! of input or Ctrl-C stops the preview.
 
 use fictionet_observe::page::{BoxFuture, Duplex, Pty};
 use std::io;
@@ -13,66 +14,101 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 
-/// A command typed on a preview's standard input.
+/// When a preview's in-world client runs its story.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Command {
-    /// An empty line: run the in-world client's story again, where the
-    /// preview can.
-    Again,
-    /// `drop`: close the screen's open connections.
-    Drop,
+pub enum Story {
+    /// Each time the viewer presses Enter.
+    OnEnter,
+    /// Once, by itself. Enter only says so.
+    Once,
 }
 
-impl Command {
-    /// The command a line names, if any.
-    fn parse(line: &str) -> Option<Self> {
-        match line.trim() {
-            "" => Some(Self::Again),
-            "drop" => Some(Self::Drop),
-            _ => None,
-        }
+/// What a preview does with one line of its standard input.
+#[derive(Debug, PartialEq, Eq)]
+enum Reply {
+    /// Run the in-world client's story.
+    Run,
+    /// Close the screen's open connections.
+    Drop,
+    /// Say this on standard error.
+    Say(String),
+}
+
+/// The line that says what a preview's standard input does.
+fn instructions(story: Story, screen: bool) -> String {
+    let mut parts = vec![match story {
+        Story::OnEnter => "Press Enter to run the in-world client's story.",
+        Story::Once => "The story runs once.",
+    }];
+    if screen {
+        parts.push("Type drop to close the screen's connections.");
+    }
+    parts.push("End the input or press Ctrl-C to stop.");
+    parts.join(" ")
+}
+
+/// The reply to one line, for a preview whose story runs as `story` and
+/// whose page has a screen or not.
+fn reply(line: &str, story: Story, screen: bool) -> Reply {
+    match line.trim() {
+        "" if story == Story::OnEnter => Reply::Run,
+        "" => Reply::Say("The story runs once.".into()),
+        "drop" if screen => Reply::Drop,
+        _ => Reply::Say(format!("{line:?}: {}", instructions(story, screen))),
     }
 }
 
 /// A preview's standard input, read on its own thread, and Ctrl-C.
 pub struct Input {
-    commands: mpsc::Receiver<Command>,
+    runs: mpsc::Receiver<()>,
     interrupt: Signal,
 }
 
 impl Input {
-    /// Starts reading standard input. A line that names no command is
-    /// named on standard error and skipped.
-    pub fn stdin() -> io::Result<Self> {
+    /// Prints what the input does on standard error and starts reading it.
+    /// `screen` is the page's placeholder screen, if the page has one: `drop`
+    /// closes its connections. Enter goes to [`Input::run`] when the story
+    /// runs on Enter, and is answered here when it runs once. Any other line
+    /// is answered with the instructions.
+    pub fn stdin(story: Story, screen: Option<Console>) -> io::Result<Self> {
         let interrupt = signal(SignalKind::interrupt())?;
-        let (send, commands) = mpsc::channel(1);
+        eprintln!("{}", instructions(story, screen.is_some()));
+        let (send, runs) = mpsc::channel(1);
         std::thread::spawn(move || {
             for line in std::io::stdin().lines() {
                 let Ok(line) = line else { break };
-                let Some(command) = Command::parse(&line) else {
-                    eprintln!(
-                        "{line:?}: press Enter to ask for the story again, type drop to close \
-                         the screen's connections, or end the input to stop"
-                    );
-                    continue;
-                };
-                if send.blocking_send(command).is_err() {
-                    break;
+                match reply(&line, story, screen.is_some()) {
+                    Reply::Run => {
+                        if send.blocking_send(()).is_err() {
+                            break;
+                        }
+                    }
+                    Reply::Drop => {
+                        if let Some(screen) = &screen {
+                            screen.drop_connections();
+                            eprintln!("Screen connections closed.");
+                        }
+                    }
+                    Reply::Say(text) => eprintln!("{text}"),
                 }
             }
         });
-        Ok(Self {
-            commands,
-            interrupt,
-        })
+        Ok(Self { runs, interrupt })
     }
 
-    /// The next command, or None at the end of input or on Ctrl-C.
-    pub async fn next(&mut self) -> Option<Command> {
+    /// Waits for Enter. True when the viewer asked for the story, false at
+    /// the end of input or on Ctrl-C. A story that runs once never gets true.
+    pub async fn run(&mut self) -> bool {
         tokio::select! {
-            command = self.commands.recv() => command,
-            _ = self.interrupt.recv() => None,
+            asked = self.runs.recv() => asked.is_some(),
+            _ = self.interrupt.recv() => false,
         }
+    }
+
+    /// Waits for the end of input or Ctrl-C, for a preview whose story runs
+    /// once.
+    pub async fn closed(&mut self) {
+        while self.run().await {}
     }
 }
 
@@ -233,13 +269,31 @@ mod tests {
     use fictionet_observe::page::Console as _;
 
     #[test]
-    fn lines_name_the_two_commands() {
-        assert_eq!(Command::parse(""), Some(Command::Again));
-        assert_eq!(Command::parse("  \r"), Some(Command::Again));
-        assert_eq!(Command::parse("drop"), Some(Command::Drop));
-        assert_eq!(Command::parse(" drop "), Some(Command::Drop));
-        assert_eq!(Command::parse("quit"), None);
-        assert_eq!(Command::parse("Drop"), None);
+    fn replies_follow_what_the_preview_offers() {
+        for line in ["", "  \r"] {
+            assert_eq!(reply(line, Story::OnEnter, true), Reply::Run);
+            assert_eq!(
+                reply(line, Story::Once, true),
+                Reply::Say("The story runs once.".into())
+            );
+        }
+        assert_eq!(reply(" drop ", Story::Once, true), Reply::Drop);
+        assert_eq!(reply("drop", Story::OnEnter, true), Reply::Drop);
+        // Without a screen, drop is a line the preview does not know.
+        assert_eq!(
+            reply("drop", Story::Once, false),
+            Reply::Say(
+                "\"drop\": The story runs once. End the input or press Ctrl-C to stop.".into()
+            )
+        );
+        assert_eq!(
+            reply("Drop", Story::OnEnter, true),
+            Reply::Say(
+                "\"Drop\": Press Enter to run the in-world client's story. Type drop to close \
+                 the screen's connections. End the input or press Ctrl-C to stop."
+                    .into()
+            )
+        );
     }
     #[tokio::test]
     async fn screen_delivers_labeled_pixels_and_closes_on_disconnect() {

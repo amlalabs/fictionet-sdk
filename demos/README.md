@@ -43,10 +43,11 @@ Five demos also run without a VM: `cargo xtask demo <name> preview` serves
 the same page with an in-world client in place of the guests, and needs only
 the browser libraries. In Artifactory, Border, FakeWiki and Search, a screen
 that says NO VM takes the guest's place. Scan's preview has no screen and
-shows its two hosts with status only. Every preview reads its standard input
-the same way. In Border and FakeWiki, Enter runs the in-world client again.
-The other previews run their story once. Where the page has a screen, type
-`drop` to close its connections. The end of input or Ctrl-C stops a preview.
+shows its two hosts with status only. After the page URL, a preview prints
+one line that says what its standard input does. In Border and FakeWiki,
+Enter runs the in-world client's story. Artifactory, Scan and Search run
+their story once, by themselves. Where the page has a screen, `drop` closes
+its connections. The end of input or Ctrl-C stops a preview.
 
 The times below are from one run of each demo on a 24-core machine with other
 work running, the pinned files downloaded, the package cache filled and no
@@ -170,9 +171,9 @@ it on the page.
 - Screenshots: `downloads/cloudimage/runs/search-<time>/`, with `desktop.png`,
   `page.png` and the world's `log.jsonl`.
 - Without a VM: `cargo xtask demo search preview` drives real in-process
-  searches with a scripted client. The story runs once. `--spend-budget` ends
-  it with new searches until the world refuses one for its generation budget.
-  Type `drop` to show the lost screen. The preview holds the package cache
+  searches with a scripted client, on the same addresses the checks search.
+  `--spend-budget` ends the story with new searches until the world refuses
+  one for its generation budget. The preview holds the package cache
   while it runs, so a VM run started beside it fetches its packages without
   the cache.
 - Times: SSH up after 6.7 s, Google loaded in Firefox after 44.9 s, story done
@@ -316,7 +317,8 @@ The checks use the same few calls in every demo, all in
   watching can follow it. No check may depend on it.
 - `kit::checks::stay_open` keeps the page open until Ctrl-C.
 - `kit::preview::Console` is a screen that says NO VM, for a page without a
-  guest, and `kit::preview::Input` reads a preview's standard input.
+  guest. `kit::preview::Input` reads a preview's standard input, prints the
+  line that explains it and answers each line.
 
 `kit::desktop::browser` declares an Ubuntu desktop with Mozilla's Firefox,
 quieted through enterprise policies so it makes no requests a page did not ask

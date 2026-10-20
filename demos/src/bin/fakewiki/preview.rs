@@ -9,7 +9,7 @@ use fakewiki_world::{
 };
 use fictionet::stdlib::{web, world::sandbox};
 use fictionet::{RunOptions, Seed};
-use fictionet_demo::kit::{self, preview::Command};
+use fictionet_demo::kit::preview::{Console, Input, Story};
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{Containment, Host, HostState, HostStatus, Labels, Page, StateLimits, StateTopic},
@@ -18,11 +18,10 @@ use fictionet_observe::{
 use super::{HOST, page, world};
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut input = kit::preview::Input::stdin()?;
     let controls = page::Controls::new("in-world client (scripted)");
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
     let status = StateTopic::<HostStatus>::new(StateLimits::default());
-    let screen = kit::preview::Console::new();
+    let screen = Console::new();
     let labels = Labels::default();
     let server = controls
         .page(
@@ -39,8 +38,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
     println!("{}", server.url());
     eprintln!(
-        "No VM or Firefox is running. Press Enter for each scripted article read; type drop to close screen connections; end the input or press Ctrl-C to stop."
+        "No VM or Firefox is running. The in-world client's story reads the article. Use the page's tamper switch between runs."
     );
+    let mut input = Input::stdin(Story::OnEnter, Some(screen))?;
     let result = fictionet::run(
         RunOptions::new(Seed::from_u64(1)).observer(dashboard.observer()),
         |cx| async move {
@@ -64,21 +64,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .start(&cx, attachments)?;
             controls.start(&cx, tampering.clone())?;
             let machine = sandbox::machine(&cx, attacher.attach(HOST)?, Ipv4Addr::new(10, 0, 0, 2));
-            while let Some(command) = cx.race(None, input.next()).await? {
-                match command {
-                    Command::Drop => {
-                        screen.drop_connections();
-                        eprintln!("Placeholder screen connections closed");
-                    }
-                    Command::Again => {
-                        let response = world::read_article(&cx, &machine).await?;
-                        eprintln!(
-                            "Scripted client received HTTP {} ({} bytes)",
-                            response.head.status,
-                            response.body.len()
-                        );
-                    }
-                }
+            while cx.race(None, input.run()).await? {
+                let response = world::read_article(&cx, &machine).await?;
+                eprintln!(
+                    "Scripted client received HTTP {} ({} bytes)",
+                    response.head.status,
+                    response.body.len()
+                );
             }
             cx.cancel();
             Ok(())

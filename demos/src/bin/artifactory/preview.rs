@@ -22,7 +22,7 @@ use fictionet::{
         world::sandbox::{self, Machine},
     },
 };
-use fictionet_demo::kit::preview::{Command, Console};
+use fictionet_demo::kit::preview::{Console, Input, Story};
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{Host, HostState, HostStatus, Server, StateLimits, StateTopic},
@@ -70,7 +70,6 @@ impl Replay {
 /// Serves the page while an in-process client replays the story's requests.
 /// `extra_reads` more index reads after the story fill the page's row bound.
 pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> Result {
-    let mut input = fictionet_demo::kit::preview::Input::stdin()?;
     let replay = Replay::new(variant, mode).map_err(std::io::Error::other)?;
     let facts = replay.facts.clone();
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
@@ -80,9 +79,7 @@ pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> 
         "Replay without VMs: an in-process client sends the story's requests. No guest runs, so steps have no exit status."
     );
     println!("Page: {}", page.url());
-    println!(
-        "The story runs once. Type drop to close the screen's connections; end the input or press Ctrl-C to stop."
-    );
+    let mut input = Input::stdin(Story::Once, Some(screen))?;
     let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
         facts.clone(),
@@ -97,11 +94,7 @@ pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> 
                 println!("replay complete");
                 replaying = false;
             }
-            command = input.next() => match command {
-                Some(Command::Drop) => screen.drop_connections(),
-                Some(Command::Again) => println!("The story runs once."),
-                None => break,
-            },
+            () = input.closed() => break,
         }
     }
     drop(page);

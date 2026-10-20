@@ -68,7 +68,6 @@ fn recorded(index: usize, no_match: Option<Ipv4Addr>) -> fictionet::Result<page:
 
 pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
     let options = options(args)?;
-    let mut input = kit::preview::Input::stdin()?;
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
     let topics = page::Topics::new();
     let progress = page::Progress::new(true);
@@ -96,8 +95,9 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
         .await?;
     println!("{}", server.url());
     eprintln!(
-        "No VM runs. An in-world scanner sends the story's probes; nmap's reports are recorded. End the input or press Ctrl-C to stop."
+        "No VM runs. An in-world scanner sends the story's probes; nmap's reports are recorded."
     );
+    let mut input = kit::preview::Input::stdin(kit::preview::Story::Once, None)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
     let world = std::thread::spawn(move || {
@@ -176,15 +176,13 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<(), Error> {
                         map.untracked
                     );
                 }
-                eprintln!("The story is done. End the input or press Ctrl-C to stop.");
+                eprintln!("The story is done.");
                 cx.cancelled().await;
                 Ok(())
             },
         ))
     });
-    while input.next().await.is_some() {
-        eprintln!("This preview has no screen, and its story runs once.");
-    }
+    input.closed().await;
     stop.store(true, Ordering::SeqCst);
     match world.join() {
         Ok(Err(error)) if !error.is::<fictionet::Cancelled>() => Err(error.into()),
