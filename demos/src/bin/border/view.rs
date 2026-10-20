@@ -1,14 +1,12 @@
-//! Bounded observations for Border. Certificates are fixed world data, made once
-//! at startup and carried in this view. Routing stays in its authoritative topic.
+//! Bounded observations for Border. Routing stays in its authoritative topic.
 //! Callbacks retain typed public fields only; a worker serializes replacement
 //! snapshots without waiting for browsers. Machine addresses stay distinct from
 //! the public destination on the guest link.
 
-use super::{
-    certificates::Certificates,
-    trace::{Trace, Tracker},
+use super::trace::{Trace, Tracker};
+use border_world::scenario::{
+    BANK_ADDR, BANK_NAMES, IMPOSTOR_ADDR, Identity, Scenario, public_address,
 };
-use border_world::scenario::{BANK_ADDR, IMPOSTOR_ADDR, Identity, Scenario, public_address};
 use fictionet::{
     events::{
         Event, Interest, Observation, Observer, Side, Stamp, Stream, TopologyKind, TopologyRef,
@@ -46,12 +44,6 @@ impl<T, const N: usize> Rows<T, N> {
             self.dropped += 1;
         }
         self.rows.push_back(row);
-    }
-    /// Drops the row at `index`, counting it.
-    pub(super) fn drop_at(&mut self, index: usize) {
-        if self.rows.remove(index).is_some() {
-            self.dropped += 1;
-        }
     }
 }
 
@@ -119,16 +111,41 @@ pub struct GuestLink {
     pub trace: Option<Trace>,
 }
 
+/// One row under the picture: who sent what to whom, as the picture names
+/// them. `tone` is `hot` for the password reaching the impostor, `warn` for
+/// a refusal or failure, and empty otherwise.
+#[derive(Clone, Debug, Serialize)]
+pub struct Row {
+    pub at_ms: u64,
+    pub event: u64,
+    pub from: &'static str,
+    pub to: Option<&'static str>,
+    pub what: String,
+    pub tone: &'static str,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct View {
     pub config: Option<Config>,
-    pub certificates: Certificates,
     pub links: Vec<GuestLink>,
     pub bgp: Rows<Bgp>,
     pub tls: Rows<Tls>,
     pub moments: Rows<Moment>,
+    pub rows: Rows<Row>,
     pub lost: u64,
     pub truncated: u64,
+}
+
+/// The workstation, as the picture names it.
+const WORKSTATION: &str = "workstation";
+
+/// Who answered at the bank's address, as the picture names them.
+fn answered_by(identity: Identity) -> Option<&'static str> {
+    match identity {
+        Identity::Bank => Some("Kestrelmoor"),
+        Identity::Impostor => Some("impostor"),
+        _ => None,
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Country {
@@ -218,7 +235,6 @@ pub struct Projection {
     inner: Arc<Inner>,
     scenario: Arc<Scenario>,
     pub topic: StateTopic<View>,
-    pub tls: super::tls::Capture,
 }
 
 impl Projection {
@@ -284,13 +300,18 @@ impl Projection {
             inner,
             scenario,
             topic,
-            tls: super::tls::Capture::new(),
         }
     }
-    pub fn certificates(&self, at: Instant, certificates: Certificates) {
+    /// Starts the picture over for a restarted run: no rows, sessions,
+    /// announcements or stolen password. The links and their traces stay.
+    pub fn clear(&self, at: Instant) {
         let mut state = self.inner.state.lock();
         state.at = at;
-        state.view.certificates = certificates;
+        let view = &mut state.view;
+        view.bgp = Rows::default();
+        view.tls = Rows::default();
+        view.moments = Rows::default();
+        view.rows = Rows::default();
         self.inner.changed.send_replace(());
     }
 }
@@ -316,12 +337,87 @@ impl View {
     fn event(&mut self, scenario: &Scenario, e: &Event) {
         let at_ms = e.at.since_start().as_millis() as u64;
         let sandbox = text(sandbox(e), &mut self.truncated);
+        let guest = self
+            .config
+            .as_ref()
+            .is_some_and(|config| sandbox == config.guest);
+        let row = |from, to, what: String, tone| Row {
+            at_ms,
+            event: e.seq,
+            from,
+            to,
+            what,
+            tone,
+        };
+        match (e.source, e.kind) {
+            ("border", "route") => {
+                let announced = e.str("mode") == Some("hijack");
+                self.rows.push(row(
+                    "Transpeak",
+                    None,
+                    if announced {
+                        "Route announced"
+                    } else {
+                        "Route withdrawn"
+                    }
+                    .into(),
+                    "",
+                ));
+                return;
+            }
+            ("border", "impostor") => {
+                let on = e.get("on").and_then(|v| v.as_bool()) == Some(true);
+                self.rows.push(row(
+                    "impostor",
+                    None,
+                    if on { "Turned on" } else { "Turned off" }.into(),
+                    "",
+                ));
+                return;
+            }
+            ("path", "unreachable") if guest => {
+                if e.str("dst") == Some(&BANK_ADDR.to_string()) {
+                    self.rows.push(row(
+                        "Transpeak",
+                        Some(WORKSTATION),
+                        "Host unreachable".into(),
+                        "warn",
+                    ));
+                }
+                return;
+            }
+            ("dns", "query") if guest => {
+                let name = e.str("name").unwrap_or_default();
+                if e.u64("qtype") == Some(1) && BANK_NAMES.contains(&name) {
+                    self.rows.push(row(
+                        WORKSTATION,
+                        Some("gateway"),
+                        format!("DNS {}", text(name, &mut self.truncated)),
+                        "",
+                    ));
+                }
+                return;
+            }
+            _ => {}
+        }
         match (e.source, e.kind) {
             ("tls", "handshake") => {
                 let Some(machine) = e.str("addr").and_then(|s| s.parse::<Ipv4Addr>().ok()) else {
                     return;
                 };
                 let sni = e.str("sni").unwrap_or_default();
+                let identity = scenario.identity(sni, machine);
+                if let Some(to) = identity.and_then(answered_by).filter(|_| guest) {
+                    let outcome = e.str("outcome").unwrap_or_default();
+                    let (what, tone) = match outcome {
+                        "accepted" if to == "impostor" => ("TLS session", "warn"),
+                        "accepted" => ("TLS session", ""),
+                        "alert" => ("Certificate refused", "warn"),
+                        _ => ("TLS failed", "warn"),
+                    };
+                    self.rows
+                        .push(row(WORKSTATION, Some(to), what.into(), tone));
+                }
                 self.tls.push(Tls {
                     peer: e.conn.peer,
                     port: e.conn.local.map(|a| a.port()),
@@ -330,7 +426,7 @@ impl View {
                     sandbox,
                     connection: e.conn.id,
                     endpoint: Address::new(machine),
-                    identity: scenario.identity(sni, machine),
+                    identity,
                     sni: text(sni, &mut self.truncated),
                     outcome: text(e.str("outcome").unwrap_or("unknown"), &mut self.truncated),
                 });
@@ -368,8 +464,29 @@ impl View {
                     detail: text(e.str("reason").unwrap_or_default(), &mut self.truncated),
                 });
             }
-            ("http", "request") if e.str("served_by") == Some("impostor") => {
+            ("http", "request") if matches!(e.str("served_by"), Some("bank" | "impostor")) => {
+                let impostor = e.str("served_by") == Some("impostor");
                 let password = e.get("carries_password").and_then(|v| v.as_bool()) == Some(true);
+                let path = text(
+                    e.str("path")
+                        .unwrap_or_default()
+                        .split('?')
+                        .next()
+                        .unwrap_or_default(),
+                    &mut self.truncated,
+                );
+                let method = text(e.str("method").unwrap_or_default(), &mut self.truncated);
+                if guest {
+                    self.rows.push(row(
+                        WORKSTATION,
+                        Some(if impostor { "impostor" } else { "Kestrelmoor" }),
+                        format!("{method} {path}"),
+                        if impostor && password { "hot" } else { "" },
+                    ));
+                }
+                if !impostor {
+                    return;
+                }
                 let payment = e.str("page") == Some("payment");
                 if !password && !payment {
                     return;
@@ -386,15 +503,8 @@ impl View {
                     connection: e.conn.id,
                     endpoint: Address::new(machine),
                     password,
-                    method: text(e.str("method").unwrap_or_default(), &mut self.truncated),
-                    path: text(
-                        e.str("path")
-                            .unwrap_or_default()
-                            .split('?')
-                            .next()
-                            .unwrap_or_default(),
-                        &mut self.truncated,
-                    ),
+                    method,
+                    path,
                     payee: e.str("payee").map(|v| text(v, &mut self.truncated)),
                     amount_pence: e.u64("amount_pence"),
                 });
@@ -408,8 +518,11 @@ impl Observer for Projection {
         match interest {
             Interest::Event(m, _) => {
                 m.source == "bgp"
+                    || m.source == "border"
                     || (m.source == "tls" && m.kind == "handshake")
                     || (m.source == "http" && m.kind == "request")
+                    || (m.source == "path" && m.kind == "unreachable")
+                    || (m.source == "dns" && m.kind == "query")
             }
             Interest::Topology(TopologyKind::Link) => true,
             Interest::Packet(packet) => !fictionet_demo::kit::console_packet(packet),
@@ -437,12 +550,6 @@ impl Observer for Projection {
                 let Some(link) = state.links.iter_mut().find(|l| l.id == p.link.get()) else {
                     return;
                 };
-                self.tls.packet(
-                    link.id,
-                    &link.sandbox,
-                    stamp.at.since_start().as_millis() as u64,
-                    p.bytes,
-                );
                 link.tracker.packet(
                     stamp.at.since_start().as_millis() as u64,
                     p.side == Side::B,
@@ -534,6 +641,82 @@ mod tests {
                 .to_lowercase()
                 .contains(&password.to_lowercase())
         );
+    }
+    #[tokio::test]
+    async fn rows_name_the_guest_traffic_as_the_picture_does() {
+        let scenario = super::super::control::scenario();
+        let mut view = View {
+            config: Projection::new(scenario.clone())
+                .inner
+                .state
+                .lock()
+                .view
+                .config
+                .clone(),
+            ..View::default()
+        };
+        let guest = |event: Event| event.field("sandbox", super::super::guest::HOSTNAME);
+        let conn = ConnInfo::new(
+            7,
+            "45.144.30.10:443".parse().unwrap(),
+            "192.168.1.2:40000".parse().unwrap(),
+        );
+        for event in [
+            Event::new("border", "route").field("mode", "hijack"),
+            guest(Event::new("dns", "query"))
+                .field("name", "kestrelmoor.co.uk")
+                .field("qtype", 1u64),
+            guest(Event::new("dns", "query"))
+                .field("name", "kestrelmoor.co.uk")
+                .field("qtype", 28u64),
+            guest(Event::new("dns", "query"))
+                .field("name", "archive.ubuntu.com")
+                .field("qtype", 1u64),
+            guest(Event::new("tls", "handshake"))
+                .field("addr", "45.144.30.10")
+                .field("sni", "kestrelmoor.co.uk")
+                .field("outcome", "alert"),
+            Event::new("http", "request")
+                .conn(&conn)
+                .field("sandbox", super::super::guest::HOSTNAME)
+                .field("served_by", "impostor")
+                .field("carries_password", true)
+                .field("method", "POST")
+                .field("path", "/login?next=/balance"),
+            Event::new("border", "impostor").field("on", false),
+            guest(Event::new("path", "unreachable")).field("dst", "84.21.44.10"),
+            guest(Event::new("path", "unreachable")).field("dst", "1.1.1.1"),
+            Event::new("http", "request")
+                .field("sandbox", "someone-else")
+                .field("served_by", "bank")
+                .field("method", "GET")
+                .field("path", "/"),
+        ] {
+            view.event(&scenario, &event);
+        }
+        let rows: Vec<_> = view
+            .rows
+            .rows
+            .iter()
+            .map(|r| (r.from, r.to, r.what.as_str(), r.tone))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Transpeak", None, "Route announced", ""),
+                ("workstation", Some("gateway"), "DNS kestrelmoor.co.uk", ""),
+                (
+                    "workstation",
+                    Some("impostor"),
+                    "Certificate refused",
+                    "warn"
+                ),
+                ("workstation", Some("impostor"), "POST /login", "hot"),
+                ("impostor", None, "Turned off", ""),
+                ("Transpeak", Some("workstation"), "Host unreachable", "warn"),
+            ]
+        );
+        assert_eq!(view.moments.rows.len(), 1);
     }
     #[test]
     fn every_history_is_bounded_and_marks_dropped_rows() {

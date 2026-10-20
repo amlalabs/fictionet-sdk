@@ -8,7 +8,6 @@
 //! later hops; late replies cannot enter the new run.
 //! This recognizes UDP traceroute, not arbitrary ICMP or TCP probes.
 
-use super::tls::ipv4;
 use border_world::scenario::BANK_ADDR;
 use serde::Serialize;
 use std::net::Ipv4Addr;
@@ -159,10 +158,37 @@ impl Tracker {
     }
 }
 
+/// A checked, unfragmented IPv4 packet, clipped to its declared length.
+pub fn ipv4(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    if bytes.len() < 20 || bytes[0] >> 4 != 4 {
+        return None;
+    }
+    let h = usize::from(bytes[0] & 15) * 4;
+    let n = usize::from(u16::from_be_bytes([bytes[2], bytes[3]]));
+    if h < 20 || n < h || bytes.len() < n || u16::from_be_bytes([bytes[6], bytes[7]]) & 0x3fff != 0
+    {
+        return None;
+    }
+    Some((&bytes[..h], &bytes[h..n]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::client::probe;
     use super::*;
+    #[test]
+    fn ipv4_length_bounds_the_captured_bytes() {
+        let mut packet = vec![0u8; 200];
+        packet[0] = 0x45;
+        packet[3] = 28;
+        let (header, payload) = ipv4(&packet).unwrap();
+        assert_eq!(header.len() + payload.len(), 28);
+        packet[6] = 0x20;
+        assert!(ipv4(&packet).is_none());
+        packet[6] = 0;
+        packet[3] = 19;
+        assert!(ipv4(&packet).is_none());
+    }
     fn reply(probe: &[u8], from: Ipv4Addr, destination: bool) -> Vec<u8> {
         border_world::path::icmp_error(
             probe,
