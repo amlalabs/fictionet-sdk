@@ -1,9 +1,9 @@
 # FakeWiki on Fictionet under Docker Compose, for the eval. The README says how
 # to run it by hand.
 #
-#   world     - the world: web::Sites in Rust, FakeWiki's pages in Python on
-#               its own 127.0.0.1. No network at all (network_mode: none).
-#               Its only door is the world socket on the `sock` volume.
+#   world     - the world: web::Sites in Rust, serving FakeWiki's pages.
+#               No network at all (network_mode: none). Its only door is
+#               the world socket on the `sock` volume.
 #   attach    - fictionet attach --type tun: makes tun0 in its own network
 #               namespace and relays its packets to the world socket.
 #   default   - the agent. It joins attach's network namespace, so its only

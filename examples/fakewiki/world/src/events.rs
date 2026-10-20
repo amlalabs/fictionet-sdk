@@ -1,6 +1,6 @@
 //! The request log, written from the events of everything the network
 //! does: one line per DNS query, rejected or failed TLS handshake, and HTTP
-//! request, in the formats FakeWiki's main.py used.
+//! request, in the format the FakeWiki eval reads.
 //!
 //! The handler ([`content`](crate::content)) puts what it knows about a
 //! page (its kind, topic, source and stance) in its response's extensions
@@ -43,8 +43,6 @@ pub struct Page {
     pub bytes: u64,
     /// The response's Location header, if present.
     pub location: Option<String>,
-    /// Why the backend could not answer, for a `backend_error`.
-    pub error: Option<String>,
 }
 
 impl Page {
@@ -59,7 +57,6 @@ impl Page {
             .with("stance", opt(self.stance.clone()))
             .with("bytes", self.bytes)
             .with("location", opt(self.location.clone()))
-            .with("error", opt(self.error.clone()))
     }
 }
 
@@ -107,7 +104,7 @@ fn text(e: &Event, name: &str) -> Option<String> {
     e.str(name).map(str::to_owned)
 }
 
-/// The log line for `entry`, if main.py logged such a thing.
+/// The log line for `e`, if the log has one for it.
 fn line(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
     match (e.source, e.kind) {
@@ -126,8 +123,7 @@ fn line(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Option<Value> {
     }
 }
 
-/// A DNS query, as main.py's `dns_answer` logged it, or a `dns_error` for
-/// one that could not be read.
+/// A DNS query, or a `dns_error` for one that could not be read.
 fn dns(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Value {
     let (Some(name), Some(qtype)) = (text(e, "name"), e.u64("qtype")) else {
         let error = match e.str("answer") {
@@ -175,8 +171,7 @@ fn tls(e: &Event) -> Option<Value> {
     Some(json!({"type": "tls_error", "sni": sni, "error": error}))
 }
 
-/// An HTTP request, as main.py's handler logged it: the request, then
-/// what the world made of it.
+/// An HTTP request: the request, then what the world made of it.
 fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Value {
     let host = text(e, "host").unwrap_or_default();
     let path = match e.str("query") {
@@ -202,14 +197,9 @@ fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Value {
             Some(kind) => {
                 fields.insert("in_world".into(), json!(true));
                 fields.insert("kind".into(), json!(kind));
-                if kind != "backend_error" {
-                    fields.insert("topic".into(), json!(text(e, "topic")));
-                    fields.insert("source".into(), json!(text(e, "source")));
-                    fields.insert("stance".into(), json!(text(e, "stance")));
-                }
-                if let Some(error) = text(e, "error") {
-                    fields.insert("error".into(), json!(error));
-                }
+                fields.insert("topic".into(), json!(text(e, "topic")));
+                fields.insert("source".into(), json!(text(e, "source")));
+                fields.insert("stance".into(), json!(text(e, "stance")));
                 bytes = e.u64("bytes").unwrap_or(0);
                 if let Some(location) = text(e, "location") {
                     fields.insert("location".into(), json!(location));
@@ -237,15 +227,14 @@ fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Event) -> Value {
         }
         Some("error") => {
             fields.insert("in_world".into(), json!(true));
-            fields.insert("kind".into(), json!("backend_error"));
+            fields.insert("kind".into(), json!("handler_error"));
         }
-        // The agent gave up before the page came: main.py logged the
-        // request before answering it, so it is logged here too, with no
-        // status.
+        // The agent gave up before the page came: the request is logged
+        // with no status.
         Some("cancelled") => {
             fields.insert("in_world".into(), json!(hosts.contains_key(&host)));
         }
-        // No host: main.py logged an empty host, with no in_world.
+        // No host: an empty host, with no in_world.
         _ => {}
     }
     fields.insert("status".into(), json!(e.u64("status")));

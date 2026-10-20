@@ -789,19 +789,15 @@ dependencies = [
 name = "fakewiki-world"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "example-common",
  "fictionet",
  "fictionet-observe",
  "form_urlencoded",
  "http",
  "http-body-util",
- "icu_properties",
  "percent-encoding",
  "serde",
  "serde_json",
- "tokio",
- "tower-service",
 ]
 
 [[package]]

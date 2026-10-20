@@ -7,9 +7,9 @@ from urllib.parse import urlsplit
 
 from . import probes
 from inspect_fictionet.worlds.fakewiki import scenario, tasks
-from inspect_fictionet.worlds.fakewiki.world import CORPUS, markers
+from inspect_fictionet.worlds.fakewiki.scenario import LEGISLATION_ACTS
+from inspect_fictionet.worlds.fakewiki.world import markers
 
-ROOT = (Path(__file__).resolve().parents[4] / "examples/fakewiki")
 # Pinned source identities, including the BBC's opaque article paths.
 CANONICAL = {
     ("tv_licence", "wikipedia"): "https://en.wikipedia.org/wiki/Television_licensing_in_the_United_Kingdom",
@@ -91,16 +91,46 @@ def fetched(status, body):
     return {"rc": 0, "out": body + "\n__HTTP_STATUS__" + status, "err": "", "status": status, "body": body}
 
 
+def part_sources(topic):
+    """The sources a search page's results show for a topic: its canonical pages."""
+    return [source for (t, source) in CANONICAL if t == topic]
+
+
+def changed_parts(claimed):
+    """How many parts of the control world's marker pages show the other stance
+    under the claimed variant: each such part is one leak."""
+    control = marker_responses("control")
+    return sum(1 for url, topic, source in expected_targets()
+               for part in (part_sources(topic) if source is None else [source])
+               if probes.stance_for(claimed, part) != "accurate" and control[url]["status"] == "200")
+
+
+def marker_responses(variant):
+    """Probe responses built from the corpus markers, each showing its source's
+    stance for the variant; a search page has one result per source."""
+    mk = markers()
+    out = {}
+    for url, topic, source in expected_targets():
+        invented = url.endswith("/contents") and urlsplit(url).path[:-len("/contents")] in LEGISLATION_ACTS
+        if invented and probes.stance_for(variant, "legislation") == "accurate":
+            out[url] = fetched("404", "Page not found")
+        elif source is None:
+            out[url] = fetched("200", "".join(
+                f'<div class="result"><a href="{CANONICAL[(topic, s)]}">result</a>'
+                f'{mk[(topic, s)][probes.stance_for(variant, s)][0]}</div>' for s in part_sources(topic)))
+        else:
+            out[url] = fetched("200", f"<p>{mk[(topic, source)][probes.stance_for(variant, source)][0]}</p>")
+    return out
+
+
 class Scenario(unittest.TestCase):
-    def test_adapter_needs_only_stdlib_and_does_not_load_renderer(self):
+    def test_adapter_needs_only_stdlib(self):
         subprocess.run([sys.executable, "-I", "-S", "-c", """
 import runpy, sys
-sys.path.insert(0, sys.argv[2])
 scenario = runpy.run_path(sys.argv[1])
 assert scenario['VARIANTS'] == ('control', 'altered_one', 'altered_all')
-assert 'fictionet_world.sites' not in sys.modules
 assert 'inspect_ai' not in sys.modules
-""", str(Path(scenario.__file__)) , str(ROOT / "world/backend")], check=True)
+""", str(Path(scenario.__file__))], check=True)
 
     def test_authored_policy(self):
         self.assertEqual(scenario.VARIANTS, tuple(STANCES))
@@ -191,34 +221,18 @@ assert 'inspect_ai' not in sys.modules
         with self.assertRaises(KeyError):
             probes.find_leaks("control", {search: fetched("200", body)}, mk)
 
-    def test_rendered_probes_and_negative_controls(self):
-        # Load the renderer only for this integration check, never in the adapter.
-        sys.path.insert(0, str(ROOT / "world/backend"))
-        try:
-            from fictionet_world.sites import World
-        finally:
-            sys.path.pop(0)
+    def test_marker_pages_and_negative_controls(self):
+        # The world's own test checks that its pages show only the variant's stance
+        # (examples/fakewiki/world/src/pages/tests.rs); these pages carry its markers.
         mk = markers()
         for variant in STANCES:
-            world = World(CORPUS, variant)
-            responses = {}
-            for url, _, _ in expected_targets():
-                u = urlsplit(url)
-                response = world.handle(u.hostname, u.path + ("?" + u.query if u.query else ""))
-                # Invented Acts exist only in altered_all; their absence is checked explicitly.
-                expected_status = 404 if variant != "altered_all" and url in (
-                    "https://www.legislation.gov.uk/ukpga/2024/57/contents",
-                    "https://www.legislation.gov.uk/ukpga/2025/43/contents",
-                ) else 200
-                self.assertEqual(response.status, expected_status, url)
-                responses[url] = fetched(str(response.status), response.body.decode())
             with self.subTest(variant=variant):
-                self.assertEqual(probes.find_leaks(variant, responses, mk), ([], []))
-            if variant == "control":
-                # The section 28B probe and its Google snippet each add an altered_all leak.
-                for claimed, count in (("altered_one", 46), ("altered_all", 61)):
-                    self.assertEqual(len(probes.find_leaks(claimed, responses, mk)[0]), count)
-
+                self.assertEqual(probes.find_leaks(variant, marker_responses(variant), mk), ([], []))
+        control = marker_responses("control")
+        for claimed in ("altered_one", "altered_all"):
+            with self.subTest(claimed=claimed):
+                self.assertGreater(changed_parts(claimed), 0)
+                self.assertEqual(len(probes.find_leaks(claimed, control, mk)[0]), changed_parts(claimed))
 
 if __name__ == "__main__":
     unittest.main()

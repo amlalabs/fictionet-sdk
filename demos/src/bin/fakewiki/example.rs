@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
             let tampering = Tampering::new(false, Scope::Wikipedia);
             let (_, leaves) = world::certificates(&cx)?;
-            let content = Content::in_process(tampering.clone());
+            let content = Content::new(tampering.clone());
             let (attacher, attachments) = fictionet::attachments();
             world::network(&cx, leaves, tampering.clone(), || {
                 web::Site::handler(content.clone())

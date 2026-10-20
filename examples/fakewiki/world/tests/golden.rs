@@ -2,20 +2,18 @@
 //! line with a recorded log (`tests/golden/`).
 //!
 //! FakeWiki's eval reads `log.jsonl` after the run, so the same lines mean
-//! the same report. The world runs here with its real Python backend
-//! (`backend/backend.py`, which needs only `python3`) and a CA made for the
-//! test. A second test runs the script in a lab with embedded content and no Python
-//! or Tokio runtime. `ts` is dropped and the lines are compared as sorted sets.
+//! the same report. The world runs the script in a lab with its embedded
+//! pages and a CA made for the test. `ts` is dropped and the lines are
+//! compared as sorted sets.
 //!
 //! `FAKEWIKI_GOLDEN_WRITE=1 cargo test --test golden` records the file again.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use example_common::backend_process::{Args, start_backend};
 use example_common::log::Log;
 use fakewiki_world::content::Content;
 use fakewiki_world::pages::{self, Variant};
@@ -24,8 +22,6 @@ use fakewiki_world::{issue_leaves, serve};
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::rr::RecordType;
 use serde_json::Value;
-
-static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -51,13 +47,6 @@ async fn get<C: fictionet::stdlib::network::Connection>(
     )
     .unwrap();
     let response = sandbox::request(fcx, &mut io, &request).await.unwrap();
-    assert!(
-        !response
-            .head
-            .headers
-            .iter()
-            .any(|h| h.name.to_ascii_lowercase().starts_with("x-fakewiki-"))
-    );
     if matches!(response.head.status, 200 | 404) {
         let header = |name: &str| {
             response
@@ -118,61 +107,14 @@ async fn tls(
 
 #[test]
 fn the_log_is_the_recorded_one() {
-    let _environment = ENVIRONMENT.lock().unwrap();
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let state_dir =
-        std::env::temp_dir().join(format!("fakewiki-golden-state-{}", std::process::id()));
+    let state_dir = std::env::temp_dir().join(format!("fakewiki-golden-{}", std::process::id()));
     std::fs::create_dir_all(&state_dir).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    // SAFETY: both tests hold ENVIRONMENT, and this test has not started threads.
-    unsafe {
-        std::env::set_var("FAKEWIKI_CORPUS", here.join("../fixtures/corpus.json"));
-        std::env::set_var("FAKEWIKI_VARIANT", "altered_one");
-    }
-    let args = Args {
-        observation: None,
-        socket: String::new(),
-        ca_dir: state_dir.join("ca"),
-        backend: here.join("backend"),
-        backend_port: port,
-        state_dir: state_dir.clone(),
-        ready: state_dir.join("ready"),
-    };
-    let (backend, mut child) = start_backend(&args).unwrap();
-    let mut hosts = HashMap::new();
-    for (name, ip) in backend["hosts"].as_object().unwrap() {
-        hosts.insert(
-            name.clone(),
-            ip.as_str().unwrap().parse::<Ipv4Addr>().unwrap(),
-        );
-    }
-    let documents: Vec<String> = backend["documents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d["url"].as_str().unwrap().to_owned())
-        .collect();
-    run_script(&here, &state_dir, hosts, documents, Some(port));
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[test]
-fn embedded_log_is_the_recorded_one() {
-    let _environment = ENVIRONMENT.lock().unwrap();
-    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let embedded_dir =
-        std::env::temp_dir().join(format!("fakewiki-embedded-golden-{}", std::process::id()));
-    std::fs::create_dir_all(&embedded_dir).unwrap();
     let documents = pages::documents(Variant::AlteredOne)
         .into_iter()
         .map(|d| d.url)
         .collect();
-    run_script(&here, &embedded_dir, pages::host_ips(), documents, None);
+    run_script(&here, &state_dir, pages::host_ips(), documents);
 }
 
 async fn script(
@@ -181,13 +123,8 @@ async fn script(
     documents: Vec<String>,
     content: Content,
     log: Arc<Log>,
-    ca_dir: Option<PathBuf>,
 ) -> fictionet::Result {
-    let (root, leaves) = issue_leaves(&fcx, hosts.keys()).unwrap();
-    if let Some(ca_dir) = ca_dir {
-        std::fs::create_dir_all(&ca_dir).unwrap();
-        std::fs::write(ca_dir.join("ca.pem"), root).unwrap();
-    }
+    let (_, leaves) = issue_leaves(&fcx, hosts.keys()).unwrap();
     log.attach(&fcx);
     let (attacher, attachments) = fictionet::attachments();
     serve(&fcx, &hosts, leaves, content, attachments)?;
@@ -212,7 +149,7 @@ async fn script(
     }
     let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
     get(&fcx, stream, "HEAD", "en.wikipedia.org", "/wiki/Main_Page").await;
-    // A backend redirect keeps its Location for the client and the log.
+    // A page redirect keeps its Location for the client and the log.
     let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
     assert_eq!(
         get(&fcx, stream, "GET", "en.wikipedia.org", "/wiki").await,
@@ -244,7 +181,6 @@ fn run_script(
     state_dir: &Path,
     hosts: HashMap<String, Ipv4Addr>,
     documents: Vec<String>,
-    port: Option<u16>,
 ) {
     let log_path = state_dir.join("log.jsonl");
     let log = Arc::new(Log::new(
@@ -252,7 +188,6 @@ fn run_script(
         &[],
         |s| s,
     ));
-    let ca_dir = port.map(|_| state_dir.join("ca"));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let drain = log.clone();
@@ -263,23 +198,10 @@ fn run_script(
             })),
         ));
         let world = move |fcx: Cx| async move {
-            let variant = Tampering::from(Variant::AlteredOne);
-            let content = match port {
-                Some(port) => Content::backend(&fcx, port, variant)?,
-                None => Content::in_process(variant),
-            };
-            script(fcx, hosts, documents, content, log, ca_dir).await
+            let content = Content::new(Tampering::from(Variant::AlteredOne));
+            script(fcx, hosts, documents, content, log).await
         };
-        let result = if port.is_some() {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(fictionet::run(options, world))
-        } else {
-            fictionet::block_on(fictionet::lab(options, world))
-        };
+        let result = fictionet::block_on(fictionet::lab(options, world));
         drain.finish().unwrap();
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });

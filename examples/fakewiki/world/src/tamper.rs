@@ -10,10 +10,6 @@ use crate::pages::Variant;
 
 /// Maximum compact JSON size of any tampering state, in bytes.
 pub const MAX_TAMPER_STATE_BYTES: usize = 160;
-/// Maximum compact JSON size of any command, in bytes.
-pub const MAX_COMMAND_BYTES: usize = 96;
-/// Maximum compact JSON size of any reply, in bytes.
-pub const MAX_REPLY_BYTES: usize = 160;
 
 /// Sources that carry the false claim when tampering is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,56 +328,20 @@ mod tests {
         }
     }
 
-    fn bounded<T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug>(
-        value: T,
-        bound: usize,
-    ) {
-        let json = serde_json::to_vec(&value).unwrap();
-        eprintln!(
-            "{}: {} bytes (bound {bound})",
-            std::any::type_name::<T>(),
-            json.len()
-        );
-        assert!(json.len() <= bound);
-        assert_eq!(serde_json::from_slice::<T>(&json).unwrap(), value);
-    }
-
     #[test]
-    fn compact_json_bounds_cover_largest_fields() {
+    fn compact_json_bound_covers_the_largest_state() {
         for scope in [Scope::Wikipedia, Scope::AllSources] {
             for on in [false, true] {
-                bounded(
-                    TamperState {
-                        revision: u64::MAX,
-                        since_start: Duration::MAX,
-                        on,
-                        scope,
-                    },
-                    MAX_TAMPER_STATE_BYTES,
-                );
-                bounded(
-                    Command::SetTampering {
-                        on,
-                        expected_revision: u64::MAX,
-                    },
-                    MAX_COMMAND_BYTES,
-                );
-                bounded(
-                    Reply::Applied {
-                        revision: u64::MAX,
-                        since_start: Duration::MAX,
-                        changed: on,
-                    },
-                    MAX_REPLY_BYTES,
-                );
+                let state = TamperState {
+                    revision: u64::MAX,
+                    since_start: Duration::MAX,
+                    on,
+                    scope,
+                };
+                let json = serde_json::to_vec(&state).unwrap();
+                assert!(json.len() <= MAX_TAMPER_STATE_BYTES);
+                assert_eq!(serde_json::from_slice::<TamperState>(&json).unwrap(), state);
             }
         }
-        bounded(
-            Reply::Rejected(Rejection::StaleRevision {
-                expected: u64::MAX,
-                current: u64::MAX,
-            }),
-            MAX_REPLY_BYTES,
-        );
     }
 }

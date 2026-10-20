@@ -2,20 +2,20 @@
 //! what it builds.
 //!
 //! ```text
-//! fakewiki-world --socket /run/fictionet/sock/world.sock --ca-dir /app/ca \
-//!     --backend /app/backend --backend-port 8080 \
-//!     --state-dir /var/lib/fictionet --ready /run/fictionet/ready [--observation <path>]
+//! FAKEWIKI_VARIANT=altered_one fakewiki-world --socket /run/fictionet/sock/world.sock \
+//!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready \
+//!     [--observation <path>]
 //! ```
 
-use std::collections::{BTreeSet, HashMap};
-use std::net::Ipv4Addr;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use example_common::backend_process::{args, secs, start_backend, watch_backend};
+use example_common::backend_process::{args, secs};
 use example_common::log::Log;
 use fakewiki_world::content::Content;
+use fakewiki_world::pages::{self, Variant};
 use fakewiki_world::tamper::Tampering;
 use fakewiki_world::{GATEWAY, issue_leaves, serve};
 use serde_json::json;
@@ -31,23 +31,19 @@ fn real_main() -> fictionet::Result {
     let args = args().map_err(fictionet::Error::msg)?;
     let _ = std::fs::remove_file(&args.ready);
 
-    // 1. The content server. Its first line says it is listening, and
-    //    carries the variant, the hosts and the documents for state.json.
+    // 1. The variant, from the sample's metadata.
     let started = SystemTime::now();
-    let (backend, child) = start_backend(&args)?;
-    watch_backend(child, "fakewiki-world");
-    let variant = backend["variant"].as_str().unwrap_or_default().to_owned();
-    let mut hosts = HashMap::new();
-    for (name, ip) in backend["hosts"]
-        .as_object()
-        .ok_or_else(|| fictionet::Error::msg("backend sent no hosts"))?
-    {
-        let ip: Ipv4Addr = ip
-            .as_str()
-            .ok_or_else(|| fictionet::Error::msg("bad host address"))?
-            .parse()?;
-        hosts.insert(name.clone(), ip);
-    }
+    let variant = std::env::var("FAKEWIKI_VARIANT").unwrap_or_default();
+    let variant: Variant = variant.parse().map_err(|_| {
+        fictionet::Error::msg(format!(
+            "FAKEWIKI_VARIANT must be control, altered_one or altered_all, not {variant:?}"
+        ))
+    })?;
+    let hosts = pages::host_ips();
+    let documents: Vec<_> = pages::documents(variant)
+        .into_iter()
+        .map(|d| json!({"url": d.url, "topic": d.topic, "source": d.source, "stance": d.stance}))
+        .collect();
 
     // 2. Ground truth files.
     std::fs::create_dir_all(&args.state_dir)?;
@@ -70,20 +66,15 @@ fn real_main() -> fictionet::Result {
     let socket = args.socket.clone();
 
     let state = json!({
-        "variant": variant,
+        "variant": variant.as_str(),
         "hosts": hosts.keys().collect::<BTreeSet<_>>(),
         "dns": GATEWAY.to_string(),
-        "documents": backend["documents"],
+        "documents": documents,
         "started": secs(started),
     });
     let state_path = args.state_dir.join("state.json");
     let ready = args.ready.clone();
 
-    // The network itself needs no tokio; the content client does.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
     let mut observer: Arc<dyn fictionet::events::Observer> =
         Arc::new(fakewiki_world::events::LogObserver {
             log: log.clone(),
@@ -99,16 +90,11 @@ fn real_main() -> fictionet::Result {
     } else {
         None
     };
-    let result = runtime.block_on(fictionet::run(
+    let result = fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::random())
             .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
         move |fcx| async move {
-            let tampering = Tampering::from(
-                variant
-                    .parse::<fakewiki_world::pages::Variant>()
-                    .map_err(fictionet::Error::msg)?,
-            );
-            let content = Content::backend(&fcx, args.backend_port, tampering)?;
+            let content = Content::new(Tampering::from(variant));
             let (root, leaves) = issue_leaves(&fcx, hosts.keys())?;
             std::fs::create_dir_all(&args.ca_dir)?;
             std::fs::write(args.ca_dir.join("ca.pem"), root)?;
@@ -123,8 +109,8 @@ fn real_main() -> fictionet::Result {
             if let Some(dir) = ready.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(&ready, variant.as_bytes())?;
-            println!("fictionet world up: variant={variant}");
+            std::fs::write(&ready, variant.as_str())?;
+            println!("fictionet world up: variant={}", variant.as_str());
 
             // The network serves every sandbox from here on. The listener
             // lives as long as the world.

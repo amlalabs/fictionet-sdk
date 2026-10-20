@@ -189,9 +189,6 @@ jobs:
           python/inspect_fictionet/tests
           examples/hosted/tests
           tests/k8s
-      - name: FakeWiki's backend
-        working-directory: examples/fakewiki/world/backend
-        run: uv run --project "${{ github.workspace }}/python/inspect_fictionet" --locked --extra k8s --no-editable python -m pytest tests
       - name: The adaptive web's backend
         working-directory: examples/adaptive-web/world/backend
         run: uv run --project "${{ github.workspace }}/python/inspect_fictionet" --locked --extra k8s --no-editable python -m pytest tests

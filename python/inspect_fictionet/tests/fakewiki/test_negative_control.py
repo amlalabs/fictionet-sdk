@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from .test_probes import ROOT, responses
+from .test_probes import responses
+from .test_scenario import changed_parts
 
 from inspect_fictionet.worlds.fakewiki import negative_control
 SCRIPT = Path(negative_control.__file__)
@@ -58,5 +59,6 @@ class NegativeControl(unittest.TestCase):
     def test_complete_control_passes_and_preserves_vm_output(self):
         code, text = self.run_script([self.sample()])
         self.assertEqual(code, 0, text)
-        for claimed, count in (("control", 0), ("altered_one", 46), ("altered_all", 61)):
+        for claimed in ("control", "altered_one", "altered_all"):
+            count = changed_parts(claimed)
             self.assertIn(f"judged as {claimed:12s}: {count:3d} leak(s)", text)

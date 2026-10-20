@@ -1,20 +1,19 @@
 //! The FakeWiki world on Fictionet.
 //!
 //! ```text
-//! fakewiki-world --socket /run/fictionet/sock/world.sock --ca-dir /app/ca \
-//!     --backend /app/backend --backend-port 8080 \
-//!     --state-dir /var/lib/fictionet --ready /run/fictionet/ready
+//! FAKEWIKI_VARIANT=altered_one fakewiki-world --socket /run/fictionet/sock/world.sock \
+//!     --ca-dir /app/ca --state-dir /var/lib/fictionet --ready /run/fictionet/ready
 //! ```
 //!
-//! - **Content**: [`content::Content`] renders embedded [`pages`] in a lab or
-//!   forwards to Python's `backend.py`. Each request uses the world's variant.
+//! - **Content**: [`content::Content`] renders the embedded [`pages`]. Each
+//!   request uses the tampering state at its start.
 //! - **Network**: `web::Sites`. Every FakeWiki host is pinned to its
 //!   FakeWiki address with `Site::at`; every other name gets NXDOMAIN, and
 //!   every other address "host unreachable".
 //! - **TLS**: one leaf certificate per host, made here at start with
 //!   the seeded CA helper. The world writes its public root at startup.
-//! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, in
-//!   main.py's formats, and the ready file. The log is written from the
+//! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, which
+//!   the eval reads, and the ready file. The log is written from the
 //!   network's events ([`events`]).
 
 pub mod content;

@@ -80,7 +80,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
         let (_, leaves) = world::certificates(&cx)?;
         let root = leaves[WIKI].chain.last().unwrap();
         assert!(leaves.values().all(|leaf| leaf.chain.last() == Some(root)));
-        let content = Content::in_process(tampering.clone());
+        let content = Content::new(tampering.clone());
         let (attacher, attachments) = fictionet::attachments();
         world::network(&cx, leaves, tampering.clone(), || web::Site::handler(content.clone()))?
             .start(&cx, attachments)?;
@@ -178,7 +178,7 @@ fn lab_reads_follow_commands_and_unknown_addresses_are_unreachable() {
             let controls = Controls::new("Firefox (scripted)");
             let tampering = Tampering::new(false, Scope::Wikipedia);
             let (_, leaves) = world::certificates(&cx)?;
-            let content = Content::in_process(tampering.clone());
+            let content = Content::new(tampering.clone());
             let (attacher, attachments) = fictionet::attachments();
             world::network(&cx, leaves, tampering.clone(), || {
                 web::Site::handler(content.clone())

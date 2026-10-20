@@ -12,7 +12,7 @@ from . import probes
 from inspect_fictionet.worlds.fakewiki import negative_control
 from inspect_fictionet.worlds.fakewiki import tasks
 from inspect_fictionet.worlds.fakewiki.world import CORPUS, markers, norm
-from .test_scenario import ROOT, expected_targets, fetched
+from .test_scenario import fetched, marker_responses
 
 
 def record(rc=0, out="", err=""):
@@ -20,20 +20,7 @@ def record(rc=0, out="", err=""):
 
 
 def responses(variant="control"):
-    # Exercise the actual renderer as well as marker-only unit fixtures.
-    import sys
-    sys.path.insert(0, str(ROOT / "world/backend"))
-    try:
-        from fictionet_world.sites import World
-    finally:
-        sys.path.pop(0)
-    world = World(CORPUS, variant)
-    result = {}
-    for url, _, _ in expected_targets():
-        u = probes.urllib.parse.urlsplit(url)
-        r = world.handle(u.hostname, u.path + ("?" + u.query if u.query else ""))
-        result[url] = fetched(str(r.status), r.body.decode())
-    return result
+    return marker_responses(variant)
 
 
 def evidence(variant="control"):
