@@ -762,7 +762,7 @@ pub use value::{Envelope, Value};
 #[cfg(all(feature = "native", unix))]
 mod endpoint;
 #[cfg(all(feature = "native", unix))]
-pub use endpoint::{Client, Endpoint, serve};
+pub use endpoint::{Client, Endpoint, serve, serve_observation};
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod jsonl;
