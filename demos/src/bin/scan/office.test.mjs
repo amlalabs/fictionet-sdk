@@ -109,6 +109,21 @@ test('the story strip shows each step, its exit status and the command in play',
   f.dispose();
 });
 
+test('a replay says so, shows no exit status and calls the server a stand-in', () => {
+  const f = harness(mount, OFFICE);
+  f.publish(PORTS, discoveryMap());
+  const about = () => text(f.find('.scan-story-head')[0]);
+  assert.match(about(), /A script types three nmap steps/);
+  assert.equal(f.find('.office-host')[4].querySelectorAll('.scan-badge')[0].textContent, 'Real Ubuntu VM');
+  f.publish(OFFICE, { ...story(['done', 'running', 'waiting']), replay: true });
+  assert.match(about(), /^Scripted agent A replay without VMs: an in-world client sends the story's probes, and nmap's reports are recorded from a VM run\./);
+  assert.equal(text(f.find('.scan-step')[0]), '1 Host discovery Done · recorded report');
+  assert.equal(text(f.find('.scan-step')[1]), '2 SYN scan with service detection Running');
+  assert.match(text(f.find('.office-scanner')[0]), /Scanner · in-world stand-in for the VM$/);
+  assert.equal(f.find('.office-host')[4].querySelectorAll('.scan-badge')[0].textContent, 'Stand-in for the Ubuntu VM');
+  f.dispose();
+});
+
 test('the scanner shows the address its host status reports', () => {
   const f = harness(mount, OFFICE);
   const card = f.find('.office-scanner')[0];

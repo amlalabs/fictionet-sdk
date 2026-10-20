@@ -279,10 +279,10 @@ checks, and ends with `every required check passed`. nmap's XML reports, the
 port map after each step and the screenshots go to
 `demos/downloads/cloudimage/shots/`.
 
-`cargo run -p fictionet-demo --example scan_page` serves the same page
-without VMs, to work on it: an in-world scanner sends the story's probes, a
-stand-in answers at 10.0.0.50, and nmap's reports are the ones recorded in a
-KVM run.
+`cargo xtask demo scan preview` serves the same page without VMs, to work on
+it: an in-world scanner sends the story's probes, a stand-in answers at
+10.0.0.50, and nmap's reports are the ones recorded in a KVM run. The page
+says it is a replay.
 
 ## Recording the dashboard
 

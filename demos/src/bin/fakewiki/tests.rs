@@ -1,6 +1,5 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use fakewiki_world::{
     content::Content,
@@ -8,13 +7,9 @@ use fakewiki_world::{
     tamper::{Reply, Scope, Tampering},
 };
 use fictionet::stdlib::{
-    codec::Wire,
-    protocols::{
-        dns::{
-            op::ResponseCode,
-            rr::{RData, RecordType},
-        },
-        http1,
+    protocols::dns::{
+        op::ResponseCode,
+        rr::{RData, RecordType},
     },
     web,
     world::sandbox,
@@ -105,9 +100,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
         let initial = stream.next("tamper", |s| s["value"]["revision"] == 0).await?;
         assert_eq!(initial["value"]["on"], false);
         for revision in 0..=2 {
-            let mut tls = machine.tls(&cx, (pages::host_ips()[WIKI], 443).into(), WIKI, None, SystemTime::now()).await?;
-            let request = http1::Request::parse(format!("GET {ARTICLE} HTTP/1.1\r\nHost: {WIKI}\r\nConnection: close\r\n\r\n").as_bytes())?;
-            let response = sandbox::request(&cx, &mut tls, &request).await?;
+            let response = world::read_article(&cx, &machine).await?;
             assert_eq!(response.head.status, 200);
             let body = String::from_utf8(response.body)?;
             assert_eq!(body.contains("stream ripping for personal, non-commercial use is fully legal"), revision == 1);
@@ -194,20 +187,7 @@ fn lab_reads_follow_commands_and_unknown_addresses_are_unreachable() {
                     .is_err()
             );
             for revision in 0..=1 {
-                let mut tls = machine
-                    .tls(
-                        &cx,
-                        (pages::host_ips()[WIKI], 443).into(),
-                        WIKI,
-                        None,
-                        SystemTime::now(),
-                    )
-                    .await?;
-                let request = http1::Request::parse(
-                    format!("GET {ARTICLE} HTTP/1.1\r\nHost: {WIKI}\r\nConnection: close\r\n\r\n")
-                        .as_bytes(),
-                )?;
-                let response = sandbox::request(&cx, &mut tls, &request).await?;
+                let response = world::read_article(&cx, &machine).await?;
                 assert_eq!(response.head.status, 200);
                 assert_eq!(
                     String::from_utf8(response.body)?

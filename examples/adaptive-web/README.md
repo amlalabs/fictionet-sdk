@@ -41,9 +41,8 @@ the earlier search whose list it reused. A tree grows with every made-up site
 and page, the world's reason for each, how it was made and how fast it was
 served. The run saves the guest's screen and the page as it ends. Screenshots
 of the page's other states, such as a failed search or a lost screen, come
-from the VM-free example
-`cargo run --locked -p fictionet-demo --example search_page`, described in
-[demos/README.md](../../demos/README.md).
+from the preview without a VM, `cargo xtask demo search preview`, described
+in [demos/README.md](../../demos/README.md).
 
 The default seed is `halvard-cve`. Select another embedded seed with
 `cargo xtask demo search -- --seed corvane-acquisition` or

@@ -4,8 +4,16 @@ use std::time::SystemTime;
 
 use fakewiki_world::{content::Content, issue_leaves, pages, sites, tamper::Tampering};
 use fictionet::Cx;
-use fictionet::stdlib::{services::ca::Leaf, web, world::net::Net};
+use fictionet::stdlib::{
+    codec::Wire,
+    protocols::http1,
+    services::ca::Leaf,
+    web,
+    world::{net::Net, sandbox},
+};
 use fictionet_demo::kit;
+
+use super::{ARTICLE, WIKI};
 
 pub const APT: &[&str] = &["archive.ubuntu.com", "security.ubuntu.com"];
 
@@ -15,6 +23,21 @@ pub fn certificates(cx: &Cx) -> fictionet::Result<(String, HashMap<String, Leaf>
         .chain(kit::desktop::HOSTS.iter().map(|s| s.to_string()))
         .collect();
     issue_leaves(cx, names.iter())
+}
+
+/// Reads the article over HTTPS from `machine`, as Firefox does.
+pub async fn read_article(
+    cx: &Cx,
+    machine: &sandbox::Machine,
+) -> fictionet::Result<http1::Response> {
+    let address = (pages::host_ips()[WIKI], 443).into();
+    let mut tls = machine
+        .tls(cx, address, WIKI, None, SystemTime::now())
+        .await?;
+    let request = http1::Request::parse(
+        format!("GET {ARTICLE} HTTP/1.1\r\nHost: {WIKI}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )?;
+    sandbox::request(cx, &mut tls, &request).await
 }
 
 pub fn network(

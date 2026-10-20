@@ -142,6 +142,12 @@ export function banners(map) {
   return new Map((map?.banners || []).map((banner) => [`${banner.host}:${banner.port}`, banner]));
 }
 
+// What the page calls the office server: the real VM, or in a replay
+// without VMs, the in-world stand-in that answers for it.
+export function server(replay) {
+  return replay ? 'Stand-in for the Ubuntu VM' : 'Real Ubuntu VM';
+}
+
 // A count with its noun, such as "1 host" or "5 hosts".
 export function count(n, noun, plural = `${noun}s`) {
   return `${Number(n).toLocaleString('en-US')} ${n === 1 ? noun : plural}`;

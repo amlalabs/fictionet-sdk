@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 type Request = oneshot::Sender<Result<(), String>>;
 pub struct Preview {
     pub server: Server,
+    screen: kit::preview::Console,
     requests: mpsc::Sender<Request>,
     stop: oneshot::Sender<()>,
     worker: tokio::task::JoinHandle<fictionet::Result>,
@@ -60,6 +61,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         scenario.clone(),
     );
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
+    let screen = kit::preview::Console::new();
     let status = StateTopic::new(StateLimits::default());
     status.publish(
         fictionet::time::Instant::ZERO,
@@ -77,7 +79,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
                     Host::new(HOSTNAME)
                         .sandbox(HOSTNAME)
                         .status(status)
-                        .console(kit::preview::Console::new()),
+                        .console(screen.clone()),
                 )
                 .standard_panels(),
         )
@@ -131,6 +133,7 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
     }
     Ok(Preview {
         server,
+        screen,
         requests,
         stop,
         worker,
@@ -139,28 +142,20 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
 }
 
 pub async fn run() -> Result<(), Error> {
+    let mut input = kit::preview::Input::stdin()?;
     let out = std::env::temp_dir().join(format!("border-page-{}", kit::random_uuid()));
     let preview = start(&out).await?;
     println!("Output: {}", out.display());
     println!(
-        "In-process scripted client; no VM, so the screen says NO VM. Change the route on the page, then press Enter here to run sign-in, balance and traceroute on that route."
+        "In-process scripted client; no VM, so the screen says NO VM. Change the route on the page, then press Enter here to run sign-in, balance and traceroute on that route. Type drop to close the screen's connections; end the input or press Ctrl-C to stop."
     );
-    let (lines, mut input) = mpsc::channel(1);
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        loop {
-            let mut line = String::new();
-            if stdin.read_line(&mut line).unwrap_or(0) == 0 || lines.blocking_send(()).is_err() {
-                break;
+    while let Some(command) = input.next().await {
+        match command {
+            kit::preview::Command::Again => {
+                preview.traffic().await?;
+                println!("Client checks complete. Change the route and press Enter to run again.");
             }
-        }
-    });
-    let stay = kit::checks::stay_open();
-    tokio::pin!(stay);
-    loop {
-        tokio::select! {
-            _ = &mut stay => break,
-            line = input.recv(), if !input.is_closed() => { if line.is_some() { preview.traffic().await?; println!("Client checks complete. Change the route and press Enter to run again."); } }
+            kit::preview::Command::Drop => preview.screen.drop_connections(),
         }
     }
     preview.shutdown().await

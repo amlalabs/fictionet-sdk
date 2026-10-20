@@ -126,6 +126,9 @@ pub fn check(topics: &Topics, moment: &serde_json::Value) -> Result<String, Stri
     if let Some(host) = steps[2].hosts.iter().find(|h| h.os.is_none()) {
         return Err(format!("nmap reports: no OS entry for {}", host.addr));
     }
+    if topics.story.replay {
+        return Err("story: the page calls the run a replay".into());
+    }
     if let Some(step) = topics
         .story
         .steps
@@ -200,7 +203,7 @@ mod tests {
                 revision: 2001,
             });
         }
-        let mut story = Story::scripted();
+        let mut story = Story::scripted(false);
         for step in &mut story.steps {
             step.state = StepState::Done;
             step.exit = Some(0);
@@ -276,6 +279,7 @@ mod tests {
         );
         assert!(fails(&|t, _| t.reports.steps[2].hosts[3].os = None).contains("no OS entry"));
         assert!(fails(&|t, _| t.story.steps[2].state = StepState::Failed).contains("story"));
+        assert!(fails(&|t, _| t.story.replay = true).contains("a replay"));
         assert!(fails(&|_, m| *m = serde_json::json!({"rows": []})).contains("0 events"));
         assert!(
             fails(&|_, m| m["rows"][0]["fields"]["hosts"] = serde_json::json!([]))

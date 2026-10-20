@@ -3,17 +3,16 @@
 //! panels. Run `cargo xtask demo artifactory`. The default variant is
 //! lookalike. Select normal, missing, lookalike or peer with `--variant`.
 //! Add `--stay` to keep the page open after the checks until Ctrl-C.
-//! Run `cargo run -p fictionet-demo --bin artifactory -- --fixture` to serve
-//! the page without a VM. `--extra-reads N` adds N index reads after the
-//! fixture's story, enough to fill the page's row bound. With `--variant
-//! peer`, `--sessions shared|separate` adds a colleague's laptop whose
-//! session leaves a note in the cache first. The two sessions use one
-//! repository state, or a separate state each.
+//! `artifactory preview` serves the page without a VM. Its `--extra-reads N`
+//! adds N index reads after the replayed story, enough to fill the page's
+//! row bound. With `--variant peer`, `--sessions shared|separate` adds a
+//! colleague's laptop whose session leaves a note in the cache first. The
+//! two sessions use one repository state, or a separate state each.
 
 mod facts;
-mod fixture;
 mod guest;
 mod page;
+mod preview;
 mod story;
 mod world;
 
@@ -38,34 +37,33 @@ use story::Mode;
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 struct Args {
-    downloads: PathBuf,
+    /// None for the preview without a VM.
+    downloads: Option<PathBuf>,
     variant: Variant,
     stay: bool,
-    fixture: bool,
     extra_reads: usize,
     sessions: Option<Mode>,
 }
 
 fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
     let first = args.next().ok_or(
-        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--sessions shared|separate] [--stay], or artifactory --fixture [--variant V] [--sessions S] [--extra-reads N]",
+        "usage: artifactory <downloads> [--variant normal|missing|lookalike|peer] [--sessions shared|separate] [--stay], or artifactory preview [--variant V] [--sessions S] [--extra-reads N]",
     )?;
+    if first.starts_with("--") {
+        return Err("expected the downloads directory or preview before options".into());
+    }
+    let preview = first == "preview";
     let mut parsed = Args {
-        fixture: first == "--fixture",
-        downloads: first.into(),
+        downloads: (!preview).then(|| first.into()),
         variant: Variant::Lookalike,
         stay: false,
         extra_reads: 0,
         sessions: None,
     };
-    if !parsed.fixture && parsed.downloads.to_string_lossy().starts_with("--") {
-        return Err("expected the downloads directory before options".into());
-    }
     let (mut selected, mut reads) = (false, false);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--fixture" if !parsed.fixture => parsed.fixture = true,
-            "--stay" if !parsed.stay => parsed.stay = true,
+            "--stay" if !preview && !parsed.stay => parsed.stay = true,
             "--variant" if !selected => {
                 selected = true;
                 parsed.variant = Variant::parse(&args.next().ok_or("--variant needs a value")?)
@@ -77,7 +75,7 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
                         .ok_or("sessions must be shared or separate")?,
                 );
             }
-            "--extra-reads" if !reads => {
+            "--extra-reads" if preview && !reads => {
                 reads = true;
                 parsed.extra_reads = args
                     .next()
@@ -86,9 +84,6 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
             }
             _ => return Err(format!("unknown argument {flag}").into()),
         }
-    }
-    if reads && !parsed.fixture {
-        return Err("--extra-reads applies only to --fixture".into());
     }
     if parsed.sessions.is_some() && parsed.variant != Variant::Peer {
         return Err("--sessions needs --variant peer, the only variant that accepts MKCOL".into());
@@ -109,13 +104,12 @@ async fn execute() -> Result {
         downloads,
         variant,
         stay,
-        fixture,
         extra_reads,
         sessions,
     } = args(std::env::args().skip(1))?;
-    if fixture {
-        return fixture::serve(variant, sessions, extra_reads).await;
-    }
+    let Some(downloads) = downloads else {
+        return preview::serve(variant, sessions, extra_reads).await;
+    };
     let start = Instant::now();
     let shots = downloads.join("shots");
     std::fs::create_dir_all(&shots)?;
@@ -307,13 +301,10 @@ mod tests {
         ] {
             assert!(parse(input).unwrap().stay);
         }
-        for input in [
-            &["--fixture"][..],
-            &["d", "--fixture"],
-            &["--fixture", "--variant", "peer"],
-        ] {
-            assert!(parse(input).unwrap().fixture);
+        for input in [&["preview"][..], &["preview", "--variant", "peer"]] {
+            assert!(parse(input).unwrap().downloads.is_none());
         }
+        assert!(parse(&["d"]).unwrap().downloads.is_some());
         for (input, mode) in [
             (
                 &["d", "--variant", "peer", "--sessions", "shared"][..],
@@ -324,7 +315,7 @@ mod tests {
                 Mode::Separate,
             ),
             (
-                &["--fixture", "--variant", "peer", "--sessions", "separate"],
+                &["preview", "--variant", "peer", "--sessions", "separate"],
                 Mode::Separate,
             ),
         ] {
@@ -333,13 +324,15 @@ mod tests {
         assert_eq!(parse(&["d", "--variant", "peer"]).unwrap().sessions, None);
         let error = parse(&["d", "--sessions", "shared"]).err().unwrap();
         assert!(error.to_string().contains("--variant peer"), "{error}");
-        let flooded = parse(&["--fixture", "--extra-reads", "600"]).unwrap();
+        let flooded = parse(&["preview", "--extra-reads", "600"]).unwrap();
         assert_eq!(flooded.extra_reads, 600);
-        assert_eq!(parse(&["--fixture"]).unwrap().extra_reads, 0);
+        assert_eq!(parse(&["preview"]).unwrap().extra_reads, 0);
         for input in [
             &[][..],
             &["--stay"],
-            &["--fixture", "--fixture"],
+            &["--variant", "peer"],
+            &["preview", "--stay"],
+            &["d", "preview"],
             &["d", "--stay", "--stay"],
             &["d", "--variant", "peer", "--variant", "normal"],
             &["d", "--variant"],
@@ -347,9 +340,9 @@ mod tests {
             &["d", "--bad", "peer"],
             &["d", "--variant", "peer", "extra"],
             &["d", "--extra-reads", "600"],
-            &["--fixture", "--extra-reads"],
-            &["--fixture", "--extra-reads", "many"],
-            &["--fixture", "--extra-reads", "1", "--extra-reads", "2"],
+            &["preview", "--extra-reads"],
+            &["preview", "--extra-reads", "many"],
+            &["preview", "--extra-reads", "1", "--extra-reads", "2"],
             &["d", "--variant", "lookalike", "--sessions", "shared"],
             &["d", "--variant", "peer", "--sessions", "both"],
             &["d", "--variant", "peer", "--sessions"],

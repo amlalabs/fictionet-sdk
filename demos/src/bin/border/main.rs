@@ -27,18 +27,19 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    const USAGE: &str = "usage: border <downloads> [--checks], or border preview";
     let mut args = std::env::args().skip(1);
-    let first = args.next();
-    if first.as_deref() == Some("page") {
+    let first = args.next().ok_or(USAGE)?;
+    if first == "preview" {
         if args.next().is_some() {
-            return Err("usage: border page".into());
+            return Err(USAGE.into());
         }
         return preview::run().await;
     }
-    let downloads = PathBuf::from(first.unwrap_or_else(|| "demos/downloads/cloudimage".into()));
+    let downloads = PathBuf::from(first);
     let option = args.next();
     if option.as_deref().is_some_and(|s| s != "--checks") || args.next().is_some() {
-        return Err("usage: border [downloads] [--checks]".into());
+        return Err(USAGE.into());
     }
     let checks_only = option.is_some() || !std::io::stdin().is_terminal();
     let started = Instant::now();

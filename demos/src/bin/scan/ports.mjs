@@ -1,7 +1,7 @@
 // The Ports panel: for each host that answered, its 1,024 scanned TCP ports
 // as a grid that fills in as the world's tap sees nmap's probes and their
 // answers. A second view compares only the ports open on any host.
-import { element, stylesheet, hosts, ports, counts, openPorts, portState, services as nmapNames, count, limits, SERVICES } from './model.mjs';
+import { element, stylesheet, hosts, ports, counts, openPorts, portState, services as nmapNames, count, limits, server, OFFICE, SERVICES } from './model.mjs';
 
 const LEGEND = [
   ['open', 'open'],
@@ -41,8 +41,10 @@ export function mount(root, services, options) {
   const heat = el('div', 'ports-heat', undefined, panel);
   const compare = el('div', 'ports-compare', undefined, panel);
 
-  let view = 'all', latest = null, names = new Map();
+  let view = 'all', latest = null, names = new Map(), replay = false;
   const rows = new Map();
+  // The labels of the office server's rows, which a replay renames.
+  const realLabels = [];
   function setView(next) {
     view = next;
     allButton.setAttribute('aria-pressed', String(view === 'all'));
@@ -62,7 +64,8 @@ export function mount(root, services, options) {
     const title = el('div', 'ports-title', undefined, label);
     el('b', '', machine.name, title);
     el('span', 'office-addr', machine.addr, title);
-    el('span', 'scan-muted', machine.kind === 'real' ? 'Real Ubuntu VM' : machine.kind === 'simulated' ? 'Simulated' : 'Unnamed address', label);
+    const kind = el('span', 'scan-muted', machine.kind === 'real' ? server(replay) : machine.kind === 'simulated' ? 'Simulated' : 'Unnamed address', label);
+    if (machine.kind === 'real') realLabels.push(kind);
     const tally = el('p', 'ports-tally', undefined, label);
     const figures = {};
     for (const state of ['open', 'closed', 'unanswered', 'unreachable', 'idle']) {
@@ -172,10 +175,15 @@ export function mount(root, services, options) {
 
   const stopMap = services.state(options.state, (snapshot) => { latest = snapshot; draw(); }, (error) => { notes.textContent = `Could not load the port map: ${error.message}`; });
   const stopNames = services.state(SERVICES, ({ value }) => { names = nmapNames(value); if (latest) draw(); }, () => {});
+  const stopStory = services.state(OFFICE, ({ value }) => {
+    replay = Boolean(value?.replay);
+    for (const label of realLabels) label.textContent = server(replay);
+  }, () => {});
   setView('all');
   return () => {
     stopMap();
     stopNames();
+    stopStory();
     cleanups.forEach((cleanup) => cleanup());
     root.replaceChildren();
   };

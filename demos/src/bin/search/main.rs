@@ -1,5 +1,6 @@
 mod checks;
 mod guest;
+mod preview;
 use fictionet_demo::search as page;
 
 use adaptive_web_world::{events::LogObserver, search::Searches, stub::Seed};
@@ -15,16 +16,35 @@ use std::{
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The downloads folder, the seed's name and whether the page stays open
-/// after the checks.
-fn arguments(args: impl Iterator<Item = String>) -> Result<(PathBuf, String, bool)> {
-    const USAGE: &str = "usage: search [downloads] [--seed <name>] [--stay]";
-    let mut args = args.peekable();
-    let downloads = if args.peek().is_some_and(|s| !s.starts_with('-')) {
-        PathBuf::from(args.next().unwrap())
-    } else {
-        PathBuf::from("demos/downloads/cloudimage")
-    };
+/// What to run: the VM demo with its downloads folder, the seed's name and
+/// whether the page stays open after the checks, or the preview without a
+/// VM and whether it spends the generation budget.
+#[derive(Debug, PartialEq)]
+enum Mode {
+    Run {
+        downloads: PathBuf,
+        seed: String,
+        stay: bool,
+    },
+    Preview {
+        spend: bool,
+    },
+}
+
+fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
+    const USAGE: &str =
+        "usage: search <downloads> [--seed <name>] [--stay], or search preview [--spend-budget]";
+    let first = args.next().ok_or(USAGE)?;
+    if first == "preview" {
+        return match (args.next().as_deref(), args.next()) {
+            (None, _) => Ok(Mode::Preview { spend: false }),
+            (Some("--spend-budget"), None) => Ok(Mode::Preview { spend: true }),
+            _ => Err(USAGE.into()),
+        };
+    }
+    if first.starts_with('-') {
+        return Err(USAGE.into());
+    }
     let (mut seed, mut stay) = (None, false);
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -33,17 +53,24 @@ fn arguments(args: impl Iterator<Item = String>) -> Result<(PathBuf, String, boo
             _ => return Err(USAGE.into()),
         }
     }
-    Ok((
-        downloads,
-        seed.unwrap_or_else(|| "halvard-cve".into()),
+    Ok(Mode::Run {
+        downloads: first.into(),
+        seed: seed.unwrap_or_else(|| "halvard-cve".into()),
         stay,
-    ))
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result {
     let total = Instant::now();
-    let (downloads, seed, stay) = arguments(std::env::args().skip(1))?;
+    let (downloads, seed, stay) = match arguments(std::env::args().skip(1))? {
+        Mode::Preview { spend } => return preview::run(spend).await,
+        Mode::Run {
+            downloads,
+            seed,
+            stay,
+        } => (downloads, seed, stay),
+    };
     let seed = Seed::builtin(&seed)?;
     let output = downloads.join("runs").join(format!(
         "search-{}",
@@ -107,40 +134,45 @@ async fn main() -> Result {
 
 #[cfg(test)]
 mod tests {
-    use super::arguments;
+    use super::{Mode, arguments};
 
-    fn parse(args: &[&str]) -> Option<(String, String, bool)> {
-        arguments(args.iter().map(|a| a.to_string()))
-            .ok()
-            .map(|(downloads, seed, stay)| (downloads.display().to_string(), seed, stay))
+    fn parse(args: &[&str]) -> Option<Mode> {
+        arguments(args.iter().map(|a| a.to_string())).ok()
     }
 
     #[test]
     fn arguments_take_a_folder_a_seed_and_stay_in_any_order() {
-        let default = Some((
-            "demos/downloads/cloudimage".to_string(),
-            "halvard-cve".to_string(),
-            false,
-        ));
-        assert_eq!(parse(&[]), default);
+        let run = |downloads: &str, seed: &str, stay| {
+            Some(Mode::Run {
+                downloads: downloads.into(),
+                seed: seed.into(),
+                stay,
+            })
+        };
+        assert_eq!(parse(&["d"]), run("d", "halvard-cve", false));
         assert_eq!(
             parse(&["d", "--stay", "--seed", "corvane-acquisition"]),
-            Some(("d".into(), "corvane-acquisition".into(), true))
+            run("d", "corvane-acquisition", true)
         );
         assert_eq!(
-            parse(&["--seed", "fastjsonl-package", "--stay"]),
-            Some((
-                "demos/downloads/cloudimage".into(),
-                "fastjsonl-package".into(),
-                true
-            ))
+            parse(&["d", "--seed", "fastjsonl-package", "--stay"]),
+            run("d", "fastjsonl-package", true)
+        );
+        assert_eq!(parse(&["preview"]), Some(Mode::Preview { spend: false }));
+        assert_eq!(
+            parse(&["preview", "--spend-budget"]),
+            Some(Mode::Preview { spend: true })
         );
         for bad in [
-            &["--stay", "--stay"][..],
-            &["--seed"],
-            &["--seed", "a", "--seed", "b"],
+            &[][..],
+            &["--stay"],
+            &["d", "--stay", "--stay"],
+            &["d", "--seed"],
+            &["d", "--seed", "a", "--seed", "b"],
             &["d", "extra"],
-            &["--other"],
+            &["d", "--other"],
+            &["preview", "--stay"],
+            &["preview", "--spend-budget", "--spend-budget"],
         ] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }

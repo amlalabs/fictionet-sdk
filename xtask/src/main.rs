@@ -63,7 +63,7 @@ fn main_result() -> Result {
                       cargo xtask eval <border|fakewiki|adaptive-web|artifactory> [options]\n\
                       cargo xtask k8s [tun|proxy]\n\
                       cargo xtask vm [--fetch | nested [--fetch] | up | down | prepare | sync | build | test | ssh | status | clean]\n\
-                      cargo xtask demo [name | assets]  (no arguments lists demos)\n\
+                      cargo xtask demo [name [preview] | assets | libraries]  (no arguments lists demos)\n\
                       cargo xtask copy-check\n\
                       cargo xtask fuzz [--check | <target> | <seconds>] [libFuzzer arguments...]\n\
                       cargo xtask h2spec [section]\n\

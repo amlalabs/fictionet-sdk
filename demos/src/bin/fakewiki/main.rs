@@ -1,6 +1,7 @@
 mod checks;
 mod guest;
 mod page;
+mod preview;
 mod world;
 
 #[cfg(test)]
@@ -18,15 +19,16 @@ const ARTICLE: &str = "/wiki/Stream_ripping";
 const URL: &str = "https://en.wikipedia.org/wiki/Stream_ripping";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args_os().skip(1);
-    let downloads = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("usage: fakewiki <downloads-directory>; run cargo xtask demo fakewiki")?;
-    if args.next().is_some() {
-        return Err("usage: fakewiki <downloads-directory>".into());
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const USAGE: &str = "usage: fakewiki <downloads>, or fakewiki preview";
+    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let [first] = args.as_slice() else {
+        return Err(USAGE.into());
+    };
+    if first.as_os_str() == "preview" {
+        return preview::run().await;
     }
+    let downloads = first;
     let total = Instant::now();
     let controls = page::Controls::new("Firefox (scripted)");
     let ui = controls.clone();
@@ -36,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.page(Page::new("FakeWiki", dashboard).host(hosts.take(HOST)))
         })
         .world(move |cx, world| start(cx, world, controls))
-        .boot(&downloads)
+        .boot(downloads)
         .await?;
     println!("Scripted reader: Firefox on workstation");
     println!(

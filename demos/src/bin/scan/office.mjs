@@ -1,7 +1,7 @@
 // The Office panel: the scripted story, then the scanner and the office
 // subnet. A cell lights as the world's port map shows a probe to its
 // address; a card rises for each machine once its address answers.
-import { element, stylesheet, addresses, summary, hosts, count, limits, PORTS } from './model.mjs';
+import { element, stylesheet, addresses, summary, hosts, count, limits, server, PORTS } from './model.mjs';
 
 const STEP = { waiting: 'Waiting', running: 'Running', done: 'Done', failed: 'Failed' };
 const CELL = {
@@ -29,7 +29,7 @@ export function mount(root, services, options) {
   strip.setAttribute('aria-label', 'Scripted agent');
   const head = el('div', 'scan-story-head', undefined, strip);
   el('h2', 'scan-eyebrow', 'Scripted agent', head);
-  el('span', 'scan-muted', 'A script types three nmap steps into the workstation terminal. No model runs.', head);
+  const about = el('span', 'scan-muted', undefined, head);
   const steps = el('ol', 'scan-steps', undefined, strip);
   const command = el('p', 'scan-command', undefined, strip);
   const commandLabel = el('span', 'scan-command-label', '', command);
@@ -61,7 +61,18 @@ export function mount(root, services, options) {
   const scannerTitle = el('div', 'office-card-title', undefined, scanner);
   el('b', 'office-name', scannerHost?.name || 'scanner', scannerTitle);
   const scannerAddr = el('span', 'scan-muted', 'waiting for its lease', scannerTitle);
-  el('span', 'scan-muted', 'Scanner · real Ubuntu VM with nmap', scannerTitle);
+  const scannerKind = el('span', 'scan-muted', undefined, scannerTitle);
+  // The labels that change when the story says it is a replay.
+  const realBadges = [];
+  let replay = false;
+  function label() {
+    about.textContent = replay
+      ? 'A replay without VMs: an in-world client sends the story\'s probes, and nmap\'s reports are recorded from a VM run. No model runs.'
+      : 'A script types three nmap steps into the workstation terminal. No model runs.';
+    scannerKind.textContent = replay ? 'Scanner · in-world stand-in for the VM' : 'Scanner · real Ubuntu VM with nmap';
+    for (const badge of realBadges) badge.textContent = server(replay);
+  }
+  label();
   const list = el('ol', 'office-hosts', undefined, left);
 
   // The subnet: 256 cells, 16 to a row.
@@ -99,7 +110,7 @@ export function mount(root, services, options) {
     el('b', 'office-name', machine.name, title);
     el('span', 'office-addr', machine.addr, title);
     if (machine.kind === 'real') {
-      el('span', 'scan-badge', 'Real Ubuntu VM', title);
+      realBadges.push(el('span', 'scan-badge', server(replay), title));
       const host = services.hosts?.find((entry) => entry.sandbox === machine.name);
       if (host) {
         const show = el('button', 'text-button', `Show ${host.name} in the workspace`, item);
@@ -162,6 +173,10 @@ export function mount(root, services, options) {
 
   function renderStory(snapshot) {
     const story = snapshot.value;
+    if (Boolean(story?.replay) !== replay) {
+      replay = Boolean(story?.replay);
+      label();
+    }
     steps.replaceChildren();
     for (const [index, step] of (story?.steps || []).entries()) {
       const item = el('li', 'scan-step', undefined, steps);
@@ -169,7 +184,9 @@ export function mount(root, services, options) {
       el('span', 'scan-step-mark', String(index + 1), item);
       const text = el('span', 'scan-step-text', undefined, item);
       el('b', '', step.title, text);
-      const exit = step.exit === null || step.exit === undefined ? '' : ` · exit ${step.exit}`;
+      const exit = step.exit === null || step.exit === undefined
+        ? (replay && step.state === 'done' ? ' · recorded report' : '')
+        : ` · exit ${step.exit}`;
       el('span', 'scan-muted', `${STEP[step.state] || step.state}${exit}`, text);
     }
     const all = story?.steps || [];

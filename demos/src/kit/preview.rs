@@ -1,8 +1,78 @@
-//! A placeholder screen for pages that run without a VM.
+//! A placeholder screen and the standard input of pages that run without
+//! a VM.
+//!
+//! Every demo's `preview` subcommand reads standard input the same way. An
+//! empty line runs the in-world client's story again, where the demo has
+//! one; `drop` closes the screen's open connections, as a lost guest
+//! connection would; the end of input or Ctrl-C stops the preview.
 
 use fictionet_observe::page::{BoxFuture, Duplex, Pty};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::mpsc;
+
+/// A command typed on a preview's standard input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// An empty line: run the in-world client's story again.
+    Again,
+    /// `drop`: close the screen's open connections.
+    Drop,
+}
+
+impl Command {
+    /// The command a line names, if any.
+    fn parse(line: &str) -> Option<Self> {
+        match line.trim() {
+            "" => Some(Self::Again),
+            "drop" => Some(Self::Drop),
+            _ => None,
+        }
+    }
+}
+
+/// A preview's standard input, read on its own thread, and Ctrl-C.
+pub struct Input {
+    commands: mpsc::Receiver<Command>,
+    interrupt: Signal,
+}
+
+impl Input {
+    /// Starts reading standard input. A line that names no command is
+    /// named on standard error and skipped.
+    pub fn stdin() -> io::Result<Self> {
+        let interrupt = signal(SignalKind::interrupt())?;
+        let (send, commands) = mpsc::channel(1);
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines() {
+                let Ok(line) = line else { break };
+                let Some(command) = Command::parse(&line) else {
+                    eprintln!(
+                        "{line:?}: press Enter to run the client again, type drop to close \
+                         the screen's connections, or end the input to stop"
+                    );
+                    continue;
+                };
+                if send.blocking_send(command).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            commands,
+            interrupt,
+        })
+    }
+
+    /// The next command, or None at the end of input or on Ctrl-C.
+    pub async fn next(&mut self) -> Option<Command> {
+        tokio::select! {
+            command = self.commands.recv() => command,
+            _ = self.interrupt.recv() => None,
+        }
+    }
+}
 
 /// A screen-only page console that draws the words NO VM, so a preview page
 /// is never mistaken for a guest's desktop. Input reaches nothing. Clones share
@@ -159,6 +229,16 @@ async fn screen(mut stream: DuplexStream) -> io::Result<()> {
 mod tests {
     use super::*;
     use fictionet_observe::page::Console as _;
+
+    #[test]
+    fn lines_name_the_two_commands() {
+        assert_eq!(Command::parse(""), Some(Command::Again));
+        assert_eq!(Command::parse("  \r"), Some(Command::Again));
+        assert_eq!(Command::parse("drop"), Some(Command::Drop));
+        assert_eq!(Command::parse(" drop "), Some(Command::Drop));
+        assert_eq!(Command::parse("quit"), None);
+        assert_eq!(Command::parse("Drop"), None);
+    }
     #[tokio::test]
     async fn screen_delivers_labeled_pixels_and_closes_on_disconnect() {
         let (mut client, server) = tokio::io::duplex(64 << 10);

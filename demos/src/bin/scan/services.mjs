@@ -1,7 +1,7 @@
 // The Services panel: one row per open port, with the banner the world's
 // tap saw on the wire beside nmap's name, product and version, and nmap's
 // OS guess for each host. Everything from nmap is labeled "nmap says".
-import { element, stylesheet, hosts, services as nmapNames, osGuess, version, banners as wireBanners, count, PORTS } from './model.mjs';
+import { element, stylesheet, hosts, services as nmapNames, osGuess, version, banners as wireBanners, count, server, OFFICE, PORTS } from './model.mjs';
 
 export function mount(root, services, options) {
   const document = root.ownerDocument;
@@ -21,7 +21,7 @@ export function mount(root, services, options) {
   nmapHead.setAttribute('scope', 'colgroup');
   const labels = el('tr', '', undefined, head);
   for (const label of ['Port', 'Banner on the wire', 'Service', 'Product', 'Version']) el('th', '', label, labels).setAttribute('scope', 'col');
-  let map = null, reports = null, mapStatus = null, reportStatus = null, drawn = '';
+  let map = null, reports = null, mapStatus = null, reportStatus = null, replay = false, drawn = '';
   const seen = new Set();
 
   function osLine(parent, addr) {
@@ -56,7 +56,8 @@ export function mount(root, services, options) {
       const [addr, port] = key.split(':');
       open.get(addr)?.add(Number(port));
     }
-    const shown = JSON.stringify([machines, [...open].map(([addr, ports]) => [addr, [...ports]]), [...kept.values()], [...names.entries()], machines.map((m) => osGuess(reports, m.addr))]);
+    nmapHead.textContent = replay ? 'nmap says · recorded report' : 'nmap says';
+    const shown = JSON.stringify([replay, machines, [...open].map(([addr, ports]) => [addr, [...ports]]), [...kept.values()], [...names.entries()], machines.map((m) => osGuess(reports, m.addr))]);
     if (shown === drawn) return;
     drawn = shown;
     for (const body of table.querySelectorAll('tbody')) body.remove();
@@ -69,7 +70,7 @@ export function mount(root, services, options) {
       const title = el('span', 'ports-title', undefined, cell);
       el('b', '', machine.name, title);
       el('span', 'office-addr', machine.addr, title);
-      el('span', machine.kind === 'real' ? 'scan-badge' : 'scan-muted', machine.kind === 'real' ? 'Real Ubuntu VM' : machine.kind === 'simulated' ? 'Simulated by the world' : 'Not one of the world\'s machines', title);
+      el('span', machine.kind === 'real' ? 'scan-badge' : 'scan-muted', machine.kind === 'real' ? server(replay) : machine.kind === 'simulated' ? 'Simulated by the world' : 'Not one of the world\'s machines', title);
       osLine(cell, machine.addr);
       const ports = [...open.get(machine.addr)].sort((a, b) => a - b);
       if (!ports.length) {
@@ -103,10 +104,12 @@ export function mount(root, services, options) {
 
   const stopReports = services.state(options.state, (snapshot) => { reports = snapshot.value; reportStatus = snapshot.status; draw(); }, (error) => { notes.textContent = `Could not load nmap's reports: ${error.message}`; });
   const stopMap = services.state(PORTS, (snapshot) => { map = snapshot.value; mapStatus = snapshot.status; draw(); }, (error) => { notes.textContent = `Could not load the port map: ${error.message}`; });
+  const stopStory = services.state(OFFICE, ({ value }) => { replay = Boolean(value?.replay); draw(); }, () => {});
   draw();
   return () => {
     stopReports();
     stopMap();
+    stopStory();
     root.replaceChildren();
   };
 }

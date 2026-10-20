@@ -1,30 +1,24 @@
-//! The real article page and world, with a placeholder screen and a scripted client.
-
-mod page;
-mod world;
+//! The article page and world without a VM: a placeholder screen and an
+//! in-world scripted client that reads the article.
 
 use std::net::Ipv4Addr;
-use std::time::SystemTime;
 
 use fakewiki_world::{
     content::Content,
-    pages,
     tamper::{Scope, Tampering},
 };
-use fictionet::stdlib::{codec::Wire, protocols::http1, web, world::sandbox};
+use fictionet::stdlib::{web, world::sandbox};
 use fictionet::{RunOptions, Seed};
-use fictionet_demo::kit;
+use fictionet_demo::kit::{self, preview::Command};
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{Containment, Host, HostState, HostStatus, Labels, Page, StateLimits, StateTopic},
 };
 
-const HOST: &str = "workstation";
-const WIKI: &str = "en.wikipedia.org";
-const ARTICLE: &str = "/wiki/Stream_ripping";
+use super::{HOST, page, world};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut input = kit::preview::Input::stdin()?;
     let controls = page::Controls::new("in-world client (scripted)");
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
     let status = StateTopic::<HostStatus>::new(StateLimits::default());
@@ -45,17 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
     println!("{}", server.url());
     eprintln!(
-        "No VM or Firefox is running. Press Enter for each scripted article read; type drop to close screen connections; EOF stops the example."
+        "No VM or Firefox is running. Press Enter for each scripted article read; type drop to close screen connections; end the input or press Ctrl-C to stop."
     );
-    let (sender, mut lines) = tokio::sync::mpsc::channel(1);
-    std::thread::spawn(move || {
-        for line in std::io::stdin().lines() {
-            let Ok(line) = line else { break };
-            if sender.blocking_send(line).is_err() {
-                break;
-            }
-        }
-    });
     let result = fictionet::run(
         RunOptions::new(Seed::from_u64(1)).observer(dashboard.observer()),
         |cx| async move {
@@ -79,35 +64,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .start(&cx, attachments)?;
             controls.start(&cx, tampering.clone())?;
             let machine = sandbox::machine(&cx, attacher.attach(HOST)?, Ipv4Addr::new(10, 0, 0, 2));
-            while let Some(line) = cx.race(None, lines.recv()).await? {
-                if line == "drop" {
-                    screen.drop_connections();
-                    eprintln!("Placeholder screen connections closed");
-                    continue;
+            while let Some(command) = cx.race(None, input.next()).await? {
+                match command {
+                    Command::Drop => {
+                        screen.drop_connections();
+                        eprintln!("Placeholder screen connections closed");
+                    }
+                    Command::Again => {
+                        let response = world::read_article(&cx, &machine).await?;
+                        eprintln!(
+                            "Scripted client received HTTP {} ({} bytes)",
+                            response.head.status,
+                            response.body.len()
+                        );
+                    }
                 }
-                if !line.is_empty() {
-                    eprintln!("Use an empty line to read, or drop to close screen connections");
-                    continue;
-                }
-                let mut tls = machine
-                    .tls(
-                        &cx,
-                        (pages::host_ips()[WIKI], 443).into(),
-                        WIKI,
-                        None,
-                        SystemTime::now(),
-                    )
-                    .await?;
-                let request = http1::Request::parse(
-                    format!("GET {ARTICLE} HTTP/1.1\r\nHost: {WIKI}\r\nConnection: close\r\n\r\n")
-                        .as_bytes(),
-                )?;
-                let response = sandbox::request(&cx, &mut tls, &request).await?;
-                eprintln!(
-                    "Scripted client received HTTP {} ({} bytes)",
-                    response.head.status,
-                    response.body.len()
-                );
             }
             cx.cancel();
             Ok(())

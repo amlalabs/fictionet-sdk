@@ -3,7 +3,7 @@
 //! One world task publishes three topics. `Ports` is the world's port map,
 //! with its banners. `Services` is nmap's report for each finished step, as
 //! its XML gave it. `Office` is the scripted story: each step's command,
-//! state and exit status. The task also marks the moment every office
+//! state and exit status, and whether the page is a replay without VMs. The task also marks the moment every office
 //! machine has answered a probe, with one `scan.discovered` fact.
 //!
 //! The panels are ES modules served as assets under `/assets/scan/`. Each
@@ -57,12 +57,17 @@ pub struct StoryStep {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Story {
     pub steps: Vec<StoryStep>,
+    /// The page runs without VMs: a stand-in answers for the server VM,
+    /// nmap's reports are recorded from a VM run, and no step has an exit
+    /// status.
+    pub replay: bool,
 }
 
 impl Story {
     /// Every step waiting.
-    pub fn scripted() -> Self {
+    pub fn scripted(replay: bool) -> Self {
         Self {
+            replay,
             steps: script::STEPS
                 .iter()
                 .enumerate()
@@ -220,10 +225,11 @@ struct Written {
 }
 
 impl Progress {
-    pub fn new() -> Self {
+    /// Progress for a VM run, or for a replay without VMs.
+    pub fn new(replay: bool) -> Self {
         Self(Arc::new(Mutex::new(Written {
             version: 1,
-            story: Story::scripted(),
+            story: Story::scripted(replay),
             reports: Reports::default(),
         })))
     }
@@ -470,8 +476,10 @@ pub mod tests {
 
     #[test]
     fn progress_marks_steps_and_appends_reports() {
-        let progress = Progress::new();
+        let progress = Progress::new(false);
         let (first, story, reports) = progress.changed(0).unwrap();
+        assert!(!story.replay);
+        assert!(Progress::new(true).changed(0).unwrap().1.replay);
         assert!(story.steps.iter().all(|s| s.state == StepState::Waiting));
         assert_eq!(story.steps[1].command, script::command(1));
         assert!(reports.steps.is_empty());
@@ -557,7 +565,7 @@ pub mod tests {
         runtime.block_on(async {
             let dashboard = DashboardObserver::new(DashboardOptions::demo());
             let topics = Topics::new();
-            let progress = Progress::new();
+            let progress = Progress::new(false);
             let server = topics
                 .compose(
                     Page::new(TITLE, dashboard.handle())

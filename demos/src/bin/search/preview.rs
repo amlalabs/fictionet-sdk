@@ -1,9 +1,8 @@
-//! The search page with real world traffic and a labeled preview console.
+//! `search preview`: the search page with real world traffic, an in-world
+//! scripted client and a labeled preview console.
 //!
 //! `--spend-budget` ends the story by turning generation back on and making
-//! new searches until the world refuses one for its generation budget. The
-//! page's `preview-screen` command closes the preview screen's connection, so
-//! the lost-connection state can be seen.
+//! new searches until the world refuses one for its generation budget.
 
 use adaptive_web_world::{
     search::{Failure, Outcome, Searches},
@@ -23,37 +22,22 @@ use fictionet::{
     },
 };
 use fictionet_demo::{
-    kit::{self, client::PageClient},
+    kit::{self, client::PageClient, preview::Command},
     search::{Topics, World},
 };
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
-    page::{
-        CommandLimits, CommandPort, Containment, Host, HostState, HostStatus, Labels, StateLimits,
-        StateTopic,
-    },
+    page::{Containment, Host, HostState, HostStatus, Labels, StateLimits, StateTopic},
 };
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use super::Result;
 
-/// Closes the preview screen's open connection: `{"command":"drop"}`.
-#[derive(serde::Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-enum ScreenCommand {
-    Drop,
-}
-
-#[tokio::main]
-async fn main() -> Result {
-    let spend = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => false,
-        [flag] if flag == "--spend-budget" => true,
-        _ => return Err("usage: search_page [--spend-budget]".into()),
-    };
+pub async fn run(spend: bool) -> Result {
+    let mut input = kit::preview::Input::stdin()?;
     let seed = Seed::builtin("halvard-cve")?;
     let searches = Arc::new(Searches::from_seed(&seed));
     let topics = Topics::new();
@@ -62,7 +46,6 @@ async fn main() -> Result {
     let labels = Labels::default();
     let containment = StateTopic::new(StateLimits::default());
     let console = kit::preview::Console::new();
-    let screen = CommandPort::<ScreenCommand, ()>::new(CommandLimits::default());
     let server = topics
         .page(
             dashboard.handle(),
@@ -73,12 +56,11 @@ async fn main() -> Result {
         )
         .labels(labels.clone())
         .containment(containment.clone())
-        .command("preview-screen", screen.clone())
         .bind_loopback(0)
         .await?;
     println!("Search preview: {}", server.url());
     println!(
-        "No VM. The screen is a preview console; an in-world scripted client makes the traffic."
+        "No VM. The screen is a preview console; an in-world scripted client makes the traffic. The story runs once. Type drop to close the screen's connections; end the input or press Ctrl-C to stop."
     );
     let page_client = PageClient::from_url(server.url())?;
     let observer = Arc::new(Fanout::new(vec![searches.clone(), dashboard.observer()]));
@@ -118,15 +100,6 @@ async fn main() -> Result {
                 Ok(())
             });
             cx.spawn(move |cx| async move {
-                while let Some(command) = cx.race(None, screen.recv()).await? {
-                    let ScreenCommand::Drop = command.command;
-                    console.drop_connections();
-                    println!("Preview screen connection dropped");
-                    command.reply(&cx, ());
-                }
-                Ok(())
-            });
-            cx.spawn(move |cx| async move {
                 let result = async {
                     story(&cx, &client, &world, &searches, &page_client).await?;
                     if spend {
@@ -136,7 +109,10 @@ async fn main() -> Result {
                 }
                 .await;
                 if let Err(error) = result {
-                    eprintln!("Preview story failed: {error}");
+                    // Stopping the preview mid-story cancels the run.
+                    if !cx.is_cancelled() {
+                        eprintln!("Preview story failed: {error}");
+                    }
                     return Err(error);
                 }
                 println!("Preview story complete.");
@@ -147,7 +123,15 @@ async fn main() -> Result {
             Ok(())
         },
     ));
-    kit::checks::stay_open().await?;
+    while let Some(command) = input.next().await {
+        match command {
+            Command::Drop => {
+                console.drop_connections();
+                println!("Preview screen connection dropped");
+            }
+            Command::Again => println!("The story runs once."),
+        }
+    }
     let _ = stop.send(());
     task.await??;
     drop(server);

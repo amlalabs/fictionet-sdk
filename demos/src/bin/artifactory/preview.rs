@@ -1,7 +1,7 @@
-//! The `--fixture` mode: the page without a VM. An in-process client replays
-//! each step's requests and door probes against the world in `fictionet::run`,
-//! so the page shows real world facts. The screen says NO VM, and steps have
-//! no exit status because no guest runs.
+//! `artifactory preview`: the page without a VM. An in-process client
+//! replays each step's requests and door probes against the world in
+//! `fictionet::run`, so the page shows real world facts. The screen says
+//! NO VM, and steps have no exit status because no guest runs.
 
 use super::{
     Result,
@@ -22,6 +22,7 @@ use fictionet::{
         world::sandbox::{self, Machine},
     },
 };
+use fictionet_demo::kit::preview::{Command, Console};
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{Host, HostState, HostStatus, Server, StateLimits, StateTopic},
@@ -69,33 +70,47 @@ impl Fixture {
 /// Serves the page while an in-process client replays the story's requests.
 /// `extra_reads` more index reads after the story fill the page's row bound.
 pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> Result {
+    let mut input = fictionet_demo::kit::preview::Input::stdin()?;
     let fixture = Fixture::new(variant, mode).map_err(std::io::Error::other)?;
     let facts = fixture.facts.clone();
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
-    let page = bind(&dashboard, &facts).await?;
+    let screen = Console::new();
+    let page = bind(&dashboard, &facts, screen.clone()).await?;
     println!("Fixture: in-process traffic replay. No guest or command exit statuses.");
     println!("Page: {}", page.url());
+    println!(
+        "The story runs once. Type drop to close the screen's connections; end the input or press Ctrl-C to stop."
+    );
     let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
         dashboard.observer(),
         facts.clone(),
     ])));
     let replay = run(options, fixture, Duration::from_secs(1), extra_reads);
     tokio::pin!(replay);
-    let stay = fictionet_demo::kit::checks::stay_open();
-    tokio::pin!(stay);
-    tokio::select! {
-        result = &mut replay => {
-            result.map_err(std::io::Error::other)?;
-            println!("fixture replay complete");
-            stay.await?;
+    let mut replaying = true;
+    loop {
+        tokio::select! {
+            result = &mut replay, if replaying => {
+                result.map_err(std::io::Error::other)?;
+                println!("fixture replay complete");
+                replaying = false;
+            }
+            command = input.next() => match command {
+                Some(Command::Drop) => screen.drop_connections(),
+                Some(Command::Again) => println!("The story runs once."),
+                None => break,
+            },
         }
-        result = &mut stay => { result?; }
     }
     drop(page);
     Ok(())
 }
 
-async fn bind(dashboard: &DashboardObserver, facts: &Facts) -> std::io::Result<Server> {
+async fn bind(
+    dashboard: &DashboardObserver,
+    facts: &Facts,
+    screen: Console,
+) -> std::io::Result<Server> {
     let status = StateTopic::new(StateLimits::default());
     status
         .publish(
@@ -112,11 +127,7 @@ async fn bind(dashboard: &DashboardObserver, facts: &Facts) -> std::io::Result<S
     super::page::compose(
         &inventory,
         dashboard.handle(),
-        vec![
-            Host::new(SANDBOXES[0])
-                .status(status)
-                .console(fictionet_demo::kit::preview::Console::new()),
-        ],
+        vec![Host::new(SANDBOXES[0]).status(status).console(screen)],
         facts.topics.clone(),
         true,
     )
@@ -584,7 +595,7 @@ mod tests {
             let fixture = Fixture::new(variant, mode).unwrap();
             let facts = fixture.facts.clone();
             let dashboard = DashboardObserver::new(DashboardOptions::demo());
-            let page = bind(&dashboard, &facts).await.unwrap();
+            let page = bind(&dashboard, &facts, Console::new()).await.unwrap();
             let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
                 dashboard.observer(),
                 facts.clone(),
@@ -817,7 +828,7 @@ mod tests {
         let fixture = Fixture::new(Variant::Normal, None).unwrap();
         let facts = fixture.facts.clone();
         let dashboard = DashboardObserver::new(DashboardOptions::demo());
-        let page = bind(&dashboard, &facts).await.unwrap();
+        let page = bind(&dashboard, &facts, Console::new()).await.unwrap();
         let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
         let reads = super::super::facts::PAGE_ROWS + 20;
         tokio::time::timeout(
