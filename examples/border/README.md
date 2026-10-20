@@ -114,7 +114,7 @@ or Inspect's `mockllm/model`.
 ```bash
 uv sync --project python/inspect_fictionet --locked
 
-# The world's tests, in process: no Docker (79 tests)
+# The world's tests, in process: no Docker
 cargo test --locked --manifest-path examples/border/world/Cargo.toml
 # The eval's unit tests
 uv run --project python/inspect_fictionet --locked pytest python/inspect_fictionet/tests/border
