@@ -206,7 +206,7 @@ def _inventory(web, queries):
     page_index = 0
     for search, engine in zip(searches, engines, strict=True):
         query = search["query"]
-        # The backend shares this normalized store key across search engines.
+        # The world shares this normalized store key (route::query_key) across search engines.
         key = ("search", " ".join(query.lower().split()))
         url = "https://www.google.com/search?q=" + quote_plus(query)
         for which in ("first", "second"):

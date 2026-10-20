@@ -381,16 +381,7 @@ two). `call_ms` is the accepted answer's call time alone, or null on failure.
 `cost_known` is the reported subtotal and `cost_unknown` counts attempts
 without a reported cost. `cost`, `input_tokens` and `output_tokens` are
 null if any included value is unknown. Attempt rows keep individual costs;
-their terminal `generation` object holds totals. The accounting functions
-(`inspect_fictionet.worlds.adaptive_web.accounting`) use
-these totals for generation statistics and count every attempt's cost once.
-They print a known subtotal, the number of unknown cost records, and a null
-recorded total if any cost is unknown. Cost means cover only fully known
-generation totals, with their denominator and unknown count shown. Token
-medians also state their measured denominator. Legacy rows are labelled:
-missing attempts and costs cannot be reconstructed from them. Their reported
-costs contribute to the known subtotal, but their generation cost and token
-totals remain unknown. Any legacy row makes the recorded cost total null.
+their terminal `generation` object holds totals.
 
 ## Speed and cost
 
@@ -405,10 +396,9 @@ an error kind; it does not classify every client error as a server failure.
 Generation percentiles cover the `generated` measured totals carried by
 HTTP responses, including failed generations. `generation_untimed` and
 `generation_failed` show the other counts in that population. The score
-does not include casts or prefetches absent from HTTP responses; the store
-reports include them. The accounting functions report timed, untimed and failed generation
-counts, and p50/p95 over timed generations. Each attempt's `ms` remains its
-individual HTTP call duration, excluding backoff.
+does not include casts or prefetches absent from HTTP responses;
+`generations.jsonl` records them. Each attempt's `ms` remains its individual
+HTTP call duration, excluding backoff.
 
 Four fast models, each making the result lists for the seeds' six queries
 and the twelve or so pages behind their first results, one at a time with no
@@ -687,7 +677,7 @@ examples/adaptive-web/
     tests/lab.rs            # the world and its budget without real I/O
     tests/model.rs          # the model client over HTTP
 python/inspect_fictionet/
-  src/inspect_fictionet/worlds/adaptive_web/  # task, scorer, accounting and realism judge
+  src/inspect_fictionet/worlds/adaptive_web/  # task, scorer, timing populations and realism judge
   tests/adaptive_web/                        # scorer tests and scripted probes
 ```
 
