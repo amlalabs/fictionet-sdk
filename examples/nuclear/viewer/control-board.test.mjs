@@ -5,7 +5,8 @@ import { registerHooks } from 'node:module';
 import * as THREE from '../../../observe/downloads/vendor/three/build/three.module.js';
 import { KNOBS, PALETTE_TOKENS } from './control-room.mjs';
 import { POINTS } from './instruments.mjs';
-import { BOARDS, BOARD, ROOM, STANDING_SPOTS, DEFAULT_VIEW, ANNUNCIATOR_WINDOWS, fitSpot, devicePlacements, boardPoint } from './board-layout.mjs';
+import { SITE_EPOCH_SECONDS, siteTime } from './desk-screens.mjs';
+import { BOARDS, BOARD, ROOM, STANDING_SPOTS, DEFAULT_VIEW, CCTV, ANNUNCIATOR_WINDOWS, fitSpot, devicePlacements, boardPoint } from './board-layout.mjs';
 
 // Only the graphics context and environment capture are replaced. Scene construction stays real.
 const lookURL = new URL('./look.mjs', import.meta.url).href;
@@ -92,10 +93,12 @@ function fixture(t, reducedMotion = () => true) {
     return target;
   };
   const makeElement = () => {
-    const ctx = { measureText: value => ({ width: value.length * 5 }),
+    const ctx = { calls: [], measureText: value => ({ width: value.length * 5 }),
       createRadialGradient: () => ({ addColorStop() {} }) };
     for (const name of ['drawImage', 'fillRect', 'clearRect', 'strokeRect', 'fillText', 'save', 'restore', 'translate', 'scale',
-      'beginPath', 'moveTo', 'lineTo', 'stroke']) ctx[name] = () => {};
+      'beginPath', 'moveTo', 'lineTo', 'stroke', 'closePath', 'fill', 'arc', 'roundRect', 'quadraticCurveTo']) {
+      ctx[name] = (...args) => ctx.calls.push({ name, args });
+    }
     return Object.assign(eventTarget(), {
       style: {}, dataset: {}, clientWidth: 785, clientHeight: 491,
       getContext: () => ctx, setAttribute() {}, append() {}, remove() {},
@@ -146,7 +149,7 @@ function fixture(t, reducedMotion = () => true) {
     },
   });
   const pairs = POINTS.map(point => ({ ...point, reported: point.range[0], trueValue: point.range[0], gap: 0 }));
-  const view = { pairs, alarms: [], telemetry: { quiet: false },
+  const view = { atMs: 1000, pairs, alarms: [], telemetry: { quiet: false },
     reportedStatus: { coolantPumpsRunning: [true, true], feedPumpsRunning: [true, true] } };
   const text = { plantTime: '0:01.0', telemetry: 'Telemetry live, heartbeat 1' };
   stage.update(view, text, []);
@@ -417,4 +420,126 @@ test('crossing fades in the new space while walking continues on the same camera
   assert.ok(camera.position.z > z);
   f.draw(90);
   assert.equal(canvas.style.opacity, '1');
+});
+
+
+test('the site clock matches the HMI default and advances only by plant time', () => {
+  const rust = readFileSync(new URL('../world/src/hmi.rs', import.meta.url), 'utf8');
+  const defaults = rust.match(/impl Default for Site \{([\s\S]*?)impl Site/)[1];
+  const epoch = Number(defaults.match(/epoch:\s*([\d_]+)/)[1].replaceAll('_', ''));
+  assert.equal(SITE_EPOCH_SECONDS, epoch);
+  assert.match(defaults, /zone: "GMT"/);
+  assert.match(defaults, /utc_offset_seconds: 0/);
+  assert.equal(siteTime(0), '2026-03-14 07:43:12 GMT');
+  assert.equal(siteTime(1000), '2026-03-14 07:43:13 GMT');
+  assert.equal(siteTime(86400000), '2026-03-15 07:43:12 GMT');
+  assert.equal(siteTime(-1), '2026-03-14 07:43:11 GMT');
+  assert.equal(siteTime(undefined), 'TIME UNAVAILABLE');
+});
+
+function displays(scene) {
+  const result = [];
+  scene.traverse(mesh => {
+    if (mesh.isMesh && mesh.material.emissiveMap?.isCanvasTexture) result.push(mesh);
+  });
+  return result;
+}
+
+function paintedText(mesh) {
+  return mesh.material.map.image.getContext('2d').calls.filter(call => call.name === 'fillText').map(call => call.args[0]);
+}
+
+test('desk screens use all four layouts, reported values and throttled display signatures', t => {
+  const f = fixture(t);
+  const desks = displays(f.renderer.frames.at(-1).scene).filter(mesh => mesh.material.map.image.width === 1024);
+  assert.equal(desks.length, 4);
+  const titles = ['HMI01 · PRIMARY OVERVIEW', 'HMI01 · ALARMS 1/2', 'HMI01 · SECONDARY OVERVIEW', 'HMI01 · ALARMS 2/2'];
+  desks.forEach((mesh, i) => {
+    assert.ok(paintedText(mesh).includes(titles[i]));
+    assert.equal(mesh.material.isMeshStandardMaterial, true);
+    const bounds = new THREE.Box3().setFromObject(mesh);
+    const center = bounds.getCenter(new THREE.Vector3());
+    assert.ok(Math.abs(center.x - [-2.16, -1.14, 1.14, 2.16][i]) < 0.001);
+  });
+  const versions = () => desks.map(mesh => mesh.material.map.version);
+  const initial = versions();
+  const hot = f.view.pairs.find(pair => pair.key === 'hot_leg:b');
+  hot.reported = 323.6;
+  hot.trueValue = 330;
+  f.stage.update(f.view, f.text, []);
+  f.draw(100);
+  assert.deepEqual(versions(), initial);
+  f.stage.update(f.view, f.text, []);
+  f.draw(900);
+  assert.deepEqual(versions(), initial.map((version, i) => version + Number(i === 0)));
+  assert.ok(paintedText(desks[0]).includes('323.6 C'));
+  assert.ok(!paintedText(desks[0]).includes('330.0 C'));
+  const updated = versions();
+  hot.trueValue = 400;
+  f.view.atMs += 1000;
+  f.stage.update(f.view, f.text, []);
+  f.draw(1000);
+  assert.deepEqual(versions(), updated);
+  f.view.alarms = [{ key: 'reactor_tripped', state: 'active' }];
+  f.stage.update(f.view, f.text, []);
+  f.draw(1000);
+  assert.ok(paintedText(desks[3]).includes('Active'));
+  assert.equal(versions()[3], updated[3] + 1);
+});
+
+test('the monitor bank frames the main feed and keeps its caption on plant time', t => {
+  const f = fixture(t);
+  const room = f.renderer.frames.at(-1).scene;
+  const bank = displays(room).find(mesh => mesh.material.map.image.width === 1030);
+  assert.ok(bank);
+  assert.equal(bank.material.isMeshStandardMaterial, true);
+  assert.ok(paintedText(bank).includes('NO SIGNAL'));
+  assert.ok(paintedText(bank).includes('CAM 03 CONTAINMENT · 2026-03-14 07:43:13 GMT'));
+  const shader = { uniforms: {}, fragmentShader: THREE.ShaderLib.standard.fragmentShader };
+  bank.material.onBeforeCompile(shader);
+  assert.equal(shader.uniforms.containmentFeed.value.isRenderTargetTexture, true);
+  assert.match(shader.fragmentShader, /diffuseColor \*= monitorBank\(map, vMapUv\)/);
+  assert.match(shader.fragmentShader, /totalEmissiveRadiance \*= monitorBank/);
+  const texture = bank.material.map;
+  const version = texture.version;
+  f.stage.update(f.view, f.text, []);
+  f.draw(1000);
+  assert.equal(texture.version, version);
+  const feedFrames = () => f.renderer.frames.filter(frame => frame.camera !== f.renderer.frames.at(-1).camera).length;
+  const before = feedFrames();
+  f.view.atMs = 61000;
+  f.stage.update(f.view, f.text, []);
+  f.draw(100);
+  assert.equal(feedFrames(), before);
+  assert.equal(texture.version, version);
+  f.stage.update(f.view, f.text, []);
+  f.draw(100);
+  assert.equal(feedFrames(), before + 1);
+  assert.ok(paintedText(bank).includes('CAM 03 CONTAINMENT · 2026-03-14 07:44:13 GMT'));
+  for (const [width, height] of [[785, 491], [692, 433]]) {
+    f.container.clientWidth = width;
+    f.container.clientHeight = height;
+    f.resize();
+    f.stage.setView('cctv');
+    f.draw();
+    const { camera } = f.renderer.frames.at(-1);
+    const corners = [];
+    for (const z of [-CCTV.width / 2, CCTV.width / 2]) {
+      for (const y of [-CCTV.height / 2, CCTV.height / 2]) {
+        corners.push(new THREE.Vector3(CCTV.x + 0.06, CCTV.y + y, CCTV.z + z).project(camera));
+      }
+    }
+    assert.ok(corners.every(p => Math.abs(p.x) < 0.92 && Math.abs(p.y) < 0.92 && p.z < 1));
+    const share = (Math.max(...corners.map(p => p.x)) - Math.min(...corners.map(p => p.x))) / 2;
+    assert.ok(share >= 0.68 && share <= 0.72, String(share));
+    const bounds = new THREE.Box3().setFromObject(bank);
+    assert.ok(Math.abs(bounds.max.z - bounds.min.z - CCTV.bankWidth) < 0.001);
+    for (const y of [bounds.min.y, bounds.max.y]) {
+      for (const z of [bounds.min.z, bounds.max.z]) {
+        const p = new THREE.Vector3(bounds.max.x, y, z).project(camera);
+        assert.ok(Math.abs(p.x) < 1 && Math.abs(p.y) < 1);
+      }
+    }
+    t.diagnostic(`${width} by ${height}: main CCTV width ${(share * 100).toFixed(2)}%, ${(share * width).toFixed(1)} px.`);
+  }
 });

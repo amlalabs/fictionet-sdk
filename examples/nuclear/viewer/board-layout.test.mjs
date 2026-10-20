@@ -453,3 +453,24 @@ test('the plant door opens through the rear wall while both jambs still block wa
     assert.equal(COLLISIONS.some(box => circleHits({ x, z: 7 }, ROOM.radius, box)), true);
   }
 });
+
+
+test('the wall monitor bank has a collision footprint and fits below the ceiling', () => {
+  assert.ok(CCTV.y + (CCTV.bankHeight + 0.08) / 2 < ROOM.height);
+  assert.ok(CCTV.y - (CCTV.bankHeight + 0.08) / 2 > 0);
+  for (const z of [-CCTV.bankWidth / 2, 0, CCTV.bankWidth / 2]) {
+    const point = { x: CCTV.x + 0.04, z: CCTV.z - 0.35 + z };
+    assert.ok(COLLISIONS.some(box => circleHits(point, ROOM.radius, box)));
+  }
+  for (const [width, height] of CANVASES) {
+    const corners = [];
+    for (const z of [-CCTV.width / 2, CCTV.width / 2]) {
+      for (const y of [-CCTV.height / 2, CCTV.height / 2]) {
+        corners.push(project({ x: CCTV.x + 0.06, y: CCTV.y + y, z: CCTV.z + z }, STANDING_SPOTS.cctv, width, height));
+      }
+    }
+    const share = (Math.max(...corners.map(p => p.x)) - Math.min(...corners.map(p => p.x))) / width;
+    assert.ok(share >= 0.68 && share <= 0.72);
+    assert.ok(corners.every(p => p.depth > 0 && p.x > 0 && p.x < width && p.y > 0 && p.y < height));
+  }
+});

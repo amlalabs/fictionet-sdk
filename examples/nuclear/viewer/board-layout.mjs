@@ -58,7 +58,7 @@ export const DESKS = Object.freeze([
 ]);
 // Chairs are parked behind the standing operator, clear of the view into the U.
 export const CHAIRS = Object.freeze([{ x: -2.8, z: 5.2 }, { x: 2.8, z: 5.2 }, { x: 0, z: 6.55 }]);
-export const CCTV = Object.freeze({ x: -6.86, y: 2.1, z: 3.1, width: 1.6, height: 0.9 });
+export const CCTV = Object.freeze({ x: -6.86, y: 1.65, z: 3.1, width: 4.15, height: 4.15 * 9 / 16, bankWidth: 5.05, bankHeight: 4.15 * 9 / 16 + 0.2 });
 export const DOOR = Object.freeze({ x: 4.5, z: 6.87, width: 1.25, height: 2.3 });
 
 export function boardPoint(board, x, y, z) {
@@ -105,7 +105,7 @@ export function fitSpot(segment, aspect, fov = ROOM.fov) {
 export const STANDING_SPOTS = Object.freeze({
   'control-room': { name: 'Control room', x: 0, z: 4.89, yaw: 0, pitch: -0.13, fov: 50.1 },
   ...Object.fromEntries(BOARDS.map(b => [b.view, { ...fitSpot(b, 16 / 10), fov: ROOM.fov }])),
-  cctv: { name: 'CCTV monitor', x: -4.1, z: 3.1, yaw: Math.PI / 2, pitch: 0.05, fov: ROOM.fov },
+  cctv: { name: 'CCTV monitor', x: -4.42, z: 3.1, yaw: Math.PI / 2, pitch: 0, fov: ROOM.fov },
   door: { name: 'Door to the plant', x: 4.5, z: 3.9, yaw: Math.PI, pitch: 0.02, fov: ROOM.fov },
 });
 
@@ -143,6 +143,7 @@ export const COLLISIONS = Object.freeze([
     const s = Math.abs(Math.sin(b.yaw));
     return box(p.x, p.z, c * 0.2 + s * (BOARD.deskDepth + 0.2), s * 0.2 + c * (BOARD.deskDepth + 0.2));
   })),
+  box(CCTV.x - 0.01, CCTV.z - 0.35, 0.12, CCTV.bankWidth + 0.08),
   ...DESKS.map(d => box(d.x, d.z, d.w, d.d)),
   ...CHAIRS.map(c => box(c.x, c.z, 0.6, 0.6)),
 ]);

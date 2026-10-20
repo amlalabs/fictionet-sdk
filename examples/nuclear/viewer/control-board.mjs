@@ -1,7 +1,7 @@
 // One stage owns the renderer, the room camera, and the live containment feed.
 import * as THREE from '/vendor/three/build/three.module.js';
 import { KNOBS } from './control-room.mjs';
-import { formatValue } from './instruments.mjs';
+import { paintDeskScreen, signature, siteTime } from './desk-screens.mjs';
 import { createMeters, paintLetters } from './meters.mjs';
 import { ROOM, FLOOR, CEILING_LIGHTS, DEFAULT_VIEW, BOARD, BOARDS, BOARD_PX, DESKS, CHAIRS, CCTV, DOOR, DOORWAYS, COLLISIONS, STANDING_SPOTS,
   boardPoint, boardLayout, windowState, devicePlacements, fitSpot, deskOutline, mimicLines } from './board-layout.mjs';
@@ -182,19 +182,77 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   ]) instance(unitBox, mat, CHAIRS.map(c => ({ position: [c.x, y, c.z + dz], scale: size })));
   const signs = [
     { text: 'TO PLANT SPACES', face: paintedFace(1.5, 0.22, staticRoom, [DOOR.x, 2.6, DOOR.z - 0.02], Math.PI, 768, 112) },
-    { text: 'CONTAINMENT CAMERA', face: paintedFace(1.7, 0.22, staticRoom, [CCTV.x + 0.02, CCTV.y + 0.66, CCTV.z], Math.PI / 2, 768, 112) },
     { text: 'SHIFT SUPERVISOR', face: paintedFace(1.6, 0.18, staticRoom, [0, 0.62, 6.26], 0, 768, 112) },
   ];
   const plant = createPlantScene({ theme, reducedMotion, environment: environment.texture, anisotropy: Math.min(4, renderer.capabilities.getMaxAnisotropy()) });
   const cctvTarget = track(new THREE.WebGLRenderTarget(480, 270, { type: THREE.HalfFloatType }));
   track(cctvTarget.texture);
   cctvTarget.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  const bankCanvas = document.createElement('canvas');
+  bankCanvas.width = 1030;
+  bankCanvas.height = 507;
+  const bankTexture = track(new THREE.CanvasTexture(bankCanvas));
+  bankTexture.colorSpace = THREE.SRGBColorSpace;
   const cctvMat = track(createMaterial(THREE, theme, 'paintedSteel', 'lightKey', {
-    map: cctvTarget.texture, emissiveMap: cctvTarget.texture, emissive: theme.lightKey, emissiveIntensity: 0.8,
+    map: bankTexture, emissiveMap: bankTexture, emissive: theme.lightKey, emissiveIntensity: 0.8,
   }));
-  block(staticRoom, [0.12, CCTV.height + 0.16, CCTV.width + 0.16], [CCTV.x - 0.01, CCTV.y, CCTV.z], material.ink);
-  const cctvScreen = new THREE.Mesh(track(new THREE.PlaneGeometry(CCTV.width, CCTV.height)), cctvMat);
-  cctvScreen.rotation.y = Math.PI / 2; cctvScreen.position.set(CCTV.x + 0.06, CCTV.y, CCTV.z); staticRoom.add(cctvScreen);
+  // Composite the feed and painted frame in the existing display's standard material.
+  cctvMat.onBeforeCompile = shader => {
+    shader.uniforms.containmentFeed = { value: cctvTarget.texture };
+    shader.fragmentShader = `
+      uniform sampler2D containmentFeed;
+      vec4 monitorBank(sampler2D overlay, vec2 uv) {
+        vec4 card = texture2D(overlay, uv);
+        vec2 feedUv = (uv * vec2(${CCTV.bankWidth}, ${CCTV.bankHeight}) - vec2(0.1))
+          / vec2(${CCTV.width}, ${CCTV.height});
+        vec4 feed = texture2D(containmentFeed, feedUv);
+        return vec4(mix(feed.rgb, card.rgb, card.a), 1.0);
+      }
+    ` + shader.fragmentShader;
+    shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>',
+      'diffuseColor *= monitorBank(map, vMapUv);');
+    shader.fragmentShader = shader.fragmentShader.replace('#include <emissivemap_fragment>',
+      'totalEmissiveRadiance *= monitorBank(emissiveMap, vEmissiveMapUv).rgb;');
+  };
+  const bankCase = new THREE.Mesh(unitBox, material.ink);
+  bankCase.scale.set(0.12, CCTV.bankHeight + 0.08, CCTV.bankWidth + 0.08);
+  bankCase.position.set(CCTV.x - 0.01, CCTV.y, CCTV.z - 0.35);
+  staticRoom.add(bankCase);
+  const cctvScreen = new THREE.Mesh(track(new THREE.PlaneGeometry(CCTV.bankWidth, CCTV.bankHeight)), cctvMat);
+  cctvScreen.rotation.y = Math.PI / 2;
+  cctvScreen.position.set(CCTV.x + 0.06, CCTV.y, CCTV.z - 0.35);
+  staticRoom.add(cctvScreen);
+  let captionSignature = '';
+  function paintCctv() {
+    const caption = `CAM 03 CONTAINMENT · ${siteTime(view?.atMs)}`;
+    const next = JSON.stringify([caption, palette]);
+    if (next === captionSignature) return;
+    captionSignature = next;
+    const ctx = bankCanvas.getContext('2d');
+    const scale = bankCanvas.width / CCTV.bankWidth;
+    const heightScale = bankCanvas.height / CCTV.bankHeight;
+    const left = 0.1 * scale;
+    const top = 0.1 * heightScale;
+    const width = CCTV.width * scale;
+    const height = CCTV.height * heightScale;
+    ctx.fillStyle = palette.steel;
+    ctx.fillRect(0, 0, bankCanvas.width, bankCanvas.height);
+    ctx.fillStyle = palette.rubber;
+    ctx.fillRect(left - 5, top - 5, width + 10, height + 10);
+    ctx.clearRect(left, top, width, height);
+    ctx.fillRect(left, top, width, 34);
+    ctx.fillStyle = palette.lightKey;
+    ctx.font = '20px monospace';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(caption, left + 12, top + 17);
+    const side = (CCTV.width + 0.22) * scale;
+    ctx.fillStyle = palette.rubber;
+    ctx.fillRect(side, 205, 120, 86);
+    ctx.fillStyle = palette.lightKey;
+    ctx.font = '16px monospace';
+    ctx.fillText('NO SIGNAL', side + 16, 248);
+    bankTexture.needsUpdate = true;
+  }
   mergeStatic(staticRoom, { add: track });
   staticRoom.traverse(mesh => {
     if (mesh.isMesh && !mesh.material.emissiveMap) bakeRoomGeometry(THREE, mesh);
@@ -395,7 +453,10 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     if (isPlant() || now - lastCctv >= 200) {
       plantMoving = plant.advance(Math.min(0.25, (now - lastPlant) / 1000)); lastPlant = now;
       if (!isPlant()) {
-        renderer.setRenderTarget(cctvTarget); render(plant.scene, plant.cctvCamera); renderer.setRenderTarget(null);
+        paintCctv();
+        renderer.setRenderTarget(cctvTarget);
+        render(plant.scene, plant.cctvCamera);
+        renderer.setRenderTarget(null);
         lastCctv = now;
       }
       plantDirty = false;
@@ -489,21 +550,18 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   }
   function paintScreens(now) {
     if (!view) return;
+    const layouts = ['primary', 'alarms-primary', 'secondary', 'alarms-secondary'];
     screens.forEach((screen, i) => {
-      const points = view.pairs.filter((_, index) => index % 4 === i);
-      const rs = view.reportedStatus;
-      const lines = [view.telemetry.quiet ? 'TELEMETRY QUIET · HELD' : 'REPORTED PLANT MIMIC',
-        ...points.map(p => `${p.label}  ${formatValue(p.reported, p.unit)}`),
-        ...rs.coolantPumpsRunning.map((on, j) => `Coolant pump ${j ? 'B' : 'A'}: ${on ? 'running' : 'stopped'}`),
-        ...rs.feedPumpsRunning.map((on, j) => `Feed pump ${j ? 'B' : 'A'}: ${on ? 'running' : 'stopped'}`),
-        `Reactor: ${rs.reactorTripped ? 'TRIPPED' : 'not tripped'} · Turbine: ${rs.turbineTripped ? 'TRIPPED' : 'not tripped'}`];
-      const signature = lines.join('\n'); screen.pending = signature !== screen.signature;
+      const layout = layouts[i];
+      const next = signature(view, layout);
+      screen.pending = next !== screen.signature;
       if (!screen.pending || now - screen.lastPaint < 1000) return;
-      screen.signature = signature; screen.pending = false; screen.lastPaint = now;
-      const ctx = screen.canvas.getContext('2d'); ctx.fillStyle = palette.surface; ctx.fillRect(0, 0, 1024, 512);
-      // A simple process line connects the reported points and equipment states.
-      ctx.strokeStyle = palette.strongLine; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(18, 58); ctx.lineTo(18, 480); ctx.stroke();
-      lines.forEach((line, j) => paintText(ctx, line, { x: 32, y: 6 + j * 39, w: 970, h: 38, font: 26 }, palette.ink, 'left'));
+      screen.signature = next;
+      screen.pending = false;
+      screen.lastPaint = now;
+      paintDeskScreen(screen.canvas.getContext('2d'), {
+        width: screen.canvas.width, height: screen.canvas.height, view, palette, layout,
+      });
       screen.texture.needsUpdate = true;
     });
   }

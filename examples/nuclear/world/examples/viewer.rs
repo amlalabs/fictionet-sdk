@@ -34,6 +34,7 @@ const CSS: &str = "text/css; charset=utf-8";
 
 const CONTROL_ROOM: &str = include_str!("../../viewer/control-room.mjs");
 const CONTROL_BOARD: &str = include_str!("../../viewer/control-board.mjs");
+const DESK_SCREENS: &str = include_str!("../../viewer/desk-screens.mjs");
 const BOARD_LAYOUT: &str = include_str!("../../viewer/board-layout.mjs");
 const ROOM_MOTION: &str = include_str!("../../viewer/room-motion.mjs");
 const LOOK: &str = include_str!("../../viewer/look.mjs");
@@ -115,6 +116,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         )
         .asset("nuclear/control-room.mjs", JS, CONTROL_ROOM)
         .asset("nuclear/control-board.mjs", JS, CONTROL_BOARD)
+        .asset("nuclear/desk-screens.mjs", JS, DESK_SCREENS)
         .asset("nuclear/board-layout.mjs", JS, BOARD_LAYOUT)
         .asset("nuclear/room-motion.mjs", JS, ROOM_MOTION)
         .asset("nuclear/look.mjs", JS, LOOK)
