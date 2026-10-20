@@ -232,7 +232,7 @@ struct Trace {
 fn replay() -> Trace {
     let trace: Arc<Mutex<Trace>> = Arc::default();
     let packets = trace.clone();
-    let log = Arc::new(fictionet::events::Memory::default());
+    let log = Arc::new(fictionet_observe::Memory::default());
     let writer = log.clone();
     fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(71)).observer(writer.clone()), move |cx| async move {
         let evidence = writer;
@@ -354,7 +354,7 @@ mod clients {
         dir: PathBuf,
         stop: Option<fictionet::End>,
         thread: Option<std::thread::JoinHandle<()>>,
-        events: Arc<fictionet::events::Memory>,
+        events: Arc<fictionet_observe::Memory>,
     }
 
     impl World {
@@ -365,7 +365,7 @@ mod clients {
             let dir = fictionet_test_support::temp::dir();
             let ca_path = dir.join("ca.pem");
             let (stop, mut stopped) = fictionet::pair();
-            let events: Arc<fictionet::events::Memory> = Arc::default();
+            let events: Arc<fictionet_observe::Memory> = Arc::default();
             let observed = events.clone();
             let (ready, started) = std::sync::mpsc::channel();
             let thread = std::thread::spawn(move || {
@@ -1402,7 +1402,7 @@ fn deferred_response_budget_refusal_preserves_other_streams() {
 fn observation_does_not_change_http2_streams() {
     let run = |observed| {
         let heads = Arc::new(crate::common::http_observer::CountHeads::default());
-        let memory = Arc::new(fictionet::events::Memory::default());
+        let memory = Arc::new(fictionet_observe::Memory::default());
         let router = Router::new().post("/", move |_, request| {
             assert_eq!(
                 request.extensions().get::<httpd::EventInterest>().is_some(),

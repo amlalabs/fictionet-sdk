@@ -68,9 +68,13 @@
 //!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every random
 //!    number drawn through `Cx` comes from `seed`;
 //!    [`Seed::random`](crate::Seed::random) picks a fresh one.
-//!    Pass [`RunOptions`](crate::RunOptions) to install observers before execution.
-//!    `run` and `lab` emit `run.start` once at zero to interested observers;
-//!    without an observer they construct and retain no events. Every task the world starts
+//!    Pass [`RunOptions`](crate::RunOptions) to install one observer before execution.
+//!    It receives events, packets, TLS keys and topology according to interest.
+//!    Use [`Fanout`](crate::events::Fanout) to combine consumers from
+//!    [Fictionet Observe](../../../fictionet_observe/index.html).
+//!    `run` and `lab` emit `run.start` once at zero when interested.
+//!    Without an observer, observation allocates nothing, reads no clock,
+//!    increments no sequence and registers no links. Every task the world starts
 //!    with [`Cx::spawn`](crate::Cx::spawn), and every stdlib task, is polled
 //!    inside this same future.
 //! 4. **[`block_on`](crate::block_on)** polls the future on the current
@@ -332,7 +336,7 @@
 //! - **A lab run is closed.** The test plays the sandboxes through
 //!   [`attachments`](crate::attachments), as above, and fakes play other
 //!   services. Attachments that a [`listen`](crate::listen) socket feeds,
-//!   observer sessions, `web::proxy` and `web::forward` refuse to work in a
+//!   `web::proxy` and `web::forward` refuse to work in a
 //!   lab. Fictionet cannot stop world code from using `std::net`, tokio timers
 //!   or other real I/O, so keeping the rest of a lab world closed is up to its author.
 //! - **The test runs inside the lab too.** The code that plays the
@@ -341,9 +345,11 @@
 //! - **Nothing waits forever.** A lab whose tasks all wait with no deadline
 //!   ends with an error that says so.
 //!
-//! With those conditions, a lab run with fixed observers repeats its observed
-//! events, including timestamps, and its packets byte for byte, subject to the HTTP/2
-//! exception below. The seed alone is not enough. Keep the world code,
+//! With those conditions, a lab run with fixed interests and limits repeats
+//! all four observation streams with the same stamps and packet bytes.
+//! Synchronous `fictionet_observe::Memory` keeps events for grading.
+//! Interactive capture and worker queue overflow depend on external scheduling.
+//! The seed alone is not enough. Keep the world code,
 //! configuration and ordered inputs fixed. Use `Cx` for time, randomness
 //! and task scheduling. Do not let host clocks, OS entropy, external I/O,
 //! independently scheduled tasks or unordered collection iteration decide
@@ -351,11 +357,9 @@
 //! fixed certificates and the [`tls`](crate::stdlib::services::tls) provider, whose
 //! key exchange and signatures draw from the run's seed.
 //!
-//! **HTTP/2 has a host-clock exception.** The h2 dependency forgets an
-//! HTTP/2 stream that the world reset after one second of real time (see
-//! [`httpd`](crate::stdlib::web::httpd)). That expiry does not follow lab time,
-//! so runs whose behavior depends on it do not have an exact replay
-//! guarantee.
+//! Native HTTP/2 reset expiry follows the run's clock. Opt-in axum upgrades
+//! use hyper; its internal time does not follow lab time. See
+//! [`httpd`](crate::stdlib::web::httpd) for the server's runtime boundaries.
 //!
 //! A real run with the same seed makes the same random choices for the
 //! same inputs in the same order. But real sandboxes decide when packets

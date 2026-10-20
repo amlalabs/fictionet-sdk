@@ -747,3 +747,27 @@ fn a_listened_hub_is_refused_by_a_lab_before_handing_out_an_attachment() {
     drop(listening);
     drop(sandbox);
 }
+
+#[test]
+fn observation_hellos_are_unknown_attach_types() {
+    let path = socket_path("unknown-type");
+    let (_listening, _attachments) =
+        fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))
+            .unwrap();
+    for kind in ["observe", "observe2"] {
+        let client = Client::connect(&path);
+        client.send(&Message::Hello(Hello {
+            version: relay::VERSION,
+            mtu: 0,
+            kind: kind.into(),
+            name: "agent".into(),
+        }));
+        let reply = client.recv().unwrap();
+        assert_eq!(
+            relay::decode(&reply),
+            Ok(Message::Refuse(format!("unknown attach type {kind}")))
+        );
+        assert!(client.recv().is_none());
+    }
+    drop(Client::attach(&path, "agent"));
+}

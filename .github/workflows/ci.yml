@@ -58,6 +58,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - name: Download the pinned browser libraries
+        if: matrix.args == '--workspace --all-features'
+        run: cargo xtask demo libraries
       - name: Build tests, examples and benchmarks
         run: cargo test --locked --all-targets --no-run ${{ matrix.args }}
       - name: Use the runner's Chrome for the dashboard regression

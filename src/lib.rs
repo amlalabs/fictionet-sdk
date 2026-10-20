@@ -16,19 +16,22 @@
 //! built from, with commands to run: a delayed website, a slow or lossy link, a
 //! packet capture and a route that changes mid-run.
 //!
-//! A world's time and randomness come from one place, its [`Cx`], and its
-//! randomness from a seed. With real sandboxes it runs on real time ([`run`]).
+//! A world's time and randomness come from its [`Cx`]. Randomness starts
+//! from a seed. With real sandboxes it runs on real time ([`run`]).
 //! In a test it runs on simulated time ([`lab`]), where the same seed and
-//! ordered inputs and observer configuration give the same observed events and
-//! packets when the world is closed.
+//! ordered inputs, interests and limits give the same observations and stamps.
 //! [Repeatable runs](guide::running#repeatable-runs) lists the requirements and
-//! the HTTP/2 host-clock exception. [`running`](guide::running) is the guide;
-//! [`run`], [`lab`] and [`Cx`] document the runtime operations, and [`events`]
-//! documents lazy emission and optional retention. Integrators install observers
-//! through [`RunOptions`]: [`events::Memory`], native `fictionet_observe::Jsonl`, [`events::Aggregate`],
-//! dashboard retention, or their own. With none, an interest check skips event
-//! construction and recording.
-//! `run.start` emits the seed automatically to interested observers.
+//! runtime boundaries. [`running`](guide::running) is the guide;
+//! [`run`], [`lab`] and [`Cx`] document runtime operations.
+//!
+//! Core produces four typed streams: events, packets, TLS keys and topology.
+//! The integrator installs one observer in [`RunOptions`]. [`events`] defines
+//! the contract. [Fictionet Observe](../fictionet_observe/index.html) consumes
+//! these streams: `Memory` and `Aggregate` for grading, `Jsonl` for files,
+//! `Collector` for bounded collection, and `DashboardObserver` for clients.
+//! With no observer, observation allocates nothing, reads no clock, increments
+//! no sequence and registers no links. `run.start` emits the seed to
+//! interested observers. Core retains no observation history.
 //!
 //! # How a sandbox connects to a world
 //!
@@ -178,9 +181,9 @@
 //!   network around the [`Host`](stdlib::world::net::Host)s it is given: the
 //!   sandboxes' subnet with DHCP, DNS for every host's names, a router, one
 //!   machine per address, and each host's services on their ports.
-//! - [`events`]: structured facts emitted lazily to installed observers, such as
-//!   bounded memory for grading, a JSON Lines exporter or dashboard retention.
-//!   Optional aggregation summarizes repeated network facts.
+//! - [`events`]: structured facts emitted lazily to the run's observer.
+//!   The companion's `Memory`, `Aggregate` and `Jsonl` retain, summarize
+//!   and export them. See [Fictionet Observe](../fictionet_observe/index.html).
 //!
 //! HTTP is a service too ([`stdlib::web::httpd`]): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
@@ -240,18 +243,23 @@
 //! HTTP has a ready server, [`stdlib::world::net::Net`] serves DNS and DHCP, and
 //! TLS is built in. For other protocols, a world writes a
 //! [`Service`](stdlib::services::serve::Service) around the module's decoder.
-//! The codecs also work in unit tests, fuzz targets and dashboard presenters.
+//! The codecs also work in unit tests and fuzz targets. The companion's
+//! `Present` adapters use them to decode captured traffic for the dashboard.
 //! See [Changing a protocol by copying it](stdlib#changing-a-protocol-by-copying-it).
 //!
 //! # Watching a world
 //!
-//! Services emit [`events`] to observers explicitly installed by the integrator.
-//! Dashboard history requires [`RunOptions::event_history`] before execution;
-//! late viewers see only retained evidence. The world itself can be watched
-//! while it runs ([`observe`]):
-//! `fictionet dashboard` draws its tasks and links and decodes the packets
-//! that cross them, HTTPS included, and `fictionet observe` prints the
-//! graph, its changes and the world's events as lines of JSON for scripts.
+//! Install `fictionet_observe::DashboardObserver` in [`RunOptions`] before
+//! execution. It consumes all four streams and owns their bounded retention.
+//! Serve its handle on a private observation socket for `fictionet dashboard`
+//! and `fictionet observe`, using `--observation unix:PATH`. The attachment
+//! socket carries sandbox traffic. Late clients see retained history.
+//!
+//! The dashboard draws tasks and groups with host context from topology and
+//! decodes captured packets. It can decrypt TLS 1.3 when instrumented endpoints
+//! emit the needed keys. `fictionet observe` prints JSON replies and streams,
+//! or exports packets and keys. The [companion crate](../fictionet_observe/index.html)
+//! covers installation, sign-in, capture limits and the observation protocol.
 //!
 //! # Where to go next
 //!
@@ -267,8 +275,9 @@
 //!    services in a few lines. [`stdlib::web`] does the same for websites.
 //! 6. [`recipes`](guide::recipes): a delayed website, a slow or lossy link, a
 //!    packet capture, and a route that changes mid-run.
-//! 7. [`observe`]: watching a running world, in the dashboard or from a
-//!    shell, and sending your own events from world code.
+//! 7. [Fictionet Observe](../fictionet_observe/index.html): collection, grading,
+//!    files, the dashboard and the observation protocol. [`events`] covers
+//!    producing observations from world code.
 //! 8. [`proto`](guide::proto): the protocol between attach and a world, if you
 //!    want to write your own attach.
 //! 9. [`roadmap`](guide::roadmap): what is planned, such as attaching remote
@@ -278,12 +287,12 @@
 //!
 //! | Feature | What it gates | Implies | Default |
 //! |---|---|---|---|
-//! | `std` | Real clocks, OS entropy, world sockets, event files, timer threads, relay, and native HTTP/1 and HTTP/2 servers | — | Yes |
+//! | `std` | Real clocks, OS entropy, real-time timers, HTTP/1 and HTTP/2 servers; world sockets and relay on native targets | — | Yes |
 //! | `tokio` | Tokio adapters and axum upgrades | `std` | No |
-//! | `observe` | Observer sessions, TLS key capture, and built-in protocol presenters | `std` | Yes |
 //! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `std` | No |
 //!
-//! The default features build without tokio, hyper or h2.
+//! The default features build without tokio, hyper or h2. File export belongs
+//! to the companion's `native` feature, not core's `std` feature.
 //! Disabling default features leaves the simulated-time executor, seeded
 //! randomness, packet links, and protocol codecs. The crate still links
 //! the Rust standard library; this is not a `no_std` build. Mutexes use a
@@ -298,11 +307,12 @@
 //! [`Cx`] and its timers, [`block_on`], [`pair`], [`attachments`], the
 //! [`stdlib`] with smoltcp, DNS, `web::Sites` and TLS (rustls with the
 //! run-aware provider and ring, whose C code needs a clang with the wasm32
-//! target). The page plays the sandboxes through [`Attacher::attach`],
+//! target). All four observation streams are available, and the companion's
+//! base collectors build for wasm too. The page plays the sandboxes through [`Attacher::attach`],
 //! whose [`End`] carries raw IP packets.
 //!
 //! What needs an operating system is left out of that build: [`listen`],
-//! [`WorldSocket`] and observer sessions. The clocks come from `performance.now()` and
+//! [`WorldSocket`]. The clocks come from `performance.now()` and
 //! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
 //! from `setTimeout`. In a page, hand [`run`] to the event loop with
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
@@ -313,18 +323,10 @@
 
 #![warn(missing_docs)]
 #![cfg_attr(
-    not(all(
-        feature = "std",
-        feature = "tokio",
-        feature = "observe",
-        feature = "web-proxy"
-    )),
+    not(all(feature = "std", feature = "tokio", feature = "web-proxy")),
     allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// A browser build leaves out the observer sessions, which are what reads
-// the watches, taps and packet decoding. That code stays in, unused there.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 // Protocol files use the same imports here and when copied into a user crate.
 extern crate self as fictionet;
@@ -344,22 +346,22 @@ pub mod guide;
 mod interface;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 mod listen;
-pub mod observe;
 mod packet_queue;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub mod relay;
 pub use entropy::{Entropy, Seed, SeededEntropy};
+mod group;
+mod link;
 mod run;
 pub mod stdlib;
 pub mod sync;
 mod sys;
-mod telemetry;
 pub mod time;
 mod timer;
+mod tls_keys;
 #[cfg(feature = "tokio")]
 pub mod tokio;
-mod watch;
 
 /// The extension traits. Import this to call methods such as
 /// [`recv`](InterfaceExt::recv) and [`read`](stdlib::network::ConnectionExt::read).
@@ -437,27 +439,6 @@ macro_rules! cfg_std {
 #[cfg(not(feature = "std"))]
 #[macro_export]
 macro_rules! cfg_std {
-    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
-    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
-    ($($enabled:tt)*) => {};
-}
-
-/// Includes tokens when the SDK's `observe` feature is enabled.
-///
-/// An optional `else` block supplies the tokens for builds without the
-/// feature. Prefix the branches with `items` to select item definitions.
-#[cfg(feature = "observe")]
-#[macro_export]
-macro_rules! cfg_observe {
-    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($enabled)* };
-    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($enabled)* }};
-    ($($enabled:tt)*) => { $($enabled)* };
-}
-
-/// Includes tokens selected by the SDK's `observe` feature.
-#[cfg(not(feature = "observe"))]
-#[macro_export]
-macro_rules! cfg_observe {
     (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
     ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
     ($($enabled:tt)*) => {};

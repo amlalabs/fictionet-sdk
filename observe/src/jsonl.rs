@@ -8,14 +8,15 @@ use std::thread::JoinHandle;
 use fictionet::stdlib::codec::Wire;
 use fictionet::sync::Mutex;
 
-use fictionet::events::{Event, Limits, Observation, Observer, Stamp};
+use crate::Limits;
+use fictionet::events::{Event, Observation, Observer, Stamp};
 
 /// A bounded native JSON Lines exporter.
 ///
 /// The run only enqueues owned events. Serialization and writes happen on a
 /// worker thread. A full queue counts loss without waiting. Call [`Self::finish`]
 /// outside the run to drain output and report loss or writer errors. Worker
-/// scheduling can affect overflow, so use [`fictionet::events::Memory`] for repeatable lab output.
+/// scheduling can affect overflow, so use [`crate::Memory`] for repeatable lab output.
 pub struct Jsonl {
     sender: Mutex<Option<SyncSender<Event>>>,
     worker: Mutex<Option<JoinHandle<io::Result<()>>>>,

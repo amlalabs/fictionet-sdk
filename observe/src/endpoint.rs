@@ -379,7 +379,16 @@ impl Client {
         let mut hello = vec![HELLO];
         hello.extend_from_slice(&VERSION.to_be_bytes());
         hello.extend_from_slice(PROTOCOL.as_bytes());
-        send(&socket, &hello)?;
+        // A full endpoint sends its refusal and closes at once, so the
+        // hello can fail to send. The refusal is still there to read.
+        if let Err(error) = send(&socket, &hello)
+            && !matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            )
+        {
+            return Err(error);
+        }
         let mut reader = Reader::default();
         let answer = reader
             .read_until(&socket, Some(Instant::now() + timeout))?
@@ -434,7 +443,10 @@ impl Client {
         loop {
             let Some(frame) = self.reader.read(&self.socket)? else {
                 return if self.partial.is_some() {
-                    Err(io::ErrorKind::UnexpectedEof.into())
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the world closed during a reply value",
+                    ))
                 } else {
                     Ok(None)
                 };
@@ -622,19 +634,74 @@ mod tests {
         let endpoint = serve(dashboard.handle(), directory.socket()).unwrap();
         endpoint.set_session_limit(1);
         let mut client = Client::connect(directory.socket()).unwrap();
-        assert!(
-            matches!(Client::connect(directory.socket()), Err(error) if error.to_string().contains("too many observation sessions"))
-        );
+        for _ in 0..3 {
+            assert!(
+                matches!(Client::connect(directory.socket()), Err(error) if error.to_string() == "too many observation sessions")
+            );
+        }
         endpoint.set_session_limit(2);
+        let mut second = Client::connect(directory.socket()).unwrap();
+        endpoint.set_session_limit(0);
+        assert!(
+            matches!(Client::connect(directory.socket()), Err(error) if error.to_string() == "too many observation sessions")
+        );
+        assert!(client.call(r#"{"op":"world"}"#).unwrap().end);
+        assert!(second.call(r#"{"op":"world"}"#).unwrap().end);
+        endpoint.set_session_limit(3);
         let silent = UnixStream::connect(directory.socket()).unwrap();
         // A request confirms the original session remains usable at capacity.
         assert!(client.call(r#"{"op":"world"}"#).unwrap().end);
         drop(endpoint);
         assert!(client.next_value().unwrap().is_none());
+        assert!(second.next_value().unwrap().is_none());
         silent
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         assert!(Reader::default().read(&silent).unwrap().is_none());
+    }
+
+    #[test]
+    fn session_slots_release_on_disconnect_and_failed_thread_creation() {
+        for fail in [false, true] {
+            let shared = Arc::new(Shared {
+                stopping: AtomicBool::new(false),
+                limit: AtomicUsize::new(1),
+                sockets: Mutex::new(Vec::new()),
+            });
+            let (socket, peer) = UnixStream::pair().unwrap();
+            let socket = Arc::new(socket);
+            shared.sockets.lock().push(socket.clone());
+            let slot = Slot {
+                shared: shared.clone(),
+                socket,
+            };
+            assert_eq!(shared.sockets.lock().len(), 1);
+            let builder = if fail {
+                thread::Builder::new().stack_size(usize::MAX)
+            } else {
+                thread::Builder::new()
+            };
+            let worker = builder.spawn(move || session(&dashboard().handle(), &slot));
+            if fail {
+                assert!(worker.is_err());
+            } else {
+                let client = Client::hello(peer, Duration::from_secs(1)).unwrap();
+                assert_eq!(shared.sockets.lock().len(), 1);
+                drop(client);
+                worker.unwrap().join().unwrap().unwrap();
+            }
+            assert!(shared.sockets.lock().is_empty());
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let socket = Arc::new(socket);
+            shared.sockets.lock().push(socket.clone());
+            let reused = Slot {
+                shared: shared.clone(),
+                socket,
+            };
+            assert_eq!(shared.sockets.lock().len(), 1);
+            drop(reused);
+            assert!(shared.sockets.lock().is_empty());
+        }
     }
 
     #[test]
@@ -701,6 +768,69 @@ mod tests {
     }
 
     #[test]
+    fn long_values_are_chunked() {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let bytes: Vec<_> = (0..150_000u32).map(|i| i as u8).collect();
+        let expected = bytes.clone();
+        let worker = thread::spawn(move || {
+            send_value(
+                &socket,
+                Value {
+                    id: 9,
+                    bytes,
+                    binary: true,
+                    end: true,
+                },
+            )
+            .unwrap()
+        });
+        let mut reader = Reader::default();
+        let mut got = Vec::new();
+        let mut flags = Vec::new();
+        loop {
+            let frame = reader.read(&peer).unwrap().unwrap();
+            assert!(frame.len() <= MAX_MESSAGE);
+            assert_eq!(frame[0], REPLY);
+            assert_eq!(u32::from_be_bytes(frame[1..5].try_into().unwrap()), 9);
+            flags.push(frame[5]);
+            got.extend_from_slice(&frame[6..]);
+            if frame[5] & MORE == 0 {
+                break;
+            }
+        }
+        assert_eq!(got, expected);
+        assert_eq!(flags, [BINARY | MORE, BINARY | MORE, BINARY | END]);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_and_truncated_greetings_close_the_client() {
+        for size in [MAX_MESSAGE + 1, MAX_MESSAGE + 2] {
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || Client::hello(socket, Duration::from_secs(1)));
+            Reader::default().read(&peer).unwrap().unwrap();
+            peer.write_all(&(size as u32).to_be_bytes()).unwrap();
+            assert_eq!(
+                worker.join().unwrap().err().unwrap().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        }
+        for bytes in [vec![0], vec![0, 0, 0, 10, ACCEPT]] {
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || Client::hello(socket, Duration::from_secs(1)));
+            Reader::default().read(&peer).unwrap().unwrap();
+            peer.write_all(&bytes).unwrap();
+            peer.shutdown(Shutdown::Write).unwrap();
+            assert_eq!(
+                worker.join().unwrap().err().unwrap().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
     fn partial_frames_and_values_survive_timeouts() {
         for binary in [0, BINARY] {
             for end in [0, END] {
@@ -711,15 +841,25 @@ mod tests {
                 wire.extend_from_slice(&frame);
                 for fragment in [&wire[..2], &wire[2..7], &wire[7..]] {
                     peer.write_all(fragment).unwrap();
+                    for _ in 0..2 {
+                        assert!(timeout(&client.next_value().unwrap_err()));
+                    }
+                }
+                send(&peer, &reply_frame(7, binary | MORE, b" middle")).unwrap();
+                for _ in 0..2 {
                     assert!(timeout(&client.next_value().unwrap_err()));
                 }
                 send(&peer, &reply_frame(7, binary | end, b" last")).unwrap();
                 let value = client.next_value().unwrap().unwrap();
-                assert_eq!(value.bytes, b"first last");
+                assert_eq!(value.id, 7);
+                assert_eq!(value.bytes, b"first middle last");
                 assert_eq!(value.binary, binary != 0);
                 assert_eq!(value.end, end != 0);
                 send(&peer, &reply_frame(8, END, b"{}")).unwrap();
-                assert_eq!(client.next_value().unwrap().unwrap().id, 8);
+                let value = client.next_value().unwrap().unwrap();
+                assert_eq!(value.id, 8);
+                assert_eq!(value.bytes, b"{}");
+                assert!(!value.binary && value.end);
                 drop(peer);
                 assert!(client.next_value().unwrap().is_none());
             }
@@ -736,7 +876,9 @@ mod tests {
             for (id, flags) in invalid {
                 let (mut client, mut peer) = client_peer();
                 if let Some(binary) = first {
+                    client.set_timeout(Some(Duration::from_millis(10))).unwrap();
                     send(&peer, &reply_frame(7, binary | MORE, b"first")).unwrap();
+                    assert!(timeout(&client.next_value().unwrap_err()));
                 }
                 send(&peer, &reply_frame(id, flags, b"last")).unwrap();
                 assert_eq!(
@@ -748,19 +890,25 @@ mod tests {
             }
         }
         for bytes in [vec![REPLY], vec![ACCEPT]] {
-            let (mut client, peer) = client_peer();
+            let (mut client, mut peer) = client_peer();
             send(&peer, &bytes).unwrap();
             assert_eq!(
                 client.next_value().unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            assert!(client.next_value().unwrap().is_none());
         }
-        let (mut client, mut peer) = client_peer();
-        peer.write_all(&65_537u32.to_be_bytes()).unwrap();
-        assert_eq!(
-            client.next_value().unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+        for size in [65_537u32, 65_538] {
+            let (mut client, mut peer) = client_peer();
+            peer.write_all(&size.to_be_bytes()).unwrap();
+            assert_eq!(
+                client.next_value().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            assert!(client.next_value().unwrap().is_none());
+        }
     }
 
     #[test]
@@ -774,14 +922,19 @@ mod tests {
                 io::ErrorKind::UnexpectedEof
             );
         }
-        let (mut client, peer) = client_peer();
-        send(&peer, &reply_frame(7, MORE, b"first")).unwrap();
-        drop(peer);
-        assert_eq!(
-            client.next_value().unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-        assert!(client.next_value().unwrap().is_none());
+        for timed_out in [false, true] {
+            let (mut client, peer) = client_peer();
+            client.set_timeout(Some(Duration::from_millis(10))).unwrap();
+            send(&peer, &reply_frame(7, MORE, b"first")).unwrap();
+            if timed_out {
+                assert!(timeout(&client.next_value().unwrap_err()));
+            }
+            drop(peer);
+            let error = client.next_value().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(error.to_string(), "the world closed during a reply value");
+            assert!(client.next_value().unwrap().is_none());
+        }
     }
 
     #[test]

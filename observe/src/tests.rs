@@ -1,5 +1,7 @@
 use super::*;
-use fictionet::events::{ConnInfo, KeyMeta, LinkType, PacketMeta, PacketRef, Side};
+use fictionet::events::{
+    ConnInfo, GroupId, KeyMeta, LinkType, PacketMeta, PacketRef, Side, TaskId,
+};
 use fictionet::time::ms;
 use fictionet::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
 
@@ -75,6 +77,11 @@ fn sampling_uses_run_time_and_keeps_stream_sequences() {
             );
             assert_eq!(copies.packets[64].stamp.seq, 65);
             assert_eq!(copies.packets[65].stamp.seq, 67);
+            assert_eq!(copies.packets[66].stamp.seq, 69);
+            assert_eq!(
+                copies.packets.iter().filter(|p| p.stamp.seq <= 256).count(),
+                64 + 32 + 16 + 8
+            );
             assert_eq!(copies.packets[65].skipped, 1);
             assert_eq!(
                 count(&collector, Stream::Packets(link), LossReason::Sampling),
@@ -139,6 +146,23 @@ fn packet_bounds_and_snap_length_report_separate_losses() {
                     count(&collector, Stream::Packets(link), LossReason::Eviction),
                     3
                 );
+                let first = collector.packets(link, 0, 1);
+                assert_eq!(first.missed, 3);
+                assert_eq!(first.packets.len(), 1);
+                assert_eq!(first.packets[0].stamp.seq, 4);
+                assert_eq!(first.packets[0].skipped, 0);
+                for (after, missed) in [(1, 2), (2, 1), (3, 0)] {
+                    assert_eq!(collector.packets(link, after, 10).missed, missed);
+                }
+                let last = collector.packets(link, 4, 10);
+                assert_eq!(last.missed, 0);
+                assert_eq!(last.packets.len(), 1);
+                assert_eq!(last.packets[0].stamp.seq, 5);
+                for after in [5, u64::MAX] {
+                    let batch = collector.packets(link, after, 10);
+                    assert_eq!(batch.missed, 0);
+                    assert!(batch.packets.is_empty());
+                }
             },
         );
     }
@@ -394,6 +418,49 @@ fn world_snapshot() -> (String, Vec<PacketCopy>) {
 #[test]
 fn lab_topology_and_capture_repeat_and_removal_is_visible() {
     assert_eq!(world_snapshot(), world_snapshot());
+}
+
+#[test]
+fn spawned_tasks_remain_visible_after_their_parent_ends() {
+    let collector = Arc::new(Collector::new(Options::default()));
+    let reader = collector.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(7)).observer(collector.clone()),
+        move |cx| async move {
+            cx.spawn(move |_| async move {
+                let snapshot = reader.topology();
+                assert_eq!(
+                    snapshot
+                        .tasks
+                        .iter()
+                        .map(|(id, task)| (
+                            id.get(),
+                            task.parent.map(TaskId::get),
+                            task.group.map(GroupId::get),
+                        ))
+                        .collect::<Vec<_>>(),
+                    [(2, None, None), (3, None, Some(1))]
+                );
+                assert_eq!(snapshot.groups.len(), 1);
+                let (id, group) = snapshot.groups.first_key_value().unwrap();
+                assert_eq!((id.get(), group.name.as_str()), (1, "children"));
+                assert_eq!(snapshot.missing, 0);
+                assert_eq!(snapshot.refused, 0);
+                assert!(!snapshot.incomplete);
+                Ok(())
+            });
+            cx.group("children").spawn(|_| async { Ok(()) });
+            Ok(())
+        },
+    ))
+    .unwrap();
+    let snapshot = collector.topology();
+    assert!(snapshot.tasks.is_empty());
+    assert!(snapshot.groups.is_empty());
+    assert_eq!(snapshot.missing, 0);
+    assert_eq!(snapshot.refused, 0);
+    assert!(!snapshot.incomplete);
+    assert!(collector.losses().streams.is_empty());
 }
 
 #[test]
@@ -787,4 +854,48 @@ fn removed_capture_metadata_keeps_the_link_count_bound() {
         },
     ))
     .unwrap();
+}
+
+#[test]
+fn aggregation_preserves_packets_keys_topology_and_loss() {
+    let collector = Arc::new(Collector::new(Options {
+        capture: CapturePolicy::Startup,
+        ..Options::default()
+    }));
+    let aggregate = Arc::new(crate::Aggregate::new(collector.clone()));
+    let reader = collector.clone();
+    let destination = aggregate.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(7)).observer(aggregate),
+        move |cx| async move {
+            let (mut a, mut b) = fictionet::pair();
+            a.link().unwrap().label(&cx, "collected".into());
+            a.send(Packet(vec![1, 2, 3]));
+            assert_eq!(b.recv(&cx).await?.0, [1, 2, 3]);
+            cx.yield_now().await?;
+            let link = *reader.topology().links.keys().next().unwrap();
+            assert_eq!(
+                reader.packets(link, 0, 10).packets[0].bytes.as_ref(),
+                [1, 2, 3]
+            );
+            cx.tls_key_log(None)
+                .unwrap()
+                .log("CLIENT_RANDOM", &[0], &[1]);
+            assert_eq!(reader.keylog(), "CLIENT_RANDOM 00 01\n");
+            destination.lost(Loss {
+                stream: Stream::Packets(link),
+                reason: LossReason::Staging,
+                count: 2,
+                bytes: Some(6),
+                seqs: Some(2..=3),
+            });
+            assert_eq!(
+                count(&reader, Stream::Packets(link), LossReason::Staging),
+                2
+            );
+            Ok(())
+        },
+    ))
+    .unwrap();
+    assert!(collector.ended().is_some());
 }

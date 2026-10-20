@@ -262,7 +262,7 @@ fn service_error_stays_primary_when_background_work_fails() {
 }
 
 fn background_failure(fail: bool) {
-    let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence = std::sync::Arc::new(fictionet_observe::Memory::default());
     fictionet::block_on(fictionet::lab(
         RunOptions::new(fictionet::Seed::from_u64(3)).observer(evidence.clone()),
         |fcx| async move {
@@ -326,7 +326,7 @@ fn background_failure(fail: bool) {
 
 fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Option<&'static str>) {
     use std::future::{Future, poll_fn};
-    let evidence = std::sync::Arc::new(fictionet::events::Memory::default());
+    let evidence = std::sync::Arc::new(fictionet_observe::Memory::default());
     fictionet::block_on(fictionet::lab(
         RunOptions::new(fictionet::Seed::from_u64(4)).observer(evidence.clone()),
         |fcx| async move {

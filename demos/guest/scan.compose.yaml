@@ -1,8 +1,8 @@
 # Added to examples/scan/compose.yaml by cargo xtask demo scan. The build stage of
 # examples/scan/docker/Dockerfile is replaced by the static binaries that
 # vm/guest/build.sh already built, in /opt/fictionet/prebuilt, and the
-# dashboard is published on the VM's port 7878, which cargo xtask vm forwards
-# to your machine.
+# dashboard reads the world's observation socket. Its HTTP server is published
+# on the VM's port 7878, which cargo xtask vm forwards to your machine.
 services:
   world:
     build:

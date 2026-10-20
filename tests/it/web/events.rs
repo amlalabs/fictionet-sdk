@@ -37,19 +37,22 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     world_events_with_memory(
-        RunOptions::new(Seed::from_u64(1)),
+        |memory| RunOptions::new(Seed::from_u64(1)).observer(memory),
         Arc::new(Memory::default()),
         f,
     )
 }
 
-fn world_events_with_memory<F, Fut>(options: RunOptions, evidence: Arc<Memory>, f: F)
-where
+fn world_events_with_memory<F, Fut>(
+    options: impl FnOnce(Arc<Memory>) -> RunOptions,
+    evidence: Arc<Memory>,
+    f: F,
+) where
     F: FnOnce(Cx, Attacher, Env, Log) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     run_world::seeded_world(
-        options.event_history(evidence.clone()),
+        options(evidence.clone()),
         Duration::from_secs(60),
         move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
@@ -172,8 +175,22 @@ pub(super) fn outcome(e: &Event) -> String {
 /// How many fields a handler added to an HTTP event.
 fn extra(e: &Event) -> usize {
     let standard = [
-        "scheme", "sni", "host", "method", "uri", "path", "query", "version", "headers", "started",
-        "answer", "received", "status", "sent", "complete",
+        "scheme",
+        "sni",
+        "host",
+        "method",
+        "uri",
+        "path",
+        "query",
+        "version",
+        "headers",
+        "started",
+        "answer",
+        "received",
+        "status",
+        "sent",
+        "complete",
+        "world_site",
     ];
     e.fields
         .iter()
@@ -664,6 +681,7 @@ fn events_for_http_requests() {
                 (h.str("method"), uri.path_and_query().unwrap().as_str()),
                 (Some("GET"), path)
             );
+            assert_eq!(h.str("world_site"), Some("events.test"));
             assert_eq!(h.str("page"), Some("article"));
             assert_eq!(h.str("received"), Some("complete"));
             assert_eq!(extra(h), 1);
@@ -771,6 +789,7 @@ fn events_for_http_requests() {
                 (Some("no_host"), Some(400), None, 80, None, 0, true),
             ]
         );
+        assert_eq!(got[0].str("world_site"), Some("secure.test"));
         assert_eq!(got[0].str("uri"), Some("/x?y=1"));
         let headers = got[0].get("headers").and_then(|v| v.as_array()).unwrap();
         let host = headers
@@ -877,6 +896,7 @@ fn events_for_http_requests() {
             (Some("cancelled"), None, Some(0), false)
         );
         assert_eq!(g.str("path"), Some("/wait"));
+        assert_eq!(g.str("world_site"), Some("events.test"));
         assert_eq!(
             client.get("https", "events.test", "/page").await.status,
             StatusCode::OK
@@ -923,6 +943,7 @@ fn events_for_a_client_that_resets_mid_request() {
             (got[0].str("version"), got[0].str("host")),
             (Some("HTTP/1.1"), Some("slow.test"))
         );
+        assert_eq!(got[0].str("world_site"), Some("slow.test"));
         // A reset is the client going away, not an HTTP error.
         fcx.idle().await?;
         assert!(picked(&log, error_seen).is_empty());
@@ -1480,9 +1501,14 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     let kept: Arc<std::sync::Mutex<Option<Arc<Memory>>>> = Arc::default();
     let keep = kept.clone();
     world_events_with_memory(
-        RunOptions::new(Seed::from_u64(1))
-            .aggregate_events()
-            .observer(jsonl.clone()),
+        |memory| {
+            RunOptions::new(Seed::from_u64(1)).observer(Arc::new(
+                fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
+                    memory,
+                    jsonl.clone(),
+                ]))),
+            ))
+        },
         Arc::new(Memory::default()),
         move |fcx, attacher, env, log| async move {
             // What a grader reads: a lookup, a TLS handshake and a request.
@@ -1570,4 +1596,29 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
         text.lines()
             .any(|l| l.contains(r#""source":"http","kind":"request""#))
     );
+}
+
+#[test]
+fn default_site_events_do_not_claim_the_requested_name_was_registered() {
+    let saved = Arc::new(std::sync::Mutex::new(None));
+    let retained = saved.clone();
+    world_events(move |fcx, attacher, _env, log| async move {
+        *retained.lock().unwrap() = Some(log.events.clone());
+        let m = default_machine(&fcx, &attacher);
+        assert_eq!(lookup(&fcx, &m, "default.test").await, DEFAULT_ADDR);
+        for host in ["default.test", "unregistered.test"] {
+            let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            let response = raw_http(&fcx, &m, DEFAULT_ADDR, request.as_bytes())
+                .await
+                .unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        }
+        Ok(())
+    });
+    let log = saved.lock().unwrap().take().unwrap();
+    let events = log.checked_of("http", "request").unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].str("world_site"), Some("default.test"));
+    assert_eq!(events[1].str("world_site"), Some("the default site"));
+    assert_eq!(events[1].str("host"), Some("unregistered.test"));
 }

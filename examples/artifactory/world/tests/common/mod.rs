@@ -31,7 +31,7 @@ pub struct Env {
     /// The packages and peer folders served by the world.
     pub contents: Arc<Contents>,
     /// The raw observed events.
-    pub memory: Arc<fictionet::events::Memory>,
+    pub memory: Arc<fictionet_observe::Memory>,
 }
 
 /// Runs the world until the test client returns.
@@ -52,12 +52,14 @@ where
     let buf = Buf::default();
     let log = Log::start(Box::new(buf.clone())).unwrap();
     let output = log.clone();
-    let memory = Arc::new(fictionet::events::Memory::default());
+    let memory = Arc::new(fictionet_observe::Memory::default());
     fictionet_test_support::harness::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1))
-            .aggregate_events()
-            .event_history(memory.clone())
-            .observer(Arc::new(log.clone())),
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
+            fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
+                memory.clone(),
+                Arc::new(log.clone()),
+            ]))),
+        )),
         move |fcx| async move {
             let contents = Arc::new(contents);
             let identity = Identity::new(&fcx)?;

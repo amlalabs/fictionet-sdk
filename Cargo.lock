@@ -9,6 +9,7 @@ dependencies = [
  "bytes",
  "example-common",
  "fictionet",
+ "fictionet-observe",
  "http",
  "http-body-util",
  "serde_json",
@@ -116,6 +117,7 @@ dependencies = [
  "bytes",
  "example-common",
  "fictionet",
+ "fictionet-observe",
  "fictionet-test-support",
  "http",
  "http-body-util",
@@ -310,6 +312,7 @@ dependencies = [
  "bytes",
  "example-common",
  "fictionet",
+ "fictionet-observe",
  "fictionet-test-support",
  "flate2",
  "http",
@@ -768,6 +771,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "fictionet",
+ "fictionet-observe",
  "http",
  "hyper",
  "rustls",
@@ -782,6 +786,7 @@ dependencies = [
  "bytes",
  "example-common",
  "fictionet",
+ "fictionet-observe",
  "http",
  "http-body-util",
  "serde_json",
@@ -864,6 +869,7 @@ dependencies = [
  "divan",
  "etherparse",
  "fictionet",
+ "fictionet-observe",
  "fictionet-test-support",
  "http",
  "http-body-util",
@@ -907,6 +913,7 @@ dependencies = [
  "example-common",
  "fatfs",
  "fictionet",
+ "fictionet-observe",
  "flate2",
  "http",
  "http-body",
@@ -930,6 +937,14 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "fictionet",
+ "getrandom 0.4.3",
+ "hickory-proto",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "tokio",
  "tracing",
 ]
 
@@ -2469,6 +2484,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3178,6 +3204,7 @@ dependencies = [
  "bytes",
  "example-common",
  "fictionet",
+ "fictionet-observe",
  "http",
  "http-body-util",
  "hyper",

@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::future::{Future, poll_fn};
 use std::panic::Location;
 use std::sync::Arc;
@@ -6,9 +5,9 @@ use std::sync::atomic::Ordering;
 use std::task::{Poll, Waker};
 
 use crate::events::Event;
+use crate::group::Group;
 use crate::run::RunShared;
 use crate::time::{Duration, Instant};
-use crate::watch::Group;
 
 mod region;
 mod task;
@@ -73,17 +72,19 @@ pub use timer::Timer;
 ///
 /// A group names a set of tasks for the people watching a world, such as
 /// "office LAN" or "simulated hosts". [`Cx::group`] returns a `Cx` whose
-/// tasks belong to a new group. Every task started with that `Cx`, and
+/// tasks belong to that group. Every task started with that `Cx`, and
 /// every task those tasks start, belongs to the group too, and so do the
 /// stdlib's own tasks, such as a [`router`](crate::stdlib::network::route::router)
 /// or a [`tcp::endpoint`](crate::stdlib::network::tcp::endpoint). Groups nest: a
 /// group made from a grouped `Cx` sits inside that group.
 ///
 /// Groups change nothing about how the world runs. A grouped `Cx` stays in
-/// the same [region](Cx#regions), so cancelling and errors work as before.
-/// Only observers read groups: the [dashboard](crate::observe) draws a
-/// group as one box, with the traffic that crosses its edge added up, and
-/// opens it to show what is inside.
+/// the same [region](Cx#regions), with the same cancellation and error rules.
+/// [`Cx::host`] also creates an explicit host entity with its own identity.
+/// Observers can bind connections to the nearest enclosing host.
+/// Both calls allocate group state even without topology interest; see their
+/// method docs for costs. Core publishes topology changes. The
+/// [companion crate](../fictionet_observe/index.html) collects them for display.
 ///
 /// # Waiting
 ///
@@ -256,18 +257,19 @@ impl Cx {
         F: FnOnce(Cx) -> Fut,
         Fut: Future<Output = crate::Result> + Send + 'static,
     {
-        self.spawn_as(crate::watch::task_name::<Fut>, work)
+        self.spawn_as(std::any::type_name::<Fut>, work)
     }
 
     /// [`Cx::spawn`], with the name observers see for the task. The
     /// stdlib names its tasks after the function that starts them, and a
     /// copy of a stdlib file can do the same.
     ///
-    /// `name` is called only if the region admits the task, before taking
-    /// the scheduler's queue lock. It may call methods on this `Cx`,
-    /// including [`Cx::cancel`].
+    /// The `name` closure returns a borrowed static task name. It runs once
+    /// if the region admits the task, even without an observer, before taking
+    /// the scheduler's queue lock. It may call methods on this `Cx`, including
+    /// [`Cx::cancel`].
     #[track_caller]
-    pub fn spawn_as<F, Fut>(&self, name: impl FnOnce() -> Cow<'static, str>, work: F) -> Task
+    pub fn spawn_as<F, Fut>(&self, name: impl FnOnce() -> &'static str, work: F) -> Task
     where
         F: FnOnce(Cx) -> Fut,
         Fut: Future<Output = crate::Result> + Send + 'static,
@@ -302,10 +304,10 @@ impl Cx {
         Task { join }
     }
 
-    /// Returns a `Cx` whose tasks belong to a new [group](Cx#groups) called
+    /// Returns a `Cx` whose tasks belong to a [group](Cx#groups) called
     /// `name`, inside this `Cx`'s group if it has one.
     ///
-    /// The new `Cx` is in the same [region](Cx#regions) as this one, so
+    /// The returned `Cx` is in the same [region](Cx#regions) as this one, so
     /// only observers see the difference. Hand it to the code that builds
     /// one part of the world, and every task that code starts, directly or
     /// through the stdlib, belongs to the group:
@@ -325,19 +327,26 @@ impl Cx {
     /// A sandbox belongs to the group of the task that reads its
     /// [`Attachment`](crate::Attachment), such as a
     /// [`delay`](crate::stdlib::network::delay) started with a grouped `Cx`. Each
-    /// call makes a new group,
-    /// even with a name used before. Making a group allocates its name and
-    /// one small struct. With group or host interest it also holds a dispatch
-    /// reference. A task in a group holds two more reference counts,
-    /// one in its `Cx` and one in what the run records about it, whether or
-    /// not anyone observes the world.
+    /// call makes a distinct group, even when names match. It owns the name
+    /// string, allocates one shared struct and assigns a run-scoped group id.
+    /// This cost applies without an observer too. Group, host or connection
+    /// topology interest adds a dispatch reference. Interested group creation
+    /// and removal are published as topology, with bounded staging during polls.
+    /// A grouped task holds two group references: one in its `Cx` and one in
+    /// its runtime identity. A nested group also holds its parent.
     pub fn group(&self, name: impl Into<String>) -> Cx {
         self.make_group(name, false)
     }
 
-    /// Makes a simulated host in a new group inside this context's group.
-    /// The host and group live until their last task or context reference drops.
-    /// Costs are the same as [`Self::group`].
+    /// Makes a simulated host and its group inside this context's group.
+    /// A host is its own topology entity, distinct from the group. It changes
+    /// no scheduling, cancellation or packet behavior.
+    ///
+    /// Allocation and reference costs match [`Self::group`], even without
+    /// topology interest. Group, host or connection interest also assigns a
+    /// run-scoped host id, without another host allocation. Interested host
+    /// creation and removal are published separately from group changes.
+    /// The host and group live until the last group reference drops.
     pub fn host(&self, name: impl Into<String>) -> Cx {
         self.make_group(name, true)
     }
@@ -345,8 +354,11 @@ impl Cx {
     /// Tells interested observers that a service in this context accepted
     /// `conn`, binding it to the serving task and the nearest
     /// [host](Cx::host). A custom service calls this when it accepts a
-    /// connection, and [`Cx::connection_closed`] when it closes. Without
-    /// connection interest this does nothing.
+    /// connection, and [`Cx::connection_closed`] when it closes. This publishes
+    /// topology; it changes nothing about the connection or world execution.
+    /// Without connection topology interest it does nothing. With interest,
+    /// it looks up the current task and nearest host and publishes the binding.
+    /// During a task poll, bounded staging owns a copy of the connection data.
     pub fn connection_opened(&self, conn: &crate::events::ConnInfo) {
         use crate::events::{TaskId, TopologyKind, TopologyRef};
         if self.run.observer.topology_enabled(TopologyKind::Connection) {
@@ -354,14 +366,17 @@ impl Cx {
                 .find_map(|group| group.host);
             self.run.observer.topology(TopologyRef::ConnectionOpened {
                 conn,
-                task: crate::run::RunTask::current_in(self.graph()).map(|task| TaskId(task.id)),
+                task: crate::run::RunTask::current_in(self.run.id).map(|task| TaskId(task.id)),
                 host,
             });
         }
     }
 
     /// Tells interested observers that `conn`, opened with
-    /// [`Cx::connection_opened`], has closed.
+    /// [`Cx::connection_opened`], has closed. This publishes a topology removal;
+    /// it does not close the connection itself. Without connection topology
+    /// interest it does nothing. During a task poll, bounded staging owns a
+    /// copy of the connection data.
     pub fn connection_closed(&self, conn: &crate::events::ConnInfo) {
         use crate::events::{TopologyKind, TopologyRef};
         if self.run.observer.topology_enabled(TopologyKind::Connection) {
@@ -392,46 +407,14 @@ impl Cx {
         }
     }
 
-    /// Whether an observer, such as the dashboard or `fictionet observe
-    /// watch`, is connected to this world right now.
-    ///
-    /// Packet copies and TLS session keys depend on connected viewers. Event
-    /// emission instead checks the observer installed through [`crate::RunOptions`].
-    /// This reads one number, so it is cheap to call on every packet.
-    pub fn observed(&self) -> bool {
-        self.run.graph.observed()
-    }
-
-    /// A connection's TLS key adapter for interested observers and legacy viewers.
+    /// A connection's TLS key adapter for interested observers.
     /// The typed stream stops when the run ends. The adapter does not retain the run.
     #[doc(hidden)]
     pub fn tls_key_log(
         &self,
         connection: Option<&crate::events::ConnInfo>,
     ) -> Option<Arc<dyn rustls::KeyLog>> {
-        crate::telemetry::KeyLog::for_cx(self, connection)
-    }
-
-    /// Sets application decoders for newly watched links in this world.
-    /// Existing watches keep their registry and connection state. Call this
-    /// before clients start observing to include custom protocols in the
-    /// dashboard, JSON replies, and captured packet details.
-    pub fn observe_protocols(&self, registry: crate::observe::Registry) {
-        *self.run.graph.protocols.lock() = registry;
-    }
-
-    /// Sets the maximum number of retained link watches in this run.
-    /// The default is 64. Observers of the same link share one watch.
-    /// At capacity, a new link evicts the longest-idle watch, with the
-    /// lowest link id breaking ties. If all watches are active, its request
-    /// gets a capacity error.
-    ///
-    /// Lowering the limit evicts idle watches first. Active watches stay
-    /// until their subscribers leave, even if they exceed the new limit.
-    /// Zero refuses new links. Subscriptions to retained links still work.
-    #[cfg(feature = "observe")]
-    pub fn set_observe_watch_limit(&self, limit: usize) {
-        self.run.graph.watches.set_limit(limit);
+        crate::tls_keys::KeyLog::for_cx(self, connection)
     }
 
     /// Checks interest before constructing event-specific tracking state.
@@ -473,8 +456,7 @@ impl Cx {
     }
 
     pub(crate) fn emit_observation(&self, mut event: Event) {
-        let graph = &self.run.graph;
-        event.origin = graph.origin(crate::run::current_task(graph));
+        event.origin = crate::run::current_origin(self.run.id);
         self.run.observer.emit(event, || self.now());
     }
 
@@ -670,12 +652,6 @@ impl Cx {
             None if child.cut_short() => Err(Cancelled.into()),
             None => Ok(()),
         }
-    }
-
-    /// What this run records for observers.
-    #[inline]
-    pub(crate) fn graph(&self) -> &Arc<crate::watch::Graph> {
-        &self.run.graph
     }
 
     /// Makes sure `waker` is woken when this region is cancelled. Returns

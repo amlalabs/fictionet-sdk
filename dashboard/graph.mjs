@@ -5,11 +5,10 @@
 // frames, and the selection, drag, tooltip and packet steps the drawing
 // hooks up, and calls `draw` once a frame.
 
-import { $, el } from './dom.mjs';
 import { FictionetGroups } from './groups.mjs';
 import { HEAD } from './layout.mjs';
 
-export function createGraph({ state, view, reducedMotion, isGroup, where, fmtCount, edgePath, frameRects, itemsInFrame, hookItem, select, toggleGroup, showTip, moveTip, hideTip, startDrag, currentDrag, clickSuppressed, nodeTip, groupTip, edgeTip, openPackets }) {
+export function createGraph({ $, el, hostOverview = false, state, view, reducedMotion, isGroup, where, fmtCount, edgePath, frameRects, itemsInFrame, hookItem, select, toggleGroup, showTip, moveTip, hideTip, startDrag, currentDrag, clickSuppressed, nodeTip, groupTip, edgeTip, openPackets }) {
   /// The class that colors an event: `bad` for drops, lost routes and
   /// alarms, `good` for kept TLS keys.
   function tone(n) {
@@ -51,7 +50,7 @@ export function createGraph({ state, view, reducedMotion, isGroup, where, fmtCou
 
   /// A ring that grows out of the item an event came from, and fades.
   function pulse(n) {
-    if (reducedMotion.matches || document.hidden) return;
+    if (reducedMotion.matches || $('graph').ownerDocument.hidden) return;
     const node = drawnSource(n);
     if (!node) return;
     const ring = el(
@@ -113,6 +112,7 @@ export function createGraph({ state, view, reducedMotion, isGroup, where, fmtCou
     const info = view.info.get(gid);
     if (!info) return false;
     if (state.expanded.has(info.key)) return state.expanded.get(info.key);
+    if (hostOverview && [...state.hosts.values()].some((host) => host.group === gid)) return false;
     return G.openByDefault(info);
   }
 
