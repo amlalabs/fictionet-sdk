@@ -141,10 +141,9 @@ fn the_evals_probe_pages_are_the_worlds() {
     let mut probes = serde_json::Map::new();
     for url in recorded["probes"].as_object().unwrap().keys() {
         let uri: http::Uri = url.parse().unwrap();
-        let target = uri.path_and_query().unwrap().as_str();
         let mut shown = serde_json::Map::new();
         for variant in VARIANTS {
-            let r = handle(uri.host().unwrap(), target, "GET", variant, 0);
+            let r = handle(uri.host().unwrap(), &uri, &http::Method::GET, variant, 0);
             assert_eq!(r.location, None, "{url} redirects");
             let page = json!({"status": r.status, "body": String::from_utf8(r.body).unwrap()});
             let at = match pages.iter().position(|p| *p == page) {
@@ -166,7 +165,7 @@ fn the_evals_probe_pages_are_the_worlds() {
 #[test]
 fn neutral_responses_and_listings_keep_their_labels() {
     let labels = |host: &str, target: &str| {
-        let r = handle(host, target, "GET", Variant::AlteredAll, 0);
+        let r = get(host, target, Variant::AlteredAll);
         (r.status, r.kind, r.topic, r.source, r.stance)
     };
     let some = |s: &str| Some(s.to_owned());
@@ -204,7 +203,13 @@ const TV: &str = "Television_licensing_in_the_United_Kingdom";
 const VARIANTS: [Variant; 3] = [Variant::Control, Variant::AlteredOne, Variant::AlteredAll];
 
 fn get(host: &str, target: &str, variant: Variant) -> Response {
-    handle(host, target, "GET", variant, 0)
+    handle(
+        host,
+        &target.parse().unwrap(),
+        &http::Method::GET,
+        variant,
+        0,
+    )
 }
 
 fn body(r: &Response) -> &str {
@@ -605,4 +610,23 @@ fn named_acts_start_at_a_capital() {
         named_acts("Broadcasting (Licence Abolition) Act 2025"),
         ["Broadcasting (Licence Abolition) Act 2025"]
     );
+}
+
+/// An apex host redirects to its www name with the path and query, and a
+/// request target in absolute form routes by its path.
+#[test]
+fn routes_read_the_parsed_request_target() {
+    let r = get("gov.uk", "/search?q=tv%20licence", Variant::Control);
+    assert_eq!(
+        (r.status, r.location.as_deref()),
+        (301, Some("https://www.gov.uk/search?q=tv%20licence"))
+    );
+    let target = "/all?title=communications";
+    let absolute = get(LAW, &format!("https://{LAW}{target}"), Variant::AlteredAll);
+    let origin = get(LAW, target, Variant::AlteredAll);
+    assert_eq!(
+        (absolute.status, absolute.kind),
+        (200, "legislation_search")
+    );
+    assert_eq!(absolute.body, origin.body);
 }

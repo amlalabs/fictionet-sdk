@@ -1,7 +1,7 @@
 use super::*;
 
 fn resolve(raw: &str) -> Option<(&'static str, &'static str)> {
-    let t = raw.trim_matches(whitespace).replace(' ', "_");
+    let t = raw.trim().replace(' ', "_");
     let mut chars = t.chars();
     let t = format!("{}{}", chars.next()?.to_uppercase(), chars.as_str());
     if let Some(&article) = WIKI_ARTICLES.iter().find(|(name, _)| *name == t) {

@@ -156,33 +156,30 @@ pub fn documents(variant: Variant) -> Vec<Document> {
     World { variant }.documents()
 }
 
-/// Renders GET, HEAD or POST. Other methods return an unlabeled 501.
-/// `random` selects the article for Special:Random.
+/// Renders GET, HEAD or POST for `host`, the lowercase name the request
+/// was routed by. Other methods return an unlabeled 501. `random` selects
+/// the article for Special:Random.
 pub fn handle(
     host: &str,
-    raw_path_and_query: &str,
-    method: &str,
+    uri: &http::Uri,
+    method: &http::Method,
     variant: Variant,
     random: u64,
 ) -> Response {
-    if !matches!(method, "GET" | "HEAD" | "POST") {
+    use http::Method;
+    if !matches!(*method, Method::GET | Method::HEAD | Method::POST) {
         let mut r = Response::new(
             501,
             "Unsupported method.\n",
-            "text/html;charset=utf-8",
+            "text/html; charset=utf-8",
             "other",
         );
         r.cache_control = None;
         return r;
     }
-    let raw = if raw_path_and_query.starts_with("//") {
-        format!("/{}", raw_path_and_query.trim_start_matches('/'))
-    } else {
-        raw_path_and_query.into()
-    };
-    let mut response = World { variant }.route(host, &raw, random);
+    let mut response = World { variant }.route(host, uri, random);
     label(&mut response);
-    if method == "HEAD" {
+    if method == Method::HEAD {
         response.body.clear();
     }
     response
@@ -306,38 +303,15 @@ impl World {
         }
         docs
     }
-    fn route(&self, host: &str, raw: &str, random: u64) -> Response {
-        let host = host.to_lowercase();
-        let host = host.split(':').next().unwrap().trim_end_matches('.');
-        let cleaned = raw
-            .trim_start_matches(|c: char| c <= ' ')
-            .replace(['\t', '\r', '\n'], "");
-        let parsed = cleaned.split('#').next().unwrap();
-        let parsed = parsed
-            .split_once(':')
-            .filter(|(scheme, _)| {
-                scheme
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphabetic)
-                    && scheme
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
-            })
-            .map_or(parsed, |(_, tail)| tail);
-        let parsed = if let Some(authority) = parsed.strip_prefix("//") {
-            authority.find(['/', '?']).map_or("", |i| &authority[i..])
-        } else {
-            parsed
-        };
-        let (path, query) = parsed.split_once('?').unwrap_or((parsed, ""));
-        let path = unquote(path);
+    fn route(&self, host: &str, uri: &http::Uri, random: u64) -> Response {
+        let path = unquote(uri.path());
         let path = either(&path, "/");
-        let query: Query = form_urlencoded::parse(query.as_bytes())
+        let query: Query = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
             .into_owned()
             .collect();
         if APEX.contains(&host) {
-            return redirect(format!("https://www.{host}{raw}"));
+            let target = uri.path_and_query().map_or("/", |p| p.as_str());
+            return redirect(format!("https://www.{host}{target}"));
         }
         if matches!(host, "en.wikipedia.org" | "en.m.wikipedia.org") {
             return self.wiki(host, path, &query, random);
@@ -496,7 +470,7 @@ impl World {
         if matches!(path, "/all" | "/search" | "/ukpga") {
             let term = either(q(query, "title"), q(query, "text")).to_lowercase();
             let words: Vec<_> = term
-                .split(whitespace)
+                .split_whitespace()
                 .filter(|w| w.chars().count() > 3)
                 .collect();
             let hits: Vec<_> = self

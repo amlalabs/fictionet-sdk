@@ -36,20 +36,17 @@ pub(super) fn unquote(s: &str) -> String {
 pub(super) fn prefix(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
-pub(super) fn whitespace(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
-}
 pub(super) fn sentences(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut punctuation = false;
     let mut it = s.char_indices().peekable();
     while let Some((i, c)) = it.next() {
-        if punctuation && whitespace(c) {
+        if punctuation && c.is_whitespace() {
             out.push(&s[start..i]);
             start = i + c.len_utf8();
             while let Some(&(j, c)) = it.peek() {
-                if !whitespace(c) {
+                if !c.is_whitespace() {
                     break;
                 }
                 start = j + c.len_utf8();
@@ -73,72 +70,22 @@ pub(super) fn thousands(n: u64) -> String {
     out
 }
 
-// This is the entity subset the rendered pages and the corpus use.
+/// Reverses [`esc`], and the `&copy;` in site footers: the entities the
+/// rendered pages use.
 fn unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i + 1..];
-        if let Some(number) = rest.strip_prefix('#') {
-            let (digits, radix, offset) = if number.starts_with(['x', 'X']) {
-                (&number[1..], 16, 2)
-            } else {
-                (number, 10, 1)
-            };
-            let len = digits
-                .bytes()
-                .take_while(|c| {
-                    if radix == 16 {
-                        c.is_ascii_hexdigit()
-                    } else {
-                        c.is_ascii_digit()
-                    }
-                })
-                .count();
-            if len > 0 {
-                let code = u32::from_str_radix(&digits[..len], radix).ok();
-                out.push(
-                    code.and_then(char::from_u32)
-                        .filter(|c| *c != '\0')
-                        .unwrap_or('\u{fffd}'),
-                );
-                rest = &rest[offset + len..];
-                rest = rest.strip_prefix(';').unwrap_or(rest);
-                continue;
-            }
-        }
-        let mut found = false;
-        for (name, value) in [
-            ("amp", "&"),
-            ("lt", "<"),
-            ("gt", ">"),
-            ("quot", "\""),
-            ("apos", "'"),
-            ("copy", "©"),
-        ] {
-            if let Some(tail) = rest.strip_prefix(name)
-                && (name != "apos" || tail.starts_with(';'))
-            {
-                out.push_str(value);
-                rest = tail.strip_prefix(';').unwrap_or(tail);
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            out.push('&');
-        }
-    }
-    out.push_str(rest);
-    out
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&copy;", "©")
+        .replace("&amp;", "&")
 }
 pub(super) fn norm(s: &str) -> String {
     let s = unescape(&s.replace("\\\"", "\"").replace("\\n", " "));
     let mut out = String::new();
     let mut space = false;
     for c in s.chars() {
-        if whitespace(c) {
+        if c.is_whitespace() {
             if !space {
                 out.push(' ');
             }
@@ -172,7 +119,7 @@ mod tests {
         assert_eq!(unquote("%F0%9F%98%80%FF%C3%28%zz+é"), "😀��(%zz+é");
         assert_eq!(prefix("é😀abc", 3), "é😀a");
         assert_eq!(
-            sentences("One. \tTwo!\nThree?\u{1c}End."),
+            sentences("One. \tTwo!\nThree?  End."),
             ["One.", "Two!", "Three?", "End."]
         );
     }
@@ -181,13 +128,7 @@ mod tests {
         assert_eq!(thousands(0), "0");
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(1234567890), "1,234,567,890");
-        assert_eq!(
-            norm(" &amp;&lt;&gt;&quot;&apos;&copy;&#39;&#x1f600;\\n\t"),
-            " &<>\"'©'😀 "
-        );
-        assert_eq!(
-            norm("&#0;&#xD800;&#x110000;&#xe9;"),
-            "\u{fffd}\u{fffd}\u{fffd}é"
-        );
+        assert_eq!(norm(" &amp;&lt;&gt;&quot;&#x27;&copy;\\n\t"), " &<>\"'© ");
+        assert_eq!(norm(&esc("&lt; <b>")), "&lt; <b>");
     }
 }

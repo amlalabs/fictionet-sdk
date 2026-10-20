@@ -37,8 +37,8 @@ impl Handler for Content {
         };
         let page = pages::handle(
             &target.host,
-            request.uri().path_and_query().map_or("/", |p| p.as_str()),
-            request.method().as_str(),
+            request.uri(),
+            request.method(),
             state.variant(),
             ex.random_u64(),
         );
