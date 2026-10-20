@@ -17,6 +17,7 @@ export function mount(root, services, options) {
   const list = el('div', { class: 'search-rows', role: 'list', 'aria-label': 'What the world served' }, root);
   const controller = new AbortController();
   const cleanup = [];
+  if (services.worldList) cleanup.push(services.worldList(root, list, 'Searches'));
   let snapshot = null, disposed = false;
   const menu = services.worldMenu;
   const request = services.command(controller.signal, () => buttons());

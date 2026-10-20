@@ -73,13 +73,14 @@ test('the picture shows the newest search, its engines and the sites its list na
   assert.equal(picture({ ...fixture(), queries: [], results: [], refused: [], planted: [] }).query, null);
 });
 
-function harness() {
+function harness(worldList) {
   const document = createDocument(), root = document.createElement('div');
   const subscriptions = new Map(), posts = [];
   const services = createServices({
     async post(path, body) { posts.push({ path, body }); return { status: 'applied', reply: { revision: 4, at_ms: 9000 } }; },
   });
   services.worldMenu = document.createElement('div');
+  if (worldList) services.worldList = worldList;
   services.state = (path, publish) => { subscriptions.set(path, publish); return () => subscriptions.delete(path); };
   const dispose = mount(root, services, { state: '/api/state/search' });
   return { root, services, subscriptions, posts, dispose, publish: (value) => subscriptions.get('/api/state/search')({ value }) };
@@ -125,4 +126,22 @@ test('the World menu chooses new pages, plants a fact and a page, and restarts a
   h.publish({ ...fixture(), generator: { ...fixture().generator, generate: false, generation_revision: 7 } });
   assert.equal(off.getAttribute('aria-pressed'), 'true');
   h.dispose();
+});
+
+test('the app hands its searches and pages to the shell and releases the tab on disposal', () => {
+  let registration, released = false;
+  const h = harness((container, list, label) => {
+    registration = { container, list, label };
+    return () => { released = true; };
+  });
+  h.publish(fixture());
+  assert.equal(registration.container, h.root);
+  assert.equal(registration.label, 'Searches');
+  assert.equal(registration.list, h.root.querySelector('.search-rows'));
+  assert.equal(registration.list.children.length, 6);
+  assert.match(registration.list.textContent, /wiki.corp/);
+  assert.equal(h.root.querySelector('.search-picture').parentNode, h.root);
+  h.dispose();
+  assert.equal(released, true);
+  assert.equal(h.subscriptions.size, 0);
 });

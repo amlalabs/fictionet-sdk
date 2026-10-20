@@ -709,6 +709,11 @@ test('an app page shows its agent tabs and world panel, with a World menu and no
   assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
   assert.equal(h.root.querySelector('.app-stage').dataset.kind, 'terminal');
   assert.match(h.root.textContent, /the world/);
+  const traffic = h.root.querySelector('.app-world-traffic');
+  assert.equal(traffic.parentNode, h.root.querySelector('.app-world'));
+  assert.equal(traffic.querySelector('#app-packets-tab').textContent, 'Packets');
+  assert.equal(traffic.querySelectorAll('button').length, 1);
+  assert.equal(traffic.querySelector('#app-packets-panel').hidden, false);
   const menu = h.root.querySelector('#world-menu');
   assert.equal(mounted, menu, 'the world panel fills the World menu');
   const button = h.root.querySelector('.app-menu-button');
@@ -724,5 +729,107 @@ test('an app page shows its agent tabs and world panel, with a World menu and no
   assert.equal(h.root.querySelector('.app-live').textContent, 'Live');
   stop();
   assert.equal(h.budget.open, 0);
+  assert.equal(h.document.listenerCount, 0);
+});
+
+test('app traffic arrives newest first, stays bounded, and closes with either tab or shell', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = {
+    title: 'Border', app: true, hosts: [DESCRIPTION.hosts[0]],
+    panels: [{ id: 'world', title: 'World', area: 'workspace', kind: 'custom', module: '/panels/world.mjs', state: '/api/state/rows' }],
+  };
+  const stop = await mount(h.root, {
+    get: async (path) => path === '/api/page' ? description : { links: ['guest-link'] },
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'), packetStream: (links) => h.stream('packets', links), close() {},
+  }, { dispose() {} }, async () => ({ mount(root, services) {
+    const { el } = services.dom.scoped(root);
+    el('svg:svg', { 'aria-label': 'Route picture' }, root);
+    const list = el('div', { role: 'list', text: 'Route activity' }, root);
+    return services.worldList(root, list, 'Route');
+  } }));
+  t.after(stop);
+  await settle();
+  const tabs = h.root.querySelector('.app-world-traffic').querySelectorAll('button');
+  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Packets', 'Route']);
+  const packetPanel = h.root.querySelector('#app-packets-panel');
+  const ownPanel = h.root.querySelector('#app-world-list-panel');
+  assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
+  assert.equal(tabs[1].getAttribute('tabindex'), '-1');
+  assert.equal(packetPanel.hidden, false);
+  assert.equal(ownPanel.hidden, true);
+  assert.match(ownPanel.textContent, /Route activity/);
+  for (const tab of tabs) {
+    const panel = h.root.querySelector(`#${tab.getAttribute('aria-controls')}`);
+    assert.equal(panel.getAttribute('role'), 'tabpanel');
+    assert.equal(panel.getAttribute('aria-labelledby'), tab.id);
+  }
+  h.streams.find((s) => s.tag === 'watch').emit('snapshot', {
+    t: 1, ended: false, hosts: [], groups: [], events: [], counters: {},
+    nodes: [{ id: 'guest', kind: 'sandbox', name: 'alpha' }], edges: [{ id: 'guest-link', a: 'guest', b: 'network' }],
+  });
+  await settle();
+  const state = h.streams.findLast((s) => s.tag === 'state' && !s.closed);
+  state.emit('snapshot', { topic: 'host-alpha', revision: 1, value: { addresses: ['192.168.1.2'] } });
+  const source = h.streams.findLast((s) => s.tag === 'packets');
+  assert.equal(source.args, 'guest-link');
+  tabs[0].click();
+  assert.equal(source.closed, undefined, 'selecting the current tab keeps its stream');
+  const frame = () => {
+    const callbacks = [...h.frames.values()]; h.frames.clear(); callbacks.forEach((fn) => fn());
+  };
+  const rows = () => packetPanel.querySelector('#prows').children;
+  assert.equal(rows().length, 0);
+  const send = (seq) => source.emit('packet', { seq, t: seq / 10, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:443', proto: 'TLS', len: 60, info: `Client hello ${seq}` });
+  send(1); frame();
+  assert.equal(rows().length, 1);
+  assert.deepEqual(rows()[0].children.map((c) => c.textContent), ['0.10', 'alpha → 203.0.113.8:443', 'TLS', 'Client hello 1']);
+  for (const seq of [4, 2, 3, 10, 8, 9, 7, 6, 5, 11]) send(seq);
+  frame();
+  assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), [11, 10, 9, 8, 7, 6, 5, 4]);
+  // Policy drops happen upstream; the stream reports totals without rows
+  // for the console packets the collector did not admit.
+  source.emit('policy', { link: 'guest-link', declined: 2000 });
+  frame();
+  source.emit('gap', { link: 'guest-link', missed: 50 });
+  frame();
+  assert.equal(rows().length, 8);
+  assert.doesNotMatch(packetPanel.textContent, /:22|:5900|missed|policy/);
+  // Guest SSH is still visible when admitted upstream. The shell must not
+  // hide a protocol or port to imitate the kit's address-aware policy.
+  source.emit('packet', { seq: 12, t: 1.2, side: 0, tags: [], src: '192.168.1.2:3456', dst: '203.0.113.8:22', proto: 'SSH', len: 60, info: 'SSH handshake' });
+  frame();
+  assert.match(rows()[0].textContent, /203.0.113.8:22/);
+  assert.equal(rows().length, 8);
+  send(2); frame();
+  assert.equal(Number(rows()[0].dataset.seq), 12, 'late older packets stay below newer traffic');
+  for (let seq = 13; seq <= 1012; seq++) send(seq);
+  frame();
+  assert.deepEqual(rows().map((row) => Number(row.dataset.seq)), [1012, 1011, 1010, 1009, 1008, 1007, 1006, 1005]);
+  tabs[1].click();
+  assert.equal(source.closed, true);
+  assert.equal(source.listenerCount, 0);
+  assert.equal(ownPanel.hidden, false);
+  assert.equal(packetPanel.hidden, true);
+  const key = new Event('keydown'); key.key = 'Home';
+  h.root.querySelector('.app-world-traffic').querySelector('.app-tabs').dispatchEvent(key);
+  await settle();
+  assert.equal(h.document.activeElement, tabs[0]);
+  assert.equal(ownPanel.hidden, true);
+  const reopened = h.streams.findLast((s) => s.tag === 'packets');
+  assert.notEqual(reopened, source);
+  assert.equal(packetPanel.querySelectorAll('#drawer').length, 1);
+  h.document.hidden = true; h.document.dispatchEvent(new Event('visibilitychange'));
+  assert.equal(reopened.closed, true);
+  assert.equal(h.frames.size, 0);
+  h.document.hidden = false; h.document.dispatchEvent(new Event('visibilitychange'));
+  await settle();
+  const finalSource = h.streams.findLast((s) => s.tag === 'packets');
+  assert.notEqual(finalSource, reopened);
+  stop();
+  assert.equal(finalSource.closed, true);
+  assert.equal(h.budget.open, 0);
+  assert.equal(h.frames.size, 0);
   assert.equal(h.document.listenerCount, 0);
 });

@@ -40,8 +40,9 @@ export class Element extends EventTarget {
     if (name.startsWith('data-')) this.dataset[name.slice(5)] = String(value);
   }
   appendChild(child) {
-    if (child.tag === 'fragment') child.children.forEach((c) => this.appendChild(c));
+    if (child.tag === 'fragment') [...child.children].forEach((c) => this.appendChild(c));
     else {
+      if (child.parent) child.remove();
       this.children.push(child);
       if (typeof child !== 'string') child.parent = this;
     }
@@ -53,6 +54,7 @@ export class Element extends EventTarget {
   focus() { this.ownerDocument.activeElement = this; }
   scrollIntoView() {}
   get firstChild() { return this.children[0]; }
+  get parentNode() { return this.parent || null; }
   // As in a browser, inserting a node that has a parent moves it.
   insertBefore(child, before) {
     if (child.parent) child.remove();

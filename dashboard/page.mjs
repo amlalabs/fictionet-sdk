@@ -474,8 +474,56 @@ export function appShell(root, services, page) {
   const agent = el('section', { class: 'app-agent', 'aria-label': 'Agent' }, body);
   const bar = el('div', { class: 'app-tabs', role: 'tablist', 'aria-label': 'Agent' }, agent);
   const controls = el('div', { class: 'app-controls' });
-  const stage = el('div', { class: 'app-stage', role: 'tabpanel' }, agent);
+  const stage = el('div', { id: 'app-agent-panel', class: 'app-stage', role: 'tabpanel' }, agent);
   const world = el('section', { class: 'app-world', 'aria-label': 'World' }, body);
+  const picture = el('div', { class: 'app-world-picture' }, world);
+  const traffic = el('section', { class: 'app-world-traffic', 'aria-label': 'Traffic' }, world);
+  const worldTabs = el('div', { class: 'app-tabs', role: 'tablist', 'aria-label': 'World traffic' }, traffic);
+  const packetTab = el('button', { id: 'app-packets-tab', type: 'button', role: 'tab', 'aria-selected': 'true', 'aria-controls': 'app-packets-panel', tabindex: '0', text: 'Packets' }, worldTabs);
+  const packetPanel = el('div', { id: 'app-packets-panel', role: 'tabpanel', 'aria-labelledby': 'app-packets-tab', tabindex: '0' }, traffic);
+  let ownTab, ownPanel, stopPackets = () => {}, packetVisible = true, disposed = false;
+  function watchPackets() {
+    stopPackets();
+    stopPackets = () => {};
+    packetPanel.replaceChildren();
+    if (!disposed && !document.hidden && packetVisible) stopPackets = packets(packetPanel, services, { compact: true, maxRows: 8 });
+  }
+  function selectWorld(showPackets, focus = false) {
+    const changed = packetVisible !== showPackets;
+    packetVisible = showPackets;
+    packetPanel.hidden = !showPackets;
+    if (ownPanel) ownPanel.hidden = showPackets;
+    for (const [tab, selected] of [[packetTab, showPackets], [ownTab, !showPackets]]) {
+      if (!tab) continue;
+      tab.setAttribute('aria-selected', String(selected));
+      tab.setAttribute('tabindex', selected ? '0' : '-1');
+      if (focus && selected) tab.focus();
+    }
+    if (changed) watchPackets();
+  }
+  // A demo leaves its picture in place and hands its existing list to the
+  // shell. The shell moves that list into the second world tab.
+  services.worldList = (container, list, label) => {
+    picture.classList.add('with-world-list');
+    traffic.remove();
+    container.append(traffic);
+    ownTab = el('button', { id: 'app-world-list-tab', type: 'button', role: 'tab', 'aria-selected': 'false', 'aria-controls': 'app-world-list-panel', tabindex: '-1', text: label }, worldTabs);
+    ownPanel = el('div', { id: 'app-world-list-panel', role: 'tabpanel', 'aria-labelledby': 'app-world-list-tab', tabindex: '0', hidden: '' }, traffic);
+    ownPanel.hidden = true;
+    list.remove();
+    ownPanel.append(list);
+    const off = listen(ownTab, 'click', () => selectWorld(false));
+    return () => {
+      off();
+      container.append(list);
+      ownTab.remove();
+      ownPanel.remove();
+      ownTab = ownPanel = null;
+      world.append(traffic);
+      picture.classList.remove('with-world-list');
+      if (!disposed) selectWorld(true);
+    };
+  };
   const host = page.hosts[0];
   const kinds = ['screen', 'terminal'].filter((kind) => host?.[kind]);
   const cleanup = [];
@@ -486,21 +534,37 @@ export function appShell(root, services, page) {
     stopConsole = () => {};
     stage.replaceChildren();
     controls.replaceChildren();
-    for (const [kind, tab] of tabs) tab.setAttribute('aria-selected', String(kind === selected));
+    for (const [kind, tab] of tabs) { tab.setAttribute('aria-selected', String(kind === selected)); tab.setAttribute('tabindex', kind === selected ? '0' : '-1'); }
     stage.dataset.kind = selected || '';
+    if (selected) stage.setAttribute('aria-labelledby', `app-agent-${selected}`);
     if (!selected || document.hidden) return;
     const options = page.panels.find((item) => item.kind === selected && item.host === host.name) || { kind: selected, host: host.name, title: host.name };
     stopConsole = panel(services, page, stage, { ...options, focus, interactive: true }, controls);
   }
   for (const kind of kinds) {
-    const tab = el('button', { type: 'button', role: 'tab', 'aria-selected': 'false', text: kind === 'screen' ? 'Screen' : 'Terminal' }, bar);
+    const tab = el('button', { type: 'button', role: 'tab', id: `app-agent-${kind}`, 'aria-controls': 'app-agent-panel', 'aria-selected': 'false', text: kind === 'screen' ? 'Screen' : 'Terminal' }, bar);
     tabs.set(kind, tab);
     cleanup.push(listen(tab, 'click', () => { if (selected !== kind) { selected = kind; open(kind === 'terminal'); } }));
   }
+  cleanup.push(listen(bar, 'keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key) || !kinds.length) return;
+    event.preventDefault();
+    const step = event.key === 'ArrowLeft' ? -1 : 1;
+    selected = event.key === 'Home' ? kinds[0] : event.key === 'End' ? kinds.at(-1) : kinds[(kinds.indexOf(selected) + step + kinds.length) % kinds.length];
+    open(selected === 'terminal');
+    tabs.get(selected).focus();
+  }));
   bar.append(controls);
   open();
   const own = page.panels.find((item) => item.area === 'workspace' && item.kind === 'custom');
-  if (own) cleanup.push(panel(services, page, world, own));
+  cleanup.push(listen(packetTab, 'click', () => selectWorld(true)));
+  cleanup.push(listen(worldTabs, 'keydown', (event) => {
+    if (!ownTab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    selectWorld(event.key === 'Home' || (event.key !== 'End' && !packetVisible), true);
+  }));
+  watchPackets();
+  if (own) cleanup.push(panel(services, page, picture, own));
   const close = () => { pop.hidden = true; toggle.setAttribute('aria-expanded', 'false'); };
   cleanup.push(listen(toggle, 'click', () => {
     pop.hidden = !pop.hidden;
@@ -517,10 +581,16 @@ export function appShell(root, services, page) {
     if (name === 'open' && !services.stopped()) { services.run.set('running'); status('Live', true); }
     if (name === 'world_error') { services.run.set('stopped'); status(value.error, false); }
   }));
-  // A hidden tab keeps no console open.
-  cleanup.push(listen(document, 'visibilitychange', () => { if (document.hidden) { stopConsole(); stopConsole = () => {}; } else open(); }));
+  // A hidden browser tab keeps neither console nor packets open.
+  cleanup.push(listen(document, 'visibilitychange', () => {
+    if (document.hidden) { stopConsole(); stopConsole = () => {}; } else open();
+    watchPackets();
+  }));
   return () => {
+    disposed = true;
     stopConsole();
+    stopPackets();
+    delete services.worldList;
     cleanup.reverse().forEach((off) => off());
     root.classList.remove('demo-app');
   };

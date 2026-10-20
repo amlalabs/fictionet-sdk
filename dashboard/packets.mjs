@@ -1,7 +1,7 @@
 // The packet list: its stream, queue, selection, detail and hex view.
 // components/packets.mjs passes in DOM helpers, the transport's packet calls,
 // labels and orientation.
-import { listen, scoped, lossLine, observationList } from './dom.mjs';
+import { listen, scoped, lossLine, observationList, reconcile } from './dom.mjs';
 
 // What the detail pane says until a packet is selected.
 const PICK = 'Select a packet';
@@ -11,7 +11,7 @@ export function createPackets({
   onDetail = () => {}, stopped = () => null,
   // A table with a Host column gives every row that cell, so gap rows span
   // all nine columns whichever are hidden.
-  hostColumn = false,
+  hostColumn = false, compact = false, endpointLabel = (value) => value,
 }) {
   const cleanup = [];
   const streamCleanup = [];
@@ -21,14 +21,23 @@ export function createPackets({
   const prows = $('prows');
   const plist = $('plist');
   let rowKey = 0;
-  const tail = observationList(prows, {
-    limit: maxRows, key: (row) => row.key,
-    create(row) {
-      const parent = document.createDocumentFragment();
-      if (row.gap) renderGap(row.gap, parent);
-      else addPacket(row, parent);
-      return { node: parent.firstChild };
+  let recent = [];
+  const compactRows = new Map();
+  const createRow = (row) => {
+    const parent = document.createDocumentFragment();
+    if (row.gap) renderGap(row.gap, parent);
+    else addPacket(row, parent);
+    return { node: parent.firstChild };
+  };
+  const tail = compact ? {
+    append(next) {
+      recent = [...recent, ...next].sort((a, b) => b.t - a.t || b.key - a.key).slice(0, maxRows);
+      reconcile(prows, recent, (row) => row.key, createRow, () => {}, compactRows);
     },
+    clear() { recent = []; compactRows.clear(); prows.replaceChildren(); },
+  } : observationList(prows, {
+    limit: maxRows, key: (row) => row.key,
+    create: createRow,
   });
   // What the list watches: { links: [{ id, flip }], source, paused, held,
   // queue, lastTime, done, skipped, evicted, missed, rows }; done holds links that
@@ -160,11 +169,13 @@ export function createPackets({
   }
 
   function queueEntry(entry) {
+    if (compact && entry.gap) return;
     entry.came = performance.now();
     // Only the last rows are ever shown, so only those are kept while the
     // view is paused or the tab is hidden. Gap notices share the same limit.
     const q = packets.paused ? packets.held : packets.queue;
     q.push(entry);
+    if (compact) q.sort((a, b) => a.t - b.t);
     if (q.length > MAX_ROWS * 2) q.splice(0, q.length - MAX_ROWS);
   }
 
@@ -216,6 +227,7 @@ export function createPackets({
   }
 
   function addGap(gap) {
+    if (compact) return;
     tail.append([{ gap, key: ++rowKey }]);
   }
 
@@ -258,8 +270,9 @@ export function createPackets({
       }
       if (!batch.length) return;
     }
-    tail.append(batch.slice(-MAX_ROWS).map((row) => ({ ...row, key: ++rowKey })));
+    tail.append((compact ? batch : batch.slice(-MAX_ROWS)).map((row) => ({ ...row, key: ++rowKey })));
     fitColumns();
+    if (compact) return;
     if (nearBottom) { plist.scrollTop = plist.scrollHeight; clearUnread(); }
     else if (jump) { unread += batch.length; jump.textContent = `↓ ${unread} new`; jump.hidden = false; }
   }
@@ -279,6 +292,13 @@ export function createPackets({
     packets.rows++;
     // One link numbers its own packets; merged links are numbered here.
     const no = packets.many ? packets.rows : p.seq;
+    if (compact) {
+      const tr = el('tr', { 'data-seq': p.seq, 'data-link': p.link }, parent);
+      for (const [index, value] of [p.t.toFixed(2), `${endpointLabel(p.src)} → ${endpointLabel(p.dst)}`, p.proto, p.info].entries()) {
+        el('td', { class: ['app-packet-time', 'app-packet-route', 'app-packet-protocol', 'app-packet-info'][index], text: value, title: value }, tr);
+      }
+      return;
+    }
     const tr = el('tr', { class: `${p.side === 1 ? 'back' : ''} ${p.skipped > 0 || p.evicted > 0 ? 'after-gap' : ''} ${p.tags.join(' ')}`, 'data-seq': p.seq, 'data-link': p.link }, parent);
     p.no = no;
     const cells = [no, time, '', p.src, p.dst, p.proto, p.len, p.info];

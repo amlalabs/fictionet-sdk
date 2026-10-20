@@ -17,11 +17,20 @@ export const APPROXIMATE = 'Address and port match';
 const STOPPED = 'Run stopped';
 
 export function mount(root, services, options = {}) {
-  const { $, el } = scoped(root);
-  structure(root, el);
+  const { $: lookup, el } = scoped(root);
+  const support = structure(root, el, options.compact);
+  const $ = (id) => support?.get(id) || lookup(id);
+  const addresses = new Map();
   const view = createPackets({
     onDetail(packet, header) {
       labelAction(header, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
+    },
+    endpointLabel(value) {
+      for (const host of services.hosts) {
+        const address = (addresses.get(host.name) || []).find((address) => value === address || value.startsWith(`${address}:`) || value.startsWith(`[${address}]:`));
+        if (address) return host.name;
+      }
+      return value;
     },
     $, el, ...services.transport, fmtCount, stopped: () => (services.stopped() ? STOPPED : null), hostColumn: true,
     ...options,
@@ -32,6 +41,7 @@ export function mount(root, services, options = {}) {
   const note = $('plist-empty');
   const frame = () => {
     view.flush();
+    if (options.compact) { animation = requestAnimationFrame(frame); return; }
     const queued = view.queued();
     const empty = !$('drawer').hidden && !$('prows').children.length && queued <= 0;
     if (note.hidden === empty) note.hidden = !empty;
@@ -41,6 +51,9 @@ export function mount(root, services, options = {}) {
   };
   animation = requestAnimationFrame(frame);
   const cleanup = [];
+  if (options.compact) for (const host of services.hosts) {
+    if (host.status) cleanup.push(services.state(host.status, ({ value }) => addresses.set(host.name, value?.addresses || [])));
+  }
   const { state } = services.graph;
   const owners = new Map();
   let request, generation = 0, current = '';
@@ -53,7 +66,7 @@ export function mount(root, services, options = {}) {
     $('drawer-title').title = 'Packets';
     $('drawer-title').setAttribute('aria-label', 'Packets');
     $('prows').replaceChildren();
-    el('td', { colspan: 9, text }, el('tr', { class: 'gap' }, $('prows')));
+    if (!options.compact) el('td', { colspan: 9, text }, el('tr', { class: 'gap' }, $('prows')));
   }
   function show(links, label) {
     const members = links.map((id) => state.edges.get(id) || { id, c: [0, 0, 0, 0] })
@@ -135,8 +148,8 @@ export function mount(root, services, options = {}) {
   };
 }
 
-function structure(root, el) {
-  const drawer = el('section', { id: 'drawer', class: 'drawer packet-panel', 'aria-label': 'Packets' }, root);
+function structure(root, el, compact = false) {
+  const drawer = el('section', { id: 'drawer', class: `drawer packet-panel${compact ? ' app-packets' : ''}`, 'aria-label': 'Packets' }, root);
   const head = el('div', { class: 'drawer-head' }, drawer);
   el('h2', { id: 'drawer-title', text: 'Packets' }, head);
   el('input', { id: 'pfilter', type: 'search', placeholder: 'Filter packets', 'aria-label': 'Filter packets', autocomplete: 'off' }, head);
@@ -170,4 +183,9 @@ function structure(root, el) {
   const hex = el('div', { id: 'hex', class: 'hex', hidden: '' }, detail);
   el('div', { id: 'hex-tabs', class: 'hex-tabs' }, hex);
   el('pre', { id: 'hex-dump' }, hex);
+  if (compact) {
+    const support = new Map(['drawer-title', 'pfilter', 'jump-packets', 'pause', 'pcap', 'pcap-label', 'dir-a', 'dir-b', 'sampled', 'pair', 'pair-text', 'pair-clear', 'tree', 'hex', 'hex-tabs', 'hex-dump', 'plist-empty'].map((id) => [id, root.querySelector(`#${id}`)]));
+    for (const node of [head, dirs, support.get('sampled'), pair, detail, table.querySelector('thead'), cols, support.get('plist-empty')]) node.remove();
+    return support;
+  }
 }
