@@ -94,29 +94,47 @@ async fn step(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> 
     finish(ssh, step, hijacked).await
 }
 
-/// Asks the page's Routing control for `mode` at `revision`.
+/// Sends a World menu command, as the page does, at `revision`.
+pub async fn world(
+    client: &PageClient,
+    id: &str,
+    mut command: Value,
+    revision: u64,
+) -> io::Result<Value> {
+    command["expected_revision"] = revision.into();
+    client.command("world", id, command).await
+}
+
+/// Asks the World menu's Route for `mode` at `revision`.
 pub async fn set_route(
     client: &PageClient,
     id: &str,
     mode: &str,
     revision: u64,
 ) -> io::Result<Value> {
-    client
-        .command(
-            "routing",
-            id,
-            json!({"mode": mode, "expected_revision": revision}),
-        )
-        .await
+    world(
+        client,
+        id,
+        json!({"command": "route", "mode": mode}),
+        revision,
+    )
+    .await
+}
+
+/// Sends a World menu command that must apply at `revision`.
+async fn applied(client: &PageClient, command: Value, revision: u64) -> io::Result<()> {
+    let reply = world(client, &kit::random_uuid(), command.clone(), revision).await?;
+    if reply["status"] != "applied" || reply["reply"]["revision"] != revision + 1 {
+        return Err(io::Error::other(format!(
+            "{command} was not applied: {reply}"
+        )));
+    }
+    println!("World: {command}, applied revision {}", revision + 1);
+    Ok(())
 }
 
 async fn flip(client: &PageClient, mode: &str, revision: u64) -> io::Result<()> {
-    let reply = set_route(client, &kit::random_uuid(), mode, revision).await?;
-    if reply["status"] != "applied" || reply["reply"]["revision"] != revision + 1 {
-        return Err(io::Error::other(format!("route was not applied: {reply}")));
-    }
-    println!("Routing: {mode}, applied revision {}", revision + 1);
-    Ok(())
+    applied(client, json!({"command": "route", "mode": mode}), revision).await
 }
 
 fn aborted_after(view: &Value, after: u64) -> bool {
@@ -230,20 +248,19 @@ async fn terminal(client: &PageClient, ssh: &ssh::Session) -> io::Result<()> {
     }).await?
 }
 
-/// The Border workspace at the hijack: the route flipped, the guest's
-/// four-hop traceroute matching it, and the credential alert, with the
-/// panel's animations finished.
+/// The world pane at the hijack: the route through Transpeak to the
+/// impostor, the impostor red with the password beside it, the sign-in row
+/// red, and the flash over.
 pub const HIJACKED_PAGE: &str = r#"(() => {
-    const panel = document.querySelector('.border-panel');
-    if (!panel || panel.dataset.mode !== 'hijack') return false;
-    const alert = panel.querySelector('.border-alert');
-    const trace = panel.querySelector('.border-trace')?.textContent || '';
-    return !!alert && !alert.hidden
-        && alert.querySelector('h2')?.textContent === 'The password reached the impostor'
-        && !!panel.querySelector('.border-path li.border-foreign')
-        && trace.includes('3 45.144.30.1 → 4 84.21.44.10')
-        && trace.includes('The observed path matches the current route.')
-        && panel.getAnimations({ subtree: true }).every(a => a.playState !== 'running');
+    const world = document.querySelector('.border-world');
+    if (!world || world.dataset.mode !== 'hijack' || world.dataset.impostor !== 'on') return false;
+    const row = [...world.querySelectorAll('.border-row.hot')].find(r => r.textContent.includes('POST /login'));
+    return !!row && row.textContent.includes('workstation → impostor')
+        && !!world.querySelector('.node.impostor.hot')
+        && !!world.querySelector('.token.shown')
+        && !!world.querySelector('.edge.bad')
+        && !world.classList.contains('flash')
+        && world.getAnimations({ subtree: true }).every(a => a.playState !== 'running');
 })()"#;
 
 async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
@@ -325,7 +342,8 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     )
     .await?;
     screen(run, out, true).await?;
-    flip(&client, "legitimate", 1).await?;
+    impostor_off(&client, ssh).await?;
+    flip(&client, "legitimate", 3).await?;
     for name in ["route", "balance", "bgp"] {
         step(ssh, name, false).await?;
     }
@@ -337,7 +355,82 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     println!(
         "Restored: three hops, a fresh trusted balance request, and Firefox reloaded the bank's page."
     );
+    restart(&client).await
+}
+
+/// Turns the impostor off in the hijack: the bank's address then has no
+/// host, Transpeak's router says so, and the page's rows show it. Then the
+/// impostor is turned back on.
+async fn impostor_off(client: &PageClient, ssh: &ssh::Session) -> io::Result<()> {
+    applied(client, json!({"command": "impostor", "on": false}), 1).await?;
+    let state: RouteState = client.state("routing").await?;
+    if state.impostor || state.mode != Variant::Hijack {
+        return Err(io::Error::other(format!(
+            "the impostor is still on: {state:?}"
+        )));
+    }
+    begin(ssh, "balance").await?;
+    let balance = output(ssh, "balance").await?;
+    if !checks::unreachable(&balance) {
+        return Err(io::Error::other(
+            "the balance request reached a host with the impostor off",
+        ));
+    }
+    client
+        .wait_for(
+            "/api/state/border",
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            "the page's rows did not show the bank's address unreachable",
+            |snapshot| {
+                Ok(rows(&snapshot["value"]).iter().any(|row| {
+                    row["from"] == "Transpeak"
+                        && row["to"] == "workstation"
+                        && row["what"] == "Host unreachable"
+                        && row["tone"] == "warn"
+                }))
+            },
+        )
+        .await?;
+    println!("Impostor off: the bank's address is unreachable through Transpeak.");
+    applied(client, json!({"command": "impostor", "on": true}), 2).await
+}
+
+/// Restarts the run from the World menu: the route normal, the impostor on,
+/// and the picture empty, at the next revision.
+async fn restart(client: &PageClient) -> io::Result<()> {
+    applied(client, json!({"command": "restart"}), 4).await?;
+    let state: RouteState = client.state("routing").await?;
+    if state.revision != 5 || state.mode != Variant::Legitimate || !state.impostor {
+        return Err(io::Error::other(format!(
+            "the restart left the route at {state:?}"
+        )));
+    }
+    client
+        .wait_for(
+            "/api/state/border",
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            "the restart did not clear the picture",
+            |snapshot| {
+                let view = &snapshot["value"];
+                Ok(rows(view).is_empty()
+                    && view["moments"]["rows"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty))
+            },
+        )
+        .await?;
+    println!("Restart: normal route, impostor on, an empty picture at revision 5.");
     Ok(())
+}
+
+/// The rows under the picture in a Border view.
+fn rows(view: &Value) -> &[Value] {
+    view["rows"]["rows"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
 }
 
 pub async fn observed(client: &PageClient, hijacked: bool) -> io::Result<()> {
@@ -424,7 +517,34 @@ fn observed_complete(view: &Value, hijacked: bool) -> bool {
                     && t["endpoint"] == m["endpoint"]
             })
     });
-    trace && bgp && tls && moments.len() == 1 && view["lost"] == 0 && view["truncated"] == 0
+    let row = |from: &str, to: Option<&str>, what: &str, tone: &str| {
+        rows("rows").iter().any(|r| {
+            r["from"] == from
+                && r["to"] == to.map_or(Value::Null, Into::into)
+                && r["what"] == what
+                && r["tone"] == tone
+        })
+    };
+    let pictured = if hijacked {
+        row("Transpeak", None, "Route announced", "")
+            && row("workstation", Some("impostor"), "POST /login", "hot")
+            && row(
+                "workstation",
+                Some("impostor"),
+                "Certificate refused",
+                "warn",
+            )
+    } else {
+        row("Transpeak", None, "Route withdrawn", "")
+            && row("workstation", Some("Kestrelmoor"), "GET /balance", "")
+    };
+    trace
+        && bgp
+        && tls
+        && pictured
+        && moments.len() == 1
+        && view["lost"] == 0
+        && view["truncated"] == 0
 }
 
 /// Whether a page event leaves the password out. An event that carries it

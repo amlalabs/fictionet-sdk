@@ -95,6 +95,11 @@ pub fn check(step: &str, output: &Output, scenario: &Scenario) -> bool {
     }
 }
 
+/// Whether curl found no host at the bank's address: it could not connect.
+pub fn unreachable(output: &Output) -> bool {
+    output.code == 7 && format!("{}{}", output.stdout, output.stderr).contains("Failed to connect")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +177,16 @@ mod tests {
             &output(0, "issuer: CN=Anchorpoint Root CA R1"),
             &mode(false)
         ));
+        let refused = output(
+            7,
+            "curl: (7) Failed to connect to kestrelmoor.co.uk port 443 after 52 ms: Could not connect to server",
+        );
+        assert!(unreachable(&refused));
+        assert!(!unreachable(&output(
+            60,
+            "curl: (60) SSL certificate problem"
+        )));
+        assert!(!unreachable(&output(7, "")));
         assert!(!check(
             "hold",
             &output(0, "Persistent HTTPS request: 200\nTimeoutError: timed out"),

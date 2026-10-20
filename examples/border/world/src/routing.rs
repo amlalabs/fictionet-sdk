@@ -33,6 +33,17 @@ impl SetRoute {
     pub const MAX_JSON_BYTES: usize = 80;
 }
 
+/// Let the impostor answer at the bank's address in the hijack, or not,
+/// only if the caller has the current revision. With the impostor off, the
+/// hijacked bank address has no host, and Transpeak's router answers "host
+/// unreachable".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetImpostor {
+    pub on: bool,
+    pub expected_revision: u64,
+}
+
 /// The revision and run time of an applied change.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Applied {
@@ -49,6 +60,7 @@ impl Applied {
 #[serde(rename_all = "snake_case")]
 pub enum Rejection {
     StaleRevision,
+    /// The command asks for the route or impostor the world already has.
     AlreadyInMode,
 }
 
@@ -94,6 +106,8 @@ pub struct RouteState {
     pub bank_route: Route,
     pub bank_hops: Vec<Ipv4Addr>,
     pub bank_identity: Identity,
+    /// Whether the impostor answers at the bank's address in the hijack.
+    pub impostor: bool,
 }
 
 impl RouteState {
@@ -114,6 +128,7 @@ impl RouteState {
             bank_route: Route::new(scenario, &scenario.bank_route()),
             bank_hops: scenario.hops(BANK_ADDR),
             bank_identity: scenario.bank_identity(),
+            impostor: true,
         }
     }
 }
@@ -125,6 +140,7 @@ pub struct Routing(Arc<Inner>);
 struct Inner {
     scenario: Arc<Scenario>,
     hijacked: AtomicBool,
+    impostor: AtomicBool,
     revision: Mutex<Revision>,
 }
 
@@ -138,6 +154,7 @@ impl Routing {
     pub(crate) fn new(scenario: Arc<Scenario>) -> Self {
         Self(Arc::new(Inner {
             hijacked: AtomicBool::new(scenario.hijacked()),
+            impostor: AtomicBool::new(true),
             scenario,
             revision: Mutex::new(Revision {
                 number: 0,
@@ -156,13 +173,21 @@ impl Routing {
         }
     }
 
+    /// Whether the impostor answers at the bank's address in the hijack.
+    pub fn impostor(&self) -> bool {
+        self.0.impostor.load(Ordering::Acquire)
+    }
+
     pub fn state(&self) -> RouteState {
         let revision = self.0.revision.lock();
-        RouteState::new(
-            &self.0.scenario.routed(self.mode()),
-            revision.number,
-            revision.since_ms,
-        )
+        RouteState {
+            impostor: self.impostor(),
+            ..RouteState::new(
+                &self.0.scenario.routed(self.mode()),
+                revision.number,
+                revision.since_ms,
+            )
+        }
     }
 
     pub(crate) fn register(&self, peer: WakeHandle) {
@@ -175,50 +200,109 @@ impl Routing {
     pub fn apply(&self, fcx: &Cx, command: SetRoute) -> Result<Applied, Rejected> {
         let mut revision = self.0.revision.lock();
         let previous = self.mode();
-        let reason = if command.expected_revision != revision.number {
-            Some(Rejection::StaleRevision)
-        } else if command.mode == previous {
-            Some(Rejection::AlreadyInMode)
+        self.check(
+            fcx,
+            &revision,
+            command.expected_revision,
+            command.mode == previous,
+        )?;
+        Ok(self.change(fcx, &mut revision, command.mode, self.impostor()))
+    }
+
+    /// Turns the impostor on or off from a world task. Rejections never move
+    /// the revision.
+    pub fn set_impostor(&self, fcx: &Cx, command: SetImpostor) -> Result<Applied, Rejected> {
+        let mut revision = self.0.revision.lock();
+        self.check(
+            fcx,
+            &revision,
+            command.expected_revision,
+            command.on == self.impostor(),
+        )?;
+        Ok(self.change(fcx, &mut revision, self.mode(), command.on))
+    }
+
+    /// Puts the route back to normal with the impostor on, whatever they are
+    /// now, as at the start of the run. Only a stale revision is rejected.
+    pub fn restart(&self, fcx: &Cx, expected_revision: u64) -> Result<Applied, Rejected> {
+        let mut revision = self.0.revision.lock();
+        self.check(fcx, &revision, expected_revision, false)?;
+        let applied = self.change(fcx, &mut revision, Variant::Legitimate, true);
+        fcx.emit("border", "restarted", |e| {
+            e.field("revision", applied.revision)
+                .field("at_ms", applied.at_ms)
+        });
+        Ok(applied)
+    }
+
+    /// Rejects a stale revision, or a command that changes nothing.
+    fn check(
+        &self,
+        fcx: &Cx,
+        revision: &Revision,
+        expected: u64,
+        unchanged: bool,
+    ) -> Result<(), Rejected> {
+        let reason = if expected != revision.number {
+            Rejection::StaleRevision
+        } else if unchanged {
+            Rejection::AlreadyInMode
         } else {
-            None
+            return Ok(());
         };
-        if let Some(reason) = reason {
-            fcx.emit("border", "route_rejected", |e| {
-                e.field("reason", name(&reason))
-                    .field("expected_revision", command.expected_revision)
-                    .field("revision", revision.number)
-                    .field("mode", name(&previous))
-            });
-            return Err(Rejected {
-                reason,
-                revision: revision.number,
-                mode: previous,
-            });
-        }
+        let mode = self.mode();
+        fcx.emit("border", "route_rejected", |e| {
+            e.field("reason", name(&reason))
+                .field("expected_revision", expected)
+                .field("revision", revision.number)
+                .field("mode", name(&mode))
+        });
+        Err(Rejected {
+            reason,
+            revision: revision.number,
+            mode,
+        })
+    }
+
+    /// Moves to the next revision with `mode` and `impostor`, emits what
+    /// changed, and wakes the BGP sessions when the route did.
+    fn change(&self, fcx: &Cx, revision: &mut Revision, mode: Variant, impostor: bool) -> Applied {
+        let previous = self.mode();
+        let was = self.impostor();
         revision.number += 1;
         revision.since_ms = fcx.now().since_start().as_millis() as u64;
         self.0
             .hijacked
-            .store(command.mode == Variant::Hijack, Ordering::Release);
-        fcx.emit("border", "route", |e| {
-            let scenario = self.0.scenario.routed(command.mode);
-            e.field("revision", revision.number)
-                .field("mode", name(&command.mode))
-                .field("previous_mode", name(&previous))
-                .field(
-                    "bank_route",
-                    field(&json!(Route::new(&scenario, &scenario.bank_route()))),
-                )
-                .field("bank_hops", field(&json!(scenario.hops(BANK_ADDR))))
-                .field("at_ms", revision.since_ms)
-        });
-        revision.peers.retain(|p| !p.is_closed());
-        for peer in &revision.peers {
-            peer.wake();
+            .store(mode == Variant::Hijack, Ordering::Release);
+        self.0.impostor.store(impostor, Ordering::Release);
+        if mode != previous {
+            fcx.emit("border", "route", |e| {
+                let scenario = self.0.scenario.routed(mode);
+                e.field("revision", revision.number)
+                    .field("mode", name(&mode))
+                    .field("previous_mode", name(&previous))
+                    .field(
+                        "bank_route",
+                        field(&json!(Route::new(&scenario, &scenario.bank_route()))),
+                    )
+                    .field("bank_hops", field(&json!(scenario.hops(BANK_ADDR))))
+                    .field("at_ms", revision.since_ms)
+            });
+            revision.peers.retain(|p| !p.is_closed());
+            for peer in &revision.peers {
+                peer.wake();
+            }
         }
-        Ok(Applied {
+        if impostor != was {
+            fcx.emit("border", "impostor", |e| {
+                e.field("revision", revision.number)
+                    .field("on", impostor)
+                    .field("at_ms", revision.since_ms)
+            });
+        }
+        Applied {
             revision: revision.number,
             at_ms: revision.since_ms,
-        })
+        }
     }
 }

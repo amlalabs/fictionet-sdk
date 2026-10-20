@@ -343,15 +343,15 @@ impl Pty for ssh::Pty {
     }
 }
 
-/// A private browser bootstrap, removed when its run ends, and the app
-/// window the run opened, if any.
+/// A private file holding the page's address and token, removed when its
+/// run ends, and the app window the run opened, if any.
 pub struct PageAccess {
     _dir: super::util::RunDir,
     _window: Option<super::shot::AppWindow>,
 }
 
 impl PageAccess {
-    /// Prints the public address and a separate action to open the authenticated page.
+    /// Prints the public address and the command that opens the page.
     pub fn new(url: &str) -> io::Result<Self> {
         let access = Self::bootstrap(url)?;
         access.print_open();
@@ -381,17 +381,12 @@ impl PageAccess {
         use std::os::unix::fs::OpenOptionsExt;
         super::client::PageClient::from_url(url)?;
         let dir = super::util::RunDir::new(&std::env::temp_dir(), "page")?;
-        let path = dir.path().join("open.html");
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
-            .open(&path)?;
-        write!(
-            file,
-            "<!doctype html><meta http-equiv=\"refresh\" content=\"0;url={}\">",
-            url.replace('&', "&amp;")
-        )?;
+            .open(dir.path().join(BOOTSTRAP))?;
+        writeln!(file, "{url}")?;
         println!("Page: {}", url.split('#').next().unwrap());
         Ok(Self {
             _dir: dir,
@@ -399,16 +394,27 @@ impl PageAccess {
         })
     }
 
-    fn path(&self) -> std::path::PathBuf {
-        self._dir.path().join("open.html")
-    }
-
     fn print_open(&self) {
         println!(
             "Open: cargo xtask demo open {}",
-            super::ssh::quote(&self.path().display().to_string())
+            super::ssh::quote(&self._dir.path().join(BOOTSTRAP).display().to_string())
         );
     }
+}
+
+/// The file in a [`PageAccess`] directory that holds the page's address.
+const BOOTSTRAP: &str = "page-address";
+
+/// Opens the page whose address the file at `path` holds, as [`PageAccess`]
+/// writes it, in a Chromium app window over DevTools. Opened this way, the
+/// page's address and token never appear on a command line, and the page
+/// sees a navigation the browser started itself, which its origin check
+/// admits.
+pub fn open_bootstrap(path: &std::path::Path) -> io::Result<super::shot::AppWindow> {
+    let url = std::fs::read_to_string(path)?;
+    let url = url.trim();
+    super::client::PageClient::from_url(url)?;
+    super::shot::AppWindow::open(url)
 }
 
 #[cfg(test)]
@@ -421,7 +427,7 @@ mod tests {
         let token = "ab".repeat(32);
         let access = PageAccess::new(&format!("http://127.0.0.1:8080/#token={token}")).unwrap();
         let dir = access._dir.path().to_path_buf();
-        let file = dir.join("open.html");
+        let file = dir.join(super::BOOTSTRAP);
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
@@ -430,10 +436,9 @@ mod tests {
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(
-            std::fs::read_to_string(&file)
-                .unwrap()
-                .contains(&format!("#token={token}"))
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("http://127.0.0.1:8080/#token={token}\n")
         );
         drop(access);
         assert!(!dir.exists());

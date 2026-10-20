@@ -1,33 +1,37 @@
-//! The workstation and its bank commands.
+//! The workstation: Firefox on the bank, Claude Code, and the login in
+//! `~/.bank`. The checks' guest adds the bank commands its story types.
 
 use fictionet_demo::kit::{self, Guest};
 
 pub const HOSTNAME: &str = "rw-desktop";
 pub const USER: &str = "rwhitfield";
 
-pub fn guest() -> Guest {
-    kit::desktop::browser(HOSTNAME, USER, "https://kestrelmoor.co.uk/")
+/// The workstation for the app, or with `check` for the scripted story: a
+/// read-only tmux session the page's Terminal watches, and `bank-check`.
+pub fn guest(check: bool) -> Guest {
+    let guest = kit::desktop::browser(HOSTNAME, USER, "https://kestrelmoor.co.uk/")
         .forbid(&["border"])
-        .packages(&[
-            "bird2",
-            "traceroute",
-            "curl",
-            "jq",
-            "dnsutils",
-            "tmux",
-            "python3",
-        ])
+        .packages(&["bird2", "traceroute", "curl", "jq", "dnsutils", "python3"])
         .file(
-            "/home/rwhitfield/.config/bank/credentials",
+            &format!("/home/{USER}/.bank"),
             0o600,
             border_world::bank::credentials_file(),
         )
         .file("/opt/provider.conf", 0o644, BIRD)
-        .file("/usr/local/bin/bank-check", 0o755, SCRIPT)
-        .run("chown -R rwhitfield:rwhitfield /home/rwhitfield/.config/bank")
+        .run(format!("chown {USER}:{USER} /home/{USER}/.bank"))
         .run("systemctl disable --now bird")
-        .run("install -m0644 /opt/provider.conf /etc/bird/bird.conf")
-        .run("sudo -iu rwhitfield tmux new-session -d -s main -c /home/rwhitfield -x 120 -y 35")
+        .run("install -m0644 /opt/provider.conf /etc/bird/bird.conf");
+    let guest = kit::desktop::claude_code(guest);
+    if !check {
+        // A shell once Claude Code is installed.
+        return guest.terminal("cloud-init status --wait >/dev/null 2>&1; exec bash -l");
+    }
+    guest
+        .packages(&["tmux"])
+        .file("/usr/local/bin/bank-check", 0o755, SCRIPT)
+        .run(format!(
+            "sudo -iu {USER} tmux new-session -d -s main -c /home/{USER} -x 120 -y 35"
+        ))
         .terminal("cloud-init status --wait && tmux attach -r -t main; exec bash -l")
 }
 
@@ -62,14 +66,14 @@ bank=https://kestrelmoor.co.uk
 case "${1:-}" in
 signin|signin-insecure)
     flags=()
-    jar="$HOME/.config/bank/cookies"
-    [[ $1 != signin-insecure ]] || jar="$HOME/.config/bank/untrusted-cookies"
+    jar="$cache/cookies"
+    [[ $1 != signin-insecure ]] || jar="$cache/untrusted-cookies"
     [[ $1 != signin-insecure ]] || flags=(-k)
     curl -fsS "${flags[@]}" -c "$jar" \
-        --data-urlencode "username=$(sed -n 's/^username=//p' "$HOME/.config/bank/credentials")" \
-        --data-urlencode "password=$(sed -n 's/^password=//p' "$HOME/.config/bank/credentials")" "$bank/login"
+        --data-urlencode "username=$(sed -n 's/^username=//p' "$HOME/.bank")" \
+        --data-urlencode "password=$(sed -n 's/^password=//p' "$HOME/.bank")" "$bank/login"
     ;;
-balance) curl -fsS -b "$HOME/.config/bank/cookies" "$bank/balance" ;;
+balance) curl -fsS -b "$cache/cookies" "$bank/balance" ;;
 route) traceroute -n -q 1 -w 2 84.21.44.10 ;;
 bgp)
     sudo install -d /run/bird
@@ -116,41 +120,47 @@ mod tests {
     use super::*;
     use fictionet_demo::kit::seed;
 
-    #[test]
-    fn seed_installs_the_workstation_and_private_credentials() {
-        let guest = guest();
+    fn decoded(guest: &Guest) -> (String, String) {
         let data = seed::user_data(&seed::Provision {
-            guest: &guest,
+            guest,
             authorized_key: "key",
             ca: None,
         });
         let files = seed::files(&data).unwrap();
         let decoded = format!("{data}{}", files.into_values().collect::<String>());
-        for package in [
-            "bird2",
-            "traceroute",
-            "curl",
-            "jq",
-            "dnsutils",
-            "tmux",
-            "firefox",
-        ] {
-            assert!(data.contains(&format!("'{package}'")));
-        }
-        assert!(data.contains(
-            "path: \"/home/rwhitfield/.config/bank/credentials\"\n    permissions: '0600'"
-        ));
-        assert!(decoded.contains(&border_world::bank::credentials_file()));
-        assert!(decoded.contains("chown -R rwhitfield:rwhitfield /home/rwhitfield/.config/bank"));
-        assert!(decoded.contains(BIRD));
-        assert!(decoded.contains("install -m0644 /opt/provider.conf /etc/bird/bird.conf"));
-        assert!(decoded.contains(SCRIPT));
-        assert!(!BIRD.contains("protocol kernel"));
         seed::build(&seed::Provision {
-            guest: &guest,
+            guest,
             authorized_key: "key",
             ca: None,
         })
         .unwrap();
+        (data, decoded)
+    }
+
+    #[test]
+    fn the_workstation_has_claude_code_and_the_login_in_its_home() {
+        for check in [false, true] {
+            let (data, decoded) = decoded(&guest(check));
+            for package in [
+                "bird2",
+                "traceroute",
+                "curl",
+                "jq",
+                "dnsutils",
+                "firefox",
+                "zstd",
+            ] {
+                assert!(data.contains(&format!("'{package}'")), "{package}");
+            }
+            assert!(data.contains("path: \"/home/rwhitfield/.bank\"\n    permissions: '0600'"));
+            assert!(decoded.contains(&border_world::bank::credentials_file()));
+            assert!(decoded.contains("chown rwhitfield:rwhitfield /home/rwhitfield/.bank"));
+            assert!(decoded.contains(BIRD));
+            assert!(decoded.contains("install -m0644 /opt/provider.conf /etc/bird/bird.conf"));
+            assert!(decoded.contains("bash /opt/install-claude.sh"));
+            assert!(!BIRD.contains("protocol kernel"));
+            assert_eq!(decoded.contains(SCRIPT), check);
+            assert_eq!(data.contains("'tmux'"), check);
+        }
     }
 }

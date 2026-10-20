@@ -50,6 +50,30 @@ async fn http_commands_change_the_route_and_record_inputs() {
         .unwrap()
     });
     let third = control.port.recv().await.unwrap();
+    let url = server.url().to_owned();
+    let off = tokio::spawn(async move {
+        story::world(
+            &PageClient::from_url(url).unwrap(),
+            "off",
+            json!({"command": "impostor", "on": false}),
+            1,
+        )
+        .await
+        .unwrap()
+    });
+    let fourth = control.port.recv().await.unwrap();
+    let url = server.url().to_owned();
+    let restart = tokio::spawn(async move {
+        story::world(
+            &PageClient::from_url(url).unwrap(),
+            "restart",
+            json!({"command": "restart"}),
+            2,
+        )
+        .await
+        .unwrap()
+    });
+    let fifth = control.port.recv().await.unwrap();
     let state_slot = Arc::new(std::sync::Mutex::new(None));
     let state_out = state_slot.clone();
     fictionet::lab(
@@ -67,21 +91,31 @@ async fn http_commands_change_the_route_and_record_inputs() {
             assert_eq!(routing.state(), changed);
             kit::answer_command(&cx, third, |route| control.apply(&cx, &routing, route))?;
             assert_eq!(routing.state(), changed);
-            *state_out.lock().unwrap() = Some(changed);
+            kit::answer_command(&cx, fourth, |command| control.apply(&cx, &routing, command))?;
+            let silent = routing.state();
+            assert_eq!(
+                (silent.revision, silent.mode, silent.impostor),
+                (2, changed.mode, false)
+            );
+            kit::answer_command(&cx, fifth, |command| control.apply(&cx, &routing, command))?;
+            let restarted = routing.state();
+            assert_eq!(
+                (restarted.revision, restarted.mode, restarted.impostor),
+                (3, border_world::scenario::Variant::Legitimate, true)
+            );
+            *state_out.lock().unwrap() = Some((changed, restarted));
             cx.cancel();
             Ok(())
         },
     )
     .await
     .unwrap();
-    let changed = state_slot.lock().unwrap().clone().unwrap();
+    let (changed, restarted) = state_slot.lock().unwrap().clone().unwrap();
     let applied = request.await.unwrap();
     assert_eq!(
         applied["reply"],
         json!({"revision": 1, "at_ms": changed.since_ms})
     );
-    let state: Value = client.get_json("/api/state/routing").await.unwrap();
-    assert_eq!(state["value"], serde_json::to_value(&changed).unwrap());
     let stale = repeat.await.unwrap();
     assert_eq!(stale["status"], "rejected");
     assert_eq!(stale["rejection"]["reason"], "stale_revision");
@@ -90,9 +124,13 @@ async fn http_commands_change_the_route_and_record_inputs() {
     assert_eq!(unchanged["rejection"]["reason"], "invalid");
     assert_eq!(
         unchanged["rejection"]["message"],
-        "the route is already Hijacked (revision 1)"
+        "The route is already hijacked."
     );
-    let unknown = client.request("POST", "/api/command/routing", Some(&json!({"request_id":"unknown", "command":{"mode":"legitimate", "expected_revision":1,"surprise":true}})), true).await.unwrap();
+    assert_eq!(off.await.unwrap()["reply"]["revision"], 2);
+    assert_eq!(restart.await.unwrap()["reply"]["revision"], 3);
+    let state: Value = client.get_json("/api/state/routing").await.unwrap();
+    assert_eq!(state["value"], serde_json::to_value(&restarted).unwrap());
+    let unknown = client.request("POST", "/api/command/world", Some(&json!({"request_id":"unknown", "command":{"command":"route","mode":"legitimate", "expected_revision":3,"surprise":true}})), true).await.unwrap();
     assert_eq!(unknown.status, 400);
     assert!(
         String::from_utf8(unknown.body)
@@ -100,7 +138,7 @@ async fn http_commands_change_the_route_and_record_inputs() {
             .contains("surprise")
     );
     let state: Value = client.get_json("/api/state/routing").await.unwrap();
-    assert_eq!(state["value"], serde_json::to_value(&changed).unwrap());
+    assert_eq!(state["value"], serde_json::to_value(&restarted).unwrap());
     let events = client
         .request("GET", "/api/events", None, true)
         .await
@@ -113,7 +151,7 @@ async fn http_commands_change_the_route_and_record_inputs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn browser_buttons_use_the_world_revision() {
+async fn world_menu_buttons_use_the_world_revision() {
     let dashboard = DashboardObserver::new(DashboardOptions {
         collector: fictionet_observe::Options::default(),
         ..Default::default()
@@ -161,30 +199,28 @@ async fn browser_buttons_use_the_world_revision() {
         }
     }
     let _directory = RemoveDirectory(dir.clone());
-    for (name, action, mode, revision, theme) in [
-        ("normal", "", "legitimate", 0, "light"),
-        ("hijacked", "Hijacked", "hijack", 1, "light"),
-        ("restored", "Normal", "legitimate", 2, "light"),
-        ("normal-dark", "", "legitimate", 2, "dark"),
-        ("hijacked-dark", "Hijacked", "hijack", 3, "dark"),
-        ("restored-dark", "Normal", "legitimate", 4, "dark"),
+    for (name, action, mode, impostor, revision, theme) in [
+        ("normal", "", "normal", "on", 0, "light"),
+        ("hijacked", "Hijacked", "hijack", "on", 1, "light"),
+        ("silent", "Off", "hijack", "off", 2, "light"),
+        ("restarted", "Restart", "normal", "on", 3, "light"),
+        ("hijacked-dark", "Hijacked", "hijack", "on", 4, "dark"),
+        ("restarted-dark", "Restart", "normal", "on", 5, "dark"),
     ] {
         let condition = format!(
             r#"(() => {{
-            const tab = document.querySelector('#tab-routing');
-            if (!tab) return false;
-            if (tab.getAttribute('aria-selected') !== 'true') {{ tab.click(); return false; }}
-            const state = document.querySelector('.control-state');
-            const buttons = [...document.querySelectorAll('.control-actions button')];
-            if (!state || !buttons.length || buttons.some(b => b.disabled)) return false;
+            const buttons = [...document.querySelectorAll('#world-menu button')];
+            const world = document.querySelector('.border-world');
+            if (!world || !buttons.length || buttons.some(b => b.disabled)) return false;
             if ({action:?} && !window.sent) {{
                 window.sent = true;
                 buttons.find(b => b.textContent === {action:?}).click();
                 return false;
             }}
-            const rows = [...state.querySelectorAll('dt')];
-            return rows.some(row => row.textContent === 'Revision' && row.nextElementSibling.textContent === String({revision}))
-                && rows.some(row => row.textContent === 'Mode' && row.nextElementSibling.textContent === {mode:?});
+            const pressed = buttons.filter(b => b.getAttribute('aria-pressed') === 'true').map(b => b.textContent);
+            return world.dataset.mode === {mode:?} && world.dataset.impostor === {impostor:?}
+                && pressed.includes({mode:?} === 'hijack' ? 'Hijacked' : 'Normal')
+                && pressed.includes({impostor:?} === 'on' ? 'On' : 'Off');
         }})()"#
         );
         let url = server.url().replace("/#", &format!("/?theme={theme}#"));
@@ -195,9 +231,18 @@ async fn browser_buttons_use_the_world_revision() {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(routing.state().revision, revision);
-        assert_eq!(json!(routing.state().mode), mode);
-        println!("Browser routing capture: {captured}");
+        let state = routing.state();
+        assert_eq!(state.revision, revision);
+        assert_eq!(state.impostor, impostor == "on");
+        assert_eq!(
+            json!(state.mode),
+            if mode == "hijack" {
+                "hijack"
+            } else {
+                "legitimate"
+            }
+        );
+        println!("Browser World menu capture: {captured}");
     }
     stop.send(()).unwrap();
     worker.await.unwrap().unwrap();

@@ -86,16 +86,7 @@ pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io:
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
-    // SAFETY: dup2 and close are async-signal-safe; the fds are plain i32s
-    // copied into the closure before the fork.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(child_cmd_fd, 3) < 0 || libc::dup2(child_reply_fd, 4) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    devtools_pipe(&mut command, child_cmd_fd, child_reply_fd);
     let mut child = command.spawn()?;
     // The child's ends belong to the child now.
     drop(to_read);
@@ -231,22 +222,15 @@ impl AppWindow {
                 "--use-mock-keychain",
                 "--window-size=1440,900",
                 "--remote-debugging-pipe",
-                "--app=about:blank",
+                // An app window needs an http, https, file or data address
+                // to start on; with about:blank it is an ordinary window.
+                "--app=data:text/html,",
             ])
             .arg(format!("--user-data-dir={}", profile.path().display()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // SAFETY: dup2 is async-signal-safe; the fds are plain i32s copied
-        // into the closure before the fork.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(child_cmd_fd, 3) < 0 || libc::dup2(child_reply_fd, 4) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        devtools_pipe(&mut command, child_cmd_fd, child_reply_fd);
         let mut child = command.spawn()?;
         drop(to_read);
         drop(from_write);
@@ -286,6 +270,13 @@ impl AppWindow {
     }
 }
 
+impl AppWindow {
+    /// Whether the window has been closed.
+    pub fn closed(&mut self) -> io::Result<bool> {
+        Ok(self.child.try_wait()?.is_some())
+    }
+}
+
 impl Drop for AppWindow {
     fn drop(&mut self) {
         let _ = write_all(&self.commands, b"{\"id\":0,\"method\":\"Browser.close\"}");
@@ -295,6 +286,29 @@ impl Drop for AppWindow {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Gives Chromium its DevTools pipe: `commands` as fd 3 and `replies` as
+/// fd 4. Both are first copied above 4, so neither is overwritten by the
+/// other, and a pipe that is already fd 3 or 4 loses its close-on-exec flag
+/// too, as `dup2` onto a different fd does.
+fn devtools_pipe(command: &mut Command, commands: RawFd, replies: RawFd) {
+    // SAFETY: fcntl and dup2 are async-signal-safe; the fds are plain i32s
+    // copied into the closure before the fork.
+    unsafe {
+        command.pre_exec(move || {
+            let commands = libc::fcntl(commands, libc::F_DUPFD_CLOEXEC, 5);
+            let replies = libc::fcntl(replies, libc::F_DUPFD_CLOEXEC, 5);
+            if commands < 0
+                || replies < 0
+                || libc::dup2(commands, 3) < 0
+                || libc::dup2(replies, 4) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 

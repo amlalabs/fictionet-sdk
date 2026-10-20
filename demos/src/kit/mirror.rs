@@ -73,6 +73,11 @@ impl Setup {
         self.pending.lock().unwrap().remove(guest);
     }
 
+    /// Ends setup for every guest at once, finished or not.
+    pub(crate) fn close(&self) {
+        self.pending.lock().unwrap().clear();
+    }
+
     fn closed(&self) -> bool {
         self.pending.lock().unwrap().is_empty()
     }

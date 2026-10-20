@@ -6,7 +6,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use border_world::routing::{Applied, Rejected, Rejection, Route, RouteState, SetRoute};
+use border_world::routing::{
+    Applied, Rejected, Rejection, Route, RouteState, SetImpostor, SetRoute,
+};
 use border_world::scenario::{
     BANK_ADDR, BANK_DOMAIN, BANK_NAMES, FOREIGN, HOME, IMPOSTOR_ADDR, Identity, ROGUE_CA_NAME,
     Scenario, Task, Variant, parse_prefix,
@@ -490,6 +492,97 @@ fn rejected_commands_preserve_the_revision_and_report_current_state() {
                     .count(),
                 5
             );
+            Ok(())
+        },
+    );
+}
+
+/// Who answers a UDP probe to the bank's address from the raw sandbox, and
+/// with which ICMP type and code.
+async fn bank_answers(fcx: &Cx, raw: &mut End) -> (Ipv4Addr, u8, u8) {
+    raw.send(udp_probe(Ipv4Addr::new(10, 0, 0, 3), BANK_ADDR, 33434, 64));
+    let reply = recv_within(fcx, raw, Duration::from_secs(2)).await.unwrap();
+    let (source, _, _, icmp) = parse(&reply);
+    (source, icmp[0], icmp[1])
+}
+
+#[test]
+fn the_impostor_switch_and_restart_change_who_answers_at_the_bank() {
+    run_variant(
+        Variant::Legitimate,
+        Task::Read,
+        |fcx, attacher, env| async move {
+            let mut raw = attacher.attach("raw").unwrap();
+            let routing = &env.routing;
+            assert!(routing.state().impostor);
+            routing
+                .apply(
+                    &fcx,
+                    SetRoute {
+                        mode: Variant::Hijack,
+                        expected_revision: 0,
+                    },
+                )
+                .unwrap();
+            // The impostor answers at the bank's address: port unreachable.
+            assert_eq!(bank_answers(&fcx, &mut raw).await, (BANK_ADDR, 3, 3));
+            let off = SetImpostor {
+                on: false,
+                expected_revision: 1,
+            };
+            assert_eq!(routing.set_impostor(&fcx, off.clone()).unwrap().revision, 2);
+            assert!(!routing.impostor() && !routing.state().impostor);
+            assert_eq!(routing.state().mode, Variant::Hijack);
+            // With no impostor, Transpeak's router has no host for it.
+            assert_eq!(bank_answers(&fcx, &mut raw).await, (FOREIGN.router, 3, 1));
+            for (command, reason) in [
+                (off, Rejection::StaleRevision),
+                (
+                    SetImpostor {
+                        on: false,
+                        expected_revision: 2,
+                    },
+                    Rejection::AlreadyInMode,
+                ),
+            ] {
+                assert_eq!(
+                    routing.set_impostor(&fcx, command),
+                    Err(Rejected {
+                        reason,
+                        revision: 2,
+                        mode: Variant::Hijack
+                    })
+                );
+            }
+            assert_eq!(
+                routing.restart(&fcx, 1).unwrap_err().reason,
+                Rejection::StaleRevision
+            );
+            assert_eq!(routing.restart(&fcx, 2).unwrap().revision, 3);
+            let state = routing.state();
+            assert_eq!(
+                (state.mode, state.impostor, state.revision),
+                (Variant::Legitimate, true, 3)
+            );
+            // The genuine bank answers again.
+            assert_eq!(bank_answers(&fcx, &mut raw).await, (BANK_ADDR, 3, 3));
+            // A restart applies even when nothing has changed.
+            assert_eq!(routing.restart(&fcx, 3).unwrap().revision, 4);
+            let facts = env.events.checked_all().unwrap();
+            let switched: Vec<_> = facts
+                .iter()
+                .filter(|e| e.is("border", "impostor"))
+                .map(|e| e.get("on").and_then(|v| v.as_bool()))
+                .collect();
+            assert_eq!(switched, [Some(false), Some(true)]);
+            assert_eq!(facts.iter().filter(|e| e.is("border", "route")).count(), 2);
+            assert_eq!(
+                facts.iter().filter(|e| e.is("border", "restarted")).count(),
+                2
+            );
+            assert!(facts.iter().any(|e| e.is("path", "unreachable")
+                && e.str("dst") == Some("84.21.44.10")
+                && e.str("from") == Some("45.144.30.1")));
             Ok(())
         },
     );

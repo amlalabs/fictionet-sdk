@@ -78,3 +78,7 @@ path = "src/bin/fakewiki/main.rs"
 [[bin]]
 name = "scan"
 path = "src/bin/scan/main.rs"
+
+[[bin]]
+name = "open"
+path = "src/bin/open.rs"

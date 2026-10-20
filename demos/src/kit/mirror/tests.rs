@@ -1762,6 +1762,78 @@ async fn setup_completion_closes_cached_and_uncached_requests() {
     .await;
 }
 
+use std::sync::atomic::AtomicBool;
+
+/// A kit run of one guest with a desktop, its world started and its SSH
+/// session on an in-process peer that answers `ready`.
+async fn app_run(ready: bool) -> (crate::kit::Run, crate::kit::ssh::tests::Peer) {
+    use crate::kit::{Guest, Kit};
+    let mut kit = Kit::new("app")
+        .guest(Guest::ubuntu("workstation", "analyst").desktop(5901, "desktop-ready"));
+    let (mut run, prepared) = kit.prepare().unwrap();
+    run.start_world(
+        |cx: Cx, world: crate::kit::World| async move {
+            cx.spawn(move |cx| async move {
+                let _world = world;
+                cx.cancelled().await;
+                Ok(())
+            });
+            Ok(())
+        },
+        prepared,
+    )
+    .await
+    .unwrap();
+    let peer = crate::kit::ssh::tests::Peer::new().await;
+    peer.ready.store(ready, std::sync::atomic::Ordering::SeqCst);
+    run.guests[0].addr = tokio::sync::watch::channel(Some(std::net::Ipv4Addr::LOCALHOST)).1;
+    run.connected(0, peer.session.clone());
+    (run, peer)
+}
+
+/// Whether the mirror on `setup` refuses cached reads and uncached posts.
+async fn refuses_everything(setup: Arc<Setup>) -> bool {
+    let refused = Arc::new(AtomicBool::new(true));
+    let out = refused.clone();
+    run(|fcx| async move {
+        let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "test").unwrap();
+        let upstream = Upstream::new().await;
+        let mut cache = upstream.cache(&fcx, dir.path());
+        cache.setup = Some(setup);
+        for (path, method) in [(PACKAGE, "GET"), ("/upload?data=secret", "POST")] {
+            let mut req = request(path);
+            *req.method_mut() = method.parse().unwrap();
+            let status = send(&fcx, &cache, req).await.unwrap().status();
+            if status != StatusCode::FORBIDDEN {
+                out.store(false, Ordering::SeqCst);
+            }
+        }
+        if upstream.count() != 0 {
+            out.store(false, Ordering::SeqCst);
+        }
+    })
+    .await;
+    refused.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn an_app_closes_setup_forwarding_once_its_guests_are_set_up() {
+    let (run, _peer) = app_run(true).await;
+    assert!(!refuses_everything(run.setup.clone()).await);
+    run.app_ready("workstation").await.unwrap();
+    assert!(refuses_everything(run.setup.clone()).await);
+    run.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_app_stopped_before_its_desktop_is_up_closes_setup_forwarding() {
+    let (run, _peer) = app_run(false).await;
+    let wait = tokio::time::timeout(Duration::from_millis(1500), run.app_ready("workstation"));
+    assert!(wait.await.is_err(), "the desktop never comes up");
+    assert!(refuses_everything(run.setup.clone()).await);
+    run.shutdown().await.unwrap();
+}
+
 #[test]
 fn closed_cache_releases_ownership_with_an_inherited_descriptor() {
     let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "cache").unwrap();

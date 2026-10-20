@@ -57,10 +57,9 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
     let scenario = control::scenario();
     let control = Control::new(&scenario)?;
     let log = Log::start(
-        Box::new(super::results::Writer::new(
-            std::fs::File::create(out.join("log.jsonl"))?,
-            control.results.clone(),
-        )),
+        Box::new(std::io::BufWriter::new(std::fs::File::create(
+            out.join("log.jsonl"),
+        )?)),
         scenario.clone(),
     );
     let dashboard = DashboardObserver::new(DashboardOptions {
@@ -109,9 +108,6 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         world_log.attach(&cx);
         let ca = Ca::new(&cx, certs::LAB_CA_NAME)?;
         let ids = border_world::identities(&cx, &ca)?;
-        control
-            .view
-            .certificates(cx.now(), super::certificates::Certificates::new(&ids)?);
         let (attacher, attachments) = fictionet::attachments();
         let routing = border_world::start(&cx, scenario, ids, attachments)?;
         let route = routing.clone();
@@ -156,7 +152,7 @@ pub async fn run() -> Result<(), Error> {
     let preview = start(&out).await?;
     println!("Output: {}", out.display());
     println!(
-        "In-process scripted client; no VM, so the screen says NO VM. Its story signs in, checks the balance and runs traceroute on the route the page shows. Change the route on the page between runs."
+        "In-process scripted client; no VM, so the screen says NO VM. Its story signs in, checks the balance and runs traceroute on the route the page shows. Change the route in the World menu between runs."
     );
     let mut input =
         kit::preview::Input::stdin(kit::preview::Story::OnEnter, Some(preview.screen.clone()))?;
@@ -206,26 +202,6 @@ mod tests {
         assert_eq!(reply["status"], "applied");
         preview.traffic().await.unwrap();
         super::super::story::observed(&client, false).await.unwrap();
-        let tls: serde_json::Value = client.get_json("/api/state/tls").await.unwrap();
-        assert_eq!(tls["value"]["lost"], 0);
-        let sessions = tls["value"]["sessions"]["rows"].as_array().unwrap();
-        assert_eq!(sessions.len(), 7, "{sessions:?}");
-        for session in sessions {
-            assert_eq!(session["gaps"], 0);
-            for key in ["versions", "ciphers", "groups"] {
-                let offered = session["offered"][key].as_array().unwrap();
-                let chosen = session["chosen"][key].as_array().unwrap();
-                assert_eq!(chosen.len(), 1);
-                assert!(offered.contains(&chosen[0]), "{session}");
-            }
-        }
-        let results: serde_json::Value = client.get_json("/api/state/results").await.unwrap();
-        assert_eq!(results["value"]["invalid"], 0);
-        assert_eq!(results["value"]["dropped"], 0);
-        let lines = results["value"]["rows"].as_array().unwrap();
-        assert!(lines.iter().any(|l| l["type"] == "http"
-            && l["served_by"] == "impostor"
-            && l["carries_password"] == true));
         // After the world ends, the guest link is closed and keeps its last,
         // three-hop traceroute from the restored route.
         let server = preview.stop().await.unwrap();
@@ -260,14 +236,15 @@ mod tests {
             ]
         );
         server.shutdown(std::time::Duration::from_secs(2)).await;
+        // The world's log holds the sign-in at the impostor, without the password.
         let written: Vec<serde_json::Value> = std::fs::read_to_string(dir.join("log.jsonl"))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        for line in lines {
-            assert!(written.contains(line));
-        }
+        assert!(written.iter().any(|l| l["type"] == "http"
+            && l["served_by"] == "impostor"
+            && l["carries_password"] == true));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

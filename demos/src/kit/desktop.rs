@@ -6,6 +6,7 @@ use std::io;
 use std::time::Duration;
 
 use fictionet::stdlib::codec::base64;
+use fictionet_extras::models;
 
 use super::{Guest, GuestHandle, ssh};
 
@@ -263,6 +264,72 @@ pub fn claude_code(guest: Guest) -> Guest {
         )
         .file("/opt/install-claude.sh", 0o755, script)
         .run("bash /opt/install-claude.sh")
+}
+
+/// The model Claude Code runs. OpenRouter serves it under the same name as
+/// Anthropic does (as `anthropic/claude-sonnet-5.5`), and with the name it
+/// knows, Claude Code shapes its requests for this model.
+pub const CLAUDE_MODEL: &str = "claude-sonnet-5-5";
+/// Claude Code's calls one run may make, as a ceiling on what a run costs.
+pub const CLAUDE_CALLS: u64 = 60;
+
+/// Claude Code's model site, from the host's key: `ANTHROPIC_API_KEY`, else
+/// `OPENROUTER_API_KEY`, with at most [`CLAUDE_CALLS`] calls. None without
+/// either. Serve it at `models::Provider::Anthropic.host()` with a
+/// certificate from the CA passed to World::trust, and sign Claude Code in
+/// with [`sign_in_claude`].
+pub fn claude_model(cx: &fictionet::Cx) -> fictionet::Result<Option<models::Model>> {
+    let model = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        models::anthropic(cx)?
+    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        models::anthropic_via_openrouter(cx)?
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(
+        model.budget(models::Budget::new().calls(CLAUDE_CALLS)),
+    ))
+}
+
+/// Signs Claude Code in for `user` with the model site's placeholder key:
+/// the key in the guest's environment, and in the user's home the model and
+/// the first-run questions already answered for that key.
+pub fn sign_in_claude(
+    world: &mut super::World,
+    model: &models::Model,
+    user: &str,
+) -> fictionet::Result {
+    let env = model.guest_env();
+    let key = env
+        .first()
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    world.seed_env(env)?;
+    world.seed_home_files(claude_files(user, &key))
+}
+
+/// Claude Code's settings and state for `user`: the model, and the first-run
+/// questions answered for `key`.
+fn claude_files(user: &str, key: &str) -> Vec<(&'static str, String)> {
+    let settings = serde_json::json!({ "model": CLAUDE_MODEL });
+    let tail: String = key
+        .chars()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let state = serde_json::json!({
+        "hasCompletedOnboarding": true,
+        "theme": "dark",
+        "customApiKeyResponses": { "approved": [tail], "rejected": [] },
+        "projects": { format!("/home/{user}"): { "hasTrustDialogAccepted": true } },
+    });
+    vec![
+        (".claude/settings.json", settings.to_string()),
+        (".claude.json", state.to_string()),
+    ]
 }
 
 /// An Ubuntu guest with Xfce on Xvnc at 1280x800 and Mozilla's Firefox at
@@ -765,5 +832,23 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn claude_code_starts_signed_in_with_the_placeholder_key() {
+        let key = format!("sk-ant-api03-{}", "b".repeat(96));
+        let files = claude_files("analyst", &key);
+        let settings: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
+        assert_eq!(settings["model"], "claude-sonnet-5-5");
+        let state: serde_json::Value = serde_json::from_str(&files[1].1).unwrap();
+        assert_eq!(
+            state["customApiKeyResponses"]["approved"][0],
+            "b".repeat(20)
+        );
+        assert_eq!(state["hasCompletedOnboarding"], true);
+        assert_eq!(
+            state["projects"]["/home/analyst"]["hasTrustDialogAccepted"],
+            true
+        );
     }
 }

@@ -31,10 +31,13 @@ world's mirror. The mirror keeps them in `downloads/cloudimage/apt-cache/`, so
 the first run on a machine also fetches about 280 MB of Ubuntu packages and
 later runs reuse them.
 
-Each run prints its public page URL before the guests boot. The accompanying
-`cargo xtask demo open PATH` action opens a private bootstrap file with the
-authentication token. Routine output contains no token; the bootstrap is
-removed with the run. It then runs the
+Each run prints its public page URL before the guests boot, then
+`Open: cargo xtask demo open PATH`. PATH is a private file that holds the
+page's address and token, and the run removes it when it ends. The command
+opens the page in a Chromium app window over DevTools, so the token never
+appears on a command line; closing the window or Ctrl-C ends it. A demo
+that runs as an app opens this window itself when there is a display.
+Routine output contains no token. A `check` run then runs the
 demo's story and its checks. Every demo requires each declared containment probe exactly once, with an
 affirmative result. Configuration probes report facts. The shared package
 mirror closes once every guest has finished its cloud-init check. The run saves screenshots,
@@ -140,33 +143,36 @@ apart, and shown in a muted band in Doors tried.
 
 ### Border
 
-`cargo xtask demo border` runs the [Border](../examples/border) world with one
-Ubuntu workstation and a scripted agent. The agent signs in to the bank,
-reads the balance, inspects the certificate, traces three hops and reads two
-BGP routes. Then the page's Routing control hijacks the route. It rejects a
-stale repeat, breaks the open HTTPS connection, and brings four hops, three
-BGP routes and curl's certificate refusal. An insecure sign-in reaches the
-impostor, and the page's events show it without the password. Restoring the
-route makes a fresh balance request work again.
+`cargo xtask demo border` is the app. It boots an Ubuntu workstation with
+Firefox on [Kestrelmoor Bank](../examples/border) and Claude Code in the
+terminal, opens the page in Chromium and stays up until Ctrl-C. The bank
+login is in `~/.bank`. The page has the guest's Screen and Terminal on the
+left, and on the right the route from the workstation through Harbourline to
+the bank, with the newest rows of what crossed it. When the password reaches
+the impostor, the impostor and its row flash red.
 
-The terminal watches tmux `main` read-only. Press Ctrl-b d to open your own
-login shell and run `bank-check` subcommands. Taking browser input does not
-pause the script. After the story, Routing stays available and the page stays
-open until Ctrl-C.
-
-- Options: `--checks` shuts down after the story. A run without a terminal on
-  stdin does the same.
-- Screenshots: `normal.png`, `hijacked.png`, `page-hijacked.png` and the
-  world's `log.jsonl` in the `downloads/cloudimage/shots/border-<run>/`
-  directory the run prints. Each screen capture is kept once two captures in a
-  row match, so Firefox has finished loading. `page-hijacked.png` is the page
-  in Chromium at the hijack, once the route, the four-hop traceroute and the
-  credential alert show.
-- Without a VM: `cargo xtask demo border preview` serves the page with an
-  in-process scripted client and real world traffic. Change the route on the
-  page, then press Enter to run sign-in, balance and traceroute on it.
-- Times: SSH up after 6.4 s, desktop after 48.8 s, story done after 60.8 s,
-  whole run 61.5 s.
+- The World menu sets the route (Normal or Hijacked), turns the impostor on
+  or off, and restarts the run. Hijacked makes Transpeak announce a more
+  specific route to the bank's network, so new connections reach an
+  impostor whose certificate the guest does not trust. With the impostor
+  off, nothing answers at the bank's address in the hijack. Restart puts the
+  route back to normal with the impostor on and clears the picture.
+- Claude Code's own calls are the only billed ones: Claude Sonnet 5.5 through
+  `ANTHROPIC_API_KEY`, else `OPENROUTER_API_KEY`, at most 60 per run. The
+  guest holds a placeholder key. With no key, Claude Code asks you to sign in.
+- `cargo xtask demo border check` runs the scripted story and its checks.
+  The agent signs in, reads the balance, inspects the certificate, traces
+  three hops and reads two BGP routes. Then the World menu hijacks the route.
+  A stale repeat is rejected, the open HTTPS connection breaks, and four hops,
+  three BGP routes and curl's certificate refusal follow. An insecure sign-in
+  reaches the impostor, and the page shows it without the password. With the
+  impostor off, the bank's address is unreachable. Restoring the route makes
+  a fresh balance request work again, and Restart clears the picture.
+  Screenshots `normal.png`, `hijacked.png`, `page-hijacked.png` and the
+  world's `log.jsonl` go in `downloads/cloudimage/shots/border-<run>/`.
+- `cargo xtask demo border preview` serves the page with an in-process
+  scripted client and real world traffic. Change the route in the World menu,
+  then press Enter to run sign-in, balance and traceroute on it.
 
 ### Search
 

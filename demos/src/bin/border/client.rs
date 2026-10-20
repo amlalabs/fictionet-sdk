@@ -177,7 +177,7 @@ impl Client {
                 .race(Some(cx.now() + Duration::from_secs(2)), self.raw.recv(cx))
                 .await
                 .map_err(|_| fictionet::Error::msg("traceroute reply timed out"))??;
-            let Some((header, icmp)) = super::tls::ipv4(&reply.0) else {
+            let Some((header, icmp)) = super::trace::ipv4(&reply.0) else {
                 return Err(fictionet::Error::msg("invalid traceroute response"));
             };
             if header[9] != 1 || icmp.len() < 8 {
