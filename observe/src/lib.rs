@@ -355,7 +355,15 @@
 //! gap resets that state. Remaining bytes may stay encrypted or undecoded;
 //! a missing message cannot be reconstructed from keys.
 //!
-//! Keys are bounded independently of packets. Each watch also caches keys
+//! Keys are bounded independently of packets. Retention prefers keys whose
+//! random follows a ClientHello header with a body length of at least 34 and
+//! a legacy version from 3.0 through 3.3 in one retained packet. This includes
+//! truncated handshakes with the complete random, but does
+//! not join headers or randoms across packets or TLS records. A random elsewhere
+//! in packet bytes does not pin a key. Packet insertion and eviction update the
+//! index used by key admission and eviction.
+//!
+//! Each watch also caches keys
 //! within the collector's configured key count and byte bounds. If the required
 //! handshake or application secrets were evicted from both caches before the
 //! decoder derived its keys, that direction cannot be decrypted even if its
