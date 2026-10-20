@@ -58,7 +58,7 @@ export function mount(root, services, options) {
   el('p', 'Searches → results → links', treeHead, 'eyebrow');
   const treeList = el('div', null, treeSection, 'search-tree');
   const treeEmpty = el('p', 'No pages yet. Pages appear here when the world is asked for them.', treeSection, 'note search-empty');
-  const sitesHead = el('h4', 'Sites with no page fetched', treeSection, 'search-list-head');
+  const sitesHead = el('h4', 'Sites with no page in the tree', treeSection, 'search-list-head');
   const otherSites = el('div', null, treeSection, 'search-sites');
   const refusedHead = el('h4', 'Names the world refused', treeSection, 'search-list-head');
   const refused = el('div', null, treeSection, 'search-refused');
@@ -183,7 +183,7 @@ export function mount(root, services, options) {
         set(entry.note, r.site ? `${r.site.address} · ${siteReason(r.site.reason)}` : 'No address assignment observed yet');
         entry.open.hidden = !r.page;
         entry.open.dataset.identity = r.url;
-        set(entry.open, r.page ? `↳ Opened · ${made(r.page.made)} · ${ms(r.page.serve_ms)} · show page` : '');
+        set(entry.open, r.page ? `Opened · ${made(r.page.made)} · ${ms(r.page.serve_ms)} · show page` : '');
       }, results);
     } else if (chosen != null) { set(origin, 'This search is no longer retained.'); reconcile(resultList, [], (r) => r.url, () => {}, () => {}, results); }
     if (!initialized) s.sites.forEach((site) => firstSites.add(site.host));
@@ -218,7 +218,7 @@ export function mount(root, services, options) {
     const occurrences = new Map();
     const refusedRows = s.refused.map((r) => { const key = `${r.name}:${r.at_ms}`; const count = occurrences.get(key) || 0; occurrences.set(key, count + 1); return { ...r, identity: `${key}:${count}` }; });
     reconcile(refused, refusedRows, (r) => r.identity, () => card('search-refusal', 'div'), (entry, r) => {
-      set(entry.top, `× ${r.name}`); set(entry.title, r.reason); set(entry.note, `at ${time(r.at_ms)}`);
+      set(entry.top, r.name); set(entry.title, r.reason); set(entry.note, `at ${time(r.at_ms)}`);
     }, refusals);
     refusedHead.hidden = !refusedRows.length;
     initialized = true;

@@ -96,7 +96,7 @@ test('tree groups normalized searches, links, direct and fixed pages and preserv
   const h = harness(t); h.publish(s);
   assert.match(h.root.querySelector('.search-sites').textContent, /www.google.com.*142.250.1.1.*Search engine address/);
   const heads = h.root.querySelectorAll('.search-list-head');
-  assert.deepEqual(heads.map((head) => [head.textContent, head.hidden]), [['Sites with no page fetched', false], ['Names the world refused', false]]);
+  assert.deepEqual(heads.map((head) => [head.textContent, head.hidden]), [['Sites with no page in the tree', false], ['Names the world refused', false]]);
   assert.doesNotMatch(h.root.querySelector('.search-sites').textContent, /made.com/);
   assert.match(h.root.querySelector('.search-refused').textContent, /printer.local.*reserved or private/);
   for (const state of ['stubbed', 'stored', 'fixed', 'missing', 'not_made', 'written_live']) assert.ok(made(state).length > 5);
@@ -118,11 +118,14 @@ test('each search root says which engines asked, what it listed and what was ope
   assert.equal(notes.get('query:a question'), 'Google, Bing · 1 result listed · 1 opened');
   assert.equal(notes.get('query:unopened'), 'Google · 3 results listed · none opened yet');
   s.pages.push(page('https://x.com/2', { via: 'direct' }));
+  assert.equal(rootNote(s, tree(s).find((n) => n.id === 'query:unopened')), 'Google · 3 results listed · 1 opened · 1 shown under another reason');
+  s.pages.pop();
+  s.pages.push(page('https://x.com/3', { via: 'search', query: 'unopened', rank: 3 }));
   assert.equal(rootNote(s, tree(s).find((n) => n.id === 'query:unopened')), 'Google · 3 results listed · 1 opened');
   s.pages.pop();
   assert.equal(notes.get('query:nothing'), 'Google · No results listed');
   assert.equal(notes.get('query:spent'), 'Google · Failed: the run’s generation budget is spent');
-  assert.equal(notes.get('query:gone'), '1 opened');
+  assert.equal(notes.get('query:gone'), 'Search no longer held · 1 opened');
   assert.equal(notes.get('query:dropped'), 'DuckDuckGo · 10 results listed · none opened yet');
   assert.equal(notes.get('direct'), '');
   const h = harness(t); h.publish(s);

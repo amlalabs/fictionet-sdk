@@ -29,9 +29,9 @@
 .search-omitted:empty { display: none; }
 .search-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: minmax(180px, 1.25fr) minmax(160px, 1fr); border-top: 1px solid var(--line); flex: 1; min-height: 0; }
 .search-stream-section { grid-column: 1; grid-row: 1; min-height: 0; overflow: auto; padding: 0 12px 12px; }
-.search-section-head { position: sticky; top: 0; z-index: 1; padding: 12px 0 8px; background: var(--paper); }
+.search-section-head { position: sticky; top: 0; z-index: 1; padding: 12px 0 8px; border-bottom: 1px solid var(--line); background: var(--paper); }
 /* Rows scrolled into view stop below the sticky heading. */
-.search-stream-section, .search-tree-section { scroll-padding-top: 72px; }
+.search-stream-section, .search-tree-section { scroll-padding-top: 56px; }
 .search-results { scroll-padding-top: 96px; }
 .search-results .search-section-head { background: var(--raised); }
 .search-stream { margin-top: 0; }
@@ -56,6 +56,8 @@
 .search-url { font: 600 12px/1.6 var(--mono); }
 .search-path { color: var(--muted); font: 10px/1.5 var(--mono); }
 .search-open { margin-top: 4px; background: var(--paper); color: var(--accent-text); border: 1px solid var(--line-strong); border-radius: 4px; font: 11px/1.5 var(--sans); padding: 4px 8px; cursor: pointer; }
+/* Marks drawn in CSS with empty alternative text, so screen readers skip them. */
+.search-open::before { content: '↳ ' / ''; }
 .search-tree { margin-top: 0; }
 .search-root { font-weight: 600; padding: 12px 0 4px; }
 .search-root .search-row-top { font: 600 12px/1.5 var(--sans); color: var(--ink); }
@@ -71,6 +73,7 @@
 .search-site .search-row-note { display: none; }
 .search-refusal { padding: 4px 0; border-bottom: 1px solid var(--line); }
 .search-refusal .search-row-top { font: 600 11px/1.6 var(--mono); color: var(--warning); }
+.search-refusal .search-row-top::before { content: '× ' / ''; }
 .search-refusal .search-row-title { font-weight: 400; font-size: 12px; }
 .search-refusal .search-row-note { color: var(--muted); }
 .search-arrival { animation: search-enter 1.4s ease-out; }

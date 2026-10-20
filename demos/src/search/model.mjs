@@ -87,12 +87,17 @@ export function rootNote(s, node) {
   const list = s.results.find((r) => r.key === node.key);
   const served = asked.findLast((q) => q.outcome.status === 'served' && q.results != null);
   const n = list?.listed.length ?? served?.results;
-  // Opened means fetched by any route, as the result view marks it.
-  const opened = list ? list.listed.filter((r) => s.pages.some((p) => p.url === r.url)).length : node.children.length;
+  // Opened means fetched by any route, as the result view marks it. Each page
+  // sits in the tree under its own reason, which can be another search, a
+  // link, a typed address or the seed, so the note says how many are there.
+  const pages = list ? list.listed.map((r) => s.pages.find((p) => p.url === r.url)).filter(Boolean) : [];
+  const opened = list ? pages.length : node.children.length;
+  const elsewhere = pages.filter((p) => !node.children.some((child) => child.page === p)).length;
+  const openedNote = opened ? `${opened} opened${elsewhere ? ` · ${elsewhere} shown under another reason` : ''}` : 'none opened yet';
   let listed;
-  if (n) listed = `${n} result${n === 1 ? '' : 's'} listed · ${opened ? `${opened} opened` : 'none opened yet'}`;
+  if (n) listed = `${n} result${n === 1 ? '' : 's'} listed · ${openedNote}`;
   else if (n === 0) listed = 'No results listed';
   else if (asked.length) listed = outcome(asked[asked.length - 1]);
-  else listed = `${opened} opened`;
+  else listed = `Search no longer held · ${opened} opened`;
   return engines ? `${engines} · ${listed}` : listed;
 }
