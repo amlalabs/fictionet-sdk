@@ -50,7 +50,7 @@ export function mount(root, services, options) {
   const detail = el('section', null, columns, 'search-results');
   const detailHead = el('header', null, detail, 'search-section-head');
   const detailTitle = el('h3', 'Results the world made', detailHead);
-  const origin = el('p', 'Select a search to inspect its result list.', detailHead);
+  const origin = el('p', 'The newest search’s result list appears here.', detailHead);
   const resultList = el('ol', null, detail);
   const treeSection = el('section', null, columns, 'search-tree-section');
   const treeHead = el('header', null, treeSection, 'search-section-head');
@@ -171,10 +171,11 @@ export function mount(root, services, options) {
       set(entry.note, `${outcome(q)}${label ? ` · ${label}` : ''}${q.serve_ms != null ? ` · ${ms(q.serve_ms)}` : ''}`);
       if (fresh) entry.node.classList.add('search-arrival');
     }, rows);
-    const q = s.queries.find((q) => q.id === chosen);
+    // Until a viewer selects a search, the result list follows the newest.
+    const q = s.queries.find((q) => q.id === (chosen ?? s.queries.at(-1)?.id));
     if (q) {
       set(detailTitle, `${q.search} · ${engine(q.engine)}`);
-      const view = resultView(s, q); set(origin, view.origin);
+      const view = resultView(s, q); set(origin, chosen == null ? `Newest search; select one to keep it here. ${view.origin}` : view.origin);
       reconcile(resultList, view.rows, (r) => `${q.key}:${r.rank}:${r.url}`, () => {
         const node = el('li', null, null);
         return { node, title: line(node, 'search-row-title'), host: line(node, 'search-url'), url: line(node, 'search-path'), note: line(node, 'search-row-note'), open: el('button', '', node, 'search-open') };

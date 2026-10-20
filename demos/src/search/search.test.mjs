@@ -62,6 +62,20 @@ test('stream renders every outcome, failure, host, cache and timing', (t) => {
   h.dispose();
 });
 
+test('until a search is selected, the result list follows the newest one', (t) => {
+  const h = harness(t), s = fixture(); h.publish(s);
+  const newest = s.queries.at(-1);
+  const results = h.root.querySelector('.search-results');
+  assert.match(results.textContent, new RegExp(`${newest.search} · `));
+  assert.match(results.textContent, /Newest search; select one to keep it here\./);
+  assert.equal(results.querySelector('ol').children.length, 1);
+  const stream = h.root.querySelector('.search-stream');
+  const older = stream.children.at(-1);
+  h.click(stream, older);
+  assert.doesNotMatch(results.textContent, /Newest search/);
+  h.dispose();
+});
+
 test('results distinguish origin and reuse and link opened pages to their tree nodes', async (t) => {
   const h = harness(t), s = fixture(); h.publish(s);
   assert.equal(resultView(s, s.queries[0]).origin, 'Made for this search.');
