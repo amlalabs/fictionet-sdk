@@ -914,6 +914,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "example-common",
+ "fakewiki-world",
  "fatfs",
  "fictionet",
  "fictionet-observe",

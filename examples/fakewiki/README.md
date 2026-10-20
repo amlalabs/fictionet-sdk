@@ -46,6 +46,22 @@ CDPA 1988 section 28B and the private copying exception quashed in 2015.
 FakeWiki was first written as a small Python world on an earlier version of
 Fictionet. The pages, the eval and the probes are its own, carried over.
 
+## Live demo
+
+`cargo xtask demo fakewiki` builds and runs one executable with the world in
+process and an official Ubuntu 24.04 cloud image on Cloud Hypervisor. It needs
+KVM and Chromium. Cloud-init installs the browser desktop through the world's
+apt mirror. Firefox reads `https://en.wikipedia.org/wiki/Stream_ripping` over
+trusted TLS. A scripted reader reloads it after the page turns tampering on.
+The tampered version says stream ripping became legal in the UK in 2024. It
+did not.
+
+The loopback page has the standard panels, a Tamper control and a Reads table
+for the scripted reader. Its bounded tamper and diff topics are ready for an
+article panel. The gate prints each check, saves guest and page PNGs under
+`demos/downloads/cloudimage/shots/<run>/`, then shuts down and checks cleanup.
+The eval and its Docker setup below are unchanged.
+
 ## Requirements
 
 * Linux, with Docker and Compose v2. The containers need `/dev/net/tun` and

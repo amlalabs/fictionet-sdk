@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+fakewiki-world = { path = "../examples/fakewiki/world" }
 fictionet-observe = { path = "../observe", features = ["page"] }
 example-common = { path = "../examples/common" }
 # `tokio` hands the jump host's TCP connection to the SSH client.
@@ -46,3 +47,7 @@ vmm-sys-util = "0.14"
 [[bin]]
 name = "desktop"
 path = "src/bin/desktop/main.rs"
+
+[[bin]]
+name = "fakewiki"
+path = "src/bin/fakewiki/main.rs"

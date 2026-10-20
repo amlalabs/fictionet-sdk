@@ -45,6 +45,16 @@ pub fn serve(
     content: Content,
     attachments: fictionet::Attachments,
 ) -> fictionet::Result {
+    sites(fcx, hosts, leaves, content)?.start(fcx, attachments)
+}
+
+/// Builds the IPv4 sites so callers can add hosts and routes before starting.
+pub fn sites(
+    fcx: &Cx,
+    hosts: &HashMap<String, Ipv4Addr>,
+    leaves: HashMap<String, fictionet::stdlib::services::ca::Leaf>,
+    content: Content,
+) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     let now = SystemTime::now();
     let mut configs = HashMap::new();
     for (host, leaf) in leaves {
@@ -64,8 +74,7 @@ pub fn serve(
                 .into_host(host),
         )
     }
-    net.start(fcx, attachments)?;
-    Ok(())
+    Ok(net)
 }
 
 /// Issues one leaf per host and returns the public root PEM with the leaves.

@@ -16,6 +16,8 @@ pub struct EventFilter {
     pub kind: Option<String>,
     /// Equality on a named member of the event's fields object.
     pub field: Option<(String, serde_json::Value)>,
+    /// Requires a named member of the event's fields object, including null values.
+    pub field_present: Option<String>,
     /// Page host name, mapped to its sandbox.
     pub host: Option<String>,
 }
@@ -25,6 +27,24 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 impl Page {
+    /// Registers bounded state without adding a panel.
+    pub fn state<T: Serialize>(mut self, name: impl Into<String>, topic: StateTopic<T>) -> Self {
+        let name = name.into();
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            self.errors.push(
+                "state needs a name of at most 128 ASCII letters, digits, hyphens or underscores"
+                    .into(),
+            );
+        }
+        self.topics.push((name, topic.topic));
+        self
+    }
+
     /// Adds one machine. Names are validated at bind.
     pub fn host(mut self, host: Host) -> Self {
         self.hosts.push(host);
@@ -414,6 +434,10 @@ pub(super) async fn projection(
                 .field
                 .as_ref()
                 .is_none_or(|(name, v)| event["fields"].get(name) == Some(v))
+            && filter
+                .field_present
+                .as_ref()
+                .is_none_or(|name| event["fields"].get(name).is_some())
             && sandbox.is_none_or(|s| event["sandbox"]["name"] == *s)
     });
     let reply = serde_json::json!({

@@ -11,6 +11,76 @@ async fn server() -> Server {
     .unwrap()
 }
 
+#[tokio::test]
+async fn state_names_are_valid_and_unique() {
+    let page = || {
+        Page::new(
+            "State",
+            crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+        )
+    };
+    let topic = || StateTopic::<serde_json::Value>::new(StateLimits::default());
+    for invalid in [
+        page().state("same", topic()).state("same", topic()),
+        page().state("bad/name", topic()),
+    ] {
+        assert!(invalid.bind_loopback(0).await.is_err());
+    }
+    let server = page()
+        .state("details", topic())
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let state = request(&server, "GET", "/api/state/details", &bearer(&server), "").await;
+    status(&state, 200);
+    assert_eq!(json_body(&state)["value"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn field_presence_includes_null_values_and_excludes_other_events() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    fictionet::lab(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(dashboard.observer()),
+        |cx| async move {
+            cx.emit("fixture", "request", |event| event.field("selected", 0u64));
+            cx.emit("fixture", "request", |event| {
+                event.field("selected", fictionet::stdlib::protocols::json::Value::Null)
+            });
+            cx.emit("fixture", "request", |event| event);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let server = Page::new("Presence", dashboard.handle())
+        .event_table(
+            "Reads",
+            EventFilter {
+                source: Some("fixture".into()),
+                kind: Some("request".into()),
+                field_present: Some("selected".into()),
+                ..EventFilter::default()
+            },
+            vec![],
+        )
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let response = request(
+        &server,
+        "GET",
+        "/api/event-table/reads",
+        &bearer(&server),
+        "",
+    )
+    .await;
+    status(&response, 200);
+    let rows = json_body(&response)["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["fields"]["selected"], 0);
+    assert_eq!(rows[1]["fields"]["selected"], serde_json::Value::Null);
+}
+
 fn address(server: &Server) -> &str {
     server
         .url()
@@ -1579,6 +1649,7 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
                 kind: Some("request".into()),
                 field: Some(("route".into(), "bank".into())),
                 host: None,
+                field_present: None,
             },
             vec![Column::new("Route", "/fields/route")],
         )
@@ -1589,6 +1660,7 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
                 kind: Some("request".into()),
                 field: Some(("route".into(), "bank".into())),
                 host: None,
+                field_present: None,
             },
         )
         .custom(

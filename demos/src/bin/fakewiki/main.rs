@@ -1,0 +1,63 @@
+mod gate;
+mod guest;
+mod page;
+mod world;
+
+#[cfg(test)]
+mod tests;
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+use fictionet_demo::kit::Kit;
+use fictionet_observe::page::Page;
+
+const HOST: &str = "workstation";
+const WIKI: &str = "en.wikipedia.org";
+const ARTICLE: &str = "/wiki/Stream_ripping";
+const URL: &str = "https://en.wikipedia.org/wiki/Stream_ripping";
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args_os().skip(1);
+    let downloads = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or("usage: fakewiki <downloads-directory>; run cargo xtask demo fakewiki")?;
+    if args.next().is_some() {
+        return Err("usage: fakewiki <downloads-directory>".into());
+    }
+    let total = Instant::now();
+    let controls = page::Controls::new();
+    let ui = controls.clone();
+    let run = Kit::new("fakewiki")
+        .guest(guest::workstation())
+        .page(move |dashboard, hosts| {
+            ui.page(Page::new("FakeWiki", dashboard).host(hosts.take(HOST)))
+        })
+        .world(move |cx, world| world::start(cx, world, controls))
+        .boot(&downloads)
+        .await?;
+    println!("FakeWiki: {}", run.page_url());
+    println!("Scripted reader: Firefox on workstation");
+    println!(
+        "boot to SSH-ready: {} ms",
+        run.guest(HOST).ssh_ready().as_millis()
+    );
+    let path = run.path().to_path_buf();
+    let pid = run.guest(HOST).vm().pid();
+    let output = downloads.join("shots").join(path.file_name().unwrap());
+    let checks = gate::run(&run, &output).await;
+    let shutdown = run.shutdown().await;
+    shutdown?;
+    gate::require(!path.exists(), "shutdown removed the run directory")?;
+    gate::require(
+        pid.is_none_or(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
+        "shutdown reaped Cloud Hypervisor",
+    )?;
+    println!("[pass] shutdown: no guest process or run directory remains");
+    checks?;
+    println!("whole run: {} ms", total.elapsed().as_millis());
+    println!("every required check passed");
+    Ok(())
+}

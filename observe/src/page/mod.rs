@@ -127,7 +127,8 @@
 //! may execute again, so callers should use fresh IDs for new inputs.
 //!
 //! The optional control state URL tells the browser to put that snapshot's
-//! revision in `command.expected_revision`. The world checks it when
+//! value's revision in `command.expected_revision`, falling back to the
+//! envelope revision when the value has none. The world checks it when
 //! applying. `Command::reply` and `Command::reject` emit source `page`, kind
 //! `command`, with fields `{panel,request_id,command,outcome}` through the
 //! world's own `Cx`, then release the HTTP reply. Observer event retention
@@ -523,7 +524,8 @@ impl Page {
     }
 
     /// Links the last control to authoritative state. The browser copies its
-    /// revision into `expected_revision`; the world must check it when applying.
+    /// value's revision (or the envelope revision when absent) into
+    /// `expected_revision`; the world must check it when applying.
     pub fn control_state<T: Serialize>(mut self, topic: StateTopic<T>) -> Self {
         if let Some(PanelDescription {
             id,
