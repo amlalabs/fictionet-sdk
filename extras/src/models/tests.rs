@@ -393,6 +393,86 @@ async fn catalog_request(cx: &Cx, site: Model, request: Request<Body>) -> Respon
 }
 
 #[test]
+fn codex_catalog_openrouter_requires_supplied_catalog() {
+    fictionet::block_on(fictionet::run(
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(34)),
+        |cx| async move {
+            let key = "sk-or-v1-private";
+            let mut credential = Credential::api_key(
+                &cx,
+                Secret::new("OPENAI_API_KEY", format!("sk-proj-{}", "a".repeat(128)))?,
+            );
+            credential.real = Secret::new("OPENROUTER_API_KEY", key.into())?;
+            let mut model = Model::at(
+                &cx,
+                Provider::OpenAi,
+                credential,
+                "https://openrouter.ai".parse()?,
+            )?;
+            model.upstream_provider = Provider::OpenRouter;
+            model.path_prefix = "/api";
+            let origin = "https://chatgpt.com".parse()?;
+            let error = model
+                .codex_catalog(origin, None)
+                .err()
+                .expect("OpenRouter forwarding must be rejected")
+                .to_string();
+            assert!(error.contains("supplied catalog"), "{error}");
+            assert!(!error.contains(key));
+            let catalog = Bytes::from_static(br#"{"models":[]}"#);
+            let site = model.codex_catalog(
+                "https://chatgpt.com".parse()?,
+                Some(("https://example.test/models".into(), catalog.clone())),
+            )?;
+            let response = site
+                .send(
+                    Request::get("/backend-api/codex/models")
+                        .header(
+                            "authorization",
+                            model.credential.wire(Provider::OpenAi, false),
+                        )
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.into_body().collect().await?.to_bytes(), catalog);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn codex_catalog_forward_origin_without_fields() {
+    let origin = "https://chatgpt.com/backend-api/codex/models";
+    for existing in [false, true] {
+        let mut response = Response::new(Body::empty());
+        if existing {
+            response.extensions_mut().insert(
+                fictionet::events::Fields::new()
+                    .with("forwarded", "https://chatgpt.com")
+                    .with("other", "preserved"),
+            );
+        }
+        set_catalog_origin(&mut response, origin);
+        let fields = response
+            .extensions()
+            .get::<fictionet::events::Fields>()
+            .unwrap();
+        assert_eq!(
+            fields.get("forwarded").and_then(|v| v.as_str()),
+            Some(origin)
+        );
+        if existing {
+            assert_eq!(
+                fields.get("other").and_then(|v| v.as_str()),
+                Some("preserved")
+            );
+        }
+    }
+}
+
+#[test]
 fn codex_catalog_answer_checks_credentials_and_passes_a_pause() {
     fictionet::block_on(fictionet::run(
         fictionet::RunOptions::new(fictionet::Seed::from_u64(31)),

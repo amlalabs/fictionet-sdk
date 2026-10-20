@@ -475,6 +475,11 @@ impl Model {
                 "Codex API-key catalogs require an OpenAI model site",
             ));
         }
+        if answer.is_none() && self.upstream_provider != Provider::OpenAi {
+            return Err(Error::msg(
+                "Codex catalogs require a supplied catalog when the upstream is not OpenAI",
+            ));
+        }
         let mut site = Self::at(
             &self.cx,
             Provider::ChatGpt,
@@ -802,11 +807,7 @@ impl Model {
         match result {
             Ok(mut response) => {
                 if let Some(Catalog::Forward(origin)) = &self.catalog {
-                    response
-                        .extensions_mut()
-                        .get_mut::<fictionet::events::Fields>()
-                        .expect("forwarded response fields")
-                        .set("forwarded", origin.clone());
+                    set_catalog_origin(&mut response, origin);
                 }
                 call.status = response.status().as_u16();
                 let sse = response
@@ -835,6 +836,13 @@ impl Model {
         }
     }
 }
+fn set_catalog_origin(response: &mut Response<Body>, origin: &str) {
+    response
+        .extensions_mut()
+        .get_or_insert_default::<fictionet::events::Fields>()
+        .set("forwarded", origin.to_owned());
+}
+
 /// The site's requests: a Responses WebSocket handshake gets its `101`
 /// here, and every other request runs as deferred work.
 impl httpd::Handler for Model {
