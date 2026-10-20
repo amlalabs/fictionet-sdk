@@ -23,6 +23,8 @@ test('the light, automatic dark and explicit dark board palettes have readable t
     for (const [foreground, background] of [
       ['ink', 'surface-raised'],
       ['ink', 'surface'],
+      ['ink', 'surface-sunken'],
+      ['surface', 'ink'],
       ['text', 'surface-raised'],
       ['text', 'surface'],
       ['warning', 'surface-raised'],

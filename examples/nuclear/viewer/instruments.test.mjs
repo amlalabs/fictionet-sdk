@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { ANNUNCIATOR_WINDOWS, windowState } from './board-layout.mjs';
 import {
   POINTS,
   findReading,
@@ -344,4 +345,20 @@ test('a small negative gap prints without a minus sign', () => {
   assert.equal(formatValue(325.0, 'C'), '325.0 °C');
   assert.equal(formatValue(15.5, 'MPa'), '15.50 MPa');
   assert.equal(formatValue(null, 'C'), 'no reading');
+});
+
+test('reported pump alarms light their permanent windows without adding a process fault window', () => {
+  const full = instruments(snapshot());
+  assert.ok(ANNUNCIATOR_WINDOWS.every(w => !windowState(full.alarms.find(a => a.key === w.key)?.state, 0).lit));
+  const snap = snapshot({ alarms: { 'coolant_flow_low:b': 'active', coolant_pump_tripped: 'active' } });
+  snap.faults.process[0] = { coolant_pump_trip: 'b' };
+  snap.reported_status.coolant_pumps_running[1] = false;
+  const view = instruments(snap);
+  const lit = at => ANNUNCIATOR_WINDOWS.filter(w => windowState(view.alarms.find(a => a.key === w.key)?.state, at).lit);
+  assert.deepEqual(lit(0).map(w => w.legend), ['Coolant flow low, loop B', 'Coolant pump tripped']);
+  assert.ok(lit(0).every(w => w.board === 'loops-board'));
+  assert.equal(lit(250).length, 0);
+  assert.equal(lit(500).length, 2);
+  assert.deepEqual(view.processFaults, [{ key: 'coolant_pump_trip:b', label: 'Coolant pump trip, loop B' }]);
+  assert.equal(ANNUNCIATOR_WINDOWS.length, 22);
 });

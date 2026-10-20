@@ -29,7 +29,6 @@ const HEADER_Y = 6.6;
 
 // Motion. Speeds are radians per second at full speed.
 const SMOOTH_S = 0.35;
-const VIEW_SMOOTH_S = 0.8;
 const SPIN = 9;
 const STEAM_RATED_KG_S = 800;
 const GENERATOR_RATED_MW = 700;
@@ -93,32 +92,7 @@ function dialSlot(rack, slot) {
 }
 const DIAL_POSE = DIALS.map(({ rack, slot }) => dialSlot(rack, slot));
 
-const TOKEN = {
-  lightKey: '--light-key',
-  surface: '--surface',
-  raised: '--surface-raised',
-  sunken: '--surface-sunken',
-  ink: '--ink',
-  steel: '--steel',
-  metal: '--metal',
-  line: '--line-strong',
-  steam: '--steam',
-  accent: '--accent',
-  warning: '--warning',
-  coldCoolant: '--coolant-cold',
-  hotCoolant: '--coolant-hot',
-};
-
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
-
-function readColors(el) {
-  const style = getComputedStyle(el);
-  const out = {};
-  for (const [name, token] of Object.entries(TOKEN)) {
-    out[name] = style.getPropertyValue(token).trim();
-  }
-  return out;
-}
 
 /** What the scene moves toward, read from one snapshot's instruments. */
 function targetsFrom(r) {
@@ -237,7 +211,7 @@ function isAnimated(object, root) {
  * draws each material once. Meshes marked animated, and instanced meshes, stay
  * as they are.
  */
-function mergeStatic(root, track) {
+export function mergeStatic(root, track) {
   root.updateMatrixWorld(true);
   const byMaterial = new Map();
   const found = [];
@@ -366,25 +340,12 @@ function paintRack(canvas, rack, colors) {
 }
 
 /**
- * The 3D scene. `container` is the element the canvas fills; give it a size.
- * Returns update(snapshot), setView(name) and dispose().
+ * Builds the plant for the shared stage. The stage advances and renders it.
+ * Cameras, geometry and animation state belong to this scene.
  */
-export function createPlantScene(container) {
+export function createPlantScene({ theme, reducedMotion }) {
   const resources = tracker();
-  const colors = readColors(container);
-  const reducedQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
-  const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
-
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.domElement.setAttribute('role', 'img');
-  renderer.domElement.setAttribute(
-    'aria-label',
-    'Three-dimensional view of the reactor building and turbine hall. The readings panel lists the same values.',
-  );
-  container.append(renderer.domElement);
-  container.dataset.plantState = 'waiting';
-
+  const colors = { ...theme, line: theme.strongLine };
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 200);
   const fill = new THREE.HemisphereLight();
@@ -413,7 +374,6 @@ export function createPlantScene(container) {
   const coldCoolant = new THREE.Color(colors.coldCoolant);
   const hotCoolant = new THREE.Color(colors.hotCoolant);
   const shownCoolant = [coldCoolant.clone(), coldCoolant.clone()];
-  const coolantTarget = new THREE.Color();
 
   // Each rack face is its own canvas: its title and dial labels are printed on it.
   const rackFaces = RACKS.map((rack) => {
@@ -454,6 +414,7 @@ export function createPlantScene(container) {
 
   const plant = new THREE.Group();
   scene.add(plant);
+  plant.visible = false;
 
   // --- Reactor building ----------------------------------------------------
   cylinder(plant, 5.4, 11, mat.containment, [REACTOR_X, 5.5, 0], 'y', resources);
@@ -639,37 +600,21 @@ export function createPlantScene(container) {
   let latest = null;
   const shown = structuredClone(START_TARGETS);
   const dialFraction = DIALS.map(() => ({ reported: 0, true: 0 }));
-  let currentView = 'overview';
-  const viewEye = new THREE.Vector3(...VIEWS.overview.eye);
-  const viewLook = new THREE.Vector3(...VIEWS.overview.look);
-  const eyeGoal = new THREE.Vector3();
-  const lookGoal = new THREE.Vector3();
   let clock = 0;
   const spinAngle = { pump: [0, 0], turbine: 0, generator: 0 };
 
-  let width = 1;
-  let height = 1;
-  let visible = true;
-  let disposed = false;
-  let last = performance.now();
-  let raf = 0;
-
-  function resize() {
-    width = Math.max(1, container.clientWidth);
-    height = Math.max(1, container.clientHeight);
-    renderer.setSize(width, height, false);
-    camera.aspect = width / height;
-    camera.updateProjectionMatrix();
-  }
-
+  let moving = false;
   function ease(value, target, k) {
-    return value + (target - value) * k;
+    const next = value + (target - value) * k;
+    if (Math.abs(next - target) <= 0.001) return target;
+    moving = true;
+    return next;
   }
 
   function animate(dt) {
-    const reduced = reducedQuery.matches;
+    moving = false;
+    const reduced = reducedMotion();
     const k = reduced ? 1 : 1 - Math.exp(-dt / SMOOTH_S);
-    const kView = reduced ? 1 : 1 - Math.exp(-dt / VIEW_SMOOTH_S);
     if (!reduced) clock += dt;
 
     shown.rods = ease(shown.rods, targets.rods, k);
@@ -686,8 +631,8 @@ export function createPlantScene(container) {
     for (let i = 0; i < 2; i++) {
       shown.sgLevel[i] = ease(shown.sgLevel[i], targets.sgLevel[i], k);
       shown.pumpSpeed[i] = ease(shown.pumpSpeed[i], targets.pumpSpeed[i], k);
-      coolantTarget.copy(coldCoolant).lerp(hotCoolant, targets.coolant[i]);
-      shownCoolant[i].lerp(coolantTarget, k);
+      shown.coolant[i] = ease(shown.coolant[i], targets.coolant[i], k);
+      shownCoolant[i].copy(coldCoolant).lerp(hotCoolant, shown.coolant[i]);
       mat.coolant[i].color.copy(shownCoolant[i]);
     }
     mat.core.opacity = shown.core;
@@ -806,68 +751,36 @@ export function createPlantScene(container) {
       m.instanceMatrix.needsUpdate = true;
     }
 
-    // The camera eases to its view, or jumps when motion is reduced.
-    const view = VIEWS[currentView];
-    eyeGoal.set(...view.eye);
-    lookGoal.set(...view.look);
-    viewEye.lerp(eyeGoal, kView);
-    viewLook.lerp(lookGoal, kView);
-    camera.position.copy(viewEye);
-    camera.lookAt(viewLook);
-
-    renderer.render(scene, camera);
+    return !reduced && (moving || (latest !== null &&
+      (shown.pumpSpeed.some(speed => speed > 0.001) || shown.turbineSpeed > 0.001 || shown.generatorSpeed > 0.001)));
   }
 
-  function frame(now) {
-    if (disposed) return;
-    raf = requestAnimationFrame(frame);
-    const dt = Math.min(0.1, (now - last) / 1000);
-    last = now;
-    if (visible) animate(dt);
+  function setView(name) {
+    const view = VIEWS[name];
+    if (!view) throw new Error(`No view named ${name}`);
+    camera.position.set(...view.eye);
+    camera.lookAt(...view.look);
   }
-
-  const resizeObserver = new ResizeObserver(resize);
-  resizeObserver.observe(container);
-  const visibilityObserver = new IntersectionObserver((entries) => {
-    visible = entries.some((entry) => entry.isIntersecting);
-  });
-  visibilityObserver.observe(container);
-
-  const onTheme = () => {
-    Object.assign(colors, readColors(container));
-    applyColors();
-  };
-  darkQuery.addEventListener('change', onTheme);
-  const themeObserver = new MutationObserver(onTheme);
-  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
-
-  resize();
-  raf = requestAnimationFrame(frame);
+  setView('reactor');
+  const cctvCamera = new THREE.PerspectiveCamera(40, 16 / 9, 0.1, 200);
+  cctvCamera.position.set(-7.5, 10, 20);
+  cctvCamera.lookAt(-8, 4, 0);
 
   return {
-    /** Shows one plant snapshot. The values are read now; the motion eases toward them. */
+    scene, camera, cctvCamera, advance: animate, setView,
     update(snapshot) {
       latest = instruments(snapshot);
+      plant.visible = true;
       targets = targetsFrom(latest);
-      container.dataset.plantState = 'live';
       return latest;
     },
-    /** Moves the camera to a named view: overview, reactor or turbine. */
-    setView(name) {
-      if (!(name in VIEWS)) throw new Error(`no view named ${name}`);
-      currentView = name;
+    setTheme(theme) {
+      Object.assign(colors, theme, { line: theme.strongLine });
+      applyColors();
     },
     dispose() {
-      disposed = true;
-      cancelAnimationFrame(raf);
-      resizeObserver.disconnect();
-      visibilityObserver.disconnect();
-      themeObserver.disconnect();
-      darkQuery.removeEventListener('change', onTheme);
-      renderer.dispose();
+      scene.traverse(object => { if (object.isInstancedMesh) object.dispose(); });
       resources.disposeAll();
-      renderer.domElement.remove();
-      delete container.dataset.plantState;
     },
   };
 }
@@ -908,14 +821,7 @@ export function createReadingsPanel(container) {
   const body = table.createTBody();
   let rows = [];
 
-  const alarmsHeading = document.createElement('h3');
-  alarmsHeading.textContent = 'Alarms';
-  const alarmList = document.createElement('ul');
-  const faultsHeading = document.createElement('h3');
-  faultsHeading.textContent = 'Equipment and trips';
-  const faultList = document.createElement('ul');
-
-  section.append(heading, status, legend, table, alarmsHeading, alarmList, faultsHeading, faultList);
+  section.append(heading, status, legend, table);
   container.append(section);
 
   return {
@@ -948,29 +854,12 @@ export function createReadingsPanel(container) {
         cells[4].textContent = state.text;
         cells[4].className = state.className;
       });
-      alarmList.replaceChildren(
-        ...(r.alarms.length === 0
-          ? [textItem('No alarms lit.')]
-          : r.alarms.map((a) => textItem(`${a.label} (${a.state})`))),
-      );
-      faultList.replaceChildren(
-        textItem(r.reactor.tripped ? `Reactor tripped: ${r.reactor.tripCause}.` : 'Reactor not tripped.'),
-        ...(r.processFaults.length === 0
-          ? [textItem('No equipment faults.')]
-          : r.processFaults.map((f) => textItem(`${f.label}.`))),
-      );
       return r;
     },
     dispose() {
       section.remove();
     },
   };
-}
-
-function textItem(text) {
-  const li = document.createElement('li');
-  li.textContent = text;
-  return li;
 }
 
 /** The state column: what the flags say, in words. */

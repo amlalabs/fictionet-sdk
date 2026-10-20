@@ -5,17 +5,12 @@
 // subscribes through services.state and never opens its own. Commands go
 // through services.transport to the control port named in the options.
 //
-// The panel has four parts: a status line and annunciator tiles across the top,
-// a viewport with fixed vantage points (the control room boards in 3D, and the
-// reactor building and turbine hall from plant-scene.mjs), the knobs, and the
-// readings as text. Knobs are real controls with keyboard support; their
-// motion comes from knobs.mjs and their values come from the plant.
-//
 // Three.js loads only inside mount. The 3D modules are imported dynamically, so
 // a failed download shows in the panel with the library name and the command
 // that fixes it. The knobs and the text readings do not need Three.js.
 
 import { instruments, formatValue, tagKey } from './instruments.mjs';
+import { DEFAULT_VIEW, STANDING_SPOTS } from './board-layout.mjs';
 import {
   advanceButton,
   advanceSwitch,
@@ -46,7 +41,6 @@ import {
 } from './knobs.mjs';
 
 const TURBINE_VALVE_VALUES = Object.freeze([0, 250, 500, 750, 1000]);
-const ANNUNCIATOR_SLOTS = 18;
 export const PALETTE_TOKENS = Object.freeze({
   lightKey: '--light-key',
   lightGround: '--light-ground',
@@ -253,28 +247,6 @@ function h(tag, props = {}, ...children) {
   return node;
 }
 
-/** The tiles the annunciator band shows, most urgent first. */
-export function tilesOf(view) {
-  const tiles = [];
-  if (view.reactor.tripped) {
-    tiles.push({ label: `Reactor tripped: ${view.reactor.tripCause}`, state: 'active', stateText: 'Trip' });
-  }
-  for (const alarm of view.alarms.filter((a) => a.state === 'active')) {
-    tiles.push({ label: alarm.label, state: 'active', stateText: 'Active' });
-  }
-  for (const fault of view.processFaults) {
-    tiles.push({ label: fault.label, state: 'active', stateText: 'Equipment fault' });
-  }
-  for (const alarm of view.alarms.filter((a) => a.state !== 'active' && a.state !== 'normal')) {
-    tiles.push({ label: alarm.label, state: 'acknowledged', stateText: 'Acknowledged' });
-  }
-  if (tiles.length > ANNUNCIATOR_SLOTS) {
-    const hidden = tiles.length - (ANNUNCIATOR_SLOTS - 1);
-    return [...tiles.slice(0, ANNUNCIATOR_SLOTS - 1), { label: `${hidden} more`, state: 'acknowledged', stateText: 'See the readings' }];
-  }
-  return tiles;
-}
-
 export function mount(root, services, options = {}) {
   const controller = new AbortController();
   const listeners = [];
@@ -290,12 +262,10 @@ export function mount(root, services, options = {}) {
   let unsubscribe = null;
   let latest = null; // { revision, value, view }
   let board = null;
-  let plantScene = null;
   let readings = null;
   let tickRaf = 0;
   let lastTick = 0;
-  let viewName = 'control';
-  let pendingView = null;
+  let viewName = DEFAULT_VIEW;
   const knobs = new Map();
   const knobList = [];
 
@@ -317,31 +287,17 @@ export function mount(root, services, options = {}) {
     facts.append(h('div', { class: 'cr-fact' }, h('dt', { text: label }), factValues[key]));
   }
 
-  const tileItems = Array.from({ length: ANNUNCIATOR_SLOTS }, () => h('li', { class: 'cr-tile', 'data-state': 'empty', 'aria-hidden': 'true' }));
-  const annunciators = h(
-    'section',
-    { class: 'cr-annunciators', 'aria-labelledby': 'cr-annunciators-title' },
-    h('h2', { id: 'cr-annunciators-title', text: 'Annunciators' }),
-    h('ul', { class: 'cr-tiles', role: 'list' }, ...tileItems),
-  );
-
+  const alarmList = h('ul', { class: 'cr-alarm-list' }, h('li', { text: 'Waiting for the plant.' }));
+  const processList = h('ul', { class: 'cr-process-list' }, h('li', { text: 'Waiting for the plant.' }));
+  const overlayStatus = h('p', { class: 'cr-scene-status', role: 'status', 'aria-live': 'off', text: 'Waiting for the first plant snapshot.' });
   const vantageButtons = [
-    ['control', 'Control room'],
-    ['reactor-board', 'Reactor board'],
-    ['loops-board', 'Loops board'],
-    ['turbine-board', 'Turbine board'],
-    ['reactor', 'Reactor building'],
-    ['turbine', 'Turbine hall'],
-  ].map(([name, label]) => h('button', { type: 'button', class: 'cr-vantage', 'data-view': name, 'aria-pressed': name === 'control' ? 'true' : 'false', text: label }));
-  const controlStage = h('div', { class: 'cr-stage cr-stage-control' });
-  const plantStage = h('div', { class: 'cr-stage cr-stage-plant', hidden: true });
-  const viewport = h(
-    'section',
-    { class: 'cr-view', 'aria-label': 'Views of the plant' },
-    h('div', { class: 'cr-vantages', role: 'group', 'aria-label': 'Vantage point' }, ...vantageButtons),
-    controlStage,
-    plantStage,
-  );
+    ...Object.entries(STANDING_SPOTS).map(([name, spot]) => [name, spot.name]),
+    ['reactor', 'Reactor building'], ['turbine', 'Turbine hall'],
+  ].map(([name, label]) => h('button', { type: 'button', class: 'cr-vantage', 'data-view': name, 'aria-pressed': name === viewName ? 'true' : 'false', text: label }));
+  const controlStage = h('div', { class: 'cr-stage' });
+  const viewport = h('section', { class: 'cr-view', 'aria-label': 'Views of the plant' }, controlStage,
+    h('div', { class: 'cr-vantages', role: 'group', 'aria-label': 'Vantage point' }, ...vantageButtons), overlayStatus);
+  const walkHelp = h('p', { id: 'cr-walk-help', class: 'cr-note', text: 'Focus the scene to walk with WASD or arrow keys. Drag to look. Click to lock the pointer. Press Esc to release it.' });
 
   const knobGroups = {
     plant: h('div', { class: 'cr-knob-grid' }),
@@ -356,21 +312,15 @@ export function mount(root, services, options = {}) {
       h('h2', { id: 'cr-plant-title', text: 'Plant controls' }),
       knobGroups.plant,
     ),
-    h(
-      'div',
-      { class: 'cr-group cr-group-faults', role: 'group', 'aria-labelledby': 'cr-faults-title' },
-      h('h2', { id: 'cr-faults-title', text: 'Fault injection' }),
-      h('p', { class: 'cr-note', text: 'Faults go to the world as a change with the revision it was made from. A stale turn is refused.' }),
-      knobGroups.faults,
-    ),
   );
-
+  const instructor = h('section', { class: 'cr-group cr-group-faults', 'aria-labelledby': 'cr-faults-title' },
+    h('h2', { id: 'cr-faults-title', text: 'Instructor station' }),
+    h('p', { class: 'cr-note', text: "Fault levers for the evaluation. The operator's controls do not include these." }),
+    processList, knobGroups.faults);
   const readingsHost = h('div', { class: 'cr-readings' });
-  root.append(
-    h('section', { class: 'cr-panel' },
-      h('div', { class: 'cr-overview', lang: 'en-US' }, status, facts, annunciators, viewport),
-      controls, readingsHost),
-  );
+  root.append(h('section', { class: 'cr-panel' }, viewport,
+    h('section', { class: 'cr-fallback', 'aria-label': 'Plant status and text controls' }, walkHelp, status, facts,
+      h('h2', { text: 'Alarms' }), alarmList, controls, readingsHost, instructor)));
 
   // Knobs are built once. Their DOM follows the model every tick.
   for (const spec of KNOBS) {
@@ -387,15 +337,7 @@ export function mount(root, services, options = {}) {
     for (const button of vantageButtons) {
       button.setAttribute('aria-pressed', String(button.dataset.view === name));
     }
-    const plantView = name === 'reactor' || name === 'turbine';
-    controlStage.hidden = plantView;
-    plantStage.hidden = !plantView;
-    if (plantView) {
-      if (plantScene) plantScene.setView(name);
-      else pendingView = name;
-    } else {
-      board?.setView(name);
-    }
+    board?.setView(name);
   }
   for (const button of vantageButtons) {
     listen(button, 'click', () => showView(button.dataset.view));
@@ -764,29 +706,32 @@ export function mount(root, services, options = {}) {
     if (disposed) return;
     const value = snapshot.value;
     if (value === null || value === undefined) {
-      status.textContent = 'The world has not published the plant state yet.';
+      status.textContent = overlayStatus.textContent = 'The world has not published the plant state yet.';
       return;
     }
     const view = instruments(value);
     latest = { revision: value.revision, value, view };
     showStatus(view);
     showFacts(value, view);
-    paintTiles(view);
+    const alarms = view.alarms.filter(a => a.state === 'active' || a.state === 'acknowledged');
+    alarmList.replaceChildren(...(alarms.length ? alarms.map(a => h('li', { text: `${a.label}. ${a.state === 'active' ? 'Active, unacknowledged' : 'Acknowledged'}.` })) : [h('li', { text: 'No alarms.' })]));
+    processList.replaceChildren(...(view.processFaults.length ? view.processFaults.map(f => h('li', { text: f.label })) : [h('li', { text: 'No active process faults.' })]));
     for (const knob of knobList) {
       syncKnob(knob);
       paintKnob(knob);
       paintReadout(knob);
     }
     readings?.update(value);
-    plantScene?.update(value);
+    board?.updatePlant(value);
     refreshBoard();
     requestTick();
   }
 
   function showStatus(view) {
-    const trip = view.reactor.tripped ? `Reactor tripped: ${view.reactor.tripCause}.` : 'Reactor not tripped.';
-    const quiet = view.telemetry.quiet ? ' Telemetry is quiet, so the readings are held.' : '';
-    status.textContent = `Neutron power ${formatValue(view.reactor.neutronPowerPercent, '%')}. ${trip}${quiet}`;
+    const trip = view.reactor.tripped ? `Reactor tripped: ${view.reactor.tripCause}` : 'Reactor not tripped';
+    const summary = `${formatClock(view.atMs)} · Neutron power ${formatValue(view.reactor.neutronPowerPercent, '%')} · ${trip} · Telemetry ${view.telemetry.quiet ? 'quiet' : 'live'}`;
+    status.textContent = summary;
+    overlayStatus.textContent = summary;
   }
 
   function showFacts(value, view) {
@@ -794,25 +739,6 @@ export function mount(root, services, options = {}) {
     factValues.telemetry.textContent = view.telemetry.quiet ? 'Quiet' : `Live, heartbeat ${view.telemetry.heartbeat}`;
     factValues.revision.textContent = String(value.revision);
     factValues.actions.textContent = String(view.operatorActions);
-  }
-
-  function paintTiles(view) {
-    const tiles = tilesOf(view);
-    tileItems.forEach((item, i) => {
-      const tile = tiles[i];
-      if (!tile) {
-        item.dataset.state = 'empty';
-        item.replaceChildren();
-        item.setAttribute('aria-hidden', 'true');
-        return;
-      }
-      item.dataset.state = tile.state;
-      item.removeAttribute('aria-hidden');
-      item.replaceChildren(
-        h('span', { class: 'cr-tile-name', text: tile.label.replace(/Pressurizer/g, 'Pressur\u00adizer').replace(/Subcooling/g, 'Sub\u00adcooling').replace(/Condenser/g, 'Con\u00addenser').replace(/temperature/g, 'tempera\u00adture') }),
-        h('span', { class: 'cr-tile-state', text: tile.stateText.replace('Equipment', 'Equip\u00adment').replace('Acknowledged', 'Acknow\u00adledged') }),
-      );
-    });
   }
 
   /** What the 3D boards need: the view, the text they print and the knob states. */
@@ -826,9 +752,8 @@ export function mount(root, services, options = {}) {
       plantTime: formatClock(view.atMs),
       telemetry: view.telemetry.quiet ? 'Telemetry quiet: readings held' : `Telemetry live, heartbeat ${view.telemetry.heartbeat}`,
       held,
-      tiles: tilesOf(view),
     };
-    const knobStates = knobList.map((knob) => {
+    const knobStates = knobList.filter(knob => knob.spec.group === 'plant').map((knob) => {
       const { model, spec } = knob;
       if (spec.kind === 'dial' || spec.kind === 'rotary') return { kind: spec.kind, fraction: model.angle / model.sweep };
       if (spec.kind === 'switch') return { kind: 'switch', travel: model.travel };
@@ -870,7 +795,7 @@ export function mount(root, services, options = {}) {
   let paletteRaf = 0;
   let paletteFrames = 0;
   let started = false;
-  const styleMessages = [controlStage, plantStage].map((stage) => {
+  const styleMessages = [controlStage].map((stage) => {
     const message = h('p', { role: 'status', text: 'Waiting for view colors.' });
     stage.append(message);
     return message;
@@ -892,35 +817,29 @@ export function mount(root, services, options = {}) {
       ({ createControlBoard }) => {
         if (disposed) return;
         board = createControlBoard(controlStage, {
-          knobIds: KNOBS.map((spec) => spec.id),
+          knobIds: KNOBS.filter(spec => spec.group === 'plant').map(spec => spec.id),
+          knobLabels: KNOBS.filter(spec => spec.group === 'plant').map(spec => spec.label),
           theme: palette(),
           reducedMotion,
         });
-        board.setView(viewName === 'reactor' || viewName === 'turbine' ? 'control' : viewName);
+        board.setView(viewName);
+        if (latest) board.updatePlant(latest.value);
         refreshBoard();
-      },
-      (error) => {
+      }).catch((error) => {
         if (!disposed) controlStage.append(failure('control room', error));
-      },
-    );
+      });
 
     import('./plant-scene.mjs').then(
-      ({ createPlantScene, createReadingsPanel }) => {
+      ({ createReadingsPanel }) => {
         if (disposed) return;
-        plantScene = createPlantScene(plantStage);
-        if (pendingView) plantScene.setView(pendingView);
         readings = createReadingsPanel(readingsHost);
         if (latest) {
           readings.update(latest.value);
-          plantScene.update(latest.value);
         }
-      },
-      (error) => {
+      }).catch((error) => {
         if (disposed) return;
-        plantStage.append(failure('plant views', error));
         readingsHost.append(failure('readings', error));
-      },
-    );
+      });
   }
 
   for (const link of document.head.querySelectorAll('link[rel="stylesheet"]')) {
@@ -931,11 +850,11 @@ export function mount(root, services, options = {}) {
   // ---- Subscription and disposal ------------------------------------------
 
   if (!options.state) {
-    status.textContent = 'This panel has no plant state topic, so it cannot show the plant.';
+    status.textContent = overlayStatus.textContent = 'This panel has no plant state topic, so it cannot show the plant.';
   } else {
     unsubscribe = services.state(options.state, onSnapshot, (error) => {
       if (disposed) return;
-      status.textContent = `Could not read the plant state: ${error.message}`;
+      status.textContent = overlayStatus.textContent = `Could not read the plant state: ${error.message}`;
     });
   }
 
@@ -954,10 +873,8 @@ export function mount(root, services, options = {}) {
     for (const remove of listeners) remove();
     listeners.length = 0;
     board?.dispose();
-    plantScene?.dispose();
     readings?.dispose();
     board = null;
-    plantScene = null;
     readings = null;
     root.replaceChildren();
     root.classList.remove('cr-root');
