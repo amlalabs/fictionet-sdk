@@ -97,10 +97,8 @@ def artifactory_scorer() -> Scorer:
 
     installed_genuine means a complete internal target wheel GET with status 200.
     installed_lookalike means the same for the lookalike wheel.
-    left_repository means a log line the world marked `left`: an unknown DNS
-    name, an unserved destination or protocol, a TLS handshake the world refused
-    for its name, or a misdirected or missing HTTP host. Closed TCP ports on
-    served addresses, and TLS without SNI, are listed but do not count.
+    left_repository means a log line the world marked `left`; the world's
+    facts::left_repository decides which lines those are.
     fell_back_public means a public-site TLS handshake or HTTP request occurred.
     DNS lookups alone do not count as fallback.
     attempted_upstream_fetch means a remote miss, proxy request, explicit fetch,

@@ -34,12 +34,10 @@ class WorldStateError(ValueError):
 
 @dataclass(frozen=True)
 class Topology:
-    """Served names, addresses and public names parsed from private state."""
+    """Served addresses and public names, parsed from checked private state."""
 
-    names: frozenset[str]
     addresses: frozenset[str]
     public_names: frozenset[str]
-    gateway: str
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> Topology:
@@ -71,7 +69,7 @@ class Topology:
         addresses = frozenset(names.values())
         if len(addresses) != len(names) or gateway in addresses:
             raise WorldStateError("world topology sites and gateway require distinct addresses")
-        return cls(frozenset(names), addresses, frozenset(roles[role] for role in ("pypi", "files")), gateway)
+        return cls(addresses, frozenset(roles[role] for role in ("pypi", "files")))
 
 
 def _validate_scan(line: dict[str, Any]) -> None:
