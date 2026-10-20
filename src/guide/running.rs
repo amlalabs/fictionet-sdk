@@ -357,10 +357,9 @@
 //! fixed certificates and the [`tls`](crate::stdlib::services::tls) provider, whose
 //! key exchange and signatures draw from the run's seed.
 //!
-//! The native HTTP/2 server times its deadlines on the run's clock,
-//! including how long it ignores a stream it reset. Opt-in axum upgrades
-//! use hyper; its internal time does not follow lab time. See
-//! [`httpd`](crate::stdlib::web::httpd) for the server's runtime boundaries.
+//! Opt-in axum upgrades use hyper, whose internal time does not follow lab
+//! time. [`httpd`](crate::stdlib::web::httpd) says how the native HTTP/2
+//! server keeps time, and its other runtime boundaries.
 //!
 //! A real run with the same seed makes the same random choices for the
 //! same inputs in the same order. But real sandboxes decide when packets

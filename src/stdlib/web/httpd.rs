@@ -78,8 +78,10 @@
 //! handler runs, with `answer: budget` and no status. A body that exceeds its
 //! allowance receives `503`. Transport storage belongs to its transport.
 //! After the HTTP/2 server resets a stream, it ignores that stream's late
-//! HEADERS and DATA for one second. That second, body deadlines and SETTINGS
-//! acknowledgment deadlines are all timed on the driver's world clock.
+//! HEADERS and DATA for one second. It holds at most 50 reset streams at a
+//! time. HEADERS and DATA on any other closed stream are errors. The
+//! one-second hold, body deadlines and SETTINGS acknowledgment deadlines are
+//! all timed on the run's clock.
 //! Stream flow control, reset limits and bounded header assembly apply
 //! independently of the runtime. PING and GOAWAY are handled by the service;
 //! graceful shutdown drains admitted streams.
