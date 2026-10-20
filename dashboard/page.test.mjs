@@ -673,3 +673,56 @@ test('each host chip says who holds its input, from the leases topic', async (t)
   assert.equal(owners[1].textContent, 'Input control unavailable: no such state topic: "leases"');
   stop();
 });
+
+test('an app page shows its agent tabs and world panel, with a World menu and no inspector', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const description = {
+    ...DESCRIPTION,
+    title: 'Search',
+    app: true,
+    hosts: [{ name: 'alpha', sandbox: 'alpha', status: '/api/state/host-alpha', screen: '/api/screen/alpha', terminal: '/api/terminal/alpha' }],
+    panels: [
+      { id: 'packets', title: 'Packets', area: 'inspector', kind: 'packets' },
+      { id: 'world', title: 'World', area: 'workspace', kind: 'custom', module: '/panels/world.mjs', state: '/api/state/rows' },
+    ],
+  };
+  let mounted;
+  const stop = await mount(h.root, {
+    get: async (path) => (path === '/api/page' ? description : { rows: [], next: 0, dropped: 0 }),
+    stateStream: (topics) => h.stream('state', { ...topics }),
+    watch: () => h.stream('watch'),
+    packetStream: (links) => h.stream('packets', links),
+    close() {},
+  }, { subscribe: (listener) => { listener('light'); return () => {}; }, dispose() {} }, async (url) => {
+    if (url === '/panels/world.mjs') return { mount(root, services) { mounted = services.worldMenu; root.textContent = 'the world'; return () => {}; } };
+    throw new TypeError('Failed to fetch dynamically imported module');
+  });
+  await settle();
+  await settle();
+  assert.ok(h.root.classList.contains('demo-app'));
+  assert.equal(h.root.querySelector('#tabs'), null, 'no inspector');
+  const tabs = h.root.querySelector('.app-tabs').children.filter((child) => child.getAttribute('role') === 'tab');
+  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Screen', 'Terminal']);
+  assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
+  tabs[1].click();
+  assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
+  assert.equal(h.root.querySelector('.app-stage').dataset.kind, 'terminal');
+  assert.match(h.root.textContent, /the world/);
+  const menu = h.root.querySelector('#world-menu');
+  assert.equal(mounted, menu, 'the world panel fills the World menu');
+  const button = h.root.querySelector('.app-menu-button');
+  assert.equal(menu.hidden, true);
+  button.click();
+  assert.equal(menu.hidden, false);
+  assert.equal(button.getAttribute('aria-expanded'), 'true');
+  const escape = new Event('keydown'); escape.key = 'Escape'; h.document.dispatchEvent(escape);
+  assert.equal(menu.hidden, true);
+  const watch = h.streams.find((source) => source.tag === 'watch');
+  watch.emit('snapshot', { t: 1, started: 0, ended: false, hosts: [], groups: [], nodes: [], edges: [], counters: {}, events: [] });
+  await settle();
+  assert.equal(h.root.querySelector('.app-live').textContent, 'Live');
+  stop();
+  assert.equal(h.budget.open, 0);
+  assert.equal(h.document.listenerCount, 0);
+});

@@ -88,13 +88,9 @@ pub async fn run(spend: bool) -> Result {
             let start = adaptive_web_world::world_start(&seed.date)?;
             let world = World::new(&cx, seed, start)?;
             let (attacher, attachments) = fictionet::attachments();
-            page::network(&world, &cx, log, kit::mirror::new(&cx)?)?.start(&cx, attachments)?;
-            topics.start(
-                &cx,
-                searches.clone(),
-                world.pages.clone(),
-                "In-world client (scripted) · no VM",
-            )?;
+            page::network(&world, &cx, log, kit::mirror::new(&cx)?, None)?
+                .start(&cx, attachments)?;
+            topics.start(&cx, searches.clone(), world.pages.clone())?;
             let workstation = machine(
                 &cx,
                 attacher.attach("workstation")?,
@@ -244,12 +240,11 @@ async fn story(client: &Client<'_>, seed: &Seed) -> fictionet::Result {
         let state = searches.snapshot();
         let (host, path, _) = pages::links(&url, &html)
             .into_iter()
-            .find(|(host, path, anchor)| {
-                anchor.ends_with(": follow-up")
-                    && !state
-                        .pages
-                        .iter()
-                        .any(|p| p.url == format!("https://{host}{path}"))
+            .find(|(host, path, _)| {
+                !state
+                    .pages
+                    .iter()
+                    .any(|p| p.url == format!("https://{host}{path}"))
             })
             .ok_or_else(|| fictionet::Error::msg("page has no unvisited link"))?;
         url = format!("https://{host}{path}");

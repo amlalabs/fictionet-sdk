@@ -68,12 +68,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
             let (attacher, attachments) = fictionet::attachments();
             world.serve(&cx, log, attachments)?;
-            topics.start(
-                &cx,
-                searches.clone(),
-                world.pages.clone(),
-                "Firefox (scripted)",
-            )?;
+            topics.start(&cx, searches.clone(), world.pages.clone())?;
             let machine = machine(
                 &cx,
                 attacher.attach("workstation")?,
@@ -156,12 +151,37 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
             assert_eq!(queries.last().unwrap()["outcome"]["status"], "served");
             assert_eq!(snapshot["value"]["generator"]["generate"], false);
             assert_eq!(snapshot["value"]["generator"]["generation_revision"], 1);
-            let policy = client.get_json("/api/state/policy").await.unwrap();
-            assert_eq!(
-                policy["value"],
-                serde_json::to_value(page::policy("Firefox (scripted)")).unwrap()
-            );
-            assert_eq!(policy["value"]["forwarded"].as_array().unwrap().len(), 3);
+            // A planted fact reaches the page through the same port; one that
+            // would give the web away is refused with why.
+            let plant = |id: &str, text: &str| {
+                json!({"request_id": id, "command": {"command": "plant_fact", "text": text,
+                    "expected_revision": 1}})
+            };
+            let refused = client
+                .request(
+                    "POST",
+                    "/api/command/generation",
+                    Some(&plant("bad", "A simulated fix.")),
+                    true,
+                )
+                .await
+                .unwrap();
+            let refused: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+            assert_eq!(refused["rejection"]["reason"], "invalid");
+            let planted = client
+                .request(
+                    "POST",
+                    "/api/command/generation",
+                    Some(&plant("fact", "The fix is 7.2.5, not 7.2.4.")),
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(planted.status, 200);
+            cx.sleep(std::time::Duration::from_millis(100)).await?;
+            let snapshot = client.get_json("/api/state/search").await.unwrap();
+            assert_eq!(snapshot["value"]["planted"][0]["kind"], "fact");
+            assert_eq!(snapshot["value"]["generator"]["generation_revision"], 2);
             let commands = client.get_json("/api/events").await.unwrap();
             assert_eq!(
                 commands["events"]
@@ -170,7 +190,7 @@ async fn page_reads_searches_and_commands_change_the_running_generator() {
                     .iter()
                     .filter(|e| e["source"] == "page" && e["kind"] == "command")
                     .count(),
-                2
+                4
             );
             cx.cancel();
             Ok(())
@@ -218,6 +238,8 @@ async fn page_declares_the_workspace_and_serves_its_modules() {
         .unwrap();
     let client = PageClient::from_url(server.url()).unwrap();
     let description = client.get_json("/api/page").await.unwrap();
+    assert_eq!(description["title"], "Search");
+    assert_eq!(description["app"], true);
     let panels = description["panels"].as_array().unwrap();
     assert_eq!(
         panels

@@ -96,6 +96,9 @@ fn line(e: &Event) -> Option<Value> {
             "generate": get(e, "generate"), "revision": get(e, "revision")})),
         ("adaptive", "query") => Some(json!({"type": "query", "id": get(e, "query_id"),
             "engine": get(e, "engine"), "search": get(e, "search"), "start": get(e, "start")})),
+        ("adaptive", "search_answer") => Some(json!({"type": "search_answer",
+            "id": get(e, "query_id"), "cache": get(e, "cache"), "results": get(e, "results"),
+            "model": get(e, "model")})),
         ("adaptive", "query_failed") => {
             let mut line =
                 json!({"type": "query_failed", "id": get(e, "query_id"), "why": get(e, "why")});
@@ -228,7 +231,7 @@ mod tests {
                     let value = json!({"command":"set_generation","generate":generate,
                         "expected_revision":expected_revision});
                     let command: Command = serde_json::from_value(value.clone()).unwrap();
-                    assert_eq!(serde_json::to_value(command).unwrap(), value);
+                    assert_eq!(serde_json::to_value(&command).unwrap(), value);
                     pages.apply(&cx, command)
                 };
                 assert_eq!(set(false, 1), Err(Rejected::Stale { current: 0 }));

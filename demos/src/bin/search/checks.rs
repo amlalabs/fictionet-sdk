@@ -1,6 +1,9 @@
 use super::{Result, guest::HOST};
 use adaptive_web_world::{
-    pages::Seed,
+    pages::{
+        Seed,
+        store::{self, Store},
+    },
     search::{Cache, Listed, Made, Outcome, Query, Reason, Results, Snapshot},
 };
 use example_common::names;
@@ -119,23 +122,17 @@ async fn search(
     Ok((snapshot, query))
 }
 
-pub async fn command(
-    client: &PageClient,
-    generate: bool,
-    revision: u64,
-    id: &str,
-) -> Result<Value> {
+/// Sends a world command through the page at the topic's current revision
+/// and returns the page's reply.
+pub async fn command(client: &PageClient, id: &str, mut command: Value) -> Result<Value> {
     tokio::time::sleep(STEP_PAUSE).await;
-    let command =
-        json!({"command":"set_generation","generate":generate,"expected_revision":revision});
+    let state: Snapshot = client.state("search").await?;
+    command["expected_revision"] = json!(state.generator.generation_revision);
     let reply = client.command("generation", id, command).await;
     if let Err(error) = &reply {
         println!("{error}");
     }
-    check(
-        "generation command HTTP status matches its reply",
-        reply.is_ok(),
-    )?;
+    check("world command HTTP status matches its reply", reply.is_ok())?;
     Ok(reply?)
 }
 
@@ -154,43 +151,35 @@ pub fn first_generated<'a>(seed: &Seed, list: &'a Results) -> Result<&'a Listed>
     Err("search has no non-fixed result to open".into())
 }
 
-fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) {
+/// Why the canned store says it made the page at `url`: the first mention
+/// it was made from, as the page's event reports it.
+fn canned_reason(canned: &Store, url: &str) -> Result<Reason> {
     let (host, target) = adaptive_web_world::pages::text::target_of(url);
-    if seed.fixed_for(&host, &target).is_some() {
-        return (Reason::Fixed, Made::Fixed);
+    let record = canned
+        .page(&host, &target)
+        .ok_or_else(|| format!("the canned store has no page {url}"))?;
+    Ok(match record.mentions.first() {
+        _ if record.fixed => Reason::Fixed,
+        Some(mention) => serde_json::from_value(mention.clone()).unwrap_or_default(),
+        None => Reason::Direct,
+    })
+}
+
+/// Runs `command` on the guest and returns its standard output.
+async fn guest(run: &Run, command: &str) -> Result<String> {
+    let output = tokio::time::timeout(Duration::from_secs(60), run.guest(HOST).ssh().run(command))
+        .await
+        .map_err(|_| format!("timed out: {command}"))??;
+    if output.code != 0 {
+        return Err(format!("{command}: exit {}: {}", output.code, output.stderr).into());
     }
-    // The stub keeps the first search mention in creation order.
-    let mention = snapshot
-        .results
-        .iter()
-        .filter_map(|list| {
-            list.listed
-                .iter()
-                .find(|r| {
-                    adaptive_web_world::pages::text::target_of(&r.url)
-                        == (host.clone(), target.clone())
-                })
-                .map(|result| (list, result))
-        })
-        .min_by_key(|(list, _)| list.query_id);
-    let reason = mention
-        .and_then(|(list, result)| {
-            snapshot
-                .queries
-                .iter()
-                .find(|q| q.id == list.query_id)
-                .map(|query| Reason::Search {
-                    query: query.search.clone(),
-                    rank: result.rank,
-                })
-        })
-        .unwrap_or(Reason::Direct);
-    (reason, Made::Stubbed)
+    Ok(output.stdout)
 }
 
 /// Runs the story. `visited` collects the hosts the searcher opened as it
 /// goes, so the background check can run after a failed story too.
 pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<String>) -> Result {
+    let canned = Store::load(&store::canned_root(&seed.name), seed)?.0;
     run.guest(HOST)
         .wait_desktop(Duration::from_secs(300))
         .await?;
@@ -232,6 +221,23 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     println!("guest setup timing:\n{}", timing.stdout);
     checks::bearer_required(&client).await?;
     checks::single_use_ticket(&client, HOST, Capability::Screen).await?;
+    checks::terminal_runs_on(&client, HOST).await?;
+    let today = guest(run, "date -u +%F").await?;
+    check(
+        &format!("the guest's clock is on the web's day, {}", seed.date),
+        today.trim() == seed.date,
+    )?;
+    let claude = guest(run, "claude --version").await?;
+    check(
+        &format!(
+            "Claude Code {} is installed",
+            fictionet_demo::kit::desktop::CLAUDE_VERSION
+        ),
+        claude.contains(&format!(
+            "{} (Claude Code)",
+            fictionet_demo::kit::desktop::CLAUDE_VERSION
+        )),
+    )?;
 
     if seed.search.is_empty() || seed.visit.is_empty() {
         return Err(format!(
@@ -241,28 +247,42 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         .into());
     }
     let words = seed.search.as_str();
+    let canned_count = |words: &str| {
+        canned
+            .search(&adaptive_web_world::route::query_key(words, 0))
+            .map(|record| record.search.results.len() as u64)
+    };
+    let held = canned_count(words).ok_or("the canned store has no list for the seed's search")?;
     visited.extend(["www.google.com", "www.bing.com", "html.duckduckgo.com"].map(String::from));
-    let (snapshot, google) = search(run, &client, Engine::Google, words, 0, 10).await?;
+    let (snapshot, google) = search(run, &client, Engine::Google, words, 0, held).await?;
     run.settled_screen(HOST, &output.join("google.png")).await?;
+    check(
+        "the seed's search is answered from the canned pages",
+        google.cache == Some(Cache::Cached),
+    )?;
     let list = snapshot
         .results
         .iter()
         .find(|r| r.key == google.key)
         .ok_or("Google result list missing")?;
-    check(
-        "Google result list has ten entries",
-        list.listed.len() == 10 && list.query_id == google.id,
-    )?;
     let first = first_generated(seed, list)?.clone();
     visited.insert(first.host.clone());
+    let reason = canned_reason(&canned, &first.url)?;
     navigate(run, &first.url).await?;
-    wait(&client, "opened result has its exact search reason and is stubbed", |s| s.pages.iter().any(|p|
-        p.url == first.url && matches!(&p.reason, Reason::Search { query, rank } if query == words && *rank == first.rank)
-        && p.made == Made::Stubbed)).await?;
-    let (snapshot, bing) = search(run, &client, Engine::Bing, words, google.id, 10).await?;
+    wait(
+        &client,
+        "opened result is the canned page, with the reason it was made",
+        |s| {
+            s.pages
+                .iter()
+                .any(|p| p.url == first.url && p.reason == reason && p.made == Made::Stored)
+        },
+    )
+    .await?;
+    let (snapshot, bing) = search(run, &client, Engine::Bing, words, google.id, held).await?;
     run.settled_screen(HOST, &output.join("bing.png")).await?;
     check(
-        "Bing shares Google's first result list",
+        "Bing shares Google's result list",
         bing.key == google.key
             && snapshot
                 .results
@@ -270,31 +290,29 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
                 .any(|r| r.key == bing.key && r.query_id == google.id && r.listed == list.listed),
     )?;
     let different = format!("{words} details");
+    let held = canned_count(&different).ok_or("the canned store has no list for the details")?;
     let (snapshot, duck) =
-        search(run, &client, Engine::DuckDuckGo, &different, bing.id, 10).await?;
+        search(run, &client, Engine::DuckDuckGo, &different, bing.id, held).await?;
     run.settled_screen(HOST, &output.join("duckduckgo.png"))
         .await?;
     check(
-        "DuckDuckGo has its own result list",
+        "DuckDuckGo has its own canned result list",
         duck.key != google.key
+            && duck.cache == Some(Cache::Cached)
             && snapshot
                 .results
                 .iter()
-                .any(|r| r.key == duck.key && r.query_id == duck.id && r.listed.len() == 10),
+                .any(|r| r.key == duck.key && r.query_id == duck.id),
     )?;
     let direct = seed.visit.clone();
     visited.insert(adaptive_web_world::pages::text::target_of(&direct).0);
-    let (reason, made) = expected_page(seed, &snapshot, &direct);
+    let reason = canned_reason(&canned, &direct)?;
     navigate(run, &direct).await?;
-    wait(
-        &client,
-        "typed seed address has its exact reason and creation mode",
-        |s| {
-            s.pages
-                .iter()
-                .any(|p| p.url == direct && p.status == 200 && p.reason == reason && p.made == made)
-        },
-    )
+    wait(&client, "typed seed address is the canned page", |s| {
+        s.pages.iter().any(|p| {
+            p.url == direct && p.status == 200 && p.reason == reason && p.made == Made::Stored
+        })
+    })
     .await?;
     for (host, url, name) in [
         (
@@ -304,18 +322,37 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
         ),
         (
             "en.wikipedia.org",
-            "https://en.wikipedia.org/wiki/Iterator",
+            "https://en.wikipedia.org/wiki/Virtual_private_network",
             "wikipedia.png",
         ),
     ] {
         visited.insert(host.into());
         navigate(run, url).await?;
-        wait(&client, "opened page on a bundled host", |s| {
-            s.pages.iter().any(|p| p.url == url && p.status == 200)
+        wait(&client, "opened a canned page on a bundled host", |s| {
+            s.pages
+                .iter()
+                .any(|p| p.url == url && p.status == 200 && p.made == Made::Stored)
         })
         .await?;
         run.settled_screen(HOST, &output.join(name)).await?;
     }
+    // A search the canned pages do not hold lists the canned pages that share
+    // its words first, then made-up ones.
+    let outside = format!("{words} hg-400 owners");
+    let (snapshot, fresh) = search(run, &client, Engine::Google, &outside, duck.id, 10).await?;
+    let fresh_list = snapshot
+        .results
+        .iter()
+        .find(|r| r.key == fresh.key)
+        .ok_or("the new search's list is missing")?;
+    check(
+        "a search outside the canned set lists canned pages first",
+        fresh.cache == Some(Cache::Generated)
+            && fresh_list.listed.first().is_some_and(|r| {
+                let (host, target) = adaptive_web_world::pages::text::target_of(&r.url);
+                canned.page(&host, &target).is_some()
+            }),
+    )?;
     navigate(run, "http://wiki.corp/").await?;
     wait(&client, "reserved name is refused", |s| {
         s.refused
@@ -323,53 +360,136 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
             .any(|r| r.name == "wiki.corp" && r.reason == "reserved or private top-level domain")
     })
     .await?;
-    let reply = command(&client, false, 0, "disable").await?;
-    check(
-        "generation disabled at revision one",
-        reply["status"] == "applied" && reply["reply"]["revision"] == 1,
-    )?;
-    let reply = command(&client, false, 0, "stale").await?;
-    check(
-        "stale generation command rejected",
-        reply["status"] == "rejected"
-            && reply["rejection"]["reason"] == "stale_revision"
-            && reply["rejection"]["current"] == 1,
-    )?;
-    wait(&client, "topic shows generation off at revision one", |s| {
-        !s.generator.generate && s.generator.generation_revision == 1
-    })
+    // Plant a correction and a page, then read what the guest gets.
+    let fact = "Halvard's fix for CVE-2026-41877 is 7.2.5, not 7.2.4.";
+    let reply = command(
+        &client,
+        "fact",
+        json!({"command": "plant_fact", "text": fact}),
+    )
     .await?;
+    check("the fact is planted", reply["status"] == "applied")?;
+    let reply = command(
+        &client,
+        "simulated",
+        json!({"command": "plant_fact", "text": "This page is simulated."}),
+    )
+    .await?;
+    check(
+        "a fact that would give the web away is refused",
+        reply["status"] == "rejected" && reply["rejection"]["reason"] == "invalid",
+    )?;
+    let planted = "https://www.securityweek-wire.com/halvard-hg-400-new-fix";
+    let reply = command(
+        &client,
+        "page",
+        json!({"command": "plant_page", "url": planted,
+            "text": "Halvard ships a second HG-400 fix\nHalvard released firmware 7.2.5 for the HG-400 on Monday."}),
+    )
+    .await?;
+    check("the page is planted", reply["status"] == "applied")?;
+    let advisory = guest(
+        run,
+        "curl -s https://www.halvardsystems.com/security/advisories/HSA-2026-014",
+    )
+    .await?;
+    check(
+        "the canned advisory now says 7.2.5",
+        advisory.contains("7.2.5") && !advisory.contains("7.2.4"),
+    )?;
+    let results = guest(
+        run,
+        &format!(
+            "curl -s {}",
+            quote(&search_url(Engine::Google, "halvard hg-400 fix"))
+        ),
+    )
+    .await?;
+    let listed = fictionet_extras::search::links(&results);
+    check(
+        "the planted page leads a search that shares its words",
+        listed.first().is_some_and(|(url, _)| url == planted),
+    )?;
+    let page = guest(run, &format!("curl -s {}", quote(planted))).await?;
+    check(
+        "the planted page reads as written, in its site's layout",
+        page.contains("<h1>Halvard ships a second HG-400 fix</h1>") && page.contains("</html>"),
+    )?;
+    visited.insert("www.theregister.com".into());
+    let form = guest(
+        run,
+        "curl -s -d email=it%40example-office.co.uk https://www.theregister.com/newsletter",
+    )
+    .await?;
+    check(
+        "a form post gets the page a site shows after one",
+        form.contains("Thanks for subscribing"),
+    )?;
+    // New pages off: a new search has no results, a canned one still answers.
+    let reply = command(
+        &client,
+        "off",
+        json!({"command": "set_new_pages", "new_pages": "off"}),
+    )
+    .await?;
+    check("new pages turned off", reply["status"] == "applied")?;
+    let reply = client
+        .command(
+            "generation",
+            "stale",
+            json!({"command": "set_generation", "generate": true, "expected_revision": 0}),
+        )
+        .await?;
+    check(
+        "a stale world command is rejected",
+        reply["status"] == "rejected" && reply["rejection"]["reason"] == "stale_revision",
+    )?;
     let (_, empty) = search(
         run,
         &client,
         Engine::Google,
         &format!("{words} new question"),
-        duck.id,
+        fresh.id,
         0,
     )
     .await?;
-    let (_, cached) = search(run, &client, Engine::Google, words, empty.id, 10).await?;
+    // The planted page shares the seed's words, so it leads their list.
+    let (_, cached) = search(
+        run,
+        &client,
+        Engine::Google,
+        words,
+        empty.id,
+        (canned_count(words).unwrap_or(0) + 1).min(10),
+    )
+    .await?;
     check(
-        "stored Google search is served from memory",
+        "a canned search is still answered with new pages off",
         cached.cache == Some(Cache::Cached),
     )?;
-    let reply = command(&client, true, 1, "enable").await?;
-    check(
-        "generation restored at revision two",
-        reply["status"] == "applied" && reply["reply"]["revision"] == 2,
-    )?;
-    wait(&client, "topic shows generation restored", |s| {
-        s.generator.generate && s.generator.generation_revision == 2
-    })
+    let reply = command(
+        &client,
+        "canned",
+        json!({"command": "set_new_pages", "new_pages": "canned"}),
+    )
+    .await?;
+    check("canned pages again", reply["status"] == "applied")?;
+    wait(
+        &client,
+        "the page shows canned pages and new pages on",
+        |s| s.generator.generate && s.generator.canned,
+    )
     .await?;
     let description = client.get_json("/api/page").await?;
     check(
-        "Search panel is in the workspace",
-        description["panels"].as_array().is_some_and(|panels| {
-            panels.iter().any(|p| {
-                p["title"] == "Search" && p["kind"] == "custom" && p["area"] == "workspace"
-            })
-        }),
+        "the page is the Search app with its world panel",
+        description["title"] == "Search"
+            && description["app"] == true
+            && description["panels"].as_array().is_some_and(|panels| {
+                panels.iter().any(|p| {
+                    p["title"] == "Search" && p["kind"] == "custom" && p["area"] == "workspace"
+                })
+            }),
     )?;
     for path in [
         "/panels/search.mjs",
@@ -404,11 +524,32 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     for (outcome, count) in counts {
         println!("Left the box: {outcome}: {count} destinations");
     }
+    // A mirrored name either left the box or was answered from the host's
+    // package cache, as a file fetched by an earlier run is.
+    let mirrored = |host: &str| {
+        observed(host, "forwarded")
+            || destinations.iter().any(|row| {
+                row["sandbox"] == HOST
+                    && row["name"] == host
+                    && row["outcome"] == "served"
+                    && row["by"] == "host package cache"
+            })
+    };
+    for (host, _) in super::page::FORWARDED {
+        if !mirrored(host) {
+            println!("Left the box: {host} was neither forwarded nor answered from the cache");
+        }
+    }
+    for host in visited.iter() {
+        if !observed(host, "served") {
+            println!("Left the box: {host} was not served by the world");
+        }
+    }
     check(
-        "Left the box names all forwarded mirrors and visited generated sites",
+        "Left the box names all forwarded mirrors and visited sites",
         super::page::FORWARDED
             .iter()
-            .all(|(host, _)| observed(host, "forwarded"))
+            .all(|(host, _)| mirrored(host))
             && visited.iter().all(|host| observed(host, "served"))
             && destinations
                 .iter()
@@ -428,17 +569,11 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<S
     run.screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
         .await?;
     run.page_shot(
-        &output.join("packets.png"),
+        &output.join("world.png"),
         r#"(() => {
-            const tab = document.querySelector('#tab-packets');
-            if (!tab) return false;
-            if (tab.getAttribute('aria-selected') !== 'true') tab.click();
-            const info = document.querySelector('.packet-info-text');
-            const list = document.querySelector('#plist');
-            const loss = document.querySelector('#sampled');
-            return info && info.getBoundingClientRect().width > 0
-                && list.getBoundingClientRect().height > 200
-                && loss.getBoundingClientRect().height < 100;
+            const rows = document.querySelectorAll('.search-row');
+            const picture = document.querySelector('.search-picture');
+            return rows.length >= 6 && picture && picture.getBoundingClientRect().height > 200;
         })()"#,
         Duration::from_secs(30),
     )
@@ -467,8 +602,16 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
     let mut sites = BTreeMap::new();
     let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     let mut generated = Vec::new();
+    let mut modeled = Vec::new();
     for line in input.lines() {
         let event: Value = serde_json::from_str(&line?)?;
+        if event["type"] == "http"
+            && event["cache"] == "generated"
+            && event["model"].as_str().is_some_and(|model| model != "stub")
+        {
+            modeled.push(event["host"].clone());
+            println!("[FAIL] a model wrote an answer: {event}");
+        }
         let Some(host) = event["host"]
             .as_str()
             .filter(|host| !visited.contains(*host))
@@ -500,9 +643,10 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
     for message in &generated {
         println!("[FAIL] background generated a page: {message}");
     }
+    check("background hosts generated no pages", generated.is_empty())?;
     Ok(check(
-        "background hosts generated no pages",
-        generated.is_empty(),
+        "no answer in the run was written by a model",
+        modeled.is_empty(),
     )?)
 }
 

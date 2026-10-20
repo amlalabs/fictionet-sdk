@@ -371,3 +371,52 @@ test('after the run stopped, consoles say they closed instead of blaming the bui
     stop();
   }
 });
+
+test('an interactive screen takes free input on connect and fits the guest display to the panel', async (t) => {
+  const h = fixture(t);
+  const controls = h.root.ownerDocument.createElement('div');
+  const dispose = screen(h.root, h.services, { ...h.screenOptions, interactive: true, controls });
+  h.publish({ state: 'desktop_up', screen: true });
+  await settle();
+  const rfb = h.rfbs[0];
+  rfb.dispatchEvent(new Event('connect'));
+  await settle();
+  assert.deepEqual(h.requests.at(-1), { method: 'POST', path: '/api/lease', body: { host: 'alpha', session: 'ours', take: false } });
+  h.lease('ours');
+  assert.equal(rfb.viewOnly, false);
+  assert.equal(rfb.resizeSession, true);
+  const claim = controls.querySelector('button');
+  assert.equal(claim.hidden, true, 'the app needs no take over button while it holds input');
+  assert.equal(controls.querySelector('span.console-owner').textContent, '');
+  // Another viewer's input shows, with the way to take it back.
+  h.lease('another');
+  assert.equal(rfb.viewOnly, true);
+  assert.equal(rfb.resizeSession, false);
+  assert.equal(claim.hidden, false);
+  dispose();
+});
+
+test('an interactive terminal starts large and its text size buttons resize it', async (t) => {
+  const h = fixture(t);
+  const controls = h.root.ownerDocument.createElement('div');
+  const stored = new Map();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (k) => stored.get(k) ?? null, setItem: (k, v) => stored.set(k, v) } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, 'localStorage', previous); else delete globalThis.localStorage; });
+  const dispose = terminal(h.root, h.services, { ...h.terminalOptions, interactive: true, controls });
+  h.publish({ state: 'ssh_up', screen: false, terminal: true });
+  await settle();
+  h.sockets[0].open();
+  const term = h.terminals[0];
+  assert.equal(term.options.fontSize, 18);
+  const [smaller, larger] = controls.querySelectorAll('button');
+  assert.deepEqual([smaller.textContent, larger.textContent], ['A−', 'A+']);
+  larger.click();
+  larger.click();
+  assert.equal(term.options.fontSize, 22);
+  assert.equal(stored.get('fictionet-terminal-size'), '22');
+  smaller.click();
+  assert.equal(term.options.fontSize, 20);
+  dispose();
+  assert.equal(controls.children.length, 0);
+});

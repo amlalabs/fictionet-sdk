@@ -161,9 +161,20 @@ fn calendar(seed: &Seed) -> String {
         .join("\n")
 }
 
+/// Words and names no page may contain, in any case, URLs included: the
+/// guest content check's list.
+fn banned() -> String {
+    let words = example_common::guest_content::WORDS.join(", ");
+    let names = example_common::guest_content::NAMES.join(", ");
+    format!(
+        "Never write these words anywhere, URLs and titles included: {words}. \
+         Never write these strings anywhere, even inside a longer word or URL: {names}."
+    )
+}
+
 /// The system prompt: the rules, the world and, once there is one, the cast.
 pub fn system(seed: &Seed, cast: &[Person]) -> String {
-    let mut out = format!("{RULES}\n\n{}", world_brief(seed));
+    let mut out = format!("{RULES}\n{}\n\n{}", banned(), world_brief(seed));
     if !cast.is_empty() {
         let people: Vec<_> = cast
             .iter()
@@ -370,9 +381,8 @@ pub fn search(
     known: &[Listed],
     claims: &[Claim],
 ) -> (String, String) {
-    let known: Vec<_> = known
-        .iter()
-        .filter(|k| super::make::shares_words(&format!("{} {}", k.title, k.url), query))
+    let known: Vec<_> = super::make::rank(known, query)
+        .into_iter()
         .take(25)
         .map(|k| {
             let mut line = format!("- {} \"{}\"", k.url, k.title);

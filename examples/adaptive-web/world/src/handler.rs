@@ -4,10 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::pages::{MAX_FORM_BYTES, Meta, Pages};
@@ -20,13 +17,11 @@ use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 
-/// Shared routing, query facts and response event fields. Clones share one
-/// query counter.
+/// Shared routing, query facts and response event fields.
 #[derive(Clone)]
 pub struct Handler {
     fcx: fictionet::Cx,
     pages: Arc<Pages>,
-    queries: Arc<AtomicU64>,
 }
 
 impl Handler {
@@ -35,7 +30,6 @@ impl Handler {
         Self {
             fcx: fcx.clone(),
             pages,
-            queries: Arc::new(AtomicU64::new(1)),
         }
     }
 }
@@ -110,7 +104,7 @@ impl Handler {
             start,
         } = &action
         {
-            let id = self.queries.fetch_add(1, Ordering::Relaxed);
+            let id = self.pages.next_query_id();
             query = Some(QueryGuard {
                 fcx: self.fcx.clone(),
                 conn: conn.clone(),
@@ -126,10 +120,13 @@ impl Handler {
                     .field("key", query_key(search, *start))
             });
         }
-        let answer = self
-            .pages
-            .handle_route(&self.fcx, &target.host, path, action)
-            .await;
+        let answer = if parts.method == http::Method::POST && action == Route::Page {
+            self.pages.form(&target.host, path)
+        } else {
+            self.pages
+                .handle_route(&self.fcx, &target.host, path, action)
+                .await
+        };
         if let Some(q) = &mut query {
             match &answer.meta {
                 Meta::Error { error, .. } => q.fail("error", Some(error), answer.serve_ms),

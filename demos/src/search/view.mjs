@@ -1,234 +1,169 @@
-import { engine, ms, made, siteReason, cache, outcome, counts, resultView, tree, rootNote } from './model.mjs';
+// The world pane: the newest search, the engines that answered it and the
+// sites its list named, above the newest rows of what the world served. The
+// World menu (services.worldMenu, when the page is an app) chooses what
+// answers, plants a fact or a page, and restarts the run.
+import { picture, rows } from './model.mjs';
 
-// Names for the snapshot's omitted counts.
-const OMITTED = { queries: 'searches', results: 'result lists', listed: 'results cut from long lists', pages: 'pages', sites: 'sites', refused: 'refused names', seed_facts: 'seed facts', seed_sites: 'seed sites' };
+const NEW_PAGES = [['canned', 'Canned'], ['stub', 'Stub'], ['off', 'Off']];
+// Run time as minutes and seconds.
+const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 
 export function mount(root, services, options) {
-  const { reconcile, listen } = services.dom, { fmtRunMs: time } = services.format;
-  root.classList.add('search-content');
   const { el } = services.dom.scoped(root);
+  const { listen } = services.dom;
   el('link', { rel: 'stylesheet', href: '/assets/search/style.css' }, root);
-  const box = el('div', { class: 'search-panel' }, root);
-  const intro = el('header', { class: 'search-intro' }, box);
-  el('p', { class: 'search-premise', text: 'Every page here is made up by the world for this run.' }, intro);
-  const context = el('div', { class: 'search-context' }, intro);
-  const seed = el('p', { class: 'search-seed', text: 'Waiting for the world’s seed…' }, context);
-  const question = el('p', { class: 'search-question' }, context);
-  const disclosure = el('details', {}, context);
-  el('summary', { text: 'Question, facts & forwarding policy' }, disclosure);
-  const fullQuestion = el('p', {}, disclosure);
-  const facts = el('p', {}, disclosure);
-  const policy = el('div', { text: 'Waiting for forwarding policy…' }, disclosure);
-  const controls = el('section', { class: 'search-generator' }, intro);
-  const toggle = el('button', { class: 'switch search-toggle' }, controls);
-  toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-checked', 'false');
-  const track = el('span', { class: 'switch-track', 'aria-hidden': 'true' }, toggle);
-  el('span', { class: 'switch-knob' }, track);
-  const toggleLabel = el('span', { text: 'Waiting for generation state…' }, toggle);
-  const revision = el('small', {}, controls);
-  const commandStatus = el('p', { class: 'search-command', role: 'status' }, controls);
-  const error = el('p', { class: 'search-error', role: 'status' }, box);
-  const meters = el('div', { class: 'search-counts' }, box);
-  const countNodes = new Map();
-  const omitted = el('small', { class: 'search-omitted' }, box);
-  const columns = el('div', { class: 'search-columns' }, box);
-  const streamSection = el('section', { class: 'search-stream-section' }, columns);
-  const streamHead = el('header', { class: 'search-section-head' }, streamSection);
-  el('h3', { text: 'Search stream' }, streamHead);
-  const source = el('p', { class: 'eyebrow', text: 'Waiting for searcher…' }, streamHead);
-  const stream = el('div', { class: 'search-stream' }, streamSection);
-  const empty = el('p', { class: 'note search-empty', text: 'No searches yet. The web starts with a question.' }, streamSection);
-  const detail = el('section', { class: 'search-results' }, columns);
-  const detailHead = el('header', { class: 'search-section-head' }, detail);
-  const detailTitle = el('h3', { text: 'Results the world made' }, detailHead);
-  const origin = el('p', { text: 'The newest search’s result list appears here.' }, detailHead);
-  const resultList = el('ol', {}, detail);
-  const treeSection = el('section', { class: 'search-tree-section' }, columns);
-  const treeHead = el('header', { class: 'search-section-head' }, treeSection);
-  el('h3', { text: 'The made-up web' }, treeHead);
-  el('p', { class: 'eyebrow', text: 'Searches → results → links' }, treeHead);
-  const treeList = el('div', { class: 'search-tree' }, treeSection);
-  const treeEmpty = el('p', { class: 'note search-empty', text: 'No pages yet. Pages appear here when the world is asked for them.' }, treeSection);
-  const sitesHead = el('h4', { class: 'search-list-head', text: 'Sites with no page in the tree' }, treeSection);
-  const otherSites = el('div', { class: 'search-sites' }, treeSection);
-  const refusedHead = el('h4', { class: 'search-list-head', text: 'Names the world refused' }, treeSection);
-  const refused = el('div', { class: 'search-refused' }, treeSection);
-  sitesHead.hidden = refusedHead.hidden = true;
-  const rows = new Map(), nodes = new Map(), results = new Map(), sites = new Map(), refusals = new Map();
-  // Hosts on screen when the panel opened, and hosts that had their moment.
-  const firstSites = new Set(), marked = new Set();
+  root.classList.add('search-world');
+  const svg = el('svg:svg', { class: 'search-picture', viewBox: '0 0 520 440', role: 'img', 'aria-label': 'Searches and the sites they named' }, root);
+  const list = el('div', { class: 'search-rows', role: 'list', 'aria-label': 'What the world served' }, root);
   const controller = new AbortController();
-  let snapshot, chosen, selectedPage, waitingRevision, disposed = false, initialized = false;
   const cleanup = [];
-  const set = (node, value) => { if (node.textContent !== String(value)) node.textContent = value; };
-  const line = (parent, cls) => el('span', { class: cls }, parent);
-  const stateButton = () => {
-    const g = snapshot?.generator;
-    // A reply describes one revision; once the switch moves past it, it is history.
-    if (!request.busy && g && waitingRevision != null && g.generation_revision > waitingRevision) { waitingRevision = null; set(commandStatus, ''); }
-    toggle.disabled = !g || request.busy || (waitingRevision != null && g.generation_revision < waitingRevision);
-    toggle.setAttribute('aria-busy', String(request.busy));
-    toggle.setAttribute('aria-checked', String(!!g?.generate));
-    toggle.dataset.known = String(!!g);
-    set(toggleLabel, request.busy ? 'Waiting for the world…' : g ? (g.generate ? 'Making new pages' : 'Serving only what exists') : 'Waiting for generation state…');
-    if (g) set(revision, `Revision ${g.generation_revision} · changed at ${time(g.generation_at_ms)}`);
-  };
-  const request = services.command(controller.signal, stateButton);
-  // Resolve real event identities; sequence numbers are never treated as request IDs.
-  async function select(seq, host) {
-    services.packetPair.set(null);
-    services.selection.set({ host: host || null, event: { seq }, request: null, connection: null, node: null, links: [] });
-    try {
-      const events = await services.transport.get('/api/events', { after: Math.max(0, seq - 1), max: 1 }, controller.signal);
-      if (disposed || services.selection.get().event?.seq !== seq) return;
-      const event = events.events?.find((e) => e.seq === seq);
-      if (event) {
-        services.selection.set({ event, host: event.sandbox?.name || host || null, request: event.fields?.request_id ?? null, connection: event.conn ?? null });
-        services.packetPair.set(event.local && event.peer ? { local: event.local, peer: event.peer } : null);
-      }
-    } catch (e) { if (!disposed) set(error, `Selection details unavailable: ${e.message}`); }
-  }
-  function openPage(url) {
-    const p = snapshot?.pages.find((p) => p.url === url);
-    if (!p) return;
-    selectedPage = url;
-    select(p.seq, null);
-    render();
-    nodes.get(`page:${url}`)?.node.scrollIntoView({ block: 'nearest' });
-  }
-  cleanup.push(listen(toggle, 'click', async () => {
-    if (toggle.disabled || disposed) return;
-    const g = snapshot.generator;
-    set(commandStatus, 'Waiting for the world…');
-    await request.send('/api/command/generation', { command: 'set_generation', generate: !g.generate }, g.generation_revision, {
+  let snapshot = null, disposed = false;
+  const menu = services.worldMenu;
+  const request = services.command(controller.signal, () => buttons());
+  const controls = [];
+  let note, segment;
+  async function send(command) {
+    if (!snapshot || request.busy) return false;
+    note.textContent = '';
+    let ok = false;
+    await request.send('/api/command/generation', command, snapshot.generator.generation_revision, {
       reply(reply) {
-      if (reply.status === 'pending') set(commandStatus, 'Command pending. Read the state before trying again.');
-      else { waitingRevision = reply.reply.revision; set(commandStatus, `Applied at ${time(reply.reply.at_ms)} · revision ${waitingRevision}`); }
-      }, error(e) {
-      const rejection = e.body?.rejection;
-      if (rejection?.reason === 'stale_revision') {
-        waitingRevision = rejection.current;
-        set(commandStatus, `The switch changed elsewhere. Current revision ${rejection.current}. No retry was sent.`);
-      } else set(commandStatus, e.body?.status === 'timeout' ? 'No reply yet. The command may still apply; read the state before trying again.' : `Command failed: ${e.message}`);
+        if (reply.status === 'applied') ok = true;
+        else note.textContent = reply.status === 'pending' ? 'The world has not answered yet.' : reply.rejection?.message || 'Not applied.';
+      },
+      error(error) {
+        const rejection = error.body?.rejection;
+        note.textContent = rejection?.reason === 'stale_revision' ? 'The world changed. Try again.' : rejection?.message || error.message;
       },
     });
-  }));
-  // One delegated listener per list also covers rows added by later snapshots.
-  const delegate = (parent, action) => cleanup.push(listen(parent, 'click', (event) => {
-    let target = event.target;
-    while (target && target !== parent) { if (target.dataset?.identity) { action(target.dataset.identity); return; } target = target.parentElement; }
-  }));
-  delegate(stream, (id) => {
-    chosen = Number(id); selectedPage = null;
-    const q = snapshot?.queries.find((q) => q.id === chosen);
-    if (q) { select(q.answer_seq ?? q.seq, q.sandbox); render(); }
-  });
-  delegate(treeList, (url) => openPage(url));
-  delegate(resultList, (url) => openPage(url));
-  const card = (cls, parentTag = 'button') => {
-    const node = el(parentTag, { class: cls }, null);
-    if (parentTag === 'button') node.type = 'button';
-    return { node, top: line(node, 'search-row-top'), title: line(node, 'search-row-title'), path: line(node, 'search-row-path'), note: line(node, 'search-row-note') };
-  };
-  function render() {
-    const s = snapshot;
-    set(seed, `${s.seed.name} · world date ${s.seed.date}`);
-    set(question, s.seed.question);
-    set(fullQuestion, s.seed.question);
-    set(facts, s.seed.facts.join('\n'));
-    stateButton();
-    for (const [label, value] of Object.entries(counts(s))) {
-      if (!countNodes.has(label)) {
-        const cell = el('div', {}, meters);
-        countNodes.set(label, el('b', {}, cell)); el('span', { text: label }, cell);
-      }
-      set(countNodes.get(label), value);
-    }
-    const lost = Object.values(s.omitted).reduce((a, b) => a + b, 0);
-    set(omitted, lost ? `No longer held here: ${Object.entries(s.omitted).filter(([, n]) => n).map(([k, n]) => `${n} ${OMITTED[k] || k.replaceAll('_', ' ')}`).join(', ')}. The counts describe what is held.` : '');
-    empty.hidden = s.queries.length > 0;
-    reconcile(stream, [...s.queries].reverse(), (q) => q.id, () => { const entry = card('search-row'); entry.badge = el('span', { class: 'pill outline' }, entry.top); entry.meta = el('span', {}, entry.top); return entry; }, (entry, q, fresh) => {
-      entry.node.dataset.identity = String(q.id);
-      entry.node.setAttribute('aria-pressed', String(chosen === q.id));
-      set(entry.badge, engine(q.engine));
-      set(entry.meta, ` ${time(q.at_ms)} · ${q.sandbox || 'Host not reported'}${q.peer ? ` · ${q.peer}` : ''}`);
-      set(entry.title, q.search);
-      // A failure already names its cause, so its cache state would repeat it.
-      const label = q.outcome.status === 'failed' ? '' : cache(q.cache);
-      set(entry.note, `${outcome(q)}${label ? ` · ${label}` : ''}${q.serve_ms != null ? ` · ${ms(q.serve_ms)}` : ''}`);
-      if (fresh) entry.node.classList.add('search-arrival');
-    }, rows);
-    // Until a viewer selects a search, the result list follows the newest
-    // one that has results, or the newest when none has.
-    const newest = s.queries.findLast((q) => q.results > 0) ?? s.queries.at(-1);
-    const q = chosen == null ? newest : s.queries.find((q) => q.id === chosen);
-    if (q) {
-      set(detailTitle, `${q.search} · ${engine(q.engine)}`);
-      const following = chosen == null ? `Newest search${q.results > 0 ? ' with results' : ''}; select one to keep it here. ` : '';
-      const view = resultView(s, q); set(origin, `${following}${view.origin}`);
-      reconcile(resultList, view.rows, (r) => `${q.key}:${r.rank}:${r.url}`, () => {
-        const node = el('li', {}, null);
-        return { node, title: line(node, 'search-row-title'), host: line(node, 'search-url'), url: line(node, 'search-path'), note: line(node, 'search-row-note'), open: el('button', { class: 'search-open' }, node) };
-      }, (entry, r) => {
-        set(entry.title, `${r.rank}. ${r.title}`); set(entry.host, r.host); set(entry.url, r.url);
-        set(entry.note, r.site ? `${r.site.address} · ${siteReason(r.site.reason)}` : 'No address assignment observed yet');
-        entry.open.hidden = !r.page;
-        entry.open.dataset.identity = r.url;
-        set(entry.open, r.page ? `Opened · ${made(r.page.made)} · ${ms(r.page.serve_ms)} · show page` : '');
-      }, results);
-    } else if (chosen != null) { set(origin, 'This search is no longer retained.'); reconcile(resultList, [], (r) => r.url, () => {}, () => {}, results); }
-    if (!initialized) s.sites.forEach((site) => firstSites.add(site.host));
-    // The story moment is the first page on a made-up site that is new to this
-    // viewer; a lookup with no page is background traffic, not the story.
-    const pool = new Set(s.sites.filter((site) => site.reason === 'pool').map((site) => site.host));
-    const mark = (entry, host) => {
-      if (!initialized || !pool.has(host) || firstSites.has(host) || marked.has(host)) return;
-      services.moment(entry.node); marked.add(host);
-    };
-    const branches = tree(s);
-    treeEmpty.hidden = branches.length > 0;
-    reconcile(treeList, branches, (n) => n.id, (n) => card(n.page ? 'search-node' : 'search-root', n.page ? 'button' : 'div'), (entry, n, fresh) => {
-      entry.node.style.setProperty('--depth', n.depth);
-      entry.node.dataset.depth = String(n.depth);
-      if (n.page) {
-        const p = n.page;
-        entry.node.dataset.identity = p.url;
-        entry.node.setAttribute('aria-pressed', String(selectedPage === p.url));
-        set(entry.top, p.host); set(entry.title, p.title || p.url);
-        set(entry.path, p.url.replace(/^https?:\/\/[^/]+/, '') || '/');
-        set(entry.note, `${made(p.made)} · first ${ms(p.first_serve_ms)} · latest ${ms(p.latest_serve_ms)}${p.fetches > 1 ? ` · ${p.fetches} fetches · ${made(p.latest)}` : ''}`);
-        if (fresh) entry.node.classList.add('search-arrival');
-        mark(entry, p.host);
-      } else { set(entry.top, n.label); set(entry.title, ''); set(entry.note, rootNote(s, n)); }
-    }, nodes);
-    const unfetched = s.sites.filter((site) => !s.pages.some((p) => p.host === site.host));
-    sitesHead.hidden = !unfetched.length;
-    reconcile(otherSites, unfetched, (site) => site.host, () => card('search-site', 'div'), (entry, site) => {
-      set(entry.top, site.host); set(entry.title, `${site.address} · ${siteReason(site.reason)}`);
-    }, sites);
-    const occurrences = new Map();
-    const refusedRows = s.refused.map((r) => { const key = `${r.name}:${r.at_ms}`; const count = occurrences.get(key) || 0; occurrences.set(key, count + 1); return { ...r, identity: `${key}:${count}` }; });
-    reconcile(refused, refusedRows, (r) => r.identity, () => card('search-refusal', 'div'), (entry, r) => {
-      set(entry.top, r.name); set(entry.title, r.reason); set(entry.note, `at ${time(r.at_ms)}`);
-    }, refusals);
-    refusedHead.hidden = !refusedRows.length;
-    initialized = true;
+    return ok;
   }
-  stateButton();
-  cleanup.push(services.state('/api/state/policy', ({ value }) => {
-    if (disposed || !value) return;
-    set(source, value.searcher);
-    policy.replaceChildren();
-    el('p', { text: `Made up: ${value.made_up}` }, policy);
-    el('p', { text: 'Forwarded to the real internet for setup:' }, policy);
-    const list = el('ul', {}, policy);
-    value.forwarded.forEach((row) => el('li', { text: `${row.host} — ${row.why}` }, list));
-    el('p', { text: `Refused: ${value.refused}` }, policy);
-  }, (e) => { if (!disposed) set(policy, `Policy unavailable: ${e.message}`); }));
+  function buttons() {
+    for (const control of controls) control.disabled = !snapshot || request.busy;
+    if (!segment || !snapshot) return;
+    const g = snapshot.generator;
+    const mode = !g.generate ? 'off' : g.canned ? 'canned' : 'stub';
+    for (const button of segment.children) button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
+  }
+  if (menu) {
+    const { el: item } = services.dom.scoped(menu);
+    menu.replaceChildren();
+    const row = item('div', { class: 'row' }, menu);
+    item('span', { text: 'New pages' }, row);
+    segment = item('div', { class: 'seg', role: 'group', 'aria-label': 'New pages' }, row);
+    for (const [mode, text] of NEW_PAGES) {
+      const button = item('button', { type: 'button', text, 'aria-pressed': 'false' }, segment);
+      button.dataset.mode = mode;
+      controls.push(button);
+      cleanup.push(listen(button, 'click', () => send({ command: 'set_new_pages', new_pages: mode })));
+    }
+    const field = (label, id) => {
+      const box = item('div', { class: 'field' }, menu);
+      item('label', { for: id, text: label }, box);
+      return box;
+    };
+    const factBox = field('Plant a fact', 'plant-fact');
+    const fact = item('input', { id: 'plant-fact', type: 'text', autocomplete: 'off' }, factBox);
+    const plantFact = item('button', { type: 'button', class: 'act', text: 'Plant' }, factBox);
+    controls.push(plantFact);
+    cleanup.push(listen(plantFact, 'click', async () => {
+      if (await send({ command: 'plant_fact', text: fact.value })) fact.value = '';
+    }));
+    const pageBox = field('Plant a page', 'plant-url');
+    const url = item('input', { id: 'plant-url', type: 'url', placeholder: 'https://', autocomplete: 'off' }, pageBox);
+    const plantPage = item('button', { type: 'button', class: 'act', text: 'Plant' }, pageBox);
+    const text = item('textarea', { 'aria-label': 'Page text', placeholder: 'Title, then the text', rows: '3' }, pageBox);
+    controls.push(plantPage);
+    cleanup.push(listen(plantPage, 'click', async () => {
+      if (await send({ command: 'plant_page', url: url.value, text: text.value })) { url.value = ''; text.value = ''; }
+    }));
+    const restartRow = item('div', { class: 'row' }, menu);
+    item('span', { text: 'Restart run' }, restartRow);
+    const restart = item('button', { type: 'button', class: 'act quiet', text: 'Restart' }, restartRow);
+    controls.push(restart);
+    cleanup.push(listen(restart, 'click', () => send({ command: 'restart' })));
+    note = item('p', { class: 'note', role: 'status' }, menu);
+  } else {
+    note = el('p', { class: 'note', role: 'status' }, null);
+  }
+  buttons();
+
+  function draw() {
+    const view = picture(snapshot);
+    svg.replaceChildren();
+    const add = (tag, attrs, text) => {
+      const node = el(`svg:${tag}`, attrs, svg);
+      if (text != null) node.textContent = text;
+      return node;
+    };
+    const ex = [110, 260, 410], ey = 134;
+    add('rect', { class: 'query', x: 60, y: 22, width: 400, height: 32, rx: 16 });
+    const words = view.query || 'Waiting for a search';
+    add('text', { class: `query-text${view.query ? '' : ' idle'}`, x: 260, y: 43, 'text-anchor': 'middle' }, words.length > 52 ? `${words.slice(0, 51)}…` : words);
+    view.engines.forEach((e, i) => {
+      add('line', { class: `edge${e.tag === 'idle' ? ' idle' : ''}`, x1: 260, y1: 54, x2: ex[i], y2: ey - 12 });
+    });
+    // Engines that showed the same list share it.
+    const shown = view.engines.map((e, i) => [e, i]).filter(([e]) => e.tag !== 'idle');
+    for (let n = 1; n < shown.length; n++) {
+      if (shown[n][0].tag === 'memory' || shown[n][0].tag === 'canned') {
+        add('line', { class: 'edge shared', x1: ex[shown[n - 1][1]] + 14, y1: ey, x2: ex[shown[n][1]] - 14, y2: ey });
+      }
+    }
+    const spots = [[90, 252], [210, 262], [330, 252], [450, 262], [150, 334], [390, 334]];
+    view.sites.forEach((site, n) => {
+      const [x, y] = spots[n];
+      view.engines.forEach((e, i) => { if (e.tag !== 'idle') add('line', { class: 'edge thin', x1: ex[i], y1: ey + 12, x2: x, y2: y - 10 }); });
+    });
+    view.engines.forEach((e, i) => {
+      add('circle', { class: `node ${e.tag}`, cx: ex[i], cy: ey, r: 12 });
+      add('text', { class: 'label', x: ex[i], y: ey - 22, 'text-anchor': 'middle' }, e.label);
+    });
+    view.sites.forEach((site, n) => {
+      const [x, y] = spots[n];
+      const r = site.pages ? Math.min(16, 8 + 3 * site.pages) : 7;
+      add('circle', { class: `node site ${site.pages ? site.tag : 'listed'}${site.seed ? ' seed' : ''}`, cx: x, cy: y, r });
+      add('text', { class: 'label small', x, y: y + r + 16, 'text-anchor': 'middle' }, site.label).append(el('svg:title', { text: site.host }, null));
+      if (site.pages) add('text', { class: 'label small muted', x, y: y + r + 30, 'text-anchor': 'middle' }, `${site.pages} ${site.pages === 1 ? 'page' : 'pages'}`);
+    });
+    if (view.more) add('text', { class: 'label small muted', x: 490, y: 300, 'text-anchor': 'end' }, `+${view.more}`);
+    view.planted.forEach((p, n) => {
+      const x = 250 + n * 135;
+      add('circle', { class: 'node planted', cx: x, cy: 404, r: 9 });
+      const label = p.label.length > 14 ? `${p.label.slice(0, 13)}…` : p.label;
+      add('text', { class: 'label small', x: x + 16, y: 408 }, label).append(el('svg:title', { text: p.text }, null));
+    });
+    if (view.refused) {
+      add('circle', { class: 'node refused', cx: 40, cy: 404, r: 11 });
+      add('line', { class: 'cross', x1: 33, y1: 397, x2: 47, y2: 411 });
+      add('line', { class: 'cross', x1: 47, y1: 397, x2: 33, y2: 411 });
+      const name = view.refused.length > 22 ? `${view.refused.slice(0, 21)}…` : view.refused;
+      add('text', { class: 'label refused', x: 60, y: 409 }, name);
+    }
+  }
+  function render() {
+    draw();
+    list.replaceChildren();
+    for (const row of rows(snapshot)) {
+      const line = el('div', { class: 'search-row', role: 'listitem' }, list);
+      el('time', { text: clock(row.at) }, line);
+      el('span', { text: row.who, title: row.who }, line);
+      el('b', { text: row.what, title: row.what }, line);
+      el('em', { class: row.tag, text: row.tag }, line);
+    }
+    buttons();
+  }
   cleanup.push(services.state(options.state, ({ value }) => {
     if (disposed || !value) return;
-    if (snapshot?.generator.generate && !value.generator.generate) services.moment(controls);
-    snapshot = value; set(error, ''); render();
-  }, (e) => { if (!disposed) { snapshot = null; stateButton(); set(error, `Search state unavailable: ${e.message}`); } }));
-  return () => { disposed = true; controller.abort(); cleanup.forEach((off) => off()); root.classList.remove('search-content'); root.replaceChildren(); };
+    snapshot = value;
+    render();
+  }, (error) => { if (!disposed) note.textContent = error.message; }));
+  return () => {
+    disposed = true;
+    controller.abort();
+    cleanup.forEach((off) => off());
+    menu?.replaceChildren();
+    root.classList.remove('search-world');
+    root.replaceChildren();
+  };
 }

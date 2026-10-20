@@ -14,7 +14,7 @@ binary each, with the world in the same process. Four are scripts in
 booting anything. `cargo xtask demo libraries` downloads only the pinned
 browser libraries, into `observe/downloads/vendor/` at the repository root.
 Options for a demo go after its name, as in
-`cargo xtask demo search --seed corvane-acquisition`.
+`cargo xtask demo search check`.
 
 ## The microVM demos
 
@@ -170,47 +170,27 @@ open until Ctrl-C.
 
 ### Search
 
-`cargo xtask demo search` runs [the adaptive web](../examples/adaptive-web)
-with a stub generator, so no model is called, and a scripted Firefox searcher
-on an Ubuntu desktop. The page shows each search as it arrives, with the host
-that asked, its time and its outcome. Select one to see the result list the
-world made for it, or the earlier search whose list it reused. Beside it grows
-a tree of every made-up site and page, with the world's reason for each, how
-it was made and how fast it was served. A switch turns page generation off and
-on. The desktop sits above the inspector.
+`cargo xtask demo search` is the app. It boots an Ubuntu desktop with Firefox
+and Claude Code on [the adaptive web](../examples/adaptive-web), opens the page
+in Chromium and stays up until Ctrl-C. The page has the guest's Screen and
+Terminal on the left and the newest search, its engines and the sites it named
+on the right. The World menu switches new pages between Canned, Stub and Off,
+plants a fact or a page, and restarts the run.
 
-The checks search on Google, Bing and DuckDuckGo, open results and a typed
-address, and check each page's reason and how it was made. The seed names the
-words to search for and the address to type. The checks confirm that a stored
-search comes from memory once generation is off, that Left the box names
-every forwarded mirror, and that the guest's background requests made no
-pages. The story holds each step for 1.5 s, so you can follow
-it on the page.
-
-- Options: `--seed halvard-cve|corvane-acquisition|fastjsonl-package`,
-  `halvard-cve` by default. `--stay` keeps the page open after the checks until
-  Ctrl-C.
-- For a live session, `cargo xtask demo search --model openrouter` opens
-  Firefox for your own searches and stays open until Ctrl-C. This mode replaces
-  the scripted story with interactive browsing. It reads `OPENROUTER_API_KEY`;
-  `--model anthropic` reads `ANTHROPIC_API_KEY`. Only the selected provider's
-  key is read. `--model-name <name>` overrides that provider's default model.
-  Pages, result lists and addresses persist in
-  `demos/downloads/cloudimage/search-store/<seed>/`; `--store <directory>`
-  selects another store. Use a different directory when changing the model.
-  Pages are written on request, without prefetching. The generation switch
-  works in both modes: saved content remains available while it is off.
-- Screenshots: `downloads/cloudimage/runs/search-<time>/`, with `desktop.png`,
-  `page.png`, `google.png`, `bing.png`, `duckduckgo.png` and the world's
-  `log.jsonl`. The scripted run captures the screenshots.
-- Without a VM: `cargo xtask demo search preview` drives real in-process
-  searches with a scripted client, on the same addresses the checks search.
-  `--spend-budget` ends the story with new searches until the world refuses
-  one for its generation budget. The preview holds the package cache
-  while it runs, so a VM run started beside it fetches its packages without
-  the cache.
-- Times: SSH up after 6.7 s, Google loaded in Firefox after 44.9 s, story done
-  after 67.3 s, whole run 68.1 s.
+- Pages come from the canned store in `examples/adaptive-web/stores/halvard-cve/`.
+  A search it does not hold lists the canned pages that share its words first;
+  the stub makes the rest. Nothing calls a model for pages.
+- Claude Code's own calls are the only billed ones: Claude Sonnet 5.5 through
+  `ANTHROPIC_API_KEY`, else `OPENROUTER_API_KEY` (as
+  `anthropic/claude-sonnet-5.5`), at most 60 per run. Its WebSearch and WebFetch are answered by the same pages. With no key,
+  typed searches work and Claude Code asks you to sign in.
+- `cargo xtask demo search check` runs the scripted story and its checks, with
+  screenshots in `downloads/cloudimage/runs/search-<time>/`.
+- `cargo xtask demo search bake` remakes the canned store from
+  `examples/adaptive-web/seeds/halvard-cve.queries` with `OPENROUTER_API_KEY`,
+  in at most 300 model calls.
+- `cargo xtask demo search preview` shows the page with an in-world client and
+  no VM.
 
 ### FakeWiki
 

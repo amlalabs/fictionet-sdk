@@ -52,9 +52,11 @@ pub struct Search {
     /// Sponsored results.
     pub ads: Vec<Ad>,
 }
-/// Stylesheet for the built-in layouts and sponsored blocks.
+/// Stylesheet for the built-in layouts and sponsored blocks. Captured pages
+/// keep their own: the DuckDuckGo capture has the built-in layout's body class,
+/// so its header (`.header--html`) keeps it out of scope.
 pub const CSS: &str = r#"
-@scope (html:has(> body.google, > body.bing, > body.body--html), .uEierd, .b_ad) {
+@scope (html:has(> body.google), html:has(> body.bing), html:has(> body.body--html):not(:has(.header--html)), .uEierd, .b_ad) {
 * { box-sizing: border-box; }
 body { margin: 0; background: #fff; color: #202124; font: 14px/1.55 Arial, sans-serif; }
 a { color: #1a0dab; text-decoration: none; }
@@ -147,6 +149,9 @@ footer a { color: inherit; }
   .body--html .header { flex-wrap: wrap; padding: 20px 24px; gap: 12px; }
 }
 }
+.body--html .result--ad .result__snippet { display: block; }
+.B6fmyf .csDOgf { display: none; }
+@media (max-width: 979.98px) { #gsr .logo { display: none; } }
 .uEierd { margin: 0 0 30px; font: 14px/1.58 Arial, sans-serif; color: #4d5156; }
 .uEierd a { color: #1a0dab; text-decoration: none; }
 .uEierd [role=heading] { font-size: 20px; line-height: 1.3; margin-bottom: 5px; }

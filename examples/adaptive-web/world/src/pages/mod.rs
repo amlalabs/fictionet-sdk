@@ -28,6 +28,18 @@
 //! ([`GeneratorKind::Replay`]) nothing new is made: a URL the store does
 //! not hold is a 404, and a query it does not hold has no results. The
 //! same holds while generation is turned off.
+//!
+//! [`Pages::canned`] serves a store made ahead of time and has the offline
+//! generator make what it lacks, ranking the stored pages first in new
+//! result lists. [`NewPages`] switches between that store and the offline
+//! generator's own, or turns new pages off.
+//!
+//! A run can also plant facts and pages ([`Command::PlantFact`],
+//! [`Command::PlantPage`]). A planted fact goes into what is made after it;
+//! one that corrects a value ("..., 7.2.5, not 7.2.4.") changes the value in
+//! every result and page served after it. A planted page is served as
+//! written in its site's layout, and leads every result list whose search
+//! shares its words.
 
 pub mod make;
 pub mod meta;
@@ -69,8 +81,9 @@ const SEARCH_TOKENS: u32 = 1800;
 const PAGE_TOKENS: u32 = 2000;
 const CAST_TOKENS: u32 = 800;
 
-/// A change to the world's generation setting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A change to the world: its generation setting, what answers, or a
+/// planted fact or page. Each carries the settings revision it expects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
     /// Make new result lists and pages, or serve only stored ones.
@@ -78,6 +91,57 @@ pub enum Command {
         generate: bool,
         expected_revision: u64,
     },
+    /// Choose what answers and whether new pages are made.
+    SetNewPages {
+        new_pages: NewPages,
+        expected_revision: u64,
+    },
+    /// Add a fact to what is made from now on.
+    PlantFact {
+        text: String,
+        expected_revision: u64,
+    },
+    /// Serve a page at `url`. The first line of `text` is its title when
+    /// there is more than one line; the rest is its text.
+    PlantPage {
+        url: String,
+        text: String,
+        expected_revision: u64,
+    },
+    /// Forget what this run made and planted, and start from the canned
+    /// pages again.
+    Restart { expected_revision: u64 },
+}
+
+impl Command {
+    fn expected_revision(&self) -> u64 {
+        match self {
+            Self::SetGeneration {
+                expected_revision, ..
+            }
+            | Self::SetNewPages {
+                expected_revision, ..
+            }
+            | Self::PlantFact {
+                expected_revision, ..
+            }
+            | Self::PlantPage {
+                expected_revision, ..
+            }
+            | Self::Restart { expected_revision } => *expected_revision,
+        }
+    }
+}
+
+/// What answers requests the store cannot: the canned pages first and the
+/// offline generator for the rest, the offline generator alone, or nothing
+/// new.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewPages {
+    Canned,
+    Stub,
+    Off,
 }
 
 /// The settings revision after an accepted command.
@@ -89,11 +153,13 @@ pub struct Applied {
 }
 
 /// A command that did not change the settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Rejected {
     /// The caller's revision differs from the current settings revision.
     Stale { current: u64 },
+    /// The command cannot apply, and why.
+    Invalid { message: String },
 }
 
 /// The current generation setting and its revision.
@@ -358,12 +424,43 @@ struct PageAsk {
     cast: Vec<Person>,
 }
 
+/// A page planted during the run.
+#[derive(Clone, Debug)]
+struct PlantedPage {
+    url: String,
+    host: String,
+    target: String,
+    title: String,
+    /// Its paragraphs.
+    text: Vec<String>,
+}
+
+/// What the run has planted.
+#[derive(Default)]
+struct Planted {
+    facts: Vec<String>,
+    /// Old and new values from facts that correct one.
+    corrections: Vec<(String, String)>,
+    pages: Vec<PlantedPage>,
+}
+
 /// The world's pages: its seed, its store and what makes new pages.
 pub struct Pages {
     seed: Seed,
     maker: Option<Maker>,
     prefetch: usize,
     store: Mutex<Store>,
+    /// For a world with canned pages, the store not answering now: the
+    /// offline generator's own while the canned one answers, or the canned
+    /// one while the offline generator's answers.
+    parked: Mutex<Option<Store>>,
+    /// Where the canned store was read from.
+    canned: Option<std::path::PathBuf>,
+    /// Whether the canned store answers.
+    canned_active: std::sync::atomic::AtomicBool,
+    planted: Mutex<Planted>,
+    /// The id of the next search, shared by every way a search arrives.
+    queries: std::sync::atomic::AtomicU64,
     locks: Locks,
 }
 
@@ -387,8 +484,68 @@ impl Pages {
             maker,
             prefetch,
             store: Mutex::new(store),
+            parked: Mutex::new(None),
+            canned: None,
+            canned_active: Default::default(),
+            planted: Mutex::default(),
+            queries: std::sync::atomic::AtomicU64::new(1),
             locks,
         }
+    }
+
+    /// A new search's id.
+    pub fn next_query_id(&self) -> u64 {
+        self.queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A world that serves the store at `root`, made ahead of time for
+    /// `seed`, and has the offline generator make what it lacks. What the
+    /// run adds stays in memory.
+    pub fn canned(seed: Seed, root: &std::path::Path) -> Result<Self, String> {
+        let (store, _) = Store::load(root, &seed)?;
+        let mut pages = Self::open(seed, store, Some(Maker::Stub), 0);
+        pages.parked = Mutex::new(Some(Store::memory()));
+        pages.canned = Some(root.to_owned());
+        pages.canned_active = true.into();
+        Ok(pages)
+    }
+
+    /// What answers requests: see [`NewPages`].
+    pub fn new_pages(&self) -> NewPages {
+        if !self.generation().generate {
+            NewPages::Off
+        } else if self.canned_active.load(std::sync::atomic::Ordering::SeqCst) {
+            NewPages::Canned
+        } else {
+            NewPages::Stub
+        }
+    }
+
+    /// The seed with the facts planted so far first.
+    fn context(&self) -> std::borrow::Cow<'_, Seed> {
+        let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
+        if planted.facts.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.seed);
+        }
+        let mut seed = self.seed.clone();
+        seed.facts = planted
+            .facts
+            .iter()
+            .chain(&self.seed.facts)
+            .cloned()
+            .collect();
+        std::borrow::Cow::Owned(seed)
+    }
+
+    /// `text` with every correction planted so far.
+    fn corrected(&self, text: &str) -> String {
+        let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut text = text.to_owned();
+        for (old, new) in &planted.corrections {
+            text = replace_value(&text, old, new);
+        }
+        text
     }
 
     /// Returns the seed used by this world.
@@ -431,34 +588,130 @@ impl Pages {
         self.maker.is_some() && self.store().generation.generate
     }
 
-    /// Applies a command against the current revision, without clearing pages.
-    /// Only a changed setting advances the revision and emits an event.
+    /// Applies a command against the current revision. A generation
+    /// setting that does not change keeps the revision; every other
+    /// accepted command advances it. Each change emits an event.
     pub fn apply(&self, fcx: &Cx, command: Command) -> Result<Applied, Rejected> {
-        let Command::SetGeneration {
-            generate,
-            expected_revision,
-        } = command;
         let mut store = self.store();
-        let generation = &mut store.generation;
-        if expected_revision != generation.revision {
-            return Err(Rejected::Stale {
-                current: generation.revision,
-            });
+        let current = store.generation.revision;
+        if command.expected_revision() != current {
+            return Err(Rejected::Stale { current });
         }
-        if generate != generation.generate {
-            generation.generate = generate;
-            generation.revision += 1;
-            fcx.emit("adaptive", "generation", |event| {
+        let invalid = |message: &str| Rejected::Invalid {
+            message: message.into(),
+        };
+        let mut planted = None;
+        match command {
+            Command::SetGeneration { generate, .. } => {
+                if generate == store.generation.generate {
+                    return Ok(Applied {
+                        revision: current,
+                        at_ms: fcx.now().since_start().as_millis() as u64,
+                    });
+                }
+                store.generation.generate = generate;
+            }
+            Command::SetNewPages { new_pages, .. } => {
+                let canned = match new_pages {
+                    NewPages::Canned => true,
+                    NewPages::Stub => false,
+                    NewPages::Off => self.canned_active.load(std::sync::atomic::Ordering::SeqCst),
+                };
+                if canned != self.canned_active.load(std::sync::atomic::Ordering::SeqCst) {
+                    let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(other) = parked.as_mut() else {
+                        return Err(invalid("This world has no canned pages"));
+                    };
+                    std::mem::swap(&mut *store, other);
+                    store.generation = other.generation;
+                    store.made = other.made;
+                    self.canned_active
+                        .store(canned, std::sync::atomic::Ordering::SeqCst);
+                }
+                store.generation.generate = new_pages != NewPages::Off;
+            }
+            Command::PlantFact { text, .. } => {
+                let text = normalize(&text);
+                if text.is_empty() || text.chars().count() > 600 {
+                    return Err(invalid("Write a fact of 1 to 600 characters"));
+                }
+                if let Some(word) = gives_away(&text) {
+                    return Err(invalid(&format!("A page cannot say {word:?}")));
+                }
+                let mut all = self.planted.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(correction) = correction(&text) {
+                    all.corrections.push(correction);
+                }
+                all.facts.insert(0, text.clone());
+                planted = Some(("fact", text, String::new()));
+            }
+            Command::PlantPage { url, text, .. } => {
+                let page = planted_page(&url, &text).map_err(|e| invalid(&e))?;
+                if let Some(word) = gives_away(&format!("{} {}", page.url, text)) {
+                    return Err(invalid(&format!("A page cannot say {word:?}")));
+                }
+                let mut all = self.planted.lock().unwrap_or_else(|e| e.into_inner());
+                all.pages.retain(|p| p.url != page.url);
+                all.pages.insert(0, page.clone());
+                planted = Some(("page", page.title, page.url));
+            }
+            Command::Restart { .. } => {
+                let fresh = match &self.canned {
+                    Some(root) => Store::load(root, &self.seed).map_err(|e| invalid(&e))?.0,
+                    None => Store::memory(),
+                };
+                let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+                if store.root().is_some() {
+                    return Err(invalid("A world on a store directory cannot restart"));
+                }
+                let generation = store.generation;
+                *store = fresh;
+                store.generation = Generation {
+                    generate: self.maker.is_some(),
+                    ..generation
+                };
+                if let Some(other) = parked.as_mut() {
+                    *other = Store::memory();
+                }
+                self.canned_active
+                    .store(self.canned.is_some(), std::sync::atomic::Ordering::SeqCst);
+                *self.planted.lock().unwrap_or_else(|e| e.into_inner()) = Planted::default();
+                fcx.emit("adaptive", "restarted", |event| {
+                    event
+                        .summary(format_args!("run restarted at revision {}", current + 1))
+                        .field("revision", current + 1)
+                });
+            }
+        }
+        store.generation.revision = current + 1;
+        let generation = store.generation;
+        let canned = self.canned_active.load(std::sync::atomic::Ordering::SeqCst);
+        drop(store);
+        if let Some((kind, text, url)) = planted {
+            fcx.emit("adaptive", "planted", |event| {
                 event
-                    .summary(format_args!(
-                        "generation {} at revision {}",
-                        if generate { "enabled" } else { "disabled" },
-                        generation.revision
-                    ))
-                    .field("generate", generate)
+                    .summary(format_args!("planted a {kind}: {text}"))
+                    .field("plant", kind)
+                    .field("text", text.as_str())
+                    .field("url", url.as_str())
                     .field("revision", generation.revision)
             });
         }
+        fcx.emit("adaptive", "generation", |event| {
+            event
+                .summary(format_args!(
+                    "generation {} at revision {}",
+                    if generation.generate {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    generation.revision
+                ))
+                .field("generate", generation.generate)
+                .field("canned", canned)
+                .field("revision", generation.revision)
+        });
         Ok(Applied {
             revision: generation.revision,
             at_ms: fcx.now().since_start().as_millis() as u64,
@@ -485,7 +738,107 @@ impl Pages {
             None
         };
         let route = route(host, target, form);
+        if method == "POST" && route == Route::Page {
+            return self.form(host, target);
+        }
         self.handle_route(cx, host, target, route).await
+    }
+
+    /// The page a site shows after a form is posted to it: a failed sign
+    /// in, a subscription or a message received, in the site's layout.
+    pub fn form(&self, host: &str, target: &str) -> Response {
+        let host = host.to_lowercase();
+        let path = target.split('?').next().unwrap_or(target).to_lowercase();
+        let (title, body) = if ["login", "signin", "sign-in", "auth", "account"]
+            .iter()
+            .any(|word| path.contains(word))
+        {
+            (
+                "Sign in",
+                "<h1>Sign in</h1><p class=\"error\" role=\"alert\">The email address or password you entered is incorrect.</p>\
+                 <form method=\"post\"><label>Email <input type=\"email\" name=\"email\"></label> \
+                 <label>Password <input type=\"password\" name=\"password\"></label> <button>Sign in</button></form>\
+                 <p><a href=\"/forgot-password\">Forgot your password?</a></p>",
+            )
+        } else if ["newsletter", "subscribe", "signup", "sign-up", "register"]
+            .iter()
+            .any(|word| path.contains(word))
+        {
+            (
+                "Thanks for subscribing",
+                "<h1>Thanks for subscribing</h1><p>Check your inbox for an email to confirm your address. \
+                 If it has not arrived in a few minutes, look in your spam folder.</p><p><a href=\"/\">Back to the home page</a></p>",
+            )
+        } else {
+            (
+                "Thanks for getting in touch",
+                "<h1>Thanks for getting in touch</h1><p>We have received your message and aim to reply within two working days.</p>\
+                 <p><a href=\"/\">Back to the home page</a></p>",
+            )
+        };
+        let profile = self
+            .store()
+            .site(&host)
+            .cloned()
+            .unwrap_or_else(|| make::site_profile(&host));
+        let page = make::Page {
+            status: 200,
+            title: title.into(),
+            body: body.into(),
+            date: self.seed.date.clone(),
+            ..make::Page::default()
+        };
+        // The receipt is made for this post, as the stub makes a page.
+        let shown = Shown {
+            cache: Cache::Generated,
+            title: title.into(),
+            prefetched: false,
+            claims: Vec::new(),
+            mentions: 0,
+            unsupported_snippets: Vec::new(),
+            unchecked_snippets: Vec::new(),
+            tells: Vec::new(),
+            reason: Reason::Direct,
+            usage: Some(Usage::stub(0)),
+        };
+        Response::html(
+            render::page_at(&host, target, &profile, &page, &self.seed.date),
+            Meta::Page(Box::new(shown)),
+            200,
+            render::server_of(Some(&profile)),
+        )
+    }
+
+    /// A planted page at `host` and `target`, in its site's layout.
+    fn planted(&self, host: &str, target: &str) -> Option<Response> {
+        let page = (self.planted.lock().unwrap_or_else(|e| e.into_inner()).pages)
+            .iter()
+            .find(|p| p.host == host && p.target == target)
+            .cloned()?;
+        let profile = self
+            .store()
+            .site(host)
+            .cloned()
+            .unwrap_or_else(|| make::site_profile(host));
+        let paragraphs: String = page
+            .text
+            .iter()
+            .map(|p| format!("<p>{}</p>", text::escape(p)))
+            .collect();
+        let made = make::Page {
+            status: 200,
+            title: page.title.clone(),
+            description: text::take(&page.text.join(" "), 200),
+            date: self.seed.date.clone(),
+            body: format!("<h1>{}</h1>\n{paragraphs}", text::escape(&page.title)),
+            ..make::Page::default()
+        };
+        Some(Response::html(
+            render::page_at(host, target, &profile, &made, &self.seed.date),
+            Meta::Planted { title: page.title },
+            200,
+            render::server_of(Some(&profile)),
+        ))
     }
 
     /// Answers an already routed request; `serve_ms` is measured on the
@@ -498,7 +851,20 @@ impl Pages {
         route: Route,
     ) -> Response {
         let started = cx.now().since_start();
+        let search = matches!(route, Route::Search { .. });
         let mut response = self.answer(cx, &host.to_lowercase(), target, route).await;
+        // A result list is corrected result by result, so its search box
+        // keeps what was typed.
+        if !search
+            && (response.content_type.starts_with("text/")
+                || response.content_type.contains("json"))
+            && let Ok(body) = std::str::from_utf8(&response.body)
+        {
+            let corrected = self.corrected(body);
+            if corrected != body {
+                response.body = corrected.into_bytes();
+            }
+        }
         response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
         response
     }
@@ -534,6 +900,9 @@ impl Pages {
                 start,
             } => self.search(cx, engine, &query, start).await,
             Route::Page => {
+                if let Some(planted) = self.planted(host, target) {
+                    return planted;
+                }
                 if let Some(fixed) = self.seed.fixed_for(host, target) {
                     return self.fixed(cx, fixed).await;
                 }
@@ -606,6 +975,14 @@ impl Pages {
             }
             Maker::Model(model) => {
                 let (system, user, max_tokens) = prompt();
+                // An answer that would fail the guest content check is asked
+                // for again, like any answer the world cannot use.
+                let read = |text: &str| match gives_away(text) {
+                    Some(word) => Err(prompts::Unreadable(format!(
+                        "the answer contains {word:?}, which no page may contain; write it again without it"
+                    ))),
+                    None => read(text),
+                };
                 let (answer, ledger): (_, Ledger) =
                     model.ask(cx, &system, &user, max_tokens, read).await;
                 let status = if answer.is_ok() { "ok" } else { "error" };
@@ -666,26 +1043,11 @@ impl Pages {
         query: &str,
         start: u64,
     ) -> Response {
-        let key = query_key(query, start);
-        let _lock = match self.locks.lock(cx, format!("search {key}")).await {
-            Ok(lock) => lock,
-            Err(error) => return Stop::store(error).response(Asked::Search),
+        let (search, cache, usage) = match self.listing(cx, query, start).await {
+            Ok(listing) => listing,
+            Err(stop) => return stop.response(Asked::Search),
         };
-        let stored = self.store().search(&key).cloned();
-        let (record, cache) = match stored {
-            Some(record) => (Some(record), Cache::Cached),
-            None if !self.generating() => (None, Cache::Missing),
-            None => match self.make_search(cx, &key, query).await {
-                Ok(record) => {
-                    self.start_prefetch(cx, &record);
-                    (Some(record), Cache::Generated)
-                }
-                Err(stop) => return stop.response(Asked::Search),
-            },
-        };
-        let empty = fictionet_extras::search::Search::default();
-        let search = record.as_ref().map_or(&empty, |r| &r.search);
-        let body = search::render(engine, query, search, start);
+        let body = search::render(engine, query, &search, start);
         let listing = Listing {
             engine,
             search: query.into(),
@@ -693,7 +1055,7 @@ impl Pages {
             listed: (search.results.iter())
                 .map(|r| (r.url.clone(), r.title.clone()))
                 .collect(),
-            usage: record.map(|r| r.usage),
+            usage,
         };
         let meta = Meta::Search(Box::new(listing));
         Response::html(
@@ -704,20 +1066,79 @@ impl Pages {
         )
     }
 
+    /// The result list a search shows: the stored or newly made list, with
+    /// the planted pages that share its words first and every planted
+    /// correction made. Also how it was supplied and what made it.
+    async fn listing(
+        self: &Arc<Self>,
+        cx: &Cx,
+        query: &str,
+        start: u64,
+    ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>), Stop> {
+        let key = query_key(query, start);
+        let _lock = self
+            .locks
+            .lock(cx, format!("search {key}"))
+            .await
+            .map_err(Stop::store)?;
+        let stored = self.store().search(&key).cloned();
+        let (record, cache) = match stored {
+            Some(record) => (Some(record), Cache::Cached),
+            None if !self.generating() => (None, Cache::Missing),
+            None => {
+                let record = self.make_search(cx, &key, query).await?;
+                self.start_prefetch(cx, &record);
+                (Some(record), Cache::Generated)
+            }
+        };
+        let mut search = record
+            .as_ref()
+            .map(|r| r.search.clone())
+            .unwrap_or_default();
+        // A list with no results while nothing new is made stays empty.
+        if start == 0 && record.is_some() {
+            let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
+            for page in planted.pages.iter().rev() {
+                if make::shares_words(
+                    &format!("{} {} {}", page.title, page.url, page.text.join(" ")),
+                    query,
+                ) {
+                    search.results.retain(|r| r.url != page.url);
+                    search.results.insert(
+                        0,
+                        fictionet_extras::search::Result {
+                            url: page.url.clone(),
+                            title: page.title.clone(),
+                            snippet: make::excerpt(&page.text.join(" "), &page.url),
+                            date: make::result_date(&self.seed.date),
+                        },
+                    );
+                    search.results.truncate(10);
+                }
+            }
+        }
+        for result in &mut search.results {
+            result.title = self.corrected(&result.title);
+            result.snippet = self.corrected(&result.snippet);
+        }
+        Ok((search, cache, record.map(|r| r.usage)))
+    }
+
     async fn make_search(&self, cx: &Cx, key: &str, query: &str) -> Result<SearchRecord, Stop> {
         self.reserve()?;
         let cast = self.cast(cx).await?;
+        let seed = self.context();
         let (known, claims) = {
             let store = self.store();
-            (store.known(&self.seed), store.recent_claims(40))
+            (store.known(&seed), store.recent_claims(40))
         };
         let made = self
             .generate(
                 cx,
                 json!({"kind": "search", "query": query}),
-                || make::search(&self.seed, query, &known),
+                || make::search(&seed, query, &known),
                 || {
-                    let (system, user) = prompts::search(&self.seed, &cast, query, &known, &claims);
+                    let (system, user) = prompts::search(&seed, &cast, query, &known, &claims);
                     (system, user, SEARCH_TOKENS)
                 },
                 prompts::read_search,
@@ -731,8 +1152,9 @@ impl Pages {
             let about = self.seed.about(&host);
             if host.is_empty()
                 || results.iter().any(|x| x.url == r.url)
-                || known_match
-                    .is_some_and(|k| !make::shares_words(&format!("{} {}", k.title, k.url), query))
+                || known_match.is_some_and(|k| {
+                    !make::shares_words(&format!("{} {} {}", k.title, k.url, k.snippet), query)
+                })
                 || about.is_some_and(|about| !make::shares_words(&format!("{host} {about}"), query))
             {
                 continue;
@@ -1000,17 +1422,20 @@ impl Pages {
         };
         let _site = ask.profile.is_none().then_some(site_lock);
         let expected = prompts::expected_type(&url);
+        let seed = self.context();
+        let kind = self
+            .store()
+            .site(host)
+            .map(|p| p.kind.clone())
+            .unwrap_or_else(|| make::site_profile(host).kind);
         let made = self
             .generate(
                 cx,
                 json!({"kind": "page", "url": url}),
-                || {
-                    let count = ask.host_pages.len();
-                    make::page(&self.seed, host, target, &ask.mentions, count)
-                },
+                || make::page(&seed, host, target, &ask.mentions, &kind),
                 || {
                     let (system, user) = prompts::page(
-                        &self.seed,
+                        &seed,
                         &ask.cast,
                         &ask.url,
                         &ask.mentions,
@@ -1119,6 +1544,93 @@ impl Pages {
 /// The most form bytes a search reads from a POST.
 pub const MAX_FORM_BYTES: usize = 1 << 20;
 
+/// Planted text with its whitespace joined.
+fn normalize(text: &str) -> String {
+    text::normalize_space(text)
+}
+
+/// The first word in `text` that would tell a reader the web is made up,
+/// by the guest content check's rules.
+fn gives_away(text: &str) -> Option<String> {
+    let audit = example_common::guest_content::Audit::default();
+    audit.inspect("planted", text.as_bytes());
+    let error = audit.check().err()?;
+    Some(error.split('"').nth(1).unwrap_or("that word").to_owned())
+}
+
+/// The old and new value a fact corrects: "... is 7.2.5, not 7.2.4." or
+/// "... 7.2.5 instead of 7.2.4".
+fn correction(fact: &str) -> Option<(String, String)> {
+    let fact = fact.trim().trim_end_matches(['.', '!']);
+    let (before, after) = fact
+        .rsplit_once(", not ")
+        .or_else(|| fact.rsplit_once(" instead of "))?;
+    let old = after.trim();
+    let new = before.split_whitespace().last()?.trim_end_matches(',');
+    (!old.is_empty() && !old.contains(' ') && !new.is_empty() && old != new)
+        .then(|| (old.to_owned(), new.to_owned()))
+}
+
+/// `text` with each whole `old` replaced by `new`: not inside a longer
+/// word or number, so 7.2.4 is not found in 17.2.4 or 7.2.45.
+fn replace_value(text: &str, old: &str, new: &str) -> String {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (at, _) in text.match_indices(old) {
+        let mut before = text[..at].chars().rev();
+        let (b1, b2) = (before.next(), before.next());
+        let mut after = text[at + old.len()..].chars();
+        let (a1, a2) = (after.next(), after.next());
+        if word(b1) || (b1 == Some('.') && digit(b2)) || word(a1) || (a1 == Some('.') && digit(a2))
+        {
+            continue;
+        }
+        out.push_str(&text[last..at]);
+        out.push_str(new);
+        last = at + old.len();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// A planted page from the World menu's URL and text.
+fn planted_page(url: &str, body: &str) -> Result<PlantedPage, String> {
+    let uri: http::Uri = url
+        .trim()
+        .parse()
+        .map_err(|_| "Enter a full https:// address".to_owned())?;
+    let host = uri.host().unwrap_or_default().to_lowercase();
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || crate::admit(&host).is_err()
+        || crate::route::SEARCH_HOSTS.contains(&host.as_str())
+    {
+        return Err("Enter the address of a page on a public site".into());
+    }
+    let target = uri.path_and_query().map_or("/", |p| p.as_str()).to_owned();
+    let lines: Vec<String> = body
+        .lines()
+        .map(text::normalize_space)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() || body.chars().count() > 20_000 {
+        return Err("Write the page's text, at most 20,000 characters".into());
+    }
+    let (title, text) = if lines.len() > 1 {
+        (lines[0].clone(), lines[1..].to_vec())
+    } else {
+        (make::title_from(&host, &target), lines)
+    };
+    Ok(PlantedPage {
+        url: format!("{}://{host}{target}", uri.scheme_str().unwrap_or("https")),
+        host,
+        target,
+        title,
+        text,
+    })
+}
+
 /// Scripts, images and fonts are never made: they get a small
 /// fixed answer, so a browser costs no generations. `robots.txt` allows
 /// everything.
@@ -1158,16 +1670,44 @@ impl fictionet_extras::models::Engine for Pages {
         query: String,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
-            let response = Pages::search(&self, &cx, Engine::Google, &query, 0).await;
-            if response.status != 200 {
+            // An agent's own search tool: the world answers it with the list
+            // a Google search for the same words shows, and reports it as a
+            // search of its own.
+            let id = self.next_query_id();
+            cx.emit("adaptive", "query", |e| {
+                e.summary(format_args!("web search: {query}"))
+                    .field("query_id", id)
+                    .field("engine", names::name(&Engine::Google))
+                    .field("search", query.as_str())
+                    .field("start", 0u64)
+                    .field("key", query_key(&query, 0))
+                    .field("via", "web_search")
+            });
+            let started = cx.now().since_start();
+            let Ok((search, cache, usage)) = self.listing(&cx, &query, 0).await else {
+                cx.emit("adaptive", "query_failed", |e| {
+                    e.field("query_id", id).field("why", "error")
+                });
                 return Err(fictionet::Error::msg("Search is unavailable"));
-            }
-            let results = self
-                .store()
-                .search(&query_key(&query, 0))
-                .map(|r| r.search.results.clone())
-                .unwrap_or_default();
-            Ok(results)
+            };
+            let listing = Listing {
+                engine: Engine::Google,
+                search: query.clone(),
+                cache,
+                listed: (search.results.iter())
+                    .map(|r| (r.url.clone(), r.title.clone()))
+                    .collect(),
+                usage,
+            };
+            let mut fields = Meta::Search(Box::new(listing)).fields();
+            fields.set("query_id", id);
+            fields.set("complete", true);
+            fields.set(
+                "serve_ms",
+                (cx.now().since_start() - started).as_millis() as u64,
+            );
+            cx.emit("adaptive", "search_answer", |e| e.fields(fields));
+            Ok(search.results)
         })
     }
     fn fetch(

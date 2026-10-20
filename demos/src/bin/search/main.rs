@@ -1,4 +1,14 @@
-use fictionet_extras::models::{Https, Key};
+//! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
+//! adaptive web, with the canned pages for the halvard-cve seed.
+//!
+//! - `search <downloads>` is the app: it boots, opens the page and stays up
+//!   until Ctrl-C. Pages come from the canned store, and the offline
+//!   generator makes what it lacks; nothing calls a model for pages.
+//! - `search <downloads> check` runs the scripted story and its checks.
+//! - `search preview` shows the page with an in-world client and no VM.
+//! - `search bake` makes the canned store with a model (see `bake.rs`).
+
+mod bake;
 mod checks;
 mod guest;
 mod preview;
@@ -6,16 +16,13 @@ use fictionet_demo::search as page;
 
 use adaptive_web_world::{
     Addresses, Ca, World,
-    pages::{
-        GeneratorKind, Maker, Pages,
-        model::{Model, Provider},
-        store::Store,
-    },
-    search::Generator,
+    events::LogObserver,
+    pages::{Pages, Seed, store},
+    search::Searches,
 };
-use adaptive_web_world::{events::LogObserver, pages::Seed, search::Searches};
 use example_common::log::Log;
 use fictionet_demo::kit::{self, Kit};
+use fictionet_extras::models;
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -26,115 +33,98 @@ use std::{
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// What to run: the VM demo with its downloads folder, the seed's name and
-/// whether the page stays open after the checks, an interactive model session,
-/// or the preview without a VM and whether it spends the generation budget.
+/// The seed the app shows, and whose canned pages it serves.
+const SEED: &str = "halvard-cve";
+/// Claude Code's calls one run may make, as a ceiling on what a call costs.
+const CLAUDE_CALLS: u64 = 60;
+
+/// What to run: the app or its checks with the downloads folder, the
+/// preview without a VM and whether it spends the generation budget, or
+/// the bake.
 #[derive(Debug, PartialEq)]
 enum Mode {
-    Run {
-        downloads: PathBuf,
-        seed: String,
-        stay: bool,
-        model: Option<ModelOptions>,
-    },
-    Preview {
-        spend: bool,
-    },
-}
-
-#[derive(Debug, PartialEq)]
-struct ModelOptions {
-    provider: Provider,
-    name: String,
-    store: Option<PathBuf>,
-}
-
-fn search_projection(seed: &Seed, model: Option<&ModelOptions>) -> Searches {
-    match model {
-        Some(options) => Searches::new(
-            Searches::from_seed(seed).snapshot().seed,
-            Generator {
-                kind: GeneratorKind::Model(options.provider),
-                model: options.name.clone(),
-                ..Generator::default()
-            },
-        ),
-        None => Searches::from_seed(seed),
-    }
+    App { downloads: PathBuf },
+    Check { downloads: PathBuf },
+    Preview { spend: bool },
+    Bake,
 }
 
 fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
-    const USAGE: &str = "usage: search <downloads> [--seed <name>] [--stay] [--model openrouter|anthropic [--model-name <name>] [--store <directory>]], or search preview [--spend-budget]";
+    const USAGE: &str =
+        "usage: search <downloads> [check], search preview [--spend-budget], or search bake";
     let first = args.next().ok_or(USAGE)?;
-    if first == "preview" {
-        return match (args.next().as_deref(), args.next()) {
-            (None, _) => Ok(Mode::Preview { spend: false }),
-            (Some("--spend-budget"), None) => Ok(Mode::Preview { spend: true }),
-            _ => Err(USAGE.into()),
-        };
-    }
-    if first.starts_with('-') {
+    let second = args.next();
+    if args.next().is_some() {
         return Err(USAGE.into());
     }
-    let (mut seed, mut stay) = (None, false);
-    let (mut provider, mut name, mut store) = (None, None, None);
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--seed" if seed.is_none() => seed = Some(args.next().ok_or(USAGE)?),
-            "--stay" if !stay => stay = true,
-            "--model" if provider.is_none() => {
-                provider = Some(match args.next().as_deref() {
-                    Some("openrouter") => Provider::OpenRouter,
-                    Some("anthropic") => Provider::Anthropic,
-                    _ => return Err(USAGE.into()),
-                });
-            }
-            "--model-name" if name.is_none() => name = Some(args.next().ok_or(USAGE)?),
-            "--store" if store.is_none() => store = Some(PathBuf::from(args.next().ok_or(USAGE)?)),
-            _ => return Err(USAGE.into()),
-        }
-    }
-    if provider.is_none() && (name.is_some() || store.is_some()) {
-        return Err(USAGE.into());
-    }
-    Ok(Mode::Run {
-        downloads: first.into(),
-        seed: seed.unwrap_or_else(|| "halvard-cve".into()),
-        stay,
-        model: provider.map(|provider| ModelOptions {
-            provider,
-            name: name
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| provider.default_model().into()),
-            store,
+    match (first.as_str(), second.as_deref()) {
+        ("preview", None) => Ok(Mode::Preview { spend: false }),
+        ("preview", Some("--spend-budget")) => Ok(Mode::Preview { spend: true }),
+        ("bake", None) => Ok(Mode::Bake),
+        ("preview" | "bake", _) => Err(USAGE.into()),
+        (folder, _) if folder.starts_with('-') => Err(USAGE.into()),
+        (folder, None) => Ok(Mode::App {
+            downloads: folder.into(),
         }),
-    })
+        (folder, Some("check")) => Ok(Mode::Check {
+            downloads: folder.into(),
+        }),
+        _ => Err(USAGE.into()),
+    }
+}
+
+/// The model Claude Code runs. OpenRouter serves it under the same name as
+/// Anthropic does (as `anthropic/claude-sonnet-5.5`), and with the name it
+/// knows, Claude Code shapes its requests for this model.
+const CLAUDE_MODEL: &str = "claude-sonnet-5-5";
+
+/// Claude Code's model site, from the host's key: `ANTHROPIC_API_KEY`, else
+/// `OPENROUTER_API_KEY`. None without either.
+fn claude_model(cx: &fictionet::Cx) -> fictionet::Result<Option<models::Model>> {
+    if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        Ok(Some(models::anthropic(cx)?))
+    } else if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        Ok(Some(models::anthropic_via_openrouter(cx)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Claude Code's settings and state for the guest user: the model, and the
+/// first-run questions already answered for the key it is given.
+fn claude_files(model: &str, key: &str) -> Vec<(&'static str, String)> {
+    let settings = serde_json::json!({ "model": model });
+    let tail: String = key
+        .chars()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let state = serde_json::json!({
+        "hasCompletedOnboarding": true,
+        "theme": "dark",
+        "customApiKeyResponses": { "approved": [tail], "rejected": [] },
+        "projects": { format!("/home/{}", guest::USER): { "hasTrustDialogAccepted": true } },
+    });
+    vec![
+        (".claude/settings.json", settings.to_string()),
+        (".claude.json", state.to_string()),
+    ]
 }
 
 #[tokio::main]
 async fn main() -> Result {
     let total = Instant::now();
-    let (downloads, seed, stay, model) = match arguments(std::env::args().skip(1))? {
+    let (downloads, check) = match arguments(std::env::args().skip(1))? {
         Mode::Preview { spend } => return preview::run(spend).await,
-        Mode::Run {
-            downloads,
-            seed,
-            stay,
-            model,
-        } => (downloads, seed, stay, model),
+        Mode::Bake => return bake::run().await,
+        Mode::App { downloads } => (downloads, false),
+        Mode::Check { downloads } => (downloads, true),
     };
-    let seed = Seed::builtin(&seed)?;
-    let live = model.is_some();
-    let key = model
-        .as_ref()
-        .map(|options| Key::from_env(options.provider.into()))
-        .transpose()?;
-    let store_root = model.as_ref().map(|options| {
-        options
-            .store
-            .clone()
-            .unwrap_or_else(|| downloads.join("search-store").join(&seed.name))
-    });
+    let seed = Seed::builtin(SEED)?;
+    let pages = Arc::new(Pages::canned(seed.clone(), &store::canned_root(SEED))?);
     let output = downloads.join("runs").join(format!(
         "search-{}",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
@@ -142,7 +132,7 @@ async fn main() -> Result {
     std::fs::create_dir_all(output.parent().unwrap())?;
     std::fs::create_dir(&output)?;
     println!("output: {}", output.display());
-    let searches = Arc::new(search_projection(&seed, model.as_ref()));
+    let searches = Arc::new(Searches::of(&pages));
     let topics = page::Topics::new();
     let view = topics.clone();
     let log = Arc::new(Log::new(
@@ -152,73 +142,98 @@ async fn main() -> Result {
     ));
     let world_log = log.clone();
     let scenario = seed.clone();
-    let kit = Kit::new("search")
-        .guest(guest::guest())
+    let mut kit = Kit::new("search")
+        .guest(guest::guest(&seed.date))
         .observer(searches.clone())
         .observer(Arc::new(LogObserver { log: log.clone() }))
-        .page(move |dashboard, hosts| view.page(dashboard, hosts.take(guest::HOST)))
-        .world(move |cx, mut world| async move {
-            let start = adaptive_web_world::world_start(&seed.date)?;
-            let web = match (model, key, store_root) {
-                (Some(options), Some(key), Some(root)) => {
-                    let https = Arc::new(Https::new(&cx, options.provider.into())?);
-                    let maker =
-                        Maker::Model(Model::new(options.provider, &options.name, "", key, https));
-                    let (store, _) = Store::open(&root, &seed, Some(&maker.identity()))
-                        .map_err(fictionet::Error::msg)?;
-                    World {
-                        ca: Arc::new(Ca::in_memory(&cx, start)?),
-                        addresses: Arc::new(Addresses::new(seed.fixed_addresses(), Some(&root))?),
-                        pages: Arc::new(Pages::open(seed, store, Some(maker), 0)),
-                        start,
-                    }
-                }
-                (None, None, None) => World::new(&cx, seed, start)?,
-                _ => unreachable!("model options include a key and store"),
-            };
-            world.trust("office", &web.ca.cert_pem())?;
-            topics.start(
-                &cx,
-                searches,
-                web.pages.clone(),
-                if live {
-                    "Firefox"
-                } else {
-                    "Firefox (scripted)"
-                },
-            )?;
-            page::network(&web, &cx, world_log, world.mirror(&cx)?)?
-                .route(kit::JUMP, kit::jump_prefix())
-                .start(&cx, world.into_attachments())
+        .page(move |dashboard, hosts| view.page(dashboard, hosts.take(guest::HOST)));
+    if !check {
+        kit = kit.open_page();
+    }
+    let kit = kit.world(move |cx, mut world| async move {
+        let start = adaptive_web_world::world_start(&seed.date)?;
+        let web = World {
+            ca: Arc::new(Ca::in_memory(&cx, start)?),
+            addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
+            pages: pages.clone(),
+            start,
+        };
+        world.trust("office", &web.ca.cert_pem())?;
+        // The checks run with no key, so the guest has no model to call.
+        let model = if check { None } else { claude_model(&cx)? };
+        let model = model.map(|model| {
+            model
+                .search(pages.clone())
+                .budget(models::Budget::new().calls(CLAUDE_CALLS))
         });
-    let run = kit.boot(downloads).await?;
+        if let Some(model) = &model {
+            let env = model.guest_env();
+            let key = env
+                .first()
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            world.seed_env(env)?;
+            world.seed_home_files(claude_files(CLAUDE_MODEL, &key))?;
+        }
+        topics.start(&cx, searches, pages)?;
+        page::network(&web, &cx, world_log, world.mirror(&cx)?, model)?
+            .route(kit::JUMP, kit::jump_prefix())
+            .start(&cx, world.into_attachments())
+    });
+    // The app stops cleanly on Ctrl-C at any point, booting included. The
+    // checks keep the terminal's default.
+    let mut interrupt = if check {
+        None
+    } else {
+        Some(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        )?)
+    };
+    let run = match &mut interrupt {
+        None => kit.boot(downloads).await?,
+        Some(interrupt) => tokio::select! {
+            run = kit.boot(downloads) => run?,
+            _ = interrupt.recv() => {
+                println!("Stopped while booting.");
+                return Ok(());
+            }
+        },
+    };
     println!(
         "boot to SSH-ready: {} ms",
         run.guest(guest::HOST).ssh_ready().as_millis()
     );
     let mut visited = BTreeSet::new();
-    let mut result = if live {
-        run.guest(guest::HOST)
-            .wait_desktop(std::time::Duration::from_secs(300))
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
-    } else {
-        checks::run(&run, &scenario, &output, &mut visited).await
+    let result = match &mut interrupt {
+        None => {
+            let result = checks::run(&run, &scenario, &output, &mut visited).await;
+            if result.is_ok() {
+                println!(
+                    "story done: {} ms",
+                    run.boot_started().elapsed().as_millis()
+                );
+            }
+            result
+        }
+        Some(interrupt) => {
+            let desktop = run.guest(guest::HOST);
+            tokio::select! {
+                ready = desktop.wait_desktop(std::time::Duration::from_secs(300)) => match ready {
+                    Ok(_) => {
+                        println!(
+                            "desktop up: {} ms",
+                            run.boot_started().elapsed().as_millis()
+                        );
+                        println!("The page stays open until Ctrl-C.");
+                        interrupt.recv().await;
+                        Ok(())
+                    }
+                    Err(error) => Err(error.into()),
+                },
+                _ = interrupt.recv() => Ok(()),
+            }
+        }
     };
-    if result.is_ok() {
-        println!(
-            "{}: {} ms",
-            if live { "ready" } else { "story done" },
-            run.boot_started().elapsed().as_millis()
-        );
-        if live {
-            println!("Search in Firefox. Pages and results are saved; Ctrl-C stops the session.");
-        }
-        if stay || live {
-            result = kit::checks::stay_open().await.map_err(Into::into);
-        }
-    }
     if result.is_err() {
         eprint!("{}", run.guest(guest::HOST).diagnostics().await);
     }
@@ -227,153 +242,72 @@ async fn main() -> Result {
     println!("whole run: {} ms", total.elapsed().as_millis());
     finish?;
     let result = result.and(shutdown.map_err(Into::into));
-    if live {
-        result?;
-    } else {
+    if check {
         checks::finish(result, &output.join("log.jsonl"), &visited)?;
         println!("every required check passed");
+    } else {
+        result?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, arguments};
+    use super::{Mode, arguments, claude_files};
 
     fn parse(args: &[&str]) -> Option<Mode> {
         arguments(args.iter().map(|a| a.to_string())).ok()
     }
 
     #[test]
-    fn arguments_take_a_folder_a_seed_and_stay_in_any_order() {
-        let run = |downloads: &str, seed: &str, stay| {
-            Some(Mode::Run {
-                downloads: downloads.into(),
-                seed: seed.into(),
-                stay,
-                model: None,
-            })
-        };
-        assert_eq!(parse(&["d"]), run("d", "halvard-cve", false));
+    fn the_app_takes_only_its_folder_and_check_its_word() {
         assert_eq!(
-            parse(&["d", "--stay", "--seed", "corvane-acquisition"]),
-            run("d", "corvane-acquisition", true)
+            parse(&["d"]),
+            Some(Mode::App {
+                downloads: "d".into()
+            })
         );
         assert_eq!(
-            parse(&["d", "--seed", "fastjsonl-package", "--stay"]),
-            run("d", "fastjsonl-package", true)
+            parse(&["d", "check"]),
+            Some(Mode::Check {
+                downloads: "d".into()
+            })
         );
         assert_eq!(parse(&["preview"]), Some(Mode::Preview { spend: false }));
         assert_eq!(
             parse(&["preview", "--spend-budget"]),
             Some(Mode::Preview { spend: true })
         );
+        assert_eq!(parse(&["bake"]), Some(Mode::Bake));
         for bad in [
             &[][..],
             &["--stay"],
-            &["d", "--stay", "--stay"],
-            &["d", "--seed"],
-            &["d", "--seed", "a", "--seed", "b"],
+            &["d", "--stay"],
+            &["d", "--seed", "corvane-acquisition"],
+            &["d", "--model", "openrouter"],
+            &["d", "--model-name", "x"],
+            &["d", "--store", "s"],
+            &["d", "check", "check"],
             &["d", "extra"],
-            &["d", "--other"],
             &["preview", "--stay"],
             &["preview", "--spend-budget", "--spend-budget"],
+            &["bake", "now"],
         ] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
     }
 
     #[test]
-    fn model_options_require_a_provider() {
-        use super::{ModelOptions, Provider};
-        for (provider, flag) in [
-            (Provider::OpenRouter, "openrouter"),
-            (Provider::Anthropic, "anthropic"),
-        ] {
-            assert_eq!(
-                parse(&["d", "--model", flag]),
-                Some(Mode::Run {
-                    downloads: "d".into(),
-                    seed: "halvard-cve".into(),
-                    stay: false,
-                    model: Some(ModelOptions {
-                        provider,
-                        name: provider.default_model().into(),
-                        store: None,
-                    }),
-                })
-            );
-            assert_eq!(
-                parse(&[
-                    "d",
-                    "--store",
-                    "saved",
-                    "--model-name",
-                    "custom",
-                    "--model",
-                    flag,
-                    "--stay"
-                ]),
-                Some(Mode::Run {
-                    downloads: "d".into(),
-                    seed: "halvard-cve".into(),
-                    stay: true,
-                    model: Some(ModelOptions {
-                        provider,
-                        name: "custom".into(),
-                        store: Some("saved".into()),
-                    }),
-                })
-            );
-        }
-        for bad in [
-            &["d", "--model"][..],
-            &["d", "--model", "other"],
-            &["d", "--model-name", "custom"],
-            &["d", "--store", "saved"],
-            &["d", "--model", "openrouter", "--model", "anthropic"],
-            &["d", "--model", "openrouter", "--model-name"],
-            &["d", "--model", "openrouter", "--store"],
-        ] {
-            assert_eq!(parse(bad), None, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn search_projection_names_the_selected_generator_before_any_request() {
-        use super::{GeneratorKind, Seed, search_projection};
-        let seed = Seed::builtin("halvard-cve").unwrap();
-        let stub = search_projection(&seed, None).snapshot();
-        assert_eq!(stub.generator.kind, GeneratorKind::Stub);
-        assert_eq!(stub.generator.model, "stub");
-        for flag in ["openrouter", "anthropic"] {
-            for override_name in [None, Some("custom"), Some("")] {
-                let mut args = vec!["d", "--model", flag];
-                if let Some(name) = override_name {
-                    args.extend(["--model-name", name]);
-                }
-                let Mode::Run {
-                    model: Some(options),
-                    ..
-                } = parse(&args).unwrap()
-                else {
-                    panic!("expected a model session");
-                };
-                let snapshot = search_projection(&seed, Some(&options)).snapshot();
-                assert_eq!(
-                    snapshot.generator.kind,
-                    GeneratorKind::Model(options.provider)
-                );
-                assert_eq!(
-                    snapshot.generator.model,
-                    override_name
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or(options.provider.default_model())
-                );
-                assert!(snapshot.generator.generate);
-                assert_eq!(snapshot.generator.generation_revision, 0);
-                assert_eq!(snapshot.generator.prefetch, 0);
-            }
-        }
+    fn claude_code_starts_signed_in_with_the_placeholder_key() {
+        let key = format!("sk-ant-api03-{}", "b".repeat(96));
+        let files = claude_files(super::CLAUDE_MODEL, &key);
+        let settings: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
+        assert_eq!(settings["model"], "claude-sonnet-5-5");
+        let state: serde_json::Value = serde_json::from_str(&files[1].1).unwrap();
+        assert_eq!(
+            state["customApiKeyResponses"]["approved"][0],
+            "b".repeat(20)
+        );
+        assert_eq!(state["hasCompletedOnboarding"], true);
     }
 }

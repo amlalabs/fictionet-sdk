@@ -180,6 +180,13 @@ impl Page {
         self.workspace_consoles = true;
         self
     }
+    /// Shows the page as an app: a header with a World menu, the first
+    /// host's Screen and Terminal as tabs, and the workspace panel beside
+    /// them. The inspector is not shown.
+    pub fn app(mut self) -> Self {
+        self.app = true;
+        self
+    }
     /// Puts the named inspector panel first and opens the inspector on it, so
     /// a demo's own panel is what a viewer sees before Packets. The page's
     /// other own panels follow it in the order they were declared, before the

@@ -166,6 +166,14 @@ fn key(host: &str, target: &str) -> (String, String) {
     (host.to_owned(), target.to_owned())
 }
 
+/// Where the canned store for the seed named `seed` is kept in the
+/// repository: `examples/adaptive-web/stores/<seed>/`.
+pub fn canned_root(seed: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../stores")
+        .join(seed)
+}
+
 /// Why a store cannot be used, and how to start over.
 fn incompatible(root: &Path, reason: &str) -> String {
     format!(
@@ -265,6 +273,39 @@ impl Store {
         Ok((store, made_by))
     }
 
+    /// Reads the store at `root` into memory, for a world that serves it
+    /// and keeps what it adds in memory only. The store must have been made
+    /// for `seed` by a generator. Returns the store and that generator's
+    /// identity. Nothing under `root` is written.
+    pub fn load(root: &Path, seed: &Seed) -> Result<(Self, Value), String> {
+        let fail = |e: io::Error| format!("{}: {e}", root.display());
+        let text = std::fs::read(root.join("store.json")).map_err(fail)?;
+        let identity: Value = serde_json::from_slice(&text)
+            .map_err(|e| incompatible(root, &format!("store.json is not JSON: {e}")))?;
+        if identity["version"] != VERSION {
+            return Err(incompatible(root, "unsupported store format version"));
+        }
+        if identity["seed"] != seed.declaration() {
+            return Err(incompatible(root, "the seed's declaration differs"));
+        }
+        if !identity["generator"].is_object() {
+            return Err(incompatible(root, "it names no generator"));
+        }
+        let lines = std::fs::read_to_string(root.join("world.jsonl")).map_err(fail)?;
+        let mut store = Self::memory();
+        for (number, line) in lines.lines().enumerate() {
+            let entry: Entry = serde_json::from_str(line).map_err(|e| {
+                format!(
+                    "{}: line {}: {e}",
+                    root.join("world.jsonl").display(),
+                    number + 1
+                )
+            })?;
+            store.apply(entry);
+        }
+        Ok((store, identity["generator"].clone()))
+    }
+
     /// Applies what other worlds have written to `world.jsonl` since this
     /// world last read it; `held` says whether this world holds
     /// `store.lock` (see [`Appended::read_on`]).
@@ -311,11 +352,14 @@ impl Store {
         match entry {
             Entry::Page(page) => {
                 let at = key(&page.host, &page.target);
-                self.claims.extend(page.claims.iter().map(|claim| Claim {
-                    url: page.url.clone(),
-                    claim: claim.clone(),
-                }));
-                self.order.push(at.clone());
+                // A page recorded again, laid out anew, keeps its place.
+                if !self.pages.contains_key(&at) {
+                    self.claims.extend(page.claims.iter().map(|claim| Claim {
+                        url: page.url.clone(),
+                        claim: claim.clone(),
+                    }));
+                    self.order.push(at.clone());
+                }
                 self.pages.insert(at, page);
             }
             Entry::Search(search) => {
@@ -388,8 +432,8 @@ impl Store {
             .collect()
     }
 
-    /// Pages the world has: the seed's fixed pages and the last 40 made with
-    /// status 200 and a title.
+    /// Pages the world has: the seed's fixed pages and every page made with
+    /// status 200 and a title, oldest first.
     pub fn known(&self, seed: &Seed) -> Vec<fictionet_extras::search::Result> {
         let fixed = seed.fixed.iter().map(|f| fictionet_extras::search::Result {
             url: f.url.clone(),
@@ -397,15 +441,22 @@ impl Store {
             snippet: f.description.clone(),
             date: String::new(),
         });
-        let made = self.order[self.order.len().saturating_sub(40)..]
+        let made = self
+            .order
             .iter()
+            .filter(|at| {
+                !seed
+                    .fixed
+                    .iter()
+                    .any(|f| f.host == at.0 && f.target == at.1)
+            })
             .map(|at| &self.pages[at])
             .filter(|p| p.status == 200 && !p.title.is_empty())
             .map(|p| fictionet_extras::search::Result {
                 url: p.url.clone(),
                 title: p.title.clone(),
                 snippet: p.description.clone(),
-                date: String::new(),
+                date: super::make::result_date(&p.date),
             });
         fixed.chain(made).collect()
     }
@@ -501,6 +552,16 @@ impl Store {
 
     pub fn search(&self, key: &str) -> Option<&SearchRecord> {
         self.searches.get(key)
+    }
+
+    /// Every page, in the order they were made.
+    pub fn pages(&self) -> impl Iterator<Item = &PageRecord> {
+        self.order.iter().map(|at| &self.pages[at])
+    }
+
+    /// Every result list, in no particular order.
+    pub fn searches(&self) -> impl Iterator<Item = &SearchRecord> {
+        self.searches.values()
     }
 
     pub fn insert_search(&mut self, search: SearchRecord) -> io::Result<()> {

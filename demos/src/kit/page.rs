@@ -343,14 +343,40 @@ impl Pty for ssh::Pty {
     }
 }
 
-/// A private browser bootstrap, removed when its run ends.
+/// A private browser bootstrap, removed when its run ends, and the app
+/// window the run opened, if any.
 pub struct PageAccess {
     _dir: super::util::RunDir,
+    _window: Option<super::shot::AppWindow>,
 }
 
 impl PageAccess {
     /// Prints the public address and a separate action to open the authenticated page.
     pub fn new(url: &str) -> io::Result<Self> {
+        let access = Self::bootstrap(url)?;
+        access.print_open();
+        Ok(access)
+    }
+
+    /// Opens the authenticated page in a Chromium app window, or prints how
+    /// to open it where there is no display to open it on.
+    pub fn open(url: &str) -> io::Result<Self> {
+        let mut access = Self::bootstrap(url)?;
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            access.print_open();
+            return Ok(access);
+        }
+        match super::shot::AppWindow::open(url) {
+            Ok(window) => access._window = Some(window),
+            Err(error) => {
+                println!("Chromium did not open the page: {error}");
+                access.print_open();
+            }
+        }
+        Ok(access)
+    }
+
+    fn bootstrap(url: &str) -> io::Result<Self> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         super::client::PageClient::from_url(url)?;
@@ -367,11 +393,21 @@ impl PageAccess {
             url.replace('&', "&amp;")
         )?;
         println!("Page: {}", url.split('#').next().unwrap());
+        Ok(Self {
+            _dir: dir,
+            _window: None,
+        })
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self._dir.path().join("open.html")
+    }
+
+    fn print_open(&self) {
         println!(
             "Open: cargo xtask demo open {}",
-            super::ssh::quote(&path.display().to_string())
+            super::ssh::quote(&self.path().display().to_string())
         );
-        Ok(Self { _dir: dir })
     }
 }
 

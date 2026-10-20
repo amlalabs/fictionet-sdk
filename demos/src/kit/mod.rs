@@ -193,6 +193,12 @@ impl Guest {
         self.steps.push(command.into());
         self
     }
+    /// Puts a shell command before every other step, still after package
+    /// installation: before the desktop starts, for one.
+    pub fn run_first(mut self, command: impl Into<String>) -> Self {
+        self.steps.insert(0, command.into());
+        self
+    }
     /// Declares a loopback VNC port and a command that exits zero when the desktop is ready.
     pub fn desktop(mut self, port: u16, ready: impl Into<String>) -> Self {
         self.desktop = Some((port, ready.into()));
@@ -417,6 +423,9 @@ pub struct Kit<W = ()> {
     page: Option<PageBuilder>,
     policy: Option<Arc<dyn fictionet_observe::Policy>>,
     pub(crate) run_parent: PathBuf,
+    /// Opens the page in Chromium once it is bound, in place of printing
+    /// how to open it.
+    open: bool,
 }
 
 impl Kit {
@@ -430,6 +439,7 @@ impl Kit {
             page: None,
             policy: None,
             run_parent: std::env::temp_dir(),
+            open: false,
         }
     }
 }
@@ -448,6 +458,12 @@ impl<W> Kit<W> {
     /// Selects observations after the kit excludes its console traffic.
     pub fn policy(mut self, policy: Arc<dyn fictionet_observe::Policy>) -> Self {
         self.policy = Some(policy);
+        self
+    }
+    /// Opens the page in a Chromium app window as soon as it is served,
+    /// for a demo someone drives by hand.
+    pub fn open_page(mut self) -> Self {
+        self.open = true;
         self
     }
     /// Builds a page before the world starts and before any guest boots.
@@ -477,6 +493,7 @@ impl<W> Kit<W> {
             page: self.page,
             policy: self.policy,
             run_parent: self.run_parent,
+            open: self.open,
         }
     }
 }
@@ -566,6 +583,8 @@ pub struct Run {
     boot: Instant,
     page: Option<Server>,
     access: Option<PageAccess>,
+    /// Whether the page opens in Chromium once it is bound.
+    open: bool,
     dashboard: Option<DashboardHandle>,
     labels: Option<Labels>,
     containment: StateTopic<Containment>,
@@ -825,6 +844,7 @@ impl<W> Kit<W> {
             boot: Instant::now(),
             page: None,
             access: None,
+            open: false,
             dashboard: None,
             labels: None,
             containment: StateTopic::new(StateLimits::default()),
@@ -895,6 +915,7 @@ where
         let identity = Arc::new(ssh::Identity::generate()?);
         let (mut run, mut prepared) = self.prepare()?;
         if let Some(build) = self.page.take() {
+            run.open = self.open;
             run.bind_page(&self.name, build, &mut prepared).await?;
         }
         let backends = std::mem::take(&mut prepared.backends);
@@ -1116,7 +1137,11 @@ impl Run {
         })?);
         self.dashboard = Some(dashboard);
         self.labels = Some(labels);
-        self.access = Some(PageAccess::new(self.page_url())?);
+        self.access = Some(if self.open {
+            PageAccess::open(self.page_url())?
+        } else {
+            PageAccess::new(self.page_url())?
+        });
         Ok(())
     }
 

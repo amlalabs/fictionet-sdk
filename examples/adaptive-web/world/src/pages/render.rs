@@ -214,6 +214,23 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         e(&copyright)
     )
 }
+/// A stored page on a host with a captured layout, laid out again with the
+/// layout as it is now. None for a page on any other host, or unchanged.
+pub fn again(
+    host: &str,
+    target: &str,
+    title: &str,
+    html: &str,
+    date: &str,
+    today: &str,
+) -> Option<String> {
+    let skin = fictionet_extras::sites::lookup(host, target)?;
+    let today = super::seed::parse_date(today).ok()?;
+    let published = super::seed::parse_date(date).unwrap_or(today);
+    let page = skin.render(title, &skin.content(html)?, published, today)?;
+    (page != html).then_some(page)
+}
+
 /// Renders a missing page using the site's layout when available.
 pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str) -> String {
     let fallback = Profile {

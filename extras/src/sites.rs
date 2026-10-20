@@ -6,7 +6,19 @@ use time::Date;
 
 static FILES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/sites");
 
+/// The host whose captured layout a host shares: the same site under
+/// another of its names.
+fn skin_host(host: &str) -> &str {
+    match host {
+        "www.wikipedia.org" | "wikipedia.org" => "en.wikipedia.org",
+        "www.bbc.co.uk" | "bbc.co.uk" | "bbc.com" => "www.bbc.com",
+        "theregister.com" => "www.theregister.com",
+        _ => host,
+    }
+}
+
 pub(crate) fn source(host: &str, target: &str) -> Option<&'static str> {
+    let host = skin_host(host);
     let page = if host == "www.bbc.com" && target.starts_with("/sport") {
         "sport.html"
     } else {
@@ -21,7 +33,7 @@ pub fn asset(host: &str, path: &str) -> Option<(&'static str, &'static [u8])> {
         "google.com" => "www.google.com",
         "bing.com" => "www.bing.com",
         "duckduckgo.com" | "lite.duckduckgo.com" => "html.duckduckgo.com",
-        _ => host,
+        _ => skin_host(host),
     };
     let name = path.strip_prefix("/_assets/")?;
     if name.contains('/') || name.contains('\\') || name.contains("..") {
@@ -45,7 +57,7 @@ pub fn asset(host: &str, path: &str) -> Option<(&'static str, &'static [u8])> {
 }
 
 fn container(host: &str, target: &str) -> Option<&'static str> {
-    Some(match host {
+    Some(match skin_host(host) {
         "en.wikipedia.org" => "#mw-content-text > .mw-parser-output",
         "www.bbc.com" if target.starts_with("/sport") => "main#main-content",
         "www.bbc.com" => "main#bbc-main",
@@ -56,6 +68,18 @@ fn container(host: &str, target: &str) -> Option<&'static str> {
         "www.theregister.com" => "main.pageWidth",
         _ => return None,
     })
+}
+
+/// A page's heading: its title without the site name the title ends with,
+/// as "Iterator - Wikipedia" heads its page "Iterator".
+fn heading(title: &str) -> &str {
+    [" - ", " — ", " | ", " • "]
+        .iter()
+        .filter_map(|separator| title.rsplit_once(separator))
+        .filter(|(page, site)| !page.trim().is_empty() && site.chars().count() <= 40)
+        .map(|(page, _)| page.trim())
+        .max_by_key(|page| page.len())
+        .unwrap_or(title)
 }
 
 /// A bundled stylesheet, assets, and page skeleton. Obtain one with [`lookup`].
@@ -101,6 +125,13 @@ impl Skin {
         )
     }
 
+    /// The body a page rendered with this skin wraps, for rendering it again.
+    pub fn content(&self, page: &str) -> Option<String> {
+        let dom = document(page);
+        let main = one(&dom, self.container).ok()?;
+        Some(main.children().map(|node| node.to_string()).collect())
+    }
+
     /// Wraps a title and trusted HTML body in the skin. The publication date is
     /// capped at `today`; navigation and contents come from this body's headings.
     /// A mismatched skeleton returns `None` so the caller can use its own layout.
@@ -135,13 +166,14 @@ impl Skin {
             heading.attributes.borrow_mut().insert("id", id.clone());
             contents.push_str(&format!("<li class=\"vector-toc-list-item\"><a class=\"vector-toc-link\" href=\"#{id}\">{}</a></li>", escape(&heading.text_contents())));
         }
+        let heading = heading(title);
         for node in dom.select(".page-title").ok()? {
-            replace(node.as_node(), &escape(title));
+            replace(node.as_node(), &escape(heading));
         }
         for node in dom.select(".page-contents").ok()? {
             replace(node.as_node(), &contents);
         }
-        let breadcrumb = format!("<a href=\"/\">Home</a> › {}", escape(title));
+        let breadcrumb = format!("<a href=\"/\">Home</a> › {}", escape(heading));
         for node in dom.select(".page-breadcrumb").ok()? {
             replace(node.as_node(), &breadcrumb);
         }
@@ -333,6 +365,49 @@ mod tests {
     }
 
     #[test]
+    fn a_rendered_page_gives_back_its_body() {
+        let skin = lookup("www.theregister.com", "/2026/10/01/a/").unwrap();
+        let page = skin
+            .render(
+                "A - The Register",
+                "<p>Text one.</p><h2>Two</h2>",
+                today(),
+                today(),
+            )
+            .unwrap();
+        let body = skin.content(&page).unwrap();
+        assert!(body.contains("<p>Text one.</p>") && body.contains("Two</h2>"));
+        let again = skin
+            .render("A - The Register", &body, today(), today())
+            .unwrap();
+        assert_eq!(again, page);
+    }
+
+    #[test]
+    fn headings_leave_out_the_site_name() {
+        assert_eq!(heading("Iterator - Wikipedia"), "Iterator");
+        assert_eq!(
+            heading("itertools — Functions creating iterators — Python 3.12.1 documentation"),
+            "itertools — Functions creating iterators"
+        );
+        assert_eq!(heading("Patch now • The Register"), "Patch now");
+        assert_eq!(heading("A plain title"), "A plain title");
+    }
+
+    #[test]
+    fn a_site_shares_its_layout_under_its_other_names() {
+        for (host, alias) in [
+            ("en.wikipedia.org", "www.wikipedia.org"),
+            ("www.bbc.com", "www.bbc.co.uk"),
+        ] {
+            assert_eq!(
+                lookup(alias, "/wiki/A").map(|skin| skin.html),
+                lookup(host, "/wiki/A").map(|skin| skin.html)
+            );
+        }
+    }
+
+    #[test]
     fn unknown_and_mismatched_skins_return_none() {
         for host in [
             "uncaptured.example.net",
@@ -385,6 +460,8 @@ mod tests {
             ("www.google.com", "google.com"),
             ("www.bing.com", "bing.com"),
             ("html.duckduckgo.com", "duckduckgo.com"),
+            ("en.wikipedia.org", "www.wikipedia.org"),
+            ("www.bbc.com", "www.bbc.co.uk"),
         ] {
             let dom = document(source(host, "/").unwrap());
             let link = dom.select_first("link[rel=stylesheet]").unwrap();
