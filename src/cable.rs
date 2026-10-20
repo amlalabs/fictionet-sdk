@@ -207,11 +207,7 @@ fn send_observed(
 ) {
     {
         let mut dir = cable.dirs[1 - side].lock();
-        if dir.closed
-            || cable
-                .limit
-                .is_some_and(|limit| dir.queue.bytes() + packet.0.len() + PACKET_COST > limit)
-        {
+        if dir.closed || !dir.queue.fits(packet.0.len(), cable.limit) {
             return;
         }
         dir.packets += 1;

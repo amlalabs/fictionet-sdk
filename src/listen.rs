@@ -719,6 +719,14 @@ impl SocketLink {
         }
     }
 
+    /// Writes a packet to attach, or queues it while the connection is full.
+    /// `accepted` counts and publishes the packet, and runs only if the
+    /// packet is written or fits in the queue and the connection is open.
+    /// For an `observed` packet it runs with no connection lock held. The
+    /// caller's per-link publication lock stays held until the packet is
+    /// queued, so packets are published in the order they enter the link.
+    /// The helper thread can only drain the queue meanwhile; if attach goes
+    /// away first, the packet is lost as queued packets are.
     pub(crate) fn send(&mut self, packet: Packet, observed: bool, accepted: impl FnOnce(&Packet)) {
         if self.closed {
             return;
@@ -749,7 +757,7 @@ impl SocketLink {
                 }
             }
         }
-        if out.queue.bytes() + packet.0.len() + crate::PACKET_COST > QUEUE_LIMIT {
+        if !out.queue.fits(packet.0.len(), Some(QUEUE_LIMIT)) {
             out.dropped += 1;
             return;
         }
