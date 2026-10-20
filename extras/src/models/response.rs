@@ -183,7 +183,14 @@ impl Drop for Call {
             .filter(|cost| cost.is_finite() && *cost >= 0.0);
         if !self.free {
             let mut ledger = self.ledger.lock().unwrap();
-            ledger.input = ledger.input.saturating_add(self.input);
+            let input = if self.path.ends_with("/messages") {
+                self.input
+                    .saturating_add(self.cache_read)
+                    .saturating_add(self.cache_write)
+            } else {
+                self.input
+            };
+            ledger.input = ledger.input.saturating_add(input);
             ledger.output = ledger.output.saturating_add(self.output);
             ledger.usd += cost.unwrap_or(0.0);
             ledger.unknown |= self.status < 400 && (!self.complete || !self.usage);
