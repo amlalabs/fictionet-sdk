@@ -13,7 +13,7 @@ export function mount(root, services, options) {
       try {
         module = await (services.importModule ? services.importModule(options.module) : import(options.module));
       } catch (error) {
-        throw new Error(`${error.message}. A panel that imports three.js needs it in the build: run \`cargo xtask demo assets\`, then rebuild`);
+        throw new Error(`${error.message}. A panel that imports three.js needs it in the build: run \`cargo xtask demo libraries\`, then rebuild`);
       }
       if (disposed) return;
       const mounted = await module.mount(content, services, options);

@@ -266,13 +266,12 @@ pub(super) async fn respond(
     kind: &str,
     body: &[u8],
 ) -> io::Result<()> {
-    headers(
-        conn,
-        status,
-        kind,
-        &format!("Content-Length: {}\r\n", body.len()),
-    )
-    .await?;
+    let framing = if status == 204 {
+        String::new()
+    } else {
+        format!("Content-Length: {}\r\n", body.len())
+    };
+    headers(conn, status, kind, &framing).await?;
     write(conn, body).await
 }
 

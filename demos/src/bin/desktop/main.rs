@@ -5,7 +5,7 @@ mod guest;
 mod page;
 mod world;
 
-use fictionet_demo::kit::{self, Kit, b64_decode, rfb, shot, ssh};
+use fictionet_demo::kit::{self, Kit, b64_decode, shot, ssh};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -391,7 +391,7 @@ async fn run_checks(
     let viewer_png = shots.join("viewer-desktop.png");
     let capture = tokio::time::timeout(
         Duration::from_secs(30),
-        rfb::capture_page(page_port, &viewer_png),
+        page::capture_page(page_port, &viewer_png),
     )
     .await
     .unwrap_or_else(|_| Err(std::io::Error::other("timed out")));
@@ -422,13 +422,21 @@ async fn run_checks(
     // effort -- it needs a Chromium whose network works in this sandbox.
     let out = shots.join("novnc.png");
     let url = page_url.to_string();
-    let captured = tokio::task::spawn_blocking(move || shot::capture(&url, &out)).await?;
+    let captured = tokio::task::spawn_blocking(move || {
+        shot::capture(
+            &url,
+            &out,
+            &shot::canvas_painted("document.querySelector('canvas')"),
+            Duration::from_secs(60),
+        )
+    })
+    .await?;
     match captured {
-        Some(path) => {
+        Ok(path) => {
             println!("noVNC viewer screenshot saved: {path}");
             screenshots.push(path);
         }
-        None => println!("noVNC viewer screenshot: not captured"),
+        Err(error) => println!("noVNC viewer screenshot: not captured ({error})"),
     }
 
     // Required: the coding agents are on the desktop user's PATH over SSH,

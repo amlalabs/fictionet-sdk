@@ -26,4 +26,4 @@ story moment style. `services.runTime()` is the run's clock in seconds.
 Options are the panel description from `/api/page`, with any explicit composition
 settings. World state comes from services, never module globals or DOM lookups
 outside the root. Libraries load through dynamic imports inside mount; a failed
-import reports the library name and `cargo xtask demo assets` in that panel.
+import reports the library name and `cargo xtask demo libraries` in that panel.

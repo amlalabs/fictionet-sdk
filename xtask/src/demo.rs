@@ -15,11 +15,16 @@ pub fn run(args: &[String]) -> Result {
     if args.is_empty() {
         println!("in-process demos: {}", binaries.join(", "));
         println!("VM scripts: {}", demos.join(", "));
-        println!("cargo xtask demo <name>; cargo xtask demo assets downloads only");
+        println!(
+            "cargo xtask demo <name>; cargo xtask demo assets downloads everything; cargo xtask demo libraries downloads browser libraries only"
+        );
         return Ok(());
     }
     if args == ["assets"] {
         return microvm::assets();
+    }
+    if args == ["libraries"] {
+        return libraries::assets();
     }
     if let [name] = args
         && binaries.contains(name)
@@ -29,7 +34,7 @@ pub fn run(args: &[String]) -> Result {
         return microvm::launch(name);
     }
     let usage = format!(
-        "usage: cargo xtask demo [assets|{}]",
+        "usage: cargo xtask demo [assets|libraries|{}]",
         binaries
             .iter()
             .chain(demos.iter())

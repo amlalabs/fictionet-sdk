@@ -1,31 +1,56 @@
 //! Shared guests, networking, provisioning, and run lifetime.
 //!
 //! ```no_run
-//! use fictionet_demo::kit::{self, Guest, Kit};
+//! use fictionet_demo::kit::{self, Guest, Kit, rfb, shot};
+//! use fictionet_observe::page::Page;
 //! use fictionet::stdlib::web;
+//! use example_common::zscaler::{DEFAULT_CLOUD, zscaler};
+//! use std::time::{Duration, SystemTime};
 //!
-//! # async fn example() -> std::io::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let kit = Kit::new("office")
-//!     .guest(Guest::ubuntu("workstation", "analyst").resources(4, 4096))
-//!     .guest(Guest::ubuntu("server", "operator").packages(&["curl"]))
+//!     .guest(kit::desktop::browser("workstation", "analyst", "http://archive.ubuntu.com"))
+//!     .guest(Guest::ubuntu("server", "operator"))
+//!     .page(|dashboard, hosts| Page::new("Office", dashboard)
+//!         .host(hosts.take("workstation")).host(hosts.take("server")).standard_panels())
 //!     .world(|fcx, mut world| async move {
+//!         let now = world.now_unix();
+//!         let date = SystemTime::UNIX_EPOCH + Duration::from_secs(now as u64);
+//!         let ca = zscaler(&fcx, DEFAULT_CLOUD, now)?;
+//!         let tls = ca.server_config(&fcx, kit::desktop::HOSTS, date, now)?;
+//!         world.trust("office", ca.root_pem())?;
 //!         let mirror = world.mirror(&fcx)?;
 //!         web::Sites::new(move |host: &str| match host {
-//!             "archive.ubuntu.com" | "security.ubuntu.com" => {
-//!                 Some(web::Site::new(mirror.clone()))
-//!             }
+//!             "archive.ubuntu.com" | "security.ubuntu.com" => Some(web::Site::new(mirror.clone())),
+//!             h if kit::desktop::HOSTS.contains(&h) => Some(web::Site::new(mirror.clone()).tls(tls.clone())),
 //!             _ => None,
-//!         }).into_net().route(kit::JUMP, kit::jump_prefix())
+//!         }).date(date).into_net().route(kit::JUMP, kit::jump_prefix())
 //!             .start(&fcx, world.into_attachments())
 //!     });
 //! let run = kit.boot("demos/downloads/cloudimage").await?;
-//! run.guest("workstation").ssh().run("cloud-init status --wait").await?;
-//! run.shutdown().await
+//! let url = run.page_url().to_string();
+//! println!("Office: {url}");
+//! run.guest("workstation").wait_desktop(Duration::from_secs(300)).await?;
+//! rfb::capture_page(&url, "workstation", &run.path().join("desktop.png")).await?;
+//! let out = run.path().join("page.png");
+//! tokio::task::spawn_blocking(move || shot::capture(
+//!     &url, &out, &shot::desktop_painted("workstation"), Duration::from_secs(30),
+//! )).await??;
+//! run.shutdown().await?;
+//! # Ok(())
 //! # }
 //! ```
+//!
+//! `Kit::page` adds the dashboard observer, containment probes and panel, labels
+//! task and panel, and each host's status; for a browser guest, the world must
+//! serve `kit::desktop::HOSTS` through `World::mirror`.
 
 pub mod bridge;
+pub mod client;
+mod page;
+pub use page::Hosts;
 pub mod containment;
+pub mod desktop;
 pub mod jump;
 pub mod mirror;
 pub mod net;
@@ -44,6 +69,9 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use fictionet_observe::page::{Containment, Labels, Page, Server, StateLimits, StateTopic};
+use fictionet_observe::{DashboardHandle, DashboardObserver, DashboardOptions};
 
 use fictionet::events::{Fanout, Interest, Observation, Observer, Stamp};
 use fictionet::stdlib::network::ethernet::Family;
@@ -81,6 +109,7 @@ pub struct Guest {
     packages: Vec<String>,
     files: Vec<File>,
     steps: Vec<String>,
+    desktop: Option<(u16, String)>,
 }
 
 impl Guest {
@@ -99,6 +128,7 @@ impl Guest {
             packages: Vec::new(),
             files: Vec::new(),
             steps: Vec::new(),
+            desktop: None,
         }
     }
     /// Sets the vCPU count and memory in MiB, defaulting to 2 and 2048.
@@ -137,6 +167,11 @@ impl Guest {
         self.steps.push(command.into());
         self
     }
+    /// Declares a loopback VNC port and a command that exits zero when the desktop is ready.
+    pub fn desktop(mut self, port: u16, ready: impl Into<String>) -> Self {
+        self.desktop = Some((port, ready.into()));
+        self
+    }
     fn initial_addr(&self) -> Option<Ipv4Addr> {
         match &self.family {
             Family::Serve(lease) => Some(lease.addr.addr),
@@ -163,6 +198,13 @@ impl Guest {
         {
             return Err(io::Error::other(
                 "guest file and package names must be neutral",
+            ));
+        }
+        if let Some((port, ready)) = &self.desktop
+            && (*port == 0 || ready.trim().is_empty() || !neutral(ready) || ready.contains('\0'))
+        {
+            return Err(io::Error::other(
+                "desktop needs a nonzero port and a neutral, nonempty readiness command",
             ));
         }
         Ok(())
@@ -222,12 +264,15 @@ impl World {
     }
 }
 
+type PageBuilder = Box<dyn FnOnce(DashboardHandle, &mut Hosts) -> Page + Send>;
+
 /// Declares guests and observers before starting the world.
 pub struct Kit<W = ()> {
     name: String,
     guests: Vec<Guest>,
     observers: Vec<Arc<dyn Observer>>,
     world: W,
+    page: Option<PageBuilder>,
     pub(crate) run_parent: PathBuf,
 }
 
@@ -239,6 +284,7 @@ impl Kit {
             guests: Vec::new(),
             observers: Vec::new(),
             world: (),
+            page: None,
             run_parent: std::env::temp_dir(),
         }
     }
@@ -255,6 +301,17 @@ impl<W> Kit<W> {
         self.observers.push(observer);
         self
     }
+    /// Builds a page before the world starts and before any guest boots.
+    /// The kit adds containment results and labels and runs their world tasks.
+    /// Do not call Page::containment or Page::labels in the builder; duplicate
+    /// panels are rejected at bind. Guests need not all be taken by the page.
+    pub fn page(
+        mut self,
+        build: impl FnOnce(DashboardHandle, &mut Hosts) -> Page + Send + 'static,
+    ) -> Self {
+        self.page = Some(Box::new(build));
+        self
+    }
     /// Sets the closure that starts the world services.
     /// It must return once services are started, as `Net::start` does, because
     /// boot waits for it before writing the guest seeds.
@@ -268,6 +325,7 @@ impl<W> Kit<W> {
             guests: self.guests,
             observers: self.observers,
             world,
+            page: self.page,
             run_parent: self.run_parent,
         }
     }
@@ -309,6 +367,7 @@ pub struct GuestHandle {
     ssh: Option<Arc<ssh::Session>>,
     backend: Option<net::Backend>,
     ssh_ready: Duration,
+    console: page::GuestConsole,
 }
 
 impl GuestHandle {
@@ -337,6 +396,12 @@ impl GuestHandle {
     pub fn vm(&self) -> &vm::Vm {
         self.vm.as_ref().expect("boot completed")
     }
+    /// Waits up to timeout for the guest's desktop, with or without Kit::page.
+    /// Returns elapsed time from VM startup. A timeout names the guest,
+    /// readiness command, and the last attempt's exit code and stderr tail.
+    pub async fn wait_desktop(&self, timeout: Duration) -> io::Result<Duration> {
+        self.console.wait_desktop(timeout).await
+    }
     /// Returns the elapsed time from VM startup until this guest accepted SSH.
     pub fn ssh_ready(&self) -> Duration {
         self.ssh_ready
@@ -352,15 +417,34 @@ pub struct Run {
     bridges: Vec<JoinHandle<()>>,
     dir: Option<util::RunDir>,
     boot: Instant,
+    page: Option<Server>,
+    dashboard: Option<DashboardHandle>,
+    labels: Option<Labels>,
+    containment: StateTopic<Containment>,
+    probes: Arc<Mutex<Containment>>,
 }
 
 impl Run {
+    /// Returns the signed page URL. Panics unless Kit::page was declared.
+    pub fn page_url(&self) -> &str {
+        self.page
+            .as_ref()
+            .expect("declare Kit::page before requesting its URL")
+            .url()
+    }
+    /// Returns the page dashboard. Panics unless Kit::page was declared.
+    pub fn dashboard(&self) -> DashboardHandle {
+        self.dashboard
+            .as_ref()
+            .expect("declare Kit::page before requesting its dashboard")
+            .clone()
+    }
     /// Returns the named guest, panicking if it was not declared.
     pub fn guest(&self, name: &str) -> &GuestHandle {
         self.guests
             .iter()
             .find(|g| g.name() == name)
-            .expect("declared guest")
+            .unwrap_or_else(|| panic!("guest {name} is not declared; add it with Kit::guest"))
     }
     /// Returns the admin jump host for connections across the world network.
     pub fn jump(&self) -> &jump::Jump {
@@ -380,6 +464,7 @@ impl Run {
     }
     /// Powers guests off, reaps every VMM, cancels the world, and removes files.
     pub async fn shutdown(mut self) -> io::Result<()> {
+        self.stop_status();
         let mut stops = JoinSet::new();
         for guest in &mut self.guests {
             let ssh = guest.ssh.take();
@@ -429,12 +514,24 @@ impl Run {
         {
             failure = Some(error);
         }
+        self.page.take();
         failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Run {
+    fn stop_status(&self) {
+        if let Some(cx) = self.fcx.lock().unwrap().as_ref() {
+            for guest in &self.guests {
+                guest.console.stopped(cx);
+            }
+        }
     }
 }
 
 impl Drop for Run {
     fn drop(&mut self) {
+        self.stop_status();
         if let Some(cx) = self.fcx.lock().unwrap().take() {
             cx.cancel();
         }
@@ -533,6 +630,11 @@ impl<W> Kit<W> {
             bridges: Vec::new(),
             dir: Some(util::RunDir::new(&self.run_parent, &self.name)?),
             boot: Instant::now(),
+            page: None,
+            dashboard: None,
+            labels: None,
+            containment: StateTopic::new(StateLimits::default()),
+            probes: Arc::new(Mutex::new(Containment::default())),
         };
         let (attacher, attachments) = fictionet::attachments();
         let mut prepared = Prepared {
@@ -559,7 +661,9 @@ impl<W> Kit<W> {
                 name: guest.hostname.clone(),
                 addr: tx,
             }));
+            let console = page::GuestConsole::new(&guest);
             run.guests.push(GuestHandle {
+                console,
                 guest,
                 resources,
                 addr,
@@ -585,6 +689,9 @@ where
         self.check_downloads(downloads)?;
         let identity = Arc::new(ssh::Identity::generate()?);
         let (mut run, mut prepared) = self.prepare()?;
+        if let Some(build) = self.page.take() {
+            run.bind_page(&self.name, build, &mut prepared).await?;
+        }
         let backends = std::mem::take(&mut prepared.backends);
         let result = async {
             let ca = run.start_world(self.world, prepared).await?;
@@ -606,6 +713,45 @@ where
 }
 
 impl Run {
+    async fn bind_page(
+        &mut self,
+        name: &str,
+        build: PageBuilder,
+        prepared: &mut Prepared,
+    ) -> io::Result<()> {
+        let observer = DashboardObserver::new(DashboardOptions::demo());
+        let dashboard = observer.handle();
+        prepared.observers.push(observer.observer());
+        let mut hosts = Hosts(
+            self.guests
+                .iter()
+                .map(|g| (g.name().to_string(), Some(g.console.clone())))
+                .collect(),
+        );
+        let labels = Labels::default();
+        let page = build(dashboard.clone(), &mut hosts)
+            .containment(self.containment.clone())
+            .labels(labels.clone());
+        self.page = Some(page.bind_loopback(0).await.map_err(|error| {
+            let text = error.to_string();
+            if text == "labels called twice" || text.contains("(\"Containment\")") {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{text}; Kit::page adds containment and labels; remove any \
+                         Page::containment or Page::labels calls from its builder"
+                    ),
+                )
+            } else {
+                error
+            }
+        })?);
+        self.dashboard = Some(dashboard);
+        self.labels = Some(labels);
+        println!("{name} page: {}", self.page_url());
+        Ok(())
+    }
+
     async fn start_world<W, F>(
         &mut self,
         start: W,
@@ -630,10 +776,28 @@ impl Run {
         let (bridge_tx, bridge_rx) = oneshot::channel();
         let options =
             RunOptions::new(Seed::random()).observer(Arc::new(Fanout::new(prepared.observers)));
+        let labels = self.labels.clone();
+        let consoles: Vec<_> = self
+            .guests
+            .iter()
+            .map(|g| (g.console.clone(), g.addr()))
+            .collect();
         self.world = Some(tokio::spawn(fictionet::run(
             options,
             move |fcx| async move {
                 *fcx_slot.lock().unwrap() = Some(fcx.clone());
+                for (console, address) in consoles {
+                    console.booting(&fcx);
+                    if let Some(address) = address {
+                        console.network(&fcx, address);
+                    }
+                }
+                if let Some(labels) = labels {
+                    fcx.spawn(move |cx| async move {
+                        labels.run(&cx).await?;
+                        Ok(())
+                    });
+                }
                 let jump = jump::Jump::new(&fcx, prepared.jump_link);
                 let tasks = prepared
                     .bridges
@@ -715,7 +879,30 @@ impl Run {
             let identity = identity.clone();
             let addr = guest.addr.clone();
             let user = guest.guest.user.clone();
+            let console = guest.console.clone();
+            let cx = self.fcx.lock().unwrap().as_ref().unwrap().clone();
             sessions.spawn(async move {
+                {
+                    let mut address = addr.clone();
+                    match tokio::time::timeout(
+                        Duration::from_secs(300),
+                        address.wait_for(Option::is_some),
+                    )
+                    .await
+                    {
+                        Ok(Ok(address)) => console.network(&cx, address.unwrap()),
+                        Ok(Err(error)) => return (index, Err(io::Error::other(error))),
+                        Err(_) => {
+                            return (
+                                index,
+                                Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "guest address was not assigned within 300 seconds",
+                                )),
+                            );
+                        }
+                    }
+                }
                 let session = ssh::Session::connect(
                     || jump.connect_addr(addr.clone(), 22, Duration::from_secs(10)),
                     &identity,
@@ -737,10 +924,39 @@ impl Run {
                     guest.vm().console_tail()
                 ))
             })?;
-            guest.ssh = Some(Arc::new(session));
-            guest.ssh_ready = self.boot.elapsed();
+            self.connected(index, Arc::new(session));
         }
         Ok(())
+    }
+
+    fn connected(&mut self, index: usize, session: Arc<ssh::Session>) {
+        let guest = &mut self.guests[index];
+        guest.ssh = Some(session);
+        guest.ssh_ready = self.boot.elapsed();
+        let cx = self.fcx.lock().unwrap().as_ref().unwrap().clone();
+        let session = guest.ssh().clone();
+        guest
+            .console
+            .connected(&cx, session.clone(), guest.addr().unwrap(), self.boot);
+        if let Some(dashboard) = self.dashboard.clone() {
+            let name = guest.name().to_string();
+            let topic = self.containment.clone();
+            let probes = self.probes.clone();
+            cx.spawn(move |cx| async move {
+                let Ok(result) = cx
+                    .race(None, containment::run(&session, &name, &dashboard, &[]))
+                    .await
+                else {
+                    return Ok(());
+                };
+                let mut all = probes.lock().unwrap();
+                all.probes.extend(result.probes);
+                if let Err(error) = topic.publish(cx.now(), &all) {
+                    eprintln!("containment: {error}");
+                }
+                Ok(())
+            });
+        }
     }
 }
 

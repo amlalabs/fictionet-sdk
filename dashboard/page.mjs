@@ -312,7 +312,7 @@ export async function mount(root, transport, theme) {
   };
 
   // The workspace: the pinned hosts, or the selected one, each in a tile.
-  function renderWorkspace() {
+  function renderWorkspace(focusHost) {
     if (!page || document.hidden) return;
     const workspace = $('workspace');
     if (customWorkspace) {
@@ -350,7 +350,7 @@ export async function mount(root, transport, theme) {
         const group = el('div', { class: 'segmented', role: 'group', 'aria-label': `${name} console` }, header);
         for (const kind of offered) {
           const button = el('button', { type: 'button', 'aria-pressed': String(kind === mode), text: kind === 'screen' ? 'Screen' : 'Terminal' }, group);
-          removers.push(listen(button, 'click', () => { if (modes.get(name) !== kind) { modes.set(name, kind); renderWorkspace(); } }));
+          removers.push(listen(button, 'click', () => { if (modes.get(name) !== kind) { modes.set(name, kind); renderWorkspace(kind === 'terminal' ? name : undefined); } }));
         }
       }
       el('span', { class: 'grow' }, header);
@@ -359,7 +359,7 @@ export async function mount(root, transport, theme) {
       let off = () => {};
       if (offered.includes(mode)) {
         const options = page.panels.find((item) => item.kind === mode && item.host === name) || { kind: mode, host: name, title: name };
-        off = panel(content, options, controls);
+        off = panel(content, { ...options, focus: name === focusHost }, controls);
       } else {
         const card = el('div', { class: 'console-card' }, el('div', { class: 'console-stage' }, content));
         el('p', { text: `${name} offers no screen or terminal.` }, card);

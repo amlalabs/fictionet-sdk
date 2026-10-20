@@ -10,6 +10,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use fictionet::stdlib::codec::{AssembleError, Fail, Side, Stream, Wire};
@@ -315,4 +316,166 @@ async fn send(write: &mut OwnedWriteHalf, message: Message) -> io::Result<()> {
     let frame = message.to_frame(None).map_err(io::Error::other)?;
     let bytes = Wire::to_bytes(&frame).map_err(io::Error::other)?;
     write.write_all(&bytes).await
+}
+
+/// Connects through the page, captures the guest's screen over RFB, and writes
+/// it to `out` as a PNG.
+pub async fn capture_page(port: u16, out: &Path) -> io::Result<fictionet_demo::kit::rfb::Capture> {
+    let (stream, bridge) = WsConn::connect(port).await?.into_stream();
+    let result = fictionet_demo::kit::rfb::capture(stream, out).await;
+    if result.is_err() {
+        bridge.await.map_err(io::Error::other)??;
+    } else {
+        bridge.abort();
+        let _ = bridge.await;
+    }
+    result
+}
+
+/// A WebSocket connection to the page's VNC bridge, carrying RFB bytes as
+/// binary messages. The server (the page) sends unmasked frames; this client
+/// masks its own, as RFC 6455 requires.
+struct WsConn {
+    stream: TcpStream,
+    messages: Stream<Messages>,
+    rx: Vec<u8>,
+}
+
+impl WsConn {
+    async fn connect(port: u16) -> io::Result<WsConn> {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+        let mut nonce = [0u8; 16];
+        fictionet_demo::kit::getrandom(&mut nonce);
+        let headers = websocket::request_headers(&format!("127.0.0.1:{port}"), nonce, &["binary"])
+            .map_err(io::Error::other)?;
+        let mut request = String::from("GET /websockify HTTP/1.1\r\n");
+        for (name, value) in &headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str(&format!("Origin: http://127.0.0.1:{port}\r\n\r\n"));
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut head = Vec::new();
+        let body_at = loop {
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(io::Error::other("the viewer closed before replying"));
+            }
+            head.extend_from_slice(&chunk[..n]);
+            if let Some(at) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            if head.len() > 16 << 10 {
+                return Err(io::Error::other("the viewer's reply head was too long"));
+            }
+        };
+        let line = String::from_utf8_lossy(&head[..body_at]);
+        let status = line.lines().next().unwrap_or_default();
+        if !status.starts_with("HTTP/1.1 101") {
+            return Err(io::Error::other(format!(
+                "the viewer did not upgrade: {status}"
+            )));
+        }
+        let mut messages = Stream::new(Messages::for_receiver(Side::Client).with_limit(1 << 20));
+        let early = head.split_off(body_at);
+        let mut taken = 0;
+        while taken < early.len() {
+            taken += messages.push(&early[taken..]);
+        }
+        let mut conn = WsConn {
+            stream,
+            messages,
+            rx: Vec::new(),
+        };
+        conn.drain_messages()?;
+        Ok(conn)
+    }
+
+    /// Moves any decoded binary-message payloads into the RFB byte buffer.
+    fn drain_messages(&mut self) -> io::Result<()> {
+        while let Some(message) = self.messages.next() {
+            match message.map_err(|e| io::Error::other(format!("the viewer's WebSocket: {e}")))? {
+                Message::Binary(data) => self.rx.extend_from_slice(&data),
+                Message::Close(_) => return Err(io::Error::other("the viewer closed the stream")),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn into_stream(
+        self,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let (client, bridge) = tokio::io::duplex(64 << 10);
+        let task = tokio::spawn(self.bridge(bridge));
+        (client, task)
+    }
+
+    async fn bridge(mut self, mut stream: tokio::io::DuplexStream) -> io::Result<()> {
+        let mut input = [0u8; 16 << 10];
+        loop {
+            if !self.rx.is_empty() {
+                stream.write_all(&self.rx).await?;
+                self.rx.clear();
+            }
+            tokio::select! {
+                read = self.stream.read(self.messages.spare()) => {
+                    let n = read?;
+                    if n == 0 {
+                        return Err(io::Error::other("the viewer's WebSocket closed"));
+                    }
+                    self.messages.commit(n);
+                    self.drain_messages()?;
+                }
+                read = stream.read(&mut input) => {
+                    let n = read?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    let mut mask = [0u8; 4];
+                    fictionet_demo::kit::getrandom(&mut mask);
+                    let frame = Message::Binary(input[..n].to_vec())
+                        .to_frame(Some(mask))
+                        .map_err(io::Error::other)?;
+                    let wire = Wire::to_bytes(&frame).map_err(io::Error::other)?;
+                    self.stream.write_all(&wire).await?;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn page_capture_reports_websocket_failure() {
+        let out = std::env::temp_dir().join(format!("{}.png", fictionet_demo::kit::random_uuid()));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+                .await
+                .unwrap();
+            stream.write_all(b"\x82\x0cRFB 003.008\n").await.unwrap();
+            let mut banner = [0; 18];
+            stream.read_exact(&mut banner).await.unwrap();
+            stream.write_all(b"\x88\x00").await.unwrap();
+        });
+        let error = capture_page(port, &out).await.err().unwrap();
+        peer.await.unwrap();
+        assert_eq!(error.to_string(), "the viewer closed the stream");
+    }
 }

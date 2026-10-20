@@ -259,6 +259,55 @@ test('a refused page description shows one not signed in card', async (t) => {
   stop();
 });
 
+test('choosing the terminal switch focuses the connected terminal but mounting it does not', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const sockets = [], terminals = [];
+  class Terminal {
+    constructor() { this.options = {}; terminals.push(this); }
+    loadAddon() {}
+    open(display) { this.input = h.document.createElement('textarea'); display.append(this.input); }
+    focus() { this.input.focus(); }
+    onData() { return { dispose() {} }; }
+    onBinary() { return { dispose() {} }; }
+    dispose() {}
+  }
+  class FitAddon { fit() {} }
+  class ResizeObserver { observe() {} disconnect() {} }
+  for (const initial of ['screen', 'terminal']) {
+    const description = {
+      title: 'Fixture',
+      hosts: [{ name: 'alpha', status: '/api/state/host-alpha', screen: initial === 'screen', terminal: true }],
+      panels: [{ kind: 'terminal', host: 'alpha', load: async () => [{ Terminal }, { FitAddon }], ResizeObserver, getComputedStyle: () => ({}) }],
+    };
+    const stop = await mount(h.root, {
+      get: async () => description,
+      stateStream: (topics) => h.stream('state', { ...topics }),
+      watch: () => h.stream('watch'),
+      async socket() { const socket = new Source('socket'); socket.readyState = 0; sockets.push(socket); return { socket }; },
+      close() {},
+    }, { subscribe: () => () => {}, dispose() {} });
+    t.after(stop);
+    await settle();
+    const source = h.streams.findLast((stream) => stream.tag === 'state' && !stream.closed);
+    source.emit('snapshot', { topic: 'host-alpha', revision: 1, value: { state: 'ssh_up', terminal: true, screen: false } });
+    const button = initial === 'screen'
+      ? h.root.querySelector('.segmented').children[1]
+      : h.root.querySelector('#theme');
+    button.focus();
+    if (initial === 'screen') button.click();
+    await settle();
+    assert.equal(h.document.activeElement, button, 'focus waits for the connection');
+    const socket = sockets.at(-1), terminal = terminals.at(-1);
+    assert.ok(socket);
+    assert.ok(terminal);
+    socket.readyState = 1;
+    socket.dispatchEvent(new Event('open'));
+    assert.equal(h.document.activeElement, initial === 'screen' ? terminal.input : button);
+    stop();
+  }
+});
+
 test('a custom workspace panel replaces the console tiles and hides the pins', async (t) => {
   const h = harness(t);
   const { mount } = await import('./page.mjs');

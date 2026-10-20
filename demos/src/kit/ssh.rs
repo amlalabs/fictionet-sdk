@@ -135,11 +135,12 @@ impl Session {
 
     /// Opens a shell with a PTY on this authenticated session.
     pub async fn pty(&self, term: &str, cols: u32, rows: u32) -> io::Result<Pty> {
-        let mut channel = self
+        let channel = self
             .handle
             .channel_open_session()
             .await
             .map_err(io::Error::other)?;
+        let mut channel = ClosingChannel(Some(channel));
         channel
             .request_pty(true, term, cols, rows, 0, 0, &[])
             .await
@@ -161,11 +162,12 @@ impl Session {
     /// Runs a command with a bound on combined stdout and stderr bytes.
     /// Closes the channel and reports an error when output exceeds the bound.
     pub async fn run_bounded(&self, command: &str, max_bytes: usize) -> io::Result<Output> {
-        let mut channel = self
+        let channel = self
             .handle
             .channel_open_session()
             .await
             .map_err(|e| io::Error::other(format!("open session: {e}")))?;
+        let mut channel = ClosingChannel(Some(channel));
         channel
             .exec(true, command)
             .await
@@ -245,7 +247,7 @@ impl russh::keys::ssh_key::rand_core::CryptoRng for OsRng {}
 
 /// A shell channel whose reads apply backpressure through russh's bounded channel and window.
 pub struct Pty {
-    channel: russh::Channel<Msg>,
+    channel: ClosingChannel,
 }
 
 impl Pty {
@@ -289,4 +291,26 @@ async fn request_accepted(channel: &mut russh::Channel<Msg>) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
+
+// russh Channel has no close-on-drop; ChannelStream does.
+struct ClosingChannel(Option<russh::Channel<Msg>>);
+
+impl std::ops::Deref for ClosingChannel {
+    type Target = russh::Channel<Msg>;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("channel is owned until drop")
+    }
+}
+impl std::ops::DerefMut for ClosingChannel {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("channel is owned until drop")
+    }
+}
+impl Drop for ClosingChannel {
+    fn drop(&mut self) {
+        if let Some(channel) = self.0.take() {
+            drop(channel.into_stream());
+        }
+    }
+}

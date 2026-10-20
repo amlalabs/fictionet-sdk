@@ -31,6 +31,7 @@ function fixture() {
     constructor(options) { this.options = options; this.writes = []; this.inputs = new Set(); this.cols = 80; this.rows = 24; terminals.push(this); }
     loadAddon(addon) { this.addon = addon; }
     open(display) { display.clientWidth = 800; display.clientHeight = 600; }
+    focus() { this.focuses = (this.focuses || 0) + 1; }
     onData(callback) { this.data = callback; this.inputs.add(callback); return { dispose: () => this.inputs.delete(callback) }; }
     onBinary(callback) { this.binary = callback; this.inputs.add(callback); return { dispose: () => this.inputs.delete(callback) }; }
     write(bytes, callback) { this.writes.push({ bytes, callback }); }
@@ -71,6 +72,72 @@ function fixture() {
     lease(value) { holder = value; subscriptions.get('/api/state/leases')?.callback({ value: { alpha: { holder } } }); },
   };
 }
+
+test('console cards follow each host state', async () => {
+  for (const [kind, mount] of [['screen', screen], ['terminal', terminal]]) {
+    const h = fixture();
+    const dispose = mount(h.root, h.services, h[`${kind}Options`]);
+    await settle();
+    const message = h.root.querySelector('p'), card = message.parent;
+    for (const state of ['booting', 'network_up', 'ssh_up', 'desktop_up', 'stopped']) {
+      h.publish({ state, screen: state === 'desktop_up', terminal: state === 'ssh_up' || state === 'desktop_up' });
+      await settle();
+      if (state === 'stopped') {
+        assert.equal(message.textContent, 'alpha has stopped.');
+      } else if (state === 'booting') {
+        assert.equal(message.textContent, kind === 'screen'
+          ? 'alpha is booting. The screen opens when its desktop is up.'
+          : 'alpha is booting. The terminal opens when SSH is up.');
+      } else if (kind === 'screen' && state !== 'desktop_up') {
+        assert.equal(message.textContent, 'alpha is up. The screen opens when its desktop is ready.');
+      } else if (kind === 'terminal' && state === 'network_up') {
+        assert.equal(message.textContent, 'alpha is on the network. The terminal opens when SSH is up.');
+      } else {
+        assert.equal(message.textContent, `Connecting to the ${kind}…`);
+        if (kind === 'screen') h.rfbs.at(-1).dispatchEvent(new Event('connect'));
+        else h.sockets.at(-1).open();
+        assert.equal(card.hidden, true);
+        continue;
+      }
+      assert.equal(card.hidden, false);
+      assert.ok(h.sockets.every((socket) => socket.readyState === 3));
+    }
+    dispose();
+  }
+});
+
+test('terminal focuses once on request and never on a later status change or reconnect', async () => {
+  for (const focus of [false, true]) {
+    const h = fixture();
+    h.publish({ state: 'ssh_up', terminal: true });
+    const dispose = terminal(h.root, h.services, { ...h.terminalOptions, focus });
+    await settle();
+    assert.equal(h.terminals[0].focuses, undefined);
+    h.sockets[0].open();
+    assert.equal(h.terminals[0].focuses || 0, Number(focus));
+    h.publish({ state: 'desktop_up', terminal: true });
+    assert.equal(h.terminals[0].focuses || 0, Number(focus));
+    h.sockets[0].close();
+    h.root.querySelector('button').click();
+    await settle();
+    h.sockets[1].open();
+    assert.equal(h.terminals[1].focuses, undefined);
+    h.publish({ state: 'stopped', terminal: false });
+    h.publish({ state: 'ssh_up', terminal: true });
+    await settle();
+    h.sockets[2].open();
+    assert.equal(h.terminals[2].focuses, undefined);
+    dispose();
+  }
+  const h = fixture();
+  const dispose = terminal(h.root, h.services, { ...h.terminalOptions, focus: true });
+  await settle();
+  h.publish({ state: 'ssh_up', terminal: true });
+  await settle();
+  h.sockets[0].open();
+  assert.equal(h.terminals[0].focuses, undefined);
+  dispose();
+});
 
 test('screen stays unavailable while booting, watches by default and follows the live lease', async () => {
   const h = fixture(), ownership = [];
@@ -254,7 +321,7 @@ test('missing libraries fail inside their own panel with the asset command', asy
     const dispose = mount(h.root, h.services, { host: 'alpha', load: async () => { throw new Error(library); } });
     await settle();
     assert.ok(h.root.textContent.includes(`${library} is not in this build.`));
-    assert.match(h.root.textContent, /cargo xtask demo assets/);
+    assert.match(h.root.textContent, /cargo xtask demo libraries/);
     assert.equal(h.sockets.length, 0);
     dispose();
   }

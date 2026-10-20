@@ -105,7 +105,7 @@ pub(super) fn licenses() -> String {
     if VENDOR.is_empty() {
         html.push_str(concat!(
             "<p>No browser libraries in this build. ",
-            "Run <code>cargo xtask demo assets</code>, then rebuild.</p>",
+            "Run <code>cargo xtask demo libraries</code>, then rebuild.</p>",
         ));
     }
     html.push_str("<p><a href=\"/\">Back to the demo</a></p></main></body></html>");

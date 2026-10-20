@@ -25,7 +25,7 @@
 //! `text`, `number`, `bytes`, `time` or `status`. An action is `{label,command}`.
 //! Values and labels are rendered as text. Browser modules live in `dashboard/`.
 //! Pinned libraries are embedded at `/vendor/<name>/<path>` after running
-//! `cargo xtask demo assets`. `/vendor/licenses` lists their versions and licenses.
+//! `cargo xtask demo libraries`. `/vendor/licenses` lists their versions and licenses.
 //! The page response uses a fresh nonce for its inline import map.
 //!
 //! # Observation

@@ -151,7 +151,9 @@ export function mount(root, services, options) {
     if (!available) {
       stop();
       const state = snapshot.value?.state;
-      if (!missing) show(state === 'stopped' ? `${options.host} has stopped.` : `${options.host} is booting. The screen opens when its desktop is up.`);
+      if (!missing) show(state === 'stopped' ? `${options.host} has stopped.`
+        : state === 'network_up' || state === 'ssh_up' ? `${options.host} is up. The screen opens when its desktop is ready.`
+        : `${options.host} is booting. The screen opens when its desktop is up.`);
     } else if (!wasAvailable) void connect();
   }, (error) => {
     available = false;
@@ -166,7 +168,7 @@ export function mount(root, services, options) {
   }).catch(() => {
     if (disposed) return;
     missing = true;
-    show('noVNC is not in this build. Run `cargo xtask demo assets`, then rebuild.');
+    show('noVNC is not in this build. Run `cargo xtask demo libraries`, then rebuild.');
   });
   return () => {
     if (disposed) return;

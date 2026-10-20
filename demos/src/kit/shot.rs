@@ -1,41 +1,59 @@
-//! A screenshot of the noVNC viewer, taken with the host's headless Chromium.
-//!
-//! Chromium is driven over the DevTools pipe (it reads commands on fd 3 and
-//! writes replies on fd 4, each a JSON object followed by a NUL), the same
-//! transport Puppeteer uses. We open the viewer page, wait a fixed time for it
-//! to connect to the guest's VNC over the world and paint the first frame,
-//! then capture. A live WebSocket keeps a `--virtual-time-budget` screenshot
-//! from ever firing, so the pipe's explicit wait is what makes this reliable.
+//! Chromium screenshots after an explicit page readiness condition.
 
+use serde_json::{Value, json};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// How long to let the page connect and paint before the shot.
-const PAINT: Duration = Duration::from_secs(8);
-/// How long to wait for any one DevTools reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long Chromium may take to close before it is killed.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Screenshots `url` to `out` with Chromium. Best effort: a missing or failing
-/// Chromium returns `None` and never blocks the caller for long.
-pub fn capture(url: &str, out: &Path) -> Option<String> {
-    let chromium = std::env::var_os("CHROMIUM_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/usr/bin/chromium"));
-    let _ = std::fs::remove_file(out);
+/// A grid sample of a visible canvas must contain at least sixteen colors.
+/// The expression must evaluate to a canvas element, or null while loading.
+pub fn canvas_painted(canvas: &str) -> String {
+    format!(
+        r#"(() => {{
+        const canvas = ({canvas});
+        if (!canvas || !canvas.width || !canvas.height || !canvas.getClientRects().length) return false;
+        const context = canvas.getContext('2d');
+        if (!context) return false;
+        const colors = new Set();
+        for (let y = 0; y < 32; y++) for (let x = 0; x < 32; x++) {{
+            const p = context.getImageData(Math.floor(x * canvas.width / 32), Math.floor(y * canvas.height / 32), 1, 1).data;
+            colors.add(Array.from(p).join(','));
+        }}
+        return colors.size >= 16;
+    }})()"#
+    )
+}
 
-    let profile_dir = super::util::RunDir::new(&std::env::temp_dir(), "chrome").ok()?;
+/// The named host's workspace screen is visible, its status card is hidden,
+/// and its noVNC canvas contains at least sixteen colors.
+pub fn desktop_painted(host: &str) -> String {
+    let host = json!(host);
+    canvas_painted(&format!(
+        r#"(() => {{
+        const tile = [...document.querySelectorAll('.workspace-tile')].find(t => t.getAttribute('aria-label') === {host});
+        return tile?.querySelector('.console-card')?.hidden ? tile.querySelector('.screen-display canvas') : null;
+    }})()"#
+    ))
+}
+
+/// Captures a 1440 by 900 viewport after condition evaluates to true.
+/// The timeout bounds navigation and readiness. Errors include the condition,
+/// Chromium's stderr tail, and collected JavaScript exceptions.
+pub fn capture(url: &str, out: &Path, condition: &str, timeout: Duration) -> io::Result<String> {
+    let chromium = std::env::var_os("CHROMIUM").unwrap_or_else(|| "chromium".into());
+    let profile_dir = super::util::RunDir::new(&std::env::temp_dir(), "chrome")?;
     let profile = profile_dir.path();
     let stderr_log = profile.join("chromium.stderr");
-    let stderr = std::fs::File::create(&stderr_log).ok();
-
+    let stderr = std::fs::File::create(&stderr_log)?;
     // Pipe pair: Chromium reads our commands on fd 3, writes replies on fd 4.
-    let (to_read, to_write) = pipe()?;
-    let (from_read, from_write) = pipe()?;
+    let (to_read, to_write) = pipe().ok_or_else(std::io::Error::last_os_error)?;
+    let (from_read, from_write) = pipe().ok_or_else(std::io::Error::last_os_error)?;
     let child_cmd_fd = to_read.as_raw_fd();
     let child_reply_fd = from_write.as_raw_fd();
 
@@ -59,17 +77,14 @@ pub fn capture(url: &str, out: &Path) -> Option<String> {
             "--password-store=basic",
             "--use-mock-keychain",
             "--hide-scrollbars",
-            "--window-size=1280,900",
+            "--window-size=1440,900",
             "--remote-debugging-pipe",
             "about:blank",
         ])
         .arg(format!("--user-data-dir={}", profile.display()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(match &stderr {
-            Some(file) => Stdio::from(file.try_clone().ok()?),
-            None => Stdio::null(),
-        });
+        .stderr(stderr);
     // SAFETY: dup2 and close are async-signal-safe; the fds are plain i32s
     // copied into the closure before the fork.
     unsafe {
@@ -80,185 +95,191 @@ pub fn capture(url: &str, out: &Path) -> Option<String> {
             Ok(())
         });
     }
-    let mut child = command.spawn().ok()?;
+    let mut child = command.spawn()?;
     // The child's ends belong to the child now.
     drop(to_read);
     drop(from_write);
 
+    let mut reader = Reader::new(from_read.as_raw_fd());
     let result = (|| {
-        let mut reader = Reader::new(from_read.as_raw_fd());
         let target = reader.call(
             &to_write,
-            1,
+            None,
             "Target.createTarget",
-            &format!("\"url\":{}", json_str(url)),
+            json!({"url":"about:blank"}),
         )?;
-        let target_id = field(&target, "targetId")?;
+        let target_id = string_field(&target, "targetId")?;
         let attach = reader.call(
             &to_write,
-            2,
+            None,
             "Target.attachToTarget",
-            &format!("\"targetId\":{},\"flatten\":true", json_str(&target_id)),
+            json!({"targetId":target_id,"flatten":true}),
         )?;
-        let session = field(&attach, "sessionId")?;
-        // Bring the target to the foreground, or headless composits no frame
-        // for it and the screenshot never returns.
+        let session = string_field(&attach, "sessionId")?;
         reader.call(
             &to_write,
-            3,
+            None,
             "Target.activateTarget",
-            &format!("\"targetId\":{}", json_str(&target_id)),
+            json!({"targetId":target_id}),
         )?;
-        // Force a viewport so the renderer lays out and composits a frame.
-        reader.call_in_session(
+        reader.call(
             &to_write,
-            4,
-            &session,
+            Some(&session),
             "Emulation.setDeviceMetricsOverride",
-            "\"width\":1280,\"height\":900,\"deviceScaleFactor\":1,\"mobile\":false",
+            json!({"width":1440,"height":900,"deviceScaleFactor":1,"mobile":false}),
         )?;
-        // Let the page connect to the guest's VNC and paint.
-        std::thread::sleep(PAINT);
-        let shot = reader.call_in_session(
+        reader.call(&to_write, Some(&session), "Runtime.enable", json!({}))?;
+        reader.deadline = Some(Instant::now() + timeout);
+        reader.call(
             &to_write,
-            5,
-            &session,
-            "Page.captureScreenshot",
-            "\"format\":\"png\"",
+            Some(&session),
+            "Page.navigate",
+            json!({"url":url}),
         )?;
-        let data = field(&shot, "data")?;
-        let bytes = crate::kit::b64_decode(&data)?;
-        if bytes.len() < 8 || &bytes[1..4] != b"PNG" {
-            return None;
+        loop {
+            let value = reader.call(
+                &to_write,
+                Some(&session),
+                "Runtime.evaluate",
+                json!({"expression":condition,"returnByValue":true}),
+            )?;
+            if let Some(exception) = value.get("exceptionDetails") {
+                reader.exception(exception);
+            }
+            if value.pointer("/result/value") == Some(&Value::Bool(true)) {
+                break;
+            }
+            let left = reader
+                .deadline
+                .unwrap()
+                .saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "page readiness timed out",
+                ));
+            }
+            std::thread::sleep(left.min(Duration::from_millis(100)));
         }
-        std::fs::write(out, &bytes).ok()?;
-        Some(out.display().to_string())
+        reader.deadline = None;
+        let shot = reader.call(
+            &to_write,
+            Some(&session),
+            "Page.captureScreenshot",
+            json!({"format":"png"}),
+        )?;
+        let data = string_field(&shot, "data")?;
+        let bytes = crate::kit::b64_decode(&data)
+            .ok_or_else(|| io::Error::other("invalid screenshot base64"))?;
+        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(io::Error::other("Chromium returned no PNG"));
+        }
+        std::fs::write(out, &bytes)?;
+        Ok(out.display().to_string())
     })();
-
-    // Close the browser over the pipe, so it stops its helper processes and
-    // they write nothing to the profile after it is removed. Killing only
-    // the browser leaves its network service writing there as it exits.
-    let _ = write_all(&to_write, b"{\"id\":6,\"method\":\"Browser.close\"}");
+    // Closing over CDP lets Chromium reap its helpers before removing the profile.
+    let _ = write_all(&to_write, b"{\"id\":0,\"method\":\"Browser.close\"}");
     let closing = Instant::now() + CLOSE_TIMEOUT;
     while matches!(child.try_wait(), Ok(None)) && Instant::now() < closing {
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = child.kill();
     let _ = child.wait();
-    if result.is_none()
-        && let Ok(log) = std::fs::read_to_string(&stderr_log)
-    {
-        let tail: Vec<&str> = log.lines().rev().take(8).collect();
-        if !tail.is_empty() {
-            eprintln!(
-                "noVNC screenshot: Chromium said: {}",
-                tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
-            );
-        }
-    }
-    result
+    result.map_err(|error| {
+        let log = std::fs::read_to_string(stderr_log).unwrap_or_default();
+        let lines: Vec<_> = log.lines().rev().take(12).collect();
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; condition: {condition}; page exceptions: {}; Chromium stderr tail: {}",
+                reader.exceptions.join(" | "),
+                lines.into_iter().rev().collect::<Vec<_>>().join(" | ")
+            ),
+        )
+    })
 }
 
-/// Reads NUL-delimited DevTools replies from fd 4, matching each to its id.
 struct Reader {
     fd: RawFd,
     buf: Vec<u8>,
+    id: u64,
+    deadline: Option<Instant>,
+    exceptions: Vec<String>,
 }
-
 impl Reader {
-    fn new(fd: RawFd) -> Reader {
-        Reader {
+    fn new(fd: RawFd) -> Self {
+        Self {
             fd,
             buf: Vec::new(),
+            id: 0,
+            deadline: None,
+            exceptions: Vec::new(),
         }
     }
-
-    /// Sends a command (no session) and returns its `result` object as JSON.
-    fn call(&mut self, write: &OwnedFd, id: u64, method: &str, params: &str) -> Option<String> {
-        let msg = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{{{params}}}}}");
-        write_all(write, msg.as_bytes())?;
-        self.await_id(id)
+    fn exception(&mut self, value: &Value) {
+        if self.exceptions.len() == 16 {
+            self.exceptions.remove(0);
+        }
+        self.exceptions.push(value.to_string());
     }
-
-    /// Sends a command on a flattened session and returns its `result`.
-    fn call_in_session(
+    fn call(
         &mut self,
         write: &OwnedFd,
-        id: u64,
-        session: &str,
+        session: Option<&str>,
         method: &str,
-        params: &str,
-    ) -> Option<String> {
-        let msg = format!(
-            "{{\"id\":{id},\"sessionId\":{},\"method\":\"{method}\",\"params\":{{{params}}}}}",
-            json_str(session)
-        );
-        write_all(write, msg.as_bytes())?;
-        self.await_id(id)
-    }
-
-    /// Reads messages until the one with `id`, returning its `result` object.
-    fn await_id(&mut self, id: u64) -> Option<String> {
-        let deadline = Instant::now() + REPLY_TIMEOUT;
+        params: Value,
+    ) -> io::Result<Value> {
+        self.id += 1;
+        let mut message = json!({"id":self.id,"method":method,"params":params});
+        if let Some(session) = session {
+            message["sessionId"] = json!(session);
+        }
+        write_all(write, message.to_string().as_bytes()).ok_or_else(io::Error::last_os_error)?;
+        let deadline = self
+            .deadline
+            .unwrap_or_else(|| Instant::now() + REPLY_TIMEOUT);
         loop {
-            while let Some(message) = self.next_message() {
-                // Skip anything that is not valid JSON or not our reply; the
-                // one reply we want carries the matching id and a result.
-                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&message) else {
-                    continue;
-                };
-                if value.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                    return value.get("result").map(|result| result.to_string());
+            while let Some(end) = self.buf.iter().position(|&b| b == 0) {
+                let message: Vec<_> = self.buf.drain(..=end).take(end).collect();
+                let value: Value = serde_json::from_slice(&message)?;
+                if value["method"] == "Runtime.exceptionThrown" {
+                    self.exception(&value["params"]);
+                }
+                if value["id"].as_u64() == Some(self.id) {
+                    return value
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| io::Error::other(format!("{method}: {}", value["error"])));
                 }
             }
-            if Instant::now() >= deadline || !self.fill(deadline)? {
-                return None;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || !wait_readable(self.fd, left) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for {method}"),
+                ));
             }
-        }
-    }
-
-    /// Takes the next complete message (up to a NUL) from the buffer.
-    fn next_message(&mut self) -> Option<Vec<u8>> {
-        let end = self.buf.iter().position(|&b| b == 0)?;
-        let message: Vec<u8> = self.buf.drain(..=end).take(end).collect();
-        Some(message)
-    }
-
-    /// Waits for and reads one chunk; returns false on timeout or EOF.
-    fn fill(&mut self, deadline: Instant) -> Option<bool> {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() || !wait_readable(self.fd, left) {
-            return Some(false);
-        }
-        let mut chunk = [0u8; 16 << 10];
-        // SAFETY: reading up to `len` bytes into a valid, owned buffer.
-        let n = unsafe {
-            libc::read(
-                self.fd,
-                chunk.as_mut_ptr() as *mut libc::c_void,
-                chunk.len(),
-            )
-        };
-        match n {
-            0 => Some(false),
-            n if n > 0 => {
-                self.buf.extend_from_slice(&chunk[..n as usize]);
-                Some(true)
+            let mut chunk = [0u8; 16 << 10];
+            // SAFETY: reading into a valid owned buffer from the DevTools pipe.
+            let n = unsafe { libc::read(self.fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
             }
-            _ => None,
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Chromium closed the DevTools pipe",
+                ));
+            }
+            self.buf.extend_from_slice(&chunk[..n as usize]);
         }
     }
 }
-
-/// Extracts a string field from a JSON object rendered as text.
-fn field(object: &str, name: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(object).ok()?;
-    value.get(name)?.as_str().map(str::to_owned)
-}
-
-/// Quotes a string as a JSON string literal.
-fn json_str(s: &str) -> String {
-    serde_json::Value::String(s.to_owned()).to_string()
+fn string_field(value: &Value, name: &str) -> io::Result<String> {
+    value[name]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other(format!("CDP reply has no {name}: {value}")))
 }
 
 /// A close-on-exec pipe, as (read, write).
@@ -304,4 +325,77 @@ fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
     let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
     // SAFETY: a single valid pollfd.
     unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn waits_for_canvas_paint_and_reports_a_condition_timeout() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/#token=test", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(stream.read_u8().await.unwrap());
+                    }
+                    let body = r#"<canvas width="64" height="64"></canvas><script>
+                        window.painted = false;
+                        setTimeout(() => {
+                            const c = document.querySelector('canvas').getContext('2d');
+                            for (let y=0;y<64;y++) for (let x=0;x<64;x++) {
+                                c.fillStyle = `rgb(${x*4},${y*4},${x^y})`; c.fillRect(x,y,1,1);
+                            }
+                            window.painted = true;
+                        }, 500);
+                        setTimeout(() => { throw new Error('page diagnostic'); }, 50);
+                    </script>"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let result = tokio::task::spawn_blocking(move || {
+            let dir = crate::kit::util::RunDir::new(&std::env::temp_dir(), "shot").unwrap();
+            let out = dir.path().join("canvas.png");
+            let condition = format!(
+                "window.painted && ({})",
+                canvas_painted("document.querySelector('canvas')")
+            );
+            capture(&url, &out, &condition, Duration::from_secs(10)).unwrap();
+            assert!(
+                std::fs::read(&out)
+                    .unwrap()
+                    .starts_with(b"\x89PNG\r\n\x1a\n")
+            );
+            let error = capture(
+                &url,
+                &out,
+                "window.neverReady === true",
+                Duration::from_secs(2),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            for text in [
+                "window.neverReady === true",
+                "Chromium stderr tail",
+                "page diagnostic",
+            ] {
+                assert!(error.to_string().contains(text), "{error}");
+            }
+        })
+        .await;
+        server.abort();
+        result.unwrap();
+    }
 }

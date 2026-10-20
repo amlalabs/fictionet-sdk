@@ -8,7 +8,9 @@ $ cargo xtask demo <name>
 
 `cargo xtask demo` lists in-process binaries and the scripts in `demos/guest/`.
 `cargo xtask demo assets` downloads the pinned Ubuntu image, kernel, initrd,
-Cloud Hypervisor and noVNC into `downloads/cloudimage/` without booting.
+and Cloud Hypervisor into `downloads/cloudimage/`, plus the browser libraries,
+without booting. `cargo xtask demo libraries` downloads only the pinned browser
+libraries into `observe/downloads/vendor/` at the repository root.
 
 ## Desktop
 

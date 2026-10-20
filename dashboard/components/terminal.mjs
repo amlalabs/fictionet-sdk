@@ -22,6 +22,7 @@ export function mount(root, services, options) {
   root.classList.add('console-panel');
   root.append(css, stage);
   let disposed = false, available = false, missing = false, constructors, active, generation = 0;
+  let focus = options.focus;
   const ResizeObserver = options.ResizeObserver || globalThis.ResizeObserver;
   const theme = () => {
     const style = (options.getComputedStyle || globalThis.getComputedStyle)(display);
@@ -44,6 +45,7 @@ export function mount(root, services, options) {
     display.replaceChildren();
   }
   function disconnected(reason) {
+    focus = false;
     stop();
     if (disposed || !available) return;
     show(reason ? `Disconnected: ${reason}.` : 'Disconnected.', true);
@@ -70,7 +72,11 @@ export function mount(root, services, options) {
         fit.fit();
         send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }));
       };
-      const opened = () => { card.hidden = true; resize(); };
+      const opened = () => {
+        card.hidden = true;
+        resize();
+        if (focus) { focus = false; terminal.focus(); }
+      };
       const received = (event) => {
         if (active !== entry || !(event.data instanceof ArrayBuffer)) return;
         const bytes = new Uint8Array(event.data);
@@ -104,11 +110,15 @@ export function mount(root, services, options) {
     const wasAvailable = available;
     available = Boolean(snapshot.value?.terminal);
     if (!available) {
+      focus = false;
       stop();
       const state = snapshot.value?.state;
-      if (!missing) show(state === 'stopped' ? `${options.host} has stopped.` : `${options.host} is booting. The terminal opens when SSH is up.`);
+      if (!missing) show(state === 'stopped' ? `${options.host} has stopped.`
+        : state === 'network_up' ? `${options.host} is on the network. The terminal opens when SSH is up.`
+        : `${options.host} is booting. The terminal opens when SSH is up.`);
     } else if (!wasAvailable) void connect();
   }, (error) => {
+    focus = false;
     available = false;
     stop();
     show(`Terminal status unavailable: ${error.message}. Reload the demo to retry.`);
@@ -124,7 +134,7 @@ export function mount(root, services, options) {
   }).catch((error) => {
     if (disposed) return;
     missing = true;
-    show(`${error.message} is not in this build. Run \`cargo xtask demo assets\`, then rebuild.`);
+    show(`${error.message} is not in this build. Run \`cargo xtask demo libraries\`, then rebuild.`);
   });
   return () => {
     if (disposed) return;
