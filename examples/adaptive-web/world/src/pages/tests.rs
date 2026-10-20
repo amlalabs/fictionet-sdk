@@ -81,21 +81,7 @@ fn on_disk(
 
 /// The result links and titles of a Google results page.
 fn results(body: &[u8]) -> Vec<(String, String)> {
-    let page = std::str::from_utf8(body).unwrap();
-    page.split(r#"<div class="yuRUbf"><a href=""#)
-        .skip(1)
-        .map(|chunk| {
-            let url = text::unescape(chunk.split('"').next().unwrap());
-            let title = chunk
-                .split("<h3>")
-                .nth(1)
-                .unwrap()
-                .split("</h3>")
-                .next()
-                .unwrap();
-            (url, text::unescape(title))
-        })
-        .collect()
+    render::google_results(std::str::from_utf8(body).unwrap())
 }
 
 async fn get(pages: &Arc<Pages>, cx: &Cx, url: &str) -> Response {

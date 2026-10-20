@@ -2,7 +2,7 @@
 
 use super::{
     make::{Page, Profile, Search},
-    text::{escape as e, normalize_space, quote, quote_plus, split_url},
+    text::{escape as e, normalize_space, quote, quote_plus, split_url, unescape},
 };
 use crate::route::Engine;
 
@@ -130,6 +130,17 @@ pub fn google(query: &str, record: &Search, start: u64) -> String {
     out.push(format!(r#"</div><div id="foot"><table><tr><td><a href="/search?q={qp}&amp;start={nxt}">Next</a></td></tr></table></div></div>
 <footer><span>United Kingdom</span> · <a href="https://support.google.com/websearch">Help</a> · <a href="https://www.google.com/tools/feedback">Send feedback</a> · <a href="https://policies.google.com/privacy">Privacy</a> · <a href="https://policies.google.com/terms">Terms</a></footer></body></html>"#));
     out.join("\n")
+}
+/// The links and titles of the results a [`google`] page lists, unescaped.
+pub fn google_results(page: &str) -> Vec<(String, String)> {
+    page.split(r#"<div class="yuRUbf"><a href=""#)
+        .skip(1)
+        .filter_map(|chunk| {
+            let (url, rest) = chunk.split_once('"')?;
+            let title = rest.split_once("<h3>")?.1.split_once("</h3>")?.0;
+            Some((unescape(url), unescape(title)))
+        })
+        .collect()
 }
 /// Returns the Google search form.
 pub fn google_home() -> &'static str {

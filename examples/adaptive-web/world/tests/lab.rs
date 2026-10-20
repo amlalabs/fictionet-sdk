@@ -2,7 +2,7 @@
 //! or files.
 use adaptive_web_world::{
     Addresses, Ca,
-    pages::{Pages, Seed, text::target_of},
+    pages::{Pages, Seed, render::google_results, text::target_of},
     search::Searches,
     serve,
 };
@@ -105,16 +105,9 @@ fn run(exhaust: bool) -> (Vec<Value>, adaptive_web_world::search::Snapshot) {
                 assert_eq!(body, b"Generation budget exhausted");
             } else {
                 assert_eq!(status, 200);
-                let html = std::str::from_utf8(&body).unwrap();
-                let urls: Vec<_> = html
-                    .split(r#"<div class="yuRUbf"><a href=""#)
-                    .skip(1)
-                    .map(|p| {
-                        adaptive_web_world::pages::text::unescape(p.split('"').next().unwrap())
-                    })
-                    .collect();
-                assert_eq!(urls.len(), 10);
-                for url in urls {
+                let results = google_results(std::str::from_utf8(&body).unwrap());
+                assert_eq!(results.len(), 10);
+                for (url, _) in results {
                     let (host, target) = target_of(&url);
                     let (status, first) = fetch(&cx, &m, &host, &target, start).await;
                     assert_eq!(status, 200);

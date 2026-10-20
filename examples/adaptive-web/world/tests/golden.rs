@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use adaptive_web_world::pages::render::google_results;
+use adaptive_web_world::pages::text::escape;
 use adaptive_web_world::pages::{Generator, Pages, Seed, store::Store};
 use adaptive_web_world::{Addresses, Ca, serve, world_start};
 use bytes::Bytes;
@@ -93,25 +95,6 @@ async fn fetch(fcx: &Cx, m: &Machine, host: &str, path: &str) -> (u16, Bytes) {
         .await
         .unwrap();
     get(fcx, stream, host, path).await
-}
-
-/// The result links and titles of a Google results page.
-fn results(page: &str) -> Vec<(String, String)> {
-    page.split(r#"<div class="yuRUbf"><a href=""#)
-        .skip(1)
-        .map(|chunk| {
-            let url = chunk.split('"').next().unwrap().replace("&amp;", "&");
-            let title = chunk
-                .split("<h3>")
-                .nth(1)
-                .unwrap()
-                .split("</h3>")
-                .next()
-                .unwrap()
-                .to_owned();
-            (url, title)
-        })
-        .collect()
 }
 
 fn split_url(url: &str) -> (String, String) {
@@ -207,7 +190,7 @@ fn the_log_is_the_recorded_one() {
                 )
                 .await;
                 assert_eq!(status, 200);
-                let found = results(std::str::from_utf8(&page).unwrap());
+                let found = google_results(std::str::from_utf8(&page).unwrap());
                 assert_eq!(found.len(), 10, "ten results");
                 // Responses are dated on the seed's day.
                 let addr = lookup(&fcx, &m, "www.google.com").await.unwrap();
@@ -269,7 +252,7 @@ fn the_log_is_the_recorded_one() {
                     assert_eq!(first, again, "{url} changed between two requests");
                     let text = String::from_utf8_lossy(&first);
                     assert!(
-                        text.contains(&format!("<title>{title}</title>")),
+                        text.contains(&format!("<title>{}</title>", escape(title))),
                         "{url} is not titled {title:?}"
                     );
                 }
@@ -282,7 +265,7 @@ fn the_log_is_the_recorded_one() {
                 )
                 .await;
                 assert_eq!(status, 200);
-                assert!(String::from_utf8_lossy(&ddg).contains(&found[1].1));
+                assert!(String::from_utf8_lossy(&ddg).contains(&escape(&found[1].1)));
                 // A name nothing pointed at.
                 let (status, _) = fetch(&fcx, &m, "totally-new-site.io", "/pricing").await;
                 assert_eq!(status, 200);
@@ -312,14 +295,7 @@ fn the_log_is_the_recorded_one() {
                 for (rank, listed) in snapshot.results[0].listed.iter().enumerate() {
                     assert_eq!(listed.rank, rank as u64 + 1);
                     assert_eq!(listed.url, found[rank].0);
-                    let rendered = listed
-                        .title
-                        .replace('&', "&amp;")
-                        .replace('<', "&lt;")
-                        .replace('>', "&gt;")
-                        .replace('"', "&quot;")
-                        .replace('\'', "&#x27;");
-                    assert_eq!(rendered, found[rank].1);
+                    assert_eq!(listed.title, found[rank].1);
                 }
                 assert_eq!(
                     snapshot
