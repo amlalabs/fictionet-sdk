@@ -62,13 +62,15 @@ impl Call {
             }),
             secret: site.credential.real.clone(),
         };
-        call.transcript(
-            "request",
-            site.credential
-                .real
-                .redact(&String::from_utf8_lossy(request))
-                .as_bytes(),
-        );
+        if call.cx.event_enabled("model", "body") {
+            call.transcript(
+                "request",
+                site.credential
+                    .real
+                    .redact(&String::from_utf8_lossy(request))
+                    .as_bytes(),
+            );
+        }
         call
     }
     fn transcript(&self, direction: &str, data: &[u8]) {

@@ -276,9 +276,12 @@ pub(super) async fn serve(
         let (tx, rx) = mpsc::channel(8);
         output.sender = Some(tx.clone());
         let cx = model.cx.clone();
-        cx.spawn(move |_| async move {
+        cx.spawn(move |cx| async move {
             if let Err(error) = run(model, engine, parts, body, tools, response, &mut output).await
             {
+                cx.emit("model", "splice_error", |e| {
+                    e.field("message", error.to_string())
+                });
                 let _ = tx.send(Err(error)).await;
             }
             Ok(())
@@ -354,7 +357,6 @@ async fn read(
     let mut decoder = Stream::new(sse::Events::new());
     let mut body = response.into_body();
     let mut inputs: std::collections::HashMap<usize, String> = Default::default();
-    let mut stopped = false;
     while let Some(frame) = body.frame().await {
         let frame = frame?;
         let Some(bytes) = frame.data_ref() else {
@@ -388,10 +390,7 @@ async fn read(
                     turn.stop = event["delta"]["stop_reason"].clone();
                     continue;
                 }
-                "message_stop" => {
-                    stopped = true;
-                    continue;
-                }
+                "message_stop" => return Ok(turn),
                 "content_block_start" => {
                     if index != turn.content.len() {
                         return Err(Error::msg("Invalid model block index"));
@@ -462,10 +461,7 @@ async fn read(
             output.event(event).await?;
         }
     }
-    if !stopped {
-        return Err(Error::msg("Model stream ended before message_stop"));
-    }
-    Ok(turn)
+    Err(Error::msg("Model stream ended before message_stop"))
 }
 fn visible(
     mut block: Value,

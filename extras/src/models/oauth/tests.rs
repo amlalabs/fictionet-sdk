@@ -79,6 +79,18 @@ fn both_logins_refresh_once_and_persist_rotated_tokens() {
             let files = authority.guest_files()?;
             assert!(!files[0].1.contains("rotated-access"));
             assert!(!files[0].1.contains("rotated-refresh"));
+            if login == Login::Codex {
+                let file: Value = serde_json::from_str(&files[0].1)?;
+                for field in ["access_token", "id_token"] {
+                    let token = file["tokens"][field].as_str().unwrap();
+                    let parts: Vec<_> = token.split('.').collect();
+                    assert_eq!(parts.len(), 3);
+                    assert_eq!(parts[2].len(), 342);
+                    let claims = parts[1].replace('-', "+").replace('_', "/");
+                    let claims = fictionet::stdlib::codec::base64::decode(claims.as_bytes(), fictionet::stdlib::codec::base64::Padding::Optional).unwrap();
+                    assert_eq!(serde_json::from_slice::<Value>(&claims)?["exp"], stored.row(login)?.tokens()?.expires_at);
+                }
+            }
             let refresh = authority.placeholders.lock().unwrap().refresh.clone();
             let req = Request::post(login.path()).body(Body::from(json!({"grant_type":"refresh_token","client_id":login.client(),"refresh_token":refresh}).to_string()))?;
             let response = Service::call(&mut authority.clone(), req).await?;
@@ -138,14 +150,30 @@ fn stale_success_and_terminal_changes_cannot_replace_a_new_login() {
 
 #[test]
 fn rejected_refresh_preserves_tokens_and_requires_login_only_for_invalid_grant() {
-    for (status, body, terminal) in [
-        (400, r#"{"error":"invalid_grant"}"#, true),
-        (503, r#"{"error":"temporarily_unavailable"}"#, false),
-        (200, r#"{"access_token":"changed","expires_in":0}"#, false),
+    for (login, status, body, terminal) in [
+        (Login::Claude, 400, r#"{"error":"invalid_grant"}"#, true),
+        (
+            Login::Claude,
+            503,
+            r#"{"error":"temporarily_unavailable"}"#,
+            false,
+        ),
+        (
+            Login::Claude,
+            200,
+            r#"{"access_token":"changed","expires_in":0}"#,
+            false,
+        ),
+        (
+            Login::Codex,
+            401,
+            r#"{"error":{"code":"refresh_token_reused"}}"#,
+            true,
+        ),
     ] {
         let dir = directory();
         let store = Store::open(dir.join("credentials.redb")).unwrap();
-        store.put(Login::Claude, tokens(now() - 1)).unwrap();
+        store.put(login, tokens(now() - 1)).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -155,15 +183,15 @@ fn rejected_refresh_preserves_tokens_and_requires_login_only_for_invalid_grant()
         });
         let stored = store.clone();
         fictionet::block_on(fictionet::run(fictionet::RunOptions::new(fictionet::Seed::from_u64(4)), |cx| async move {
-            let authority = OAuth::at(&cx, Login::Claude, stored.clone(), format!("http://{address}").parse()?)?;
+            let authority = OAuth::at(&cx, login, stored.clone(), format!("http://{address}").parse()?)?;
             assert!(authority.ensure_fresh().await.is_err());
             assert!(authority.ensure_fresh().await.is_err());
-            let row = stored.row(Login::Claude)?;
+            let row = stored.row(login)?;
             assert_eq!(row.needs_login, terminal);
             assert_eq!(row.tokens.unwrap()["refresh"], "host-refresh");
-            stored.put(Login::Claude, tokens(now() + 3600))?;
+            stored.put(login, tokens(now() + 3600))?;
             assert_eq!(authority.secret().await?.value, "sk-ant-oat01-host-access");
-            let response = Service::call(&mut authority.clone(), Request::post(Login::Claude.path()).body(Body::from(r#"{"grant_type":"refresh_token","client_id":"wrong","refresh_token":"host-refresh"}"#))?).await?;
+            let response = Service::call(&mut authority.clone(), Request::post(login.path()).body(Body::from(r#"{"grant_type":"refresh_token","client_id":"wrong","refresh_token":"host-refresh"}"#))?).await?;
             assert_eq!(response.status(), 400);
             cx.cancel();
             Ok(())

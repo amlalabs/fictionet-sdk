@@ -73,7 +73,8 @@ fn response(socket: &mut std::net::TcpStream, content: Vec<Value>, stop: &str, s
             events
                 .into_iter()
                 .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
-                .collect::<String>(),
+                .collect::<String>()
+                + "data: [DONE]\n\n",
         )
     } else {
         message["content"] = json!(content);

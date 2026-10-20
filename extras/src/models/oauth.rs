@@ -242,6 +242,7 @@ struct Placeholders {
     access: String,
     previous: Option<String>,
     refresh: String,
+    expires_at: u64,
 }
 /// A shared refresh authority and guest token endpoint.
 #[derive(Clone)]
@@ -291,6 +292,7 @@ impl OAuth {
             placeholders: Arc::new(Mutex::new(Placeholders {
                 access: placeholder(cx, login, &tokens),
                 previous: None,
+                expires_at: tokens.expires_at,
                 refresh: Credential::api_key(cx, tokens.refresh).placeholder,
             })),
         };
@@ -417,7 +419,18 @@ impl OAuth {
             .map_err(|_| Error::msg("OAuth token server could not be reached"))?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| Error::msg("Invalid OAuth token response"))?;
-        if value["error"] == "invalid_grant" {
+        if value["error"] == "invalid_grant"
+            || (self.login == Login::Codex
+                && (status == http::StatusCode::UNAUTHORIZED
+                    || matches!(
+                        value["error"]["code"].as_str(),
+                        Some(
+                            "refresh_token_expired"
+                                | "refresh_token_reused"
+                                | "refresh_token_invalidated"
+                        )
+                    )))
+        {
             self.store
                 .change(self.login, Some(row.revision), row.tokens, true)?;
             return Err(Error::msg("OAuth login must be renewed"));
@@ -464,7 +477,12 @@ impl OAuth {
     /// Placeholder-only credential files, relative to the guest user's home.
     pub fn guest_files(&self) -> fictionet::Result<Vec<(&'static str, String)>> {
         let tokens = self.store.row(self.login)?.tokens()?;
-        let placeholders = self.placeholders.lock().unwrap();
+        let mut placeholders = self.placeholders.lock().unwrap();
+        if self.login == Login::Codex && placeholders.expires_at != tokens.expires_at {
+            let next = placeholder(&self.cx, self.login, &tokens);
+            placeholders.previous = Some(std::mem::replace(&mut placeholders.access, next));
+            placeholders.expires_at = tokens.expires_at;
+        }
         let (path, value) = match self.login {
             Login::Claude => (
                 ".claude/.credentials.json",
@@ -475,7 +493,7 @@ impl OAuth {
             Login::Codex => (
                 ".codex/auth.json",
                 json!({"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{
-                "access_token":placeholders.access,"refresh_token":placeholders.refresh,"id_token":identity(&tokens),"account_id":tokens.account_id}}),
+                "access_token":placeholders.access,"refresh_token":placeholders.refresh,"id_token":identity(&self.cx, &tokens),"account_id":tokens.account_id}}),
             ),
         };
         Ok(vec![(path, value.to_string())])
@@ -512,10 +530,11 @@ impl OAuth {
         let mut placeholders = self.placeholders.lock().unwrap();
         let next = placeholder(&self.cx, self.login, &tokens);
         placeholders.previous = Some(std::mem::replace(&mut placeholders.access, next));
+        placeholders.expires_at = tokens.expires_at;
         let mut response = json!({"token_type":"Bearer","access_token":placeholders.access,"refresh_token":placeholders.refresh,
             "expires_in":tokens.expires_at.saturating_sub(now()),"scope":tokens.scopes.join(" ")});
         if self.login == Login::Codex {
-            response["id_token"] = json!(identity(&tokens));
+            response["id_token"] = json!(identity(&self.cx, &tokens));
         }
         Ok(Response::builder()
             .header("content-type", "application/json")
@@ -595,27 +614,34 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn jwt(value: Value) -> String {
+fn jwt(cx: &Cx, value: Value) -> String {
     let encode = |bytes: &[u8]| {
         fictionet::stdlib::codec::base64::encode(bytes)
             .trim_end_matches('=')
             .replace('+', "-")
             .replace('/', "_")
     };
+    let mut signature = [0; 256];
+    cx.fill_random(&mut signature);
     format!(
-        "{}.{}.c2ln",
+        "{}.{}.{}",
         encode(br#"{"alg":"RS256","typ":"JWT"}"#),
-        encode(value.to_string().as_bytes())
+        encode(value.to_string().as_bytes()),
+        encode(&signature)
     )
 }
-fn identity(tokens: &Tokens) -> String {
+fn identity(cx: &Cx, tokens: &Tokens) -> String {
     jwt(
+        cx,
         json!({"exp":tokens.expires_at,"https://api.openai.com/auth":{"chatgpt_account_id":tokens.account_id,"chatgpt_plan_type":tokens.plan}}),
     )
 }
 fn placeholder(cx: &Cx, login: Login, tokens: &Tokens) -> String {
     if login == Login::Codex {
-        jwt(json!({"exp":tokens.expires_at,"iat":now(),"jti":cx.random_u64()}))
+        jwt(
+            cx,
+            json!({"exp":tokens.expires_at,"iat":now(),"jti":format!("{:016x}", cx.random_u64())}),
+        )
     } else {
         Credential::api_key(cx, tokens.access.clone()).placeholder
     }

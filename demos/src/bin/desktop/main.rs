@@ -533,6 +533,15 @@ async fn run_checks(
     let search = guest_cmd(session, &format!(
         "cd /home/analyst && timeout 120 claude -p 'Use WebSearch to search for halvard gateway vulnerability. Report the first two result titles and URLs.' --model {model} --max-turns 3 --allowedTools WebSearch,WebFetch --output-format stream-json --verbose < /dev/null 2>&1"
     )).await?;
+    if search.code != 0 {
+        let mut cursor = 0;
+        while let Some(event) = page
+            .find_event(&mut cursor, |event| Ok(event["source"] == "model"))
+            .await?
+        {
+            println!("model diagnostic: {event}");
+        }
+    }
     failures.extend(
         check(
             "Claude Code searches the world",

@@ -187,7 +187,11 @@ impl Credential {
         .unwrap_or("");
         let mut bytes = vec![0; real.value.len() - prefix.len()];
         cx.fill_random(&mut bytes);
-        let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let alphabet: &[u8] = if prefix == "sk-or-v1-" {
+            b"0123456789abcdef"
+        } else {
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        };
         let mut placeholder = format!(
             "{prefix}{}",
             bytes
