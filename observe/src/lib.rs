@@ -1145,5 +1145,16 @@ impl Observer for Collector {
     }
 }
 
+/// Appends `b` in lowercase hex, two digits a byte: the crate's one hex
+/// encoder, for key logs and decoded packets.
+pub(crate) fn push_hex(out: &mut String, b: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(b.len() * 2);
+    for &x in b {
+        out.push(DIGITS[(x >> 4) as usize] as char);
+        out.push(DIGITS[(x & 15) as usize] as char);
+    }
+}
+
 #[cfg(test)]
 mod tests;

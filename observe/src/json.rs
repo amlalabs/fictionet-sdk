@@ -34,16 +34,6 @@ pub(crate) fn quote(s: &str) -> String {
     out
 }
 
-/// Appends `b` in lowercase hex, two digits a byte.
-pub(crate) fn push_hex(out: &mut String, b: &[u8]) {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    out.reserve(b.len() * 2);
-    for &x in b {
-        out.push(DIGITS[(x >> 4) as usize] as char);
-        out.push(DIGITS[(x & 15) as usize] as char);
-    }
-}
-
 /// An object written field by field.
 pub(crate) struct Object {
     out: String,

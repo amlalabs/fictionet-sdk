@@ -69,7 +69,7 @@ impl From<&crate::Key> for KeyLine {
 /// Renders bytes as lowercase hexadecimal, with two digits per byte.
 pub fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
-    json::push_hex(&mut s, b);
+    crate::push_hex(&mut s, b);
     s
 }
 
@@ -312,7 +312,7 @@ impl Decoded {
             out.push_str("{\"name\":");
             json::string(out, name);
             out.push_str(",\"hex\":\"");
-            json::push_hex(out, bytes);
+            crate::push_hex(out, bytes);
             out.push_str("\"}");
         }
         out.push(']');

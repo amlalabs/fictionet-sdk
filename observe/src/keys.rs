@@ -114,7 +114,7 @@ pub(crate) fn push_keylog_line(
     output.push_str(label);
     for bytes in [client_random, secret] {
         output.push(' ');
-        crate::json::push_hex(output, bytes);
+        crate::push_hex(output, bytes);
     }
     output.push('\n');
 }
