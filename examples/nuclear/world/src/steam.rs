@@ -50,3 +50,78 @@ pub fn saturation(pressure_mpa: f64) -> Saturation {
     }
     unreachable!("pressure is bounded by the table")
 }
+
+/// Saturation pressure in MPa, interpolated by temperature in C.
+pub fn saturation_pressure(t_c: f64) -> f64 {
+    let t = t_c.clamp(TABLE[0][1], TABLE[TABLE.len() - 1][1]);
+    for pair in TABLE.windows(2) {
+        let [a, b] = [pair[0], pair[1]];
+        if t <= b[1] {
+            return a[0] + (t - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+        }
+    }
+    unreachable!("temperature is bounded by the table")
+}
+
+/// Saturated temperature in C, pressure in kPa and vapor density in kg/m3.
+const ATMOSPHERE: [[f64; 3]; 9] = [
+    [40.0, 7.38, 0.0512],
+    [60.0, 19.95, 0.1302],
+    [80.0, 47.41, 0.2937],
+    [100.0, 101.42, 0.5982],
+    [120.0, 198.67, 1.1219],
+    [140.0, 361.53, 1.9665],
+    [160.0, 618.23, 3.2594],
+    [180.0, 1002.8, 5.1597],
+    [200.0, 1554.9, 7.8603],
+];
+/// Steam temperature in C and partial pressure in kPa at a density in kg/m3.
+pub fn atmosphere(steam_kg_m3: f64) -> (f64, f64) {
+    if steam_kg_m3 <= ATMOSPHERE[0][2] {
+        return (40.0, steam_kg_m3 * 144.5);
+    }
+    for pair in ATMOSPHERE.windows(2) {
+        let [a, b] = [pair[0], pair[1]];
+        if steam_kg_m3 <= b[2] {
+            let f = (steam_kg_m3 - a[2]) / (b[2] - a[2]);
+            return (a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1]));
+        }
+    }
+    (200.0, 1554.9)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inverse_saturation_rows_and_interpolation() {
+        for row in TABLE {
+            assert!((saturation_pressure(row[1]) - row[0]).abs() < 0.001);
+            assert!((saturation_pressure(saturation(row[0]).temperature_c) - row[0]).abs() < 0.001);
+        }
+        for pair in TABLE.windows(2) {
+            assert!(
+                (saturation_pressure((pair[0][1] + pair[1][1]) / 2.0)
+                    - (pair[0][0] + pair[1][0]) / 2.0)
+                    .abs()
+                    < 0.001
+            );
+        }
+        assert_eq!(saturation_pressure(0.0), 0.1);
+        assert_eq!(saturation_pressure(400.0), 18.0);
+    }
+
+    #[test]
+    fn atmosphere_rows_low_density_and_clamp() {
+        assert_eq!(atmosphere(0.5982), (100.0, 101.42));
+        assert_eq!(atmosphere(0.03), (40.0, 4.335));
+        assert_eq!(atmosphere(10.0), (200.0, 1554.9));
+        assert_eq!(atmosphere(0.0512), (40.0, 0.0512 * 144.5));
+        for row in &ATMOSPHERE[1..] {
+            let (t, p) = atmosphere(row[2]);
+            assert!((t - row[0]).abs() < 1e-10);
+            assert!((p - row[1]).abs() < 1e-10);
+        }
+    }
+}

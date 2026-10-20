@@ -2,14 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { ANNUNCIATOR_WINDOWS, windowState } from './board-layout.mjs';
-import {
-  POINTS,
-  findReading,
-  formatGap,
-  formatValue,
-  instruments,
-  isFrozen,
-} from './instruments.mjs';
+import { POINTS, findReading, formatGap, formatValue, instruments, isFrozen } from './instruments.mjs';
 
 // Sensor tags in the order the plant lists them, and the serde value of each.
 const SENSOR_ORDER = [
@@ -179,13 +172,7 @@ function trueValues(t) {
  * `readings` overrides a sensor's reading (value and fault), and `alarms` lights
  * alarms by tag. Every other reading agrees with its true value.
  */
-function snapshot({
-  edit = () => {},
-  readings = {},
-  alarms = {},
-  quiet = false,
-  revision = 4,
-} = {}) {
+function snapshot({ edit = () => {}, readings = {}, alarms = {}, quiet = false, revision = 4 } = {}) {
   const truth = baseTruth();
   edit(truth);
   const truths = trueValues(truth);
@@ -200,9 +187,7 @@ function snapshot({
       fault: override.fault ?? null,
     };
   });
-  const alarmSlots = ALARM_ORDER.map((tag) =>
-    alarms[tag] ? { alarm: serde(tag), state: alarms[tag] } : null,
-  );
+  const alarmSlots = ALARM_ORDER.map((tag) => (alarms[tag] ? { alarm: serde(tag), state: alarms[tag] } : null));
   const sensorFaults = SENSOR_ORDER.map((tag) => readings[tag]?.fault ?? null);
   return {
     at_ms: 250_000,
@@ -268,7 +253,7 @@ test('gate envelopes keep five percent margins except at physical limits', () =>
   const views = snapshots.map(instruments);
   for (const p of POINTS) {
     for (const field of ['trueValue', 'reported']) {
-      const values = views.map(view => pair(view, p.key)[field]);
+      const values = views.map((view) => pair(view, p.key)[field]);
       const minimum = Math.min(...values);
       const maximum = Math.max(...values);
       const margin = (p.range[1] - p.range[0]) * 0.05;
@@ -284,9 +269,7 @@ test('gate envelopes keep five percent margins except at physical limits', () =>
 
 test('a normal snapshot has no diverged pair and no frozen reading', () => {
   // Reported values differ from true by instrument noise only.
-  const noisy = Object.fromEntries(
-    SENSOR_ORDER.map((tag) => [tag, { value: trueValues(baseTruth())[tag] + 0.03 }]),
-  );
+  const noisy = Object.fromEntries(SENSOR_ORDER.map((tag) => [tag, { value: trueValues(baseTruth())[tag] + 0.03 }]));
   const result = instruments(snapshot({ readings: noisy }));
 
   assert.equal(result.pairs.length, POINTS.length);
@@ -326,9 +309,7 @@ test('a stuck hot leg B shows its gap from the true value and is diverged', () =
   for (const p of result.pairs) assert.equal(p.marked, p.key === 'hot_leg:b', `${p.key} mark`);
 
   assert.equal(pair(result, 'hot_leg:a').diverged, false);
-  assert.deepEqual(result.alarms, [
-    { key: 'subcooling_margin_low', label: 'Subcooling margin low', state: 'active' },
-  ]);
+  assert.deepEqual(result.alarms, [{ key: 'subcooling_margin_low', label: 'Subcooling margin low', state: 'active' }]);
   assert.equal(findReading(snap, { hot_leg: 'b' }).fault.stuck.value, 3250);
 });
 
@@ -394,14 +375,18 @@ test('a small negative gap prints without a minus sign', () => {
 
 test('reported pump alarms light their permanent windows without adding a process fault window', () => {
   const full = instruments(snapshot());
-  assert.ok(ANNUNCIATOR_WINDOWS.every(w => !windowState(full.alarms.find(a => a.key === w.key)?.state, 0).lit));
+  assert.ok(ANNUNCIATOR_WINDOWS.every((w) => !windowState(full.alarms.find((a) => a.key === w.key)?.state, 0).lit));
   const snap = snapshot({ alarms: { 'coolant_flow_low:b': 'active', coolant_pump_tripped: 'active' } });
   snap.faults.process[0] = { coolant_pump_trip: 'b' };
   snap.reported_status.coolant_pumps_running[1] = false;
   const view = instruments(snap);
-  const lit = at => ANNUNCIATOR_WINDOWS.filter(w => windowState(view.alarms.find(a => a.key === w.key)?.state, at).lit);
-  assert.deepEqual(lit(0).map(w => w.legend), ['Coolant flow low, loop B', 'Coolant pump tripped']);
-  assert.ok(lit(0).every(w => w.board === 'rcs-board'));
+  const lit = (at) =>
+    ANNUNCIATOR_WINDOWS.filter((w) => windowState(view.alarms.find((a) => a.key === w.key)?.state, at).lit);
+  assert.deepEqual(
+    lit(0).map((w) => w.legend),
+    ['Coolant flow low, loop B', 'Coolant pump tripped'],
+  );
+  assert.ok(lit(0).every((w) => w.board === 'rcs-board'));
   assert.equal(lit(250).length, 0);
   assert.equal(lit(500).length, 2);
   assert.deepEqual(view.processFaults, [{ key: 'coolant_pump_trip:b', label: 'Coolant pump trip, loop B' }]);

@@ -9,9 +9,9 @@
 //! model boundary. Both boundaries latch the plant's model_limit flag.
 //!
 //! Decay groups are tuning, not isotope inventories. Fractions of rated total
-//! heat are 0.020, 0.015, 0.015, 0.016; time constants are 2, 30, 300, 10000 s.
-//! Their equilibrium sum is 6.6%. After shutdown they approximate the long
-//! irradiation Way-Wigner curve to within a factor of 1.5 at 10–1000 s.
+//! heat sum to 6.6%. After shutdown the six groups stay within 1.15 times
+//! the infinite-irradiation Way-Wigner curve from 10 s to 3 hours, and within
+//! 1.35 times the one-year-irradiation curve out to three days.
 //! Fission supplies the remaining 93.4% of equilibrium thermal heat.
 
 /// Delayed neutron fractions, dimensionless.
@@ -20,14 +20,16 @@ pub const BETA_GROUPS: [f64; 6] = [0.000215, 0.001424, 0.001274, 0.002568, 0.000
 pub const LAMBDA: [f64; 6] = [0.0124, 0.0305, 0.111, 0.301, 1.14, 3.01];
 /// Total delayed neutron fraction.
 pub const BETA: f64 = 0.006502;
-const DECAY_FRACTIONS: [f64; 4] = [0.020, 0.015, 0.015, 0.016];
-const DECAY_SECONDS: [f64; 4] = [2.0, 30.0, 300.0, 10000.0];
+/// Rule: fractions of rated heat assigned to the six decay groups.
+const DECAY_FRACTIONS: [f64; 6] = [0.020, 0.013, 0.012, 0.008, 0.007, 0.006];
+/// Rule: decay group time constants in seconds.
+const DECAY_SECONDS: [f64; 6] = [2.0, 30.0, 300.0, 3000.0, 30000.0, 300000.0];
 
 #[derive(Clone, Debug)]
 pub(crate) struct Kinetics {
     pub power: f64,
     precursors: [f64; 6],
-    decay: [f64; 4],
+    decay: [f64; 6],
 }
 
 impl Kinetics {
@@ -51,14 +53,7 @@ impl Kinetics {
         for (c, lambda) in self.precursors.iter_mut().zip(LAMBDA) {
             *c += dt * lambda * (self.power - *c);
         }
-        for ((d, fraction), tau) in self
-            .decay
-            .iter_mut()
-            .zip(DECAY_FRACTIONS)
-            .zip(DECAY_SECONDS)
-        {
-            *d += dt * (fraction * self.power - *d) / tau;
-        }
+        decay_step(&mut self.decay, self.power, dt);
         rho > limited || power > 10.0
     }
 
@@ -70,9 +65,37 @@ impl Kinetics {
     }
 }
 
+fn decay_step(decay: &mut [f64; 6], fission_power: f64, dt: f64) {
+    for ((d, fraction), tau) in decay.iter_mut().zip(DECAY_FRACTIONS).zip(DECAY_SECONDS) {
+        *d += dt * (fraction * fission_power - *d) / tau;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decay_after_shutdown() {
+        let mut decay = DECAY_FRACTIONS;
+        let mut step = 0;
+        for (seconds, expected) in [
+            (10, 4.20),
+            (100, 2.98),
+            (1000, 1.89),
+            (3600, 1.46),
+            (36000, 0.74),
+            (100000, 0.46),
+        ] {
+            while step < seconds * 20 {
+                decay_step(&mut decay, 0.0, 0.05);
+                step += 1;
+            }
+            let measured = decay.iter().sum::<f64>() * 100.0;
+            println!("{seconds} s: {measured:.6}% (target {expected}%)");
+            assert!((measured / expected - 1.0).abs() < 0.03);
+        }
+    }
 
     #[test]
     fn prompt_jump_and_asymptotic_inhour_period() {

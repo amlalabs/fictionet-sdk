@@ -2,7 +2,7 @@
 //!
 //! Every fact is an event from source `plant`. Each fact has a fixed short
 //! list of fields, and every fact carries `at_ms`: the plant
-//! time of the snapshot it was read from. Facts go to a [`Sink`]: a world's
+//! time of the change. Stage and end facts use their logged first time. Facts go to a [`Sink`]: a world's
 //! [`Cx`], or the driver of a Modbus connection. A sink builds a fact only
 //! when a destination wants that kind, so a run without an observer builds
 //! nothing.
@@ -14,6 +14,9 @@
 //! | `fault` | a fault started or cleared | [`fault`] |
 //! | `first_action` | the first accepted command after a fault start | [`changes`] |
 //! | `trip` | a reactor trip, or a turbine trip without one | [`changes`] |
+//! | `stage` | a newly reached stage | [`changes`] |
+//! | `end` | the first end | [`changes`] |
+//! | `reset` | a scenario started at time zero | [`reset`] |
 //! | `divergence` | a faulted instrument's true and reported values | [`divergence`] |
 //!
 //! Limits: a write's facts are held by [`Held`] until the whole write is
@@ -35,14 +38,25 @@ use fictionet::stdlib::services::serve;
 use crate::command::{Command, Controller, Loop, Mode, Pump, Rejection, Valve};
 use crate::faults::{Fault, FaultChange, FaultTarget, ProcessFault};
 use crate::protection::TripCause;
+use crate::scenarios::Scenario;
 use crate::sensors::{Sensor, Unit};
 use crate::snapshot::{PlantSnapshot, Truth};
+use crate::stages::{FailureCause, Stage};
 
 /// The source name of every plant fact.
 const SOURCE: &str = "plant";
 
-/// Plant time formatted as minutes, seconds, and tenths.
+/// Plant time with hours when needed, minutes, seconds, and tenths.
 pub fn time(at_ms: u64) -> String {
+    if at_ms >= 3_600_000 {
+        return format!(
+            "{}:{:02}:{:02}.{}",
+            at_ms / 3_600_000,
+            at_ms / 60_000 % 60,
+            at_ms / 1_000 % 60,
+            at_ms / 100 % 10
+        );
+    }
     format!(
         "{}:{:02}.{}",
         at_ms / 60_000,
@@ -176,6 +190,13 @@ impl<S: Sink> Sink for Held<'_, S> {
 pub fn action(sink: &impl Sink, command: Command, source: Source, after: &PlantSnapshot) {
     sink.record("action", |event| {
         let name = command_name(command);
+        let event = match command {
+            Command::Pump {
+                pump: Pump::SafetyInjection,
+                ..
+            } => event.field("pump", "safety_injection"),
+            _ => event,
+        };
         event
             .summary(format!(
                 "{} from {}",
@@ -246,8 +267,78 @@ pub fn fault(sink: &impl Sink, change: FaultChange, after: &PlantSnapshot) {
 
 /// The facts one change made, from the snapshots before and after it: a
 /// reactor trip, or a turbine trip without one, and the first accepted command
-/// after a fault start. Each fires once per change.
+/// after a fault start. New stages follow time order, with array order for ties,
+/// followed by the first end. Each fires once per change.
 pub fn changes(sink: &impl Sink, before: &PlantSnapshot, after: &PlantSnapshot) {
+    if sink.wants("stage") {
+        let mut stages = Stage::ALL
+            .into_iter()
+            .filter_map(|stage| {
+                let index = stage.index();
+                after.stages[index]
+                    .filter(|_| before.stages[index].is_none())
+                    .map(|at| (stage, at))
+            })
+            .collect::<Vec<_>>();
+        stages.sort_by_key(|(stage, at)| (*at, stage.index()));
+        for (stage, at_ms) in stages {
+            sink.record("stage", |event| {
+                let name = wire_name(stage);
+                let event = event
+                    .level(
+                        if matches!(stage, Stage::Boiling | Stage::TurbineHallSteam) {
+                            Level::Notice
+                        } else {
+                            Level::Alarm
+                        },
+                    )
+                    .summary(sentence(&name))
+                    .field("stage", name)
+                    .field("at_ms", at_ms)
+                    .field("time", time(at_ms))
+                    .field("operator_actions", after.operator_actions)
+                    .field(
+                        "last_command",
+                        after
+                            .last_command
+                            .map_or("none", |last| command_name(last.command)),
+                    );
+                match after.last_command {
+                    Some(last) => event.field("last_command_ms", last.at_ms),
+                    None => event,
+                }
+            });
+        }
+    }
+    if before.end.is_none()
+        && let Some(end) = after.end
+    {
+        sink.record("end", |event| {
+            let name = wire_name(end.stage);
+            let cause = if end.stage == Stage::ContainmentFailure {
+                after.severe.containment.failure
+            } else {
+                None
+            };
+            let suffix = match cause {
+                Some(FailureCause::HydrogenBurn) => " from a hydrogen burn",
+                Some(FailureCause::Overpressure) => " from overpressure",
+                None => "",
+            };
+            let event = event
+                .level(Level::Alarm)
+                .summary(format!("End: {}{suffix}", words(&name)))
+                .field("stage", name)
+                .field("at_ms", end.at_ms)
+                .field("time", time(end.at_ms))
+                .field("operator_actions", after.operator_actions);
+            match cause {
+                Some(cause) => event.field("cause", wire_name(cause)),
+                None => event,
+            }
+        });
+    }
+
     let new_reactor_trip = match (before.truth.reactor.trip, after.truth.reactor.trip) {
         (None, Some(trip)) => Some(trip),
         _ => None,
@@ -289,6 +380,27 @@ pub fn changes(sink: &impl Sink, before: &PlantSnapshot, after: &PlantSnapshot) 
                 .field("time", time(after.at_ms))
         });
     }
+}
+
+/// A scenario starts at plant time zero.
+pub fn reset(sink: &impl Sink, scenario: Scenario, speed: u16) {
+    sink.record("reset", |event| {
+        event
+            .level(Level::Notice)
+            .summary(format!("Started {}", words(&wire_name(scenario))))
+            .field("scenario", wire_name(scenario))
+            .field("speed", u64::from(speed))
+            .field("at_ms", 0_u64)
+            .field("time", time(0))
+    });
+}
+
+fn wire_name(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .expect("wire name serializes")
+        .as_str()
+        .expect("wire name is text")
+        .to_owned()
 }
 
 /// One sensor's true and reported values at a fault's start, peak, or clear.
@@ -353,6 +465,17 @@ fn command_words(command: Command) -> String {
         Command::RodDemand { tenths_percent } => {
             format!("Rod demand {:.1}%", f64::from(tenths_percent) / 10.0)
         }
+        Command::Relief { open } => {
+            format!("Relief valves {}", if open { "opened" } else { "closed" })
+        }
+        Command::ReliefBlock { closed } => format!(
+            "Relief block valves {}",
+            if closed { "closed" } else { "opened" }
+        ),
+        Command::SteamIsolation { closed } => format!(
+            "Steam isolation valves {}",
+            if closed { "closed" } else { "opened" }
+        ),
         Command::ManualTrip => "Manual trip".into(),
         Command::ResetTrip => "Trip reset".into(),
         Command::AcknowledgeAlarms => "Alarm acknowledgment".into(),
@@ -363,6 +486,7 @@ fn command_words(command: Command) -> String {
                 Pump::MainFeed(l) => format!("Main feed pump {}", words(loop_name(l))),
                 Pump::AuxiliaryFeed => "Auxiliary feed pump".into(),
                 Pump::CirculatingWater => "Circulating water pump".into(),
+                Pump::SafetyInjection => "Safety injection pumps".into(),
             };
             format!("{name} {}", if running { "started" } else { "stopped" })
         }
@@ -395,6 +519,9 @@ fn command_words(command: Command) -> String {
 fn command_name(command: Command) -> &'static str {
     match command {
         Command::RodDemand { .. } => "rod_demand",
+        Command::Relief { .. } => "relief",
+        Command::ReliefBlock { .. } => "relief_block",
+        Command::SteamIsolation { .. } => "steam_isolation",
         Command::ManualTrip => "manual_trip",
         Command::ResetTrip => "reset_trip",
         Command::Pump { .. } => "pump",
@@ -466,6 +593,10 @@ fn process_name(fault: ProcessFault) -> String {
         }
         ProcessFault::FeedValveStuck { line } => format!("feed_valve_stuck_{}", loop_name(line)),
         ProcessFault::CondenserCoolingLoss => "condenser_cooling_loss".into(),
+        ProcessFault::ReliefStuckOpen => "relief_stuck_open".into(),
+        ProcessFault::SafetyInjectionFailure => "safety_injection_failure".into(),
+        ProcessFault::SteamLineBreak => "steam_line_break".into(),
+        ProcessFault::StationBlackout => "station_blackout".into(),
     }
 }
 
@@ -557,6 +688,62 @@ mod tests {
 
     fn snapshot() -> PlantSnapshot {
         Plant::new(Config::default()).snapshot()
+    }
+
+    #[test]
+    fn stage_ties_keep_array_order_and_end_follows_them() {
+        let before = snapshot();
+        let mut after = before.clone();
+        after.at_ms = 500;
+        for stage in Stage::ALL {
+            after.stages[stage.index()] = Some(100);
+        }
+        after.stages[Stage::TurbineHallSteam.index()] = Some(50);
+        after.end = Some(crate::stages::End {
+            stage: Stage::ControlRoomUninhabitable,
+            at_ms: 100,
+        });
+        let log = Log::default();
+        changes(&log, &before, &after);
+        changes(&log, &after, &after);
+        let events = log.0.borrow();
+        assert_eq!(events.len(), 13);
+        let mut expected = vec![Stage::TurbineHallSteam];
+        expected.extend(
+            Stage::ALL
+                .into_iter()
+                .filter(|stage| *stage != Stage::TurbineHallSteam),
+        );
+        for (event, stage) in events.iter().zip(expected) {
+            assert_eq!(event.kind, "stage");
+            assert_eq!(event.str("stage"), Some(wire_name(stage).as_str()));
+            assert_eq!(
+                event.level,
+                if matches!(stage, Stage::Boiling | Stage::TurbineHallSteam) {
+                    Level::Notice
+                } else {
+                    Level::Alarm
+                }
+            );
+        }
+        let end = events.last().unwrap();
+        assert_eq!(end.kind, "end");
+        assert_eq!(end.level, Level::Alarm);
+        assert_eq!(end.u64("at_ms"), Some(100));
+        assert!(end.get("cause").is_none());
+    }
+
+    #[test]
+    fn reset_names_the_scenario_speed_and_zero_time() {
+        let log = Log::default();
+        reset(&log, Scenario::StuckOpenRelief, 600);
+        let events = log.of("reset");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, Level::Notice);
+        assert_eq!(events[0].str("scenario"), Some("stuck_open_relief"));
+        assert_eq!(events[0].u64("speed"), Some(600));
+        assert_eq!(events[0].u64("at_ms"), Some(0));
+        assert_eq!(events[0].str("time"), Some("0:00.0"));
     }
 
     #[test]
@@ -667,7 +854,8 @@ mod tests {
     fn time_keeps_minutes_seconds_and_tenths() {
         assert_eq!(time(0), "0:00.0");
         assert_eq!(time(123_950), "2:03.9");
-        assert_eq!(time(3_600_000), "60:00.0");
+        assert_eq!(time(3_599_900), "59:59.9");
+        assert_eq!(time(3_600_000), "1:00:00.0");
     }
 
     #[test]
@@ -709,6 +897,54 @@ mod tests {
         assert_eq!(actions[0].u64("operator_actions"), Some(3));
         assert_eq!(actions[0].u64("revision"), Some(2));
         assert_eq!(actions[0].u64("at_ms"), Some(450));
+    }
+
+    #[test]
+    fn new_equipment_actions_and_faults_keep_their_wire_names() {
+        let snap = snapshot();
+        for (command, name) in [
+            (Command::Relief { open: true }, "relief"),
+            (Command::ReliefBlock { closed: true }, "relief_block"),
+            (Command::SteamIsolation { closed: true }, "steam_isolation"),
+            (
+                Command::Pump {
+                    pump: Pump::SafetyInjection,
+                    running: true,
+                },
+                "pump",
+            ),
+        ] {
+            let log = Log::default();
+            action(&log, command, Source::Panel, &snap);
+            let actions = log.of("action");
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].str("command"), Some(name));
+            if matches!(command, Command::Pump { .. }) {
+                assert_eq!(actions[0].str("pump"), Some("safety_injection"));
+            }
+        }
+        for (process, name) in [
+            (ProcessFault::ReliefStuckOpen, "relief_stuck_open"),
+            (
+                ProcessFault::SafetyInjectionFailure,
+                "safety_injection_failure",
+            ),
+            (ProcessFault::SteamLineBreak, "steam_line_break"),
+            (ProcessFault::StationBlackout, "station_blackout"),
+        ] {
+            let log = Log::default();
+            fault(&log, FaultChange::Inject(Fault::Process(process)), &snap);
+            fault(
+                &log,
+                FaultChange::Clear(FaultTarget::Process(process)),
+                &snap,
+            );
+            let faults = log.of("fault");
+            assert_eq!(faults.len(), 2);
+            for event in faults {
+                assert_eq!(event.str("target"), Some(name));
+            }
+        }
     }
 
     #[test]

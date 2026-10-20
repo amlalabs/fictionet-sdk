@@ -1,7 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MATERIAL_ROLES, materialSpec, indicatorSpec, setIndicator, createRenderer, createMaterial,
-  applyMaterialPalette, roomLightAt } from './look.mjs';
+import * as THREE from '../../../observe/downloads/vendor/three/build/three.module.js';
+import {
+  MATERIAL_ROLES,
+  materialSpec,
+  indicatorSpec,
+  setIndicator,
+  createRenderer,
+  createMaterial,
+  createDisplayMaterial,
+  applyMaterialPalette,
+  roomLightAt,
+} from './look.mjs';
 import { windowState, DESKS, BOARDS, boardPoint, CEILING_LIGHTS } from './board-layout.mjs';
 
 test('surface roles separate painted steel, brushed metal, glass, rubber and concrete', () => {
@@ -32,7 +42,12 @@ test('material specs require a palette color and leave the palette and roles int
 });
 
 const palette = Object.freeze({ lampGlow: '#ffbe50', lampOff: '#222b27' });
-const color = () => ({ value: null, set(value) { this.value = value; } });
+const color = () => ({
+  value: null,
+  set(value) {
+    this.value = value;
+  },
+});
 
 test('emission follows the window decision through flashing, acknowledgement and clearing', () => {
   const material = { color: color(), emissive: color(), emissiveIntensity: 0 };
@@ -58,9 +73,15 @@ test('emission follows the window decision through flashing, acknowledgement and
 
 test('material creation and theme updates use the requested role and token', () => {
   class Material {
-    constructor(spec) { this.spec = spec; this.userData = {}; this.color = color(); }
+    constructor(spec) {
+      this.spec = spec;
+      this.userData = {};
+      this.color = color();
+    }
   }
-  const material = createMaterial({ MeshStandardMaterial: Material }, palette, 'lamp', 'lampOff', { depthWrite: false });
+  const material = createMaterial({ MeshStandardMaterial: Material }, palette, 'lamp', 'lampOff', {
+    depthWrite: false,
+  });
   assert.equal(material.spec.roughness, MATERIAL_ROLES.lamp.roughness);
   assert.equal(material.spec.color, palette.lampOff);
   assert.equal(material.spec.depthWrite, false);
@@ -72,9 +93,16 @@ test('material creation and theme updates use the requested role and token', () 
 test('the renderer factory creates one context with filmic output and shadow accounting', () => {
   let count = 0;
   const THREE = {
-    ACESFilmicToneMapping: Symbol(), SRGBColorSpace: Symbol(), PCFSoftShadowMap: Symbol(),
+    ACESFilmicToneMapping: Symbol(),
+    SRGBColorSpace: Symbol(),
+    PCFSoftShadowMap: Symbol(),
     WebGLRenderer: class {
-      constructor(options) { count++; this.options = options; this.shadowMap = {}; this.info = {}; }
+      constructor(options) {
+        count++;
+        this.options = options;
+        this.shadowMap = {};
+        this.info = {};
+      }
     },
   };
   const renderer = createRenderer(THREE);
@@ -85,7 +113,31 @@ test('the renderer factory creates one context with filmic output and shadow acc
   assert.equal(renderer.outputColorSpace, THREE.SRGBColorSpace);
   assert.equal(renderer.shadowMap.enabled, true);
   assert.equal(renderer.shadowMap.type, THREE.PCFSoftShadowMap);
+  assert.equal(renderer.shadowMap.autoUpdate, false);
+  assert.equal(renderer.shadowMap.needsUpdate, true);
   assert.equal(renderer.info.autoReset, false);
+});
+
+test('display emission passes palette ink through with no tone mapping or extra gain', () => {
+  const palette = { lightKey: '#ffffff', ink: '#17201c' };
+  const texture = new THREE.Texture();
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const material = createDisplayMaterial(THREE, palette, texture);
+  assert.equal(material.isMeshStandardMaterial, true);
+  assert.equal(material.map, texture);
+  assert.equal(material.emissiveMap, texture);
+  assert.equal(material.toneMapped, false);
+  assert.equal(material.emissiveIntensity, 1);
+  assert.equal(material.color.getHex(), 0);
+  assert.equal(material.envMapIntensity, 0);
+  const ink = new THREE.Color(palette.ink);
+  const output = ink.clone().multiply(material.emissive).multiplyScalar(material.emissiveIntensity);
+  assert.equal(output.getHexString(THREE.SRGBColorSpace), palette.ink.slice(1));
+  const shader = { fragmentShader: THREE.ShaderLib.standard.fragmentShader };
+  material.onBeforeCompile(shader);
+  assert.match(shader.fragmentShader, /outgoingLight = totalEmissiveRadiance;\n#include <opaque_fragment>/);
+  material.dispose();
+  texture.dispose();
 });
 
 test('baked light pools under troffers and darkens kneeholes, desk lips, board bases and corners', () => {

@@ -322,6 +322,11 @@ fn manual_pressurizer_heat_spray_and_expansion() {
     p.advance(40_000);
     assert!(p.snapshot().truth.primary.pressure_mpa < heated - 0.5);
     p.apply(Command::ValveDemand {
+        valve: Valve::PressurizerSpray,
+        permille: 0,
+    })
+    .unwrap();
+    p.apply(Command::ValveDemand {
         valve: Valve::Turbine,
         permille: 800,
     })
@@ -838,7 +843,7 @@ fn first_action_delay_survives_later_commands_and_resets_on_new_fault() {
 }
 
 #[test]
-fn primary_saturation_latches_at_the_first_crossing() {
+fn boiling_starts_at_the_first_crossing() {
     let mut p = plant_unprotected();
     loss_of_feed(&mut p);
     let mut previous_margin = p.snapshot().truth.primary.subcooling_margin_c;
@@ -846,13 +851,19 @@ fn primary_saturation_latches_at_the_first_crossing() {
         p.advance(at_ms);
         let s = p.snapshot();
         let margin = s.truth.primary.subcooling_margin_c;
-        if s.model_limit {
+        assert!(!s.model_limit);
+        if let Some(boiling_at) = s.stages[nuclear_world::stages::Stage::Boiling.index()] {
+            assert_eq!(boiling_at, at_ms);
             assert!(previous_margin > 0.0);
             assert!(margin <= 0.0 && margin > -0.1, "{margin}");
             assert!(s.truth.reactor.trip.is_none());
             p.apply(Command::ManualTrip).unwrap();
             p.advance(at_ms + 60_000);
-            assert!(p.snapshot().model_limit);
+            assert!(!p.snapshot().model_limit);
+            assert_eq!(
+                p.snapshot().severe.regime,
+                nuclear_world::snapshot::Regime::TwoPhase
+            );
             return;
         }
         assert!(margin > 0.0);

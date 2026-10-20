@@ -62,12 +62,16 @@ test('an open guard sends one manual trip until it closes', () => {
 test('control lamps contrast with unlit lenses in light and both dark palettes', () => {
   const controls = readFileSync(new URL('./control-room.css', import.meta.url), 'utf8');
   const viewer = readFileSync(new URL('./viewer.css', import.meta.url), 'utf8');
-  const green = [...controls.matchAll(/--control-green:\s*(#[\da-f]+);/g)].map(match => match[1]);
-  const red = [...viewer.matchAll(/--accent:\s*(#[\da-f]+);/g)].map(match => match[1]);
-  const off = [...viewer.matchAll(/--lamp-off:\s*(#[\da-f]+);/g)].map(match => match[1]);
-  const luminance = hex => hex.slice(1).match(/../g).map(value => parseInt(value, 16) / 255)
-    .map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
-    .reduce((sum, value, i) => sum + value * [0.2126, 0.7152, 0.0722][i], 0);
+  const green = [...controls.matchAll(/--control-green:\s*(#[\da-f]+);/g)].map((match) => match[1]);
+  const red = [...viewer.matchAll(/--accent:\s*(#[\da-f]+);/g)].map((match) => match[1]);
+  const off = [...viewer.matchAll(/--lamp-off:\s*(#[\da-f]+);/g)].map((match) => match[1]);
+  const luminance = (hex) =>
+    hex
+      .slice(1)
+      .match(/../g)
+      .map((value) => parseInt(value, 16) / 255)
+      .map((value) => (value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4))
+      .reduce((sum, value, i) => sum + value * [0.2126, 0.7152, 0.0722][i], 0);
   assert.equal(green.length, 3);
   assert.equal(red.length, 3);
   assert.equal(off.length, 3);
@@ -173,7 +177,11 @@ test('a posted command carries the revision of the snapshot it was made from', (
   const transport = {
     post(path, body) {
       sent.push({ path, body });
-      return Promise.resolve({ status: 'applied', request_id: body.request_id, reply: { Ok: { revision: 43, at_ms: 9000 } } });
+      return Promise.resolve({
+        status: 'applied',
+        request_id: body.request_id,
+        reply: { Ok: { revision: 43, at_ms: 9000 } },
+      });
     },
   };
   return postCommand(transport, '/api/faults/command', command, { requestId: 'req-1' }).then((outcome) => {
@@ -266,16 +274,25 @@ test('the plant commands take the serde forms of the world', () => {
 test('the sensor table follows every Rust sensor and its resolution', () => {
   const rust = readFileSync(new URL('../world/src/sensors.rs', import.meta.url), 'utf8');
   const all = rust.match(/pub const ALL:[\s\S]*?= \[([\s\S]*?)\];/)[1];
-  const snake = name => name.replace(/[A-Z]/g, (letter, index) => `${index ? '_' : ''}${letter.toLowerCase()}`);
+  const snake = (name) => name.replace(/[A-Z]/g, (letter, index) => `${index ? '_' : ''}${letter.toLowerCase()}`);
   const variants = [...all.matchAll(/Self::(\w+)(?:\(Loop::([AB])\))?/g)];
-  const keys = variants.map(([, name, loop]) => loop ? `${snake(name)}:${loop.toLowerCase()}` : snake(name));
+  const keys = variants.map(([, name, loop]) => (loop ? `${snake(name)}:${loop.toLowerCase()}` : snake(name)));
   assert.equal(keys.length, 22);
-  assert.deepEqual(FAULT_SENSORS.map(point => point.key), keys);
+  assert.deepEqual(
+    FAULT_SENSORS.map((point) => point.key),
+    keys,
+  );
   const spec = rust.match(/let \(unit, min, max, resolution\) = match self \{([\s\S]*?)\n        \};/)[1];
-  const arms = [...spec.matchAll(/^\s*((?:Self::\w+(?:\(_\))?\s*(?:\|\s*)?)+|_)\s*=>\s*\{?\s*\(Unit::\w+,\s*[\d.]+,\s*[\d.]+,\s*([\d.]+)\)/gm)];
+  const arms = [
+    ...spec.matchAll(
+      /^\s*((?:Self::\w+(?:\(_\))?\s*(?:\|\s*)?)+|_)\s*=>\s*\{?\s*\(Unit::\w+,\s*[\d.]+,\s*[\d.]+,\s*([\d.]+)\)/gm,
+    ),
+  ];
   assert.ok(arms.length > 0);
   variants.forEach(([, name, loop], index) => {
-    const arm = arms.find(([, pattern]) => pattern.includes(`Self::${name}`)) ?? arms.find(([, pattern]) => pattern.trim() === '_');
+    const arm =
+      arms.find(([, pattern]) => pattern.includes(`Self::${name}`)) ??
+      arms.find(([, pattern]) => pattern.trim() === '_');
     assert.ok(arm, name);
     const point = FAULT_SENSORS[index];
     assert.equal(point.resolution, Number(arm[2]), point.key);
@@ -289,17 +306,39 @@ const faultSnapshot = () => ({
   readings: [],
   faults: { process: [], sensors: Array(22).fill(null), telemetry_quiet: false },
   truth: {
-    reactor: { neutron_power_percent: 80, control_rod_percent: 60, core_exit_c: 330, shutdown_rod_percent_inserted: 20 },
-    primary: { pressure_mpa: 15.5, level_percent: 50,
-      loops: [{ hot_leg_c: 320, cold_leg_c: 280, flow_percent: 95 }, { hot_leg_c: 321, cold_leg_c: 281, flow_percent: 96 }] },
-    secondary: { steam_pressure_mpa: 6.5, turbine_valve_percent: 70, generator_mw: 500, condenser_pressure_kpa: 5,
-      loops: [{ level_percent: 55, steam_kg_s: 450, feed_kg_s: 440 }, { level_percent: 56, steam_kg_s: 451, feed_kg_s: 441 }] },
+    reactor: {
+      neutron_power_percent: 80,
+      control_rod_percent: 60,
+      core_exit_c: 330,
+      shutdown_rod_percent_inserted: 20,
+    },
+    primary: {
+      pressure_mpa: 15.5,
+      level_percent: 50,
+      loops: [
+        { hot_leg_c: 320, cold_leg_c: 280, flow_percent: 95 },
+        { hot_leg_c: 321, cold_leg_c: 281, flow_percent: 96 },
+      ],
+    },
+    secondary: {
+      steam_pressure_mpa: 6.5,
+      turbine_valve_percent: 70,
+      generator_mw: 500,
+      condenser_pressure_kpa: 5,
+      loops: [
+        { level_percent: 55, steam_kg_s: 450, feed_kg_s: 440 },
+        { level_percent: 56, steam_kg_s: 451, feed_kg_s: 441 },
+      ],
+    },
   },
 });
 
 function assertFaultCommand(snapshot, change, expected) {
   for (const revision of [snapshot.revision, snapshot.revision + 1]) {
-    assert.deepEqual(faultCommand({ ...snapshot, revision }, change), { expected_revision: revision, change: expected });
+    assert.deepEqual(faultCommand({ ...snapshot, revision }, change), {
+      expected_revision: revision,
+      change: expected,
+    });
   }
 }
 
@@ -309,20 +348,28 @@ test('every sensor supports reported stuck counts, quiet and clearing with the c
     snapshot.readings = [{ sensor: point.sensor, reading: { value: 12.34, sampled_at_ms: 250 } }];
     const stuck = sensorFault(snapshot, point, 'stuck');
     const count = point.resolution === 0.01 ? 1234 : 123;
-    assertFaultCommand(snapshot, stuck.change, { inject: { sensor: { sensor: point.sensor, kind: { stuck: { value: count } } } } });
+    assertFaultCommand(snapshot, stuck.change, {
+      inject: { sensor: { sensor: point.sensor, kind: { stuck: { value: count } } } },
+    });
     assert.equal(stuck.note, 'Used the current reported reading.');
-    assertFaultCommand(snapshot, sensorFault(snapshot, point, 'quiet').change,
-      { inject: { sensor: { sensor: point.sensor, kind: 'quiet' } } });
+    assertFaultCommand(snapshot, sensorFault(snapshot, point, 'quiet').change, {
+      inject: { sensor: { sensor: point.sensor, kind: 'quiet' } },
+    });
     assertFaultCommand(snapshot, fault.clear({ sensor: point.sensor }), { clear: { sensor: point.sensor } });
   }
 });
 
 test('stuck falls back to truth only when the reported reading is absent', () => {
   const snapshot = faultSnapshot();
-  const expected = [800, 600, 3200, 3210, 2800, 2810, 1550, 500, 950, 960, 550, 560, 650, 4500, 4510, 4400, 4410, 700, 5000, 50, 3300, 200];
+  const expected = [
+    800, 600, 3200, 3210, 2800, 2810, 1550, 500, 950, 960, 550, 560, 650, 4500, 4510, 4400, 4410, 700, 5000, 50, 3300,
+    200,
+  ];
   FAULT_SENSORS.forEach((point, index) => {
     const result = sensorFault(snapshot, point, 'stuck');
-    assertFaultCommand(snapshot, result.change, { inject: { sensor: { sensor: point.sensor, kind: { stuck: { value: expected[index] } } } } });
+    assertFaultCommand(snapshot, result.change, {
+      inject: { sensor: { sensor: point.sensor, kind: { stuck: { value: expected[index] } } } },
+    });
     assert.match(result.note, /No reported reading. Used the true value/);
   });
   const point = FAULT_SENSORS[3];
@@ -334,16 +381,29 @@ test('stuck falls back to truth only when the reported reading is absent', () =>
 
 test('bias uses each point resolution and carries the snapshot revision', () => {
   const snapshot = faultSnapshot();
-  for (const [key, value, delta] of [['hot_leg:b', -1.25, -13], ['pressurizer_pressure', 0.125, 13], ['feed_flow:a', 12, 120]]) {
-    const point = FAULT_SENSORS.find(entry => entry.key === key);
-    assertFaultCommand(snapshot, sensorFault(snapshot, point, 'bias', value).change,
-      { inject: { sensor: { sensor: point.sensor, kind: { bias: { delta } } } } });
+  for (const [key, value, delta] of [
+    ['hot_leg:b', -1.25, -13],
+    ['pressurizer_pressure', 0.125, 13],
+    ['feed_flow:a', 12, 120],
+  ]) {
+    const point = FAULT_SENSORS.find((entry) => entry.key === key);
+    assertFaultCommand(snapshot, sensorFault(snapshot, point, 'bias', value).change, {
+      inject: { sensor: { sensor: point.sensor, kind: { bias: { delta } } } },
+    });
   }
 });
 
 test('signed counts round halves away from zero and refuse beyond the clamped limit', () => {
   for (const point of FAULT_SENSORS) {
-    for (const [scaled, count] of [[1.5, 2], [-1.5, -2], [0.5, 1], [-0.5, -1], [0, 0], [32767, 32767], [-32768, -32768]]) {
+    for (const [scaled, count] of [
+      [1.5, 2],
+      [-1.5, -2],
+      [0.5, 1],
+      [-0.5, -1],
+      [0, 0],
+      [32767, 32767],
+      [-32768, -32768],
+    ]) {
       assert.equal(sensorCount(point, scaled * point.resolution), count);
     }
     for (const count of [32767.5, -32768.5, 40000, -40000]) {
@@ -356,12 +416,12 @@ test('signed counts round halves away from zero and refuse beyond the clamped li
 test('process switches and telemetry encode injection and per-fault clearing', () => {
   const snapshot = faultSnapshot();
   const cases = [
-    [on => fault.condenserCoolingLoss(on), { process: 'condenser_cooling_loss' }],
-    [on => fault.telemetryQuiet(on), 'telemetry_quiet'],
+    [(on) => fault.condenserCoolingLoss(on), { process: 'condenser_cooling_loss' }],
+    [(on) => fault.telemetryQuiet(on), 'telemetry_quiet'],
   ];
   for (const loop of ['a', 'b']) {
-    cases.push([on => fault.coolantPumpTrip(loop, on), { process: { coolant_pump_trip: { pump: loop } } }]);
-    cases.push([on => fault.feedPumpTrip(loop, on), { process: { feed_pump_trip: { pump: loop } } }]);
+    cases.push([(on) => fault.coolantPumpTrip(loop, on), { process: { coolant_pump_trip: { pump: loop } } }]);
+    cases.push([(on) => fault.feedPumpTrip(loop, on), { process: { feed_pump_trip: { pump: loop } } }]);
   }
   for (const [build, target] of cases) {
     assertFaultCommand(snapshot, build(true), { inject: target });
@@ -373,22 +433,37 @@ test('process switches and telemetry encode injection and per-fault clearing', (
 test('active faults name the point or equipment, kind and engineering value', () => {
   const snapshot = faultSnapshot();
   assert.deepEqual(activeFaults(snapshot), []);
-  snapshot.faults.process = [null, { coolant_pump_trip: { pump: 'b' } }, { feed_pump_trip: { pump: 'a' } },
-    { feed_valve_stuck: { line: 'b' } }, 'condenser_cooling_loss'];
+  snapshot.faults.process = [
+    null,
+    { coolant_pump_trip: { pump: 'b' } },
+    { feed_pump_trip: { pump: 'a' } },
+    { feed_valve_stuck: { line: 'b' } },
+    'condenser_cooling_loss',
+  ];
   snapshot.faults.sensors[3] = { stuck: { value: 3236 } };
   snapshot.faults.sensors[6] = { bias: { delta: -12 } };
   snapshot.faults.sensors[15] = { bias: { delta: 120 } };
   snapshot.faults.sensors[21] = 'quiet';
   snapshot.faults.telemetry_quiet = true;
   const entries = activeFaults(snapshot);
-  assert.deepEqual(entries.map(entry => entry.label), [
-    'Coolant pump B: trip', 'Feed pump A: trip', 'Feed valve B: stuck', 'Condenser cooling: loss',
-    'Hot leg B: stuck at 323.6 C', 'Pressurizer pressure: bias -0.12 MPa', 'Feed flow A: bias +12.0 kg/s',
-    'Shutdown rod position: quiet', 'Telemetry: quiet',
-  ]);
+  assert.deepEqual(
+    entries.map((entry) => entry.label),
+    [
+      'Coolant pump B: trip',
+      'Feed pump A: trip',
+      'Feed valve B: stuck',
+      'Condenser cooling: loss',
+      'Hot leg B: stuck at 323.6 C',
+      'Pressurizer pressure: bias -0.12 MPa',
+      'Feed flow A: bias +12.0 kg/s',
+      'Shutdown rod position: quiet',
+      'Telemetry: quiet',
+    ],
+  );
   const targets = [
-    ...snapshot.faults.process.filter(Boolean).map(process => ({ process })),
-    ...[3, 6, 15, 21].map(index => ({ sensor: FAULT_SENSORS[index].sensor })), 'telemetry_quiet',
+    ...snapshot.faults.process.filter(Boolean).map((process) => ({ process })),
+    ...[3, 6, 15, 21].map((index) => ({ sensor: FAULT_SENSORS[index].sensor })),
+    'telemetry_quiet',
   ];
   entries.forEach((entry, index) => assertFaultCommand(snapshot, entry.change, { clear: targets[index] }));
 });
@@ -400,7 +475,11 @@ test('fault replies show stale, already active and inactive refusals', async () 
     ['not_active', /nothing to reset/],
   ]) {
     const transport = { post: async () => ({ status: 'applied', reply: { Err: { reason, revision: 73 } } }) };
-    const outcome = await postCommand(transport, '/api/faults/command', faultCommand(faultSnapshot(), fault.clearAll()));
+    const outcome = await postCommand(
+      transport,
+      '/api/faults/command',
+      faultCommand(faultSnapshot(), fault.clearAll()),
+    );
     assert.equal(outcome.state, 'refused');
     assert.match(outcome.text, message);
   }
