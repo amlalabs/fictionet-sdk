@@ -1612,6 +1612,9 @@ async fn two_hosts_publish_status_scope_links_and_filter_dashboard_events() {
                 cx.emit("fixture", "request", |e| e.field("route", "bank"));
                 cx.emit("fixture", "request", |e| e.field("route", "other"));
                 cx.emit("fixture", "ready", |e| e.field("route", "bank"));
+                // The run delivers the topology a poll staged when that poll
+                // returns, so end this one before the test reads the links.
+                cx.yield_now().await?;
                 assert!(ready.send((sandboxes, links)).is_ok());
                 Ok(())
             },
@@ -2654,6 +2657,9 @@ async fn shutdown_drains_packets_while_the_world_is_running() {
                     let attached = attachments.next(&cx).await?;
                     links.push((sandbox, attached));
                 }
+                // The run delivers the topology a poll staged when that poll
+                // returns, so end this one before the test reads the links.
+                cx.yield_now().await?;
                 ready.send(()).unwrap();
                 sending.await.unwrap();
                 for (sandbox, attached) in &mut links {
