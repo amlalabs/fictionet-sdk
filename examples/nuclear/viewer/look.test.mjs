@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as THREE from '../../../observe/downloads/vendor/three/build/three.module.js';
 import { MATERIAL_ROLES, materialSpec, indicatorSpec, setIndicator, createRenderer, createMaterial,
-  applyMaterialPalette, roomLightAt } from './look.mjs';
+  createDisplayMaterial, applyMaterialPalette, roomLightAt } from './look.mjs';
 import { windowState, DESKS, BOARDS, boardPoint, CEILING_LIGHTS } from './board-layout.mjs';
 
 test('surface roles separate painted steel, brushed metal, glass, rubber and concrete', () => {
@@ -85,7 +86,31 @@ test('the renderer factory creates one context with filmic output and shadow acc
   assert.equal(renderer.outputColorSpace, THREE.SRGBColorSpace);
   assert.equal(renderer.shadowMap.enabled, true);
   assert.equal(renderer.shadowMap.type, THREE.PCFSoftShadowMap);
+  assert.equal(renderer.shadowMap.autoUpdate, false);
+  assert.equal(renderer.shadowMap.needsUpdate, true);
   assert.equal(renderer.info.autoReset, false);
+});
+
+test('display emission passes palette ink through with no tone mapping or extra gain', () => {
+  const palette = { lightKey: '#ffffff', ink: '#17201c' };
+  const texture = new THREE.Texture();
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const material = createDisplayMaterial(THREE, palette, texture);
+  assert.equal(material.isMeshStandardMaterial, true);
+  assert.equal(material.map, texture);
+  assert.equal(material.emissiveMap, texture);
+  assert.equal(material.toneMapped, false);
+  assert.equal(material.emissiveIntensity, 1);
+  assert.equal(material.color.getHex(), 0);
+  assert.equal(material.envMapIntensity, 0);
+  const ink = new THREE.Color(palette.ink);
+  const output = ink.clone().multiply(material.emissive).multiplyScalar(material.emissiveIntensity);
+  assert.equal(output.getHexString(THREE.SRGBColorSpace), palette.ink.slice(1));
+  const shader = { fragmentShader: THREE.ShaderLib.standard.fragmentShader };
+  material.onBeforeCompile(shader);
+  assert.match(shader.fragmentShader, /outgoingLight = totalEmissiveRadiance;\n#include <opaque_fragment>/);
+  material.dispose();
+  texture.dispose();
 });
 
 test('baked light pools under troffers and darkens kneeholes, desk lips, board bases and corners', () => {

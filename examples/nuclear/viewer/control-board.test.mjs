@@ -21,6 +21,7 @@ const graphicsURL = `data:text/javascript,${encodeURIComponent(`
       domElement: document.createElement('canvas'),
       capabilities: { getMaxAnisotropy: () => 4 },
       frames: [],
+      shadowMap: { enabled: true, type: THREE.PCFSoftShadowMap, autoUpdate: false, needsUpdate: true },
       info: { render: { calls: 0, triangles: 0 }, reset() { this.render = { calls: 0, triangles: 0 }; } },
       setPixelRatio() {}, setSize() {}, setRenderTarget() {}, dispose() {}, forceContextLoss() {},
       render(scene, camera) {
@@ -30,22 +31,41 @@ const graphicsURL = `data:text/javascript,${encodeURIComponent(`
         const frustum = new THREE.Frustum().setFromProjectionMatrix(matrix);
         let calls = 0;
         let triangles = 0;
-        scene.traverseVisible(mesh => {
+        let shadowCalls = 0;
+        const draw = (mesh, frustum, shadow = false) => {
           if ((!mesh.isMesh && !mesh.isSprite) || !mesh.material.visible || !mesh.layers.test(camera.layers)) return;
+          if (shadow && (!mesh.isMesh || !mesh.castShadow)) return;
           if (mesh.frustumCulled) {
             const intersects = mesh.isSprite ? frustum.intersectsSprite(mesh) : frustum.intersectsObject(mesh);
             if (!intersects) return;
           }
           const count = mesh.isInstancedMesh ? mesh.count : 1;
           if (!count) return;
-          const passes = mesh.material.transparent && mesh.material.side === THREE.DoubleSide && !mesh.material.forceSinglePass ? 2 : 1;
+          const doublePass = mesh.material.transparent && mesh.material.side === THREE.DoubleSide && !mesh.material.forceSinglePass;
+          const passes = !shadow && doublePass ? 2 : 1;
           calls += passes;
+          if (shadow) shadowCalls += passes;
           if (mesh.isSprite) triangles += 2;
           else triangles += (mesh.geometry.index?.count ?? mesh.geometry.attributes.position.count) / 3 * count * passes;
-        });
+        };
+        if (this.shadowMap.enabled && (this.shadowMap.autoUpdate || this.shadowMap.needsUpdate)) {
+          let lights = 0;
+          scene.traverseVisible(light => {
+            if (!light.isLight || !light.castShadow || !light.layers.test(camera.layers)) return;
+            lights++;
+            if (!light.shadow.autoUpdate && !light.shadow.needsUpdate) return;
+            for (let viewport = 0; viewport < light.shadow.getViewportCount(); viewport++) {
+              light.shadow.updateMatrices(light, viewport);
+              scene.traverseVisible(mesh => draw(mesh, light.shadow.getFrustum(), true));
+            }
+            light.shadow.needsUpdate = false;
+          });
+          if (lights) this.shadowMap.needsUpdate = false;
+        }
+        scene.traverseVisible(mesh => draw(mesh, frustum));
         this.info.render.calls += calls;
         this.info.render.triangles += triangles;
-        this.frames.push({ scene, camera, calls, triangles });
+        this.frames.push({ scene, camera, calls, triangles, shadowCalls });
       },
     };
     renderers.push(renderer);
@@ -72,7 +92,10 @@ const theme = Object.fromEntries(Object.entries(PALETTE_TOKENS).map(([name, toke
 
 function fixture(t, reducedMotion = () => true) {
   const frames = new Map();
+  const timers = new Map();
   let frameNumber = 0;
+  let timerNumber = 0;
+  let time = 0;
   let resize;
   const targets = [];
   const eventTarget = () => {
@@ -112,6 +135,12 @@ function fixture(t, reducedMotion = () => true) {
     IntersectionObserver: class { observe() {} disconnect() {} },
     requestAnimationFrame: callback => { frames.set(++frameNumber, callback); return frameNumber; },
     cancelAnimationFrame: id => frames.delete(id),
+    setTimeout: (callback, delay) => {
+      timers.set(++timerNumber, { callback, at: time + delay });
+      return timerNumber;
+    },
+    clearTimeout: id => timers.delete(id),
+    performance: { now: () => time },
   };
   const restore = [];
   for (const [name, value] of Object.entries(globals)) {
@@ -128,7 +157,7 @@ function fixture(t, reducedMotion = () => true) {
     knobIds: knobs.map(knob => knob.id), knobLabels: knobs.map(knob => knob.label), knobKinds: knobs.map(knob => knob.kind),
     theme, reducedMotion, onDevice() {},
   });
-  stage.updatePlant({
+  const snapshot = {
     at_ms: 1000, revision: 1, operator_actions: 0,
     telemetry: { quiet: false, heartbeat: 1, last_sample_ms: 1000 },
     reported_status: {}, readings: [], alarms: [], faults: { process: [] },
@@ -147,15 +176,20 @@ function fixture(t, reducedMotion = () => true) {
         circulating_water_running: true, steam_dump_percent: 0, steam_relief_open: false,
       },
     },
-  });
+  };
+  stage.updatePlant(snapshot);
   const pairs = POINTS.map(point => ({ ...point, reported: point.range[0], trueValue: point.range[0], gap: 0 }));
   const view = { atMs: 1000, pairs, alarms: [], telemetry: { quiet: false },
     reportedStatus: { coolantPumpsRunning: [true, true], feedPumpsRunning: [true, true] } };
   const text = { plantTime: '0:01.0', telemetry: 'Telemetry live, heartbeat 1' };
   stage.update(view, text, []);
-  let time = performance.now();
   function draw(elapsed = 16) {
     time += elapsed;
+    for (const [id, timer] of timers) {
+      if (timer.at > time) continue;
+      timers.delete(id);
+      timer.callback();
+    }
     const pending = [...frames.values()];
     frames.clear();
     pending.forEach(callback => callback(time));
@@ -166,7 +200,8 @@ function fixture(t, reducedMotion = () => true) {
     stage.dispose();
     restore.forEach(reset => reset());
   });
-  return { stage, renderer, container, draw, view, text, targets, resize: () => resize() };
+  return { stage, renderer, container, draw, view, text, targets, snapshot, frames, timers,
+    now: () => time, resize: () => resize() };
 }
 
 test('the built room uses lit surfaces, baked geometry and bounded geometry cost', t => {
@@ -179,7 +214,7 @@ test('the built room uses lit surfaces, baked geometry and bounded geometry cost
     if (object.isLight) lights.push(object);
     if (!object.isMesh) return;
     assert.equal(object.material.isMeshBasicMaterial, undefined);
-    assert.equal(object.material.toneMapped, true);
+    assert.equal(object.material.toneMapped, !object.material.emissiveMap);
     if (object.geometry.attributes.color) baked.push(object);
     if (object.material.emissiveMap) assert.ok(object.material.emissiveIntensity > 0);
   });
@@ -190,10 +225,10 @@ test('the built room uses lit surfaces, baked geometry and bounded geometry cost
     const values = mesh.geometry.attributes.color.array;
     return Math.max(...values) - Math.min(...values) > 0.2;
   }));
-  assert.ok(f.renderer.info.render.calls <= 98, `${f.renderer.info.render.calls} calls including CCTV`);
-  assert.ok(f.renderer.info.render.triangles <= 80296, `${f.renderer.info.render.triangles} triangles including CCTV`);
   t.diagnostic(`Estimated visible room: ${frame.calls} calls, ${frame.triangles} triangles.`);
   t.diagnostic(`Including CCTV: ${f.renderer.info.render.calls} calls, ${f.renderer.info.render.triangles} triangles.`);
+  assert.ok(f.renderer.info.render.calls < 60, `${f.renderer.info.render.calls} calls including CCTV`);
+  assert.ok(f.renderer.info.render.triangles < 40000, `${f.renderer.info.render.triangles} triangles including CCTV`);
   for (const pair of f.view.pairs) {
     pair.marked = true;
     pair.frozen = true;
@@ -203,15 +238,19 @@ test('the built room uses lit surfaces, baked geometry and bounded geometry cost
   }));
   f.stage.update(f.view, f.text, []);
   f.draw(250);
-  assert.ok(f.renderer.info.render.calls <= 101);
-  assert.ok(f.renderer.info.render.triangles <= 82564);
+  assert.ok(f.renderer.info.render.calls < 60);
+  assert.ok(f.renderer.info.render.triangles < 40000);
   const windows = [];
   room.traverse(mesh => {
-    if (mesh.isInstancedMesh && mesh.material.userData.paletteToken === 'lampOff') windows.push(mesh);
+    if (mesh.isInstancedMesh && mesh.name === 'Annunciator windows') windows.push(mesh);
   });
-  assert.equal(windows.length, 2);
+  assert.equal(windows.length, 1);
   assert.equal(windows.reduce((sum, mesh) => sum + mesh.count, 0), ANNUNCIATOR_WINDOWS.length);
   assert.ok(windows.every(mesh => mesh.count > 0));
+  const offsets = windows[0].geometry.attributes.atlasOffset;
+  for (let i = 0; i < ANNUNCIATOR_WINDOWS.length; i++) {
+    assert.equal(Math.round(offsets.getX(i) * 4) % 2, i % 2);
+  }
   t.diagnostic(`Held and marked, with mixed alarms and CCTV: ${f.renderer.info.render.calls} calls, `
     + `${f.renderer.info.render.triangles} triangles.`);
 });
@@ -254,18 +293,29 @@ test('rendered nameplates and hit volumes fit every section at both measured can
           const ray = new THREE.Raycaster(origin, up.negate());
           assert.ok(ray.intersectObject(mesh).length > 0, 'invisible grab volume remains raycastable');
         }
-        if (!mesh.material.map || mesh.geometry.parameters.width !== 0.6) return;
+      });
+      const nameplates = scene.getObjectByName('Device labels');
+      nameplates.userData.devices.forEach((index, instance) => {
+        if (plantKnobs[index].board !== board.id) return;
+        let frame;
+        scene.traverse(mesh => {
+          if (mesh.userData.hitVolume && mesh.userData.device === index) frame = mesh.parent;
+        });
+        const matrix = new THREE.Matrix4();
+        nameplates.getMatrixAt(instance, matrix);
+        const local = frame.matrixWorld.clone().invert().multiply(matrix);
+        const mesh = nameplates;
         labels++;
-        assert.ok(mesh.position.z < -0.3, 'the nameplate sits toward the panel above its device');
-        const labelCenter = new THREE.Vector3();
-        mesh.getWorldPosition(labelCenter);
-        const deviceCenter = mesh.parent.position.clone();
+        assert.ok(new THREE.Vector3().setFromMatrixPosition(local).z < -0.3,
+          'the nameplate sits toward the panel above its device');
+        const labelCenter = new THREE.Vector3().setFromMatrixPosition(matrix);
+        const deviceCenter = frame.position.clone();
         assert.ok(labelCenter.project(camera).y > deviceCenter.project(camera).y);
-        assert.equal(mesh.geometry.parameters.height * mesh.parent.scale.y, 0.04);
-        assert.equal(mesh.geometry.parameters.width * mesh.parent.scale.x, 0.15);
+        assert.equal(mesh.geometry.parameters.height * frame.scale.y, 0.04);
+        assert.equal(mesh.geometry.parameters.width * frame.scale.x, 0.15);
         const positions = mesh.geometry.attributes.position;
         for (let i = 0; i < positions.count; i++) {
-          const point = new THREE.Vector3().fromBufferAttribute(positions, i).applyMatrix4(mesh.matrixWorld).project(camera);
+          const point = new THREE.Vector3().fromBufferAttribute(positions, i).applyMatrix4(matrix).project(camera);
           assert.ok(Math.abs(point.x) <= 0.92 && Math.abs(point.y) <= 0.92 && point.z < 1, plantKnobs[index].id);
         }
       });
@@ -542,4 +592,212 @@ test('the monitor bank frames the main feed and keeps its caption on plant time'
     }
     t.diagnostic(`${width} by ${height}: main CCTV width ${(share * 100).toFixed(2)}%, ${(share * width).toFixed(1)} px.`);
   }
+});
+
+test('every standing view fits the frame budget with and without a CCTV refresh', t => {
+  const f = fixture(t);
+  f.container.clientWidth = 1440;
+  f.container.clientHeight = 900;
+  f.resize();
+  let maxCalls = 0;
+  let maxTriangles = 0;
+  for (const state of ['normal', 'held', 'mixed', 'held with steam', 'mixed with steam']) {
+    const held = state.startsWith('held');
+    const mixed = state.startsWith('mixed');
+    f.view.pairs.forEach((pair, i) => {
+      pair.marked = state !== 'normal' && (!mixed || i % 3 !== 0);
+      pair.frozen = held || (mixed && i % 3 !== 1);
+    });
+    f.snapshot.truth.primary.spray_percent = state.includes('steam') ? 100 : 0;
+    f.snapshot.truth.primary.relief_open = state.includes('steam');
+    f.snapshot.truth.secondary.steam_relief_open = state.includes('steam');
+    f.stage.updatePlant(f.snapshot);
+    f.view.alarms = ANNUNCIATOR_WINDOWS.map(({ key }, i) => ({ key, state: i % 2 ? 'active' : 'normal' }));
+    f.stage.update(f.view, f.text, []);
+    for (const name of [...Object.keys(STANDING_SPOTS), 'reactor', 'turbine']) {
+      f.stage.setView(name);
+      f.draw(250);
+      const refresh = { ...f.renderer.info.render };
+      const main = f.renderer.frames.at(-1);
+      assert.ok(refresh.calls < 60, `${state} ${name}: ${refresh.calls} calls`);
+      assert.ok(refresh.triangles < 40000, `${state} ${name}: ${refresh.triangles} triangles`);
+      maxCalls = Math.max(maxCalls, refresh.calls);
+      maxTriangles = Math.max(maxTriangles, refresh.triangles);
+      assert.equal(main.shadowCalls, 0);
+      const before = f.renderer.frames.length;
+      f.stage.update(f.view, f.text, []);
+      f.draw(16);
+      assert.equal(f.renderer.frames.length, before + 1);
+      const cached = { ...f.renderer.info.render };
+      assert.equal(cached.calls, main.calls);
+      assert.equal(cached.triangles, main.triangles);
+      if (state === 'normal') {
+        t.diagnostic(`${name}: ${cached.calls} calls / ${cached.triangles} triangles; `
+          + `refresh ${refresh.calls} calls / ${refresh.triangles} triangles.`);
+      }
+    }
+  }
+  t.diagnostic(`Maximum across all states and views: ${maxCalls} calls; ${maxTriangles} triangles.`);
+});
+
+test('window flashes change atlas offsets without repainting any canvas or requesting full rate frames', t => {
+  let reduced = true;
+  const f = fixture(t, () => reduced);
+  f.snapshot.truth.primary.loops.forEach(loop => { loop.pump_speed_percent = 0; });
+  f.snapshot.truth.secondary.generator_mw = 0;
+  f.snapshot.truth.secondary.turbine_valve_percent = 0;
+  f.stage.updatePlant(f.snapshot);
+  f.draw(250);
+  reduced = false;
+  f.view.alarms = [{ key: ANNUNCIATOR_WINDOWS[0].key, state: 'active' }];
+  f.stage.update(f.view, f.text, []);
+  f.draw(1000);
+  const room = f.renderer.frames.at(-1).scene;
+  const windows = room.getObjectByName('Annunciator windows');
+  const textures = new Set();
+  room.traverse(mesh => { if (mesh.material?.map?.isCanvasTexture) textures.add(mesh.material.map); });
+  const versions = [...textures].map(texture => texture.version);
+  assert.equal(f.frames.size, 0);
+  const start = f.renderer.frames.length;
+  const offsets = [];
+  for (let i = 0; i < 1000; i++) {
+    f.draw(1);
+    if (i % 250 === 249) offsets.push(windows.geometry.attributes.atlasOffset.getX(0));
+    assert.equal(f.frames.size, 0);
+  }
+  assert.equal(f.renderer.frames.length - start, 8);
+  assert.equal(new Set(offsets).size, 2);
+  assert.deepEqual([...textures].map(texture => texture.version), versions);
+  const shader = { uniforms: {}, vertexShader: THREE.ShaderLib.standard.vertexShader,
+    fragmentShader: THREE.ShaderLib.standard.fragmentShader };
+  windows.material.onBeforeCompile(shader);
+  assert.match(shader.vertexShader, /attribute vec2 atlasOffset/);
+  assert.match(shader.fragmentShader, /vAlarmMark > 0.5/);
+  reduced = true;
+  f.stage.update(f.view, f.text, []);
+  f.draw(250);
+  assert.equal(windows.geometry.attributes.alarmMark.getX(0), 1);
+  assert.equal(f.frames.size, 0);
+  assert.equal(f.timers.size, 0);
+});
+
+test('board text coalesces changes to one canvas upload per second', t => {
+  const f = fixture(t);
+  const room = f.renderer.frames.at(-1).scene;
+  let board;
+  room.traverse(mesh => {
+    if (mesh.material?.map?.image.width === 4200) board = mesh.material.map;
+  });
+  assert.ok(board);
+  const start = board.version;
+  for (let i = 0; i < 9; i++) {
+    f.stage.update(f.view, { plantTime: String(i), telemetry: `Telemetry ${i}` }, []);
+    f.draw(100);
+    assert.equal(board.version, start);
+  }
+  f.draw(100);
+  assert.equal(board.version, start + 1);
+  assert.equal(f.timers.size, 0);
+});
+
+test('device motion reuses bounds and invalidates shadows only when casting geometry moves', t => {
+  const f = fixture(t);
+  const room = f.renderer.frames.at(-1).scene;
+  const batches = [];
+  room.traverse(mesh => {
+    if (mesh.isInstancedMesh && mesh.castShadow) batches.push(mesh);
+  });
+  assert.ok(batches.length > 0);
+  batches.forEach(mesh => {
+    assert.equal(mesh.frustumCulled, false);
+    mesh.computeBoundingSphere = () => assert.fail('device bounds must not be recomputed during rendering');
+  });
+  f.renderer.shadowMap.needsUpdate = false;
+  f.stage.update(f.view, f.text, []);
+  f.draw(16);
+  assert.equal(f.renderer.shadowMap.needsUpdate, false);
+  const knobs = KNOBS.filter(knob => knob.group === 'plant');
+  const states = knobs.map(knob => ({ fraction: 0, travel: 0, depth: 0, value: 0,
+    cover: { open: false, fired: false } }));
+  const dial = knobs.findIndex(knob => knob.kind === 'dial');
+  states[dial].fraction = 0.5;
+  f.stage.update(f.view, f.text, states);
+  f.draw(16);
+  assert.equal(f.renderer.shadowMap.needsUpdate, true);
+});
+
+test('all installed display materials preserve ink after their shader hooks and theme changes', t => {
+  const f = fixture(t);
+  const room = f.renderer.frames.at(-1).scene;
+  const surfaces = displays(room);
+  assert.equal(surfaces.length, 6);
+  for (const palette of [theme, { ...theme, ink: theme.lampInk }]) {
+    f.stage.setTheme(palette);
+    f.draw(1000);
+    for (const { material } of surfaces) {
+      assert.equal(material.toneMapped, false);
+      assert.equal(material.emissiveIntensity, 1);
+      assert.equal(material.color.getHex(), 0);
+      assert.equal(material.envMapIntensity, 0);
+      const output = new THREE.Color(palette.ink).multiply(material.emissive).multiplyScalar(material.emissiveIntensity);
+      assert.equal(output.getHexString(), palette.ink.slice(1));
+      const shader = { uniforms: {}, vertexShader: THREE.ShaderLib.standard.vertexShader,
+        fragmentShader: THREE.ShaderLib.standard.fragmentShader };
+      material.onBeforeCompile(shader);
+      assert.match(shader.fragmentShader, /outgoingLight = totalEmissiveRadiance;\n#include <opaque_fragment>/);
+    }
+  }
+});
+
+test('camera motion keeps CCTV at its own cadence and counts only passes that ran', t => {
+  const f = fixture(t, () => false);
+  f.stage.setView('loops-board');
+  const start = f.renderer.frames.length;
+  const feed = f.renderer.frames[0].camera;
+  const refreshes = [];
+  for (let i = 0; i < 100; i++) {
+    const before = f.renderer.frames.length;
+    f.draw(10);
+    const passes = f.renderer.frames.slice(before);
+    if (passes.some(pass => pass.camera === feed)) refreshes.push(f.now());
+    if (!passes.length) continue;
+    assert.equal(f.renderer.info.render.calls, passes.reduce((sum, pass) => sum + pass.calls, 0));
+    assert.equal(f.renderer.info.render.triangles, passes.reduce((sum, pass) => sum + pass.triangles, 0));
+  }
+  assert.equal(refreshes.length, 5);
+  assert.ok(refreshes.every((time, i) => !i || time - refreshes[i - 1] === 200));
+  assert.ok(f.renderer.frames.length - start > 50);
+});
+
+test('the counting renderer includes instancing, transparent back faces and static shadow passes', () => {
+  const renderer = renderers.at(-1);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 20);
+  camera.position.z = 5;
+  const material = new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide });
+  const geometry = new THREE.BoxGeometry();
+  const mesh = new THREE.InstancedMesh(geometry, material, 3);
+  mesh.castShadow = true;
+  for (let i = 0; i < 3; i++) mesh.setMatrixAt(i, new THREE.Matrix4());
+  scene.add(mesh);
+  const light = new THREE.DirectionalLight();
+  light.position.set(0, 3, 5);
+  light.castShadow = true;
+  scene.add(light, light.target);
+  renderer.shadowMap.needsUpdate = true;
+  renderer.info.reset();
+  renderer.render(scene, camera);
+  assert.deepEqual(renderer.info.render, { calls: 3, triangles: 108 });
+  assert.equal(renderer.frames.at(-1).shadowCalls, 1);
+  renderer.info.reset();
+  renderer.render(scene, camera);
+  assert.deepEqual(renderer.info.render, { calls: 2, triangles: 72 });
+  material.forceSinglePass = true;
+  renderer.info.reset();
+  renderer.render(scene, camera);
+  assert.deepEqual(renderer.info.render, { calls: 1, triangles: 36 });
+  mesh.dispose();
+  material.dispose();
+  geometry.dispose();
+  light.dispose();
 });

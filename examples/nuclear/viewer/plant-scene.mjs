@@ -1,7 +1,7 @@
 // Plant interiors use snapshot truth. Motion only interpolates the picture.
 import * as THREE from '/vendor/three/build/three.module.js';
 import { formatGap, formatValue, instruments } from './instruments.mjs';
-import { createMaterial, createLighting, applyMaterialPalette, setIndicator } from './look.mjs';
+import { createMaterial, createLighting, applyMaterialPalette, setIndicator, joinGeometries } from './look.mjs';
 import { PLANT_OFFSETS, passageCollisions } from './board-layout.mjs';
 
 const HALF_PI = Math.PI / 2;
@@ -53,53 +53,6 @@ function tracker() {
   };
 }
 
-/**
- * Joins indexed geometries into one, each moved by its matrix. Normals move
- * with the matrix; the UVs are copied as they are.
- */
-function joinGeometries(entries, track) {
-  let vertexCount = 0;
-  let indexCount = 0;
-  for (const { geometry } of entries) {
-    vertexCount += geometry.attributes.position.count;
-    indexCount += geometry.index.count;
-  }
-  const position = new Float32Array(vertexCount * 3);
-  const normal = new Float32Array(vertexCount * 3);
-  const uv = new Float32Array(vertexCount * 2);
-  const index = new Uint32Array(indexCount);
-  const v = new THREE.Vector3();
-  const normalMatrix = new THREE.Matrix3();
-  let vo = 0;
-  let io = 0;
-  for (const { geometry, matrix } of entries) {
-    const p = geometry.attributes.position;
-    const n = geometry.attributes.normal;
-    const t = geometry.attributes.uv;
-    normalMatrix.getNormalMatrix(matrix);
-    for (let i = 0; i < p.count; i++) {
-      v.fromBufferAttribute(p, i).applyMatrix4(matrix);
-      position.set([v.x, v.y, v.z], (vo + i) * 3);
-      v.fromBufferAttribute(n, i).applyMatrix3(normalMatrix).normalize();
-      normal.set([v.x, v.y, v.z], (vo + i) * 3);
-      if (t) {
-        uv[(vo + i) * 2] = t.getX(i);
-        uv[(vo + i) * 2 + 1] = t.getY(i);
-      }
-    }
-    const idx = geometry.index;
-    for (let i = 0; i < idx.count; i++) index[io + i] = idx.getX(i) + vo;
-    vo += p.count;
-    io += idx.count;
-  }
-  const out = new THREE.BufferGeometry();
-  out.setAttribute('position', new THREE.BufferAttribute(position, 3));
-  out.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
-  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
-  out.setIndex(new THREE.BufferAttribute(index, 1));
-  return track.add(out);
-}
-
 /** True when an object, or one of its parents up to root, is marked as moving. */
 function isAnimated(object, root) {
   for (let o = object; o; o = o.parent) {
@@ -130,7 +83,7 @@ export function mergeStatic(root, track) {
   });
   for (const mesh of found) mesh.removeFromParent();
   for (const { material, castShadow, receiveShadow, renderOrder, entries } of byMaterial.values()) {
-    const mesh = new THREE.Mesh(joinGeometries(entries, track), material);
+    const mesh = new THREE.Mesh(joinGeometries(THREE, entries, track), material);
     Object.assign(mesh, { castShadow, receiveShadow, renderOrder });
     root.add(mesh);
   }
@@ -171,12 +124,14 @@ export function createPlantScene({ theme, reducedMotion, environment, anisotropy
     warning: make('paintedSteel', 'warning'), water: make('paintedSteel', 'coldCoolant'),
     steam: make('concrete', 'steam', { transparent: true, opacity: 0.58, depthWrite: false }),
     lit: make('lamp', 'lampGlow'), off: make('lamp', 'lampOff'),
+    rodLight: make('lamp', 'lampGlow', { emissiveIntensity: 2.4 }),
     fixture: make('lamp', 'plantKey', { emissiveIntensity: 3 }),
     coolant: [make('paintedSteel', 'coldCoolant'), make('paintedSteel', 'coldCoolant')],
   };
   const cold = new THREE.Color(), hot = new THREE.Color();
   const cube = resources.add(new THREE.BoxGeometry(1, 1, 1));
   const tube = resources.add(new THREE.CylinderGeometry(1, 1, 1, 16));
+  const stemTube = resources.add(new THREE.CylinderGeometry(1, 1, 1, 8));
   const sphere = resources.add(new THREE.SphereGeometry(1, 12, 8));
   const plane = resources.add(new THREE.PlaneGeometry(1, 1));
   const reactor = new THREE.Group(), hall = new THREE.Group();
@@ -272,9 +227,7 @@ export function createPlantScene({ theme, reducedMotion, environment, anisotropy
   }
   function sightLevel(parent, x, z, height) {
     box(parent, [0.2, height, 0.12], mat.ink, [x, height / 2 + 0.35, z]);
-    const fill = box(parent, [0.1, 1, 0.04], mat.water, [x, 0.35, z + 0.08]);
-    fill.geometry = resources.add(cube.clone()); fill.geometry.translate(0, 0.5, 0);
-    fill.userData.animated = true; levels.push({ fill, height });
+    levels.push({ at: [x, 0.35, z + 0.08], height });
     for (let i = 0; i <= 5; i++) box(parent, [0.08, 0.02, 0.03], mat.face, [x + 0.06, 0.35 + height * i / 5, z + 0.09]);
   }
 
@@ -291,10 +244,22 @@ export function createPlantScene({ theme, reducedMotion, environment, anisotropy
     if (Math.abs(x) === 2 && Math.abs(z) === 2) continue;
     rodPositions.push([x * 0.48, z * 0.48 - 2]);
   }
-  const housings = instances(reactor, tube, mat.metal, rodPositions.length, 'CRDM housings');
-  const rods = instances(reactor, tube, mat.accent, rodPositions.length, 'Rod stems');
-  const collars = instances(reactor, tube, mat.warning, rodPositions.length, 'Rod position collars');
-  const rodLights = [mat.lit, mat.off].map((material, i) => instances(reactor, cube, material, rodPositions.length * 5, i ? 'Rod lights off' : 'Rod lights on'));
+  const housings = instances(reactor, stemTube, mat.metal, rodPositions.length, 'CRDM housings');
+  const rods = instances(reactor, stemTube, mat.accent, rodPositions.length, 'Rod stems');
+  const collars = instances(reactor, stemTube, mat.warning, rodPositions.length, 'Rod position collars');
+  const rodLightGeometry = resources.add(cube.clone());
+  const rodGlow = new THREE.InstancedBufferAttribute(new Float32Array(rodPositions.length * 5), 1);
+  rodLightGeometry.setAttribute('instanceGlow', rodGlow);
+  mat.rodLight.onBeforeCompile = shader => {
+    shader.vertexShader = 'attribute float instanceGlow; varying float vInstanceGlow;\n' + shader.vertexShader;
+    shader.vertexShader = shader.vertexShader.replace('#include <color_vertex>',
+      '#include <color_vertex>\nvInstanceGlow = instanceGlow;');
+    shader.fragmentShader = 'varying float vInstanceGlow;\n' + shader.fragmentShader;
+    shader.fragmentShader = shader.fragmentShader.replace('#include <emissivemap_fragment>',
+      '#include <emissivemap_fragment>\ntotalEmissiveRadiance *= vColor.rgb * vInstanceGlow;');
+  };
+  const rodLights = instances(reactor, rodLightGeometry, mat.rodLight, rodPositions.length * 5, 'Rod position lights');
+  const rodColor = new THREE.Color();
   rodPositions.forEach(([x, z], i) => place(housings, i, [x, 1.95, z], [0.13, 1.4, 0.13]));
   label(reactor, 'REACTOR HEAD / ROD POSITION', [0, 0.62, -0.16], 2.6, 0.3);
 
@@ -325,8 +290,6 @@ export function createPlantScene({ theme, reducedMotion, environment, anisotropy
     rotor.userData.animated = true;
     rotor.position.set(px, 1.32, 1.3);
     reactor.add(rotor);
-    cylinder(rotor, 0.43, 0.38, mat.metal, [0, 0, 0]);
-    box(rotor, [0.12, 0.4, 0.04], mat.warning, [0, 0, 0.43]);
     const lamp = solid(reactor, sphere, mat.off, [px + 0.6, 1.9, 1.7], [0.06, 0.06, 0.06]);
     lamp.userData.animated = true;
     pumps.push({ rotor, lamp });
@@ -346,8 +309,13 @@ export function createPlantScene({ theme, reducedMotion, environment, anisotropy
   pipe(reactor, [[-6.5, 5.1, -0.5], [-5.45, 5.1, -0.5], [-5.45, 4.6, -0.5]], 0.08, mat.metal);
   box(reactor, [0.5, 1.3, 0.08], mat.ink, [-5.45, 3.95, -0.65]);
   label(reactor, 'SPRAY', [-5.45, 3.45, -0.59], 0.45, 0.18);
-  const spray = instances(reactor, sphere, mat.water, 8, 'Pressurizer spray');
-  const relief = instances(reactor, sphere, mat.steam, 6, 'Pressurizer relief');
+  const droplet = resources.add(new THREE.SphereGeometry(1, 8, 6));
+  const spray = instances(reactor, droplet, mat.water, 8, 'Pressurizer spray');
+  const relief = instances(reactor, droplet, mat.steam, 6, 'Pressurizer relief');
+  const levelGeometry = resources.add(cube.clone().translate(0, 0.5, 0));
+  const levelFills = instances(reactor, levelGeometry, mat.water, levels.length, 'Sight glass levels');
+  const pumpRotors = instances(reactor, tube, mat.metal, pumps.length, 'Pump couplings');
+  const pumpMarks = instances(reactor, cube, mat.warning, pumps.length, 'Pump coupling stripes');
   gauge(reactor, 'reactor', 'pressurizer_pressure', 'PRESSURIZER', [-6.4, 1.35, 1.35]);
   gauge(reactor, 'reactor', 'core_exit_temperature', 'CORE EXIT', [1.9, 1.35, -0.05]);
   const craneRing = resources.add(new THREE.TorusGeometry(7.8, 0.12, 8, 64));
@@ -432,22 +400,28 @@ export function createPlantScene({ theme, reducedMotion, environment, anisotropy
   pipe(hall, [[HALL_X - 1.8, -1, 2.5], [HALL_X - 1.8, 0.1, 5.7], [HALL_X - 1.8, 1.2, 5.7]], 0.025, mat.metal);
   gauge(hall, 'turbine', 'generator_output', 'GENERATOR', [HALL_X + 6.4, 1.35, 3.6]);
 
-  // Shared pipe geometry is instanced once per room and material.
+  const openTube = resources.add(new THREE.CylinderGeometry(1, 1, 1, 16, 1, true));
+  const cap = resources.add(new THREE.CircleGeometry(1, 16).rotateX(-HALF_PI));
+  // Pipe walls join the static material batches. Bends cover the internal caps.
   for (const parent of [reactor, hall]) for (const material of new Set(pipeRuns.filter(run => run.parent === parent).map(run => run.material))) {
     const runs = pipeRuns.filter(run => run.parent === parent && run.material === material);
     const segments = runs.flatMap(run => run.points.slice(1).map((p, i) => ({ a: run.points[i], b: p, radius: run.radius })));
-    const pipes = instances(parent, tube, material, segments.length, 'Pipe segments');
-    segments.forEach(({ a, b, radius }, i) => {
+    segments.forEach(({ a, b, radius }) => {
       const start = new THREE.Vector3(...a), end = new THREE.Vector3(...b), direction = end.clone().sub(start);
-      dummy.position.copy(start).add(end).multiplyScalar(0.5);
-      dummy.scale.set(radius, direction.length(), radius);
-      dummy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
-      dummy.updateMatrix(); pipes.setMatrixAt(i, dummy.matrix);
+      const mesh = new THREE.Mesh(openTube, material);
+      mesh.position.copy(start).add(end).multiplyScalar(0.5);
+      mesh.scale.set(radius, direction.length(), radius);
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
+      parent.add(mesh);
     });
-    pipes.instanceMatrix.needsUpdate = true;
-    const bends = runs.flatMap(run => run.points.slice(1, -1).map(at => ({ at, radius: run.radius })));
-    const joints = instances(parent, sphere, material, bends.length, 'Pipe bends');
-    bends.forEach(({ at, radius }, i) => place(joints, i, at, [radius, radius, radius]));
+    for (const run of runs) {
+      for (const at of run.points.slice(1, -1)) solid(parent, sphere, material, at, [run.radius, run.radius, run.radius]);
+      for (const [end, neighbor] of [[0, 1], [run.points.length - 1, run.points.length - 2]]) {
+        const mesh = solid(parent, cap, material, run.points[end], [run.radius, 1, run.radius]);
+        const direction = new THREE.Vector3(...run.points[end]).sub(new THREE.Vector3(...run.points[neighbor])).normalize();
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+      }
+    }
   }
 
   // Paint each plate at its own aspect, then pack it without stretching.
@@ -546,6 +520,8 @@ export function createPlantScene({ theme, reducedMotion, environment, anisotropy
     lighting.setTheme(colors);
     for (const material of Object.values(mat).flat()) applyMaterialPalette(material, colors);
     setIndicator(mat.lit, colors, { lit: true }); setIndicator(mat.off, colors, { lit: false });
+    mat.rodLight.color.setScalar(1);
+    mat.rodLight.emissive.setScalar(1);
     mat.fixture.emissive.set(colors.plantKey);
     puffMaterial.color.set(colors.steam);
     cold.set(colors.coldCoolant); hot.set(colors.hotCoolant);
@@ -612,19 +588,27 @@ export function createPlantScene({ theme, reducedMotion, environment, anisotropy
       const trueFraction = i < 13 ? targets.rods : targets.shutdown;
       for (let n = 0; n < 5; n++) {
         const index = i * 5 + n;
-        rodLights.forEach((mesh, state) => {
-          const lit = trueFraction >= n / 4;
-          const size = lit === (state === 0) ? 0.055 : 0;
-          place(mesh, index, [x, 1.45 + n * 0.38, z + 0.15], [size, size, size]);
-        });
+        const lit = trueFraction >= n / 4;
+        place(rodLights, index, [x, 1.45 + n * 0.38, z + 0.15], [0.055, 0.055, 0.055]);
+        rodLights.setColorAt(index, rodColor.set(colors[lit ? 'lampGlow' : 'lampOff']));
+        rodGlow.setX(index, Number(lit));
       }
     });
-    levels.forEach(({ fill, height }, i) => { fill.scale.y = Math.max(0.0001, shown.levels[i] * height); });
+    rodGlow.needsUpdate = true;
+    rodLights.instanceColor.needsUpdate = true;
+    levels.forEach(({ at, height }, i) => {
+      place(levelFills, i, at, [0.1, Math.max(0.0001, shown.levels[i] * height), 0.04]);
+    });
     pumps.forEach((pump, i) => {
       // Pump status switches the lamp. Speed alone drives the coastdown.
       pump.lamp.material = latest.loops[i].pumpRunning ? mat.lit : mat.off;
       if (!reduced) pump.rotor.rotation.y -= targets.pumps[i] * SPIN * dt;
       else pump.rotor.rotation.y = -targets.pumps[i] * Math.PI;
+      const angle = pump.rotor.rotation.y;
+      const { x, y, z } = pump.rotor.position;
+      place(pumpRotors, i, [x, y, z], [0.43, 0.38, 0.43], [0, angle, 0]);
+      place(pumpMarks, i, [x + Math.sin(angle) * 0.43, y, z + Math.cos(angle) * 0.43],
+        [0.12, 0.4, 0.04], [0, angle, 0]);
       mat.coolant[i].color.copy(cold).lerp(hot, shown.coolant[i]);
     });
     if (!reduced) shaft.rotation.x += targets.shaft * SPIN * dt;

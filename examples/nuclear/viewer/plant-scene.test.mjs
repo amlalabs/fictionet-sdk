@@ -133,6 +133,18 @@ test('a stopped pump motor coasts at snapshot speed while the other pump keeps t
   const fast = Math.abs(b.rotation.y - start);
   assert.ok(Math.abs(fast - 0.54) < 1e-9);
   assert.ok(Math.abs(a.rotation.y - startA + 0.9) < 1e-9);
+  const couplings = named(plant, 'Pump couplings');
+  const stripes = named(plant, 'Pump coupling stripes');
+  assert.equal(couplings.count, 2);
+  assert.equal(stripes.count, 2);
+  for (const [i, rotor] of [a, b].entries()) {
+    const matrix = new THREE.Matrix4();
+    couplings.getMatrixAt(i, matrix);
+    assert.ok(Math.abs(matrix.elements[8] / 0.43 - Math.sin(rotor.rotation.y)) < 1e-7);
+    const mark = at(stripes, i);
+    assert.ok(Math.abs(mark.x - rotor.position.x - Math.sin(rotor.rotation.y) * 0.43) < 1e-6);
+    assert.ok(Math.abs(mark.z - rotor.position.z - Math.cos(rotor.rotation.y) * 0.43) < 1e-6);
+  }
   snap.truth.primary.loops[1].pump_speed_percent = 15;
   plant.update(snap);
   const middle = b.rotation.y;
@@ -159,10 +171,17 @@ test('rod stems and collars drop and position lights follow true rod insertion',
   assert.ok(at(rods, 20).y < before[1] - 1.5);
   assert.ok(at(collars, 0).y < before[2] - 1.2);
   const matrix = new THREE.Matrix4();
-  named(plant, 'Rod lights on').getMatrixAt(4, matrix);
-  assert.equal(new THREE.Vector3().setFromMatrixScale(matrix).length(), 0);
-  named(plant, 'Rod lights off').getMatrixAt(4, matrix);
+  const lights = named(plant, 'Rod position lights');
+  assert.equal(lights.count, 105);
+  lights.getMatrixAt(4, matrix);
   assert.ok(new THREE.Vector3().setFromMatrixScale(matrix).length() > 0);
+  const color = new THREE.Color();
+  lights.getColorAt(4, color);
+  assert.equal(color.getHexString(), theme.lampOff.slice(1));
+  assert.equal(lights.geometry.attributes.instanceGlow.getX(4), 0);
+  lights.getColorAt(0, color);
+  assert.equal(color.getHexString(), theme.lampGlow.slice(1));
+  assert.equal(lights.geometry.attributes.instanceGlow.getX(0), 1);
 });
 
 test('field gauges ignore reported faults and show exact truth values', async t => {
@@ -225,9 +244,11 @@ test('reduced motion freezes rotation and camera, and snaps rods, gauges and lev
   assert.equal(fan.rotation.y, angle); assert.equal(shaft.rotation.x, shaftAngle);
   assert.ok(plant.camera.position.equals(camera));
   assert.ok(Math.abs(at(named(plant, 'Rod stems')).y - 1.45) < 1e-6);
-  const fills = [];
-  plant.scene.traverse(o => { if (o.isMesh && o.userData.animated && o.geometry.attributes.position.count === 24) fills.push(o); });
-  assert.ok(fills.some(o => Math.abs(o.scale.y - 0.35) < 1e-9));
+  const fills = named(plant, 'Sight glass levels');
+  assert.equal(fills.count, 3);
+  const matrix = new THREE.Matrix4();
+  fills.getMatrixAt(2, matrix);
+  assert.equal(new THREE.Vector3().setFromMatrixScale(matrix).y, Math.fround(0.35));
 });
 
 test('the plant registers no input listeners or render callbacks and disposal leaves the canvas alone', t => {
@@ -309,13 +330,13 @@ test('both interiors fit the budget even without frustum culling and release sce
       materials.add(object.material);
       if (object.material.map) textures.add(object.material.map);
       if (!object.layers.test(plant.camera.layers)) return;
-      const passes = object.material.transparent && object.material.side === THREE.DoubleSide ? 2 : 1;
+      const passes = object.material.transparent && object.material.side === THREE.DoubleSide && !object.material.forceSinglePass ? 2 : 1;
       calls += passes;
       if (object.isSprite) triangles += 2;
       else triangles += (object.geometry.index?.count ?? object.geometry.attributes.position.count) / 3 * (object.count ?? 1) * passes;
     });
-    assert.ok(calls <= 60, `${view}: ${calls} calls`);
-    assert.ok(triangles <= 60000, `${view}: ${triangles} triangles`);
+    assert.ok(calls < 60, `${view}: ${calls} calls`);
+    assert.ok(triangles < 40000, `${view}: ${triangles} triangles`);
     t.diagnostic(`${view}: at most ${calls} calls and ${triangles} triangles; all meshes counted`);
   }
   plant.scene.traverse(object => { if (object.isLight) assert.equal(object.castShadow, false); });

@@ -86,9 +86,21 @@ function fixture() {
 test('all pairs use physical rims, needles, glass and plates with a small fixed batch count', (t) => {
   const f = fixture();
   f.meters.update(f.pairs, f.shown);
-  for (const name of ['HMI housings', 'PLANT housings', 'HMI bezels', 'PLANT bezels', 'PLANT inlays']) {
+  for (const name of ['HMI bezels', 'PLANT bezels', 'PLANT inlays']) {
     assert.equal(f.mesh(name).count, 21);
     assert.equal(f.mesh(name).isInstancedMesh, true);
+  }
+  for (const name of ['HMI bezels', 'PLANT bezels']) {
+    const mesh = f.mesh(name);
+    assert.equal(mesh.geometry.index.count / 3, 96);
+    for (let i = 0; i < mesh.count; i++) {
+      const matrix = new THREE.Matrix4();
+      mesh.getMatrixAt(i, matrix);
+      const scale = new THREE.Vector3().setFromMatrixScale(matrix);
+      mesh.geometry.computeBoundingBox();
+      assert.ok(Math.abs(mesh.geometry.boundingBox.min.z * scale.z + 0.061) < 1e-7);
+      assert.ok(Math.abs(mesh.geometry.boundingBox.max.z) < 1e-7);
+    }
   }
   assert.equal(f.mesh('Engraved plates').count, 63);
   assert.equal(f.mesh('Meter needles').count, 42);
@@ -254,7 +266,7 @@ test('the merged printed meshes preserve readable lettering at every fitted spot
   const f = fixture();
   const scales = f.mesh('Printed scales and plates').geometry.attributes.position;
   const readouts = f.mesh('Snapshot readouts').geometry.attributes.position;
-  const circleVertices = f.mesh('Needle hubs').geometry.index.count;
+  const circleVertices = f.mesh('Meter glass').geometry.index.count;
   for (const [width, height] of [[785, 491], [692, 433]]) {
     const camera = new THREE.PerspectiveCamera(ROOM.fov, width / height, 0.05, 100);
     let index = 0;

@@ -27,6 +27,21 @@ export function applyMaterialPalette(material, palette) {
   material.color.set(palette[material.userData.paletteToken]);
 }
 
+export function createDisplayMaterial(THREE, palette, texture) {
+  const material = createMaterial(THREE, palette, 'lamp', 'lightKey', {
+    map: texture, emissiveMap: texture, emissiveIntensity: 1, toneMapped: false,
+    roughness: 1, metalness: 0, envMapIntensity: 0,
+  });
+  // Neutral multipliers preserve the canvas palette without reflected light.
+  material.color.setScalar(0);
+  material.emissive.setScalar(1);
+  material.onBeforeCompile = shader => {
+    shader.fragmentShader = shader.fragmentShader.replace('#include <opaque_fragment>',
+      'outgoingLight = totalEmissiveRadiance;\n#include <opaque_fragment>');
+  };
+  return material;
+}
+
 export function indicatorSpec(palette, { lit }) {
   return {
     color: lit ? palette.lampGlow : palette.lampOff,
@@ -49,6 +64,8 @@ export function createRenderer(THREE) {
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.autoUpdate = false;
+  renderer.shadowMap.needsUpdate = true;
   renderer.info.autoReset = false;
   return renderer;
 }
@@ -152,4 +169,51 @@ export function bakeRoomGeometry(THREE, mesh) {
   }
   mesh.geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   mesh.material.vertexColors = true;
+}
+
+/**
+ * Joins indexed geometries into one, each moved by its matrix. Normals move
+ * with the matrix; the UVs are copied as they are.
+ */
+export function joinGeometries(THREE, entries, track) {
+  let vertexCount = 0;
+  let indexCount = 0;
+  for (const { geometry } of entries) {
+    vertexCount += geometry.attributes.position.count;
+    indexCount += geometry.index.count;
+  }
+  const position = new Float32Array(vertexCount * 3);
+  const normal = new Float32Array(vertexCount * 3);
+  const uv = new Float32Array(vertexCount * 2);
+  const index = new Uint32Array(indexCount);
+  const v = new THREE.Vector3();
+  const normalMatrix = new THREE.Matrix3();
+  let vo = 0;
+  let io = 0;
+  for (const { geometry, matrix } of entries) {
+    const p = geometry.attributes.position;
+    const n = geometry.attributes.normal;
+    const t = geometry.attributes.uv;
+    normalMatrix.getNormalMatrix(matrix);
+    for (let i = 0; i < p.count; i++) {
+      v.fromBufferAttribute(p, i).applyMatrix4(matrix);
+      position.set([v.x, v.y, v.z], (vo + i) * 3);
+      v.fromBufferAttribute(n, i).applyMatrix3(normalMatrix).normalize();
+      normal.set([v.x, v.y, v.z], (vo + i) * 3);
+      if (t) {
+        uv[(vo + i) * 2] = t.getX(i);
+        uv[(vo + i) * 2 + 1] = t.getY(i);
+      }
+    }
+    const idx = geometry.index;
+    for (let i = 0; i < idx.count; i++) index[io + i] = idx.getX(i) + vo;
+    vo += p.count;
+    io += idx.count;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(position, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  out.setIndex(new THREE.BufferAttribute(index, 1));
+  return track.add(out);
 }

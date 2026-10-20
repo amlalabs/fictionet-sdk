@@ -1,6 +1,6 @@
 import { BOARD, BOARD_PX, BOARDS, boardLayout, boardPoint, cellLayout } from './board-layout.mjs';
 import { formatGap, formatValue } from './instruments.mjs';
-import { createMaterial, applyMaterialPalette } from './look.mjs';
+import { createMaterial, applyMaterialPalette, joinGeometries } from './look.mjs';
 
 const TAU = Math.PI * 2;
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif";
@@ -57,11 +57,16 @@ export function createMeters(THREE, scene, theme, { makeCanvas = () => document.
   const dummy = new THREE.Object3D();
   const unitBox = track(new THREE.BoxGeometry(1, 1, 1));
   const circle = track(new THREE.CircleGeometry(1, 24));
+  const hub = track(new THREE.CircleGeometry(1, 8));
   const plane = track(new THREE.PlaneGeometry(1, 1));
   const ring = track(new THREE.RingGeometry(0.85, 1, 24));
   const inlay = track(new THREE.RingGeometry(0.92, 0.95, 24));
   const dash = track(new THREE.RingGeometry(0.87, 0.99, 3, 1, 0, TAU / 24));
   const wall = track(new THREE.CylinderGeometry(1, 1, 1, 24, 1, true).rotateX(Math.PI / 2));
+  const housing = joinGeometries(THREE, [
+    { geometry: ring, matrix: new THREE.Matrix4() },
+    { geometry: wall, matrix: new THREE.Matrix4().makeTranslation(0, 0, -0.031 / 0.06) },
+  ], { add: track });
   const blade = track(new THREE.BoxGeometry(0.76, 0.045, 0.025).translate(0.28, 0, 0));
   const standard = (role, token) => track(createMaterial(THREE, theme, role, token));
   const flat = token => standard('paintedSteel', token);
@@ -97,14 +102,12 @@ export function createMeters(THREE, scene, theme, { makeCanvas = () => document.
     board, cell, key: board.points[i], layout: cellLayout(cell.w, cell.h), scaleSignature: '', readoutSignature: '',
   })));
   const count = cells.length;
-  const blackWalls = instances('HMI housings', wall, materials.black, count);
-  const metalWalls = instances('PLANT housings', wall, materials.metal, count);
-  const blackRims = instances('HMI bezels', ring, materials.black, count);
-  const metalRims = instances('PLANT bezels', ring, materials.metal, count);
+  const blackRims = instances('HMI bezels', housing, materials.black, count);
+  const metalRims = instances('PLANT bezels', housing, materials.metal, count);
   const inlays = instances('PLANT inlays', inlay, materials.ink, count);
   const plates = instances('Engraved plates', unitBox, materials.metal, count * 3);
   const needles = instances('Meter needles', blade, materials.ink, count * 2);
-  const hubs = instances('Needle hubs', circle, materials.ink, count * 2);
+  const hubs = instances('Needle hubs', hub, materials.ink, count * 2);
   const glass = instances('Meter glass', circle, materials.glass, count * 2);
   glass.renderOrder = 2;
   const warnings = instances('Marked HMI rims', ring, materials.warning, count);
@@ -168,8 +171,7 @@ export function createMeters(THREE, scene, theme, { makeCanvas = () => document.
       return rect;
     });
     dials.forEach((dial, i) => {
-      atDial(i ? metalWalls : blackWalls, index, entry, dial, 0.055, 1, 0, 0.06);
-      atDial(i ? metalRims : blackRims, index, entry, dial, 0.086);
+      atDial(i ? metalRims : blackRims, index, entry, dial, 0.086, 1, 0, 0.06);
       if (i) atDial(inlays, index, entry, dial, 0.087);
       atDial(hubs, index * 2 + i, entry, dial, 0.084, 0.085);
       atDial(glass, index * 2 + i, entry, dial, 0.091, 0.845);
@@ -261,7 +263,8 @@ export function createMeters(THREE, scene, theme, { makeCanvas = () => document.
         paintScale(entry, pair); paintReadout(entry, pair);
         const level = shown.get(pair.key);
         entry.layout.dials.forEach((dial, i) => {
-          const value = i ? level?.truth ?? pair.trueValue : pair.reported === null ? null : level?.reported ?? pair.reported;
+          let value = level?.truth ?? pair.trueValue;
+          if (!i) value = pair.reported === null ? null : level?.reported ?? pair.reported;
           const angle = needleAngle(value, pair.range);
           if (angle !== null) atDial(needles, needles.count++, entry, dial, 0.081, 1, angle);
         });
