@@ -135,47 +135,24 @@ fn read_frame(mut peer: &std::os::unix::net::UnixStream) -> Option<Vec<u8>> {
     Some(body)
 }
 
-/// A scripted observer peer, with the same replies for each request.
-fn with_observer(replies: &[(u8, &[u8])], requests: usize, run: impl FnOnce(&str)) {
-    with_observer_action(
-        requests,
-        |peer, id| {
-            for &(flags, body) in replies {
-                send_reply(peer, id, flags, body);
-            }
-        },
-        run,
-    );
-}
-
-/// A scripted observer peer that runs an action for each request.
-fn with_observer_action(
-    requests: usize,
-    mut reply: impl FnMut(&std::os::unix::net::UnixStream, u32) + Send,
-    run: impl FnOnce(&str),
-) {
+/// A scripted observer peer that answers one request with `replies`.
+fn with_observer(replies: &[(u8, &[u8])], run: impl FnOnce(&str)) {
     let path = temp::socket();
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     std::thread::scope(|scope| {
         let server = scope.spawn(|| {
-            let mut remaining = requests;
-            while remaining != 0 {
-                let (peer, _) = listener.accept().unwrap();
-                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                assert_eq!(
-                    read_frame(&peer).unwrap(),
-                    [b"\x01\x00\x00\x00\x02".as_slice(), b"fictionet-observe"].concat()
-                );
-                send_frame(&peer, &[2]);
-                while remaining != 0 {
-                    let Some(frame) = read_frame(&peer) else {
-                        break;
-                    };
-                    remaining -= 1;
-                    assert_eq!(frame[0], 4, "expected an observation request");
-                    let id = u32::from_be_bytes(frame[1..5].try_into().unwrap());
-                    reply(&peer, id);
-                }
+            let (peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(
+                read_frame(&peer).unwrap(),
+                [b"\x01\x00\x00\x00\x02".as_slice(), b"fictionet-observe"].concat()
+            );
+            send_frame(&peer, &[2]);
+            let frame = read_frame(&peer).expect("an observation request");
+            assert_eq!(frame[0], 4, "expected an observation request");
+            let id = u32::from_be_bytes(frame[1..5].try_into().unwrap());
+            for &(flags, body) in replies {
+                send_reply(&peer, id, flags, body);
             }
         });
         run(&path);
@@ -200,7 +177,7 @@ fn observe_inspects_envelopes_and_preserves_bytes() {
         (0, br#"{"event":"ended","data":{}} trailing"#, 1),
         (BINARY, br#"{"event":"ended","data":{}}"#, 1),
     ] {
-        with_observer(&[(flags, bytes)], 1, |path| {
+        with_observer(&[(flags, bytes)], |path| {
             let out = Command::new(BIN)
                 .args(["observe", "--observation", &format!("unix:{path}"), "watch"])
                 .output()
@@ -270,7 +247,7 @@ fn observe_partial_frame_after_ended_is_an_error() {
         if partial {
             replies.push((MORE, br#"{"event":"end","data":"#.as_slice()));
         }
-        with_observer(&replies, 1, |path| {
+        with_observer(&replies, |path| {
             let out = Command::new(BIN)
                 .args(["observe", "--observation", &format!("unix:{path}"), "watch"])
                 .output()
