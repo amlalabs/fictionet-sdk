@@ -242,16 +242,21 @@ test('every page creation mode and first and latest latency render as words', (t
   h.dispose();
 });
 
-test('only new pool sites get a story moment, once per site', (t) => {
+test('the first page on a new pool site gets the story moment, once per site', (t) => {
   const h = harness(t), s = fixture(); h.publish(s);
   assert.equal(h.moments.length, 0);
-  s.sites.push({ host: 'new.com', address: '23.1.2.4', reason: 'pool' });
+  s.sites.push({ host: 'new.com', address: '23.1.2.4', reason: 'pool' }, { host: 'engine.com', address: '23.1.2.5', reason: 'search_engine' });
   h.publish(s);
+  assert.equal(h.moments.length, 0, 'a lookup with no page is not a moment');
+  s.pages.push(page('https://new.com/', { via: 'direct' }), page('https://engine.com/', { via: 'direct' })); h.publish(s);
   assert.equal(h.moments.length, 1);
+  assert.match(h.moments[0].textContent, /new\.com/);
   h.publish(structuredClone(s));
   assert.equal(h.moments.length, 1);
-  s.pages.push(page('https://new.com/', { via: 'direct' })); h.publish(s);
+  s.pages.push(page('https://new.com/2', { via: 'direct' })); h.publish(s);
   assert.equal(h.moments.length, 1);
+  s.pages.push(page('https://made.com/later', { via: 'direct' })); h.publish(s);
+  assert.equal(h.moments.length, 1, 'sites already on screen when the panel opened get none');
   h.dispose();
 });
 

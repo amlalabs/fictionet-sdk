@@ -49,10 +49,28 @@ async fn wait(
     Ok(snapshot(&value)?.expect("the accepted state has a value"))
 }
 
+/// Enters a URL in Firefox's address bar and presses Return only once the bar
+/// holds the whole URL.
 async fn navigate(run: &Run, url: &str) -> Result {
     let quoted = quote(url);
+    // Typed keys can lose the start of a URL when the bar selects its text
+    // late, and a paste can land after a Return sent with it. So the URL is
+    // pasted, then copied back out of the bar until it matches.
     let command = format!(
-        "env DISPLAY=:1 xdotool search --sync --onlyvisible --class Firefox windowactivate --sync key --clearmodifiers ctrl+l type --clearmodifiers -- {quoted} && env DISPLAY=:1 xdotool key --clearmodifiers Return"
+        r#"export DISPLAY=:1
+url={quoted}
+clip() {{ printf %s "$1" | xclip -selection clipboard >/dev/null 2>&1; }}
+xdotool search --sync --onlyvisible --class Firefox windowactivate --sync || exit 1
+clip "$url"
+xdotool key --clearmodifiers ctrl+l key --clearmodifiers ctrl+v
+for try in $(seq 50); do
+  clip ''
+  xdotool key --clearmodifiers ctrl+a key --clearmodifiers ctrl+c
+  sleep 0.1
+  [ "$(xclip -o -selection clipboard 2>/dev/null)" = "$url" ] && exec xdotool key --clearmodifiers Return
+done
+echo "the address bar never held $url" >&2
+exit 1"#
     );
     // The kit connects SSH as the guest user, who also owns the desktop.
     let output = tokio::time::timeout(Duration::from_secs(15), run.guest(HOST).ssh().run(&command))
@@ -61,7 +79,7 @@ async fn navigate(run: &Run, url: &str) -> Result {
     if output.code != 0 {
         return Err(format!("scripted Firefox navigation: {}", output.stderr).into());
     }
-    println!("Firefox (scripted) typed: {url}");
+    println!("Firefox (scripted) entered: {url}");
     Ok(())
 }
 

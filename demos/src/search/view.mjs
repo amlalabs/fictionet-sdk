@@ -64,7 +64,8 @@ export function mount(root, services, options) {
   const refused = el('div', null, treeSection, 'search-refused');
   sitesHead.hidden = refusedHead.hidden = true;
   const rows = new Map(), nodes = new Map(), results = new Map(), sites = new Map(), refusals = new Map();
-  const seenSites = new Set();
+  // Hosts on screen when the panel opened, and hosts that had their moment.
+  const firstSites = new Set(), marked = new Set();
   const controller = new AbortController();
   let snapshot, chosen, selectedPage, busy = false, waitingRevision, disposed = false, initialized = false;
   const cleanup = [];
@@ -185,9 +186,14 @@ export function mount(root, services, options) {
         set(entry.open, r.page ? `↳ Opened · ${made(r.page.made)} · ${ms(r.page.serve_ms)} · show page` : '');
       }, results);
     } else if (chosen != null) { set(origin, 'This search is no longer retained.'); reconcile(resultList, [], (r) => r.url, () => {}, () => {}, results); }
-    const freshSites = new Set(s.sites.filter((site) => initialized && site.reason === 'pool' && !seenSites.has(site.host)).map((site) => site.host));
-    const moments = new Set();
-    const mark = (entry, host) => { if (freshSites.has(host) && !moments.has(host)) { services.moment(entry.node); moments.add(host); } };
+    if (!initialized) s.sites.forEach((site) => firstSites.add(site.host));
+    // The story moment is the first page on a made-up site that is new to this
+    // viewer; a lookup with no page is background traffic, not the story.
+    const pool = new Set(s.sites.filter((site) => site.reason === 'pool').map((site) => site.host));
+    const mark = (entry, host) => {
+      if (!initialized || !pool.has(host) || firstSites.has(host) || marked.has(host)) return;
+      services.moment(entry.node); marked.add(host);
+    };
     const branches = tree(s);
     treeEmpty.hidden = branches.length > 0;
     reconcile(treeList, branches, (n) => n.id, (n) => card(n.page ? 'search-node' : 'search-root', n.page ? 'button' : 'div'), (entry, n, fresh) => {
@@ -207,7 +213,7 @@ export function mount(root, services, options) {
     const unfetched = s.sites.filter((site) => !s.pages.some((p) => p.host === site.host));
     sitesHead.hidden = !unfetched.length;
     reconcile(otherSites, unfetched, (site) => site.host, () => card('search-site', 'div'), (entry, site) => {
-      set(entry.top, site.host); set(entry.title, `${site.address} · ${siteReason(site.reason)}`); mark(entry, site.host);
+      set(entry.top, site.host); set(entry.title, `${site.address} · ${siteReason(site.reason)}`);
     }, sites);
     const occurrences = new Map();
     const refusedRows = s.refused.map((r) => { const key = `${r.name}:${r.at_ms}`; const count = occurrences.get(key) || 0; occurrences.set(key, count + 1); return { ...r, identity: `${key}:${count}` }; });
@@ -215,7 +221,6 @@ export function mount(root, services, options) {
       set(entry.top, `× ${r.name}`); set(entry.title, r.reason); set(entry.note, `at ${time(r.at_ms)}`);
     }, refusals);
     refusedHead.hidden = !refusedRows.length;
-    s.sites.forEach((site) => seenSites.add(site.host));
     initialized = true;
   }
   stateButton();
