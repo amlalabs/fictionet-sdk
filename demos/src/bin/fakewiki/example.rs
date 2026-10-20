@@ -1,7 +1,6 @@
 //! The real article page and world, with a placeholder screen and a scripted client.
 
 mod page;
-mod preview;
 mod world;
 
 use std::net::Ipv4Addr;
@@ -14,6 +13,7 @@ use fakewiki_world::{
 };
 use fictionet::stdlib::{codec::Wire, protocols::http1, web, world::sandbox};
 use fictionet::{RunOptions, Seed};
+use fictionet_demo::kit;
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{Host, HostState, HostStatus, Page, StateLimits, StateTopic},
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .page(
             Page::new("FakeWiki · no VM · placeholder screen", dashboard.handle()).host(
                 Host::new(HOST)
-                    .console(preview::Screen)
+                    .console(kit::preview::Console)
                     .status(status.clone()),
             ),
         )

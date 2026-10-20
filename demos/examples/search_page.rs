@@ -19,7 +19,7 @@ use fictionet::{
 };
 use fictionet_demo::{
     kit::{self, client::PageClient},
-    search::{Topics, World, console::PreviewConsole},
+    search::{Topics, World},
 };
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
@@ -46,7 +46,7 @@ async fn main() -> Result {
             dashboard.handle(),
             Host::new("workstation")
                 .sandbox("workstation")
-                .console(PreviewConsole)
+                .console(kit::preview::Console)
                 .status(status.clone()),
         )
         .labels(labels.clone())
@@ -99,9 +99,7 @@ async fn main() -> Result {
                     eprintln!("Preview story failed: {error}");
                     return Err(error);
                 }
-                println!(
-                    "Preview story complete. Generation is off; the page remains open until Ctrl-C."
-                );
+                println!("Preview story complete. Generation is off.");
                 Ok(())
             });
             let _ = cx.race(None, stopped).await;
@@ -109,7 +107,7 @@ async fn main() -> Result {
             Ok(())
         },
     ));
-    tokio::signal::ctrl_c().await?;
+    kit::gate::stay_open().await?;
     let _ = stop.send(());
     task.await??;
     drop(server);
@@ -214,21 +212,16 @@ async fn story(
         .await?;
     println!("Scripted client asked for wiki.corp");
     pause().await?;
-    let response = page
-        .request(
-            "POST",
-            "/api/command/generation",
-            Some(&serde_json::json!({
-                "request_id": "preview-generation",
-                "command": {"command": "set_generation", "generate": false,
-                    "expected_revision": searches.snapshot().generator.generation_revision}
-            })),
-            true,
+    let reply = page
+        .command(
+            "generation",
+            "preview-generation",
+            serde_json::json!({"command": "set_generation", "generate": false,
+                "expected_revision": searches.snapshot().generator.generation_revision}),
         )
         .await
         .map_err(fictionet::Error::msg)?;
-    let reply: serde_json::Value = serde_json::from_slice(&response.body)?;
-    if response.status != 200 || reply["status"] != "applied" {
+    if reply["status"] != "applied" {
         return Err(fictionet::Error::msg(format!(
             "generation command: {reply}"
         )));

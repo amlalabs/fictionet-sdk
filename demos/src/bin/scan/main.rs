@@ -5,9 +5,8 @@ mod story;
 mod world;
 
 use fictionet_demo::kit::{
-    self, Kit,
+    Kit,
     client::{Capability, PageClient},
-    rfb, shot,
 };
 use fictionet_observe::page::Page;
 use std::path::{Path, PathBuf};
@@ -17,7 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -74,9 +73,10 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
     }
     let result = async {
         let ports = receive.await?;
+        let cloud_init = Duration::from_secs(300);
         let (station, server) = tokio::join!(
-            cloud_init(&run, guests::WORKSTATION),
-            cloud_init(&run, guests::SERVER)
+            run.guest(guests::WORKSTATION).wait_cloud_init(cloud_init),
+            run.guest(guests::SERVER).wait_cloud_init(cloud_init)
         );
         let station = station?;
         let server = server?;
@@ -98,48 +98,19 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
         let boot = run.boot_started().elapsed();
         let story = story::run(&run, &ports, &shots).await?;
         tokio::time::timeout(Duration::from_secs(45), page_checks(run.page_url())).await??;
-        let capture = tokio::time::timeout(
-            Duration::from_secs(30),
-            rfb::capture_page(
-                run.page_url(),
-                guests::WORKSTATION,
-                &shots.join("viewer-scan.png"),
-            ),
+        run.screenshots(
+            guests::WORKSTATION,
+            &shots.join("viewer-scan.png"),
+            &shots.join("page-scan.png"),
         )
-        .await??;
-        if capture.colors < 16 {
-            return Err("scanner framebuffer has fewer than 16 colors".into());
-        }
-        println!(
-            "RFB screenshot: {} ({}x{}, {} colors)",
-            capture.png.display(),
-            capture.width,
-            capture.height,
-            capture.colors
-        );
-        let url = run.page_url().to_owned();
-        let out = shots.join("page-scan.png");
-        let screenshot = tokio::task::spawn_blocking(move || {
-            shot::capture(
-                &url,
-                &out,
-                &shot::desktop_painted(guests::WORKSTATION),
-                Duration::from_secs(60),
-            )
-        })
-        .await??;
-        println!("Chromium screenshot: {screenshot}");
+        .await?;
         Ok::<_, Error>((boot, story))
     }
     .await;
     if let Err(error) = &result {
         eprintln!("gate failed: {error}");
         for guest in run.guests() {
-            eprintln!(
-                "{} console tail:\n{}",
-                guest.name(),
-                guest.vm().console_tail()
-            );
+            eprint!("{}", guest.diagnostics().await);
         }
     }
     let stop = run.shutdown().await;
@@ -165,24 +136,6 @@ async fn gate(downloads: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-async fn cloud_init(run: &kit::Run, name: &str) -> Result<Duration, Error> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        run.guest(name)
-            .ssh()
-            .run_bounded("sudo cloud-init status --wait --long", 64 << 10),
-    )
-    .await??;
-    if output.code != 0 {
-        return Err(format!(
-            "{name}: cloud-init exit {}\n{}\n{}",
-            output.code, output.stdout, output.stderr
-        )
-        .into());
-    }
-    Ok(run.boot_started().elapsed())
-}
-
 async fn page_checks(url: &str) -> Result<(), Error> {
     let client = PageClient::from_url(url)?;
     if client
@@ -194,11 +147,7 @@ async fn page_checks(url: &str) -> Result<(), Error> {
         return Err("page accepted an API call without the bearer".into());
     }
     client.bootstrap().await?;
-    let page = client.request("GET", "/api/page", None, true).await?;
-    if page.status != 200 {
-        return Err("authenticated page API failed".into());
-    }
-    let description: serde_json::Value = serde_json::from_slice(&page.body)?;
+    let description = client.get_json("/api/page").await?;
     let hosts = description["hosts"].as_array().ok_or("page has no hosts")?;
     if hosts.len() != 2 || hosts.iter().any(|h| h["pinned"] != true) {
         return Err("page must pin both guests".into());
@@ -224,24 +173,9 @@ async fn page_checks(url: &str) -> Result<(), Error> {
     socket
         .write_all(b"printf 'name:%s:end\\n' \"$(hostname)\"\r")
         .await?;
-    let expected = format!("name:{}:end", guests::SERVER);
-    let mut output = Vec::new();
-    let mut chunk = [0; 4096];
-    loop {
-        let n = socket.read(&mut chunk).await?;
-        if n == 0 {
-            return Err("server terminal closed before returning hostname".into());
-        }
-        output.extend_from_slice(&chunk[..n]);
-        if output
-            .windows(expected.len())
-            .any(|w| w == expected.as_bytes())
-        {
-            break;
-        }
-        let keep = output.len().saturating_sub(expected.len() - 1);
-        output.drain(..keep);
-    }
+    socket
+        .read_until(format!("name:{}:end", guests::SERVER).as_bytes(), 64 << 10)
+        .await?;
     println!("[pass] page terminal hostname: {}", guests::SERVER);
     Ok(())
 }

@@ -90,19 +90,25 @@ async fn main() -> Result<(), Error> {
         run.guest(guest::HOSTNAME).ssh_ready().as_secs_f64()
     );
     let result: Result<(), Error> = async {
-        let ready = run.guest(guest::HOSTNAME).wait_desktop(Duration::from_secs(300)).await?;
+        let ready = run
+            .guest(guest::HOSTNAME)
+            .wait_desktop(Duration::from_secs(300))
+            .await?;
         println!("Boot to desktop-ready: {:.2} s", ready.as_secs_f64());
         story::run(&run, &out).await?;
-        println!("Story completed in {:.2} s", started.elapsed().as_secs_f64());
+        println!(
+            "Story completed in {:.2} s",
+            started.elapsed().as_secs_f64()
+        );
         if !gate {
-            println!("Page stays open: {}", run.page_url());
-            println!("Use Routing to flip the route, or Ctrl-b d in the terminal for bank-check. Ctrl-C shuts down.");
-            tokio::signal::ctrl_c().await?;
+            println!("Use Routing to flip the route, or Ctrl-b d in the terminal for bank-check.");
+            kit::gate::stay_open().await?;
         }
         Ok(())
-    }.await;
+    }
+    .await;
     if result.is_err() {
-        story::diagnostics(&run).await;
+        eprint!("{}", run.guest(guest::HOSTNAME).diagnostics().await);
     }
     let run_path = run.path().to_owned();
     let shutdown = run.shutdown().await;

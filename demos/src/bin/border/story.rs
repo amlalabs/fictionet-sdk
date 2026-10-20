@@ -4,18 +4,13 @@ use super::{checks, guest::HOSTNAME};
 use fictionet_demo::kit::{
     self, Run,
     client::{Capability, PageClient},
-    ssh,
+    ssh::{self, quote},
 };
 use serde_json::{Value, json};
 use std::io;
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-/// Quotes one literal argument for a POSIX shell, including embedded quotes.
-pub fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
+use tokio::io::AsyncWriteExt;
 
 pub async fn command(ssh: &ssh::Session, command: &str) -> io::Result<ssh::Output> {
     let output =
@@ -73,28 +68,20 @@ async fn step(ssh: &ssh::Session, step: &str, hijacked: bool) -> io::Result<()> 
     finish(ssh, step, hijacked).await
 }
 
+/// Asks the page's Routing control for `mode` at `revision`.
 pub async fn set_route(
     client: &PageClient,
     id: &str,
     mode: &str,
     revision: u64,
 ) -> io::Result<Value> {
-    let response = client
-        .request(
-            "POST",
-            "/api/command/routing",
-            Some(&json!({"request_id": id, "command":{"mode":mode,"expected_revision":revision}})),
-            true,
+    client
+        .command(
+            "routing",
+            id,
+            json!({"mode": mode, "expected_revision": revision}),
         )
-        .await?;
-    let value: Value = serde_json::from_slice(&response.body)?;
-    if response.status != 200 && response.status != 409 {
-        return Err(io::Error::other(format!(
-            "routing HTTP {}: {value}",
-            response.status
-        )));
-    }
-    Ok(value)
+        .await
 }
 
 async fn flip(client: &PageClient, mode: &str, revision: u64) -> io::Result<()> {
@@ -111,16 +98,7 @@ async fn title(ssh: &ssh::Session) -> io::Result<String> {
 }
 
 async fn border_state(client: &PageClient) -> io::Result<Value> {
-    let response = client
-        .request("GET", "/api/state/border", None, true)
-        .await?;
-    if response.status != 200 {
-        return Err(io::Error::other(format!(
-            "Border state HTTP {}",
-            response.status
-        )));
-    }
-    Ok(serde_json::from_slice::<Value>(&response.body)?["value"].clone())
+    Ok(client.get_json("/api/state/border").await?["value"].take())
 }
 
 fn aborted_after(view: &Value, after: u64) -> bool {
@@ -172,26 +150,6 @@ async fn reload(run: &Run, hijacked: bool) -> io::Result<()> {
     }
 }
 
-pub async fn diagnostics(run: &Run) {
-    let ssh = run.guest(HOSTNAME).ssh();
-    for cmd in [
-        "cloud-init status --long",
-        "sudo tail -30 /var/log/cloud-init-output.log",
-        "systemctl is-active vnc",
-        "tail -n 15 /tmp/xvnc.log /tmp/xfce.log",
-        "env DISPLAY=:1 sh -c 'xdotool search --onlyvisible --class firefox | head -n1 | xargs -r xdotool getwindowname'",
-    ] {
-        match tokio::time::timeout(Duration::from_secs(3), ssh.run_bounded(cmd, 8192)).await {
-            Ok(Ok(out)) => eprintln!(
-                "Diagnostic: {cmd}\n{}{}[exit {}]",
-                out.stdout, out.stderr, out.code
-            ),
-            Ok(Err(error)) => eprintln!("Diagnostic unavailable: {cmd}: {error}"),
-            Err(error) => eprintln!("Diagnostic timed out: {cmd}: {error}"),
-        }
-    }
-}
-
 async fn terminal(client: &PageClient, ssh: &ssh::Session) -> io::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let expected = command(ssh, "tail -1 ~/.cache/bank-check/output").await?.stdout;
@@ -201,15 +159,7 @@ async fn terminal(client: &PageClient, ssh: &ssh::Session) -> io::Result<()> {
         }
         let ticket = client.ticket(HOSTNAME, Capability::Terminal).await?;
         let mut socket = client.open(HOSTNAME, Capability::Terminal, Some(&ticket.ticket)).await?;
-        let mut output = Vec::new();
-        let mut chunk = [0; 4096];
-        loop {
-            let n = socket.read(&mut chunk).await?;
-            if n == 0 { return Err(io::Error::other("page terminal closed before agent output")); }
-            output.extend_from_slice(&chunk[..n]);
-            if output.windows(expected.len()).any(|bytes| bytes == expected.as_bytes()) { break; }
-            if output.len() > 65536 { return Err(io::Error::other("page terminal did not show the agent output")); }
-        }
+        socket.read_until(expected.as_bytes(), 64 << 10).await?;
         // The tmux client flag proves input is disabled before sending a command.
         let clients = command(ssh, "tmux list-clients -t main -F '#{client_readonly}'").await?;
         if !clients.stdout.lines().any(|line| line == "1") {
@@ -237,18 +187,7 @@ async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
     } else {
         "normal.png"
     };
-    let capture = tokio::time::timeout(
-        Duration::from_secs(30),
-        kit::rfb::capture_page(run.page_url(), HOSTNAME, &run.path().join(file)),
-    )
-    .await??;
-    if capture.colors < 16 {
-        return Err(io::Error::other(
-            "the captured desktop has fewer than 16 colors",
-        ));
-    }
-    std::fs::copy(&capture.png, out.join(file))?;
-    println!("Screen: {}", out.join(file).display());
+    run.screen(HOSTNAME, &out.join(file)).await?;
     println!(
         "Captured Firefox title: {:?}",
         title(run.guest(HOSTNAME).ssh()).await?
@@ -258,7 +197,9 @@ async fn screen(run: &Run, out: &Path, hijacked: bool) -> io::Result<()> {
 
 pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     let ssh = run.guest(HOSTNAME).ssh();
-    command(ssh, "cloud-init status --wait").await?;
+    run.guest(HOSTNAME)
+        .wait_cloud_init(Duration::from_secs(100))
+        .await?;
     command(ssh, "tmux has-session -t main").await?;
     println!(
         "Boot to agent-ready: {:.2} s",
@@ -286,10 +227,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
         )));
     }
     println!("Repeated command: rejected stale_revision; revision remains 1.");
-    let state = client
-        .request("GET", "/api/state/routing", None, true)
-        .await?;
-    let state: Value = serde_json::from_slice(&state.body)?;
+    let state = client.get_json("/api/state/routing").await?;
     if state["value"]["revision"] != 1 || state["value"]["mode"] != "hijack" {
         return Err(io::Error::other(
             "the rejected command changed the route state",
@@ -303,7 +241,7 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
     for name in ["route", "bgp 3", "balance", "cert -k"] {
         step(ssh, name, true).await?;
     }
-    let before = events(&client, 0).await?;
+    let before = events(&client).await?;
     let cursor = before["last"]
         .as_u64()
         .ok_or_else(|| io::Error::other("events reply has no last sequence"))?;
@@ -331,38 +269,36 @@ pub async fn run(run: &Run, out: &Path) -> io::Result<()> {
 }
 
 pub async fn observed(client: &PageClient, hijacked: bool) -> io::Result<()> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let response = client
-                .request("GET", "/api/state/border", None, true)
-                .await?;
-            if response.status != 200 {
-                return Err(io::Error::other(format!(
-                    "Border state HTTP {}",
-                    response.status
-                )));
+    client
+        .wait_for(
+            "/api/state/border",
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            |snapshot| {
+                if exposes_password(snapshot) {
+                    return Err(io::Error::other("Border state exposed the password"));
+                }
+                if snapshot["status"]["too_large"] == true {
+                    return Err(io::Error::other("Border state exceeded its byte bound"));
+                }
+                Ok(observed_complete(&snapshot["value"], hijacked))
+            },
+        )
+        .await
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::TimedOut => {
+                io::Error::other("Border observations did not contain the complete traffic story")
             }
-            let text = String::from_utf8(response.body).map_err(io::Error::other)?;
-            if text
-                .to_lowercase()
-                .contains(&border_world::bank::ACCOUNT.password.to_lowercase())
-            {
-                return Err(io::Error::other("Border state exposed the password"));
-            }
-            let snapshot: Value = serde_json::from_str(&text)?;
-            if snapshot["status"]["too_large"] == true {
-                return Err(io::Error::other("Border state exceeded its byte bound"));
-            }
-            if observed_complete(&snapshot["value"], hijacked) {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .map_err(|_| {
-        io::Error::other("Border observations did not contain the complete traffic story")
-    })?
+            _ => error,
+        })?;
+    Ok(())
+}
+
+fn exposes_password(value: &Value) -> bool {
+    value
+        .to_string()
+        .to_lowercase()
+        .contains(&border_world::bank::ACCOUNT.password.to_lowercase())
 }
 
 fn observed_complete(view: &Value, hijacked: bool) -> bool {
@@ -425,48 +361,40 @@ fn observed_complete(view: &Value, hijacked: bool) -> bool {
     trace && bgp && tls && moments.len() == 1 && view["lost"] == 0 && view["truncated"] == 0
 }
 
-async fn events(client: &PageClient, after: u64) -> io::Result<Value> {
-    let response = client
-        .request(
-            "GET",
-            &format!("/api/events?after={after}&max=1000"),
-            None,
-            true,
-        )
-        .await?;
-    if response.status != 200 {
-        return Err(io::Error::other(format!("events HTTP {}", response.status)));
-    }
-    let text = String::from_utf8(response.body).map_err(io::Error::other)?;
-    if text
-        .to_lowercase()
-        .contains(&border_world::bank::ACCOUNT.password.to_lowercase())
-    {
+async fn events(client: &PageClient) -> io::Result<Value> {
+    let batch = client.events(0).await?;
+    if exposes_password(&batch) {
         return Err(io::Error::other("page events exposed the password"));
     }
-    serde_json::from_str(&text).map_err(io::Error::other)
+    Ok(batch)
 }
 
-async fn password_received(client: &PageClient, mut cursor: u64) -> io::Result<()> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let batch = events(client, cursor).await?;
-            if has_password_event(&batch) {
-                return Ok(());
+async fn password_received(client: &PageClient, cursor: u64) -> io::Result<()> {
+    client
+        .wait_for_event(
+            cursor,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            |event| {
+                if exposes_password(event) {
+                    return Err(io::Error::other("page events exposed the password"));
+                }
+                Ok(has_password_event(event))
+            },
+        )
+        .await
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::TimedOut => {
+                io::Error::other("page events did not show a password-bearing impostor request")
             }
-            let rows = batch["events"]
-                .as_array()
-                .ok_or_else(|| io::Error::other("events reply has no rows"))?;
-            if let Some(last) = rows.last() {
-                cursor = last["seq"]
-                    .as_u64()
-                    .ok_or_else(|| io::Error::other("event has no sequence"))?;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .map_err(|_| io::Error::other("page events did not show a password-bearing impostor request"))?
+            _ => error,
+        })?;
+    // Every event the page now shows after the cursor, not only those read
+    // up to the match, must still leave the password out.
+    if exposes_password(&client.events(cursor).await?) {
+        return Err(io::Error::other("page events exposed the password"));
+    }
+    Ok(())
 }
 
 fn has_password_event(value: &Value) -> bool {
@@ -507,17 +435,6 @@ mod tests {
         assert!(!aborted_after(&view(changed), 11));
     }
 
-    #[test]
-    fn shell_arguments_round_trip_without_expansion() {
-        for text in ["", "hello world", "a'b", "$(exit 7); `exit 8`\n$HOME"] {
-            let output = std::process::Command::new("sh")
-                .args(["-c", &format!("printf %s {}", quote(text))])
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            assert_eq!(output.stdout, text.as_bytes());
-        }
-    }
     #[test]
     fn password_events_require_the_source_and_classification() {
         let event = json!({"source":"http","kind":"request","fields":{"served_by":"impostor","carries_password":true}});

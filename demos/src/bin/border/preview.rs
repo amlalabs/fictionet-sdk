@@ -8,6 +8,7 @@ use super::{
 };
 use border_world::{certs, log::Log};
 use fictionet::{RunOptions, Seed, events::Fanout, stdlib::services::ca::Ca};
+use fictionet_demo::kit;
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
     page::{
@@ -60,14 +61,19 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
         &HostStatus {
             state: HostState::NetworkUp,
             addresses: vec!["192.168.1.2".into()],
-            screen: false,
+            screen: true,
             terminal: false,
         },
     )?;
     let server = control
         .page(
             Page::new("Border", dashboard.handle())
-                .host(Host::new(HOSTNAME).sandbox(HOSTNAME).status(status))
+                .host(
+                    Host::new(HOSTNAME)
+                        .sandbox(HOSTNAME)
+                        .status(status)
+                        .console(kit::preview::Console),
+                )
                 .standard_panels(),
         )
         .containment(StateTopic::<Containment>::new(StateLimits::default()))
@@ -128,15 +134,11 @@ pub async fn start(out: &Path) -> Result<Preview, Error> {
 }
 
 pub async fn run() -> Result<(), Error> {
-    let out = std::env::temp_dir().join(format!(
-        "border-page-{}",
-        fictionet_demo::kit::random_uuid()
-    ));
+    let out = std::env::temp_dir().join(format!("border-page-{}", kit::random_uuid()));
     let preview = start(&out).await?;
-    println!("Page ready: {}", preview.server.url());
     println!("Output: {}", out.display());
     println!(
-        "In-process scripted client; no VM consoles. Change the route on the page, then press Enter here to run sign-in, balance and traceroute on that route. Ctrl-C shuts down."
+        "In-process scripted client; no VM, so the screen says NO VM. Change the route on the page, then press Enter here to run sign-in, balance and traceroute on that route."
     );
     let (lines, mut input) = mpsc::channel(1);
     std::thread::spawn(move || {
@@ -148,9 +150,11 @@ pub async fn run() -> Result<(), Error> {
             }
         }
     });
+    let stay = kit::gate::stay_open();
+    tokio::pin!(stay);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut stay => break,
             line = input.recv(), if !input.is_closed() => { if line.is_some() { preview.traffic().await?; println!("Client checks complete. Change the route and press Enter to run again."); } }
         }
     }

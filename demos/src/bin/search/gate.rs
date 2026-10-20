@@ -7,7 +7,8 @@ use adaptive_web_world::{
 use fictionet_demo::kit::{
     Run,
     client::{Capability, PageClient},
-    rfb, shot,
+    gate::check,
+    ssh::quote,
 };
 use fictionet_observe::page::{Containment, ProbeOutcome};
 use serde_json::{Value, json};
@@ -17,57 +18,39 @@ use std::{
     time::Duration,
 };
 
-pub fn check(label: &str, condition: bool) -> Result {
-    println!("[{}] {label}", if condition { "pass" } else { "FAIL" });
-    if condition {
-        Ok(())
-    } else {
-        Err(format!("gate failed: {label}").into())
-    }
-}
-
-pub async fn get(client: &PageClient, path: &str) -> Result<Value> {
-    let response = client.request("GET", path, None, true).await?;
-    if response.status != 200 {
-        return Err(format!(
-            "{path}: {} {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        )
-        .into());
-    }
-    Ok(serde_json::from_slice(&response.body)?)
-}
-
 async fn wait(
     client: &PageClient,
     label: &str,
     predicate: impl Fn(&Snapshot) -> bool,
 ) -> Result<Snapshot> {
-    let result = tokio::time::timeout(Duration::from_secs(45), async {
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            tick.tick().await;
-            let value = get(client, "/api/state/search").await?;
-            if !value["value"].is_null() {
-                let snapshot: Snapshot = serde_json::from_value(value["value"].clone())?;
-                if predicate(&snapshot) {
-                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(snapshot);
-                }
-            }
+    let snapshot = |value: &Value| {
+        if value["value"].is_null() {
+            return Ok(None);
         }
-    })
-    .await
-    .map_err(|_| {
-        println!("[FAIL] {label}: timed out");
-        format!("timed out waiting for {label}")
-    })??;
+        serde_json::from_value::<Snapshot>(value["value"].clone()).map(Some)
+    };
+    let value = client
+        .wait_for(
+            "/api/state/search",
+            Duration::from_secs(45),
+            Duration::from_millis(100),
+            |value| Ok(snapshot(value)?.is_some_and(|s| predicate(&s))),
+        )
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                println!("[FAIL] {label}: timed out");
+                format!("timed out waiting for {label}").into()
+            } else {
+                Box::<dyn std::error::Error + Send + Sync>::from(error)
+            }
+        })?;
     check(label, true)?;
-    Ok(result)
+    Ok(snapshot(&value)?.expect("the accepted state has a value"))
 }
 
 async fn navigate(run: &Run, url: &str) -> Result {
-    let quoted = format!("'{}'", url.replace('\'', "'\\''"));
+    let quoted = quote(url);
     let command = format!(
         "env DISPLAY=:1 xdotool search --sync --onlyvisible --class Firefox windowactivate --sync key --clearmodifiers ctrl+l type --clearmodifiers -- {quoted} && env DISPLAY=:1 xdotool key --clearmodifiers Return"
     );
@@ -132,20 +115,17 @@ pub async fn command(
     revision: u64,
     id: &str,
 ) -> Result<Value> {
-    let response = client.request("POST", "/api/command/generation", Some(&json!({
-        "request_id":id, "command":{"command":"set_generation","generate":generate,"expected_revision":revision}
-    })), true).await?;
-    let value: Value = serde_json::from_slice(&response.body)?;
-    let expected = if value["status"] == "applied" {
-        200
-    } else {
-        409
-    };
+    let command =
+        json!({"command":"set_generation","generate":generate,"expected_revision":revision});
+    let reply = client.command("generation", id, command).await;
+    if let Err(error) = &reply {
+        println!("{error}");
+    }
     check(
         "generation command HTTP status matches its reply",
-        response.status == expected,
+        reply.is_ok(),
     )?;
-    Ok(value)
+    Ok(reply?)
 }
 
 pub fn first_generated<'a>(seed: &Seed, list: &'a Results) -> Result<&'a Listed> {
@@ -204,34 +184,32 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
     let client = PageClient::from_url(run.page_url())?;
     client.bootstrap().await?;
     // Home requests are HTTP facts; the search projection only retains content pages.
-    let home = tokio::time::timeout(Duration::from_secs(45), async {
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            tick.tick().await;
-            let events = get(&client, "/api/events").await?;
-            if events["events"].as_array().is_some_and(|rows| {
-                rows.iter().any(|e| {
-                    e["source"] == "http"
-                        && e["kind"] == "request"
-                        && e["fields"]["host"] == "www.google.com"
-                        && e["fields"]["path"] == "/"
-                        && e["fields"]["status"] == 200
-                        && e["fields"]["complete"] == true
-                        && e["fields"]["headers"].to_string().contains("Firefox/")
-                })
-            }) {
-                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+    client
+        .wait_for_event(
+            0,
+            Duration::from_secs(45),
+            Duration::from_millis(100),
+            |e| {
+                Ok(e["source"] == "http"
+                    && e["kind"] == "request"
+                    && e["fields"]["host"] == "www.google.com"
+                    && e["fields"]["path"] == "/"
+                    && e["fields"]["status"] == 200
+                    && e["fields"]["complete"] == true
+                    && e["fields"]["headers"].to_string().contains("Firefox/"))
+            },
+        )
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::TimedOut => {
+                std::io::Error::other("Firefox did not load the Google home page")
             }
-        }
-    })
-    .await
-    .map_err(|_| "Firefox did not load the Google home page")?;
-    home?;
+            _ => error,
+        })?;
     println!(
         "boot to desktop with Google loaded: {} ms",
         run.boot_started().elapsed().as_millis()
     );
-    println!("page: {}", run.page_url());
     check(
         "API without bearer is refused",
         client
@@ -372,7 +350,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
         s.generator.generate && s.generator.generation_revision == 2
     })
     .await?;
-    let description = get(&client, "/api/page").await?;
+    let description = client.get_json("/api/page").await?;
     check(
         "Search panel is in the workspace",
         description["panels"].as_array().is_some_and(|panels| {
@@ -393,7 +371,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
             response.status == 200,
         )?;
     }
-    let egress = get(&client, "/api/egress").await?;
+    let egress = client.get_json("/api/egress").await?;
     let destinations = egress["destinations"]
         .as_array()
         .ok_or("egress has no destinations")?;
@@ -429,12 +407,12 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
                         .any(|(host, _)| row["name"] == *host)
                 }),
     )?;
-    let graph = get(&client, "/api/graph").await?;
+    let graph = client.get_json("/api/graph").await?;
     check(
         "map has nodes",
         graph["nodes"].as_array().is_some_and(|v| !v.is_empty()),
     )?;
-    let probes = get(&client, "/api/state/containment").await?;
+    let probes = client.get_json("/api/state/containment").await?;
     let probes: Containment = serde_json::from_value(probes["value"].clone())?;
     check("containment probes have data", !probes.probes.is_empty())?;
     for probe in &probes.probes {
@@ -452,22 +430,8 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
             )
         }),
     )?;
-    let desktop = output.join("desktop.png");
-    rfb::capture_page(run.page_url(), HOST, &desktop).await?;
-    println!("guest screen: {}", desktop.display());
-    let url = run.page_url().to_owned();
-    let page = output.join("page.png");
-    let out = page.clone();
-    tokio::task::spawn_blocking(move || {
-        shot::capture(
-            &url,
-            &out,
-            &shot::desktop_painted(HOST),
-            Duration::from_secs(30),
-        )
-    })
-    .await??;
-    println!("page screen: {}", page.display());
+    run.screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
+        .await?;
     Ok(visited)
 }
 
@@ -513,7 +477,10 @@ fn background_lines(input: impl std::io::BufRead, visited: &BTreeSet<String>) ->
     for message in &generated {
         println!("[FAIL] background generated a page: {message}");
     }
-    check("background hosts generated no pages", generated.is_empty())
+    Ok(check(
+        "background hosts generated no pages",
+        generated.is_empty(),
+    )?)
 }
 
 #[cfg(test)]

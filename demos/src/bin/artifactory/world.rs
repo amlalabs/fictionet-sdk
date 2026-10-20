@@ -1,4 +1,3 @@
-use super::mirror::Mirror;
 use artifactory_world::{Identity, log::Log, repository::Contents};
 use fictionet::{Cx, Result, stdlib::web};
 use fictionet_demo::kit;
@@ -17,10 +16,7 @@ pub fn start(
         .iter()
         .map(|name| identity.server_config(fcx, name))
         .collect::<Result<Vec<_>>>()?;
-    let mirror = Mirror {
-        upstream: world.mirror(fcx)?,
-        closed,
-    };
+    let mirror = kit::mirror::Closable::new(world.mirror(fcx)?, closed);
     let mut net = artifactory_world::network(fcx, contents, identity, log)?
         .route(kit::JUMP, kit::jump_prefix());
     for name in ["archive.ubuntu.com", "security.ubuntu.com"] {

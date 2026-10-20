@@ -1,16 +1,14 @@
-//! An in-memory preview screen with no guest or input side effects.
+//! A placeholder screen for pages that run without a VM.
 
-use fictionet_observe::page::{BoxFuture, Console, Duplex};
+use fictionet_observe::page::{BoxFuture, Duplex, Pty};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-pub struct PreviewConsole;
-impl Console for PreviewConsole {
-    fn terminal(
-        &self,
-        _: u16,
-        _: u16,
-    ) -> Option<BoxFuture<'static, io::Result<Box<dyn fictionet_observe::page::Pty>>>> {
+/// A screen-only page console that draws the words NO VM, so a preview page
+/// is never mistaken for a guest's desktop. Input reaches nothing.
+pub struct Console;
+impl fictionet_observe::page::Console for Console {
+    fn terminal(&self, _: u16, _: u16) -> Option<BoxFuture<'static, io::Result<Box<dyn Pty>>>> {
         None
     }
     fn screen(&self) -> Option<BoxFuture<'static, io::Result<Box<dyn Duplex>>>> {

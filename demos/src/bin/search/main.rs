@@ -72,9 +72,12 @@ async fn main() -> Result {
         run.guest(guest::HOST).ssh_ready().as_millis()
     );
     let result = gate::run(&run, &scenario, &output).await;
+    if result.is_err() {
+        eprint!("{}", run.guest(guest::HOST).diagnostics().await);
+    }
     let shutdown = run.shutdown().await;
     let finish = log.finish();
-    gate::check(
+    kit::gate::check(
         "shutdown removes the VMM and run directory",
         shutdown.is_ok()
             && !path.exists()

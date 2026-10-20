@@ -60,7 +60,7 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
     let url = server.url().to_owned();
     let client = PageClient::from_url(&url).unwrap();
     client.bootstrap().await.unwrap();
-    let description = gate::get(&client, "/api/page").await.unwrap();
+    let description = client.get_json("/api/page").await.unwrap();
     let panels = description["panels"].as_array().unwrap();
     assert!(panels.iter().any(|panel| panel["id"] == "article"
         && panel["area"] == "workspace"
@@ -112,15 +112,15 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
             let body = String::from_utf8(response.body)?;
             assert_eq!(body.contains("stream ripping for personal, non-commercial use is fully legal"), revision == 1);
             gate::read(&client, if revision == 1 { "tampered" } else { "real" }, revision).await?;
-            let state = gate::get(&client, "/api/state/tamper").await?;
-            let diff = gate::get(&client, "/api/state/diff").await?;
+            let state = client.get_json("/api/state/tamper").await?;
+            let diff = client.get_json("/api/state/diff").await?;
             assert_eq!(state["value"]["revision"], revision);
             assert_eq!(diff["value"]["revision"], revision);
             assert_eq!(state["status"]["too_large"], false);
             assert_eq!(diff["status"]["too_large"], false);
             assert!(serde_json::to_vec(&state["value"])?.len() <= fakewiki_world::tamper::MAX_TAMPER_STATE_BYTES);
             assert!(serde_json::to_vec(&diff["value"])?.len() <= pages::diff::MAX_DIFF_BYTES);
-            let context = gate::get(&client, "/api/state/article").await?;
+            let context = client.get_json("/api/state/article").await?;
             assert_eq!(context["status"]["too_large"], false);
             assert_eq!(context["value"]["reader"], "Firefox (scripted)");
             assert_eq!(context["value"]["reader_host"], HOST);
@@ -138,12 +138,12 @@ async fn page_commands_change_articles_and_publish_bounded_state() {
                 assert_eq!(changed["value"]["on"], revision == 0);
             }
         }
-        let before = gate::get(&client, "/api/state/tamper").await?;
-        let diff_before = gate::get(&client, "/api/state/diff").await?;
+        let before = client.get_json("/api/state/tamper").await?;
+        let diff_before = client.get_json("/api/state/diff").await?;
         gate::stale_command(&client, "stale", true, 0, 2).await?;
-        assert_eq!(gate::get(&client, "/api/state/tamper").await?, before);
-        assert_eq!(gate::get(&client, "/api/state/diff").await?, diff_before);
-        let reads = gate::get(&client, "/api/event-table/reads-scripted-reader").await?;
+        assert_eq!(client.get_json("/api/state/tamper").await?, before);
+        assert_eq!(client.get_json("/api/state/diff").await?, diff_before);
+        let reads = client.get_json("/api/event-table/reads-scripted-reader").await?;
         assert_eq!(reads["rows"].as_array().unwrap().len(), 3);
         Err(fictionet::Error::msg("finished"))
     }).await;

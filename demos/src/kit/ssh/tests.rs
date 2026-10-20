@@ -11,6 +11,18 @@ use std::sync::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
+fn shell_arguments_round_trip_without_expansion() {
+    for text in ["", "hello world", "a'b", "$(exit 7); `exit 8`\n$HOME"] {
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("printf %s {}", quote(text))])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, text.as_bytes());
+    }
+}
+
+#[test]
 fn request_waits_for_success_after_window_adjustments() {
     for request in ["pty-req", "shell"] {
         let messages = [

@@ -17,6 +17,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// How long one connection attempt may take, from dialing to logging in.
 const ATTEMPT: Duration = Duration::from_secs(30);
 
+/// Quotes one literal argument for the guest's POSIX shell, including
+/// embedded single quotes, so data put in a command never expands.
+pub fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// A per-run SSH identity.
 pub struct Identity {
     key: Arc<PrivateKey>,

@@ -9,7 +9,7 @@ mod tests;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use fictionet_demo::kit::Kit;
+use fictionet_demo::kit::{Kit, gate::check};
 use fictionet_observe::page::Page;
 
 const HOST: &str = "workstation";
@@ -38,7 +38,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .world(move |cx, world| start(cx, world, controls))
         .boot(&downloads)
         .await?;
-    println!("FakeWiki: {}", run.page_url());
     println!("Scripted reader: Firefox on workstation");
     println!(
         "boot to SSH-ready: {} ms",
@@ -48,12 +47,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid = run.guest(HOST).vm().pid();
     let output = downloads.join("shots").join(path.file_name().unwrap());
     let checks = gate::run(&run, &output).await;
+    if checks.is_err() {
+        eprint!("{}", run.guest(HOST).diagnostics().await);
+    }
     let shutdown = run.shutdown().await;
     shutdown?;
-    gate::require(!path.exists(), "shutdown removed the run directory")?;
-    gate::require(
-        pid.is_none_or(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
+    check("shutdown removed the run directory", !path.exists())?;
+    check(
         "shutdown reaped Cloud Hypervisor",
+        pid.is_none_or(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
     )?;
     println!("[pass] shutdown: no guest process or run directory remains");
     checks?;

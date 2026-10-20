@@ -7,7 +7,6 @@
 mod facts;
 mod fixture;
 mod guest;
-mod mirror;
 mod story;
 mod world;
 
@@ -120,14 +119,17 @@ async fn execute() -> Result {
     let result = gate(&run, &facts, &publisher, &closed, variant, &shots).await;
     let result = match result {
         Ok(duration) if stay => {
-            println!("gate passed; the page stays open until Ctrl-C");
-            wait_for_interrupt()
+            println!("gate passed");
+            kit::gate::stay_open()
                 .await
                 .map(|()| duration)
                 .map_err(Into::into)
         }
         result => result,
     };
+    if result.is_err() {
+        eprint!("{}", run.guest(HOSTNAME).diagnostics().await);
+    }
     let run_dir = run.path().to_path_buf();
     let pid = run.guest(HOSTNAME).vm().pid();
     let shutdown = run.shutdown().await;
@@ -189,14 +191,7 @@ async fn gate(
     shots: &Path,
 ) -> Result<Duration> {
     let guest = run.guest(HOSTNAME);
-    let out = tokio::time::timeout(
-        Duration::from_secs(300),
-        guest.ssh().run("sudo cloud-init status --wait --long"),
-    )
-    .await??;
-    if out.code != 0 {
-        return Err(format!("cloud-init exit {}: {}{}", out.code, out.stdout, out.stderr).into());
-    }
+    guest.wait_cloud_init(Duration::from_secs(300)).await?;
     println!("cloud-init done");
     closed.store(true, Ordering::SeqCst);
     println!("mirror closed");
@@ -221,52 +216,32 @@ async fn gate(
     .map_err(|_| "Firefox did not load the internal package index")?;
     guest::open_terminal(guest).await?;
     let story_time = story::run(guest, facts, publisher, variant).await?;
-    let screen = shots.join("artifactory-screen.png");
-    kit::rfb::capture_page(run.page_url(), HOSTNAME, &screen).await?;
-    println!("RFB screenshot: {}", screen.display());
-    let page = shots.join("artifactory-page.png");
-    let path = page.clone();
-    let url = run.page_url().to_string();
-    tokio::task::spawn_blocking(move || {
-        kit::shot::capture(
-            &url,
-            &path,
-            &kit::shot::desktop_painted(HOSTNAME),
-            Duration::from_secs(30),
-        )
-    })
-    .await??;
-    println!("Chromium screenshot: {}", page.display());
+    run.screenshots(
+        HOSTNAME,
+        &shots.join("artifactory-screen.png"),
+        &shots.join("artifactory-page.png"),
+    )
+    .await?;
     Ok(story_time)
-}
-
-/// Waits for the operator before the caller shuts down its run.
-async fn wait_for_interrupt() -> io::Result<()> {
-    tokio::signal::ctrl_c().await
 }
 
 async fn wait_setup(url: &str) -> io::Result<()> {
     let client = kit::client::PageClient::from_url(url)?;
     client.bootstrap().await?;
-    tokio::time::timeout(Duration::from_secs(90), async {
-        loop {
-            let response = client
-                .request("GET", "/api/state/containment", None, true)
-                .await?;
-            if response.status != 200 {
-                return Err(io::Error::other("containment state unavailable"));
-            }
-            let value: serde_json::Value = serde_json::from_slice(&response.body)?;
-            if value["value"]["probes"].as_array().is_some_and(|rows| {
-                rows.iter().filter(|r| r["guest"] == HOSTNAME).count()
-                    == kit::containment::PROBES.len()
-            }) {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    })
-    .await?
+    client
+        .wait_for(
+            "/api/state/containment",
+            Duration::from_secs(90),
+            Duration::from_millis(250),
+            |value| {
+                Ok(value["value"]["probes"].as_array().is_some_and(|rows| {
+                    rows.iter().filter(|r| r["guest"] == HOSTNAME).count()
+                        == kit::containment::PROBES.len()
+                }))
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 fn tail(path: &Path) -> io::Result<()> {

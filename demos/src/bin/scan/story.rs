@@ -1,6 +1,6 @@
 //! The scripted office inventory and its checks.
 use crate::{Error, guests, nmap};
-use fictionet_demo::kit::{self, base64};
+use fictionet_demo::kit::{self, base64, ssh::quote};
 use scan_world::{PortMap, PortState, Protocol};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -189,8 +189,8 @@ pub async fn run(run: &kit::Run, ports: &scan_world::Ports, out: &Path) -> Resul
         let command = format!("sudo nmap {} -oX {file} {}", step.options, step.target);
         println!("scripted agent: {command}");
         let send = format!(
-            "printf '%s' '{}' | base64 -d > ~/notes/requests; cat ~/notes/results",
-            base64(format!("{command}\n").as_bytes())
+            "printf '%s' {} | base64 -d > ~/notes/requests; cat ~/notes/results",
+            quote(&base64(format!("{command}\n").as_bytes()))
         );
         let result = async {
             let output = tokio::time::timeout(

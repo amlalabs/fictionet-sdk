@@ -5,8 +5,8 @@ use std::time::Duration;
 use fakewiki_world::tamper::Reply;
 use fictionet_demo::kit::{
     Run,
-    client::{Capability, PageClient, Response},
-    rfb, shot,
+    client::{Capability, PageClient},
+    gate::check,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,50 +14,22 @@ use tokio::net::TcpStream;
 
 use super::{ARTICLE, HOST, WIKI};
 
-pub fn require(ok: bool, message: &str) -> io::Result<()> {
-    if ok {
-        Ok(())
-    } else {
-        Err(io::Error::other(message))
-    }
-}
-
-pub async fn get(client: &PageClient, path: &str) -> io::Result<Value> {
-    let reply = client.request("GET", path, None, true).await?;
-    require(
-        reply.status == 200,
-        &format!("GET {path}: {}", reply.status_line),
-    )?;
-    Ok(serde_json::from_slice(&reply.body)?)
-}
-
-async fn post_command(
-    client: &PageClient,
-    id: &str,
-    on: bool,
-    revision: u64,
-) -> io::Result<Response> {
+async fn post_command(client: &PageClient, id: &str, on: bool, revision: u64) -> io::Result<Value> {
     client
-        .request(
-            "POST",
-            "/api/command/tamper",
-            Some(&json!({
-                "request_id": id,
-                "command": {"type":"set_tampering", "on":on, "expected_revision":revision}
-            })),
-            true,
+        .command(
+            "tamper",
+            id,
+            json!({"type":"set_tampering", "on":on, "expected_revision":revision}),
         )
         .await
 }
 
 pub async fn command(client: &PageClient, id: &str, on: bool, revision: u64) -> io::Result<Reply> {
     let response = post_command(client, id, on, revision).await?;
-    require(
-        response.status == 200,
-        &format!("tamper command: {}", response.status_line),
+    check(
+        "the tamper command was applied",
+        response["status"] == "applied",
     )?;
-    let response: Value = serde_json::from_slice(&response.body)?;
-    require(response["status"] == "applied", "command was not applied")?;
     Ok(serde_json::from_value(response["reply"].clone())?)
 }
 
@@ -69,18 +41,13 @@ pub async fn stale_command(
     current: u64,
 ) -> io::Result<()> {
     let response = post_command(client, id, on, expected).await?;
-    require(
-        response.status == 409,
-        "stale command did not return HTTP 409",
-    )?;
-    let response: Value = serde_json::from_slice(&response.body)?;
-    require(
+    check(
+        "a stale tamper command gets HTTP 409 and the framework's stale rejection",
         response
             == json!({
                 "status": "rejected", "request_id": id,
                 "rejection": {"reason": "stale_revision", "current": current}
             }),
-        "stale command did not return the expected framework rejection",
     )?;
     event(
         client,
@@ -110,13 +77,14 @@ impl StateStream {
         let mut stream = Self(BufReader::new(socket));
         let mut line = String::new();
         stream.0.read_line(&mut line).await?;
-        require(line.starts_with("HTTP/1.1 200 "), "state stream refused")?;
+        if !line.starts_with("HTTP/1.1 200 ") {
+            return Err(io::Error::other(format!("state stream refused: {line}")));
+        }
         loop {
             line.clear();
-            require(
-                stream.0.read_line(&mut line).await? > 0,
-                "state stream closed in headers",
-            )?;
+            if stream.0.read_line(&mut line).await? == 0 {
+                return Err(io::Error::other("state stream closed in headers"));
+            }
             if line == "\r\n" {
                 break;
             }
@@ -128,18 +96,18 @@ impl StateStream {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let mut line = String::new();
-                require(
-                    self.0.read_line(&mut line).await? > 0,
-                    "state stream closed",
-                )?;
-                require(line.len() <= 128 << 10, "state stream line exceeds bound")?;
+                if self.0.read_line(&mut line).await? == 0 {
+                    return Err(io::Error::other("state stream closed"));
+                }
+                if line.len() > 128 << 10 {
+                    return Err(io::Error::other("state stream line exceeds bound"));
+                }
                 if let Some(data) = line.strip_prefix("data: ") {
                     let value: Value = serde_json::from_str(data.trim())?;
                     if value["topic"] == topic && value["value"]["revision"] == revision {
-                        require(
-                            value["status"]["too_large"] == false,
-                            "state stream exceeded its bound",
-                        )?;
+                        if value["status"]["too_large"] != false {
+                            return Err(io::Error::other("state stream exceeded its bound"));
+                        }
                         return Ok(value);
                     }
                 }
@@ -159,25 +127,19 @@ async fn event(
     missing: &str,
     matches: impl Fn(&Value) -> bool,
 ) -> io::Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let mut after = 0;
-        let mut poll = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            poll.tick().await;
-            let value = get(client, &format!("/api/events?after={after}")).await?;
-            let events = value["events"]
-                .as_array()
-                .ok_or_else(|| io::Error::other("events API has no events"))?;
-            if events.iter().any(&matches) {
-                return Ok(());
-            }
-            after = value["last"]
-                .as_u64()
-                .ok_or_else(|| io::Error::other("events API has no cursor"))?;
-        }
-    })
-    .await
-    .map_err(|_| io::Error::other(missing))?
+    client
+        .wait_for_event(
+            0,
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            |event| Ok(matches(event)),
+        )
+        .await
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::TimedOut => io::Error::other(missing),
+            _ => error,
+        })?;
+    Ok(())
 }
 
 pub(super) async fn read(client: &PageClient, served: &str, revision: u64) -> io::Result<()> {
@@ -211,22 +173,20 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
         run.boot_started().elapsed().as_millis()
     );
 
-    require(
+    check(
+        "the page API refuses a request without the token",
         client
             .request("GET", "/api/page", None, false)
             .await?
             .status
             == 401,
-        "page API accepted a request without the token",
     )?;
-    let missing = client
-        .open(HOST, Capability::Screen, None)
-        .await
-        .err()
-        .ok_or_else(|| io::Error::other("screen accepted a missing ticket"))?;
-    require(
-        missing.to_string().contains("HTTP/1.1 401 "),
-        "missing ticket did not return 401",
+    let missing = client.open(HOST, Capability::Screen, None).await;
+    check(
+        "the screen refuses a missing ticket with 401",
+        missing
+            .err()
+            .is_some_and(|e| e.to_string().contains("HTTP/1.1 401 ")),
     )?;
     let ticket = client.ticket(HOST, Capability::Screen).await?;
     let socket = client
@@ -234,12 +194,12 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
         .await?;
     let reused = client
         .open(HOST, Capability::Screen, Some(&ticket.ticket))
-        .await
-        .err()
-        .ok_or_else(|| io::Error::other("screen accepted a reused ticket"))?;
-    require(
-        reused.to_string().contains("HTTP/1.1 401 "),
-        "reused ticket did not return 401",
+        .await;
+    check(
+        "the screen refuses a reused ticket with 401",
+        reused
+            .err()
+            .is_some_and(|e| e.to_string().contains("HTTP/1.1 401 ")),
     )?;
     drop(socket);
     println!("[pass] page security: token required, missing and reused tickets refused");
@@ -247,8 +207,9 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
 
     let mut stream = StateStream::open(run.page_url()).await?;
     let initial = stream.state("tamper", 0).await?;
-    require(initial["value"]["on"] == false, "tampering must start off")?;
-    require(
+    check("tampering starts off", initial["value"]["on"] == false)?;
+    check(
+        "the switch is applied at revision 1",
         matches!(
             command(&client, "switch-on", true, 0).await?,
             Reply::Applied {
@@ -257,14 +218,13 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
                 ..
             }
         ),
-        "switch was not applied at revision 1",
     )?;
     stale_command(&client, "stale-switch", true, 0, 1).await?;
-    let state = get(&client, "/api/state/tamper").await?;
+    let state = client.get_json("/api/state/tamper").await?;
     let streamed = stream.state("tamper", 1).await?;
-    require(
+    check(
+        "GET and the stream agree that tampering is on",
         state["value"] == streamed["value"] && state["value"]["on"] == true,
-        "GET and stream disagree about tampering",
     )?;
     println!(
         "[pass] switch: applied revision 1, stale revision rejected with HTTP 409 and world event, GET and stream agree"
@@ -273,23 +233,23 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
     let reload = tokio::time::timeout(Duration::from_secs(30), guest.ssh().run(
         "env DISPLAY=:1 xdotool search --sync --onlyvisible --class firefox windowactivate --sync key --clearmodifiers ctrl+F5"
     )).await.map_err(|_| io::Error::other("scripted Firefox reload timed out"))??;
-    require(
-        reload.code == 0,
-        &format!("scripted Firefox reload failed: {}", reload.stderr),
-    )?;
+    if reload.code != 0 {
+        println!("{}", reload.stderr);
+    }
+    check("scripted Firefox reloads the article", reload.code == 0)?;
     read(&client, "tampered", 1).await?;
-    let diff = get(&client, "/api/state/diff").await?;
-    require(
+    let diff = client.get_json("/api/state/diff").await?;
+    check(
+        "the diff has revision 1 within its bound",
         diff["status"]["too_large"] == false && diff["value"]["revision"] == 1,
-        "diff is missing revision 1",
     )?;
     let diff: fakewiki_world::pages::diff::Diff = serde_json::from_value(diff["value"].clone())?;
-    require(
+    check(
+        "the diff marks the article tampered",
         diff.topics
             .iter()
             .flat_map(|t| &t.sources)
             .any(|s| s.url == super::URL && s.served == fakewiki_world::pages::Version::Tampered),
-        "diff does not mark the article tampered",
     )?;
     println!("[pass] second read: tampered, revision 1; diff agrees");
 
@@ -299,42 +259,23 @@ pub async fn run(run: &Run, output: &Path) -> io::Result<()> {
         ("/api/state/containment", "/value/probes"),
         ("/api/graph", "/nodes"),
     ] {
-        let value = get(&client, path).await?;
-        require(
+        let value = client.get_json(path).await?;
+        check(
+            &format!("panel has data: {path}"),
             value
                 .pointer(pointer)
                 .and_then(Value::as_array)
                 .is_some_and(|a| !a.is_empty()),
-            &format!("panel has no data: {path}"),
         )?;
     }
     println!("[pass] panels: Reads, Left the box, containment and map have data");
     std::fs::create_dir_all(output)?;
-    let screen = output.join("desktop.png");
-    let capture = tokio::time::timeout(
-        Duration::from_secs(30),
-        rfb::capture_page(run.page_url(), HOST, &screen),
-    )
-    .await
-    .map_err(|_| io::Error::other("guest screen capture timed out"))??;
-    require(
-        capture.width == 1280 && capture.height == 800 && capture.colors >= 16,
-        "guest screen is blank or has unexpected dimensions",
+    let shots = run
+        .screenshots(HOST, &output.join("desktop.png"), &output.join("page.png"))
+        .await?;
+    check(
+        "the guest screen is 1280x800",
+        shots.screen.width == 1280 && shots.screen.height == 800,
     )?;
-    println!("guest screenshot: {}", screen.display());
-    let page = output.join("page.png");
-    let url = run.page_url().to_owned();
-    let screenshot = page.clone();
-    tokio::task::spawn_blocking(move || {
-        shot::capture(
-            &url,
-            &screenshot,
-            &shot::desktop_painted(HOST),
-            Duration::from_secs(30),
-        )
-    })
-    .await
-    .map_err(io::Error::other)??;
-    println!("page screenshot: {}", page.display());
     Ok(())
 }

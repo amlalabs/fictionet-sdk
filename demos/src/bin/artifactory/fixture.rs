@@ -33,14 +33,16 @@ pub async fn serve(variant: Variant) -> Result {
         &HostStatus {
             state: HostState::NetworkUp,
             addresses: vec!["10.0.0.2".into()],
-            screen: false,
+            screen: true,
             terminal: false,
         },
     )?;
     let page = super::page(
         variant,
         dashboard.handle(),
-        Host::new("fixture").status(status),
+        Host::new("fixture")
+            .status(status)
+            .console(fictionet_demo::kit::preview::Console),
         facts.topics.clone(),
         true,
     )
@@ -54,13 +56,15 @@ pub async fn serve(variant: Variant) -> Result {
     ])));
     let replay = run(options, contents, facts.clone(), Duration::from_secs(1));
     tokio::pin!(replay);
+    let stay = fictionet_demo::kit::gate::stay_open();
+    tokio::pin!(stay);
     tokio::select! {
         result = &mut replay => {
             result.map_err(std::io::Error::other)?;
-            println!("fixture replay complete; page stays open until Ctrl-C");
-            super::wait_for_interrupt().await?;
+            println!("fixture replay complete");
+            stay.await?;
         }
-        result = super::wait_for_interrupt() => { result?; }
+        result = &mut stay => { result?; }
     }
     drop(page);
     Ok(())

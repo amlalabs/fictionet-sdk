@@ -1,7 +1,5 @@
 //! Search page, authoritative topics, and the in-process network.
 
-pub mod console;
-
 use std::sync::Arc;
 use std::time::Duration;
 

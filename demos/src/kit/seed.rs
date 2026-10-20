@@ -137,7 +137,7 @@ pub fn user_data(p: &Provision) -> String {
             "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {}",
             g.packages
                 .iter()
-                .map(|s| format!("'{}'", s.replace('\'', "'\\''")))
+                .map(|s| super::ssh::quote(s))
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
