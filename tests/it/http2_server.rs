@@ -522,6 +522,7 @@ window.addEventListener('load', () => {
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--password-store=basic",
+                    "--use-mock-keychain",
                     "--no-proxy-server",
                     "--ignore-certificate-errors",
                     "--dump-dom",

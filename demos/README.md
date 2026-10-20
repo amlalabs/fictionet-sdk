@@ -235,6 +235,8 @@ The kit adds one dashboard observer with startup packet capture, each host's
 status, the containment probes and labels. The standard panels are the
 screen, terminal, packets, events, map, Left the box, containment, labels and
 export. `Page::table` adds a view over a world-owned `StateTopic`.
+[Fictionet Observe](../observe/README.md) covers the collector, the page and
+capture limits.
 
 The page binds to loopback. Data and commands need its per-run bearer token,
 with exact Host and Origin checks. Consoles use short-lived, single-use
