@@ -3591,7 +3591,6 @@ dependencies = [
  "libc",
  "regex",
  "serde_json",
- "tungstenite",
 ]
 
 [[package]]
