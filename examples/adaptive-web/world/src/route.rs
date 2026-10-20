@@ -28,17 +28,6 @@ pub enum Engine {
     Bing,
 }
 
-impl Engine {
-    /// Returns the backend's engine name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Google => "google",
-            Self::DuckDuckGo => "duckduckgo",
-            Self::Bing => "bing",
-        }
-    }
-}
-
 /// The action requested from the world.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

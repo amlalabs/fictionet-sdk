@@ -4,6 +4,7 @@ use adaptive_web_world::{
     route::Engine,
     search::{Cache, Listed, Made, Outcome, Query, Reason, Results, Snapshot},
 };
+use example_common::names;
 use fictionet_demo::kit::{
     Run,
     client::{Capability, PageClient},
@@ -120,7 +121,10 @@ async fn search(
     };
     let snapshot = wait(
         client,
-        &format!("scripted {} search served {count} results", engine.as_str()),
+        &format!(
+            "scripted {} search served {count} results",
+            names::name(&engine)
+        ),
         |s| s.queries.iter().any(|q| matches(&q)),
     )
     .await?;

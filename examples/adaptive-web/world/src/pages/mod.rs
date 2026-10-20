@@ -576,7 +576,7 @@ impl Pages {
             .collect();
         let mut meta = json!({
             "kind": "search",
-            "engine": engine.as_str(),
+            "engine": engine,
             "search": query,
             "cache": cache,
             "model": record.as_ref().map(|r| r.usage.model.clone()),

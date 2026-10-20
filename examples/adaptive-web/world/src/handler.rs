@@ -14,6 +14,7 @@ use crate::pages::{MAX_FORM_BYTES, Pages};
 use crate::route::{Route, query_key, route};
 use bytes::Bytes;
 use example_common::events::field;
+use example_common::names::name;
 use fictionet::events::{ConnInfo, Fields};
 use fictionet::stdlib::web::{self, Body};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -146,9 +147,9 @@ impl Handler {
                 finished: false,
             });
             self.fcx.emitter(&conn).emit("adaptive", "query", |e| {
-                e.summary(format_args!("{} search: {search}", engine.as_str()))
+                e.summary(format_args!("{} search: {search}", name(&engine)))
                     .field("query_id", id)
-                    .field("engine", engine.as_str())
+                    .field("engine", name(&engine))
                     .field("search", search.as_str())
                     .field("start", *start)
                     .field("key", query_key(search, *start))
