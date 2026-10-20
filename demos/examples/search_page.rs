@@ -24,7 +24,7 @@ use fictionet::{
 };
 use fictionet_demo::{
     kit::{self, client::PageClient},
-    search::{Topics, World, console::PreviewConsole},
+    search::{Topics, World},
 };
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
@@ -61,7 +61,7 @@ async fn main() -> Result {
     let status = StateTopic::new(StateLimits::default());
     let labels = Labels::default();
     let containment = StateTopic::new(StateLimits::default());
-    let console = PreviewConsole::new();
+    let console = kit::preview::Console::new();
     let screen = CommandPort::<ScreenCommand, ()>::new(CommandLimits::default());
     let server = topics
         .page(
@@ -139,7 +139,7 @@ async fn main() -> Result {
                     eprintln!("Preview story failed: {error}");
                     return Err(error);
                 }
-                println!("Preview story complete. The page remains open until Ctrl-C.");
+                println!("Preview story complete.");
                 Ok(())
             });
             let _ = cx.race(None, stopped).await;
@@ -147,7 +147,7 @@ async fn main() -> Result {
             Ok(())
         },
     ));
-    tokio::signal::ctrl_c().await?;
+    kit::gate::stay_open().await?;
     let _ = stop.send(());
     task.await??;
     drop(server);
@@ -288,21 +288,16 @@ async fn story(
 /// Sends the generation switch through the page, as a viewer's click would.
 async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> fictionet::Result {
     let revision = searches.snapshot().generator.generation_revision;
-    let response = page
-        .request(
-            "POST",
-            "/api/command/generation",
-            Some(&serde_json::json!({
-                "request_id": format!("preview-generation-{revision}"),
-                "command": {"command": "set_generation", "generate": generate,
-                    "expected_revision": revision}
-            })),
-            true,
+    let reply = page
+        .command(
+            "generation",
+            &format!("preview-generation-{revision}"),
+            serde_json::json!({"command": "set_generation", "generate": generate,
+                "expected_revision": revision}),
         )
         .await
         .map_err(fictionet::Error::msg)?;
-    let reply: serde_json::Value = serde_json::from_slice(&response.body)?;
-    if response.status != 200 || reply["status"] != "applied" {
+    if reply["status"] != "applied" {
         return Err(fictionet::Error::msg(format!(
             "generation command: {reply}"
         )));

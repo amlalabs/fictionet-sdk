@@ -381,6 +381,41 @@ fn events_without_a_sandbox_are_not_attempts_from_a_guest() {
 }
 
 #[test]
+fn a_world_names_the_sandbox_of_a_packet_it_refused_itself() {
+    let egress = Egress::default();
+    let refused = |sandbox: Option<&str>| {
+        let event = Event::new("net", "blocked")
+            .field("why", "NoRoute")
+            .field("protocol", 17u32)
+            .field("dst", "1.1.1.1")
+            .field("dst_port", 53u32);
+        match sandbox {
+            Some(name) => event.field("sandbox", name),
+            None => event,
+        }
+    };
+    feed(&egress, 1, refused(None));
+    feed(
+        &egress,
+        2,
+        Event::new("path", "unreachable").field("sandbox", "agent"),
+    );
+    assert_eq!(
+        egress.snapshot().revision,
+        0,
+        "no sandbox, or not net.blocked"
+    );
+    feed(&egress, 3, refused(Some("agent")));
+    let snapshot = egress.snapshot();
+    let row = row(&snapshot, "1.1.1.1:53", Outcome::NoRoute);
+    assert_eq!(
+        (row.sandbox.as_str(), row.transport.as_str(), row.packets),
+        ("agent", "udp", 1)
+    );
+    assert_eq!(row.by, "no machine at that address");
+}
+
+#[test]
 fn cached_answers_name_the_host_cache() {
     let egress = Egress::default();
     feed(

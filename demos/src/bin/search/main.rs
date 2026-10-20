@@ -74,22 +74,23 @@ async fn main() -> Result {
     );
     let mut visited = BTreeSet::new();
     let result = gate::run(&run, &scenario, &output, &mut visited).await;
+    if result.is_err() {
+        eprint!("{}", run.guest(guest::HOST).diagnostics().await);
+    }
     let shutdown = run.shutdown().await;
     let finish = log.finish();
-    let removed = gate::check(
+    let clean = kit::gate::check(
         "shutdown removes the VMM and run directory",
         shutdown.is_ok()
             && !path.exists()
             && pid.is_none_or(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
     );
     println!("whole run: {} ms", total.elapsed().as_millis());
-    // A failed story still shows what the guest did in the background.
     finish?;
-    let background = gate::background(&output.join("log.jsonl"), &visited);
-    result?;
-    shutdown?;
-    removed?;
-    background?;
+    let result = result
+        .and(clean.map_err(Into::into))
+        .and(shutdown.map_err(Into::into));
+    gate::finish(result, &output.join("log.jsonl"), &visited)?;
     println!("every required check passed");
     Ok(())
 }

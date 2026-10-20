@@ -1,15 +1,17 @@
-//! An in-memory preview screen with no guest or input side effects.
+//! A placeholder screen for pages that run without a VM.
 
-use fictionet_observe::page::{BoxFuture, Console, Duplex};
+use fictionet_observe::page::{BoxFuture, Duplex, Pty};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-/// A labeled screen for previews. Clones share one set of open connections.
+/// A screen-only page console that draws the words NO VM, so a preview page
+/// is never mistaken for a guest's desktop. Input reaches nothing. Clones share
+/// one set of open connections.
 #[derive(Clone)]
-pub struct PreviewConsole {
+pub struct Console {
     drops: tokio::sync::watch::Sender<u64>,
 }
-impl PreviewConsole {
+impl Console {
     pub fn new() -> Self {
         Self {
             drops: tokio::sync::watch::channel(0).0,
@@ -21,17 +23,13 @@ impl PreviewConsole {
         self.drops.send_modify(|count| *count += 1);
     }
 }
-impl Default for PreviewConsole {
+impl Default for Console {
     fn default() -> Self {
         Self::new()
     }
 }
-impl Console for PreviewConsole {
-    fn terminal(
-        &self,
-        _: u16,
-        _: u16,
-    ) -> Option<BoxFuture<'static, io::Result<Box<dyn fictionet_observe::page::Pty>>>> {
+impl fictionet_observe::page::Console for Console {
+    fn terminal(&self, _: u16, _: u16) -> Option<BoxFuture<'static, io::Result<Box<dyn Pty>>>> {
         None
     }
     fn screen(&self) -> Option<BoxFuture<'static, io::Result<Box<dyn Duplex>>>> {
@@ -160,6 +158,7 @@ async fn screen(mut stream: DuplexStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet_observe::page::Console as _;
     #[tokio::test]
     async fn screen_delivers_labeled_pixels_and_closes_on_disconnect() {
         let (mut client, server) = tokio::io::duplex(64 << 10);
@@ -193,7 +192,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_connections_closes_open_screens_only() {
-        let console = PreviewConsole::new();
+        let console = Console::new();
         let mut open = console.screen().unwrap().await.unwrap();
         let mut version = [0; 12];
         open.read_exact(&mut version).await.unwrap();

@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use example_common::backend_process::{args, secs, start_backend, watch_backend};
 use example_common::log::Log;
 use fakewiki_world::content::Content;
+use fakewiki_world::tamper::Tampering;
 use fakewiki_world::{GATEWAY, issue_leaves, serve};
 use serde_json::json;
 
@@ -102,9 +103,17 @@ fn real_main() -> fictionet::Result {
         fictionet::RunOptions::new(fictionet::Seed::random())
             .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
         move |fcx| async move {
-            let content = Content::new(&fcx, args.backend_port)?;
-            let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys())?;
-            serve(&fcx, &hosts, leaves, content, log, attachments)?;
+            let tampering = Tampering::from(
+                variant
+                    .parse::<fakewiki_world::pages::Variant>()
+                    .map_err(fictionet::Error::msg)?,
+            );
+            let content = Content::backend(&fcx, args.backend_port, tampering)?;
+            let (root, leaves) = issue_leaves(&fcx, hosts.keys())?;
+            std::fs::create_dir_all(&args.ca_dir)?;
+            std::fs::write(args.ca_dir.join("ca.pem"), root)?;
+            log.attach(&fcx);
+            serve(&fcx, &hosts, leaves, content, attachments)?;
 
             // Every site answers before the first sandbox can attach.
             let _listening =

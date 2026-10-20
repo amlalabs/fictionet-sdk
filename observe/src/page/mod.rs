@@ -131,9 +131,10 @@
 //! Only completed IDs can be evicted, oldest first. After eviction the ID
 //! may execute again, so callers should use fresh IDs for new inputs.
 //!
-//! The optional control state URL tells the browser to put that snapshot's
-//! revision in `command.expected_revision`. The world checks it when
-//! applying. `Command::reply` and `Command::reject` emit source `page`, kind
+//! The optional control state URL tells the browser to put the snapshot value's
+//! `revision` in `command.expected_revision`, falling back to the snapshot's
+//! revision when the value has none. The world checks it when applying.
+//! `Command::reply` and `Command::reject` emit source `page`, kind
 //! `command`, with fields `{panel,request_id,command,outcome}` through the
 //! world's own `Cx`, then release the HTTP reply. Observer event retention
 //! and event truncation bounds still apply. Dropping an unanswered command
@@ -174,7 +175,9 @@
 //! each offered console. Their kinds are `packets`, `events`, `map`, `left_the_box`,
 //! `screen` or `terminal`; console panels also have `host`.
 //! `workspace(title)` places that custom panel in the workspace and moves
-//! the consoles to the inspector. Names, columns, actions, paths and
+//! the consoles to the inspector. Add `workspace_consoles()` to keep their
+//! tiles beside the custom panel. `command(name, port)` registers a mailbox
+//! at `/api/command/<name>` without a control panel. Names, columns, actions, paths and
 //! composition conflicts are checked before the listener binds.
 //!
 //! `left_the_box()` adds the destination panel by itself. `GET /api/egress`
@@ -452,7 +455,7 @@ pub struct Page {
     standard: bool,
     labels: Option<Labels>,
     workspace: Option<String>,
-    workspace_hosts: bool,
+    workspace_consoles: bool,
     modules: Vec<(String, String)>,
     assets: Vec<(String, String, Vec<u8>)>,
     filters: Vec<(String, EventFilter)>,
@@ -474,7 +477,7 @@ impl Page {
             standard: false,
             labels: None,
             workspace: None,
-            workspace_hosts: false,
+            workspace_consoles: false,
             modules: vec![],
             assets: vec![],
             filters: vec![],
@@ -483,12 +486,6 @@ impl Page {
                 Arc::new(move || start.elapsed())
             },
         }
-    }
-
-    /// Registers an authoritative topic without adding a panel.
-    pub fn state<T: Serialize>(mut self, name: impl Into<String>, topic: StateTopic<T>) -> Self {
-        self.topics.push((name.into(), topic.topic));
-        self
     }
 
     /// Registers a typed command endpoint without adding a control panel.
@@ -547,7 +544,8 @@ impl Page {
     }
 
     /// Links the last control to authoritative state. The browser copies its
-    /// revision into `expected_revision`; the world must check it when applying.
+    /// value's revision (or the envelope revision when absent) into
+    /// `expected_revision`; the world must check it when applying.
     pub fn control_state<T: Serialize>(mut self, topic: StateTopic<T>) -> Self {
         if let Some(PanelDescription {
             id,
@@ -583,6 +581,23 @@ impl Page {
         }
         if let Some(error) = self.errors.first() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, error.clone()));
+        }
+        let mut commands = std::collections::BTreeSet::new();
+        for (name, port) in &self.commands {
+            if name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                || !commands.insert(name)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command needs a unique name of at most 128 ASCII letters, digits, hyphens or underscores",
+                ));
+            }
+            port.validate(&[], false)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         }
         let mut ids = std::collections::BTreeMap::new();
         for panel in &self.panels {

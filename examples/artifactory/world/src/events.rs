@@ -115,6 +115,26 @@ fn tls(e: &Event) -> Value {
     line
 }
 
+/// The served site for the connection's local address.
+pub(crate) fn site(e: &Event) -> Option<crate::repository::Site> {
+    crate::NAMES
+        .iter()
+        .position(|(_, addr)| e.conn.local.is_some_and(|a| a.ip() == *addr))
+        .map(|i| crate::SITES[i])
+}
+
+/// The log label, including service overrides before the handler.
+pub(crate) fn label(e: &Event) -> Option<crate::repository::Label> {
+    use crate::repository::Label;
+    if e.str("answer") == Some("redirect") {
+        Some(Label::Redirect)
+    } else if e.u64("status") == Some(413) {
+        Some(Label::TooLarge)
+    } else {
+        e.str("label").and_then(Label::parse)
+    }
+}
+
 fn http(e: &Event) -> Value {
     let (names, ua) = example_common::events::request_headers(e);
     let answer = e.str("answer").unwrap_or("other");
@@ -157,71 +177,71 @@ fn http(e: &Event) -> Value {
             line[key] = js(e.get(key));
         }
     }
-    if e.u64("status") == Some(413) {
-        line["label"] = json!(crate::repository::Label::TooLarge.as_str());
+    if let Some(label) = label(e) {
+        line["label"] = json!(label.as_str());
     }
-    if answer == "redirect" {
-        line["label"] = json!(crate::repository::Label::Redirect.as_str());
+    if let Some(site) = site(e) {
+        line["site"] = json!(site.as_str());
     }
-    // Sites can answer before the handler, including redirects and HTTP/2 size refusals.
+    scan(e, &mut line);
+    line
+}
+
+/// Adds the shared scan fallback without changing existing handler scan fields.
+pub(crate) fn scan(e: &Event, line: &mut Value) {
     if let Some(i) = crate::NAMES
         .iter()
         .position(|(_, addr)| e.conn.local.is_some_and(|a| a.ip() == *addr))
+        && e.get("ssrf_scan").is_none()
     {
-        let site = ["artifactory", "pypi", "files"][i];
-        line["site"] = json!(site);
-        if e.get("ssrf_scan").is_none() {
-            let (Some(method), Some(uri)) = (e.str("method"), e.str("uri")) else {
-                line["ssrf_scan"] = json!({"state": "incomplete", "reason": "request_unavailable"});
-                return line;
-            };
-            let mut request = http::Request::builder().method(method).uri(uri);
-            for pair in e.get("headers").and_then(J::as_array).unwrap_or_default() {
-                if let Some(pair) = pair.as_array()
-                    && let (Some(k), Some(v)) = (
-                        pair.first().and_then(J::as_str),
-                        pair.get(1).and_then(J::as_str),
-                    )
-                {
-                    request = request.header(k, v);
+        let (Some(method), Some(uri)) = (e.str("method"), e.str("uri")) else {
+            line["ssrf_scan"] = json!({"state": "incomplete", "reason": "request_unavailable"});
+            return;
+        };
+        let mut request = http::Request::builder().method(method).uri(uri);
+        for pair in e.get("headers").and_then(J::as_array).unwrap_or_default() {
+            if let Some(pair) = pair.as_array()
+                && let (Some(k), Some(v)) = (
+                    pair.first().and_then(J::as_str),
+                    pair.get(1).and_then(J::as_str),
+                )
+            {
+                request = request.header(k, v);
+            }
+        }
+        match request.body(bytes::Bytes::new()) {
+            Ok(request) => {
+                let declared_body = request.headers().contains_key("transfer-encoding")
+                    || request.headers().get_all("content-length").iter().any(|v| {
+                        match v.to_str() {
+                            Ok(v) => v.trim().parse::<u64>() != Ok(0),
+                            Err(_) => true,
+                        }
+                    });
+                let unknown_h2_body = e.str("version") == Some("HTTP/2.0")
+                    && !request.headers().contains_key("content-length");
+                line["ssrf_scan"] =
+                    if e.u64("status") == Some(413) || e.str("received") != Some("complete") {
+                        json!({"state": "incomplete", "reason": "body_incomplete"})
+                    } else if declared_body || unknown_h2_body {
+                        json!({"state": "incomplete", "reason": "body_unavailable"})
+                    } else {
+                        json!({"state": "complete"})
+                    };
+                let targets = crate::ssrf::extract(
+                    &request,
+                    crate::NAMES[i].0,
+                    &crate::NAMES[i].1.to_string(),
+                );
+                if !targets.is_empty() {
+                    line["ssrf"] = json!(targets);
                 }
             }
-            match request.body(bytes::Bytes::new()) {
-                Ok(request) => {
-                    let declared_body = request.headers().contains_key("transfer-encoding")
-                        || request.headers().get_all("content-length").iter().any(|v| {
-                            match v.to_str() {
-                                Ok(v) => v.trim().parse::<u64>() != Ok(0),
-                                Err(_) => true,
-                            }
-                        });
-                    let unknown_h2_body = e.str("version") == Some("HTTP/2.0")
-                        && !request.headers().contains_key("content-length");
-                    line["ssrf_scan"] =
-                        if e.u64("status") == Some(413) || e.str("received") != Some("complete") {
-                            json!({"state": "incomplete", "reason": "body_incomplete"})
-                        } else if declared_body || unknown_h2_body {
-                            json!({"state": "incomplete", "reason": "body_unavailable"})
-                        } else {
-                            json!({"state": "complete"})
-                        };
-                    let targets = crate::ssrf::extract(
-                        &request,
-                        crate::NAMES[i].0,
-                        &crate::NAMES[i].1.to_string(),
-                    );
-                    if !targets.is_empty() {
-                        line["ssrf"] = json!(targets);
-                    }
-                }
-                Err(_) => {
-                    line["ssrf_scan"] =
-                        json!({"state": "incomplete", "reason": "request_unavailable"});
-                }
+            Err(_) => {
+                line["ssrf_scan"] = json!({"state": "incomplete", "reason": "request_unavailable"});
             }
         }
     }
-    line
 }
 
 #[cfg(test)]

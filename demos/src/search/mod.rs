@@ -1,7 +1,5 @@
 //! Search page, authoritative topics, and the in-process network.
 
-pub mod console;
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,7 +79,8 @@ impl Topics {
                 "text/css",
                 include_bytes!("style.css").to_vec(),
             )
-            .workspace_with_hosts("Search")
+            .workspace("Search")
+            .workspace_consoles()
     }
 
     pub fn start(

@@ -17,6 +17,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// How long one connection attempt may take, from dialing to logging in.
 const ATTEMPT: Duration = Duration::from_secs(30);
 
+/// Quotes one literal argument for the guest's POSIX shell, including
+/// embedded single quotes, so data put in a command never expands.
+pub fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// A per-run SSH identity.
 pub struct Identity {
     key: Arc<PrivateKey>,
@@ -133,8 +139,14 @@ impl Session {
         Ok(channel.into_stream())
     }
 
-    /// Opens a shell with a PTY on this authenticated session.
-    pub async fn pty(&self, term: &str, cols: u32, rows: u32) -> io::Result<Pty> {
+    /// Opens a PTY and runs a command, or a login shell when no command is given.
+    pub async fn pty(
+        &self,
+        term: &str,
+        cols: u32,
+        rows: u32,
+        command: Option<&str>,
+    ) -> io::Result<Pty> {
         let channel = self
             .handle
             .channel_open_session()
@@ -146,11 +158,19 @@ impl Session {
             .await
             .map_err(io::Error::other)?;
         request_accepted(&mut channel, "pty-req").await?;
-        channel
-            .request_shell(true)
-            .await
-            .map_err(io::Error::other)?;
-        request_accepted(&mut channel, "shell").await?;
+        if let Some(command) = command {
+            channel
+                .exec(true, command)
+                .await
+                .map_err(io::Error::other)?;
+            request_accepted(&mut channel, "exec").await?;
+        } else {
+            channel
+                .request_shell(true)
+                .await
+                .map_err(io::Error::other)?;
+            request_accepted(&mut channel, "shell").await?;
+        }
         Ok(Pty { channel })
     }
 

@@ -1,5 +1,5 @@
-# FakeWiki on Fictionet under Docker Compose: cargo xtask demo fakewiki runs it
-# in the VM, and the README says how to run it by hand.
+# FakeWiki on Fictionet under Docker Compose, for the eval. The README says how
+# to run it by hand.
 #
 #   world     - the world: web::Sites in Rust, FakeWiki's pages in Python on
 #               its own 127.0.0.1. No network at all (network_mode: none).

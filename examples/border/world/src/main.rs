@@ -143,8 +143,9 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
         fictionet::RunOptions::new(fictionet::Seed::random())
             .observer(Arc::new(fictionet_observe::Aggregate::new(observer))),
         move |fcx| async move {
-            let ids = border_world::identities(&fcx, &scenario, &world_ca)?;
-            border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
+            let ids = border_world::identities(&fcx, &world_ca)?;
+            log.attach(&fcx);
+            let _routing = border_world::start(&fcx, scenario.clone(), ids, attachments)?;
             let _listening = fictionet::listen(
                 fictionet::WorldSocket::UnixSocket(args.socket.clone().into()),
                 attacher,

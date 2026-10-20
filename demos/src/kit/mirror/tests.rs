@@ -1621,3 +1621,40 @@ async fn mutable_request_directives_are_forwarded_and_counted() {
     })
     .await;
 }
+
+#[derive(Clone)]
+struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Service<Request<Body>> for Counting {
+    type Response = Response<Body>;
+    type Error = Error;
+    type Future = std::future::Ready<Answer>;
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, _: Request<Body>) -> Self::Future {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Ok(web::httpd::text(StatusCode::OK, "package")))
+    }
+}
+
+#[tokio::test]
+async fn closing_stops_forwarding_on_clones_made_before_closing() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut mirror = Closable::new(Counting(calls.clone()), closed.clone());
+    let mut earlier = mirror.clone();
+    let status = |response: Response<Body>| response.status();
+    assert_eq!(
+        status(mirror.call(Request::new(Body::empty())).await.unwrap()),
+        StatusCode::OK
+    );
+    closed.store(true, Ordering::SeqCst);
+    for service in [&mut mirror, &mut earlier] {
+        assert_eq!(
+            status(service.call(Request::new(Body::empty())).await.unwrap()),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

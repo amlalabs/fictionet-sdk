@@ -11,6 +11,18 @@ use std::sync::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
+fn shell_arguments_round_trip_without_expansion() {
+    for text in ["", "hello world", "a'b", "$(exit 7); `exit 8`\n$HOME"] {
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("printf %s {}", quote(text))])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, text.as_bytes());
+    }
+}
+
+#[test]
 fn request_waits_for_success_after_window_adjustments() {
     for request in ["pty-req", "shell"] {
         let messages = [
@@ -305,7 +317,7 @@ async fn shell_input_output_resize_and_close() {
         )
         .await
         .unwrap();
-        let mut pty = session.pty("xterm-256color", 80, 24).await.unwrap();
+        let mut pty = session.pty("xterm-256color", 80, 24, None).await.unwrap();
         assert_eq!(events.recv().await.unwrap(), "pty xterm-256color 80 24");
         assert_eq!(events.recv().await.unwrap(), "shell");
         assert_eq!(pty.read().await.unwrap().unwrap(), b"ready");
@@ -316,7 +328,7 @@ async fn shell_input_output_resize_and_close() {
         pty.close().await.unwrap();
         assert_eq!(events.recv().await.unwrap(), "closed");
         // Another shell uses the same authenticated connection.
-        let mut second = session.pty("vt100", 40, 20).await.unwrap();
+        let mut second = session.pty("vt100", 40, 20, None).await.unwrap();
         assert_eq!(second.read().await.unwrap().unwrap(), b"ready");
         second.close().await.unwrap();
         server.abort();
@@ -382,7 +394,7 @@ async fn fake_rfb(
 #[tokio::test]
 async fn dropping_a_pty_closes_its_channel() {
     let mut peer = Peer::new().await;
-    let pty = peer.session.pty("xterm", 80, 24).await.unwrap();
+    let pty = peer.session.pty("xterm", 80, 24, None).await.unwrap();
     drop(pty);
     tokio::time::timeout(Duration::from_secs(5), async {
         while peer.events.recv().await.as_deref() != Some("closed") {}

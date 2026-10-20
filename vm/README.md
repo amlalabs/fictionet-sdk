@@ -51,7 +51,7 @@ command at a time changes the VM: a second one waits for the first.
 | `cargo xtask vm up` | Boots the VM. The first time, it downloads and prepares the image. |
 | `cargo xtask vm ssh [command]` | Opens a root shell in the VM, or runs one command there. |
 | `cargo xtask vm sync` | Copies this working tree into the VM, at `/src`. |
-| `cargo xtask vm build [sdk] [border] [fakewiki] [adaptive-web]` | Syncs, then builds the static binaries in the VM (see below). |
+| `cargo xtask vm build [sdk]` | Syncs, then builds the static binaries in the VM (see below). |
 | `cargo xtask vm test <name>` | Runs one test suite in the VM. The table below lists them. |
 | `cargo xtask demo <name>` | Runs a [demo](../demos/README.md). |
 | `cargo xtask vm status` | Says whether the VM is running, on which ports, and how much disk `.vm/` uses. |
@@ -143,8 +143,7 @@ machine. Everything under `.vm/` is readable by you alone.
 the tracked files, and untracked ones that are not ignored, so uncommitted
 changes are included. File times are kept, so cargo rebuilds only what changed.
 `vm/guest/build.sh` then builds static musl binaries of `fictionet` and the crate's
-examples, and of the example worlds a demo asks for (`border-world`, `fakewiki-world`,
-`adaptive-web-world`), into `/opt/fictionet/bin`.
+examples into `/opt/fictionet/bin`.
 Static binaries run in the VM and in any container image, so the demos put them
 straight into images, without a second build.
 

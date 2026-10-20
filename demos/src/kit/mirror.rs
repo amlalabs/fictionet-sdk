@@ -296,6 +296,59 @@ where
     }
 }
 
+/// Forwards to `upstream`, usually this run's [`Cache`], until `closed` is
+/// set, then answers every request with 403. Clones share the flag, so a
+/// demo can close the mirror once setup is done.
+#[derive(Clone)]
+pub struct Closable<S> {
+    upstream: S,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<S> Closable<S> {
+    /// Wraps `upstream`; setting `closed` stops forwarding.
+    pub fn new(upstream: S, closed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { upstream, closed }
+    }
+
+    fn refusal() -> Response<Body> {
+        web::httpd::text(StatusCode::FORBIDDEN, "Package mirror closed\n")
+    }
+}
+
+impl<S> Service<Request<Body>> for Closable<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = Error>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+{
+    type Response = Response<Body>;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Answer> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let mut service = self.clone();
+        Box::pin(async move {
+            if service.closed.load(Ordering::SeqCst) {
+                return Ok(Self::refusal());
+            }
+            std::future::poll_fn(|cx| service.upstream.poll_ready(cx)).await?;
+            // The mirror can close while the upstream gets ready.
+            if service.closed.load(Ordering::SeqCst) {
+                return Ok(Self::refusal());
+            }
+            service.upstream.call(request).await
+        })
+    }
+}
+
 impl<S> Cache<S>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = Error>

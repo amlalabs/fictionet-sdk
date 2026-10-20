@@ -9,14 +9,15 @@
 //! | `http.request` | A request served by a world site, or forwarded when its `forwarded` field names the real origin. `misdirected`, `no_host`, `too_large`, body `timeout` and `budget` answers are refused. Requests ending without an answer stay with their named site or origin and increment `unanswered`. |
 //! | `tls.handshake` | A refused connection when the world rejected the name. |
 //! | `dns.query` | A query served by the world's DNS, and a [`Lookup`] with its answer. |
-//! | `net.blocked` | Refused (`ClosedPort`, `TooManyConnections`) or no route (every other reason), counted in packets. |
+//! | `net.blocked` | Refused (`ClosedPort`, `TooManyConnections`) or no route (every other reason), counted in packets. A world that answers some of a sandbox's packets itself, before its `Net` sees them, reports its refusals with this event too, naming the sandbox in a `sandbox` field. |
 //! | `conn.open`, `conn.close` | A connection served by a world service, counted once per connection. |
 //!
 //! Forwarding means requests sent through `web::proxy` or `web::forward`,
 //! including the mirror. A world that sends traffic out another way must
 //! report the same `forwarded` origin on its request events.
 //!
-//! Only events from a sandbox count. A connection that carried a request,
+//! Only events from a sandbox count: their connection names the sandbox, or,
+//! for `net.blocked` alone, their `sandbox` field does. A connection that carried a request,
 //! a handshake or a query counts on that row; any other connection counts
 //! when it closes. Names come from the request's host, the TLS name or the
 //! sandbox's own DNS answers for the address.
@@ -311,8 +312,24 @@ impl Egress {
         )
     }
 
+    /// A `net.blocked` event a world reports for a sandbox it answers itself.
+    fn named_block(source: &str, kind: &str) -> bool {
+        (source, kind) == ("net", "blocked")
+    }
+
     fn event(&self, at: f64, event: &Event) {
-        let Some(sandbox) = event.conn.sandbox.as_ref().map(|s| s.name.to_string()) else {
+        let named = || {
+            Self::named_block(event.source, event.kind)
+                .then(|| event.str("sandbox").map(str::to_owned))
+                .flatten()
+        };
+        let Some(sandbox) = event
+            .conn
+            .sandbox
+            .as_ref()
+            .map(|s| s.name.to_string())
+            .or_else(named)
+        else {
             return;
         };
         let mut state = self.state.lock();
@@ -699,7 +716,8 @@ impl State {
 impl Observer for Egress {
     fn enabled(&self, interest: Interest<'_>) -> bool {
         matches!(interest, Interest::Event(meta, conn)
-            if conn.sandbox.is_some() && Self::wanted(meta.source, meta.kind))
+            if conn.sandbox.is_some() && Self::wanted(meta.source, meta.kind)
+                || Self::named_block(meta.source, meta.kind))
             || matches!(
                 interest,
                 Interest::Topology(TopologyKind::Connection | TopologyKind::Host)

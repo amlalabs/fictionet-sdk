@@ -4,6 +4,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use fictionet::stdlib::codec::{Side, Stream, Wire};
 use fictionet::stdlib::protocols::{
@@ -116,6 +117,112 @@ impl PageClient {
             status_line: status_line(&reply.head),
             body: reply.body,
         })
+    }
+
+    /// Sends GET with the bearer and decodes the JSON reply. Any status but 200
+    /// is an error that names the path, the status line and the body.
+    pub async fn get_json(&self, path: &str) -> io::Result<Value> {
+        let reply = self.request("GET", path, None, true).await?;
+        require(&reply, 200).map_err(|error| io::Error::other(format!("GET {path}: {error}")))?;
+        Ok(serde_json::from_slice(&reply.body)?)
+    }
+
+    /// Posts a command to a page control and returns the page's JSON reply.
+    /// The reply must be `applied` with HTTP 200 or `rejected` with HTTP 409;
+    /// anything else is an error with the status line and the body.
+    pub async fn command(
+        &self,
+        control: &str,
+        request_id: &str,
+        command: Value,
+    ) -> io::Result<Value> {
+        let path = format!("/api/command/{control}");
+        let body = json!({"request_id": request_id, "command": command});
+        let reply = self.request("POST", &path, Some(&body), true).await?;
+        let refused = |detail: &dyn std::fmt::Display| {
+            io::Error::other(format!("POST {path}: {}: {detail}", reply.status_line))
+        };
+        let value: Value = serde_json::from_slice(&reply.body)
+            .map_err(|_| refused(&String::from_utf8_lossy(&reply.body)))?;
+        match (reply.status, value["status"].as_str()) {
+            (200, Some("applied")) | (409, Some("rejected")) => Ok(value),
+            _ => Err(refused(&value)),
+        }
+    }
+
+    /// Returns at most 1000 events after sequence number `after`, as the
+    /// page's `{"events", "last", "dropped"}` reply.
+    pub async fn events(&self, after: u64) -> io::Result<Value> {
+        self.get_json(&format!("/api/events?after={after}&max=1000"))
+            .await
+    }
+
+    /// Reads GET `path` every `interval` until `done` accepts its JSON, and
+    /// returns that JSON. `done` can end the wait with its own error. A wait
+    /// longer than `timeout` is a `TimedOut` error.
+    pub async fn wait_for(
+        &self,
+        path: &str,
+        timeout: Duration,
+        interval: Duration,
+        mut done: impl FnMut(&Value) -> io::Result<bool>,
+    ) -> io::Result<Value> {
+        let wait = async {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let value = self.get_json(path).await?;
+                if done(&value)? {
+                    return Ok(value);
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("GET {path} did not reach the expected state within {timeout:?}"),
+            )
+        })?
+    }
+
+    /// Reads the events after sequence number `after` every `interval` until
+    /// `matches` accepts one, and returns that event. Each read starts after
+    /// the last event already read. `matches` can end the wait with its own
+    /// error. A wait longer than `timeout` is a `TimedOut` error.
+    pub async fn wait_for_event(
+        &self,
+        after: u64,
+        timeout: Duration,
+        interval: Duration,
+        mut matches: impl FnMut(&Value) -> io::Result<bool>,
+    ) -> io::Result<Value> {
+        let wait = async {
+            let mut cursor = after;
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let mut batch = self.events(cursor).await?;
+                let Some(events) = batch["events"].as_array_mut() else {
+                    return Err(io::Error::other("the events reply has no events"));
+                };
+                for event in events.iter_mut() {
+                    if matches(event)? {
+                        return Ok(event.take());
+                    }
+                    cursor = event["seq"]
+                        .as_u64()
+                        .ok_or_else(|| io::Error::other("an event has no sequence number"))?;
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no matching event arrived within {timeout:?}"),
+            )
+        })?
     }
 
     /// Requests a single-use credential for a declared host console.
@@ -299,6 +406,47 @@ impl Socket {
             stream: client,
             task,
             error,
+        }
+    }
+}
+impl Socket {
+    /// Reads until `expected` appears in the output, keeping only enough
+    /// bytes to match across reads. Fails if the socket closes first or
+    /// `max_bytes` arrive without a match.
+    pub async fn read_until(&mut self, expected: &[u8], max_bytes: usize) -> io::Result<()> {
+        let mut window = Vec::new();
+        let mut chunk = [0; 4096];
+        let mut read = 0;
+        loop {
+            let n = self.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the console closed before showing {:?}",
+                        String::from_utf8_lossy(expected)
+                    ),
+                ));
+            }
+            read += n;
+            window.extend_from_slice(&chunk[..n]);
+            if window
+                .windows(expected.len())
+                .any(|bytes| bytes == expected)
+            {
+                return Ok(());
+            }
+            if read > max_bytes {
+                return Err(io::Error::other(format!(
+                    "the console showed {read} bytes without {:?}",
+                    String::from_utf8_lossy(expected)
+                )));
+            }
+            window.drain(
+                ..window
+                    .len()
+                    .saturating_sub(expected.len().saturating_sub(1)),
+            );
         }
     }
 }
