@@ -23,6 +23,8 @@ pub struct Class {
     pub count: usize,
     /// Maximum retained bytes per stream.
     pub bytes: usize,
+    /// Lower ranks are evicted first under the shared byte budget.
+    pub rank: usize,
     /// Maximum copied packet bytes. None keeps the whole packet.
     pub snap: Option<usize>,
     /// Items per 100 ms before exponential thinning. None never thins.
@@ -37,6 +39,7 @@ impl Class {
             when: When::Always,
             count: usize::MAX,
             bytes: usize::MAX,
+            rank: 0,
             snap: None,
             burst: None,
         }
@@ -49,6 +52,11 @@ impl Class {
     /// Sets the retained byte bound.
     pub const fn bytes(mut self, bytes: usize) -> Self {
         self.bytes = bytes;
+        self
+    }
+    /// Sets the shared-budget eviction rank. Higher ranks retain priority.
+    pub const fn rank(mut self, rank: usize) -> Self {
+        self.rank = rank;
         self
     }
     /// Requires a viewer on the packet's link.
@@ -112,11 +120,32 @@ impl dyn Policy {
     }
 }
 
+pub(crate) const NOISE: crate::Limits = crate::Limits::new(5_000, 2 << 20);
+
+pub(crate) fn default_bytes(links: usize) -> usize {
+    default_classes()
+        .iter()
+        .enumerate()
+        .fold(0usize, |total, (index, class)| {
+            total.saturating_add(
+                class
+                    .bytes
+                    .saturating_mul(if index >= 3 { links } else { 1 }),
+            )
+        })
+}
+
 pub(crate) fn default_classes() -> Vec<Class> {
     vec![
-        Class::new("events").count(50_000).bytes(16 << 20),
-        Class::new("noise").count(5_000).bytes(2 << 20),
-        Class::new("keys").count(20_000).bytes(8 << 20),
+        Class::new("events")
+            .count(crate::MAX_EVENTS)
+            .bytes(crate::MAX_EVENT_BYTES)
+            .rank(1),
+        Class::new("noise")
+            .count(NOISE.events)
+            .bytes(NOISE.bytes)
+            .rank(1),
+        Class::new("keys").count(20_000).bytes(8 << 20).rank(2),
         Class::new("packets")
             .count(4_096)
             .bytes(8 << 20)

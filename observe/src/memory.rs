@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Poll, Waker};
 
@@ -71,26 +72,27 @@ pub struct Memory {
     policy: Arc<dyn Policy>,
     bytes: usize,
     state: Mutex<State>,
+    retained_bytes: AtomicUsize,
     pub(crate) losses: Arc<Mutex<LossStatus>>,
     pub(crate) loss_streams: usize,
 }
 
 #[derive(Default)]
 struct State {
-    history: Vec<Ring<Arc<Event>>>,
+    history: Vec<(usize, Ring<Arc<Event>>)>,
     last: u64,
     waiters: Vec<Weak<Mutex<Option<Waker>>>>,
 }
 
 impl State {
     fn after(&self, after: u64) -> impl Iterator<Item = &Arc<Event>> {
-        crate::ring::after(&self.history, after)
+        crate::ring::after(self.history.iter().map(|(_, ring)| ring), after)
     }
 }
 
 impl Default for Memory {
     fn default() -> Self {
-        Self::with_noise_limits(Limits::default(), Limits::new(5_000, 2 << 20))
+        Self::with_noise_limits(Limits::default(), crate::policy::NOISE)
     }
 }
 
@@ -127,16 +129,13 @@ impl Memory {
     }
 
     pub(crate) fn with_policy(policy: Arc<dyn Policy>, bytes: usize) -> Self {
-        let history = policy.classes().iter().map(|_| Ring::default()).collect();
         Self {
             policy,
             bytes,
             losses: Arc::new(Mutex::new(LossStatus::default())),
             loss_streams: 1,
-            state: Mutex::new(State {
-                history,
-                ..State::default()
-            }),
+            state: Mutex::new(State::default()),
+            retained_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -157,11 +156,11 @@ impl Memory {
     ) -> Result<Vec<Event>, Incomplete> {
         let state = self.state.lock();
         let losses = self.losses.lock();
-        if kind.map_or(losses.events() != 0, |(source, kind)| {
+        if kind.map_or(losses.missing_events() != 0, |(source, kind)| {
             losses.incomplete(source, kind)
         }) {
             return Err(Incomplete {
-                lost: losses.events(),
+                lost: losses.missing_events(),
             });
         }
         Ok(state
@@ -255,7 +254,7 @@ impl Memory {
     /// events; `Some(after)` selects events following that sequence.
     pub(crate) fn batch(&self, after: Option<u64>, max: usize) -> crate::ring::Batch<Event> {
         let state = self.state.lock();
-        let batch = crate::ring::batch(&state.history, after, max);
+        let batch = crate::ring::batch(state.history.iter().map(|(_, ring)| ring), after, max);
         crate::ring::Batch {
             events: batch
                 .events
@@ -282,8 +281,8 @@ impl Memory {
     pub fn retained(&self) -> (usize, usize) {
         let state = self.state.lock();
         (
-            state.history.iter().map(|h| h.events.len()).sum(),
-            state.history.iter().map(|h| h.bytes).sum(),
+            state.history.iter().map(|(_, h)| h.items.len()).sum(),
+            state.history.iter().map(|(_, h)| h.bytes).sum(),
         )
     }
 }
@@ -350,7 +349,16 @@ impl Memory {
         let mut state = self.state.lock();
         state.last = stamp.seq;
         let mut losses = self.losses.lock();
-        let history = &mut state.history[index];
+        let slot = state
+            .history
+            .iter()
+            .position(|(class, _)| *class == index)
+            .unwrap_or_else(|| {
+                state.history.push((index, Ring::default()));
+                state.history.len() - 1
+            });
+        let history = &mut state.history[slot].1;
+        let before = history.bytes;
         if !history.admit(stamp, class.burst) {
             losses.record_event(self.loss_streams, stamp, index, LossReason::Sampling, event);
         } else if class.count == 0 || size > class.bytes.min(self.bytes) {
@@ -369,6 +377,13 @@ impl Memory {
             event.seq = stamp.seq;
             event.at = stamp.at;
             history.push(Arc::new(event));
+        }
+        if history.bytes >= before {
+            self.retained_bytes
+                .fetch_add(history.bytes - before, Ordering::Relaxed);
+        } else {
+            self.retained_bytes
+                .fetch_sub(before - history.bytes, Ordering::Relaxed);
         }
         if event.is_truncated() {
             losses.record_event(
@@ -389,21 +404,24 @@ impl Memory {
         let mut events: Vec<_> = state
             .history
             .iter()
-            .enumerate()
             .filter(|(class, _)| selection.class(*class))
             .flat_map(|(class, ring)| {
-                ring.events
+                ring.items
                     .iter()
                     .filter(|event| {
                         selection.sequence(event.seq)
                             && selection
                                 .host(event.conn.sandbox.as_ref().map(|sandbox| &*sandbox.name))
                     })
-                    .map(move |event| (class, event.clone()))
+                    .map(move |event| (*class, event.clone()))
             })
             .collect();
         events.sort_by_key(|(_, event)| event.seq);
         events
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn largest(&self) -> Option<(usize, usize)> {
@@ -411,15 +429,26 @@ impl Memory {
             .lock()
             .history
             .iter()
-            .enumerate()
-            .filter(|(_, ring)| !ring.events.is_empty())
-            .max_by_key(|(_, ring)| ring.bytes)
-            .map(|(index, ring)| (index, ring.bytes))
+            .filter(|(_, ring)| !ring.items.is_empty())
+            .max_by_key(|(index, ring)| {
+                (
+                    std::cmp::Reverse(self.policy.classes()[*index].rank),
+                    ring.bytes,
+                )
+            })
+            .map(|(index, ring)| (*index, ring.bytes))
     }
 
     pub(crate) fn evict(&self, index: usize) -> Option<Arc<Event>> {
         let mut state = self.state.lock();
-        let event = state.history[index].evict()?;
+        let event = state
+            .history
+            .iter_mut()
+            .find(|(class, _)| *class == index)?
+            .1
+            .evict()?;
+        self.retained_bytes
+            .fetch_sub(event.size(), Ordering::Relaxed);
         self.losses.lock().record_event(
             self.loss_streams,
             event.stamp(),
@@ -493,7 +522,7 @@ mod tests {
         assert!(events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
         let noise = events.iter().filter(|e| e.is("net", "blocked")).count();
         assert!(noise > 0 && noise <= 5_000);
-        assert!(memory.state.lock().history[1].bytes <= 2 << 20);
+        assert!(memory.state.lock().history[1].1.bytes <= 2 << 20);
         assert_eq!(memory.losses().events() + noise as u64, flood);
         assert_eq!(memory.checked_of("http", "request").unwrap().len(), 10);
     }
@@ -532,8 +561,8 @@ mod tests {
             );
             assert_eq!(memory.losses().events(), 2);
             let state = memory.state.lock();
-            assert!(state.history[1].bytes <= limits.bytes);
-            assert!(state.history[1].events.len() <= limits.events);
+            assert!(state.history[1].1.bytes <= limits.bytes);
+            assert!(state.history[1].1.items.len() <= limits.events);
         }
     }
 

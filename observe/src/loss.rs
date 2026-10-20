@@ -14,6 +14,8 @@ pub struct LossStatus {
     stream_count: usize,
     kinds: BTreeSet<(&'static str, &'static str)>,
     unknown_events: bool,
+    missing_kinds: BTreeSet<(&'static str, &'static str)>,
+    missing_events: u64,
     events: u64,
 }
 
@@ -53,8 +55,12 @@ impl LossStatus {
         self.events
     }
 
+    pub(crate) fn missing_events(&self) -> u64 {
+        self.missing_events
+    }
+
     pub(crate) fn incomplete(&self, source: &str, kind: &str) -> bool {
-        self.unknown_events || self.kinds.contains(&(source, kind))
+        self.unknown_events || self.missing_kinds.contains(&(source, kind))
     }
 
     pub(crate) fn omissions(&self, stream: Stream, class: usize) -> u64 {
@@ -105,7 +111,14 @@ impl LossStatus {
                     loss.event = None;
                 }
             }
-            self.unknown_events |= loss.event.is_none();
+            if loss.reason != LossReason::Truncation {
+                self.missing_events = self.missing_events.saturating_add(loss.count);
+                if let Some(pair) = loss.event {
+                    self.missing_kinds.insert(pair);
+                } else {
+                    self.unknown_events = true;
+                }
+            }
         }
         if let Some(total) = self.streams.iter_mut().find(|total| {
             total.stream == loss.stream

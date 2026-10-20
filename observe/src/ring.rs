@@ -9,7 +9,7 @@ pub(crate) trait Kept {
 }
 
 pub(crate) struct Ring<T> {
-    pub(crate) events: VecDeque<T>,
+    pub(crate) items: VecDeque<T>,
     pub(crate) bytes: usize,
     pub(crate) evicted: u64,
     pub(crate) last: u64,
@@ -21,7 +21,7 @@ pub(crate) struct Ring<T> {
 impl<T> Default for Ring<T> {
     fn default() -> Self {
         Self {
-            events: VecDeque::new(),
+            items: VecDeque::new(),
             bytes: 0,
             evicted: 0,
             last: 0,
@@ -58,7 +58,7 @@ impl<T: Kept> Ring<T> {
     }
 
     pub(crate) fn evict(&mut self) -> Option<T> {
-        let item = self.events.pop_front()?;
+        let item = self.items.pop_front()?;
         self.bytes -= item.size();
         self.evicted = self.evicted.saturating_add(1);
         Some(item)
@@ -71,8 +71,8 @@ impl<T: Kept> Ring<T> {
         bytes: usize,
         mut lost: impl FnMut(T),
     ) {
-        while !self.events.is_empty()
-            && (self.events.len() >= count || size > bytes || self.bytes > bytes - size)
+        while !self.items.is_empty()
+            && (self.items.len() >= count || size > bytes || self.bytes > bytes - size)
         {
             lost(self.evict().expect("ring budget"));
         }
@@ -81,7 +81,7 @@ impl<T: Kept> Ring<T> {
     pub(crate) fn push(&mut self, item: T) {
         self.last = item.stamp().seq;
         self.bytes += item.size();
-        self.events.push_back(item);
+        self.items.push_back(item);
     }
 }
 
@@ -92,8 +92,8 @@ pub(crate) fn after<'a, T: Kept + 'a>(
     let mut parts: Vec<_> = rings
         .into_iter()
         .map(|ring| {
-            let start = ring.events.partition_point(|item| item.stamp().seq <= seq);
-            ring.events.range(start..).peekable()
+            let start = ring.items.partition_point(|item| item.stamp().seq <= seq);
+            ring.items.range(start..).peekable()
         })
         .collect();
     std::iter::from_fn(move || {
@@ -126,7 +126,7 @@ pub(crate) fn batch<'a, T: Kept + Clone + 'a>(
     let skip = if cursor.is_none() {
         rings
             .iter()
-            .map(|ring| ring.events.len())
+            .map(|ring| ring.items.len())
             .sum::<usize>()
             .saturating_sub(max)
     } else {
@@ -148,7 +148,7 @@ pub(crate) fn batch<'a, T: Kept + Clone + 'a>(
             .iter()
             .map(|ring| {
                 ring.evicted.saturating_add(
-                    ring.events
+                    ring.items
                         .partition_point(|item| item.stamp().seq <= through)
                         as u64,
                 )

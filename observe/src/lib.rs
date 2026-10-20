@@ -281,19 +281,21 @@
 //! [`Policy`] defines selection and independent class budgets.
 //!
 //! A `packets` subscriber holds capture demand for its link. Dropping the last
-//! demand handle stops demand capture. Startup capture continues without
+//! demand handle stops demand capture. Always classes retain copies without
 //! subscribers. `Admit::Skip` declines capture. Packets that were
 //! not captured cannot be recovered later. Watching the graph alone does not
 //! start demand capture.
 //!
 //! Packet interest carries the tap and sandbox, so policy applies before
 //! topology arrives. Removed links keep copies within the same budgets.
-//! Under aggregate pressure removed captures go first, then the largest ring.
+//! Under shared byte pressure removed captures go first, then the lowest class
+//! rank, then the largest ring among equal ranks.
 //!
-//! Sampling uses run time. Each link keeps the first 64 packets in each
-//! 100 ms window, then one in two, one in four, and so on. Each [`PacketCopy`]
+//! Sampling uses run time. Each default packet class on a link keeps the first
+//! 64 packets in each 100 ms window, then one in two, one in four, and so on.
+//! Each [`PacketCopy`]
 //! keeps its stream stamp, original length and preceding sampling count.
-//! A separate copy cursor distinguishes eviction from sampling gaps.
+//! The core stream sequence is the copy cursor; per-class totals track eviction.
 //!
 //! A watch decodes kept copies in order. All subscribers to a link share its
 //! decoder and rows. The packet list shows sampling, capture eviction and subscriber
@@ -423,7 +425,7 @@
 //! | `events` | 50,000 events, 16 MiB | Ordinary events, sized by [`Event::size`](fictionet::events::Event::size). |
 //! | `noise` | 5,000 events, 2 MiB | Separate storage for facts marked with [`Event::repeat`](fictionet::events::Event::repeat). |
 //! | `packets` | 4,096 copies, 8 MiB per link | Packet payload bytes. |
-//! | `Options::bytes` | 64 MiB | Bytes across every event, packet and key ring. |
+//! | `Options::bytes` | Sum of default class budgets across allowed links | Bytes across every event, packet and key ring. |
 //! | Packet class `snap` | 65,535 bytes | Maximum copied bytes per packet; excess bytes count as truncation. |
 //! | `keys` | 20,000 keys, 8 MiB | Key entries, labels, randoms, secrets and owned connection text. |
 //! | `loss_streams` | 4,099 streams | Detailed loss totals by stream and reason. |
@@ -661,14 +663,14 @@
 //! whose capture remains. Each `packet` event has `seq`, `t`, `side`, `len`,
 //! `skipped`, `evicted`, `src`, `dst`, `proto`, `info` and `tags`.
 //! `seq` numbers decoded rows from 1 within a watch. It is separate from the
-//! core packet stream sequence and the collector's copy cursor. `t` is run
+//! core packet stream sequence, which is also the capture cursor. `t` is run
 //! time in seconds. `len` is the original length before snap truncation.
 //! `side` is 0 for end `a`, 1 for end `b`.
 //!
 //! `skipped` counts sampling omissions since the preceding copy. `evicted`
 //! counts copies lost before decoding since the preceding row. If every copy
-//! is evicted, the next decoded row carries that loss. Sampling counts carried
-//! by evicted copies are unavailable. Capture loss does not leave holes in
+//! in a class is evicted, the next decoded row of that class carries that loss.
+//! Sampling counts carried by evicted copies are unavailable. Capture loss does not leave holes in
 //! row numbers. Tags include `decrypted`, `retransmission`, `reset`, `fragment`,
 //! `gap`, `malformed` and `dns-error`.
 //!
@@ -804,8 +806,9 @@ use keys::Keys;
 use ring::Kept;
 
 /// Count and byte bounds. Zero refuses retention.
+#[cfg(any(feature = "decode", test))]
 #[derive(Clone, Copy, Debug)]
-pub struct Bounds {
+pub(crate) struct Bounds {
     /// Maximum retained items.
     pub count: usize,
     /// Maximum retained bytes.
@@ -819,7 +822,8 @@ pub struct Options {
     pub policy: Arc<dyn Policy>,
     /// Topology count and text limits.
     pub topology: TopologyLimits,
-    /// Byte budget across every event, packet and key ring.
+    /// Byte budget across every event, packet and key ring. The default covers
+    /// all default class budgets, including packet classes on every allowed link.
     pub bytes: usize,
     /// Maximum streams with detailed loss totals.
     pub loss_streams: usize,
@@ -840,7 +844,7 @@ impl Default for Options {
         Self {
             policy: <dyn Policy>::default(),
             topology: TopologyLimits::default(),
-            bytes: 64 << 20,
+            bytes: policy::default_bytes(TopologyLimits::default().links),
             loss_streams: 4099,
         }
     }
@@ -1000,12 +1004,17 @@ impl Collector {
     }
 }
 
-impl Observer for Collector {
-    fn enabled(&self, interest: Interest<'_>) -> bool {
+impl Collector {
+    fn admission(&self, interest: Interest<'_>) -> Admit {
         if let Interest::Topology(kind) = interest {
-            return self.options.policy.topology(kind);
+            return if self.options.policy.topology(kind) {
+                Admit::Build
+            } else {
+                Admit::Skip
+            };
         }
-        match self.options.policy.admit(interest) {
+        let decision = self.options.policy.admit(interest);
+        let enabled = match decision {
             Admit::Skip => false,
             Admit::Build => matches!(interest, Interest::Event(..)),
             Admit::Class(index) => self
@@ -1022,23 +1031,24 @@ impl Observer for Collector {
                         .is_some_and(|demand| demand.enabled()),
                     _ => false,
                 }),
-        }
+        };
+        if enabled { decision } else { Admit::Skip }
+    }
+}
+
+impl Observer for Collector {
+    fn enabled(&self, interest: Interest<'_>) -> bool {
+        self.admission(interest) != Admit::Skip
     }
 
     fn observe(&self, stamp: Stamp, item: Observation<'_>) {
-        if !self.enabled(item.interest()) {
-            return;
-        }
-        let index = if matches!(item, Observation::Topology(_)) {
-            None
-        } else {
-            match self.options.policy.admit(item.interest()) {
-                Admit::Class(index) => Some(index),
-                Admit::Build if matches!(item, Observation::Event(_)) => {
-                    self.options.policy.sort(&item)
-                }
-                _ => None,
+        let index = match self.admission(item.interest()) {
+            Admit::Skip => return,
+            Admit::Class(index) => Some(index),
+            Admit::Build if matches!(item, Observation::Event(_)) => {
+                self.options.policy.sort(&item)
             }
+            Admit::Build => None,
         };
         if let Observation::Event(event) = item {
             let Some(index) = index else {
@@ -1156,28 +1166,31 @@ impl Collector {
             let keys_bytes: usize = state.keys.rings.values().map(|ring| ring.bytes).sum();
             if self
                 .events
-                .retained()
-                .1
+                .retained_bytes()
                 .saturating_add(keys_bytes)
                 .saturating_add(state.captures.bytes)
                 <= self.options.bytes
             {
                 break;
             }
+            let classes = self.options.policy.classes();
+            let priority = |index: usize, bytes| (std::cmp::Reverse(classes[index].rank), bytes);
             let events = self.events.largest();
             let keys = state
                 .keys
                 .rings
                 .iter()
-                .filter(|(_, ring)| !ring.events.is_empty())
-                .max_by_key(|(_, ring)| ring.bytes)
+                .filter(|(_, ring)| !ring.items.is_empty())
+                .max_by_key(|(index, ring)| priority(**index, ring.bytes))
                 .map(|(index, ring)| (*index, ring.bytes));
-            let packets = state.captures.largest();
-            let largest = events
-                .map_or(0, |(_, bytes)| bytes)
-                .max(keys.map_or(0, |(_, bytes)| bytes));
+            let packets = state.captures.largest(classes);
+            let highest = events
+                .into_iter()
+                .chain(keys)
+                .map(|(index, bytes)| priority(index, bytes))
+                .max();
             if let Some((link, class, bytes, removed)) = packets
-                && (removed || bytes >= largest)
+                && (removed || highest.is_none_or(|other| priority(class, bytes) >= other))
             {
                 state.captures.evict(
                     link,
@@ -1186,7 +1199,9 @@ impl Collector {
                     self.options.loss_streams,
                 );
             } else if let Some((index, bytes)) = events
-                && bytes >= keys.map_or(0, |(_, bytes)| bytes)
+                && keys.is_none_or(|(key, key_bytes)| {
+                    priority(index, bytes) >= priority(key, key_bytes)
+                })
             {
                 self.events.evict(index).expect("event budget");
                 evicted_events = true;

@@ -173,16 +173,12 @@ fn packet_bounds_and_snap_length_report_separate_losses() {
                 assert_eq!(first.packets.len(), 1);
                 assert_eq!(first.packets[0].stamp.seq, 4);
                 assert_eq!(first.packets[0].skipped, 0);
-                for after in [1, 2, 3] {
-                    assert_eq!(evictions(&collector.packets(link, after, 10)), 3);
-                }
                 let last = collector.packets(link, 4, 10);
                 assert_eq!(evictions(&last), 3);
                 assert_eq!(last.packets.len(), 1);
                 assert_eq!(last.packets[0].stamp.seq, 5);
                 for after in [5, u64::MAX] {
                     let batch = collector.packets(link, after, 10);
-                    assert_eq!(evictions(&batch), 3);
                     assert!(batch.packets.is_empty());
                 }
             },
@@ -715,8 +711,6 @@ fn an_oversized_copy_reports_overflow_and_preserves_retained_copies() {
             assert_eq!(batch.packets.len(), 1);
             assert_eq!(batch.packets[0].stamp.seq, 1);
             assert_eq!(collector.packets(link, 1, 10).cursor, 2);
-            assert_eq!(evictions(&collector.packets(link, 1, 10)), 0);
-            assert_eq!(evictions(&collector.packets(link, 2, 10)), 0);
             packet(&collector, link, 3, Instant::ZERO, &[1; 4]);
             let batch = collector.packets(link, 2, 10);
             assert_eq!(evictions(&batch), 1);
@@ -791,18 +785,31 @@ fn a_first_packet_is_classified_before_topology_arrives() {
             cx.yield_now().await?;
             let snapshot = reader.topology();
             let links: Vec<_> = snapshot.links.iter().collect();
-            let collector = Collector::with_options(Options {
-                policy: policy([Class::new("packets")
-                    .count(4096)
-                    .bytes(8 << 20)
-                    .snap(65_535)
-                    .burst(64)]),
-                ..Options::default()
-            });
-            for (index, (id, link)) in links.iter().rev().enumerate() {
-                if index == 1 {
-                    packet(&collector, **id, 1, Instant::ZERO, &[7]);
-                }
+            let collector = Collector::default();
+            for (index, (id, _)) in links.iter().enumerate() {
+                let packet = PacketRef {
+                    link: **id,
+                    tap: if index == 0 { "first" } else { "second" },
+                    sandbox: (index == 0).then_some("guest"),
+                    side: Side::A,
+                    len: 1,
+                    link_type: LinkType::Ip,
+                    bytes: &[7],
+                };
+                assert_eq!(collector.enabled(Interest::Packet(packet)), index == 0);
+                collector.observe(
+                    Stamp {
+                        stream: Stream::Packets(**id),
+                        seq: 1,
+                        at: Instant::ZERO,
+                    },
+                    Observation::Packet(packet),
+                );
+            }
+            assert!(collector.topology().links.is_empty());
+            assert_eq!(collector.packets(*links[0].0, 0, 10).packets.len(), 1);
+            assert!(collector.packets(*links[1].0, 0, 10).packets.is_empty());
+            for (index, (id, link)) in links.iter().enumerate() {
                 collector.observe(
                     Stamp {
                         stream: Stream::Topology,
@@ -821,6 +828,9 @@ fn a_first_packet_is_classified_before_topology_arrives() {
             let batch = collector.packets(*links[0].0, 0, 10);
             assert_eq!(batch.packets.len(), 1);
             assert_eq!(batch.packets[0].bytes.as_ref(), &[7]);
+            assert_eq!(&*batch.packets[0].tap, "first");
+            assert_eq!(batch.packets[0].class, 3);
+            assert!(collector.packets(*links[1].0, 0, 10).packets.is_empty());
             Ok(())
         },
     ))
@@ -1027,7 +1037,7 @@ fn one_ring_evicts_the_same_way_for_events_packets_and_keys() {
                     assert_eq!(rows[0].count, 3);
                     assert_eq!(rows[0].bytes, Some((3 * size) as u64));
                 }
-                assert_eq!(reader.events().batch(None, 10).evicted, [3, 0, 0, 0, 0]);
+                assert_eq!(reader.events().batch(None, 10).evicted, [3]);
                 assert_eq!(evictions(&reader.packets(link, 0, 10)), 3);
                 assert_eq!(reader.state.lock().keys.rings[&2].evicted, 3);
                 Ok(())
@@ -1038,10 +1048,14 @@ fn one_ring_evicts_the_same_way_for_events_packets_and_keys() {
 }
 
 const WORK_CLASSES: [Class; 5] = [
-    Class::new("events").count(50_000).bytes(16 << 20),
-    Class::new("noise").count(5_000).bytes(2 << 20).burst(64),
-    Class::new("keys").count(20_000).bytes(8 << 20),
-    Class::new("agent").count(8_192).bytes(32 << 20),
+    Class::new("events").count(50_000).bytes(16 << 20).rank(3),
+    Class::new("noise")
+        .count(5_000)
+        .bytes(2 << 20)
+        .burst(64)
+        .rank(1),
+    Class::new("keys").count(20_000).bytes(8 << 20).rank(4),
+    Class::new("agent").count(8_192).bytes(32 << 20).rank(2),
     Class::new("bulk")
         .watched()
         .count(4_096)
@@ -1158,7 +1172,7 @@ fn a_policy_sorts_a_built_event_by_its_repeat_mark() {
             .collect::<Vec<_>>(),
         [1, 3]
     );
-    assert_eq!(collector.events().batch(None, 10).evicted, [0, 1, 0, 0, 0]);
+    assert_eq!(collector.events().batch(None, 10).evicted, [0, 1]);
 }
 
 #[test]
@@ -1194,10 +1208,7 @@ fn noise_and_events_classes_evict_independently() {
             .collect::<Vec<_>>(),
         [1, 2, 98, 99, 100]
     );
-    assert_eq!(
-        collector.events().batch(None, 100).evicted,
-        [0, 95, 0, 0, 0]
-    );
+    assert_eq!(collector.events().batch(None, 100).evicted, [0, 95]);
     assert_eq!(count(&collector, Stream::Events, LossReason::Eviction), 95);
 }
 
@@ -2014,4 +2025,248 @@ fn core_packet_loss_breaks_the_next_copy_continuity() {
             assert_eq!(collector.losses().streams[0].class, None);
         },
     );
+}
+
+#[test]
+fn bulk_is_evicted_before_agent_under_the_shared_budget() {
+    let agent = WORK_CLASSES[3];
+    let bulk = WORK_CLASSES[4];
+    let agent_size = 65_536;
+    let agent_count = agent.count.min(agent.bytes / agent_size);
+    let bulk_size = bulk.snap.unwrap();
+    let bulk_count = bulk.count.min(bulk.bytes / bulk_size);
+    let bytes = agent_count * agent_size + bulk_count * bulk_size / 2;
+    with_link(Options::default(), move |source, link| {
+        let collector = Collector::with_options(Options {
+            policy: Arc::new(WorkPolicy),
+            bytes,
+            ..Options::default()
+        });
+        collector.observe(
+            Stamp {
+                stream: Stream::Topology,
+                seq: 1,
+                at: Instant::ZERO,
+            },
+            Observation::Topology(TopologyRef::LinkAdded {
+                link,
+                creator: None,
+                host: None,
+                sandbox: None,
+                counters: source.topology().links[&link].counters.clone(),
+            }),
+        );
+        let _demand = collector.capture_demand(link).unwrap();
+        let data = vec![0; agent_size];
+        for seq in 1..=agent_count {
+            collector.observe(
+                Stamp {
+                    stream: Stream::Packets(link),
+                    seq: seq as u64,
+                    at: Instant::ZERO,
+                },
+                Observation::Packet(PacketRef {
+                    link,
+                    tap: "guest",
+                    sandbox: Some("guest"),
+                    side: Side::A,
+                    len: data.len(),
+                    bytes: &data,
+                    link_type: LinkType::Ip,
+                }),
+            );
+        }
+        for index in 1..=bulk_count {
+            packet(
+                &collector,
+                link,
+                (agent_count + index) as u64,
+                Instant::ZERO + ms(index as u64 * 100),
+                &vec![0; bulk_size],
+            );
+        }
+        let batch = collector.packets(link, 0, usize::MAX);
+        let bulk_kept = (bytes - agent_count * agent_size) / bulk_size;
+        assert_eq!(
+            batch.packets.iter().filter(|copy| copy.class == 3).count(),
+            agent_count
+        );
+        assert_eq!(
+            batch.packets.iter().filter(|copy| copy.class == 4).count(),
+            bulk_kept
+        );
+        assert_eq!(
+            batch.evicted,
+            [(3, 0), (4, (bulk_count - bulk_kept) as u64)]
+        );
+    });
+}
+
+#[test]
+fn events_survive_packet_load_under_the_default_policy() {
+    use fictionet::events::Event;
+    let source = Arc::new(Collector::default());
+    let reader = source.clone();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)).observer(source),
+        move |cx| async move {
+            let mut ends = Vec::new();
+            for _ in 0..10 {
+                let (a, b) = fictionet::pair();
+                ends.push((cx.tap("guest", a), b));
+            }
+            cx.yield_now().await?;
+            let collector = Collector::default();
+            let classes = collector.options.policy.classes();
+            let event = Event::new("http", "request");
+            let event_count = classes[0].count.min(classes[0].bytes / event.size());
+            let packet_size = classes[3].snap.unwrap();
+            let packet_count = classes[3].count.min(classes[3].bytes / packet_size);
+            let expected_budget = classes[..3].iter().map(|class| class.bytes).sum::<usize>()
+                + classes[3..].iter().map(|class| class.bytes).sum::<usize>()
+                    * collector.options.topology.links;
+            assert!(collector.options.bytes >= expected_budget);
+            for seq in 1..=event_count {
+                collector.observe(
+                    Stamp {
+                        stream: Stream::Events,
+                        seq: seq as u64,
+                        at: Instant::ZERO,
+                    },
+                    Observation::Event(&event),
+                );
+            }
+            let data = vec![0; packet_size];
+            for link in reader.topology().links.keys() {
+                for seq in 1..=packet_count + 2 {
+                    collector.observe(
+                        Stamp {
+                            stream: Stream::Packets(*link),
+                            seq: seq as u64,
+                            at: Instant::ZERO + ms(seq as u64 * 100),
+                        },
+                        Observation::Packet(PacketRef {
+                            link: *link,
+                            tap: "guest",
+                            sandbox: Some("guest"),
+                            side: Side::A,
+                            len: data.len(),
+                            bytes: &data,
+                            link_type: LinkType::Ip,
+                        }),
+                    );
+                }
+                assert_eq!(
+                    collector.packets(*link, 0, usize::MAX).packets.len(),
+                    packet_count
+                );
+                assert_eq!(evictions(&collector.packets(*link, 0, 0)), 2);
+            }
+            assert_eq!(
+                collector
+                    .events()
+                    .checked_of("http", "request")
+                    .unwrap()
+                    .len(),
+                event_count
+            );
+            assert_eq!(count(&collector, Stream::Events, LossReason::Eviction), 0);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn checked_of_returns_truncated_events_with_their_flag() {
+    use fictionet::events::Event;
+    for loss_streams in [0, 1] {
+        let collector = Collector::with_options(Options {
+            loss_streams,
+            ..Options::default()
+        });
+        collector.observe(
+            Stamp {
+                stream: Stream::Events,
+                seq: 1,
+                at: Instant::ZERO,
+            },
+            Observation::Event(
+                &Event::new("http", "request")
+                    .field("path", "shortened")
+                    .truncated(),
+            ),
+        );
+        for events in [
+            collector.events().checked_of("http", "request").unwrap(),
+            collector.events().checked_all().unwrap(),
+        ] {
+            assert_eq!(events.len(), 1);
+            assert!(events[0].is_truncated());
+            assert_eq!(events[0].seq, 1);
+        }
+        let losses = collector.losses();
+        assert_eq!(losses.events(), 1);
+        assert_eq!(
+            losses
+                .streams
+                .iter()
+                .filter(|loss| loss.reason == LossReason::Truncation)
+                .map(|loss| loss.count)
+                .sum::<u64>()
+                + losses
+                    .untracked
+                    .iter()
+                    .filter(|loss| loss.reason == LossReason::Truncation)
+                    .map(|loss| loss.count)
+                    .sum::<u64>(),
+            1
+        );
+    }
+}
+
+#[test]
+fn kept_packets_share_the_tap_name() {
+    with_link(
+        Options {
+            policy: policy([Class::new("packets")]),
+            ..Options::default()
+        },
+        |collector, link| {
+            packet(&collector, link, 1, Instant::ZERO, &[1]);
+            packet(&collector, link, 2, Instant::ZERO, &[2]);
+            let batch = collector.packets(link, 0, 10);
+            assert_eq!(batch.packets.len(), 2);
+            assert!(Arc::ptr_eq(&batch.packets[0].tap, &batch.packets[1].tap));
+        },
+    );
+}
+
+#[test]
+fn delivery_classifies_a_packet_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountPolicy(AtomicUsize);
+    impl Policy for CountPolicy {
+        fn classes(&self) -> &[Class] {
+            &WORK_CLASSES
+        }
+        fn admit(&self, interest: Interest<'_>) -> Admit {
+            if matches!(interest, Interest::Packet(_)) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Admit::Class(3)
+            } else {
+                Admit::Skip
+            }
+        }
+        fn sort(&self, _: &Observation<'_>) -> Option<usize> {
+            panic!("packet sorting")
+        }
+    }
+    with_link(Options::default(), |_, link| {
+        let policy = Arc::new(CountPolicy(AtomicUsize::new(0)));
+        let collector = Collector::new(policy.clone());
+        packet(&collector, link, 1, Instant::ZERO, &[1]);
+        assert_eq!(policy.0.load(Ordering::Relaxed), 1);
+        assert_eq!(collector.packets(link, 0, 10).packets[0].class, 3);
+    });
 }

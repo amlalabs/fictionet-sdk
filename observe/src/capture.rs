@@ -79,6 +79,7 @@ pub(crate) struct Capture {
     pub(crate) sandbox: Option<String>,
     pub(crate) rings: BTreeMap<usize, Ring<PacketCopy>>,
     removed: Option<u64>,
+    tap: Option<Arc<str>>,
 }
 
 impl Capture {
@@ -122,20 +123,25 @@ impl Captures {
             .map(|(id, _)| id)
     }
 
-    pub(crate) fn largest(&self) -> Option<(LinkId, usize, usize, bool)> {
+    pub(crate) fn largest(&self, classes: &[crate::Class]) -> Option<(LinkId, usize, usize, bool)> {
         self.links
             .iter()
             .flat_map(|(link, capture)| {
                 capture
                     .rings
                     .iter()
-                    .filter(|(_, ring)| !ring.events.is_empty())
+                    .filter(|(_, ring)| !ring.items.is_empty())
                     .map(move |(class, ring)| {
                         (*link, *class, ring.bytes, capture.removed.is_some())
                     })
             })
             .max_by_key(|(link, class, bytes, removed)| {
-                (*removed, *bytes, std::cmp::Reverse((*link, *class)))
+                (
+                    *removed,
+                    std::cmp::Reverse(classes[*class].rank),
+                    *bytes,
+                    std::cmp::Reverse((*link, *class)),
+                )
             })
     }
 
@@ -169,7 +175,7 @@ impl Captures {
         if let Some(capture) = self.links.remove(&id) {
             for ring in capture.rings.into_values() {
                 self.bytes -= ring.bytes;
-                for old in ring.events {
+                for old in ring.items {
                     losses.record(
                         limit,
                         old.stamp,
@@ -253,10 +259,14 @@ impl Captures {
                 old.bytes.len(),
             );
         });
+        if capture.tap.as_deref() != Some(packet.tap) {
+            capture.tap = Some(packet.tap.into());
+        }
+        let tap = capture.tap.as_ref().expect("capture tap").clone();
         let copy = PacketCopy {
             stamp,
             class: index,
-            tap: packet.tap.into(),
+            tap,
             side: packet.side,
             original_len: packet.len,
             link_type: packet.link_type,

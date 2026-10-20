@@ -843,3 +843,41 @@ fn a_capture_of_a_detached_sandbox_stays_readable() {
     let file = download(&mut session, 3, link, now);
     assert_eq!(&file[..4], &[0x0a, 0x0d, 0x0d, 0x0a]);
 }
+
+#[test]
+fn evicting_copies_already_read_does_not_count_them_again() {
+    let options = startup(Options {
+        policy: crate::tests::policy([Class::new("packets").count(2).bytes(1024)]),
+        ..Options::default()
+    });
+    with_dashboard(options, |cx, handle| async move {
+        let (mut ends, links) = links(&cx, &handle, 1).await;
+        let mut session = handle.session();
+        let now = Instant::now();
+        call(&mut session, 1, &packets(links[0], 0), now);
+        let watch = watch_of(&handle, links[0], now);
+        for _ in 0..2 {
+            ends[0].send(ip());
+        }
+        watch.pump(&handle.0);
+        assert_eq!(watch.rows_after(0, 10).1.len(), 2);
+        for _ in 0..2 {
+            ends[0].send(ip());
+        }
+        watch.pump(&handle.0);
+        let (_, rows) = watch.rows_after(2, 10);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, row)| row.contains(r#""evicted":0"#)));
+        for _ in 0..3 {
+            ends[0].send(ip());
+        }
+        watch.pump(&handle.0);
+        let (_, rows) = watch.rows_after(4, 10);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].1.contains(r#""evicted":1"#));
+        assert!(rows[1].1.contains(r#""evicted":0"#));
+        watch.pump(&handle.0);
+        assert_eq!(watch.rows_after(4, 10).1, rows);
+        Ok(())
+    });
+}
