@@ -80,6 +80,7 @@ async fn execute() -> Result {
     )
     .map_err(io::Error::other)?;
     let facts = Arc::new(facts::Facts::new(contents.inventory()));
+    let publisher = facts::Publisher::start(facts.clone());
     let listener = facts.clone();
     let contents =
         Arc::new(contents.on_change(move |at, change, inventory| {
@@ -130,7 +131,7 @@ async fn execute() -> Result {
     };
     let boot = run.guest(HOSTNAME).ssh_ready();
     println!("boot to SSH-ready: {} ms", boot.as_millis());
-    let result = gate(&run, &facts, &closed, variant, &shots).await;
+    let result = gate(&run, &facts, &publisher, &closed, variant, &shots).await;
     let result = match result {
         Ok(duration) if stay => {
             println!("gate passed; the page stays open until Ctrl-C");
@@ -144,13 +145,18 @@ async fn execute() -> Result {
     let run_dir = run.path().to_path_buf();
     let pid = run.guest(HOSTNAME).vm().pid();
     let shutdown = run.shutdown().await;
+    let published = publisher
+        .flush()
+        .await
+        .and_then(|()| facts.state.lock().unwrap().check_complete());
     let finished = log.finish();
     println!("world log: {}", log_path.display());
-    if result.is_err() || shutdown.is_err() || finished.is_err() {
+    if result.is_err() || shutdown.is_err() || published.is_err() || finished.is_err() {
         tail(&log_path)?;
     }
     let story_time = result?;
     shutdown?;
+    published?;
     finished?;
     if run_dir.exists() || pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists()) {
         return Err("shutdown left a VM process or run directory".into());
@@ -169,6 +175,7 @@ async fn execute() -> Result {
 async fn gate(
     run: &kit::Run,
     facts: &facts::Facts,
+    publisher: &facts::Publisher,
     closed: &AtomicBool,
     variant: Variant,
     shots: &Path,
@@ -205,7 +212,7 @@ async fn gate(
     .await
     .map_err(|_| "Firefox did not load the internal package index")?;
     guest::open_terminal(guest).await?;
-    let story_time = story::run(guest, facts, variant).await?;
+    let story_time = story::run(guest, facts, publisher, variant).await?;
     let screen = shots.join("artifactory-screen.png");
     kit::rfb::capture_page(run.page_url(), HOSTNAME, &screen).await?;
     println!("RFB screenshot: {}", screen.display());

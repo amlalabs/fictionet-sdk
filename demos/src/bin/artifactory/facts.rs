@@ -1,6 +1,6 @@
 use artifactory_world::{
     facts::{Door, MAX_DOOR_JSON_BYTES, MAX_REQUEST_JSON_BYTES, Request},
-    inventory::{FolderAdded, Inventory, MAX_INVENTORY_JSON_BYTES},
+    inventory::{Entry, EntryKind, FolderAdded, Inventory, MAX_INVENTORY_JSON_BYTES, Origin},
 };
 use fictionet::{
     events::{Interest, Loss, Observation, Observer, Stamp, Stream},
@@ -9,10 +9,13 @@ use fictionet::{
 use fictionet_observe::page::{PublishError, StateLimits, StateTopic};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::Mutex;
-use tokio::sync::Notify;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{Notify, mpsc, oneshot};
 
 const ROWS: usize = 4096;
+const PAGE_ROWS: usize = 512;
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +75,7 @@ pub struct Snapshot {
     pub doors_dropped: u64,
     pub lost: u64,
     pub publication_error: Option<String>,
+    dirty: bool,
 }
 
 #[derive(Clone)]
@@ -101,12 +105,12 @@ impl Facts {
                 max_bytes: MAX_INVENTORY_JSON_BYTES,
                 deltas: 64,
             }),
-            requests: StateTopic::new(limits(ROWS * (MAX_REQUEST_JSON_BYTES + 512))),
-            doors: StateTopic::new(limits(ROWS * (MAX_DOOR_JSON_BYTES + 512))),
+            requests: StateTopic::new(limits(PAGE_ROWS * (MAX_REQUEST_JSON_BYTES + 512))),
+            doors: StateTopic::new(limits(PAGE_ROWS * (MAX_DOOR_JSON_BYTES + 512))),
             // Retained row references use at most 2 * ROWS * 21 bytes. Commands
             // and titles come from the fixed story and fit in the remainder.
             story: StateTopic::new(StateLimits::default()),
-            other: StateTopic::new(limits(ROWS * (MAX_DOOR_JSON_BYTES + 512))),
+            other: StateTopic::new(limits(PAGE_ROWS * (MAX_DOOR_JSON_BYTES + 512))),
         };
         let story = super::story::steps(inventory.variant)
             .into_iter()
@@ -133,10 +137,12 @@ impl Facts {
             doors_dropped: 0,
             lost: 0,
             publication_error: None,
+            dirty: true,
         };
         let result = topics.inventory.publish(state.at, &state.inventory);
         state.record(result);
-        topics.publish(&mut state);
+        let batch = Batch::take(&mut state).unwrap();
+        state.record(topics.publish(batch));
         Self {
             state: Mutex::new(state),
             changed: Notify::new(),
@@ -150,7 +156,7 @@ impl Facts {
         if let Some(row) = state.story.iter_mut().find(|s| s.title == step) {
             row.state = Status::Running;
         }
-        self.topics.publish(&mut state);
+        state.dirty = true;
     }
     pub fn exit(&self, code: i32) {
         let mut state = self.state.lock().unwrap();
@@ -158,7 +164,7 @@ impl Facts {
         if let Some(row) = state.story.iter_mut().find(|s| s.title == step) {
             row.exit = Some(code);
         }
-        self.topics.publish(&mut state);
+        state.dirty = true;
     }
     pub fn finish(&self, exit: Option<i32>, success: bool) {
         let mut state = self.state.lock().unwrap();
@@ -171,7 +177,7 @@ impl Facts {
                 Status::Failed
             };
         }
-        self.topics.publish(&mut state);
+        state.dirty = true;
     }
     pub fn inventory_changed(&self, at: Instant, change: &FolderAdded, inventory: &Inventory) {
         let mut state = self.state.lock().unwrap();
@@ -187,11 +193,7 @@ impl Facts {
                 row: change.clone(),
             },
         );
-        let result = self
-            .topics
-            .inventory
-            .publish_with_delta(at, inventory, change);
-        state.record(result);
+        state.dirty = true;
         self.changed.notify_one();
     }
 }
@@ -214,28 +216,23 @@ impl Snapshot {
         }
     }
 }
-impl Topics {
-    fn publish(&self, state: &mut Snapshot) {
-        let requests = Rows {
-            rows: state.requests.clone(),
-            dropped: state.requests_dropped,
-            lost: state.lost,
-        };
-        state.record(self.requests.publish(state.at, &requests));
-        let doors = Rows {
-            rows: state.doors.clone(),
-            dropped: state.doors_dropped,
-            lost: state.lost,
-        };
-        state.record(self.doors.publish(state.at, &doors));
-        let other = state
-            .doors
-            .iter()
-            .filter(|row| row.traffic == Traffic::Other)
-            .cloned()
-            .collect();
-        state.record(self.other.publish(state.at, &other));
-        for step in &mut state.story {
+struct Batch {
+    at: Instant,
+    requests: Rows<Request>,
+    doors: Rows<Door>,
+    story: Vec<StoryStep>,
+    changes: Vec<Tagged<FolderAdded>>,
+}
+
+impl Batch {
+    fn take(state: &mut Snapshot) -> Option<Self> {
+        if !std::mem::take(&mut state.dirty) {
+            return None;
+        }
+        let requests = page_rows(&state.requests, state.requests_dropped, state.lost);
+        let doors = page_rows(&state.doors, state.doors_dropped, state.lost);
+        let mut story = state.story.clone();
+        for step in &mut story {
             step.requests = state
                 .requests
                 .iter()
@@ -249,9 +246,114 @@ impl Topics {
                 .map(|r| r.row.seq)
                 .collect();
         }
-        state.record(self.story.publish(state.at, &state.story));
+        Some(Self {
+            at: state.at,
+            requests,
+            doors,
+            story,
+            changes: state.changes.iter().cloned().collect(),
+        })
     }
 }
+
+fn page_rows<T: Clone>(rows: &VecDeque<Tagged<T>>, dropped: u64, lost: u64) -> Rows<T> {
+    let omitted = rows.len().saturating_sub(PAGE_ROWS);
+    Rows {
+        rows: rows.iter().skip(omitted).cloned().collect(),
+        dropped: dropped + omitted as u64,
+        lost,
+    }
+}
+
+impl Topics {
+    fn publish(&self, batch: Batch) -> Result<u64, PublishError> {
+        self.requests.publish(batch.at, &batch.requests)?;
+        let other = batch
+            .doors
+            .rows
+            .iter()
+            .filter(|row| row.traffic == Traffic::Other)
+            .cloned()
+            .collect();
+        self.other.publish(batch.at, &other)?;
+        self.doors.publish(batch.at, &batch.doors)?;
+        self.story.publish(batch.at, &batch.story)
+    }
+}
+
+/// One worker serializes changed topics and acknowledges story boundaries.
+pub struct Publisher {
+    flush: mpsc::Sender<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Publisher {
+    pub fn start(facts: Arc<Facts>) -> Self {
+        let (flush, mut receiver) = mpsc::channel::<oneshot::Sender<()>>(1);
+        let mut inventory = facts.state.lock().unwrap().inventory.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let ack = tokio::select! {
+                    _ = interval.tick() => None,
+                    request = receiver.recv() => match request {
+                        Some(ack) => Some(ack),
+                        None => break,
+                    },
+                };
+                publish_changed(&facts, &mut inventory);
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+            }
+        });
+        Self { flush, task }
+    }
+
+    pub async fn flush(&self) -> std::io::Result<()> {
+        let (send, received) = oneshot::channel();
+        self.flush.send(send).await.map_err(std::io::Error::other)?;
+        received.await.map_err(std::io::Error::other)
+    }
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn publish_changed(facts: &Facts, inventory: &mut Inventory) {
+    let Some(batch) = Batch::take(&mut facts.state.lock().unwrap()) else {
+        return;
+    };
+    // Copy rows under the facts lock, then serialize without holding it.
+    let result = (|| {
+        for change in &batch.changes {
+            if change.row.revision <= inventory.revision {
+                continue;
+            }
+            let entries = &mut inventory.repositories[2].entries;
+            entries.push(Entry {
+                path: change.row.path.clone(),
+                kind: EntryKind::Folder,
+                origin: Origin::Reply,
+            });
+            let replies = entries.partition_point(|e| e.origin != Origin::Reply);
+            entries[replies..].sort_by(|a, b| a.path.cmp(&b.path));
+            inventory.revision = change.row.revision;
+            let at = Instant::from_since_start(Duration::from_secs_f64(change.at));
+            facts
+                .topics
+                .inventory
+                .publish_with_delta(at, inventory, &change.row)?;
+        }
+        facts.topics.publish(batch)
+    })();
+    facts.state.lock().unwrap().record(result);
+}
+
 fn state_traffic(step: &str, own: bool) -> Traffic {
     match step {
         "setup" => Traffic::Setup,
@@ -332,7 +434,7 @@ impl Observer for Facts {
             changed = true;
         }
         if changed {
-            self.topics.publish(&mut state);
+            state.dirty = true;
         }
         self.changed.notify_one();
     }
@@ -340,7 +442,7 @@ impl Observer for Facts {
         if loss.stream == Stream::Events {
             let mut state = self.state.lock().unwrap();
             state.lost += loss.count;
-            self.topics.publish(&mut state);
+            state.dirty = true;
             self.changed.notify_one();
         }
     }
@@ -423,6 +525,108 @@ mod tests {
             assert_eq!(row.step, "Send public UDP");
         }
     }
+    #[tokio::test]
+    async fn bursts_publish_once_and_idle_flushes_do_not_publish() {
+        let facts = Arc::new(Facts::new(
+            Contents::new(Variant::Lookalike, "", &[1; 32])
+                .unwrap()
+                .inventory(),
+        ));
+        let publisher = Publisher::start(facts.clone());
+        let event = Event::new("dns", "query")
+            .field("name", "github.com")
+            .field("answer", "nxdomain");
+        let stamp = Stamp {
+            stream: Stream::Events,
+            seq: 1,
+            at: Instant::ZERO,
+        };
+        for revision in 1..=3 {
+            for _ in 0..1000 {
+                facts.observe(stamp, Observation::Event(&event));
+            }
+            facts.phase("Look up GitHub", &["github.com"]);
+            facts.exit(0);
+            facts.finish(Some(0), true);
+            assert_eq!(facts.topics.doors.revision(), revision);
+            assert_eq!(facts.topics.requests.revision(), revision);
+            assert_eq!(facts.topics.story.revision(), revision);
+            publisher.flush().await.unwrap();
+            assert_eq!(facts.topics.doors.revision(), revision + 1);
+            assert_eq!(facts.topics.requests.revision(), revision + 1);
+            assert_eq!(facts.topics.story.revision(), revision + 1);
+            publisher.flush().await.unwrap();
+            assert_eq!(facts.topics.doors.revision(), revision + 1);
+        }
+        assert_eq!(facts.state.lock().unwrap().doors.len(), 3000);
+        facts.state.lock().unwrap().check_complete().unwrap();
+    }
+
+    #[test]
+    fn page_retention_does_not_discard_gate_rows() {
+        let facts = Facts::new(
+            Contents::new(Variant::Normal, "", &[1; 32])
+                .unwrap()
+                .inventory(),
+        );
+        let stamp = Stamp {
+            stream: Stream::Events,
+            seq: 0,
+            at: Instant::ZERO,
+        };
+        for seq in 0..=PAGE_ROWS {
+            let mut event = Event::new("dns", "query")
+                .field("name", "github.com")
+                .field("answer", "nxdomain");
+            event.seq = seq as u64;
+            facts.observe(stamp, Observation::Event(&event));
+        }
+        let mut state = facts.state.lock().unwrap();
+        let batch = Batch::take(&mut state).unwrap();
+        assert_eq!(batch.doors.rows.len(), PAGE_ROWS);
+        assert_eq!(batch.doors.dropped, 1);
+        assert_eq!(batch.doors.rows.front().unwrap().row.seq, 1);
+        assert_eq!(batch.doors.rows.back().unwrap().row.seq, PAGE_ROWS as u64);
+        assert_eq!(state.doors.len(), PAGE_ROWS + 1);
+        assert_eq!(state.dropped, 0);
+        state.check_complete().unwrap();
+    }
+
+    #[test]
+    fn inventory_bursts_keep_each_revision_and_sorted_replies() {
+        let contents = Contents::new(Variant::Peer, "", &[1; 32]).unwrap();
+        let mut published = contents.inventory();
+        let facts = Arc::new(Facts::new(published.clone()));
+        let mut next = published.clone();
+        let replies = next.repositories[2].entries.len();
+        for (index, path) in ["reply-z", "reply-a", "reply-m"].iter().enumerate() {
+            next.revision = index as u64 + 1;
+            next.repositories[2].entries.push(Entry {
+                path: (*path).into(),
+                kind: EntryKind::Folder,
+                origin: Origin::Reply,
+            });
+            next.repositories[2].entries[replies..].sort_by(|a, b| a.path.cmp(&b.path));
+            facts.inventory_changed(
+                Instant::from_since_start(Duration::from_secs(index as u64 + 1)),
+                &FolderAdded {
+                    revision: next.revision,
+                    path: (*path).into(),
+                    sandbox: None,
+                },
+                &next,
+            );
+            assert_eq!(facts.topics.inventory.revision(), 1);
+        }
+        publish_changed(&facts, &mut published);
+        assert_eq!(published, next);
+        assert_eq!(facts.topics.inventory.revision(), 4);
+        assert_eq!(facts.state.lock().unwrap().changes.len(), 3);
+        publish_changed(&facts, &mut published);
+        assert_eq!(facts.topics.inventory.revision(), 4);
+        facts.state.lock().unwrap().check_complete().unwrap();
+    }
+
     async fn topic(
         client: &fictionet_demo::kit::client::PageClient,
         name: &str,
@@ -444,7 +648,8 @@ mod tests {
         let initial = Contents::new(Variant::Peer, "", &[1; 32])
             .unwrap()
             .inventory();
-        let facts = Facts::new(initial.clone());
+        let facts = Arc::new(Facts::new(initial.clone()));
+        let publisher = Publisher::start(facts.clone());
         let dashboard = DashboardObserver::new(DashboardOptions::demo());
         let page = Page::new("Topic publishing", dashboard.handle())
             .custom("Packages", "", facts.topics.inventory.clone())
@@ -487,6 +692,7 @@ mod tests {
             sandbox: None,
         };
         facts.inventory_changed(at, &change, &next);
+        publisher.flush().await.unwrap();
         let inventory = topic(&client, "packages").await;
         assert_eq!(inventory["revision"], 2);
         assert_eq!(inventory["at"], 3.0);
@@ -537,11 +743,13 @@ mod tests {
             Observation::Event(&event),
         );
         facts.exit(0);
+        publisher.flush().await.unwrap();
         assert_eq!(
             topic(&client, "story").await["value"][2]["state"],
             "running"
         );
         facts.finish(Some(0), true);
+        publisher.flush().await.unwrap();
         let story = topic(&client, "story").await;
         assert_eq!(story["value"][2]["state"], "done");
         assert_eq!(story["value"][2]["exit"], 0);
@@ -561,10 +769,16 @@ mod tests {
                 Observation::Event(&event),
             );
         }
+        publisher.flush().await.unwrap();
+        assert_eq!(facts.state.lock().unwrap().requests.len(), ROWS);
+        assert_eq!(facts.state.lock().unwrap().requests_dropped, 1);
         for name in ["requests", "doors"] {
             let snapshot = topic(&client, name).await;
-            assert_eq!(snapshot["value"]["rows"].as_array().unwrap().len(), ROWS);
-            assert_eq!(snapshot["value"]["dropped"], 1);
+            assert_eq!(
+                snapshot["value"]["rows"].as_array().unwrap().len(),
+                PAGE_ROWS
+            );
+            assert_eq!(snapshot["value"]["dropped"], ROWS + 1 - PAGE_ROWS);
             assert_eq!(snapshot["status"]["too_large"], false);
         }
         assert!(facts.state.lock().unwrap().publication_error.is_none());

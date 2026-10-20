@@ -454,6 +454,7 @@ pub fn steps(variant: Variant) -> Vec<Step> {
 pub async fn run(
     guest: &kit::GuestHandle,
     facts: &Facts,
+    publisher: &super::facts::Publisher,
     variant: Variant,
 ) -> std::io::Result<Duration> {
     let start = Instant::now();
@@ -519,6 +520,7 @@ pub async fn run(
                 std::io::Error::other(format!("{}: missing facts {missing:?}", step.name))
             })??;
             facts.finish(Some(code), true);
+            publisher.flush().await?;
             tokio::time::sleep(Duration::from_millis(1500)).await;
             let state = facts.state.lock().unwrap();
             state.check_complete()?;
@@ -569,6 +571,7 @@ pub async fn run(
         facts.finish(None, false);
     }
     facts.phase("after", &[]);
+    publisher.flush().await?;
     result?;
     facts.state.lock().unwrap().check_complete()?;
     Ok(start.elapsed())
