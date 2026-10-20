@@ -15,6 +15,9 @@ pub const HOSTS: [u8; 5] = [10, 11, 12, 13, 50];
 /// Each machine's open TCP ports, in the order of `HOSTS`.
 const OPEN: [&[u16]; 5] = [&[22, 80], &[25, 110, 143], &[21, 22], &[80, 631], &[22, 80]];
 
+/// How long one nmap step may run in the analyst's terminal.
+const STEP_LIMIT: Duration = Duration::from_secs(300);
+
 pub fn addr(last: u8) -> Ipv4Addr {
     Ipv4Addr::new(10, 0, 0, last)
 }
@@ -186,7 +189,7 @@ pub async fn run(
         let mut output = String::new();
         let mut report = None;
         let result = async {
-            let typed = guest.type_command(&command).await?;
+            let typed = guest.type_command(&command, STEP_LIMIT).await?;
             let status = typed.code;
             exit = Some(status);
             output = typed.output;
@@ -220,8 +223,14 @@ pub async fn run(
         .await;
         progress.finish(index, exit, report, result.is_ok());
         if let Err(error) = result {
+            // A failed type_command carries nmap's output in its error.
+            let output = if output.is_empty() {
+                String::new()
+            } else {
+                format!("\nnmap output:\n{output}")
+            };
             return Err(format!(
-                "{} failed: {error}\nnmap output:\n{output}\nguest console tail:\n{}",
+                "{} failed: {error}{output}\nguest console tail:\n{}",
                 step.title,
                 guest.vm().console_tail()
             )

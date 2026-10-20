@@ -194,6 +194,8 @@ pub struct Step {
     pub exit: Exit,
     pub checks: Vec<Check>,
 }
+/// How long one of Maya's steps may run in her terminal.
+const STEP_LIMIT: Duration = Duration::from_secs(120);
 const INTERNAL: &[&str] = &[artifactory_world::REPOSITORY_NAME, "10.20.0.15"];
 const PUBLIC: &[&str] = &[
     "pypi.org",
@@ -558,7 +560,7 @@ pub async fn run(
             facts.phase(step.name, step.destinations, step.who);
             println!("story: {} [{}]", step.name, facts.name(step.who));
             let code = match step.who {
-                Who::Maya => maya.type_command(&step.command).await?.code,
+                Who::Maya => maya.type_command(&step.command, STEP_LIMIT).await?.code,
                 Who::Colleague => {
                     let guest = colleague.ok_or_else(|| {
                         std::io::Error::other(format!("{}: no colleague workstation", step.name))

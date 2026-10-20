@@ -20,20 +20,22 @@ const MOZILLA_KEY: &str = include_str!("desktop/packages.mozilla.org.asc");
 /// Where the typed-command program reads commands and writes results, in
 /// the user's home.
 const WORK: &str = ".local/work";
-/// The typed-command program. It waits for a command on its pipe, shows a
-/// prompt and types the command out, runs it for at most 300 s, and writes
-/// back its exit status. Its arguments are a heading it shows first.
+/// The typed-command program. It waits on its pipe for a line holding a time
+/// limit in seconds and a command. It shows a prompt and types the command
+/// out, runs it for at most that limit, and writes back its exit status. Its
+/// arguments are a heading it shows first.
 const ASSISTANT: &str = r#"#!/bin/bash
 work=$HOME/.local/work
 [ $# -eq 0 ] || printf '%s\n\n' "$*"
-while IFS= read -r command < "$work/commands"; do
+while read -r limit command < "$work/commands"; do
+    : > "$work/output"
     printf '\033[01;32m%s@%s\033[00m:\033[01;34m%s\033[00m$ ' "$USER" "$(hostname)" "${PWD/#$HOME/\~}"
     for ((i = 0; i < ${#command}; i++)); do
         printf '%s' "${command:i:1}"
         sleep 0.03
     done
     printf '\n'
-    timeout 300 bash -c "$command" 2>&1 | tee "$work/output"
+    timeout "$limit" bash -c "$command" 2>&1 | tee "$work/output"
     status=${PIPESTATUS[0]}
     printf '\n[exit %s]\n\n' "$status"
     printf '%s\n' "$status" > "$work/results"
@@ -59,9 +61,12 @@ pub async fn firefox_title(ssh: &ssh::Session) -> io::Result<String> {
     Ok(out.stdout.trim().to_owned())
 }
 
-/// How long [`GuestHandle::type_command`] waits: the program's own 300 s
-/// limit and time to type.
-const TYPED_TIMEOUT: Duration = Duration::from_secs(330);
+/// How much longer than a command's limit [`GuestHandle::type_command`]
+/// waits, for the typing.
+const TYPING: Duration = Duration::from_secs(30);
+/// The most of a typed command's output [`GuestHandle::type_command`] reads
+/// back: its last 1 MiB.
+const OUTPUT_LIMIT: usize = 1 << 20;
 
 impl Guest {
     /// Installs `/opt/assistant`, the program a terminal window runs to
@@ -80,65 +85,70 @@ impl Guest {
 pub struct Typed {
     /// The command's exit status; 124 when it ran out of time.
     pub code: i32,
-    /// Its output and error output together, up to 1 MiB.
+    /// Its output and error output together: the last 1 MiB when it printed
+    /// more.
     pub output: String,
 }
 
 impl GuestHandle {
     /// Types `command` in the terminal window that runs `/opt/assistant`
-    /// (see [`Guest::typed_commands`]) and waits up to 330 s for it to run.
-    /// The command is one line.
-    pub async fn type_command(&self, command: &str) -> io::Result<Typed> {
+    /// (see [`Guest::typed_commands`]) and runs it for at most `limit`,
+    /// whole seconds and at least one. The command is one line. When the
+    /// terminal does not report back, the error carries the output so far.
+    pub async fn type_command(&self, command: &str, limit: Duration) -> io::Result<Typed> {
         if command.contains(['\n', '\r', '\0']) {
             return Err(io::Error::other("a typed command must be one line"));
         }
-        let send = send_typed(command);
-        let out = tokio::time::timeout(TYPED_TIMEOUT, self.ssh().run_bounded(&send, 1 << 20))
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "{}: {command:?} did not finish in {TYPED_TIMEOUT:?}",
-                        self.name()
-                    ),
-                )
-            })??;
-        let failed = || {
-            io::Error::other(format!(
-                "{}: the terminal did not run {command:?}: exit {}; {}",
-                self.name(),
-                out.code,
-                out.stderr
-            ))
+        let wait = limit + TYPING;
+        let send = send_typed(command, limit);
+        let sent = self.ssh().run_bounded(&send, OUTPUT_LIMIT + 64);
+        let error = match tokio::time::timeout(wait, sent).await {
+            Err(_) => format!("it did not finish in {wait:?}"),
+            Ok(Err(error)) => error.to_string(),
+            Ok(Ok(out)) => match out.stdout.split_once('\n') {
+                Some((status, output)) if out.code == 0 => match status.trim().parse() {
+                    Ok(code) => {
+                        return Ok(Typed {
+                            code,
+                            output: output.to_owned(),
+                        });
+                    }
+                    Err(_) => format!("its status line was {status:?}"),
+                },
+                _ => format!("exit {}; {}", out.code, out.stderr),
+            },
         };
-        if out.code != 0 {
-            return Err(failed());
-        }
-        let (status, output) = out.stdout.split_once('\n').ok_or_else(failed)?;
-        Ok(Typed {
-            code: status.trim().parse().map_err(|_| failed())?,
-            output: output.to_owned(),
-        })
+        let read = format!("tail -c {OUTPUT_LIMIT} ~/{WORK}/output");
+        let output =
+            match tokio::time::timeout(TYPING, self.ssh().run_bounded(&read, OUTPUT_LIMIT)).await {
+                Ok(Ok(out)) => out.stdout,
+                Ok(Err(error)) => format!("(unreadable: {error})"),
+                Err(_) => "(reading it timed out)".into(),
+            };
+        Err(io::Error::other(format!(
+            "{}: the terminal did not run {command:?}: {error}\nits output so far:\n{output}",
+            self.name()
+        )))
     }
 }
 
-/// The shell command that hands `command` to `/opt/assistant` and prints
-/// its exit status on one line, then its output.
-fn send_typed(command: &str) -> String {
-    let encoded = base64::encode(format!("{command}\n").as_bytes());
+/// The shell command that hands `command` and its time limit to
+/// `/opt/assistant` and prints its exit status on one line, then the last
+/// [`OUTPUT_LIMIT`] bytes of its output.
+fn send_typed(command: &str, limit: Duration) -> String {
+    let line = format!("{} {command}\n", limit.as_secs().max(1));
     format!(
         "printf %s {} | base64 -d > ~/{WORK}/commands && head -n1 ~/{WORK}/results \
-         && cat ~/{WORK}/output",
-        ssh::quote(&encoded)
+         && tail -c {OUTPUT_LIMIT} ~/{WORK}/output",
+        ssh::quote(&base64::encode(line.as_bytes()))
     )
 }
 
-/// An Ubuntu guest whose screen is Xvnc on display :1 at `size`, on the
-/// guest's loopback with no password: only the admin SSH tunnel reaches
-/// it. Once the X server answers, `session` runs as `user`, and `ready`
-/// exits zero once the desktop is up. The caller enables `vnc.service`
-/// after its own setup.
+/// An Ubuntu guest whose screen is Xvnc on display :1, `width` by `height`
+/// pixels, on the guest's loopback with no password: only the admin SSH
+/// tunnel reaches it. Once the X server answers, `session` runs as `user`,
+/// and `ready` exits zero once the desktop is up. The caller enables
+/// `vnc.service` after its own setup.
 fn xvnc(
     hostname: &str,
     user: &str,
@@ -468,6 +478,18 @@ fn setup_script(user: &str) -> String {
 mod tests {
     use super::*;
     use crate::kit::seed;
+    use std::collections::BTreeMap;
+
+    /// The guest's seed as the guest receives it, and the files it writes.
+    fn seed(guest: &Guest) -> (String, BTreeMap<String, String>) {
+        let data = seed::user_data(&seed::Provision {
+            guest,
+            authorized_key: "key",
+            ca: None,
+        });
+        let files = seed::files(&data).unwrap();
+        (data, files)
+    }
 
     #[test]
     fn browser_seed_has_the_desktop_and_firefox_policy() {
@@ -478,15 +500,8 @@ mod tests {
         assert_eq!(*port, VNC_PORT);
         assert!(ready.contains("DISPLAY=:1 xdpyinfo"));
         assert!(ready.contains("pgrep -x xfwm4"));
-        let data = seed::user_data(&seed::Provision {
-            guest: &guest,
-            authorized_key: "key",
-            ca: None,
-        });
-        let content = |path: &str| {
-            let file = guest.files.iter().find(|f| f.path == path).unwrap();
-            file.content.clone()
-        };
+        let (data, files) = seed(&guest);
+        let content = |path: &str| files[path].clone();
         assert_eq!(
             content("/etc/apt/keyrings/packages.mozilla.org.asc"),
             MOZILLA_KEY
@@ -575,10 +590,7 @@ mod tests {
     fn terminal_runs_the_assistant_full_screen_on_the_shared_session() {
         let guest = terminal("workstation", "analyst", "Office inventory", (960, 400), 15);
         guest.validate().unwrap();
-        let content = |guest: &Guest, path: &str| {
-            let file = guest.files.iter().find(|f| f.path == path).unwrap();
-            file.content.clone()
-        };
+        let content = |guest: &Guest, path: &str| seed(guest).1[path].clone();
         let start = content(&guest, "/opt/start-desktop.sh");
         assert!(start.contains("Xvnc :1 -localhost -SecurityTypes None"));
         assert!(start.contains(" -SendCutText=0 "));
@@ -641,20 +653,29 @@ mod tests {
             .unwrap();
         let mut stdout = child.stdout.take().unwrap();
         let assistant = Running(child);
-        let typed = |command: &str| {
+        // The screen is read as the program writes it, so a long output
+        // never fills the pipe.
+        let screen = std::thread::spawn(move || {
+            let mut screen = String::new();
+            std::io::Read::read_to_string(&mut stdout, &mut screen).unwrap();
+            screen
+        });
+        let typed = |command: &str, limit: u64| {
             let out = std::process::Command::new("bash")
-                .args(["-c", &send_typed(command)])
+                .args(["-c", &send_typed(command, Duration::from_secs(limit))])
                 .env("HOME", home)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{out:?}");
             String::from_utf8(out.stdout).unwrap()
         };
-        assert_eq!(typed("echo \"it's here\"; exit 3"), "3\nit's here\n");
-        assert_eq!(typed("printf 'one\\ntwo\\n'"), "0\none\ntwo\n");
+        assert_eq!(typed("echo \"it's here\"; exit 3", 10), "3\nit's here\n");
+        assert_eq!(typed("printf 'one\\ntwo\\n'", 10), "0\none\ntwo\n");
+        assert_eq!(typed("echo started; sleep 5", 1), "124\nstarted\n");
+        let long = typed("head -c 1100000 /dev/zero | tr '\\0' x", 10);
+        assert_eq!(long, format!("0\n{}", "x".repeat(OUTPUT_LIMIT)));
         drop(assistant);
-        let mut screen = String::new();
-        std::io::Read::read_to_string(&mut stdout, &mut screen).unwrap();
+        let screen = screen.join().unwrap();
         assert!(screen.starts_with("Office inventory\n\n"), "{screen}");
         assert!(
             screen.contains("echo \"it's here\"; exit 3\nit's here\n\n[exit 3]\n"),
