@@ -386,11 +386,21 @@ window.addEventListener('load', () => {
   document.body.textContent = completed === 4 && resources.length === 4 && resources.every(r => r.nextHopProtocol === 'h2') ? 'HTTP2 COMPLETE' : 'HTTP2 FAILED';
 });
 </script><script async src="/large/1"></script><script async src="/large/2"></script><script async src="/large/3"></script><script async src="/large/4"></script><script defer src="/gate"></script></body></html>"#;
+                    let downloads = Arc::new(tokio::sync::Barrier::new(4));
+                    let large = || {
+                        let body = format!("/*{}*/completed++;", "x".repeat(1 << 20));
+                        http::Response::builder().header("content-type", "application/javascript").body(Bytes::from(body)).unwrap()
+                    };
                     let router = Router::new()
                         .get("/", move |_, _| http::Response::builder().header("content-type", "text/html").body(Bytes::from_static(page.as_bytes())).unwrap())
-                        .get("/large/*", |_, _| {
-                            let body = format!("/*{}*/completed++;", "x".repeat(1 << 20));
-                            http::Response::builder().header("content-type", "application/javascript").body(Bytes::from(body)).unwrap()
+                        .get("/large/curl", move |_, _| large())
+                        .route_async(Some(http::Method::GET), "/large/*", move |_, _| {
+                            let downloads = downloads.clone();
+                            async move {
+                                // Start all browser streams before sending any response.
+                                downloads.wait().await;
+                                large()
+                            }
                         })
                         .route_async(Some(http::Method::GET), "/gate", move |cx, _| { let log = observed.clone(); async move {
                             log.wait(&cx, 0, 1, Duration::from_secs(10), |e| e.is("http", "request") && e.str("path") == Some("/cancel")).await.unwrap();

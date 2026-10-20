@@ -2327,27 +2327,34 @@ mod tests {
 
     #[test]
     fn bad_option_takes_linear_time() {
-        // Many elective options, then many repeatable critical ones.
         let message = |n: usize| {
-            let mut o = Options::new();
+            let mut options = Vec::with_capacity(2 * n);
             for i in 0..n {
-                o.add(2 + 2 * (i % 2000) as u16 + 2000, Vec::new());
+                options.push(CoapOption {
+                    number: 2 + 2 * (i % 2000) as u16 + 2000,
+                    value: Vec::new(),
+                });
             }
             for _ in 0..n {
-                o.add(option::URI_PATH, b"p".to_vec());
+                options.push(CoapOption {
+                    number: option::URI_PATH,
+                    value: b"p".to_vec(),
+                });
             }
+            options.sort_by_key(|o| o.number);
             Message {
-                options: o,
+                options: Options(options),
                 ..Message::new(Type::Confirmable, Code::GET, 1)
             }
         };
-        // Only bad_option is timed, after the first call at each size
-        // builds the message. The larger size is 60,000 of each kind.
-        let mut messages = std::collections::HashMap::new();
-        fictionet::stdlib::test_support::assert_linear("CoAP bad_option", 15_000, |n| {
-            let m = messages.entry(n).or_insert_with(|| message(n));
-            assert_eq!(m.bad_option(), None);
-        });
+        // Exclude setup and measure a fixed batch on the thread CPU clock.
+        fictionet::stdlib::test_support::assert_linear_with_setup(
+            "CoAP bad_option",
+            15_000,
+            message,
+            |m| std::array::from_fn::<_, 8, _>(|_| std::hint::black_box(m).bad_option()),
+            |_, results| assert_eq!(results, [None; 8]),
+        );
     }
 
     #[test]
