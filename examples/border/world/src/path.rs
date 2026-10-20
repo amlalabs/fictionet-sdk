@@ -57,6 +57,7 @@ use crate::scenario::{BANK_ADDR, FOREIGN, HOME, IMPOSTOR_ADDR, Scenario, Variant
 pub struct Shared {
     pub scenario: Arc<Scenario>,
     pub routing: Routing,
+    pub extra: Vec<fictionet::stdlib::network::route::Prefix>,
 }
 
 const TTL: u8 = 64;
@@ -257,7 +258,15 @@ pub async fn run(
                     inner.send(packet);
                     continue;
                 }
-                let hops = scenario.hops(dst);
+                let extra = shared
+                    .extra
+                    .iter()
+                    .any(|prefix| prefix.contains(dst.into()));
+                let hops = if extra {
+                    vec![scenario.gateway()]
+                } else {
+                    scenario.hops(dst)
+                };
                 if hops.is_empty() {
                     on_the_way.hold(now + scenario.one_way(dst), To::Sites, packet);
                     continue;
@@ -266,7 +275,7 @@ pub async fn run(
                 let ttl = p[8];
                 // Where the packet's way ends: at `dst`, or, with no host
                 // there, at the last router, which has no route for it.
-                let ends_at = (!scenario.has_host(dst)).then(|| hops.len() - 1);
+                let ends_at = (!extra && !scenario.has_host(dst)).then(|| hops.len() - 1);
                 let reach = ends_at.unwrap_or(hops.len());
                 if usize::from(ttl) <= reach {
                     // It runs out at hop `ttl` (a TTL of 0 at the first).
@@ -322,7 +331,15 @@ pub async fn run(
                     sandbox.send(Packet(p));
                     continue;
                 };
-                let back = scenario.hops(src).len() as u8;
+                let back = if shared
+                    .extra
+                    .iter()
+                    .any(|prefix| prefix.contains(src.into()))
+                {
+                    1
+                } else {
+                    scenario.hops(src).len() as u8
+                };
                 if back > 0 {
                     let ttl = p[8].saturating_sub(back).max(1);
                     set_ttl(&mut p, ttl);

@@ -729,3 +729,37 @@ fn desktop_readiness_commands_are_neutral() {
         );
     }
 }
+
+#[tokio::test]
+async fn page_terminal_executes_the_declared_command_on_a_pty() {
+    use fictionet_observe::page::Console;
+    let mut peer = ssh::tests::Peer::new().await;
+    let guest =
+        Guest::ubuntu("workstation", "analyst").terminal("tmux attach -r -t main; exec bash -l");
+    guest.validate().unwrap();
+    let console = page::GuestConsole::new(&guest);
+    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)), |cx| {
+        console.connected(
+            &cx,
+            peer.session.clone(),
+            "10.0.0.2".parse().unwrap(),
+            Instant::now(),
+        );
+        async { Ok(()) }
+    }))
+    .unwrap();
+    let mut terminal = console.terminal(120, 35).unwrap().await.unwrap();
+    assert_eq!(
+        peer.events.recv().await.unwrap(),
+        "pty xterm-256color 120 35"
+    );
+    assert_eq!(
+        peer.events.recv().await.unwrap(),
+        "exec tmux attach -r -t main; exec bash -l"
+    );
+    assert_eq!(
+        terminal.read().await.unwrap().unwrap(),
+        b"window manager is not running"
+    );
+    assert!(terminal.read().await.unwrap().is_none());
+}

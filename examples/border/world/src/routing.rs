@@ -120,7 +120,8 @@ impl RouteState {
     /// The maximum for a projection produced by this world, in either mode.
     pub const MAX_JSON_BYTES: usize = 1024;
 
-    pub(crate) fn new(scenario: &Scenario, revision: u64, since_ms: u64) -> Self {
+    /// Projects a scenario at the supplied routing revision and run time.
+    pub fn new(scenario: &Scenario, revision: u64, since_ms: u64) -> Self {
         Self {
             revision,
             mode: scenario.variant,

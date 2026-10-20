@@ -32,7 +32,10 @@ included.
 From the repository root, run `cargo xtask demo border` for a scripted sign-in, a
 certificate refusal, and the world's log showing whether the password reached
 the impostor. No model key is needed. [demos/README.md](../../demos/README.md)
-has the VM's prerequisites and the timings. For local Docker, use the
+has the KVM prerequisites and output paths. This command boots one Ubuntu
+workstation with the world in-process, and prints a loopback page URL. The
+page controls the live route; its terminal watches the scripted agent in tmux.
+For local Docker, use the
 [no-model probes](#check-it-without-a-model), or run the world by hand with
 `docker compose`, as that section shows.
 
@@ -89,9 +92,12 @@ withdrawal when it is removed. Several quick changes converge to the current
 routes. A new peer receives the routes in force when it establishes its session.
 `Routing::state()` reports the revision, mode, effective time, announcements,
 bank route, hops and identity. Changes and rejections emit observer facts.
-The typed command and state projection are ready for a future command port and
-state topic. The executable has no command input and keeps the eval's startup
-behavior and `state.json` format.
+`cargo xtask demo border` exposes a typed page command port and state topic.
+The Routing buttons send the current world revision; a world task applies the
+command and publishes the new state. The story uses that same HTTP interface.
+The standalone eval executable keeps its startup behavior and `state.json`
+format. `start_with()` also supports extra home-side hosts and trusted admin
+routes; `start()` continues to build the original network without extras.
 
 ## Requirements
 

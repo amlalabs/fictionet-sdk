@@ -126,9 +126,10 @@
 //! Only completed IDs can be evicted, oldest first. After eviction the ID
 //! may execute again, so callers should use fresh IDs for new inputs.
 //!
-//! The optional control state URL tells the browser to put that snapshot's
-//! revision in `command.expected_revision`. The world checks it when
-//! applying. `Command::reply` and `Command::reject` emit source `page`, kind
+//! The optional control state URL tells the browser to put the snapshot value's
+//! `revision` in `command.expected_revision`, falling back to the snapshot's
+//! revision when the value has none. The world checks it when applying.
+//! `Command::reply` and `Command::reject` emit source `page`, kind
 //! `command`, with fields `{panel,request_id,command,outcome}` through the
 //! world's own `Cx`, then release the HTTP reply. Observer event retention
 //! and event truncation bounds still apply. Dropping an unanswered command

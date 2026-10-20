@@ -74,7 +74,7 @@ export function mount(root, services, options) {
   }
   if (options.state) {
     cleanup.push(services.state(options.state, (snapshot) => {
-      revision = snapshot.revision;
+      revision = snapshot.value?.revision ?? snapshot.revision;
       state.replaceChildren();
       if (snapshot.value === null || snapshot.value === undefined) el('p', { class: 'empty-note', text: 'The world has not published this state yet.' }, state);
       else keyValues(state, el, snapshot.value);

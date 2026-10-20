@@ -26,6 +26,9 @@ pub mod path;
 pub mod routing;
 pub mod scenario;
 
+use fictionet::Interface;
+use fictionet::stdlib::network::route::Prefix;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -68,6 +71,28 @@ fn server_config(fcx: &Cx, leaf: Leaf) -> Result<Arc<tls::ServerConfig>> {
     leaf.server_config(fcx, SystemTime::now())
 }
 
+/// Additional home-side hosts and directly attached administrative routes.
+#[derive(Default)]
+pub struct Extra {
+    hosts: Vec<(Ipv4Addr, Host)>,
+    routes: Vec<(String, Prefix)>,
+}
+
+impl Extra {
+    /// Adds a host at a fixed address, one gateway hop from the guest.
+    pub fn host(mut self, address: Ipv4Addr, host: Host) -> Self {
+        self.hosts.push((address, host.at(address)));
+        self
+    }
+
+    /// Adds a trusted attachment without a Border path in front of it.
+    /// Guest traffic to this prefix still passes its own gateway hop.
+    pub fn route(mut self, name: &str, prefix: Prefix) -> Self {
+        self.routes.push((name.into(), prefix));
+        self
+    }
+}
+
 /// Builds the network in `fcx`'s region and serves every sandbox in
 /// `attachments`. Both endpoints run for the whole run. The returned handle
 /// controls future packets; DNS always names the genuine bank address.
@@ -75,8 +100,41 @@ pub fn start(
     fcx: &Cx,
     scenario: Arc<Scenario>,
     ids: Identities,
-    mut attachments: Attachments,
+    attachments: Attachments,
 ) -> Result<Routing> {
+    start_with(fcx, scenario, ids, attachments, Extra::default())
+}
+
+/// Starts the scenario with additional hosts and trusted attachment routes.
+/// Extra prefixes must be outside the scenario's networks.
+pub fn start_with(
+    fcx: &Cx,
+    scenario: Arc<Scenario>,
+    ids: Identities,
+    mut attachments: Attachments,
+    extra: Extra,
+) -> Result<Routing> {
+    let prefixes: Vec<_> = extra
+        .hosts
+        .iter()
+        .map(|(addr, _)| Prefix {
+            addr: (*addr).into(),
+            len: 32,
+        })
+        .chain(extra.routes.iter().map(|(_, prefix)| *prefix))
+        .collect();
+    for prefix in &prefixes {
+        for reserved in [
+            scenario.subnet,
+            scenario::HOME.prefix,
+            scenario::FOREIGN.prefix,
+            scenario::STATUS_PREFIX,
+        ] {
+            if prefix.contains(reserved.addr) || reserved.contains(prefix.addr) {
+                return Err(fictionet::Error::msg("extra prefix overlaps the scenario"));
+            }
+        }
+    }
     let routing = Routing::new(scenario.clone());
     let impostor_config = server_config(fcx, ids.impostor)?;
     let bank_config = server_config(fcx, ids.bank)?;
@@ -129,6 +187,12 @@ pub fn start(
         net = net.add_host(site_for(name).unwrap().into_host(name));
     }
     net = net.add_host(impostor_host);
+    for (_, host) in extra.hosts {
+        net = net.add_host(host);
+    }
+    for (name, prefix) in &extra.routes {
+        net = net.route(name, *prefix);
+    }
     let (inner, inner_attachments) = fictionet::attachments();
     net.subnet(scenario.subnet)
         // The scenarios are IPv4 networks, and the agent has IPv6 off.
@@ -139,6 +203,7 @@ pub fn start(
     let shared = Arc::new(path::Shared {
         scenario: scenario.clone(),
         routing: routing.clone(),
+        extra: prefixes,
     });
     let to_sites = inner.clone();
     fcx.spawn(move |fcx| async move {
@@ -147,8 +212,12 @@ pub fn start(
             let name: Arc<str> = Arc::from(sandbox.name());
             match to_sites.attach(&name) {
                 Ok(end) => {
-                    let shared = shared.clone();
-                    fcx.spawn(move |fcx| path::run(fcx, sandbox, end, shared, name));
+                    if extra.routes.iter().any(|(route, _)| route == &*name) {
+                        fcx.spawn(move |fcx| relay(fcx, sandbox, end));
+                    } else {
+                        let shared = shared.clone();
+                        fcx.spawn(move |fcx| path::run(fcx, sandbox, end, shared, name));
+                    }
                 }
                 Err(e) => {
                     fcx.emit("border", "attach_failed", |event| {
@@ -159,6 +228,30 @@ pub fn start(
         }
     });
     Ok(routing)
+}
+
+/// Forwards packets between an administrative attachment and the inner network.
+async fn relay(fcx: Cx, mut a: impl Interface, mut b: impl Interface) -> Result {
+    loop {
+        let packet = std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(p) = a.poll_recv(&fcx, cx) {
+                return std::task::Poll::Ready(p.map(|p| (true, p)));
+            }
+            b.poll_recv(&fcx, cx).map(|p| p.map(|p| (false, p)))
+        })
+        .await;
+        let packet = match packet {
+            Ok(packet) => packet,
+            Err(fictionet::RecvError::Closed) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if packet.0 {
+            b.send(packet.1);
+        } else {
+            a.send(packet.1);
+        }
+        fcx.yield_now().await?;
+    }
 }
 
 /// The ground truth the eval reads from `state.json`.

@@ -133,8 +133,14 @@ impl Session {
         Ok(channel.into_stream())
     }
 
-    /// Opens a shell with a PTY on this authenticated session.
-    pub async fn pty(&self, term: &str, cols: u32, rows: u32) -> io::Result<Pty> {
+    /// Opens a PTY and runs a command, or a login shell when no command is given.
+    pub async fn pty(
+        &self,
+        term: &str,
+        cols: u32,
+        rows: u32,
+        command: Option<&str>,
+    ) -> io::Result<Pty> {
         let channel = self
             .handle
             .channel_open_session()
@@ -146,10 +152,17 @@ impl Session {
             .await
             .map_err(io::Error::other)?;
         request_accepted(&mut channel).await?;
-        channel
-            .request_shell(true)
-            .await
-            .map_err(io::Error::other)?;
+        if let Some(command) = command {
+            channel
+                .exec(true, command)
+                .await
+                .map_err(io::Error::other)?;
+        } else {
+            channel
+                .request_shell(true)
+                .await
+                .map_err(io::Error::other)?;
+        }
         request_accepted(&mut channel).await?;
         Ok(Pty { channel })
     }

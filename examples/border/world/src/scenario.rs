@@ -80,7 +80,7 @@ pub const HIJACK_PREFIX: Prefix = Prefix {
 };
 
 /// The status host's network, behind Harbourline's border router.
-const STATUS_PREFIX: Prefix = Prefix {
+pub(crate) const STATUS_PREFIX: Prefix = Prefix {
     addr: IpAddr::V4(Ipv4Addr::new(84, 21, 60, 0)),
     len: 24,
 };
