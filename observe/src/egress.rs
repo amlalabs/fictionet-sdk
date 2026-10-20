@@ -314,14 +314,15 @@ impl Egress {
         )
     }
 
-    /// A `path.unreachable` event a world reports for a sandbox it answers itself.
-    fn named_block(source: &str, kind: &str) -> bool {
+    /// An event that names its sandbox in a `sandbox` field: the
+    /// `path.unreachable` a world reports for a sandbox it answers itself.
+    fn names_its_sandbox(source: &str, kind: &str) -> bool {
         (source, kind) == ("path", "unreachable")
     }
 
     fn event(&self, at: f64, event: &Event) {
         let named = || {
-            Self::named_block(event.source, event.kind)
+            Self::names_its_sandbox(event.source, event.kind)
                 .then(|| event.str("sandbox").map(str::to_owned))
                 .flatten()
         };
@@ -539,19 +540,19 @@ impl Egress {
                 );
             }
             ("net", "blocked") | ("path", "unreachable") => {
-                let why = match event.kind {
-                    "unreachable" => "NoRoute",
-                    _ => event.str("why").unwrap_or(""),
-                };
-                let (outcome, by) = match why {
-                    "ClosedPort" => (Outcome::Refused, "port closed"),
-                    "TooManyConnections" => (Outcome::Refused, "too many connections"),
-                    "NoRoute" => (Outcome::NoRoute, "no machine at that address"),
-                    "Ipv6" => (Outcome::NoRoute, "IPv6 is off"),
-                    "OtherSandbox" => (Outcome::NoRoute, "another sandbox's address"),
-                    "Broadcast" => (Outcome::NoRoute, "broadcast"),
-                    "NotItsAddress" => (Outcome::NoRoute, "not its own source address"),
-                    _ => (Outcome::NoRoute, "malformed packet"),
+                let (outcome, by) = if event.source == "path" {
+                    (Outcome::NoRoute, "no machine at that address")
+                } else {
+                    match event.str("why").unwrap_or("") {
+                        "ClosedPort" => (Outcome::Refused, "port closed"),
+                        "TooManyConnections" => (Outcome::Refused, "too many connections"),
+                        "NoRoute" => (Outcome::NoRoute, "no machine at that address"),
+                        "Ipv6" => (Outcome::NoRoute, "IPv6 is off"),
+                        "OtherSandbox" => (Outcome::NoRoute, "another sandbox's address"),
+                        "Broadcast" => (Outcome::NoRoute, "broadcast"),
+                        "NotItsAddress" => (Outcome::NoRoute, "not its own source address"),
+                        _ => (Outcome::NoRoute, "malformed packet"),
+                    }
                 };
                 let dst = event.str("dst");
                 let port = event.u64("dst_port");
@@ -722,7 +723,7 @@ impl Observer for Egress {
     fn enabled(&self, interest: Interest<'_>) -> bool {
         matches!(interest, Interest::Event(meta, conn)
             if conn.sandbox.is_some() && Self::wanted(meta.source, meta.kind)
-                || Self::named_block(meta.source, meta.kind))
+                || Self::names_its_sandbox(meta.source, meta.kind))
             || matches!(
                 interest,
                 Interest::Topology(TopologyKind::Connection | TopologyKind::Host)

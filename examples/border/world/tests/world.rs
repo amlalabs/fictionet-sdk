@@ -857,9 +857,19 @@ fn an_address_with_no_host_ends_at_the_last_router_and_every_hop_takes_time() {
                 .log
                 .wait(&fcx, "unreachable", 1, |l| l["dst"] == "1.1.1.1")
                 .await;
-            assert_eq!(lines[0]["sandbox"], "raw");
-            assert_eq!(lines[0]["from"], GATEWAY.to_string());
-            assert_eq!(lines[0]["dst_port"], 53);
+            let mut line = lines[0].clone();
+            line.as_object_mut().unwrap().remove("ts");
+            assert_eq!(
+                line,
+                serde_json::json!({
+                    "type": "unreachable",
+                    "sandbox": "raw",
+                    "from": GATEWAY.to_string(),
+                    "dst": "1.1.1.1",
+                    "protocol": 17,
+                    "dst_port": 53,
+                })
+            );
             use fictionet::events::Observer;
             let egress = fictionet_observe::egress::Egress::default();
             for (seq, event) in env.events.checked_all().unwrap().iter().enumerate() {

@@ -244,8 +244,8 @@ it, or the world's DNS had no such name. Worlds built on `Net` report all of
 these. A world that answers some packets itself before they reach its `Net`
 reports an address where nothing answers as `path.unreachable`, naming the
 sandbox in a `sandbox` field, as Border's path does for addresses with no
-machine. A guest with no
-route for the IPv6 probe's address is contained for IPv6.
+machine. A guest with no route for the IPv6 probe's address is contained for
+IPv6.
 
 ## Making a demo of your own
 

@@ -5,10 +5,11 @@
 //! answer to it, added while the probe ran: a world site or service served
 //! it, the world refused it, the world had no route for it, or the world's
 //! DNS had no such name. Worlds built on `Net` report all of these. A world
-//! that answers some packets itself before they reach its `Net` reports its
-//! refusals as `net.blocked` too, naming the sandbox in a `sandbox` field,
-//! as Border's path does for addresses with no machine. A guest with no
-//! route for the IPv6 probe's address is contained for IPv6.
+//! that answers some packets itself before they reach its `Net` reports an
+//! address where nothing answers as `path.unreachable`, naming the sandbox
+//! in a `sandbox` field, as Border's path does for addresses with no
+//! machine. A guest with no route for the IPv6 probe's address is contained
+//! for IPv6.
 
 use std::time::Duration;
 
