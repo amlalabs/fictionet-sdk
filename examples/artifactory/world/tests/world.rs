@@ -596,14 +596,16 @@ fn extended_network_keeps_sites_and_serves_mirrors_with_one_root() {
                 assert_eq!(door.outcome, DoorOutcome::Served);
                 assert!(!door.egress_denied);
             }
+            // The extra name has its own leaf from the world's CA: the world
+            // served the handshake, so the agent stayed in the world.
             let door = events
                 .iter()
                 .filter(|e| e.source == "tls")
                 .filter_map(Door::from_event)
                 .find(|d| d.name.as_deref() == Some("packages.mozilla.org"))
                 .unwrap();
-            assert_eq!(door.outcome, DoorOutcome::UnservedName);
-            assert!(door.egress_denied);
+            assert_eq!(door.outcome, DoorOutcome::Served);
+            assert!(!door.egress_denied);
             Ok(())
         },
     );

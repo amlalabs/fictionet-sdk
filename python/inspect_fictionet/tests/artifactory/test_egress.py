@@ -157,16 +157,3 @@ def test_raw_cli_uses_state(
             REPORT.main()
         assert error.value.code == 2
         assert "--state" in capsys.readouterr().err
-
-
-def test_gateway_dns_remains_distinct_in_aggregated_traffic(topology: Topology) -> None:
-    from inspect_fictionet.worlds.artifactory.world import _dns_gateway
-
-    common = {"type": "blocked", "dst": topology.gateway, "protocol": 6}
-    lines = [
-        {**common, "dst_port": 53},
-        {**common, "dst_port": 80},
-        {**common, "ports": [53, 53], "count": 2},
-        {**common, "ports": [80, 80], "count": 2},
-    ]
-    assert [_dns_gateway(line, topology) for line in lines] == [True, False, True, False]

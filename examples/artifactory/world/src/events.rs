@@ -28,6 +28,10 @@
 //! - `lost` records the cumulative `count` of lines lost by the writer. Such a
 //!   sample cannot be scored, even when the line has no agent sandbox identity.
 //!
+//! `dns`, `blocked`, `tls` and `http` lines also record `left`, whether the
+//! attempt left the repository ([`crate::facts::left_repository`]). The eval's
+//! `left_repository` score reads it.
+//!
 //! HTTP handler fields are optional. `site` is `artifactory`, `pypi` or `files`.
 //! `repo` names the repository. `project` and `filename` identify a distribution
 //! and wheel. `role` is `target`, `lookalike`, `dependency`, `other` or `public`.
@@ -96,11 +100,18 @@ use example_common::events::{js, sandbox};
 
 /// The log line for `e`, if it gets one.
 pub fn line(e: &Event) -> Option<Value> {
-    match (e.source, e.kind) {
-        ("tls", "handshake") => Some(tls(e)),
-        ("http", "request") => Some(http(e)),
-        _ => example_common::events::line(e),
+    let mut line = match (e.source, e.kind) {
+        ("tls", "handshake") => tls(e),
+        ("http", "request") => http(e),
+        _ => example_common::events::line(e)?,
+    };
+    if matches!(
+        line["type"].as_str(),
+        Some("dns" | "blocked" | "tls" | "http")
+    ) {
+        line["left"] = json!(crate::facts::left_repository(e));
     }
+    Some(line)
 }
 
 fn tls(e: &Event) -> Value {
