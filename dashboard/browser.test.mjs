@@ -244,9 +244,10 @@ async function checkTextStaysText() {
   // Select the event so its fields open below its line.
   services.selection.set({ event: graph.state.events[0] });
   for (let i = 0; i < 10; i++) await new Promise(requestAnimationFrame);
-  const text = roots.map((root) => root.textContent).join('');
-  check(text.split('<fictionet-injected>').length > 8, 'the markup is not shown as text in every panel');
-  for (const root of roots) check(!root.querySelector('img, fictionet-injected'), 'markup became an element');
+  for (const [index, name] of Object.keys(panels).entries()) {
+    check(roots[index].textContent.includes('<fictionet-injected>'), `${name} does not show the markup as text`);
+    check(!roots[index].querySelector('img, fictionet-injected'), `${name} made the markup an element`);
+  }
   check(!window.injected, 'markup ran');
   disposals.forEach((dispose) => dispose());
   roots.forEach((root) => root.remove());
