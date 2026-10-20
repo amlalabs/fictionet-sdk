@@ -1016,11 +1016,19 @@ dependencies = [
 name = "fictionet-extras"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "fictionet",
+ "fictionet-observe",
+ "http",
+ "http-body",
+ "http-body-util",
  "include_dir",
  "kuchiki",
  "percent-encoding",
  "serde",
+ "serde_json",
  "time",
+ "tower-service",
  "url",
 ]
 
