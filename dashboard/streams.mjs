@@ -83,9 +83,15 @@ export function createWatchHub(transport, { limit = 5000 } = {}) {
 /// Every state topic the page shows, on one stream. `subscribe(id, onSnapshot,
 /// onError)` returns an unsubscribe function. Deltas are the author's, so a
 /// delta makes the hub fetch the topic's replacement snapshot.
-export function createStateHub(transport) {
+///
+/// Opening a panel must not cost the page its stream: the stream reopens only
+/// for a topic it does not carry yet. A topic whose last panel closed stays on
+/// the stream, kept current, until nothing listens or the stream would carry
+/// more than the server allows. Reopening drops what the old stream had not
+/// delivered yet, and the new one can only resend it if it connects.
+export function createStateHub(transport, { most = 64 } = {}) {
   const topics = new Map();
-  let stream, unbind = () => {}, scheduled = false, disposed = false;
+  let stream, carried = '', unbind = () => {}, scheduled = false;
 
   function deliver(topic, snapshot) {
     if (snapshot.revision < (topic.latest?.revision ?? 0)) return;
@@ -110,13 +116,22 @@ export function createStateHub(transport) {
   function fail(topic, error) {
     for (const listener of topic.listeners) listener.onError(error);
   }
+  function drop(id) {
+    topics.get(id).controller.abort();
+    topics.delete(id);
+  }
   function reopen() {
     scheduled = false;
+    const listened = [...topics.values()].some((topic) => topic.listeners.size);
+    if (!listened || topics.size > most) for (const [id, topic] of topics) if (!topic.listeners.size) drop(id);
+    const ids = [...topics.keys()].join(',');
+    if (stream && ids === carried) return;
     unbind();
     unbind = () => {};
     stream?.close();
     stream = null;
-    if (disposed || !topics.size) return;
+    carried = ids;
+    if (!ids) return;
     const cursors = Object.fromEntries([...topics].map(([id, topic]) => [id, topic.latest?.revision]));
     const source = stream = transport.stateStream(cursors);
     const on = (name, callback) => {
@@ -128,13 +143,21 @@ export function createStateHub(transport) {
       on('snapshot', ({ topic: id, ...snapshot }) => { const topic = topics.get(id); if (topic) deliver(topic, snapshot); }),
       on('delta', ({ topic: id, revision }) => {
         const topic = topics.get(id);
-        if (topic && revision > (topic.latest?.revision ?? 0)) void refresh(id, topic);
+        if (!topic || revision <= (topic.latest?.revision ?? 0)) return;
+        // A topic no panel shows is fetched when a panel shows it again.
+        if (topic.listeners.size) void refresh(id, topic);
+        else topic.stale = true;
       }),
       // A dropped connection is not a failure: the transport reconnects with
       // the cursors this stream opened with, which are never newer than what
       // the topics hold, so the server sends what changed in between. Only a
-      // refusal ends the stream.
-      on('world_error', ({ error }) => topics.forEach((topic) => fail(topic, new Error(error)))),
+      // refusal ends the stream: its topics fail, and a later subscription
+      // starts a stream without them.
+      on('world_error', ({ error }) => {
+        for (const [id, topic] of topics) { fail(topic, new Error(error)); drop(id); }
+        stream = null;
+        carried = '';
+      }),
     ];
     unbind = () => removers.forEach((remove) => remove());
   }
@@ -148,25 +171,22 @@ export function createStateHub(transport) {
     subscribe(id, onSnapshot, onError = () => {}) {
       let topic = topics.get(id);
       if (!topic) {
-        topic = { listeners: new Set(), latest: null, controller: new AbortController(), refreshing: false, dirty: false };
+        topic = { listeners: new Set(), latest: null, controller: new AbortController(), refreshing: false, dirty: false, stale: false };
         topics.set(id, topic);
         schedule();
       }
       const listener = { onSnapshot, onError };
       topic.listeners.add(listener);
       if (topic.latest) onSnapshot(topic.latest);
+      if (topic.stale) { topic.stale = false; void refresh(id, topic); }
       return () => {
         topic.listeners.delete(listener);
-        if (topic.listeners.size || topics.get(id) !== topic) return;
-        topic.controller.abort();
-        topics.delete(id);
-        schedule();
+        if (topics.get(id) !== topic) return;
+        if (![...topics.values()].some((item) => item.listeners.size)) schedule();
       };
     },
     dispose() {
-      disposed = true;
-      for (const topic of topics.values()) topic.controller.abort();
-      topics.clear();
+      for (const id of [...topics.keys()]) drop(id);
       reopen();
     },
   };

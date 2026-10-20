@@ -12,7 +12,7 @@ class Source extends Element {
   close() { this.closed = true; }
 }
 
-test('every state topic shares one stream, reopened with cursors when the topics change', async () => {
+test('every state topic shares one stream, which reopens only for a topic it does not carry', async () => {
   const streams = [], requests = [];
   const services = createServices({
     stateStream(topics) { const source = new Source('state', { ...topics }); streams.push(source); return source; },
@@ -47,27 +47,70 @@ test('every state topic shares one stream, reopened with cursors when the topics
   assert.equal(errors.length, 0);
   streams[0].emit('snapshot', { topic: 'host-alpha', revision: 4, value: { state: 'ssh_up' } });
   assert.deepEqual(hosts.map((snapshot) => snapshot.value.state), ['booting', 'ssh_up']);
-  // A refusal ends the stream, and every topic on it hears why.
-  streams[0].emit('world_error', { error: 'too many streams' });
-  assert.match(errors[0].message, /too many streams/);
-  // Dropping a topic reopens the stream for the rest, with what is held.
+  // Closing a panel keeps its topic on the stream and current, so switching
+  // back to it neither reopens the stream nor waits for the next change.
   stopHost();
+  await settle();
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].closed, undefined);
+  streams[0].emit('snapshot', { topic: 'host-alpha', revision: 5, value: { state: 'desktop_up' } });
+  const again = [];
+  const stopAgain = services.state('/api/state/host-alpha', (value) => again.push(value));
+  await settle();
+  assert.equal(streams.length, 1, 'a topic the stream carries opens no stream');
+  assert.deepEqual(again.map((snapshot) => snapshot.value.state), ['desktop_up']);
+  // A delta for a topic no panel shows is fetched once a panel shows it.
+  stopAgain();
+  streams[0].emit('delta', { topic: 'host-alpha', revision: 6, delta: {} });
+  assert.equal(requests.length, 2);
+  const later = [];
+  const stopLater = services.state('/api/state/host-alpha', (value) => later.push(value));
+  assert.equal(requests.length, 3);
+  assert.equal(requests[2].path, '/api/state/host-alpha');
+  requests[2].resolve({ revision: 6, value: { state: 'stopped' } });
+  await settle();
+  assert.deepEqual(later.map((snapshot) => snapshot.value.state), ['desktop_up', 'stopped']);
+  stopLater();
+  // A new topic reopens the stream once, with what is held.
+  const routes = [];
+  const stopRoutes = services.state('/api/state/routing', (value) => routes.push(value), (error) => errors.push(error));
   await settle();
   assert.equal(streams[0].closed, true);
   assert.equal(streams[0].listenerCount, 0);
-  assert.deepEqual(streams[1].args, { exchanges: 4 });
-  // A topic another listener still holds keeps the stream open.
-  stop();
+  assert.deepEqual(streams[1].args, { exchanges: 4, 'host-alpha': 6, routing: undefined });
+  // A refusal ends the stream, every topic on it hears why, and a later
+  // subscription opens a stream without them.
+  streams[1].emit('world_error', { error: 'no such state topic: "routing"' });
+  assert.deepEqual(errors.map((error) => error.message), ['no such state topic: "routing"', 'no such state topic: "routing"']);
+  const stopLeases = services.state('/api/state/leases', () => {});
   await settle();
-  assert.equal(streams.length, 2);
-  assert.equal(streams[1].closed, undefined);
-  stopOther();
+  assert.deepEqual(streams[2].args, { leases: undefined });
+  // When nothing listens, no stream stays open.
+  for (const unsubscribe of [stop, stopOther, stopRoutes]) unsubscribe();
   await settle();
-  assert.equal(streams[1].closed, true);
-  assert.equal(streams[1].listenerCount, 0);
-  assert.equal(streams.length, 2, 'no stream while nothing listens');
+  assert.equal(streams[2].closed, undefined);
+  stopLeases();
+  await settle();
+  assert.equal(streams[2].closed, true);
+  assert.equal(streams[2].listenerCount, 0);
+  assert.equal(streams.length, 3, 'no stream while nothing listens');
   assert.ok(requests.every((request) => request.signal.aborted));
   services.dispose();
+});
+
+test('a stream carries at most the server limit, dropping topics no panel shows to stay under it', async () => {
+  const streams = [];
+  const hub = createStateHub({ stateStream(topics) { const source = new Source('state', { ...topics }); streams.push(source); return source; } }, { most: 2 });
+  const stopA = hub.subscribe('a', () => {});
+  hub.subscribe('b', () => {});
+  await settle();
+  stopA();
+  await settle();
+  assert.equal(streams.length, 1);
+  hub.subscribe('c', () => {});
+  await settle();
+  assert.deepEqual(Object.keys(streams[1].args), ['b', 'c']);
+  hub.dispose();
 });
 
 test('the watch hub replays the latest snapshot and changes to a late subscriber', async () => {
@@ -216,12 +259,19 @@ test('the page holds at most three long-lived streams across every panel, and no
   assert.equal(h.root.querySelectorAll('section.workspace-tile').length, 2);
   const tabs = h.root.querySelector('#tabs').children;
   assert.deepEqual(tabs.map((tab) => tab.textContent), ['Packets', 'Events', 'Map', 'Rows', 'Log', 'Traffic', 'Plant']);
-  for (const tab of [...tabs, ...tabs]) {
+  const states = () => h.streams.filter((source) => source.tag === 'state').length;
+  let afterFirstPass;
+  for (const [index, tab] of [...tabs, ...tabs].entries()) {
+    if (index === tabs.length) afterFirstPass = states();
     tab.click();
     await settle();
     watch.emit('counters', { t: 2, edges: {} });
     await settle();
   }
+  // Switching tabs must not reopen the state stream: a reopen drops what the
+  // old stream had not delivered, and a page whose run just ended cannot
+  // connect again, so it would keep showing stale state.
+  assert.equal(states(), afterFirstPass, 'a second pass through every tab opened a state stream');
   // The keyboard moves focus along the tabs without opening them; Enter opens one.
   tabs[0].click();
   await settle();

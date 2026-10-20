@@ -57,7 +57,8 @@
 //! [crate's packet data](crate#packet-values). `world_error` carries `{error}`
 //! and terminates a refused stream. `end` carries `{reason}` and is terminal.
 //! There are at most 32 active SSE streams, shared with state streams;
-//! capacity returns 503 before starting a subscription.
+//! capacity returns 503 before starting a subscription. A stream ends as soon
+//! as its client closes the connection, which frees its place.
 //! [`Server::shutdown`] stops accepting connections and drains available stream
 //! data, including `ended` when the run has ended, before the terminal `end`.
 //! State streams also end with `end`; the server reason is `the page server stopped`.
