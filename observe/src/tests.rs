@@ -1,7 +1,5 @@
 use super::*;
-use fictionet::events::{
-    ConnInfo, GroupId, KeyMeta, LinkType, PacketMeta, PacketRef, Side, TaskId,
-};
+use fictionet::events::{ConnInfo, GroupId, KeyMeta, LinkType, PacketRef, Side, TaskId};
 use fictionet::time::ms;
 use fictionet::{Interface, InterfaceExt, Packet, RunOptions, Seed, block_on, lab};
 
@@ -181,10 +179,11 @@ fn capture_follows_policy_and_reference_counted_demand() {
                 ..Options::default()
             },
             move |collector, link| {
-                let interest = Interest::Packet(PacketMeta {
+                let interest = Interest::Packet(PacketRef {
                     link,
                     side: Side::A,
                     len: 1,
+                    bytes: &[0],
                     link_type: LinkType::Ip,
                 });
                 assert_eq!(
@@ -592,10 +591,11 @@ fn packet_interest_does_not_take_the_collector_lock() {
         },
         |collector, link| {
             let _state = collector.state.lock();
-            assert!(collector.enabled(Interest::Packet(PacketMeta {
+            assert!(collector.enabled(Interest::Packet(PacketRef {
                 link,
                 side: Side::A,
                 len: 1,
+                bytes: &[0],
                 link_type: LinkType::Ip
             })));
         },

@@ -506,6 +506,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_declining_check_reads_no_clock_and_numbers_nothing() {
+        #[derive(Default)]
+        struct EvenPackets(Mutex<Vec<(u64, u8)>>);
+        impl Observer for EvenPackets {
+            fn enabled(&self, interest: Interest<'_>) -> bool {
+                matches!(interest, Interest::Packet(packet) if packet.bytes[0] % 2 == 0)
+            }
+            fn observe(&self, stamp: Stamp, item: Observation<'_>) {
+                if let Observation::Packet(packet) = item {
+                    self.0.lock().push((stamp.seq, packet.bytes[0]));
+                }
+            }
+        }
+        let sink = Arc::new(EvenPackets::default());
+        block_on(crate::lab(
+            crate::RunOptions::new(crate::Seed::from_u64(1)).observer(sink.clone()),
+            |cx| async move {
+                let (mut a, mut b) = pair();
+                for byte in 1..=6 {
+                    let reads = cx.run.environment.clock.reads.load(Ordering::Relaxed);
+                    a.send(Packet(vec![byte]));
+                    assert_eq!(
+                        cx.run.environment.clock.reads.load(Ordering::Relaxed),
+                        reads + usize::from(byte % 2 == 0)
+                    );
+                    assert_eq!(b.recv(&cx).await?, Packet(vec![byte]));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        assert_eq!(*sink.0.lock(), [(1, 2), (2, 4), (3, 6)]);
+    }
+
+    #[test]
     fn packet_callbacks_release_direction_locks_before_delivery() {
         struct ClosePeer(Mutex<Option<End>>);
         impl Observer for ClosePeer {

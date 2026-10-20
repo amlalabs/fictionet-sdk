@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use crate::time::Instant;
 use crate::{Cx, sync::Mutex};
 
-use super::{ConnInfo, Event, Interest, KeyRef, Loss, PacketMeta, PacketRef, Stream, TopologyRef};
+use super::{ConnInfo, Event, Interest, KeyRef, Loss, LossReason, PacketRef, Stream, TopologyRef};
 
 /// Metadata available before constructing an event.
 #[derive(Clone, Copy, Debug)]
@@ -51,12 +51,7 @@ impl Observation<'_> {
                 },
                 &event.conn,
             ),
-            Self::Packet(packet) => Interest::Packet(PacketMeta {
-                link: packet.link,
-                side: packet.side,
-                len: packet.len,
-                link_type: packet.link_type,
-            }),
+            Self::Packet(packet) => Interest::Packet(*packet),
             Self::TlsKey(key) => Interest::TlsKey(super::KeyMeta {
                 label: key.label,
                 connection: key.connection,

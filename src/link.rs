@@ -40,10 +40,9 @@ pub(crate) struct PacketStream {
 }
 
 impl PacketStream {
-    pub(crate) fn packet(&self, side: usize, packet: &Packet) -> Option<Publication<'_>> {
-        let stream = self;
-        let meta = crate::events::PacketMeta {
-            link: stream.link,
+    fn reference<'a>(&self, side: usize, packet: &'a Packet) -> crate::events::PacketRef<'a> {
+        crate::events::PacketRef {
+            link: self.link,
             side: if side == 0 {
                 crate::events::Side::A
             } else {
@@ -51,14 +50,19 @@ impl PacketStream {
             },
             len: packet.0.len(),
             link_type: crate::events::LinkType::Ip,
-        };
-        stream
-            .observer
-            .enabled(crate::events::Interest::Packet(meta))
+            bytes: &packet.0,
+        }
+    }
+
+    pub(crate) fn packet(&self, side: usize, packet: &Packet) -> Option<Publication<'_>> {
+        self.observer
+            .enabled(crate::events::Interest::Packet(
+                self.reference(side, packet),
+            ))
             .then(|| Publication {
-                stream,
-                sequence: stream.sequence.lock(),
-                meta,
+                stream: self,
+                sequence: self.sequence.lock(),
+                side,
             })
     }
 }
@@ -66,21 +70,14 @@ impl PacketStream {
 pub(crate) struct Publication<'a> {
     stream: &'a PacketStream,
     sequence: MutexGuard<'a, u64>,
-    meta: crate::events::PacketMeta,
+    side: usize,
 }
 
 impl Publication<'_> {
     pub(crate) fn publish(&mut self, packet: &Packet) {
-        self.stream.observer.packet(
-            &mut self.sequence,
-            crate::events::PacketRef {
-                link: self.meta.link,
-                side: self.meta.side,
-                len: self.meta.len,
-                link_type: self.meta.link_type,
-                bytes: &packet.0,
-            },
-        );
+        self.stream
+            .observer
+            .packet(&mut self.sequence, self.stream.reference(self.side, packet));
     }
 }
 

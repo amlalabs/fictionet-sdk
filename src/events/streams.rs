@@ -62,19 +62,6 @@ pub enum LinkType {
     Ip,
 }
 
-/// Packet metadata available without copying bytes.
-#[derive(Clone, Copy, Debug)]
-pub struct PacketMeta {
-    /// The link crossed.
-    pub link: LinkId,
-    /// The sending end.
-    pub side: Side,
-    /// The original byte length.
-    pub len: usize,
-    /// The packet framing.
-    pub link_type: LinkType,
-}
-
 /// Borrowed bytes of an interested successful link crossing.
 /// Core delivers every such crossing without copying, decoding or sampling.
 #[derive(Clone, Copy, Debug)]
@@ -319,7 +306,7 @@ pub enum Interest<'a> {
     /// Service or network fact.
     Event(Metadata, &'a ConnInfo),
     /// Packet crossing.
-    Packet(PacketMeta),
+    Packet(PacketRef<'a>),
     /// TLS secret.
     TlsKey(KeyMeta<'a>),
     /// Topology change.

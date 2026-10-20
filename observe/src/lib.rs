@@ -1053,12 +1053,7 @@ impl Observer for Collector {
                 }
             }
             Observation::Packet(packet) => {
-                if self.enabled(Interest::Packet(fictionet::events::PacketMeta {
-                    link: packet.link,
-                    side: packet.side,
-                    len: packet.len,
-                    link_type: packet.link_type,
-                })) {
+                if self.enabled(Interest::Packet(packet)) {
                     let link = packet.link;
                     captures.push(stamp, packet, &self.options, losses);
                     if let Some(capture) = captures.links.get_mut(&link)
