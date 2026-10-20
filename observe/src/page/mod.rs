@@ -79,26 +79,20 @@
 //! `GET /api/state/<id>` returns
 //! `{revision,at,value,status:{too_large}}`. `at` is run time in seconds.
 //! Before publication, revision and time are zero and value is null.
-//! A successful publish advances the revision once. Oversized snapshots or
-//! deltas keep the previous revision and value and permanently set
-//! `status.too_large`. Snapshot values are serialized once at publication.
-//! Delta count is bounded by `StateLimits.deltas`, total delta payload bytes
-//! by `StateLimits.max_bytes`, and each snapshot by that same byte bound.
+//! A successful publish advances the revision once. An oversized snapshot
+//! keeps the previous revision and value and permanently sets
+//! `status.too_large`. Snapshot values are serialized once at publication,
+//! and each is bounded by `StateLimits.max_bytes`.
 //!
 //! `GET /api/states/stream?topics=a,b&after=a:3,b:7` is one SSE stream for
 //! up to 64 topics. A browser allows six HTTP/1.1 connections to one origin,
 //! so a page streams all of its state on one connection. `topics` lists topic
 //! ids; `after` is optional and gives a revision per listed topic. An unknown
 //! topic returns 404 naming it; a malformed or repeated list returns 400.
-//! Each event's data starts with `topic`. Without a cursor, or when
-//! continuity from it is unavailable, a topic gets `snapshot` with the GET
-//! shape plus `topic`. Otherwise it gets `delta` events with
-//! `{topic,revision,at,delta,status:{too_large}}` in revision order. No event
-//! is needed when the cursor is current. A future cursor also receives a
-//! snapshot. A publish without a delta breaks continuity. Status changes wake
-//! subscribers even when the revision has not changed. Delta semantics are
-//! author-defined; readers unable to apply a delta can fetch the replacement
-//! snapshot.
+//! Each event is `snapshot`, with the GET shape plus `topic`. A topic gets
+//! one when the stream opens, unless its cursor is current, and one after
+//! each change; a reader that falls behind gets only the latest. Status
+//! changes send a snapshot even when the revision has not changed.
 //!
 //! A page holds at most three long-lived streams: `watch`, the state stream
 //! and `packets`. Everything else is a short request. The browser components

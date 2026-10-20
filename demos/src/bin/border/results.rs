@@ -39,7 +39,6 @@ impl<W: Write> Writer<W> {
     pub fn topic() -> StateTopic<Results> {
         StateTopic::new(StateLimits {
             max_bytes: (ROWS + 1) * LINE_BYTES,
-            deltas: 0,
         })
     }
     fn line(&mut self) {

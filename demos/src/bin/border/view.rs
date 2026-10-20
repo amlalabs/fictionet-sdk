@@ -258,7 +258,6 @@ impl Projection {
         });
         let topic = StateTopic::new(StateLimits {
             max_bytes: 256 << 10,
-            deltas: 0,
         });
         // The worker ends once every projection is dropped. A change made just
         // before that, such as the run ending, is still published.

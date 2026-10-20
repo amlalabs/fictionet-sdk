@@ -56,7 +56,6 @@ impl Sessions {
                 .expect("lease map is serializable")
                 .len()
                 + 64 * hosts.len(),
-            deltas: 0,
         });
         topic
             .publish(

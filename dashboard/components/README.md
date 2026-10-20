@@ -16,8 +16,7 @@ snapshot and the changes since, then live events. Close it when done.
 `services.connect(graph)` binds that watch to a graph state (see `state.mjs`).
 `services.state(path, onSnapshot, onError)` subscribes to a state topic and
 returns an unsubscribe function; snapshots have `{revision, at, value, status}`.
-It fetches a replacement snapshot when a delta arrives, since deltas are the
-author's. A topic stays on the stream after its panel closes, so switching
+A topic stays on the stream after its panel closes, so switching
 panels never reopens the stream. `services.selection` holds explicit host, node, link, event,
 connection and request identities. `services.theme` has `current()` and
 `subscribe(listener) -> unsubscribe`. `services.format` contains text formatters

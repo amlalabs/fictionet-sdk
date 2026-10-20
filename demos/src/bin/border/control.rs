@@ -33,7 +33,6 @@ impl Control {
             port: Port::new(CommandLimits::default()),
             state: StateTopic::new(StateLimits {
                 max_bytes: RouteState::MAX_JSON_BYTES,
-                deltas: 0,
             }),
         };
         control.publish(

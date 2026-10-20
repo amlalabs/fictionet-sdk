@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -12,25 +11,22 @@ use tokio::task::JoinSet;
 
 use super::{http, observation};
 
-/// Snapshot and delta retention bounds.
+/// The snapshot size bound.
 #[derive(Clone, Copy, Debug)]
 pub struct StateLimits {
-    /// Maximum serialized snapshot bytes and total retained delta bytes.
+    /// Maximum serialized snapshot bytes.
     pub max_bytes: usize,
-    /// Maximum retained delta count. Zero keeps snapshots only.
-    pub deltas: usize,
 }
 
 impl Default for StateLimits {
     fn default() -> Self {
         Self {
             max_bytes: 256 << 10,
-            deltas: 64,
         }
     }
 }
 
-/// Persistent publication status, included with every snapshot and delta.
+/// Persistent publication status, included with every snapshot.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StateStatus {
     /// A publication exceeded its byte bound; the preceding value was kept.
@@ -53,7 +49,7 @@ pub struct Snapshot<T> {
 /// A failed publication leaves the previous revision and value intact.
 #[derive(Debug)]
 pub enum PublishError {
-    /// The snapshot or delta exceeded the configured byte budget.
+    /// The snapshot exceeded the configured byte budget.
     TooLarge,
     /// Serialization failed.
     Serialize(serde_json::Error),
@@ -72,8 +68,8 @@ impl std::fmt::Display for PublishError {
 }
 impl std::error::Error for PublishError {}
 
-/// Executor-neutral state publication. Clones share one bounded snapshot and
-/// delta ring; publishing never waits for subscribers or requires a runtime.
+/// Executor-neutral state publication. Clones share one bounded snapshot;
+/// publishing never waits for subscribers or requires a runtime.
 pub struct StateTopic<T> {
     pub(super) topic: Topic,
     marker: PhantomData<fn() -> T>,
@@ -99,14 +95,7 @@ struct State {
     revision: u64,
     at: f64,
     value: String,
-    deltas: VecDeque<Delta>,
-    bytes: usize,
     status: StateStatus,
-}
-struct Delta {
-    revision: u64,
-    at: f64,
-    value: String,
 }
 
 impl<T> StateTopic<T> {
@@ -120,8 +109,6 @@ impl<T> StateTopic<T> {
                     revision: 0,
                     at: 0.0,
                     value: "null".into(),
-                    deltas: VecDeque::new(),
-                    bytes: 0,
                     status: StateStatus::default(),
                 }),
                 changed,
@@ -137,37 +124,12 @@ impl<T> StateTopic<T> {
 }
 
 impl<T: Serialize> StateTopic<T> {
-    /// Publishes a replacement snapshot, invalidating delta continuity.
+    /// Publishes a replacement snapshot.
     pub fn publish(&self, at: Instant, snapshot: &T) -> Result<u64, PublishError> {
-        self.publish_bytes(at, snapshot, None)
-    }
-
-    /// Publishes one snapshot and its delta from the preceding revision.
-    /// The delta's application semantics belong to the custom panel.
-    pub fn publish_with_delta<D: Serialize>(
-        &self,
-        at: Instant,
-        snapshot: &T,
-        delta: &D,
-    ) -> Result<u64, PublishError> {
-        let delta = serde_json::to_string(delta).map_err(PublishError::Serialize)?;
-        self.publish_bytes(at, snapshot, Some(delta))
-    }
-
-    fn publish_bytes(
-        &self,
-        at: Instant,
-        snapshot: &T,
-        delta: Option<String>,
-    ) -> Result<u64, PublishError> {
         let value = serde_json::to_string(snapshot).map_err(PublishError::Serialize)?;
         let inner = &self.topic.0;
         let mut state = inner.state.lock();
-        if value.len() > inner.limits.max_bytes
-            || delta
-                .as_ref()
-                .is_some_and(|d| d.len() > inner.limits.max_bytes)
-        {
+        if value.len() > inner.limits.max_bytes {
             state.status.too_large = true;
             inner.changed.send_modify(|n| *n = n.wrapping_add(1));
             return Err(PublishError::TooLarge);
@@ -179,21 +141,6 @@ impl<T: Serialize> StateTopic<T> {
         state.revision = revision;
         state.at = at.since_start().as_secs_f64();
         state.value = value;
-        if let Some(value) = delta.filter(|_| inner.limits.deltas > 0) {
-            state.bytes += value.len();
-            let at = state.at;
-            state.deltas.push_back(Delta {
-                revision,
-                at,
-                value,
-            });
-            while state.deltas.len() > inner.limits.deltas || state.bytes > inner.limits.max_bytes {
-                state.bytes -= state.deltas.pop_front().unwrap().value.len();
-            }
-        } else {
-            state.deltas.clear();
-            state.bytes = 0;
-        }
         inner.changed.send_modify(|n| *n = n.wrapping_add(1));
         Ok(revision)
     }
@@ -213,39 +160,12 @@ impl Topic {
         self.0.state.lock().snapshot()
     }
 
-    fn since(&self, after: Option<u64>) -> (u64, Vec<(&'static str, String)>) {
+    /// The snapshot a reader at revision `after` needs, or `None` when it
+    /// holds the current revision.
+    fn since(&self, after: Option<u64>) -> (u64, Option<String>) {
         let state = self.0.state.lock();
-        let snapshot = || (state.revision, vec![("snapshot", state.snapshot())]);
-        let Some(after) = after else {
-            return snapshot();
-        };
-        if after > state.revision {
-            return snapshot();
-        }
-        if after == state.revision {
-            return (state.revision, vec![]);
-        }
-        if !state
-            .deltas
-            .front()
-            .is_some_and(|d| d.revision <= after.saturating_add(1))
-        {
-            return snapshot();
-        }
-        let too_large = state.status.too_large;
-        let values = state
-            .deltas
-            .iter()
-            .filter(|d| d.revision > after)
-            .map(|d| {
-                let data = format!(
-                    "{{\"revision\":{},\"at\":{},\"delta\":{},\"status\":{{\"too_large\":{}}}}}",
-                    d.revision, d.at, d.value, too_large
-                );
-                ("delta", data)
-            })
-            .collect();
-        (state.revision, values)
+        let current = after == Some(state.revision);
+        (state.revision, (!current).then(|| state.snapshot()))
     }
 }
 
@@ -253,8 +173,9 @@ impl Topic {
 pub(super) const MAX_STREAM_TOPICS: usize = 64;
 
 /// Streams several topics on one connection, so a page needs one connection
-/// for all of its state. Each topic first gets its snapshot, or the deltas
-/// after its cursor, then every change. Every event names its topic.
+/// for all of its state. Each topic first gets its snapshot, unless its
+/// cursor is current, then the snapshot after every change. Every event names
+/// its topic.
 pub(super) async fn stream(
     conn: &mut TcpStream,
     topics: &[(&str, &Topic, Option<u64>)],
@@ -283,11 +204,16 @@ pub(super) async fn stream(
                 cursors[i] = None;
                 too_large_shown[i] = true;
             }
-            let (revision, values) = topic.since(cursors[i]);
+            let (revision, snapshot) = topic.since(cursors[i]);
             cursors[i] = Some(revision);
-            for (name, data) in values {
+            if let Some(data) = snapshot {
                 let id = serde_json::to_string(id).map_err(io::Error::other)?;
-                observation::event(conn, name, &format!("{{\"topic\":{id},{}", &data[1..])).await?;
+                observation::event(
+                    conn,
+                    "snapshot",
+                    &format!("{{\"topic\":{id},{}", &data[1..]),
+                )
+                .await?;
             }
         }
         if closing {
@@ -317,48 +243,41 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_replace_missing_history_and_keep_rejected_values() {
-        let topic = StateTopic::new(StateLimits {
-            max_bytes: 16,
-            deltas: 2,
-        });
+    fn readers_get_the_snapshot_unless_current_and_rejections_keep_the_value() {
+        let topic = StateTopic::<u64>::new(StateLimits { max_bytes: 16 });
+        assert_eq!(topic.topic.since(None).0, 0);
+        assert!(topic.topic.since(Some(0)).1.is_none());
         topic.publish(at(), &1).unwrap();
-        topic.publish_with_delta(at(), &2, &1).unwrap();
-        topic.publish_with_delta(at(), &3, &1).unwrap();
-        let (_, values) = topic.topic.since(Some(1));
-        assert_eq!(values.len(), 2);
-        assert!(values.iter().all(|(name, _)| *name == "delta"));
-        topic.publish_with_delta(at(), &4, &1).unwrap();
-        assert_eq!(topic.topic.since(Some(1)).1[0].0, "snapshot");
-        assert!(topic.topic.since(Some(4)).1.is_empty());
+        topic.publish(at(), &2).unwrap();
+        for after in [None, Some(0), Some(1), Some(7)] {
+            let (revision, snapshot) = topic.topic.since(after);
+            assert_eq!(revision, 2);
+            let value: Snapshot<u64> = serde_json::from_str(&snapshot.unwrap()).unwrap();
+            assert_eq!(value.value, Some(2));
+        }
+        assert!(topic.topic.since(Some(2)).1.is_none());
         assert!(matches!(
-            topic.publish_with_delta(at(), &5, &"x".repeat(17)),
+            topic.publish(at(), &u64::MAX),
             Err(PublishError::TooLarge)
         ));
-        let value: Snapshot<u32> = serde_json::from_str(&topic.topic.snapshot()).unwrap();
-        assert_eq!(value.revision, 4);
-        assert_eq!(value.value, Some(4));
+        let value: Snapshot<u64> = serde_json::from_str(&topic.topic.snapshot()).unwrap();
+        assert_eq!(value.revision, 2);
+        assert_eq!(value.value, Some(2));
         assert!(value.status.too_large);
+        assert_eq!(value.at, 3.0);
         topic.publish(at(), &6).unwrap();
         assert!(topic.topic.0.state.lock().status.too_large);
-        assert_eq!(topic.topic.since(Some(4)).1[0].0, "snapshot");
-        topic.publish_with_delta(at(), &7, &1).unwrap();
-        assert_eq!(topic.topic.since(Some(5)).1[0].0, "delta");
+        assert_eq!(topic.revision(), 3);
     }
 
     #[test]
     fn publishers_do_not_wait_for_subscribers_or_need_a_runtime() {
-        let topic = StateTopic::new(StateLimits {
-            max_bytes: 16,
-            deltas: 100,
-        });
+        let topic = StateTopic::new(StateLimits { max_bytes: 16 });
         let _stalled = topic.topic.0.changed.subscribe();
         for n in 0..10_000 {
-            topic.publish_with_delta(at(), &n, &"12345678").unwrap();
+            topic.publish(at(), &n).unwrap();
         }
         assert_eq!(topic.revision(), 10_000);
-        let state = topic.topic.0.state.lock();
-        assert!(state.bytes <= 16);
-        assert_eq!(state.deltas.len(), 1);
+        assert_eq!(topic.topic.0.state.lock().value, "9999");
     }
 }

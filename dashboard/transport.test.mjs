@@ -469,12 +469,11 @@ test('one state stream carries every topic, sends revisions and closes with the 
   const h = transport(t), seen = [];
   const stream = h.stateStream({ leases: 4, 'host-alpha': undefined });
   stream.addEventListener('snapshot', (event) => seen.push(JSON.parse(event.data)));
-  stream.addEventListener('delta', (event) => seen.push(JSON.parse(event.data)));
   await settle();
   assert.equal(h.requests[0].url, 'http://127.0.0.1:7878/api/states/stream?topics=leases%2Chost-alpha&after=leases%3A4');
   assert.equal(h.requests[0].headers.Authorization, 'Bearer secret');
   h.sources[0].emit('snapshot', { revision: 5, value: { alpha: { holder: null } } });
-  h.sources[0].emit('delta', { revision: 6, delta: {} });
+  h.sources[0].emit('snapshot', { revision: 6, value: { alpha: { holder: 'a' } } });
   await settle();
   assert.deepEqual(seen.map((v) => v.revision), [5, 6]);
   h.close();

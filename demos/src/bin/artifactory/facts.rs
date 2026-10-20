@@ -272,11 +272,9 @@ impl Facts {
     ) -> Self {
         let rows = |row_bytes: usize, rest: usize| StateLimits {
             max_bytes: PAGE_ROWS * (row_bytes + TAG_BYTES) + rest,
-            deltas: 0,
         };
         let inventory_limits = StateLimits {
             max_bytes: MAX_INVENTORY_JSON_BYTES,
-            deltas: INVENTORY_DELTAS,
         };
         let topics = Topics {
             inventory: StateTopic::new(inventory_limits),
@@ -606,16 +604,10 @@ fn publish_changed(facts: &Facts) {
     // Copy rows under the facts lock, then serialize without holding it.
     let result = (|| {
         if !batch.changes.is_empty() {
-            facts.topics.inventory.publish_with_delta(
-                batch.at,
-                &batch.inventory,
-                &batch.changes,
-            )?;
+            facts.topics.inventory.publish(batch.at, &batch.inventory)?;
         }
-        if let (Some(topic), Some((inventory, changes))) =
-            (&facts.topics.colleague, &batch.colleague)
-        {
-            topic.publish_with_delta(batch.at, inventory, changes)?;
+        if let (Some(topic), Some((inventory, _))) = (&facts.topics.colleague, &batch.colleague) {
+            topic.publish(batch.at, inventory)?;
         }
         facts.topics.publish(batch)
     })();
@@ -1205,7 +1197,7 @@ pub(super) mod tests {
         assert_eq!(inventory["at"], 3.0);
         assert_eq!(inventory["value"], serde_json::to_value(&next).unwrap());
 
-        // The stream carries the change, not just a replacement snapshot.
+        // A reader behind the topic gets the new inventory on the stream.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (origin, token) = page.url().split_once("/#token=").unwrap();
         let authority = origin.strip_prefix("http://").unwrap();
@@ -1226,10 +1218,11 @@ pub(super) mod tests {
         .await
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("event: snapshot\n"), "{response}");
         assert!(
             response.contains(&format!(
-                "\"delta\":{}",
-                serde_json::to_string(&changes).unwrap()
+                "\"revision\":2,\"at\":3,\"value\":{}",
+                serde_json::to_string(&next).unwrap()
             )),
             "{response}"
         );
