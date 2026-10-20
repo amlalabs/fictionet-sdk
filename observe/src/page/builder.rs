@@ -163,6 +163,15 @@ impl Page {
         self.workspace_consoles = true;
         self
     }
+    /// Names an address the page's consoles reach the hosts from, such as an
+    /// admin SSH host. Its packets are the page's own screen and terminal
+    /// traffic, so the packet list hides them until a viewer shows them.
+    pub fn console_address(mut self, address: std::net::IpAddr) -> Self {
+        if !self.console_addresses.contains(&address) {
+            self.console_addresses.push(address);
+        }
+        self
+    }
     /// Puts the named inspector panel first and opens the inspector on it, so
     /// a demo's own panel is what a viewer sees before Packets. The page's
     /// other own panels follow it in the order they were declared, before the

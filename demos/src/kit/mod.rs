@@ -767,7 +767,8 @@ impl Run {
         let labels = Labels::default();
         let page = build(dashboard.clone(), &mut hosts)
             .containment(self.containment.clone())
-            .labels(labels.clone());
+            .labels(labels.clone())
+            .console_address(jump::JUMP_ADDR.into());
         self.page = Some(page.bind_loopback(0).await.map_err(|error| {
             let text = error.to_string();
             if text == "labels called twice" || text.contains("(\"Containment\")") {

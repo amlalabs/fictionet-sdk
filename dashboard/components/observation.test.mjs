@@ -107,6 +107,65 @@ test('all hosts keeps startup captures after their links leave the map', async (
   h.clean();
 });
 
+test('a packet list keeps its rows when its links end and the run stops', async (t) => {
+  const h = fixture(t);
+  let stopped = false;
+  h.services.stopped = () => stopped;
+  const dispose = packets(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e2', a: 's1', b: 't1' }], counters: { e2: [1, 0, 0, 0] } });
+  await settle();
+  const opened = h.streams.length;
+  h.streams.at(-1).emit('packet', { seq: 1, t: 1, side: 0, len: 28, skipped: 0, evicted: 0, src: '10.0.0.2', dst: '10.0.0.3', proto: 'ICMP', info: 'Echo', tags: [] });
+  h.frame();
+  const rows = () => h.root.querySelector('#prows').children.filter((row) => !row.classList.contains('gap')).length;
+  assert.equal(rows(), 1);
+  h.watches[0].emit('edge_end', { id: 'e2' });
+  h.watches[0].emit('node_end', { id: 's1' });
+  await settle();
+  assert.equal(h.streams.length, opened, 'an ended link does not reopen the list');
+  assert.equal(rows(), 1);
+  stopped = true;
+  h.watches[0].emit('edge', { id: 'e3', a: 's1', b: 't1' });
+  await settle();
+  assert.equal(h.streams.length, opened, 'a stopped run does not reopen the list');
+  h.streams.at(-1).emit('end', { reason: 'every link closed' });
+  h.frame();
+  assert.equal(rows(), 1);
+  assert.match(h.root.querySelector('#prows').textContent, /link closed/);
+  dispose();
+  h.clean();
+});
+
+test('the page\'s own console traffic is hidden with a count until a viewer shows it', async (t) => {
+  const h = fixture(t);
+  h.services.consoleAddresses = ['10.10.5.20'];
+  const dispose = packets(h.root, h.services);
+  h.watches[0].emit('snapshot', { ...h.snapshot, edges: [{ id: 'e2', a: 's1', b: 't1' }], counters: { e2: [1, 0, 0, 0] } });
+  await settle();
+  const sent = (stream) => {
+    stream.emit('packet', { seq: 1, t: 1, side: 0, len: 90, skipped: 3, evicted: 0, src: '10.10.5.20:54926', dst: '10.0.0.2:22', proto: 'TCP', info: '54926 → 22', tags: [] });
+    stream.emit('packet', { seq: 2, t: 2, side: 0, len: 60, skipped: 0, evicted: 0, src: '10.0.0.2:40000', dst: '142.250.1.1:443', proto: 'TLS', info: 'Client Hello', tags: [] });
+    h.frame();
+  };
+  const rows = () => h.root.querySelector('#prows').children.filter((row) => !row.classList.contains('gap')).map((row) => row.dataset.src);
+  const note = h.root.querySelector('#console-note');
+  assert.equal(note.hidden, true);
+  sent(h.streams.at(-1));
+  assert.deepEqual(rows(), ['10.0.0.2:40000']);
+  assert.equal(note.hidden, false);
+  assert.equal(h.root.querySelector('#console-text').textContent, "1 packet of the page's own console traffic hidden, to and from 10.10.5.20.");
+  assert.match(h.root.querySelector('#sampled').textContent, /3 packets not copied/, 'a hidden packet keeps its sampling count');
+  const opened = h.streams.length;
+  h.root.querySelector('#console-toggle').click();
+  assert.equal(h.streams.length, opened + 1, 'showing reopens the stream to replay its history');
+  sent(h.streams.at(-1));
+  assert.deepEqual(rows(), ['10.10.5.20:54926', '10.0.0.2:40000']);
+  assert.equal(h.root.querySelector('#console-text').textContent, "Showing the page's own console traffic, to and from 10.10.5.20.");
+  assert.equal(h.root.querySelector('#console-toggle').textContent, 'Hide');
+  dispose();
+  h.clean();
+});
+
 test('events filters text, preserves loss and selects only explicit flow identities', (t) => {
   const h = fixture(t);
   const dispose = events(h.root, h.services);

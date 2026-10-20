@@ -10,6 +10,9 @@ export function createPackets({
   // A table with a Host column gives every row that cell, so gap rows span
   // all nine columns whichever are hidden.
   hostColumn = false,
+  // Addresses the page's consoles reach the hosts from. Their packets are
+  // the page's own screen and terminal traffic, hidden until shown.
+  consoleAddresses = [],
 }) {
   // ---------------------------------------------------------------------------
   // The packet drawer
@@ -38,6 +41,27 @@ export function createPackets({
   const MAX_ROWS = maxRows;
   /// How long a merged packet view holds packets to put them in order.
   const MERGE_HOLD_MS = 400;
+  // The address of `10.0.0.2:22`, `[fe80::1]:22` or a bare address.
+  const address = (text) => (text.startsWith('[') ? text.slice(1, text.indexOf(']')) : text.split(':').length === 2 ? text.split(':')[0] : text);
+  const fromConsole = (p) => consoleAddresses.includes(address(p.src)) || consoleAddresses.includes(address(p.dst));
+  let showConsole = false, reopen = null;
+  const consoleNote = $('console-note');
+  function showConsoleNote() {
+    if (!consoleNote || !consoleAddresses.length || !packets) return;
+    const where = consoleAddresses.join(', ');
+    $('console-text').textContent = showConsole
+      ? `Showing the page's own console traffic, to and from ${where}.`
+      : `${fmtCount(packets.console)} ${packets.console === 1 ? 'packet' : 'packets'} of the page's own console traffic hidden, to and from ${where}.`;
+    $('console-toggle').textContent = showConsole ? 'Hide' : 'Show';
+    consoleNote.hidden = !showConsole && !packets.console;
+  }
+  if (consoleNote) {
+    on($('console-toggle'), 'click', () => {
+      showConsole = !showConsole;
+      // The stream replays the history it keeps, now with or without them.
+      reopen?.();
+    });
+  }
 
   /// Opens the packets of drawn edge `id`: one link, or every link it stands
   /// for, merged.
@@ -63,6 +87,7 @@ export function createPackets({
   /// from `fromName` to `toName`.
   function openLinks(fromName, toName, members, label, total = members.length) {
     closePackets();
+    reopen = () => openLinks(fromName, toName, members, label, total);
     clearUnread();
     drawer.hidden = false;
     const many = members.length > 1;
@@ -98,7 +123,8 @@ export function createPackets({
       $('sampled').textContent = '';
       clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
     });
-    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
+    packets = { list, flips, hosts, showHost, widths: { time: 6, src: 6, dst: 9, proto: 6 }, many, source, rows: 0, console: 0, paused: false, held: [], queue: [], lastTime: new Map(), done: new Set(), skipped: 0, evicted: 0, missed: 0, open: members.length, failed: false };
+    showConsoleNote();
     onStream('packet', (ev) => {
       const p = JSON.parse(ev.data);
       if (!packets || packets.source !== source) return;
@@ -264,6 +290,19 @@ export function createPackets({
         packets.queue = batch.slice(ready);
         batch = batch.slice(0, ready);
       }
+      if (!batch.length) return;
+    }
+    if (!showConsole && consoleAddresses.length) {
+      // Hidden console packets take no rows, so they cannot push the
+      // world's own traffic out of the list.
+      const before = packets.console;
+      batch = batch.filter((p) => {
+        if (p.gap || !fromConsole(p)) return true;
+        packets.console++;
+        if (p.skipped > 0) packets.skipped += p.skipped;
+        return false;
+      });
+      if (packets.console !== before) { showCounts(); showConsoleNote(); }
       if (!batch.length) return;
     }
     const frag = document.createDocumentFragment();

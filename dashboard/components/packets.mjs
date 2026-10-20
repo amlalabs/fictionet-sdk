@@ -18,7 +18,8 @@ export function mount(root, services, options = {}) {
     onDetail(packet, header) {
       labelAction(header, services, { kind: 'flow', link: packet.link, a: packet.src, b: packet.dst }, 'Label flow');
     },
-    $, el, ...services.transport, fmtCount, fit() {}, stopped: () => (services.stopped?.() ? STOPPED : null), hostColumn: true, ...options,
+    $, el, ...services.transport, fmtCount, fit() {}, stopped: () => (services.stopped?.() ? STOPPED : null), hostColumn: true,
+    consoleAddresses: services.consoleAddresses || [], ...options,
     placeholder: options.placeholder || (() => 'Select a packet to see its layers.'),
     ...(options.drawer ? {} : { pcapLabel: 'pcapng' }),
   });
@@ -74,6 +75,9 @@ export function mount(root, services, options = {}) {
     // Opening before the graph is known would open the stream again once it
     // is, since each link's host and direction come from the graph.
     if (!graph) return;
+    // A stopped run's links can no longer be read, so the list keeps what it
+    // shows.
+    if (current && services.stopped?.()) return;
     const attempt = ++generation;
     request?.abort();
     if (selected.links.length) show(selected.links, selected.host || 'Selected links');
@@ -109,10 +113,11 @@ export function mount(root, services, options = {}) {
       edges = new Map(snapshot.edges.map((edge) => [edge.id, { ...edge, c: snapshot.counters[edge.id] }]));
       void scope();
     });
+    // A link that ends keeps its rows: its stream says when it closed.
     on('node', (node) => { nodes.set(node.id, node); void scope(); });
-    on('node_end', ({ id }) => { nodes.delete(id); void scope(); });
+    on('node_end', ({ id }) => { nodes.delete(id); });
     on('edge', (edge) => { edges.set(edge.id, edge); void scope(); });
-    on('edge_end', ({ id }) => { edges.delete(id); void scope(); });
+    on('edge_end', ({ id }) => { edges.delete(id); });
     on('counters', ({ edges: counts }) => {
       for (const [id, c] of Object.entries(counts || {})) if (edges.has(id)) edges.get(id).c = c;
     });
@@ -159,6 +164,9 @@ function structure(root, el) {
   const dirs = el('div', { class: 'dirs', hidden: '' }, drawer);
   for (const id of ['dir-a', 'dir-b']) el('span', { id }, dirs);
   el('p', { id: 'sampled', class: 'sampled', hidden: '' }, drawer);
+  const consoles = el('p', { id: 'console-note', class: 'console-note', hidden: '' }, drawer);
+  el('span', { id: 'console-text' }, consoles);
+  el('button', { id: 'console-toggle', class: 'text-button', type: 'button', text: 'Show' }, consoles);
   const pair = el('p', { id: 'pair', class: 'pair-note', hidden: '' }, drawer);
   el('span', { id: 'pair-text' }, pair);
   el('button', { id: 'pair-clear', class: 'text-button', type: 'button', text: 'Show all packets' }, pair);

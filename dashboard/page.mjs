@@ -156,6 +156,7 @@ export async function mount(root, transport, theme) {
   if (disposed) return stop;
   root.dataset.state = 'ready';
   services.hosts = page.hosts;
+  services.consoleAddresses = page.console_addresses || [];
   document.title = `${page.title} · Fictionet`;
   $('page-title').textContent = page.title;
 
