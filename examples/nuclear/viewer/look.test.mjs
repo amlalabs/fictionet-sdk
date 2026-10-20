@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MATERIAL_ROLES, materialSpec, indicatorSpec, setIndicator, createRenderer, createMaterial, applyMaterialPalette } from './look.mjs';
-import { windowState } from './board-layout.mjs';
+import { MATERIAL_ROLES, materialSpec, indicatorSpec, setIndicator, createRenderer, createMaterial,
+  applyMaterialPalette, roomLightAt } from './look.mjs';
+import { windowState, DESKS, BOARDS, boardPoint, CEILING_LIGHTS } from './board-layout.mjs';
 
 test('surface roles separate painted steel, brushed metal, glass, rubber and concrete', () => {
   for (const spec of Object.values(MATERIAL_ROLES)) {
@@ -85,4 +86,22 @@ test('the renderer factory creates one context with filmic output and shadow acc
   assert.equal(renderer.shadowMap.enabled, true);
   assert.equal(renderer.shadowMap.type, THREE.PCFSoftShadowMap);
   assert.equal(renderer.info.autoReset, false);
+});
+
+test('baked light pools under troffers and darkens kneeholes, desk lips, board bases and corners', () => {
+  const up = { x: 0, y: 1, z: 0 };
+  const down = { x: 0, y: -1, z: 0 };
+  const x = CEILING_LIGHTS.xs[1];
+  const z = CEILING_LIGHTS.zs[0];
+  const underLight = roomLightAt({ x, y: 1.8, z }, up);
+  const betweenLights = roomLightAt({ x: 0, y: 1.8, z: z + 1.5 }, up);
+  assert.ok(underLight > betweenLights + 0.2);
+  const desk = DESKS[0];
+  const knee = { x: desk.x, y: 0.6, z: desk.z };
+  const top = { ...knee, y: 0.82 };
+  assert.ok(roomLightAt(knee, up) < roomLightAt(top, up) * 0.7);
+  assert.ok(roomLightAt(knee, down) < roomLightAt(knee, up));
+  const base = boardPoint(BOARDS[2], 0, 0.04, 0.4);
+  assert.ok(roomLightAt(base, up) < roomLightAt({ ...base, y: 1.8 }, up) * 0.6);
+  assert.ok(roomLightAt({ x: 6.9, y: 0, z: 6.9 }, up) < betweenLights);
 });

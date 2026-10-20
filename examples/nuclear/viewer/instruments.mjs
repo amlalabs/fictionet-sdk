@@ -42,33 +42,34 @@ const LOOP_NAME = (loop) => loop.toUpperCase();
 /**
  * The displayed points, in the order the plant lists its instruments. `key` is
  * the sensor tag (`neutron_power`, `hot_leg:a`), `range` is the gauge scale for
- * the scene, and `truth` reads the true value from snapshot.truth.
+ * the scene, `physical` marks scale ends at physical limits, and `truth` reads
+ * the true value from snapshot.truth.
  */
 export const POINTS = Object.freeze([
-  point('neutron_power', 'Neutron power', '%', [0, 120], (t) => t.reactor.neutron_power_percent),
-  point('rod_position', 'Control rod position', '%', [0, 100], (t) => t.reactor.control_rod_percent),
-  ...loopPoints('hot_leg', 'Hot leg', 'C', [280, 350], (t, i) => t.primary.loops[i].hot_leg_c),
-  ...loopPoints('cold_leg', 'Cold leg', 'C', [270, 320], (t, i) => t.primary.loops[i].cold_leg_c),
-  point('pressurizer_pressure', 'Pressurizer pressure', 'MPa', [12, 18], (t) => t.primary.pressure_mpa),
-  point('pressurizer_level', 'Pressurizer level', '%', [0, 100], (t) => t.primary.level_percent),
-  ...loopPoints('coolant_flow', 'Coolant flow', '%', [0, 120], (t, i) => t.primary.loops[i].flow_percent),
-  ...loopPoints('steam_generator_level', 'Steam generator level', '%', [0, 100], (t, i) => t.secondary.loops[i].level_percent),
-  point('steam_pressure', 'Steam pressure', 'MPa', [0, 10], (t) => t.secondary.steam_pressure_mpa),
-  ...loopPoints('steam_flow', 'Steam flow', 'kg/s', [0, 600], (t, i) => t.secondary.loops[i].steam_kg_s),
-  ...loopPoints('feed_flow', 'Feed flow', 'kg/s', [0, 600], (t, i) => t.secondary.loops[i].feed_kg_s),
-  point('turbine_valve', 'Turbine valve', '%', [0, 100], (t) => t.secondary.turbine_valve_percent),
-  point('generator_output', 'Generator output', 'MW', [0, 700], (t) => t.secondary.generator_mw),
-  point('condenser_pressure', 'Condenser pressure', 'kPa', [0, 20], (t) => t.secondary.condenser_pressure_kpa),
-  point('core_exit_temperature', 'Core exit temperature', 'C', [280, 350], (t) => t.reactor.core_exit_c),
+  point('neutron_power', 'Neutron power', '%', [0, 120], [true, false], (t) => t.reactor.neutron_power_percent),
+  point('rod_position', 'Control rod position', '%', [0, 100], [true, true], (t) => t.reactor.control_rod_percent),
+  ...loopPoints('hot_leg', 'Hot leg', 'C', [260, 350], [false, false], (t, i) => t.primary.loops[i].hot_leg_c),
+  ...loopPoints('cold_leg', 'Cold leg', 'C', [260, 350], [false, false], (t, i) => t.primary.loops[i].cold_leg_c),
+  point('pressurizer_pressure', 'Pressurizer pressure', 'MPa', [12, 18], [false, false], (t) => t.primary.pressure_mpa),
+  point('pressurizer_level', 'Pressurizer level', '%', [0, 100], [true, false], (t) => t.primary.level_percent),
+  ...loopPoints('coolant_flow', 'Coolant flow', '%', [0, 120], [true, false], (t, i) => t.primary.loops[i].flow_percent),
+  ...loopPoints('steam_generator_level', 'Steam generator level', '%', [0, 100], [true, false], (t, i) => t.secondary.loops[i].level_percent),
+  point('steam_pressure', 'Steam pressure', 'MPa', [0, 10], [true, false], (t) => t.secondary.steam_pressure_mpa),
+  ...loopPoints('steam_flow', 'Steam flow', 'kg/s', [0, 1000], [true, false], (t, i) => t.secondary.loops[i].steam_kg_s),
+  ...loopPoints('feed_flow', 'Feed flow', 'kg/s', [0, 1000], [true, false], (t, i) => t.secondary.loops[i].feed_kg_s),
+  point('turbine_valve', 'Turbine valve', '%', [0, 100], [true, true], (t) => t.secondary.turbine_valve_percent),
+  point('generator_output', 'Generator output', 'MW', [0, 700], [true, false], (t) => t.secondary.generator_mw),
+  point('condenser_pressure', 'Condenser pressure', 'kPa', [0, 20], [true, false], (t) => t.secondary.condenser_pressure_kpa),
+  point('core_exit_temperature', 'Core exit temperature', 'C', [260, 350], [false, false], (t) => t.reactor.core_exit_c),
 ]);
 
-function point(key, label, unit, range, truth) {
-  return { key, label, unit, range, truth };
+function point(key, label, unit, range, physical, truth) {
+  return { key, label, unit, range, physical, truth };
 }
 
-function loopPoints(key, label, unit, range, truth) {
+function loopPoints(key, label, unit, range, physical, truth) {
   return LOOPS.map((loop, i) =>
-    point(`${key}:${loop}`, `${label} ${LOOP_NAME(loop)}`, unit, range, (t) => truth(t, i)),
+    point(`${key}:${loop}`, `${label} ${LOOP_NAME(loop)}`, unit, range, physical, (t) => truth(t, i)),
   );
 }
 

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { ANNUNCIATOR_WINDOWS, windowState } from './board-layout.mjs';
 import {
   POINTS,
@@ -239,6 +240,48 @@ function pair(result, key) {
   return found;
 }
 
+test('the gate snapshots stay inside every instrument range', () => {
+  const snapshots = JSON.parse(readFileSync(new URL('./fixtures/gate-run-extremes.json', import.meta.url), 'utf8'));
+  assert.equal(snapshots.length, 47);
+  for (const snap of snapshots) {
+    const result = instruments(snap);
+    assert.equal(result.pairs.length, POINTS.length);
+    for (const p of result.pairs) {
+      for (const field of ['trueValue', 'reported']) {
+        const value = p[field];
+        assert.ok(Number.isFinite(value), `${p.key} ${field} at ${snap.at_ms}`);
+        assert.ok(value >= p.range[0] && value <= p.range[1], `${p.key} ${field} ${value} at ${snap.at_ms}`);
+      }
+    }
+  }
+});
+
+test('flow and temperature instruments share their plant scales', () => {
+  for (const p of POINTS) {
+    if (p.unit === 'kg/s') assert.deepEqual(p.range, [0, 1000]);
+    if (p.unit === 'C') assert.deepEqual(p.range, [260, 350]);
+  }
+});
+
+test('gate envelopes keep five percent margins except at physical limits', () => {
+  const snapshots = JSON.parse(readFileSync(new URL('./fixtures/gate-run-extremes.json', import.meta.url), 'utf8'));
+  const views = snapshots.map(instruments);
+  for (const p of POINTS) {
+    for (const field of ['trueValue', 'reported']) {
+      const values = views.map(view => pair(view, p.key)[field]);
+      const minimum = Math.min(...values);
+      const maximum = Math.max(...values);
+      const margin = (p.range[1] - p.range[0]) * 0.05;
+      if (!p.physical[1]) {
+        assert.ok(p.range[1] - maximum >= margin, `${p.key} ${field} upper margin`);
+      }
+      if (!p.physical[0]) {
+        assert.ok(minimum - p.range[0] >= margin, `${p.key} ${field} lower margin`);
+      }
+    }
+  }
+});
+
 test('a normal snapshot has no diverged pair and no frozen reading', () => {
   // Reported values differ from true by instrument noise only.
   const noisy = Object.fromEntries(
@@ -358,7 +401,7 @@ test('reported pump alarms light their permanent windows without adding a proces
   const view = instruments(snap);
   const lit = at => ANNUNCIATOR_WINDOWS.filter(w => windowState(view.alarms.find(a => a.key === w.key)?.state, at).lit);
   assert.deepEqual(lit(0).map(w => w.legend), ['Coolant flow low, loop B', 'Coolant pump tripped']);
-  assert.ok(lit(0).every(w => w.board === 'loops-board'));
+  assert.ok(lit(0).every(w => w.board === 'rcs-board'));
   assert.equal(lit(250).length, 0);
   assert.equal(lit(500).length, 2);
   assert.deepEqual(view.processFaults, [{ key: 'coolant_pump_trip:b', label: 'Coolant pump trip, loop B' }]);

@@ -80,3 +80,42 @@ test('forced colors preserve meter text and warning contrast with system colors'
   for (const name of ['ink', 'text', 'warning', 'line', 'line-strong']) assert.equal(colors[name], 'CanvasText');
   assert.notEqual(colors.rubber, colors['lamp-legend']);
 });
+
+test('vantage buttons stay below a wide canvas in one fitted row with visible focus', () => {
+  const styles = readFileSync(new URL('./control-room.css', import.meta.url), 'utf8');
+  const stage = styles.match(/\.cr-stage\s*\{([^}]+)\}/)[1];
+  const row = styles.match(/\.cr-vantages\s*\{([^}]+)\}/)[1];
+  const button = styles.match(/\.cr-vantage\s*\{([^}]+)\}/)[1];
+  assert.match(stage, /aspect-ratio:\s*16\s*\/\s*10/);
+  assert.doesNotMatch(stage, /height:\s*100%/);
+  assert.match(row, /flex-wrap:\s*nowrap/);
+  assert.doesNotMatch(row, /overflow[^:]*:\s*(auto|scroll|hidden)/);
+  assert.doesNotMatch(row, /position:\s*absolute/);
+  assert.ok(Number(button.match(/min-height:\s*(\d+)px/)[1]) >= 24);
+  assert.match(styles, /:focus-visible\s*\{[^}]*outline:/);
+  assert.match(styles, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+  assert.match(styles, /@media\s*\(forced-colors:\s*active\)/);
+});
+
+
+test('all ten vantage labels fit the smaller measured canvas with full accessible names', t => {
+  const source = readFileSync(new URL('./control-room.mjs', import.meta.url), 'utf8');
+  const styles = readFileSync(new URL('./control-room.css', import.meta.url), 'utf8');
+  const sourceRow = source.slice(source.indexOf('  const vantageButtons = ['), source.indexOf('  const controlStage'));
+  const labels = [...sourceRow.matchAll(/\['([^']+)', '([^']+)', ([^\n]+)\],/g)];
+  assert.deepEqual(labels.map(match => match[2]), ['Room', 'RPS', 'RCS', 'Loops', 'SG / feed', 'Turbine', 'CCTV', 'Door', 'Containment', 'Turbine hall']);
+  assert.deepEqual(labels.map(match => match[1]), ['control-room', 'rps-board', 'rcs-board', 'loops-board', 'feed-board', 'turbine-board', 'cctv', 'door', 'reactor', 'turbine']);
+  assert.match(sourceRow, /'aria-label': accessible/);
+  for (const match of labels.slice(0, 8)) assert.match(match[3], /STANDING_SPOTS/);
+  const row = styles.match(/\.cr-vantages\s*\{([^}]+)\}/)[1];
+  const button = styles.match(/\.cr-vantage\s*\{([^}]+)\}/)[1];
+  const font = Number(button.match(/font-size:\s*([\d.]+)rem/)[1]) * 16;
+  const padding = Number(button.match(/padding:\s*\d+px\s+(\d+)px/)[1]);
+  const border = Number(button.match(/border:\s*(\d+)px/)[1]);
+  const gap = Number(row.match(/gap:\s*(\d+)px/)[1]);
+  const outer = Number(row.match(/padding:\s*(\d+)px/)[1]);
+  const width = labels.reduce((sum, match) => sum + match[2].length * font * 0.65 + 2 * (padding + border), 0)
+    + (labels.length - 1) * gap + 2 * outer;
+  assert.ok(width <= 692, `${width} px`);
+  t.diagnostic(`Estimated chip row ${width.toFixed(1)} px of 692 px.`);
+});

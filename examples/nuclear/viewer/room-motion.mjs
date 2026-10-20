@@ -85,8 +85,8 @@ export function walkPath(start, end, boxes, radius) {
 
 export function glidePose(start, end, path, elapsed) {
   const t = glideEase(elapsed / 0.8);
-  if (t === 0) return { x: start.x, z: start.z, yaw: wrapYaw(start.yaw), pitch: start.pitch };
-  if (t === 1) return { x: end.x, z: end.z, yaw: wrapYaw(end.yaw), pitch: end.pitch };
+  if (t === 0) return { x: start.x, z: start.z, yaw: wrapYaw(start.yaw), pitch: start.pitch, fov: start.fov };
+  if (t === 1) return { x: end.x, z: end.z, yaw: wrapYaw(end.yaw), pitch: end.pitch, fov: end.fov };
   const lengths = path.slice(1).map((p, i) => Math.hypot(p.x - path[i].x, p.z - path[i].z));
   let remaining = lengths.reduce((a, b) => a + b, 0) * t;
   let p = end;
@@ -97,5 +97,6 @@ export function glidePose(start, end, path, elapsed) {
     }
     remaining -= lengths[i];
   }
-  return { x: p.x, z: p.z, yaw: wrapYaw(start.yaw + wrapYaw(end.yaw - start.yaw) * t), pitch: start.pitch + (end.pitch - start.pitch) * t };
+  return { x: p.x, z: p.z, yaw: wrapYaw(start.yaw + wrapYaw(end.yaw - start.yaw) * t), pitch: start.pitch + (end.pitch - start.pitch) * t,
+    fov: start.fov + (end.fov - start.fov) * t };
 }

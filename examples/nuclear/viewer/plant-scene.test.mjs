@@ -95,11 +95,14 @@ test('standing views frame the equipment and overhead structure, with an open vi
     ['turbine', [[32.5, 1.4, -0.7], [46.4, 1.4, -0.7], [38.3, -1.3, 2.5], [40, 7.4, -7]]],
   ]) {
     plant.setView(view);
-    plant.camera.aspect = 1440 / 630;
-    plant.camera.updateProjectionMatrix(); plant.camera.updateMatrixWorld(true);
-    for (const point of points) {
-      const p = new THREE.Vector3(...point).project(plant.camera);
-      assert.ok(Math.abs(p.x) < 1 && Math.abs(p.y) < 1 && p.z < 1, `${view}: ${point} in frame`);
+    // The canvas sizes the page measures at 1440x900 and 1280x800.
+    for (const [width, height] of [[785, 491], [692, 433]]) {
+      plant.camera.aspect = width / height;
+      plant.camera.updateProjectionMatrix(); plant.camera.updateMatrixWorld(true);
+      for (const point of points) {
+        const p = new THREE.Vector3(...point).project(plant.camera);
+        assert.ok(Math.abs(p.x) < 1 && Math.abs(p.y) < 1 && p.z < 1, `${view} at ${width}x${height}: ${point} in frame`);
+      }
     }
   }
   const target = new THREE.Vector3(38.3, -1.3, 2.5);
@@ -153,7 +156,7 @@ test('rod stems and collars drop and position lights follow true rod insertion',
   assert.ok(new THREE.Vector3().setFromMatrixScale(matrix).length() > 0);
 });
 
-test('field gauges ignore reported faults and show exact truth values', t => {
+test('field gauges ignore reported faults and show exact truth values', async t => {
   const { plant, text } = fixture(t), snap = snapshot();
   snap.truth.primary.loops[1].hot_leg_c = 338.2;
   snap.readings = [{ sensor: { hot_leg: 'b' }, reading: { value: 301.1 }, fault: 'quiet' }];
@@ -164,7 +167,9 @@ test('field gauges ignore reported faults and show exact truth values', t => {
   const matrix = new THREE.Matrix4();
   needles.getMatrixAt(1, matrix);
   const angle = Math.atan2(matrix.elements[1], matrix.elements[0]);
-  const expected = Math.PI * 0.75 - Math.PI * 1.5 * ((338.2 - 280) / 70);
+  const { POINTS } = await import('./instruments.mjs');
+  const [low, high] = POINTS.find(point => point.key === 'hot_leg:b').range;
+  const expected = Math.PI * 0.75 - Math.PI * 1.5 * ((338.2 - low) / (high - low));
   assert.ok(Math.abs(angle - expected) < 1e-6);
   assert.equal(text.some(value => /reported|gap|diverged/i.test(value)), false);
 });

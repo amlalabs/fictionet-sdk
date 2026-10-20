@@ -5,6 +5,27 @@ import { createMaterial, applyMaterialPalette } from './look.mjs';
 const TAU = Math.PI * 2;
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif";
 
+// The reserved height measures the ink, including descenders, rather than the font em.
+export function paintLetters(ctx, value, box, color, align = 'center') {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = `600 ${box.font}px ${FONT}`;
+  const metrics = ctx.measureText(value || 'M');
+  const ascent = metrics.actualBoundingBoxAscent ?? box.font * 0.8;
+  const descent = metrics.actualBoundingBoxDescent ?? box.font * 0.2;
+  const inkHeight = ascent + descent || box.font;
+  const stretch = Math.min(box.stretch ?? 1, box.w / (metrics.width || box.w));
+  let x = box.x + box.w / 2;
+  if (align === 'left') x = box.x;
+  if (align === 'right') x = box.x + box.w;
+  ctx.translate(x, box.y + box.h / 2);
+  ctx.scale(stretch, box.font / inkHeight);
+  ctx.fillText(value, 0, (ascent - descent) / 2);
+  ctx.restore();
+}
+
 // Angles are measured from the right in the meter's local plane.
 export function needleAngle(value, [low, high]) {
   if (value === null || value === undefined) return null;
@@ -12,9 +33,12 @@ export function needleAngle(value, [low, high]) {
 }
 
 export function scaleTicks(range) {
-  return Array.from({ length: 9 }, (_, i) => {
-    const value = range[0] + (range[1] - range[0]) * i / 8;
-    return { value, angle: needleAngle(value, range), label: i % 2 ? '' : String(Number(value.toFixed(4))) };
+  const span = range[1] - range[0];
+  let intervals = 4;
+  while (intervals > 1 && !Number.isInteger(span / intervals)) intervals--;
+  return Array.from({ length: intervals * 2 + 1 }, (_, i) => {
+    const value = range[0] + span * i / (intervals * 2);
+    return { value, angle: needleAngle(value, range), label: i % 2 ? '' : String(value) };
   });
 }
 
@@ -32,24 +56,20 @@ export function createMeters(THREE, scene, theme, { makeCanvas = () => document.
   scene.add(group);
   const dummy = new THREE.Object3D();
   const unitBox = track(new THREE.BoxGeometry(1, 1, 1));
-  const circle = track(new THREE.CircleGeometry(1, 48));
+  const circle = track(new THREE.CircleGeometry(1, 24));
   const plane = track(new THREE.PlaneGeometry(1, 1));
-  const ring = track(new THREE.RingGeometry(0.85, 1, 48));
-  const inlay = track(new THREE.RingGeometry(0.92, 0.95, 48));
+  const ring = track(new THREE.RingGeometry(0.85, 1, 24));
+  const inlay = track(new THREE.RingGeometry(0.92, 0.95, 24));
   const dash = track(new THREE.RingGeometry(0.87, 0.99, 3, 1, 0, TAU / 24));
-  const wall = track(new THREE.CylinderGeometry(1, 1, 1, 48, 1, true).rotateX(Math.PI / 2));
+  const wall = track(new THREE.CylinderGeometry(1, 1, 1, 24, 1, true).rotateX(Math.PI / 2));
   const blade = track(new THREE.BoxGeometry(0.76, 0.045, 0.025).translate(0.28, 0, 0));
   const standard = (role, token) => track(createMaterial(THREE, theme, role, token));
-  const flat = token => {
-    const mat = track(new THREE.MeshBasicMaterial({ color: theme[token], toneMapped: false }));
-    mat.userData.paletteToken = token;
-    return mat;
-  };
+  const flat = token => standard('paintedSteel', token);
   const materials = {
     black: standard('rubber', 'rubber'), metal: standard('brushedMetal', 'metal'),
     ink: flat('ink'), held: flat('lampLegend'), warning: flat('warning'),
     glass: track(new THREE.MeshPhysicalMaterial({
-      color: theme.lightKey, roughness: 0.16, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.22,
+      color: theme.lightKey, roughness: 0.85, metalness: 0, clearcoat: 0,
       transparent: true, opacity: 0.045, depthWrite: false,
     })),
   };
@@ -60,7 +80,7 @@ export function createMeters(THREE, scene, theme, { makeCanvas = () => document.
     canvas.width = 2048; canvas.height = 1536;
     const texture = track(new THREE.CanvasTexture(canvas));
     texture.colorSpace = THREE.SRGBColorSpace; texture.anisotropy = anisotropy;
-    const material = track(new THREE.MeshBasicMaterial({ map: texture, toneMapped: false }));
+    const material = track(createMaterial(THREE, theme, 'paintedSteel', 'lightKey', { map: texture }));
     return { canvas, texture, material, positions: [], normals: [], uvs: [] };
   }
   const scales = atlas(), readouts = atlas();
@@ -171,11 +191,12 @@ export function createMeters(THREE, scene, theme, { makeCanvas = () => document.
   let palette = theme;
 
   function lettering(ctx, value, rect, box, foreground, background) {
-    ctx.save(); ctx.translate(rect.x, rect.y); ctx.scale(rect.w / box.w, rect.h / box.h);
-    ctx.fillStyle = background; ctx.fillRect(0, 0, box.w, box.h);
-    ctx.fillStyle = foreground; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.font = `600 ${box.font}px ${FONT}`;
-    ctx.fillText(value, box.w / 2, box.h / 2, box.w - 8);
+    ctx.save();
+    ctx.translate(rect.x, rect.y);
+    ctx.scale(rect.w / box.w, rect.h / box.h);
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, box.w, box.h);
+    paintLetters(ctx, value, { ...box, x: 0, y: 0 }, foreground);
     ctx.restore();
   }
   function paintScale(entry, pair) {
@@ -196,28 +217,34 @@ export function createMeters(THREE, scene, theme, { makeCanvas = () => document.
     }
     ctx.font = `600 26px ${FONT}`;
     ctx.fillText(pair.unit === 'C' ? '°C' : pair.unit, x + 128, y + 178);
-    for (const [i, label] of [pair.label, 'HMI', 'PLANT'].entries()) {
+    for (const [i, label] of [pair.label.replace('Steam generator', 'Steam gen.'), 'HMI', 'PLANT'].entries()) {
       const box = entry.labels[i];
-      lettering(ctx, label, box, entry.labelBoxes[i], palette.ink, palette.raised);
+      lettering(ctx, label, box, entry.labelBoxes[i], palette.ink, palette.steel);
       ctx.strokeStyle = palette.strongLine; ctx.lineWidth = 2;
       ctx.strokeRect(box.x + 2, box.y + 2, box.w - 4, box.h - 4);
     }
     scales.texture.needsUpdate = true;
   }
   function paintReadout(entry, pair) {
+    const marked = pair.reported !== null && pair.marked;
+    let gap = '';
+    if (pair.reported === null) {
+      gap = 'No reading';
+    } else if (marked) {
+      gap = `▲ Gap ${formatGap(pair.gap, pair.unit)}`;
+    }
     const values = [
       formatValue(pair.reported, pair.unit), formatValue(pair.trueValue, pair.unit),
-      pair.reported === null ? 'No instrument' : pair.marked ? `▲ Gap ${formatGap(pair.gap, pair.unit)}`
-        : pair.diverged ? `Lagging ${formatGap(pair.gap, pair.unit)}` : '',
+      gap,
       pair.frozen ? heldTag(pair.sampledAtMs) : '',
     ];
-    const signature = JSON.stringify([values, pair.marked]);
+    const signature = JSON.stringify([values, marked]);
     if (entry.readoutSignature === signature) return;
     entry.readoutSignature = signature;
     const ctx = readouts.canvas.getContext('2d');
     values.forEach((value, i) => lettering(ctx, value, entry.readings[i], entry.readoutBoxes[i],
-      i === 2 && pair.marked ? palette.surface : palette.ink,
-      i === 2 && pair.marked ? palette.warning : palette.raised));
+      i === 2 && marked ? palette.surface : palette.ink,
+      i === 2 && marked ? palette.warning : palette.steel));
     readouts.texture.needsUpdate = true;
   }
   return {

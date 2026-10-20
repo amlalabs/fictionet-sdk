@@ -33,7 +33,7 @@
 .cr-view {
   position: relative;
   width: 100%;
-  height: max(84dvh, 420px);
+  height: auto;
   min-width: 0;
 }
 
@@ -45,10 +45,7 @@
 }
 
 .cr-scene-status {
-  position: absolute;
-  bottom: 10px;
-  left: 10px;
-  right: 10px;
+  position: static;
   width: fit-content;
   max-width: calc(100% - 20px);
   margin: 0;
@@ -100,26 +97,25 @@
 
 /* Viewport. */
 .cr-vantages {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  right: 10px;
-  pointer-events: none;
+  margin-top: 6px;
+  padding: 4px;
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-wrap: nowrap;
+  gap: 4px;
 }
 
 .cr-vantage {
+  flex: 0 0 auto;
+  white-space: nowrap;
   pointer-events: auto;
-  min-height: 32px;
-  padding: 4px 8px;
+  min-height: 24px;
+  padding: 2px 6px;
   border: 1px solid var(--line-strong);
   border-radius: 999px;
   background: var(--surface-raised);
   color: var(--ink);
   font: inherit;
-  font-size: 0.8125rem;
+  font-size: 0.75rem;
   cursor: pointer;
 }
 
@@ -132,9 +128,9 @@
 .cr-stage {
   position: relative;
   width: 100%;
-  height: 100%;
+  aspect-ratio: 16 / 10;
   overflow: hidden;
-  border: 1px solid var(--line);
+  border: 0;
   border-radius: 0;
   background: var(--surface-sunken);
 }
@@ -353,6 +349,16 @@
 
   .cr-knob-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cr-root *,
+  .cr-root *::before,
+  .cr-root *::after {
+    animation: none;
+    transition: none;
+    scroll-behavior: auto;
   }
 }
 

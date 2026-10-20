@@ -76,10 +76,12 @@ export function paletteReady(values) {
 const LOAD_FAILURE = 'Run `cargo xtask demo libraries`, then rebuild.';
 
 /** Knobs in the order they appear on the page and the console. */
-const KNOBS = Object.freeze([
+export const KNOBS = Object.freeze([
   // Plant controls. These post the plant's Command.
   {
     id: 'rod-demand',
+    board: 'rps',
+    point: 'rod_position',
     group: 'plant',
     kind: 'dial',
     label: 'Rod demand',
@@ -95,6 +97,8 @@ const KNOBS = Object.freeze([
   },
   {
     id: 'turbine-valve',
+    board: 'turbine',
+    point: 'turbine_valve',
     group: 'plant',
     kind: 'rotary',
     label: 'Turbine valve',
@@ -105,14 +109,23 @@ const KNOBS = Object.freeze([
     readout: (value) => `Valve ${formatValue(value.truth.secondary.turbine_valve_percent, '%')}`,
     describe: (permille) => `${formatValue(permille / 10, '%')} demanded`,
   },
-  pumpSwitch('coolant-pump-a', 'Coolant pump A', 'a'),
-  pumpSwitch('coolant-pump-b', 'Coolant pump B', 'b'),
-  controllerSwitch('feed-level-a', 'Feed level A control', { feed_level: 'a' }, (v) => v.truth.controllers.feed_level[0]),
-  controllerSwitch('feed-level-b', 'Feed level B control', { feed_level: 'b' }, (v) => v.truth.controllers.feed_level[1]),
-  controllerSwitch('pressurizer-control', 'Pressurizer pressure control', 'pressurizer_pressure', (v) => v.truth.controllers.pressurizer_pressure),
-  controllerSwitch('steam-dump-control', 'Steam dump control', 'steam_dump', (v) => v.truth.controllers.steam_dump),
+  { ...pumpSwitch('coolant-pump-a', 'Coolant pump A', 'a'),
+    board: 'rcs', point: 'coolant_flow:a' },
+  { ...pumpSwitch('coolant-pump-b', 'Coolant pump B', 'b'),
+    board: 'rcs', point: 'coolant_flow:b' },
+  { ...controllerSwitch('feed-level-a', 'Feed level A control', { feed_level: 'a' }, (v) => v.truth.controllers.feed_level[0]),
+    board: 'feed', point: 'feed_flow:a' },
+  { ...controllerSwitch('feed-level-b', 'Feed level B control', { feed_level: 'b' }, (v) => v.truth.controllers.feed_level[1]),
+    board: 'feed', point: 'feed_flow:b' },
+  { ...controllerSwitch('pressurizer-control', 'Pressurizer pressure control', 'pressurizer_pressure',
+    (v) => v.truth.controllers.pressurizer_pressure),
+    board: 'rcs', point: 'pressurizer_pressure' },
+  { ...controllerSwitch('steam-dump-control', 'Steam dump control', 'steam_dump', (v) => v.truth.controllers.steam_dump),
+    board: 'turbine', point: 'steam_pressure' },
   {
     id: 'heaters',
+    board: 'rcs',
+    point: 'pressurizer_pressure',
     group: 'plant',
     kind: 'switch',
     label: 'Pressurizer heaters',
@@ -124,6 +137,8 @@ const KNOBS = Object.freeze([
   },
   {
     id: 'manual-trip',
+    board: 'rps',
+    point: 'neutron_power',
     group: 'plant',
     kind: 'button',
     label: 'Manual trip',
@@ -132,6 +147,8 @@ const KNOBS = Object.freeze([
   },
   {
     id: 'reset-trip',
+    board: 'rps',
+    point: 'neutron_power',
     group: 'plant',
     kind: 'button',
     label: 'Reset trip',
@@ -140,6 +157,8 @@ const KNOBS = Object.freeze([
   },
   {
     id: 'acknowledge',
+    board: 'loops',
+    point: null,
     group: 'plant',
     kind: 'button',
     label: 'Acknowledge alarms',
@@ -291,9 +310,20 @@ export function mount(root, services, options = {}) {
   const processList = h('ul', { class: 'cr-instructor-active' }, h('li', { text: 'Waiting for the plant.' }));
   const overlayStatus = h('p', { class: 'cr-scene-status', role: 'status', 'aria-live': 'off', text: 'Waiting for the first plant snapshot.' });
   const vantageButtons = [
-    ...Object.entries(STANDING_SPOTS).map(([name, spot]) => [name, spot.name]),
-    ['reactor', 'Reactor building'], ['turbine', 'Turbine hall'],
-  ].map(([name, label]) => h('button', { type: 'button', class: 'cr-vantage', 'data-view': name, 'aria-pressed': name === viewName ? 'true' : 'false', text: label }));
+    ['control-room', 'Room', STANDING_SPOTS['control-room'].name],
+    ['rps-board', 'RPS', STANDING_SPOTS['rps-board'].name],
+    ['rcs-board', 'RCS', STANDING_SPOTS['rcs-board'].name],
+    ['loops-board', 'Loops', STANDING_SPOTS['loops-board'].name],
+    ['feed-board', 'SG / feed', STANDING_SPOTS['feed-board'].name],
+    ['turbine-board', 'Turbine', STANDING_SPOTS['turbine-board'].name],
+    ['cctv', 'CCTV', STANDING_SPOTS.cctv.name],
+    ['door', 'Door', STANDING_SPOTS.door.name],
+    ['reactor', 'Containment', 'Reactor building'],
+    ['turbine', 'Turbine hall', 'Turbine hall'],
+  ].map(([name, label, accessible]) => h('button', {
+    type: 'button', class: 'cr-vantage', 'data-view': name, 'aria-label': accessible,
+    'aria-pressed': name === viewName ? 'true' : 'false', text: label,
+  }));
   const controlStage = h('div', { class: 'cr-stage' });
   const viewport = h('section', { class: 'cr-view', 'aria-label': 'Views of the plant' }, controlStage,
     h('div', { class: 'cr-vantages', role: 'group', 'aria-label': 'Vantage point' }, ...vantageButtons), overlayStatus);

@@ -1,3 +1,5 @@
+import { ROOM, BOARD, BOARDS, DESKS, CEILING_LIGHTS } from './board-layout.mjs';
+
 // Three is supplied by the stage so the material specs can also run in Node.
 export const MATERIAL_ROLES = Object.freeze({
   paintedSteel: Object.freeze({ roughness: 0.72, metalness: 0.18 }),
@@ -79,11 +81,11 @@ export function createEnvironment(THREE, renderer, palette) {
 }
 
 export function createLighting(THREE, scene, palette, plant = false) {
-  const fill = new THREE.HemisphereLight(palette.lightKey, palette.lightGround, plant ? 0.35 : 0.65);
-  const key = new THREE.DirectionalLight(palette[plant ? 'plantKey' : 'lightKey'], plant ? 1.25 : 2.6);
+  const fill = new THREE.HemisphereLight(palette.lightKey, palette.lightGround, plant ? 0.35 : 1.1);
+  const key = new THREE.DirectionalLight(palette[plant ? 'plantKey' : 'lightKey'], plant ? 1.25 : 1.5);
   key.position.set(...(plant ? [-6, 14, 18] : [-3, 3.4, 3]));
   key.target.position.set(...(plant ? [0, 0, 0] : [0, 0, -1.5]));
-  key.castShadow = true;
+  key.castShadow = plant;
   key.shadow.mapSize.set(1024, 1024);
   const extent = plant ? 19 : 8;
   Object.assign(key.shadow.camera, {
@@ -105,4 +107,49 @@ export function createLighting(THREE, scene, palette, plant = false) {
       scene.remove(key, fill, key.target);
     },
   };
+}
+
+// Scalar irradiance modulates the palette; it introduces no new surface colors.
+export function roomLightAt(point, normal) {
+  let pool = 0;
+  for (const x of CEILING_LIGHTS.xs) for (const z of CEILING_LIGHTS.zs) {
+    const distance = (point.x - x) ** 2 + (point.z - z) ** 2;
+    pool = Math.max(pool, Math.exp(-distance / 2.2));
+  }
+  let light = 0.62 + 0.38 * pool;
+  const wallGap = Math.min(ROOM.width / 2 - Math.abs(point.x), ROOM.depth / 2 - Math.abs(point.z));
+  light *= 0.76 + 0.24 * Math.min(1, Math.max(0, wallGap) / 0.65);
+  if (normal.y < -0.5) light *= 0.65;
+  for (const desk of DESKS) {
+    const beneath = Math.abs(point.x - desk.x) < desk.w / 2 && Math.abs(point.z - desk.z) < desk.d / 2;
+    if (beneath && point.y < 0.76) light *= 0.62;
+  }
+  for (const board of BOARDS) {
+    const dx = point.x - board.x;
+    const dz = point.z - board.z;
+    const across = Math.cos(board.yaw) * dx - Math.sin(board.yaw) * dz;
+    const front = Math.sin(board.yaw) * dx + Math.cos(board.yaw) * dz;
+    if (Math.abs(across) > BOARD.width / 2 || front < -0.25 || front > BOARD.deskDepth + 0.25) continue;
+    if (point.y < BOARD.deskY - 0.08) light *= 0.64;
+    if (point.y < 0.12) light *= 0.8;
+  }
+  return Math.max(0.2, light);
+}
+
+export function bakeRoomGeometry(THREE, mesh) {
+  const positions = mesh.geometry.attributes.position;
+  const normals = mesh.geometry.attributes.normal;
+  const colors = new Float32Array(positions.count * 3);
+  const point = new THREE.Vector3();
+  const normal = new THREE.Vector3();
+  mesh.updateWorldMatrix(true, false);
+  const normalMatrix = new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld);
+  for (let i = 0; i < positions.count; i++) {
+    point.fromBufferAttribute(positions, i).applyMatrix4(mesh.matrixWorld);
+    normal.fromBufferAttribute(normals, i).applyMatrix3(normalMatrix).normalize();
+    const light = roomLightAt(point, normal);
+    colors.set([light, light, light], i * 3);
+  }
+  mesh.geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  mesh.material.vertexColors = true;
 }

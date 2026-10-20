@@ -1,12 +1,14 @@
 // One stage owns the renderer, the room camera, and the live containment feed.
 import * as THREE from '/vendor/three/build/three.module.js';
+import { KNOBS } from './control-room.mjs';
 import { formatValue } from './instruments.mjs';
-import { createMeters } from './meters.mjs';
+import { createMeters, paintLetters } from './meters.mjs';
 import { ROOM, FLOOR, CEILING_LIGHTS, DEFAULT_VIEW, BOARD, BOARDS, BOARD_PX, DESKS, CHAIRS, CCTV, DOOR, COLLISIONS, STANDING_SPOTS,
-  boardPoint, boardLayout, windowState } from './board-layout.mjs';
+  boardPoint, boardLayout, windowState, devicePlacements, fitSpot, deskOutline, mimicLines } from './board-layout.mjs';
 import { look, walk, walkDelta, walkPath, glidePose } from './room-motion.mjs';
 import { createPlantScene, mergeStatic } from './plant-scene.mjs';
-import { createRenderer, createEnvironment, createLighting, createMaterial, applyMaterialPalette, setIndicator } from './look.mjs';
+import { createRenderer, createEnvironment, createLighting, createMaterial, applyMaterialPalette,
+  setIndicator, bakeRoomGeometry, roomLightAt } from './look.mjs';
 
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif";
 
@@ -29,7 +31,7 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   const scene = new THREE.Scene();
   const environment = track(createEnvironment(THREE, renderer, theme));
   scene.environment = environment.texture;
-  const camera = new THREE.PerspectiveCamera(ROOM.fov, 1, 0.05, 100);
+  const camera = new THREE.PerspectiveCamera(STANDING_SPOTS[DEFAULT_VIEW].fov, 1, 0.05, 100);
   camera.rotation.order = 'YXZ';
   const lighting = createLighting(THREE, scene, theme);
   const material = Object.fromEntries([
@@ -45,9 +47,13 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   const unitBox = track(new THREE.BoxGeometry(1, 1, 1));
   const dummy = new THREE.Object3D();
   function block(parent, size, position, mat, rotation = 0) {
-    const mesh = new THREE.Mesh(unitBox, mat);
+    let geometry = unitBox;
+    if (Math.max(...size) > 2 && size.filter(length => length > 0.5).length >= 2) {
+      geometry = track(new THREE.BoxGeometry(1, 1, 1, ...size.map(length => Math.max(1, Math.ceil(length / 0.6)))));
+    }
+    const mesh = new THREE.Mesh(geometry, mat);
     mesh.castShadow = mat === material.metal || mat === material.steel || mat === material.ink;
-    mesh.receiveShadow = mat !== material.light;
+    mesh.receiveShadow = false;
     mesh.scale.set(...size); mesh.position.set(...position); mesh.rotation.y = rotation;
     parent.add(mesh); return mesh;
   }
@@ -57,6 +63,10 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     poses.forEach((p, i) => {
       dummy.position.set(...p.position); dummy.rotation.set(...(p.rotation ?? [0, 0, 0]));
       dummy.scale.set(...(p.scale ?? [1, 1, 1])); dummy.updateMatrix(); mesh.setMatrixAt(i, dummy.matrix);
+      if (mat === material.floor) {
+        const [x, y, z] = p.position;
+        mesh.setColorAt(i, new THREE.Color().setScalar(roomLightAt({ x, y, z }, { x: 0, y: 1, z: 0 })));
+      }
     });
     mesh.instanceMatrix.needsUpdate = true;
     scene.add(mesh); return mesh;
@@ -64,11 +74,11 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   const halfW = ROOM.width / 2, halfD = ROOM.depth / 2;
   block(staticRoom, [ROOM.width, 0.16, ROOM.depth], [0, -FLOOR.thickness - 0.08, 0], material.ceiling);
   block(staticRoom, [ROOM.width, 0.16, ROOM.depth], [0, ROOM.height + 0.08, 0], material.ceiling);
-  for (const x of [-halfW, halfW]) block(staticRoom, [0.24, ROOM.height, ROOM.depth], [x, ROOM.height / 2, 0], material.wall);
-  block(staticRoom, [ROOM.width, ROOM.height, 0.24], [0, ROOM.height / 2, -halfD], material.wall);
+  for (const x of [-halfW, halfW]) block(staticRoom, [0.24, ROOM.height + FLOOR.thickness, ROOM.depth], [x, (ROOM.height - FLOOR.thickness) / 2, 0], material.wall);
+  block(staticRoom, [ROOM.width, ROOM.height + FLOOR.thickness, 0.24], [0, (ROOM.height - FLOOR.thickness) / 2, -halfD], material.wall);
   const doorLeft = DOOR.x - DOOR.width / 2, doorRight = DOOR.x + DOOR.width / 2;
-  block(staticRoom, [doorLeft + halfW, ROOM.height, 0.24], [(doorLeft - halfW) / 2, ROOM.height / 2, halfD], material.wall);
-  block(staticRoom, [halfW - doorRight, ROOM.height, 0.24], [(halfW + doorRight) / 2, ROOM.height / 2, halfD], material.wall);
+  block(staticRoom, [doorLeft + halfW, ROOM.height + FLOOR.thickness, 0.24], [(doorLeft - halfW) / 2, (ROOM.height - FLOOR.thickness) / 2, halfD], material.wall);
+  block(staticRoom, [halfW - doorRight, ROOM.height + FLOOR.thickness, 0.24], [(halfW + doorRight) / 2, (ROOM.height - FLOOR.thickness) / 2, halfD], material.wall);
   block(staticRoom, [DOOR.width, ROOM.height - DOOR.height, 0.24], [DOOR.x, (ROOM.height + DOOR.height) / 2, halfD], material.wall);
   block(staticRoom, [DOOR.width, DOOR.height, 0.08], [DOOR.x, DOOR.height / 2, DOOR.z], material.metal);
   block(staticRoom, [0.08, 0.08, 0.14], [DOOR.x - 0.45, 1.05, DOOR.z - 0.1], material.ink);
@@ -77,6 +87,12 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     for (let z = -halfD + FLOOR.tile / 2; z < halfD; z += FLOOR.tile)
       tiles.push({ position: [x, -FLOOR.thickness / 2, z], scale: [FLOOR.tile - FLOOR.seam, FLOOR.thickness, FLOOR.tile - FLOOR.seam] });
   instance(unitBox, material.floor, tiles);
+  for (let x = -halfW; x <= halfW; x += FLOOR.tile) {
+    block(staticRoom, [0.018, 0.02, ROOM.depth], [x, ROOM.height - 0.02, 0], material.metal);
+  }
+  for (let z = -halfD; z <= halfD; z += FLOOR.tile) {
+    block(staticRoom, [ROOM.width, 0.02, 0.018], [0, ROOM.height - 0.02, z], material.metal);
+  }
   const lights = [], recesses = [];
   for (const x of CEILING_LIGHTS.xs) for (const z of CEILING_LIGHTS.zs) {
     lights.push({ position: [x, ROOM.height - 0.04, z], rotation: [Math.PI / 2, 0, 0], scale: [CEILING_LIGHTS.width, CEILING_LIGHTS.depth, 1] });
@@ -89,31 +105,55 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     const surface = document.createElement('canvas'); surface.width = pxW; surface.height = pxH;
     const texture = track(new THREE.CanvasTexture(surface)); texture.colorSpace = THREE.SRGBColorSpace;
     texture.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
-    const mat = track(new THREE.MeshBasicMaterial({ map: texture, toneMapped: false }));
-    const mesh = new THREE.Mesh(track(new THREE.PlaneGeometry(width, height)), mat);
+    const mat = track(createMaterial(THREE, theme, 'paintedSteel', 'lightKey', { map: texture }));
+    const mesh = new THREE.Mesh(track(new THREE.PlaneGeometry(width, height, Math.ceil(width / 0.35), Math.ceil(height / 0.35))), mat);
     mesh.position.set(...position); mesh.rotation.y = rotation; parent.add(mesh);
     return { canvas: surface, texture, mesh, signature: '' };
   }
+  const alarmMaterials = [false, true].map(lit => {
+    const mat = track(createMaterial(THREE, theme, 'lamp', 'lampOff'));
+    setIndicator(mat, theme, { lit });
+    return mat;
+  });
+  const alarmBatches = alarmMaterials.map(mat => {
+    const mesh = instance(unitBox, mat, Array.from({ length: 22 }, () => ({ position: [0, 0, 0] })));
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    mesh.receiveShadow = false;
+    return mesh;
+  });
   const boards = BOARDS.map(config => {
     const group = new THREE.Group(); group.position.set(config.x, 0, config.z); group.rotation.y = config.yaw;
     staticRoom.add(group);
-    block(group, [BOARD.width + 0.1, BOARD.top, 0.18], [0, BOARD.top / 2, -0.11], material.metal);
-    const desk = block(group, [BOARD.width, 0.12, BOARD.deskDepth], [0, BOARD.deskY, BOARD.deskDepth / 2], material.steel);
-    desk.rotation.x = BOARD.slope;
-    for (const x of [-1.8, 1.8]) block(group, [0.12, 0.85, 0.65], [x, 0.425, 0.4], material.metal);
+    block(group, [BOARD.width, BOARD.top, 0.18], [0, BOARD.top / 2, -0.11], material.metal);
+    const outline = deskOutline(config);
+    const deskGeometry = track(new THREE.BoxGeometry(1, 1, 1, 5, 1, 2));
+    const positions = deskGeometry.attributes.position;
+    for (let i = 0; i < positions.count; i++) {
+      const t = positions.getZ(i) + 0.5;
+      const left = outline[0].x * (1 - t) + outline[3].x * t;
+      const right = outline[1].x * (1 - t) + outline[2].x * t;
+      const z = t * BOARD.deskDepth;
+      positions.setXYZ(i, left + (positions.getX(i) + 0.5) * (right - left),
+        BOARD.deskY + positions.getY(i) * 0.12 - Math.sin(BOARD.slope) * z, z);
+    }
+    deskGeometry.computeVertexNormals();
+    group.add(new THREE.Mesh(deskGeometry, material.steel));
+    for (const x of [-1.1, 1.1]) block(group, [0.12, 0.85, 0.65], [x, 0.425, 0.4], material.metal);
     block(group, [BOARD.width, BOARD.top - BOARD.bottom, 0.03], [0, (BOARD.top + BOARD.bottom) / 2, -0.015], material.steel);
     const face = paintedFace(BOARD.width, BOARD.top - BOARD.bottom, group, [0, (BOARD.top + BOARD.bottom) / 2, 0.031], 0, BOARD_PX.width, BOARD_PX.height);
     Object.assign(face.mesh.material, { transparent: true, depthWrite: false });
     face.mesh.renderOrder = 1;
     const layout = boardLayout(config.points.length, config.view);
+    group.updateMatrixWorld(true);
     const windows = layout.windows.map(w => {
-      const mat = track(createMaterial(THREE, theme, 'lamp', 'lampOff'));
-      const mesh = block(group, [w.w / BOARD_PX.width * BOARD.width, w.h / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.022],
-        [(w.x + w.w / 2) / BOARD_PX.width * BOARD.width - BOARD.width / 2,
-          BOARD.top - (w.y + w.h / 2) / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.014], mat);
-      mesh.userData.animated = true;
-      mesh.receiveShadow = false;
-      return mesh;
+      const p = boardPoint(config, (w.x + w.w / 2) / BOARD_PX.width * BOARD.width - BOARD.width / 2,
+        BOARD.top - (w.y + w.h / 2) / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.014);
+      dummy.position.set(p.x, p.y, p.z);
+      dummy.rotation.set(0, config.yaw, 0);
+      dummy.scale.set(w.w / BOARD_PX.width * BOARD.width, w.h / BOARD_PX.height * (BOARD.top - BOARD.bottom), 0.022);
+      dummy.updateMatrix();
+      return dummy.matrix.clone();
     });
     return { ...face, config, windows };
   });
@@ -127,7 +167,11 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     if (!desk.supervisor) for (const offset of [-0.51, 0.51]) {
       block(staticRoom, [0.91, 0.59, 0.1], [desk.x + offset, 1.18, desk.z - 0.13], material.ink);
       block(staticRoom, [0.08, 0.3, 0.12], [desk.x + offset, 0.9, desk.z - 0.17], material.metal);
-      screens.push({ ...paintedFace(0.85, 0.52, staticRoom, [desk.x + offset, 1.18, desk.z - 0.073]), lastPaint: -Infinity });
+      const screen = paintedFace(0.85, 0.52, staticRoom, [desk.x + offset, 1.18, desk.z - 0.073]);
+      screen.mesh.material.emissive.set(theme.lightKey);
+      screen.mesh.material.emissiveMap = screen.texture;
+      screen.mesh.material.emissiveIntensity = 0.8;
+      screens.push({ ...screen, lastPaint: -Infinity });
     }
   }
   for (const [size, y, dz, mat] of [
@@ -138,41 +182,50 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   const signs = [
     { text: 'TO PLANT SPACES', face: paintedFace(1.5, 0.22, staticRoom, [DOOR.x, 2.6, DOOR.z - 0.02], Math.PI, 768, 112) },
     { text: 'CONTAINMENT CAMERA', face: paintedFace(1.7, 0.22, staticRoom, [CCTV.x + 0.02, CCTV.y + 0.66, CCTV.z], Math.PI / 2, 768, 112) },
-    { text: 'SHIFT SUPERVISOR', face: paintedFace(1.6, 0.18, staticRoom, [0, 0.62, 5.06], 0, 768, 112) },
+    { text: 'SHIFT SUPERVISOR', face: paintedFace(1.6, 0.18, staticRoom, [0, 0.62, 6.26], 0, 768, 112) },
   ];
   const plant = createPlantScene({ theme, reducedMotion, environment: environment.texture });
   const cctvTarget = track(new THREE.WebGLRenderTarget(480, 270, { type: THREE.HalfFloatType }));
   track(cctvTarget.texture);
   cctvTarget.texture.colorSpace = THREE.LinearSRGBColorSpace;
-  const cctvMat = track(new THREE.MeshBasicMaterial({ map: cctvTarget.texture }));
+  const cctvMat = track(createMaterial(THREE, theme, 'paintedSteel', 'lightKey', {
+    map: cctvTarget.texture, emissiveMap: cctvTarget.texture, emissive: theme.lightKey, emissiveIntensity: 0.8,
+  }));
   block(staticRoom, [0.12, CCTV.height + 0.16, CCTV.width + 0.16], [CCTV.x - 0.01, CCTV.y, CCTV.z], material.ink);
   const cctvScreen = new THREE.Mesh(track(new THREE.PlaneGeometry(CCTV.width, CCTV.height)), cctvMat);
   cctvScreen.rotation.y = Math.PI / 2; cctvScreen.position.set(CCTV.x + 0.06, CCTV.y, CCTV.z); staticRoom.add(cctvScreen);
   mergeStatic(staticRoom, { add: track });
+  staticRoom.traverse(mesh => {
+    if (mesh.isMesh && !mesh.material.emissiveMap) bakeRoomGeometry(THREE, mesh);
+  });
 
   // Device coordinates follow the sloped desk, with their fronts toward the operator.
+  const placements = devicePlacements(KNOBS);
+  const hitMaterial = track(createMaterial(THREE, theme, 'rubber', 'rubber', { visible: false }));
   const devices = knobIds.map((id, i) => {
-    const b = BOARDS[Math.floor(i * 3 / knobIds.length)];
-    const first = Math.ceil(BOARDS.indexOf(b) * knobIds.length / 3);
-    const count = Math.ceil((BOARDS.indexOf(b) + 1) * knobIds.length / 3) - first;
-    const x = ((i - first + 0.5) / count - 0.5) * (BOARD.width - 0.4);
-    const p = boardPoint(b, x, BOARD.deskY, BOARD.deskDepth / 2);
+    const placement = placements.find(p => p.id === id);
+    const p = placement.position;
     const frame = new THREE.Group();
-    frame.position.set(p.x, p.y, p.z); frame.rotation.set(BOARD.slope, b.yaw, 0, 'YXZ');
+    frame.position.set(p.x, p.y, p.z);
+    frame.rotation.set(BOARD.slope, placement.yaw, 0, 'YXZ');
+    frame.scale.setScalar(0.25);
     frame.translateY(0.065); frame.updateMatrix(); scene.add(frame);
     const kind = knobKinds[i];
-    const label = paintedFace(0.8, 0.2, frame, [0, 0.117, 0.311], 0, 768, 192);
+    const label = paintedFace(0.6, 0.16, frame, [0, 0.117, -0.311], 0, 768, 192);
     label.mesh.rotation.x = -0.22; label.mesh.userData.device = i;
+    const hit = block(frame, [0.66, 0.32, 0.66], [0, 0.1, 0], hitMaterial);
+    hit.userData.device = i;
+    hit.userData.hitVolume = true;
     const device = { id, kind, frame, label, index: i };
     if (kind === 'dial' || kind === 'rotary') {
-      const size = kind === 'dial' ? 0.49 : 0.42;
+      const size = 0.4;
       device.skirt = paintedFace(size, size, frame, [0, 0.025, -0.02], 0, 512, 512);
       device.skirt.mesh.rotation.x = -Math.PI / 2; device.skirt.mesh.userData.device = i;
     }
     return device;
   });
-  const cylinder = track(new THREE.CylinderGeometry(1, 1, 1, 32));
-  const statusMaterial = track(new THREE.MeshBasicMaterial({ color: theme.lightKey, toneMapped: false }));
+  const cylinder = track(new THREE.CylinderGeometry(1, 1, 1, 16));
+  const statusMaterial = track(createMaterial(THREE, theme, 'lamp', 'lightKey'));
   const batches = [];
   function batch(geometry, mat, entries) {
     const mesh = instance(geometry, mat, entries.map(() => ({ position: [0, 0, 0] })));
@@ -186,9 +239,13 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   const turning = d => d.kind === 'dial' || d.kind === 'rotary';
   const switches = d => d.kind === 'switch';
   const buttons = d => d.kind === 'button';
-  batch(unitBox, material.metal, entries(all, () => [{ position: [0, 0.115, 0.30], rotation: [-0.22, 0, 0], scale: [0.82, 0.22, 0.018] }]));
-  batch(cylinder, material.metal, entries(all, d => [{ position: [0, 0.013, -0.02], scale: [turning(d) ? 0.25 : 0.14, 0.025, turning(d) ? 0.25 : 0.14] }]));
-  batch(cylinder, material.ink, entries(turning, d => [{ position: [0, 0.08, -0.02], scale: [d.kind === 'dial' ? 0.13 : 0.095, 0.11, d.kind === 'dial' ? 0.13 : 0.095] }]));
+  batch(unitBox, material.metal, entries(all, () => [{ position: [0, 0.115, -0.32], rotation: [-0.22, 0, 0], scale: [0.62, 0.18, 0.018] }]));
+  batch(cylinder, material.metal, entries(all, d => [{
+    position: [0, 0.013, -0.02], scale: [turning(d) ? 0.21 : 0.14, 0.025, turning(d) ? 0.21 : 0.14],
+  }]));
+  batch(cylinder, material.ink, entries(turning, d => [{
+    position: [0, 0.08, -0.02], scale: [d.kind === 'dial' ? 0.14 : 0.12, 0.11, d.kind === 'dial' ? 0.14 : 0.12],
+  }]));
   batch(unitBox, material.steel, entries(turning, () => [{ part: 'pointer' }]));
   batch(cylinder, material.ink, entries(switches, () => [{ position: [0, 0.045, -0.02], scale: [0.08, 0.07, 0.08] }]));
   batch(unitBox, material.ink, entries(switches, () => [{ part: 'grip' }, { part: 'heel' }]));
@@ -200,7 +257,10 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   const tripMaterial = track(createMaterial(THREE, theme, 'rubber', 'hotCoolant'));
   batch(cylinder, material.metal, entries(d => d.id === 'manual-trip', () => [{ position: [0, 0.08, -0.02], scale: [0.045, 0.12, 0.045] }]));
   batch(cylinder, tripMaterial, entries(d => d.id === 'manual-trip', () => [{ part: 'mushroom' }]));
-  batch(cylinder, statusMaterial, entries(all, () => [{ part: 'pending', position: [0.35, 0.117, 0.326], rotation: [Math.PI / 2 - 0.22, 0, 0], scale: [0.017, 0.015, 0.017] }]));
+  batch(cylinder, statusMaterial, entries(all, () => [{
+    part: 'pending', position: [0.25, 0.117, -0.296],
+    rotation: [Math.PI / 2 - 0.22, 0, 0], scale: [0.017, 0.015, 0.017],
+  }]));
   const trip = devices.find(d => d.id === 'manual-trip');
   const cover = new THREE.Group();
   const glass = track(createMaterial(THREE, theme, 'glass', 'steam', { transparent: true, opacity: 0.26, depthWrite: false, side: THREE.DoubleSide }));
@@ -232,6 +292,9 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     palette = next;
     scene.background = new THREE.Color(palette.sunken);
     lighting.setTheme(palette);
+    alarmMaterials.forEach((mat, index) => setIndicator(mat, palette, { lit: index === 1 }));
+    cctvMat.emissive.set(palette.lightKey);
+    screens.forEach(screen => screen.mesh.material.emissive.set(palette.lightKey));
     Object.values(material).forEach(mat => applyMaterialPalette(mat, palette));
     material.light.emissive.set(palette.lightKey);
     setIndicator(material.lamp, palette, { lit: true });
@@ -255,6 +318,11 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     const width = Math.max(1, container.clientWidth), height = Math.max(1, container.clientHeight);
     renderer.setSize(width, height, false);
     for (const c of [camera, plant.camera]) { c.aspect = width / height; c.updateProjectionMatrix(); }
+    const segment = BOARDS.find(board => board.view === selected);
+    if (segment) {
+      pose = { ...STANDING_SPOTS[selected], ...fitSpot(segment, camera.aspect, STANDING_SPOTS[selected].fov) };
+      glide = null;
+    }
     requestFrame();
   }
   const resizeObserver = new ResizeObserver(resize); resizeObserver.observe(container);
@@ -289,7 +357,12 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     const previous = pose;
     if (!isPlant()) pose = walk(pose, delta.x, delta.z, COLLISIONS, ROOM.radius);
     const walking = pose.x !== previous.x || pose.z !== previous.z;
-    camera.position.set(pose.x, ROOM.eye, pose.z); camera.rotation.set(pose.pitch, pose.yaw, 0, 'YXZ');
+    camera.position.set(pose.x, ROOM.eye, pose.z);
+    camera.rotation.set(pose.pitch, pose.yaw, 0, 'YXZ');
+    if (camera.fov !== pose.fov) {
+      camera.fov = pose.fov;
+      camera.updateProjectionMatrix();
+    }
     const needlesMoving = !isPlant() && easeNeedles(dt);
     if (!isPlant()) { meters.update(view?.pairs ?? [], shown); paintBoards(now); paintScreens(now); }
     placeKnobs(now);
@@ -304,7 +377,7 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     }
     container.dataset.camera = glide || walking || dragging ? 'moving' : 'still';
     render(isPlant() ? plant.scene : scene, isPlant() ? plant.camera : camera);
-    // The budget includes the containment pass: under 150 calls and 300,000 triangles.
+    // Renderer counters include the containment pass as well as the room.
     frameTimes.push(performance.now() - frameStart); if (frameTimes.length > 30) frameTimes.shift();
     const mean = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
     if (pixelRatio > 1 && frameTimes.length === 30 && mean > 20) { pixelRatio = 1; renderer.setPixelRatio(pixelRatio); resize(); }
@@ -335,31 +408,58 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     return moving;
   }
   function paintBoards(now) {
+    for (const mesh of alarmBatches) mesh.count = 0;
     for (const board of boards) {
       const layout = boardLayout(board.config.points.length, board.config.view);
       const states = layout.windows.map(w => windowState(view?.alarms.find(a => a.key === w.key)?.state, now, reducedMotion()));
+      states.forEach((state, index) => {
+        const mesh = alarmBatches[Number(state.lit)];
+        mesh.setMatrixAt(mesh.count++, board.windows[index]);
+      });
       const signature = JSON.stringify([text?.plantTime, text?.telemetry, states]);
       if (signature === board.signature && !themeDirty) continue;
       board.signature = signature;
       const ctx = board.canvas.getContext('2d');
       ctx.clearRect(0, 0, BOARD_PX.width, BOARD_PX.height);
-      ctx.fillStyle = palette.surface; ctx.fillRect(0, 0, BOARD_PX.width, layout.header.h);
+      ctx.fillStyle = palette.steel;
+      ctx.fillRect(0, 0, BOARD_PX.width, layout.header.h);
       paintText(ctx, board.config.title, layout.text.title, palette.ink, 'left');
-      paintText(ctx, text ? `Plant time ${text.plantTime}` : 'Waiting for snapshot', layout.text.time, palette.text, 'right');
-      paintText(ctx, text?.telemetry ?? 'No telemetry received', layout.text.telemetry, palette.text, 'left');
+      paintText(ctx, text ? `Plant time ${text.plantTime}` : 'Waiting for snapshot', layout.text.time, palette.ink, 'left');
+      paintText(ctx, text?.telemetry ?? 'No telemetry received', layout.text.telemetry, palette.ink, 'left');
+      ctx.strokeStyle = palette.strongLine;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(0, 150, BOARD_PX.width, 80);
       layout.windows.forEach((w, i) => {
         const state = states[i];
-        setIndicator(board.windows[i].material, palette, state);
         ctx.strokeStyle = palette.ink; ctx.lineWidth = 2;
         ctx.strokeRect(w.x - 2, w.y - 2, w.w + 4, w.h + 4);
         ctx.strokeStyle = state.lit ? palette.lampInk : palette.lampLegend;
         ctx.strokeRect(w.x + 1, w.y + 1, w.w - 2, w.h - 2);
-        const lines = wrapLines(ctx, w.legend, w.w - 20, w.font);
-        lines.forEach((line, j) => paintText(ctx, line, { x: w.x + 10, y: w.y + j * 23, w: w.w - 20, h: 23, font: w.font }, state.lit ? palette.lampInk : palette.lampLegend));
+        const lines = wrapLines(ctx, w.engraved, w.w - 8, w.font);
+        const lineHeight = w.font * 1.3;
+        lines.forEach((line, j) => paintText(ctx, line, {
+          x: w.x + 4, y: w.y + (w.h - lines.length * lineHeight) / 2 + j * lineHeight,
+          w: w.w - 8, h: lineHeight, font: w.font,
+        }, state.lit ? palette.lampInk : palette.lampLegend));
         if (state.mark) { ctx.fillStyle = palette.lampInk; ctx.fillRect(w.x + w.w - 9, w.y + 3, 6, 6); }
       });
+      // Hot flow runs to the steam generators; cold flow returns to the pumps.
+      for (const line of mimicLines(board.config)) {
+        ctx.strokeStyle = palette[line.color];
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(line.start, line.y);
+        ctx.lineTo(line.end, line.y);
+        for (const x of [line.start + 20, line.end - 20]) {
+          ctx.moveTo(x - line.direction * 10, line.y - 6);
+          ctx.lineTo(x, line.y);
+          ctx.lineTo(x - line.direction * 10, line.y + 6);
+        }
+        ctx.stroke();
+      }
       board.texture.needsUpdate = true;
     }
+    for (const mesh of alarmBatches) mesh.instanceMatrix.needsUpdate = true;
     themeDirty = false;
   }
   function paintScreens(now) {
@@ -414,7 +514,7 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
           const offset = part === 'heel' ? -0.025 : 0.035;
           dummy.position.set(-Math.sin(angle) * offset, part === 'heel' ? 0.17 : 0.10, -0.02 + Math.cos(angle) * offset);
           dummy.rotation.y = -angle;
-          dummy.scale.set(...(part === 'heel' ? [0.065, 0.05, 0.17] : [0.05, 0.13, 0.08]));
+          dummy.scale.set(...(part === 'heel' ? [0.065, 0.05, 0.32] : [0.05, 0.13, 0.08]));
         } else if (part === 'lamp') {
           const lit = state && typeof state.green === 'boolean' && (entry.side === 1 ? state.green : !state.green);
           color = lit ? (entry.side === 1 ? palette.controlGreen : palette.accent) : palette.lampOff;
@@ -448,7 +548,7 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
       if (device.label.signature === signature) continue;
       device.label.signature = signature;
       const ctx = device.label.canvas.getContext('2d');
-      const bg = refused ? palette.warning : focused ? palette.ink : palette.surface;
+      const bg = refused ? palette.warning : focused ? palette.ink : palette.steel;
       const fg = refused || focused ? palette.surface : palette.ink;
       ctx.fillStyle = bg; ctx.fillRect(0, 0, 768, 192);
       ctx.strokeStyle = fg; ctx.lineWidth = focused ? 9 : 3; ctx.strokeRect(6, 6, 756, 180);
@@ -464,7 +564,12 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     pointer.set((event.clientX - rect.left) / rect.width * 2 - 1, 1 - (event.clientY - rect.top) / rect.height * 2);
     scene.updateMatrixWorld(true); camera.updateMatrixWorld(true);
     raycaster.setFromCamera(pointer, camera);
-    const hit = raycaster.intersectObjects(scene.children, true)[0];
+    const hits = raycaster.intersectObjects(scene.children, true);
+    const surface = hits.find(hit => !hit.object.userData.hitVolume);
+    let hit = surface;
+    const proxy = hits.find(hit => hit.object.userData.hitVolume);
+    const surfaceDevice = surface?.object.userData.device ?? surface?.object.userData.devices?.[surface?.instanceId];
+    if (surfaceDevice === undefined && proxy && (!surface || proxy.distance < surface.distance)) hit = proxy;
     if (!hit) return null;
     const index = hit.object.userData.device ?? hit.object.userData.devices?.[hit.instanceId];
     if (index === undefined) return null;
@@ -486,12 +591,7 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     canvas.style.cursor = '';
   }
   function paintText(ctx, value, box, color, align = 'center') {
-    ctx.textAlign = align;
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = color;
-    ctx.font = `600 ${box.font}px ${FONT}`;
-    const x = align === 'left' ? box.x : align === 'right' ? box.x + box.w : box.x + box.w / 2;
-    ctx.fillText(value, x, box.y + box.h / 2);
+    paintLetters(ctx, value, box, color, align);
   }
 
   function setView(name) {
@@ -501,9 +601,12 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     if (document.pointerLockElement === canvas) document.exitPointerLock();
     if (isPlant()) { glide = null; plant.setView(name); }
     else {
-      const end = STANDING_SPOTS[name], path = walkPath(pose, end, COLLISIONS, ROOM.radius);
+      const segment = BOARDS.find(board => board.view === name);
+      const spot = STANDING_SPOTS[name];
+      const end = segment ? { ...spot, ...fitSpot(segment, camera.aspect, spot.fov) } : spot;
+      const path = walkPath(pose, end, COLLISIONS, ROOM.radius);
       if (reducedMotion()) { pose = { ...end }; glide = null; }
-      else if (path && (Math.hypot(pose.x - end.x, pose.z - end.z) > 0.001 || Math.abs(pose.yaw - end.yaw) > 0.001 || Math.abs(pose.pitch - end.pitch) > 0.001))
+      else if (path && (Math.hypot(pose.x - end.x, pose.z - end.z) > 0.001 || Math.abs(pose.yaw - end.yaw) > 0.001 || Math.abs(pose.pitch - end.pitch) > 0.001 || Math.abs(pose.fov - end.fov) > 0.001))
         glide = { start: { ...pose }, end, path, at: performance.now() };
     }
     const label = STANDING_SPOTS[name]?.name ?? (name === 'reactor' ? 'Reactor building' : 'Turbine hall');

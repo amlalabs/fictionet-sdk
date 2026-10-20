@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PITCH_LIMIT, look, wrapYaw, glideEase, circleHits, walk, walkDelta, walkPath, glidePose } from './room-motion.mjs';
-import { ROOM, COLLISIONS, STANDING_SPOTS } from './board-layout.mjs';
+import { ROOM, COLLISIONS, STANDING_SPOTS, BOARDS, fitSpot } from './board-layout.mjs';
 
 test('look wraps yaw and limits pitch without moving the eye', () => {
   const p = look({ x: 2, z: 3, yaw: 0, pitch: 0 }, 10000, -10000);
@@ -48,11 +48,12 @@ test('every vantage route clears furniture and finishes at eight tenths of a sec
     }
     const p = glidePose(start, end, path, 0.8);
     assert.equal(p.x, end.x); assert.equal(p.z, end.z);
+    assert.equal(p.fov, end.fov);
     assert.ok(Math.abs(wrapYaw(p.yaw - end.yaw)) < 1e-10); assert.equal(p.pitch, end.pitch);
   }
 });
 test('glides rotate across the short yaw arc', () => {
-  const a = { x: 0, z: 0, yaw: Math.PI - 0.1, pitch: 0 };
+  const a = { x: 0, z: 0, yaw: Math.PI - 0.1, pitch: 0, fov: 76 };
   const b = { ...a, yaw: -Math.PI + 0.1 };
   const p = glidePose(a, b, [a, b], 0.4);
   assert.ok(Math.abs(Math.abs(p.yaw) - Math.PI) < 1e-10);
@@ -64,4 +65,30 @@ test('a walk beside a rounded corner can still start a clear glide', () => {
   const end = { ...start, x: -1, z: -1 };
   assert.equal(circleHits(start, 0.22, boxes[0]), false);
   assert.deepEqual(walkPath(start, end, boxes, 0.22), [start, end]);
+});
+
+test('resized section spots have clear routes from the control room at the measured canvas sizes', () => {
+  const start = STANDING_SPOTS['control-room'];
+  for (const [width, height] of [[785, 491], [692, 433]]) for (const board of BOARDS) {
+    const end = { ...STANDING_SPOTS[board.view], ...fitSpot(board, width / height, STANDING_SPOTS[board.view].fov) };
+    const path = walkPath(start, end, COLLISIONS, ROOM.radius);
+    assert.ok(path, board.id);
+    for (let i = 0; i <= 160; i++) {
+      const pose = glidePose(start, end, path, 0.8 * i / 160);
+      assert.ok(!COLLISIONS.some(box => circleHits(pose, ROOM.radius, box)), board.id);
+    }
+  }
+});
+
+test('glides ease the field of view with the pose and walking keeps it', () => {
+  const start = STANDING_SPOTS['control-room'];
+  const end = STANDING_SPOTS['loops-board'];
+  const path = walkPath(start, end, COLLISIONS, ROOM.radius);
+  for (const elapsed of [-0.1, 0, 0.2, 0.4, 0.6, 0.8, 1]) {
+    const pose = glidePose(start, end, path, elapsed);
+    const expected = start.fov + (end.fov - start.fov) * glideEase(elapsed / 0.8);
+    assert.ok(Math.abs(pose.fov - expected) < 1e-10);
+    assert.equal(walk(pose, 0.1, 0, COLLISIONS, ROOM.radius).fov, pose.fov);
+    assert.equal(look(pose, 20, 10).fov, pose.fov);
+  }
 });
