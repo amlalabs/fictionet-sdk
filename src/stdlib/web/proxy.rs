@@ -5,31 +5,32 @@ use fictionet::{Cx, Error};
 use http::{Request, Response};
 use std::sync::Arc;
 
-mod upstream;
-use upstream::Client as ProxyClient;
+/// A transport supplied by the host application. The core performs no host I/O.
+pub trait Upstream: Send + Sync + 'static {
+    /// Sends a request whose URI contains the selected origin.
+    fn request(self: Arc<Self>, request: Request<Body>) -> UpstreamFuture;
+}
+
+/// One upstream request and its streaming response.
+pub type UpstreamFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response<Body>, Error>> + Send>>;
 
 /// A handler that forwards each request to the real site, over the world's
 /// own network. Needs the `web-proxy` feature, which enables `std`.
-/// Host helper threads handle DNS, sockets and TLS, waking the world when
-/// data is ready. Works with [`fictionet::block_on`] or another executor.
-/// Upstream connections use HTTP/1.1 and are reused after complete bodies.
-/// Connecting, with the name lookup and the TLS handshake, has thirty
-/// seconds. After that a response may take as long as the site does. At
-/// most 64 requests are upstream at once, and later ones wait their turn.
+/// The supplied transport owns DNS, sockets, TLS and connection pooling.
+/// `fictionet_host::Client` supplies the host HTTP/1.1 transport.
 ///
-/// It needs no arguments: it forwards to the [`Target`] that [`Sites`](fictionet::stdlib::web::Sites) puts
-/// on every request. The scheme and port come from the connection the
-/// agent made; the host comes from the request's authority or `Host` header.
-/// The path and query come from the request. The world process makes a new,
-/// separate request there through its operating system's network, resolving
-/// the name with its own DNS, and returns the answer to the agent.
+/// The proxy forwards to the [`Target`] that [`Sites`](fictionet::stdlib::web::Sites)
+/// puts on each request. The scheme and port come from the agent's connection;
+/// the host comes from the authority or `Host` header. The path and query come
+/// from the request.
 ///
 /// The agent never touches the real internet: its connection ends at the
 /// world. Over HTTPS the agent sees the world's certificate, from
 /// [`Site::tls`](fictionet::stdlib::web::Site::tls), and the real certificate stays between the world and the
 /// real site.
 ///
-/// Only names the callback hands to `proxy(&fcx)` are forwarded, so the world
+/// Only names the callback hands to `proxy(&fcx, client)` are forwarded, so the world
 /// stays closed unless it opens a name on purpose. To change some responses
 /// and pass the rest through, wrap it in tower or axum middleware.
 /// A target must have [`Routing::Exact`]. Requests routed through a
@@ -37,8 +38,7 @@ use upstream::Client as ProxyClient;
 /// Their request events carry `answer: misdirected`.
 /// Use [`forward`] for a catch-all that forwards to one fixed origin.
 ///
-/// The world checks the real site's certificate against the Mozilla root
-/// store (`webpki-roots`). Hop-by-hop headers (`Connection`, `Keep-Alive`,
+/// The transport must verify upstream certificates. Hop-by-hop headers (`Connection`, `Keep-Alive`,
 /// `Transfer-Encoding` and the like) are not passed on in either direction,
 /// so it carries no protocol upgrades: a WebSocket handshake reaches the
 /// real site as a plain `GET`. A world that wants WebSockets serves them
@@ -47,12 +47,10 @@ use upstream::Client as ProxyClient;
 /// Every request it sends upstream, answered or not, has a `forwarded`
 /// field in its `http.request` event: the origin it went to, such as
 /// `https://github.com`.
-/// Returns an error in a lab before constructing a client.
-pub fn proxy(fcx: &Cx) -> Result<Proxy, Error> {
+/// Returns an error in a lab before using the transport.
+pub fn proxy(fcx: &Cx, client: Arc<dyn Upstream>) -> Result<Proxy, Error> {
     fcx.require_real_io()?;
-    Ok(Proxy {
-        client: Arc::new(ProxyClient::new()),
-    })
+    Ok(Proxy { client })
 }
 
 /// The handler made by [`proxy`].
@@ -60,7 +58,7 @@ pub fn proxy(fcx: &Cx) -> Result<Proxy, Error> {
 /// local routing rejections.
 #[derive(Clone)]
 pub struct Proxy {
-    client: Arc<ProxyClient>,
+    client: Arc<dyn Upstream>,
 }
 
 impl tower_service::Service<Request<Body>> for Proxy {
@@ -112,7 +110,7 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
 
 /// Forwards one request to its [`Target`] over the world's own network.
 async fn send_upstream(
-    client: Arc<ProxyClient>,
+    client: Arc<dyn Upstream>,
     request: Request<Body>,
 ) -> Result<Response<Body>, Error> {
     use http::uri::Scheme;
@@ -122,7 +120,7 @@ async fn send_upstream(
         .cloned()
         .ok_or_else(|| {
             fictionet::Error::msg(
-                "web::proxy(&fcx) serves only requests that web::Sites routed: there is no web::Target",
+                "web::proxy serves only requests that web::Sites routed: there is no web::Target",
             )
         })?;
     if target.routing != Routing::Exact {
@@ -168,7 +166,7 @@ enum Host<'a> {
 /// request records a `forwarded` event field naming `origin`, so the
 /// request's event says it left the world.
 async fn dispatch(
-    client: Arc<ProxyClient>,
+    client: Arc<dyn Upstream>,
     request: Request<Body>,
     destination: impl FnOnce(&str) -> Result<http::Uri, Error>,
     host: Host<'_>,
@@ -214,11 +212,11 @@ async fn dispatch(
 /// The origin does not depend on [`Target`], so default-host requests can
 /// be forwarded here even when their routing is [`Routing::Fallback`].
 /// This handler requires real host I/O and works with any executor.
-/// It uses the same HTTP/1.1 transport and limits as [`proxy`], and its
+/// It uses the supplied transport, and its
 /// requests' events carry the same `forwarded` field.
-/// Returns an error in a lab before constructing a client, and for an
+/// Returns an error in a lab before using the transport, and for an
 /// upstream without such a scheme or without an authority.
-pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
+pub fn forward(fcx: &Cx, upstream: http::Uri, client: Arc<dyn Upstream>) -> Result<Forward, Error> {
     use http::uri::Scheme;
     fcx.require_real_io()?;
     let parts = upstream.into_parts();
@@ -227,7 +225,7 @@ pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
             Ok(Forward {
                 scheme,
                 authority,
-                client: Arc::new(ProxyClient::new()),
+                client,
             })
         }
         _ => Err(Error::msg(
@@ -242,7 +240,7 @@ pub fn forward(fcx: &Cx, upstream: http::Uri) -> Result<Forward, Error> {
 pub struct Forward {
     scheme: http::uri::Scheme,
     authority: http::uri::Authority,
-    client: Arc<ProxyClient>,
+    client: Arc<dyn Upstream>,
 }
 
 impl Handler for Forward {

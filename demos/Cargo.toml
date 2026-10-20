@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+fictionet-host = { path = "../host" }
 artifactory-world = { path = "../examples/artifactory/world" }
 border-world = { path = "../examples/border/world" }
 adaptive-web-world = { path = "../examples/adaptive-web/world" }

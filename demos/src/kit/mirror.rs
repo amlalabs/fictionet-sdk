@@ -44,7 +44,7 @@ type Answer = Result<Response<Body>, Error>;
 /// Opens the shared host cache and its upstream web proxy.
 pub fn new(fcx: &Cx) -> Result<Cache<web::Proxy>, Error> {
     Ok(Cache::new(
-        web::proxy(fcx)?,
+        web::proxy(fcx, std::sync::Arc::new(fictionet_host::Client::new()))?,
         Path::new(env!("CARGO_MANIFEST_DIR")).join("downloads/cloudimage/apt-cache"),
     ))
 }

@@ -429,7 +429,7 @@ fn unreachable(compose: &Compose, checks: &mut Checks) -> Result {
 
 fn upstream(compose: &Compose, checks: &mut Checks) -> Result {
     checks.ok(
-        "web::proxy(&fcx) reaches the real upstream",
+        "web::proxy reaches the real upstream",
         "^hello from the real upstream: GET /some/path\\?q=1 HTTP/1.1 $",
         &mut compose.agent(&["curl", "-sS", "http://upstream/some/path?q=1"]),
     )?;

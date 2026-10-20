@@ -502,18 +502,25 @@ fn real_io_is_refused_before_opening_resources() {
         #[cfg(feature = "web-proxy")]
         {
             assert!(
-                fictionet::stdlib::web::proxy(&fcx)
-                    .err()
-                    .unwrap()
-                    .to_string()
-                    .contains("lab")
+                fictionet::stdlib::web::proxy(
+                    &fcx,
+                    std::sync::Arc::new(fictionet_host::Client::new())
+                )
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("lab")
             );
             assert!(
-                fictionet::stdlib::web::forward(&fcx, "http://127.0.0.1:8080".parse()?)
-                    .err()
-                    .unwrap()
-                    .to_string()
-                    .contains("lab")
+                fictionet::stdlib::web::forward(
+                    &fcx,
+                    "http://127.0.0.1:8080".parse()?,
+                    std::sync::Arc::new(fictionet_host::Client::new())
+                )
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("lab")
             );
         }
         Ok(())

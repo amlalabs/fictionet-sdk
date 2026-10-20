@@ -717,7 +717,7 @@ With `web-proxy`, `web::Proxy` forwards only exact matches. A fallback
 request gets `421 Misdirected Request` before any upstream I/O, even if
 the proxy's site has `default_host()`. Its request event carries
 `answer: misdirected`. For catch-all forwarding, use
-`web::forward(&fcx, upstream)?`: it always connects to that fixed origin and
+`web::forward(&fcx, upstream, client)?`: the injected `Upstream` transport connects to that fixed origin and
 preserves the requested `Host`. Both `web::proxy` and `web::forward` require
 a real run's context and return an error in a lab before constructing a
 client. The feature requires `std` and works without tokio. Host helper

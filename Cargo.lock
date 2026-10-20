@@ -9,6 +9,7 @@ dependencies = [
  "bytes",
  "example-common",
  "fictionet",
+ "fictionet-host",
  "fictionet-observe",
  "form_urlencoded",
  "http",
@@ -841,6 +842,7 @@ dependencies = [
  "example-common",
  "fictionet-codegen",
  "fictionet-codegen-golden",
+ "fictionet-host",
  "fictionet-observe",
  "fictionet-test-support",
  "getrandom 0.4.3",
@@ -865,7 +867,6 @@ dependencies = [
  "tower-service",
  "wasm-bindgen",
  "web-time",
- "webpki-roots",
  "x25519-dalek",
 ]
 
@@ -878,6 +879,7 @@ dependencies = [
  "divan",
  "etherparse",
  "fictionet",
+ "fictionet-host",
  "fictionet-observe",
  "fictionet-test-support",
  "http",
@@ -926,6 +928,7 @@ dependencies = [
  "fakewiki-world",
  "fatfs",
  "fictionet",
+ "fictionet-host",
  "fictionet-observe",
  "flate2",
  "http",
@@ -947,6 +950,23 @@ dependencies = [
  "virtio-queue",
  "vm-memory",
  "vmm-sys-util 0.14.0",
+]
+
+[[package]]
+name = "fictionet-host"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fictionet",
+ "fictionet-observe",
+ "http",
+ "http-body",
+ "http-body-util",
+ "libc",
+ "rustls",
+ "tokio",
+ "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]

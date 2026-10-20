@@ -65,7 +65,12 @@ impl Upstream {
 
     fn cache(&self, fcx: &Cx, root: &Path) -> Cache<web::Forward> {
         Cache::new(
-            web::forward(fcx, self.uri.clone()).unwrap(),
+            web::forward(
+                fcx,
+                self.uri.clone(),
+                std::sync::Arc::new(fictionet_host::Client::new()),
+            )
+            .unwrap(),
             root.to_owned(),
         )
     }

@@ -144,7 +144,11 @@ impl Https {
     /// A client that posts to `path` at `origin`, such as a test server.
     pub fn at(fcx: &Cx, origin: http::Uri, path: &'static str) -> fictionet::Result<Self> {
         Ok(Self {
-            forward: web::forward(fcx, origin)?,
+            forward: web::forward(
+                fcx,
+                origin,
+                std::sync::Arc::new(fictionet_host::Client::new()),
+            )?,
             path,
         })
     }

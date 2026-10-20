@@ -23,7 +23,11 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
     fictionet::run(
         RunOptions::new(fictionet::Seed::from_u64(1)),
         move |fcx| async move {
-            let mut forward = web::forward(&fcx, format!("http://{address}/ignored").parse()?)?;
+            let mut forward = web::forward(
+                &fcx,
+                format!("http://{address}/ignored").parse()?,
+                std::sync::Arc::new(fictionet_host::Client::new()),
+            )?;
             let response = forward
                 .call(
                     http::Request::builder()
@@ -137,7 +141,11 @@ async fn a_chunked_upstream_answer_reaches_the_agent_chunked() {
         RunOptions::new(fictionet::Seed::random()),
         |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            let forward = web::forward(&fcx, upstream)?;
+            let forward = web::forward(
+                &fcx,
+                upstream,
+                std::sync::Arc::new(fictionet_host::Client::new()),
+            )?;
             web::Sites::new(move |name: &str| {
                 (name == "clone.test").then(|| web::Site::new(forward.clone()))
             })
@@ -213,9 +221,13 @@ async fn invalid_upstreams_are_refused_at_construction() {
         RunOptions::new(fictionet::Seed::from_u64(1)),
         |fcx| async move {
             for upstream in ["/path", "example.com:80", "ftp://example.com/"] {
-                let error = web::forward(&fcx, upstream.parse().unwrap())
-                    .err()
-                    .expect("invalid upstream must be refused");
+                let error = web::forward(
+                    &fcx,
+                    upstream.parse().unwrap(),
+                    std::sync::Arc::new(fictionet_host::Client::new()),
+                )
+                .err()
+                .expect("invalid upstream must be refused");
                 let message = error.to_string();
                 assert!(
                     message.contains("http")
@@ -225,7 +237,14 @@ async fn invalid_upstreams_are_refused_at_construction() {
                 );
             }
             for upstream in ["http://example.com/", "https://example.com/"] {
-                assert!(web::forward(&fcx, upstream.parse().unwrap()).is_ok());
+                assert!(
+                    web::forward(
+                        &fcx,
+                        upstream.parse().unwrap(),
+                        std::sync::Arc::new(fictionet_host::Client::new())
+                    )
+                    .is_ok()
+                );
             }
             fcx.cancel();
             Ok(())

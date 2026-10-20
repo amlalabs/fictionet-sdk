@@ -54,12 +54,25 @@ const PIECE: usize = 64 * 1024;
 /// limit on a line.
 const HEAD: usize = 400 * 1024;
 
-pub(super) struct Client {
+/// A bounded HTTP/1.1 client using host DNS, sockets and verified TLS.
+pub struct Client {
     tls: Arc<rustls::ClientConfig>,
     idle: Mutex<Vec<Idle>>,
     slots: Mutex<Slots>,
     exchanges: usize,
     connect_timeout: Duration,
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fictionet::stdlib::web::Upstream for Client {
+    fn request(self: Arc<Self>, request: Request<Body>) -> fictionet::stdlib::web::UpstreamFuture {
+        Box::pin(self.send(request))
+    }
 }
 
 struct Idle {
@@ -89,7 +102,8 @@ struct Job {
 type Event = http1::Event<http1::ResponseHead>;
 
 impl Client {
-    pub(super) fn new() -> Self {
+    /// Creates a client with the Mozilla root store.
+    pub fn new() -> Self {
         let roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -109,10 +123,7 @@ impl Client {
         }
     }
 
-    pub(super) async fn request(
-        self: Arc<Self>,
-        request: Request<Body>,
-    ) -> Result<Response<Body>, Error> {
+    async fn send(self: Arc<Self>, request: Request<Body>) -> Result<Response<Body>, Error> {
         let (mut parts, body) = request.into_parts();
         let authority = parts
             .uri
@@ -363,7 +374,12 @@ fn idempotent(method: &Method) -> bool {
 fn expects_content(method: &Method) -> bool {
     !matches!(
         *method,
-        Method::GET | Method::HEAD | Method::DELETE | Method::OPTIONS | Method::TRACE | Method::CONNECT
+        Method::GET
+            | Method::HEAD
+            | Method::DELETE
+            | Method::OPTIONS
+            | Method::TRACE
+            | Method::CONNECT
     )
 }
 
@@ -461,7 +477,8 @@ impl Exchange<'_> {
                 if self.pending.is_none() && !self.stream.is_eof() {
                     events |= libc::POLLIN;
                 }
-                if self.refused.is_none() && (self.written < self.out.len() || self.conn.wants_write())
+                if self.refused.is_none()
+                    && (self.written < self.out.len() || self.conn.wants_write())
                 {
                     events |= libc::POLLOUT;
                 }
@@ -759,9 +776,8 @@ fn race(
     deadline: Instant,
 ) -> Result<Option<TcpStream>, Error> {
     let first_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
-    let (first, second): (Vec<_>, Vec<_>) = addresses
-        .into_iter()
-        .partition(|a| a.is_ipv6() == first_v6);
+    let (first, second): (Vec<_>, Vec<_>) =
+        addresses.into_iter().partition(|a| a.is_ipv6() == first_v6);
     let mut second = second.into_iter();
     let mut next: Vec<_> = first
         .into_iter()
@@ -869,13 +885,7 @@ fn begin_connect(address: SocketAddr) -> io::Result<TcpStream> {
     // SAFETY: socket returned a new descriptor that nothing else owns.
     let tcp = unsafe { TcpStream::from_raw_fd(fd) };
     // SAFETY: `storage` holds a socket address of `len` bytes.
-    let started = unsafe {
-        libc::connect(
-            fd,
-            (&raw const storage).cast(),
-            len as libc::socklen_t,
-        )
-    };
+    let started = unsafe { libc::connect(fd, (&raw const storage).cast(), len as libc::socklen_t) };
     if started == 0 {
         return Ok(tcp);
     }
@@ -908,9 +918,7 @@ fn handshake(
         }
         match conn.read_tls(&mut tcp) {
             Ok(0) => {
-                return Err(Error::msg(
-                    "the upstream closed during the TLS handshake",
-                ));
+                return Err(Error::msg("the upstream closed during the TLS handshake"));
             }
             Ok(_) => {
                 if let Err(e) = conn.process_new_packets() {
@@ -965,10 +973,11 @@ impl Tls {
 fn ready(result: io::Result<usize>) -> io::Result<Option<usize>> {
     match result {
         Ok(n) => Ok(Some(n)),
-        Err(e) if matches!(
-            e.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) =>
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
         {
             Ok(None)
         }
@@ -1370,4 +1379,5 @@ impl<T> Drop for Receiver<T> {
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;
