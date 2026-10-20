@@ -731,6 +731,40 @@ fn desktop_readiness_commands_are_neutral() {
 }
 
 #[tokio::test]
+async fn page_terminal_executes_the_declared_command_on_a_pty() {
+    use fictionet_observe::page::Console;
+    let mut peer = ssh::tests::Peer::new().await;
+    let guest =
+        Guest::ubuntu("workstation", "analyst").terminal("tmux attach -r -t main; exec bash -l");
+    guest.validate().unwrap();
+    let console = page::GuestConsole::new(&guest);
+    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(1)), |cx| {
+        console.connected(
+            &cx,
+            peer.session.clone(),
+            "10.0.0.2".parse().unwrap(),
+            Instant::now(),
+        );
+        async { Ok(()) }
+    }))
+    .unwrap();
+    let mut terminal = console.terminal(120, 35).unwrap().await.unwrap();
+    assert_eq!(
+        peer.events.recv().await.unwrap(),
+        "pty xterm-256color 120 35"
+    );
+    assert_eq!(
+        peer.events.recv().await.unwrap(),
+        "exec tmux attach -r -t main; exec bash -l"
+    );
+    assert_eq!(
+        terminal.read().await.unwrap().unwrap(),
+        b"window manager is not running"
+    );
+    assert!(terminal.read().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn rfb_pointer_update_waits_for_every_rectangle() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -870,4 +904,26 @@ async fn page_capture_reports_websocket_failure() {
     assert_eq!(error.to_string(), "page WebSocket closed: None");
     peer.await.unwrap();
     assert!(!out.exists());
+}
+
+#[test]
+fn home_files_are_written_after_user_creation() {
+    let guest = Guest::ubuntu("station", "analyst")
+        .file("/home/analyst/.config/account", 0o600, "private")
+        .file("/home/analyst-other/account", 0o644, "other")
+        .file("/etc/account", 0o644, "system");
+    let data = seed::user_data(&seed::Provision {
+        guest: &guest,
+        authorized_key: "key",
+        ca: None,
+    });
+    for entry in data.split("  - path: ").skip(1) {
+        let home = entry.starts_with("\"/home/analyst/");
+        assert_eq!(entry.contains("owner: analyst:analyst"), home);
+        assert_eq!(entry.contains("defer: true"), home);
+        if home {
+            assert!(entry.contains("permissions: '0600'"));
+            assert!(entry.contains(&base64(b"private")));
+        }
+    }
 }

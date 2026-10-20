@@ -12,23 +12,29 @@
 //!   [`Scenario::hops`] lists. Its TTL is lowered by one for each. If it
 //!   runs out on the way, the router where it ran out answers with ICMP
 //!   "time exceeded", so `traceroute` shows the path. Replies are lowered by
-//!   the same count on the way back. Like a real router, each sandbox's
+//!   the count for the sender's physical path on the way back. Each sandbox's
 //!   routers send at most [`TIME_EXCEEDED_PER_SECOND`] of these a second.
 //! - **No host.** A packet for an address where no machine answers
 //!   ([`Scenario::has_host`]) ends at the last router on its way, which
 //!   answers ICMP "host unreachable", as a router with no route does.
 //! - **Delay.** Every packet takes [`Scenario::one_way`] to reach where it
-//!   goes, and replies the same to come back: about 24 ms for a round trip
+//!   goes. Replies use the sender's physical path: 24 ms for a round trip
 //!   to the bank, and 52 ms in the hijack, where it crosses the border.
 //! - **The routers.** Packets for 84.21.44.1 and 45.144.30.1 go to two
 //!   small machines of this sandbox's own, built from stdlib parts: they
 //!   answer pings, refuse TCP with a RST and UDP with "port unreachable",
 //!   and 84.21.44.1 runs the BGP speaker on port 179.
-//! - Everything else goes to `Sites`, delayed but otherwise unchanged.
+//! - The border translates the hijacked bank destination to the impostor's
+//!   machine. Replies use the sender's physical path and translate its address
+//!   back. No connection state is tracked here.
 //!
-//! The task owns every end. When the sandbox detaches it returns, which
-//! closes its `Sites` attachment, so `Sites` sees the detach, and stops the
-//! routers' tasks.
+//! Packets already on their way keep the route and destination assigned at
+//! entry, even if the routing table changes before they arrive.
+//! The return path uses the sender's address under the legitimate table,
+//! independent of the current mode.
+//!
+//! The task owns every end. When the sandbox detaches, the task returns.
+//! This closes its `Sites` attachment and stops the routers' tasks.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -42,16 +48,16 @@ use fictionet::prelude::*;
 use fictionet::stdlib::network::{icmp, ip, tcp, udp};
 use fictionet::time::Instant;
 use fictionet::{Cx, End, Interface, Packet, RecvError, pair};
-use serde_json::json;
 
 use crate::bgp;
-use crate::log::Log;
-use crate::scenario::{FOREIGN, HOME, Scenario};
+use crate::routing::Routing;
+use crate::scenario::{BANK_ADDR, FOREIGN, HOME, IMPOSTOR_ADDR, Scenario, Variant};
 
 /// What every sandbox's path shares.
 pub struct Shared {
     pub scenario: Arc<Scenario>,
-    pub log: Log,
+    pub routing: Routing,
+    pub extra: Vec<fictionet::stdlib::network::route::Prefix>,
 }
 
 const TTL: u8 = 64;
@@ -243,6 +249,7 @@ pub async fn run(
         let now = fcx.now();
         match from {
             0 => {
+                let scenario = scenario.routed(shared.routing.mode());
                 let Some(dst) = v4_dst(&packet.0) else {
                     inner.send(packet);
                     continue;
@@ -251,7 +258,15 @@ pub async fn run(
                     inner.send(packet);
                     continue;
                 }
-                let hops = scenario.hops(dst);
+                let extra = shared
+                    .extra
+                    .iter()
+                    .any(|prefix| prefix.contains(dst.into()));
+                let hops = if extra {
+                    vec![scenario.gateway()]
+                } else {
+                    scenario.hops(dst)
+                };
                 if hops.is_empty() {
                     on_the_way.hold(now + scenario.one_way(dst), To::Sites, packet);
                     continue;
@@ -260,7 +275,7 @@ pub async fn run(
                 let ttl = p[8];
                 // Where the packet's way ends: at `dst`, or, with no host
                 // there, at the last router, which has no route for it.
-                let ends_at = (!scenario.has_host(dst)).then(|| hops.len() - 1);
+                let ends_at = (!extra && !scenario.has_host(dst)).then(|| hops.len() - 1);
                 let reach = ends_at.unwrap_or(hops.len());
                 if usize::from(ttl) <= reach {
                     // It runs out at hop `ttl` (a TTL of 0 at the first).
@@ -270,13 +285,12 @@ pub async fn run(
                     }
                     if let Some(reply) = icmp_error(&p, hops[at], TTL - at as u8, id, 11, 0) {
                         id = id.wrapping_add(1);
-                        shared.log.line(json!({
-                            "type": "ttl_exceeded",
-                            "sandbox": &*name,
-                            "hop": hops[at].to_string(),
-                            "dst": dst.to_string(),
-                            "protocol": p[9],
-                        }));
+                        fcx.emit("path", "ttl_exceeded", |e| {
+                            e.field("sandbox", &*name)
+                                .display("hop", hops[at])
+                                .display("dst", dst)
+                                .field("protocol", u64::from(p[9]))
+                        });
                         on_the_way.hold(now + scenario.one_way(hops[at]) * 2, To::Sandbox, reply);
                     }
                     continue;
@@ -286,18 +300,20 @@ pub async fn run(
                     set_ttl(&mut p, ttl - k as u8);
                     if let Some(reply) = icmp_error(&p, hops[k], TTL - k as u8, id, 3, 1) {
                         id = id.wrapping_add(1);
-                        shared.log.line(json!({
-                            "type": "unreachable",
-                            "sandbox": &*name,
-                            "from": hops[k].to_string(),
-                            "dst": dst.to_string(),
-                            "protocol": p[9],
-                        }));
+                        fcx.emit("path", "unreachable", |e| {
+                            e.field("sandbox", &*name)
+                                .display("from", hops[k])
+                                .display("dst", dst)
+                                .field("protocol", u64::from(p[9]))
+                        });
                         on_the_way.hold(now + scenario.one_way(hops[k]) * 2, To::Sandbox, reply);
                     }
                     continue;
                 }
                 set_ttl(&mut p, ttl - hops.len() as u8);
+                if dst == BANK_ADDR && scenario.hijacked() {
+                    translate(&mut p, 16, IMPOSTOR_ADDR);
+                }
                 let to = if dst == HOME.router {
                     To::Home
                 } else if dst == FOREIGN.router {
@@ -308,14 +324,22 @@ pub async fn run(
                 on_the_way.hold(now + scenario.one_way(dst), to, Packet(p));
             }
             _ => {
-                // Toward the sandbox: back over the same routers, taking
-                // the same time.
+                // The sender's physical location determines the return path.
+                let scenario = scenario.routed(Variant::Legitimate);
                 let mut p = packet.0;
                 let Some(src) = v4_src(&p) else {
                     sandbox.send(Packet(p));
                     continue;
                 };
-                let back = scenario.hops(src).len() as u8;
+                let back = if shared
+                    .extra
+                    .iter()
+                    .any(|prefix| prefix.contains(src.into()))
+                {
+                    1
+                } else {
+                    scenario.hops(src).len() as u8
+                };
                 if back > 0 {
                     let ttl = p[8].saturating_sub(back).max(1);
                     set_ttl(&mut p, ttl);
@@ -325,6 +349,9 @@ pub async fn run(
                 } else {
                     scenario.one_way(src)
                 };
+                if src == IMPOSTOR_ADDR {
+                    translate(&mut p, 12, BANK_ADDR);
+                }
                 on_the_way.hold(now + by, To::Sandbox, Packet(p));
             }
         }
@@ -356,8 +383,8 @@ fn router(fcx: &Cx, side: End, addr: Ipv4Addr, bgp: Option<(&Arc<Shared>, Arc<st
     if let Some((shared, name)) = bgp
         && let Ok(listener) = tcp.listen(179)
     {
-        let (scenario, log) = (shared.scenario.clone(), shared.log.clone());
-        fcx.spawn(move |fcx| bgp::serve(fcx, listener, scenario, log, name));
+        let (scenario, routing) = (shared.scenario.clone(), shared.routing.clone());
+        fcx.spawn(move |fcx| bgp::serve(fcx, listener, scenario, routing, name));
     }
 }
 
@@ -389,6 +416,52 @@ fn set_ttl(p: &mut [u8], ttl: u8) {
     let Some(ihl) = header_len(p) else { return };
     p[8] = ttl;
     ip::set_header_checksum(&mut p[..ihl]);
+}
+
+/// Rewrites one IPv4 address, including transport checksums and ICMP quotes.
+fn translate(p: &mut [u8], address: usize, to: Ipv4Addr) {
+    let Some(ihl) = header_len(p) else { return };
+    let old: [u8; 4] = p[address..address + 4].try_into().unwrap();
+    p[address..address + 4].copy_from_slice(&to.octets());
+    ip::set_header_checksum(&mut p[..ihl]);
+    if u16::from_be_bytes([p[6], p[7]]) & 0x1fff != 0 {
+        return;
+    }
+    let offset = match p[9] {
+        6 => Some(ihl + 16),
+        17 => Some(ihl + 6),
+        _ => None,
+    };
+    // RFC 1624 updates the pseudo-header sum without needing the payload.
+    if let Some(offset) = offset.filter(|&i| p.len() >= i + 2) {
+        let sum = u16::from_be_bytes([p[offset], p[offset + 1]]);
+        if p[9] != 17 || sum != 0 {
+            let mut sum = u32::from(!sum);
+            for (old, new) in old
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(to.octets().as_chunks::<2>().0)
+            {
+                sum += u32::from(!u16::from_be_bytes(*old)) + u32::from(u16::from_be_bytes(*new));
+            }
+            while sum >> 16 != 0 {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            let sum = !(sum as u16);
+            let sum = if p[9] == 17 && sum == 0 { 0xffff } else { sum };
+            p[offset..offset + 2].copy_from_slice(&sum.to_be_bytes());
+        }
+    }
+    if address == 12 && p[9] == 1 && p.len() >= ihl + 8 && matches!(p[ihl], 3 | 4 | 5 | 11 | 12) {
+        let quote = &mut p[ihl + 8..];
+        if v4_dst(quote) == Some(Ipv4Addr::from(old)) {
+            translate(quote, 16, to);
+        }
+        p[ihl + 2..ihl + 4].fill(0);
+        let sum = ip::checksum(&p[ihl..]);
+        p[ihl + 2..ihl + 4].copy_from_slice(&sum.to_be_bytes());
+    }
 }
 
 /// The most of a packet an ICMP error quotes: RFC 1812 keeps the error
@@ -473,6 +546,143 @@ mod tests {
         p[10..12].copy_from_slice(&sum.to_be_bytes());
         p.extend_from_slice(payload);
         p
+    }
+
+    fn transport_packet(proto: u8, frag: u16, payload: &[u8]) -> Vec<u8> {
+        let mut p = packet(proto, 64, frag, payload);
+        let offset = if proto == 6 { 16 } else { 6 };
+        let sum = ip::transport_checksum(
+            v4_src(&p).unwrap().into(),
+            v4_dst(&p).unwrap().into(),
+            proto,
+            &p[20..],
+        );
+        p[20 + offset..22 + offset].copy_from_slice(&sum.to_be_bytes());
+        p
+    }
+
+    fn verify_transport(p: &[u8]) {
+        assert_eq!(checksum(&p[..20]), 0);
+        assert_eq!(
+            ip::transport_checksum(
+                v4_src(p).unwrap().into(),
+                v4_dst(p).unwrap().into(),
+                p[9],
+                &p[20..]
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn translation_preserves_tcp_and_udp_checksums() {
+        for proto in [6, 17] {
+            for address in [12, 16] {
+                let original = transport_packet(proto, 0, &[0; 24]);
+                let mut p = original.clone();
+                let old = if address == 12 {
+                    v4_src(&p)
+                } else {
+                    v4_dst(&p)
+                }
+                .unwrap();
+                translate(&mut p, address, IMPOSTOR_ADDR);
+                verify_transport(&p);
+                translate(&mut p, address, old);
+                verify_transport(&p);
+                assert_eq!(p, original);
+            }
+        }
+    }
+
+    #[test]
+    fn translation_preserves_udp_zero_and_encodes_computed_zero() {
+        let original = packet(17, 64, 0, &[0; 8]);
+        let mut p = original.clone();
+        translate(&mut p, 16, IMPOSTOR_ADDR);
+        assert_eq!(&p[26..28], &[0, 0]);
+        assert_eq!(checksum(&p[..20]), 0);
+        translate(&mut p, 16, BANK_ADDR);
+        assert_eq!(p, original);
+
+        // Choose a payload that makes the translated UDP checksum zero.
+        let mut p = packet(17, 64, 0, &[0, 1, 0, 2, 0, 10, 0, 0, 0, 0]);
+        translate(&mut p, 16, IMPOSTOR_ADDR);
+        let sum = ip::transport_checksum(
+            v4_src(&p).unwrap().into(),
+            IMPOSTOR_ADDR.into(),
+            17,
+            &p[20..],
+        );
+        p[28..30].copy_from_slice(&sum.to_be_bytes());
+        translate(&mut p, 16, BANK_ADDR);
+        let original = transport_packet(17, 0, &p[20..]);
+        let mut p = original.clone();
+        translate(&mut p, 16, IMPOSTOR_ADDR);
+        assert_eq!(&p[26..28], &[255, 255]);
+        verify_transport(&p);
+        translate(&mut p, 16, BANK_ADDR);
+        assert_eq!(p, original);
+    }
+
+    #[test]
+    fn translation_preserves_echo_and_error_quotes() {
+        let mut echo = vec![8, 0, 0, 0, 1, 2, 3, 4];
+        let sum = checksum(&echo);
+        echo[2..4].copy_from_slice(&sum.to_be_bytes());
+        let original = packet(1, 64, 0, &echo);
+        let mut p = original.clone();
+        translate(&mut p, 16, IMPOSTOR_ADDR);
+        assert_eq!(checksum(&p[..20]), 0);
+        assert_eq!(checksum(&p[20..]), 0);
+        translate(&mut p, 16, BANK_ADDR);
+        assert_eq!(p, original);
+
+        for proto in [6, 17] {
+            let mut probe = transport_packet(proto, 0, &[0; 24]);
+            translate(&mut probe, 16, IMPOSTOR_ADDR);
+            let original = icmp_error(&probe, IMPOSTOR_ADDR, 64, 1, 3, 3).unwrap().0;
+            let mut p = original.clone();
+            translate(&mut p, 12, BANK_ADDR);
+            assert_eq!(checksum(&p[..20]), 0);
+            assert_eq!(checksum(&p[20..]), 0);
+            assert_eq!(v4_dst(&p[28..]), Some(BANK_ADDR));
+            verify_transport(&p[28..]);
+            translate(&mut p, 12, IMPOSTOR_ADDR);
+            assert_eq!(p, original);
+
+            // A minimal TCP quote lacks its checksum; a UDP quote includes it.
+            let mut short = original[..56].to_vec();
+            short[2..4].copy_from_slice(&56u16.to_be_bytes());
+            ip::set_header_checksum(&mut short[..20]);
+            short[22..24].fill(0);
+            let sum = checksum(&short[20..]);
+            short[22..24].copy_from_slice(&sum.to_be_bytes());
+            let mut p = short.clone();
+            translate(&mut p, 12, BANK_ADDR);
+            assert_eq!(checksum(&p[..20]), 0);
+            assert_eq!(checksum(&p[20..]), 0);
+            assert_eq!(checksum(&p[28..48]), 0);
+            translate(&mut p, 12, IMPOSTOR_ADDR);
+            assert_eq!(p, short);
+        }
+    }
+
+    #[test]
+    fn translation_updates_only_the_first_fragments_transport_header() {
+        let original = transport_packet(17, 0x2000, &[0; 24]);
+        let mut first = original.clone();
+        translate(&mut first, 16, IMPOSTOR_ADDR);
+        verify_transport(&first);
+        translate(&mut first, 16, BANK_ADDR);
+        assert_eq!(first, original);
+        let original = packet(17, 64, 1, &[9; 24]);
+        let mut later = original.clone();
+        translate(&mut later, 16, IMPOSTOR_ADDR);
+        assert_eq!(checksum(&later[..20]), 0);
+        assert_eq!(&later[20..], &original[20..]);
+        translate(&mut later, 16, BANK_ADDR);
+        assert_eq!(later, original);
     }
 
     #[test]

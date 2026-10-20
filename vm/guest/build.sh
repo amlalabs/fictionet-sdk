@@ -13,7 +13,7 @@
 # takes seconds. The binaries go to /opt/fictionet/bin, and also to
 # /opt/fictionet/prebuilt, laid out the way the examples' Dockerfiles copy
 # them out of their build stages (usr/local/bin/ and out/). A Compose file
-# can then use that folder in place of a build stage (cargo xtask demo border).
+# can then use that folder in place of a build stage (cargo xtask vm build border).
 # Static binaries run anywhere: in the VM, and in any container image.
 # Everything builds with --locked, as in CI and the examples' Dockerfiles,
 # in one target directory, so the example worlds reuse the SDK's dependencies.

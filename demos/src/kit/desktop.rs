@@ -54,7 +54,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
          /usr/bin/Xvnc :1 -localhost -SecurityTypes None -AlwaysShared -nolisten tcp \
            -geometry 1280x800 -depth 24 >/tmp/xvnc.log 2>&1 &\n\
          for _ in $(seq 1 150); do xdpyinfo -display :1 >/dev/null 2>&1 && break; sleep 0.2; done\n\
-         eval \"$(dbus-launch --sh-syntax)\"\n\
+         while IFS= read -r entry; do export \"$entry\"; done < <(dbus-launch)\n\
          # The Xfce session, then the window manager, then Firefox: launched\n\
          # here (not via Xfce autostart, which did not run reliably) so its\n\
          # start is ordered and its output is captured.\n\

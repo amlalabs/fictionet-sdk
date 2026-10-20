@@ -110,6 +110,7 @@ pub struct Guest {
     files: Vec<File>,
     steps: Vec<String>,
     desktop: Option<(u16, String)>,
+    terminal: Option<String>,
 }
 
 impl Guest {
@@ -129,6 +130,7 @@ impl Guest {
             files: Vec::new(),
             steps: Vec::new(),
             desktop: None,
+            terminal: None,
         }
     }
     /// Sets the vCPU count and memory in MiB, defaulting to 2 and 2048.
@@ -172,6 +174,11 @@ impl Guest {
         self.desktop = Some((port, ready.into()));
         self
     }
+    /// Runs a command on the page terminal's PTY instead of a login shell.
+    pub fn terminal(mut self, command: impl Into<String>) -> Self {
+        self.terminal = Some(command.into());
+        self
+    }
     fn initial_addr(&self) -> Option<Ipv4Addr> {
         match &self.family {
             Family::Serve(lease) => Some(lease.addr.addr),
@@ -205,6 +212,13 @@ impl Guest {
         {
             return Err(io::Error::other(
                 "desktop needs a nonzero port and a neutral, nonempty readiness command",
+            ));
+        }
+        if self.terminal.as_ref().is_some_and(|command| {
+            command.trim().is_empty() || command.contains('\0') || !neutral(command)
+        }) {
+            return Err(io::Error::other(
+                "terminal needs a neutral, nonempty command",
             ));
         }
         Ok(())
