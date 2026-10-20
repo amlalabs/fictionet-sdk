@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Run the watch command in another terminal. See `fictionet_observe` for
-//! browser access and capture limits.
+//! the shell commands and capture limits.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;

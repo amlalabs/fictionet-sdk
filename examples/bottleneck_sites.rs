@@ -12,7 +12,7 @@
 //! fictionet observe --observation unix:/run/fictionet/observation.sock watch
 //! ```
 //!
-//! For browser access and capture limits, see `fictionet_observe`.
+//! For the shell commands and capture limits, see `fictionet_observe`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

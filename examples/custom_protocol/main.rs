@@ -3,7 +3,7 @@
 //! `cargo run --example custom_protocol` sends one request in a lab and exits.
 //! It takes no arguments and serves no observation socket. Its in-process
 //! `DashboardObserver` installs the custom presenter. To serve a handle for
-//! `fictionet observe` or the dashboard, see `fictionet_observe`.
+//! `fictionet observe`, or to show a page of its own, see `fictionet_observe`.
 use fictionet::events::Transport;
 use fictionet::stdlib::{
     codec::{Decode, Frames, Step, Wire},
