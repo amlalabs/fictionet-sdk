@@ -197,7 +197,10 @@ fn expected_page(seed: &Seed, snapshot: &Snapshot, url: &str) -> (Reason, Made) 
     (reason, Made::Stubbed)
 }
 
-pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<String>> {
+/// Runs the story and its checks. Hosts the story visits go into `visited`
+/// as it goes, so a failed run can still report background traffic.
+pub async fn run(run: &Run, seed: &Seed, output: &Path, visited: &mut BTreeSet<String>) -> Result {
+    visited.extend(["www.google.com", "www.bing.com", "html.duckduckgo.com"].map(String::from));
     run.guest(HOST)
         .wait_desktop(Duration::from_secs(300))
         .await?;
@@ -264,11 +267,6 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
         "fastjsonl-package" => "fastjsonl package",
         _ => return Err("unknown embedded seed".into()),
     };
-    let mut visited = BTreeSet::from([
-        "www.google.com".to_string(),
-        "www.bing.com".into(),
-        "html.duckduckgo.com".into(),
-    ]);
     let (snapshot, google) = search(run, &client, Engine::Google, words, 0, 10).await?;
     let list = snapshot
         .results
@@ -468,7 +466,7 @@ pub async fn run(run: &Run, seed: &Seed, output: &Path) -> Result<BTreeSet<Strin
     })
     .await??;
     println!("page screen: {}", page.display());
-    Ok(visited)
+    Ok(())
 }
 
 // Read the drained log so startup traffic cannot fall out of a bounded view.

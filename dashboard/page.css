@@ -1118,11 +1118,32 @@ body.licenses {
 .probe-title strong svg { flex: none; width: 12px; height: 16px; color: var(--muted); }
 .containment-probe[open] .probe-title strong svg { transform: rotate(90deg); }
 
-/* A custom workspace can share the surface with live consoles. */
-#workbench.with-custom { grid-template-columns: minmax(0, var(--workspace, 64%)) 8px minmax(0, 1fr); }
-#workspace.with-custom { grid-template-columns: minmax(0, .42fr) minmax(0, 1fr); }
-#workspace.with-custom > .custom-workspace { grid-column: 2; grid-row: 1 / span var(--console-count, 1); }
-#workspace.with-custom > .workspace-tile { grid-column: 1; }
+/* Shared workspaces keep the custom panel and consoles visible together. */
+/* Wide pages put the custom panel on the left and each console, sized to its screen, above the inspector. */
+.shared-workspace .screen-display { position: relative; }
+.shared-workspace .screen-display > div { height: auto !important; }
+.shared-workspace .screen-display canvas { display: block; width: 100% !important; height: auto !important; margin: 0 !important; }
+/* While no screen is drawn, the stage keeps a desktop's 16:10 shape, so the layout holds still. */
+.shared-workspace .console-stage:has(.screen-display):not(:has(canvas)) { aspect-ratio: 16 / 10; }
+@media (min-width: 1001px) {
+  #workbench.shared-workbench {
+    grid-template-columns: minmax(0, min(var(--workspace), calc(100% - 408px))) 8px minmax(400px, 1fr);
+    grid-template-rows: repeat(var(--console-count, 1), auto) minmax(0, 1fr);
+    background: var(--sunken);
+  }
+  #workspace.shared-workspace { display: contents; }
+  .shared-workspace > .custom-workspace { grid-column: 1; grid-row: 1 / -1; margin: 8px 0 8px 8px; }
+  .shared-workspace > .workspace-tile { grid-column: 3; min-height: 160px; margin: 8px 8px 0 0; }
+  .shared-workbench > #divider { grid-column: 2; grid-row: 1 / -1; }
+  .shared-workbench > #inspector { grid-column: 3; grid-row: -2 / -1; margin-top: 8px; border-top: 1px solid var(--line-strong); }
+  .shared-workbench > .notice { grid-row: 1 / -1; }
+}
+@media (max-width: 1000px) {
+  #workbench.shared-workbench { grid-template-columns: minmax(0, var(--workspace)) 8px minmax(0, 1fr); }
+  #workspace.shared-workspace { grid-template-columns: minmax(0, 1fr); overflow: auto; }
+  .shared-workspace > .custom-workspace { grid-row: auto; min-height: 640px; }
+  .shared-workspace > .workspace-tile { grid-column: 1; min-height: 320px; }
+}
 
 #inspector .egress-groups td { overflow-wrap: normal; }
 #inspector .egress-groups .egress-name,

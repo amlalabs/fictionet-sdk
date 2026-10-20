@@ -68,6 +68,9 @@ lockPref("browser.newtabpage.activity-stream.asrouter.useRemoteL10n", false);
 lockPref("browser.contentblocking.report.monitor.enabled", false);
 lockPref("nimbus.rollouts.enabled", false);
 lockPref("services.settings.poll_interval", 2147483647);
+// Release builds ignore services.settings.server, so the settings host
+// resolves to this machine and the first-start sync never leaves it.
+lockPref("network.dns.localDomains", "firefox.settings.services.mozilla.com");
 // Push keeps a background connection even when no page requests it.
 lockPref("dom.push.enabled", false);
 lockPref("dom.push.connection.enabled", false);

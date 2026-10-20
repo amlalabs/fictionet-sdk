@@ -151,7 +151,6 @@ export async function mount(root, transport, theme) {
   services.hosts = page.hosts;
   document.title = `${page.title} · Fictionet`;
   $('page-title').textContent = page.title;
-  cleanup.push(divider($('divider'), $('workbench'), page.title, page.panels.some((p) => p.kind === 'custom' && p.area === 'workspace') && page.panels.some((p) => ['screen', 'terminal'].includes(p.kind) && p.area === 'workspace') ? 64 : DEFAULT_SPLIT));
 
   // The host bar.
   const selectHost = (host) => services.selection.set({ host, node: null, links: [], event: null, connection: null, request: null });
@@ -160,11 +159,10 @@ export async function mount(root, transport, theme) {
   const all = el('button', { type: 'button', class: 'host-chip all', 'aria-pressed': 'true', text: 'All hosts' }, bar);
   cleanup.push(listen(all, 'click', () => selectHost(null)));
   const customWorkspace = page.panels.find((panel) => panel.area === 'workspace' && panel.kind === 'custom');
-  const workspaceHosts = page.panels.some((p) => p.area === 'workspace' && ['screen', 'terminal'].includes(p.kind));
-  if (customWorkspace && workspaceHosts) {
-    $('workspace').classList.add('with-custom');
-    $('workbench').classList.add('with-custom');
-  }
+  const sharedWorkspace = customWorkspace && page.panels.some((panel) => panel.area === 'workspace' && ['screen', 'terminal'].includes(panel.kind));
+  $('workspace').classList.toggle('shared-workspace', Boolean(sharedWorkspace));
+  $('workbench').classList.toggle('shared-workbench', Boolean(sharedWorkspace));
+  cleanup.push(divider($('divider'), $('workbench'), page.title, sharedWorkspace ? 68 : DEFAULT_SPLIT));
   for (const host of page.hosts) {
     const group = el('div', { class: 'host-group' }, bar);
     const chip = el('button', { type: 'button', class: 'host-chip', 'aria-pressed': 'false' }, group);
@@ -176,7 +174,7 @@ export async function mount(root, transport, theme) {
     const owner = el('span', { class: 'host-owner' }, chip);
     const pin = el('button', { type: 'button', class: 'pin', 'aria-label': `Pin ${host.name} to the workspace`, title: 'Pin to the workspace', 'aria-pressed': 'false' }, group);
     icon(el, pin, 'pin');
-    pin.hidden = Boolean(customWorkspace) && !workspaceHosts;
+    pin.hidden = Boolean(customWorkspace && !sharedWorkspace);
     chips.set(host.name, { chip, pin, owner });
     cleanup.push(listen(chip, 'click', () => selectHost(host.name)));
     cleanup.push(listen(pin, 'click', () => {
@@ -327,9 +325,10 @@ export async function mount(root, transport, theme) {
       workspaceMounted = true;
       stopWorkspace = () => { off(); workspaceMounted = false; };
     }
-    if (customWorkspace && !workspaceHosts) return;
+    if (customWorkspace && !sharedWorkspace) return;
     const names = pinned.size ? [...pinned] : [services.selection.get().host || page.hosts[0]?.name].filter(Boolean);
-    workspace.style.setProperty('--console-count', String(Math.max(names.length, 1)));
+    // The shared layout gives each console its own row above the inspector.
+    $('workbench').style.setProperty('--console-count', String(Math.max(names.length, 1)));
     for (const [name, tile] of tiles) {
       if (!names.includes(name) || tile.mode !== modes.get(name)) { tile.dispose(); tile.root.remove(); tiles.delete(name); }
     }
@@ -348,6 +347,7 @@ export async function mount(root, transport, theme) {
       if (tiles.has(name)) continue;
       const mode = modes.get(name);
       const tile = el('section', { class: 'workspace-tile', 'aria-label': name }, workspace);
+      if (sharedWorkspace && mode === 'screen') tile.style.alignSelf = 'start';
       const header = el('header', {}, tile);
       el('h2', { text: name }, header);
       const removers = [];

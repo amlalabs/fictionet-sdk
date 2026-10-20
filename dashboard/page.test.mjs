@@ -353,6 +353,9 @@ test('a custom workspace can sit beside consoles while pins remain available', a
   const custom = workspace.querySelector('section.custom-workspace');
   assert.ok(custom);
   assert.equal(workspace.querySelectorAll('section.workspace-tile').length, 1);
+  assert.ok(workspace.classList.contains('shared-workspace'));
+  assert.ok(h.root.querySelector('#workbench').classList.contains('shared-workbench'));
+  assert.equal(workspace.querySelector('section.workspace-tile').style.alignSelf, 'start');
   const pins = h.root.querySelectorAll('button.pin');
   assert.ok(pins.every((pin) => !pin.hidden));
   pins.forEach((pin) => pin.click());
@@ -360,7 +363,7 @@ test('a custom workspace can sit beside consoles while pins remain available', a
   assert.equal(workspace.querySelector('section.custom-workspace'), custom);
   pins[0].click();
   assert.equal(workspace.querySelector('section.workspace-tile').getAttribute('aria-label'), 'beta');
-  assert.equal(h.root.querySelector('#divider').getAttribute('aria-valuenow'), '64');
+  assert.equal(h.root.querySelector('#divider').getAttribute('aria-valuenow'), '68');
   stop();
   assert.equal(h.budget.open, 0);
   assert.equal(h.timers.size, 0);

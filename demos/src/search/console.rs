@@ -4,7 +4,28 @@ use fictionet_observe::page::{BoxFuture, Console, Duplex};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-pub struct PreviewConsole;
+/// A labeled screen for previews. Clones share one set of open connections.
+#[derive(Clone)]
+pub struct PreviewConsole {
+    drops: tokio::sync::watch::Sender<u64>,
+}
+impl PreviewConsole {
+    pub fn new() -> Self {
+        Self {
+            drops: tokio::sync::watch::channel(0).0,
+        }
+    }
+    /// Closes every open screen connection, as a lost guest connection would.
+    /// Later connections open normally.
+    pub fn drop_connections(&self) {
+        self.drops.send_modify(|count| *count += 1);
+    }
+}
+impl Default for PreviewConsole {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Console for PreviewConsole {
     fn terminal(
         &self,
@@ -14,10 +35,14 @@ impl Console for PreviewConsole {
         None
     }
     fn screen(&self) -> Option<BoxFuture<'static, io::Result<Box<dyn Duplex>>>> {
-        Some(Box::pin(async {
+        let mut drops = self.drops.subscribe();
+        Some(Box::pin(async move {
             let (client, server) = tokio::io::duplex(64 << 10);
             tokio::spawn(async move {
-                let _ = screen(server).await;
+                tokio::select! {
+                    _ = screen(server) => {}
+                    _ = drops.changed() => {}
+                }
             });
             Ok(Box::new(client) as Box<dyn Duplex>)
         }))
@@ -164,5 +189,19 @@ mod tests {
         assert_eq!(&frame[offset..offset + 4], &[214, 228, 226, 0]);
         drop(client);
         assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_connections_closes_open_screens_only() {
+        let console = PreviewConsole::new();
+        let mut open = console.screen().unwrap().await.unwrap();
+        let mut version = [0; 12];
+        open.read_exact(&mut version).await.unwrap();
+        console.drop_connections();
+        let mut rest = Vec::new();
+        assert_eq!(open.read_to_end(&mut rest).await.unwrap(), 0);
+        let mut next = console.screen().unwrap().await.unwrap();
+        next.read_exact(&mut version).await.unwrap();
+        assert_eq!(&version, b"RFB 003.008\n");
     }
 }

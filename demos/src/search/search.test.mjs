@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDocument, Element } from '../../../dashboard/test-dom.mjs';
 import { createSelection } from '../../../dashboard/selection.mjs';
-import { counts, tree, queryKey, resultView, made } from './model.mjs';
+import { counts, tree, queryKey, resultView, made, rootNote } from './model.mjs';
 import { mount } from './view.mjs';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
@@ -56,7 +56,13 @@ test('stream renders every outcome, failure, host, cache and timing', (t) => {
   const stream = h.root.querySelector('.search-stream');
   assert.equal(stream.children.length, 9);
   assert.equal(stream.children[0].dataset.identity, '9');
-  for (const text of ['Pending', 'Served · 10 results', 'Served with no results — generation was off', 'Not fully delivered', '200 generation calls are spent', 'browser left before the answer', 'page maker failed — detail backend_error', 'page maker failed — detail meta_error', 'page maker failed — detail error', 'workstation · 10.0.0.2', 'Google', 'Made for this search', '8 ms']) assert.ok(stream.textContent.includes(text), text);
+  const empty = stream.children.find((row) => row.dataset.identity === '3');
+  assert.match(empty.textContent, /Served with no results · Generation was off · 8 ms/);
+  assert.equal(empty.textContent.match(/generation was off/gi).length, 1);
+  const spent = stream.children.find((row) => row.dataset.identity === '5');
+  assert.match(spent.textContent, /Failed: the run’s generation budget is spent · 8 ms/);
+  assert.doesNotMatch(spent.textContent, /Made for this search/);
+  for (const text of ['Pending', 'Served · 10 results', 'Not fully delivered', 'generation budget is spent', 'browser left before the answer', 'page maker failed — detail backend_error', 'page maker failed — detail meta_error', 'page maker failed — detail error', 'workstation · 10.0.0.2', 'Google', 'Made for this search', '8 ms']) assert.ok(stream.textContent.includes(text), text);
   assert.match(h.root.textContent, /Firefox \(scripted\)/);
   h.dispose();
 });
@@ -93,10 +99,52 @@ test('tree groups normalized searches, links, direct and fixed pages and preserv
   assert.equal(queryKey(' A\u0085\u001c B '), 'a b');
   assert.equal(queryKey('\ufeffA'), '\ufeffa');
   const h = harness(t); h.publish(s);
-  assert.match(h.root.querySelector('.search-sites').textContent, /www.google.com.*142.250.1.1.*Search engine address.*no page fetched/);
+  assert.match(h.root.querySelector('.search-sites').textContent, /www.google.com.*142.250.1.1.*Search engine address/);
+  const heads = h.root.querySelectorAll('.search-list-head');
+  assert.deepEqual(heads.map((head) => [head.textContent, head.hidden]), [['Sites with no page fetched', false], ['Names the world refused', false]]);
   assert.doesNotMatch(h.root.querySelector('.search-sites').textContent, /made.com/);
   assert.match(h.root.querySelector('.search-refused').textContent, /printer.local.*reserved or private/);
   for (const state of ['stubbed', 'stored', 'fixed', 'missing', 'not_made', 'written_live']) assert.ok(made(state).length > 5);
+  h.dispose();
+});
+
+test('each search root says which engines asked, what it listed and what was opened', (t) => {
+  const s = fixture();
+  s.queries.push(
+    query(3, 'served', { key: 'unopened', search: 'Unopened' }),
+    query(4, 'served', { key: 'nothing', search: 'Nothing', results: 0, cache: 'missing' }),
+    query(5, 'failed', { key: 'spent', search: 'Spent', results: null, cache: 'budget', outcome: { status: 'failed', why: 'budget' } }),
+    query(6, 'served', { key: 'dropped', search: 'Dropped', engine: 'duckduckgo' }),
+  );
+  s.results.push({ key: 'unopened', query_id: 3, cache: 'generated', listed: [1, 2, 3].map((rank) => ({ rank, title: 'T', host: 'x.com', url: `https://x.com/${rank}` })) });
+  s.results.push({ key: 'nothing', query_id: 4, cache: 'missing', listed: [] });
+  s.pages.push(page('https://kept.com/', { via: 'search', query: 'Gone', rank: 4 }));
+  const notes = new Map(tree(s).filter((n) => !n.page).map((n) => [n.id, rootNote(s, n)]));
+  assert.equal(notes.get('query:a question'), 'Google, Bing · 1 result listed · 1 opened');
+  assert.equal(notes.get('query:unopened'), 'Google · 3 results listed · none opened yet');
+  s.pages.push(page('https://x.com/2', { via: 'direct' }));
+  assert.equal(rootNote(s, tree(s).find((n) => n.id === 'query:unopened')), 'Google · 3 results listed · 1 opened');
+  s.pages.pop();
+  assert.equal(notes.get('query:nothing'), 'Google · No results listed');
+  assert.equal(notes.get('query:spent'), 'Google · Failed: the run’s generation budget is spent');
+  assert.equal(notes.get('query:gone'), '1 opened');
+  assert.equal(notes.get('query:dropped'), 'DuckDuckGo · 10 results listed · none opened yet');
+  assert.equal(notes.get('direct'), '');
+  const h = harness(t); h.publish(s);
+  const roots = h.root.querySelectorAll('.search-root');
+  assert.ok(roots.some((node) => /Unopened.*3 results listed · none opened yet/.test(node.textContent)));
+  h.dispose();
+});
+
+test('list headings hide when their lists are empty and the switch is unknown until state arrives', (t) => {
+  const h = harness(t);
+  assert.equal(h.root.querySelector('.search-toggle').dataset.known, 'false');
+  const s = fixture(); s.sites = []; s.refused = []; s.pages = []; s.queries = []; s.results = [];
+  h.publish(s);
+  assert.equal(h.root.querySelector('.search-toggle').dataset.known, 'true');
+  assert.ok(h.root.querySelectorAll('.search-list-head').every((head) => head.hidden));
+  const note = h.root.querySelectorAll('.search-empty').find((node) => node.textContent.startsWith('No pages yet'));
+  assert.equal(note.hidden, false);
   h.dispose();
 });
 
@@ -113,7 +161,7 @@ test('counts exclude missing pages and separate served, empty and failed searche
   assert.deepEqual(counts(s), { Searches: 6, Served: 2, 'No results': 1, Failed: 1, 'Pages made': 5, Sites: 2, Refused: 1 });
   s.omitted.pages = 4;
   const h = harness(t); h.publish(s);
-  assert.match(h.root.textContent, /4 rows are no longer held.*Counts describe retained rows/);
+  assert.match(h.root.textContent, /No longer held here: 4 pages\. The counts describe what is held\./);
   h.dispose();
 });
 
@@ -139,6 +187,11 @@ test('switch posts the world revision, waits, reports stale and never retries', 
   await settle();
   assert.match(h.root.textContent, /Applied at 6.00 s · revision 9/);
   assert.equal(toggle.disabled, true);
+  h.publish({ ...s, generator: { ...s.generator, generation_revision: 9, generate: true } });
+  assert.match(h.root.textContent, /Applied at 6.00 s · revision 9/);
+  assert.equal(toggle.disabled, false);
+  h.publish({ ...s, generator: { ...s.generator, generation_revision: 10, generate: false } });
+  assert.equal(h.root.querySelector('.search-command').textContent, '');
   h.dispose();
 });
 
@@ -182,6 +235,7 @@ test('a later result list is never attributed to an earlier empty search', () =>
   assert.deepEqual(resultView(s, query(1, 'served', { results: 0, cache: 'missing' })), { origin: 'No results: generation was off for this search.', rows: [] });
   assert.match(resultView(s, s.queries[0]).origin, /made after this search/);
   assert.equal(resultView(s, query(3, 'pending')).rows.length, 0);
+  assert.deepEqual(resultView(s, query(4, 'failed', { key: 'a question', results: null, outcome: { status: 'failed', why: 'budget' } })), { origin: 'Failed: the run’s generation budget is spent. The world made no result list for it.', rows: [] });
 });
 
 test('every page creation mode and first and latest latency render as words', (t) => {

@@ -1,7 +1,12 @@
 //! The search page with real world traffic and a labeled preview console.
+//!
+//! `--spend-budget` ends the story by turning generation back on and making
+//! new searches until the world refuses one for its generation budget. The
+//! page's `preview-screen` command closes the preview screen's connection, so
+//! the lost-connection state can be seen.
 
 use adaptive_web_world::{
-    search::Searches,
+    search::{Failure, Outcome, Searches},
     stub::{self, Seed},
 };
 use example_common::log::Log;
@@ -23,7 +28,10 @@ use fictionet_demo::{
 };
 use fictionet_observe::{
     DashboardObserver, DashboardOptions,
-    page::{Containment, Host, HostState, HostStatus, Labels, StateLimits, StateTopic},
+    page::{
+        CommandLimits, CommandPort, Containment, Host, HostState, HostStatus, Labels, StateLimits,
+        StateTopic,
+    },
 };
 use std::{
     sync::Arc,
@@ -32,8 +40,20 @@ use std::{
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Closes the preview screen's open connection: `{"command":"drop"}`.
+#[derive(serde::Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+enum ScreenCommand {
+    Drop,
+}
+
 #[tokio::main]
 async fn main() -> Result {
+    let spend = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => false,
+        [flag] if flag == "--spend-budget" => true,
+        _ => return Err("usage: search_page [--spend-budget]".into()),
+    };
     let seed = Seed::builtin("halvard-cve")?;
     let searches = Arc::new(Searches::from_seed(&seed));
     let topics = Topics::new();
@@ -41,16 +61,19 @@ async fn main() -> Result {
     let status = StateTopic::new(StateLimits::default());
     let labels = Labels::default();
     let containment = StateTopic::new(StateLimits::default());
+    let console = PreviewConsole::new();
+    let screen = CommandPort::<ScreenCommand, ()>::new(CommandLimits::default());
     let server = topics
         .page(
             dashboard.handle(),
             Host::new("workstation")
                 .sandbox("workstation")
-                .console(PreviewConsole)
+                .console(console.clone())
                 .status(status.clone()),
         )
         .labels(labels.clone())
         .containment(containment.clone())
+        .command("preview-screen", screen.clone())
         .bind_loopback(0)
         .await?;
     println!("Search preview: {}", server.url());
@@ -95,13 +118,28 @@ async fn main() -> Result {
                 Ok(())
             });
             cx.spawn(move |cx| async move {
-                if let Err(error) = story(&cx, &client, &world, &searches, &page_client).await {
+                while let Some(command) = cx.race(None, screen.recv()).await? {
+                    let ScreenCommand::Drop = command.command;
+                    console.drop_connections();
+                    println!("Preview screen connection dropped");
+                    command.reply(&cx, ());
+                }
+                Ok(())
+            });
+            cx.spawn(move |cx| async move {
+                let result = async {
+                    story(&cx, &client, &world, &searches, &page_client).await?;
+                    if spend {
+                        spend_budget(&cx, &client, &world, &searches, &page_client).await?;
+                    }
+                    Ok::<_, fictionet::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
                     eprintln!("Preview story failed: {error}");
                     return Err(error);
                 }
-                println!(
-                    "Preview story complete. Generation is off; the page remains open until Ctrl-C."
-                );
+                println!("Preview story complete. The page remains open until Ctrl-C.");
                 Ok(())
             });
             let _ = cx.race(None, stopped).await;
@@ -116,12 +154,26 @@ async fn main() -> Result {
     Ok(())
 }
 
+/// Opens a page and requires HTTP 200.
 async fn fetch(
     cx: &Cx,
     machine: &Machine,
     url: &str,
     start: SystemTime,
 ) -> fictionet::Result<String> {
+    let (status, body) = get(cx, machine, url, start).await?;
+    if status != 200 {
+        return Err(fictionet::Error::msg(format!("{url}: HTTP {status}")));
+    }
+    Ok(body)
+}
+
+async fn get(
+    cx: &Cx,
+    machine: &Machine,
+    url: &str,
+    start: SystemTime,
+) -> fictionet::Result<(u16, String)> {
     let (host, path) = stub::text::target_of(url);
     let answer = machine
         .lookup(cx, "10.0.0.1".parse()?, &host, RecordType::A)
@@ -143,14 +195,14 @@ async fn fetch(
     let request =
         http1::Request::parse(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())?;
     let response = sandbox::request(cx, &mut conn, &request).await?;
-    if response.head.status != 200 {
-        return Err(fictionet::Error::msg(format!(
-            "{url}: HTTP {}",
-            response.head.status
-        )));
-    }
-    println!("Scripted client opened {url}");
-    Ok(String::from_utf8_lossy(&response.body).into_owned())
+    println!(
+        "Scripted client opened {url} (HTTP {})",
+        response.head.status
+    );
+    Ok((
+        response.head.status,
+        String::from_utf8_lossy(&response.body).into_owned(),
+    ))
 }
 
 async fn story(
@@ -214,26 +266,7 @@ async fn story(
         .await?;
     println!("Scripted client asked for wiki.corp");
     pause().await?;
-    let response = page
-        .request(
-            "POST",
-            "/api/command/generation",
-            Some(&serde_json::json!({
-                "request_id": "preview-generation",
-                "command": {"command": "set_generation", "generate": false,
-                    "expected_revision": searches.snapshot().generator.generation_revision}
-            })),
-            true,
-        )
-        .await
-        .map_err(fictionet::Error::msg)?;
-    let reply: serde_json::Value = serde_json::from_slice(&response.body)?;
-    if response.status != 200 || reply["status"] != "applied" {
-        return Err(fictionet::Error::msg(format!(
-            "generation command: {reply}"
-        )));
-    }
-    println!("Generation off at revision {}", reply["reply"]["revision"]);
+    generation(page, searches, false).await?;
     fetch(
         cx,
         client,
@@ -250,4 +283,68 @@ async fn story(
     )
     .await?;
     Ok(())
+}
+
+/// Sends the generation switch through the page, as a viewer's click would.
+async fn generation(page: &PageClient, searches: &Searches, generate: bool) -> fictionet::Result {
+    let revision = searches.snapshot().generator.generation_revision;
+    let response = page
+        .request(
+            "POST",
+            "/api/command/generation",
+            Some(&serde_json::json!({
+                "request_id": format!("preview-generation-{revision}"),
+                "command": {"command": "set_generation", "generate": generate,
+                    "expected_revision": revision}
+            })),
+            true,
+        )
+        .await
+        .map_err(fictionet::Error::msg)?;
+    let reply: serde_json::Value = serde_json::from_slice(&response.body)?;
+    if response.status != 200 || reply["status"] != "applied" {
+        return Err(fictionet::Error::msg(format!(
+            "generation command: {reply}"
+        )));
+    }
+    println!(
+        "Generation {} at revision {}",
+        if generate { "on" } else { "off" },
+        reply["reply"]["revision"]
+    );
+    Ok(())
+}
+
+/// Makes new searches until the world refuses one for its generation budget.
+async fn spend_budget(
+    cx: &Cx,
+    client: &Machine,
+    world: &World,
+    searches: &Searches,
+    page: &PageClient,
+) -> fictionet::Result {
+    cx.sleep(Duration::from_secs(3)).await?;
+    generation(page, searches, true).await?;
+    println!("Spending the generation budget with new searches");
+    // Every search with a new key takes one generation call. The bound is far
+    // above the stub's budget, so it only stops a story that cannot fail.
+    for n in 1..=1_000 {
+        let url = format!("https://www.google.com/search?q=halvard+gateway+question+{n}");
+        let (status, _) = get(cx, client, &url, world.start).await?;
+        let failed = searches.snapshot().queries.iter().any(|q| {
+            q.search == format!("halvard gateway question {n}")
+                && matches!(
+                    q.outcome,
+                    Outcome::Failed {
+                        why: Failure::Budget,
+                        ..
+                    }
+                )
+        });
+        if failed {
+            println!("Search {n} failed: the world answered HTTP {status} for its budget");
+            return Ok(());
+        }
+    }
+    Err(fictionet::Error::msg("the generation budget was not spent"))
 }

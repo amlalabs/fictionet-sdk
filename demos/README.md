@@ -203,3 +203,5 @@ container, and a Compose file.
    the script by its name. Add a row to the table above.
 
 Preview the search page without a VM with `cargo run --locked -p fictionet-demo --example search_page`. It prints a loopback URL and drives real in-process searches with a scripted client. The screen says “NO VM”. Press Ctrl-C to close the page.
+
+The search page shows each search as it arrives, with the host that asked, its time and its outcome. Select one to see the result list the world made for it, marked as made for that search or reused from an earlier one. Beside it grows a tree of every made-up site and page, each with the world's reason for it and how it was made. The page's screenshots come from this example. `--spend-budget` ends its story with new searches until the world refuses one for its generation budget, and its `preview-screen` command (`{"command":"drop"}`) closes the screen's connection to show the lost state.

@@ -35,6 +35,14 @@ Firefox across Google, Bing and DuckDuckGo; the loopback page has the desktop,
 standard observation panels, search events and generation control. Search results
 and opened web pages are made up for this run. Only package installation hosts are forwarded.
 
+The page streams each search with the host that asked, its time and its
+outcome. A selected search shows the result list the world made for it, or
+the earlier search whose list it reused. A tree grows with every made-up site
+and page, the world's reason for each, how it was made and how fast it was
+served. The page's screenshots come from the VM-free example
+`cargo run --locked -p fictionet-demo --example search_page`, described in
+[demos/README.md](../../demos/README.md).
+
 The default seed is `halvard-cve`. Select another embedded seed with
 `cargo xtask demo search -- --seed corvane-acquisition` or
 `cargo xtask demo search -- --seed fastjsonl-package`. The gate prints each
