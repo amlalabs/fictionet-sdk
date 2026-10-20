@@ -228,12 +228,21 @@ pub async fn start(
         "api.anthropic.com" => model
             .clone()
             .map(|model| web::Site::new(model).tls(model_cfg.clone())),
-        "api.openai.com" if codex_oauth.is_none() => codex
+        // Codex's model site is chatgpt.com with a ChatGPT login and
+        // api.openai.com with a key. The other name does not resolve, so
+        // Codex's account and catalog requests fail as on a network that
+        // blocks it, instead of reaching a generated page.
+        "api.openai.com" | "chatgpt.com" => codex
             .clone()
-            .map(|model| web::Site::new(model).tls(codex_api_cfg.clone())),
-        "chatgpt.com" if codex_oauth.is_some() => codex
-            .clone()
-            .map(|model| web::Site::new(model).tls(chatgpt_cfg.clone())),
+            .filter(|_| (host == "chatgpt.com") == codex_oauth.is_some())
+            .map(|model| {
+                let tls = if host == "chatgpt.com" {
+                    &chatgpt_cfg
+                } else {
+                    &codex_api_cfg
+                };
+                web::Site::new(model).tls(tls.clone())
+            }),
         "auth.openai.com" => codex_oauth
             .clone()
             .map(|oauth| web::Site::new(oauth).tls(codex_token_cfg.clone())),
