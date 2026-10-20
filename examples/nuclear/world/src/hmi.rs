@@ -30,6 +30,8 @@
 //! Engineering values are the input-register count times its scale: 0.1 for
 //! most channels, 0.01 for the two pressures, and `(count - 32768) * 0.1` for
 //! reactivity. Holding registers for rod and valve positions use 0.1 too.
+//! Each link shows its unscaled telemetry heartbeat from the last good read.
+//! It stops when the feed freezes, while the HMI poll count keeps advancing.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -125,19 +127,19 @@ pub struct Layout {
 pub fn layout(plc: Plc) -> Layout {
     match plc {
         Plc::Rps1 => Layout {
-            input: 5,
+            input: 6,
             discrete: 2,
             coils: 3,
             holding: 1,
         },
         Plc::Rcs1 => Layout {
-            input: 8,
+            input: 9,
             discrete: 4,
             coils: 4,
             holding: 1,
         },
         Plc::Bop1 => Layout {
-            input: 10,
+            input: 11,
             discrete: 6,
             coils: 7,
             holding: 4,
@@ -201,7 +203,7 @@ pub struct Held {
     /// Run clock of the last poll cycle, in ms.
     pub clock_ms: Option<u64>,
     /// Completed poll cycles.
-    pub heartbeat: u64,
+    pub polls: u64,
     alarms: [Latch; ALARM_COUNT],
 }
 
@@ -396,6 +398,13 @@ enum Rule {
         limit: f64,
         clear: f64,
     },
+    /// Saturation temperature at pressure minus core exit temperature.
+    Subcooling {
+        pressure: &'static str,
+        temperature: &'static str,
+        limit: f64,
+        clear: f64,
+    },
     /// Active while any of `flags` reads `set`.
     Flag {
         flags: &'static [&'static str],
@@ -413,6 +422,16 @@ struct Alarm {
 /// The alarm list. Limits are the HMI's configuration, with a deadband on
 /// each analog limit.
 const ALARMS: &[Alarm] = &[
+    Alarm {
+        id: "subcooling_margin_low",
+        label: "Subcooling margin low",
+        rule: Rule::Subcooling {
+            pressure: "pressurizer_pressure",
+            temperature: "core_exit_temperature",
+            limit: 15.0,
+            clear: 16.0,
+        },
+    },
     Alarm {
         id: "pressurizer_pressure_high",
         label: "Pressurizer pressure high",
@@ -604,6 +623,16 @@ impl Rule {
                     worst < limit
                 })
             }
+            Rule::Subcooling {
+                pressure,
+                temperature,
+                limit,
+                clear,
+            } => {
+                let margin = crate::steam::saturation(*known.points.get(pressure)?).temperature_c
+                    - known.points.get(temperature)?;
+                Some(margin < if was_active { clear } else { limit })
+            }
             Rule::Flag { flags, set } => {
                 let values: Vec<bool> = flags
                     .iter()
@@ -684,6 +713,8 @@ pub struct Reading {
 /// One controller's link state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Link {
+    /// Telemetry count at the last good read, or null before the first read.
+    pub heartbeat: Option<u16>,
     pub id: &'static str,
     pub online: bool,
     pub read_ms: Option<u64>,
@@ -702,7 +733,7 @@ pub struct AlarmView {
 /// What `/api/plant` returns.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct View {
-    pub heartbeat: u64,
+    pub polls: u64,
     pub clock_ms: Option<u64>,
     pub links: Vec<Link>,
     pub readings: BTreeMap<&'static str, Reading>,
@@ -716,13 +747,16 @@ pub struct View {
 /// The HMI's view of the held blocks.
 pub fn view(held: &Held) -> View {
     View {
-        heartbeat: held.heartbeat,
+        polls: held.polls,
         clock_ms: held.clock_ms,
         links: PLCS
             .iter()
             .map(|&plc| {
                 let b = block(held, plc);
                 Link {
+                    heartbeat: b
+                        .read_ms
+                        .and_then(|_| b.input.get(usize::from(layout(plc).input - 1)).copied()),
                     id: link_id(plc),
                     online: b.online,
                     read_ms: b.read_ms,
@@ -976,7 +1010,7 @@ async fn poll(
         {
             let clock = run_ms(&fcx);
             let mut state = held.lock();
-            state.heartbeat += 1;
+            state.polls += 1;
             state.clock_ms = Some(clock);
             update_alarms(&mut state);
         }
@@ -1371,6 +1405,7 @@ mod tests {
         assert_eq!(view.readings["pressurizer_pressure"].value, None);
         assert_eq!(view.status["reactor_tripped"], None);
         assert_eq!(view.modes["pressurizer"], None);
+        assert!(view.links.iter().all(|link| link.heartbeat.is_none()));
         assert!(view.readings["pressurizer_pressure"].stale);
     }
 
@@ -1399,6 +1434,35 @@ mod tests {
         assert_eq!(view.status["coolant_pump_a"], Some(true));
         assert_eq!(view.status["auxiliary_feed"], Some(false));
         assert_eq!(view.modes["pressurizer"], Some("automatic"));
+    }
+
+    #[test]
+    fn subcooling_alarm_has_a_deadband_and_keeps_state_when_unknown() {
+        let rule = ALARMS
+            .iter()
+            .find(|alarm| alarm.id == "subcooling_margin_low")
+            .unwrap()
+            .rule;
+        let mut known = Known {
+            points: BTreeMap::new(),
+            flags: BTreeMap::new(),
+        };
+        let pressure = 15.5;
+        let saturation = crate::steam::saturation(pressure).temperature_c;
+        known.points.insert("pressurizer_pressure", pressure);
+        let mut active = false;
+        for (margin, expected) in [(14.9, true), (15.5, true), (16.1, false), (15.5, false)] {
+            known
+                .points
+                .insert("core_exit_temperature", saturation - margin);
+            active = rule.decide(&known, active).unwrap();
+            assert_eq!(active, expected);
+        }
+        known.points.remove("pressurizer_pressure");
+        assert_eq!(rule.decide(&known, true), None);
+        known.points.insert("pressurizer_pressure", pressure);
+        known.points.remove("core_exit_temperature");
+        assert_eq!(rule.decide(&known, false), None);
     }
 
     #[test]

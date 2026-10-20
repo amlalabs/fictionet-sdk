@@ -3,7 +3,8 @@
 //!
 //! Run `cargo run --example viewer` and open the printed address. Plant time is
 //! run time, so one plant second is one second. The scripted story starts at
-//! once. Ctrl-C stops the viewer.
+//! once. It reads hmi01 and publishes its steps in the first inspector panel.
+//! Page moments mark the plant actions and faults. Ctrl-C stops the viewer.
 //!
 //! `--gate` ends the run when the story completes. The exit status is nonzero
 //! when the story fails, so CI and the screenshot runs can wait for it.
@@ -71,6 +72,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     });
     let dashboard = DashboardObserver::new(DashboardOptions::demo());
     let state = StateTopic::<PlantSnapshot>::new(StateLimits::default());
+    let lines_topic = StateTopic::<Vec<story::Line>>::new(StateLimits::default());
     let plant = CommandPort::<Command, Reply>::new(CommandLimits::default());
     let faults = CommandPort::<FaultCommand, Reply>::new(CommandLimits::default());
     let log = EventFilter {
@@ -82,7 +84,31 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .workspace("Control room")
         .command("plant", plant.clone())
         .command("faults", faults.clone())
+        .table(
+            "Scripted operator",
+            lines_topic.clone(),
+            vec![
+                Column::new("Plant ms", "/at_ms").format(Format::Number),
+                Column::new("Step", "/step").format(Format::Number),
+                Column::new("Text", "/text"),
+            ],
+        )
+        .inspector_first("Scripted operator")
         .event_table("Plant log", log, plant_log_columns())
+        .moment(
+            "Maneuver",
+            moment("action", Some(("command", "rod_demand"))),
+        )
+        .moment(
+            "Stuck gauge",
+            moment("fault", Some(("target", "hot_leg_b"))),
+        )
+        .moment("First action", moment("first_action", None))
+        .moment("Reactor trip", moment("trip", None))
+        .moment(
+            "Telemetry quiet",
+            moment("fault", Some(("target", "telemetry_quiet"))),
+        )
         .asset("nuclear/control-room.mjs", JS, CONTROL_ROOM)
         .asset("nuclear/control-board.mjs", JS, CONTROL_BOARD)
         .asset("nuclear/instruments.mjs", JS, INSTRUMENTS)
@@ -138,10 +164,24 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
             let story_driver = driver.clone();
             cx.spawn(move |cx| async move {
+                let mut lines = Vec::new();
+                let mut publish_error = None;
                 let report = story::run(&cx, &story_driver, &operator, |line| {
-                    println!("scripted: {line}");
+                    println!(
+                        "scripted: {:>7.1} s  step {}  {}",
+                        line.at_ms as f64 / 1000.0,
+                        line.step,
+                        line.text
+                    );
+                    lines.push(line);
+                    if let Err(error) = lines_topic.publish(cx.now(), &lines) {
+                        publish_error = Some(fictionet::Error::msg(format!(
+                            "the operator lines did not publish: {error:?}"
+                        )));
+                    }
                 })
-                .await;
+                .await
+                .and_then(|report| publish_error.map_or(Ok(report), Err));
                 let _ = story_done.send(report.map_err(|error| error.to_string()));
                 Ok(())
             });
@@ -195,6 +235,15 @@ fn apply_plant(cx: &Cx, driver: &Driver, command: Command) -> Reply {
             facts::rejected(cx, command, Source::Panel, rejected.reason, at_ms);
             Err(rejected)
         }
+    }
+}
+
+fn moment(kind: &str, field: Option<(&str, &str)>) -> EventFilter {
+    EventFilter {
+        source: Some("plant".into()),
+        kind: Some(kind.into()),
+        field: field.map(|(key, value)| (key.into(), value.into())),
+        ..EventFilter::default()
     }
 }
 

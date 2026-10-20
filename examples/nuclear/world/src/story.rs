@@ -2,10 +2,8 @@
 //!
 //! The operator works through the HMI. Its commands reach the controllers over
 //! Modbus, so each one is logged with source `hmi`. Faults are injected on the
-//! driver, the way the evaluation injects them. The story reads the plant's
-//! reported readings and alarms, the values a screen would show, and checks the
-//! plant against each step's expected outcome. A step that does not happen fails
-//! the run with a message, so a plant that does not behave cannot pass.
+//! driver. The operator reads only hmi01's HTTP view. The checks read plant
+//! truth to verify each step. A step that does not happen fails the run.
 //!
 //! The steps, in plant time:
 //!
@@ -34,6 +32,7 @@ use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::http1::{self, Header, RequestHead, Version};
 use fictionet::stdlib::world::sandbox::{self, Machine};
 use fictionet::{Cx, Error};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::command::{FaultCommand, Loop};
@@ -102,15 +101,28 @@ const DECAY_POWER_LIMIT: f64 = 1.0;
 /// The HMI polls every 250 ms, so one second covers the last sample before the fault.
 const QUIET_BASELINE_MS: u64 = 1_000;
 
+/// Plant time the restored gauge must track within one degree before the next fault.
+const GAUGE_TRACKING_MS: u64 = 3_000;
+
 /// Plant time the telemetry stays quiet in step 6.
 const QUIET_MS: u64 = 20_000;
 
 /// Plant time after the quiet fault clears before the story checks that readings resume.
 const RESUME_MS: u64 = 3_000;
 
+/// One scripted operator line, labeled with plant time and step.
+#[derive(Clone, Debug, Serialize)]
+pub struct Line {
+    pub at_ms: u64,
+    pub step: u8,
+    pub text: String,
+}
+
 /// What the story saw, in plant milliseconds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report {
+    /// When the operator lowered rod demand.
+    pub maneuver_at_ms: u64,
     /// When the stuck hot-leg gauge and the coolant pump trip began.
     pub fault_at_ms: u64,
     /// When the subcooling margin alarm was seen active.
@@ -176,43 +188,67 @@ pub fn plant_ms(fcx: &Cx) -> u64 {
 }
 
 /// Runs the six steps against `driver`, through the HMI on `operator`. `say`
-/// receives one line per step, labeled with the plant time.
+/// receives the lines for each step, labeled with the plant time.
 pub async fn run(
     fcx: &Cx,
     driver: &Driver,
     operator: &Machine,
-    mut say: impl FnMut(String),
+    mut say: impl FnMut(Line),
 ) -> Result<Report, Error> {
     let hot_b = Sensor::HotLeg(Loop::B);
     let start = driver.snapshot();
 
     // 1. Full power.
+    let initial_view = until_hmi(
+        fcx,
+        operator,
+        FULL_POWER_CHECK_MS,
+        "the initial HMI readings",
+        |view| {
+            Ok(["hot_leg_a", "hot_leg_b", "cold_leg_a", "cold_leg_b"]
+                .iter()
+                .all(|name| view["readings"][name]["value"].as_f64().is_some()))
+        },
+    )
+    .await?;
+    let initial_average = average_temperature(&initial_view)?;
     let full = wait_for(fcx, driver, FULL_POWER_CHECK_MS).await?;
-    let power = full.truth.reactor.neutron_power_percent;
-    let average = full.truth.primary.average_temperature_c;
+    let screen = hmi_view(fcx, operator).await?;
+    let power = reading(&screen, "neutron_power")?;
+    let average = average_temperature(&screen)?;
+    check((power - 100.0).abs() < 1.0, "HMI power is not in balance")?;
     check(
-        (power - 100.0).abs() < 1.0,
+        (average - initial_average).abs() < 0.5,
+        "HMI average temperature drifts at full power",
+    )?;
+    let true_power = full.truth.reactor.neutron_power_percent;
+    let true_average = full.truth.primary.average_temperature_c;
+    check(
+        (true_power - 100.0).abs() < 1.0,
         format!("full power is not in balance: {power:.2} %"),
     )?;
     check(
-        (average - start.truth.primary.average_temperature_c).abs() < 0.5,
+        (true_average - start.truth.primary.average_temperature_c).abs() < 0.5,
         format!("average temperature drifts at full power: {average:.2} C"),
     )?;
     say(line(
         full.at_ms,
+        1,
         &format!("full power: {power:.1} % power, {average:.1} C average"),
     ));
 
     // 2. A normal maneuver through the HMI.
-    let demand = full.truth.reactor.rod_demand_percent;
+    let demand = reading(&screen, "rod_demand")?;
     let target = demand - ROD_STEP_PERCENT;
-    let maneuver_at = full.at_ms;
     control(fcx, operator, "rod-demand", json!({ "percent": target })).await?;
+    let maneuver_at = driver.snapshot().at_ms;
     say(line(
         maneuver_at,
+        2,
         &format!("maneuver: rod demand from {demand:.1} % to {target:.1} % through the HMI"),
     ));
     let settled_from = wait_for(fcx, driver, maneuver_at + MANEUVER_SETTLE_MS).await?;
+    let before_view = hmi_view(fcx, operator).await?;
     let settled_to = wait_for(fcx, driver, settled_from.at_ms + SETTLE_WINDOW_MS).await?;
     let before = settled_from.truth.reactor.neutron_power_percent;
     let after = settled_to.truth.reactor.neutron_power_percent;
@@ -224,9 +260,21 @@ pub async fn run(
         (after - before).abs() < SETTLED_POWER_BAND,
         format!("power has not settled: {before:.2} % then {after:.2} % in 10 s"),
     )?;
+    let after_view = hmi_view(fcx, operator).await?;
+    let shown_before = reading(&before_view, "neutron_power")?;
+    let shown_after = reading(&after_view, "neutron_power")?;
+    check(
+        100.0 - shown_before >= MANEUVER_MIN_DROP_PERCENT,
+        "HMI power did not fall after the maneuver",
+    )?;
+    check(
+        (shown_after - shown_before).abs() < SETTLED_POWER_BAND,
+        "HMI power has not settled",
+    )?;
     say(line(
         settled_to.at_ms,
-        &format!("power settled at {after:.1} %"),
+        2,
+        &format!("power settled at {shown_after:.1} %"),
     ));
 
     // 3. The fault: the hot-leg gauge sticks at its present count, and coolant
@@ -251,21 +299,41 @@ pub async fn run(
         })),
     )?;
     let fault_at = driver.snapshot().at_ms;
+    let fault_heartbeat = heartbeats(&after_view)?[1];
     say(line(
         fault_at,
+        3,
         &format!("fault: loop B hot-leg gauge sticks at {stuck_c:.1} C, and coolant pump B trips"),
     ));
 
     // 4. The operator does nothing about loop B. The margin alarm comes from
     // the core exit channel, which still reads true.
-    let alarmed = until(
+    let alarm_view = until_hmi(
         fcx,
-        driver,
+        operator,
         fault_at + ALARM_LIMIT_MS,
         "the subcooling margin alarm",
-        |s| alarm_active(s, Alarm::SubcoolingMarginLow),
+        |view| {
+            if heartbeats(view)?[1].wrapping_sub(fault_heartbeat) < 2 {
+                return Ok(false);
+            }
+            check(
+                (reading(view, "hot_leg_b")? / resolution).round() as i16 == stuck_count,
+                "the HMI hot-leg gauge is not holding its stuck value",
+            )?;
+            check(
+                !hmi_alarm(view, "hot_leg_high")?,
+                "the HMI hot-leg alarm fired from the stuck gauge",
+            )?;
+            hmi_alarm(view, "subcooling_margin_low")
+        },
     )
     .await?;
+    let alarmed = driver.snapshot();
+    check(
+        alarm_active(&alarmed, Alarm::SubcoolingMarginLow),
+        "the plant subcooling margin alarm is not active",
+    )?;
     let gauge = &alarmed.readings[hot_b.index()];
     check(
         gauge.fault == Some(SensorFault::Stuck { value: stuck_count })
@@ -281,11 +349,10 @@ pub async fn run(
         true_hot_b > stuck_c + 1.0,
         format!("loop B did not heat: true hot leg {true_hot_b:.1} C against {stuck_c:.1} C"),
     )?;
-    let core_exit = alarmed.readings[Sensor::CoreExitTemperature.index()]
-        .reading
-        .value;
+    let core_exit = reading(&alarm_view, "core_exit_temperature")?;
     say(line(
         alarmed.at_ms,
+        4,
         &format!(
             "subcooling margin alarm: core exit reads {core_exit:.1} C, while the loop B gauge still reads {stuck_c:.1} C against {true_hot_b:.1} C"
         ),
@@ -293,29 +360,35 @@ pub async fn run(
 
     // 5. The operator reads the physics: the estimated margin, from the reported
     // pressure and core exit temperature. Trip before saturation.
-    let trip_point = until(
+    let trip_view = until_hmi(
         fcx,
-        driver,
+        operator,
         alarmed.at_ms + TRIP_LIMIT_MS,
         "the operator's trip condition",
-        |s| estimated_margin_c(s) < TRIP_MARGIN_C,
+        |view| Ok(estimated_margin_c(view)? < TRIP_MARGIN_C),
     )
     .await?;
+    let trip_point = driver.snapshot();
     check(
         !trip_point.model_limit,
         "the plant reached saturation before the operator tripped",
     )?;
     control(fcx, operator, "trip", Value::Null).await?;
     let tripped = driver.snapshot();
+    check(
+        !tripped.model_limit,
+        "the plant reached saturation during the HMI trip",
+    )?;
     let trip_at = match tripped.truth.reactor.trip {
         Some(trip) => trip.at_ms,
         None => return Err(Error::msg("the HMI trip did not trip the reactor")),
     };
     say(line(
-        tripped.at_ms,
+        trip_at,
+        5,
         &format!(
             "operator trips the reactor from the HMI, at an estimated {:.1} C margin",
-            estimated_margin_c(&trip_point)
+            estimated_margin_c(&trip_view)?
         ),
     ));
     let dropped = wait_for(fcx, driver, trip_at + ROD_DROP_MS).await?;
@@ -326,8 +399,14 @@ pub async fn run(
             dropped.truth.reactor.control_rod_percent
         ),
     )?;
+    let rods = hmi_view(fcx, operator).await?;
+    check(
+        reading(&rods, "rod_position")? < 1.0,
+        "the HMI has not confirmed the rods are in",
+    )?;
     say(line(
         dropped.at_ms,
+        5,
         "the rods are in; the operator starts auxiliary feed from the HMI",
     ));
     control(
@@ -347,6 +426,7 @@ pub async fn run(
     )?;
     say(line(
         settled.at_ms,
+        5,
         &format!(
             "settled on decay heat: {:.2} % power, {:.1} % decay heat",
             settled.truth.reactor.neutron_power_percent, settled.truth.reactor.decay_heat_percent
@@ -360,20 +440,51 @@ pub async fn run(
             pump: Loop::B,
         })),
     )?;
+    let cleared_at = driver.snapshot().at_ms;
+    say(line(
+        cleared_at,
+        5,
+        "fault cleared: loop B gauge and pump trip",
+    ));
+    let mut tracking_since = None;
+    let (gauge, true_hot_b) = loop {
+        let view = hmi_view(fcx, operator).await?;
+        let snapshot = driver.snapshot();
+        let gauge = reading(&view, "hot_leg_b")?;
+        let true_hot_b = snapshot.truth.primary.loops[Loop::B.index()].hot_leg_c;
+        check(
+            snapshot.at_ms <= cleared_at + 15_000,
+            "the loop B gauge did not catch up within 15 s after the faults cleared",
+        )?;
+        if (gauge - true_hot_b).abs() < 1.0 {
+            let since = *tracking_since.get_or_insert(snapshot.at_ms);
+            if snapshot.at_ms - since >= GAUGE_TRACKING_MS {
+                break (gauge, true_hot_b);
+            }
+        } else {
+            tracking_since = None;
+        }
+        pause(fcx).await?;
+    };
     say(line(
         driver.snapshot().at_ms,
-        "fault cleared: the loop B gauge reads the plant again",
+        5,
+        &format!(
+            "the loop B gauge reads the plant again: HMI {gauge:.1} C, true hot leg {true_hot_b:.1} C"
+        ),
     ));
 
     // 6. A second fault: telemetry goes quiet. The readings and their sample
     // times stop while the plant moves. The HMI holds the last values it polled.
     inject(fcx, driver, FaultChange::Inject(Fault::TelemetryQuiet))?;
     let quiet_from = driver.snapshot().at_ms;
-    say(line(quiet_from, "fault: telemetry goes quiet"));
+    say(line(quiet_from, 6, "fault: telemetry goes quiet"));
     // The baseline is taken after the last sample before the fault, so every
     // reading and the heartbeat hold the values they will keep through the window.
     let baseline = wait_for(fcx, driver, quiet_from + QUIET_BASELINE_MS).await?;
-    let hmi_before = hmi_reading(fcx, operator, "hot_leg_b").await?;
+    let view_before = hmi_view(fcx, operator).await?;
+    let hmi_before = reading(&view_before, "hot_leg_b")?;
+    let heartbeat_before = heartbeats(&view_before)?;
     let quiet_end = wait_for(fcx, driver, baseline.at_ms + QUIET_MS).await?;
     check(
         quiet_end.telemetry.quiet && quiet_end.telemetry.heartbeat == baseline.telemetry.heartbeat,
@@ -392,28 +503,47 @@ pub async fn run(
             != baseline.truth.primary.average_temperature_c,
         "the plant did not move while telemetry was quiet",
     )?;
-    let hmi_after = hmi_reading(fcx, operator, "hot_leg_b").await?;
+    let view_after = hmi_view(fcx, operator).await?;
+    let hmi_after = reading(&view_after, "hot_leg_b")?;
     check(
-        hmi_before.is_some() && hmi_before == hmi_after,
+        heartbeats(&view_after)? == heartbeat_before,
+        "the HMI heartbeats moved while telemetry was quiet",
+    )?;
+    check(
+        view_after["polls"].as_u64() > view_before["polls"].as_u64(),
+        "the HMI stopped polling",
+    )?;
+    check(
+        hmi_before == hmi_after,
         format!("the HMI gauge moved while telemetry was quiet: {hmi_before:?} then {hmi_after:?}"),
     )?;
     say(line(
         quiet_end.at_ms,
+        6,
         &format!(
             "telemetry quiet: the heartbeat stays at {}; the HMI holds loop B at {:.1} C while the plant moves",
-            quiet_end.telemetry.heartbeat,
-            hmi_after.unwrap_or(f64::NAN)
+            heartbeat_before[0], hmi_after
         ),
     ));
     inject(fcx, driver, FaultChange::Clear(FaultTarget::TelemetryQuiet))?;
     let quiet_to = driver.snapshot().at_ms;
+    say(line(quiet_to, 6, "fault cleared: telemetry quiet"));
     let resumed = wait_for(fcx, driver, quiet_to + RESUME_MS).await?;
     check(
         !resumed.telemetry.quiet && resumed.telemetry.heartbeat > quiet_end.telemetry.heartbeat,
         "the readings did not resume after the quiet fault cleared",
     )?;
+    let resumed_view = hmi_view(fcx, operator).await?;
+    check(
+        heartbeats(&resumed_view)?
+            .iter()
+            .zip(heartbeat_before)
+            .all(|(a, b)| *a != b),
+        "the HMI heartbeats did not resume",
+    )?;
     say(line(
         resumed.at_ms,
+        6,
         "telemetry resumes; the gauges catch up",
     ));
 
@@ -421,6 +551,7 @@ pub async fn run(
         Error::msg("no accepted command followed the fault, so the first action has no delay")
     })?;
     Ok(Report {
+        maneuver_at_ms: maneuver_at,
         fault_at_ms: fault_at,
         alarm_at_ms: alarmed.at_ms,
         trip_at_ms: trip_at,
@@ -430,8 +561,12 @@ pub async fn run(
     })
 }
 
-fn line(at_ms: u64, text: &str) -> String {
-    format!("{:>7.1} s  {text}", at_ms as f64 / 1000.0)
+fn line(at_ms: u64, step: u8, text: &str) -> Line {
+    Line {
+        at_ms,
+        step,
+        text: text.to_owned(),
+    }
 }
 
 fn check(ok: bool, message: impl Into<String>) -> Result<(), Error> {
@@ -452,14 +587,47 @@ fn alarm_active(snapshot: &PlantSnapshot, alarm: Alarm) -> bool {
 
 /// The subcooling margin the operator can estimate from the reported values:
 /// saturation at the reported pressure, minus the reported core exit temperature.
-fn estimated_margin_c(snapshot: &PlantSnapshot) -> f64 {
-    let pressure = snapshot.readings[Sensor::PressurizerPressure.index()]
-        .reading
-        .value;
-    let core_exit = snapshot.readings[Sensor::CoreExitTemperature.index()]
-        .reading
-        .value;
-    steam::saturation(pressure).temperature_c - core_exit
+fn estimated_margin_c(view: &Value) -> Result<f64, Error> {
+    Ok(
+        steam::saturation(reading(view, "pressurizer_pressure")?).temperature_c
+            - reading(view, "core_exit_temperature")?,
+    )
+}
+
+fn average_temperature(view: &Value) -> Result<f64, Error> {
+    Ok((reading(view, "hot_leg_a")?
+        + reading(view, "hot_leg_b")?
+        + reading(view, "cold_leg_a")?
+        + reading(view, "cold_leg_b")?)
+        / 4.0)
+}
+
+fn reading(view: &Value, name: &str) -> Result<f64, Error> {
+    view["readings"][name]["value"]
+        .as_f64()
+        .ok_or_else(|| Error::msg(format!("the HMI has no reading for {name}")))
+}
+
+fn hmi_alarm(view: &Value, name: &str) -> Result<bool, Error> {
+    view["alarms"]
+        .as_array()
+        .and_then(|alarms| alarms.iter().find(|a| a["id"] == name))
+        .and_then(|alarm| alarm["state"].as_str())
+        .map(|state| state != "normal")
+        .ok_or_else(|| Error::msg(format!("the HMI has no alarm for {name}")))
+}
+
+fn heartbeats(view: &Value) -> Result<[u16; 3], Error> {
+    let mut counts = [0; 3];
+    for (index, id) in ["rps1", "rcs1", "bop1"].iter().enumerate() {
+        counts[index] = view["links"]
+            .as_array()
+            .and_then(|links| links.iter().find(|link| link["id"] == *id))
+            .and_then(|link| link["heartbeat"].as_u64())
+            .and_then(|count| u16::try_from(count).ok())
+            .ok_or_else(|| Error::msg(format!("the HMI has no heartbeat for {id}")))?;
+    }
+    Ok(counts)
 }
 
 /// Applies a fault change on the driver, logging it on `fcx`. The expected
@@ -497,19 +665,19 @@ async fn wait_for(fcx: &Cx, driver: &Driver, at_ms: u64) -> Result<PlantSnapshot
 
 /// Waits until `done` holds. Fails when the plant reaches `limit_ms` first;
 /// `what` names the event in the failure.
-async fn until(
+async fn until_hmi(
     fcx: &Cx,
-    driver: &Driver,
+    operator: &Machine,
     limit_ms: u64,
     what: &str,
-    done: impl Fn(&PlantSnapshot) -> bool,
-) -> Result<PlantSnapshot, Error> {
+    done: impl Fn(&Value) -> Result<bool, Error>,
+) -> Result<Value, Error> {
     loop {
-        let snapshot = driver.snapshot();
-        if done(&snapshot) {
-            return Ok(snapshot);
+        let view = hmi_view(fcx, operator).await?;
+        if done(&view)? {
+            return Ok(view);
         }
-        if snapshot.at_ms >= limit_ms {
+        if plant_ms(fcx) >= limit_ms {
             return Err(Error::msg(format!(
                 "{what} did not happen by {limit_ms} ms"
             )));
@@ -550,8 +718,8 @@ async fn control(fcx: &Cx, operator: &Machine, kind: &str, body: Value) -> Resul
     Ok(())
 }
 
-/// Reads one reading value from the HMI's plant view, in engineering units.
-async fn hmi_reading(fcx: &Cx, operator: &Machine, name: &str) -> Result<Option<f64>, Error> {
+/// Reads the complete HMI view over the operator connection.
+async fn hmi_view(fcx: &Cx, operator: &Machine) -> Result<Value, Error> {
     let request = http1::Request {
         head: RequestHead {
             method: "GET".to_owned(),
@@ -562,9 +730,11 @@ async fn hmi_reading(fcx: &Cx, operator: &Machine, name: &str) -> Result<Option<
         body: Vec::new(),
     };
     let response = exchange(fcx, operator, &request).await?;
-    let view: Value =
-        serde_json::from_slice(&response.body).map_err(|e| Error::msg(e.to_string()))?;
-    Ok(view["readings"][name]["value"].as_f64())
+    check(
+        response.head.status == 200,
+        "the HMI plant view request failed",
+    )?;
+    serde_json::from_slice(&response.body).map_err(|e| Error::msg(e.to_string()))
 }
 
 fn header(name: &str, value: &str) -> Header {

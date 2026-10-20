@@ -113,7 +113,7 @@ async fn plant(fcx: &Cx, operator: &Machine) -> Value {
 async fn next_poll(fcx: &Cx, operator: &Machine, after: u64) -> Value {
     for _ in 0..400 {
         let view = plant(fcx, operator).await;
-        if view["heartbeat"].as_u64().unwrap_or(0) > after {
+        if view["polls"].as_u64().unwrap_or(0) > after {
             return view;
         }
         fcx.sleep(Duration::from_millis(50))
@@ -322,12 +322,8 @@ fn a_control_post_changes_the_plant_and_the_next_poll_shows_it() {
             );
 
             driver.advance_to(&(), 6_000);
-            let after = next_poll(
-                &fcx,
-                &world.operator,
-                before["heartbeat"].as_u64().unwrap_or(0),
-            )
-            .await;
+            let after =
+                next_poll(&fcx, &world.operator, before["polls"].as_u64().unwrap_or(0)).await;
             assert_eq!(
                 value(&after, "rod_demand"),
                 40.0,
@@ -421,12 +417,8 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
             .await;
             assert_eq!(stop.head.status, 200);
             driver.advance_to(&(), 4_000);
-            let stopped = next_poll(
-                &fcx,
-                &world.operator,
-                before["heartbeat"].as_u64().unwrap_or(0),
-            )
-            .await;
+            let stopped =
+                next_poll(&fcx, &world.operator, before["polls"].as_u64().unwrap_or(0)).await;
             assert_eq!(stopped["status"]["coolant_pump_b"], json!(false));
             assert_eq!(alarm_state(&stopped, "coolant_pump_stopped"), "active");
 
@@ -440,7 +432,7 @@ fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
             let acknowledged = next_poll(
                 &fcx,
                 &world.operator,
-                stopped["heartbeat"].as_u64().unwrap_or(0),
+                stopped["polls"].as_u64().unwrap_or(0),
             )
             .await;
             assert_eq!(
@@ -493,4 +485,71 @@ fn an_ordinary_sandbox_cannot_reach_hmi01() {
         },
     ));
     result.unwrap();
+}
+
+#[test]
+fn telemetry_heartbeats_hold_across_polls_and_resume_after_clearing() {
+    use nuclear_world::command::FaultCommand;
+    use nuclear_world::faults::{Fault, FaultChange, FaultTarget};
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(9)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let world = start_world(&fcx, &driver)?;
+            let before = next_poll(&fcx, &world.operator, 0).await;
+            let counts = |view: &Value| {
+                view["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|link| link["heartbeat"].as_u64().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let held_counts = counts(&before);
+            assert_eq!(
+                held_counts,
+                vec![u64::from(driver.snapshot().telemetry.heartbeat); 3]
+            );
+            driver
+                .apply_fault(
+                    &fcx,
+                    FaultCommand {
+                        change: FaultChange::Inject(Fault::TelemetryQuiet),
+                        expected_revision: driver.snapshot().revision,
+                    },
+                )
+                .unwrap();
+            let mut polls = before["polls"].as_u64().unwrap();
+            for at_ms in [3_000, 4_000, 5_000, 6_000] {
+                driver.advance_to(&(), at_ms);
+                let view = next_poll(&fcx, &world.operator, polls).await;
+                let next = view["polls"].as_u64().unwrap();
+                assert!(next > polls);
+                assert_eq!(counts(&view), held_counts);
+                polls = next;
+            }
+            assert_eq!(driver.snapshot().at_ms, 6_000);
+            driver
+                .apply_fault(
+                    &fcx,
+                    FaultCommand {
+                        change: FaultChange::Clear(FaultTarget::TelemetryQuiet),
+                        expected_revision: driver.snapshot().revision,
+                    },
+                )
+                .unwrap();
+            driver.advance_to(&(), 7_000);
+            let resumed = next_poll(&fcx, &world.operator, polls).await;
+            assert!(
+                counts(&resumed)
+                    .iter()
+                    .zip(&held_counts)
+                    .all(|(a, b)| a > b)
+            );
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
 }

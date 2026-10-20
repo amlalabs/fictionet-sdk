@@ -47,7 +47,7 @@
 //! | [`plant`] | Time, energy balances, controls and command application |
 //! | [`steam`] | Coarse saturation table |
 //! | [`protection`] | True-channel trips and reported-channel alarms |
-//! | [`registers`] | Modbus register map of the three controllers |
+//! | [`registers`] | Modbus register map and telemetry heartbeats of the three controllers |
 //! | [`sensors`] | Instrument ranges, lag, noise and sampling |
 //! | [`faults`] | Fixed fault slots and schedules |
 //! | [`command`] | Integer commands and replies |
@@ -72,7 +72,9 @@
 //! status together; controller modes remain live.
 //! Fault slots and the schedule are fixed arrays, so overflow cannot be built.
 //! The viewer example, `examples/viewer.rs`, runs the plant in real time and
-//! serves the control room page with the scripted story.
+//! serves the control room page with scripted steps and plant moments. The operator
+//! reads and commands through hmi01. The checks read plant truth. Each HMI link
+//! shows a telemetry heartbeat that stops when the feed freezes; polls keep counting.
 //!
 //! ```
 //! use nuclear_world::{Plant, Config, command::{Command, FaultCommand}};

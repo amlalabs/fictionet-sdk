@@ -21,6 +21,8 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     });
     let outcome: Arc<Mutex<Option<Result<Report, fictionet::Error>>>> = Arc::new(Mutex::new(None));
     let stored = outcome.clone();
+    let spoken = Arc::new(Mutex::new(Vec::new()));
+    let collected = spoken.clone();
     let options = RunOptions::new(Seed::from_u64(1)).observer(memory.clone());
     block_on(lab(options, move |cx| async move {
         let operator = story::start_network(&cx, &driver)?;
@@ -28,7 +30,10 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         cx.spawn(move |cx| async move { story::clock(&cx, &clock_driver, |_| Ok(())).await });
         let story_driver = driver.clone();
         cx.spawn(move |cx| async move {
-            let report = story::run(&cx, &story_driver, &operator, |line| println!("{line}")).await;
+            let report = story::run(&cx, &story_driver, &operator, |line| {
+                collected.lock().push(line)
+            })
+            .await;
             *stored.lock() = Some(report);
             cx.cancel();
             Ok(())
@@ -42,8 +47,28 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
         .ok_or_else(|| fictionet::Error::msg("the story did not finish"))?
         .map_err(|error| fictionet::Error::msg(format!("the story failed: {error}")))?;
 
+    let spoken = spoken.lock();
+    assert!(spoken.windows(2).all(|pair| pair[0].at_ms <= pair[1].at_ms));
+    let mut steps: Vec<_> = spoken.iter().map(|line| line.step).collect();
+    steps.dedup();
+    assert_eq!(steps, vec![1, 2, 3, 4, 5, 6]);
+    let at = |prefix: &str| {
+        spoken
+            .iter()
+            .find(|line| line.text.starts_with(prefix))
+            .unwrap()
+            .at_ms
+    };
+    assert_eq!(at("maneuver:"), report.maneuver_at_ms);
+    assert_eq!(at("fault: loop B"), report.fault_at_ms);
+    assert_eq!(at("subcooling margin alarm:"), report.alarm_at_ms);
+    assert_eq!(at("operator trips"), report.trip_at_ms);
+    assert_eq!(at("fault: telemetry"), report.quiet_from_ms);
+    assert_eq!(at("fault cleared: telemetry"), report.quiet_to_ms);
+
     // The maneuver, the trip, and the auxiliary feed start all come from the HMI.
     let actions = memory.checked_of("plant", "action")?;
+    assert_eq!(actions[0].u64("at_ms"), Some(report.maneuver_at_ms));
     let commands: Vec<_> = actions
         .iter()
         .map(|a| (a.str("command"), a.str("source")))
@@ -77,6 +102,17 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
             .count(),
         3,
         "the loop B gauge, the pump, and telemetry clear"
+    );
+
+    for clear in faults
+        .iter()
+        .filter(|f| f.str("change") == Some("clear") && f.str("target") != Some("telemetry_quiet"))
+    {
+        assert!(report.quiet_from_ms >= clear.u64("at_ms").unwrap() + 3_000);
+    }
+    assert_eq!(
+        starts[2],
+        (Some("telemetry_quiet"), Some(report.quiet_from_ms))
     );
 
     // One first action after the fault, with the delay the report gives.

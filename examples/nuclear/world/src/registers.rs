@@ -20,6 +20,15 @@
 //! no state. Holding registers read back the rod demand. The snapshot holds no
 //! valve demands, so valve registers read back the valve position.
 
+//! Each input block ends with an unscaled Telemetry heartbeat count. It wraps
+//! at 16 bits and holds while telemetry is quiet.
+//!
+//! | Controller | Address | Name | Scale |
+//! | --- | --- | --- | --- |
+//! | rps1 | 5 (30006) | Telemetry heartbeat | 1 |
+//! | rcs1 | 8 (30009) | Telemetry heartbeat | 1 |
+//! | bop1 | 10 (30011) | Telemetry heartbeat | 1 |
+
 use crate::command::{Command, Controller, Loop, Mode, Pump, Valve};
 use crate::sensors::Sensor;
 use crate::snapshot::PlantSnapshot;
@@ -44,21 +53,24 @@ enum Input {
     ShutdownRods,
     /// Reactivity with the +32768 bias, from the true reactor state.
     Reactivity,
+    /// The telemetry sample count.
+    Heartbeat,
 }
 
 const REACTIVITY_RESOLUTION_PCM: f64 = 0.1;
 const REACTIVITY_BIAS: f64 = 32_768.0;
 const ROD_RESOLUTION_PERCENT: f64 = 0.1;
 
-const RPS1_INPUTS: [Input; 5] = [
+const RPS1_INPUTS: [Input; 6] = [
     Input::Sensor(Sensor::NeutronPower),
     Input::Sensor(Sensor::RodPosition),
     Input::Sensor(Sensor::CoreExitTemperature),
     Input::ShutdownRods,
     Input::Reactivity,
+    Input::Heartbeat,
 ];
 
-const RCS1_INPUTS: [Input; 8] = [
+const RCS1_INPUTS: [Input; 9] = [
     Input::Sensor(Sensor::HotLeg(Loop::A)),
     Input::Sensor(Sensor::HotLeg(Loop::B)),
     Input::Sensor(Sensor::ColdLeg(Loop::A)),
@@ -67,9 +79,10 @@ const RCS1_INPUTS: [Input; 8] = [
     Input::Sensor(Sensor::PressurizerLevel),
     Input::Sensor(Sensor::CoolantFlow(Loop::A)),
     Input::Sensor(Sensor::CoolantFlow(Loop::B)),
+    Input::Heartbeat,
 ];
 
-const BOP1_INPUTS: [Input; 10] = [
+const BOP1_INPUTS: [Input; 11] = [
     Input::Sensor(Sensor::SteamGeneratorLevel(Loop::A)),
     Input::Sensor(Sensor::SteamGeneratorLevel(Loop::B)),
     Input::Sensor(Sensor::SteamPressure),
@@ -80,6 +93,7 @@ const BOP1_INPUTS: [Input; 10] = [
     Input::Sensor(Sensor::TurbineValve),
     Input::Sensor(Sensor::GeneratorOutput),
     Input::Sensor(Sensor::CondenserPressure),
+    Input::Heartbeat,
 ];
 
 fn inputs(plc: Plc) -> &'static [Input] {
@@ -110,6 +124,7 @@ fn input_count(input: Input, s: &PlantSnapshot) -> u16 {
             ROD_RESOLUTION_PERCENT,
         ),
         Input::Reactivity => reactivity_count(s.truth.reactor.reactivity_pcm),
+        Input::Heartbeat => s.telemetry.heartbeat,
     }
 }
 
@@ -247,6 +262,47 @@ mod tests {
         Plant::new(Config::default()).snapshot()
     }
 
+    fn assert_heartbeats(snapshot: &PlantSnapshot, expected: u16) {
+        for (plc, address) in [(Plc::Rps1, 5), (Plc::Rcs1, 8), (Plc::Bop1, 10)] {
+            assert_eq!(input_registers(plc, snapshot)[address], expected);
+            assert_eq!(expected, snapshot.telemetry.heartbeat);
+        }
+    }
+
+    #[test]
+    fn telemetry_registers_hold_while_the_plant_advances() {
+        use crate::command::FaultCommand;
+        use crate::faults::{Fault, FaultChange};
+        let mut plant = Plant::new(Config::default());
+        plant.advance(1_000);
+        let before = plant.snapshot();
+        assert_heartbeats(&before, 4);
+        plant
+            .apply_fault(FaultCommand {
+                change: FaultChange::Inject(Fault::TelemetryQuiet),
+                expected_revision: before.revision,
+            })
+            .unwrap();
+        plant.apply(Command::ManualTrip).unwrap();
+        plant.advance(5_000);
+        let after = plant.snapshot();
+        assert!(after.at_ms > before.at_ms);
+        assert_ne!(
+            after.truth.reactor.neutron_power_percent,
+            before.truth.reactor.neutron_power_percent
+        );
+        assert_heartbeats(&after, before.telemetry.heartbeat);
+    }
+
+    #[test]
+    fn telemetry_registers_wrap_at_sixteen_bits() {
+        let mut plant = Plant::new(Config::default());
+        plant.advance(u64::from(u16::MAX) * 250);
+        assert_heartbeats(&plant.snapshot(), u16::MAX);
+        plant.advance((u64::from(u16::MAX) + 1) * 250);
+        assert_heartbeats(&plant.snapshot(), 0);
+    }
+
     #[test]
     fn counts_use_instrument_resolution() {
         assert_eq!(count(325.0, 0.1), 3250);
@@ -293,7 +349,17 @@ mod tests {
         }
         assert_eq!(
             input_registers(Plc::Rcs1, &s),
-            vec![3000, 3010, 2900, 2910, 1500, 600, 990, 980],
+            vec![
+                3000,
+                3010,
+                2900,
+                2910,
+                1500,
+                600,
+                990,
+                980,
+                s.telemetry.heartbeat
+            ],
         );
     }
 
@@ -317,7 +383,19 @@ mod tests {
         }
         assert_eq!(
             input_registers(Plc::Bop1, &s),
-            vec![500, 510, 690, 4000, 4010, 4020, 4030, 800, 9000, 50,],
+            vec![
+                500,
+                510,
+                690,
+                4000,
+                4010,
+                4020,
+                4030,
+                800,
+                9000,
+                50,
+                s.telemetry.heartbeat
+            ],
         );
     }
 

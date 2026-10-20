@@ -92,12 +92,12 @@ const byLabel = (root, label) => find(root, (n) => n.getAttribute('aria-label') 
 // One reply of /api/plant, as the HMI sends it at full power with one active
 // alarm (relief valve open) and one acknowledged alarm (coolant pump B stopped).
 const SAMPLE = {
-  heartbeat: 42,
+  polls: 42,
   clock_ms: 12500,
   links: [
-    { id: 'rps1', online: true, read_ms: 12500, error: null },
-    { id: 'rcs1', online: true, read_ms: 12000, error: null },
-    { id: 'bop1', online: true, read_ms: 12250, error: null },
+    { id: 'rps1', online: true, read_ms: 12500, error: null, heartbeat: 50 },
+    { id: 'rcs1', online: true, read_ms: 12000, error: null, heartbeat: 50 },
+    { id: 'bop1', online: true, read_ms: 12250, error: null, heartbeat: 50 },
   ],
   readings: {
     neutron_power: { value: 100.0, unit: '%', stale: false },
@@ -150,6 +150,7 @@ const SAMPLE = {
     steam_dump: 'automatic',
   },
   alarms: [
+    { id: 'subcooling_margin_low', label: 'Subcooling margin low', state: 'normal' },
     { id: 'pressurizer_pressure_high', label: 'Pressurizer pressure high', state: 'normal' },
     { id: 'pressurizer_pressure_low', label: 'Pressurizer pressure low', state: 'normal' },
     { id: 'pressurizer_level_high', label: 'Pressurizer level high', state: 'normal' },
@@ -251,16 +252,16 @@ test('the status bar shows the clock, each controller and the heartbeat', () => 
   const root = fakeRoot();
   render(root, SAMPLE, []);
   find(root, (n) => n.textContent === 'Clock 12.5 s');
-  find(root, (n) => n.textContent === 'Heartbeat 42');
-  find(root, (n) => n.textContent === 'rcs1 online, last poll 12.0 s');
+  assert.ok(!root.textContent.includes('Heartbeat 42'));
+  find(root, (n) => n.textContent === 'rcs1 online, last poll 12.0 s, heartbeat 50');
 });
 
 test('a controller that was never read shows dashes and no values', () => {
   const root = fakeRoot();
   const unread = structuredClone(SAMPLE);
   unread.clock_ms = null;
-  unread.heartbeat = 0;
-  unread.links = unread.links.map((link) => ({ ...link, online: false, read_ms: null }));
+  unread.polls = 0;
+  unread.links = unread.links.map((link) => ({ ...link, online: false, read_ms: null, heartbeat: null }));
   for (const reading of Object.values(unread.readings)) {
     reading.value = null;
     reading.stale = true;
@@ -269,7 +270,7 @@ test('a controller that was never read shows dashes and no values', () => {
   render(root, unread, []);
   assert.equal(byReading(root, 'pressurizer_pressure').textContent, 'Pressure: —');
   find(root, (n) => n.textContent === 'Clock: waiting for the first poll');
-  find(root, (n) => n.textContent === 'rcs1 offline, never read');
+  find(root, (n) => n.textContent === 'rcs1 offline, never read, heartbeat not yet read');
   assert.ok(byReading(root, 'pressurizer_pressure').classList.contains('stale'));
 });
 
@@ -364,4 +365,20 @@ test('the pump button starts a stopped pump and stops a running one', async () =
       body: { name: 'coolant-b', running: true },
     });
   });
+});
+
+test('the subcooling margin tile follows its state', () => {
+  const root = fakeRoot();
+  const plant = structuredClone(SAMPLE);
+  plant.alarms.find((alarm) => alarm.id === 'subcooling_margin_low').state = 'active';
+  render(root, plant, []);
+  assert.ok(byAlarm(root, 'subcooling_margin_low').classList.contains('active'));
+});
+
+test('a null link heartbeat is not yet read', () => {
+  const root = fakeRoot();
+  const plant = structuredClone(SAMPLE);
+  plant.links[0].heartbeat = null;
+  render(root, plant, []);
+  find(root, (n) => n.textContent === 'rps1 online, last poll 12.5 s, heartbeat not yet read');
 });

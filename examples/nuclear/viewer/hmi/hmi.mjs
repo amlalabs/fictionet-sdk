@@ -533,11 +533,9 @@ function buildStatus(doc) {
     bar.appendChild(link);
     links.set(id, link);
   }
-  const heartbeat = make(doc, 'span', { class: 'status-item heartbeat' });
   const notice = make(doc, 'span', { class: 'status-item notice', role: 'status' });
-  bar.appendChild(heartbeat);
   bar.appendChild(notice);
-  return { bar, clock, links, heartbeat, notice };
+  return { bar, clock, links, notice };
 }
 
 function fillStatus(s, plant) {
@@ -548,10 +546,10 @@ function fillStatus(s, plant) {
     const item = s.links.get(link.id);
     if (!item) continue;
     const last = link.read_ms === null || link.read_ms === undefined ? 'never read' : `last poll ${seconds(link.read_ms)}`;
-    item.textContent = `${link.id} ${link.online ? 'online' : 'offline'}, ${last}`;
+    const heartbeat = link.heartbeat == null ? 'not yet read' : link.heartbeat;
+    item.textContent = `${link.id} ${link.online ? 'online' : 'offline'}, ${last}, heartbeat ${heartbeat}`;
     setFlag(item, 'offline', !link.online);
   }
-  s.heartbeat.textContent = `Heartbeat ${plant.heartbeat ?? 0}`;
 }
 
 // ---- Page loop -------------------------------------------------------------
