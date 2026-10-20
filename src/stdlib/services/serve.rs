@@ -898,13 +898,10 @@ impl Staged {
             cx.events_lost(state.lost);
         }
         if let Some(observer) = &self.observer {
-            observer.report_loss(fictionet::events::Loss {
-                stream: fictionet::events::Stream::Events,
-                reason: fictionet::events::LossReason::Staging,
-                count: state.lost,
-                bytes: None,
-                seqs: None,
-            });
+            observer.lost(fictionet::events::Loss::staged(
+                fictionet::events::Stream::Events,
+                state.lost,
+            ));
         }
     }
 }

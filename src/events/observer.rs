@@ -353,7 +353,7 @@ impl Dispatch {
 
     /// Reports observations a producer omitted before delivery. A zero
     /// count, or a loss after the run ends, reports nothing.
-    pub fn report_loss(&self, loss: Loss) {
+    pub fn lost(&self, loss: Loss) {
         if loss.count != 0
             && let Some(observer) = &self.observer
         {

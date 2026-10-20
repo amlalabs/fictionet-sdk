@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use super::{Dispatch, Loss, LossReason, Stream, TopologyRef};
+use super::{Dispatch, Loss, Stream, TopologyRef};
 
 /// Topology records one poll may stage. A world's first poll can build
 /// thousands of tasks, groups and links.
@@ -81,13 +81,9 @@ impl Drop for Scope {
             item(&batch.dispatch);
         }
         if batch.lost != 0 {
-            batch.dispatch.report_loss(Loss {
-                stream: Stream::Topology,
-                reason: LossReason::Staging,
-                count: batch.lost,
-                bytes: None,
-                seqs: None,
-            });
+            batch
+                .dispatch
+                .lost(Loss::staged(Stream::Topology, batch.lost));
         }
     }
 }
@@ -253,7 +249,7 @@ fn own(item: TopologyRef<'_>) -> Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{Interest, Observation, Observer, Stamp, TaskId};
+    use crate::events::{Interest, LossReason, Observation, Observer, Stamp, TaskId};
     use crate::sync::Mutex;
 
     #[derive(Default)]

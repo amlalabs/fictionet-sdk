@@ -359,6 +359,20 @@ pub struct Loss {
     pub seqs: Option<RangeInclusive<u64>>,
 }
 
+impl Loss {
+    /// `count` observations of `stream` that a producer dropped because its
+    /// buffer was full, before they were numbered.
+    pub fn staged(stream: Stream, count: u64) -> Self {
+        Loss {
+            stream,
+            reason: LossReason::Staging,
+            count,
+            bytes: None,
+            seqs: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -452,13 +452,10 @@ impl Cx {
     /// Reports facts omitted by a bounded producer before event delivery.
     /// Installed observers retain this loss status for completeness checks.
     pub fn events_lost(&self, count: u64) {
-        self.run.observer.report_loss(crate::events::Loss {
-            stream: crate::events::Stream::Events,
-            reason: crate::events::LossReason::Staging,
+        self.run.observer.lost(crate::events::Loss::staged(
+            crate::events::Stream::Events,
             count,
-            bytes: None,
-            seqs: None,
-        });
+        ));
     }
 
     pub(crate) fn emit_observation(&self, mut event: Event) {
