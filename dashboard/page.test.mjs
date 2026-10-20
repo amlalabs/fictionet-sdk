@@ -365,3 +365,40 @@ test('a custom workspace can sit beside consoles while pins remain available', a
   assert.equal(h.budget.open, 0);
   assert.equal(h.timers.size, 0);
 });
+
+test('the stopped page stays stopped without an Events reconnect banner after the stream drops', async (t) => {
+  const h = harness(t);
+  const { mount } = await import('./page.mjs');
+  const { createTransport } = await import('./transport.mjs');
+  let watch, requests = 0;
+  const transport = createTransport({ state: {} }, {
+    location: { href: 'http://127.0.0.1:12345/' },
+    storage: { getItem: () => 'token' },
+    window: h.window,
+    fetch: async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/page') return Response.json({ ...DESCRIPTION, hosts: [], moments: [], panels: [DESCRIPTION.panels[1]] });
+      if (path === '/api/watch') {
+        requests++;
+        return new Response(new ReadableStream({ start(controller) { watch = controller; } }), { headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const stop = await mount(h.root, transport, { subscribe: () => () => {}, dispose() {} });
+  await settle();
+  const send = (name, data) => watch.enqueue(new TextEncoder().encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`));
+  send('snapshot', { t: 1, ended: false, hosts: [], groups: [], nodes: [], edges: [], events: [], counters: {} });
+  await settle();
+  assert.equal(h.root.querySelector('#page-status').textContent, 'Running');
+  send('ended', { t: 2 });
+  send('end', { reason: 'the page server stopped' });
+  watch.close();
+  await settle();
+  assert.equal(h.root.querySelector('#page-status').textContent, 'Stopped');
+  assert.equal(h.root.querySelector('#run-status').dataset.state, 'stopped');
+  assert.equal(h.root.querySelector('.loss-note').hidden, true);
+  assert.doesNotMatch(h.root.textContent, /Connection dropped|Reconnecting/);
+  assert.equal(requests, 1);
+  stop();
+});

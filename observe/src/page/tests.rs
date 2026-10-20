@@ -2155,3 +2155,188 @@ async fn workspace_with_hosts_keeps_consoles_beside_the_custom_panel() {
             .any(|p| p["kind"] == "packets" && p["area"] == "inspector")
     );
 }
+
+async fn open_events(server: &Server, path: &str) -> (TcpStream, Vec<u8>) {
+    let mut conn = TcpStream::connect(address(server)).await.unwrap();
+    conn.write_all(
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\n{}\r\n",
+            address(server),
+            bearer(server),
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut wire = Vec::new();
+    next_events(&mut conn, &mut wire, 1).await;
+    (conn, wire)
+}
+
+#[tokio::test]
+async fn shutdown_drains_run_and_state_events_and_closes_consoles() {
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let topic = StateTopic::new(StateLimits::default());
+    let server = Page::new("Shutdown", dashboard.handle())
+        .table("Numbers", topic.clone(), vec![])
+        .host(Host::new("alpha").console(FakeConsole::default()))
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(3)).observer(dashboard.observer()),
+            |cx| async move {
+                ready.send(()).unwrap();
+                finished.await.unwrap();
+                topic.publish(cx.now(), &vec![42]).unwrap();
+                for n in 0..300 {
+                    cx.emit("fixture", "finished", |event| event.field("number", n));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+    });
+    started.await.unwrap();
+    let (mut watch, mut watch_wire) = open_events(&server, "/api/watch").await;
+    let (mut state, mut state_wire) =
+        open_events(&server, "/api/states/stream?topics=numbers").await;
+    let mut consoles = Vec::new();
+    for capability in ["screen", "terminal"] {
+        let ticket = mint(&server, "alpha", capability).await;
+        let mut ws = Ws::connect(&server, "alpha", capability, &ticket, 101).await;
+        ws.barrier().await;
+        consoles.push(ws);
+    }
+    finish.send(()).unwrap();
+    worker.join().unwrap();
+    server.shutdown(Duration::from_secs(2)).await;
+    watch.read_to_end(&mut watch_wire).await.unwrap();
+    state.read_to_end(&mut state_wire).await.unwrap();
+    let watch = String::from_utf8(watch_wire).unwrap();
+    let state = String::from_utf8(state_wire).unwrap();
+    assert!(watch.find("event: ended\n").unwrap() < watch.find("event: end\n").unwrap());
+    assert_eq!(
+        watch.matches("\"kind\":\"finished\"").count(),
+        300,
+        "{watch}"
+    );
+    assert!(state.find("\"value\":[42]").unwrap() < state.find("event: end\n").unwrap());
+    assert!(state.contains(r#"{"reason":"the page server stopped"}"#));
+    for mut ws in consoles {
+        let Message::Close(Some(close)) = ws.recv().await else {
+            panic!("expected a close frame")
+        };
+        assert_eq!(close.code, 1001);
+        assert_eq!(close.reason, "the page server stopped");
+    }
+}
+
+#[tokio::test]
+async fn shutdown_bounds_a_stream_whose_client_stops_reading() {
+    let topic = StateTopic::new(StateLimits::default());
+    topic
+        .publish(fictionet::time::Instant::ZERO, &vec!["x".repeat(250 << 10)])
+        .unwrap();
+    let mut page = Page::new(
+        "Stalled reader",
+        crate::DashboardObserver::new(crate::DashboardOptions::demo()).handle(),
+    );
+    let topics: Vec<_> = (0..64).map(|n| format!("data-{n}")).collect();
+    for name in &topics {
+        page = page.table(name, topic.clone(), vec![]);
+    }
+    let server = page.bind_loopback(0).await.unwrap();
+    let addr = address(&server).parse().unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(1024).unwrap();
+    let mut client = socket.connect(addr).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "GET /api/states/stream?topics={} HTTP/1.1\r\nHost: {}\r\n{}\r\n",
+                topics.join(","),
+                address(&server),
+                bearer(&server),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(client.read_u8().await.unwrap());
+    }
+    status(std::str::from_utf8(&head).unwrap(), 200);
+    let task = server.task.abort_handle();
+    let bound = Duration::from_millis(100);
+    tokio::time::timeout(bound + Duration::from_millis(100), server.shutdown(bound))
+        .await
+        .unwrap();
+    assert!(task.is_finished());
+    assert!(TcpStream::connect(addr).await.is_err());
+}
+
+#[tokio::test]
+async fn shutdown_drains_packets_while_the_world_is_running() {
+    use fictionet::{Interface, InterfaceExt};
+    let dashboard = crate::DashboardObserver::new(crate::DashboardOptions::demo());
+    let server = Page::new("Packets", dashboard.handle())
+        .bind_loopback(0)
+        .await
+        .unwrap();
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let (send, sending) = tokio::sync::oneshot::channel();
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        fictionet::block_on(fictionet::run(
+            fictionet::RunOptions::new(fictionet::Seed::from_u64(3)).observer(dashboard.observer()),
+            |cx| async move {
+                let (attacher, mut attachments) = fictionet::attachments();
+                let mut links = Vec::new();
+                for n in 0..6 {
+                    let sandbox = attacher.attach(&format!("guest-{n}")).unwrap();
+                    let attached = attachments.next(&cx).await?;
+                    links.push((sandbox, attached));
+                }
+                ready.send(()).unwrap();
+                sending.await.unwrap();
+                for (sandbox, attached) in &mut links {
+                    // Keep each link below burst sampling without changing capture limits.
+                    for _ in 0..50 {
+                        sandbox.send(fictionet::Packet(vec![
+                            0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1, 8,
+                            0, 0, 0, 0x12, 0x34, 0, 1,
+                        ]));
+                        attached.recv(&cx).await?;
+                    }
+                }
+                sent.send(()).unwrap();
+                finished.await.unwrap();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    });
+    started.await.unwrap();
+    let (mut packets, mut wire) = open_events(&server, "/api/packets?link=e1,e2,e3,e4,e5,e6").await;
+    let (mut watch, mut watch_wire) = open_events(&server, "/api/watch").await;
+    send.send(()).unwrap();
+    received.await.unwrap();
+    server.shutdown(Duration::from_secs(2)).await;
+    packets.read_to_end(&mut wire).await.unwrap();
+    watch.read_to_end(&mut watch_wire).await.unwrap();
+    finish.send(()).unwrap();
+    worker.join().unwrap();
+    let packets = String::from_utf8(wire).unwrap();
+    assert_eq!(packets.matches("event: packet\n").count(), 300, "{packets}");
+    let end = "event: end\ndata: {\"reason\":\"the page server stopped\"}\n\n";
+    assert!(packets.ends_with(end), "{packets}");
+    let watch = String::from_utf8(watch_wire).unwrap();
+    assert!(watch.ends_with(end), "{watch}");
+    assert!(!watch.contains("event: ended\n"));
+}

@@ -82,6 +82,21 @@ async function checkPacketLayout() {
   const last = $('#prows').lastElementChild;
   check(last.querySelector('.c-src').textContent === src && last.querySelector('.c-dst').textContent === dst, 'long address changed');
   for (const cell of root.querySelectorAll('td.c-src, td.c-dst, td.c-time')) whole(cell);
+  view.openLinks('All hosts', 'network', [{ e: { id: 'a' }, host: 'workstation1' }, { e: { id: 'b' }, host: 'jump' }]);
+  for (const width of [530, 600]) {
+    root.style.width = width + 'px';
+    const rows = root.querySelectorAll('#prows tr').length;
+    send(4, '10.0.0.2', '10.0.0.3');
+    while (root.querySelectorAll('#prows tr').length < rows + 1) await frame();
+    const host = $('td.c-host'), bounds = host.getBoundingClientRect();
+    const range = document.createRange(); range.selectNodeContents(host);
+    check(host.textContent === 'workstation1', 'host name changed');
+    check(range.getBoundingClientRect().right <= bounds.right - 7, 'host name truncated');
+    send(5, '10.0.0.2', '10.0.0.3');
+    while (root.querySelectorAll('#prows tr').length < rows + 2) await frame();
+    check(host.getBoundingClientRect().width === bounds.width, 'host column moved');
+    check($('#plist').scrollWidth <= $('#plist').clientWidth, 'host column overflows');
+  }
   dispose(); root.remove(); css.remove();
 }
 

@@ -258,6 +258,7 @@ pub(super) const MAX_STREAM_TOPICS: usize = 64;
 pub(super) async fn stream(
     conn: &mut TcpStream,
     topics: &[(&str, &Topic, Option<u64>)],
+    mut stopping: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     // Subscribe before the first read, so no change in between is lost. A
     // notification that arrives while events are written is kept as a permit.
@@ -272,6 +273,7 @@ pub(super) async fn stream(
             }
         });
     }
+    let mut closing = false;
     let mut cursors: Vec<Option<u64>> = topics.iter().map(|(_, _, after)| *after).collect();
     let mut too_large_shown = vec![false; topics.len()];
     http::headers(conn, 200, "text/event-stream", "").await?;
@@ -288,7 +290,12 @@ pub(super) async fn stream(
                 observation::event(conn, name, &format!("{{\"topic\":{id},{}", &data[1..])).await?;
             }
         }
+        if closing {
+            return observation::end(conn).await;
+        }
         tokio::select! {
+            biased;
+            () = async { let _ = stopping.wait_for(|stopped| *stopped).await; } => closing = true,
             () = changed.notified() => {}
             () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                 http::write(conn, b": ping\n\n").await?;

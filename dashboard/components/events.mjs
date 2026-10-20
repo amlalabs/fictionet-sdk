@@ -66,7 +66,7 @@ export function mount(root, services, options = {}) {
   const newRows = new Set();
   const source = services.watch();
   const cleanup = [];
-  const on = (name, callback) => cleanup.push(listen(source, name, (event) => callback(JSON.parse(event.data))));
+  const on = (name, callback) => cleanup.push(listen(source, name, (event) => callback(event.data ? JSON.parse(event.data) : null)));
   const hostOf = (event) => services.hosts?.find((item) => item.sandbox === event.sandbox?.name || item.name === event.sandbox?.name)?.name || null;
 
   function select(event) {
