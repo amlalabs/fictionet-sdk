@@ -80,21 +80,23 @@ only `native` and `page` add native I/O.
 
 ## Serve an external world
 
-With `native` on Unix, serve the handle on its own private socket. Keep the
-returned endpoint alive alongside the run. This needs the `fictionet` crate's
-`std` feature, for `listen` and `run`. This pattern comes from
-`examples/common/web_world.rs`. World code supplies the network and services.
+With `native` on Unix, serve the handle on its own private socket.
+`serve_observation` installs a `DashboardObserver` served at an optional
+path, beside the world's own observer if it has one, behind one `Aggregate`.
+Keep the returned endpoint alive alongside the run. This needs the
+`fictionet` crate's `std` feature, for `listen` and `run`. World code supplies
+the network and services.
 
 ```rust,no_run
 # #[cfg(all(feature = "native", unix))] {
-use std::sync::Arc;
 use fictionet::{RunOptions, Seed};
-use fictionet_observe::{Aggregate, DashboardObserver, serve};
+use fictionet_observe::serve_observation;
 
-let dashboard = DashboardObserver::new(Default::default());
-let _endpoint = serve(dashboard.handle(), "/run/fictionet/observe.sock")?;
-let options = RunOptions::new(Seed::random())
-    .observer(Arc::new(Aggregate::new(dashboard.observer())));
+let (options, _endpoint) = serve_observation(
+    RunOptions::new(Seed::random()),
+    Some("/run/fictionet/observe.sock"),
+    None,
+)?;
 let (_listener, mut attachments) = fictionet::Listening::bind(
     fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into()),
 )?;
