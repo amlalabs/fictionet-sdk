@@ -92,3 +92,20 @@ test('glides ease the field of view with the pose and walking keeps it', () => {
     assert.equal(look(pose, 20, 10).fov, pose.fov);
   }
 });
+
+test('doorway crossings require a swept center inside the opening and keep their direction', async () => {
+  const { doorwayCrossing, doorwayFade } = await import('./room-motion.mjs');
+  const { DOORWAYS } = await import('./board-layout.mjs');
+  for (const door of DOORWAYS) {
+    const start = { x: 4.5, z: door.z - 0.08 };
+    const end = { ...start, z: door.z + 0.08 };
+    assert.equal(doorwayCrossing(door.from, start, end, DOORWAYS, ROOM.radius), door.to);
+    assert.equal(doorwayCrossing(door.to, end, start, DOORWAYS, ROOM.radius), door.from);
+    assert.equal(doorwayCrossing(door.from, end, start, DOORWAYS, ROOM.radius), door.from);
+    assert.equal(doorwayCrossing(door.from, { ...start, x: door.minX }, { ...end, x: door.minX }, DOORWAYS, ROOM.radius), door.from);
+  }
+  assert.equal(doorwayFade(0, false), 0);
+  assert.equal(doorwayFade(90, false), 0.5);
+  assert.equal(doorwayFade(180, false), 1);
+  assert.equal(doorwayFade(0, true), 1);
+});

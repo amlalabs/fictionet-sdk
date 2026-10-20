@@ -443,3 +443,13 @@ test('standing spots own their field of view and keep section optics unchanged',
     assert.ok(Number.isFinite(spot.fov) && spot.fov > 0 && spot.fov < 180);
   }
 });
+
+test('the plant door opens through the rear wall while both jambs still block walking', () => {
+  const start = STANDING_SPOTS.door;
+  for (const z of [6.8, 7, 7.2]) {
+    assert.equal(COLLISIONS.some(box => circleHits({ x: start.x, z }, ROOM.radius, box)), false);
+  }
+  for (const x of [3.7, 5.3]) {
+    assert.equal(COLLISIONS.some(box => circleHits({ x, z: 7 }, ROOM.radius, box)), true);
+  }
+});

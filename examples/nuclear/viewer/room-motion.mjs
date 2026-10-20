@@ -100,3 +100,22 @@ export function glidePose(start, end, path, elapsed) {
   return { x: p.x, z: p.z, yaw: wrapYaw(start.yaw + wrapYaw(end.yaw - start.yaw) * t), pitch: start.pitch + (end.pitch - start.pitch) * t,
     fov: start.fov + (end.fov - start.fov) * t };
 }
+
+// Only a swept crossing inside the opening changes spaces.
+export function doorwayCrossing(space, previous, next, doorways, radius) {
+  for (const door of doorways) {
+    const forward = space === door.from && previous.z <= door.z && next.z > door.z;
+    const backward = space === door.to && previous.z >= door.z && next.z < door.z;
+    if (!forward && !backward) continue;
+    const fraction = (door.z - previous.z) / (next.z - previous.z);
+    const x = previous.x + (next.x - previous.x) * fraction;
+    if (x < door.minX + radius || x > door.maxX - radius) continue;
+    return forward ? door.to : door.from;
+  }
+  return space;
+}
+
+export function doorwayFade(elapsed, reduced) {
+  if (reduced || elapsed >= 180) return 1;
+  return Math.max(0, elapsed / 180);
+}

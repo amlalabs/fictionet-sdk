@@ -134,7 +134,9 @@ export function devicePlacements(knobs) {
 
 const box = (x, z, w, d) => ({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2 });
 export const COLLISIONS = Object.freeze([
-  box(-7, 0, 0.24, 14), box(7, 0, 0.24, 14), box(0, -7, 14, 0.24), box(0, 7, 14, 0.24),
+  box(-7, 0, 0.24, 14), box(7, 0, 0.24, 14), box(0, -7, 14, 0.24),
+  box((-7 + DOOR.x - DOOR.width / 2) / 2, 7, DOOR.x - DOOR.width / 2 + 7, 0.24),
+  box((7 + DOOR.x + DOOR.width / 2) / 2, 7, 7 - DOOR.x - DOOR.width / 2, 0.24),
   ...BOARDS.flatMap(b => Array.from({ length: 14 }, (_, i) => {
     const p = boardPoint(b, -BOARD.width / 2 + (i + 0.5) * 0.2, 0, (BOARD.deskDepth - 0.2) / 2);
     const c = Math.abs(Math.cos(b.yaw));
@@ -225,4 +227,17 @@ export function mimicLines(segment) {
       { loop, start, end, y: center + dial.radius * 0.55, direction: -1, color: 'coldCoolant' },
     ];
   });
+}
+
+// Door planes and room offsets use the same world frame as the control room.
+export const PLANT_OFFSETS = Object.freeze({ reactor: { x: 4.5, z: 43 }, turbine: { x: -23.5, z: 20 } });
+export const DOORWAYS = Object.freeze([
+  { from: 'control-room', to: 'corridor', z: 7, minX: 3.875, maxX: 5.125 },
+  { from: 'corridor', to: 'turbine', z: 11, minX: 3.875, maxX: 5.125 },
+  { from: 'turbine', to: 'airlock', z: 29, minX: 3.875, maxX: 5.125 },
+  { from: 'airlock', to: 'reactor', z: 33, minX: 3.875, maxX: 5.125 },
+]);
+export function passageCollisions(start, end) {
+  return [box(3.725, (start + end) / 2, 0.3, end - start + 0.3),
+    box(5.275, (start + end) / 2, 0.3, end - start + 0.3)];
 }

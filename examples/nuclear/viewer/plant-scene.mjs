@@ -2,9 +2,8 @@
 import * as THREE from '/vendor/three/build/three.module.js';
 import { formatGap, formatValue, instruments } from './instruments.mjs';
 import { createMaterial, createLighting, applyMaterialPalette, setIndicator } from './look.mjs';
-import { look, walk, walkDelta } from './room-motion.mjs';
+import { PLANT_OFFSETS, passageCollisions } from './board-layout.mjs';
 
-const TAU = Math.PI * 2;
 const HALF_PI = Math.PI / 2;
 const HALL_X = 40;
 const SPIN = 9;
@@ -14,6 +13,14 @@ export const VIEWS = {
   reactor: { eye: [0, 1.7, 7.8], look: [0, 2.5, -2] },
   turbine: { eye: [HALL_X - 9, 1.7, 6.4], look: [HALL_X + 0.5, 2.2, -0.5] },
 };
+
+for (const [name, view] of Object.entries(VIEWS)) {
+  const offset = PLANT_OFFSETS[name === 'turbine' ? 'turbine' : 'reactor'];
+  for (const point of [view.eye, view.look]) {
+    point[0] += offset.x;
+    point[2] += offset.z;
+  }
+}
 
 function targetsFrom(r) {
   const steam = clamp01(r.loops.reduce((sum, loop) => sum + loop.steamKgS, 0) / 800);
@@ -136,11 +143,12 @@ function place(mesh, index, at, scale = [1, 1, 1], rotation = [0, 0, 0]) {
   mesh.instanceMatrix.needsUpdate = true;
 }
 
-export function createPlantScene({ theme, reducedMotion, environment }) {
+export function createPlantScene({ theme, reducedMotion, environment, anisotropy = 4 }) {
   const resources = tracker();
   const colors = { ...theme };
   const scene = new THREE.Scene();
   scene.environment = environment;
+  scene.name = 'Plant interiors';
   const camera = new THREE.PerspectiveCamera(64, 1, 0.08, 38);
   const cctvCamera = new THREE.PerspectiveCamera(62, 16 / 9, 0.08, 30);
   cctvCamera.position.set(5.8, 2.5, 6.8);
@@ -149,7 +157,11 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
   const lighting = createLighting(THREE, scene, colors, true);
   // Interior fixtures light the equipment without a shadow pass through the roof.
   scene.traverse(object => {
-    if (object.isLight) { object.layers.enableAll(); object.castShadow = false; }
+    if (object.isLight) {
+      object.layers.enableAll();
+      object.castShadow = false;
+      object.intensity = 0.15;
+    }
   });
   const make = (role, token, options) => resources.add(createMaterial(THREE, colors, role, token, options));
   const mat = {
@@ -172,7 +184,7 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
   scene.add(reactor, hall);
   reactor.visible = hall.visible = false;
   const fixtures = [], labels = [], gauges = [], levels = [], pipeRuns = [];
-  const obstacles = { reactor: [], turbine: [] };
+  const obstacles = { reactor: [], turbine: [], corridor: passageCollisions(7, 11), airlock: passageCollisions(29, 33) };
   function solid(parent, geometry, material, at, scale, rotation = [0, 0, 0]) {
     const mesh = new THREE.Mesh(geometry, material);
     mesh.position.set(...at); mesh.scale.set(...scale); mesh.rotation.set(...rotation);
@@ -188,6 +200,11 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
     obstacles[room].push({ minX: x - width / 2, maxX: x + width / 2, minZ: z - depth / 2, maxZ: z + depth / 2 });
   }
   function label(parent, text, at, width = 1.6, height = 0.4, gauge = null) {
+    box(parent, [width + 0.04, height + 0.04, 0.035], mat.metal, [at[0], at[1], at[2] - 0.025]);
+    if (!gauge) {
+      for (const side of [-1, 1]) box(parent, [0.06, height * 0.7, 0.3], mat.metal,
+        [at[0] + side * width * 0.4, at[1], at[2] - 0.18]);
+    }
     labels.push({ parent, text, at, width, height, gauge });
   }
   function pipe(parent, points, radius, material) {
@@ -201,12 +218,22 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
   }
   function building(parent, room, x, width, depth, height, floorY = 0) {
     box(parent, [width, 0.3, depth], mat.wall, [x, floorY - 0.15, 0]);
-    box(parent, [width, height - floorY, 0.3], mat.wall, [x, (height + floorY) / 2, -depth / 2]);
-    box(parent, [width, height - floorY, 0.3], mat.wall, [x, (height + floorY) / 2, depth / 2]);
+    const opening = room === 'reactor' ? 0 : HALL_X - 12;
     for (const side of [-1, 1]) {
+      const z = side * depth / 2;
+      const open = room === 'turbine' || side === -1;
+      if (open) {
+        for (const [left, right] of [[x - width / 2, opening - 0.625], [opening + 0.625, x + width / 2]]) {
+          box(parent, [right - left, height - floorY, 0.3], mat.wall, [(left + right) / 2, (height + floorY) / 2, z]);
+          block(room, (left + right) / 2, z, right - left, 0.3);
+        }
+        box(parent, [1.25, height - 2.3, 0.3], mat.wall, [opening, (height + 2.3) / 2, z]);
+      } else {
+        box(parent, [width, height - floorY, 0.3], mat.wall, [x, (height + floorY) / 2, z]);
+        block(room, x, z, width, 0.3);
+      }
       box(parent, [0.3, height - floorY, depth], mat.wall, [x + side * width / 2, (height + floorY) / 2, 0]);
       block(room, x + side * width / 2, 0, 0.3, depth);
-      block(room, x, side * depth / 2, width, 0.3);
     }
     // Roof panels leave a vent slot above the service aisle.
     for (const side of [-1, 1]) box(parent, [width, 0.25, depth / 2 - 0.6], mat.steel, [x, height, side * (depth / 4 + 0.3)]);
@@ -218,9 +245,16 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
         box(parent, [1.65, 0.04, 0.65], mat.fixture, [x + side * width / 4, height - 1.09, z]);
       }
     }
-    for (const z of [-4, 3]) {
-      const light = new THREE.PointLight(colors.plantKey, 100, 19, 2);
-      light.position.set(x, height - 2, z); parent.add(light); fixtures.push(light);
+    for (const z of [-5, 3]) for (const side of [-1, 1]) {
+      const token = room === 'reactor' ? 'coldCoolant' : 'plantKey';
+      const intensity = room === 'reactor' ? 100 : 180;
+      const light = new THREE.SpotLight(colors[token], intensity, 18, 0.7, 0.65, 2);
+      light.position.set(x + side * width / 4, height - 1.15, z);
+      light.target.position.set(x + side * width / 4, 0, z);
+      light.userData.paletteToken = token;
+      light.layers.enableAll();
+      parent.add(light, light.target);
+      fixtures.push(light);
     }
     // Floor seams and a marked walking aisle establish the scale.
     for (let z = -depth / 2 + 1; z < depth / 2; z += 2)
@@ -232,7 +266,8 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
     box(parent, [0.34, 0.06, 0.3], mat.metal, [x, 0.03, z - 0.05]);
     block(room, x, z, 0.48, 0.35);
     const g = { parent, key, text, at, fraction: 0, pair: null };
-    gauges.push(g); label(parent, text, [x, y, z + 0.07], 0.85, 0.85, g);
+    gauges.push(g);
+    label(parent, text, [x, y, z + 0.07], 0.26, 0.26, g);
     return g;
   }
   function sightLevel(parent, x, z, height) {
@@ -246,7 +281,6 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
   building(reactor, 'reactor', 0, 18, 20, 9);
   for (const x of [-1.1, 1.1]) box(reactor, [0.045, 0.01, 4.3], mat.warning, [x, 0.01, 5.5]);
   label(reactor, 'CONTAINMENT / OPERATING DECK', [0, 6.8, -9.82], 7, 0.65);
-  label(reactor, 'WASD / arrows to walk. Drag to look.', [0, 5.95, -9.81], 5.8, 0.4);
   // The vessel extends below the deck. The head and drive housings stand above it.
   cylinder(reactor, 1.65, 1.4, mat.metal, [0, -0.2, -2]);
   solid(reactor, sphere, mat.steel, [0, 0.55, -2], [1.65, 0.7, 1.65]);
@@ -260,40 +294,43 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
   const housings = instances(reactor, tube, mat.metal, rodPositions.length, 'CRDM housings');
   const rods = instances(reactor, tube, mat.accent, rodPositions.length, 'Rod stems');
   const collars = instances(reactor, tube, mat.warning, rodPositions.length, 'Rod position collars');
-  const rodLights = [mat.lit, mat.off].map((material, i) => instances(reactor, sphere, material, rodPositions.length * 5, i ? 'Rod lights off' : 'Rod lights on'));
+  const rodLights = [mat.lit, mat.off].map((material, i) => instances(reactor, cube, material, rodPositions.length * 5, i ? 'Rod lights off' : 'Rod lights on'));
   rodPositions.forEach(([x, z], i) => place(housings, i, [x, 1.95, z], [0.13, 1.4, 0.13]));
   label(reactor, 'REACTOR HEAD / ROD POSITION', [0, 0.62, -0.16], 2.6, 0.3);
 
   const pumps = [];
   for (const [i, x] of [-4.5, 4.5].entries()) {
-    cylinder(reactor, 1.05, 5.7, mat.steel, [x, 3.15, -5]);
-    solid(reactor, sphere, mat.metal, [x, 6, -5], [1.05, 0.8, 1.05]);
-    cylinder(reactor, 1.16, 0.18, mat.metal, [x, 1.1, -5]);
-    cylinder(reactor, 1.16, 0.18, mat.metal, [x, 4.7, -5]);
+    cylinder(reactor, 0.85, 3.6, mat.steel, [x, 2.1, -5]);
+    solid(reactor, resources.add(new THREE.CylinderGeometry(1.25, 0.85, 1, 24)), mat.steel, [x, 4.4, -5], [1, 1, 1]);
+    cylinder(reactor, 1.25, 1.5, mat.steel, [x, 5.65, -5]);
+    solid(reactor, sphere, mat.metal, [x, 6.4, -5], [1.25, 0.55, 1.25]);
+    for (const y of [1.1, 4.9, 6.35]) cylinder(reactor, y < 4 ? 0.94 : 1.3, 0.12, mat.metal, [x, y, -5]);
     block('reactor', x, -5, 2.5, 2.5);
     sightLevel(reactor, x + 0.5, -3.93, 3.8);
-    label(reactor, `STEAM GENERATOR ${i ? 'B' : 'A'}`, [x, 4.3, -3.93], 1.9, 0.35);
+    label(reactor, `STEAM GENERATOR ${i ? 'B' : 'A'}`, [x, 5.5, -3.72], 1.9, 0.35);
     pipe(reactor, [[x, 6.7, -5], [x, 7.3, -5], [x, 7.3, -9.8]], 0.23, mat.metal);
     const px = i ? 3.7 : -3.7;
     box(reactor, [1.5, 0.18, 1.5], mat.steel, [px, 0.09, 1.3]);
-    for (const dx of [-0.5, 0.5]) box(reactor, [0.14, 1.25, 0.8], mat.metal, [px + dx, 0.75, 1.3]);
-    cylinder(reactor, 0.46, 1.05, mat.steel, [px, 1.45, 1.0], [HALF_PI, 0, 0]);
-    cylinder(reactor, 0.58, 0.12, mat.metal, [px, 1.45, 1.53], [HALF_PI, 0, 0]);
+    cylinder(reactor, 0.65, 0.7, mat.steel, [px, 0.53, 1.3]);
+    cylinder(reactor, 0.4, 0.45, mat.metal, [px, 1.05, 1.3]);
+    cylinder(reactor, 0.57, 2, mat.steel, [px, 2.6, 1.3]);
+    cylinder(reactor, 0.68, 0.42, mat.metal, [px, 3.8, 1.3]);
+    for (const y of [1.65, 3.55, 4.05]) cylinder(reactor, 0.67, 0.08, mat.metal, [px, y, 1.3]);
+    // The guard has a front inspection opening onto the striped coupling.
+    for (const dx of [-0.55, 0.55]) box(reactor, [0.12, 0.58, 1.1], mat.metal, [px + dx, 1.32, 1.3]);
+    box(reactor, [1.1, 0.58, 0.12], mat.metal, [px, 1.32, 0.8]);
     block('reactor', px, 1.3, 1.9, 2.2);
-    const rotor = new THREE.Group(); rotor.name = `Pump ${i ? 'B' : 'A'} fan`; rotor.userData.animated = true;
-    rotor.position.set(px, 1.45, 1.83); reactor.add(rotor);
-    cylinder(rotor, 0.16, 0.7, mat.metal, [0, 0, -0.18], [HALF_PI, 0, 0]);
-    cylinder(rotor, 0.25, 0.18, mat.warning, [0, 0, -0.12], [HALF_PI, 0, 0]);
-    const blades = instances(rotor, cube, mat.accent, 5, 'Fan blades');
-    for (let b = 0; b < 5; b++) {
-      const a = b * TAU / 5;
-      place(blades, b, [Math.sin(a) * 0.31, Math.cos(a) * 0.31, 0.13], [0.15, 0.48, 0.055], [0, 0, -a]);
-    }
-    // One pale blade makes direction and coastdown visible at low CCTV resolution.
-    box(rotor, [0.15, 0.48, 0.06], mat.face, [0, 0.31, 0.14]);
-    const lamp = solid(reactor, sphere, mat.off, [px + 0.6, 1.9, 1.7], [0.09, 0.09, 0.09]);
-    lamp.userData.animated = true; pumps.push({ rotor, lamp });
-    label(reactor, `RCP ${i ? 'B' : 'A'} / MOTOR`, [px, 0.46, 2.08], 1.5, 0.3);
+    const rotor = new THREE.Group();
+    rotor.name = `Pump ${i ? 'B' : 'A'} coupling`;
+    rotor.userData.animated = true;
+    rotor.position.set(px, 1.32, 1.3);
+    reactor.add(rotor);
+    cylinder(rotor, 0.43, 0.38, mat.metal, [0, 0, 0]);
+    box(rotor, [0.12, 0.4, 0.04], mat.warning, [0, 0, 0.43]);
+    const lamp = solid(reactor, sphere, mat.off, [px + 0.6, 1.9, 1.7], [0.06, 0.06, 0.06]);
+    lamp.userData.animated = true;
+    pumps.push({ rotor, lamp });
+    label(reactor, `RCP ${i ? 'B' : 'A'} / MOTOR`, [px, 2.7, 1.88], 0.9, 0.2);
     pipe(reactor, [[Math.sign(x) * 1.4, 0.75, -2], [x, 0.75, -2], [x, 0.75, -4]], 0.24, mat.coolant[i]);
     pipe(reactor, [[x, 0.45, -5], [px + Math.sign(x), 0.45, -5], [px + Math.sign(x), 0.45, 1.3], [px, 0.45, 1.3], [Math.sign(x) * 1.4, 0.45, -2]], 0.2, mat.coolant[i]);
     gauge(reactor, 'reactor', `hot_leg:${i ? 'b' : 'a'}`, `HOT LEG ${i ? 'B' : 'A'}`, [px + (i ? 1 : -1), 1.35, 2.6]);
@@ -302,13 +339,13 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
   solid(reactor, sphere, mat.metal, [-6.5, 4.95, -0.5], [0.75, 0.55, 0.75]);
   block('reactor', -6.5, -0.5, 2, 2);
   sightLevel(reactor, -6.5, 0.28, 3.5);
-  label(reactor, 'PRESSURIZER', [-6.5, 4.25, 0.28], 1.5, 0.35);
+  label(reactor, 'PRESSURIZER', [-6.5, 4.25, 0.28], 1.1, 0.25);
   pipe(reactor, [[-6.5, 0.5, -0.5], [-6.5, 0.5, -2], [-1.5, 0.5, -2]], 0.15, mat.metal);
   pipe(reactor, [[-6.5, 5.5, -0.5], [-6.5, 6.4, -0.5]], 0.12, mat.metal);
   // A small open spray sight chamber sits beside the pressure vessel.
   pipe(reactor, [[-6.5, 5.1, -0.5], [-5.45, 5.1, -0.5], [-5.45, 4.6, -0.5]], 0.08, mat.metal);
   box(reactor, [0.5, 1.3, 0.08], mat.ink, [-5.45, 3.95, -0.65]);
-  label(reactor, 'SPRAY', [-5.45, 3.08, -0.4], 0.8, 0.25);
+  label(reactor, 'SPRAY', [-5.45, 3.45, -0.59], 0.45, 0.18);
   const spray = instances(reactor, sphere, mat.water, 8, 'Pressurizer spray');
   const relief = instances(reactor, sphere, mat.steam, 6, 'Pressurizer relief');
   gauge(reactor, 'reactor', 'pressurizer_pressure', 'PRESSURIZER', [-6.4, 1.35, 1.35]);
@@ -327,11 +364,10 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
   box(hall, [13.8, 0.3, 2.25], mat.wall, [HALL_X + 6.9, -0.15, 4.375]);
   box(hall, [22, 0.5, 4], mat.steel, [HALL_X, -0.25, -1]);
   for (const x of [-9, -3, 3, 9]) box(hall, [0.8, 2.5, 3], mat.wall, [HALL_X + x, -1.75, -1]);
-  for (const x of [-12, 12]) box(hall, [3, 0.3, 12], mat.wall, [HALL_X + x, -0.15, -1]);
+  for (const x of [-12, 12]) box(hall, [3, 0.3, 18], mat.wall, [HALL_X + x, -0.15, 0]);
   block('turbine', HALL_X, -2, 22, 10.5);
-  block('turbine', HALL_X, -8, 28, 2);
+  block('turbine', HALL_X, -8, 22, 2);
   block('turbine', HALL_X - 3.5, 4.375, 7, 2.25);
-  for (const x of [-12, 12]) block('turbine', HALL_X + x, -3, 2.5, 5);
   railing(hall, HALL_X - 9, 3.3, 4);
   railing(hall, HALL_X + 5.5, 3.3, 11);
   railing(hall, HALL_X - 3.5, 5.5, 7);
@@ -362,6 +398,7 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
     place(shaftBands, i * 2 + 1, [x, -0.32, 0], [0.46, 0.09, 0.13]);
   }
   // The shaft is exposed between the last turbine and generator.
+  box(hall, [1.9, 0.7, 0.2], mat.steel, [HALL_X + 3.2, 0.35, 0.17]);
   label(hall, 'EXPOSED COUPLING', [HALL_X + 3.2, 0.5, 0.3], 1.8, 0.28);
   box(hall, [9, 1.9, 3.1], mat.metal, [HALL_X - 1.7, -1.8, 0.9]);
   box(hall, [7.8, 0.8, 1.7], mat.steel, [HALL_X - 1.7, -0.5, 0]);
@@ -370,14 +407,27 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
   const steamPoints = [[HALL_X - 11, 5.4, -7], [HALL_X - 11, 5.4, 0.8], [HALL_X - 7.5, 5.4, 0.8], [HALL_X - 7.5, 2.2, 0.8]];
   pipe(hall, steamPoints, 0.25, mat.metal);
   pipe(hall, [[HALL_X - 9.5, 5.4, -7], [HALL_X - 9.5, 4.8, -0.2], [HALL_X - 7.5, 4.8, -0.2], [HALL_X - 7.5, 2.2, -0.2]], 0.25, mat.metal);
-  const steamPath = new THREE.CurvePath();
-  steamPoints.slice(1).forEach((p, i) => steamPath.add(new THREE.LineCurve3(new THREE.Vector3(...steamPoints[i]), new THREE.Vector3(...p))));
-  const steam = instances(hall, sphere, mat.steam, 12, 'Main steam flow');
   pipe(hall, [[HALL_X - 7.5, 5.4, 0.8], [HALL_X + 5, 5.4, 0.8], [HALL_X + 5, 6.6, 0]], 0.18, mat.metal);
   box(hall, [2, 0.15, 1.1], mat.metal, [HALL_X + 5, 8.4, 0]);
-  label(hall, 'STEAM DUMP / ROOF VENT', [HALL_X + 4, 5.9, 1.05], 4, 0.4);
-  const vent = instances(hall, sphere, mat.steam, 6, 'Roof vent plume');
-  gauge(hall, 'turbine', 'steam_pressure', 'MAIN STEAM', [HALL_X - 8, 1.35, 3.6]);
+  label(hall, 'STEAM DUMP / ROOF VENT', [HALL_X + 4, 5.9, -8.82], 4, 0.4);
+  const puffCanvas = document.createElement('canvas');
+  puffCanvas.width = puffCanvas.height = 64;
+  const puffContext = puffCanvas.getContext('2d');
+  const gradient = puffContext.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, colors.lightKey);
+  gradient.addColorStop(1, `${colors.lightKey}00`);
+  puffContext.fillStyle = gradient;
+  puffContext.fillRect(0, 0, 64, 64);
+  const puffTexture = resources.add(new THREE.CanvasTexture(puffCanvas));
+  const puffMaterial = resources.add(new THREE.SpriteMaterial({ map: puffTexture, color: colors.steam, transparent: true, opacity: 0.35, depthWrite: false }));
+  const vent = new THREE.Group();
+  vent.name = 'Roof vent plume';
+  vent.userData.animated = true;
+  hall.add(vent);
+  for (let i = 0; i < 6; i++) vent.add(new THREE.Sprite(puffMaterial));
+  gauge(hall, 'turbine', 'steam_pressure', 'MAIN STEAM', [HALL_X - 6.5, 1.35, 3.6]);
+  gauge(hall, 'turbine', 'steam_flow:a', 'STEAM A FLOW', [HALL_X - 5.9, 1.35, 3.6]);
+  gauge(hall, 'turbine', 'steam_flow:b', 'STEAM B FLOW', [HALL_X - 5.3, 1.35, 3.6]);
   gauge(hall, 'turbine', 'condenser_pressure', 'CONDENSER VACUUM', [HALL_X - 1.8, 1.35, 5.7]);
   pipe(hall, [[HALL_X - 1.8, -1, 2.5], [HALL_X - 1.8, 0.1, 5.7], [HALL_X - 1.8, 1.2, 5.7]], 0.025, mat.metal);
   gauge(hall, 'turbine', 'generator_output', 'GENERATOR', [HALL_X + 6.4, 1.35, 3.6]);
@@ -400,77 +450,146 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
     bends.forEach(({ at, radius }, i) => place(joints, i, at, [radius, radius, radius]));
   }
 
-  const canvas = document.createElement('canvas');
-  canvas.width = 2048; canvas.height = 512 * Math.ceil(labels.length / 4);
-  const texture = resources.add(new THREE.CanvasTexture(canvas));
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.generateMipmaps = false; texture.minFilter = THREE.LinearFilter;
-  const textMaterial = resources.add(new THREE.MeshBasicMaterial({ map: texture, toneMapped: false }));
-  labels.forEach((entry, i) => {
-    const geometry = resources.add(plane.clone()), uv = geometry.attributes.uv;
-    for (let v = 0; v < uv.count; v++) {
-      uv.setXY(v, (uv.getX(v) + i % 4) / 4, (uv.getY(v) + Math.ceil(labels.length / 4) - 1 - Math.floor(i / 4)) / Math.ceil(labels.length / 4));
+  // Paint each plate at its own aspect, then pack it without stretching.
+  for (const parent of [reactor, hall]) {
+    const local = labels.filter(entry => entry.parent === parent);
+    const atlas = document.createElement('canvas');
+    atlas.width = 2048;
+    let x = 16;
+    let y = 16;
+    let rowHeight = 0;
+    for (const entry of local) {
+      const canvas = document.createElement('canvas');
+      canvas.height = entry.gauge ? 512 : 128;
+      canvas.width = Math.round(canvas.height * entry.width / entry.height);
+      if (x + canvas.width + 16 > atlas.width) {
+        x = 16;
+        y += rowHeight + 32;
+        rowHeight = 0;
+      }
+      Object.assign(entry, { canvas, x, y });
+      x += canvas.width + 32;
+      rowHeight = Math.max(rowHeight, canvas.height);
     }
-    solid(entry.parent, geometry, textMaterial, entry.at, [entry.width, entry.height, 1]);
-  });
-  const needleGeometry = resources.add(new THREE.BoxGeometry(0.018, 0.17, 0.014));
-  needleGeometry.translate(0, 0.075, 0);
+    atlas.height = 2 ** Math.ceil(Math.log2(y + rowHeight + 16));
+    const texture = resources.add(new THREE.CanvasTexture(atlas));
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.generateMipmaps = true;
+    texture.minFilter = THREE.LinearMipmapLinearFilter;
+    texture.anisotropy = anisotropy;
+    const material = resources.add(new THREE.MeshBasicMaterial({ map: texture, toneMapped: false }));
+    for (const entry of local) {
+      const geometry = resources.add(plane.clone());
+      const uv = geometry.attributes.uv;
+      for (let i = 0; i < uv.count; i++) {
+        uv.setXY(i, (entry.x + uv.getX(i) * entry.canvas.width) / atlas.width,
+          1 - (entry.y + (1 - uv.getY(i)) * entry.canvas.height) / atlas.height);
+      }
+      solid(parent, geometry, material, entry.at, [entry.width, entry.height, 1]);
+      Object.assign(entry, { atlas, texture });
+    }
+  }
+  const needleGeometry = resources.add(new THREE.BoxGeometry(0.006, 0.052, 0.006));
+  needleGeometry.translate(0, 0.023, 0);
   const gaugeMeshes = [reactor, hall].map(parent => {
     const local = gauges.filter(g => g.parent === parent);
     const cases = instances(parent, tube, mat.metal, local.length, 'Field gauge cases');
     const needles = instances(parent, needleGeometry, mat.ink, local.length, 'Field gauge needles');
     local.forEach((g, i) => {
-      place(cases, i, [g.at[0], g.at[1] + 0.1, g.at[2]], [0.25, 0.12, 0.25], [HALF_PI, 0, 0]);
+      place(cases, i, [g.at[0], g.at[1] + 0.03, g.at[2]], [0.14, 0.12, 0.14], [HALF_PI, 0, 0]);
     });
     return { local, needles };
   });
   const forcedColors = globalThis.matchMedia?.('(forced-colors: active)');
   function paintLabels() {
-    const ctx = canvas.getContext('2d');
     const background = forcedColors?.matches ? 'Canvas' : colors.raised;
     const foreground = forcedColors?.matches ? 'CanvasText' : colors.ink;
-    ctx.fillStyle = background; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    labels.forEach((entry, i) => {
-      ctx.save(); ctx.translate((i % 4) * 512, Math.floor(i / 4) * 512); ctx.fillStyle = foreground; ctx.strokeStyle = foreground;
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    labels.forEach(entry => {
+      const { canvas, texture } = entry;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = background;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = foreground;
+      ctx.strokeStyle = foreground;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
       if (entry.gauge) {
         const g = entry.gauge;
         ctx.lineWidth = 3;
         for (let tick = 0; tick <= 8; tick++) {
           const a = Math.PI * 0.75 - Math.PI * 1.5 * tick / 8;
-          ctx.beginPath(); ctx.moveTo(256 - Math.sin(a) * 120, 194 - Math.cos(a) * 120);
-          ctx.lineTo(256 - Math.sin(a) * 137, 194 - Math.cos(a) * 137); ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(256 - Math.sin(a) * 120, 194 - Math.cos(a) * 120);
+          ctx.lineTo(256 - Math.sin(a) * 137, 194 - Math.cos(a) * 137);
+          ctx.stroke();
         }
         ctx.font = '24px system-ui, sans-serif';
         ctx.fillText(g.pair ? String(g.pair.range[0]) : '—', 135, 320);
         ctx.fillText(g.pair ? String(g.pair.range[1]) : '—', 377, 320);
-        ctx.font = 'bold 27px system-ui, sans-serif'; ctx.fillText(entry.text, 256, 398, 490);
-        ctx.font = '32px system-ui, sans-serif'; ctx.fillText(g.pair ? formatValue(g.pair.trueValue, g.pair.unit) : 'Awaiting snapshot', 256, 468, 490);
+        ctx.font = 'bold 27px system-ui, sans-serif';
+        ctx.fillText(entry.text, 256, 398, 490);
+        ctx.font = '32px system-ui, sans-serif';
+        ctx.fillText(g.pair ? formatValue(g.pair.trueValue, g.pair.unit) : 'Awaiting snapshot', 256, 468, 490);
       } else {
-        ctx.scale(0.25, 1);
-        ctx.font = 'bold 144px system-ui, sans-serif'; ctx.fillText(entry.text, 1024, 256, 1960);
+        const font = Math.min(80, (canvas.width - 32) / (entry.text.length * 0.65));
+        ctx.font = `bold ${font}px system-ui, sans-serif`;
+        ctx.fillText(entry.text, canvas.width / 2, canvas.height / 2);
       }
-      ctx.restore();
+      const atlasContext = entry.atlas.getContext('2d');
+      atlasContext.fillStyle = background;
+      atlasContext.fillRect(entry.x - 16, entry.y - 16, canvas.width + 32, canvas.height + 32);
+      atlasContext.drawImage(canvas, entry.x, entry.y);
+      texture.needsUpdate = true;
     });
-    texture.needsUpdate = true;
   }
   function applyColors() {
     lighting.setTheme(colors);
     for (const material of Object.values(mat).flat()) applyMaterialPalette(material, colors);
     setIndicator(mat.lit, colors, { lit: true }); setIndicator(mat.off, colors, { lit: false });
     mat.fixture.emissive.set(colors.plantKey);
+    puffMaterial.color.set(colors.steam);
     cold.set(colors.coldCoolant); hot.set(colors.hotCoolant);
-    fixtures.forEach(light => light.color.set(colors.plantKey));
+    fixtures.forEach(light => light.color.set(colors[light.userData.paletteToken]));
     scene.background = new THREE.Color(colors.sunken); paintLabels();
   }
-  forcedColors?.addEventListener('change', paintLabels);
   applyColors();
   for (const [parent, layer] of [[reactor, 1], [hall, 2]]) {
     mergeStatic(parent, resources);
     parent.traverse(object => object.layers.set(layer));
   }
 
-  let latest = null, targets = null, shown = null, clock = 0, steamPhase = 0, currentView = 'reactor';
+  for (const [name, parent] of [['reactor', reactor], ['turbine', hall]]) {
+    const offset = PLANT_OFFSETS[name];
+    parent.position.set(offset.x, 0, offset.z);
+    obstacles[name] = obstacles[name].map(b => ({ minX: b.minX + offset.x, maxX: b.maxX + offset.x,
+      minZ: b.minZ + offset.z, maxZ: b.maxZ + offset.z }));
+  }
+  for (const [start, end, layer] of [[7, 11, 3], [29, 33, 4]]) {
+    const passage = new THREE.Group();
+    for (const x of [3.725, 5.275]) box(passage, [0.3, 2.6, end - start], mat.wall, [x, 1.3, (start + end) / 2]);
+    for (const y of [-0.15, 2.6]) box(passage, [1.85, 0.3, end - start], mat.wall, [4.5, y, (start + end) / 2]);
+    for (const z of [start, end]) {
+      for (const x of [3.825, 5.175]) box(passage, [0.08, 2.3, 0.16], mat.metal, [x, 1.15, z]);
+      box(passage, [1.43, 0.12, 0.16], mat.metal, [4.5, 2.36, z]);
+      if (layer === 4) {
+        for (const x of [3.84, 5.16]) box(passage, [0.03, 2.3, 0.18], mat.ink, [x, 1.15, z]);
+        box(passage, [1.35, 0.03, 0.18], mat.ink, [4.5, 2.31, z]);
+      }
+    }
+    const light = new THREE.PointLight(colors.plantKey, 12, 6, 2);
+    light.position.set(4.5, 2.25, (start + end) / 2);
+    light.userData.paletteToken = 'plantKey';
+    fixtures.push(light);
+    passage.add(light);
+    box(passage, [0.65, 0.04, 1.8], mat.fixture, [4.5, 2.42, (start + end) / 2]);
+    mergeStatic(passage, resources);
+    passage.traverse(object => object.layers.set(layer));
+    scene.add(passage);
+  }
+  cctvCamera.position.x += PLANT_OFFSETS.reactor.x;
+  cctvCamera.position.z += PLANT_OFFSETS.reactor.z;
+
+  let latest = null, targets = null, shown = null, clock = 0, currentView = 'reactor';
   let moving = false;
   function ease(value, target, k) {
     if (Math.abs(value - target) < 0.0001) return target;
@@ -485,7 +604,7 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
       if (Array.isArray(targets[key])) shown[key] = shown[key].map((v, i) => ease(v, targets[key][i], k));
       else shown[key] = ease(shown[key], targets[key], k);
     }
-    if (!reduced) { clock += dt; steamPhase = (steamPhase + dt * shown.steam * 0.25) % 1; }
+    if (!reduced) clock += dt;
     rodPositions.forEach(([x, z], i) => {
       const fraction = i < 13 ? shown.rods : shown.shutdown;
       place(rods, i, [x, 1.45 + fraction * 1.6, z], [0.055, 1.5, 0.055]);
@@ -504,99 +623,52 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
     pumps.forEach((pump, i) => {
       // Pump status switches the lamp. Speed alone drives the coastdown.
       pump.lamp.material = latest.loops[i].pumpRunning ? mat.lit : mat.off;
-      if (!reduced) pump.rotor.rotation.z -= targets.pumps[i] * SPIN * dt;
+      if (!reduced) pump.rotor.rotation.y -= targets.pumps[i] * SPIN * dt;
+      else pump.rotor.rotation.y = -targets.pumps[i] * Math.PI;
       mat.coolant[i].color.copy(cold).lerp(hot, shown.coolant[i]);
     });
     if (!reduced) shaft.rotation.x += targets.shaft * SPIN * dt;
     spray.visible = targets.spray > 0;
     relief.visible = targets.relief > 0;
-    steam.visible = targets.steam > 0;
     vent.visible = targets.vent > 0;
     for (let i = 0; i < spray.count; i++) {
       const fall = (i / spray.count + clock * 0.8) % 1, size = 0.035 + 0.035 * shown.spray;
       place(spray, i, [-5.45 + Math.sin(i * 2.3) * 0.14, 4.5 - fall * 1.1, -0.45], [size, size * 1.8, size]);
     }
-    for (const [mesh, x, y, z, amount] of [[relief, -6.5, 6.5, -0.5, shown.relief], [vent, HALL_X + 5, 6.7, 0, shown.vent]]) {
+    for (const [mesh, x, y, z, amount] of [[relief, -6.5, 6.5, -0.5, shown.relief]]) {
       for (let i = 0; i < mesh.count; i++) {
         const rise = (i / mesh.count + clock * 0.32) % 1, size = (0.14 + rise * 0.4) * amount;
         place(mesh, i, [x + rise * 0.2, y + rise * 1.6, z], [size, size * 1.4, size]);
       }
     }
-    for (let i = 0; i < steam.count; i++) {
-      const p = steamPath.getPointAt((i / steam.count + steamPhase) % 1);
-      // Puffs run on the pipe surface, where they remain visible outside the steel.
-      place(steam, i, [p.x, p.y, p.z + 0.26], [0.075, 0.075, 0.075]);
-    }
+    vent.children.forEach((sprite, i) => {
+      const rise = (i / vent.children.length + clock * 0.32) % 1;
+      const size = (0.3 + rise * 0.8) * shown.vent;
+      sprite.position.set(HALL_X + 5 + rise * 0.2, 6.7 + rise * 1.6, 0);
+      sprite.scale.set(size, size * 1.4, 1);
+    });
     gaugeMeshes.forEach(({ local, needles }) => local.forEach((g, i) => {
       const [low, high] = g.pair.range;
       g.fraction = ease(g.fraction, clamp01((g.pair.trueValue - low) / (high - low)), k);
-      place(needles, i, [g.at[0], g.at[1] + 0.103, g.at[2] + 0.09], [1, 1, 1], [0, 0, Math.PI * 0.75 - Math.PI * 1.5 * g.fraction]);
+      place(needles, i, [g.at[0], g.at[1] + 0.0303, g.at[2] + 0.09], [1, 1, 1], [0, 0, Math.PI * 0.75 - Math.PI * 1.5 * g.fraction]);
     }));
-    return !reduced && (moving || targets.pumps.some(v => v > 0) || targets.shaft > 0 || targets.steam > 0 || targets.spray > 0 || targets.relief > 0 || targets.vent > 0);
+    return !reduced && (moving || targets.pumps.some(v => v > 0) || targets.shaft > 0 || targets.spray > 0 || targets.relief > 0 || targets.vent > 0);
   }
   function setView(name) {
     const view = VIEWS[name];
     if (!view) throw new Error(`No view named ${name}`);
     currentView = name === 'turbine' ? 'turbine' : 'reactor';
     camera.layers.set(currentView === 'reactor' ? 1 : 2);
-    camera.position.set(...view.eye); camera.lookAt(...view.look);
+    camera.layers.enable(4);
+    if (currentView === 'turbine') camera.layers.enable(3);
+    camera.position.set(...view.eye);
+    camera.lookAt(...view.look);
     camera.rotation.order = 'YXZ';
-    stopWalking();
   }
 
-  // Input belongs to the shared canvas. No renderer or graphics context is created.
-  let inputCanvas = null, sharedRenderer = null, walkFrame = 0, drag = null, lastWalk = 0;
-  const keys = new Set(), listeners = [];
-  function active() {
-    const host = inputCanvas?.closest('[data-view]');
-    return host && host.dataset.view === (currentView === 'reactor' ? 'Reactor building' : 'Turbine hall');
-  }
-  function stopWalking() {
-    keys.clear(); drag = null;
-    if (walkFrame) cancelAnimationFrame(walkFrame);
-    walkFrame = 0;
-  }
-  function redraw() {
-    if (!active() || reducedMotion()) return;
-    sharedRenderer.info.reset(); sharedRenderer.render(scene, camera);
-  }
-  function walkingFrame(now) {
-    walkFrame = 0;
-    if (!active() || reducedMotion() || !keys.size) return;
-    const delta = walkDelta(keys, camera.rotation.y, Math.min(0.05, (now - lastWalk) / 1000)); lastWalk = now;
-    const next = walk({ x: camera.position.x, z: camera.position.z }, delta.x, delta.z, obstacles[currentView], 0.28);
-    camera.position.set(next.x, 1.7, next.z); redraw();
-    walkFrame = requestAnimationFrame(walkingFrame);
-  }
-  function listen(target, type, callback) {
-    target.addEventListener(type, callback); listeners.push(() => target.removeEventListener(type, callback));
-  }
-  scene.onBeforeRender = renderer => {
-    if (inputCanvas) return;
-    sharedRenderer = renderer; inputCanvas = renderer.domElement;
-    const walkingKeys = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
-    listen(inputCanvas, 'keydown', event => {
-      if (!active() || reducedMotion() || !walkingKeys.has(event.code) || event.altKey || event.ctrlKey || event.metaKey) return;
-      event.preventDefault(); keys.add(event.code);
-      if (!walkFrame) { lastWalk = performance.now(); walkFrame = requestAnimationFrame(walkingFrame); }
-    });
-    listen(inputCanvas, 'keyup', event => { keys.delete(event.code); });
-    listen(inputCanvas, 'blur', stopWalking); listen(window, 'blur', stopWalking);
-    listen(inputCanvas, 'pointerdown', event => {
-      if (!active() || reducedMotion() || event.button !== 0) return;
-      inputCanvas.focus(); inputCanvas.setPointerCapture?.(event.pointerId); drag = { x: event.clientX, y: event.clientY };
-    });
-    listen(inputCanvas, 'pointermove', event => {
-      if (!drag || !active() || reducedMotion()) return;
-      const pose = look({ yaw: camera.rotation.y, pitch: camera.rotation.x }, event.clientX - drag.x, event.clientY - drag.y);
-      camera.rotation.set(pose.pitch, pose.yaw, 0, 'YXZ'); drag = { x: event.clientX, y: event.clientY }; redraw();
-    });
-    listen(inputCanvas, 'pointerup', () => { drag = null; });
-    listen(inputCanvas, 'pointercancel', stopWalking);
-  };
   setView('reactor');
   return {
-    scene, camera, cctvCamera, advance: animate, setView,
+    scene, camera, cctvCamera, obstacles, advance: animate, setView,
     update(snapshot) {
       latest = instruments(snapshot); targets = targetsFrom(latest);
       const first = shown === null;
@@ -610,10 +682,11 @@ export function createPlantScene({ theme, reducedMotion, environment }) {
     },
     setTheme(next) { Object.assign(colors, next); applyColors(); if (latest) animate(0); },
     dispose() {
-      stopWalking(); listeners.forEach(remove => remove()); forcedColors?.removeEventListener('change', paintLabels);
       scene.traverse(object => { if (object.isInstancedMesh) object.dispose(); });
       fixtures.forEach(light => light.dispose()); lighting.dispose();
-      scene.onBeforeRender = () => {}; scene.environment = null; scene.clear(); resources.disposeAll();
+      scene.environment = null;
+      scene.clear();
+      resources.disposeAll();
     },
   };
 }

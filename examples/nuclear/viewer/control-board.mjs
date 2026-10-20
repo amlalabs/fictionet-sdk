@@ -3,10 +3,10 @@ import * as THREE from '/vendor/three/build/three.module.js';
 import { KNOBS } from './control-room.mjs';
 import { formatValue } from './instruments.mjs';
 import { createMeters, paintLetters } from './meters.mjs';
-import { ROOM, FLOOR, CEILING_LIGHTS, DEFAULT_VIEW, BOARD, BOARDS, BOARD_PX, DESKS, CHAIRS, CCTV, DOOR, COLLISIONS, STANDING_SPOTS,
+import { ROOM, FLOOR, CEILING_LIGHTS, DEFAULT_VIEW, BOARD, BOARDS, BOARD_PX, DESKS, CHAIRS, CCTV, DOOR, DOORWAYS, COLLISIONS, STANDING_SPOTS,
   boardPoint, boardLayout, windowState, devicePlacements, fitSpot, deskOutline, mimicLines } from './board-layout.mjs';
-import { look, walk, walkDelta, walkPath, glidePose } from './room-motion.mjs';
-import { createPlantScene, mergeStatic } from './plant-scene.mjs';
+import { look, walk, walkDelta, walkPath, glidePose, doorwayCrossing, doorwayFade } from './room-motion.mjs';
+import { createPlantScene, mergeStatic, VIEWS } from './plant-scene.mjs';
 import { createRenderer, createEnvironment, createLighting, createMaterial, applyMaterialPalette,
   setIndicator, bakeRoomGeometry, roomLightAt } from './look.mjs';
 
@@ -80,8 +80,9 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   block(staticRoom, [doorLeft + halfW, ROOM.height + FLOOR.thickness, 0.24], [(doorLeft - halfW) / 2, (ROOM.height - FLOOR.thickness) / 2, halfD], material.wall);
   block(staticRoom, [halfW - doorRight, ROOM.height + FLOOR.thickness, 0.24], [(halfW + doorRight) / 2, (ROOM.height - FLOOR.thickness) / 2, halfD], material.wall);
   block(staticRoom, [DOOR.width, ROOM.height - DOOR.height, 0.24], [DOOR.x, (ROOM.height + DOOR.height) / 2, halfD], material.wall);
-  block(staticRoom, [DOOR.width, DOOR.height, 0.08], [DOOR.x, DOOR.height / 2, DOOR.z], material.metal);
-  block(staticRoom, [0.08, 0.08, 0.14], [DOOR.x - 0.45, 1.05, DOOR.z - 0.1], material.ink);
+  for (const x of [3.725, 5.275]) block(staticRoom, [0.3, 2.6, 4], [x, 1.3, 9], material.wall);
+  for (const y of [-0.15, 2.6]) block(staticRoom, [1.85, 0.3, 4], [4.5, y, 9], material.wall);
+  block(staticRoom, [0.65, 0.04, 1.8], [4.5, 2.42, 9], material.light);
   const tiles = [];
   for (let x = -halfW + FLOOR.tile / 2; x < halfW; x += FLOOR.tile)
     for (let z = -halfD + FLOOR.tile / 2; z < halfD; z += FLOOR.tile)
@@ -184,7 +185,7 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     { text: 'CONTAINMENT CAMERA', face: paintedFace(1.7, 0.22, staticRoom, [CCTV.x + 0.02, CCTV.y + 0.66, CCTV.z], Math.PI / 2, 768, 112) },
     { text: 'SHIFT SUPERVISOR', face: paintedFace(1.6, 0.18, staticRoom, [0, 0.62, 6.26], 0, 768, 112) },
   ];
-  const plant = createPlantScene({ theme, reducedMotion, environment: environment.texture });
+  const plant = createPlantScene({ theme, reducedMotion, environment: environment.texture, anisotropy: Math.min(4, renderer.capabilities.getMaxAnisotropy()) });
   const cctvTarget = track(new THREE.WebGLRenderTarget(480, 270, { type: THREE.HalfFloatType }));
   track(cctvTarget.texture);
   cctvTarget.texture.colorSpace = THREE.LinearSRGBColorSpace;
@@ -286,7 +287,27 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   let disposed = false, visible = true, raf = 0, timer = 0, last = 0, lastCctv = -Infinity;
   let lastPlant = 0, plantDirty = true, plantMoving = false, themeDirty = true;
   let dragging = false, dragDistance = 0, pointerX = 0, pointerY = 0;
-  const isPlant = () => selected === 'reactor' || selected === 'turbine';
+  let space = 'control-room';
+  let fadeAt = -Infinity;
+  const isPlant = () => space !== 'control-room';
+  const collisions = () => isPlant() ? plant.obstacles[space] : COLLISIONS;
+  function enterSpace(next, now) {
+    if (next === space) return;
+    space = next;
+    fadeAt = now;
+    camera.layers.set(0);
+    if (space === 'reactor' || space === 'airlock') {
+      camera.layers.set(1);
+      camera.layers.enable(4);
+    } else if (space !== 'control-room') {
+      camera.layers.set(2);
+      camera.layers.enable(3);
+      camera.layers.enable(4);
+    }
+    const names = { 'control-room': 'Control room', corridor: 'Plant corridor', turbine: 'Turbine hall', airlock: 'Personnel airlock', reactor: 'Containment operating deck' };
+    container.dataset.view = names[space];
+    canvas.setAttribute('aria-label', `${names[space]}. First-person control room and plant views. The text section lists the same values.`);
+  }
 
   function applyTheme(next) {
     palette = next;
@@ -355,8 +376,12 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
     }
     const delta = walkDelta(keys, pose.yaw, dt);
     const previous = pose;
-    if (!isPlant()) pose = walk(pose, delta.x, delta.z, COLLISIONS, ROOM.radius);
+    pose = walk(pose, delta.x, delta.z, collisions(), ROOM.radius);
+    enterSpace(doorwayCrossing(space, previous, pose, DOORWAYS, ROOM.radius), now);
+    const opacity = doorwayFade(now - fadeAt, reducedMotion());
+    canvas.style.opacity = String(Math.round(opacity * 1000) / 1000);
     const walking = pose.x !== previous.x || pose.z !== previous.z;
+    if (walking) selected = null;
     camera.position.set(pose.x, ROOM.eye, pose.z);
     camera.rotation.set(pose.pitch, pose.yaw, 0, 'YXZ');
     if (camera.fov !== pose.fov) {
@@ -376,13 +401,13 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
       plantDirty = false;
     }
     container.dataset.camera = glide || walking || dragging ? 'moving' : 'still';
-    render(isPlant() ? plant.scene : scene, isPlant() ? plant.camera : camera);
+    render(isPlant() ? plant.scene : scene, camera);
     // Renderer counters include the containment pass as well as the room.
     frameTimes.push(performance.now() - frameStart); if (frameTimes.length > 30) frameTimes.shift();
     const mean = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
     if (pixelRatio > 1 && frameTimes.length === 30 && mean > 20) { pixelRatio = 1; renderer.setPixelRatio(pixelRatio); resize(); }
     const flashing = !reducedMotion() && (view?.alarms.some(a => a.state === 'active') || knobStates.some(s => s.pending || s.refusedUntil > now));
-    if (glide || walking || needlesMoving || (isPlant() && plantMoving) || (!isPlant() && flashing)) {
+    if (opacity < 1 || glide || walking || needlesMoving || (isPlant() && plantMoving) || (!isPlant() && flashing)) {
       if (!raf) raf = requestAnimationFrame(frame);
     } else if (!isPlant()) {
       const waitingScreen = screens.some(s => s.pending);
@@ -597,26 +622,40 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   function setView(name) {
     if (!(name in STANDING_SPOTS) && name !== 'reactor' && name !== 'turbine') return;
     cancelGrab(); hovered = null; canvas.style.cursor = '';
-    selected = name; keys.clear(); dragging = false;
+    selected = name;
+    keys.clear();
+    dragging = false;
     if (document.pointerLockElement === canvas) document.exitPointerLock();
-    if (isPlant()) { glide = null; plant.setView(name); }
-    else {
+    const destination = name === 'reactor' || name === 'turbine' ? name : 'control-room';
+    const changedSpace = destination !== space;
+    if (destination !== 'control-room') {
+      const view = VIEWS[name];
+      const dx = view.look[0] - view.eye[0];
+      const dz = view.look[2] - view.eye[2];
+      pose = { x: view.eye[0], z: view.eye[2], yaw: Math.atan2(-dx, -dz),
+        pitch: Math.atan2(view.look[1] - ROOM.eye, Math.hypot(dx, dz)), fov: 64 };
+      glide = null;
+    } else {
       const segment = BOARDS.find(board => board.view === name);
       const spot = STANDING_SPOTS[name];
       const end = segment ? { ...spot, ...fitSpot(segment, camera.aspect, spot.fov) } : spot;
-      const path = walkPath(pose, end, COLLISIONS, ROOM.radius);
-      if (reducedMotion()) { pose = { ...end }; glide = null; }
-      else if (path && (Math.hypot(pose.x - end.x, pose.z - end.z) > 0.001 || Math.abs(pose.yaw - end.yaw) > 0.001 || Math.abs(pose.pitch - end.pitch) > 0.001 || Math.abs(pose.fov - end.fov) > 0.001))
+      const path = changedSpace ? null : walkPath(pose, end, COLLISIONS, ROOM.radius);
+      if (changedSpace || reducedMotion() || !path) {
+        pose = { ...end };
+        glide = null;
+      } else {
         glide = { start: { ...pose }, end, path, at: performance.now() };
+      }
     }
-    const label = STANDING_SPOTS[name]?.name ?? (name === 'reactor' ? 'Reactor building' : 'Turbine hall');
+    enterSpace(destination, performance.now());
+    const label = STANDING_SPOTS[name]?.name ?? (name === 'reactor' ? 'Containment operating deck' : 'Turbine hall');
     container.dataset.view = label;
     canvas.setAttribute('aria-label', `${label}. First-person control room and plant views. The text section lists the same values.`);
     requestFrame();
   }
   const walkingKeys = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
   listen(canvas, 'keydown', event => {
-    if (document.activeElement !== canvas || grabbed || isPlant() || !walkingKeys.has(event.code) || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (document.activeElement !== canvas || grabbed || !walkingKeys.has(event.code) || event.ctrlKey || event.metaKey || event.altKey) return;
     event.preventDefault(); keys.add(event.code); glide = null; requestFrame();
   });
   listen(canvas, 'keyup', event => { if (keys.delete(event.code)) { event.preventDefault(); requestFrame(); } });
@@ -624,7 +663,7 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
   listen(canvas, 'blur', stop); listen(window, 'blur', stop);
   listen(document, 'pointerlockchange', () => { if (document.pointerLockElement !== canvas) stop(); });
   listen(canvas, 'pointerdown', event => {
-    if (event.button !== 0 || isPlant() || grabbed) return;
+    if (event.button !== 0 || grabbed) return;
     const hit = hitDevice(event);
     if (hit) {
       if (document.pointerLockElement === canvas) document.exitPointerLock();
@@ -652,7 +691,7 @@ export function createControlBoard(container, { knobIds, knobLabels, knobKinds, 
       canvas.style.cursor = hovered ? knobStates[hovered.index]?.disabled ? 'not-allowed' : 'grab' : '';
       requestFrame();
     }
-    if ((!dragging && !locked) || isPlant()) return;
+    if (!dragging && !locked) return;
     const dx = locked ? event.movementX : event.clientX - pointerX, dy = locked ? event.movementY : event.clientY - pointerY;
     pointerX = event.clientX; pointerY = event.clientY; dragDistance += Math.abs(dx) + Math.abs(dy);
     pose = look(pose, dx, dy); requestFrame();

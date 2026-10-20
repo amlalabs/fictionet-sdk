@@ -30,13 +30,17 @@ const graphicsURL = `data:text/javascript,${encodeURIComponent(`
         let calls = 0;
         let triangles = 0;
         scene.traverseVisible(mesh => {
-          if (!mesh.isMesh || !mesh.material.visible || !mesh.layers.test(camera.layers)) return;
-          if (mesh.frustumCulled && !frustum.intersectsObject(mesh)) return;
+          if ((!mesh.isMesh && !mesh.isSprite) || !mesh.material.visible || !mesh.layers.test(camera.layers)) return;
+          if (mesh.frustumCulled) {
+            const intersects = mesh.isSprite ? frustum.intersectsSprite(mesh) : frustum.intersectsObject(mesh);
+            if (!intersects) return;
+          }
           const count = mesh.isInstancedMesh ? mesh.count : 1;
           if (!count) return;
           const passes = mesh.material.transparent && mesh.material.side === THREE.DoubleSide && !mesh.material.forceSinglePass ? 2 : 1;
           calls += passes;
-          triangles += (mesh.geometry.index?.count ?? mesh.geometry.attributes.position.count) / 3 * count * passes;
+          if (mesh.isSprite) triangles += 2;
+          else triangles += (mesh.geometry.index?.count ?? mesh.geometry.attributes.position.count) / 3 * count * passes;
         });
         this.info.render.calls += calls;
         this.info.render.triangles += triangles;
@@ -69,18 +73,38 @@ function fixture(t, reducedMotion = () => true) {
   const frames = new Map();
   let frameNumber = 0;
   let resize;
-  const makeElement = () => {
-    const ctx = { measureText: value => ({ width: value.length * 5 }) };
-    for (const name of ['fillRect', 'clearRect', 'strokeRect', 'fillText', 'save', 'restore', 'translate', 'scale',
-      'beginPath', 'moveTo', 'lineTo', 'stroke']) ctx[name] = () => {};
-    return {
-      style: {}, dataset: {}, clientWidth: 785, clientHeight: 491,
-      getContext: () => ctx, setAttribute() {}, append() {}, remove() {}, addEventListener() {}, removeEventListener() {},
+  const targets = [];
+  const eventTarget = () => {
+    const target = new EventTarget();
+    const listeners = new Map();
+    const add = target.addEventListener.bind(target);
+    const remove = target.removeEventListener.bind(target);
+    target.addEventListener = (type, fn) => {
+      listeners.set(fn, type);
+      add(type, fn);
     };
+    target.removeEventListener = (type, fn) => {
+      listeners.delete(fn);
+      remove(type, fn);
+    };
+    target.listeners = listeners;
+    targets.push(target);
+    return target;
+  };
+  const makeElement = () => {
+    const ctx = { measureText: value => ({ width: value.length * 5 }),
+      createRadialGradient: () => ({ addColorStop() {} }) };
+    for (const name of ['drawImage', 'fillRect', 'clearRect', 'strokeRect', 'fillText', 'save', 'restore', 'translate', 'scale',
+      'beginPath', 'moveTo', 'lineTo', 'stroke']) ctx[name] = () => {};
+    return Object.assign(eventTarget(), {
+      style: {}, dataset: {}, clientWidth: 785, clientHeight: 491,
+      getContext: () => ctx, setAttribute() {}, append() {}, remove() {},
+      focus() { document.activeElement = this; },
+    });
   };
   const globals = {
-    document: { createElement: makeElement, addEventListener() {}, removeEventListener() {} },
-    window: { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} },
+    document: Object.assign(eventTarget(), { createElement: makeElement }),
+    window: Object.assign(eventTarget(), { devicePixelRatio: 1 }),
     ResizeObserver: class { constructor(callback) { resize = callback; } observe() {} disconnect() {} },
     IntersectionObserver: class { observe() {} disconnect() {} },
     requestAnimationFrame: callback => { frames.set(++frameNumber, callback); return frameNumber; },
@@ -139,7 +163,7 @@ function fixture(t, reducedMotion = () => true) {
     stage.dispose();
     restore.forEach(reset => reset());
   });
-  return { stage, renderer, container, draw, view, text, resize: () => resize() };
+  return { stage, renderer, container, draw, view, text, targets, resize: () => resize() };
 }
 
 test('the built room uses lit surfaces, baked geometry and bounded geometry cost', t => {
@@ -334,4 +358,63 @@ test('resizing during a section glide fits the section at its own field of view'
   assert.equal(camera.fov, spot.fov);
   assert.equal(camera.position.x, fitted.x);
   assert.equal(camera.position.z, fitted.z);
+});
+
+test('one canvas walks through every space, looks in the plant, teleports back, and releases every listener', t => {
+  const f = fixture(t);
+  const canvas = f.renderer.domElement;
+  f.stage.setView('door');
+  f.draw();
+  const sharedCamera = f.renderer.frames.at(-1).camera;
+  canvas.focus();
+  canvas.dispatchEvent(Object.assign(new Event('keydown', { cancelable: true }), { code: 'KeyW' }));
+  const visited = new Set();
+  let previousZ = sharedCamera.position.z;
+  for (let i = 0; i < 200 && sharedCamera.position.z < 35; i++) {
+    f.draw(100);
+    const frame = f.renderer.frames.at(-1);
+    assert.equal(frame.camera, sharedCamera);
+    assert.ok(Math.abs(frame.camera.position.z - previousZ - 0.17) < 1e-8);
+    assert.equal(frame.camera.position.y, ROOM.eye);
+    assert.equal(canvas.style.opacity, '1');
+    previousZ = frame.camera.position.z;
+    visited.add(f.container.dataset.view);
+  }
+  assert.deepEqual([...visited], ['Door to the plant', 'Plant corridor', 'Turbine hall', 'Personnel airlock', 'Containment operating deck']);
+  canvas.dispatchEvent(Object.assign(new Event('keyup', { cancelable: true }), { code: 'KeyW' }));
+  canvas.dispatchEvent(Object.assign(new Event('pointerdown'), { button: 0, clientX: 100, clientY: 100 }));
+  const yaw = sharedCamera.rotation.y;
+  document.dispatchEvent(Object.assign(new Event('pointermove'), { clientX: 140, clientY: 120 }));
+  f.draw();
+  assert.ok(Math.abs(sharedCamera.rotation.y - yaw) > 0.09);
+  canvas.dispatchEvent(new Event('pointerup'));
+  for (const view of ['turbine', 'reactor', 'cctv', 'door', DEFAULT_VIEW]) {
+    f.stage.setView(view);
+    f.draw();
+    assert.equal(f.renderer.frames.at(-1).camera, sharedCamera);
+  }
+  assert.ok(f.targets.some(target => target.listeners.size > 0));
+  f.stage.dispose();
+  assert.ok(f.targets.every(target => target.listeners.size === 0));
+});
+
+test('crossing fades in the new space while walking continues on the same camera', t => {
+  let reduced = true;
+  const f = fixture(t, () => reduced);
+  const canvas = f.renderer.domElement;
+  f.stage.setView('door');
+  f.draw();
+  reduced = false;
+  canvas.focus();
+  canvas.dispatchEvent(Object.assign(new Event('keydown', { cancelable: true }), { code: 'KeyW' }));
+  for (let i = 0; i < 30 && f.container.dataset.view !== 'Plant corridor'; i++) f.draw(100);
+  assert.equal(f.container.dataset.view, 'Plant corridor');
+  assert.equal(canvas.style.opacity, '0');
+  const camera = f.renderer.frames.at(-1).camera;
+  const z = camera.position.z;
+  f.draw(90);
+  assert.equal(canvas.style.opacity, '0.5');
+  assert.ok(camera.position.z > z);
+  f.draw(90);
+  assert.equal(canvas.style.opacity, '1');
 });
