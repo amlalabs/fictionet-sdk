@@ -595,7 +595,7 @@ test('a page can open its inspector on its own panel', async (t) => {
   };
   const stop = await mount(h.root, transport, { subscribe: () => () => {}, dispose() {} });
   const tabs = h.root.querySelector('#tabs').children;
-  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Plant', 'Packets', 'Events', 'Map', 'Rows', 'Log', 'Traffic']);
+  assert.deepEqual(tabs.map((tab) => tab.textContent), ['Plant', 'Rows', 'Log', 'Traffic', 'Packets', 'Events', 'Map']);
   assert.equal(tabs[0].getAttribute('aria-selected'), 'true');
   assert.equal(h.root.querySelector('#inspector-content').dataset.kind, 'custom');
   stop();

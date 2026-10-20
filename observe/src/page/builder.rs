@@ -164,7 +164,9 @@ impl Page {
         self
     }
     /// Puts the named inspector panel first and opens the inspector on it, so
-    /// a demo's own panel is what a viewer sees before Packets.
+    /// a demo's own panel is what a viewer sees before Packets. The page's
+    /// other own panels follow it in the order they were declared, before the
+    /// standard panels.
     pub fn inspector_first(mut self, title: impl Into<String>) -> Self {
         let title = title.into();
         if self.inspector_first.replace(title.clone()).is_some() {

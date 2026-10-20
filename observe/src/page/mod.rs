@@ -178,8 +178,9 @@
 //! `workspace(title)` places that custom panel in the workspace and moves
 //! the consoles to the inspector. Add `workspace_consoles()` to keep their
 //! tiles beside the custom panel. `inspector_first(title)` puts that
-//! inspector panel first and opens the inspector on it; `/api/page` gives its
-//! id as `inspector_first`, which is null without the call. `command(name, port)` registers a mailbox
+//! inspector panel first and opens the inspector on it, with the page's other
+//! own panels after it; `/api/page` gives its id as `inspector_first`, which
+//! is null without the call. `command(name, port)` registers a mailbox
 //! at `/api/command/<name>` without a control panel. Names, columns, actions, paths and
 //! composition conflicts are checked before the listener binds.
 //!

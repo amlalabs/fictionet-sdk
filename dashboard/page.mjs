@@ -227,9 +227,13 @@ export async function mount(root, transport, theme) {
   services.labelCommand = page.panels.find((panel) => panel.kind === 'labels')?.command;
   const panels = page.panels.filter((panel) => panel.area === 'inspector');
   panels.sort((a, b) => (ORDER.indexOf(a.kind) < 0 ? ORDER.length : ORDER.indexOf(a.kind)) - (ORDER.indexOf(b.kind) < 0 ? ORDER.length : ORDER.indexOf(b.kind)));
-  // A page can open on its own panel: it goes first and opens first.
-  const first = panels.findIndex((panel) => panel.id === page.inspector_first);
-  if (first > 0) panels.unshift(...panels.splice(first, 1));
+  // A page can open on its own panel: it goes first and opens first, and the
+  // page's other own panels follow it in the order the page declared them.
+  if (panels.some((panel) => panel.id === page.inspector_first)) {
+    const own = (panel) => !ORDER.includes(panel.kind);
+    const rank = (panel) => (panel.id === page.inspector_first ? 0 : own(panel) ? 1 : 2);
+    panels.sort((a, b) => rank(a) - rank(b));
+  }
   const tabs = [];
   const consoleOptions = (options, controls) => ({
     ...options, controls,
