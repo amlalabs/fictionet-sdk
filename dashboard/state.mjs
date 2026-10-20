@@ -180,59 +180,54 @@ export function createState() {
   return { state, runTime, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent };
 }
 
-// Bind one watch to a graph state, until the returned function is called.
-export function watchState(source, { state, tick, snapshot, upsertHost, removeHost, upsertGroup, removeGroup, upsertNode, removeNode, upsertEdge, removeEdge, counters, addEvent }) {
-  const cleanup = [];
-  const on = (name, callback) => {
-    source.addEventListener(name, callback);
-    cleanup.push(() => source.removeEventListener(name, callback));
-  };
-  on('waiting', () => { state.connected = true; });
-  on('snapshot', (e) => snapshot(JSON.parse(e.data)));
-  on('host', (e) => upsertHost(JSON.parse(e.data)));
-  on('host_end', (e) => removeHost(JSON.parse(e.data).id));
-  on('group', (e) => upsertGroup(JSON.parse(e.data)));
-  on('group_end', (e) => removeGroup(JSON.parse(e.data).id));
-  on('node', (e) => upsertNode(JSON.parse(e.data)));
-  on('node_end', (e) => removeNode(JSON.parse(e.data).id));
-  on('edge', (e) => upsertEdge(JSON.parse(e.data)));
-  on('edge_end', (e) => removeEdge(JSON.parse(e.data).id));
-  on('counters', (e) => counters(JSON.parse(e.data)));
-  on('event', (e) => addEvent(JSON.parse(e.data)));
-  on('ended', (e) => {
-    tick(JSON.parse(e.data).t);
-    state.ended = true;
-    state.sideDirty = true;
-  });
-  on('end', () => {
+// The watch events the model listens for, and what each does to the graph.
+// `error` and `open` change nothing there and only reach subscribers.
+const WATCH = {
+  waiting: (graph) => { graph.state.connected = true; },
+  snapshot: (graph, data) => graph.snapshot(data),
+  host: (graph, data) => graph.upsertHost(data),
+  host_end: (graph, data) => graph.removeHost(data.id),
+  group: (graph, data) => graph.upsertGroup(data),
+  group_end: (graph, data) => graph.removeGroup(data.id),
+  node: (graph, data) => graph.upsertNode(data),
+  node_end: (graph, data) => graph.removeNode(data.id),
+  edge: (graph, data) => graph.upsertEdge(data),
+  edge_end: (graph, data) => graph.removeEdge(data.id),
+  counters: (graph, data) => graph.counters(data),
+  event: (graph, data) => graph.addEvent(data),
+  ended: (graph, data) => {
+    graph.tick(data.t);
+    graph.state.ended = true;
+    graph.state.sideDirty = true;
+  },
+  end: (graph, _, source) => {
     source.close();
-    state.ended = true;
-  });
-  on('status', (e) => { state.status = JSON.parse(e.data).status; });
-  on('world_error', () => { state.ended = true; });
-  return () => {
-    cleanup.forEach((remove) => remove());
-    source.close();
-  };
-}
+    graph.state.ended = true;
+  },
+  status: (graph, data) => { graph.state.status = data.status; },
+  world_error: (graph) => { graph.state.ended = true; },
+  error: () => {},
+  open: () => {},
+};
 
-// The watch events the model passes on to its subscribers.
-const EVENTS = ['waiting', 'snapshot', 'host', 'host_end', 'group', 'group_end', 'node', 'node_end', 'edge', 'edge_end', 'counters', 'status', 'event', 'ended', 'end', 'world_error', 'error', 'open'];
-
-/// The page's one graph, bound to `source`, a watch. `subscribe(listener)`
-/// calls `listener(name, data)` for each watch event once the graph holds it,
-/// and returns an unsubscribe function.
+/// The page's one graph, bound to `source`, a watch. Each watch event is
+/// parsed once and applied to the graph; then `subscribe(listener)` calls
+/// `listener(name, data)` with it. `subscribe` returns an unsubscribe function.
 export function createModel(source) {
   const graph = createState();
   const listeners = new Set();
-  const unbind = watchState(source, graph);
-  const removers = EVENTS.map((name) => listen(source, name, (event) => {
+  const removers = Object.entries(WATCH).map(([name, apply]) => listen(source, name, (event) => {
     const data = event.data ? JSON.parse(event.data) : null;
+    apply(graph, data, source);
     for (const listener of [...listeners]) listener(name, data);
   }));
   return {
     ...graph,
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
-    dispose() { listeners.clear(); removers.forEach((remove) => remove()); unbind(); },
+    dispose() {
+      listeners.clear();
+      removers.forEach((remove) => remove());
+      source.close();
+    },
   };
 }

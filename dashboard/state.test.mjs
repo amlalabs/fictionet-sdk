@@ -6,10 +6,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModel, createState } from './state.mjs';
 
-const world = createState;
-
 test('a snapshot replaces the graph and events and applies counters', () => {
-  const w = world();
+  const w = createState();
   w.upsertGroup({ id: 'old-group', name: 'old' });
   w.upsertNode({ id: 'old-a' });
   w.upsertNode({ id: 'old-b' });
@@ -51,7 +49,7 @@ test('a snapshot replaces the graph and events and applies counters', () => {
 });
 
 test('node and edge updates keep endpoint edge sets and node removal clears selection', () => {
-  const w = world();
+  const w = createState();
   for (const id of ['a', 'b', 'c']) w.upsertNode({ id });
   w.upsertEdge({ id: 'e1', a: 'a', b: 'b' });
   assert.deepEqual(w.state.nodes.get('a').edges, new Set(['e1']));
@@ -76,7 +74,7 @@ test('node and edge updates keep endpoint edge sets and node removal clears sele
 });
 
 test('group removal clears a matching selection', () => {
-  const w = world();
+  const w = createState();
   w.upsertGroup({ id: 'g1', name: 'office' });
   w.state.selected = { kind: 'group', id: 'g1' };
   w.removeGroup('g1');
@@ -85,7 +83,7 @@ test('group removal clears a matching selection', () => {
 });
 
 test('counters compute packet and byte rates from the previous counts', () => {
-  const w = world();
+  const w = createState();
   w.snapshot({
     t: 10, started: 1000, ended: false, nodes: [{ id: 'a' }, { id: 'b' }],
     edges: [{ id: 'e1', a: 'a', b: 'b' }], counters: { e1: [10, 1000, 20, 2000] }, events: [],
@@ -104,7 +102,7 @@ test('counters compute packet and byte rates from the previous counts', () => {
 });
 
 test('events retain the newest 500 and drops count repeats with a default of one', () => {
-  const w = world();
+  const w = createState();
   w.upsertNode({ id: 'a' });
   const events = Array.from({ length: 501 }, (_, t) => ({ kind: 'info', t }));
   for (const event of events) w.addEvent(event);
